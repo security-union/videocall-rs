@@ -38,29 +38,17 @@ env:
     value: webtransport
   - name: SERVER_STATS_INTERVAL_SECS
     value: "5"
-  # NOTE: TOKIO_WORKER_THREADS is intentionally NOT set for this relay.
-  # The webtransport_server binary is `#[actix_rt::main]`, which builds a
-  # single-threaded current-thread tokio runtime that never reads
-  # TOKIO_WORKER_THREADS / worker_threads. The runtime is single-threaded
-  # *by necessity*: the per-session `WtChatSession` actor and its
-  # WebTransport I/O are driven on the actix LocalSet via spawn_local
-  # (see actix-api/src/webtransport/mod.rs and the actor's `!Send` I/O),
-  # which a multi-threaded runtime cannot host. Setting the env here was
-  # therefore inert — a prior bump 2->4 (believed to relieve outbound
-  # back-pressure in the 17-peer cc7tp meeting on 2026-05-06) did nothing,
-  # because thread count cannot relieve back-pressure on a current-thread
-  # runtime. The real multi-core fix (multi-Arbiter sharding / off-thread
-  # parse — issue #1639 options a/b) is deferred to after the #1637
-  # scheduler-lag instrumentation lands. The inert env was removed in #1639
-  # (option c). TOKIO_BLOCKING_THREADS below still applies: the
-  # current-thread runtime keeps a blocking-task pool for spawn_blocking.
-  - name: TOKIO_BLOCKING_THREADS
-    value: "2"
-  # WT outbound mpsc capacity per session. Default in code is 512
+  # TOKIO_WORKER_THREADS stays unset, and MUST: the #2727 sharded relay is
+  # multi-threaded, where tokio DOES read it and PANICS on 0 or garbage (the
+  # relay passes its pool size explicitly, which is what makes it ignored).
+  # WT_SESSION_ARBITERS is the knob; see docs/DEPLOYMENT_CONFIG_MAP.md.
+
+  # WT outbound mpsc capacity per session. Default in code is 1024
   # (fail-fast per issue #979: a deep queue only buffers stale, useless
   # video for slow receivers — the priority-drop policy + CONGESTION
-  # feedback are the correct response, not a bigger buffer). Override
-  # here only for exceptional workloads.
+  # feedback are the correct response, not a bigger buffer; #2717 bounds
+  # the camera/screen backlog in BYTES rather than by a shallower slot
+  # count). Override here only for exceptional workloads.
   #
   # Shedding is NOT env-tunable: the priority-drop policy lives in
   # actix-api/src/actors/priority_drop.rs and uses fixed fill ratios
@@ -69,6 +57,19 @@ env:
   # old dead var was removed in #731.
   # - name: WT_OUTBOUND_CHANNEL_CAPACITY
   #   value: "1024"
+  #
+  # Which QUIC primitive carries downlink audio to a ds=1 receiver (#2724).
+  # Code default is "reliable": audio gets a dedicated reliable stream, so loss
+  # is recovered in about one RTT instead of concealed and the recurring
+  # sub-second hitches of #1878 go away. A multi-second stall is still heard as
+  # a gap -- NetEq caps its target at 300 ms and flushes above 1000 ms, so it
+  # discards the backlog. Set "datagram" to revert this cluster to the
+  # pre-#2724 route. Read once at startup, so a change needs a pod restart.
+  # Pre-#2723 clients keep datagram audio either way. Confirm which way a
+  # cluster is running with
+  # videocall_relay_wt_audio_downlink_sessions_total{lane,mode}.
+  # - name: WT_AUDIO_DOWNLINK_LANE
+  #   value: "reliable"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
   # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
   - name: JWT_SECRET
@@ -82,22 +83,45 @@ env:
   - name: FEATURE_MEETING_MANAGEMENT
     value: "true"
 resources:
-  # Bumped from 500m / 256Mi: a 17-peer cc7tp meeting on 2026-05-06
-  # peaked at 0.47 CPU against the 0.5 limit and saw the outbound mpsc
-  # queue overflow ~38.5k times. 1500m gives ~3x headroom for 17-peer
-  # meetings; the observed 7d memory peak was 60 MiB, so 512Mi keeps
-  # ample headroom for the 512-slot per-session queue (each slot is a
-  # `WtOutbound` enum holding at most one ~1200-byte datagram or a
-  # bounded stream message, so worst-case per-session queue <1 MiB and
-  # the dominant memory line item remains the codec/session state, not
-  # the queue) while keeping the customer-facing default right-sized
-  # rather than over-inflated.
+  # limits.cpu MUST be WHOLE cores (#2727): available_parallelism() floors the
+  # cgroup quota, so "1500m" reports ONE core and disables sharding.
+  # Memory: the 60 MiB observed 7d peak is TYPICAL occupancy, not
+  # the bound. The bound is ~15.6 MiB per receiver (#2717 byte shed plus the
+  # datagram lane and mailbox), so ~470 MiB at 30 sessions: 512Mi is the
+  # bound, NOT headroom. #2715 gives the HCL relays 2Gi via --set, so size
+  # per cluster rather than trusting this default. The byte bound is keyed
+  # off the cleartext outer media_kind, so a publisher that leaves it unset
+  # under E2EE is bounded only by slots x MAX_FRAME_SIZE.
   limits:
-    cpu: "1500m"
+    cpu: "2000m"
     memory: "512Mi"
   requests:
     cpu: "100m"
     memory: "32Mi"
+# /healthz is 503 while the relay's actix_rt heartbeat is stale past 2000 ms.
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: wt-api-health
+  initialDelaySeconds: 5
+  periodSeconds: 2
+  timeoutSeconds: 1
+  failureThreshold: 3
+# Restarts a pod stalled ~1 min; every session on it drops. RELAY_HEALTH_STALE_MS tunes it.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: wt-api-health
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 6
+  terminationGracePeriodSeconds: 10
+terminationGracePeriodSeconds: 30
+# Dormant: templates/pdb.yaml renders only above one replica, which the #1202
+# guard in templates/validate-values.yaml forbids. It returns with the guard.
+podDisruptionBudget:
+  minAvailable: 1
 podAnnotations:
   prometheus.io/scrape: "true"
   prometheus.io/port: "444"
@@ -108,6 +132,11 @@ service:
   type: NodePort
   port: 443
   healthPort: 444
+  # Cluster while the #1202 guard holds; flip to Local with it, not before. 86400
+  # is MaxClientIPServiceAffinitySeconds. docs/hcl-daily-operations.md section 4.
+  externalTrafficPolicy: Cluster
+  sessionAffinity: ClientIP
+  sessionAffinityTimeoutSeconds: 86400
 autoscaling:
   enabled: false
   minReplicas: 1

@@ -152,7 +152,11 @@
  * whichever transport the client elects.
  */
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { BrowserContext, Page } from "@playwright/test";
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Topology constants (must match docker/docker-compose.e2e.yaml `toxiproxy`)
@@ -166,6 +170,48 @@ export const WS_PROXY_NAME = "ws-downlink";
 
 /** Shaped WS URL the degraded browser dials instead of `ws://localhost:8080`. */
 export const SHAPED_WS_URL = process.env.SHAPED_WS_URL || "ws://localhost:8666";
+
+const TOXIPROXY_CONTAINER = "videocall-e2e-toxiproxy-1";
+
+/**
+ * toxiproxy's address on the compose bridge. Throws instead of falling back to
+ * {@link SHAPED_WS_URL}: that docker-proxy hop hides the backlog from `bufferedAmount`.
+ */
+export async function resolveShapedWsUrl(): Promise<string> {
+  if (process.env.SHAPED_WS_URL) {
+    return process.env.SHAPED_WS_URL;
+  }
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(
+      "docker",
+      [
+        "inspect",
+        "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        TOXIPROXY_CONTAINER,
+      ],
+      { timeout: 5_000 },
+    ));
+  } catch (err) {
+    throw new Error(
+      `resolveShapedWsUrl: could not read ${TOXIPROXY_CONTAINER}'s bridge IP. Not falling back ` +
+        `to ${SHAPED_WS_URL}: the loopback path adds multi-MB kernel buffer slack, so send-side ` +
+        "backpressure gates keyed on WebSocket bufferedAmount never engage and the test would " +
+        "pass for a harness reason. Start the impair profile (`make e2e-up-impair`) or set " +
+        "SHAPED_WS_URL explicitly.",
+      { cause: err },
+    );
+  }
+  const ip = stdout.trim();
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+    throw new Error(
+      `resolveShapedWsUrl: docker inspect returned ${JSON.stringify(ip)} for ` +
+        `${TOXIPROXY_CONTAINER}, which is not an IPv4 address. Set SHAPED_WS_URL explicitly.`,
+    );
+  }
+  return `ws://${ip}:8666`;
+}
 
 /** Stable name of the downstream bandwidth toxic we add/remove. */
 const TOXIC_NAME = "downlink-bandwidth";

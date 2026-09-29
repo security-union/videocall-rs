@@ -54,17 +54,8 @@ import { chromium } from "@playwright/test";
  * BEFORE navigation, so they actually publish, get decoded by the peer, and
  * trigger the remote `peer_status` emit that carries the transport.
  *
- * ## Which transport (WT vs WS) the badge shows
- *
- * Authenticated contexts default to WebSocket: `createAuthenticatedContext`
- * injects `DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT`, which seeds
- * `vc_transport_preference="websocket"` when unset. But WebTransport is enabled
- * in the stack (`config.js: webTransportEnabled "true"`) and a context CAN end
- * up on WT, and the local dev WT cert may or may not be reachable in CI. The
- * existing transport specs therefore accept EITHER transport, and so do we: the
- * positive test asserts the badge is exactly one of the two valid, mutually
- * exclusive states — never an unclassified/empty badge — and that its class,
- * text, and aria-label all agree on the SAME transport.
+ * The first test accepts EITHER transport; the WT-default and WS-pinned tests
+ * below each pin one outcome.
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
@@ -392,6 +383,59 @@ test.describe("Per-tile transport badge (#1483)", () => {
       const iconCluster = remoteTile.locator(".tile-top-icons");
       await expect(iconCluster.locator("button.signal-indicator")).toHaveCount(1);
       await expect(iconCluster.locator(".transport-badge")).toHaveCount(1);
+    } finally {
+      await tearDown(members, browsers);
+    }
+  });
+
+  test("flag ON + nothing pinned: a fresh session elects WebTransport and both badges read WT", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_xport_badge_default_${Date.now()}`;
+
+    const profiles = [
+      { email: "host-xbdef@videocall.rs", name: "XBDefHost" },
+      { email: "guest-xbdef@videocall.rs", name: "XBDefGuest" },
+    ];
+
+    // No `pinWebsocket` — the contexts carry no transport preference at all.
+    const { members, browsers } = await bringUpTwoPeerMeeting(uiURL, meetingId, profiles, {
+      enableBadgeFlag: true,
+    });
+
+    try {
+      const hostPage = members[0].page;
+
+      // Or a helper that re-seeds a preference would pass vacuously.
+      const stored = await hostPage.evaluate(() => ({
+        pref: localStorage.getItem("vc_transport_preference"),
+        sticky: localStorage.getItem("vc_transport_sticky"),
+        session: sessionStorage.getItem("vc_transport_session"),
+      }));
+      expect(stored).toEqual({ pref: null, sticky: null, session: null });
+
+      const remoteBadge = hostPage.locator(
+        "#grid-container .canvas-container .tile-top-icons .transport-badge",
+      );
+      await expect(remoteBadge).toHaveCount(1, { timeout: 60_000 });
+      await expect(remoteBadge).toHaveText("WT");
+      await expect(remoteBadge).toHaveAttribute(
+        "aria-label",
+        "Transport reported by peer: WebTransport",
+      );
+      expect((await remoteBadge.getAttribute("class")) || "").toMatch(/\btransport-badge--wt\b/);
+
+      const selfBadge = hostPage.locator(
+        '.transport-badge[aria-label="Your connection transport: WebTransport"]',
+      );
+      await expect(selfBadge).toHaveCount(1, { timeout: 30_000 });
+      await expect(selfBadge).toHaveText("WT");
+      expect((await selfBadge.getAttribute("class")) || "").toMatch(/\btransport-badge--wt\b/);
+
+      await expect(hostPage.locator(".transport-badge")).toHaveCount(2);
+      await expect(hostPage.locator(".transport-badge--ws")).toHaveCount(0);
     } finally {
       await tearDown(members, browsers);
     }

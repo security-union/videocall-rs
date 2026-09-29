@@ -2,7 +2,7 @@ import { test, expect, chromium, Page, Locator } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import {
   BROWSER_ARGS,
-  DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
+  PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
   createAuthenticatedContext,
 } from "../helpers/auth-context";
 import { waitForVisibleState } from "../helpers/visible-state";
@@ -119,7 +119,7 @@ async function createGuestContext(
     baseURL: uiURL,
     ignoreHTTPSErrors: true,
   });
-  await context.addInitScript(DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 

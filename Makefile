@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test test-scripts build-videocall-postgres test-videocall-postgres up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
+.PHONY: tests_up test test-scripts build-videocall-postgres test-videocall-postgres test-webtransport-chart test-api-chart up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -64,6 +64,18 @@ test-scripts:
 		python3 scripts/test_e2e_up_stamp_clear.py
 		python3 scripts/test_check_native_test_coverage.py
 		python3 scripts/test_mutation_check.py
+		@if [ -f helm/global/hcl/prometheus/values.yaml ] && [ -f helm/global/hcl-daily-deployment/prometheus/values.yaml ]; then \
+			python3 scripts/test_check_prometheus_alert_parity.py; \
+			PROMTOOL_SKIP_RUNTIME=1 python3 scripts/test_check_prometheus_rules_parse.py; \
+		else \
+			echo "SKIP: scripts/test_check_prometheus_alert_parity.py (helm/global/hcl* prometheus values stripped for public sync)"; \
+			echo "SKIP: scripts/test_check_prometheus_rules_parse.py (same files)"; \
+		fi
+		@if [ -f scripts/test_verify_audio_single_layer.py ]; then \
+			python3 scripts/test_verify_audio_single_layer.py; \
+		else \
+			echo "SKIP: scripts/test_verify_audio_single_layer.py absent (stripped for public sync)"; \
+		fi
 		python3 scripts/test_meeting_quality_xref.py
 		python3 scripts/test_meeting_quality_xref_load.py
 		@if [ -f scripts/test_sync_strip_blocked_paths.py ]; then \
@@ -78,6 +90,16 @@ build-videocall-postgres:
 test-videocall-postgres:
 		./scripts/test-videocall-postgres-chart.sh
 		./scripts/test-digitalocean-preview-postgres.sh
+
+test-webtransport-chart:
+		python3 ./scripts/check_wt_service_affinity.py
+		python3 ./scripts/test_check_wt_service_affinity.py
+
+test-api-chart:
+		python3 ./scripts/check_api_readiness_probe.py
+		python3 ./scripts/test_check_api_readiness_probe.py
+		python3 ./scripts/check_api_migration_hook.py
+		python3 ./scripts/test_check_api_migration_hook.py
 
 clippy-ci:
 		cargo clippy --all -- -D warnings
@@ -229,6 +251,7 @@ e2e-bvt1:
 # divergence test in tests/simulcast-per-receiver.spec.ts and
 # helpers/downlink-impair.ts.
 e2e-impair:
+	@echo "issue 2809 precondition: sudo sysctl -w net.ipv4.tcp_wmem='4096 16384 131072'"
 	cd e2e && npx playwright test --project=impair --workers=1
 
 # Run e2e tests with visible browsers (assumes stack is already up; same

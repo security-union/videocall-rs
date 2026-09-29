@@ -2,6 +2,7 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 /**
  * Crop toggle E2E tests.
@@ -61,6 +62,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 
@@ -486,8 +488,9 @@ test.describe("Crop toggle", () => {
   // Test 5: Screen-share canvas always uses contain
   //
   // During screen share the `.split-screen-tile canvas` should have
-  // computed `object-fit: contain` regardless of crop toggle state, because
-  // the CSS attribute selector `canvas[id^="screen-share-"]` forces it.
+  // computed `object-fit: contain`, because the CSS attribute selector
+  // `canvas[id^="screen-share-"]` forces it, and the shared-content tile
+  // offers no crop toggle (issue 2792).
   // ────────────────────────────────────────────────────────────────────────
   test("screen-share canvas always uses contain", async ({ baseURL }) => {
     test.setTimeout(120_000);
@@ -600,27 +603,9 @@ test.describe("Crop toggle", () => {
         .evaluate((el) => window.getComputedStyle(el).objectFit);
       expect(objectFit).toBe("contain");
 
-      // Toggle the crop button on the screen-share tile if visible, and
-      // verify object-fit stays `contain`.
-      const ssTile = hostPage.locator(".split-screen-tile").first();
-      const ssTileVisible = await ssTile.isVisible().catch(() => false);
-
-      if (ssTileVisible) {
-        await ssTile.hover();
-
-        const ssCropBtn = ssTile.locator(".crop-icon").first();
-        const cropBtnVisible = await ssCropBtn.isVisible().catch(() => false);
-
-        if (cropBtnVisible) {
-          await ssCropBtn.click();
-          await hostPage.waitForTimeout(300);
-
-          const objectFitAfter = await ssCanvas
-            .first()
-            .evaluate((el) => window.getComputedStyle(el).objectFit);
-          expect(objectFitAfter).toBe("contain");
-        }
-      }
+      const ssTile = hostPage.locator('[data-share-origin="received"]');
+      await expect(ssTile).toBeVisible({ timeout: 10_000 });
+      await expect(ssTile.locator(".crop-icon")).toHaveCount(0);
     } finally {
       await browser1.close();
       await browser2.close();

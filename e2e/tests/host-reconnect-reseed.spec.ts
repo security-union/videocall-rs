@@ -1,5 +1,9 @@
 import { test, expect, chromium, Page } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import {
@@ -74,6 +78,12 @@ const HOST_EMAIL = "host-reconnect-owner@videocall.rs";
 const HOST_NAME = "HostReconnectOwner";
 const PEER_EMAIL = "host-reconnect-peer@videocall.rs";
 const PEER_NAME = "HostReconnectPeer";
+
+// Lets A's sever register before the host transfer. MUST stay well under
+// `RECONNECT_GRACE_PERIOD` (`actix-api/src/constants.rs`, 3 s): both clocks
+// start at the toxiproxy disable, and at 3000 ms the transfer races the
+// relay's deferred `PARTICIPANT_LEFT` and loses about half the time.
+const SEVER_SETTLE_MS = 800;
 
 // ---------------------------------------------------------------------------
 // Shared helpers (mirror transfer-host.spec.ts / host-kick.spec.ts)
@@ -215,6 +225,8 @@ test.describe("Host controls re-sync on transport reconnect", () => {
       // MUST happen before the context's first navigation.
       await routeDownlinkThroughProxy(hostCtx);
       const peerCtx = await createAuthenticatedContext(peerBrowser, PEER_EMAIL, PEER_NAME, uiURL);
+      // Same relay process as the proxied host, or the reseed spans two.
+      await pinWebSocketTransport(peerCtx);
 
       const hostPage = await hostCtx.newPage();
       const peerPage = await peerCtx.newPage();
@@ -238,7 +250,7 @@ test.describe("Host controls re-sync on transport reconnect", () => {
       await severWsTransport();
       // Give A's onclose + on_connection_lost a beat to register before we
       // transfer, so the HOST_REVOKED is genuinely delivered while A is down.
-      await hostPage.waitForTimeout(3000);
+      await hostPage.waitForTimeout(SEVER_SETTLE_MS);
 
       // ---- Transfer host A→B via REST with A's own host token (demotes A) ----
       // A is offline, so A never receives the HOST_REVOKED packet.

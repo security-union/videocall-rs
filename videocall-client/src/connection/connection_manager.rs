@@ -20,13 +20,13 @@ use std::collections::VecDeque;
 
 use super::connection::Connection;
 use super::url_log::strip_query_for_log;
-use super::webmedia::{ConnectOptions, MediaStreamKey};
+use super::webmedia::{ConnectOptions, InboundLane, MediaStreamKey, ReceivedAtMs};
 use crate::adaptive_quality_constants::{
-    ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, POST_REBASE_RETRY_DELAY_MS,
-    POST_REBASE_RETRY_MAX_ATTEMPTS, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT,
-    RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_PHASE1_MS, RECONNECT_MAX_DELAY_PHASE2_MS,
-    RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS, RECONNECT_PHASE2_MAX_ATTEMPTS,
-    REELECTION_CATASTROPHIC_RTT_MS, REELECTION_CONSECUTIVE_SAMPLES,
+    ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, HEARTBEAT_KEEPALIVE_INTERVAL_MS,
+    POST_REBASE_RETRY_DELAY_MS, POST_REBASE_RETRY_MAX_ATTEMPTS, RECONNECT_BACKOFF_MULTIPLIER,
+    RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_PHASE1_MS,
+    RECONNECT_MAX_DELAY_PHASE2_MS, RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS,
+    RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CATASTROPHIC_RTT_MS, REELECTION_CONSECUTIVE_SAMPLES,
     REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD, REELECTION_MIN_IMPROVEMENT_MS,
     REELECTION_PRESERVATION_FRESHNESS_MS, REELECTION_PRESERVATION_RETRY_MS,
     REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
+use videocall_transport::downlink_stream::DOWNLINK_STREAMS_QUERY;
 use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -147,18 +148,49 @@ const REFRESH_TIMEOUT_MS: u32 = 3_000;
 /// the legacy `start_reelection` path.
 const MIN_REFRESH_INTERVAL_MS: f64 = 30_000.0;
 
-/// Inbound-liveness window for the CPU-stall guard in
-/// [`ConnectionManager::check_rtt_degradation`]. If we have observed any
-/// inbound traffic on the active connection more recently than this many
-/// milliseconds ago, the watchdog suppresses re-election: elevated RTT
-/// samples are treated as JS-event-loop stall artifacts (the wall clock ran
-/// late while the network was quietly delivering packets), not as proof that
-/// the network actually degraded.
-///
-/// 2 s is roughly 2× the 1 Hz probe cadence — wide enough to absorb normal
-/// scheduling jitter, narrow enough that a genuine stall (no inbound for >2 s)
-/// stops suppressing and lets the existing re-election logic fire.
+/// Inbound-liveness window for ANY-lane traffic in
+/// [`ConnectionManager::check_rtt_degradation`].
 const LAST_INBOUND_LIVENESS_MS: f64 = 2_000.0;
+
+/// Inbound-liveness window for RELIABLE-lane traffic (#2720), used by the
+/// CPU-stall guard's `recent_inbound` arm and the stall counter.
+const RELIABLE_LANE_LIVENESS_MS: f64 = 2.5 * HEARTBEAT_KEEPALIVE_INTERVAL_MS as f64;
+
+/// Per-connection inbound freshness split by lane: a wedged reliable unistream
+/// is invisible in an any-lane stamp (#2720). WebSocket stamps both.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct InboundFreshness {
+    any_lane_ms: f64,
+    reliable_ms: Option<f64>,
+}
+
+impl InboundFreshness {
+    fn stamp(&mut self, now_ms: f64, lane: InboundLane) {
+        self.any_lane_ms = now_ms;
+        if lane == InboundLane::Reliable {
+            self.reliable_ms = Some(now_ms);
+        }
+    }
+
+    fn new(now_ms: f64, lane: InboundLane) -> Self {
+        let mut freshness = Self {
+            any_lane_ms: now_ms,
+            reliable_ms: None,
+        };
+        freshness.stamp(now_ms, lane);
+        freshness
+    }
+
+    #[cfg(test)]
+    fn reliable(now_ms: f64) -> Self {
+        Self::new(now_ms, InboundLane::Reliable)
+    }
+
+    #[cfg(test)]
+    fn datagram_only(now_ms: f64) -> Self {
+        Self::new(now_ms, InboundLane::Datagram)
+    }
+}
 
 /// Main-thread drift threshold consulted by the CPU-overloaded watchdog in
 /// `ConnectionController::start_timers`. The 1 Hz timer measures how much
@@ -243,6 +275,38 @@ pub(super) const SUPPRESSION_RESET_QUIET_MS: f64 = 30_000.0;
 pub(super) const PROBE_TIMEOUT_MS: f64 = 5000.0; // per-probe deadline
 pub(super) const MAX_INFLIGHT_PROBES: usize = 6; // cap on in-flight probes
 pub(super) const STALE_THRESHOLD: u32 = 3; // consecutive timeouts before stale
+pub(super) const RTT_SAMPLE_WINDOW: usize = 10; // rolling samples kept per lane
+
+/// How much worse a WebTransport candidate's `election_score()` may be than the
+/// best WebSocket candidate's and still win the election (issue #2725). The
+/// asserts below are declared ordering choices, not derivations.
+pub(super) const WT_ELECTION_BONUS_MS: f64 = 30.0;
+
+const _: () = assert!(
+    WT_ELECTION_BONUS_MS > REELECTION_MIN_IMPROVEMENT_MS,
+    "the WT election bonus must not be finer than the smallest RTT difference \
+     this client will act on at all"
+);
+const _: () = assert!(
+    WT_ELECTION_BONUS_MS < REELECTION_RTT_MIN_THRESHOLD_MS,
+    "the WT election bonus must stay below the absolute RTT rise the \
+     degradation watchdog treats as significant"
+);
+
+/// Election-lane samples each compared mean needs before [`WT_ELECTION_BONUS_MS`]
+/// may be applied. Below this
+/// bar the rule is plain lowest-score-wins.
+pub(super) const ELECTION_BONUS_MIN_SAMPLES: usize = 5;
+
+const _: () = assert!(
+    ELECTION_BONUS_MIN_SAMPLES > ELECTION_MIN_RTT_SAMPLES,
+    "the bonus sample bar must be stricter than the tier bar, which exists for \
+     the 200ms+ join case and must not be raised"
+);
+const _: () = assert!(
+    ELECTION_BONUS_MIN_SAMPLES <= RTT_SAMPLE_WINDOW,
+    "a bar above the rolling window size could never be met"
+);
 
 /// Pure cap-decision helper extracted so the in-flight cap is unit-testable on
 /// host (a live datagram Connection cannot be constructed off-wasm).
@@ -485,6 +549,34 @@ struct ElectionCandidate {
     base_url: String,
 }
 
+/// The server the relay just closed with the downlink-unrecoverable code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExcludedCandidate {
+    is_webtransport: bool,
+    /// The base URL with its query stripped.
+    server: String,
+}
+
+impl ExcludedCandidate {
+    /// `None` when the URL strips to nothing: that matches every candidate.
+    fn new(is_webtransport: bool, base_url: &str) -> Option<Self> {
+        let server = strip_query_for_log(base_url);
+        (!server.is_empty()).then_some(Self {
+            is_webtransport,
+            server,
+        })
+    }
+
+    fn matches(&self, candidate: &ElectionCandidate) -> bool {
+        self.is_webtransport == candidate.is_webtransport
+            && self.server == strip_query_for_log(&candidate.base_url)
+    }
+}
+
+const PRIOR_CLOSE_NONE: &str = "none";
+
+const PRIOR_CLOSE_DOWNLINK_UNRECOVERABLE: &str = "downlink_unrecoverable";
+
 /// Pure: build the ordered election candidate set that `create_all_connections`
 /// spawns 1:1. WebSocket candidates come first (in configured order), then
 /// WebTransport (in configured order) — UNLESS the issue-2029 WS-only latch is
@@ -497,10 +589,14 @@ struct ElectionCandidate {
 /// `#[test]` suite. Driving this helper pins BOTH directions (latched => no WT;
 /// unlatched => WT present, in order), so deleting or reordering the guard is
 /// red on host.
+///
+/// `excluded` drops a downlink-unrecoverable-closed server (#2726) unless that
+/// leaves nothing to elect.
 fn build_election_candidates(
     websocket_urls: &[String],
     webtransport_urls: &[String],
     ws_only_latched: bool,
+    excluded: Option<&ExcludedCandidate>,
 ) -> Vec<ElectionCandidate> {
     let mut candidates: Vec<ElectionCandidate> = websocket_urls
         .iter()
@@ -525,7 +621,31 @@ fn build_election_candidates(
         );
     }
 
-    candidates
+    let Some(excluded) = excluded else {
+        return candidates;
+    };
+    let kept: Vec<ElectionCandidate> = candidates
+        .iter()
+        .filter(|candidate| !excluded.matches(candidate))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        candidates
+    } else {
+        kept
+    }
+}
+
+/// Pure: build the URL a candidate is dialled with from its configured base.
+/// `instance_id` lets the server evict this instance's stale sessions.
+fn build_connect_url(base_url: &str, instance_id: &str, is_webtransport: bool) -> String {
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    let mut url = format!("{base_url}{separator}instance_id={instance_id}");
+    if is_webtransport {
+        url.push('&');
+        url.push_str(DOWNLINK_STREAMS_QUERY);
+    }
+    url
 }
 
 /// Stateful accumulator behind the issue-2029 WT→WS audio fallback.
@@ -635,9 +755,12 @@ fn format_election_candidate(
 #[derive(Clone, Debug, PartialEq)]
 struct RecordedElectionDecision {
     reason: &'static str,
+    rtt_lane: &'static str,
+    transport_pick: &'static str,
     outcome: ElectionOutcome,
     elected: Option<String>,
     active: Option<String>,
+    prior_close: &'static str,
 }
 
 #[cfg(test)]
@@ -647,18 +770,25 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn record_election_decision(
     reason: &'static str,
+    rtt_lane: &'static str,
+    transport_pick: &'static str,
     outcome: ElectionOutcome,
     elected: Option<&str>,
     active: Option<&str>,
+    prior_close: &'static str,
 ) {
     LAST_ELECTION_DECISION.with(|slot| {
         *slot.borrow_mut() = Some(RecordedElectionDecision {
             reason,
+            rtt_lane,
+            transport_pick,
             outcome,
             elected: elected.map(str::to_string),
             active: active.map(str::to_string),
+            prior_close,
         });
     });
 }
@@ -681,15 +811,62 @@ fn take_retry_scheduled() -> bool {
     RETRY_SCHEDULED.with(|flag| flag.replace(false))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Reconnection loops `spawn_reconnection_loop` would have spawned.
+    static RECONNECTION_LOOPS_SPAWNED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_reconnection_loops_spawned() -> u32 {
+    RECONNECTION_LOOPS_SPAWNED.with(|count| count.replace(0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_reconnection_loop(
+    reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
+    active_connection_id: Rc<RefCell<Option<String>>>,
+    on_state_changed: Callback<ConnectionState>,
+    server_url: String,
+    manager_ref: Weak<RefCell<ConnectionManager>>,
+    election_period_ms: u64,
+    intentionally_disconnected: Rc<RefCell<bool>>,
+) {
+    let reconnection_loop = ConnectionManager::run_reconnection_loop(
+        reconnection_phase,
+        active_connection_id,
+        on_state_changed,
+        server_url,
+        manager_ref,
+        election_period_ms,
+        intentionally_disconnected,
+    );
+    #[cfg(test)]
+    {
+        drop(reconnection_loop);
+        RECONNECTION_LOOPS_SPAWNED.with(|count| count.set(count.get() + 1));
+    }
+    #[cfg(not(test))]
+    wasm_bindgen_futures::spawn_local(reconnection_loop);
+}
+
 /// Pre-decision snapshot of the election reason and per-transport sample/RTT
 /// columns, captured while the candidate maps still reflect the election that
 /// ran (before abort/preserve restore old state).
 struct ElectionDecisionSnapshot {
     reason: &'static str,
+    /// Lane the winner's RTT was measured on ([`ElectionRttLane::label`]), or
+    /// `none` when no candidate was selectable.
+    rtt_lane: &'static str,
     wt_samples: usize,
     ws_samples: usize,
     wt_avg_rtt_ms: Option<f64>,
     ws_avg_rtt_ms: Option<f64>,
+    /// [`ElectionScan::transport_pick`], then the two best-tier
+    /// `election_score()` values it compared.
+    transport_pick: &'static str,
+    best_wt_score_ms: Option<f64>,
+    best_ws_score_ms: Option<f64>,
 }
 
 /// The terminal outcome of an election, distinct from which candidate won the
@@ -732,27 +909,32 @@ impl ElectionOutcome {
 /// `aborted_kept_old`/`preserved_old`, `none` on `failed`). `outcome`
 /// disambiguates the two so a reader never mistakes an aborted re-election for a
 /// real switch.
-#[allow(clippy::too_many_arguments)]
 fn format_election_decision(
-    reason: &'static str,
+    snapshot: &ElectionDecisionSnapshot,
     outcome: ElectionOutcome,
     elected: Option<&str>,
     active: Option<&str>,
-    wt_samples: usize,
-    ws_samples: usize,
-    wt_avg_rtt_ms: Option<f64>,
-    ws_avg_rtt_ms: Option<f64>,
     election_duration_ms: Option<u64>,
+    prior_close: &str,
 ) -> String {
     format!(
-        "Election decision: reason={reason} outcome={} elected={} active={} \
-         wt_samples={wt_samples} ws_samples={ws_samples} wt_avg_rtt_ms={} \
-         ws_avg_rtt_ms={} election_duration_ms={}",
+        "Election decision: reason={} rtt_lane={} outcome={} elected={} active={} \
+         wt_samples={} ws_samples={} wt_avg_rtt_ms={} \
+         ws_avg_rtt_ms={} transport_pick={} best_wt_score_ms={} best_ws_score_ms={} \
+         wt_bonus_ms={:.0} election_duration_ms={} prior_close={prior_close}",
+        snapshot.reason,
+        snapshot.rtt_lane,
         outcome.as_str(),
         elected.unwrap_or("none"),
         active.unwrap_or("none"),
-        fmt_opt_rtt(wt_avg_rtt_ms),
-        fmt_opt_rtt(ws_avg_rtt_ms),
+        snapshot.wt_samples,
+        snapshot.ws_samples,
+        fmt_opt_rtt(snapshot.wt_avg_rtt_ms),
+        fmt_opt_rtt(snapshot.ws_avg_rtt_ms),
+        snapshot.transport_pick,
+        fmt_opt_rtt(snapshot.best_wt_score_ms),
+        fmt_opt_rtt(snapshot.best_ws_score_ms),
+        WT_ELECTION_BONUS_MS,
         election_duration_ms
             .map(|duration| duration.to_string())
             .unwrap_or_else(|| "null".to_string()),
@@ -762,13 +944,14 @@ fn format_election_decision(
 #[derive(Default)]
 struct ElectionScan {
     best_wt: Option<(String, ServerRttMeasurement)>,
-    best_wt_rtt: f64,
+    /// Lowest `election_score()` seen in this tier, not a raw RTT.
+    best_wt_score: f64,
     best_ws: Option<(String, ServerRttMeasurement)>,
-    best_ws_rtt: f64,
+    best_ws_score: f64,
     fallback_wt: Option<(String, ServerRttMeasurement)>,
-    fallback_wt_rtt: f64,
+    fallback_wt_score: f64,
     fallback_ws: Option<(String, ServerRttMeasurement)>,
-    fallback_ws_rtt: f64,
+    fallback_ws_score: f64,
     live_wt_exists: bool,
     wt_with_measurements_exists: bool,
     demote_wt: bool,
@@ -788,10 +971,10 @@ enum ElectionCandidateTier {
 impl ElectionScan {
     fn new() -> Self {
         Self {
-            best_wt_rtt: f64::INFINITY,
-            best_ws_rtt: f64::INFINITY,
-            fallback_wt_rtt: f64::INFINITY,
-            fallback_ws_rtt: f64::INFINITY,
+            best_wt_score: f64::INFINITY,
+            best_ws_score: f64::INFINITY,
+            fallback_wt_score: f64::INFINITY,
+            fallback_ws_score: f64::INFINITY,
             ..Default::default()
         }
     }
@@ -808,31 +991,89 @@ impl ElectionScan {
         }
     }
 
-    /// WebTransport leads within each tier, or WebSocket under the issue-1924
-    /// demotion. Min-samples tiers precede any-samples tiers either way.
-    fn preference_order(&self) -> [ElectionCandidateTier; 4] {
+    fn transport_pick(&self) -> &'static str {
+        match (self.best_wt.is_some(), self.best_ws.is_some()) {
+            (true, true) if self.demote_wt => "wt_demoted",
+            (true, true) if self.best_wt_score <= self.best_ws_score => "wt_faster",
+            (true, true) if self.wt_wins_best_tier() => "wt_within_bonus",
+            (true, true) if self.best_wt_score > self.best_ws_score + WT_ELECTION_BONUS_MS => {
+                "ws_faster"
+            }
+            (true, true) if !self.wt_bonus_lane_is_reliable() => "ws_bonus_unearned_lane",
+            (true, true) => "ws_bonus_unearned_samples",
+            (true, false) => "wt_only",
+            (false, true) => "ws_only",
+            (false, false) => "no_best_tier",
+        }
+    }
+
+    /// Whether the WebTransport score came from [`ElectionRttLane::Reliable`].
+    fn wt_bonus_lane_is_reliable(&self) -> bool {
+        self.best_wt.as_ref().is_some_and(|(_, measurement)| {
+            measurement.election_lane() == ElectionRttLane::Reliable
+        })
+    }
+
+    fn wt_bonus_has_samples(&self) -> bool {
+        let deep = |candidate: &Option<(String, ServerRttMeasurement)>| {
+            candidate
+                .as_ref()
+                .is_some_and(|(_, m)| m.election_series().2 >= ELECTION_BONUS_MIN_SAMPLES)
+        };
+        deep(&self.best_wt) && deep(&self.best_ws)
+    }
+
+    /// Cross-transport best-tier rule (issue #2725). A lower score wins outright;
+    /// the bonus only rescues a WebTransport candidate that is behind. The
+    /// issue-1924 demotion removes the bonus AND the tie.
+    fn wt_wins_best_tier(&self) -> bool {
         if self.demote_wt {
+            return false;
+        }
+        if self.best_wt_score <= self.best_ws_score {
+            return true;
+        }
+        self.wt_bonus_lane_is_reliable()
+            && self.wt_bonus_has_samples()
+            && self.best_wt_score <= self.best_ws_score + WT_ELECTION_BONUS_MS
+    }
+
+    fn best_tier(&self) -> Option<ElectionCandidateTier> {
+        match (self.best_wt.is_some(), self.best_ws.is_some()) {
+            (true, true) if self.wt_wins_best_tier() => Some(ElectionCandidateTier::BestWt),
+            (true, true) => Some(ElectionCandidateTier::BestWs),
+            (true, false) => Some(ElectionCandidateTier::BestWt),
+            (false, true) => Some(ElectionCandidateTier::BestWs),
+            (false, false) => None,
+        }
+    }
+
+    fn fallback_tier(&self) -> Option<ElectionCandidateTier> {
+        let order = if self.demote_wt {
             [
-                ElectionCandidateTier::BestWs,
-                ElectionCandidateTier::BestWt,
                 ElectionCandidateTier::FallbackWs,
                 ElectionCandidateTier::FallbackWt,
             ]
         } else {
             [
-                ElectionCandidateTier::BestWt,
-                ElectionCandidateTier::BestWs,
                 ElectionCandidateTier::FallbackWt,
                 ElectionCandidateTier::FallbackWs,
             ]
-        }
+        };
+        order
+            .into_iter()
+            .find(|tier| self.candidate_for(*tier).is_some())
     }
 
     fn selected(&self) -> Option<(ElectionCandidateTier, &(String, ServerRttMeasurement))> {
-        self.preference_order()
-            .into_iter()
-            .find_map(|tier| self.candidate_for(tier).map(|candidate| (tier, candidate)))
+        let tier = self.best_tier().or_else(|| self.fallback_tier())?;
+        self.candidate_for(tier).map(|candidate| (tier, candidate))
     }
+}
+
+/// A PRESENT connection must be connected; an absent one is still scanned.
+fn election_candidate_is_eligible(connection: Option<&Connection>) -> bool {
+    connection.is_none_or(|conn| conn.is_connected())
 }
 
 fn scan_election_candidates(
@@ -844,43 +1085,47 @@ fn scan_election_candidates(
     scan.demote_wt = demote_wt;
 
     for (connection_id, measurement) in rtt_measurements {
-        if let Some(conn) = connections.get(connection_id) {
-            if !conn.is_connected() {
-                continue;
-            }
+        let connection = connections.get(connection_id);
+        if !election_candidate_is_eligible(connection) {
+            continue;
+        }
+        if connection.is_some() {
             scan.live_candidates += 1;
             scan.max_implausible_discards = scan
                 .max_implausible_discards
                 .max(measurement.consecutive_implausible_discards);
         }
 
+        let (_, lane_avg_rtt, lane_samples, _) = measurement.election_series();
+        let lane_timeouts = measurement.election_penalty_timeouts();
+
         if measurement.is_webtransport {
             scan.live_wt_exists = true;
-            if measurement.average_rtt.is_some() {
+            if lane_avg_rtt.is_some() {
                 scan.wt_with_measurements_exists = true;
             }
         }
 
-        if let Some(avg_rtt) = measurement.average_rtt {
-            if measurement.measurements.is_empty() {
+        if let (Some(_), Some(score)) = (lane_avg_rtt, measurement.election_score()) {
+            if lane_samples == 0 {
                 continue;
             }
 
-            let has_enough = measurement.measurements.len() >= ELECTION_MIN_RTT_SAMPLES;
+            let has_enough = qualifies_for_best_tier(lane_samples, lane_timeouts);
 
             if measurement.is_webtransport {
-                if has_enough && avg_rtt < scan.best_wt_rtt {
-                    scan.best_wt_rtt = avg_rtt;
+                if has_enough && score < scan.best_wt_score {
+                    scan.best_wt_score = score;
                     scan.best_wt = Some((connection_id.clone(), measurement.clone()));
-                } else if !has_enough && avg_rtt < scan.fallback_wt_rtt {
-                    scan.fallback_wt_rtt = avg_rtt;
+                } else if !has_enough && score < scan.fallback_wt_score {
+                    scan.fallback_wt_score = score;
                     scan.fallback_wt = Some((connection_id.clone(), measurement.clone()));
                 }
-            } else if has_enough && avg_rtt < scan.best_ws_rtt {
-                scan.best_ws_rtt = avg_rtt;
+            } else if has_enough && score < scan.best_ws_score {
+                scan.best_ws_score = score;
                 scan.best_ws = Some((connection_id.clone(), measurement.clone()));
-            } else if !has_enough && avg_rtt < scan.fallback_ws_rtt {
-                scan.fallback_ws_rtt = avg_rtt;
+            } else if !has_enough && score < scan.fallback_ws_score {
+                scan.fallback_ws_score = score;
                 scan.fallback_ws = Some((connection_id.clone(), measurement.clone()));
             }
         }
@@ -961,6 +1206,34 @@ fn election_retries_for_measurements(failure: Option<ElectionFailure>, retries_u
         && retries_used < ELECTION_NO_MEASUREMENT_MAX_RETRIES
 }
 
+/// `(is_webtransport, election-lane samples, still answering)` per candidate.
+type ElectionLaneDepth = (bool, usize, bool);
+
+/// Pure: may the expired election deadline complete now?
+fn election_may_complete(
+    lane_depth: &[ElectionLaneDepth],
+    any_candidate_qualifies: bool,
+    extensions_used: u32,
+) -> bool {
+    if extensions_used >= ELECTION_MAX_EXTENSIONS {
+        return true;
+    }
+    if !any_candidate_qualifies {
+        return false;
+    }
+    let racing = |(is_wt, samples, answering): &ElectionLaneDepth, want_wt: bool| {
+        *is_wt == want_wt && *samples > 0 && *answering
+    };
+    let answering = |want_wt: bool| lane_depth.iter().any(|d| racing(d, want_wt));
+    if !(answering(true) && answering(false)) {
+        return true;
+    }
+    lane_depth.iter().all(|d| {
+        let (_, samples, answering) = d;
+        !*answering || *samples == 0 || *samples >= ELECTION_BONUS_MIN_SAMPLES
+    })
+}
+
 /// `ElectionWaitBudget` has a private field and no constructor outside this
 /// module, so `reconnect_election_wait_ms` is the only way to obtain one. A
 /// caller cannot hand the reconnection loop a hand-rolled margin instead.
@@ -1005,13 +1278,24 @@ mod election_wait {
 
 use election_wait::reconnect_election_wait_ms;
 
+/// Sample count and average of the lane the election actually scored.
 fn best_transport_measurement_for_log(
     best: Option<&ServerRttMeasurement>,
     fallback: Option<&ServerRttMeasurement>,
 ) -> (usize, Option<f64>) {
     best.or(fallback)
-        .map(|measurement| (measurement.measurements.len(), measurement.average_rtt))
+        .map(|measurement| {
+            let (_, average, samples, _) = measurement.election_series();
+            (samples, average)
+        })
         .unwrap_or((0, None))
+}
+
+fn election_rtt_lane_label(scan: &ElectionScan) -> &'static str {
+    match scan.selected() {
+        Some((_, (_, measurement))) => measurement.election_lane().label(),
+        None => "none",
+    }
 }
 
 /// Returns a monotonic, high-resolution timestamp in milliseconds using
@@ -1257,10 +1541,47 @@ pub enum ConnectionState {
     },
 }
 
+/// One lane's RTT probe series, its average, and its in-flight probes.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeLaneState {
+    pub measurements: VecDeque<f64>,
+    pub average_rtt: Option<f64>,
+    /// Monotonic send timestamps (`monotonic_now_ms()`) of probes awaiting a
+    /// response on this lane, oldest first.
+    pub in_flight_probes: VecDeque<f64>,
+    /// Count of consecutive probes on this lane that hit [`PROBE_TIMEOUT_MS`]
+    /// without a response; reset to 0 when any response arrives on this lane.
+    pub consecutive_probe_timeouts: u32,
+    /// Monotonic stamp of the last PLAUSIBLE echo on this lane. `None` until the
+    /// first one lands.
+    pub last_echo_ms: Option<f64>,
+}
+
+/// Which lane produced the RTT the election scored for one candidate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ElectionRttLane {
+    /// WebSocket's single socket, or WebTransport's persistent Control stream.
+    Reliable,
+    /// WebTransport's datagram probe, scored when the reliable series is empty.
+    DatagramFallback,
+}
+
+impl ElectionRttLane {
+    pub fn label(self) -> &'static str {
+        match self {
+            ElectionRttLane::Reliable => "reliable",
+            ElectionRttLane::DatagramFallback => "datagram-fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerRttMeasurement {
     pub url: String,
     pub is_webtransport: bool,
+    /// Default-lane samples: a QUIC datagram on WebTransport, the single socket
+    /// on WebSocket. Feeds `active_server_rtt`, the uplink-saturation baseline
+    /// and [`Self::rtt_probe_stale`].
     pub measurements: VecDeque<f64>,
     pub average_rtt: Option<f64>,
     pub connection_id: String,
@@ -1274,12 +1595,181 @@ pub struct ServerRttMeasurement {
     /// treated as a re-election signal so the user is not silently stuck on
     /// a broken connection (see discussion #539).
     pub consecutive_implausible_discards: u32,
-    /// Monotonic send timestamps (`monotonic_now_ms()`) of probes awaiting a
+    /// Default-lane send timestamps (`monotonic_now_ms()`) of probes awaiting a
     /// response, oldest first.
     pub in_flight_probes: VecDeque<f64>,
-    /// Count of consecutive probes that hit `PROBE_TIMEOUT_MS` without a
-    /// response; reset to 0 when any response arrives.
+    /// Count of consecutive default-lane probes that hit `PROBE_TIMEOUT_MS`
+    /// without a response; reset to 0 by a response on that lane.
     pub consecutive_probe_timeouts: u32,
+    /// Default-lane counterpart of [`ProbeLaneState::last_echo_ms`].
+    pub last_echo_ms: Option<f64>,
+    /// Reliable-lane series, fed only on WebTransport by the Control-stream
+    /// probe and by echoes that arrive on [`InboundLane::Reliable`]. Stays
+    /// empty on WebSocket, whose one lane is the default series above.
+    pub reliable_lane: ProbeLaneState,
+}
+
+impl ServerRttMeasurement {
+    fn election_lane_is_reliable_series(&self) -> bool {
+        self.is_webtransport && !self.reliable_lane.measurements.is_empty()
+    }
+
+    /// Answering NOW (#2765): not stale, and its last ECHO newer than
+    /// `max(2 x average, ELECTION_EXTENSION_STEP_MS)`.
+    pub fn election_lane_answering(&self, now: f64) -> bool {
+        let (_, average, _, penalty) = self.election_series();
+        if election_candidate_is_stale(penalty) {
+            return false;
+        }
+        let last_echo = if self.election_lane_is_reliable_series() {
+            self.reliable_lane.last_echo_ms
+        } else {
+            self.last_echo_ms
+        };
+        let bound = average
+            .map(|avg| 2.0 * avg)
+            .unwrap_or(0.0)
+            .max(ELECTION_EXTENSION_STEP_MS as f64)
+            .min(PROBE_TIMEOUT_MS);
+        last_echo.is_none_or(|echo| now - echo <= bound)
+    }
+
+    /// The lane the election scores, with that lane's average, sample count and
+    /// consecutive-timeout streak.
+    pub fn election_series(&self) -> (ElectionRttLane, Option<f64>, usize, u32) {
+        if self.election_lane_is_reliable_series() {
+            return (
+                ElectionRttLane::Reliable,
+                self.reliable_lane.average_rtt,
+                self.reliable_lane.measurements.len(),
+                self.reliable_lane.consecutive_probe_timeouts,
+            );
+        }
+        let lane = if self.is_webtransport {
+            ElectionRttLane::DatagramFallback
+        } else {
+            ElectionRttLane::Reliable
+        };
+        (
+            lane,
+            self.average_rtt,
+            self.measurements.len(),
+            self.consecutive_probe_timeouts,
+        )
+    }
+
+    /// Average RTT on the election lane. Every election-facing comparison reads
+    /// this, so ranking and thresholds always describe the same lane.
+    pub fn election_rtt(&self) -> Option<f64> {
+        self.election_series().1
+    }
+
+    pub fn election_lane(&self) -> ElectionRttLane {
+        self.election_series().0
+    }
+
+    /// Consecutive election-lane timeouts that count against this candidate.
+    /// Always 0 on WebSocket, whose single socket has no second lane to be
+    /// ranked against; see the #2029 `demote_wt` interaction in the commit body.
+    pub fn election_penalty_timeouts(&self) -> u32 {
+        if self.is_webtransport {
+            self.election_series().3
+        } else {
+            0
+        }
+    }
+
+    pub fn election_score(&self) -> Option<f64> {
+        let (_, average, _, _) = self.election_series();
+        average.map(|avg| effective_election_rtt(avg, self.election_penalty_timeouts()))
+    }
+}
+
+fn effective_election_rtt(average_rtt: f64, consecutive_timeouts: u32) -> f64 {
+    average_rtt + f64::from(consecutive_timeouts) * PROBE_TIMEOUT_MS
+}
+
+fn election_candidate_is_stale(consecutive_timeouts: u32) -> bool {
+    consecutive_timeouts >= STALE_THRESHOLD
+}
+
+fn qualifies_for_best_tier(sample_count: usize, penalty_timeouts: u32) -> bool {
+    sample_count >= ELECTION_MIN_RTT_SAMPLES && !election_candidate_is_stale(penalty_timeouts)
+}
+
+fn fallback_tier_cause(sample_count: usize) -> &'static str {
+    if sample_count < ELECTION_MIN_RTT_SAMPLES {
+        "too few RTT samples"
+    } else {
+        "a stale probe pipeline"
+    }
+}
+
+fn probe_echo_is_reliable_lane(is_webtransport: bool, lane: InboundLane) -> bool {
+    is_webtransport && lane == InboundLane::Reliable
+}
+
+/// `(in_flight, consecutive_timeouts, measurements, average_rtt)` of one lane.
+type LaneSeriesMut<'a> = (
+    &'a mut VecDeque<f64>,
+    &'a mut u32,
+    &'a mut VecDeque<f64>,
+    &'a mut Option<f64>,
+);
+
+fn lane_series_mut(measurement: &mut ServerRttMeasurement, reliable: bool) -> LaneSeriesMut<'_> {
+    if reliable {
+        let series = &mut measurement.reliable_lane;
+        (
+            &mut series.in_flight_probes,
+            &mut series.consecutive_probe_timeouts,
+            &mut series.measurements,
+            &mut series.average_rtt,
+        )
+    } else {
+        (
+            &mut measurement.in_flight_probes,
+            &mut measurement.consecutive_probe_timeouts,
+            &mut measurement.measurements,
+            &mut measurement.average_rtt,
+        )
+    }
+}
+
+fn lane_last_echo_mut(measurement: &mut ServerRttMeasurement, reliable: bool) -> &mut Option<f64> {
+    if reliable {
+        &mut measurement.reliable_lane.last_echo_ms
+    } else {
+        &mut measurement.last_echo_ms
+    }
+}
+
+fn prune_lane_probes(in_flight: &mut VecDeque<f64>, consecutive_timeouts: &mut u32, now: f64) {
+    while let Some(&front) = in_flight.front() {
+        if now - front > PROBE_TIMEOUT_MS {
+            in_flight.pop_front();
+            *consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+}
+
+fn record_lane_sample(measurements: &mut VecDeque<f64>, average_rtt: &mut Option<f64>, rtt: f64) {
+    measurements.push_back(rtt);
+    if measurements.len() > RTT_SAMPLE_WINDOW {
+        measurements.pop_front();
+    }
+    *average_rtt = Some(measurements.iter().sum::<f64>() / measurements.len() as f64);
+}
+
+/// One inbound RTT echo awaiting processing on the next diagnostics tick.
+#[derive(Debug)]
+struct QueuedRttResponse {
+    connection_id: String,
+    media_packet: MediaPacket,
+    reception_time: f64,
+    lane: InboundLane,
 }
 
 #[derive(Debug)]
@@ -1331,7 +1821,7 @@ pub struct ConnectionManagerOptions {
     /// `update_server_urls`).
     ///
     /// The dioxus-ui passes `true` only when the user's
-    /// [`TransportPreference`](https://github01.hclpnp.com/labs-projects/videocall)
+    /// `TransportPreference`
     /// is the default `WebTransport` (WT-with-WS-fallback) mode — i.e. the
     /// single-candidate state is system-side, not a deliberate user choice.
     /// A manual `WebSocket` selection sets this to `false` so the retry
@@ -1462,7 +1952,7 @@ pub struct ConnectionManager {
     rtt_reporter: Option<Interval>,
     rtt_probe_timer: Option<Interval>,
     election_timer: Option<Interval>,
-    rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>,
+    rtt_responses: Rc<RefCell<Vec<QueuedRttResponse>>>,
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
     own_session_id: Rc<RefCell<Option<u64>>>,
@@ -1472,6 +1962,14 @@ pub struct ConnectionManager {
     // --- Reconnection state ---
     reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
 
+    /// Armed by a relay downlink-unrecoverable close (#2726), TAKEN by
+    /// `create_all_connections`, so it covers exactly one election.
+    downlink_close_pending: Rc<RefCell<Option<ExcludedCandidate>>>,
+
+    /// `prior_close=` for the election in flight. Overwritten at every election
+    /// start, so it only ever describes the one its decision line quotes.
+    election_prior_close: &'static str,
+
     /// Weak self-reference set by `ConnectionController` after construction.
     /// Used by the reconnection loop to call `reset_and_start_election` on the
     /// real manager instance instead of creating a throwaway one.
@@ -1480,6 +1978,8 @@ pub struct ConnectionManager {
     // --- Re-election state (RTT quality monitoring) ---
     /// The average RTT of the elected connection at the time of election.
     baseline_rtt: Option<f64>,
+    /// The lane [`Self::baseline_rtt`] was measured on; a flip re-bases (#2754).
+    baseline_rtt_lane: Option<ElectionRttLane>,
     /// Number of consecutive 1-Hz RTT samples that exceeded the degradation threshold.
     degradation_counter: u32,
     /// Whether a re-election is currently in progress (prevents overlapping re-elections).
@@ -1536,6 +2036,8 @@ pub struct ConnectionManager {
     /// RTT-probe pipeline was stale and so `active_server_rtt` was suppressed in
     /// `build_main_diagnostic_metrics`. Observability-only (#522).
     rtt_probe_stale_suppressions_total: Rc<Cell<u64>>,
+    /// Cumulative reliable-lane stall episodes (#2720), one per contiguous episode.
+    reliable_lane_stall_episodes_total: Rc<Cell<u64>>,
     /// Timestamp of last metrics calculation
     last_metrics_timestamp_ms: Rc<RefCell<f64>>,
     /// Last calculated packets received per second
@@ -1550,13 +2052,8 @@ pub struct ConnectionManager {
     /// encoder's control loop checks this to suppress crash ceiling arming
     /// during server-swap transients.
     reelection_completed_signal: Rc<AtomicBool>,
-    /// Per-connection timestamp (`monotonic_now_ms()`) of the most recent
-    /// inbound packet observed on each connection. Used by
-    /// `complete_election`'s candidate-failure preservation path to decide
-    /// whether the old active connection is still alive. Shared via `Rc` with
-    /// the per-connection inbound-media callback closures so updates can fire
-    /// without re-borrowing `self`.
-    last_inbound_at_ms: Rc<RefCell<HashMap<String, f64>>>,
+    /// Per-connection inbound freshness, split by downlink lane.
+    last_inbound_at_ms: Rc<RefCell<HashMap<String, InboundFreshness>>>,
     /// Set to `true` when `complete_election` preserves the old active
     /// connection in response to total candidate failure (PR-C). Cleared when
     /// a re-election cycle finishes successfully (Elected) or when the user
@@ -1629,6 +2126,11 @@ pub struct ConnectionManager {
     /// the 1 Hz timer doesn't spam the log every tick during a sustained
     /// stall.
     was_suppressed_last_check: bool,
+
+    reliable_lane_stalled_last_check: bool,
+
+    /// One wedge asks for ONE re-election; released under [`STALE_THRESHOLD`].
+    reliable_lane_wedge_fired: bool,
 
     /// Monotonic-millis timestamp captured when the CPU-stall guard fires
     /// the rising-edge suppression log (i.e. when `was_suppressed_last_check`
@@ -1704,7 +2206,7 @@ pub struct ConnectionManager {
 /// carrying a superseded session id must fare exactly as one carrying the
 /// current id, otherwise a post-reconnect congestion signal would be silently
 /// dropped (or, before #625, silently privileged) purely by accident of timing.
-fn should_filter_self_packet(
+pub(crate) fn should_filter_self_packet(
     packet: &PacketWrapper,
     own_session_id: Option<u64>,
     own_session_ids: &SessionIdHistory,
@@ -1733,24 +2235,9 @@ fn should_filter_self_packet(
     // reach VideoCallClient (which re-checks self-targeting before applying the
     // cap). Whitelist it alongside CONGESTION.
     //
-    // DOWNLINK_CONGESTION is deliberately NOT whitelisted here, even though the
-    // relay stamps it self-addressed too — see the rationale on
-    // `video_call_client::suppresses_peer_creation_for_packet`, which pins the
-    // two gates together, and open issue #1481, which tracks reconciling them.
-    //
-    // #625 does not merely extend that verdict to historical ids, it CLOSES the
-    // last way in. `VideoCallClient` records every id it adopts into the same
-    // history this filter reads, so its self-target test there
-    // (`own_session_id == sid || history.contains(sid)`) can only be true for an
-    // id this filter also sees as ours — and, not being whitelisted, drops.
-    // Self-targeted DOWNLINK_CONGESTION is therefore unreachable from the wire,
-    // and `seed_local_congestion_and_publish` (#1219 Half 2) is dead on that path.
-    // Pre-#625 its ONLY live route was the historical-id leak fixed here. That is
-    // defensible — a superseded session's downlink congestion is moot — but it is
-    // a real reachability change, and #1481 must reconcile the two gates knowing
-    // the accidental route is now gone rather than merely narrowed.
     packet.packet_type != PacketType::CONGESTION.into()
         && packet.packet_type != PacketType::LAYER_HINT.into()
+        && packet.packet_type != PacketType::DOWNLINK_CONGESTION.into()
 }
 
 impl ConnectionManager {
@@ -1785,8 +2272,11 @@ impl ConnectionManager {
             own_session_id: Rc::new(RefCell::new(None)),
             pending_session_ids: Rc::new(RefCell::new(HashMap::new())),
             reconnection_phase: Rc::new(RefCell::new(ReconnectionPhase::Idle)),
+            downlink_close_pending: Rc::new(RefCell::new(None)),
+            election_prior_close: PRIOR_CLOSE_NONE,
             manager_ref: Weak::new(),
             baseline_rtt: None,
+            baseline_rtt_lane: None,
             degradation_counter: 0,
             reelection_in_progress: false,
             reelection_generation: 0,
@@ -1798,6 +2288,7 @@ impl ConnectionManager {
             packets_sent: Rc::new(Cell::new(0)),
             rtt_probe_dropped_total: Rc::new(Cell::new(0)),
             rtt_probe_stale_suppressions_total: Rc::new(Cell::new(0)),
+            reliable_lane_stall_episodes_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(js_sys::Date::now())),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -1813,6 +2304,8 @@ impl ConnectionManager {
             cpu_overloaded: Rc::new(AtomicBool::new(false)),
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
+            reliable_lane_stalled_last_check: false,
+            reliable_lane_wedge_fired: false,
             suppression_started_at_ms: None,
             cpu_suppression_budget_ms: 0.0,
             cpu_suppression_started_at_ms: None,
@@ -1887,6 +2380,7 @@ impl ConnectionManager {
 
         // Reset re-election monitoring state.
         self.baseline_rtt = None;
+        self.baseline_rtt_lane = None;
         self.degradation_counter = 0;
         self.reelection_in_progress = false;
         // Fresh session — restore the full post-rebase retry budget.
@@ -1908,6 +2402,7 @@ impl ConnectionManager {
         // whatever the new session is using. Clearing the flag also lets a
         // post-reset re-election immediately request its own refresh.
         self.refresh_in_progress.set(false);
+        self.reliable_lane_stalled_last_check = false;
         // Clear the inbound-freshness map — old connections are gone, so any
         // residual timestamps are meaningless.
         if let Ok(mut map) = self.last_inbound_at_ms.try_borrow_mut() {
@@ -1963,11 +2458,8 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Append `&instance_id=<uuid>` to a lobby URL so the server can correlate
-    /// reconnections from the same client instance and silently evict stale sessions.
-    fn append_instance_id(&self, url: &str) -> String {
-        let separator = if url.contains('?') { '&' } else { '?' };
-        format!("{url}{separator}instance_id={}", self.options.instance_id)
+    fn connect_url(&self, base_url: &str, is_webtransport: bool) -> String {
+        build_connect_url(base_url, &self.options.instance_id, is_webtransport)
     }
 
     /// Build a candidate connection ID, applying the re-election generation
@@ -2002,16 +2494,38 @@ impl ConnectionManager {
     }
 
     /// Create connections to all configured servers
+    /// Consume the exclusion a downlink-unrecoverable close armed and stamp
+    /// `prior_close=` for the election about to start.
+    fn take_election_exclusion(&mut self) -> Option<ExcludedCandidate> {
+        let excluded = self.downlink_close_pending.borrow_mut().take();
+        self.election_prior_close = if excluded.is_some() {
+            PRIOR_CLOSE_DOWNLINK_UNRECOVERABLE
+        } else {
+            PRIOR_CLOSE_NONE
+        };
+        excluded
+    }
+
     fn create_all_connections(&mut self) -> Result<()> {
         // Build the ordered candidate set (WS first, then WT) with the pure,
         // natively-tested [`build_election_candidates`] — which is also where the
         // issue-2029 WS-only latch excludes every WebTransport candidate. This
         // loop then dials the set 1:1, so the guard is exercised by whatever the
         // helper returns (no separate, untested inline branch).
+        let excluded = self.take_election_exclusion();
+        if let Some(excluded) = &excluded {
+            info!(
+                "[DOWNLINK_CLOSE] Relay gave up on this receiver's downlink — skipping {} \
+                 {} candidate this election",
+                excluded.server,
+                if excluded.is_webtransport { "WT" } else { "WS" },
+            );
+        }
         let candidates = build_election_candidates(
             &self.options.websocket_urls,
             &self.options.webtransport_urls,
             self.wt_audio_fallback_latched,
+            excluded.as_ref(),
         );
 
         // Session-scoped skip notice: the configured URLs are left untouched (a
@@ -2033,7 +2547,7 @@ impl ConnectionManager {
                 ("ws", "WebSocket")
             };
             let conn_id = self.make_connection_id(prefix, candidate.index);
-            let url = self.append_instance_id(&candidate.base_url);
+            let url = self.connect_url(&candidate.base_url, is_wt);
             let connect_options = ConnectOptions {
                 websocket_url: if is_wt { String::new() } else { url.clone() },
                 webtransport_url: if is_wt { url.clone() } else { String::new() },
@@ -2042,6 +2556,7 @@ impl ConnectionManager {
                 on_connection_lost: self.create_connection_lost_callback(
                     conn_id.clone(),
                     url.clone(),
+                    candidate.base_url.clone(),
                     is_wt,
                 ),
                 peer_monitor: self.options.peer_monitor.clone(),
@@ -2063,6 +2578,8 @@ impl ConnectionManager {
                             consecutive_implausible_discards: 0,
                             in_flight_probes: VecDeque::new(),
                             consecutive_probe_timeouts: 0,
+                            last_echo_ms: None,
+                            reliable_lane: ProbeLaneState::default(),
                         },
                     );
                     debug!(
@@ -2118,7 +2635,10 @@ impl ConnectionManager {
     }
 
     /// Create callback for handling inbound media packets
-    fn create_inbound_media_callback(&self, connection_id: String) -> Callback<PacketWrapper> {
+    fn create_inbound_media_callback(
+        &self,
+        connection_id: String,
+    ) -> Callback<(PacketWrapper, InboundLane, ReceivedAtMs)> {
         let userid = self.options.userid.clone();
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
@@ -2130,110 +2650,95 @@ impl ConnectionManager {
         let packets_received = self.packets_received.clone();
         let last_inbound_at_ms = self.last_inbound_at_ms.clone();
 
-        Callback::from(move |packet: PacketWrapper| {
-            // Increment packets received counter for all packets
-            packets_received.set(packets_received.get() + 1);
-            // Stamp the per-connection freshness timestamp on every inbound
-            // packet — media, RTT echo, SESSION_ASSIGNED, and heartbeat ACK
-            // all qualify. This is read by complete_election's
-            // candidate-failure preservation path to decide whether the old
-            // active connection is still alive.
-            if let Ok(mut map) = last_inbound_at_ms.try_borrow_mut() {
-                map.insert(connection_id.clone(), monotonic_now_ms());
-            }
-            // Intercept SESSION_ASSIGNED before anything else
-            if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
-                let sid = packet.session_id;
-                info!(
-                    "SESSION_ASSIGNED received on connection {}: {}",
-                    connection_id, sid
-                );
-
-                let is_elected = active_connection_id
-                    .borrow()
-                    .as_deref()
-                    .map(|id| id == connection_id)
-                    .unwrap_or(false);
-
-                if is_elected {
-                    info!("Applying SESSION_ASSIGNED immediately (connection already elected)");
-                    *own_session_id.borrow_mut() = Some(sid);
-                    on_inbound_media.emit(packet);
-                } else {
-                    pending_session_ids
-                        .borrow_mut()
-                        .insert(connection_id.clone(), sid);
-                }
-                return;
-            }
-
-            // Handle RTT responses internally
-            if packet.user_id[..] == *userid.as_bytes() {
-                let reception_time = monotonic_now_ms();
-                if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
-                    if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
-                        if media_packet.media_type == MediaType::RTT.into() {
-                            // PER-ECHO hot path; demoted debug!->trace! (#2760).
-                            trace!(
-                                "RTT response received on connection {} at {}, sent at {}",
-                                connection_id,
-                                reception_time,
-                                media_packet.timestamp
-                            );
-                            if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
-                                responses.push((
-                                    connection_id.clone(),
-                                    media_packet,
-                                    reception_time,
-                                ));
-                            } else {
-                                warn!("Unable to add RTT response to queue - queue is borrowed");
-                            }
-                            return;
+        Callback::from(
+            move |(packet, lane, received_at): (PacketWrapper, InboundLane, ReceivedAtMs)| {
+                packets_received.set(packets_received.get() + 1);
+                if let Ok(mut map) = last_inbound_at_ms.try_borrow_mut() {
+                    let now = received_at.0;
+                    match map.get_mut(&connection_id) {
+                        Some(freshness) => freshness.stamp(now, lane),
+                        None => {
+                            map.insert(connection_id.clone(), InboundFreshness::new(now, lane));
                         }
                     }
                 }
-            }
+                if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
+                    let sid = packet.session_id;
+                    info!(
+                        "SESSION_ASSIGNED received on connection {}: {}",
+                        connection_id, sid
+                    );
 
-            // Filter self-packets using session_id — the one we hold now and any
-            // we held earlier this page load (#625). Self-targeted CONGESTION is
-            // exempt because it is the server's feedback path telling this
-            // sender to step down quality under relay backpressure.
-            //
-            // The history's only mutable writer is `VideoCallClient`'s
-            // SESSION_ASSIGNED arm, which this path cannot re-enter: SESSION_ASSIGNED
-            // is intercepted at the top of this callback and returns there, so the
-            // `emit` below never carries one. The borrow is nonetheless scoped to
-            // this decision and `try_borrow`ed, and a momentary conflict fails OPEN
-            // (forward the packet) — the same outcome as the pre-SESSION_ASSIGNED
-            // window, where nothing is self-filtered, so a control packet is never
-            // silently dropped by a borrow race.
-            let is_self_packet = match own_session_ids.try_borrow() {
-                Ok(history) => {
-                    should_filter_self_packet(&packet, *own_session_id.borrow(), &history)
-                }
-                Err(_) => false,
-            };
-            if is_self_packet {
-                debug!(
-                    "Rejecting packet from same session_id: {}",
-                    packet.session_id
-                );
-                return;
-            }
+                    let is_elected = active_connection_id
+                        .borrow()
+                        .as_deref()
+                        .map(|id| id == connection_id)
+                        .unwrap_or(false);
 
-            // Only forward packets from the elected connection.
-            // During the election period (active_connection_id is None), all
-            // connections forward packets so that RTT probes work and the
-            // first SESSION_ASSIGNED can be processed.
-            if let Some(ref elected_id) = *active_connection_id.borrow() {
-                if *elected_id != connection_id {
+                    if is_elected {
+                        info!("Applying SESSION_ASSIGNED immediately (connection already elected)");
+                        *own_session_id.borrow_mut() = Some(sid);
+                        on_inbound_media.emit(packet);
+                    } else {
+                        pending_session_ids
+                            .borrow_mut()
+                            .insert(connection_id.clone(), sid);
+                    }
                     return;
                 }
-            }
 
-            on_inbound_media.emit(packet);
-        })
+                if packet.user_id[..] == *userid.as_bytes() {
+                    let reception_time = received_at.0;
+                    if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
+                        if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
+                            if media_packet.media_type == MediaType::RTT.into() {
+                                trace!(
+                                    "RTT response received on connection {} at {}, sent at {}",
+                                    connection_id,
+                                    reception_time,
+                                    media_packet.timestamp
+                                );
+                                if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
+                                    responses.push(QueuedRttResponse {
+                                        connection_id: connection_id.clone(),
+                                        media_packet,
+                                        reception_time,
+                                        lane,
+                                    });
+                                } else {
+                                    warn!(
+                                        "Unable to add RTT response to queue - queue is borrowed"
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let is_self_packet = match own_session_ids.try_borrow() {
+                    Ok(history) => {
+                        should_filter_self_packet(&packet, *own_session_id.borrow(), &history)
+                    }
+                    Err(_) => false,
+                };
+                if is_self_packet {
+                    debug!(
+                        "Rejecting packet from same session_id: {}",
+                        packet.session_id
+                    );
+                    return;
+                }
+
+                if let Some(ref elected_id) = *active_connection_id.borrow() {
+                    if *elected_id != connection_id {
+                        return;
+                    }
+                }
+
+                on_inbound_media.emit(packet);
+            },
+        )
     }
 
     /// Create callback for connection established
@@ -2254,6 +2759,7 @@ impl ConnectionManager {
         &self,
         connection_id: String,
         server_url: String,
+        base_url: String,
         is_webtransport: bool,
     ) -> Callback<ConnectionLostReason> {
         let on_state_changed = self.options.on_state_changed.clone();
@@ -2262,6 +2768,7 @@ impl ConnectionManager {
         let manager_ref = self.manager_ref.clone();
         let election_period_ms = self.options.election_period_ms;
         let intentionally_disconnected = self.intentionally_disconnected.clone();
+        let downlink_close_pending = self.downlink_close_pending.clone();
 
         Callback::from(move |reason: ConnectionLostReason| {
             // If the user explicitly called disconnect(), do not attempt reconnection.
@@ -2300,6 +2807,16 @@ impl ConnectionManager {
                     );
                     record_session_drop(is_webtransport);
                 }
+                ConnectionLostReason::DownlinkUnrecoverable(msg) => {
+                    warn!(
+                        "Active {} connection {connection_id} lost \
+                         [DOWNLINK UNRECOVERABLE]: {msg}",
+                        if is_webtransport { "WT" } else { "WS" },
+                    );
+                    record_session_drop(is_webtransport);
+                    *downlink_close_pending.borrow_mut() =
+                        ExcludedCandidate::new(is_webtransport, &base_url);
+                }
             }
 
             // Clear the active connection so is_connected() returns false immediately.
@@ -2333,35 +2850,26 @@ impl ConnectionManager {
             info!("Active connection lost, starting automatic reconnection (unlimited retries with backoff)");
 
             // Launch the async reconnection loop.
-            let reconnection_phase_clone = reconnection_phase.clone();
-            let active_connection_id_clone = active_connection_id.clone();
-            let on_state_changed_clone = on_state_changed.clone();
-            let server_url_clone = server_url.clone();
-            let manager_ref_clone = manager_ref.clone();
-            let intentionally_disconnected_clone = intentionally_disconnected.clone();
-
-            wasm_bindgen_futures::spawn_local(async move {
-                ConnectionManager::run_reconnection_loop(
-                    reconnection_phase_clone,
-                    active_connection_id_clone,
-                    on_state_changed_clone,
-                    server_url_clone,
-                    manager_ref_clone,
-                    election_period_ms,
-                    intentionally_disconnected_clone,
-                )
-                .await;
-            });
+            spawn_reconnection_loop(
+                reconnection_phase.clone(),
+                active_connection_id.clone(),
+                on_state_changed.clone(),
+                server_url.clone(),
+                manager_ref.clone(),
+                election_period_ms,
+                intentionally_disconnected.clone(),
+            );
         })
     }
 
     /// Send RTT probe to a specific connection.
     ///
     /// RTT probes are periodic and expendable — a missed probe just means we
-    /// skip one measurement. They use datagrams for lower overhead.
+    /// skip one measurement.
     fn send_rtt_probe(&mut self, connection_id: &str) -> Result<()> {
         // Scope the immutable borrow of `connection` so it ends before we mutate
         // `self.rtt_measurements` / `self.packets_sent` below.
+        let is_webtransport;
         {
             let connection = self
                 .connections
@@ -2371,57 +2879,72 @@ impl ConnectionManager {
             if !connection.is_connected() {
                 return Ok(()); // Skip non-connected connections
             }
+            is_webtransport = connection.is_webtransport();
         }
 
-        // Compute the send timestamp BEFORE the in-flight push — this is the
-        // value we enqueue and that the matching response will clear.
         let timestamp = monotonic_now_ms();
 
-        // Update connection status + read the current in-flight depth. End this
-        // borrow before mutating other `self` fields below.
-        let at_cap;
-        let len;
+        let datagram_len;
+        let reliable_len;
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
             measurement.connected = true;
-            len = measurement.in_flight_probes.len();
-            at_cap = should_drop_probe(len);
+            datagram_len = measurement.in_flight_probes.len();
+            reliable_len = measurement.reliable_lane.in_flight_probes.len();
         } else {
             // No measurement entry means there is nothing to track; skip.
             return Ok(());
         }
 
-        if at_cap {
+        let send_datagram = !should_drop_probe(datagram_len);
+        let send_reliable = is_webtransport && !should_drop_probe(reliable_len);
+        let dropped = u64::from(!send_datagram) + u64::from(is_webtransport && !send_reliable);
+        if dropped > 0 {
             self.rtt_probe_dropped_total
-                .set(self.rtt_probe_dropped_total.get().saturating_add(1));
+                .set(self.rtt_probe_dropped_total.get().saturating_add(dropped));
             trace!(
-                "dropping RTT probe to {connection_id}: {len} already in flight (cap {MAX_INFLIGHT_PROBES})"
+                "dropping RTT probe to {connection_id}: datagram {datagram_len} / reliable \
+                 {reliable_len} already in flight (cap {MAX_INFLIGHT_PROBES})"
             );
+        }
+        if !send_datagram && !send_reliable {
             return Ok(());
         }
 
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
-        // Enqueue the in-flight slot only AFTER create_rtt_packet succeeds, so a
-        // packet-build failure can't leave a phantom probe that falsely ages
-        // into a timeout. Record the send timestamp so the prune path can age it
-        // out and the response path can clear it.
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
-            measurement.in_flight_probes.push_back(timestamp);
+            if send_datagram {
+                measurement.in_flight_probes.push_back(timestamp);
+            }
+            if send_reliable {
+                measurement
+                    .reliable_lane
+                    .in_flight_probes
+                    .push_back(timestamp);
+            }
         }
 
         let connection = self
             .connections
             .get(connection_id)
             .ok_or_else(|| anyhow!("Connection {connection_id} not found"))?;
-        connection.send_packet_datagram(rtt_packet);
+        let mut sent = 0_u64;
+        if send_reliable {
+            connection.send_packet(rtt_packet.clone(), MediaStreamKey::Control);
+            sent += 1;
+        }
+        if send_datagram {
+            connection.send_packet_datagram(rtt_packet);
+            sent += 1;
+        }
         // Count RTT probes in packets_sent so the sent/received rates are symmetric.
         // packets_received already counts inbound RTT echoes; excluding probes from
         // packets_sent made the two rates incomparable (ratio was meaningless).
-        self.packets_sent.set(self.packets_sent.get() + 1);
+        self.packets_sent.set(self.packets_sent.get() + sent);
         // PER-PROBE hot path: fires on every RTT probe (~1 Hz per connection,
         // O(connections) during election). Demoted debug!->trace! (#1100/#1129
         // follow-up); not on the meeting-analyzer keep-list.
-        trace!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
+        trace!("Sent {sent} RTT probe(s) to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
 
@@ -2455,19 +2978,15 @@ impl ConnectionManager {
         connection_id: &str,
         media_packet: &MediaPacket,
         reception_time: f64,
+        lane: InboundLane,
     ) {
+        let reliable_echo = self
+            .rtt_measurements
+            .get(connection_id)
+            .is_some_and(|m| probe_echo_is_reliable_lane(m.is_webtransport, lane));
         let sent_timestamp = media_packet.timestamp;
         let rtt = reception_time - sent_timestamp;
         let plausible = (0.0..=RTT_SANITY_MAX_MS).contains(&rtt);
-
-        // Reset consecutive_probe_timeouts to 0 on ANY received response
-        // (plausible or not): a received response means the loop is no longer
-        // fully starved and the pipeline is draining. The
-        // implausibly-huge-RTT-under-starvation symptom is handled by
-        // SUPPRESSION (rtt_probe_stale), not by counting it as a fake
-        // measurement. A late-but-received response still proves draining and
-        // clears its own in-flight slot (retain removes the matching send
-        // timestamp).
 
         // Discard implausible RTT measurements but bump the per-connection
         // streak counter so a sustained discard pattern becomes actionable
@@ -2483,7 +3002,7 @@ impl ConnectionManager {
             // copy the f64 out and drop the borrow inside this tight scope.
             let gap_str = {
                 match self.last_inbound_at_ms.try_borrow() {
-                    Ok(map) => match map.get(connection_id).copied() {
+                    Ok(map) => match map.get(connection_id).map(|f| f.any_lane_ms) {
                         Some(ts) => format!("{:.1}ms", now_perf - ts),
                         None => "n/a".to_string(),
                     },
@@ -2508,10 +3027,14 @@ impl ConnectionManager {
             // block below (no overlap of &/&mut on rtt_measurements).
             let (count, oldest_age): (usize, Option<f64>) = {
                 match self.rtt_measurements.get(connection_id) {
-                    Some(measurement) => (
-                        measurement.in_flight_probes.len(),
-                        oldest_probe_age_ms(&measurement.in_flight_probes, now_perf),
-                    ),
+                    Some(measurement) => {
+                        let in_flight = if reliable_echo {
+                            &measurement.reliable_lane.in_flight_probes
+                        } else {
+                            &measurement.in_flight_probes
+                        };
+                        (in_flight.len(), oldest_probe_age_ms(in_flight, now_perf))
+                    }
                     None => (0, None),
                 }
             };
@@ -2545,10 +3068,9 @@ impl ConnectionManager {
                 measurement.consecutive_implausible_discards = measurement
                     .consecutive_implausible_discards
                     .saturating_add(1);
-                measurement.consecutive_probe_timeouts = 0;
-                measurement
-                    .in_flight_probes
-                    .retain(|&ts| ts != sent_timestamp);
+                let (in_flight, timeouts, _, _) = lane_series_mut(measurement, reliable_echo);
+                *timeouts = 0;
+                in_flight.retain(|&ts| ts != sent_timestamp);
             }
             return;
         }
@@ -2556,22 +3078,12 @@ impl ConnectionManager {
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
             // Reset the discard streak — we just got a usable measurement.
             measurement.consecutive_implausible_discards = 0;
-            measurement.consecutive_probe_timeouts = 0;
-            measurement
-                .in_flight_probes
-                .retain(|&ts| ts != sent_timestamp);
-
-            measurement.measurements.push_back(rtt);
-
-            // Keep only recent measurements (last 10)
-            if measurement.measurements.len() > 10 {
-                measurement.measurements.pop_front();
-            }
-
-            // Update average
-            let avg_rtt = measurement.measurements.iter().sum::<f64>()
-                / measurement.measurements.len() as f64;
-            measurement.average_rtt = Some(avg_rtt);
+            *lane_last_echo_mut(measurement, reliable_echo) = Some(reception_time);
+            let (in_flight, timeouts, samples, average) =
+                lane_series_mut(measurement, reliable_echo);
+            *timeouts = 0;
+            in_flight.retain(|&ts| ts != sent_timestamp);
+            record_lane_sample(samples, average, rtt);
         }
     }
 
@@ -2590,8 +3102,9 @@ impl ConnectionManager {
                 .get(connection_id)
                 .map(|c| c.is_connected())
                 .unwrap_or(true);
-            let qualifies_for_best = measurement.average_rtt.is_some()
-                && measurement.measurements.len() >= ELECTION_MIN_RTT_SAMPLES
+            let (_, lane_avg_rtt, lane_samples, _) = measurement.election_series();
+            let qualifies_for_best = lane_avg_rtt.is_some()
+                && qualifies_for_best_tier(lane_samples, measurement.election_penalty_timeouts())
                 && is_connected;
 
             info!(
@@ -2601,8 +3114,8 @@ impl ConnectionManager {
                     &measurement.connection_id,
                     &strip_query_for_log(&measurement.url),
                     is_connected,
-                    measurement.measurements.len(),
-                    measurement.average_rtt,
+                    lane_samples,
+                    lane_avg_rtt,
                     qualifies_for_best,
                 )
             );
@@ -2617,6 +3130,7 @@ impl ConnectionManager {
     /// the wrong `reason=` for the very outcome being logged (codex review).
     fn snapshot_election_decision(scan: &ElectionScan) -> ElectionDecisionSnapshot {
         let reason = classify_election_reason_from_scan(scan);
+        let rtt_lane = election_rtt_lane_label(scan);
         let (wt_samples, wt_avg_rtt_ms) = best_transport_measurement_for_log(
             scan.best_wt.as_ref().map(|(_, measurement)| measurement),
             scan.fallback_wt
@@ -2631,10 +3145,14 @@ impl ConnectionManager {
         );
         ElectionDecisionSnapshot {
             reason,
+            rtt_lane,
             wt_samples,
             ws_samples,
             wt_avg_rtt_ms,
             ws_avg_rtt_ms,
+            transport_pick: scan.transport_pick(),
+            best_wt_score_ms: scan.best_wt.as_ref().map(|_| scan.best_wt_score),
+            best_ws_score_ms: scan.best_ws.as_ref().map(|_| scan.best_ws_score),
         }
     }
 
@@ -2659,23 +3177,23 @@ impl ConnectionManager {
         #[cfg(test)]
         record_election_decision(
             snapshot.reason,
+            snapshot.rtt_lane,
+            snapshot.transport_pick,
             outcome,
             elected_connection_id,
             active_connection_id,
+            self.election_prior_close,
         );
 
         info!(
             "{}",
             format_election_decision(
-                snapshot.reason,
+                snapshot,
                 outcome,
                 elected_connection_id,
                 active_connection_id,
-                snapshot.wt_samples,
-                snapshot.ws_samples,
-                snapshot.wt_avg_rtt_ms,
-                snapshot.ws_avg_rtt_ms,
                 election_duration_ms,
+                self.election_prior_close,
             )
         );
     }
@@ -2725,7 +3243,7 @@ impl ConnectionManager {
                 // always be Some. If it is somehow None, we skip the abort
                 // comparison — we cannot evaluate whether the winner is better
                 // without data, so we proceed with the switch.
-                let winner_rtt = match measurement.average_rtt {
+                let winner_rtt = match measurement.election_rtt() {
                     Some(rtt) => rtt,
                     None => {
                         log::warn!(
@@ -2774,7 +3292,9 @@ impl ConnectionManager {
                                         // but its RTT measurement entry was cleared.
                                         // Check if a fresh entry was re-inserted by
                                         // the probe timer during the election.
-                                        self.rtt_measurements.get(oid).and_then(|m| m.average_rtt)
+                                        self.rtt_measurements
+                                            .get(oid)
+                                            .and_then(|m| m.election_rtt())
                                     })
                             })
                             .unwrap_or(snapshot_rtt);
@@ -2848,6 +3368,8 @@ impl ConnectionManager {
                                             consecutive_implausible_discards: 0,
                                             in_flight_probes: VecDeque::new(),
                                             consecutive_probe_timeouts: 0,
+                                            last_echo_ms: None,
+                                            reliable_lane: ProbeLaneState::default(),
                                         },
                                     );
                                 }
@@ -2873,6 +3395,7 @@ impl ConnectionManager {
                             // immediately trigger *another* re-election,
                             // causing an infinite loop.
                             self.baseline_rtt = Some(comparison_rtt);
+                            self.baseline_rtt_lane = self.active_election_lane();
                             self.degradation_counter = 0;
                             self.reelection_in_progress = false;
                             // Tier B #3: re-election ran but the winner was not
@@ -3006,7 +3529,8 @@ impl ConnectionManager {
                 }
 
                 // Store baseline RTT for re-election quality monitoring.
-                self.baseline_rtt = measurement.average_rtt;
+                self.baseline_rtt = measurement.election_rtt();
+                self.baseline_rtt_lane = Some(measurement.election_lane());
                 self.degradation_counter = 0;
                 // Tier B #3: count a `proceeded` outcome ONLY when this was a
                 // re-election (a switch away from a prior active connection),
@@ -3048,6 +3572,7 @@ impl ConnectionManager {
                     drop(old_conn);
                 }
 
+                self.reliable_lane_stalled_last_check = false;
                 // Trim the inbound-freshness map to the surviving connections
                 // so that closed candidates do not leak stale timestamps.
                 if let Ok(mut map) = self.last_inbound_at_ms.try_borrow_mut() {
@@ -3206,7 +3731,11 @@ impl ConnectionManager {
         };
 
         let now = monotonic_now_ms();
-        let last_inbound = self.last_inbound_at_ms.borrow().get(&old_id).copied();
+        let last_inbound = self
+            .last_inbound_at_ms
+            .borrow()
+            .get(&old_id)
+            .map(|f| f.any_lane_ms);
         let age_ms = match last_inbound {
             Some(ts) => now - ts,
             None => {
@@ -3271,6 +3800,8 @@ impl ConnectionManager {
                         consecutive_implausible_discards: 0,
                         in_flight_probes: VecDeque::new(),
                         consecutive_probe_timeouts: 0,
+                        last_echo_ms: None,
+                        reliable_lane: ProbeLaneState::default(),
                     },
                 );
             }
@@ -3292,10 +3823,11 @@ impl ConnectionManager {
                 .borrow()
                 .as_deref()
                 .and_then(|id| self.rtt_measurements.get(id))
-                .and_then(|m| m.average_rtt)
+                .and_then(|m| m.election_rtt())
         });
         if let Some(rtt) = new_baseline {
             self.baseline_rtt = Some(rtt);
+            self.baseline_rtt_lane = self.active_election_lane();
         }
         self.degradation_counter = 0;
 
@@ -3313,6 +3845,7 @@ impl ConnectionManager {
         // but are not the active id (these are the failed candidates).
         self.close_unused_connections();
 
+        self.reliable_lane_stalled_last_check = false;
         // Trim the freshness map to surviving connections.
         if let Ok(mut map) = self.last_inbound_at_ms.try_borrow_mut() {
             map.retain(|k, _| self.connections.contains_key(k));
@@ -3407,9 +3940,14 @@ impl ConnectionManager {
             tier,
             ElectionCandidateTier::FallbackWt | ElectionCandidateTier::FallbackWs
         ) {
+            let (connection_id, measurement) = candidate;
+            let (_, _, lane_samples, _) = measurement.election_series();
             warn!(
-                "No connection has {} RTT samples; falling back to best available measurement",
-                ELECTION_MIN_RTT_SAMPLES,
+                "Best candidate {} is a fallback tier ({} on its election lane, {} samples); \
+                 electing it on best available measurement",
+                connection_id,
+                fallback_tier_cause(lane_samples),
+                lane_samples,
             );
         }
 
@@ -3456,7 +3994,7 @@ impl ConnectionManager {
         intentionally_disconnected: Rc<RefCell<bool>>,
     ) {
         let mut attempt: u32 = 0;
-        let mut delay_ms: u64 = RECONNECT_INITIAL_DELAY_MS;
+        let mut delay_ms: u64 = jittered_initial_reconnect_delay();
         // Track consecutive attempts where zero servers respond. If this counter
         // reaches RECONNECT_CONSECUTIVE_ZERO_LIMIT we treat it as a likely
         // auth/server rejection and stop reconnecting immediately.
@@ -3687,9 +4225,8 @@ impl ConnectionManager {
     /// that purely reflect a late timer, not a slow network. Two local
     /// signals tell us this is happening:
     ///
-    ///   1. We *are* receiving inbound traffic on the active connection
-    ///      within the last [`LAST_INBOUND_LIVENESS_MS`] ms (so the network
-    ///      cannot be broken).
+    ///   1. We *are* receiving inbound traffic on the active connection within
+    ///      its transport's liveness window (#2720, #2753).
     ///   2. The controller's drift watchdog has set `cpu_overloaded`,
     ///      indicating the main thread itself was blocked for at least
     ///      [`CPU_OVERLOAD_DRIFT_THRESHOLD_MS`] ms recently.
@@ -3702,7 +4239,7 @@ impl ConnectionManager {
     /// # CPU-stall guard trade-off
     ///
     /// When the suppression guard fires (recent inbound traffic on the active
-    /// connection within [`LAST_INBOUND_LIVENESS_MS`], or the main-thread
+    /// connection within its transport's liveness window, or the main-thread
     /// drift watchdog has fired within [`CPU_OVERLOADED_DURATION_MS`]), the
     /// `degradation_counter` for the elevated-RTT path is reset to 0 — those
     /// samples are presumed to be main-thread stall artifacts, not network
@@ -3719,39 +4256,115 @@ impl ConnectionManager {
     /// cause the user-visible cascades documented in discussion #562, while
     /// false negatives (delayed re-election under sustained CPU+network
     /// distress) only delay recovery.
+    fn active_election_lane(&self) -> Option<ElectionRttLane> {
+        let id = self.active_connection_id.borrow().clone()?;
+        self.rtt_measurements.get(&id).map(|m| m.election_lane())
+    }
+
+    fn rebase_baseline_on_election_lane_flip(&mut self, active_id: &str) {
+        let Some(baseline) = self.baseline_rtt else {
+            return;
+        };
+        let Some(lane) = self
+            .rtt_measurements
+            .get(active_id)
+            .map(|m| m.election_lane())
+        else {
+            return;
+        };
+        if self.baseline_rtt_lane.is_none() {
+            self.baseline_rtt_lane = Some(lane);
+            return;
+        }
+        if self.baseline_rtt_lane == Some(lane) {
+            return;
+        }
+        let Some(rtt) = self
+            .rtt_measurements
+            .get(active_id)
+            .and_then(|m| m.election_rtt())
+        else {
+            return;
+        };
+        info!(
+            "Election lane flipped to {} on {} — re-basing RTT baseline \
+             {:.1}ms -> {:.1}ms and clearing the degradation streak",
+            lane.label(),
+            active_id,
+            baseline,
+            rtt,
+        );
+        self.baseline_rtt = Some(rtt);
+        self.baseline_rtt_lane = Some(lane);
+        self.degradation_counter = 0;
+    }
+
     pub fn check_rtt_degradation(&mut self) -> bool {
         if self.reelection_in_progress {
+            self.reliable_lane_stalled_last_check = false;
             return false;
         }
 
         let active_id = match self.active_connection_id.borrow().clone() {
             Some(id) => id,
-            None => return false,
+            None => {
+                self.reliable_lane_stalled_last_check = false;
+                return false;
+            }
         };
 
         // --- CPU-stall guard ----------------------------------------------
         // Pre-compute the suppression decision so both trigger paths share it
         // and the transition log fires exactly once.
-        //
-        // `recent_inbound` is true iff the active connection has produced
-        // inbound traffic within `LAST_INBOUND_LIVENESS_MS` AND its RTT
-        // measurement entry is marked `connected`. The connectivity check
-        // protects against stale freshness stamps lingering after a
-        // hand-tested transport drops mid-cycle.
         let active_connected = self
             .rtt_measurements
             .get(&active_id)
             .map(|m| m.connected)
             .unwrap_or(false);
+        let active_is_webtransport = self
+            .rtt_measurements
+            .get(&active_id)
+            .map(|m| m.is_webtransport)
+            .unwrap_or(false);
         let now = monotonic_now_ms();
-        let last_inbound = self.last_inbound_at_ms.borrow().get(&active_id).copied();
-        let recent_inbound = active_connected
-            && matches!(last_inbound, Some(ts) if (now - ts) < LAST_INBOUND_LIVENESS_MS);
+        let freshness = self.last_inbound_at_ms.borrow().get(&active_id).copied();
+        let (last_inbound, liveness_window_ms) = if active_is_webtransport {
+            (
+                freshness.and_then(|f| f.reliable_ms),
+                RELIABLE_LANE_LIVENESS_MS,
+            )
+        } else {
+            (freshness.map(|f| f.any_lane_ms), LAST_INBOUND_LIVENESS_MS)
+        };
+        let recent_inbound =
+            active_connected && matches!(last_inbound, Some(ts) if (now - ts) < liveness_window_ms);
         let cpu_overloaded = self.cpu_overloaded.load(Ordering::Relaxed);
 
-        // Pre-compute "would have fired" against the inputs as they stand
-        // *now*, before mutating any counters. Both triggers are subject to
-        // the same suppression decision, so we evaluate them up front.
+        let reliable_lane_stalled = !recent_inbound
+            && active_connected
+            && matches!(
+                freshness.map(|f| f.any_lane_ms),
+                Some(ts) if (now - ts) < LAST_INBOUND_LIVENESS_MS
+            );
+        if reliable_lane_stalled && !self.reliable_lane_stalled_last_check {
+            self.reliable_lane_stall_episodes_total
+                .set(self.reliable_lane_stall_episodes_total.get() + 1);
+            warn!(
+                "Reliable downlink lane stale on {} for over {:.0}ms (last reliable packet {}, \
+                 datagrams still arriving) — re-election is no longer suppressed by datagram \
+                 liveness",
+                active_id,
+                RELIABLE_LANE_LIVENESS_MS,
+                match last_inbound {
+                    Some(ts) => format!("{:.0}ms ago", now - ts),
+                    None => "never".to_string(),
+                },
+            );
+        }
+        self.reliable_lane_stalled_last_check = reliable_lane_stalled;
+
+        self.rebase_baseline_on_election_lane_flip(&active_id);
+
         let discard_streak = self
             .rtt_measurements
             .get(&active_id)
@@ -3772,7 +4385,7 @@ impl ConnectionManager {
             .and_then(|baseline| {
                 self.rtt_measurements
                     .get(&active_id)
-                    .and_then(|m| m.average_rtt)
+                    .and_then(|m| m.election_rtt())
                     .map(|current_rtt| {
                         let threshold = f64::max(
                             baseline * REELECTION_RTT_MULTIPLIER,
@@ -3783,7 +4396,19 @@ impl ConnectionManager {
             })
             .unwrap_or(false);
 
-        let would_have_fired = discards_would_fire || elevated_currently;
+        let reliable_lane_wedged = self
+            .rtt_measurements
+            .get(&active_id)
+            .map(|m| {
+                m.is_webtransport
+                    && election_candidate_is_stale(m.reliable_lane.consecutive_probe_timeouts)
+            })
+            .unwrap_or(false);
+        if !reliable_lane_wedged {
+            self.reliable_lane_wedge_fired = false;
+        }
+
+        let would_have_fired = discards_would_fire || elevated_currently || reliable_lane_wedged;
 
         // Issue 2643: budget accrues ONLY on `cpu_overloaded`. Outside the latch so a window
         // closes while the latch stays engaged on `recent_inbound`.
@@ -3838,9 +4463,9 @@ impl ConnectionManager {
                 } else {
                     let age_ms = last_inbound.map(|ts| now - ts).unwrap_or(0.0);
                     info!(
-                        "Re-election suppressed: recent inbound traffic on {} (last inbound \
-                         {:.0}ms ago) — interpreting elevated RTT as main-thread stall, not \
-                         network degradation",
+                        "Re-election suppressed: recent reliable-lane inbound traffic on {} \
+                         (last reliable packet {:.0}ms ago) — interpreting elevated RTT as \
+                         main-thread stall, not network degradation",
                         active_id, age_ms,
                     );
                 }
@@ -3902,6 +4527,23 @@ impl ConnectionManager {
             return true;
         }
 
+        if reliable_lane_wedged && !self.reliable_lane_wedge_fired {
+            self.reliable_lane_wedge_fired = true;
+            if self.total_server_count() > 1 {
+                warn!(
+                    "Reliable lane wedged on {} ({} consecutive Control-stream probe \
+                     timeouts at or past threshold {}) — triggering re-election",
+                    active_id,
+                    self.rtt_measurements
+                        .get(&active_id)
+                        .map(|m| m.reliable_lane.consecutive_probe_timeouts)
+                        .unwrap_or(0),
+                    STALE_THRESHOLD,
+                );
+                return true;
+            }
+        }
+
         // --- Elevated-RTT watchdog (existing) -------------------------------
         // Only check when we have a baseline and are in Elected state.
         let baseline = match self.baseline_rtt {
@@ -3912,7 +4554,7 @@ impl ConnectionManager {
         let current_rtt = self
             .rtt_measurements
             .get(&active_id)
-            .and_then(|m| m.average_rtt);
+            .and_then(|m| m.election_rtt());
 
         let current_rtt = match current_rtt {
             Some(rtt) => rtt,
@@ -3952,6 +4594,7 @@ impl ConnectionManager {
                     );
                     self.degradation_counter = 0;
                     self.baseline_rtt = Some(current_rtt);
+                    self.baseline_rtt_lane = self.active_election_lane();
                     self.maybe_schedule_post_rebase_retry();
                     return false;
                 }
@@ -4065,6 +4708,7 @@ impl ConnectionManager {
         );
         self.degradation_counter = 0;
         self.baseline_rtt = None;
+        self.baseline_rtt_lane = None;
 
         // Capture the old active connection's current average RTT, URL, full
         // RTT measurement snapshot, and transport type *before* clearing
@@ -4082,7 +4726,7 @@ impl ConnectionManager {
         let old_measurement = old_active_id
             .as_ref()
             .and_then(|id| self.rtt_measurements.get(id));
-        self.old_active_rtt = old_measurement.and_then(|m| m.average_rtt);
+        self.old_active_rtt = old_measurement.and_then(|m| m.election_rtt());
         self.old_active_rtt_measurement = old_measurement.cloned();
         if let Some(rtt) = self.old_active_rtt {
             info!("Re-election: captured old active connection RTT: {rtt:.1}ms");
@@ -4103,6 +4747,7 @@ impl ConnectionManager {
         // Clear any remaining non-active stale connections.
         self.connections.clear();
 
+        self.reliable_lane_stalled_last_check = false;
         // Trim the inbound-freshness map: keep only the old active's entry
         // (it remains alive in `old_active_connection` and continues to
         // accumulate inbound traffic), drop everything else so candidate IDs
@@ -4628,7 +5273,7 @@ impl ConnectionManager {
     /// Process any queued RTT responses
     fn process_queued_rtt_responses(&mut self) {
         // First collect all responses to avoid borrow conflicts
-        let responses_to_process: Vec<(String, MediaPacket, f64)> =
+        let responses_to_process: Vec<QueuedRttResponse> =
             if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
                 responses.drain(..).collect()
             } else {
@@ -4636,8 +5281,13 @@ impl ConnectionManager {
             };
 
         // Now process each response
-        for (connection_id, media_packet, reception_time) in responses_to_process {
-            self.handle_rtt_response(&connection_id, &media_packet, reception_time);
+        for response in responses_to_process {
+            self.handle_rtt_response(
+                &response.connection_id,
+                &response.media_packet,
+                response.reception_time,
+                response.lane,
+            );
         }
 
         // Age out any probes that never got a response THIS tick. Runs AFTER the
@@ -4649,26 +5299,19 @@ impl ConnectionManager {
     /// Age out RTT probes that have exceeded [`PROBE_TIMEOUT_MS`] without a
     /// response, marking the connection's probe pipeline as increasingly stale.
     ///
-    /// Increment `consecutive_probe_timeouts` on each expiry; it is reset to 0
-    /// in `handle_rtt_response` on ANY received response. So a healthy link that
-    /// occasionally loses one probe but keeps getting others resets before
-    /// reaching `STALE_THRESHOLD`. Called AFTER draining this tick's responses
-    /// (see `process_queued_rtt_responses`) so this-tick responses clear their
-    /// slots first.
     fn prune_stale_probes(&mut self) {
         let now = monotonic_now_ms();
         for measurement in self.rtt_measurements.values_mut() {
-            // `in_flight_probes` is oldest-first, so once the front entry is
-            // within the deadline every later entry is too — we can stop.
-            while let Some(&front) = measurement.in_flight_probes.front() {
-                if now - front > PROBE_TIMEOUT_MS {
-                    measurement.in_flight_probes.pop_front();
-                    measurement.consecutive_probe_timeouts =
-                        measurement.consecutive_probe_timeouts.saturating_add(1);
-                } else {
-                    break;
-                }
-            }
+            prune_lane_probes(
+                &mut measurement.in_flight_probes,
+                &mut measurement.consecutive_probe_timeouts,
+                now,
+            );
+            prune_lane_probes(
+                &mut measurement.reliable_lane.in_flight_probes,
+                &mut measurement.reliable_lane.consecutive_probe_timeouts,
+                now,
+            );
         }
     }
 
@@ -5484,6 +6127,7 @@ impl ConnectionManager {
         // Drop all connections (stops heartbeats, closes transports).
         self.connections.clear();
 
+        self.reliable_lane_stalled_last_check = false;
         // Drop inbound-freshness timestamps — they refer to closed transports.
         if let Ok(mut map) = self.last_inbound_at_ms.try_borrow_mut() {
             map.clear();
@@ -5504,6 +6148,22 @@ impl ConnectionManager {
             }
         }
         Ok(())
+    }
+
+    fn election_lane_depth(&self) -> Vec<ElectionLaneDepth> {
+        let connections = &self.connections;
+        let now = monotonic_now_ms();
+        self.rtt_measurements
+            .iter()
+            .filter(|(id, _)| election_candidate_is_eligible(connections.get(*id)))
+            .map(|(_, m)| {
+                (
+                    m.is_webtransport,
+                    m.election_series().2,
+                    m.election_lane_answering(now),
+                )
+            })
+            .collect()
     }
 
     /// Check if election should be completed and do so if needed.
@@ -5531,8 +6191,13 @@ impl ConnectionManager {
             let has_enough_samples = self.rtt_measurements.values().any(|m| {
                 m.measurements.len() >= ELECTION_MIN_RTT_SAMPLES && m.average_rtt.is_some()
             });
+            let may_complete = election_may_complete(
+                &self.election_lane_depth(),
+                has_enough_samples,
+                *extensions_used,
+            );
 
-            if has_enough_samples || *extensions_used >= ELECTION_MAX_EXTENSIONS {
+            if may_complete {
                 if !has_enough_samples {
                     warn!(
                         "Election deadline reached after {} extensions with no connection \
@@ -5554,11 +6219,13 @@ impl ConnectionManager {
                     *extensions_used = ext + 1;
                     info!(
                         "Election extended by {}ms (extension {}/{}) — \
-                         no connection has {} RTT samples yet, new deadline {}ms",
+                         waiting for {} RTT samples on one candidate, then {} on every \
+                         answering candidate of both transports, new deadline {}ms",
                         ELECTION_EXTENSION_STEP_MS,
                         ext + 1,
                         ELECTION_MAX_EXTENSIONS,
                         ELECTION_MIN_RTT_SAMPLES,
+                        ELECTION_BONUS_MIN_SAMPLES,
                         *duration_ms,
                     );
                 }
@@ -5669,6 +6336,10 @@ impl ConnectionManager {
         self.rtt_probe_stale_suppressions_total.get()
     }
 
+    pub fn reliable_lane_stall_episodes_total(&self) -> u64 {
+        self.reliable_lane_stall_episodes_total.get()
+    }
+
     /// Whether the ACTIVE link's RTT probe pipeline is stale (issue #522).
     ///
     /// True when the local main thread is CPU-overloaded (probe timing is
@@ -5689,14 +6360,32 @@ impl ConnectionManager {
         false
     }
 
-    /// Get send queue depth from the active connection (bufferedAmount for WebSocket)
+    /// Get send queue depth from the active connection (bufferedAmount for WebSocket).
+    /// During re-election the old active connection keeps carrying media via
+    /// `send_packet`'s fallback, so the depth must resolve the same way.
     pub fn get_send_queue_depth(&self) -> Option<u64> {
-        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
-            if let Some(connection) = self.connections.get(active_id) {
-                return connection.get_send_queue_depth();
-            }
-        }
-        None
+        self.get_active_connection()?.get_send_queue_depth()
+    }
+
+    /// Test-only: install a connection and elect it in one step (#2722).
+    #[cfg(test)]
+    pub(crate) fn insert_active_connection_for_test(&mut self, id: &str, connection: Connection) {
+        self.connections.insert(id.to_string(), connection);
+        *self.active_connection_id.borrow_mut() = Some(id.to_string());
+    }
+
+    /// Test-only: the shared fixture, reachable from sibling modules.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        tests::make_test_manager()
+    }
+
+    /// Uplink queue depth of the ACTIVE connection, for telemetry (#2722).
+    /// Which CONNECTION is asked follows election, reconnect and WT<->WS
+    /// fallback; what the answer COUNTS does not on the WebTransport arm, which
+    /// is a per-tab total — see [`super::task::Task::uplink_queue_depth_bytes`].
+    pub fn uplink_queue_depth_bytes(&self) -> Option<u64> {
+        self.get_active_connection()?.uplink_queue_depth_bytes()
     }
 }
 
@@ -5731,6 +6420,16 @@ fn next_backoff_delay(current_delay_ms: u64, multiplier: f64, attempt: u32) -> u
     // Decorrelated jitter: add random(0, base * 0.5).
     let jitter = (base as f64 * 0.5 * uniform_unit_sample()) as u64;
     (base + jitter).min(max_delay_ms)
+}
+
+/// The FIRST reconnect delay, uniform in `[RECONNECT_INITIAL_DELAY_MS, 2 *
+/// RECONNECT_INITIAL_DELAY_MS)`.
+fn jittered_initial_reconnect_delay() -> u64 {
+    jittered_initial_reconnect_delay_from(uniform_unit_sample())
+}
+
+fn jittered_initial_reconnect_delay_from(unit_sample: f64) -> u64 {
+    RECONNECT_INITIAL_DELAY_MS + (RECONNECT_INITIAL_DELAY_MS as f64 * unit_sample) as u64
 }
 
 /// A uniform sample in `[0, 1)` for backoff jitter. Two arms because
@@ -5783,6 +6482,7 @@ mod tests {
         REELECTION_CONSECUTIVE_SAMPLES, REELECTION_MIN_IMPROVEMENT_MS,
         REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
     };
+    use crate::connection::task::StubSendKind;
     // wasm32-gated tests in this module must be `#[wasm_bindgen_test]`, which
     // the `wasm-pack test --headless --chrome` step runs; a plain `#[test]`
     // behind that gate executes in no CI job at all (#2446).
@@ -5798,7 +6498,7 @@ mod tests {
     // is initialised, so we can unit-test `check_rtt_degradation`, `handle_rtt_response`,
     // `find_best_connection`, etc.
     // -----------------------------------------------------------------------
-    fn make_test_manager() -> ConnectionManager {
+    pub(super) fn make_test_manager() -> ConnectionManager {
         let options = ConnectionManagerOptions {
             websocket_urls: vec![],
             webtransport_urls: vec![],
@@ -5836,8 +6536,11 @@ mod tests {
             own_session_id: Rc::new(RefCell::new(None)),
             pending_session_ids: Rc::new(RefCell::new(HashMap::new())),
             reconnection_phase: Rc::new(RefCell::new(ReconnectionPhase::Idle)),
+            downlink_close_pending: Rc::new(RefCell::new(None)),
+            election_prior_close: PRIOR_CLOSE_NONE,
             manager_ref: Weak::new(),
             baseline_rtt: None,
+            baseline_rtt_lane: None,
             degradation_counter: 0,
             reelection_in_progress: false,
             reelection_generation: 0,
@@ -5849,6 +6552,7 @@ mod tests {
             packets_sent: Rc::new(Cell::new(0)),
             rtt_probe_dropped_total: Rc::new(Cell::new(0)),
             rtt_probe_stale_suppressions_total: Rc::new(Cell::new(0)),
+            reliable_lane_stall_episodes_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(0.0)),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -5864,6 +6568,8 @@ mod tests {
             cpu_overloaded: Rc::new(AtomicBool::new(false)),
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
+            reliable_lane_stalled_last_check: false,
+            reliable_lane_wedge_fired: false,
             suppression_started_at_ms: None,
             cpu_suppression_budget_ms: 0.0,
             cpu_suppression_started_at_ms: None,
@@ -5897,6 +6603,8 @@ mod tests {
                 consecutive_implausible_discards: 0,
                 in_flight_probes: VecDeque::new(),
                 consecutive_probe_timeouts: 0,
+                last_echo_ms: None,
+                reliable_lane: ProbeLaneState::default(),
             },
         );
     }
@@ -5946,7 +6654,11 @@ mod tests {
         }
 
         let callback = mgr.create_inbound_media_callback("conn".to_string());
-        callback.emit(packet);
+        callback.emit((
+            packet,
+            InboundLane::Reliable,
+            ReceivedAtMs(monotonic_now_ms()),
+        ));
 
         let packets = forwarded.borrow().clone();
         packets
@@ -6042,23 +6754,56 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn decision_snapshot(
+        reason: &'static str,
+        rtt_lane: &'static str,
+        wt_samples: usize,
+        ws_samples: usize,
+        wt_avg_rtt_ms: Option<f64>,
+        ws_avg_rtt_ms: Option<f64>,
+        transport_pick: &'static str,
+        best_wt_score_ms: Option<f64>,
+        best_ws_score_ms: Option<f64>,
+    ) -> ElectionDecisionSnapshot {
+        ElectionDecisionSnapshot {
+            reason,
+            rtt_lane,
+            wt_samples,
+            ws_samples,
+            wt_avg_rtt_ms,
+            ws_avg_rtt_ms,
+            transport_pick,
+            best_wt_score_ms,
+            best_ws_score_ms,
+        }
+    }
+
     #[test]
     fn format_election_decision_matches_canonical_best_wt() {
         assert_eq!(
             format_election_decision(
-                "best_wt_min_samples",
+                &decision_snapshot(
+                    "best_wt_min_samples",
+                    "reliable",
+                    3,
+                    2,
+                    Some(42.74),
+                    Some(58.14),
+                    "wt_faster",
+                    Some(42.74),
+                    Some(58.14),
+                ),
                 ElectionOutcome::Elected,
                 Some("wt_0"),
                 Some("wt_0"),
-                3,
-                2,
-                Some(42.74),
-                Some(58.14),
                 Some(1500),
+                PRIOR_CLOSE_NONE,
             ),
-            "Election decision: reason=best_wt_min_samples outcome=elected elected=wt_0 \
-             active=wt_0 wt_samples=3 ws_samples=2 wt_avg_rtt_ms=42.7 ws_avg_rtt_ms=58.1 \
-             election_duration_ms=1500"
+            "Election decision: reason=best_wt_min_samples rtt_lane=reliable outcome=elected \
+             elected=wt_0 active=wt_0 wt_samples=3 ws_samples=2 wt_avg_rtt_ms=42.7 \
+             ws_avg_rtt_ms=58.1 transport_pick=wt_faster best_wt_score_ms=42.7 \
+             best_ws_score_ms=58.1 wt_bonus_ms=30 election_duration_ms=1500 prior_close=none"
         );
     }
 
@@ -6066,19 +6811,28 @@ mod tests {
     fn format_election_decision_renders_none_and_nulls() {
         assert_eq!(
             format_election_decision(
-                "election_failed_no_candidates",
+                &decision_snapshot(
+                    "election_failed_no_candidates",
+                    "none",
+                    0,
+                    0,
+                    None,
+                    None,
+                    "no_best_tier",
+                    None,
+                    None,
+                ),
                 ElectionOutcome::Failed,
                 None,
                 None,
-                0,
-                0,
                 None,
-                None,
-                None,
+                PRIOR_CLOSE_NONE,
             ),
-            "Election decision: reason=election_failed_no_candidates outcome=failed \
-             elected=none active=none wt_samples=0 ws_samples=0 wt_avg_rtt_ms=null \
-             ws_avg_rtt_ms=null election_duration_ms=null"
+            "Election decision: reason=election_failed_no_candidates rtt_lane=none \
+             outcome=failed elected=none active=none wt_samples=0 ws_samples=0 \
+             wt_avg_rtt_ms=null ws_avg_rtt_ms=null transport_pick=no_best_tier \
+             best_wt_score_ms=null best_ws_score_ms=null wt_bonus_ms=30 \
+             election_duration_ms=null prior_close=none"
         );
     }
 
@@ -6091,15 +6845,22 @@ mod tests {
     #[test]
     fn format_election_decision_abort_reports_winner_and_kept_old_distinctly() {
         let line = format_election_decision(
-            "best_wt_min_samples",
+            &decision_snapshot(
+                "best_wt_min_samples",
+                "reliable",
+                2,
+                2,
+                Some(40.0),
+                Some(41.0),
+                "wt_faster",
+                Some(40.0),
+                Some(41.0),
+            ),
             ElectionOutcome::AbortedKeptOld,
             Some("wt_1"),
             Some("ws_0"),
-            2,
-            2,
-            Some(40.0),
-            Some(41.0),
             Some(900),
+            PRIOR_CLOSE_NONE,
         );
         assert!(
             line.contains("outcome=aborted_kept_old"),
@@ -6127,8 +6888,25 @@ mod tests {
     fn election_winner_and_reason_share_candidate_selection() {
         let mut best_wt = make_test_manager();
         insert_measurement(&mut best_wt, "wt_best", true, Some(80.0), vec![80.0, 80.0]);
-        insert_measurement(&mut best_wt, "ws_best", false, Some(20.0), vec![20.0, 20.0]);
+        insert_measurement(&mut best_wt, "ws_best", false, Some(120.0), vec![120.0; 2]);
         assert_election_selection(&best_wt, "wt_best", "best_wt_min_samples");
+
+        let mut outside_bonus = make_test_manager();
+        insert_measurement(
+            &mut outside_bonus,
+            "wt_best",
+            true,
+            Some(80.0),
+            vec![80.0; 2],
+        );
+        insert_measurement(
+            &mut outside_bonus,
+            "ws_best",
+            false,
+            Some(20.0),
+            vec![20.0; 2],
+        );
+        assert_election_selection(&outside_bonus, "ws_best", "best_ws_min_samples");
 
         let mut best_ws = make_test_manager();
         insert_measurement(&mut best_ws, "wt_fallback", true, Some(10.0), vec![10.0]);
@@ -6185,7 +6963,7 @@ mod tests {
     #[test]
     fn classify_election_reason_best_wt_min_samples() {
         let mut mgr = make_test_manager();
-        insert_measurement(&mut mgr, "wt_0", true, Some(42.0), vec![42.0, 42.0]);
+        insert_measurement(&mut mgr, "wt_0", true, Some(20.0), vec![20.0, 20.0]);
         insert_measurement(&mut mgr, "ws_0", false, Some(25.0), vec![25.0, 25.0]);
 
         assert_eq!(
@@ -6280,6 +7058,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn send_queue_depth_resolves_the_old_active_connection_during_reelection() {
+        let mut mgr = make_test_manager();
+
+        let old_active_still_carrying_media = Connection::new_for_test_with_transport(false);
+        old_active_still_carrying_media.set_send_queue_depth_for_test(262_144);
+        mgr.old_active_connection = Some(("ws_old".to_string(), old_active_still_carrying_media));
+        *mgr.active_connection_id.borrow_mut() = Some("ws_old".to_string());
+
+        let non_elected_connection = Connection::new_for_test_with_transport(false);
+        non_elected_connection.set_send_queue_depth_for_test(1);
+        mgr.connections
+            .insert("ws_new".to_string(), non_elected_connection);
+
+        assert_eq!(
+            mgr.get_send_queue_depth(),
+            Some(262_144),
+            "the socket still carrying media during re-election must report its own depth, \
+             not None and not the non-elected connection's"
+        );
+    }
+
     /// PRODUCTION-PATH regression for BOTH #1745 review findings, driven through
     /// the real `complete_election` re-election ABORT branch (host-runnable — the
     /// pre-existing `complete_election_aborts_*` tests are `#[cfg(target_arch =
@@ -6326,6 +7126,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         });
         mgr.old_active_connection = Some((
             "wt_old".to_string(),
@@ -6414,6 +7216,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         });
         mgr.old_active_connection = Some((
             "wt_old".to_string(),
@@ -6421,9 +7225,10 @@ mod tests {
         ));
         *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
         // Fresh inbound (well within the 5s freshness window) so preservation fires.
-        mgr.last_inbound_at_ms
-            .borrow_mut()
-            .insert("wt_old".to_string(), monotonic_now_ms() - 100.0);
+        mgr.last_inbound_at_ms.borrow_mut().insert(
+            "wt_old".to_string(),
+            InboundFreshness::reliable(monotonic_now_ms() - 100.0),
+        );
         // No rtt_measurements inserted => find_best_connection returns Err.
 
         let _ = take_last_election_decision();
@@ -6697,15 +7502,37 @@ mod tests {
     }
 
     #[test]
+    fn self_packet_filter_exempts_downlink_congestion_on_both_id_arms() {
+        assert!(
+            !should_filter_self_packet(
+                &packet(PacketType::DOWNLINK_CONGESTION, 99),
+                Some(99),
+                &history_of(&[42, 99]),
+            ),
+            "self-targeted DOWNLINK_CONGESTION on the CURRENT session id must \
+             reach VideoCallClient, or #1219 Half 2 is dead on the wire"
+        );
+        assert!(
+            !should_filter_self_packet(
+                &packet(PacketType::DOWNLINK_CONGESTION, 42),
+                Some(99),
+                &history_of(&[42, 99]),
+            ),
+            "self-targeted DOWNLINK_CONGESTION on a PRIOR session id must reach \
+             VideoCallClient on the same terms as CONGESTION and LAYER_HINT"
+        );
+        assert!(
+            should_filter_self_packet(
+                &packet(PacketType::MEDIA, 99),
+                Some(99),
+                &history_of(&[42, 99]),
+            ),
+            "anti-vacuity: the filter must still drop our own MEDIA"
+        );
+    }
+
+    #[test]
     fn self_packet_filter_treats_prior_and_current_session_ids_identically() {
-        // The core invariant #625 establishes: a session id we held earlier fares
-        // EXACTLY as the one we hold now. Deliberately asserted as a property over
-        // `PacketType::VALUES` — every type the protobuf defines — rather than a
-        // hand-picked list, so it keeps holding when the whitelist changes (#1481
-        // may add DOWNLINK_CONGESTION to it) and so a packet type added later is
-        // covered without anyone remembering to extend this test. It pins parity,
-        // NOT any particular verdict: which types are filtered is the whitelist's
-        // business and is pinned by the whitelist tests above.
         let history = history_of(&[42, 99]);
         let mut checked = 0;
         for packet_type in <PacketType as protobuf::Enum>::VALUES {
@@ -6949,6 +7776,44 @@ mod tests {
                 RECONNECT_MAX_DELAY_PHASE1_MS
             );
         }
+    }
+
+    #[test]
+    fn the_first_reconnect_delay_spans_its_whole_base() {
+        assert_eq!(
+            jittered_initial_reconnect_delay_from(0.0),
+            RECONNECT_INITIAL_DELAY_MS,
+            "the floor is the old fixed delay, so nobody retries sooner than before"
+        );
+        assert_eq!(
+            jittered_initial_reconnect_delay_from(0.999),
+            2 * RECONNECT_INITIAL_DELAY_MS - 1,
+            "the ceiling is one base above the floor"
+        );
+        assert_ne!(
+            jittered_initial_reconnect_delay_from(0.0),
+            jittered_initial_reconnect_delay_from(0.5),
+            "two clients drawing different samples must not land on one delay"
+        );
+    }
+
+    /// 25 receivers closed in one relay round must not all retry at once.
+    #[test]
+    fn concurrently_closed_clients_do_not_share_a_first_reconnect_delay() {
+        let delays: Vec<u64> = (0..200)
+            .map(|_| jittered_initial_reconnect_delay())
+            .collect();
+        let range = RECONNECT_INITIAL_DELAY_MS..(2 * RECONNECT_INITIAL_DELAY_MS);
+        assert!(
+            delays.iter().all(|delay| range.contains(delay)),
+            "every first delay must sit in {range:?}"
+        );
+        let distinct: std::collections::HashSet<u64> = delays.iter().copied().collect();
+        assert!(
+            distinct.len() > 20,
+            "expected the wave to spread across many delays, got {} distinct",
+            distinct.len()
+        );
     }
 
     #[test]
@@ -7604,7 +8469,7 @@ mod tests {
         };
 
         // RTT = reception_time - sent_timestamp = 1050 - 1000 = 50ms
-        mgr.handle_rtt_response("wt_0", &media_packet, 1050.0);
+        mgr.handle_rtt_response("wt_0", &media_packet, 1050.0, InboundLane::Datagram);
 
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
         assert_eq!(m.measurements.len(), 1);
@@ -7622,7 +8487,7 @@ mod tests {
                 timestamp: sent,
                 ..Default::default()
             };
-            mgr.handle_rtt_response("wt_0", &pkt, recv);
+            mgr.handle_rtt_response("wt_0", &pkt, recv, InboundLane::Datagram);
         }
 
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
@@ -7643,7 +8508,7 @@ mod tests {
                 timestamp: sent,
                 ..Default::default()
             };
-            mgr.handle_rtt_response("wt_0", &pkt, recv);
+            mgr.handle_rtt_response("wt_0", &pkt, recv, InboundLane::Datagram);
         }
 
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
@@ -7658,7 +8523,7 @@ mod tests {
             ..Default::default()
         };
         // No "unknown" entry in rtt_measurements — should not panic.
-        mgr.handle_rtt_response("unknown", &pkt, 1050.0);
+        mgr.handle_rtt_response("unknown", &pkt, 1050.0, InboundLane::Datagram);
         assert!(!mgr.rtt_measurements.contains_key("unknown"));
     }
 
@@ -7672,7 +8537,7 @@ mod tests {
             timestamp: 2000.0,
             ..Default::default()
         };
-        mgr.handle_rtt_response("wt_0", &pkt, 1000.0);
+        mgr.handle_rtt_response("wt_0", &pkt, 1000.0, InboundLane::Datagram);
 
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
         assert!(
@@ -7692,7 +8557,7 @@ mod tests {
             timestamp: 1000.0,
             ..Default::default()
         };
-        mgr.handle_rtt_response("wt_0", &pkt, 16000.0);
+        mgr.handle_rtt_response("wt_0", &pkt, 16000.0, InboundLane::Datagram);
 
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
         assert!(
@@ -7712,7 +8577,12 @@ mod tests {
             timestamp: 1000.0,
             ..Default::default()
         };
-        mgr.handle_rtt_response("wt_0", &pkt, 1000.0 + RTT_SANITY_MAX_MS);
+        mgr.handle_rtt_response(
+            "wt_0",
+            &pkt,
+            1000.0 + RTT_SANITY_MAX_MS,
+            InboundLane::Datagram,
+        );
 
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
         assert_eq!(m.measurements.len(), 1);
@@ -7729,7 +8599,7 @@ mod tests {
             timestamp: 1000.0,
             ..Default::default()
         };
-        mgr.handle_rtt_response("wt_0", &pkt, 1000.0);
+        mgr.handle_rtt_response("wt_0", &pkt, 1000.0, InboundLane::Datagram);
 
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
         assert_eq!(m.measurements.len(), 1);
@@ -7845,7 +8715,7 @@ mod tests {
             timestamp: 1000.0,
             ..Default::default()
         };
-        mgr.handle_rtt_response("wt_0", &pkt, 1100.0);
+        mgr.handle_rtt_response("wt_0", &pkt, 1100.0, InboundLane::Datagram);
 
         assert_eq!(
             mgr.rtt_measurements
@@ -7918,7 +8788,7 @@ mod tests {
             ..Default::default()
         };
         // recv - sent = 16000ms, exceeds RTT_SANITY_MAX_MS -> discarded.
-        mgr.handle_rtt_response(conn_id, &pkt, 17000.0);
+        mgr.handle_rtt_response(conn_id, &pkt, 17000.0, InboundLane::Datagram);
     }
 
     /// Helper: feed a plausible RTT measurement into the active connection.
@@ -7928,7 +8798,7 @@ mod tests {
             ..Default::default()
         };
         // recv - sent = 50ms.
-        mgr.handle_rtt_response(conn_id, &pkt, 1050.0);
+        mgr.handle_rtt_response(conn_id, &pkt, 1050.0, InboundLane::Datagram);
     }
 
     #[test]
@@ -8126,19 +8996,548 @@ mod tests {
         }
     }
 
+    // ===== 5a-bis. Per-lane RTT probes (#2721) =====
+
+    /// Drive one RTT echo through the REAL inbound callback on `lane`, then run
+    /// the production drain that feeds `handle_rtt_response`.
+    fn deliver_rtt_echo(
+        mgr: &mut ConnectionManager,
+        conn_id: &str,
+        rtt_ms: f64,
+        lane: InboundLane,
+    ) -> f64 {
+        let sent_timestamp = monotonic_now_ms() - rtt_ms;
+        let media_packet = MediaPacket {
+            media_type: MediaType::RTT.into(),
+            user_id: mgr.options.userid.as_bytes().to_vec(),
+            timestamp: sent_timestamp,
+            ..Default::default()
+        };
+        let data = mgr
+            .aes
+            .encrypt(&media_packet.write_to_bytes().unwrap())
+            .unwrap();
+        let packet = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: mgr.options.userid.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        let callback = mgr.create_inbound_media_callback(conn_id.to_string());
+        callback.emit((packet, lane, ReceivedAtMs(monotonic_now_ms())));
+        mgr.process_queued_rtt_responses();
+        sent_timestamp
+    }
+
+    // ===== 5a-ter. Receipt stamping across the #2728 Worker hop =====
+
+    const HAND_OFF_STALL_MS: f64 = 3_000.0;
+
+    #[test]
+    fn freshness_records_when_the_transport_received_a_packet_not_when_main_drained_it() {
+        let mgr = make_test_manager();
+        let wire_instant = monotonic_now_ms() - HAND_OFF_STALL_MS;
+
+        let callback = mgr.create_inbound_media_callback("wt_0".to_string());
+        callback.emit((
+            PacketWrapper::new(),
+            InboundLane::Reliable,
+            ReceivedAtMs(wire_instant),
+        ));
+
+        let freshness = mgr
+            .last_inbound_at_ms
+            .borrow()
+            .get("wt_0")
+            .copied()
+            .expect("the callback stamps every inbound packet");
+        assert_eq!(
+            freshness.any_lane_ms, wire_instant,
+            "stamping `now` here would make the #2720 lane watchdog measure \
+             time since main drained the Worker's inbox, and re-elect during \
+             the very stall the Worker exists to ride out"
+        );
+        assert_eq!(freshness.reliable_ms, Some(wire_instant));
+    }
+
+    /// One RTT echo that arrived `hand_off_ms` before this callback runs.
+    fn deliver_delayed_rtt_echo(
+        mgr: &mut ConnectionManager,
+        conn_id: &str,
+        rtt_ms: f64,
+        hand_off_ms: f64,
+    ) {
+        let wire_arrival = monotonic_now_ms() - hand_off_ms;
+        let media_packet = MediaPacket {
+            media_type: MediaType::RTT.into(),
+            user_id: mgr.options.userid.as_bytes().to_vec(),
+            timestamp: wire_arrival - rtt_ms,
+            ..Default::default()
+        };
+        let data = mgr
+            .aes
+            .encrypt(&media_packet.write_to_bytes().unwrap())
+            .unwrap();
+        let packet = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: mgr.options.userid.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        let callback = mgr.create_inbound_media_callback(conn_id.to_string());
+        callback.emit((packet, InboundLane::Reliable, ReceivedAtMs(wire_arrival)));
+        mgr.process_queued_rtt_responses();
+    }
+
+    #[test]
+    fn a_stalled_hand_off_does_not_inflate_the_rtt_election_scores_on() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        for _ in 0..2 {
+            deliver_delayed_rtt_echo(&mut mgr, "wt_0", 40.0, HAND_OFF_STALL_MS);
+        }
+
+        let election_rtt = mgr
+            .rtt_measurements
+            .get("wt_0")
+            .and_then(|m| m.election_rtt())
+            .expect("two reliable-lane echoes must produce a sample");
+        assert!(
+            (election_rtt - 40.0).abs() < 25.0,
+            "the wire RTT is 40ms; stamping reception on main would score \
+             {:.0}ms instead, charging WebTransport for a postMessage hop \
+             WebSocket never pays and biasing election against a healthy WT",
+            40.0 + HAND_OFF_STALL_MS
+        );
+    }
+
+    fn connected_candidate(mgr: &mut ConnectionManager, conn_id: &str, webtransport: bool) {
+        mgr.connections.insert(
+            conn_id.to_string(),
+            Connection::new_for_test_with_transport(webtransport),
+        );
+        insert_measurement(mgr, conn_id, webtransport, None, vec![]);
+    }
+
+    #[test]
+    fn wt_probe_tick_sends_one_reliable_control_probe_and_one_datagram() {
+        let mut mgr = make_test_manager();
+        connected_candidate(&mut mgr, "wt_0", true);
+        mgr.connections.get("wt_0").unwrap().take_sends_for_test();
+
+        mgr.send_rtt_probe("wt_0").unwrap();
+
+        assert_eq!(
+            mgr.connections.get("wt_0").unwrap().take_sends_for_test(),
+            vec![
+                (StubSendKind::Reliable, MediaStreamKey::Control),
+                (StubSendKind::Datagram, MediaStreamKey::Control),
+            ],
+            "WebTransport must probe both lanes each tick — the Control stream \
+             carries its media, the datagram feeds the saturation baseline"
+        );
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.in_flight_probes.len(), 1);
+        assert_eq!(m.reliable_lane.in_flight_probes.len(), 1);
+        assert_eq!(
+            m.in_flight_probes.front(),
+            m.reliable_lane.in_flight_probes.front(),
+            "both probes of a tick carry the same send timestamp; the per-lane \
+             queues are what keep their echoes apart"
+        );
+    }
+
+    #[test]
+    fn websocket_probe_tick_sends_exactly_one_probe() {
+        let mut mgr = make_test_manager();
+        connected_candidate(&mut mgr, "ws_0", false);
+        mgr.connections.get("ws_0").unwrap().take_sends_for_test();
+
+        mgr.send_rtt_probe("ws_0").unwrap();
+
+        assert_eq!(
+            mgr.connections.get("ws_0").unwrap().take_sends_for_test(),
+            vec![(StubSendKind::Datagram, MediaStreamKey::Control)],
+            "one socket, one probe — a second would double-count the same lane"
+        );
+        let m = mgr.rtt_measurements.get("ws_0").unwrap();
+        assert_eq!(m.in_flight_probes.len(), 1);
+        assert!(m.reliable_lane.in_flight_probes.is_empty());
+    }
+
+    #[test]
+    fn election_rtt_follows_the_slow_reliable_lane_not_the_fast_datagram_lane() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        for _ in 0..2 {
+            deliver_rtt_echo(&mut mgr, "wt_0", 300.0, InboundLane::Reliable);
+            deliver_rtt_echo(&mut mgr, "wt_0", 20.0, InboundLane::Datagram);
+        }
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.election_lane(), ElectionRttLane::Reliable);
+        let election_rtt = m.election_rtt().expect("reliable series must have samples");
+        assert!(
+            (election_rtt - 300.0).abs() < 25.0,
+            "the election must score the 300ms reliable lane, got {election_rtt:.1}ms \
+             (one shared series would average the two lanes to ~160ms)"
+        );
+        let datagram_rtt = m.average_rtt.expect("datagram series must have samples");
+        assert!(
+            (datagram_rtt - 20.0).abs() < 25.0,
+            "the datagram series keeps its own 20ms average for the saturation \
+             baseline, got {datagram_rtt:.1}ms"
+        );
+    }
+
+    #[test]
+    fn websocket_echo_lands_in_the_default_series_though_it_arrives_reliable() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
+
+        deliver_rtt_echo(&mut mgr, "ws_0", 40.0, InboundLane::Reliable);
+
+        let m = mgr.rtt_measurements.get("ws_0").unwrap();
+        assert_eq!(
+            m.measurements.len(),
+            1,
+            "WS has one lane: the default series"
+        );
+        assert!(
+            m.reliable_lane.measurements.is_empty(),
+            "splitting a single socket into two series would halve its sample count"
+        );
+        assert_eq!(m.election_lane(), ElectionRttLane::Reliable);
+        assert_eq!(m.election_rtt(), m.average_rtt);
+    }
+
+    #[test]
+    fn datagram_fallback_scores_a_wt_candidate_whose_reliable_series_is_empty() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        deliver_rtt_echo(&mut mgr, "wt_0", 20.0, InboundLane::Datagram);
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(
+            m.election_lane(),
+            ElectionRttLane::DatagramFallback,
+            "a relay that predates the arrival-lane echo must not leave the \
+             candidate unscorable"
+        );
+        assert_eq!(m.election_rtt(), m.average_rtt);
+
+        deliver_rtt_echo(&mut mgr, "wt_0", 300.0, InboundLane::Reliable);
+        assert_eq!(
+            mgr.rtt_measurements.get("wt_0").unwrap().election_lane(),
+            ElectionRttLane::Reliable,
+            "one reliable sample ends the fallback"
+        );
+    }
+
+    #[test]
+    fn a_datagram_lane_timeout_leaves_the_reliable_lane_counter_at_zero() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        let expired = monotonic_now_ms() - PROBE_TIMEOUT_MS - 1000.0;
+        let fresh = monotonic_now_ms();
+        {
+            let m = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+            m.in_flight_probes.push_back(expired);
+            m.reliable_lane.in_flight_probes.push_back(fresh);
+        }
+
+        mgr.prune_stale_probes();
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.consecutive_probe_timeouts, 1);
+        assert_eq!(
+            m.reliable_lane.consecutive_probe_timeouts, 0,
+            "a lost datagram says nothing about the Control stream"
+        );
+        assert_eq!(m.reliable_lane.in_flight_probes.len(), 1);
+    }
+
+    #[test]
+    fn a_reliable_lane_timeout_leaves_the_datagram_lane_counter_at_zero() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        let expired = monotonic_now_ms() - PROBE_TIMEOUT_MS - 1000.0;
+        {
+            let m = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+            m.reliable_lane.in_flight_probes.push_back(expired);
+        }
+
+        mgr.prune_stale_probes();
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.reliable_lane.consecutive_probe_timeouts, 1);
+        assert_eq!(m.consecutive_probe_timeouts, 0);
+    }
+
+    #[test]
+    fn an_echo_resets_only_its_own_lanes_timeout_streak() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        {
+            let m = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+            m.consecutive_probe_timeouts = 2;
+            m.reliable_lane.consecutive_probe_timeouts = 2;
+        }
+
+        deliver_rtt_echo(&mut mgr, "wt_0", 30.0, InboundLane::Reliable);
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.reliable_lane.consecutive_probe_timeouts, 0);
+        assert_eq!(
+            m.consecutive_probe_timeouts, 2,
+            "a Control-stream echo does not prove the datagram lane is draining"
+        );
+    }
+
+    fn scores_across_timeout_streaks(mgr: &mut ConnectionManager, conn_id: &str) -> Vec<f64> {
+        (0..3)
+            .map(|timeouts| {
+                mgr.rtt_measurements
+                    .get_mut(conn_id)
+                    .unwrap()
+                    .consecutive_probe_timeouts = timeouts;
+                mgr.rtt_measurements
+                    .get(conn_id)
+                    .unwrap()
+                    .election_score()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn election_score_adds_one_probe_deadline_per_consecutive_timeout() {
+        assert!(
+            (PROBE_TIMEOUT_MS - 5000.0).abs() < f64::EPSILON,
+            "the literals below are written against a 5s probe deadline"
+        );
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0, 50.0]);
+
+        assert_eq!(
+            scores_across_timeout_streaks(&mut mgr, "wt_0"),
+            vec![50.0, 5_050.0, 10_050.0]
+        );
+    }
+
+    #[test]
+    fn a_websocket_candidates_score_is_its_raw_rtt_at_every_timeout_streak() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "ws_0", false, Some(50.0), vec![50.0, 50.0]);
+
+        assert_eq!(
+            scores_across_timeout_streaks(&mut mgr, "ws_0"),
+            vec![50.0, 50.0, 50.0],
+            "a single socket has no second lane to be compared against, so #2721 \
+             must leave the WebSocket ranking key exactly as it was"
+        );
+    }
+
+    /// Demoting a WS candidate hands the tier order back to `BestWt`.
+    #[test]
+    fn a_stale_websocket_candidate_still_wins_while_the_wt_audio_demotion_is_active() {
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_with_transport(true),
+        );
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0, 50.0]);
+        insert_measurement(&mut mgr, "ws_0", false, Some(50.0), vec![50.0, 50.0]);
+        {
+            let wt = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+            wt.reliable_lane.measurements = VecDeque::from(vec![50.0, 50.0]);
+            wt.reliable_lane.average_rtt = Some(50.0);
+        }
+        mgr.rtt_measurements
+            .get_mut("ws_0")
+            .unwrap()
+            .consecutive_probe_timeouts = STALE_THRESHOLD;
+        mgr.wt_audio_demote_until_ms = Some(1000.0);
+
+        let scan = mgr.election_scan(0.0);
+        assert!(scan.demote_wt, "fixture must arm the #2029 demotion");
+        let (winner, _) = ConnectionManager::find_best_connection(&scan).unwrap();
+        assert_eq!(
+            winner, "ws_0",
+            "a WebSocket probe-timeout streak must not evict the candidate the \
+             audio-loss guard is steering toward"
+        );
+    }
+
+    #[test]
+    fn the_candidate_log_and_the_scan_agree_on_the_tier() {
+        assert!(
+            qualifies_for_best_tier(ELECTION_MIN_RTT_SAMPLES, 0),
+            "enough samples and a clean lane qualifies"
+        );
+        assert!(
+            !qualifies_for_best_tier(ELECTION_MIN_RTT_SAMPLES - 1, 0),
+            "too few samples does not"
+        );
+        assert!(
+            !qualifies_for_best_tier(ELECTION_MIN_RTT_SAMPLES, STALE_THRESHOLD),
+            "a stale lane does not, even with samples to spare"
+        );
+        assert_eq!(
+            fallback_tier_cause(ELECTION_MIN_RTT_SAMPLES - 1),
+            "too few RTT samples"
+        );
+        assert_eq!(
+            fallback_tier_cause(ELECTION_MIN_RTT_SAMPLES),
+            "a stale probe pipeline"
+        );
+    }
+
+    #[test]
+    fn a_stale_reliable_lane_demotes_a_wt_candidate_below_a_clean_ws_candidate() {
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_with_transport(true),
+        );
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        insert_measurement(&mut mgr, "ws_0", false, Some(50.0), vec![50.0, 50.0]);
+        {
+            let wt = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+            wt.reliable_lane.measurements = VecDeque::from(vec![50.0, 50.0]);
+            wt.reliable_lane.average_rtt = Some(50.0);
+        }
+
+        for (timeouts, expected_winner, expect_best_tier) in [
+            (0, "wt_0", true),
+            (STALE_THRESHOLD - 1, "ws_0", true),
+            (STALE_THRESHOLD, "ws_0", false),
+        ] {
+            mgr.rtt_measurements
+                .get_mut("wt_0")
+                .unwrap()
+                .reliable_lane
+                .consecutive_probe_timeouts = timeouts;
+            let scan = mgr.election_scan(0.0);
+            let (winner, _) = ConnectionManager::find_best_connection(&scan).unwrap();
+            assert_eq!(
+                winner, expected_winner,
+                "with {timeouts} consecutive reliable-lane timeouts and equal {}ms RTT",
+                50.0
+            );
+            assert_eq!(
+                scan.best_wt.is_some(),
+                expect_best_tier,
+                "{timeouts} timeouts must leave wt_0 in the {} tier",
+                if expect_best_tier { "best" } else { "fallback" }
+            );
+            assert_eq!(scan.fallback_wt.is_some(), !expect_best_tier);
+        }
+    }
+
+    #[test]
+    fn the_election_decision_snapshot_names_the_lane_the_rtt_came_from() {
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_with_transport(true),
+        );
+        insert_measurement(&mut mgr, "wt_0", true, Some(20.0), vec![20.0, 20.0]);
+
+        let fallback = ConnectionManager::snapshot_election_decision(&mgr.election_scan(0.0));
+        assert_eq!(fallback.rtt_lane, "datagram-fallback");
+
+        {
+            let wt = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+            wt.reliable_lane.measurements = VecDeque::from(vec![300.0, 300.0]);
+            wt.reliable_lane.average_rtt = Some(300.0);
+        }
+        let reliable = ConnectionManager::snapshot_election_decision(&mgr.election_scan(0.0));
+        assert_eq!(reliable.rtt_lane, "reliable");
+        assert_eq!(
+            reliable.wt_avg_rtt_ms,
+            Some(300.0),
+            "the decision line's RTT column must quote the lane that decided it"
+        );
+
+        let empty = make_test_manager();
+        assert_eq!(
+            ConnectionManager::snapshot_election_decision(&empty.election_scan(0.0)).rtt_lane,
+            "none"
+        );
+
+        let line = format_election_decision(
+            &reliable,
+            ElectionOutcome::Elected,
+            Some("wt_0"),
+            Some("wt_0"),
+            None,
+            PRIOR_CLOSE_NONE,
+        );
+        assert!(
+            line.contains("rtt_lane=reliable"),
+            "the #1745 decision line must carry the lane: {line}"
+        );
+    }
+
+    #[test]
+    fn a_solo_wt_room_on_reliable_probe_echoes_alone_books_no_stall_episode() {
+        let rounds = (RELIABLE_LANE_LIVENESS_MS / 1000.0).ceil() as usize + 3;
+
+        let episodes_for = |lane: InboundLane| {
+            let mut mgr = make_test_manager();
+            mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+            mgr.baseline_rtt = Some(50.0);
+            setup_active_elected(&mut mgr, "wt_0");
+            insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0]);
+            deliver_rtt_echo(&mut mgr, "wt_0", 20.0, lane);
+
+            for _ in 0..rounds {
+                if let Some(freshness) = mgr.last_inbound_at_ms.borrow_mut().get_mut("wt_0") {
+                    freshness.any_lane_ms -= 1000.0;
+                    freshness.reliable_ms = freshness.reliable_ms.map(|ts| ts - 1000.0);
+                }
+                deliver_rtt_echo(&mut mgr, "wt_0", 20.0, lane);
+                mgr.check_rtt_degradation();
+            }
+            (mgr.reliable_lane_stall_episodes_total(), mgr)
+        };
+
+        let (reliable_episodes, mgr) = episodes_for(InboundLane::Reliable);
+        assert_eq!(
+            reliable_episodes, 0,
+            "a 1 Hz reliable-lane probe echo is the cadence the solo room was missing"
+        );
+        assert!(
+            !mgr.reliable_lane_stalled_last_check,
+            "the suppression arm must stay armed while the Control stream echoes"
+        );
+
+        let (datagram_episodes, _) = episodes_for(InboundLane::Datagram);
+        assert!(
+            datagram_episodes >= 1,
+            "datagram-only echoes must still book the stall — otherwise this test \
+             would pass without the reliable-lane probe"
+        );
+    }
+
     // ===================================================================
     // 5b. CPU-stall guard (Phase 2 — discussion #562)
-    //
-    // The guard suppresses both re-election triggers when the local main
-    // thread is overloaded. Two independent signals are sufficient:
-    //   (1) recent inbound traffic on the active connection (network is
-    //       observably alive — elevated RTT must be a local stall artifact)
-    //   (2) the controller's drift watchdog has set `cpu_overloaded`
     // ===================================================================
 
     /// Helper: mark `wt_0` as the elected, connected, active connection,
-    /// then push a synthetic measurement entry. Used by the guard tests
-    /// below to avoid repeating the same fixture wiring.
+    /// then push a synthetic measurement entry.
     fn setup_active_elected(mgr: &mut ConnectionManager, conn_id: &str) {
         *mgr.active_connection_id.borrow_mut() = Some(conn_id.to_string());
         mgr.election_state = ElectionState::Elected {
@@ -8149,23 +9548,478 @@ mod tests {
 
     /// Helper: stamp a fresh inbound timestamp (now) for `conn_id`.
     fn mark_inbound_now(mgr: &mut ConnectionManager, conn_id: &str) {
-        mgr.last_inbound_at_ms
-            .borrow_mut()
-            .insert(conn_id.to_string(), monotonic_now_ms());
+        mgr.last_inbound_at_ms.borrow_mut().insert(
+            conn_id.to_string(),
+            InboundFreshness::reliable(monotonic_now_ms()),
+        );
     }
 
-    /// Helper: stamp a stale inbound timestamp (5 s ago — well past the
-    /// liveness window) for `conn_id`.
     fn mark_inbound_stale(mgr: &mut ConnectionManager, conn_id: &str) {
+        let age = RELIABLE_LANE_LIVENESS_MS + 5_000.0;
+        mgr.last_inbound_at_ms.borrow_mut().insert(
+            conn_id.to_string(),
+            InboundFreshness::reliable(monotonic_now_ms() - age),
+        );
+    }
+
+    fn mark_reliable_stale_datagrams_fresh(
+        mgr: &mut ConnectionManager,
+        conn_id: &str,
+        reliable_age_ms: f64,
+    ) {
+        let now = monotonic_now_ms();
+        let mut freshness = InboundFreshness::reliable(now - reliable_age_ms);
+        freshness.stamp(now, InboundLane::Datagram);
         mgr.last_inbound_at_ms
             .borrow_mut()
-            .insert(conn_id.to_string(), monotonic_now_ms() - 5_000.0);
+            .insert(conn_id.to_string(), freshness);
+    }
+
+    const DISCUSSION_2033_STALENESS_MS: f64 = 60_000.0;
+
+    #[test]
+    fn reliable_lane_window_outlasts_a_lost_heartbeat_and_still_catches_2033() {
+        let heartbeat = f64::from(HEARTBEAT_KEEPALIVE_INTERVAL_MS);
+        let window = std::hint::black_box(RELIABLE_LANE_LIVENESS_MS);
+        let any_lane = std::hint::black_box(LAST_INBOUND_LIVENESS_MS);
+        let staleness_2033 = std::hint::black_box(DISCUSSION_2033_STALENESS_MS);
+        assert!(
+            window > 2.0 * heartbeat,
+            "window {window}ms must outlast one LOST heartbeat (2 x {heartbeat}ms) \
+             or a healthy camera-off call reads as wedged"
+        );
+        assert!(
+            window > any_lane,
+            "window {window}ms must exceed the {any_lane}ms any-lane window; \
+             reusing that one is the #2720 review blocker"
+        );
+        assert!(
+            window < staleness_2033 / 2.0,
+            "window {window}ms must flag the #2033 freeze ({staleness_2033}ms \
+             staleness) with room to spare"
+        );
+    }
+
+    #[test]
+    fn healthy_camera_off_session_on_peer_heartbeats_alone_books_no_stall_episodes() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+
+        let heartbeat = f64::from(HEARTBEAT_KEEPALIVE_INTERVAL_MS);
+        for reliable_age in [heartbeat, 2.0 * heartbeat] {
+            mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", reliable_age);
+            for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
+                assert!(
+                    !mgr.check_rtt_degradation(),
+                    "a {reliable_age}ms reliable-lane gap is a normal heartbeat \
+                     cadence, not a wedge — re-election must stay suppressed"
+                );
+            }
+        }
+        assert_eq!(
+            mgr.reliable_lane_stall_episodes_total(),
+            0,
+            "a healthy camera-off call must book ZERO stall episodes; booking one \
+             per heartbeat period buries the real #2033 signal"
+        );
+    }
+
+    #[test]
+    fn wedged_reliable_lane_does_not_suppress_re_election_while_datagrams_flow() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", DISCUSSION_2033_STALENESS_MS);
+        assert!(
+            !mgr.cpu_overloaded.load(Ordering::Relaxed),
+            "fixture must not be CPU-suppressed — that is the other half of the guard"
+        );
+
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        assert!(
+            mgr.check_rtt_degradation(),
+            "datagram-lane traffic must not prove the reliable video lane is alive"
+        );
+    }
+
+    #[test]
+    fn wedged_reliable_lane_counts_one_episode_per_contiguous_stall() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", DISCUSSION_2033_STALENESS_MS);
+
+        mgr.check_rtt_degradation();
+        mgr.check_rtt_degradation();
+        assert_eq!(
+            mgr.reliable_lane_stall_episodes_total(),
+            1,
+            "a sustained wedge is ONE episode, not one per tick"
+        );
+
+        mark_inbound_now(&mut mgr, "wt_0");
+        mgr.check_rtt_degradation();
+        assert_eq!(
+            mgr.reliable_lane_stall_episodes_total(),
+            1,
+            "reliable-lane recovery must not book an episode"
+        );
+
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", DISCUSSION_2033_STALENESS_MS);
+        mgr.check_rtt_degradation();
+        assert_eq!(
+            mgr.reliable_lane_stall_episodes_total(),
+            2,
+            "a second wedge after recovery is a second episode"
+        );
+    }
+
+    #[test]
+    fn stall_latch_drops_when_the_watchdog_tick_sees_a_re_election_or_no_active_id() {
+        let mut mgr = make_test_manager();
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", DISCUSSION_2033_STALENESS_MS);
+
+        mgr.check_rtt_degradation();
+        assert!(mgr.reliable_lane_stalled_last_check, "latch must be set");
+
+        mgr.reelection_in_progress = true;
+        mgr.check_rtt_degradation();
+        assert!(
+            !mgr.reliable_lane_stalled_last_check,
+            "a tick during re-election must drop the latch"
+        );
+
+        mgr.reelection_in_progress = false;
+        mgr.check_rtt_degradation();
+        assert_eq!(
+            mgr.reliable_lane_stall_episodes_total(),
+            2,
+            "the still-wedged lane must re-book after the re-election"
+        );
+
+        *mgr.active_connection_id.borrow_mut() = None;
+        mgr.check_rtt_degradation();
+        assert!(
+            !mgr.reliable_lane_stalled_last_check,
+            "a tick with no active connection must drop the latch"
+        );
+    }
+
+    #[test]
+    fn stall_latch_drops_with_the_freshness_map_on_a_full_reset() {
+        let mut mgr = make_test_manager();
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", DISCUSSION_2033_STALENESS_MS);
+        mgr.check_rtt_degradation();
+        assert!(mgr.reliable_lane_stalled_last_check, "latch must be set");
+
+        mgr.reset_and_start_election().unwrap();
+
+        assert!(
+            !mgr.reliable_lane_stalled_last_check,
+            "clearing the freshness map must clear the latch that describes it"
+        );
+    }
+
+    #[test]
+    fn the_liveness_window_is_selected_on_the_transport_not_shared() {
+        assert!(
+            std::hint::black_box(LAST_INBOUND_LIVENESS_MS) + 500.0
+                < std::hint::black_box(RELIABLE_LANE_LIVENESS_MS),
+            "the probe age must sit BETWEEN the two windows or this test pins nothing"
+        );
+        let arm = |is_webtransport: bool, age_ms: f64| {
+            let mut mgr = make_test_manager();
+            mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+            let conn_id = if is_webtransport { "wt_0" } else { "ws_0" };
+            setup_active_elected(&mut mgr, conn_id);
+            insert_measurement(&mut mgr, conn_id, is_webtransport, Some(50.0), vec![50.0]);
+            mgr.rtt_measurements
+                .get_mut(conn_id)
+                .unwrap()
+                .consecutive_implausible_discards = REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1;
+            mgr.last_inbound_at_ms.borrow_mut().insert(
+                conn_id.to_string(),
+                InboundFreshness::reliable(monotonic_now_ms() - age_ms),
+            );
+            mgr.check_rtt_degradation()
+        };
+
+        let just_inside_ws = LAST_INBOUND_LIVENESS_MS - 500.0;
+        let just_outside_ws = LAST_INBOUND_LIVENESS_MS + 500.0;
+        assert!(
+            !arm(false, just_inside_ws),
+            "a WebSocket delivering inside the any-lane window must still suppress"
+        );
+        assert!(
+            arm(false, just_outside_ws),
+            "a silent WebSocket with an armed discard streak must re-elect at the \
+             any-lane window, not hold for the reliable-lane window"
+        );
+        assert!(
+            !arm(true, just_outside_ws),
+            "WebTransport must keep the reliable-lane window — one lost relayed \
+             heartbeat is not a wedged unistream"
+        );
+        assert!(
+            arm(true, RELIABLE_LANE_LIVENESS_MS + 500.0),
+            "WebTransport must still release once the reliable lane goes stale"
+        );
+    }
+
+    fn fill_reliable_lane(mgr: &mut ConnectionManager, conn_id: &str, avg_ms: f64, n: usize) {
+        let m = mgr.rtt_measurements.get_mut(conn_id).unwrap();
+        m.reliable_lane.measurements = VecDeque::from(vec![avg_ms; n]);
+        m.reliable_lane.average_rtt = Some(avg_ms);
+    }
+
+    #[test]
+    fn an_election_lane_flip_rebases_the_baseline_instead_of_reading_elevated_forever() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://a".into(), "https://b".into()];
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(20.0), vec![20.0; 5]);
+        mgr.baseline_rtt = Some(20.0);
+        mgr.baseline_rtt_lane = Some(ElectionRttLane::DatagramFallback);
+
+        fill_reliable_lane(&mut mgr, "wt_0", 120.0, 10);
+        assert_eq!(
+            mgr.rtt_measurements["wt_0"].election_lane(),
+            ElectionRttLane::Reliable,
+            "anti-vacuity: the lane must actually have flipped"
+        );
+        mark_inbound_now(&mut mgr, "wt_0");
+        mgr.cpu_overloaded.store(true, Ordering::Relaxed);
+
+        assert!(!mgr.check_rtt_degradation());
+        assert_eq!(
+            mgr.baseline_rtt,
+            Some(120.0),
+            "the baseline must re-base onto the lane the watchdog now reads"
+        );
+        assert_eq!(
+            mgr.baseline_rtt_lane,
+            Some(ElectionRttLane::Reliable),
+            "the recorded lane must follow the baseline"
+        );
+        assert!(
+            mgr.cpu_suppression_started_at_ms.is_none(),
+            "a healthy link must accrue NO #2643 escalation budget after the flip"
+        );
+
+        fill_reliable_lane(&mut mgr, "wt_0", 400.0, 10);
+        mgr.cpu_overloaded.store(false, Ordering::Relaxed);
+        mgr.last_inbound_at_ms.borrow_mut().clear();
+        for _ in 0..REELECTION_CONSECUTIVE_SAMPLES {
+            mgr.check_rtt_degradation();
+        }
+        assert!(
+            mgr.degradation_counter >= REELECTION_CONSECUTIVE_SAMPLES,
+            "re-basing must not disarm the elevated-RTT detector on the new lane"
+        );
+    }
+
+    #[test]
+    fn a_wedged_reliable_lane_reaches_the_watchdog_through_the_timeout_streak() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://a".into(), "https://b".into()];
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0; 10]);
+        fill_reliable_lane(&mut mgr, "wt_0", 50.0, 10);
+        mgr.baseline_rtt = Some(50.0);
+        mgr.baseline_rtt_lane = Some(ElectionRttLane::Reliable);
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", 60_000.0);
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "anti-vacuity: with the streak below threshold nothing may fire — \
+             the frozen average and the absent discards are the whole problem"
+        );
+
+        let set_streak = |mgr: &mut ConnectionManager, n: u32| {
+            mgr.rtt_measurements
+                .get_mut("wt_0")
+                .unwrap()
+                .reliable_lane
+                .consecutive_probe_timeouts = n;
+        };
+        set_streak(&mut mgr, STALE_THRESHOLD - 1);
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "one timeout short of the threshold must not fire"
+        );
+        set_streak(&mut mgr, STALE_THRESHOLD);
+        assert!(
+            mgr.check_rtt_degradation(),
+            "a wedged Control stream must reach the watchdog at STALE_THRESHOLD"
+        );
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "the same unbroken streak must not ask a second time"
+        );
+        set_streak(&mut mgr, 0);
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "a recovered lane fires nothing"
+        );
+        set_streak(&mut mgr, STALE_THRESHOLD);
+        assert!(
+            mgr.check_rtt_degradation(),
+            "a NEW wedge after a recovery must fire again — the latch releases on \
+             the streak it describes, so it cannot pin a healthy connection"
+        );
+        set_streak(&mut mgr, 0);
+        mgr.check_rtt_degradation();
+
+        set_streak(&mut mgr, STALE_THRESHOLD);
+        mgr.cpu_overloaded.store(true, Ordering::Relaxed);
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "the wedge trigger must be suppressed while the main thread is stalled"
+        );
+        mgr.cpu_overloaded.store(false, Ordering::Relaxed);
+
+        mgr.options.webtransport_urls = vec!["https://a".into()];
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "a single-server client must not re-elect to the same server"
+        );
+    }
+
+    #[test]
+    fn a_single_server_wedge_does_not_starve_the_elevated_rtt_watchdog() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://a".into()];
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(400.0), vec![400.0; 10]);
+        fill_reliable_lane(&mut mgr, "wt_0", 400.0, 10);
+        mgr.baseline_rtt = Some(50.0);
+        mgr.baseline_rtt_lane = Some(ElectionRttLane::Reliable);
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "wt_0", 60_000.0);
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .reliable_lane
+            .consecutive_probe_timeouts = STALE_THRESHOLD;
+
+        for _ in 0..REELECTION_CONSECUTIVE_SAMPLES {
+            assert!(
+                !mgr.check_rtt_degradation(),
+                "a one-server client must never re-elect to the same server"
+            );
+        }
+        assert!(
+            mgr.baseline_rtt.is_some_and(|b| (b - 400.0).abs() < 0.01),
+            "the elevated-RTT watchdog must still run and rebase; returning from \
+             the wedge arm every tick starves it for the life of the streak"
+        );
+    }
+
+    #[test]
+    fn the_wedge_trigger_is_webtransport_only() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        setup_active_elected(&mut mgr, "ws_0");
+        insert_measurement(&mut mgr, "ws_0", false, Some(50.0), vec![50.0; 10]);
+        mgr.baseline_rtt = Some(50.0);
+        mgr.baseline_rtt_lane = Some(ElectionRttLane::Reliable);
+        mark_reliable_stale_datagrams_fresh(&mut mgr, "ws_0", 60_000.0);
+        mgr.rtt_measurements
+            .get_mut("ws_0")
+            .unwrap()
+            .reliable_lane
+            .consecutive_probe_timeouts = STALE_THRESHOLD * 10;
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "a WebSocket carries no reliable-lane probe series; its streak must \
+             not fire the wedge trigger"
+        );
+    }
+
+    #[test]
+    fn websocket_reliable_lane_packets_still_suppress_re_election() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "ws_0");
+        insert_measurement(&mut mgr, "ws_0", false, Some(500.0), vec![500.0]);
+
+        let callback = mgr.create_inbound_media_callback("ws_0".to_string());
+        callback.emit((
+            PacketWrapper::new(),
+            InboundLane::Reliable,
+            ReceivedAtMs(monotonic_now_ms()),
+        ));
+
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
+            assert!(
+                !mgr.check_rtt_degradation(),
+                "a WebSocket packet must still suppress the elevated-RTT trigger"
+            );
+        }
+        assert_eq!(
+            mgr.reliable_lane_stall_episodes_total(),
+            0,
+            "the stall condition is unrepresentable on a single-socket transport"
+        );
+    }
+
+    #[test]
+    fn datagram_only_liveness_still_preserves_old_active_connection() {
+        let mut mgr = make_test_manager();
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(20.0);
+        mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
+            url: "https://test/wt_old".to_string(),
+            is_webtransport: true,
+            measurements: VecDeque::from(vec![20.0, 20.0]),
+            average_rtt: Some(20.0),
+            connection_id: "wt_old".to_string(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
+        });
+        mgr.old_active_connection = Some((
+            "wt_old".to_string(),
+            Connection::new_for_test_with_transport(true),
+        ));
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+        mgr.last_inbound_at_ms.borrow_mut().insert(
+            "wt_old".to_string(),
+            InboundFreshness::datagram_only(monotonic_now_ms() - 100.0),
+        );
+
+        let _ = take_retry_scheduled();
+        mgr.complete_election();
+
+        assert!(
+            matches!(mgr.election_state, ElectionState::Elected { .. }),
+            "datagram-only liveness must still satisfy the preservation freshness gate"
+        );
+        assert!(
+            mgr.reelection_preserved_once,
+            "preserve path must set reelection_preserved_once"
+        );
     }
 
     #[test]
     fn cpu_stall_guard_suppresses_elevated_rtt_when_inbound_recent() {
-        // Two servers configured: re-election would normally fire after
-        // REELECTION_CONSECUTIVE_SAMPLES elevated samples.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         mgr.baseline_rtt = Some(50.0);
@@ -8173,15 +10027,12 @@ mod tests {
         insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
         mark_inbound_now(&mut mgr, "wt_0");
 
-        // Drive enough samples that the trigger would otherwise fire.
         for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
             assert!(
                 !mgr.check_rtt_degradation(),
                 "recent inbound traffic must suppress re-election from the elevated-RTT path"
             );
         }
-        // The transition latch should be set so the suppression log only
-        // fires once across the whole streak.
         assert!(
             mgr.was_suppressed_last_check,
             "guard must remember it suppressed last tick"
@@ -8190,8 +10041,6 @@ mod tests {
 
     #[test]
     fn cpu_stall_guard_does_not_suppress_when_inbound_is_stale() {
-        // Same setup, but the active connection has not produced inbound
-        // traffic for 5 s — the guard must NOT suppress.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         mgr.baseline_rtt = Some(50.0);
@@ -8199,12 +10048,9 @@ mod tests {
         insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
         mark_inbound_stale(&mut mgr, "wt_0");
 
-        // First REELECTION_CONSECUTIVE_SAMPLES - 1 calls: counter increments,
-        // no fire yet.
         for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
             assert!(!mgr.check_rtt_degradation());
         }
-        // Threshold reached on the next call — re-election fires.
         assert!(
             mgr.check_rtt_degradation(),
             "stale inbound timestamp must NOT suppress re-election"
@@ -8213,11 +10059,6 @@ mod tests {
 
     #[test]
     fn cpu_stall_guard_suppresses_even_with_single_server() {
-        // Single-server case still benefits from suppression: a stalled main
-        // thread on a single-server config would otherwise hit the rebase
-        // path and pin baseline_rtt to a synthetic value. Keeping the guard
-        // active here prevents the false positive from ever reaching the
-        // rebase logic.
         let mut mgr = make_test_manager();
         mgr.options.webtransport_urls = vec!["https://only-server".into()];
         mgr.baseline_rtt = Some(50.0);
@@ -8231,8 +10072,6 @@ mod tests {
                 "single-server config must still benefit from CPU-stall suppression"
             );
         }
-        // Baseline must NOT have been rebased — the guard short-circuits
-        // before the rebase path runs.
         assert!(
             (mgr.baseline_rtt.unwrap() - 50.0).abs() < 0.01,
             "guard must short-circuit before the single-server rebase path"
@@ -8241,8 +10080,6 @@ mod tests {
 
     #[test]
     fn cpu_stall_guard_suppresses_implausible_discards_when_inbound_recent() {
-        // The implausible-discards path (commit 645572e) is subject to the
-        // same false-positive failure mode under main-thread stalls.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into()];
         mgr.options.webtransport_urls = vec!["https://b".into()];
@@ -8262,9 +10099,6 @@ mod tests {
 
     #[test]
     fn cpu_stall_guard_does_not_suppress_implausible_when_inbound_stale() {
-        // Stale inbound timestamp: the implausible-discards trigger fires
-        // normally because we cannot rule out that the network is actually
-        // broken.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into()];
         mgr.options.webtransport_urls = vec!["https://b".into()];
@@ -8284,9 +10118,6 @@ mod tests {
 
     #[test]
     fn cpu_overloaded_flag_suppresses_elevated_rtt_regardless_of_inbound() {
-        // The flag is OR'd with the inbound-liveness signal: even with a
-        // stale inbound timestamp, an asserted cpu_overloaded flag must
-        // suppress.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         mgr.baseline_rtt = Some(50.0);
@@ -8303,10 +10134,6 @@ mod tests {
         }
         assert!(mgr.was_suppressed_last_check);
 
-        // Once the flag clears AND no inbound, the trigger fires (give it
-        // one full cycle of REELECTION_CONSECUTIVE_SAMPLES to re-arm because
-        // the previous calls did not increment the counter — we returned
-        // false before the increment).
         mgr.cpu_overloaded.store(false, Ordering::Relaxed);
         for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
             assert!(!mgr.check_rtt_degradation());
@@ -8317,21 +10144,6 @@ mod tests {
         );
     }
 
-    // #522: the stale-suppression counter must advance by exactly one on every
-    // 1 Hz diagnostics tick on which `rtt_probe_stale()` is true (the same
-    // predicate that suppresses `active_server_rtt`), and must NOT advance when
-    // the link is healthy. We drive the REAL `report_diagnostics` — it is
-    // native-safe: `now_ms()` uses `SystemTime` off-wasm, and on native targets
-    // `global_sender()` has no receiver, so `try_broadcast` returns an Err that
-    // `report_diagnostics` logs and swallows (it never panics or blocks). The
-    // increment runs at the top of `report_diagnostics`, before the broadcast,
-    // so it executes regardless of receiver state. We toggle staleness via
-    // `cpu_overloaded`, the same knob the existing suppression tests use.
-    //
-    // MUTATION: deleting the `if self.rtt_probe_stale() { ...set... }` block in
-    // `report_diagnostics` makes the counter stay 0 forever, so both the `== 1`
-    // and `== 2` assertions below fail. Removing only the guard (always
-    // incrementing) makes the healthy-tick assertion (`still 0`) fail.
     #[test]
     fn report_diagnostics_counts_stale_suppression_ticks() {
         let mgr = make_test_manager();
@@ -8341,8 +10153,6 @@ mod tests {
             "counter must start at 0"
         );
 
-        // Healthy link (cpu_overloaded not set, no Elected stale timeouts):
-        // rtt_probe_stale() == false, so a tick must NOT advance the counter.
         assert!(
             !mgr.rtt_probe_stale(),
             "precondition: a fresh test manager must not be stale"
@@ -8354,9 +10164,6 @@ mod tests {
             "a non-stale tick must NOT advance the suppression counter (proves the guard)"
         );
 
-        // Force staleness via the CPU-overload signal (same mechanism the
-        // existing suppression tests use). Each subsequent tick must advance the
-        // counter by exactly one.
         mgr.cpu_overloaded.store(true, Ordering::Relaxed);
         assert!(
             mgr.rtt_probe_stale(),
@@ -8378,10 +10185,6 @@ mod tests {
 
     #[test]
     fn cpu_stall_guard_logs_suppression_only_on_transition() {
-        // The was_suppressed_last_check field is the proxy for the log
-        // transition: it goes false -> true on the first suppression and
-        // stays true on subsequent ticks. When the suppression condition
-        // clears, it goes back to false.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         mgr.baseline_rtt = Some(50.0);
@@ -8391,27 +10194,19 @@ mod tests {
 
         assert!(!mgr.was_suppressed_last_check, "starts in cleared state");
 
-        // Tick 1: current RTT (500) > threshold (max(50*3, 50) = 150), so
-        // the elevated-RTT trigger would otherwise advance — guard
-        // suppresses and the latch flips true.
         assert!(!mgr.check_rtt_degradation());
         assert!(
             mgr.was_suppressed_last_check,
             "first suppressed tick must set the latch"
         );
 
-        // Tick 2: still suppressed; latch stays true (no transition log).
         assert!(!mgr.check_rtt_degradation());
         assert!(
             mgr.was_suppressed_last_check,
             "subsequent suppressed ticks keep the latch set"
         );
 
-        // Make the guard inactive (stale inbound, no cpu_overloaded). The
-        // latch must clear so a future suppression logs again.
         mark_inbound_stale(&mut mgr, "wt_0");
-        // Lower the RTT so the trigger does not actually fire — we just
-        // want to observe the latch reset.
         mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(80.0);
         assert!(!mgr.check_rtt_degradation());
         assert!(
@@ -8422,31 +10217,18 @@ mod tests {
 
     #[test]
     fn cpu_stall_does_not_trigger_reelection_when_inbound_is_recent() {
-        // Integration-style scenario from the test gate (Phase 2 plan):
-        // simulate the 5-second tick-pause case where inbound traffic IS
-        // arriving (server is healthy) but the local main thread stalled.
-        // Both signals fire: recent inbound timestamp AND the drift
-        // watchdog has asserted cpu_overloaded.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         mgr.baseline_rtt = Some(50.0);
         setup_active_elected(&mut mgr, "wt_0");
-        // Synthetic post-stall RTT sample reflects the 5-second timer
-        // delay, not the network.
         insert_measurement(&mut mgr, "wt_0", true, Some(5_500.0), vec![5_500.0]);
-        // Server kept sending packets through the stall; main thread sees
-        // the inbound timestamp from a recent packet draining the queue.
         mark_inbound_now(&mut mgr, "wt_0");
-        // Drift watchdog detected the 5 s stall.
         mgr.cpu_overloaded.store(true, Ordering::Relaxed);
-        // Plus the implausible-discards path also primed (high samples
-        // exceeding RTT_SANITY_MAX_MS).
         mgr.rtt_measurements
             .get_mut("wt_0")
             .unwrap()
             .consecutive_implausible_discards = REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1;
 
-        // Even with both triggers primed, suppression wins.
         for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 2) {
             assert!(
                 !mgr.check_rtt_degradation(),
@@ -8457,23 +10239,14 @@ mod tests {
 
     #[test]
     fn cpu_stall_guard_inbound_path_requires_connected_measurement() {
-        // The inbound-liveness path requires `measurement.connected == true`
-        // because a stale inbound stamp could otherwise erroneously suppress
-        // after the transport dropped mid-cycle. (The cpu_overloaded path
-        // has NO `connected` gate — that's intentional and tested in
-        // `cpu_overloaded_flag_suppresses_even_when_disconnected` below:
-        // CPU stall is a local signal independent of transport state.)
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         mgr.baseline_rtt = Some(50.0);
         setup_active_elected(&mut mgr, "wt_0");
         insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
-        // Mark the measurement as not connected.
         mgr.rtt_measurements.get_mut("wt_0").unwrap().connected = false;
         mark_inbound_now(&mut mgr, "wt_0");
 
-        // Inbound is "recent" by timestamp but the connection is not
-        // marked connected — the guard must not apply.
         for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
             assert!(!mgr.check_rtt_degradation());
         }
@@ -8485,29 +10258,15 @@ mod tests {
 
     #[test]
     fn cpu_overloaded_flag_suppresses_even_when_disconnected() {
-        // Sibling to `cpu_stall_guard_inbound_path_requires_connected_measurement`.
-        // The OR-composition's two suppression signals are independent: the
-        // cpu_overloaded path is purely local (drift watchdog observed the
-        // main thread stall) and must fire regardless of transport state.
-        // With `connected=false` AND a stale inbound stamp, the inbound path
-        // cannot suppress, but the cpu_overloaded path still must — otherwise
-        // a CPU-stalled, momentarily-disconnected machine would re-elect on
-        // synthetic RTT samples, exactly the false positive we are guarding
-        // against.
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         mgr.baseline_rtt = Some(50.0);
         setup_active_elected(&mut mgr, "wt_0");
         insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
-        // Disconnected measurement + stale inbound stamp -> inbound path
-        // cannot suppress.
         mgr.rtt_measurements.get_mut("wt_0").unwrap().connected = false;
         mark_inbound_stale(&mut mgr, "wt_0");
-        // ...but the drift watchdog flag is asserted.
         mgr.cpu_overloaded.store(true, Ordering::Relaxed);
 
-        // Push more than REELECTION_CONSECUTIVE_SAMPLES elevated samples;
-        // suppression must hold the entire time.
         for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
             assert!(
                 !mgr.check_rtt_degradation(),
@@ -8522,10 +10281,6 @@ mod tests {
 
     #[test]
     fn cpu_stall_constants_are_reasonable() {
-        // Sanity check the new constants. The drift threshold should be
-        // generous enough to ignore normal scheduling jitter (which is
-        // typically <50 ms on healthy machines) but small enough to catch
-        // genuine stalls before they trip the existing detectors.
         const {
             assert!(
                 CPU_OVERLOAD_DRIFT_THRESHOLD_MS >= 100.0,
@@ -8535,16 +10290,11 @@ mod tests {
                 CPU_OVERLOAD_DRIFT_THRESHOLD_MS <= 2_000.0,
                 "drift threshold must catch stalls before REELECTION_CONSECUTIVE_SAMPLES (5s)"
             );
-            // Suppression duration covers at least one full elevated-RTT cycle
-            // (REELECTION_CONSECUTIVE_SAMPLES at 1 Hz = ~5 s) so the post-stall
-            // RTT-probe backlog has time to drain.
             assert!(
                 CPU_OVERLOADED_DURATION_MS >= 3_000.0,
                 "suppression must outlast at least one re-election sample window"
             );
         }
-        // Liveness window is roughly 2× the 1 Hz probe cadence — wide
-        // enough for jitter, narrow enough to detect genuine silence.
         assert!(
             (1_000.0..=5_000.0).contains(&LAST_INBOUND_LIVENESS_MS),
             "liveness window should be 1-5 s"
@@ -8553,17 +10303,10 @@ mod tests {
 
     // ===================================================================
     // 5c. CPU-stall suppression panic-threshold escalation (issue #572)
-    //
-    // When a client is BOTH CPU-stalled AND network-distressed, the PR #571
-    // suppression latch can stay engaged indefinitely. These tests cover the
-    // escalation that breaks that deadlock: a cumulative budget
-    // (MAX_SUSTAINED_SUPPRESSION_MS) that, when exhausted, emits
-    // ConnectionState::Failed to drive the dioxus-ui fresh-token reconnect.
     // ===================================================================
 
     /// Helper: wire an `on_state_changed` sink onto `mgr` and return the shared
-    /// vec the escalation path will push `ConnectionState` values into. Mirrors
-    /// the `forwarded_packets_for` capture pattern for `on_inbound_media`.
+    /// vec the escalation path will push `ConnectionState` values into.
     fn capture_state_changes(mgr: &mut ConnectionManager) -> Rc<RefCell<Vec<ConnectionState>>> {
         let sink = Rc::new(RefCell::new(Vec::<ConnectionState>::new()));
         let sink_for_cb = sink.clone();
@@ -8575,13 +10318,8 @@ mod tests {
 
     #[test]
     fn suppression_escalation_action_flips_exactly_at_budget_boundary() {
-        // The pure decision helper is the single source of truth for the panic
-        // threshold. The escalation site reads `monotonic_now_ms()` (Instant-
-        // derived, unmockable on host), so this is where the boundary contract
-        // is actually pinned.
         let max = MAX_SUSTAINED_SUPPRESSION_MS;
 
-        // Well below budget: never escalate.
         assert!(
             !suppression_escalation_action(0.0, max),
             "zero suppression must not escalate"
@@ -8591,18 +10329,11 @@ mod tests {
             "half the budget must not escalate"
         );
 
-        // Exactly at the budget: the contract is strict greater-than, so a
-        // total exactly equal to the ceiling does NOT escalate. (If someone
-        // weakens `>` to `>=`, this assertion fails.)
         assert!(
             !suppression_escalation_action(max, max),
             "a total exactly equal to MAX_SUSTAINED_SUPPRESSION_MS must NOT escalate"
         );
 
-        // Just above the budget: escalate. (If someone flips the comparison
-        // direction, this assertion fails.) Use the smallest representable
-        // step above the boundary to prove the flip is exactly at MAX, not at
-        // some larger fudge value.
         let just_above = max + f64::EPSILON * max;
         assert!(
             suppression_escalation_action(just_above, max),
@@ -8616,8 +10347,6 @@ mod tests {
 
     #[test]
     fn uplink_rtt_baseline_feed_passes_elected_rtt_when_fresh() {
-        // Steady state: Elected with a measured RTT and a healthy probe pipeline
-        // feeds that RTT to the WT saturation governor.
         assert_eq!(
             uplink_rtt_baseline_feed(Some(255.0), false),
             Some(255.0),
@@ -8627,10 +10356,6 @@ mod tests {
 
     #[test]
     fn uplink_rtt_baseline_feed_resets_when_probe_stale() {
-        // Stale RTT-probe pipeline (CPU stall / starvation): the average may be a
-        // garbage/elevated value, so we must RESET (feed None) rather than pin a
-        // bogus high baseline that would desensitize saturation detection. If the
-        // stale guard is removed, this returns Some(700.0) and fails.
         assert_eq!(
             uplink_rtt_baseline_feed(Some(700.0), true),
             None,
@@ -8640,15 +10365,11 @@ mod tests {
 
     #[test]
     fn uplink_rtt_baseline_feed_resets_when_not_elected() {
-        // Not Elected (e.g. mid re-election / Testing): the caller passes None for
-        // `elected_avg_rtt`, so the feed resets — a re-elected transport re-anchors
-        // on its OWN RTT instead of inheriting the prior path's baseline.
         assert_eq!(
             uplink_rtt_baseline_feed(None, false),
             None,
             "no Elected RTT must reset the baseline (re-anchor on re-election)",
         );
-        // Stale AND not elected still resets.
         assert_eq!(uplink_rtt_baseline_feed(None, true), None);
     }
 
@@ -8659,7 +10380,6 @@ mod tests {
     #[test]
     fn wt_audio_tick_classify_uniformity_rules() {
         let thr = WT_AUDIO_LOSS_THRESHOLD_PER_SEC;
-        // No audio-active peers this tick: nothing to fall back for.
         assert_eq!(
             wt_audio_tick_classify(&[], thr),
             WtAudioLossSample {
@@ -8667,15 +10387,10 @@ mod tests {
                 uniform_lossy: false
             }
         );
-        // Single peer: lossy at/over the threshold, not below.
         assert!(wt_audio_tick_classify(&[thr], thr).uniform_lossy);
         assert!(!wt_audio_tick_classify(&[thr - 0.1], thr).uniform_lossy);
-        // Two peers both lossy => uniform receive-queue drop.
         assert!(wt_audio_tick_classify(&[30.0, 30.0], thr).uniform_lossy);
-        // Two peers, only one lossy => path loss, NOT uniform (WS would not fix
-        // it) — this is the core gate against firing on per-sender loss.
         assert!(!wt_audio_tick_classify(&[30.0, 0.0], thr).uniform_lossy);
-        // Five peers: 4/5 = 80% lossy => uniform; 3/5 = 60% => not.
         assert!(wt_audio_tick_classify(&[30.0, 30.0, 30.0, 30.0, 0.0], thr).uniform_lossy);
         assert!(!wt_audio_tick_classify(&[30.0, 30.0, 30.0, 0.0, 0.0], thr).uniform_lossy);
     }
@@ -8695,10 +10410,8 @@ mod tests {
             uniform_lossy: true,
         };
 
-        // Empty / cold-start window never fires.
         assert!(!wt_audio_fallback_should_fire(&[]));
 
-        // Multi-peer: exactly K_MULTI lossy fires; one fewer does not.
         assert!(wt_audio_fallback_should_fire(
             &[multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI]
         ));
@@ -8706,15 +10419,10 @@ mod tests {
             &[multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1]
         ));
 
-        // Intermittent / decayed: (K_MULTI - 1) lossy diluted by clean samples
-        // stays below the bar (windowed, not consecutive — clean samples do not
-        // "reset" progress, but they also don't count toward it).
         let mut intermittent = vec![multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1];
         intermittent.resize(WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1 + 5, multi_clean);
         assert!(!wt_audio_fallback_should_fire(&intermittent));
 
-        // Single remote peer: the multi bar (8) is NOT enough — the stricter
-        // single-peer bar (10) applies because uniformity is uncheckable.
         assert!(!wt_audio_fallback_should_fire(
             &[single_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI]
         ));
@@ -8735,12 +10443,36 @@ mod tests {
         );
     }
 
-    // These two pin the WS-fallback ACTION natively: `create_all_connections`
-    // dials `build_election_candidates(...)` 1:1, and `Connection::connect` is
-    // wasm-only, so this pure helper is the only host-reachable seam for the
-    // WT-exclusion guard. Deleting the latch check (WT never excluded) reddens
-    // the latched test; reordering to put WT before WS reddens the unlatched
-    // test — so the guard is red-on-mutation in both directions.
+    #[test]
+    fn the_downlink_capability_rides_on_webtransport_and_only_webtransport() {
+        let wt = build_connect_url("https://relay.example/lobby/room/user", "inst-1", true);
+        assert_eq!(
+            wt, "https://relay.example/lobby/room/user?instance_id=inst-1&ds=1",
+            "the WebTransport URL must carry both the instance id and the capability"
+        );
+
+        let ws = build_connect_url("wss://relay.example/lobby/room/user", "inst-1", false);
+        assert_eq!(
+            ws, "wss://relay.example/lobby/room/user?instance_id=inst-1",
+            "WebSocket has one downlink connection and no stream to split"
+        );
+        assert!(!ws.contains("ds="));
+    }
+
+    #[test]
+    fn the_connect_url_keeps_the_existing_query_and_its_separator() {
+        let wt = build_connect_url("https://relay.example/lobby?token=abc", "inst-2", true);
+        assert_eq!(
+            wt, "https://relay.example/lobby?token=abc&instance_id=inst-2&ds=1",
+            "an existing query must be extended with `&`, never restarted with `?`"
+        );
+        assert_eq!(
+            wt.matches('?').count(),
+            1,
+            "a second `?` would fold the whole tail into one parameter value"
+        );
+    }
+
     #[test]
     fn build_election_candidates_unlatched_ws_then_wt_in_order() {
         let ws = vec!["ws://a".to_string(), "ws://b".to_string()];
@@ -8749,7 +10481,7 @@ mod tests {
             "https://y".to_string(),
             "https://z".to_string(),
         ];
-        let candidates = build_election_candidates(&ws, &wt, false);
+        let candidates = build_election_candidates(&ws, &wt, false, None);
         assert_eq!(
             candidates,
             vec![
@@ -8787,7 +10519,7 @@ mod tests {
     fn build_election_candidates_latched_excludes_all_wt() {
         let ws = vec!["ws://a".to_string()];
         let wt = vec!["https://x".to_string(), "https://y".to_string()];
-        let candidates = build_election_candidates(&ws, &wt, true);
+        let candidates = build_election_candidates(&ws, &wt, true, None);
         assert!(
             candidates.iter().all(|c| !c.is_webtransport),
             "WS-only latch must exclude every WebTransport candidate regardless of configured WT URLs"
@@ -8801,6 +10533,213 @@ mod tests {
             }],
             "latched: WS candidates only, unchanged"
         );
+    }
+
+    /// The shape `build_lobby_urls` produces: the room JWT sits in the query.
+    fn lobby(host: &str, token: &str) -> String {
+        format!("{host}/lobby?token={token}")
+    }
+
+    fn two_wt_one_ws_manager(token: &str) -> ConnectionManager {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec![lobby("wss://ws-a", token)];
+        mgr.options.webtransport_urls =
+            vec![lobby("https://wt-a", token), lobby("https://wt-b", token)];
+        mgr
+    }
+
+    fn is_wt_server(candidate: &ElectionCandidate, host: &str) -> bool {
+        candidate.is_webtransport && candidate.base_url.starts_with(host)
+    }
+
+    fn lose_active_connection(
+        mgr: &ConnectionManager,
+        base_url: &str,
+        reason: ConnectionLostReason,
+    ) {
+        let callback = mgr.create_connection_lost_callback(
+            "wt_0".to_string(),
+            format!("{base_url}?instance_id=test-instance-id&ds=1"),
+            base_url.to_string(),
+            true,
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        callback.emit(reason);
+    }
+
+    fn next_election_candidates(mgr: &mut ConnectionManager) -> Vec<ElectionCandidate> {
+        let excluded = mgr.take_election_exclusion();
+        build_election_candidates(
+            &mgr.options.websocket_urls,
+            &mgr.options.webtransport_urls,
+            mgr.wt_audio_fallback_latched,
+            excluded.as_ref(),
+        )
+    }
+
+    #[test]
+    fn a_downlink_unrecoverable_close_drops_that_server_from_the_next_election() {
+        let mut mgr = two_wt_one_ws_manager("jwt-1");
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "jwt-1"),
+            ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string()),
+        );
+
+        let candidates = next_election_candidates(&mut mgr);
+
+        assert!(
+            !candidates.iter().any(|c| is_wt_server(c, "https://wt-a")),
+            "the election that follows must not re-dial the path the relay closed: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|c| is_wt_server(c, "https://wt-b")),
+            "only the closed server is dropped — the other WT server stays a candidate"
+        );
+        assert!(
+            candidates.iter().any(|c| !c.is_webtransport),
+            "WebSocket stays a candidate, which is where #2725 lets the client land"
+        );
+        assert_eq!(
+            mgr.election_prior_close, PRIOR_CLOSE_DOWNLINK_UNRECOVERABLE,
+            "the #1745 decision line must say what triggered this election"
+        );
+    }
+
+    #[test]
+    fn the_exclusion_survives_a_room_token_refresh() {
+        let mut mgr = two_wt_one_ws_manager("jwt-1");
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "jwt-1"),
+            ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string()),
+        );
+
+        mgr.options.websocket_urls = vec![lobby("wss://ws-a", "jwt-2")];
+        mgr.options.webtransport_urls = vec![
+            lobby("https://wt-a", "jwt-2"),
+            lobby("https://wt-b", "jwt-2"),
+        ];
+
+        let candidates = next_election_candidates(&mut mgr);
+        assert!(
+            !candidates.iter().any(|c| is_wt_server(c, "https://wt-a")),
+            "a rotated token must not resurrect the closed server: {candidates:?}"
+        );
+        assert!(candidates.iter().any(|c| is_wt_server(c, "https://wt-b")));
+    }
+
+    #[test]
+    fn the_exclusion_does_not_retain_the_room_token() {
+        let mgr = two_wt_one_ws_manager("jwt-1");
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "secret-jwt-value"),
+            ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string()),
+        );
+
+        let excluded = mgr.downlink_close_pending.borrow().clone().unwrap();
+        assert_eq!(excluded.server, "https://wt-a/lobby");
+        assert!(!excluded.server.contains("secret-jwt-value"));
+    }
+
+    #[test]
+    fn a_url_that_strips_to_nothing_arms_no_exclusion() {
+        assert_eq!(ExcludedCandidate::new(true, "not-a-url"), None);
+        assert_eq!(ExcludedCandidate::new(true, ""), None);
+    }
+
+    #[test]
+    fn a_generic_session_drop_excludes_nothing() {
+        let mut mgr = two_wt_one_ws_manager("jwt-1");
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "jwt-1"),
+            ConnectionLostReason::SessionDropped("idle timeout".to_string()),
+        );
+
+        assert!(
+            mgr.take_election_exclusion().is_none(),
+            "an ordinary drop must not narrow the candidate set"
+        );
+        assert_eq!(mgr.election_prior_close, PRIOR_CLOSE_NONE);
+    }
+
+    #[test]
+    fn the_exclusion_covers_exactly_one_election() {
+        let mut mgr = two_wt_one_ws_manager("jwt-1");
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "jwt-1"),
+            ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string()),
+        );
+
+        assert!(mgr.take_election_exclusion().is_some());
+        assert!(
+            mgr.take_election_exclusion().is_none(),
+            "a windowless latch would strand the client off a relay that recovered"
+        );
+        assert_eq!(mgr.election_prior_close, PRIOR_CLOSE_NONE);
+    }
+
+    #[test]
+    fn excluding_the_last_candidate_keeps_it() {
+        let wt = vec![lobby("https://wt-a", "jwt-1")];
+        let excluded = ExcludedCandidate::new(true, &lobby("https://wt-a", "jwt-1")).unwrap();
+        assert_eq!(
+            build_election_candidates(&[], &wt, false, Some(&excluded)),
+            build_election_candidates(&[], &wt, false, None),
+            "electing nothing is worse than retrying the server the relay closed"
+        );
+    }
+
+    #[test]
+    fn two_closes_in_quick_succession_start_one_reconnection_sequence() {
+        let mgr = two_wt_one_ws_manager("jwt-1");
+        let _ = take_reconnection_loops_spawned();
+
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "jwt-1"),
+            ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string()),
+        );
+        assert!(matches!(
+            *mgr.reconnection_phase.borrow(),
+            ReconnectionPhase::Reconnecting { .. }
+        ));
+
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "jwt-1"),
+            ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string()),
+        );
+
+        assert_eq!(
+            take_reconnection_loops_spawned(),
+            1,
+            "the second close must be absorbed by the in-progress reconnection, \
+             not start a second backoff sequence"
+        );
+    }
+
+    #[test]
+    fn the_decision_line_carries_the_relay_close_as_its_trigger() {
+        let mut mgr = two_wt_one_ws_manager("jwt-1");
+        lose_active_connection(
+            &mgr,
+            &lobby("https://wt-a", "jwt-1"),
+            ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string()),
+        );
+        let _ = mgr.take_election_exclusion();
+        insert_measurement(&mut mgr, "ws_0", false, Some(30.0), vec![30.0, 30.0]);
+
+        let _ = take_last_election_decision();
+        mgr.complete_election();
+
+        let decision =
+            take_last_election_decision().expect("complete_election must emit a decision line");
+        assert_eq!(decision.prior_close, PRIOR_CLOSE_DOWNLINK_UNRECOVERABLE);
+        assert_eq!(decision.active.as_deref(), Some("ws_0"));
     }
 
     #[test]
@@ -8825,9 +10764,6 @@ mod tests {
 
     #[test]
     fn wt_audio_tracker_does_not_fire_on_per_sender_only_loss() {
-        // One lossy sender, one healthy sender, every second for two full
-        // windows: never uniform, so WS (which cannot fix a single path's loss)
-        // is never forced.
         let mut tracker = WtAudioLossTracker::default();
         for i in 0..(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
             let now = i as f64 * 1000.0;
@@ -8843,7 +10779,6 @@ mod tests {
 
     #[test]
     fn wt_audio_tracker_does_not_fire_on_short_burst() {
-        // A 4-second burst then clean: the window can never reach K-of-M.
         let mut tracker = WtAudioLossTracker::default();
         for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
             let now = i as f64 * 1000.0;
@@ -8861,10 +10796,6 @@ mod tests {
 
     #[test]
     fn wt_audio_tracker_single_peer_requires_full_strength() {
-        // A single continuously-lossy remote sender must hold out for the
-        // stricter single-peer bar (10), NOT the multi-peer bar (8): asserting
-        // it fires exactly at SINGLE-1 proves the multi bar did not fire it
-        // early.
         let mut tracker = WtAudioLossTracker::default();
         let mut fired_at = None;
         for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
@@ -8891,7 +10822,6 @@ mod tests {
         tracker.tick(0.0);
         assert_eq!(tracker.active_peer_count(), 2, "both peers seen this tick");
 
-        // Only peer-a keeps emitting; advance past the stale window.
         let after = WT_AUDIO_LOSS_PEER_STALE_MS + 1000.0;
         tracker.observe("peer-a", 30.0, after);
         tracker.tick(after);
@@ -8903,26 +10833,16 @@ mod tests {
         );
     }
 
-    // Regression (issue 2029): on the UN-fixed code neither
-    // `observe_peer_audio_datagram_loss` nor `check_audio_datagram_fallback`
-    // exists and nothing consumes the per-peer WT audio-loss gauge, so the
-    // WS-fallback action asserted below cannot occur. Concretely: reverting the
-    // decision (making the detector never return `true`) breaks `assert!(fired)`,
-    // and reverting the action (not setting `wt_audio_fallback_latched`) breaks
-    // the latch assertion. Drives the PRODUCTION feed + tick methods — it does
-    // not re-implement the predicate.
     #[test]
     fn check_audio_datagram_fallback_fires_latches_and_is_one_way() {
         let mut mgr = make_test_manager();
         assert!(!mgr.wt_audio_fallback_latched, "cold start: not latched");
 
-        // Cold start (no observations) must not fire.
         assert!(
             !mgr.check_audio_datagram_fallback(0.0),
             "no peers / no loss must not fire"
         );
 
-        // Sustained, cross-sender-uniform loss across two audio-active WT peers.
         let mut fired = false;
         for i in 1..=WT_AUDIO_LOSS_WINDOW_SAMPLES {
             let now = i as f64 * 1000.0;
@@ -8942,8 +10862,6 @@ mod tests {
             "firing must latch the session WebSocket-only"
         );
 
-        // One-way latch: no re-fire, and post-latch observations are ignored so
-        // the detector is quiescent (the WS switch makes the source gauge ~0).
         mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, 99_000.0);
         assert!(
             !mgr.check_audio_datagram_fallback(100_000.0),
@@ -8958,8 +10876,6 @@ mod tests {
 
     #[test]
     fn check_audio_datagram_fallback_does_not_fire_on_per_sender_loss() {
-        // Manager-level mirror of the per-sender case: two WT peers, only one
-        // lossy, for two full windows — never fires, never latches.
         let mut mgr = make_test_manager();
         for i in 1..=(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
             let now = i as f64 * 1000.0;
@@ -9025,10 +10941,6 @@ mod tests {
         now
     }
 
-    /// Regression (issue 1924): un-fixed, `ElectionScan::selected()` hard-prefers
-    /// any WT candidate over WS on RTT + sample count, so the faster-but-lossy
-    /// `wt_0` wins and this fails on `ws_0`. Six lossy samples stays BELOW the
-    /// #2029 latch bar (8), pinning the ranking and not the pre-existing latch.
     #[test]
     fn lossy_wt_loses_election_to_ws() {
         let mut mgr = make_test_manager();
@@ -9057,6 +10969,600 @@ mod tests {
         assert_eq!(
             classify_election_reason_from_scan(&scan),
             "ws_preferred_wt_audio_loss"
+        );
+    }
+
+    // 5c. Issue 2725 — cross-transport election with an explicit WT bonus
+
+    /// A best-tier WT/WS pair; no probe timeouts, so score == RTT.
+    fn seed_wt_ws_pair(mgr: &mut ConnectionManager, wt_rtt: f64, ws_rtt: f64) {
+        seed_wt_ws_pair_with_depth(
+            mgr,
+            wt_rtt,
+            ws_rtt,
+            ELECTION_BONUS_MIN_SAMPLES,
+            ELECTION_BONUS_MIN_SAMPLES,
+            true,
+        );
+    }
+
+    /// The same pair with both evidence gates under the caller's control:
+    /// per-side election-lane sample counts, and the WT candidate's lane.
+    fn seed_wt_ws_pair_with_depth(
+        mgr: &mut ConnectionManager,
+        wt_rtt: f64,
+        ws_rtt: f64,
+        wt_samples: usize,
+        ws_samples: usize,
+        wt_reliable_lane: bool,
+    ) {
+        insert_measurement(mgr, "wt_0", true, Some(wt_rtt), vec![wt_rtt; wt_samples]);
+        if wt_reliable_lane {
+            let wt = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+            wt.reliable_lane.measurements = VecDeque::from(vec![wt_rtt; wt_samples]);
+            wt.reliable_lane.average_rtt = Some(wt_rtt);
+        }
+        insert_measurement(mgr, "ws_0", false, Some(ws_rtt), vec![ws_rtt; ws_samples]);
+    }
+
+    fn elected_for_pair(wt_rtt: f64, ws_rtt: f64) -> String {
+        let mut mgr = make_test_manager();
+        seed_wt_ws_pair(&mut mgr, wt_rtt, ws_rtt);
+        elected_id(&mgr, 0.0)
+    }
+
+    #[test]
+    fn a_far_slower_wt_loses_the_election_to_ws() {
+        assert_eq!(
+            elected_for_pair(500.0, 20.0),
+            "ws_0",
+            "a 500ms WT link must lose to a 20ms WS link"
+        );
+        assert_eq!(
+            elected_for_pair(20.0, 500.0),
+            "wt_0",
+            "the mirrored numbers must still elect WT"
+        );
+    }
+
+    #[test]
+    fn wt_wins_inside_the_bonus_and_loses_just_outside_it() {
+        let ws = 20.0;
+        assert_eq!(
+            elected_for_pair(ws + WT_ELECTION_BONUS_MS, ws),
+            "wt_0",
+            "exactly WT_ELECTION_BONUS_MS worse is still inside the bonus"
+        );
+        assert_eq!(
+            elected_for_pair(ws + WT_ELECTION_BONUS_MS + 0.1, ws),
+            "ws_0",
+            "one tenth of a millisecond past the bonus hands it to WS"
+        );
+    }
+
+    #[test]
+    fn a_demoted_wt_loses_inside_the_bonus_too() {
+        let mut mgr = make_test_manager();
+        seed_wt_ws_pair(&mut mgr, 20.0 + WT_ELECTION_BONUS_MS, 20.0);
+        assert_eq!(elected_id(&mgr, 0.0), "wt_0");
+
+        let now = drive_uniform_wt_audio_loss(&mut mgr, 0.0, 6, 30.0);
+        assert!(
+            !mgr.wt_audio_fallback_latched,
+            "6 of 12 stays under the #2029 latch bar — this must isolate the ranking"
+        );
+        assert!(mgr.wt_audio_demote_active(now));
+        assert_eq!(
+            elected_id(&mgr, now),
+            "ws_0",
+            "a demoted WT loses to a qualifying WS at every gap, bonus included"
+        );
+    }
+
+    #[test]
+    fn the_bonus_is_wider_than_the_reelection_hysteresis_deadband() {
+        assert_eq!(
+            elected_for_pair(20.0 + REELECTION_MIN_IMPROVEMENT_MS, 20.0),
+            "wt_0",
+            "a gap at the hysteresis deadband must still be inside the bonus"
+        );
+        assert_eq!(
+            elected_for_pair(20.0 + WT_ELECTION_BONUS_MS + 0.1, 20.0),
+            "ws_0",
+            "past the bonus the election concedes, and the gap clears the deadband"
+        );
+    }
+
+    #[test]
+    fn a_datagram_fallback_wt_candidate_does_not_win_on_the_bonus() {
+        let deep = ELECTION_BONUS_MIN_SAMPLES;
+        let inside = 20.0 + WT_ELECTION_BONUS_MS;
+
+        let mut fallback = make_test_manager();
+        seed_wt_ws_pair_with_depth(&mut fallback, inside, 20.0, deep, deep, false);
+        let scan = fallback.election_scan(0.0);
+        assert_eq!(
+            scan.best_wt.as_ref().unwrap().1.election_lane(),
+            ElectionRttLane::DatagramFallback,
+            "fixture must actually be on the fallback lane"
+        );
+        assert_eq!(
+            ConnectionManager::find_best_connection(&scan).unwrap().0,
+            "ws_0"
+        );
+        assert_eq!(scan.transport_pick(), "ws_bonus_unearned_lane");
+
+        let mut reliable = make_test_manager();
+        seed_wt_ws_pair_with_depth(&mut reliable, inside, 20.0, deep, deep, true);
+        assert_eq!(
+            elected_id(&reliable, 0.0),
+            "wt_0",
+            "the lane is the only difference from the case above"
+        );
+
+        let mut faster = make_test_manager();
+        seed_wt_ws_pair_with_depth(&mut faster, 15.0, 20.0, deep, deep, false);
+        assert_eq!(
+            elected_id(&faster, 0.0),
+            "wt_0",
+            "the gate withholds the concession, never an outright win"
+        );
+    }
+
+    #[test]
+    fn a_thin_sample_wt_candidate_does_not_win_on_the_bonus() {
+        let deep = ELECTION_BONUS_MIN_SAMPLES;
+        let thin = ELECTION_BONUS_MIN_SAMPLES - 1;
+        let inside = 20.0 + WT_ELECTION_BONUS_MS;
+
+        let mut wt_thin = make_test_manager();
+        seed_wt_ws_pair_with_depth(&mut wt_thin, inside, 20.0, thin, deep, true);
+        assert_eq!(elected_id(&wt_thin, 0.0), "ws_0");
+        assert_eq!(
+            wt_thin.election_scan(0.0).transport_pick(),
+            "ws_bonus_unearned_samples"
+        );
+
+        let mut ws_thin = make_test_manager();
+        seed_wt_ws_pair_with_depth(&mut ws_thin, inside, 20.0, deep, thin, true);
+        assert_eq!(
+            elected_id(&ws_thin, 0.0),
+            "ws_0",
+            "the standard error depends on both means, so the WS depth counts too"
+        );
+
+        let mut both_deep = make_test_manager();
+        seed_wt_ws_pair_with_depth(&mut both_deep, inside, 20.0, deep, deep, true);
+        assert_eq!(elected_id(&both_deep, 0.0), "wt_0");
+
+        let mut thin_faster = make_test_manager();
+        seed_wt_ws_pair_with_depth(&mut thin_faster, 15.0, 20.0, thin, thin, true);
+        assert_eq!(
+            elected_id(&thin_faster, 0.0),
+            "wt_0",
+            "a thin WT that is genuinely faster still wins"
+        );
+    }
+
+    #[test]
+    fn the_election_deadline_waits_only_for_a_real_cross_transport_race() {
+        let deep = ELECTION_BONUS_MIN_SAMPLES;
+        let thin = ELECTION_MIN_RTT_SAMPLES;
+
+        assert!(
+            !election_may_complete(&[(true, thin, true), (false, deep, true)], true, 0),
+            "both answering but one thin: extend"
+        );
+        assert!(election_may_complete(
+            &[(true, deep, true), (false, deep, true)],
+            true,
+            0
+        ));
+        assert!(
+            election_may_complete(&[(false, thin, true)], true, 0),
+            "a WS-only room must not be slowed down"
+        );
+        assert!(
+            election_may_complete(&[(true, 0, true), (false, thin, true)], true, 0),
+            "a silent candidate is never waited on"
+        );
+        assert!(
+            !election_may_complete(&[(true, 0, true), (false, 0, true)], false, 0),
+            "the original bar still extends when nothing qualifies"
+        );
+        assert!(
+            election_may_complete(
+                &[(true, thin, true), (false, deep, true)],
+                true,
+                ELECTION_MAX_EXTENSIONS
+            ),
+            "the extension budget terminates the wait"
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_stopped_answering_does_not_hold_the_election_deadline() {
+        let deep = ELECTION_BONUS_MIN_SAMPLES;
+        let thin = ELECTION_MIN_RTT_SAMPLES;
+
+        assert!(
+            !election_may_complete(&[(true, thin, true), (false, deep, true)], true, 0),
+            "anti-vacuity: while it IS answering, a thin candidate must still hold"
+        );
+        assert!(
+            election_may_complete(&[(true, thin, false), (false, deep, true)], true, 0),
+            "a thin candidate that stopped answering must not hold the deadline"
+        );
+        assert!(
+            election_may_complete(&[(true, deep, false), (false, thin, true)], true, 0),
+            "with the only WT candidate silent this is a one-transport race, so \
+             the #2725 hold must not engage for the remaining thin WS candidate"
+        );
+        assert!(
+            !election_may_complete(
+                &[(true, thin, true), (true, deep, false), (false, deep, true)],
+                true,
+                0
+            ),
+            "a second, live WT candidate must keep the hold: dropping the silent \
+             one must not drop the race it is not part of"
+        );
+    }
+
+    #[test]
+    fn election_lane_answering_reads_silence_staleness_and_its_own_rtt() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, Some(600.0), vec![600.0; 3]);
+        let now = 100_000.0;
+
+        let m = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+        assert!(
+            m.election_lane_answering(now),
+            "a candidate that has never echoed is excluded by the hold's own \
+             `samples > 0` test, not called silent here"
+        );
+
+        m.last_echo_ms = Some(now - 1_200.0);
+        assert!(
+            m.election_lane_answering(now),
+            "2 x its own 600ms average is the bound, not the 1s floor"
+        );
+
+        m.last_echo_ms = Some(now - 1_300.0);
+        assert!(
+            !m.election_lane_answering(now),
+            "past 2 x its own average with nothing coming back, it is silent"
+        );
+
+        m.average_rtt = Some(20.0);
+        m.measurements = VecDeque::from(vec![20.0; 3]);
+        m.last_echo_ms = Some(now - (ELECTION_EXTENSION_STEP_MS as f64) + 1.0);
+        assert!(
+            m.election_lane_answering(now),
+            "inside one extension step a fast candidate is still answering"
+        );
+        m.last_echo_ms = Some(now - (ELECTION_EXTENSION_STEP_MS as f64) - 1.0);
+        assert!(
+            !m.election_lane_answering(now),
+            "the floor is one extension step, the unit the hold spends"
+        );
+
+        m.last_echo_ms = Some(now);
+        m.consecutive_probe_timeouts = STALE_THRESHOLD;
+        assert!(
+            !m.election_lane_answering(now),
+            "a stale candidate must leave the hold however recent its echoes"
+        );
+    }
+
+    #[test]
+    fn one_lost_probe_does_not_make_a_healthy_candidate_read_as_silent() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "ws_0", false, Some(600.0), vec![600.0; 3]);
+
+        let now = monotonic_now_ms();
+        let lost_at = now - 4_000.0;
+        mgr.rtt_measurements
+            .get_mut("ws_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(lost_at);
+
+        let sent_at = now - 600.0;
+        mgr.rtt_measurements
+            .get_mut("ws_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(sent_at);
+        let echo = MediaPacket {
+            timestamp: sent_at,
+            ..Default::default()
+        };
+        mgr.handle_rtt_response("ws_0", &echo, now, InboundLane::Reliable);
+
+        let m = mgr.rtt_measurements.get("ws_0").unwrap();
+        assert_eq!(
+            m.in_flight_probes.front().copied(),
+            Some(lost_at),
+            "anti-vacuity: the lost probe must still be at the FRONT, which is \
+             exactly what the old predicate read"
+        );
+        assert!(
+            m.election_lane_answering(monotonic_now_ms()),
+            "a candidate echoing on time must keep the hold even with one lost \
+             probe stuck at the front of its queue"
+        );
+
+        let stamp = m.last_echo_ms.expect("the echo must have stamped");
+        mgr.rtt_measurements.get_mut("ws_0").unwrap().last_echo_ms =
+            Some(stamp - 2.0 * 600.0 - 1.0);
+        assert!(
+            !mgr.rtt_measurements["ws_0"].election_lane_answering(monotonic_now_ms()),
+            "the predicate must still detect a candidate that stopped echoing"
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_extends_while_one_transport_is_still_thin() {
+        let mut mgr = make_test_manager();
+        seed_wt_ws_pair_with_depth(
+            &mut mgr,
+            25.0,
+            20.0,
+            ELECTION_MIN_RTT_SAMPLES,
+            ELECTION_BONUS_MIN_SAMPLES,
+            true,
+        );
+        mgr.election_state = ElectionState::Testing {
+            start_time: monotonic_now_ms() - 5_000.0,
+            duration_ms: 2_000,
+            probe_timer: None,
+            extensions_used: 0,
+        };
+
+        mgr.check_and_complete_election();
+        assert!(
+            matches!(
+                mgr.election_state,
+                ElectionState::Testing {
+                    extensions_used: 1,
+                    duration_ms: 3_000,
+                    ..
+                }
+            ),
+            "an asymmetric candidate set must extend, not elect: {:?}",
+            mgr.get_connection_state()
+        );
+
+        let wt = mgr.rtt_measurements.get_mut("wt_0").unwrap();
+        wt.reliable_lane.measurements = VecDeque::from(vec![25.0; ELECTION_BONUS_MIN_SAMPLES]);
+        if let ElectionState::Testing {
+            ref mut start_time, ..
+        } = mgr.election_state
+        {
+            *start_time = monotonic_now_ms() - 9_000.0;
+        }
+        mgr.check_and_complete_election();
+        assert!(
+            !matches!(mgr.election_state, ElectionState::Testing { .. }),
+            "once both lanes are comparable the deadline completes"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_candidate_does_not_hold_the_election_deadline() {
+        let mut mgr = make_test_manager();
+        seed_wt_ws_pair_with_depth(
+            &mut mgr,
+            25.0,
+            20.0,
+            ELECTION_MIN_RTT_SAMPLES,
+            ELECTION_BONUS_MIN_SAMPLES,
+            true,
+        );
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_with_transport(true),
+        );
+        mgr.election_state = ElectionState::Testing {
+            start_time: monotonic_now_ms() - 5_000.0,
+            duration_ms: 2_000,
+            probe_timer: None,
+            extensions_used: 0,
+        };
+
+        mgr.check_and_complete_election();
+        assert!(
+            matches!(
+                mgr.election_state,
+                ElectionState::Testing {
+                    extensions_used: 1,
+                    ..
+                }
+            ),
+            "a connected but thin candidate still holds the deadline"
+        );
+
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_disconnected(true),
+        );
+        let depth = mgr.election_lane_depth();
+        assert!(
+            !depth.iter().any(|(is_wt, _, _)| *is_wt),
+            "a disconnected candidate must leave the race: {depth:?}"
+        );
+        assert!(
+            election_may_complete(&depth, true, 0),
+            "the same thin candidate, now disconnected, must not hold the deadline"
+        );
+    }
+
+    #[test]
+    fn the_elected_transport_does_not_oscillate_across_a_demotion_window() {
+        let mut mgr = make_test_manager();
+        seed_wt_ws_pair(&mut mgr, 20.0, 200.0);
+
+        let mut elected = Vec::new();
+        for tick in 1..=WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = tick as f64 * 1000.0;
+            let loss = if tick <= WT_AUDIO_LOSS_WINDOW_SAMPLES / 2 {
+                30.0
+            } else {
+                0.0
+            };
+            mgr.observe_peer_audio_datagram_loss("peer-a", loss, now);
+            mgr.observe_peer_audio_datagram_loss("peer-b", loss, now);
+            assert!(
+                !mgr.check_audio_datagram_fallback(now),
+                "the #2029 latch must not fire inside this window"
+            );
+            elected.push(elected_id(&mgr, now));
+        }
+
+        assert!(!mgr.wt_audio_fallback_latched);
+        let changes = elected.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert_eq!(changes, 1, "expected one WT->WS change, got {elected:?}");
+        assert_eq!(elected.first().map(String::as_str), Some("wt_0"));
+        assert_eq!(elected.last().map(String::as_str), Some("ws_0"));
+    }
+
+    #[test]
+    fn the_decision_line_carries_the_cross_transport_comparison() {
+        let mut inside = make_test_manager();
+        seed_wt_ws_pair(&mut inside, 20.0 + WT_ELECTION_BONUS_MS, 20.0);
+        let snapshot = ConnectionManager::snapshot_election_decision(&inside.election_scan(0.0));
+        assert_eq!(snapshot.transport_pick, "wt_within_bonus");
+        assert_eq!(snapshot.best_wt_score_ms, Some(20.0 + WT_ELECTION_BONUS_MS));
+        assert_eq!(snapshot.best_ws_score_ms, Some(20.0));
+
+        let line = format_election_decision(
+            &snapshot,
+            ElectionOutcome::Elected,
+            Some("wt_0"),
+            Some("wt_0"),
+            None,
+            PRIOR_CLOSE_NONE,
+        );
+        for token in [
+            "transport_pick=wt_within_bonus".to_string(),
+            format!("best_wt_score_ms={:.1}", 20.0 + WT_ELECTION_BONUS_MS),
+            "best_ws_score_ms=20.0".to_string(),
+            format!("wt_bonus_ms={WT_ELECTION_BONUS_MS:.0}"),
+        ] {
+            assert!(line.contains(&token), "missing {token} in: {line}");
+        }
+
+        let mut outside = make_test_manager();
+        seed_wt_ws_pair(&mut outside, 500.0, 20.0);
+        assert_eq!(
+            ConnectionManager::snapshot_election_decision(&outside.election_scan(0.0))
+                .transport_pick,
+            "ws_faster"
+        );
+
+        let mut demoted = make_test_manager();
+        seed_wt_ws_pair(&mut demoted, 20.0, 200.0);
+        let now = drive_uniform_wt_audio_loss(&mut demoted, 0.0, 6, 30.0);
+        assert_eq!(
+            ConnectionManager::snapshot_election_decision(&demoted.election_scan(now))
+                .transport_pick,
+            "wt_demoted"
+        );
+
+        let deep = ELECTION_BONUS_MIN_SAMPLES;
+        let mut unearned_lane = make_test_manager();
+        seed_wt_ws_pair_with_depth(
+            &mut unearned_lane,
+            20.0 + WT_ELECTION_BONUS_MS,
+            20.0,
+            deep,
+            deep,
+            false,
+        );
+        assert_eq!(
+            ConnectionManager::snapshot_election_decision(&unearned_lane.election_scan(0.0))
+                .transport_pick,
+            "ws_bonus_unearned_lane"
+        );
+
+        let mut unearned_samples = make_test_manager();
+        seed_wt_ws_pair_with_depth(
+            &mut unearned_samples,
+            20.0 + WT_ELECTION_BONUS_MS,
+            20.0,
+            deep - 1,
+            deep,
+            true,
+        );
+        assert_eq!(
+            ConnectionManager::snapshot_election_decision(&unearned_samples.election_scan(0.0))
+                .transport_pick,
+            "ws_bonus_unearned_samples"
+        );
+    }
+
+    #[test]
+    fn a_single_transport_room_is_unchanged_by_the_bonus() {
+        let mut wt_only = make_test_manager();
+        insert_measurement(
+            &mut wt_only,
+            "wt_0",
+            true,
+            Some(500.0),
+            vec![500.0; ELECTION_MIN_RTT_SAMPLES],
+        );
+        assert_eq!(elected_id(&wt_only, 0.0), "wt_0");
+        assert_eq!(
+            ConnectionManager::snapshot_election_decision(&wt_only.election_scan(0.0))
+                .transport_pick,
+            "wt_only"
+        );
+
+        let mut ws_only = make_test_manager();
+        insert_measurement(
+            &mut ws_only,
+            "ws_0",
+            false,
+            Some(500.0),
+            vec![500.0; ELECTION_MIN_RTT_SAMPLES],
+        );
+        assert_eq!(elected_id(&ws_only, 0.0), "ws_0");
+        assert_eq!(
+            ConnectionManager::snapshot_election_decision(&ws_only.election_scan(0.0))
+                .transport_pick,
+            "ws_only"
+        );
+    }
+
+    #[test]
+    fn fallback_tiers_stay_below_the_best_tier_and_keep_their_order() {
+        let mut fallbacks = make_test_manager();
+        insert_measurement(&mut fallbacks, "wt_0", true, Some(500.0), vec![500.0]);
+        insert_measurement(&mut fallbacks, "ws_0", false, Some(20.0), vec![20.0]);
+        assert_eq!(
+            elected_id(&fallbacks, 0.0),
+            "wt_0",
+            "the bonus does not reach the fallback tiers"
+        );
+
+        let mut mixed = make_test_manager();
+        insert_measurement(&mut mixed, "wt_0", true, Some(20.0), vec![20.0]);
+        insert_measurement(
+            &mut mixed,
+            "ws_0",
+            false,
+            Some(500.0),
+            vec![500.0; ELECTION_MIN_RTT_SAMPLES],
+        );
+        assert_eq!(
+            elected_id(&mixed, 0.0),
+            "ws_0",
+            "a qualifying WS outranks a faster WT that is still a fallback"
         );
     }
 
@@ -9215,6 +11721,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         });
         mgr.old_active_connection = Some((
             "wt_old".to_string(),
@@ -9776,8 +12284,6 @@ mod tests {
         assert_eq!(mgr.election_no_measurement_retries, 0);
     }
 
-    /// WebSocket is the default transport and WebTransport is opt-in, so the
-    /// live-candidate census must not acquire a transport term either way.
     #[test]
     fn a_webtransport_candidate_counts_as_live_too() {
         let mut mgr = make_test_manager();
@@ -10070,6 +12576,27 @@ mod tests {
         assert!(
             mgr.active_is_webtransport(),
             "during re-election the preserved WT connection's transport is read"
+        );
+    }
+
+    #[test]
+    fn uplink_queue_depth_resolves_the_old_active_connection_during_reelection() {
+        let mut mgr = make_test_manager();
+        mgr.old_active_connection = Some((
+            "ws_old".to_string(),
+            Connection::new_for_test_with_uplink(false, Some(262_144)),
+        ));
+        *mgr.active_connection_id.borrow_mut() = Some("ws_old".to_string());
+        mgr.connections.insert(
+            "ws_new".to_string(),
+            Connection::new_for_test_with_uplink(false, Some(1)),
+        );
+
+        assert_eq!(
+            mgr.uplink_queue_depth_bytes(),
+            Some(262_144),
+            "the socket still carrying media during re-election must report its own depth, \
+             not None and not the non-elected connection's"
         );
     }
 
@@ -10952,6 +13479,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         });
         // old_active_connection is None (no real Connection object).
         *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
@@ -11022,6 +13551,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         });
         *mgr.active_connection_id.borrow_mut() = Some("custom_id".to_string());
 
@@ -11049,6 +13580,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         });
 
         mgr.reset_and_start_election().unwrap();
@@ -11184,6 +13717,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         });
         *mgr.active_connection_id.borrow_mut() = Some(old_id.to_string());
         // Synthesise the moved-out old connection slot. We cannot build
@@ -11202,9 +13737,10 @@ mod tests {
         //
         // Mark the freshness map.
         let now = monotonic_now_ms();
-        mgr.last_inbound_at_ms
-            .borrow_mut()
-            .insert(old_id.to_string(), now - last_inbound_age_ms);
+        mgr.last_inbound_at_ms.borrow_mut().insert(
+            old_id.to_string(),
+            InboundFreshness::reliable(now - last_inbound_age_ms),
+        );
     }
 
     #[test]
@@ -11291,9 +13827,10 @@ mod tests {
         // connection slot the helper returns false.
         let mut mgr = make_test_manager();
         mgr.reelection_in_progress = true;
-        mgr.last_inbound_at_ms
-            .borrow_mut()
-            .insert("wt_0".to_string(), monotonic_now_ms_for_test());
+        mgr.last_inbound_at_ms.borrow_mut().insert(
+            "wt_0".to_string(),
+            InboundFreshness::reliable(monotonic_now_ms_for_test()),
+        );
         // No old_active_connection set.
         let result = mgr.try_preserve_old_connection_on_candidate_failure("test");
         assert!(!result, "must return false without an old connection slot");
@@ -11354,14 +13891,14 @@ mod tests {
         let last = now - 4_990.0; // 4.99 s ago
         mgr.last_inbound_at_ms
             .borrow_mut()
-            .insert("wt_0".to_string(), last);
+            .insert("wt_0".to_string(), InboundFreshness::reliable(last));
 
         // Read it back and verify the comparison logic returns "fresh".
         let read = mgr
             .last_inbound_at_ms
             .borrow()
             .get("wt_0")
-            .copied()
+            .map(|f| f.any_lane_ms)
             .unwrap();
         let age = now - read;
         assert!(
@@ -11378,13 +13915,13 @@ mod tests {
         let last = now - 5_010.0; // 5.01 s ago
         mgr.last_inbound_at_ms
             .borrow_mut()
-            .insert("wt_0".to_string(), last);
+            .insert("wt_0".to_string(), InboundFreshness::reliable(last));
 
         let read = mgr
             .last_inbound_at_ms
             .borrow()
             .get("wt_0")
-            .copied()
+            .map(|f| f.any_lane_ms)
             .unwrap();
         let age = now - read;
         assert!(
@@ -11419,9 +13956,10 @@ mod tests {
         //     freshness)
         let mut mgr = make_test_manager();
         mgr.reelection_in_progress = true;
-        mgr.last_inbound_at_ms
-            .borrow_mut()
-            .insert("wt_0".to_string(), monotonic_now_ms() - 100.0);
+        mgr.last_inbound_at_ms.borrow_mut().insert(
+            "wt_0".to_string(),
+            InboundFreshness::reliable(monotonic_now_ms() - 100.0),
+        );
         // No old_active_connection.
         let result = mgr.try_preserve_old_connection_on_candidate_failure("test");
         assert!(
@@ -11442,9 +13980,9 @@ mod tests {
         // Pre-seed freshness map with old + candidates + stranger.
         let now = monotonic_now_ms();
         let mut map = mgr.last_inbound_at_ms.borrow_mut();
-        map.insert("wt_0".to_string(), now);
-        map.insert("ws_0".to_string(), now); // stale candidate
-        map.insert("ws_1".to_string(), now); // stranger
+        map.insert("wt_0".to_string(), InboundFreshness::reliable(now));
+        map.insert("ws_0".to_string(), InboundFreshness::reliable(now)); // stale candidate
+        map.insert("ws_1".to_string(), InboundFreshness::reliable(now)); // stranger
         drop(map);
 
         mgr.start_reelection().unwrap();
@@ -11468,7 +14006,7 @@ mod tests {
         *mgr.reelection_retry_pending.borrow_mut() = true;
         mgr.last_inbound_at_ms
             .borrow_mut()
-            .insert("wt_0".to_string(), 1.0);
+            .insert("wt_0".to_string(), InboundFreshness::reliable(1.0));
 
         mgr.reset_and_start_election().unwrap();
 
@@ -12305,6 +14843,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         mgr.election_state = ElectionState::Elected {
@@ -12367,6 +14907,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
 
@@ -12433,6 +14975,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         mgr.election_state = ElectionState::Elected {
@@ -12493,6 +15037,8 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
+            last_echo_ms: None,
+            reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         // Set the active connection so `last_known_server` is populated from it.

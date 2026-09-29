@@ -33,6 +33,7 @@ async function report(
     fpsByBot: new Map<string, FpsStats>(),
     arrival,
     joinedBots,
+    imageRevision: null,
   });
   return result.reportText;
 }

@@ -125,7 +125,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Per-session heap as a ratio of each client's first-seen value in the last 30 minutes. >2.0 sustained 60s is the ClientHeapGrowthHigh alert condition. Read this together with the absolute MB chart above.",
+      "description": "Per-session heap as a ratio of its own value 30 minutes earlier. The ClientHeapGrowthHigh alert uses the same shape over a 5-minute offset and fires above 2.0 sustained 60s. Read this together with the absolute MB chart above.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -210,14 +210,14 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} / on(meeting_id, session_id, peer_id) first_over_time(videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"}[30m])) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "expr": "(videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} / on(meeting_id, session_id, peer_id) (videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} offset 30m)) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "{{display_name}} ({{meeting_id}})",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Client Heap Growth Ratio (current / first-seen)",
+      "title": "Client Heap Growth Ratio (current / 30m earlier)",
       "type": "timeseries"
     },
     {

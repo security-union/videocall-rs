@@ -254,9 +254,8 @@ async fn meeting_state(pool: &sqlx::PgPool, room_id: &str) -> String {
 }
 
 /// Admitting a waiting participant must re-activate a meeting that has gone
-/// `idle` (everyone-left → idle). This guards the `db_meetings::activate` call
-/// added to the `admit` handler so a participant admitted into a briefly-idle
-/// meeting reliably lands in an `active` meeting.
+/// `idle`. This guards the activation in `db_participants::admit`, so a
+/// participant admitted into a briefly-idle meeting lands in an `active` one.
 #[tokio::test]
 #[serial]
 async fn test_admit_reactivates_idle_meeting() {
@@ -267,15 +266,17 @@ async fn test_admit_reactivates_idle_meeting() {
     // Precondition: meeting is active with one waiting attendee.
     assert_eq!(meeting_state(&pool, room_id).await, "active");
 
-    // Simulate the presence-driven empty->idle transition (as if everyone left
-    // and the became-empty consumer fired).
+    // Force the state idle, as a relay's report of its own copy of the room
+    // emptying once could.
     let meeting = meeting_api::db::meetings::get_by_room_id(&pool, room_id)
         .await
         .unwrap()
         .unwrap();
-    meeting_api::db::meetings::set_idle(&pool, meeting.id)
+    sqlx::query("UPDATE meetings SET state = 'idle' WHERE id = $1")
+        .bind(meeting.id)
+        .execute(&pool)
         .await
-        .expect("set_idle must succeed");
+        .expect("force idle");
     assert_eq!(meeting_state(&pool, room_id).await, "idle");
 
     // Host admits the waiting attendee — this must flip the meeting back to
@@ -314,9 +315,11 @@ async fn test_admit_all_reactivates_idle_meeting() {
         .await
         .unwrap()
         .unwrap();
-    meeting_api::db::meetings::set_idle(&pool, meeting.id)
+    sqlx::query("UPDATE meetings SET state = 'idle' WHERE id = $1")
+        .bind(meeting.id)
+        .execute(&pool)
         .await
-        .expect("set_idle must succeed");
+        .expect("force idle");
     assert_eq!(meeting_state(&pool, room_id).await, "idle");
 
     let app = build_app(pool.clone());

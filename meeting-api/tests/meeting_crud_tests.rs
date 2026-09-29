@@ -489,3 +489,53 @@ async fn test_delete_meeting_not_owner() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+#[tokio::test]
+#[serial]
+async fn test_list_meetings_and_search_include_a_never_joined_co_host() {
+    let pool = get_test_pool().await;
+    let room_id = "test-list-cohost-never-joined";
+    let owner = "crud-r11-owner@example.com";
+    let co_host = "crud-r11-cohost@example.com";
+    cleanup_test_data(&pool, room_id).await;
+
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", owner)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "meeting_id": room_id, "attendees": [], "co_hosts": [co_host] })
+                .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("GET", "/api/v1/meetings?limit=10&offset=0", co_host)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: APIResponse<ListMeetingsResponse> = response_json(resp).await;
+    assert!(
+        body.result.meetings.iter().any(|m| m.meeting_id == room_id),
+        "a never-joined co-host must see the meeting in the plain list"
+    );
+
+    let query = &room_id[room_id.len() - 6..];
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("GET", &format!("/api/v1/meetings?q={query}"), co_host)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: APIResponse<ListMeetingsResponse> = response_json(resp).await;
+    assert!(
+        body.result.meetings.iter().any(|m| m.meeting_id == room_id),
+        "a never-joined co-host must find the meeting via the search modal"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}

@@ -26,7 +26,8 @@ use crate::constants::{
     ENCODER_QUEUE_BACKPRESSURE_CLEAR, ENCODER_QUEUE_BACKPRESSURE_HIGH, LAYER_PROBE_CLEAR_WINDOW_MS,
     LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC, LAYER_PROBE_OSCILLATION_WINDOW_MS,
     LAYER_PROBE_PENALTY_BACKOFF, LAYER_PROBE_PENALTY_BASE_MS, LAYER_PROBE_PENALTY_MAX_MS,
-    STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_QUALITY_TIERS,
+    LAYER_PROBE_UPLINK_HOLD_TICKS, LAYER_PROBE_UPLINK_TICK_WINDOW, STEP_UP_STABILIZATION_WINDOW_MS,
+    VIDEO_QUALITY_TIERS,
 };
 use crate::manager::{AdaptiveQualityManager, TierTransitionRecord};
 
@@ -213,16 +214,16 @@ pub struct EncoderBitrateController {
     layer_probe_clear_since_ms: Option<f64>,
 
     /// Timestamp (ms) of the most recent headroom probe-ADD (issue #1141). Used
-    /// only by the anti-flap penalty box: if a layer is shed by BACKPRESSURE
-    /// within [`LAYER_PROBE_OSCILLATION_WINDOW_MS`] of this marker, the add is
-    /// judged an oscillation and the penalty box is armed/escalated. `None` when
+    /// only by the anti-flap penalty box: if a layer is shed within
+    /// [`LAYER_PROBE_OSCILLATION_WINDOW_MS`] of this marker, the add is judged an
+    /// oscillation and the penalty box is armed/escalated. `None` when
     /// no probe-add is "in flight" (never added, or the last add already aged out
     /// of the oscillation window / was shed).
     last_probe_add_at_ms: Option<f64>,
 
     /// Timestamp (ms) until which headroom probe-adds are suppressed by the
     /// anti-flap penalty box (issue #1141). Armed when a probed-up layer is shed
-    /// by backpressure within the oscillation window. `0.0` means no penalty is
+    /// within the oscillation window. `0.0` means no penalty is
     /// active (`now >= 0.0` is always true, so the gate is open).
     layer_probe_penalty_until_ms: f64,
 
@@ -250,12 +251,22 @@ pub struct EncoderBitrateController {
     /// The highest active-layer count this controller has EARNED at runtime and
     /// is entitled to recover back to (issue #1140 / #1141). Distinct from the
     /// device ceiling (`simulcast_layer_count`): the ramp starts active at 1 and
-    /// only raises this as headroom probes succeed. The backpressure union-restore
+    /// rises as headroom probes succeed or a no-cap tier step-up re-earns a layer;
+    /// a forced shed lowers it to the remaining active count. The backpressure union-restore
     /// path clamps recovery to THIS earned ceiling rather than the full ladder, so
     /// a transient clear cannot vault active straight back to the device max
     /// without re-earning each rung. A legacy full-ladder `set_simulcast_layers`
     /// sets this to the full active count (byte-identical to pre-ramp behavior).
     earned_active_ceiling: usize,
+
+    /// Timestamp (ms) of the most recent uplink-drop hold stamp; `None` if none (issue 2811).
+    last_uplink_drop_ms: Option<f64>,
+
+    /// Bit per AQ tick over the last `LAYER_PROBE_UPLINK_TICK_WINDOW` ticks; set = an uplink axis advanced.
+    uplink_advance_ticks: u8,
+
+    /// Throttle timestamp for the drop-activity probe-hold log (issue 2811).
+    last_drop_activity_hold_log_ms: f64,
 }
 
 impl EncoderBitrateController {
@@ -368,6 +379,9 @@ impl EncoderBitrateController {
             layer_probe_penalty_ms: LAYER_PROBE_PENALTY_BASE_MS,
             union_cap_shed_total: 0,
             earned_active_ceiling: 1,
+            last_uplink_drop_ms: None,
+            uplink_advance_ticks: 0,
+            last_drop_activity_hold_log_ms: 0.0,
         }
     }
 
@@ -443,13 +457,9 @@ impl EncoderBitrateController {
     /// under sustained backpressure, and the ramp can still earn the deferred
     /// MIDDLE `medium` rung up to the full ceiling.
     ///
-    /// `earned_active_ceiling` is set to the seeded active count, NOT 1 — this is
-    /// load-bearing: the backpressure union/cap-restore path in
-    /// [`tick`](Self::tick) clamps recovery to `earned_active_ceiling`, so if a
-    /// transient congestion blip sheds the optimistic rung, the controller is
-    /// entitled to restore back UP to the seeded baseline without re-earning it
-    /// through a fresh 6 s probe. (Down-side shedding via `drop_top_layer` floors
-    /// at 1 and does not consult this ceiling, so shed-to-floor still works.) The
+    /// `earned_active_ceiling` is set to the seeded active count, NOT 1, so the
+    /// cap-restore path in [`tick`](Self::tick) may recover to the seed after a
+    /// cap-only shed; a forced shed lowers it (see `note_forced_layer_shed`). The
     /// per-layer tier table is built for the FULL ceiling. Call once after
     /// construction / on each (re)share rising edge, before the first tick.
     pub fn set_simulcast_ceiling_start_optimistic(&mut self, n: usize, initial_active: usize) {
@@ -483,16 +493,11 @@ impl EncoderBitrateController {
             tiers.iter().map(|t| t.ideal_bitrate_kbps as f64).collect();
     }
 
-    /// Whether there is genuine UPLINK room to add one more simulcast layer
-    /// (issue #1141).
-    ///
-    /// `encode_queue_size()` backpressure detects CPU/encoder saturation, NOT "my
-    /// uplink cannot carry another rung even though my CPU is bored". This gate
-    /// closes that gap: a probe-up is permitted only when the uplink budget for
-    /// `active + 1` layers exceeds the budget for `active` layers by at least
-    /// [`LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC`] of the current budget — i.e. the
-    /// next rung's nominal cost genuinely fits. Returns `false` at the ceiling
-    /// (nothing to add) and in single-stream mode (`layer_tiers` empty).
+    /// Whether the next simulcast layer's nominal bitrate exceeds the current
+    /// budget by more than [`LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC`] of it (issue
+    /// #1141). A minimum-benefit test, not an uplink-headroom test; see the
+    /// constant's doc. Returns `false` at the ceiling (nothing to add) and in
+    /// single-stream mode (`layer_tiers` empty).
     fn uplink_precondition_for_add(&self) -> bool {
         let active = self.quality_manager.active_layer_count();
         let ceiling = self.quality_manager.simulcast_layer_count();
@@ -513,9 +518,8 @@ impl EncoderBitrateController {
     ///
     /// 1. simulcast mode (a ceiling > 1 exists);
     /// 2. `active_layer_count` is below the device ceiling (room to add);
-    /// 3. the relay layer-union cap (`max_layer + 1` count; `usize::MAX` =
-    ///    fail-open) permits another active layer — never probe a rung no
-    ///    receiver wants;
+    /// 3. both the relay layer-union cap (`usize::MAX` = fail-open) and the user
+    ///    send-layer ceiling permit another active layer;
     /// 4. NOT under a backpressure `degrade` this tick, and NOT inside a
     ///    self-targeted CONGESTION drain hold (climbing mid-shed/mid-drain would
     ///    immediately re-flap);
@@ -525,9 +529,14 @@ impl EncoderBitrateController {
     /// 7. the forced-transition guards (warmup + min-transition interval) are
     ///    clear — reusing the same gate the force_* layer sheds use, so a probe
     ///    cannot fire during warmup or back-to-back with another transition;
-    /// 8. there is genuine uplink headroom for the next rung
-    ///    ([`uplink_precondition_for_add`](Self::uplink_precondition_for_add)).
-    fn probe_add_allowed(&self, now: f64, degrade: bool) -> bool {
+    /// 8. no video step-DOWN within [`LAYER_PROBE_CLEAR_WINDOW_MS`] (the
+    ///    tier-quiet precondition, issue #2179, for out-of-band tier axes);
+    /// 9. no uplink-drop hold stamp within [`LAYER_PROBE_CLEAR_WINDOW_MS`]; the stamp
+    ///    needs [`LAYER_PROBE_UPLINK_HOLD_TICKS`] of the last
+    ///    [`LAYER_PROBE_UPLINK_TICK_WINDOW`] AQ ticks to have seen an axis advance (issue 2811);
+    /// 10. the next video layer's relative benefit clears [`LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC`]
+    ///     ([`uplink_precondition_for_add`](Self::uplink_precondition_for_add)).
+    fn probe_add_allowed(&mut self, now: f64, degrade: bool) -> bool {
         if !self.quality_manager.is_simulcast() {
             return false;
         }
@@ -578,6 +587,16 @@ impl EncoderBitrateController {
             .quality_manager
             .no_video_step_down_within(now, LAYER_PROBE_CLEAR_WINDOW_MS)
         {
+            return false;
+        }
+        if !self.no_uplink_drop_within(now, LAYER_PROBE_CLEAR_WINDOW_MS) {
+            if now - self.last_drop_activity_hold_log_ms >= AQ_SUMMARY_INTERVAL_MS {
+                self.last_drop_activity_hold_log_ms = now;
+                log::info!(
+                    "AQ_LAYER_PROBE: held by uplink axis activity (stamp within {:.0}ms)",
+                    LAYER_PROBE_CLEAR_WINDOW_MS,
+                );
+            }
             return false;
         }
         // Relative benefit of the next rung (see the constant's own doc for why
@@ -709,12 +728,20 @@ impl EncoderBitrateController {
             let degrade_down = (tier_changed && tier_index_after > tier_index_before)
                 || self.quality_manager.wanted_degrade_at_floor();
             let recover_up = tier_changed && tier_index_after < tier_index_before;
+            let cap = self
+                .union_requested_layer_cap
+                .min(self.user_layer_ceiling_cap);
+            let restore_allowed = cap == usize::MAX
+                || self.quality_manager.active_layer_count() < self.earned_active_ceiling.min(cap);
             if degrade_down {
                 if self.quality_manager.drop_top_layer() {
                     self.tier_changed = true;
                 }
-            } else if recover_up && self.quality_manager.add_top_layer() {
+            } else if recover_up && restore_allowed && self.quality_manager.add_top_layer() {
                 self.tier_changed = true;
+                self.earned_active_ceiling = self
+                    .earned_active_ceiling
+                    .max(self.quality_manager.active_layer_count());
             }
         }
         if tier_changed {
@@ -1019,17 +1046,11 @@ impl EncoderBitrateController {
     /// only decides whether that shed counts as a flap. It does NOT clear
     /// `last_probe_add_at_ms` — the caller owns that, because the `tick` path
     /// clears it on ANY shed (backpressure or union) while the out-of-band
-    /// `force_congestion_cut` path clears it on the cut it just performed.
+    /// forced paths clear it in `note_forced_layer_shed`.
     ///
-    /// Two call sites share this so they cannot drift apart (issue #1159):
-    /// 1. `tick`'s in-band backpressure shed, and
-    /// 2. `force_congestion_cut`'s OUT-OF-BAND top-layer drop. Before #1159 the
-    ///    cut path touched no `layer_probe_*` field, so an uplink-driven cut of a
-    ///    probed layer never escalated the backoff and re-flapped every
-    ///    ~`CONGESTION_HOLD_MS`; routing it here fixes that.
-    ///
-    /// `cause` is a short label for the log line (e.g. `"backpressure"` or
-    /// `"congestion_cut"`) identifying which path detected the flap.
+    /// Shared by `tick`'s backpressure shed and `note_forced_layer_shed` (issues
+    /// #1159, 2811). `cause` labels the log line: `"backpressure"`,
+    /// `"congestion_cut"`, `"forced_step_down"`.
     fn arm_probe_penalty_if_oscillation(&mut self, now: f64, cause: &str) -> bool {
         let is_oscillation = self
             .last_probe_add_at_ms
@@ -1049,6 +1070,17 @@ impl EncoderBitrateController {
         self.layer_probe_penalty_ms = (self.layer_probe_penalty_ms * LAYER_PROBE_PENALTY_BACKOFF)
             .min(LAYER_PROBE_PENALTY_MAX_MS);
         true
+    }
+
+    /// Shared by the out-of-band forced sheds: penalty, probe marker, earned
+    /// ceiling, probe quiet window.
+    fn note_forced_layer_shed(&mut self, now: f64, cause: &str) {
+        self.arm_probe_penalty_if_oscillation(now, cause);
+        self.last_probe_add_at_ms = None;
+        self.quality_manager.record_forced_layer_shed(now);
+        self.earned_active_ceiling = self
+            .earned_active_ceiling
+            .min(self.quality_manager.active_layer_count());
     }
 
     /// Compute and store per-layer target bitrates for the active simulcast
@@ -1302,6 +1334,23 @@ impl EncoderBitrateController {
         self.user_layer_ceiling_cap
     }
 
+    /// One AQ tick's uplink-axis reading for the probe-hold gate (issue 2811). Call once per
+    /// AQ tick, before `tick`; stamps the hold only once `LAYER_PROBE_UPLINK_HOLD_TICKS` of the
+    /// last `LAYER_PROBE_UPLINK_TICK_WINDOW` ticks advanced.
+    pub fn observe_uplink_axis_tick(&mut self, now: f64, advanced: bool) {
+        let mask = (1u8 << LAYER_PROBE_UPLINK_TICK_WINDOW) - 1;
+        self.uplink_advance_ticks = ((self.uplink_advance_ticks << 1) | advanced as u8) & mask;
+        if self.uplink_advance_ticks.count_ones() >= LAYER_PROBE_UPLINK_HOLD_TICKS {
+            self.last_uplink_drop_ms = Some(now);
+        }
+    }
+
+    /// Mirrors [`AdaptiveQualityManager::no_video_step_down_within`] for the uplink axis (issue 2811).
+    fn no_uplink_drop_within(&self, now: f64, window_ms: f64) -> bool {
+        self.last_uplink_drop_ms
+            .is_none_or(|last| now - last >= window_ms)
+    }
+
     /// Force an immediate video quality step-down due to server congestion.
     ///
     /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
@@ -1330,6 +1379,7 @@ impl EncoderBitrateController {
             && self.quality_manager.drop_top_layer()
         {
             self.tier_changed = true;
+            self.note_forced_layer_shed(now, "forced_step_down");
         }
         if changed {
             self.tier_changed = true;
@@ -1406,8 +1456,7 @@ impl EncoderBitrateController {
             // re-probing on the same cadence forever. Mirror the `tick` path and
             // clear the in-flight probe marker afterward: the probed layer is gone,
             // so a LATER shed must not be penalized against this same add.
-            self.arm_probe_penalty_if_oscillation(now, "congestion_cut");
-            self.last_probe_add_at_ms = None;
+            self.note_forced_layer_shed(now, "congestion_cut");
         }
         if changed {
             self.tier_changed = true;
@@ -1632,9 +1681,10 @@ mod tests {
     use crate::constants::{
         ENCODER_BACKPRESSURE_SUSTAIN_MS, ENCODER_QUEUE_BACKPRESSURE_CLEAR,
         ENCODER_QUEUE_BACKPRESSURE_HIGH, LAYER_PROBE_CLEAR_WINDOW_MS,
-        LAYER_PROBE_OSCILLATION_WINDOW_MS, LAYER_PROBE_PENALTY_BASE_MS,
-        MIN_TIER_TRANSITION_INTERVAL_MS, QUALITY_WARMUP_MS, SCREEN_QUALITY_TIERS,
-        STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_QUALITY_TIERS,
+        LAYER_PROBE_OSCILLATION_WINDOW_MS, LAYER_PROBE_PENALTY_BACKOFF,
+        LAYER_PROBE_PENALTY_BASE_MS, MIN_TIER_TRANSITION_INTERVAL_MS, QUALITY_WARMUP_MS,
+        SCREEN_QUALITY_TIERS, STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS,
+        VIDEO_QUALITY_TIERS,
     };
     use crate::manager::AdaptiveQualityManager;
     use std::sync::atomic::AtomicU32;
@@ -1684,6 +1734,17 @@ mod tests {
         clock.set_ms(t_ms as u64);
         controller.observe_encoder_queue_depth(depth);
         controller.tick(t_ms);
+    }
+
+    /// One AQ-loop tick as the camera encoder drives it: uplink-axis reading, then `tick`.
+    fn tick_uplink(
+        controller: &mut EncoderBitrateController,
+        clock: &Arc<TestClock>,
+        t_ms: f64,
+        advanced: bool,
+    ) {
+        controller.observe_uplink_axis_tick(t_ms, advanced);
+        tick_at(controller, clock, t_ms, 0);
     }
 
     /// Tick repeatedly with backpressure CLEAR (depth 0) from `start_ms`,
@@ -3638,7 +3699,7 @@ mod tests {
     /// the sender's TIER axis is still shedding, even though the encoder queue is
     /// perfectly clear.
     ///
-    /// This is the out-of-band case the other seven gates are blind to: the WS
+    /// This is the out-of-band case gates 4 and 6 are blind to: the WS
     /// send-buffer / WS stale-delta / WT unistream drop bursts all call
     /// `force_video_step_down` without ever touching `encode_queue_size()`, so
     /// the 6 s clear dwell and the `degrade` check both read "healthy" while the
@@ -3690,6 +3751,809 @@ mod tests {
             controller.active_layer_count(),
             2,
             "the quiet window must RE-OPEN the probe, not pin the ladder at base"
+        );
+    }
+
+    /// Camera controller with the tier pinned at its floor by the user `best`
+    /// bound (so the tier step-up cannot restore a layer) and video layer 1 just probed.
+    fn floor_pinned_controller_with_probed_layer(
+        clock: &Arc<TestClock>,
+        base_ms: u64,
+    ) -> (EncoderBitrateController, f64) {
+        let mut controller = probe_controller_with_clock(clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let mut t = warm_up(&mut controller, clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        let floor = VIDEO_QUALITY_TIERS.len() - 1;
+        clock.set_ms(t as u64);
+        controller.set_video_quality_bounds(Some(floor), None);
+        assert_eq!(
+            controller.video_tier_index(),
+            floor,
+            "precondition: the bound moves the tier to its floor"
+        );
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: the probe earned video layer 1"
+        );
+        assert!(
+            controller.last_probe_add_at_ms.is_some(),
+            "precondition: the add was the probe's, not a tier step-up's"
+        );
+        assert_eq!(
+            controller.video_tier_index(),
+            floor,
+            "precondition: the tier stayed at the floor through the ramp"
+        );
+        (controller, t)
+    }
+
+    /// a1: a forced shed of a probed layer at the tier floor arms the penalty box.
+    #[test]
+    fn forced_floor_shed_of_a_probed_layer_arms_the_penalty_box() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, added_at) = floor_pinned_controller_with_probed_layer(&clock, base_ms);
+        let floor = controller.video_tier_index();
+
+        let shed_at = added_at + 2_000.0;
+        assert!(
+            shed_at - added_at < LAYER_PROBE_OSCILLATION_WINDOW_MS,
+            "test precondition: the shed lands inside the oscillation window"
+        );
+        clock.set_ms(shed_at as u64);
+        assert!(
+            !controller.force_video_step_down(),
+            "precondition: at the floor the tier cannot move"
+        );
+        assert_eq!(controller.video_tier_index(), floor);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the forced step-down sheds the layer even at the tier floor"
+        );
+        assert!(
+            controller.layer_probe_penalty_until_ms > shed_at,
+            "a forced shed inside the oscillation window must arm the penalty box \
+             (penalty_until={} now={})",
+            controller.layer_probe_penalty_until_ms,
+            shed_at,
+        );
+
+        for i in 1..=12 {
+            tick_at(&mut controller, &clock, shed_at + i as f64 * 1_000.0, 0);
+            assert_eq!(
+                controller.active_layer_count(),
+                1,
+                "the probe re-added the shed layer {i} s after the shed"
+            );
+        }
+
+        tick_at(
+            &mut controller,
+            &clock,
+            shed_at + LAYER_PROBE_PENALTY_BASE_MS + 1_000.0,
+            0,
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "past the penalty the probe must re-add the layer"
+        );
+    }
+
+    /// a2: a floor shed stamps the probe's quiet window. The shed lands outside the
+    /// oscillation window, which also pins that a1 does not arm unconditionally.
+    #[test]
+    fn forced_floor_shed_stamps_the_probe_quiet_window() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, added_at) = floor_pinned_controller_with_probed_layer(&clock, base_ms);
+        // Hold the probe at 2 so the ticks below cannot add video layer 2.
+        controller.observe_union_requested_layer(1);
+        let mut t = added_at + LAYER_PROBE_OSCILLATION_WINDOW_MS + 500.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(controller.active_layer_count(), 2);
+        assert!(
+            controller.last_probe_add_at_ms.is_none(),
+            "precondition: the probe-add aged out of the oscillation window"
+        );
+
+        // The dwell re-armed at that tick is satisfied at shed + 4 s, so only a2 can hold the probe.
+        let shed_at = t + 3_500.0;
+        assert!(
+            controller
+                .quality_manager
+                .no_video_step_down_within(shed_at, LAYER_PROBE_CLEAR_WINDOW_MS),
+            "precondition: no step-down stamped before the shed"
+        );
+        clock.set_ms(shed_at as u64);
+        assert!(!controller.force_video_step_down());
+        assert_eq!(controller.active_layer_count(), 1);
+        assert!(
+            controller.layer_probe_penalty_until_ms <= shed_at,
+            "a shed outside the oscillation window must not arm the penalty box"
+        );
+        assert!(
+            !controller
+                .quality_manager
+                .no_video_step_down_within(shed_at + 1.0, LAYER_PROBE_CLEAR_WINDOW_MS),
+            "a floor shed must stamp the probe's quiet window"
+        );
+
+        t = shed_at + 4_000.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "a layer was re-added inside the quiet window"
+        );
+        t = shed_at + LAYER_PROBE_CLEAR_WINDOW_MS + 500.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "the quiet window must re-open the probe"
+        );
+    }
+
+    /// Full 3-layer ladder earned with a non-binding relay union cap present.
+    fn capped_controller_with_full_ladder(
+        clock: &Arc<TestClock>,
+        base_ms: u64,
+    ) -> (EncoderBitrateController, f64) {
+        let mut controller = probe_controller_with_clock(clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        controller.observe_union_requested_layer(2);
+        let mut t = warm_up(&mut controller, clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..8 {
+            t += probe_step_ms();
+            tick_at(&mut controller, clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "precondition: the probe earned the full ladder"
+        );
+        assert_eq!(controller.earned_active_ceiling, 3);
+        (controller, t)
+    }
+
+    /// a3: a forced shed lowers the earned ceiling, so the union-cap restore cannot
+    /// climb back above it.
+    #[test]
+    fn union_restore_does_not_climb_above_a_forced_shed() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, mut t) = capped_controller_with_full_ladder(&clock, base_ms);
+
+        t += 2_000.0;
+        clock.set_ms(t as u64);
+        assert!(controller.force_video_step_down());
+        assert_eq!(controller.active_layer_count(), 2);
+        assert_eq!(
+            controller.earned_active_ceiling, 2,
+            "a forced shed must lower the earned ceiling to the remaining active count"
+        );
+
+        // Dead-band depth: neither the probe dwell nor the tier step-up can move active.
+        let dead_band = ENCODER_QUEUE_BACKPRESSURE_CLEAR + 1;
+        assert!(dead_band < ENCODER_QUEUE_BACKPRESSURE_HIGH);
+        for _ in 0..6 {
+            t += 2_000.0;
+            tick_at(&mut controller, &clock, t, dead_band);
+            assert_eq!(
+                controller.active_layer_count(),
+                2,
+                "the union-cap restore climbed above the forced shed"
+            );
+        }
+
+        let mut re_earned = false;
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                re_earned = true;
+                break;
+            }
+        }
+        assert!(re_earned, "the lowered ceiling must be re-earnable");
+    }
+
+    /// a2 (congestion path): a `force_congestion_cut` of a probed layer stamps the
+    /// probe's quiet window, holding the ramp for `LAYER_PROBE_CLEAR_WINDOW_MS`.
+    #[test]
+    fn congestion_cut_stamps_the_probe_quiet_window() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = probe_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        // Cap at 2 active layers so the ticks below only ever re-add the shed
+        // video layer 1, never probe toward video layer 2.
+        controller.observe_union_requested_layer(1);
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..8 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: the probe earned video layer 1"
+        );
+
+        // The probe-add reset the clear dwell; re-arm it and hold the queue clear
+        // so the dwell stays satisfied through the cut and both post-cut asserts,
+        // leaving the quiet window (a2) as the sole hold on the re-add below.
+        t += 1_000.0;
+        tick_at(&mut controller, &clock, t, 0);
+
+        // Age the probe-add out of the oscillation window so the cut is NOT a flap:
+        // this isolates a2 (quiet window) from a1 (penalty box).
+        t += LAYER_PROBE_OSCILLATION_WINDOW_MS + 500.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert!(
+            controller.last_probe_add_at_ms.is_none(),
+            "precondition: the probe-add aged out of the oscillation window"
+        );
+        assert_eq!(controller.active_layer_count(), 2);
+
+        let shed_at = t + 1_100.0; // > MIN_TIER_TRANSITION_INTERVAL_MS since the last tier move
+        clock.set_ms(shed_at as u64);
+        assert!(
+            controller
+                .quality_manager
+                .no_video_step_down_within(shed_at, LAYER_PROBE_CLEAR_WINDOW_MS),
+            "precondition: no step-down stamped before the cut"
+        );
+        controller.force_congestion_cut();
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the congestion cut sheds the probed top layer"
+        );
+        assert!(
+            controller.layer_probe_penalty_until_ms <= shed_at,
+            "a cut outside the oscillation window must not arm the penalty box (a1 isolated)"
+        );
+        assert!(
+            !controller
+                .quality_manager
+                .no_video_step_down_within(shed_at + 1.0, LAYER_PROBE_CLEAR_WINDOW_MS),
+            "the congestion cut must stamp the probe's quiet window"
+        );
+
+        // Past the ~2.5 s drain hold but inside the 6 s quiet window. Assert the
+        // clear dwell is satisfied HERE so the re-add can only be held by a2 — the
+        // check that makes the behavioral assert below bite the consumer gate.
+        let in_window = shed_at + 4_000.0;
+        assert!(
+            controller
+                .layer_probe_clear_since_ms
+                .is_some_and(|since| in_window - since >= LAYER_PROBE_CLEAR_WINDOW_MS),
+            "isolation: the clear dwell must be satisfied, so only a2 can hold the re-add"
+        );
+        tick_at(&mut controller, &clock, in_window, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "a layer was re-added inside the quiet window"
+        );
+
+        // Past the quiet window: the ramp re-opens, so a2 is time-bounded.
+        tick_at(
+            &mut controller,
+            &clock,
+            shed_at + LAYER_PROBE_CLEAR_WINDOW_MS + 500.0,
+            0,
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "the quiet window must re-open the probe"
+        );
+    }
+
+    /// a3 (congestion path): a `force_congestion_cut` under a cap of 3 lowers the
+    /// earned ceiling, so the cap restore cannot re-add the shed layer.
+    #[test]
+    fn congestion_cut_lowers_the_earned_ceiling_under_a_cap() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, mut t) = capped_controller_with_full_ladder(&clock, base_ms);
+
+        t += 2_000.0;
+        clock.set_ms(t as u64);
+        assert!(controller.force_congestion_cut());
+        assert_eq!(controller.active_layer_count(), 2);
+        assert_eq!(
+            controller.earned_active_ceiling, 2,
+            "the congestion cut must lower the earned ceiling to the remaining active count"
+        );
+
+        // Dead-band depth: neither the probe dwell nor the tier step-up moves active,
+        // so only the cap restore can climb — and the lowered earned ceiling blocks it.
+        let dead_band = ENCODER_QUEUE_BACKPRESSURE_CLEAR + 1;
+        assert!(dead_band < ENCODER_QUEUE_BACKPRESSURE_HIGH);
+        for _ in 0..6 {
+            t += 2_000.0;
+            tick_at(&mut controller, &clock, t, dead_band);
+            assert_eq!(
+                controller.active_layer_count(),
+                2,
+                "the cap restore climbed above the congestion cut"
+            );
+        }
+    }
+
+    /// The forced shed must clear the probe marker, or `tick` ages it out and resets the backoff.
+    #[test]
+    fn repeated_forced_shed_flaps_escalate_the_penalty() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, added_at) = floor_pinned_controller_with_probed_layer(&clock, base_ms);
+
+        let first_shed = added_at + 2_000.0;
+        clock.set_ms(first_shed as u64);
+        controller.force_video_step_down();
+        assert_eq!(controller.active_layer_count(), 1);
+        assert!(
+            (controller.layer_probe_penalty_until_ms - (first_shed + LAYER_PROBE_PENALTY_BASE_MS))
+                .abs()
+                < 1.0,
+            "precondition: the first flap arms the base penalty"
+        );
+
+        let mut t = first_shed;
+        let mut re_added_at = None;
+        for _ in 0..30 {
+            t += 1_000.0;
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                re_added_at = Some(t);
+                break;
+            }
+        }
+        let re_added_at = re_added_at.expect("precondition: the probe re-adds after the penalty");
+        assert!(controller.last_probe_add_at_ms.is_some());
+
+        let second_shed = re_added_at + 2_000.0;
+        clock.set_ms(second_shed as u64);
+        controller.force_video_step_down();
+        assert_eq!(controller.active_layer_count(), 1);
+        let expected = second_shed + LAYER_PROBE_PENALTY_BASE_MS * LAYER_PROBE_PENALTY_BACKOFF;
+        assert!(
+            (controller.layer_probe_penalty_until_ms - expected).abs() < 1.0,
+            "the second flap must arm the escalated penalty (until={} expected={})",
+            controller.layer_probe_penalty_until_ms,
+            expected,
+        );
+    }
+
+    /// Warmed-up start-at-base camera controller ticked once a second with
+    /// `advanced(i)` on tick `i`; returns the tick at which `target` video layers became active.
+    fn first_probe_add_at(
+        ticks: usize,
+        target: usize,
+        advanced: impl Fn(usize) -> bool,
+    ) -> Option<f64> {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = probe_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let t0 = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        assert_eq!(controller.active_layer_count(), 1);
+        for i in 1..=ticks {
+            let t = t0 + i as f64 * 1_000.0;
+            tick_uplink(&mut controller, &clock, t, advanced(i));
+            if controller.active_layer_count() == target {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn single_uplink_advance_does_not_park_the_probe() {
+        let quiet = first_probe_add_at(20, 2, |_| false);
+        assert!(
+            quiet.is_some(),
+            "precondition: a quiet uplink lets the probe add"
+        );
+        assert_eq!(
+            first_probe_add_at(20, 2, |i| i == 1),
+            quiet,
+            "a single uplink advance delayed the probe add"
+        );
+    }
+
+    #[test]
+    fn alternating_advances_hold_the_probe() {
+        assert!(
+            first_probe_add_at(20, 2, |_| false).is_some(),
+            "precondition: a quiet uplink lets the probe add"
+        );
+        assert_eq!(
+            first_probe_add_at(20, 2, |i| i % 2 == 1),
+            None,
+            "advance, quiet, advance is 2 of 3 ticks and must hold the probe"
+        );
+    }
+
+    #[test]
+    fn one_advance_per_three_ticks_does_not_park_the_probe() {
+        let quiet = first_probe_add_at(20, 3, |_| false);
+        assert!(
+            quiet.is_some(),
+            "precondition: a quiet uplink lets the probe reach video layer 2"
+        );
+        assert_eq!(
+            first_probe_add_at(20, 3, |i| i % 3 == 0),
+            quiet,
+            "one advance every third tick parked the probe before video layer 2"
+        );
+    }
+
+    /// Warmed-up controller after `advancing` consecutive advancing 1 s ticks, each
+    /// asserted held. Returns (controller, clock, last advancing tick).
+    fn controller_after_sustained_uplink_advances(
+        advancing: usize,
+    ) -> (EncoderBitrateController, Arc<TestClock>, f64) {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = probe_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for i in 1..=advancing {
+            t += 1_000.0;
+            tick_uplink(&mut controller, &clock, t, true);
+            assert_eq!(
+                controller.active_layer_count(),
+                1,
+                "the probe climbed while uplink advances recurred at tick {i}"
+            );
+        }
+        (controller, clock, t)
+    }
+
+    #[test]
+    fn sustained_advances_hold_the_probe_then_reopen() {
+        let (mut controller, clock, last_advance) = controller_after_sustained_uplink_advances(8);
+
+        let last_stamp = last_advance + 1_000.0;
+        let mut t = last_advance;
+        while t + 1_000.0 <= last_stamp + LAYER_PROBE_CLEAR_WINDOW_MS - 1_000.0 {
+            t += 1_000.0;
+            tick_uplink(&mut controller, &clock, t, false);
+            assert_eq!(
+                controller.active_layer_count(),
+                1,
+                "the probe re-opened {} ms after the last advance",
+                t - last_advance
+            );
+        }
+        tick_uplink(
+            &mut controller,
+            &clock,
+            last_stamp + LAYER_PROBE_CLEAR_WINDOW_MS - 500.0,
+            false,
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the probe re-opened before the last stamp aged past the window"
+        );
+        tick_uplink(&mut controller, &clock, last_stamp + probe_step_ms(), false);
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "the drained window must re-open the probe, not pin the ladder"
+        );
+    }
+
+    #[test]
+    fn probe_hold_log_is_throttled_to_the_summary_interval() {
+        let (mut controller, clock, mut t) = controller_after_sustained_uplink_advances(2);
+
+        let mut first_log = None;
+        for _ in 0..20 {
+            t += 1_000.0;
+            tick_uplink(&mut controller, &clock, t, true);
+            assert_eq!(controller.active_layer_count(), 1);
+            if controller.last_drop_activity_hold_log_ms != 0.0 {
+                first_log = Some(t);
+                break;
+            }
+        }
+        let first_log = first_log.expect("the uplink hold never logged");
+        assert_eq!(controller.last_drop_activity_hold_log_ms, first_log);
+
+        while t + 1_000.0 < first_log + AQ_SUMMARY_INTERVAL_MS {
+            t += 1_000.0;
+            tick_uplink(&mut controller, &clock, t, true);
+            assert_eq!(controller.active_layer_count(), 1);
+            assert_eq!(
+                controller.last_drop_activity_hold_log_ms,
+                first_log,
+                "the hold log re-fired {} ms after the first",
+                t - first_log
+            );
+        }
+        let second = first_log + AQ_SUMMARY_INTERVAL_MS;
+        tick_uplink(&mut controller, &clock, second, true);
+        assert_eq!(controller.active_layer_count(), 1);
+        assert_eq!(controller.last_drop_activity_hold_log_ms, second);
+    }
+
+    #[test]
+    fn penalty_box_outlasts_the_uplink_activity_window() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, added_at) = floor_pinned_controller_with_probed_layer(&clock, base_ms);
+
+        let shed_at = added_at + 2_000.0;
+        tick_uplink(&mut controller, &clock, shed_at, true);
+        controller.force_video_step_down();
+        assert_eq!(controller.active_layer_count(), 1);
+        assert!(
+            (controller.layer_probe_penalty_until_ms - (shed_at + LAYER_PROBE_PENALTY_BASE_MS))
+                .abs()
+                < 1.0,
+            "precondition: the shed armed the base penalty"
+        );
+        tick_uplink(&mut controller, &clock, shed_at + 1_000.0, true);
+        assert!(
+            !controller.no_uplink_drop_within(shed_at + 1_000.0, LAYER_PROBE_CLEAR_WINDOW_MS),
+            "precondition: the advances stamped the uplink hold"
+        );
+
+        let held_ticks = (LAYER_PROBE_PENALTY_BASE_MS / 1_000.0) as usize - 1;
+        for i in 2..=held_ticks {
+            tick_uplink(&mut controller, &clock, shed_at + i as f64 * 1_000.0, false);
+            assert_eq!(
+                controller.active_layer_count(),
+                1,
+                "the probe re-added the shed layer {i} s after the shed, inside the penalty"
+            );
+        }
+        let penalty_end = shed_at + LAYER_PROBE_PENALTY_BASE_MS;
+        assert!(
+            controller.no_uplink_drop_within(penalty_end, LAYER_PROBE_CLEAR_WINDOW_MS),
+            "precondition: the uplink hold expired inside the penalty"
+        );
+        tick_uplink(&mut controller, &clock, penalty_end, false);
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "the activity window must not outlive the penalty when the drops stopped at the shed"
+        );
+    }
+
+    #[test]
+    fn uplink_activity_outlasts_the_penalty_box() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, added_at) = floor_pinned_controller_with_probed_layer(&clock, base_ms);
+
+        let shed_at = added_at + 2_000.0;
+        tick_uplink(&mut controller, &clock, shed_at, true);
+        controller.force_video_step_down();
+        assert_eq!(controller.active_layer_count(), 1);
+        assert!(
+            controller.layer_probe_penalty_until_ms > shed_at,
+            "precondition: the shed armed the penalty"
+        );
+
+        let last_advance_s = (LAYER_PROBE_PENALTY_BASE_MS / 1_000.0) as usize + 3;
+        for i in 1..=last_advance_s {
+            tick_uplink(&mut controller, &clock, shed_at + i as f64 * 1_000.0, true);
+            assert_eq!(
+                controller.active_layer_count(),
+                1,
+                "the probe re-added the shed layer {i} s after the shed while drops still recurred"
+            );
+        }
+        let last_stamp = shed_at + (last_advance_s + 1) as f64 * 1_000.0;
+        tick_uplink(&mut controller, &clock, last_stamp, false);
+        assert_eq!(controller.active_layer_count(), 1);
+        tick_uplink(&mut controller, &clock, last_stamp + probe_step_ms(), false);
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "the drop-activity hold must release once the sustained drops stop"
+        );
+    }
+
+    /// Under a cap the tier step-up must not restore a force-shed layer above the
+    /// earned ceiling: `restore_allowed` is false when `active >= earned.min(cap)`,
+    /// so the add is suppressed — no add happens.
+    #[test]
+    fn tier_step_up_does_not_restore_a_force_shed_layer_under_a_cap() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, mut t) = capped_controller_with_full_ladder(&clock, base_ms);
+        let tier_before = controller.video_tier_index();
+
+        t += 2_000.0;
+        clock.set_ms(t as u64);
+        assert!(controller.force_video_step_down());
+        assert_eq!(controller.active_layer_count(), 2);
+        let restores_after_shed = controller.quality_manager.layer_restore_total();
+        let shed_at = t;
+
+        let mut stepped_up = false;
+        for i in 1..=10 {
+            t = shed_at + i as f64 * 1_000.0;
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.video_tier_index() == tier_before {
+                stepped_up = true;
+                break;
+            }
+        }
+        assert!(stepped_up, "precondition: the tier stepped back up");
+        assert!(
+            t < controller.layer_probe_penalty_until_ms,
+            "precondition: the probe is still in the penalty box when the tier restores"
+        );
+        assert_eq!(controller.active_layer_count(), 2);
+        assert_eq!(
+            controller.quality_manager.layer_restore_total(),
+            restores_after_shed,
+            "the restore_allowed gate must suppress the add under a cap (no add happens)"
+        );
+    }
+
+    /// Without a cap the tier step-up's restore is authoritative and re-earns
+    /// the layer; otherwise a later non-binding LAYER_HINT would shed it as
+    /// `union_cap` (`active > earned`).
+    #[test]
+    fn no_cap_tier_step_up_re_earns_the_restored_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = probe_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..8 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "precondition: earned the full ladder"
+        );
+        let tier_before = controller.video_tier_index();
+
+        t += 2_000.0;
+        clock.set_ms(t as u64);
+        assert!(controller.force_video_step_down());
+        assert_eq!(controller.active_layer_count(), 2);
+        assert_eq!(controller.earned_active_ceiling, 2);
+
+        let shed_at = t;
+        let mut stepped_up = false;
+        for i in 1..=10 {
+            t = shed_at + i as f64 * 1_000.0;
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.video_tier_index() == tier_before {
+                stepped_up = true;
+                break;
+            }
+        }
+        assert!(stepped_up, "precondition: the tier stepped back up");
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "no cap: the step-up restores the layer"
+        );
+        assert_eq!(
+            controller.earned_active_ceiling, 3,
+            "a no-cap step-up restore must re-earn the layer"
+        );
+
+        // A non-binding hint (count 3) must not shed the restored layer.
+        controller.observe_union_requested_layer(2);
+        t += 1_000.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(controller.active_layer_count(), 3);
+        assert_eq!(
+            controller.union_cap_shed_total(),
+            0,
+            "a non-binding LAYER_HINT shed the layer the tier step-up restored"
+        );
+    }
+
+    /// The step-up gate must honour a cap BELOW the earned ceiling: with user cap
+    /// 2, earned 3 and active 2, an add would only be re-dropped in the same tick.
+    #[test]
+    fn tier_step_up_does_not_add_above_a_cap_below_the_earned_ceiling() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = probe_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..8 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "precondition: earned the full ladder"
+        );
+        let tier_before = controller.video_tier_index();
+
+        controller.observe_user_layer_ceiling(2);
+        t += 1_000.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: user cap suppressed to 2"
+        );
+        assert_eq!(
+            controller.earned_active_ceiling, 3,
+            "precondition: a cap shed keeps earned"
+        );
+
+        // In-band backpressure shed (keeps `earned`), then sustained clear.
+        let down_step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 200.0;
+        for _ in 0..6 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            if controller.active_layer_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "precondition: backpressure shed to base"
+        );
+        assert!(controller.video_tier_index() > tier_before);
+
+        let mut stepped_up = false;
+        let mut restores_at_cap = None;
+        for _ in 0..20 {
+            t += 1_000.0;
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 && restores_at_cap.is_none() {
+                restores_at_cap = Some(controller.quality_manager.layer_restore_total());
+            }
+            if controller.video_tier_index() == tier_before {
+                stepped_up = true;
+                break;
+            }
+        }
+        assert!(stepped_up, "precondition: the tier stepped back up");
+        let restores_at_cap =
+            restores_at_cap.expect("precondition: the cap restore brought active back to 2");
+        assert_eq!(controller.active_layer_count(), 2);
+        assert_eq!(
+            controller.quality_manager.layer_restore_total(),
+            restores_at_cap,
+            "the tier step-up added a layer above the user cap only for the cap block to re-drop it"
         );
     }
 }

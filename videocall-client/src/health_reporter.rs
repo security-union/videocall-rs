@@ -28,12 +28,12 @@ use crate::encode::{
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
     camera_encoder_frames_submitted_ok, camera_encoder_restarts_closed_codec,
     camera_encoder_restarts_configure, camera_encoder_restarts_memory,
-    camera_encoder_restarts_other, screen_encoder_errors_closed_codec,
+    camera_encoder_restarts_other, camera_ws_stale_delta_drops, screen_encoder_errors_closed_codec,
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
     screen_encoder_max_stall_gap_ms, screen_encoder_restarts_closed_codec,
     screen_encoder_restarts_configure, screen_encoder_restarts_memory,
-    screen_encoder_restarts_other, screen_encoder_stall_episodes,
+    screen_encoder_restarts_other, screen_encoder_stall_episodes, screen_ws_stale_delta_drops,
 };
 use log::{debug, trace, warn};
 use protobuf::Message;
@@ -101,10 +101,9 @@ pub struct PeerHealthData {
     pub decode_errors_total: u64,
     /// Issue #1878: windowed receive-side audio DATAGRAM loss (lost audio
     /// packets/sec) observed for this peer while THIS client is on WebTransport.
-    /// Nonzero only when audio riding unreliable QUIC datagrams is being dropped
+    /// Nonzero when audio riding unreliable QUIC datagrams is being dropped
     /// (e.g. the browser's incoming-datagram queue overflowing during a
-    /// main-thread stall) — the pathology was previously invisible in every
-    /// dashboard. ~0 on WebSocket and on E2EE-on WebTransport (reliable paths).
+    /// main-thread stall).
     ///
     /// A contiguous gap is booked as its positions shift off the reorder window,
     /// so the ones still inside it — which may yet arrive — are not counted yet.
@@ -1317,15 +1316,6 @@ impl HealthReporter {
                         &audio_health_log_batch,
                     );
 
-                    // Issue 2029: hand each per-peer WT audio-datagram loss
-                    // sample (peer id + pkt/s, ~1 Hz per audio-active WT peer,
-                    // incl. 0.0) to the connection manager's fallback detector.
-                    // Best-effort: a momentarily-borrowed manager just drops one
-                    // ~1 Hz sample. On WebSocket no sample is produced (the
-                    // emitter is gated on receiver_on_webtransport); on E2EE-on
-                    // WebTransport the reliable audio unistream has no datagram
-                    // gaps, so the fed value is a steady 0.0 the detector treats
-                    // as not-lossy — neither can trip the fallback.
                     if let Some((peer_id, loss_per_sec)) = audio_loss {
                         if let Some(cc_rc) = Weak::upgrade(&connection_controller) {
                             if let Ok(cc_opt) = cc_rc.try_borrow() {
@@ -2020,26 +2010,28 @@ impl HealthReporter {
                             packets_sent_per_sec,
                             rtt_probe_dropped_total,
                             rtt_probe_stale_suppressions_total,
+                            reliable_lane_stall_episodes_total,
                         ) = if let Some(cc_rc) = Weak::upgrade(&connection_controller) {
                             if let Ok(cc_opt) = cc_rc.try_borrow() {
                                 if let Some(cc) = cc_opt.as_ref() {
                                     // Calculate latest packet rates
                                     cc.calculate_packet_rates();
                                     (
-                                        cc.get_send_queue_depth(),
+                                        cc.health_send_queue_bytes(),
                                         Some(cc.get_packets_received_per_sec()),
                                         Some(cc.get_packets_sent_per_sec()),
                                         cc.rtt_probe_dropped_total(),
                                         cc.rtt_probe_stale_suppressions_total(),
+                                        cc.reliable_lane_stall_episodes_total(),
                                     )
                                 } else {
-                                    (None, None, None, 0, 0)
+                                    (None, None, None, 0, 0, 0)
                                 }
                             } else {
-                                (None, None, None, 0, 0)
+                                (None, None, None, 0, 0, 0)
                             }
                         } else {
-                            (None, None, None, 0, 0)
+                            (None, None, None, 0, 0, 0)
                         };
 
                         // Read encoder decision inputs from shared atomics (f32 bits → f64).
@@ -2223,6 +2215,8 @@ impl HealthReporter {
                             connection_session_drops(),
                             rtt_probe_dropped_total,
                             rtt_probe_stale_suppressions_total,
+                            reliable_lane_stall_episodes_total,
+                            videocall_transport::webtransport::inbound_unistream_reset_count(),
                             [
                                 reelection_proceeded_total(),
                                 reelection_aborted_total(),
@@ -2382,6 +2376,8 @@ impl HealthReporter {
         // via the connection controller. Cumulative since process start.
         rtt_probe_dropped_total: u64,
         rtt_probe_stale_suppressions_total: u64,
+        reliable_lane_stall_episodes_total: u64,
+        inbound_unistream_resets_total: u64,
         // Cumulative re-election outcome totals (Tier B #3), in the fixed order
         // [proceeded, aborted, preserved, failed]. Cumulative since process
         // start — the relay maps these onto a GaugeVec it .set()s, so the
@@ -2469,6 +2465,8 @@ impl HealthReporter {
         pb.unistream_bytes_offered_total = Some(unistream_bytes_offered_total);
         pb.unistream_bytes_drained_total = Some(unistream_bytes_drained_total);
         pb.unistream_stale_delta_drops_total = Some(unistream_stale_delta_drops_total);
+        pb.camera_ws_stale_delta_drops = Some(camera_ws_stale_delta_drops());
+        pb.screen_ws_stale_delta_drops = Some(screen_ws_stale_delta_drops());
         pb.websocket_drops_total = Some(websocket_drops_total);
         Self::set_ws_stream_counters(&mut pb);
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
@@ -2709,6 +2707,14 @@ impl HealthReporter {
         }
         if rtt_probe_stale_suppressions_total > 0 {
             pb.rtt_probe_stale_suppressions_total = Some(rtt_probe_stale_suppressions_total);
+        }
+
+        if reliable_lane_stall_episodes_total > 0 {
+            pb.reliable_lane_stall_episodes_total = Some(reliable_lane_stall_episodes_total);
+        }
+
+        if inbound_unistream_resets_total > 0 {
+            pb.inbound_unistream_resets_total = Some(inbound_unistream_resets_total);
         }
 
         // Re-election outcome counters (Tier B #3). Only attach a field when its
@@ -3226,18 +3232,6 @@ impl HealthReporter {
                 ps.decoder_errors_total = Some(health_data.decode_errors_total);
             }
 
-            // Issue #1878: receive-side audio DATAGRAM loss (audio sibling of
-            // video_seq_loss_per_sec above). Folded UNCONDITIONALLY as Some — like
-            // its sibling — so the exported gauge recovers to 0 instead of
-            // latching a stale value. On WebTransport we fold the tracker's live
-            // windowed value (refreshed ~1 Hz, including 0.0 when a loss burst
-            // clears). On WebSocket the value is definitionally 0.0 (audio rides
-            // ordered TCP — no datagram loss is possible), and folding 0.0 rather
-            // than `wt_datagram_audio_loss_per_sec` — which the emitter stops
-            // refreshing on WS and so pins at its last WT reading — un-latches the
-            // gauge on a mid-call WT→WS fallback. E2EE-WT is still "webtransport",
-            // so it folds the tracker value, which reads ~0 there because audio
-            // rides the reliable unistream.
             ps.audio_datagram_loss_per_sec = Some(if reporter_on_webtransport {
                 health_data.wt_datagram_audio_loss_per_sec
             } else {
@@ -3917,6 +3911,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -4038,6 +4034,8 @@ mod tests {
             0,
             0,
             0,
+            0, // reliable_lane_stall_episodes_total
+            0, // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0],
             Vec::new(),
             None,
@@ -4193,6 +4191,28 @@ mod tests {
         set_screen_encoder_stall_counters_for_test(0, 0);
     }
 
+    #[test]
+    fn ws_stale_delta_drop_counters_reach_the_wire_including_zero() {
+        use crate::encode::{
+            set_camera_ws_stale_delta_drops_for_test, set_screen_ws_stale_delta_drops_for_test,
+        };
+
+        set_camera_ws_stale_delta_drops_for_test(0);
+        set_screen_ws_stale_delta_drops_for_test(0);
+        let pb = built_health_packet(0, None);
+        assert_eq!(pb.camera_ws_stale_delta_drops, Some(0));
+        assert_eq!(pb.screen_ws_stale_delta_drops, Some(0));
+
+        set_camera_ws_stale_delta_drops_for_test(41);
+        set_screen_ws_stale_delta_drops_for_test(7);
+        let pb = built_health_packet(0, None);
+        assert_eq!(pb.camera_ws_stale_delta_drops, Some(41));
+        assert_eq!(pb.screen_ws_stale_delta_drops, Some(7));
+
+        set_camera_ws_stale_delta_drops_for_test(0);
+        set_screen_ws_stale_delta_drops_for_test(0);
+    }
+
     /// Build a HealthPacket through the production `create_health_packet` path and
     /// return the two stall fields as they landed on the wire.
     fn health_packet_stall_counters() -> (Option<u64>, Option<u64>) {
@@ -4238,6 +4258,8 @@ mod tests {
             0,
             0,
             0,
+            0, // reliable_lane_stall_episodes_total
+            0, // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0],
             Vec::new(),
             None,
@@ -4472,6 +4494,8 @@ mod tests {
             0,
             0,
             0,
+            0, // reliable_lane_stall_episodes_total
+            0, // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0],
             Vec::new(),
             None,
@@ -4728,6 +4752,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -4819,6 +4845,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -4849,6 +4877,8 @@ mod tests {
     fn health_packet_with_rtt_probe_signals(
         rtt_probe_dropped_total: u64,
         rtt_probe_stale_suppressions_total: u64,
+        reliable_lane_stall_episodes_total: u64,
+        inbound_unistream_resets_total: u64,
     ) -> PbHealthPacket {
         let mut health_map = HashMap::new();
         health_map.insert(
@@ -4893,6 +4923,8 @@ mod tests {
             0, // session_drops_total
             rtt_probe_dropped_total,
             rtt_probe_stale_suppressions_total,
+            reliable_lane_stall_episodes_total,
+            inbound_unistream_resets_total,
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -4922,7 +4954,7 @@ mod tests {
     /// failing the matching `Some(7)` / `Some(3)` assertion below.
     #[test]
     fn create_health_packet_emits_nonzero_rtt_probe_signals() {
-        let pb = health_packet_with_rtt_probe_signals(7, 3);
+        let pb = health_packet_with_rtt_probe_signals(7, 3, 5, 9);
         assert_eq!(
             pb.rtt_probe_dropped_total,
             Some(7),
@@ -4933,6 +4965,16 @@ mod tests {
             Some(3),
             "nonzero rtt_probe_stale_suppressions_total must round-trip as Some(3)"
         );
+        assert_eq!(
+            pb.reliable_lane_stall_episodes_total,
+            Some(5),
+            "nonzero reliable_lane_stall_episodes_total must round-trip as Some(5) (#2720)"
+        );
+        assert_eq!(
+            pb.inbound_unistream_resets_total,
+            Some(9),
+            "nonzero inbound_unistream_resets_total must round-trip as Some(9) (#2722)"
+        );
     }
 
     /// #522: zero counters must be omitted (gated on `> 0`), so they decode as
@@ -4942,7 +4984,7 @@ mod tests {
     /// fields decode as `Some(0)`, failing the `None` assertions below.
     #[test]
     fn create_health_packet_omits_zero_rtt_probe_signals() {
-        let pb = health_packet_with_rtt_probe_signals(0, 0);
+        let pb = health_packet_with_rtt_probe_signals(0, 0, 0, 0);
         assert_eq!(
             pb.rtt_probe_dropped_total, None,
             "zero rtt_probe_dropped_total must be omitted (None) per the > 0 gate"
@@ -4950,6 +4992,14 @@ mod tests {
         assert_eq!(
             pb.rtt_probe_stale_suppressions_total, None,
             "zero rtt_probe_stale_suppressions_total must be omitted (None) per the > 0 gate"
+        );
+        assert_eq!(
+            pb.reliable_lane_stall_episodes_total, None,
+            "zero reliable_lane_stall_episodes_total must be omitted (None) per the > 0 gate"
+        );
+        assert_eq!(
+            pb.inbound_unistream_resets_total, None,
+            "zero inbound_unistream_resets_total must be omitted (None) per the > 0 gate"
         );
     }
 
@@ -5009,6 +5059,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -5184,6 +5236,8 @@ mod tests {
             0,            // session_drops_total
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals
             Vec::new(),   // longtask_durations
             None,         // render_fps
@@ -5422,6 +5476,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -5450,6 +5506,16 @@ mod tests {
         drained_bytes: u64,
         stale_delta_drops: u64,
     ) -> PbHealthPacket {
+        health_packet_with_uplink_queue(offered_bytes, drained_bytes, stale_delta_drops, None)
+    }
+
+    /// Same, plus the `send_queue_bytes` uplink-depth gauge (#2722).
+    fn health_packet_with_uplink_queue(
+        offered_bytes: u64,
+        drained_bytes: u64,
+        stale_delta_drops: u64,
+        send_queue_bytes: Option<u64>,
+    ) -> PbHealthPacket {
         let mut health_map = HashMap::new();
         health_map.insert(
             "peer-1".to_string(),
@@ -5467,7 +5533,7 @@ mod tests {
             None,
             Some("webtransport".to_string()),
             Some(42.0),
-            None,
+            send_queue_bytes, // #2722: the uplink-depth gauge
             None,
             None,
             0,
@@ -5493,6 +5559,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -5545,6 +5613,29 @@ mod tests {
             Some(37),
             "stale-delta-drops total must round-trip as Some(37) on field 104 — distinct \
              from the byte totals so a tag collision or arg transposition is caught"
+        );
+    }
+
+    #[test]
+    fn create_health_packet_emits_the_uplink_queue_depth() {
+        let reported = health_packet_with_uplink_queue(0, 0, 0, Some(48_000));
+        assert_eq!(
+            reported.send_queue_bytes,
+            Some(48_000),
+            "a reported uplink depth must round-trip byte for byte"
+        );
+
+        let drained = health_packet_with_uplink_queue(0, 0, 0, Some(0));
+        assert_eq!(
+            drained.send_queue_bytes,
+            Some(0),
+            "an empty uplink queue is an honest zero, not an omitted field"
+        );
+
+        let unavailable = health_packet_with_uplink_queue(0, 0, 0, None);
+        assert_eq!(
+            unavailable.send_queue_bytes, None,
+            "with no elected connection there is no depth to report"
         );
     }
 
@@ -6001,6 +6092,8 @@ mod tests {
             0,
             0,
             0,
+            0, // reliable_lane_stall_episodes_total
+            0, // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0],
             Vec::new(),
             None,
@@ -6459,6 +6552,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -7461,6 +7556,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -7577,6 +7674,8 @@ mod tests {
             0,
             0,            // rtt_probe_dropped_total
             0,            // rtt_probe_stale_suppressions_total
+            0,            // reliable_lane_stall_episodes_total
+            0,            // inbound_unistream_resets_total (#2722)
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,

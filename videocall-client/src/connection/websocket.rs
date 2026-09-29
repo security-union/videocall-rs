@@ -21,11 +21,12 @@
 //
 use super::connection_lost_reason::ConnectionLostReason;
 use super::url_log::strip_query_for_log;
-use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
+use super::webmedia::{ConnectOptions, InboundLane, MediaStreamKey, ReceivedAtMs, WebMedia};
 use log::debug;
 use std::cell::Cell;
 use std::rc::Rc;
 use videocall_transport::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 
 impl WebMedia<WebSocketTask> for WebSocketTask {
@@ -95,11 +96,9 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
             "WebSocket connecting to {}",
             strip_query_for_log(&options.websocket_url)
         );
-        let task = WebSocketService::connect(
-            &options.websocket_url,
-            options.on_inbound_media,
-            notification,
-        )?;
+        let on_inbound_media = reliable_lane_adapter(options.on_inbound_media.clone());
+        let task =
+            WebSocketService::connect(&options.websocket_url, on_inbound_media, notification)?;
         debug!("WebSocket task created (connection pending)");
         Ok(task)
     }
@@ -120,5 +119,46 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
             }
         }
         self.send_binary_for_stream(bytes, stream_key.as_u8());
+    }
+}
+
+/// One TCP socket, no datagram lane: every WebSocket packet is reliable (#2720).
+fn reliable_lane_adapter(
+    callback: Callback<(PacketWrapper, InboundLane, ReceivedAtMs)>,
+) -> Callback<PacketWrapper> {
+    Callback::from(move |packet: PacketWrapper| {
+        callback.emit((
+            packet,
+            InboundLane::Reliable,
+            ReceivedAtMs(videocall_transport::clock::now_ms()),
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn websocket_inbound_packets_are_tagged_reliable() {
+        let seen: Rc<RefCell<Vec<InboundLane>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = {
+            let seen = Rc::clone(&seen);
+            Callback::from(
+                move |(_, lane, _): (PacketWrapper, InboundLane, ReceivedAtMs)| {
+                    seen.borrow_mut().push(lane);
+                },
+            )
+        };
+
+        reliable_lane_adapter(sink).emit(PacketWrapper::new());
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![InboundLane::Reliable],
+            "WebSocket has no datagram lane, so its packets must count as reliable liveness"
+        );
     }
 }

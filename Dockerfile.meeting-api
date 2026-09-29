@@ -26,4 +26,4 @@ COPY --from=build /app/dbmate /app/dbmate
 
 STOPSIGNAL SIGINT
 
-CMD [ "/bin/bash", "-c", "/app/dbmate/startup.sh && meeting-api" ]
+CMD [ "meeting-api" ]

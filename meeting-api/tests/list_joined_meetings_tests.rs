@@ -743,7 +743,9 @@ async fn test_list_joined_participant_and_waiting_counts_match_legacy() {
         .expect("meeting must appear in the host's joined list");
 
     let pk = lookup_meeting_pk(&pool, room_id).await;
-    let legacy_admitted = db_participants::count_admitted(&pool, pk).await.unwrap();
+    let legacy_admitted = db_participants::count_admitted(&pool, pk, true)
+        .await
+        .unwrap();
     let legacy_waiting = db_participants::count_waiting(&pool, pk).await.unwrap();
 
     assert_eq!(

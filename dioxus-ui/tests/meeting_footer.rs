@@ -598,9 +598,13 @@ async fn the_footer_sits_on_the_visible_viewport_bottom_when_its_container_is_ta
 }
 
 #[component]
-fn PinnedScreenTileWithZoomBar() -> Element {
+fn EnlargedShareWithZoomBar() -> Element {
     rsx! {
-        div { class: "split-screen-tile grid-item-pinned",
+        div {
+            class: "split-screen-tile share-tile",
+            "data-share-mode": "enlarged",
+            style: "position: fixed; left: 0; right: 0; top: 0; bottom: var(--meeting-footer-h); \
+                    height: auto;",
             div {
                 class: "canvas-container video-on",
                 "data-testid": "screen-canvas",
@@ -618,22 +622,22 @@ fn PinnedScreenTileWithZoomBar() -> Element {
     }
 }
 
-fn pinned_screen_tile_with_zoom_bar() -> Element {
-    rsx! { PinnedScreenTileWithZoomBar {} }
+fn enlarged_share_with_zoom_bar() -> Element {
+    rsx! { EnlargedShareWithZoomBar {} }
 }
 
 #[wasm_bindgen_test]
 async fn the_screen_share_zoom_bar_sits_on_the_dock_clearance_line_not_above_it() {
     let mount = fresh_mount();
     install_stylesheets("");
-    render_into(&mount, pinned_screen_tile_with_zoom_bar);
+    render_into(&mount, enlarged_share_with_zoom_bar);
     yield_now().await;
 
     let bottom_of = |selector: &str| html(&mount, selector).get_bounding_client_rect().bottom();
     let footer_top = bottom_of("[data-testid='footer-top-line']");
     assert!(
         (bottom_of("[data-testid='screen-canvas']") - footer_top).abs() < 1.0,
-        "premise: the pinned screen tile already ends at the footer's top edge ({footer_top})"
+        "premise: the enlarged screen tile already ends at the footer's top edge ({footer_top})"
     );
     let clearance_line = bottom_of("[data-testid='dock-clearance-line']");
     let zoom_bar = bottom_of("[data-testid='zoom-bar']");

@@ -2,13 +2,19 @@ import { test, expect, chromium, Locator, Page } from "@playwright/test";
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
 import { wakeControls } from "../helpers/controls";
 import { openPerformancePanel, readNetEqPacketsPerSec } from "../helpers/diagnostics-drawer";
+import {
+  getEncoderAudioGumCount,
+  getEncoderAudioTracks,
+  installGetUserMediaMock,
+} from "../helpers/media-mock";
 import { enterTwoUserMeeting } from "../helpers/two-user-meeting";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
- * E2E: the receiver's NetEq actually consumes the publisher's audio (issue 2622).
+ * E2E: the receiver's NetEq consumes the publisher's audio (issue 2622); the
+ * publisher keeps its mic device claim across a mute (issue 2772).
  * `packets_per_sec` is incremented only in `NetEq::insert_packet`, so no
- * heartbeat can move it. The three phases must stay ONE test: A and C both
+ * heartbeat can move it. The four phases must stay ONE test: A and C both
  * assert 0 and either alone passes on a build where audio never works.
  */
 
@@ -68,7 +74,7 @@ test.describe("#2622 receiver NetEq audio liveness", () => {
     await waitForServices();
   });
 
-  test("NetEq packets/s is 0 muted, rises when the publisher unmutes, and returns to 0 @bvt1", async ({
+  test("NetEq packets/s is 0 muted, rises on unmute, returns to 0, and rises again without re-acquiring the mic @bvt1", async ({
     baseURL,
   }) => {
     test.setTimeout(300_000);
@@ -93,6 +99,7 @@ test.describe("#2622 receiver NetEq audio liveness", () => {
       );
 
       const pubPage = await pubCtx.newPage();
+      await installGetUserMediaMock(pubPage);
       const rxPage = await rxCtx.newPage();
 
       const t0 = Date.now();
@@ -154,6 +161,28 @@ test.describe("#2622 receiver NetEq audio liveness", () => {
         .toBeGreaterThan(0);
       mark("phase B green");
 
+      // Phase B's poll returns on a RAMP value; half of one is below DTX rate.
+      const rampSamples: number[] = [];
+      rampSamples.push(await readNetEqPacketsPerSec(drawer));
+      await rxPage.waitForTimeout(1000);
+      rampSamples.push(await readNetEqPacketsPerSec(drawer));
+      await rxPage.waitForTimeout(1000);
+      rampSamples.push(await readNetEqPacketsPerSec(drawer));
+      const packetsWhileUnmuted = Math.max(...rampSamples);
+      expect(
+        packetsWhileUnmuted,
+        "issue 2772 setup: phase B's poll returns on a ramp value, so re-sample the " +
+          "rate here and require it non-zero — a zero denominator would make the " +
+          "phase-D1 ratio assertion pass on a silent reused track. " +
+          `rampSamples=[${rampSamples.join(", ")}]`,
+      ).toBeGreaterThan(0);
+      const encoderGumBeforeMute = await getEncoderAudioGumCount(pubPage);
+      expect(
+        encoderGumBeforeMute,
+        "issue 2772 setup: the mic encoder must have acquired at least one capture " +
+          "so far, else the phase-D comparison has no baseline.",
+      ).toBeGreaterThan(0);
+
       await setMic(pubPage, false);
 
       await expect
@@ -167,7 +196,38 @@ test.describe("#2622 receiver NetEq audio liveness", () => {
             "only if BOTH stop running.",
         })
         .toBe(0);
+
+      const mutedTracks = (await getEncoderAudioTracks(pubPage))[encoderGumBeforeMute - 1];
+      expect(
+        mutedTracks,
+        "issue 2772 phase C2: the muted publisher's encoder track must be PARKED — " +
+          "live (device still claimed) and disabled (no audio). `ended` means the " +
+          "mute stopped the track and released the device.",
+      ).toEqual([{ readyState: "live", enabled: false }]);
       mark("phase C green");
+
+      await setMic(pubPage, true);
+
+      // Not `> 0`: DTX plus no VAD gate means a silent track still emits.
+      await expect
+        .poll(async () => readNetEqPacketsPerSec(drawer), {
+          timeout: 45_000,
+          intervals: PHASE_POLL_INTERVALS,
+          message:
+            "issue 2772 phase D1: after the second unmute the receiver's NetEq rate " +
+            `must return to within 50% of the phase-B reading (${packetsWhileUnmuted}/s). ` +
+            "The publisher REUSES the capture it held across the mute, so a reuse " +
+            "path yielding a detached or silent track fails here.",
+        })
+        .toBeGreaterThan(packetsWhileUnmuted * 0.5);
+
+      expect(
+        await getEncoderAudioGumCount(pubPage),
+        "issue 2772 phase D2: the mute must not have released the microphone, so " +
+          "the unmute must NOT have re-run the encoder's getUserMedia. A rising " +
+          "count means the capture was stopped on mute and re-acquired.",
+      ).toBe(encoderGumBeforeMute);
+      mark("phase D green");
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();

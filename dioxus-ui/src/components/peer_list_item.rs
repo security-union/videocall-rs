@@ -16,6 +16,9 @@
  * conditions.
  */
 
+use crate::components::co_hosts::{
+    host_indicator, run_co_host_request, CoHostMenuIcon, CoHostNoticeCtx, CoHostRequest, HostRole,
+};
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::raised_hand::RaisedHandIcon;
@@ -23,12 +26,16 @@ use crate::components::icons::recording::RecordingIcon;
 use crate::components::raised_hands::raised_hand_badge_label;
 use crate::context::AppearanceSettingsCtx;
 use dioxus::prelude::*;
+use std::rc::Rc;
 
 #[component]
 pub fn PeerListItem(
     name: String,
     #[props(default)] tooltip: String,
     #[props(default)] is_host: bool,
+    /// The host role is held by a non-owner.
+    #[props(default)]
+    is_co_host: bool,
     #[props(default)] is_recording: bool,
     /// This participant's 1-based position in the raise-hand queue AND the queue
     /// length (issue 2135), or `None` when their hand is down.
@@ -51,16 +58,21 @@ pub fn PeerListItem(
     #[props(default)] on_disable_video: Option<EventHandler<()>>,
     #[props(default)] on_kick: Option<EventHandler<()>>,
     #[props(default)] on_transfer_host: Option<EventHandler<()>>,
+    #[props(default)] co_host_request: Option<CoHostRequest>,
 ) -> Element {
     let effective_tooltip = if tooltip.is_empty() {
         name.clone()
     } else {
         tooltip.clone()
     };
-    let title = if is_host {
-        format!("Host: {effective_tooltip}")
-    } else {
-        effective_tooltip
+    let role = match (is_host, is_co_host) {
+        (false, _) => None,
+        (true, false) => Some(HostRole::Host),
+        (true, true) => Some(HostRole::CoHost),
+    };
+    let title = match role {
+        Some(role) => format!("{}: {effective_tooltip}", role.label()),
+        None => effective_tooltip,
     };
 
     let mic_class = if speaking && !muted {
@@ -78,14 +90,20 @@ pub fn PeerListItem(
         String::new()
     };
 
-    let indicator = match (is_self, is_host) {
-        (true, true) => Some("(You/Host)"),
-        (true, false) => Some("(You)"),
-        (false, true) => Some("(Host)"),
-        (false, false) => None,
-    };
+    let indicator = host_indicator(is_self, role);
 
+    let co_host_notice = try_use_context::<CoHostNoticeCtx>();
     let mut peer_menu_open = use_signal(|| false);
+    let mut menu_trigger: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
+    // The chosen item unmounts with the menu; focus goes back to the trigger.
+    let mut close_menu = move || {
+        peer_menu_open.set(false);
+        if let Some(trigger) = menu_trigger.peek().clone() {
+            spawn(async move {
+                let _ = trigger.set_focus(true).await;
+            });
+        }
+    };
 
     rsx! {
         div { class: "peer_item", title,
@@ -152,13 +170,16 @@ pub fn PeerListItem(
                 }
             }
             if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some()
-                || on_transfer_host.is_some()
+                || on_transfer_host.is_some() || co_host_request.is_some()
             {
                 div { class: "peer_item_menu_wrapper",
                     button {
                         class: "peer_item_menu_btn",
                         title: "More options",
-                        aria_label: "More options",
+                        aria_label: "More options for {name}",
+                        "aria-expanded": if peer_menu_open() { "true" } else { "false" },
+                        "data-testid": "peer-item-menu-button",
+                        onmounted: move |e| menu_trigger.set(Some(e.data())),
                         onclick: move |e: MouseEvent| {
                             e.stop_propagation();
                             peer_menu_open.set(!peer_menu_open());
@@ -189,7 +210,7 @@ pub fn PeerListItem(
                                     class: "context-menu-item",
                                     onclick: move |e: MouseEvent| {
                                         e.stop_propagation();
-                                        peer_menu_open.set(false);
+                                        close_menu();
                                         on_mute.call(());
                                     },
                                     svg {
@@ -216,7 +237,7 @@ pub fn PeerListItem(
                                     class: "context-menu-item",
                                     onclick: move |e: MouseEvent| {
                                         e.stop_propagation();
-                                        peer_menu_open.set(false);
+                                        close_menu();
                                         on_disable_video.call(());
                                     },
                                     svg {
@@ -235,29 +256,20 @@ pub fn PeerListItem(
                                     "Disable video"
                                 }
                             }
-                            if let Some(on_kick) = on_kick {
+                            if let Some(request) = co_host_request.clone() {
                                 button {
                                     class: "context-menu-item",
-                                    onclick: move |e: MouseEvent| {
-                                        e.stop_propagation();
-                                        peer_menu_open.set(false);
-                                        on_kick.call(());
+                                    "data-testid": "peer-item-co-host-action",
+                                    onclick: {
+                                        let request = request.clone();
+                                        move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            close_menu();
+                                            run_co_host_request(request.clone(), co_host_notice);
+                                        }
                                     },
-                                    svg {
-                                        xmlns: "http://www.w3.org/2000/svg",
-                                        width: "16",
-                                        height: "16",
-                                        view_box: "0 0 24 24",
-                                        fill: "none",
-                                        stroke: "currentColor",
-                                        stroke_width: "2",
-                                        stroke_linecap: "round",
-                                        stroke_linejoin: "round",
-                                        path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
-                                        polyline { points: "17 8 21 12 17 16" }
-                                        line { x1: "21", y1: "12", x2: "9", y2: "12" }
-                                    }
-                                    "Remove from meeting"
+                                    CoHostMenuIcon { action: request.action, size: 16 }
+                                    "{request.action.label()}"
                                 }
                             }
                             if let Some(on_transfer_host) = on_transfer_host {
@@ -265,7 +277,7 @@ pub fn PeerListItem(
                                     class: "context-menu-item",
                                     onclick: move |e: MouseEvent| {
                                         e.stop_propagation();
-                                        peer_menu_open.set(false);
+                                        close_menu();
                                         on_transfer_host.call(());
                                     },
                                     svg {
@@ -284,6 +296,31 @@ pub fn PeerListItem(
                                         path { d: "M21 13v2a4 4 0 0 1-4 4H3" }
                                     }
                                     "Transfer host"
+                                }
+                            }
+                            if let Some(on_kick) = on_kick {
+                                button {
+                                    class: "context-menu-item",
+                                    onclick: move |e: MouseEvent| {
+                                        e.stop_propagation();
+                                        close_menu();
+                                        on_kick.call(());
+                                    },
+                                    svg {
+                                        xmlns: "http://www.w3.org/2000/svg",
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                        polyline { points: "17 8 21 12 17 16" }
+                                        line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                    }
+                                    "Remove from meeting"
                                 }
                             }
                         }

@@ -103,6 +103,54 @@ pub(super) fn pli_keyframe_allowed(
     }
 }
 
+/// At the tier floor a forced shed leaves the min-transition guard unarmed, so
+/// two axes crossing in one tick would shed two layers.
+#[inline]
+fn permit_forced_step_down(axis_wants: bool, already_stepped: bool) -> bool {
+    axis_wants && !already_stepped
+}
+
+/// A denied axis keeps its snapshot, so the tick that refused it does not also
+/// consume its evidence.
+#[inline]
+fn roll_window_after_permit(roll_window: bool, axis_wants: bool, permitted: bool) -> bool {
+    roll_window && (permitted || !axis_wants)
+}
+
+/// Spent by the first axis to cross in the encode loop's fixed axis order.
+pub(super) struct ForcedStepDownBudget {
+    spent: bool,
+}
+
+pub(super) struct AxisTickOutcome {
+    pub(super) permitted: bool,
+    pub(super) roll_window: bool,
+}
+
+impl ForcedStepDownBudget {
+    pub(super) fn new() -> Self {
+        Self { spent: false }
+    }
+
+    /// Spent outside the axis path by the server CONGESTION cut.
+    pub(super) fn spend(&mut self) {
+        self.spent = true;
+    }
+
+    pub(super) fn spent(&self) -> bool {
+        self.spent
+    }
+
+    pub(super) fn admit(&mut self, axis_wants: bool, roll_window: bool) -> AxisTickOutcome {
+        let permitted = permit_forced_step_down(axis_wants, self.spent);
+        self.spent |= permitted;
+        AxisTickOutcome {
+            permitted,
+            roll_window: roll_window_after_permit(roll_window, axis_wants, permitted),
+        }
+    }
+}
+
 /// Determines whether a periodic keyframe is due this frame (issue #1510).
 /// Shared by both camera and screen encode loops so the test exercises the
 /// exact production predicate (not a copy).
@@ -261,7 +309,8 @@ pub(super) fn keyframe_tick_decision(input: KeyframeTickInput) -> KeyframeTickDe
 #[cfg(test)]
 mod tests {
     use super::{
-        keyframe_tick_decision, pli_keyframe_allowed, ForcedKeyframeCause, KeyframeTickInput,
+        keyframe_tick_decision, permit_forced_step_down, pli_keyframe_allowed,
+        roll_window_after_permit, ForcedKeyframeCause, ForcedStepDownBudget, KeyframeTickInput,
     };
 
     /// Build a [`KeyframeTickInput`] with the cooldown-reset edge OFF (the common
@@ -461,5 +510,74 @@ mod tests {
             "after the one-shot reset is consumed, the coalescer resumes suppressing \
              PLIs inside the cooldown window"
         );
+    }
+
+    #[test]
+    fn only_the_first_axis_to_cross_in_a_tick_may_force_a_step_down() {
+        assert!(permit_forced_step_down(true, false));
+        assert!(!permit_forced_step_down(true, true));
+        assert!(!permit_forced_step_down(false, false));
+        assert!(!permit_forced_step_down(false, true));
+    }
+
+    #[test]
+    fn only_the_first_crossing_axis_in_a_tick_is_admitted_and_the_rest_retain() {
+        let mut budget = ForcedStepDownBudget::new();
+
+        let quiet = budget.admit(false, true);
+        assert!(!quiet.permitted);
+        assert!(quiet.roll_window, "an axis below threshold rolls normally");
+        assert!(!budget.spent());
+
+        let first = budget.admit(true, true);
+        assert!(first.permitted);
+        assert!(first.roll_window);
+        assert!(budget.spent());
+
+        let second = budget.admit(true, true);
+        assert!(
+            !second.permitted,
+            "the tick's budget was already spent by the first crossing axis"
+        );
+        assert!(
+            !second.roll_window,
+            "a denied axis must keep its drop evidence"
+        );
+
+        assert!(
+            ForcedStepDownBudget::new().admit(true, true).permitted,
+            "the next tick's fresh budget lets the retained axis cash"
+        );
+    }
+
+    #[test]
+    fn a_congestion_cut_spends_the_tick_budget_ahead_of_every_axis() {
+        let mut budget = ForcedStepDownBudget::new();
+        budget.spend();
+        let axis = budget.admit(true, true);
+        assert!(!axis.permitted);
+        assert!(
+            !axis.roll_window,
+            "a denied axis retains regardless of cause"
+        );
+    }
+
+    #[test]
+    fn a_denied_axis_keeps_its_window_which_is_cashable_at_the_tier_floor() {
+        let wants = true;
+        assert!(
+            !roll_window_after_permit(true, wants, permit_forced_step_down(wants, true)),
+            "a denied axis must keep its drop evidence"
+        );
+        assert!(roll_window_after_permit(
+            true,
+            wants,
+            permit_forced_step_down(wants, false)
+        ));
+        assert!(
+            roll_window_after_permit(true, false, false),
+            "an axis below threshold rolls normally"
+        );
+        assert!(!roll_window_after_permit(false, false, false));
     }
 }

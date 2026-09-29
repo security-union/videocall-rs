@@ -23,6 +23,8 @@ pub mod protos;
 pub mod url_log;
 pub mod user_id;
 pub mod validation;
+pub mod wt_close;
+pub mod wt_downlink;
 
 pub use callback::Callback;
 pub use feature_flags::{FeatureFlags, ResolvedFlag};

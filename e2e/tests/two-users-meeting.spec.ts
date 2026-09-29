@@ -6,6 +6,7 @@ import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 // raise-hand cross-peer specs. Moved verbatim to helpers/two-user-meeting.ts so
 // there is ONE implementation rather than two that drift.
 import { enterTwoUserMeeting, joinMeetingFromPage } from "../helpers/two-user-meeting";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 
@@ -51,6 +52,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 

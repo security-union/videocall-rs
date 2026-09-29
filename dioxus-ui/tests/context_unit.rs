@@ -22,6 +22,8 @@ use dioxus_ui::context::{
 };
 use videocall_types::validation::normalize_spaces;
 
+mod support;
+
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 // ---------------------------------------------------------------------------
@@ -361,14 +363,11 @@ fn transport_preference_parse_invalid_returns_err() {
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen_test]
-fn transport_preference_default_is_websocket() {
-    // The product default flipped from WebTransport to WebSocket: WebSocket is
-    // the proactive default and WebTransport is now opt-in. On the pre-flip
-    // code this assertion fails (default was WebTransport).
+fn transport_preference_default_is_webtransport() {
     assert_eq!(
         TransportPreference::default(),
-        TransportPreference::WebSocket,
-        "Default is now WebSocket; WebTransport is the opt-in, experimental choice"
+        TransportPreference::WebTransport,
+        "Default is WebTransport, with WebSocket as its fallback and the opt-out"
     );
 }
 
@@ -432,7 +431,7 @@ fn resolve_webtransport_with_server_wt_enabled_passes_through_both_lists() {
 }
 
 #[wasm_bindgen_test]
-fn resolve_webtransport_with_server_wt_disabled_passes_through() {
+fn resolve_webtransport_with_server_wt_disabled_empties_the_wt_list() {
     let ws = vec!["ws://a:8080".to_string()];
     let wt = vec!["https://a:4433".to_string()];
     let (enable_wt, ws_out, wt_out) = resolve_transport_config(
@@ -449,9 +448,10 @@ fn resolve_webtransport_with_server_wt_disabled_passes_through() {
         ws_out, ws,
         "WebTransport should pass WS URLs through unchanged"
     );
-    assert_eq!(
-        wt_out, wt,
-        "WebTransport should pass WT URLs through unchanged"
+    assert!(
+        wt_out.is_empty(),
+        "server WT disabled must EMPTY the WT list, not just clear the bool — \
+         ConnectionManager::update_server_urls has no enable_webtransport gate"
     );
 }
 
@@ -555,12 +555,12 @@ fn transport_preference_storage_round_trip() {
     // Start clean — no sticky, no pref, no session value.
     clear_transport_sticky_and_pref();
 
-    // Default (nothing stored) should return WebSocket.
     assert_eq!(
         load_transport_preference(),
-        TransportPreference::WebSocket,
+        TransportPreference::WebTransport,
         "With nothing stored, load_transport_preference should return the default \
-         (WebSocket — was WebTransport, and Auto before the protocol-settings simplification)"
+         (WebTransport since epic #2711 — briefly WebSocket, and Auto before the \
+         protocol-settings simplification)"
     );
 
     // The sticky path: save_transport_preference writes to localStorage and is
@@ -628,7 +628,6 @@ fn transport_preference_storage_migrates_legacy_auto() {
 #[wasm_bindgen_test]
 fn transport_preference_storage_invalid_value_returns_default() {
     // If localStorage contains an invalid string, load_transport_preference
-    // should fall back to the default (WebSocket).
     clear_transport_sticky_and_pref();
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item("vc_transport_preference", "invalid_value");
@@ -636,8 +635,8 @@ fn transport_preference_storage_invalid_value_returns_default() {
 
     assert_eq!(
         load_transport_preference(),
-        TransportPreference::WebSocket,
-        "Invalid stored value should fall back to the default (WebSocket)"
+        TransportPreference::WebTransport,
+        "Invalid stored value should fall back to the default (WebTransport)"
     );
 
     // Cleanup
@@ -730,8 +729,8 @@ fn load_with_source_nothing_stored_reports_default() {
     let (pref, source) = load_transport_preference_with_source();
     assert_eq!(
         pref,
-        TransportPreference::WebSocket,
-        "with nothing stored the default (WebSocket) applies"
+        TransportPreference::WebTransport,
+        "with nothing stored the default (WebTransport) applies"
     );
     assert_eq!(
         source, "default",
@@ -759,7 +758,7 @@ fn load_with_source_sticky_without_value_reports_default() {
     let (pref, source) = load_transport_preference_with_source();
     assert_eq!(
         pref,
-        TransportPreference::WebSocket,
+        TransportPreference::WebTransport,
         "sticky-on with no stored value must resolve to the default"
     );
     assert_eq!(
@@ -809,21 +808,8 @@ fn load_transport_preference_delegates_to_with_source() {
 // start AND end via `clear_transport_sticky_and_pref()`.
 // ---------------------------------------------------------------------------
 
-/// #1291 hazard C.3 (post default-flip): with WebSocket now the default,
-/// choosing WebTransport explicitly (remember OFF) is a NON-default,
-/// session-scoped choice. It must clear a prior pinned WebSocket sticky pin
-/// FIRST (so the stale pin can't shadow it) and then write the session-scoped
-/// value, so the next load resolves to WebTransport from `sessionStorage`
-/// rather than the WebSocket default.
-///
-/// Fails if the `(false, false)` arm of `apply_transport_decision` stops
-/// clearing the prior `localStorage` sticky+pref: `load_transport_preference`
-/// would see `sticky == true`, read the stale `websocket` value, and return
-/// WebSocket — failing the final assertion. Also fails on the PRE-flip code,
-/// where WebTransport was the default and this call ran the clear-all arm, so
-/// `vc_transport_session` would be absent instead of "webtransport".
 #[wasm_bindgen_test]
-fn apply_decision_webtransport_not_remembered_clears_prior_ws_pin() {
+fn apply_decision_websocket_not_remembered_clears_prior_wt_pin() {
     clear_transport_sticky_and_pref();
 
     let local_storage = web_sys::window()
@@ -833,87 +819,15 @@ fn apply_decision_webtransport_not_remembered_clears_prior_ws_pin() {
         .and_then(|w| w.session_storage().ok().flatten())
         .expect("test environment must have sessionStorage");
 
-    // Plant a prior pinned WebSocket choice.
-    local_storage
-        .set_item("vc_transport_sticky", "true")
-        .expect("plant sticky");
-    local_storage
-        .set_item("vc_transport_preference", "websocket")
-        .expect("plant WS pref");
-
-    // Explicit WebTransport, NOT remembered — a non-default, session-scoped choice.
-    apply_transport_decision(TransportPreference::WebTransport, false);
-
-    // The stale WebSocket sticky pin must be cleared from localStorage...
-    assert_eq!(
-        local_storage.get_item("vc_transport_sticky").ok().flatten(),
-        None,
-        "stale WS sticky flag must be cleared"
-    );
-    assert_eq!(
-        local_storage
-            .get_item("vc_transport_preference")
-            .ok()
-            .flatten(),
-        None,
-        "stale WS localStorage preference must be cleared"
-    );
-    // ...and the session-scoped WebTransport value must be written.
-    assert_eq!(
-        session_storage
-            .get_item("vc_transport_session")
-            .ok()
-            .flatten(),
-        Some("webtransport".to_string()),
-        "a non-default WebTransport choice writes the session-scoped value"
-    );
-
-    // Next load resolves to WebTransport from the session-scoped value.
-    assert_eq!(
-        load_transport_preference(),
-        TransportPreference::WebTransport,
-        "session-scoped WebTransport must win over a cleared WS pin on next load"
-    );
-
-    clear_transport_sticky_and_pref();
-}
-
-/// Post default-flip: WebSocket is now the DEFAULT, so choosing it explicitly
-/// (remember OFF) runs the `(true, false)` clear-all arm — every transport key
-/// (a prior WebTransport sticky pin AND any stray session value) is removed,
-/// and the next load resolves to WebSocket from the implicit default.
-///
-/// Fails if the `(true, false)` arm stops clearing storage (e.g. reverted to a
-/// no-op): the planted WT sticky pin would survive and `load_transport_preference`
-/// would return WebTransport. Also fails on the PRE-flip code, where WebSocket
-/// was non-default and this call ran the session arm — leaving
-/// `vc_transport_session == "websocket"` instead of the None asserted below.
-#[wasm_bindgen_test]
-fn apply_decision_websocket_not_remembered_clears_all_storage() {
-    clear_transport_sticky_and_pref();
-
-    let local_storage = web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .expect("test environment must have localStorage");
-    let session_storage = web_sys::window()
-        .and_then(|w| w.session_storage().ok().flatten())
-        .expect("test environment must have sessionStorage");
-
-    // Plant a prior pinned WebTransport choice AND a stray session value.
     local_storage
         .set_item("vc_transport_sticky", "true")
         .expect("plant sticky");
     local_storage
         .set_item("vc_transport_preference", "webtransport")
         .expect("plant WT pref");
-    session_storage
-        .set_item("vc_transport_session", "webtransport")
-        .expect("plant stray session value");
 
-    // Explicit WebSocket (the default), NOT remembered → clear-all arm.
     apply_transport_decision(TransportPreference::WebSocket, false);
 
-    // Every key must be gone — including the session value.
     assert_eq!(
         local_storage.get_item("vc_transport_sticky").ok().flatten(),
         None,
@@ -925,7 +839,62 @@ fn apply_decision_websocket_not_remembered_clears_all_storage() {
             .ok()
             .flatten(),
         None,
-        "stale localStorage WT preference must be cleared"
+        "stale WT localStorage preference must be cleared"
+    );
+    assert_eq!(
+        session_storage
+            .get_item("vc_transport_session")
+            .ok()
+            .flatten(),
+        Some("websocket".to_string()),
+        "a non-default WebSocket choice writes the session-scoped value"
+    );
+
+    assert_eq!(
+        load_transport_preference(),
+        TransportPreference::WebSocket,
+        "session-scoped WebSocket must win over a cleared WT pin on next load"
+    );
+
+    clear_transport_sticky_and_pref();
+}
+
+#[wasm_bindgen_test]
+fn apply_decision_webtransport_not_remembered_clears_all_storage() {
+    clear_transport_sticky_and_pref();
+
+    let local_storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    let session_storage = web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .expect("test environment must have sessionStorage");
+
+    local_storage
+        .set_item("vc_transport_sticky", "true")
+        .expect("plant sticky");
+    local_storage
+        .set_item("vc_transport_preference", "websocket")
+        .expect("plant WS pref");
+    session_storage
+        .set_item("vc_transport_session", "websocket")
+        .expect("plant stray session value");
+
+    apply_transport_decision(TransportPreference::WebTransport, false);
+
+    // Every key must be gone — including the session value.
+    assert_eq!(
+        local_storage.get_item("vc_transport_sticky").ok().flatten(),
+        None,
+        "stale WS sticky flag must be cleared"
+    );
+    assert_eq!(
+        local_storage
+            .get_item("vc_transport_preference")
+            .ok()
+            .flatten(),
+        None,
+        "stale localStorage WS preference must be cleared"
     );
     assert_eq!(
         session_storage
@@ -936,14 +905,107 @@ fn apply_decision_websocket_not_remembered_clears_all_storage() {
         "the default-not-remembered clear-all arm also removes the session value"
     );
 
-    // Next load resolves to the implicit WebSocket default.
     assert_eq!(
         load_transport_preference(),
-        TransportPreference::WebSocket,
-        "after clear-all, the next load resolves to the WebSocket default"
+        TransportPreference::WebTransport,
+        "after clear-all, the next load resolves to the WebTransport default"
     );
 
     clear_transport_sticky_and_pref();
+}
+
+#[wasm_bindgen_test]
+fn config_default_websocket_applies_when_nothing_is_stored() {
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+    support::inject_app_config_with_default_transport("websocket");
+
+    // Resolve, CLEAN UP, then assert: wasm32 aborts on panic, so an assertion
+    // above the cleanup leaks `__APP_CONFIG` into every later test.
+    let (pref, source) = load_transport_preference_with_source();
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+
+    assert_eq!(
+        pref,
+        TransportPreference::WebSocket,
+        "defaultTransport=websocket must roll this deployment's default back"
+    );
+    assert_eq!(
+        source, "default",
+        "a config-sourced default is still \"default\""
+    );
+}
+
+#[wasm_bindgen_test]
+fn config_default_applies_on_the_sticky_without_value_branch() {
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+    support::inject_app_config_with_default_transport("websocket");
+
+    let local_storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    local_storage
+        .set_item("vc_transport_sticky", "true")
+        .expect("plant sticky");
+
+    let (pref, source) = load_transport_preference_with_source();
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+
+    assert_eq!(pref, TransportPreference::WebSocket);
+    assert_eq!(source, "default");
+}
+
+#[wasm_bindgen_test]
+fn config_default_unknown_value_keeps_webtransport() {
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+    support::inject_app_config_with_default_transport("quic");
+
+    let pref = load_transport_preference();
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+
+    assert_eq!(
+        pref,
+        TransportPreference::WebTransport,
+        "an unrecognised defaultTransport must fall back to the compiled default"
+    );
+}
+
+#[wasm_bindgen_test]
+fn stored_webtransport_outranks_a_rolled_back_cluster_default() {
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+    support::inject_app_config_with_default_transport("websocket");
+
+    let session_storage = web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .expect("test environment must have sessionStorage");
+
+    apply_transport_decision(TransportPreference::WebTransport, false);
+
+    let session_value = session_storage
+        .get_item("vc_transport_session")
+        .ok()
+        .flatten();
+    let pref = load_transport_preference();
+    support::remove_app_config();
+    clear_transport_sticky_and_pref();
+
+    assert_eq!(
+        session_value,
+        Some("webtransport".to_string()),
+        "against a websocket cluster default, WebTransport is a non-default choice \
+         and must be persisted"
+    );
+    assert_eq!(
+        pref,
+        TransportPreference::WebTransport,
+        "the stored choice must outrank the runtime-config default"
+    );
 }
 
 // ---------------------------------------------------------------------------

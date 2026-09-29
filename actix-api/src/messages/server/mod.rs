@@ -68,8 +68,6 @@ pub struct JoinRoom {
     pub instance_id: Option<String>,
     /// Whether this participant is the meeting host.
     pub is_host: bool,
-    /// Whether the meeting should end when the host leaves.
-    pub end_on_host_leave: bool,
     /// Transport this session connected over (`"websocket"` | `"webtransport"`).
     ///
     /// Threaded through so the per-session NATS subscription loop's `handle_msg`
@@ -133,10 +131,6 @@ pub struct Disconnect {
     /// When true, the disconnecting session is an observer (waiting room)
     /// and should NOT trigger PARTICIPANT_LEFT notifications.
     pub observer: bool,
-    /// Whether this participant is the meeting host.
-    pub is_host: bool,
-    /// Whether the meeting should end when the host leaves.
-    pub end_on_host_leave: bool,
 }
 
 #[derive(ActixMessage)]

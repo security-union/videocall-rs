@@ -541,7 +541,7 @@ async fn test_path_traversal_meeting_id_rejected() {
     let pool = get_test_pool().await;
     let log_dir = enable_console_logs();
 
-    // meeting_id containing dots is rejected by SAFE_MEETING_ID_RE.
+    // meeting_id containing dots is rejected by the meeting ID validator.
     // No meeting setup needed — validate_id fails before the DB lookup.
     let token = room_token("room..name", HOST_EMAIL);
     let app = build_app(pool.clone());
@@ -556,6 +556,26 @@ async fn test_path_traversal_meeting_id_rejected() {
         "meeting_id with dots should be rejected as path traversal"
     );
 
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert_eq!(body.result.code, "INVALID_PARAMETER");
+
+    disable_console_logs(&log_dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_invalid_meeting_id_is_rejected_before_the_token_mismatch_check() {
+    let pool = get_test_pool().await;
+    let log_dir = enable_console_logs();
+
+    let token = room_token("test-clog-other-room", HOST_EMAIL);
+    let app = build_app(pool.clone());
+    let req = console_log_request_with_token("t2832%0Aforged", &token)
+        .body(Body::from(LOG_BODY))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body: APIResponse<APIError> = response_json(resp).await;
     assert_eq!(body.result.code, "INVALID_PARAMETER");
 

@@ -448,14 +448,14 @@ trait VideoFrameDecoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 #[derive(Default)]
 struct NoopDecoder {
     last_context: RefCell<Option<StreamContext>>,
     freshness_evictions: Cell<(u64, u64)>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl VideoFrameDecoder for NoopDecoder {
     fn push_frame(&self, _: FrameBuffer, context: Option<&StreamContext>) {
         *self.last_context.borrow_mut() = context.cloned();
@@ -467,9 +467,11 @@ impl VideoFrameDecoder for NoopDecoder {
     fn freshness_eviction_counts(&self) -> (u64, u64) {
         self.freshness_evictions.get()
     }
+    #[cfg(test)]
     fn set_freshness_eviction_counts_for_test(&self, total: u64, keyframeless: u64) {
         self.freshness_evictions.set((total, keyframeless));
     }
+    #[cfg(test)]
     fn last_pushed_context(&self) -> Option<StreamContext> {
         self.last_context.borrow().clone()
     }
@@ -1014,13 +1016,8 @@ impl VideoPeerDecoder {
     /// visible source is *scaled to fill* the whole display-sized buffer. This
     /// corrects the crop-padding and non-square-sample-aspect cases (the browser
     /// folds SAR into `display_*`), so the painted content's aspect matches the
-    /// buffer's declared `display` aspect. NOTE: `drawImage` does NOT apply a
-    /// frame's *rotation* metadata — it paints the visible pixels unrotated and
-    /// only scales them, so a genuinely 90°/270°-rotated source would still need a
-    /// canvas transform (out of scope here; the VP9 decode path in this pipeline
-    /// does not carry rotation metadata — capture-side rotation is already baked
-    /// into the pixels). Applies to both the camera and screen-share decoders
-    /// (same `VideoPeerDecoder` path).
+    /// buffer's declared `display` aspect. Applies to both the camera and
+    /// screen-share decoders (same `VideoPeerDecoder` path).
     ///
     /// Returns `true` when a frame was actually drawn to a wired canvas (the honest
     /// "painted" signal the #1784 painted-fps meter counts), and `false` when no
@@ -1256,7 +1253,7 @@ impl VideoPeerDecoder {
     }
 
     /// No-op decoder for unit tests — avoids requiring WebCodecs / worker link tags.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn noop() -> Self {
         Self {
             decoder: Box::new(NoopDecoder::default()),

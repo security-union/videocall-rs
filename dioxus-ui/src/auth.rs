@@ -52,7 +52,10 @@ use crate::constants::{
     login_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_prompt,
     oauth_redirect_url, oauth_scopes,
 };
-use crate::context::{read_session_storage, remove_session_storage, write_session_storage};
+use crate::context::{
+    clear_display_name_from_storage, read_session_storage, remove_session_storage,
+    write_session_storage,
+};
 use crate::pkce::{self};
 use anyhow::anyhow;
 use gloo_utils::window;
@@ -635,7 +638,11 @@ fn build_auth_url(params: &OAuthParams, pkce: &pkce::PkceParams) -> String {
 ///    to `/login`).
 /// 2. The current URL search string (e.g. `/login?returnTo=…`).
 /// 3. The current page origin root.
+///
+/// The stored display name is forgotten first, so the signed-in pages derive
+/// it from the new profile.
 pub fn do_login() {
+    clear_display_name_from_storage();
     // Determine `return_to` synchronously before the async task runs.
     let return_to = resolve_return_to_for_do_login();
 
@@ -665,8 +672,9 @@ pub fn do_login() {
 /// page) when an unauthenticated request is detected.
 ///
 /// Like [`do_login`] this is a synchronous wrapper around [`start_oauth_flow`]
-/// and can be called from any context.
+/// and can be called from any context, and it forgets the stored display name.
 pub fn redirect_to_login() {
+    clear_display_name_from_storage();
     let return_to = window().location().href().ok().filter(|s| !s.is_empty());
 
     if crate::constants::is_pkce_flow() {

@@ -10,7 +10,7 @@ fi
 dist="${1:-${TRUNK_STAGING_DIR:-dist}}"
 
 # Each name drives an asset triple: <bin>.js, <bin>_bg.wasm, <bin>_loader.js.
-workers=(worker_decoder neteq_worker)
+workers=(worker_decoder neteq_worker wt_session_worker)
 
 hex16='[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
 

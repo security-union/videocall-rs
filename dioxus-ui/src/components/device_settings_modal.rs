@@ -2,7 +2,10 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
-use crate::context::{apply_transport_decision, load_transport_sticky, TransportPreference};
+use crate::context::{
+    apply_transport_decision, displayed_default_transport, effective_default_transport,
+    load_transport_sticky, pinned_protocol_advice, transport_option_label, TransportPreference,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
@@ -555,7 +558,15 @@ pub fn DeviceSettingsModal(
                                     }
                                 }
                             },
-                            SettingsSection::Network => rsx! {
+                            SettingsSection::Network => {
+                                let server_wt_enabled =
+                                    crate::constants::webtransport_enabled().unwrap_or(false);
+                                let default_transport = effective_default_transport();
+                                let marked_default = displayed_default_transport(
+                                    default_transport,
+                                    server_wt_enabled,
+                                );
+                                rsx! {
                                 div {
                                     id: SettingsSection::Network.panel_id(),
                                     class: "settings-section",
@@ -581,22 +592,17 @@ pub fn DeviceSettingsModal(
                                             role: "radiogroup",
                                             "aria-labelledby": "transport-segmented-label",
                                             for option in [
-                                                (TransportPreference::WebSocket, "WebSocket (default)", "transport-radio-websocket"),
-                                                (TransportPreference::WebTransport, "WebTransport", "transport-radio-webtransport"),
+                                                (TransportPreference::WebTransport, "transport-radio-webtransport"),
+                                                (TransportPreference::WebSocket, "transport-radio-websocket"),
                                             ] {
                                                 {
-                                                    let (value, label, test_id) = option;
+                                                    let (value, test_id) = option;
                                                     let is_selected = pending_protocol() == value;
-                                                    // Associate the WebTransport radio with the experimental
-                                                    // warning while WT is the selected value — that is exactly
-                                                    // when the panel (id="transport-webtransport-warning") is
-                                                    // populated, so the reference is always valid.
-                                                    let describedby = if value == TransportPreference::WebTransport
-                                                        && is_selected
-                                                    {
-                                                        Some("transport-webtransport-warning")
-                                                    } else {
-                                                        None
+                                                    let unavailable = value == TransportPreference::WebTransport
+                                                        && !server_wt_enabled;
+                                                    let describedby = match value {
+                                                        TransportPreference::WebTransport => "transport-webtransport-desc",
+                                                        TransportPreference::WebSocket => "transport-websocket-desc",
                                                     };
                                                     rsx! {
                                                         button {
@@ -605,9 +611,20 @@ pub fn DeviceSettingsModal(
                                                             role: "radio",
                                                             "aria-checked": if is_selected { "true" } else { "false" },
                                                             "aria-describedby": describedby,
+                                                            // aria-disabled, not the native attribute: this radio
+                                                            // may carry the group's checked state.
+                                                            "aria-disabled": if unavailable { "true" } else { "false" },
                                                             "data-testid": test_id,
-                                                            class: if is_selected { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                                            class: match (is_selected, unavailable) {
+                                                                (true, true) => "transport-segmented-option selected unavailable",
+                                                                (true, false) => "transport-segmented-option selected",
+                                                                (false, true) => "transport-segmented-option unavailable",
+                                                                (false, false) => "transport-segmented-option",
+                                                            },
                                                             onclick: move |_| {
+                                                                if unavailable {
+                                                                    return;
+                                                                }
                                                                 // Picking a DIFFERENT protocol is a fresh, uncommitted
                                                                 // choice, so un-check "Remember" in the UI — otherwise a
                                                                 // stale pin from the previously selected protocol (e.g.
@@ -628,83 +645,79 @@ pub fn DeviceSettingsModal(
                                                                 }
                                                                 pending_protocol.set(value);
                                                             },
-                                                            "{label}"
+                                                            {transport_option_label(value, marked_default, server_wt_enabled)}
                                                         }
                                                     }
                                                 }
                                             }
                                         }
+                                        span {
+                                            id: "transport-webtransport-desc",
+                                            class: "visually-hidden",
+                                            if server_wt_enabled {
+                                                "Preferred, with an automatic switch to WebSocket when a network blocks it."
+                                            } else {
+                                                "Unavailable on this deployment."
+                                            }
+                                        }
+                                        span {
+                                            id: "transport-websocket-desc",
+                                            class: "visually-hidden",
+                                            "Skips WebTransport entirely. Useful if this network or device has trouble with it."
+                                        }
                                     }
 
-                                    // WebTransport is still experimental. The CONTAINER below is a
-                                    // PERSISTENT live region (always in the DOM, `aria-live="polite"` +
-                                    // `aria-atomic`); only its CONTENT changes with `pending_protocol`.
-                                    // A freshly *inserted* live region is skipped by some screen readers
-                                    // (notably VoiceOver), so switching content inside a stable region is
-                                    // what makes the WS->WT toggle announcement dependable. `display:
-                                    // contents` on the container keeps it out of the section's flex `gap`,
-                                    // so the empty (WebSocket-default) state adds no stray spacing and the
-                                    // visual result is identical to a plain conditional panel. The panel's
-                                    // `id` + `data-testid` live on the CONTENT node (not the wrapper) so
-                                    // the e2e present/absent assertions discriminate and the WebTransport
-                                    // radio's `aria-describedby` targets the panel itself. On open with
-                                    // WebTransport already stored the content renders populated
-                                    // (`pending_protocol` initialises from the stored preference); for the
-                                    // WebSocket default it is empty, so merely opening Settings never warns.
+                                    // A freshly inserted live region is skipped by some screen readers,
+                                    // so this one stays in the DOM and only its content changes.
                                     div {
                                         class: "transport-warning-live",
                                         "aria-live": "polite",
                                         "aria-atomic": "true",
-                                        if pending_protocol() == TransportPreference::WebTransport {
+                                        if pending_protocol() == TransportPreference::WebSocket {
                                             div {
-                                                id: "transport-webtransport-warning",
-                                                class: "settings-info-panel settings-info-panel--warning",
+                                                class: "settings-info-panel",
                                                 role: "note",
-                                                "data-testid": "transport-webtransport-warning",
+                                                "data-testid": "transport-websocket-note",
                                                 div { class: "settings-info-panel-icon",
                                                     svg {
                                                         view_box: "0 0 24 24",
                                                         width: "16",
                                                         height: "16",
                                                         "aria-hidden": "true",
-                                                        path {
-                                                            d: "M12 3.5 2.5 20h19L12 3.5z",
+                                                        circle {
+                                                            cx: "12",
+                                                            cy: "12",
+                                                            r: "10",
                                                             fill: "none",
                                                             stroke: "currentColor",
                                                             stroke_width: "1.5",
-                                                            stroke_linejoin: "round",
                                                         }
                                                         path {
-                                                            d: "M12 10v4",
+                                                            d: "M12 8v5",
                                                             stroke: "currentColor",
                                                             stroke_width: "1.5",
                                                             stroke_linecap: "round",
                                                         }
                                                         circle {
                                                             cx: "12",
-                                                            cy: "17",
+                                                            cy: "16",
                                                             r: "0.9",
                                                             fill: "currentColor",
                                                         }
                                                     }
                                                 }
                                                 div { class: "settings-info-panel-body",
-                                                    p { class: "settings-info-panel-title", "WebTransport is experimental" }
+                                                    p { class: "settings-info-panel-title", "WebSocket is the compatibility fallback" }
                                                     p { class: "settings-info-panel-text",
-                                                        "WebTransport may have unresolved issues, including audio or video degradation on some networks. WebSocket is the recommended default \u{2014} switch to it if you hit problems."
+                                                        "WebSocket skips WebTransport entirely, which helps if this network or device has trouble with it. Otherwise WebTransport switches to WebSocket on its own when a network blocks it, so most people never need to change this."
                                                     }
                                                 }
                                             }
                                         }
                                     }
 
-                                    // Shown for BOTH protocols (#1291): the "Remember" toggle must be
-                                    // available on the default too, otherwise a stale pin of the OTHER
-                                    // protocol becomes un-clearable when the user switches the radio
-                                    // back to the default. Pinning the default (now WebSocket) is
-                                    // itself harmless — `apply_transport_decision` writes
-                                    // `vc_transport_preference=websocket` + `vc_transport_sticky=true`,
-                                    // which `load_transport_preference` resolves to WebSocket anyway.
+                                    // Shown for BOTH protocols (#1291), or a stale pin of the other
+                                    // protocol becomes un-clearable.
                                     div { class: "device-setting-group sticky-protocol-row",
                                         div { class: "sticky-protocol-row-inner",
                                             div { class: "sticky-protocol-text",
@@ -736,47 +749,40 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Advisory shown only for a NON-default (WebTransport) pin. The
-                                    // "switch back to WebSocket to clear" wording is only true
-                                    // when the pinned protocol is WebTransport, so it stays suppressed
-                                    // for a WebSocket+remember selection (which is itself
-                                    // harmless — load resolves it to the default regardless).
-                                    if sticky_transport() && pending_protocol() != TransportPreference::default() {
+                                    if sticky_transport() && pending_protocol() != marked_default {
                                         div {
                                             class: "settings-info-panel",
                                             role: "note",
+                                            "data-testid": "transport-pinned-advisory",
                                             div { class: "settings-info-panel-icon",
                                                 svg {
                                                     view_box: "0 0 24 24",
                                                     width: "16",
                                                     height: "16",
                                                     "aria-hidden": "true",
-                                                    circle {
-                                                        cx: "12",
-                                                        cy: "12",
-                                                        r: "10",
+                                                    rect {
+                                                        x: "6",
+                                                        y: "11",
+                                                        width: "12",
+                                                        height: "9",
+                                                        rx: "1.5",
                                                         fill: "none",
                                                         stroke: "currentColor",
                                                         stroke_width: "1.5",
                                                     }
                                                     path {
-                                                        d: "M12 8v5",
+                                                        d: "M9 11V8a3 3 0 0 1 6 0v3",
+                                                        fill: "none",
                                                         stroke: "currentColor",
                                                         stroke_width: "1.5",
                                                         stroke_linecap: "round",
-                                                    }
-                                                    circle {
-                                                        cx: "12",
-                                                        cy: "16",
-                                                        r: "0.9",
-                                                        fill: "currentColor",
                                                     }
                                                 }
                                             }
                                             div { class: "settings-info-panel-body",
                                                 p { class: "settings-info-panel-title", "Protocol pinned" }
                                                 p { class: "settings-info-panel-text",
-                                                    "This protocol will be used on every future page load. Turn off \"Remember protocol choice\" (or switch back to WebSocket) to clear it."
+                                                    {pinned_protocol_advice(pending_protocol(), marked_default)}
                                                 }
                                             }
                                         }
@@ -805,6 +811,7 @@ pub fn DeviceSettingsModal(
                                             }
                                         }
                                     }
+                                }
                                 }
                             },
                             SettingsSection::Appearance => rsx! {

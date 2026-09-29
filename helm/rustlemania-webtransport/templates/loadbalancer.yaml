@@ -12,6 +12,17 @@ metadata:
   {{- end }}
 spec:
   type: LoadBalancer
+  {{- with .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- if eq (.Values.service.sessionAffinity | default "None") "ClientIP" }}
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ int .Values.service.sessionAffinityTimeoutSeconds }}
+  {{- else }}
+  sessionAffinity: {{ .Values.service.sessionAffinity | default "None" }}
+  {{- end }}
   selector:
     {{- include "rustlemania.selectorLabels" . | nindent 4 }}
   ports:

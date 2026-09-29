@@ -87,7 +87,7 @@ services:
       context: ../
     working_dir: /app/meeting-api
     command: >
-      nix develop /app#backend-dev --command bash -c
+      nix develop path:/flake#backend-dev --no-write-lock-file --command bash -c
       "/app/dbmate/startup.sh && /app/docker/e2e-backend.sh supervise meeting-api"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
@@ -143,6 +143,14 @@ services:
       - type: bind
         source: ../
         target: /app
+      - type: bind
+        source: ../flake.nix
+        target: /flake/flake.nix
+        read_only: true
+      - type: bind
+        source: ../flake.lock
+        target: /flake/flake.lock
+        read_only: true
       - nix-store-e2e-meeting-api:/nix
       - e2e-meeting-api-registry:/root/.cargo/registry
       - e2e-meeting-api-git:/root/.cargo/git
@@ -159,7 +167,7 @@ services:
       context: ../
     working_dir: /app/actix-api
     command: >
-      nix develop /app#backend-dev --command bash -c
+      nix develop path:/flake#backend-dev --no-write-lock-file --command bash -c
       "/app/docker/e2e-backend.sh supervise websocket_server"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
@@ -184,6 +192,14 @@ services:
       - type: bind
         source: ../
         target: /app
+      - type: bind
+        source: ../flake.nix
+        target: /flake/flake.nix
+        read_only: true
+      - type: bind
+        source: ../flake.lock
+        target: /flake/flake.lock
+        read_only: true
       - nix-store-e2e-websocket-api:/nix
       - e2e-websocket-api-registry:/root/.cargo/registry
       - e2e-websocket-api-git:/root/.cargo/git
@@ -205,7 +221,7 @@ services:
       context: ../
     working_dir: /app/actix-api
     command: >
-      nix develop /app#backend-dev --command bash -c
+      nix develop path:/flake#backend-dev --no-write-lock-file --command bash -c
       "/app/docker/e2e-backend.sh supervise webtransport_server"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
@@ -249,6 +265,14 @@ services:
       - type: bind
         source: ../
         target: /app
+      - type: bind
+        source: ../flake.nix
+        target: /flake/flake.nix
+        read_only: true
+      - type: bind
+        source: ../flake.lock
+        target: /flake/flake.lock
+        read_only: true
       - nix-store-e2e-webtransport-api:/nix
       - e2e-webtransport-api-registry:/root/.cargo/registry
       - e2e-webtransport-api-git:/root/.cargo/git
@@ -262,7 +286,7 @@ services:
       context: ../
     working_dir: /app/dioxus-ui
     command: >
-      nix develop /app#frontend --command bash -c
+      nix develop path:/flake#frontend --no-write-lock-file --command bash -c
       "/app/docker/start-dioxus.sh"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
@@ -309,10 +333,11 @@ services:
       # (TRUNK_BUILD_FEATURES, equivalent to `--features netsim`) and applies
       # it ONLY to the primary `rel="rust"` target in index.html — the
       # videocall-ui app binary, which has no per-link `data-cargo-features`.
-      # The codecs/neteq worker targets set their own `data-cargo-features`
-      # (+ data-cargo-no-default-features) so they are unaffected (verified via
-      # `trunk build -v`: the codecs/neteq cargo invocations stay
-      # `--no-default-features --features wasm|web`, only videocall-ui gains
+      # The codecs/neteq/wt_session_worker targets each carry their own
+      # per-link cargo feature config so they are unaffected (verified via
+      # `trunk build -v` on 2026-09-17: codecs/neteq stay
+      # `--no-default-features --features wasm|web`, the #2728 session worker
+      # stays `--no-default-features`, and only videocall-ui gains
       # `--features netsim`).
       #
       # WHY netsim is e2e-only and always-on here: it compiles in the
@@ -338,6 +363,14 @@ services:
       - type: bind
         source: ../
         target: /app
+      - type: bind
+        source: ../flake.nix
+        target: /flake/flake.nix
+        read_only: true
+      - type: bind
+        source: ../flake.lock
+        target: /flake/flake.lock
+        read_only: true
       - nix-store-e2e-dioxus-ui:/nix
       - e2e-dioxus-ui-registry:/root/.cargo/registry
       - e2e-dioxus-ui-git:/root/.cargo/git

@@ -11,7 +11,7 @@
  * at your option.
  */
 
-use crate::context::{save_display_name_to_storage, validate_display_name};
+use crate::components::display_name_edit::{persist_display_name, validate_rename};
 use dioxus::prelude::*;
 
 #[component]
@@ -76,46 +76,20 @@ pub fn UpdateDisplayNameModal(
                                     return;
                                 }
 
-                                let new_name = pending_name().trim().to_string();
-
-                                if new_name.is_empty() {
-                                    error_message.set(Some("Display name cannot be empty.".to_string()));
-                                    return;
-                                }
-
-                                match validate_display_name(&new_name) {
+                                match validate_rename(&pending_name()) {
                                     Ok(valid_name) => {
                                         let meeting_id = meeting_id.clone();
-                                        let valid_name_clone = valid_name.clone();
-                                        let session_id_for_request = session_id;
 
                                         is_updating.set(true);
                                         error_message.set(None);
 
                                         wasm_bindgen_futures::spawn_local(async move {
-                                            log::info!(
-                                                "RENAME: API CALL INITIATED for: {} (session_id: {:?})",
-                                                valid_name_clone,
-                                                session_id_for_request
-                                            );
-
-                                            match crate::meeting_api::update_display_name(&meeting_id, &valid_name_clone, session_id_for_request).await {
-                                                Ok(_) => {
-                                                    log::info!("RENAME: API CALL SUCCESS");
-
-                                                    save_display_name_to_storage(&valid_name_clone);
-                                                    is_updating.set(false);
-                                                    on_success.call(valid_name_clone);
-                                                }
-                                                Err(e) => {
-                                                    log::error!("RENAME: API CALL FAILED: {}", e);
-
-                                                    is_updating.set(false);
-                                                    error_message.set(Some(format!(
-                                                        "Failed to update display name: {}",
-                                                        e
-                                                    )));
-                                                }
+                                            let result =
+                                                persist_display_name(&meeting_id, &valid_name, session_id).await;
+                                            is_updating.set(false);
+                                            match result {
+                                                Ok(()) => on_success.call(valid_name),
+                                                Err(msg) => error_message.set(Some(msg)),
                                             }
                                         });
                                     }

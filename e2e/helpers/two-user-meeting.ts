@@ -80,15 +80,20 @@ export async function joinMeetingFromPage(
  *
  * The split is a pure cut, NOT a rewrite: this body and `guestJoinsMeeting`'s
  * are the old `enterTwoUserMeeting` body line for line, in order, with nothing
- * added or removed, and `enterTwoUserMeeting` is now their concatenation. That
+ * added or removed (the host's name is a parameter defaulting to the old
+ * literal), and `enterTwoUserMeeting` is now their concatenation. That
  * matters because `two-users-meeting.spec.ts` is `@bvt1` and calls it. (No grid
  * assertion is added here on purpose: `joinMeetingFromPage` already asserts
  * `#grid-container` visible on BOTH paths that return "in-meeting", so one here
  * would be a tautology — and a redundant line is still a line that did not exist
  * in the function bvt1 is running.)
  */
-export async function enterMeetingAsHost(hostPage: Page, meetingId: string): Promise<void> {
-  await fillAndSubmitJoinForm(hostPage, meetingId, "HostUser");
+export async function enterMeetingAsHost(
+  hostPage: Page,
+  meetingId: string,
+  hostName = "HostUser",
+): Promise<void> {
+  await fillAndSubmitJoinForm(hostPage, meetingId, hostName);
   await hostPage.waitForTimeout(1500);
   const hostResult = await joinMeetingFromPage(hostPage);
   expect(hostResult).toBe("in-meeting");
@@ -104,8 +109,9 @@ export async function guestJoinsMeeting(
   hostPage: Page,
   guestPage: Page,
   meetingId: string,
+  guestName = "GuestUser",
 ): Promise<void> {
-  await fillAndSubmitJoinForm(guestPage, meetingId, "GuestUser");
+  await fillAndSubmitJoinForm(guestPage, meetingId, guestName);
   await guestPage.waitForTimeout(1500);
   const guestResult = await joinMeetingFromPage(guestPage);
 
@@ -155,7 +161,8 @@ export async function enterTwoUserMeeting(
   hostPage: Page,
   guestPage: Page,
   meetingId: string,
+  hostName?: string,
 ): Promise<void> {
-  await enterMeetingAsHost(hostPage, meetingId);
+  await enterMeetingAsHost(hostPage, meetingId, hostName);
   await guestJoinsMeeting(hostPage, guestPage, meetingId);
 }

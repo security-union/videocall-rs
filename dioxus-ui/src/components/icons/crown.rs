@@ -3,13 +3,13 @@
 use dioxus::prelude::*;
 
 #[component]
-pub fn CrownIcon() -> Element {
+pub fn CrownIcon(#[props(default)] co_host: bool) -> Element {
     rsx! {
         span {
             class: "host-indicator",
             // @token-exempt: subtle host indicator, #888 has no matching token
             style: "color: #888; font-size: 0.85em; margin-left: var(--space-1);",
-            "(Host)"
+            if co_host { "(Co-host)" } else { "(Host)" }
         }
     }
 }

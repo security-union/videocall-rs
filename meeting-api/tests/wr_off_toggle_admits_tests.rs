@@ -75,7 +75,6 @@ async fn test_wr_off_toggle_reports_the_participants_it_admitted() {
     let update = db_meetings::update_meeting_settings(
         &pool,
         room_id,
-        HOST,
         Some(false),
         None,
         None,
@@ -118,7 +117,6 @@ async fn test_settings_update_that_admits_nobody_reports_nobody() {
     let update = db_meetings::update_meeting_settings(
         &pool,
         room_id,
-        HOST,
         None,
         Some(true),
         None,

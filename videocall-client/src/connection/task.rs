@@ -32,6 +32,28 @@ use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
 #[cfg(test)]
 use std::cell::RefCell;
 
+/// Separated from [`Task`] so the choice is one function the stub shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UplinkTransport {
+    WebSocket,
+    WebTransport,
+}
+
+/// The `send_queue_bytes` reading for one transport (#2722). WebSocket gives
+/// its socket's `bufferedAmount`; WebTransport has no such counter and gives the
+/// persistent-unistream buried backlog, which the WS-only accessor could not.
+pub(super) fn uplink_queue_depth_for(
+    transport: UplinkTransport,
+    ws_buffered_amount: Option<u64>,
+) -> Option<u64> {
+    match transport {
+        UplinkTransport::WebSocket => ws_buffered_amount,
+        UplinkTransport::WebTransport => {
+            Some(videocall_transport::webtransport::unistream_queue_depth_bytes())
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Task {
@@ -53,14 +75,30 @@ pub(super) enum StubSendKind {
 #[derive(Debug)]
 pub(super) struct StubTask {
     last_send: RefCell<Option<(StubSendKind, MediaStreamKey)>>,
+    /// Every send since the last drain, in order — `last_send` keeps only the
+    sends: RefCell<Vec<(StubSendKind, MediaStreamKey)>>,
+    transport: UplinkTransport,
+    buffered_amount: std::cell::Cell<Option<u64>>,
 }
 
 #[cfg(test)]
 impl StubTask {
     pub(super) fn new() -> Self {
+        Self::for_transport(UplinkTransport::WebSocket, None)
+    }
+
+    pub(super) fn for_transport(transport: UplinkTransport, buffered_amount: Option<u64>) -> Self {
         Self {
             last_send: RefCell::new(None),
+            sends: RefCell::new(Vec::new()),
+            transport,
+            buffered_amount: std::cell::Cell::new(buffered_amount),
         }
+    }
+
+    fn record(&self, kind: StubSendKind, stream_key: MediaStreamKey) {
+        *self.last_send.borrow_mut() = Some((kind, stream_key));
+        self.sends.borrow_mut().push((kind, stream_key));
     }
 
     pub(super) fn take_last_send_for_test(&self) -> Option<(StubSendKind, MediaStreamKey)> {
@@ -69,6 +107,15 @@ impl StubTask {
 
     pub(super) fn clear_last_send_for_test(&self) {
         *self.last_send.borrow_mut() = None;
+        self.sends.borrow_mut().clear();
+    }
+
+    pub(super) fn take_sends_for_test(&self) -> Vec<(StubSendKind, MediaStreamKey)> {
+        std::mem::take(&mut *self.sends.borrow_mut())
+    }
+
+    pub(super) fn set_send_queue_depth_for_test(&self, bytes: u64) {
+        self.buffered_amount.set(Some(bytes));
     }
 }
 
@@ -76,6 +123,16 @@ impl Task {
     #[cfg(test)]
     pub(super) fn stub() -> Self {
         Task::Stub(StubTask::new())
+    }
+
+    #[cfg(test)]
+    pub(super) fn stub_for_transport(webtransport: bool, ws_buffered_amount: Option<u64>) -> Self {
+        let transport = if webtransport {
+            UplinkTransport::WebTransport
+        } else {
+            UplinkTransport::WebSocket
+        };
+        Task::Stub(StubTask::for_transport(transport, ws_buffered_amount))
     }
 
     pub fn connect(webtransport: bool, options: ConnectOptions) -> anyhow::Result<Self> {
@@ -107,7 +164,7 @@ impl Task {
             #[cfg(test)]
             Task::Stub(stub) => {
                 let _ = packet;
-                *stub.last_send.borrow_mut() = Some((StubSendKind::Reliable, stream_key));
+                stub.record(StubSendKind::Reliable, stream_key);
             }
         }
     }
@@ -127,18 +184,38 @@ impl Task {
             #[cfg(test)]
             Task::Stub(stub) => {
                 let _ = packet;
-                *stub.last_send.borrow_mut() =
-                    Some((StubSendKind::Datagram, MediaStreamKey::Control));
+                stub.record(StubSendKind::Datagram, MediaStreamKey::Control);
             }
         }
     }
 
+    /// WebSocket `bufferedAmount`, or `None` on WebTransport. Deliberately
     pub fn get_send_queue_depth(&self) -> Option<u64> {
         match self {
             Task::WebSocket(ws) => ws.get_buffered_amount(),
             Task::WebTransport(_) => None, // WebTransport doesn't expose bufferedAmount
             #[cfg(test)]
-            Task::Stub(_) => None,
+            Task::Stub(stub) => match stub.transport {
+                UplinkTransport::WebSocket => stub.buffered_amount.get(),
+                UplinkTransport::WebTransport => None,
+            },
+        }
+    }
+
+    /// Bytes queued in the active transport's uplink, for the `send_queue_bytes`
+    /// health field (#2722). Both arms are an INSTANTANEOUS GAUGE in bytes, so
+    /// one Grafana panel reads correctly for either transport. The WebTransport
+    /// arm is a PER-TAB total, not this connection's own: its four counters are
+    /// process-global, so during election candidates' #2721 Control probes
+    /// contribute and it converges once elected.
+    pub fn uplink_queue_depth_bytes(&self) -> Option<u64> {
+        match self {
+            Task::WebSocket(ws) => {
+                uplink_queue_depth_for(UplinkTransport::WebSocket, ws.get_buffered_amount())
+            }
+            Task::WebTransport(_) => uplink_queue_depth_for(UplinkTransport::WebTransport, None),
+            #[cfg(test)]
+            Task::Stub(stub) => uplink_queue_depth_for(stub.transport, stub.buffered_amount.get()),
         }
     }
 
@@ -189,6 +266,21 @@ impl Task {
     pub(super) fn clear_last_send_for_test(&self) {
         if let Task::Stub(stub) = self {
             stub.clear_last_send_for_test();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_send_queue_depth_for_test(&self, bytes: u64) {
+        if let Task::Stub(stub) = self {
+            stub.set_send_queue_depth_for_test(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_sends_for_test(&self) -> Vec<(StubSendKind, MediaStreamKey)> {
+        match self {
+            Task::Stub(stub) => stub.take_sends_for_test(),
+            _ => Vec::new(),
         }
     }
 }

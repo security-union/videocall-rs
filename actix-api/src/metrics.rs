@@ -80,7 +80,7 @@ pub async fn metrics_responder() -> impl Responder {
 ///
 /// This is the UNION of:
 /// - `relay_packet_drops_total{drop_reason}` (`mailbox_full`, `channel_full`,
-///   `priority_drop_video`, `priority_drop_audio`), and
+///   `lane_dead`, `priority_drop_video`, `priority_drop_audio`), and
 /// - `relay_session_drops_total{kind}` / `videocall_outbound_channel_drops_total{kind}`
 ///   (`audio`, `video`, `screen`, `media`, `control`, `rtt`, `unknown`,
 ///   `priority_drop_video`, `priority_drop_audio`, `overflow_critical`).
@@ -93,9 +93,11 @@ pub const RELAY_DROP_KINDS: &[&str] = &[
     // relay_packet_drops_total drop_reasons
     "mailbox_full",
     "channel_full",
+    "lane_dead",
     // shared priority-policy reasons (both counters)
     "priority_drop_video",
     "priority_drop_audio",
+    "priority_drop_rtt_echo",
     // outbound/session drop kinds (drop_kind_label + overflow_critical)
     "audio",
     "video",
@@ -355,14 +357,26 @@ pub fn record_ws_outbound_queue_sample(
     RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
         .with_label_values(&[room, "websocket", session_id, "ws"])
         .set(depth as f64);
+    record_outbound_queue_bytes(room, "websocket", session_id, bytes);
+}
+
+/// Sample one session's per-kind queued bytes onto the room-level and
+/// per-session byte gauges. Both transports call this: WS passes its single
+/// channel's meter, WT passes its unistream lane's (#2717).
+pub fn record_outbound_queue_bytes(
+    room: &str,
+    transport: &str,
+    session_id: &str,
+    bytes: &crate::actors::priority_drop::QueueByteMeter,
+) {
     for &priority in crate::actors::priority_drop::QUEUE_BYTE_KIND_PRIORITIES {
         let kind = crate::actors::priority_drop::queue_byte_kind_label(priority);
         let queued = bytes.queued_for(priority) as f64;
         RELAY_OUTBOUND_QUEUE_BYTES
-            .with_label_values(&[room, "websocket", kind])
+            .with_label_values(&[room, transport, kind])
             .set(queued);
         RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION
-            .with_label_values(&[room, "websocket", session_id, kind])
+            .with_label_values(&[room, transport, session_id, kind])
             .set(queued);
     }
 }
@@ -784,9 +798,16 @@ lazy_static! {
     /// un-latches. Sustained nonzero => plaintext-datagram audio dropped (e.g.
     /// incoming-datagram queue overflow on a main-thread stall), a burst-loss
     /// NetEQ cannot conceal.
+    ///
+    /// Since #2724 this reads ~0 for a `ds=1` receiver, because reliable
+    /// delivery leaves no sequence gaps — NOT because the tracker is disabled.
+    /// What lifts it there is a RELAY-made gap (the audio-lane tail drop), not a
+    /// lost datagram, and such a gap is uniform across senders by construction,
+    /// so it satisfies #2029's uniformity test and can latch a receiver to
+    /// WebSocket.
     pub static ref AUDIO_DATAGRAM_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_audio_datagram_loss_per_sec",
-        "Per-peer windowed receive-side audio datagram loss rate (lost audio packets/sec) observed by a WebTransport receiver; sustained nonzero => audio datagrams being dropped",
+        "Per-peer windowed receive-side audio datagram loss rate (lost audio packets/sec) observed by a WebTransport receiver. Since #2724 a ds=1 receiver's audio rides a reliable stream, so this reads ~0 for it by design and is no longer its audio-health signal. The tracker still RUNS there: it is gated on the receiver's transport, not on the lane a packet arrived by, and it reads ~0 because reliable delivery leaves no sequence gaps, not because a path is disabled. What lifts it there is a RELAY-made gap, not a lost datagram - this relay's audio-lane tail drop, counted as videocall_outbound_channel_drops_total{transport=\"webtransport\",kind=\"audio\"}. One audio lane serves every sender, so such a gap is uniform across senders by construction and can still latch a receiver to WebSocket via #2029, which means a latch must be debugged at the relay as well as the receiver. Only the browser datagram drop this series is NAMED for is gone from that path; it stays reachable on a pre-#2723 client, a pre-#2724 relay, or a WT_AUDIO_DOWNLINK_LANE=datagram cluster",
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create audio_datagram_loss_per_sec metric");
@@ -797,7 +818,8 @@ lazy_static! {
     /// its positions shift off the 64-slot reorder window. This sums the
     /// sequence-gap sizes un-truncated at the jump, so it leads by the positions
     /// still inside the window.
-    /// Same recover-to-0 semantics and WebTransport gate; 0.0 on WS / E2EE-WT.
+    /// Same recover-to-0 semantics and WebTransport gate, and the same #2724
+    /// caveat its capped sibling above carries.
     pub static ref AUDIO_DATAGRAM_RAW_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_audio_datagram_raw_loss_per_sec",
         "Per-peer windowed receive-side audio datagram RAW (uncapped) loss rate (skipped sequences/sec) observed by a WebTransport receiver; the magnitude companion to videocall_audio_datagram_loss_per_sec",
@@ -1152,6 +1174,22 @@ lazy_static! {
     )
     .expect("Failed to create unistream_stale_delta_drops_total metric");
 
+    /// Cumulative camera deltas dropped by the publisher's WS freshness gate (#2809).
+    pub static ref CAMERA_WS_STALE_DELTA_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_camera_ws_stale_delta_drops_total",
+        "Cumulative camera delta frames dropped by the publisher's WebSocket freshness gate as of the latest client health snapshot; per-tab since page load, spans sessions",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create camera_ws_stale_delta_drops_total metric");
+
+    /// Cumulative screen deltas dropped by the publisher's WS freshness gate (#1921).
+    pub static ref SCREEN_WS_STALE_DELTA_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_ws_stale_delta_drops_total",
+        "Cumulative screen delta frames dropped by the publisher's WebSocket freshness gate as of the latest client health snapshot; per-tab since page load, spans sessions",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create screen_ws_stale_delta_drops_total metric");
+
     /// Cumulative WebSocket packet drops as of the latest client health snapshot.
     pub static ref WEBSOCKET_DROPS: GaugeVec = register_gauge_vec!(
         "videocall_websocket_drops",
@@ -1228,6 +1266,24 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create rtt_probe_stale_suppressions_total metric");
+
+    /// Reliable-lane stall episodes (#2720). GaugeVec set() to the client's
+    /// cumulative value, like the RTT-probe counters above.
+    pub static ref RELIABLE_LANE_STALL_EPISODES_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_reliable_lane_stall_episodes_total",
+        "Cumulative episodes where the client's reliable WebTransport downlink lane was silent for over 2.5 peer-heartbeat periods (~12.5s) while its datagram lane kept delivering (#2720) as of the latest client health snapshot. Since #2721 the client probes the reliable lane once a second and the relay echoes on the arrival lane, so that lane carries a 1 Hz cadence of its own even with no peers in the room",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create reliable_lane_stall_episodes_total metric");
+
+    /// Inbound unistreams the client lost, by read rejection or supersession
+    /// (#2722). GaugeVec set() to the client's cumulative value, like the above.
+    pub static ref INBOUND_UNISTREAM_RESETS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_inbound_unistream_resets_total",
+        "Cumulative inbound WebTransport unistreams a client lost as of its latest health snapshot (#2722): a read rejection, or a queued stream superseded before any reader saw it. The relay produces both by resetting the wedged downlink stream on a #1638 write-deadline shed, so this is the client-side correlate of the relay's own shed counters; a WebTransport session teardown also rejects the pending read and contributes one",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create inbound_unistream_resets_total metric");
 
     /// Cumulative transport re-election outcomes reported by the client
     /// (dashboard audit Tier B #3; discussion #562).
@@ -2331,12 +2387,12 @@ lazy_static! {
     )
     .expect("Failed to create relay_outbound_queue_depth metric");
 
-    /// Outbound channel occupancy in BYTES per media kind (#2261). WS only.
+    /// Outbound channel occupancy in BYTES per media kind (#2261, #2717).
     /// Split by `kind` because the budgets are: camera must be judged on
     /// camera bytes, not on a presenter's.
     pub static ref RELAY_OUTBOUND_QUEUE_BYTES: GaugeVec = register_gauge_vec!(
         "relay_outbound_queue_bytes",
-        "Current outbound channel occupancy in bytes by media kind (video|screen|other), WebSocket only. video/screen are the dimensions the #2261 priority policy sheds on; `other` (audio, control) is queued and reported but never shed on bytes. Room-level: each scrape reports one arbitrary session, so this does not reliably detect a single backed-up receiver -- use relay_outbound_queue_bytes_by_session for that",
+        "Current outbound channel occupancy in bytes by media kind (video|screen|other). On WebSocket this is the single outbound channel; on WebTransport it is the unistream lane, the only lane video and screen ride (the datagram lane is sub-MTU, so slots already bound its bytes). video/screen are the dimensions the #2261 priority policy sheds on; `other` (audio, control) is queued and reported but never shed on bytes. Room-level: each scrape reports one arbitrary session, so this does not reliably detect a single backed-up receiver -- use relay_outbound_queue_bytes_by_session for that",
         &["room", "transport", "kind"]
     )
     .expect("Failed to create relay_outbound_queue_bytes metric");
@@ -2344,7 +2400,7 @@ lazy_static! {
     /// Per-receiver outbound queue occupancy in BYTES keyed by session.
     pub static ref RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION: GaugeVec = register_gauge_vec!(
         "relay_outbound_queue_bytes_by_session",
-        "Per-receiver outbound queue occupancy in bytes keyed by session, split by media kind (video|screen|other), WebSocket only. The attributable form of relay_outbound_queue_bytes: one series per receiver, so a single backed-up receiver at its #2261 byte shed point is visible instead of being overwritten by an idle peer in the same room",
+        "Per-receiver outbound queue occupancy in bytes keyed by session, split by media kind (video|screen|other). WebSocket reports its single outbound channel; WebTransport reports its unistream lane (#2717). The attributable form of relay_outbound_queue_bytes: one series per receiver, so a single backed-up receiver at its #2261 byte shed point is visible instead of being overwritten by an idle peer in the same room",
         &["room", "transport", "session_id", "kind"]
     )
     .expect("Failed to create relay_outbound_queue_bytes_by_session metric");
@@ -2570,19 +2626,153 @@ lazy_static! {
     /// persistent uni stream), kept for label-shape parity with the sibling
     /// bridge counters.
     ///
-    /// CARDINALITY BOUND: at most 2 series
-    /// (`webtransport` x {write_timeout, write_error}). Safe for indefinite
-    /// retention; no cleanup required.
+    /// CONSUMER (#2726): the escalation reads this counter's per-session
+    /// `write_timeout` history.
+    ///
+    /// CARDINALITY BOUND: at most 3 series
+    /// (`webtransport` x {write_timeout, write_error, lane_abort}). Safe for
+    /// indefinite retention; no cleanup required.
     pub static ref RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL: CounterVec = register_counter_vec!(
         "relay_outbound_bridge_stream_resets_total",
-        "Persistent server->client WebTransport uni stream resets at the outbound bridge writer, by transport and reason (write_timeout|write_error) (#1638)",
+        "Server->client WebTransport uni stream resets at the outbound bridge writer, by transport and reason (write_timeout|write_error|lane_abort) (#1638). lane_abort is a #2723 lane whose task was cancelled with its stream still open — an idle reap or session teardown — reset rather than dropped, because dropping a quinn SendStream finishes it and leaves it open undrained (#2757). BASELINE CHANGED BY #2723: the #2717 byte dimension of the shed predicate is receiver-wide, so connection-level congestion parks every lane above the ratio at once and one congestion event now sheds up to WT_MAX_DOWNLINK_STREAMS streams where it shed one. Re-baseline before comparing across that deploy. CONSUMED BY #2726: the write_timeout series is the shed-escalation input; one shed per closed session is counted here although no stream reset followed it.",
         &["transport", "reason"]
     )
     .expect("Failed to create relay_outbound_bridge_stream_resets_total metric");
 
-    /// Outbound (relay→client) WebTransport DATAGRAM send failures at the
+    /// PRODUCING PATH: `bridge::escalate_unistream_shed`, on a `write_timeout`
+    /// shed that first crosses a threshold in an episode. REACHABILITY: fed by
+    /// `relay_outbound_bridge_stream_resets_total{reason="write_timeout"}`, so
+    /// `one` is expected non-zero wherever that shows repeated sheds on one
+    /// receiver; `two` is a CANARY for a sustainedly wedged receiver, expected
+    /// zero. CARDINALITY: 2 series.
+    pub static ref RELAY_DOWNLINK_SHED_ESCALATIONS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_shed_escalations_total",
+        "Receiver-downlink shed escalations entered, by transport and stage (one=camera video dropped at admission, two=session closed) (#2726)",
+        &["transport", "stage"]
+    )
+    .expect("Failed to create relay_downlink_shed_escalations_total metric");
+
+    /// PRODUCING PATH: `bridge::escalate_unistream_shed`, before
+    /// `Session::close`. Once per session, guarded by an `AtomicBool::swap`.
+    /// Both CANARIES, expected zero. CARDINALITY: 2 series.
+    pub static ref RELAY_WT_SESSION_CLOSES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_wt_session_closes_total",
+        "WebTransport sessions closed by the relay, by transport and reason (shed_rounds|delivery_stalled) (#2726)",
+        &["transport", "reason"]
+    )
+    .expect("Failed to create relay_wt_session_closes_total metric");
+
+    /// Downlink stream SLOTS currently held across all receivers on this relay
+    /// (#2723). A slot is one dispatcher lane — control, one publisher key, or
+    /// the overflow lane — and each lane holds at most one open QUIC stream, so
+    /// this is the quantity bounded by `WT_MAX_DOWNLINK_STREAMS` per receiver.
+    ///
+    /// CARDINALITY BOUND: 1 series (`webtransport`).
+    pub static ref RELAY_DOWNLINK_STREAM_SLOTS: GaugeVec = register_gauge_vec!(
+        "relay_downlink_stream_slots",
+        "Server->client WebTransport downlink stream slots currently held (control + per-publisher + overflow lanes), by transport (#2723)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_downlink_stream_slots metric");
+
+    /// Downlink streams CLEANLY finished (`finish`, application code 0), as
+    /// opposed to the #1638 shed `reset` counted by
+    /// [`RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL`] (#2723). Incremented by the
+    /// lane that owned the stream, so a lane that never opened one is not
+    /// counted.
+    ///
+    /// CARDINALITY BOUND: 1 series (`webtransport`).
+    pub static ref RELAY_DOWNLINK_STREAM_FINISHES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_stream_finishes_total",
+        "Server->client WebTransport downlink streams cleanly finished (not reset), by transport (#2723)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_downlink_stream_finishes_total metric");
+
+    /// Task entries the downlink dispatcher's `JoinSet` is holding (#2723).
+    ///
+    /// tokio removes a finished task's entry only when the owner calls a join,
+    /// so this is the leak surface for the reap-and-respawn cycle. Sampled at
+    /// each idle sweep, AFTER the drain.
+    ///
+    /// CARDINALITY BOUND: 1 series (`webtransport`).
+    pub static ref RELAY_DOWNLINK_LANE_TASK_ENTRIES: GaugeVec = register_gauge_vec!(
+        "relay_downlink_lane_task_entries",
+        "Task entries held by the downlink dispatcher's JoinSet, sampled after each idle sweep's drain, by transport (#2723)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_downlink_lane_task_entries metric");
+
+    /// Publisher stream keys evicted by the idle sweep (#2723) — the relay has
+    /// no per-peer "publisher left" fan-out event, so a key going quiet for
+    /// `WT_DOWNLINK_STREAM_IDLE_TIMEOUT` IS the observable leave signal. Also
+    /// fires on camera-off, screen-share stop and viewport exclusion.
+    ///
+    /// CARDINALITY BOUND: 1 series (`webtransport`).
+    pub static ref RELAY_DOWNLINK_STREAM_IDLE_REAPS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_stream_idle_reaps_total",
+        "Publisher downlink stream keys evicted by the idle sweep, by transport (#2723)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_downlink_stream_idle_reaps_total metric");
+
+    /// Frames written to a receiver's shared OVERFLOW stream, by CAUSE (#2723).
+    /// The two are very different and only one is a canary.
+    ///
+    /// `cause="unattributed"`: media the relay cannot attribute to a
+    /// (publisher, kind), because the publisher predates
+    /// `PacketWrapper.media_kind`. A rollout gauge, not a fault.
+    ///
+    /// `cause="cap"`: the receiver's publisher-key map was full. THIS is the
+    /// canary, and its expected magnitude is zero.
+    ///
+    /// CARDINALITY BOUND: 2 series (`webtransport` x {unattributed, cap}).
+    pub static ref RELAY_DOWNLINK_STREAM_OVERFLOW_FRAMES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_stream_overflow_frames_total",
+        "Frames written to the shared overflow downlink stream, by transport and cause: unattributed = media with no usable media_kind (expected high during the field-6 rollout), cap = the per-receiver publisher-stream cap was reached (expected zero) (#2723)",
+        &["transport", "cause"]
+    )
+    .expect("Failed to create relay_downlink_stream_overflow_frames_total metric");
+
+    /// WebTransport sessions accepted, by which primitive carries their downlink
+    /// audio (#2724). Booked ONCE per session, not per frame, because the
+    /// routing decision is otherwise invisible to an operator.
+    ///
+    /// REACHABILITY: 3 of the 4 declared series. `single`+`reliable` cannot
+    /// occur — `resolve_session_audio_lane` forces Datagram for Single — and
+    /// without `mode` the legacy and reverted populations are one series on a
+    /// reverted cluster (#2763).
+    ///
+    /// CARDINALITY BOUND: 4 series.
+    pub static ref RELAY_WT_AUDIO_DOWNLINK_SESSIONS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_relay_wt_audio_downlink_sessions_total",
+        "WebTransport sessions accepted, by the primitive carrying their downlink audio and by the downlink stream mode that chose it: lane reliable = the dedicated audio stream, datagram = the pre-#2724 unreliable route; mode single = a pre-#2723 client (always datagram), per_publisher_v1 = a ds=1 client, whose datagram rows are a WT_AUDIO_DOWNLINK_LANE revert rather than a legacy build (#2724, mode label #2763)",
+        &["lane", "mode"]
+    )
+    .expect("Failed to create videocall_relay_wt_audio_downlink_sessions_total metric");
+
+    /// Frames TAIL-DROPPED at the downlink dispatcher because a key's lane could
+    /// not take them (#2723): almost always a full hand-off queue, meaning that
+    /// key's stream is wedged and its #1638 shed has not fired yet; also a lane
+    /// whose task has exited, which happens only as the session dies. `kind` is
+    /// the byte-bucket label (`video`|`screen`|`other`), so a wedged publisher is
+    /// attributable.
+    ///
+    /// CARDINALITY BOUND: at most 3 series (`webtransport` x QUEUE_BYTE_KINDS).
+    pub static ref RELAY_DOWNLINK_STREAM_QUEUE_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_stream_queue_drops_total",
+        "Frames dropped at the downlink dispatcher because a stream key's lane could not take them (queue full, or lane gone), by transport and kind (#2723)",
+        &["transport", "kind"]
+    )
+    .expect("Failed to create relay_downlink_stream_queue_drops_total metric");
+
+    /// Outbound (relay→client) WebTransport DATAGRAM send ERRORS at the
     /// outbound bridge writer (`webtransport/bridge.rs` `spawn_datagram_writer`),
     /// by transport and `reason` (issue 2030).
+    ///
+    /// THIS COUNTS ERRORS, NOT OVERFLOW DROPS: quinn's `Datagrams::send(_, drop =
+    /// true)` pops the OLDEST queued datagram and returns `Ok` on overflow
+    /// (quinn-proto-0.11.13 `connection/datagrams.rs`).
     ///
     /// Fills the last quadrant of the bridge-drop counter family: inbound
     /// datagram/unistream drops are `relay_inbound_bridge_drops_total`; outbound
@@ -2606,10 +2796,8 @@ lazy_static! {
     /// datagram and STILL returns `Ok` from `send_datagram` (pacing / the
     /// congestion window only govern how fast that queue drains, so a slow
     /// drain is what lets it fill and overflow). This call site therefore
-    /// cannot observe those send-buffer-overflow evictions. Surfacing that
-    /// class would need a quinn-level dropped-datagram hook and is deliberately
-    /// out of scope for issue 2030 (that is the territory of the relay->client
-    /// sequence-number idea, subsumed by the reliable-audio reframe).
+    /// cannot observe those send-buffer-overflow evictions;
+    /// [`RELAY_CONNECTION_DATAGRAM_SILENT_DROPS`] surfaces them instead (#2712).
     ///
     /// `transport` is always `webtransport` here (only the WT bridge sends QUIC
     /// datagrams; the WS path has no datagram primitive), kept for label-shape
@@ -2634,7 +2822,7 @@ lazy_static! {
     /// above). Safe for indefinite retention; no cleanup required.
     pub static ref RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL: CounterVec = register_counter_vec!(
         "relay_outbound_bridge_datagram_send_failures_total",
-        "Outbound relay->client WebTransport datagram send failures at the bridge writer, by transport and reason (too_large|connection_lost|unsupported|disabled|webtransport) (issue 2030)",
+        "Outbound relay->client WebTransport datagram send ERRORS at the bridge writer — send_datagram returned Err — by transport and reason (too_large|connection_lost|unsupported|disabled|webtransport). Since #2716 reason=too_large and reason=unsupported are still counted here but the packet is NOT lost: the writer diverts it to the reliable uni stream and records the outcome on videocall_relay_datagram_unistream_fallbacks_total. The other reasons are still losses. NOT overflow drops: quinn's outgoing-datagram queue evicts the OLDEST entry and still returns Ok, so those are invisible here; use videocall_relay_connection_datagram_silent_drops instead (issue 2030, corrected by #2712)",
         &["transport", "reason"]
     )
     .expect("Failed to create relay_outbound_bridge_datagram_send_failures_total metric");
@@ -2775,6 +2963,18 @@ lazy_static! {
     )
     .expect("Failed to create relay_receiver_downlink_recovered_total metric");
 
+    /// Writes to a receiver's shared downlink-relief epoch, by `source` (#2718).
+    ///
+    /// A stamp is NOT an episode: the fan-out closure's windowed read coalesces
+    /// many stamps into one congestion event. Read it as "who is driving
+    /// relief", not "how many episodes".
+    pub static ref RELAY_DOWNLINK_RELIEF_STAMPS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_relief_stamps_total",
+        "Writes to the shared receiver-downlink relief epoch, by source (outbound_drop|unistream_shed) (#2718)",
+        &["source"]
+    )
+    .expect("Failed to create relay_downlink_relief_stamps_total metric");
+
     /// Non-base-layer media packets shed by the downlink congestion pre-filter
     /// (#1219 Half 2).
     ///
@@ -2793,9 +2993,12 @@ lazy_static! {
     ///
     /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
     /// retention.
+    /// SECOND PRODUCER (#2726): stage 1 sheds EVERY camera layer for one
+    /// receiver, at WT admission. Booked here and NOT on the two alerting
+    /// series, which it would otherwise page.
     pub static ref RELAY_DOWNLINK_SHED_TOTAL: CounterVec = register_counter_vec!(
         "relay_downlink_shed_total",
-        "Non-base-layer media packets shed before try_send for receivers in downlink congestion (#1219)",
+        "Media packets shed for receivers in downlink congestion: #1219's non-base layers in fan-out, plus #2726 stage 1's whole camera stream at WT admission",
         &["transport"]
     )
     .expect("Failed to create relay_downlink_shed_total metric");
@@ -2822,7 +3025,7 @@ lazy_static! {
     // ===== RELAY-MEASURED PER-CONNECTION QUIC PATH HEALTH (#1637, epic #1636) =====
     //
     // LEAD SIGNAL SET for distinguishing the two incident mechanisms epic #1636 is
-    // chasing on the single-threaded WT relay. Read these FOUR per-connection
+    // chasing on the WT relay. Read these FOUR per-connection
     // gauges TOGETHER — no single one separates B from C; the separability comes
     // from the PATTERN across them plus `videocall_relay_scheduler_lag_ms`:
     //
@@ -2856,8 +3059,9 @@ lazy_static! {
     // depends on the client's own clock + probe pipeline and is absent when a
     // client is wedged) this is the RELAY's authoritative measurement of every
     // live WT downlink. The sampler runs in `webtransport::handle_webtransport_session`
-    // ~every `WT_HEARTBEAT_INTERVAL` (5s) and reads ALL four values from a SINGLE
-    // `stats()` snapshot per tick (see `publish_connection_path_stats`).
+    // ~every `WT_HEARTBEAT_INTERVAL` (5s): ONE `stats()` snapshot (these four plus
+    // most of #2712's) plus two reads that are NOT in it — the bridge's call
+    // counter and `datagram_send_buffer_space()`. See `publish_connection_path_stats`.
     //
     // NOTE — there is NO "last-ACK age" field in quinn (quinn-proto 0.11
     // `connection/stats.rs` exposes `PathStats { rtt, lost_packets, lost_bytes,
@@ -2986,23 +3190,113 @@ lazy_static! {
     )
     .expect("Failed to create videocall_relay_connection_path_sent_packets metric");
 
+
+    /// Replaces #2712's structurally-zero `frame_tx_data_blocked` (#2716).
+    pub static ref RELAY_CONNECTION_FRAME_RX_MAX_DATA: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_frame_rx_max_data",
+        "Relay-measured cumulative MAX_DATA frames RECEIVED (quinn ConnectionStats.frame_rx.max_data) on a live WebTransport connection: connection-level flow-control credit the peer granted the relay. Read it as the INVERSE of a stall — a receiver that stops granting credit while the relay still has data queued is the wedge. Pair with videocall_relay_connection_path_cwnd_bytes and the outbound queue depth. Replaces frame_tx_data_blocked, which quinn-proto 0.11.13 never increments (it has no TX construction site for DATA_BLOCKED). Cumulative-in-a-gauge; chart with rate()/increase() (#2712, corrected by #2716)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_frame_rx_max_data metric");
+
+    /// Per-stream counterpart; replaces `frame_tx_stream_data_blocked` (#2716).
+    pub static ref RELAY_CONNECTION_FRAME_RX_MAX_STREAM_DATA: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_frame_rx_max_stream_data",
+        "Relay-measured cumulative MAX_STREAM_DATA frames RECEIVED (quinn ConnectionStats.frame_rx.max_stream_data) on a live WebTransport connection: per-stream flow-control credit the peer granted. This is the window the persistent unistream writer parks on (#1638), so a flat line here while that writer is parked identifies the receiver as the stall. Replaces frame_tx_stream_data_blocked, which quinn-proto 0.11.13 never increments. Cumulative-in-a-gauge; chart with rate()/increase() (#2712, corrected by #2716)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_frame_rx_max_stream_data metric");
+
+    pub static ref RELAY_CONNECTION_PATH_CWND_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_path_cwnd_bytes",
+        "Relay-measured CURRENT congestion window in bytes (quinn ConnectionStats.path.cwnd) for a live WebTransport connection. INSTANTANEOUS level, not cumulative — read directly, do NOT rate(). A cwnd collapsed to a few MTUs means the congestion controller is metering the downlink (#2712)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_path_cwnd_bytes metric");
+
+    pub static ref RELAY_CONNECTION_PATH_CURRENT_MTU_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_path_current_mtu_bytes",
+        "Relay-measured CURRENT path MTU in bytes (quinn ConnectionStats.path.current_mtu) for a live WebTransport connection. INSTANTANEOUS level, not cumulative. Bounds max_datagram_size and therefore the largest packet the relay can send as a datagram (#2712)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_path_current_mtu_bytes metric");
+
+    pub static ref RELAY_CONNECTION_PATH_BLACK_HOLES_DETECTED: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_path_black_holes_detected",
+        "Relay-measured cumulative black-hole detections (quinn ConnectionStats.path.black_holes_detected) on a live WebTransport connection's path; quinn falls back to the minimum MTU on each. Any nonzero value is a path fault, not ordinary congestion. Cumulative-in-a-gauge (#2712)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_path_black_holes_detected metric");
+
+    pub static ref RELAY_CONNECTION_FRAME_TX_DATAGRAM: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_frame_tx_datagram",
+        "Relay-measured cumulative DATAGRAM frames TRANSMITTED (quinn ConnectionStats.frame_tx.datagram) on a live WebTransport connection — datagrams that actually left the relay. Pair with datagram_send_calls; the difference is datagram_silent_drops. Cumulative-in-a-gauge; chart with rate()/increase() (#2712)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_frame_tx_datagram metric");
+
+    pub static ref RELAY_CONNECTION_DATAGRAM_SEND_CALLS: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_datagram_send_calls",
+        "Cumulative outbound relay->client send_datagram calls that returned Ok, counted at the bridge datagram writer for a live WebTransport connection (an AtomicU64 shared with the path-stat sampler, not a quinn stat). Ok means quinn ACCEPTED the datagram into its bounded outgoing queue, not that it was transmitted. Cumulative-in-a-gauge (#2712)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_datagram_send_calls metric");
+
+    pub static ref RELAY_CONNECTION_DATAGRAM_SILENT_DROPS: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_datagram_silent_drops",
+        "Relay->client datagrams enqueued but never transmitted on a live WebTransport connection: datagram_send_calls - frame_tx.datagram, clamped at 0. quinn's outgoing-datagram queue pops the OLDEST entry on overflow and still returns Ok, so the send-failures counter cannot see these; this can. Part of the value is queued-not-yet-sent, bounded by datagram_send_buffer_size, which #2742 set to WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES = 65975 (about 325 sub-MTU datagrams) — so read only a value CLIMBING across 5s ticks as real silent loss, and anything past ~325 as eviction (#2712, bound corrected by #2742)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_datagram_silent_drops metric");
+
+    pub static ref RELAY_CONNECTION_DATAGRAM_SEND_BUFFER_SPACE_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_datagram_send_buffer_space_bytes",
+        "Bytes free in quinn's outgoing datagram queue (quinn::Connection::datagram_send_buffer_space) for a live WebTransport connection. INSTANTANEOUS level, not cumulative. Zero means the queue has reached its budget: quinn evicts only while the queued total EXCEEDS datagram_send_buffer_size, so zero is the threshold at which the next send_datagram may start evicting, not proof one already did. Sustained zero + climbing datagram_silent_drops identifies queue overflow as the drop mechanism (#2712)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_datagram_send_buffer_space_bytes metric");
+
+    /// CARDINALITY BOUND: 2 series.
+    pub static ref RELAY_UDP_SOCKET_RECV_BUFFER_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_relay_udp_socket_recv_buffer_bytes",
+        "Requested vs effective SO_RCVBUF on the WebTransport relay's UDP socket, set once at endpoint construction. setting=requested is QUIC_UDP_RECV_BUFFER_BYTES; setting=effective is the raw getsockopt read-back. HOW TO READ IT ON LINUX: the kernel reports back DOUBLE what it accepted, so halve effective to get the granted bytes — effective/2 < requested means net.core.rmem_max clamped the request and the relay is running short. A stock node clamps a 4 MiB request to 212992, which reads back as 425984; a node with net.core.rmem_max=4194304 reads back 8388608. On macOS and the BSDs effective is the granted value as-is. No pod-level knob exists for net.core.*; it is a node-level sysctl (#2716)",
+        &["setting"]
+    )
+    .expect("Failed to create videocall_relay_udp_socket_recv_buffer_bytes metric");
+
+    /// CARDINALITY BOUND: 2 series.
+    pub static ref RELAY_UDP_SOCKET_SEND_BUFFER_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_relay_udp_socket_send_buffer_bytes",
+        "Requested vs effective SO_SNDBUF on the WebTransport relay's UDP socket, set once at endpoint construction. setting=requested is QUIC_UDP_SEND_BUFFER_BYTES; setting=effective is the raw getsockopt read-back. HOW TO READ IT ON LINUX: the kernel reports back DOUBLE what it accepted, so halve effective to get the granted bytes — effective/2 < requested means net.core.wmem_max clamped the request and the relay is running short. A stock node clamps a 4 MiB request to 212992, which reads back as 425984; a node with net.core.wmem_max=4194304 reads back 8388608. On macOS and the BSDs effective is the granted value as-is. No pod-level knob exists for net.core.*; it is a node-level sysctl (#2716)",
+        &["setting"]
+    )
+    .expect("Failed to create videocall_relay_udp_socket_send_buffer_bytes metric");
+
+    /// CARDINALITY BOUND: 4 series (2 reasons x 2 outcomes).
+    pub static ref RELAY_DATAGRAM_UNISTREAM_FALLBACKS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_relay_datagram_unistream_fallbacks_total",
+        "Outbound relay->client packets the bridge datagram writer diverted to the reliable uni stream after send_datagram refused them, by reason (too_large|unsupported) and outcome (unistream|dropped). Each divert also increments relay_outbound_bridge_datagram_send_failures_total with the same reason; read the two together — that counter says the datagram lane refused the packet, this one says whether the reliable lane carried it. Before #2716 every one of these was counted there and then DROPPED with no fallback (#2716)",
+        &["reason", "outcome"]
+    )
+    .expect("Failed to create videocall_relay_datagram_unistream_fallbacks_total metric");
+
     // ===== TOKIO SCHEDULER-LAG PROBE (#1637, epic #1636 — INSURANCE SIGNAL) =====
 
     /// Tokio scheduler lag of the WebTransport relay's runtime, in ms — a
     /// HISTOGRAM (#1637).
     ///
     /// This is the ONLY signal that resolves sub-second correlated scheduling
-    /// jitter on the relay's SINGLE-THREADED `#[actix_rt::main]` runtime (the
-    /// latent Gun #2 / #1639). The cgroup CPU average (cAdvisor `rate()` over
+    /// jitter on a relay runtime (the latent Gun #2 / #1639; since #2727 that is
+    /// the main runtime plus each session arbiter). The cgroup CPU average (cAdvisor `rate()` over
     /// >=15s) is structurally blind to a short stall: a 200ms freeze hides
     /// completely in a 5-second CPU average, yet it is exactly long enough to make
     /// every receiver's outbound channel back up at once. The only way to see it
     /// is to measure how late a timer that SHOULD fire on the relay's runtime
     /// actually fires.
     ///
-    /// WHAT IT MEASURES: a dedicated probe task (spawned in
-    /// `bin/webtransport_server.rs` `main` via `actix_rt::spawn`, so it lives on
-    /// the SAME single-thread runtime whose lag we want to observe) ticks a fixed
+    /// WHAT IT MEASURES: one probe task per relay runtime (#2727: the main one
+    /// plus each session arbiter), each spawned ON the runtime whose lag it
+    /// observes and all feeding this one histogram, ticks a fixed
     /// `tokio::time::interval` and `observe()`s how late each tick was POLLED versus
     /// the deadline it was SCHEDULED to fire — `Interval::tick().await` returns that
     /// scheduled deadline `Instant`, so the lag is `Instant::now() - deadline` via
@@ -3014,7 +3308,7 @@ lazy_static! {
     /// Measuring from the returned deadline (not an expected-vs-actual period) makes
     /// this correct under both `MissedTickBehavior::Burst` and `Delay` — see
     /// [`scheduler_lag_from_deadline`] for why. A probe on any OTHER thread would
-    /// measure nothing — running on the relay's own runtime is the whole point.
+    /// measure that thread — running on the runtime being observed is the point.
     ///
     /// WHY A HISTOGRAM, NOT A GAUGE: the relay is Prometheus-scraped every ~15s but
     /// the probe samples every 500ms. A Gauge holding only the most-recent sample
@@ -3029,8 +3323,8 @@ lazy_static! {
     ///
     /// BUCKETS (ms): 1/5/10/25/50/100/250/500/1000/2500. Sub-10ms is healthy
     /// timer jitter on a busy runtime; the 100ms+ buckets are the freeze class
-    /// epic #1636 cares about (a single-thread stall long enough to back up every
-    /// receiver's outbound channel at once). A nonzero `increase()` in the >=100ms
+    /// epic #1636 cares about (a stall long enough to back up the outbound
+    /// channel of every receiver on the affected runtime at once). A nonzero `increase()` in the >=100ms
     /// buckets during an incident window is the mechanism-B fingerprint.
     ///
     /// HOW TO READ B-vs-C: upper-bucket `increase()` HERE during an incident, with
@@ -3044,47 +3338,84 @@ lazy_static! {
     /// No cleanup needed (it is never per-session).
     pub static ref RELAY_SCHEDULER_LAG_MS: Histogram = register_histogram!(
         "videocall_relay_scheduler_lag_ms",
-        "Tokio scheduler lag of the WebTransport relay's single-threaded runtime, in ms (actual minus expected wake of a fixed-interval probe running ON that runtime), as a histogram so sub-second spikes survive the ~15s scrape. Upper-bucket increase() with sent_packets flat => relay thread-starvation (mechanism B, #1639); no upper-bucket movement while RTT/loss spike or sent_packets climbs => shared downlink/NIC (mechanism C) (#1637)",
+        "Tokio scheduler lag of a WebTransport relay runtime, in ms (actual minus expected wake of a fixed-interval probe running ON that runtime). Since #2727 the main runtime and every session arbiter each run one probe and all feed this one UNLABELLED histogram, so a spike names the relay, not which arbiter; /healthz reads the oldest per-runtime heartbeat and is what identifies a wedged one. A histogram so sub-second spikes survive the ~15s scrape. Upper-bucket increase() with sent_packets flat => relay thread-starvation (mechanism B, #1639); no upper-bucket movement while RTT/loss spike or sent_packets climbs => shared downlink/NIC (mechanism C) (#1637)",
         vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]
     )
     .expect("Failed to create videocall_relay_scheduler_lag_ms metric");
 }
 
-/// Publish a per-connection QUIC path-health snapshot to all FOUR per-`session_id`
-/// gauges (#1637). This is the SINGLE production emission seam — the relay's
-/// per-tick sampler (`webtransport::sample_connection_path_stats`) reads ONE
-/// `quinn` `ConnectionStats` snapshot per tick and calls exactly this, so the
-/// scalar→gauge mapping is pinned to a function a host unit test can drive without
-/// a live quinn connection
-/// (`metrics::tests::publish_connection_path_stats_sets_all_four_gauges`). Reverting
-/// any one `.set()` here therefore fails that test.
-///
-/// `rtt_ms` is the already-converted millisecond RTT (the caller runs
-/// `duration_to_millis_f64` on the `Duration`); the three packet counters are the
-/// raw cumulative `u64`s from `ConnectionStats.path`, set as `f64` (a gauge's
-/// native type) — Prometheus gauges are `f64` and packet counts well within
-/// `f64`'s exact-integer range. See each gauge's doc for how the four values
-/// separate mechanism B from C.
-pub fn publish_connection_path_stats(
-    room: &str,
-    session_id: &str,
-    rtt_ms: f64,
-    lost_packets: u64,
-    congestion_events: u64,
-    sent_packets: u64,
-) {
+/// One per-tick QUIC snapshot for a live WT connection (#1637, #2712). Most field
+/// names match their `ConnectionStats` source; `rtt_ms` is `path.rtt` converted,
+/// `datagram_frames_sent` is `frame_tx.datagram`, and the last two are not in
+/// `stats()` at all — the bridge's call counter and a `Connection` method.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectionPathSample {
+    pub rtt_ms: f64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub sent_packets: u64,
+    pub cwnd: u64,
+    pub current_mtu: u16,
+    pub black_holes_detected: u64,
+    pub max_data: u64,
+    pub max_stream_data: u64,
+    pub datagram_frames_sent: u64,
+    pub datagram_send_calls: u64,
+    pub datagram_send_buffer_space: u64,
+}
+
+impl ConnectionPathSample {
+    /// Datagrams accepted by quinn that never reached the wire. Saturates because
+    /// `datagram_frames_sent` can advance between the two reads.
+    pub fn silent_datagram_drops(&self) -> u64 {
+        self.datagram_send_calls
+            .saturating_sub(self.datagram_frames_sent)
+    }
+}
+
+/// Publish one [`ConnectionPathSample`] to all THIRTEEN per-`session_id` gauges
+/// (#1637, #2712). The SINGLE emission seam, so a host test pins every mapping.
+pub fn publish_connection_path_stats(room: &str, session_id: &str, sample: &ConnectionPathSample) {
+    let labels = &[room, session_id];
     RELAY_CONNECTION_RTT_MS
-        .with_label_values(&[room, session_id])
-        .set(rtt_ms);
+        .with_label_values(labels)
+        .set(sample.rtt_ms);
     RELAY_CONNECTION_PATH_LOST_PACKETS
-        .with_label_values(&[room, session_id])
-        .set(lost_packets as f64);
+        .with_label_values(labels)
+        .set(sample.lost_packets as f64);
     RELAY_CONNECTION_PATH_CONGESTION_EVENTS
-        .with_label_values(&[room, session_id])
-        .set(congestion_events as f64);
+        .with_label_values(labels)
+        .set(sample.congestion_events as f64);
     RELAY_CONNECTION_PATH_SENT_PACKETS
-        .with_label_values(&[room, session_id])
-        .set(sent_packets as f64);
+        .with_label_values(labels)
+        .set(sample.sent_packets as f64);
+    RELAY_CONNECTION_PATH_CWND_BYTES
+        .with_label_values(labels)
+        .set(sample.cwnd as f64);
+    RELAY_CONNECTION_PATH_CURRENT_MTU_BYTES
+        .with_label_values(labels)
+        .set(sample.current_mtu as f64);
+    RELAY_CONNECTION_PATH_BLACK_HOLES_DETECTED
+        .with_label_values(labels)
+        .set(sample.black_holes_detected as f64);
+    RELAY_CONNECTION_FRAME_RX_MAX_DATA
+        .with_label_values(labels)
+        .set(sample.max_data as f64);
+    RELAY_CONNECTION_FRAME_RX_MAX_STREAM_DATA
+        .with_label_values(labels)
+        .set(sample.max_stream_data as f64);
+    RELAY_CONNECTION_FRAME_TX_DATAGRAM
+        .with_label_values(labels)
+        .set(sample.datagram_frames_sent as f64);
+    RELAY_CONNECTION_DATAGRAM_SEND_CALLS
+        .with_label_values(labels)
+        .set(sample.datagram_send_calls as f64);
+    RELAY_CONNECTION_DATAGRAM_SILENT_DROPS
+        .with_label_values(labels)
+        .set(sample.silent_datagram_drops() as f64);
+    RELAY_CONNECTION_DATAGRAM_SEND_BUFFER_SPACE_BYTES
+        .with_label_values(labels)
+        .set(sample.datagram_send_buffer_space as f64);
 }
 
 /// Convert a [`std::time::Duration`] to whole-plus-fractional milliseconds as an
@@ -3147,12 +3478,12 @@ pub fn scheduler_lag_from_deadline(
 /// which drives it under tokio paused time and asserts the histogram sample count
 /// rises; deleting the `.observe(...)` below makes that test fail.
 ///
-/// `main` spawns this with `actix_rt::spawn(run_scheduler_lag_probe(...))` so it
-/// runs ON the relay's single-threaded runtime — the whole point of the signal (a
-/// probe on any other thread would measure that thread's scheduler, not the
-/// relay's). It never returns (infinite loop); the process owns its lifetime.
-/// `pub` (not `pub(crate)`) because the `webtransport_server` binary is a separate
-/// crate target that imports it from the `sec_api` library.
+/// Each relay runtime runs its own probe ON itself (#2727) and stamps the
+/// heartbeat `slot` it claimed from
+/// [`crate::relay_health::register_heartbeat_slot`]. Every probe observes into
+/// the SAME [`RELAY_SCHEDULER_LAG_MS`] histogram with no extra label; the slot
+/// is what separates the runtimes, because `/healthz` reads the oldest stamp.
+/// Never returns. `pub` because `webtransport_server` is a separate target.
 ///
 /// Lag is measured from the tick's SCHEDULED DEADLINE — `Interval::tick().await`
 /// returns the `Instant` the tick was scheduled to fire (tokio 1.48
@@ -3160,7 +3491,11 @@ pub fn scheduler_lag_from_deadline(
 /// correct under both `MissedTickBehavior::Burst` and `Delay`; `Delay` is retained
 /// only as the cadence policy (no burst catch-up after a stall), NOT load-bearing
 /// for correctness. See [`scheduler_lag_from_deadline`].
-pub async fn run_scheduler_lag_probe(period: std::time::Duration) {
+///
+/// Since #2719 each tick also calls
+/// [`crate::relay_health::stamp_relay_heartbeat_slot`], so this is the single
+/// timer behind both the lag histogram and the WT relay's `/healthz` answer.
+pub async fn run_scheduler_lag_probe_on_slot(period: std::time::Duration, slot: usize) {
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -3170,43 +3505,38 @@ pub async fn run_scheduler_lag_probe(period: std::time::Duration) {
         let deadline = interval.tick().await;
         let now = tokio::time::Instant::now();
         RELAY_SCHEDULER_LAG_MS.observe(scheduler_lag_from_deadline(deadline, now));
+        crate::relay_health::stamp_relay_heartbeat_slot(slot);
     }
 }
 
-/// Spawn the scheduler-lag probe on the relay's single-thread runtime (#1637).
+/// Spawn the scheduler-lag probe on one relay runtime (#1637, #2727).
 ///
 /// Extracted (mirrors `webtransport::spawn_connection_path_sampler`) so the
 /// `actix_rt::spawn` + probe loop + `.observe()` wiring is exercised by a host
-/// test: `metrics::tests::spawn_scheduler_lag_probe_observes_into_histogram` calls
-/// THIS fn and asserts the histogram sample count rises, so deleting the spawn
-/// here fails that test. `actix_rt::spawn` keeps the probe on the relay runtime
-/// whose lag it measures (a probe on any other thread would measure that thread's
-/// scheduler, not the relay's).
+/// test rather than left unguarded inside a binary.
 ///
-/// The residual `main() -> spawn_scheduler_lag_probe()` call is the one
-/// irreducible composition line — same status as `main`'s NATS-connect /
-/// health-server-bind / `webtransport::start` wiring: a binary's `main` cannot be
-/// unit-tested without a full smoke harness, so we deliberately do NOT add a
-/// fragile binary smoke test for it. Every reducible seam below `main` is now
-/// covered.
+/// MUST be called ON the runtime being measured: `actix_rt::spawn` is
+/// `spawn_local`, so the probe lands on the caller's `LocalSet`. `main` calls it
+/// for the main runtime and `SessionShards::spawn_scheduler_lag_probes` calls it
+/// from inside each arbiter, for that reason.
 ///
-/// `pub` (not `pub(crate)`) because the `webtransport_server` binary is a separate
-/// crate target that imports it from the `sec_api` library — same as
-/// [`run_scheduler_lag_probe`].
-pub fn spawn_scheduler_lag_probe(period: std::time::Duration) -> actix_rt::task::JoinHandle<()> {
-    actix_rt::spawn(run_scheduler_lag_probe(period))
+/// It also installs the `/healthz` staleness threshold for `period` (#2719) via
+/// [`crate::relay_health::configure_stale_threshold`], so the threshold and the
+/// stamping cadence cannot drift: whatever period the caller picks, the threshold
+/// is derived from it.
+pub fn spawn_scheduler_lag_probe_on_slot(
+    period: std::time::Duration,
+    slot: usize,
+) -> actix_rt::task::JoinHandle<()> {
+    crate::relay_health::configure_stale_threshold(period);
+    actix_rt::spawn(run_scheduler_lag_probe_on_slot(period, slot))
 }
 
 /// Remove the per-connection QUIC path-health gauges for a single WebTransport
 /// `session_id` (#1637; issue #996 cardinality-GC pattern).
 ///
-/// `videocall_relay_connection_rtt_ms` /
-/// `videocall_relay_connection_path_lost_packets` /
-/// `videocall_relay_connection_path_congestion_events` /
-/// `videocall_relay_connection_path_sent_packets` carry an unbounded-over-time
-/// `session_id` label, so — like [`forget_session_drops`] — the series for a
-/// disconnected connection must be removed the instant its session ends or it
-/// leaks for the process lifetime.
+/// Every gauge [`publish_connection_path_stats`] sets carries an unbounded
+/// `session_id` label, so a disconnected connection's series must go at once.
 ///
 /// CALL SITE (note the difference from [`forget_session_drops`]): this is invoked
 /// inline in `webtransport::handle_webtransport_session` right after
@@ -3221,10 +3551,20 @@ pub fn spawn_scheduler_lag_probe(period: std::time::Duration) -> actix_rt::task:
 /// (e.g. the sampler had not yet taken its first sample), so each call is
 /// intentionally `let _ =`-discarded.
 pub fn forget_connection_path_stats(room: &str, session_id: &str) {
-    let _ = RELAY_CONNECTION_RTT_MS.remove_label_values(&[room, session_id]);
-    let _ = RELAY_CONNECTION_PATH_LOST_PACKETS.remove_label_values(&[room, session_id]);
-    let _ = RELAY_CONNECTION_PATH_CONGESTION_EVENTS.remove_label_values(&[room, session_id]);
-    let _ = RELAY_CONNECTION_PATH_SENT_PACKETS.remove_label_values(&[room, session_id]);
+    let labels = &[room, session_id];
+    let _ = RELAY_CONNECTION_RTT_MS.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_PATH_LOST_PACKETS.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_PATH_CONGESTION_EVENTS.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_PATH_SENT_PACKETS.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_PATH_CWND_BYTES.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_PATH_CURRENT_MTU_BYTES.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_PATH_BLACK_HOLES_DETECTED.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_FRAME_RX_MAX_DATA.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_FRAME_RX_MAX_STREAM_DATA.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_FRAME_TX_DATAGRAM.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_DATAGRAM_SEND_CALLS.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_DATAGRAM_SILENT_DROPS.remove_label_values(labels);
+    let _ = RELAY_CONNECTION_DATAGRAM_SEND_BUFFER_SPACE_BYTES.remove_label_values(labels);
 }
 
 // =============================================================================
@@ -3264,7 +3604,7 @@ pub fn init_websocket_relay_series() {
     init_ws_fragment_discard_series();
 }
 
-/// `webtransport_server`. Only it spawns `spawn_scheduler_lag_probe`.
+/// `webtransport_server`. Only it runs a scheduler-lag probe.
 pub fn init_webtransport_relay_series() {
     init_relay_common_series();
     lazy_static::initialize(&RELAY_SCHEDULER_LAG_MS);
@@ -3287,6 +3627,48 @@ pub fn init_server_stats_series() {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// There is no automatic namespace, so a mismatch between the registered
+    /// and documented names reads to an operator as "the deploy did not take
+    /// effect" (contract A23). Reads the name off the live registry.
+    #[test]
+    #[serial]
+    fn the_audio_downlink_sessions_series_is_registered_under_its_documented_name() {
+        const DOCUMENTED: &str = "videocall_relay_wt_audio_downlink_sessions_total";
+        RELAY_WT_AUDIO_DOWNLINK_SESSIONS_TOTAL
+            .with_label_values(&["reliable", "per_publisher_v1"])
+            .inc_by(0.0);
+        assert!(
+            prometheus::gather()
+                .iter()
+                .any(|mf| mf.get_name() == DOCUMENTED),
+            "docs/DEPLOYMENT_CONFIG_MAP.md, the WT chart values and the contract \
+             all tell operators to query {DOCUMENTED}; the registry has no such \
+             series",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_shed_escalation_series_are_registered_under_their_documented_names() {
+        RELAY_DOWNLINK_SHED_ESCALATIONS_TOTAL
+            .with_label_values(&["webtransport", "one"])
+            .inc_by(0.0);
+        RELAY_WT_SESSION_CLOSES_TOTAL
+            .with_label_values(&["webtransport", "shed_rounds"])
+            .inc_by(0.0);
+        let families = prometheus::gather();
+        for documented in [
+            "relay_downlink_shed_escalations_total",
+            "relay_wt_session_closes_total",
+        ] {
+            assert!(
+                families.iter().any(|mf| mf.get_name() == documented),
+                "the #2726 contract tells operators to query {documented}; the \
+                 registry has no such series",
+            );
+        }
+    }
 
     /// Snapshot the counter, mutate, and assert delta. The counter is a global
     /// static so any concurrent test in the same process could alter it; we
@@ -3770,6 +4152,7 @@ mod tests {
             OutboundPriority::Audio,
             OutboundPriority::Video,
             OutboundPriority::Screen,
+            OutboundPriority::ProbeEcho,
         ];
         for p in all_priorities {
             // Compile-time exhaustiveness guard: adding an OutboundPriority
@@ -3780,7 +4163,8 @@ mod tests {
                 | OutboundPriority::Control
                 | OutboundPriority::Audio
                 | OutboundPriority::Video
-                | OutboundPriority::Screen => {}
+                | OutboundPriority::Screen
+                | OutboundPriority::ProbeEcho => {}
             }
             if let Some(label) = p.priority_drop_label() {
                 emitted.insert(label);
@@ -3810,8 +4194,13 @@ mod tests {
         //     WT RTT-echo channel-full site (`wt_chat_session`); `drop_kind_label`
         //     never returns it (a `MediaType::RTT` packet maps to the `media`
         //     catch-all), so it must be witnessed by hand here.
-        let string_literal_drop_labels =
-            ["mailbox_full", "channel_full", "overflow_critical", "rtt"];
+        let string_literal_drop_labels = [
+            "mailbox_full",
+            "channel_full",
+            "lane_dead",
+            "overflow_critical",
+            "rtt",
+        ];
         for k in &string_literal_drop_labels {
             assert!(
                 RELAY_DROP_KINDS.contains(k),
@@ -4457,106 +4846,138 @@ mod tests {
         );
     }
 
-    /// `publish_connection_path_stats` sets ALL FOUR per-connection gauges from a
-    /// known snapshot, then `forget_connection_path_stats` removes all four
-    /// (#1637 / #996). This pins BOTH production seams: the per-tick EMISSION
-    /// mapping (the function the sampler calls every tick — reverting any one
-    /// `.set()` makes the matching assert below fail) AND the teardown GC sweep
-    /// (deleting any one `remove_label_values` makes the matching 0.0 assert fail).
-    /// It calls the REAL production functions, not inline replicas, so a mutation
-    /// to either is caught here.
+    /// `publish_connection_path_stats` sets EVERY gauge, then
+    /// `forget_connection_path_stats` removes every one (#1637 / #996 / #2712).
     #[test]
     #[serial(relay_connection_path_stats_metric)]
-    fn publish_connection_path_stats_sets_all_four_gauges_then_gc_removes_them() {
+    fn publish_connection_path_stats_sets_all_gauges_then_gc_removes_them() {
         let room = "gc-room-1637";
         let session_id = "987654321";
 
         // Distinct sentinel values so a copy-paste bug that wires one gauge to the
         // wrong field is caught (each gauge must read ITS OWN value, not another's).
-        let rtt_ms = 123.0_f64;
-        let lost_packets = 7_u64;
-        let congestion_events = 3_u64;
-        let sent_packets = 9001_u64;
+        let sample = ConnectionPathSample {
+            rtt_ms: 123.0,
+            lost_packets: 7,
+            congestion_events: 3,
+            sent_packets: 9001,
+            cwnd: 64_240,
+            current_mtu: 1372,
+            black_holes_detected: 2,
+            max_data: 11,
+            max_stream_data: 17,
+            datagram_frames_sent: 400,
+            datagram_send_calls: 555,
+            datagram_send_buffer_space: 8192,
+        };
+        let expected_silent_drops = 155.0_f64;
 
         // PRODUCTION emission seam — the exact function the per-tick sampler calls.
-        publish_connection_path_stats(
-            room,
-            session_id,
-            rtt_ms,
-            lost_packets,
-            congestion_events,
-            sent_packets,
-        );
+        publish_connection_path_stats(room, session_id, &sample);
 
-        // Each gauge must hold ITS OWN published value. Reverting/mis-wiring any
-        // single `.set()` in `publish_connection_path_stats` breaks exactly one of
-        // these (non-vacuous: the values are distinct and nonzero).
-        assert_eq!(
-            RELAY_CONNECTION_RTT_MS
-                .with_label_values(&[room, session_id])
-                .get(),
-            rtt_ms,
-            "rtt gauge must reflect the published rtt_ms"
-        );
-        assert_eq!(
-            RELAY_CONNECTION_PATH_LOST_PACKETS
-                .with_label_values(&[room, session_id])
-                .get(),
-            lost_packets as f64,
-            "lost_packets gauge must reflect the published count"
-        );
-        assert_eq!(
-            RELAY_CONNECTION_PATH_CONGESTION_EVENTS
-                .with_label_values(&[room, session_id])
-                .get(),
-            congestion_events as f64,
-            "congestion_events gauge must reflect the published count"
-        );
-        assert_eq!(
-            RELAY_CONNECTION_PATH_SENT_PACKETS
-                .with_label_values(&[room, session_id])
-                .get(),
-            sent_packets as f64,
-            "sent_packets gauge must reflect the published count (B-vs-C disambiguator)"
-        );
+        let expected: Vec<(&GaugeVec, f64, &str)> = vec![
+            (&RELAY_CONNECTION_RTT_MS, sample.rtt_ms, "rtt_ms"),
+            (
+                &RELAY_CONNECTION_PATH_LOST_PACKETS,
+                sample.lost_packets as f64,
+                "lost_packets",
+            ),
+            (
+                &RELAY_CONNECTION_PATH_CONGESTION_EVENTS,
+                sample.congestion_events as f64,
+                "congestion_events",
+            ),
+            (
+                &RELAY_CONNECTION_PATH_SENT_PACKETS,
+                sample.sent_packets as f64,
+                "sent_packets (B-vs-C disambiguator)",
+            ),
+            (
+                &RELAY_CONNECTION_PATH_CWND_BYTES,
+                sample.cwnd as f64,
+                "cwnd",
+            ),
+            (
+                &RELAY_CONNECTION_PATH_CURRENT_MTU_BYTES,
+                sample.current_mtu as f64,
+                "current_mtu",
+            ),
+            (
+                &RELAY_CONNECTION_PATH_BLACK_HOLES_DETECTED,
+                sample.black_holes_detected as f64,
+                "black_holes_detected",
+            ),
+            (
+                &RELAY_CONNECTION_FRAME_RX_MAX_DATA,
+                sample.max_data as f64,
+                "max_data",
+            ),
+            (
+                &RELAY_CONNECTION_FRAME_RX_MAX_STREAM_DATA,
+                sample.max_stream_data as f64,
+                "max_stream_data",
+            ),
+            (
+                &RELAY_CONNECTION_FRAME_TX_DATAGRAM,
+                sample.datagram_frames_sent as f64,
+                "datagram_frames_sent",
+            ),
+            (
+                &RELAY_CONNECTION_DATAGRAM_SEND_CALLS,
+                sample.datagram_send_calls as f64,
+                "datagram_send_calls",
+            ),
+            (
+                &RELAY_CONNECTION_DATAGRAM_SILENT_DROPS,
+                expected_silent_drops,
+                "silent_datagram_drops (calls - frames)",
+            ),
+            (
+                &RELAY_CONNECTION_DATAGRAM_SEND_BUFFER_SPACE_BYTES,
+                sample.datagram_send_buffer_space as f64,
+                "datagram_send_buffer_space",
+            ),
+        ];
+
+        for (gauge, want, name) in &expected {
+            assert_eq!(
+                gauge.with_label_values(&[room, session_id]).get(),
+                *want,
+                "{name} gauge must reflect its own published value"
+            );
+        }
 
         // PRODUCTION teardown sweep — the exact function the session teardown calls.
         forget_connection_path_stats(room, session_id);
 
-        // All four series must be gone (re-fetch yields a fresh 0.0 handle).
-        // Deleting any one removal line in `forget_connection_path_stats` leaves a
-        // residual nonzero value here and fails the matching assert.
-        assert_eq!(
-            RELAY_CONNECTION_RTT_MS
-                .with_label_values(&[room, session_id])
-                .get(),
-            0.0,
-            "rtt gauge must be removed at teardown"
-        );
-        assert_eq!(
-            RELAY_CONNECTION_PATH_LOST_PACKETS
-                .with_label_values(&[room, session_id])
-                .get(),
-            0.0,
-            "lost_packets gauge must be removed at teardown"
-        );
-        assert_eq!(
-            RELAY_CONNECTION_PATH_CONGESTION_EVENTS
-                .with_label_values(&[room, session_id])
-                .get(),
-            0.0,
-            "congestion_events gauge must be removed at teardown"
-        );
-        assert_eq!(
-            RELAY_CONNECTION_PATH_SENT_PACKETS
-                .with_label_values(&[room, session_id])
-                .get(),
-            0.0,
-            "sent_packets gauge must be removed at teardown"
-        );
+        for (gauge, _, name) in &expected {
+            assert_eq!(
+                gauge.with_label_values(&[room, session_id]).get(),
+                0.0,
+                "{name} gauge must be removed at teardown"
+            );
+        }
 
         // Clean up the fresh zero handles the asserts above created.
         forget_connection_path_stats(room, session_id);
+    }
+
+    /// A plain `u64` subtraction here would panic in debug, wrap in release.
+    #[test]
+    fn silent_datagram_drops_saturates_when_frames_lead_calls() {
+        let skewed = ConnectionPathSample {
+            datagram_send_calls: 10,
+            datagram_frames_sent: 12,
+            ..Default::default()
+        };
+        assert_eq!(skewed.silent_datagram_drops(), 0);
+
+        let real = ConnectionPathSample {
+            datagram_send_calls: 900,
+            datagram_frames_sent: 120,
+            ..Default::default()
+        };
+        assert_eq!(real.silent_datagram_drops(), 780);
     }
 
     /// Regression test for the scheduler-lag probe's PRODUCTION emission wiring
@@ -4579,7 +5000,10 @@ mod tests {
 
         // Spawn the REAL production probe loop. It never returns, so we drive it a
         // few ticks under paused time then abort it.
-        let handle = tokio::spawn(run_scheduler_lag_probe(period));
+        let handle = tokio::spawn(run_scheduler_lag_probe_on_slot(
+            period,
+            crate::relay_health::MAIN_HEARTBEAT_SLOT,
+        ));
 
         // Under `start_paused`, timers only fire when we advance the clock. The
         // first `interval.tick()` is immediate; advancing by several periods (with
@@ -4609,7 +5033,7 @@ mod tests {
     /// stop rising and FAILS this test. The sibling
     /// `run_scheduler_lag_probe_observes_into_histogram` pins the LOOP/observe;
     /// THIS pins the spawn — together the only uncovered line is the irreducible
-    /// `main() -> spawn_scheduler_lag_probe()` composition.
+    /// `main() -> spawn_scheduler_lag_probe_on_slot()` composition.
     ///
     /// `#[actix_rt::test]` (NOT `#[tokio::test]`): `actix_rt::spawn` needs the
     /// actix System/LocalSet that `actix_rt::test` provides — exactly like the
@@ -4625,7 +5049,10 @@ mod tests {
         let before = RELAY_SCHEDULER_LAG_MS.get_sample_count();
 
         // Drive the REAL production spawn helper.
-        let handle = spawn_scheduler_lag_probe(std::time::Duration::from_millis(10));
+        let handle = spawn_scheduler_lag_probe_on_slot(
+            std::time::Duration::from_millis(10),
+            crate::relay_health::MAIN_HEARTBEAT_SLOT,
+        );
 
         // Let a few real ticks land (immediate first tick => >=1 observe).
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;

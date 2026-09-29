@@ -268,6 +268,7 @@ pub mod screen_first_render_inject;
 mod test_serial;
 pub mod utils;
 mod wrappers;
+pub mod wt_receive_inject;
 // Issue 2135: raise-hand send policy. Pure + host-testable; the UI owns one
 // `RaiseHandAnnouncer` and drives it (see the module docs for why this coalesces
 // rather than drops, unlike the reactions self-throttle below).

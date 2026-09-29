@@ -66,6 +66,9 @@ pub use connection_manager::{
     connection_session_drops_ws, connection_session_drops_wt,
 };
 pub use webmedia::{ConnectOptions, MediaStreamKey};
+// #2746: test-only, to pin this whitelist against the peer-creation gate.
+#[cfg(test)]
+pub(crate) use connection_manager::should_filter_self_packet;
 
 // Issue #1080: the runtime netsim control-surface installer, re-exported
 // so the UI crate (e.g. `dioxus-ui`) can register `window.__vcNetsim` at
@@ -73,3 +76,11 @@ pub use webmedia::{ConnectOptions, MediaStreamKey};
 // arm impairment pre-join and toggle it mid-call.
 #[cfg(feature = "netsim")]
 pub use netsim_control::install_window_hook as install_netsim_window_hook;
+#[cfg(all(test, feature = "netsim"))]
+pub(crate) use netsim_control::{
+    force_camera_keyframe_for_netsim, set_ws_buffered_override_for_netsim,
+};
+#[cfg(feature = "netsim")]
+pub(crate) use netsim_control::{
+    register_camera_force_keyframe_for_netsim, ws_buffered_override_for_netsim,
+};

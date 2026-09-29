@@ -19,43 +19,48 @@
 use std::net::ToSocketAddrs;
 
 use actix::Actor;
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpServer};
 use tracing::{error, info};
 
 use sec_api::actors::chat_server::ChatServer;
-use sec_api::metrics::{metrics_responder, spawn_scheduler_lag_probe};
+use sec_api::metrics::{metrics_responder, spawn_scheduler_lag_probe_on_slot};
+use sec_api::relay_health;
+use sec_api::relay_shards::SessionShards;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
 use sec_api::version;
 use sec_api::webtransport::{self, Certs};
 
-async fn health_responder() -> impl Responder {
-    HttpResponse::Ok().body("Ok")
-}
-
-// This relay runs on a SINGLE-THREADED runtime by necessity.
-//
-// `#[actix_rt::main]` builds a current-thread tokio runtime (actix-rt never
-// reads `worker_threads` / the `TOKIO_WORKER_THREADS` env var). It must be
-// single-threaded because the per-session `WtChatSession` actor and its
-// WebTransport stream/datagram I/O are driven on the actix `LocalSet` via
-// `spawn_local` (see `webtransport::mod` connection-accept loop), which a
-// multi-threaded runtime cannot host. Consequently `TOKIO_WORKER_THREADS` is
-// INERT for this binary — setting it in deploy config does nothing, and
-// thread count cannot relieve outbound back-pressure here.
-//
-// Scaling past one core (multi-Arbiter sharding / off-thread parse — issue
-// #1639 options a/b) is future work, gated on the #1637 scheduler-lag
-// instrumentation. Issue #1639 option (c) only removed the inert env and
-// documented this ceiling.
-#[actix_rt::main]
-async fn main() {
+// #2727: `WT_SESSION_ARBITERS` shards the relay. Past one it builds a
+// MULTI-THREADED tokio runtime, for which `TOKIO_WORKER_THREADS` is LIVE and a
+// bad value FATAL — so the pool size is passed explicitly below, which is what
+// makes tokio ignore it. Leave it unset; use `WT_SESSION_ARBITERS`.
+fn main() {
+    // Before reading the arbiter count: resolving it warns on a rejected value,
+    // and a `warn!` predating the subscriber is dropped by the facade.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
         .with_writer(std::io::stderr)
         .init();
 
+    let arbiters = sec_api::relay_shards::session_arbiter_count();
+    let workers = sec_api::relay_shards::resolve_worker_thread_count(arbiters);
+    let runner = if sec_api::relay_shards::needs_multi_thread_runtime(arbiters) {
+        actix_rt::System::with_tokio_rt(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .expect("failed to build the relay's multi-threaded tokio runtime")
+        })
+    } else {
+        actix_rt::System::new()
+    };
+    runner.block_on(run(arbiters, workers));
+}
+
+async fn run(arbiters: usize, workers: usize) {
     info!("Starting WebTransport server with actor-based session handling");
     sec_api::startup::log_feature_flags();
     sec_api::metrics::init_webtransport_relay_series();
@@ -88,29 +93,31 @@ async fn main() {
         tracker_task.run_message_loop(tracker_receiver).await;
     });
 
-    // #1637 (epic #1636, INSURANCE SIGNAL): tokio scheduler-lag probe.
-    //
-    // This relay runs on a SINGLE-THREADED `#[actix_rt::main]` runtime, so a long
-    // synchronous span or fan-out burst on that one thread stalls EVERY task at
-    // once — the latent Gun #2 (#1639). The cgroup CPU average cannot resolve such
-    // a sub-second stall (a 200ms freeze vanishes in a multi-second average). The
-    // only way to see it is to measure how late a timer that SHOULD fire on THIS
-    // runtime actually fires.
-    //
-    // The probe spawn + loop live in `metrics::spawn_scheduler_lag_probe` /
-    // `run_scheduler_lag_probe` (library fns, so the `actix_rt::spawn` + loop +
-    // `.observe()` wiring is unit-testable — an inline spawn here would not be,
-    // leaving it unguarded; mirrors `webtransport::spawn_connection_path_sampler`).
-    // It spawns on `actix_rt` ON PURPOSE: the probe must live on the SAME
-    // single-thread runtime whose lag we want to measure — a probe on any other
-    // thread would measure that thread's scheduler, not the relay's. See
-    // `run_scheduler_lag_probe` for the deadline-based measurement (correct under
-    // both MissedTickBehavior variants) and the histogram-vs-gauge rationale. This
-    // `main() -> spawn_scheduler_lag_probe()` line is the irreducible composition
-    // boundary (like the NATS-connect / health-bind / webtransport::start calls
-    // around it — `main` is not unit-tested).
-    const SCHEDULER_LAG_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-    spawn_scheduler_lag_probe(SCHEDULER_LAG_PROBE_INTERVAL);
+    // #1637 scheduler-lag probe, also the #2719 `/healthz` heartbeat. The main
+    // runtime claims slot 0 and each arbiter its own, so `/healthz` reads the
+    // OLDEST stamp.
+    const SCHEDULER_LAG_PROBE_INTERVAL: std::time::Duration = relay_health::HEARTBEAT_PERIOD;
+    let main_slot = relay_health::register_heartbeat_slot();
+    spawn_scheduler_lag_probe_on_slot(SCHEDULER_LAG_PROBE_INTERVAL, main_slot);
+
+    // Before the QUIC listener accepts, so no connection lands on a shard whose
+    // heartbeat slot is unregistered.
+    let mut shards = SessionShards::new(arbiters);
+    let arbiter_probes = shards.spawn_scheduler_lag_probes(SCHEDULER_LAG_PROBE_INTERVAL);
+    let shards = std::sync::Arc::new(shards);
+    info!(
+        "Session sharding: {} arbiter(s) ({} probed), {} tokio worker(s), override with {}",
+        shards.len(),
+        arbiter_probes,
+        workers,
+        sec_api::relay_shards::SESSION_ARBITERS_ENV
+    );
+    info!(
+        "Relay liveness heartbeat: period={:?}, /healthz fails past {}ms (override with {})",
+        SCHEDULER_LAG_PROBE_INTERVAL,
+        relay_health::stale_threshold_ms(),
+        relay_health::STALE_THRESHOLD_ENV
+    );
 
     // Health server setup
     let health_listen = std::env::var("HEALTH_LISTEN_URL")
@@ -141,12 +148,17 @@ async fn main() {
     // Start health server
     actix_rt::spawn(async move {
         info!("Starting health/metrics HTTP server: {:?}", health_listen);
+        // actix-server's default is one worker thread per available core.
         let server = HttpServer::new(|| {
             App::new()
-                .route("/healthz", web::get().to(health_responder))
+                .route(
+                    "/healthz",
+                    web::get().to(relay_health::relay_health_responder),
+                )
                 .route("/metrics", web::get().to(metrics_responder))
                 .route("/version", web::get().to(version::webtransport_version))
-        });
+        })
+        .workers(1);
 
         match server.bind(&health_listen) {
             Ok(server) => {
@@ -169,6 +181,7 @@ async fn main() {
             nats_client,
             tracker_sender,
             session_manager,
+            shards,
         )
         .await
         {

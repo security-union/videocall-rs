@@ -37,6 +37,7 @@
 //! ```
 
 pub mod auth;
+pub mod co_hosts;
 pub mod error;
 pub mod host;
 pub mod meetings;

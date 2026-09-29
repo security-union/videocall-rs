@@ -26,11 +26,14 @@ use videocall_meeting_types::{
 use crate::auth::AuthUser;
 use crate::auth::{GuestObserver, OptionalGuestObserver};
 use crate::db::meetings::MeetingRow;
-use crate::db::{meetings as db_meetings, participants as db_participants};
+use crate::db::{
+    co_hosts as db_co_hosts, meetings as db_meetings, participants as db_participants,
+};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
 use crate::password::ClientAddr;
+use crate::routes::valid_meeting_id::ValidMeetingId;
 use crate::search;
 use crate::state::AppState;
 use crate::token::{generate_observer_token, generate_room_token};
@@ -141,7 +144,7 @@ async fn enforce_display_name_rate_limit(state: &AppState, user_id: &str) -> Res
 pub async fn join_meeting(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     ClientAddr(client_ip): ClientAddr,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
@@ -171,21 +174,25 @@ pub async fn join_meeting(
     let is_creator = meeting.creator_id.as_deref() == Some(user_id.as_str());
 
     if is_creator {
-        // Single-host model: the creator is the DEFAULT host, but a
-        // transfer-host hands host to another participant for the duration of
-        // the meeting. The creator becomes host only when (re)activating the
-        // meeting (fresh create, or restart after end/idle) — NOT when
-        // rejoining a meeting that is already active, where the current host
-        // (possibly a transfer target) must be preserved so the creator never
-        // reclaims host mid-meeting.
-        let current_state = meeting.state.as_deref().unwrap_or("idle");
-        let reactivating = current_state != "active";
-        if reactivating {
-            db_meetings::activate(&state.db, meeting.id).await?;
+        // The creator becomes host only when starting a new instance — NOT
+        // when rejoining a running one, where a transfer-host may have handed
+        // their host role away for the rest of the instance.
+        // Display-name reconciliation on rejoin (issue #502): a cached non-empty
+        // `host_display_name` is never overwritten from the request.
+        let healthy = state.presence_healthy().await?;
+        let (row, activation) =
+            db_meetings::owner_join(&state.db, meeting.id, &user_id, display_name, healthy).await?;
+        if activation.activated() {
             nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
-            // Live homepage-feed nudge (issue #1081): the host (re)started the
-            // meeting (idle/ended -> active), which the feed shows. Only on a
-            // real reactivation — an already-active rejoin does not nudge.
+            nats_events::announce_demotions(
+                state.nats.as_ref(),
+                &meeting_id,
+                activation.demoted(),
+                &user_id,
+            )
+            .await;
+            // Live homepage-feed nudge (issue #1081): the host (re)started
+            // the meeting (idle/ended -> active), which the feed shows.
             feed_events::publish_feed_change(
                 state.nats.as_ref(),
                 &state.feed_tx,
@@ -194,50 +201,13 @@ pub async fn join_meeting(
             .await;
         }
 
-        let row = if reactivating {
-            // Fresh / reset session → the creator is the sole host.
-            //
-            // Display-name reconciliation on rejoin (issue #502): if the meeting
-            // already has a cached non-empty `host_display_name`, do NOT
-            // overwrite it from the request — mirrors `upsert_host`'s
-            // `COALESCE(NULLIF(...), $3)`. Mid-meeting renames go through the
-            // rate-limited `update_display_name` endpoint, never `join`.
-            let existing_host_dn_nonempty = meeting
-                .host_display_name
-                .as_deref()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-            if let Some(dn) = display_name {
-                if !existing_host_dn_nonempty {
-                    db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
-                }
-            }
-            let r =
-                db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
-            // Demote any stale host (e.g. a transfer target left over from a
-            // previous active session that went idle) so the creator is the
-            // sole host on this fresh activation.
-            db_participants::clear_non_creator_hosts(&state.db, meeting.id).await?;
-            r
-        } else {
-            // Active meeting → re-admit the creator but PRESERVE the current
-            // host (a transfer target keeps host until the meeting ends).
-            db_participants::admit_creator_preserve_host(
-                &state.db,
-                meeting.id,
-                &user_id,
-                display_name,
-            )
-            .await?
-        };
-
         // Row inserted/updated — refresh the SearchV2 doc so the creator
         // appears in acls/participants even on a fresh meeting.
         search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
         // Token reflects the creator's ACTUAL host flag from the row above — it
         // is `false` when a transfer is in effect, so the creator rejoins as a
-        // regular participant rather than a second host.
+        // regular participant.
         let persisted_dn = row.display_name.clone();
         let token = generate_room_token(
             &state.jwt_secret,
@@ -302,10 +272,11 @@ pub async fn join_meeting(
 /// not that it had run against *this* meeting's hash.
 ///
 /// This is the sole entry point into every `meeting_participants` INSERT for a
-/// non-owner (`db_participants::join_attendee`, whose only two call sites are
-/// below); `admit`/`admit_all` are `UPDATE ... WHERE status = 'waiting'` and
-/// cannot create a row, so a waiting-room admit cannot smuggle in a participant
-/// who never cleared this gate. Keep it that way: a new join path that bypasses
+/// non-owner (`db_participants::join_attendee` and
+/// `db_participants::admit_as_co_host`, whose only call sites are below);
+/// `admit`/`admit_all` are `UPDATE ... WHERE status = 'waiting'` and cannot
+/// create a row, so a waiting-room admit cannot smuggle in a participant who
+/// never cleared this gate. Keep it that way: a new join path that bypasses
 /// this function bypasses the password.
 #[allow(clippy::too_many_arguments)]
 async fn join_as_attendee(
@@ -334,8 +305,17 @@ async fn join_as_attendee(
     let is_host = meeting.creator_id.as_deref() == Some(user_id);
     let current_state = meeting.state.as_deref().unwrap_or("idle");
     if current_state != "active" {
-        // Three independent gates must all pass before a non-host joiner may
-        // activate (or re-activate) the meeting:
+        // A live, unsuspended co-host may start or restart the meeting
+        // exactly like the owner — skipping the waiting room and the
+        // end-on-host-leave "ended is terminal" rule below — since issue
+        // #2702 round 10 gives co-hosts host authority over the session
+        // lifecycle. Guests can never be co-hosts (`validate_target` rejects
+        // the guest-id prefix at grant time); `!is_guest` here is defensive.
+        let is_live_co_host = !is_guest
+            && db_co_hosts::has_live_persistent_entry(&state.db, meeting.id, user_id).await?;
+
+        // Absent a co-host entry, three independent gates must all pass
+        // before a non-host joiner may activate (or re-activate) the meeting:
         //
         // 1. !waiting_room_enabled — when a waiting room is present, only the
         //    host may start the meeting; attendees queue up instead.
@@ -351,21 +331,38 @@ async fn join_as_attendee(
         //    (`end_on_host_leave=true`) we honour that policy by keeping the
         //    meeting in the `ended` state.  Only meetings where the host opted
         //    into "keep going after I leave" may be re-opened by a non-host.
-        let can_auto_activate = !meeting.waiting_room_enabled
-            && !is_guest
-            && (current_state != "ended" || !meeting.end_on_host_leave);
+        let can_auto_activate = is_live_co_host
+            || (!meeting.waiting_room_enabled
+                && !is_guest
+                && (current_state != "ended" || !meeting.end_on_host_leave));
         if can_auto_activate {
-            // No waiting room: auto-activate the meeting and admit
-            // a non-host joiner so they can wait inside the call.
-            db_meetings::activate(&state.db, meeting.id).await?;
-            nats_events::publish_meeting_activated(state.nats.as_ref(), meeting_id).await;
+            // A live co-host, or (no waiting room) any non-guest joiner:
+            // activate and admit them so they can wait inside the call.
+            let healthy = state.presence_healthy().await?;
+            let activation = db_meetings::start_instance(&state.db, meeting.id, healthy).await?;
+            if activation.activated() {
+                nats_events::publish_meeting_activated(state.nats.as_ref(), meeting_id).await;
+                nats_events::announce_demotions(
+                    state.nats.as_ref(),
+                    meeting_id,
+                    activation.demoted(),
+                    user_id,
+                )
+                .await;
+            }
+            if let Some(resp) =
+                try_join_as_co_host(state, &meeting, user_id, meeting_id, display_name).await?
+            {
+                return Ok(Json(APIResponse::ok(resp)));
+            }
             let (auto_admitted, row, wr_enabled) = db_participants::join_attendee(
                 &state.db,
                 meeting.id,
                 user_id,
                 display_name,
-                None,
+                false,
                 is_guest,
+                healthy,
             )
             .await?
             .ok_or_else(|| {
@@ -426,11 +423,14 @@ async fn join_as_attendee(
         }
 
         // An `ended` meeting that reached this point could NOT be
-        // auto-activated by this joiner (the block above already re-opens the
-        // only reopenable case: a non-guest, WR-off, `end_on_host_leave=false`
-        // meeting). Anything still `ended` here is terminal for this caller —
-        // e.g. the host left with `end_on_host_leave=true` (issue #742), or a
-        // guest / WR-on joiner hit a meeting that only the host may restart.
+        // auto-activated by this joiner (the block above already re-opens
+        // every reopenable case: a live co-host regardless of WR or
+        // end-on-host-leave, or else a non-guest, WR-off,
+        // `end_on_host_leave=false` meeting). Anything still `ended` here is
+        // terminal for this caller — e.g. the host left with
+        // `end_on_host_leave=true` (issue #742) and no co-host can restart
+        // it either, or a guest / WR-on, non-co-host joiner hit a meeting
+        // that only the host (or a co-host) may restart.
         //
         // Returning `waiting_for_meeting` here would strand the joiner in a
         // phantom waiting room for a server-ended meeting, contradicting both
@@ -481,6 +481,14 @@ async fn join_as_attendee(
         };
         return Ok(Json(APIResponse::ok(resp)));
     }
+    if !is_guest {
+        if let Some(resp) =
+            try_join_as_co_host(state, &meeting, user_id, meeting_id, display_name).await?
+        {
+            return Ok(Json(APIResponse::ok(resp)));
+        }
+    }
+
     // Build the optional host-presence guard that is forwarded into the
     // join_attendee transaction.
     //
@@ -498,29 +506,26 @@ async fn join_as_attendee(
     //   needed.
     //
     // • !end_on_host_leave — when this flag is true the meeting should already
-    //   be in state='ended' before we reach this point (the host-leave handler
-    //   ends it); the guard is moot but included for defensive completeness.
+    //   be in state='ended' before we reach this point (the last present host
+    //   leaving ends it); the guard is moot but included for defensive
+    //   completeness.
     //
     // Folding this check inside join_attendee's transaction closes the TOCTOU
     // window where concurrent requests could both pass a pre-transaction read.
-    let check_creator = if !meeting.end_on_host_leave
-        && !meeting.admitted_can_admit
-        && meeting.waiting_room_enabled
-    {
-        meeting.creator_id.as_deref()
-    } else {
-        None
-    };
+    let require_present_host =
+        !meeting.end_on_host_leave && !meeting.admitted_can_admit && meeting.waiting_room_enabled;
 
     // Atomically check waiting_room_enabled and insert participant in one
     // transaction, using FOR UPDATE to serialize against concurrent toggles.
+    let healthy = state.presence_healthy().await?;
     let (auto_admitted, row, waiting_room_enabled) = match db_participants::join_attendee(
         &state.db,
         meeting.id,
         user_id,
         display_name,
-        check_creator,
+        require_present_host,
         is_guest,
+        healthy,
     )
     .await?
     {
@@ -582,6 +587,63 @@ async fn join_as_attendee(
     Ok(Json(APIResponse::ok(resp)))
 }
 
+/// `Ok(None)` when `user_id` is not a co-host of this active meeting.
+async fn try_join_as_co_host(
+    state: &AppState,
+    meeting: &MeetingRow,
+    user_id: &str,
+    meeting_id: &str,
+    display_name: Option<&str>,
+) -> Result<Option<ParticipantStatusResponse>, AppError> {
+    if !db_co_hosts::has_live_entry(&state.db, meeting.id, user_id).await? {
+        return Ok(None);
+    }
+    let Some((row, promoted)) =
+        db_participants::admit_as_co_host(&state.db, meeting.id, user_id, display_name).await?
+    else {
+        return Ok(None);
+    };
+    search::spawn_repush(state, meeting.id, meeting_id.to_string());
+
+    if promoted {
+        nats_events::announce_host_change(
+            state.nats.as_ref(),
+            meeting_id,
+            user_id,
+            meeting.creator_id.as_deref().unwrap_or_default(),
+            true,
+        )
+        .await;
+    }
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(meeting_id.to_string(), FeedChangeReason::Joined),
+    )
+    .await;
+
+    let token = generate_room_token(
+        &state.jwt_secret,
+        state.token_ttl_secs,
+        user_id,
+        meeting_id,
+        row.is_host,
+        row.display_name.as_deref().unwrap_or(user_id),
+        meeting.end_on_host_leave,
+        false,
+    )?;
+    let mut resp = row.into_participant_status(Some(token));
+    resp.waiting_room_enabled = meeting.waiting_room_enabled;
+    resp.admitted_can_admit = meeting.admitted_can_admit;
+    resp.end_on_host_leave = meeting.end_on_host_leave;
+    resp.allow_guests = meeting.allow_guests;
+    resp.recording_allowed_for_all = meeting.recording_allowed_for_all;
+    resp.chat_allowed_for_all = meeting.chat_allowed_for_all;
+    resp.host_display_name = meeting.host_display_name.clone();
+    resp.host_user_id = meeting.creator_id.clone();
+    Ok(Some(resp))
+}
+
 fn new_guest_user_id() -> String {
     format!(
         "{}{}",
@@ -635,7 +697,7 @@ fn resolve_guest_identity(
 /// exists and accepts guests.
 pub async fn join_meeting_as_guest(
     State(state): State<AppState>,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     ClientAddr(client_ip): ClientAddr,
     OptionalGuestObserver(observer): OptionalGuestObserver,
     body: Json<GuestJoinRequest>,
@@ -805,52 +867,26 @@ pub async fn leave_meeting(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    let row = db_participants::leave(&state.db, meeting.id, &user_id)
+    // Broadcast here: the leaving host's own client may navigate away before
+    // the transport departure reaches meeting-api.
+    let healthy = state.presence_healthy().await?;
+    let (row, end) = db_participants::depart(&state.db, meeting.id, &user_id, true, healthy)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
+    if end == Some(db_participants::DepartureEnd::LastHostLeft) {
+        nats_events::publish_meeting_ended(
+            state.nats.as_ref(),
+            &meeting_id,
+            nats_events::HOST_LEFT_MESSAGE,
+        )
+        .await;
+    }
+    let ended = end.is_some();
 
     // Participant left — they're still a row in meeting_participants but
     // `list_for_search` filters to `admitted`/`waiting`, so this removal
     // drops their principal from the ACL set on the next push.
     search::spawn_repush(&state, meeting.id, meeting_id.clone());
-
-    // Single-host termination rules, in priority order. `left_as_host` is the
-    // row's `is_host` BEFORE the leave flipped status to 'left' — i.e. whether
-    // the departing participant was THE host (there is at most one).
-    //
-    // a) Host leaves + end_on_host_leave=true → end immediately for everyone.
-    //    We broadcast MEETING_ENDED here so all clients are notified (the
-    //    leaving host's own client may not round-trip the transport-layer
-    //    broadcast before navigating away).
-    // b) Host leaves + end_on_host_leave=false → do NOT end, even if no other
-    //    participant remains. The host opted into "keep the meeting alive after
-    //    I leave"; ending on zero count would silently violate that (and block
-    //    a later host-absent join).
-    // c) Non-host attendee leaves → end only when the room is now empty (last
-    //    admitted participant out). Same invariant as leave_meeting_as_guest.
-    let left_as_host = row.is_host;
-    let mut ended = false;
-    if left_as_host {
-        if meeting.end_on_host_leave {
-            // Rule (a).
-            db_meetings::end_meeting(&state.db, meeting.id).await?;
-            ended = true;
-            nats_events::publish_meeting_ended(
-                state.nats.as_ref(),
-                &meeting_id,
-                "The host has ended the meeting",
-            )
-            .await;
-        }
-        // Rule (b): eohl=false → leave the meeting alive.
-    } else {
-        // Rule (c).
-        let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
-        if remaining == 0 {
-            db_meetings::end_meeting(&state.db, meeting.id).await?;
-            ended = true;
-        }
-    }
 
     // Live homepage-feed nudge (issue #1081): a leave always drops the present
     // participant count (shown in the feed), and may have ended the meeting. One
@@ -901,7 +937,8 @@ pub async fn leave_meeting_as_guest(
     };
 
     // End the meeting if no admitted participants remain after the guest leaves.
-    let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
+    let healthy = state.presence_healthy().await?;
+    let remaining = db_participants::count_admitted(&state.db, meeting.id, healthy).await?;
     let mut ended = false;
     if remaining == 0 {
         db_meetings::end_meeting(&state.db, meeting.id).await?;
@@ -928,6 +965,63 @@ pub async fn leave_meeting_as_guest(
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
 
+/// POST /api/v1/meetings/{meeting_id}/presence/keepalive
+///
+/// Renews the caller's own presence lease while they sit in the manual
+/// pre-join lobby: admitted, but with no live transport session yet (the
+/// REST connect window alone only covers the first 60s). `404
+/// PARTICIPANT_NOT_FOUND` when the caller has no row eligible for this —
+/// not admitted, already has a live session (a heartbeat's job, not this
+/// one's), or the meeting has ended — so the client can stop calling.
+///
+/// No rate limit: unlike a display-name change this is a single indexed
+/// `UPDATE` with no NATS publish and nothing broadcast to other
+/// participants, so there is no fan-out for a client calling it faster than
+/// its intended ~30s cadence to amplify.
+pub async fn presence_keepalive(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<()>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    if db_participants::keepalive(&state.db, meeting.id, &user_id).await? {
+        Ok(Json(APIResponse::ok(())))
+    } else {
+        Err(AppError::participant_not_found(&user_id))
+    }
+}
+
+/// POST /api/v1/meetings/{meeting_id}/presence/keepalive-guest
+///
+/// Guest counterpart of [`presence_keepalive`], authenticated by observer
+/// token exactly like [`leave_meeting_as_guest`] / [`get_guest_status`].
+pub async fn presence_keepalive_guest(
+    State(state): State<AppState>,
+    GuestObserver {
+        user_id,
+        meeting_id: token_meeting_id,
+        ..
+    }: GuestObserver,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<()>>, AppError> {
+    if token_meeting_id != meeting_id {
+        return Err(AppError::unauthorized_msg(
+            "observer token is not valid for this meeting",
+        ));
+    }
+
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    if db_participants::keepalive(&state.db, meeting.id, &user_id).await? {
+        Ok(Json(APIResponse::ok(())))
+    } else {
+        Err(AppError::participant_not_found(&user_id))
+    }
+}
+
 /// PUT /api/v1/meetings/{meeting_id}/display-name
 ///
 /// Update the participant's display name during an active meeting.
@@ -935,7 +1029,7 @@ pub async fn leave_meeting_as_guest(
 pub async fn update_display_name(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<UpdateDisplayNameRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -1261,6 +1355,7 @@ mod tests {
             display_name_rate_limit_disabled: disabled,
             dev_user: None,
             password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
+            presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

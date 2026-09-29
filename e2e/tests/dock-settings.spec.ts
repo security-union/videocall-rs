@@ -32,13 +32,7 @@ test.describe("Dock settings", () => {
   });
 
   async function joinMeeting(page: Page, testLabel: string): Promise<void> {
-    // Meeting IDs only allow ASCII alphanumerics + underscores (see
-    // `is_valid_meeting_id` in videocall-types/src/validation.rs). The home
-    // form's onsubmit rejects hyphens and returns early without navigating,
-    // which is what previously caused all dock-settings tests to time out at
-    // toHaveURL: the URL stayed at "/". Replace hyphens with underscores.
-    const safeLabel = testLabel.replace(/-/g, "_");
-    const meetingId = `dock_test_${safeLabel}_${Date.now()}`;
+    const meetingId = `dock_test_${testLabel}_${Date.now()}`;
 
     await page.goto("/");
     await page.waitForTimeout(1500);

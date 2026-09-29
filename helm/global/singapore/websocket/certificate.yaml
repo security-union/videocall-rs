@@ -10,4 +10,4 @@ spec:
     kind: Issuer
   dnsNames:
     - websocket-singapore.webtransport.video
-    - webwebtransport-singapore.webtransport.video
+    - webtransport-singapore.webtransport.video

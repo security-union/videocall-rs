@@ -87,10 +87,24 @@
         />
         <link id="neteq-worker" href="/neteq_worker_loader.js" />
 
+        <!-- WebTransport session worker (#2728): owns the QUIC session so a
+             main-thread stall cannot starve the receive path. -->
+        <link
+            data-trunk
+            rel="rust"
+            href="../videocall-transport/Cargo.toml"
+            data-bin="wt_session_worker"
+            data-type="worker"
+            data-cargo-no-default-features
+            data-loader-shim
+        />
+        <link id="wt-session-worker" href="/wt_session_worker_loader.js" />
+
         <!-- Load wasm worker scripts from the videocall-codecs crate -->
-        <!-- MediaStreamTrackProcessor polyfill using LiveKit's approach:
-             Creates VideoFrame directly from video element instead of canvas copy.
-             See: https://github.com/livekit/track-processors-js/pull/65 -->
+        <!-- MediaStreamTrackProcessor polyfill. Creates VideoFrame directly from the
+             video element (LiveKit's approach, https://github.com/livekit/track-processors-js/pull/65),
+             except for a WebKit camera track without VideoFrame `rotation`, which it
+             draws to a canvas. -->
         <script>
             if (!self.MediaStreamTrackProcessor) {
             self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {
@@ -111,9 +125,14 @@
                             console.warn("Video dimensions not available after metadata load");
                         }
 
-                        // Try direct VideoFrame from video element (LiveKit approach)
                         const supportsDirectVideoFrame = (() => {
                             try {
+                                const webKitCamera = !("rotation" in VideoFrame.prototype)
+                                    && (navigator.vendor || "").startsWith("Apple")
+                                    && !track.getSettings().displaySurface;
+                                if (webKitCamera) {
+                                    return false;
+                                }
                                 const testFrame = new VideoFrame(this.video);
                                 testFrame.close();
                                 return true;
@@ -183,7 +202,7 @@
                                 requestAnimationFrame(processFrameRAF);
                             }
                         } else {
-                            console.log("Using canvas-based polyfill (direct VideoFrame not supported)");
+                            console.log("Using canvas-based polyfill (direct VideoFrame unsupported or cannot carry rotation)");
                             this.canvas = new OffscreenCanvas(
                                 this.video.videoWidth || 640,
                                 this.video.videoHeight || 480

@@ -47,7 +47,7 @@ const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
 ///   which is the failure mode #1020 describes.
 /// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
 ///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
-const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
+pub const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
 
 /// *Base* (first-strike) interval between proactive keyframe requests fired by the
 /// keyframe-less eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST
@@ -474,7 +474,7 @@ const MAX_SOURCE_FRAME_INTERVAL_MS: f64 = 1000.0;
 
 // --- Resync-to-live governor (issue #1252, v1) ---
 //
-// Field read on conceptcar7 confirmed H1: under loss a slow receiver's
+// Field read on production confirmed H1: under loss a slow receiver's
 // `playout_latency` total tracks the stage-1 jitter-buffer backlog span while the decode
 // queue stays ≈ 0, so the multi-second video-behind-audio lag lives in THIS buffer. The
 // 1800ms freshness deadline (`MAX_PLAYOUT_AGE_MS`) only fires when the *head-of-line* frame

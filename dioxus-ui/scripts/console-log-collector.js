@@ -412,7 +412,7 @@
     // Authenticate via the room_token. The console-logs route validates this
     // room_token (a meeting-api-signed JWT) as the sole credential on BOTH
     // deployments — it does not read the session cookie — so the Bearer header
-    // is required everywhere (fnxlabs Google OAuth and Ascend Okta PKCE alike).
+    // is required everywhere (Google OAuth and Ascend Okta PKCE alike).
     // `credentials:"include"` is harmless and left in place, but is not an auth
     // fallback: without a room_token the upload is rejected.
     if (authToken) {

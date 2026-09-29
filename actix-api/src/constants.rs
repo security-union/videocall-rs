@@ -31,9 +31,9 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// broadcast, avoiding false join/leave notification spam.
 pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
-/// Regex pattern for validating usernames and room IDs
-/// Allows alphanumeric characters, underscores, and hyphens
-pub const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";
+/// Regex pattern for validating user IDs on the deprecated `/lobby/{user_id}/{room}`
+/// path. Room IDs use `videocall_types::validation::is_valid_meeting_id` instead.
+pub const VALID_USER_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";
 
 /// Maximum incoming frame/stream size in bytes for both WebSocket and WebTransport.
 ///
@@ -96,22 +96,8 @@ pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000)
 /// a 60-second-late one. Holding that much in memory simply defers the
 /// inevitable drop while inflating per-session memory and latency.
 ///
-/// 512 caps the unistream backlog at ~16 seconds of single-stream video
-/// (512 / 30 fps), which is already generous for burst absorption, and
-/// deliberately aligns the unistream bound with the already-512 datagram
-/// bound ([`WT_DATAGRAM_CHANNEL_CAPACITY`]). Once the queue saturates,
-/// the priority-drop policy (see `priority_drop.rs`) sheds video before
-/// audio before control, and the per-sender CONGESTION feedback path
-/// tells fast senders to step their quality down — both of which are the
-/// *correct* response to a slow receiver, far better than hoarding stale
-/// frames in a 4096-deep buffer.
-///
-/// The previous 4096 default was a 2026-05-11 stopgap chosen before the
-/// priority-drop policy (discussion #699) and congestion feedback existed.
-/// With those landed, the large buffer is no longer needed and is lowered
-/// here per issue #979. Operators with an exceptional workload can still
-/// raise the bound at deploy-time via `WT_OUTBOUND_CHANNEL_CAPACITY`.
-pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 512;
+/// Overridable at deploy time via `WT_OUTBOUND_CHANNEL_CAPACITY`.
+pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 1024;
 
 /// Resolve the WebTransport outbound channel capacity from the
 /// `WT_OUTBOUND_CHANNEL_CAPACITY` environment variable, falling back
@@ -217,6 +203,45 @@ pub fn viewport_filter_enabled() -> bool {
     })
 }
 
+/// Which QUIC primitive carries downlink audio to a `ds=1` receiver (#2724).
+/// A legacy (`Single`-mode) receiver keeps datagrams whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioDownlinkLane {
+    /// The default: a dedicated reliable stream.
+    Reliable,
+    /// Sub-MTU cleartext audio on an unreliable datagram.
+    Datagram,
+}
+
+/// Pure resolver for [`wt_audio_downlink_lane`]. Anything unrecognised warns
+/// and takes the [`AudioDownlinkLane::Reliable`] default.
+pub(crate) fn resolve_audio_downlink_lane(raw: Option<&str>) -> AudioDownlinkLane {
+    match raw {
+        None => AudioDownlinkLane::Reliable,
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "datagram" | "datagrams" => AudioDownlinkLane::Datagram,
+            "reliable" | "stream" => AudioDownlinkLane::Reliable,
+            _ => {
+                tracing::warn!(
+                    "WT_AUDIO_DOWNLINK_LANE={:?} is not recognised; falling back to the default \"reliable\"",
+                    value
+                );
+                AudioDownlinkLane::Reliable
+            }
+        },
+    }
+}
+
+/// Memoized accessor: reads `WT_AUDIO_DOWNLINK_LANE` once, so a change needs a
+/// relay restart.
+pub fn wt_audio_downlink_lane() -> AudioDownlinkLane {
+    use std::sync::OnceLock;
+    static LANE: OnceLock<AudioDownlinkLane> = OnceLock::new();
+    *LANE.get_or_init(|| {
+        resolve_audio_downlink_lane(std::env::var("WT_AUDIO_DOWNLINK_LANE").ok().as_deref())
+    })
+}
+
 /// Pure #988 viewport drop decision. Returns true iff the off-screen VIDEO
 /// packet must be dropped. `enabled` is the #1436 kill-switch state.
 ///
@@ -258,23 +283,27 @@ pub(crate) fn nonvideo_reached_viewport_drop_branch(
 /// Slot capacity of the WS per-receiver outbound relay queue (issue #2261).
 pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
 
-pub const WS_OUTBOUND_LEGACY_SLOT_CAPACITY: usize = 128;
+/// Depth the byte budgets are anchored to: the multiplier in the two
+/// transport-neutral budgets below.
+pub const OUTBOUND_LEGACY_SLOT_CAPACITY: usize = 128;
 
 /// Bytes one encoded frame of `tier` occupies at its ideal bitrate.
 pub const fn tier_frame_bytes(tier: &videocall_aq::constants::VideoQualityTier) -> usize {
     (tier.ideal_bitrate_kbps as usize) * 1000 / 8 / (tier.target_fps as usize)
 }
 
-/// Camera VIDEO budget: legacy slots x one default-tier frame.
-pub const WS_OUTBOUND_VIDEO_BYTE_BUDGET: usize = WS_OUTBOUND_LEGACY_SLOT_CAPACITY
+/// Camera VIDEO budget: legacy slots x one default-tier frame. Transport-neutral.
+pub const OUTBOUND_VIDEO_BYTE_BUDGET: usize = OUTBOUND_LEGACY_SLOT_CAPACITY
     * tier_frame_bytes(
         &videocall_aq::constants::VIDEO_QUALITY_TIERS
             [videocall_aq::constants::DEFAULT_VIDEO_TIER_INDEX],
     );
 
-pub const WS_OUTBOUND_SCREEN_BYTE_BUDGET: usize = WS_OUTBOUND_LEGACY_SLOT_CAPACITY
+pub const OUTBOUND_SCREEN_BYTE_BUDGET: usize = OUTBOUND_LEGACY_SLOT_CAPACITY
     * tier_frame_bytes(&videocall_aq::constants::SCREEN_QUALITY_TIERS[0]);
 
+/// Dormant publish-side ladder DEPTH (#2620/#2621). NOT the fan-out
+/// multiplier: that is [`AUDIO_PUBLISHED_LAYER_COUNT`] (#2279).
 pub const AUDIO_SIMULCAST_RUNGS: usize = 3;
 
 pub const AUDIO_PACKETS_PER_SEC_PER_RUNG: usize = 50;
@@ -299,18 +328,52 @@ pub const fn queue_absorption_millis(slots: usize, packets_per_sec: usize) -> us
     slots * 1000 / packets_per_sec
 }
 
+/// Audio LAYERS a publisher puts on the wire (#2279), not [`AUDIO_SIMULCAST_RUNGS`].
+pub const AUDIO_PUBLISHED_LAYER_COUNT: usize = 1;
+
+pub const fn audio_tier_packet_bytes(bitrate_kbps: usize, packets_per_sec: usize) -> usize {
+    if packets_per_sec == 0 {
+        return 0;
+    }
+    bitrate_kbps * 1000 / 8 / packets_per_sec
+}
+
+pub const fn buffer_absorption_millis(buffer_bytes: usize, bytes_per_sec: usize) -> usize {
+    if bytes_per_sec == 0 {
+        return usize::MAX;
+    }
+    buffer_bytes * 1000 / bytes_per_sec
+}
+
+/// WebTransport session-ID header prepended before quinn's queue accounting.
+pub const WT_DATAGRAM_SESSION_HEADER_BYTES: usize = 1;
+
+/// Bytes one top-tier audio datagram occupies in quinn's queue: the serialized
+/// `PacketWrapper` plus the session header, NOT the bare Opus payload.
+pub const WT_DATAGRAM_AUDIO_WIRE_BYTES: usize = 203;
+
+pub const WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 65_975;
+
+/// quinn's CONNECTION-level unacked-byte cap, not a per-stream one. Bounds the
+/// backlog a receiver must absorb; its own test pins the resulting ceiling from
+/// both sides. Overridable per cluster via `QUIC_SEND_WINDOW_BYTES`.
+pub const WT_QUIC_SEND_WINDOW_BYTES: u64 = 1_048_576;
+
+pub const WT_QUIC_KEEP_ALIVE_DEFAULT_SECS: u64 = 5;
+
+pub const WT_QUIC_MAX_IDLE_TIMEOUT_DEFAULT_SECS: u64 = 30;
+
+pub const WT_QUIC_UDP_BUFFER_DEFAULT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Bounded channel capacity for the WebTransport **datagram** outbound queue.
 ///
 /// As of the Phase 2 WT-freeze fix (discussion #756), the per-session
 /// outbound channel is split into two: a unistream channel and a
 /// datagram channel. Splitting the channels is the architectural change;
 /// the unistream side keeps the env-tunable
-/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] (now 512, see issue #979)
-/// since it continues to absorb video + screen + oversized control
-/// packets, while the datagram side is sized small on purpose:
+/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`], while the datagram side carries
+/// only sub-MTU traffic:
 ///
-/// * Datagram traffic is small (~80 audio packets/sec/sender at ~80B
-///   each, plus heartbeats / RTT echoes / non-media control under MTU).
 /// * Datagrams are independent: there is no QUIC flow-control coupling
 ///   between them, so a slow receiver cannot stall the queue.
 /// * `session.send_datagram` returns immediately on the wire (UDP-style
@@ -318,156 +381,177 @@ pub const fn queue_absorption_millis(slots: usize, packets_per_sec: usize) -> us
 ///   absorb actor-side bursts during scheduling jitter — not to buffer
 ///   for receiver congestion.
 ///
-/// 512 slots ≈ 10 seconds of headroom at 50 audio pps (the dominant
-/// datagram rate per session); more than enough for actor / writer
-/// scheduling jitter, and small enough that a misrouted video burst
-/// (oversized audio mis-classified as datagram) would not balloon
-/// per-session memory.
-///
 /// This value is NOT env-tunable today. If a future workload genuinely
 /// needs a larger datagram queue (e.g. very chatty diagnostics), promote
 /// it to an env-resolved getter mirroring [`wt_outbound_channel_capacity`].
 pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
 
-/// Grace period a write onto the persistent server→client WebTransport uni
-/// stream may stay parked **while the outbound channel is backed up** before the
-/// writer sheds the wedged stream (issue #1638 — "#979 part 2": bound the
-/// WRITER, but ONLY when real backpressure is present).
+/// Grace period a write onto a server→client WebTransport uni stream may stay
+/// parked WHILE THE OUTBOUND CHANNEL IS BACKED UP before the writer sheds the
+/// wedged stream (issue #1638). The gate is the channel backing up, never
+/// wall-clock alone, so executor starvation on a healthy stream cannot shed it.
 ///
-/// ## The defect the shed bounds — and the defect the v1 shed CAUSED
-///
-/// `spawn_unistream_writer` (`webtransport/bridge.rs`) owns the single
-/// persistent uni stream and drains the 512-deep `unistream_tx` channel with
-/// back-to-back `stream.write_all().await` calls. Those writes are subject to
-/// QUIC per-stream flow control: when a slow receiver stops granting credits
-/// (a downlink stall), `write_all` PARKS. The writer task is the channel's only
-/// consumer, so while it is parked the 512-slot channel fills and `try_send`
-/// starts returning `Full` (`wt_chat_session.rs`) — and at that point media
-/// drops for EVERY publisher targeting that one receiver. #979 deliberately
-/// keeps the channel SHALLOW (512) so a stall fails fast rather than hoarding
-/// stale frames; the shed is the matching bound on the WRITER so a single wedged
-/// receiver sheds (via stream reset+reopen) instead of holding the channel full
-/// indefinitely.
-///
-/// The FIRST cut of this fix bounded each write with a bare per-frame
-/// `tokio::time::timeout(.., write_all)` on WALL-CLOCK. That conflated two
-/// distinct causes of "this write did not finish in N ms": (1) the receiver's
-/// downlink is flow-control-stalled (the thing to shed), and (2) the relay's
-/// single-threaded runtime simply did not POLL the write future in time because
-/// the one thread was CPU/scheduling-starved.
-///
-/// Cause (2) is NOT congestion — credits may be available; the executor was just
-/// busy. Resetting on cause (2) sheds a perfectly HEALTHY low-traffic stream and
-/// drops its in-flight frame. That regression is observable: it failed
-/// `webtransport::tests::test_lobby_isolation` (a few-frames-of-traffic stream)
-/// under the test runner's CPU starvation. So the shed must be gated on the
-/// GENUINE congestion signal — the outbound channel actually backing up — NOT on
-/// wall-clock elapsed on a single write.
-///
-/// ## How this grace is now used (see `spawn_unistream_writer`)
-///
-/// The writer polls each `write_all` against a periodic tick
-/// ([`WT_UNISTREAM_BACKPRESSURE_POLL`]). It maintains a "stalled-while-backed-up"
-/// accumulator that advances ONLY on ticks where the outbound channel is at or
-/// above [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] full (real backpressure: the
-/// parked writer is starving publishers). The stream is sheds only once that
-/// accumulator reaches THIS grace. On any tick where the channel is below the
-/// ratio (healthy / draining) the accumulator RESETS — so a write that is merely
-/// slow to be polled, on a stream whose channel is not backing up, can NEVER
-/// trip the shed no matter how long the executor starves it. The shed fires iff
-/// the channel is genuinely wedging because the receiver isn't draining.
-///
-/// ## Why 1000 ms
-///
-/// The grace must straddle two requirements:
-///
-/// * **Long enough not to falsely reset a bursty-but-recovering link.** On a
-///   200 ms+ high-latency path, a single `write_all` for a large keyframe can
-///   legitimately take several RTTs while the receiver drains a transient
-///   backlog and re-grants credits. At 30 fps the frame cadence is ~33 ms, so
-///   1000 ms is ~30 frame intervals of slack — comfortably more than a healthy
-///   high-RTT link needs to clear a normal jitter burst, so we do NOT reset a
-///   stream that is merely slow-and-recovering (a needless reset throws away an
-///   in-flight frame and costs a fresh-stream round trip).
-/// * **Short enough that a genuinely stalled receiver cannot pin the channel
-///   full for multiple seconds.** Under a 4-publisher fan-in the channel can
-///   refill in ~4 s once the single writer parks; a grace of 1 s of
-///   continuous backpressure caps the head-of-line stall to ~1 s (plus at most
-///   one poll interval) before the writer sheds and resumes draining the next
-///   frame onto a fresh stream, well under that floor.
-///
-/// We deliberately pin it to [`CONGESTION_WINDOW`] (1000 ms) — the same window
-/// the relay already uses to decide a receiver is congested. A write that has
-/// not completed within one congestion window WHILE THE CHANNEL IS BACKED UP is,
-/// by the relay's own existing definition of congestion, a stalled (not merely
-/// jittery) stream, so resetting it is consistent with the rest of the
-/// congestion machinery. It sits below [`KEYFRAME_CONGESTION_RELAX_WINDOW`] (2 s)
-/// and well below [`RECEIVER_DOWNLINK_RELIEF_WINDOW`] (8 s), so the writer sheds
-/// a wedged stream before those longer recovery windows would even arm.
-pub const WT_UNISTREAM_WRITE_DEADLINE: Duration = Duration::from_millis(1000);
+/// Pinned to [`CONGESTION_WINDOW`] and below [`KEYFRAME_CONGESTION_RELAX_WINDOW`];
+/// the assertion below holds that pin. Lives in `videocall-types`: the client
+/// halves it, and nothing else sees both.
+pub const WT_UNISTREAM_WRITE_DEADLINE: Duration =
+    Duration::from_millis(videocall_types::wt_downlink::WT_UNISTREAM_WRITE_DEADLINE_MS);
 
-/// Fill ratio of the 512-deep `unistream_tx` channel at or above which the
-/// outbound stream is considered to be under REAL backpressure, arming the
-/// [`WT_UNISTREAM_WRITE_DEADLINE`] shed grace (issue #1638).
-///
-/// This is the gate that prevents the v1 spurious-reset regression. The shed's
-/// stalled-while-backed-up accumulator advances ONLY while the channel depth is
-/// at or above `ceil(max_capacity * this)`; below it the accumulator resets and
-/// a parked write is left to park (executor starvation only delays it, never
-/// resets it). The number that matters is therefore: "is the writer being parked
-/// actually starving publishers?" — answered by the channel filling, the genuine
-/// per-receiver downlink-backpressure surface (#1219's B1 note: the per-session
-/// outbound channel overflow is the real per-receiver signal, NOT a wall-clock
-/// or a mailbox `Full`).
-///
-/// ## Why 0.5
-///
-/// The channel only climbs to and stays near half-full (256+ of 512 frames
-/// queued) when its single consumer — this writer — is parked on a stalled
-/// stream and publishers keep enqueuing faster than it drains. A healthy stream
-/// drains every frame essentially immediately, so its depth hovers at 0–1 and
-/// never approaches this ratio; thus a healthy stream's shed never arms even
-/// under heavy executor starvation. 0.5 is deliberately well ABOVE the noise
-/// floor of a transient burst (a join-fan-out spike spills a few dozen frames
-/// and clears within one drain) yet well BELOW the
-/// [`crate::actors::priority_drop::PRIORITY_DROP_VIDEO_FILL_RATIO`] (0.8) at
-/// which the producer-side policy
-/// begins shedding video — so by the time the channel reaches the priority-drop
-/// zone the writer-shed accumulator is already armed and counting, and the two
-/// backpressure responses compose rather than fight. A sustained ≥50%-full
-/// channel is, unambiguously, a writer that cannot keep up — exactly the
-/// receiver-not-draining condition the shed targets.
+const _: () = assert!(
+    WT_UNISTREAM_WRITE_DEADLINE.as_millis() == CONGESTION_WINDOW.as_millis()
+        && WT_UNISTREAM_WRITE_DEADLINE.as_millis() < KEYFRAME_CONGESTION_RELAX_WINDOW.as_millis(),
+    "the shed deadline is pinned to one CONGESTION_WINDOW and must stay below \
+     KEYFRAME_CONGESTION_RELAX_WINDOW, as the rationale above claims"
+);
+
+/// Fill ratio of a bounded dimension — slot depth, or a media byte bucket — at
+/// or above which the outbound lane counts as under REAL backpressure, arming
+/// the [`WT_UNISTREAM_WRITE_DEADLINE`] shed grace (issue #1638). Below it the
+/// accumulator resets, so a parked write on a lane that is not backing up is
+/// left to park. Sits above a transient burst's noise floor and below
+/// [`crate::actors::priority_drop::PRIORITY_DROP_VIDEO_FILL_RATIO`], so the two
+/// backpressure responses compose rather than fight.
 pub const WT_UNISTREAM_BACKPRESSURE_SHED_RATIO: f64 = 0.5;
 
-/// Interval at which `spawn_unistream_writer` re-evaluates whether a parked write
-/// is stalled-while-backed-up (issue #1638).
-///
-/// On each tick the writer samples the outbound channel depth: a tick spent at or
-/// above [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] advances the shed accumulator;
-/// a tick below it resets the accumulator. The poll only runs while a write is
-/// actually parked (it is one arm of a `select!` against the write future).
-///
-/// The interval timer itself is constructed ONCE per writer task — in
-/// `spawn_unistream_writer`, before the drain loop — and the per-frame shed
-/// helper borrows it and `reset()`s it at the start of each call rather than
-/// rebuilding it. So on the fast path (a write that completes promptly) this poll
-/// touches no timer allocation at all: the shared interval's next tick is reset
-/// one period into the future and the write returns before that tick ever arms.
-/// A timer only does work while a write is actually parked.
-///
-/// ## Why 50 ms
-///
-/// 50 ms is fine-grained relative to the 1000 ms shed grace (≈20 samples across
-/// the grace), so the worst-case shed latency overshoot from sampling
-/// granularity is one tick (≤50 ms on top of the 1000 ms grace) — negligible
-/// against the multi-second floor a genuinely wedged channel would otherwise sit
-/// at. It is also coarse enough that the periodic wakeups add no meaningful load:
-/// they only fire while a write is parked, and a parked write means the thread is
-/// otherwise idle on this task anyway. Critically, because the accumulator only
-/// advances on backed-up ticks, a slow/starved poll cadence on a HEALTHY stream
-/// (ticks arriving late, or the channel near-empty) cannot manufacture a false
-/// shed — late ticks on a non-backed-up channel simply reset the accumulator.
+/// Interval at which the writer re-evaluates whether a parked write is
+/// stalled-while-backed-up (issue #1638). One arm of a `select!` against the
+/// write future, so it only runs while a write is actually parked; the timer is
+/// built once per writer task and `reset()` per frame.
 pub const WT_UNISTREAM_BACKPRESSURE_POLL: Duration = Duration::from_millis(50);
+
+// ---------------------------------------------------------------------------
+// Per-publisher downlink streams (issue #2723)
+// ---------------------------------------------------------------------------
+
+/// Concurrent SERVER-initiated unidirectional streams a Chrome WebTransport
+/// session can hold open: quiche's 100-stream default, less the 3 HTTP/3
+/// reserves, which Chromium leaves untouched unless the JS supplies
+/// `anticipatedConcurrentIncomingUnidirectionalStreams` (videocall's does not).
+///
+/// NOT the relay's own `max_concurrent_uni_streams(100)` in `webtransport::mod`,
+/// which bounds CLIENT-initiated uplink streams out of a different pool.
+pub const WT_BROWSER_MAX_SERVER_UNI_STREAMS: usize = 100;
+
+/// Concurrent downlink streams the relay will hold open for ONE receiver
+/// (#2723): 1 control + 1 audio (#2724) + 1 overflow + 45 publisher-keyed.
+///
+/// #2724 paid for its audio lane out of the PUBLISHER budget rather than by
+/// raising this number, so the peak stream-ID demand the assertion below bounds
+/// is unchanged.
+pub const WT_MAX_DOWNLINK_STREAMS: usize = 48;
+
+const _: () = assert!(
+    2 * WT_MAX_DOWNLINK_STREAMS <= WT_BROWSER_MAX_SERVER_UNI_STREAMS,
+    "a whole-map shed needs one fresh stream ID per lane while every reset one is \
+     still counted, so 2 * WT_MAX_DOWNLINK_STREAMS must fit under the verified \
+     browser limit documented on WT_BROWSER_MAX_SERVER_UNI_STREAMS."
+);
+
+/// Per-PUBLISHER hand-off queue between the downlink dispatcher and one key's
+/// writer task (#2723). Absorbs dispatch pipelining only: the RECEIVER's total
+/// backlog is bounded by [`wt_outbound_channel_capacity`] and the byte budgets
+/// at admission, and a wedged key sheds long before this queue can tail-drop for
+/// long. The control lane aggregates the whole room and is sized separately.
+pub const WT_DOWNLINK_KEY_CHANNEL_CAPACITY: usize = 32;
+
+/// How long a run of #2723 lane tail drops must last before it arms the #1219
+/// relief epoch (#2745). The drop is booked immediately; only the stamp waits,
+/// because arming costs the receiver shed non-base camera layers and a client
+/// dwell on top. An ENTRY gate, so it can delay arming but never wedge a
+/// receiver out of relief.
+pub const WT_DOWNLINK_LANE_DROP_RELIEF_SUSTAIN: Duration = WT_UNISTREAM_WRITE_DEADLINE;
+
+/// Hand-off queue for the receiver-scoped CONTROL lane (#2723). Unlike a
+/// publisher lane this one aggregates the whole room — relayed heartbeats, the
+/// join-time keyframe-request burst, probe echoes, oversized audio and all
+/// Critical control — so the per-publisher size does not apply.
+pub const WT_DOWNLINK_CONTROL_CHANNEL_CAPACITY: usize = 256;
+
+/// Slots of the CONTROL lane's queue that only the never-preempted classes —
+/// `Critical` and `Control` — may use (#2723).
+///
+/// Without a reserve a lane wedged with media tail-drops the lifecycle packets
+/// #2718 routes onto the reliable stream. The protected set is exactly
+/// `evaluate_dual`'s `Critical | Control` arm.
+///
+/// Applied to the control lane ONLY: `DownlinkStreamKey::for_media` never routes
+/// a `Critical` or non-media `Control` frame to a publisher or overflow lane.
+pub const WT_DOWNLINK_CONTROL_RESERVE: usize = 16;
+
+/// Hand-off queue for the SHARED overflow lane (#2723). Carries every publisher
+/// older than `PacketWrapper.media_kind` — whose above-MTU media the relay
+/// cannot attribute — plus any keys past the publisher cap, so it is deeper than
+/// a publisher lane but deliberately not deep enough to trade freshness for
+/// backlog. No reserve: `Critical` and non-media `Control` never key here.
+pub const WT_DOWNLINK_OVERFLOW_CHANNEL_CAPACITY: usize = 128;
+
+/// Hand-off queue for the receiver-scoped AUDIO lane (#2724).
+///
+/// This lane does NOT run the #1638 shed
+/// ([`DownlinkStreamClass::sheds_on_backpressure`]), so it is not that shed's
+/// arming surface. Under congestion its protection is send priority, not a send
+/// buffer (contract A18). No reserve: only audio keys here.
+pub const WT_DOWNLINK_AUDIO_CHANNEL_CAPACITY: usize = 512;
+
+/// Idle grace after which a publisher-keyed downlink stream is finished and
+/// evicted (#2723). The relay has no per-peer "publisher left" fan-out event,
+/// so absence of frames IS the signal; it must therefore stay above both GOP
+/// intervals so an ordinary keyframe gap cannot reap a live stream.
+pub const WT_DOWNLINK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cadence at which the downlink dispatcher sweeps for idle keys (#2723).
+pub const WT_DOWNLINK_STREAM_IDLE_SWEEP: Duration = Duration::from_secs(2);
+
+/// How long a reaped lane is given to exit on its own before the sweep aborts it
+/// (#2723). Dropping its sender cancels nothing while the task is parked inside
+/// `write_all`, so the abort is what makes the slot count the truth.
+pub const WT_DOWNLINK_LANE_RETIRE_GRACE: Duration = WT_DOWNLINK_STREAM_IDLE_SWEEP;
+
+/// Minimum spacing between replacements of a lane whose task has exited, so a
+/// session whose `open_uni` is itself failing cannot spawn a task per frame.
+pub const WT_DOWNLINK_LANE_RESPAWN_COOLDOWN: Duration = Duration::from_millis(500);
+
+/// How long receiver teardown waits for every downlink lane to drain and
+/// `finish` its stream before aborting the stragglers (#2723). A lane parked in
+/// `open_uni` with no stream credit left has no bound of its own.
+pub const WT_DOWNLINK_TEARDOWN_DRAIN: Duration = Duration::from_millis(2500);
+
+/// A `write_timeout` shed inside the open round does not open a new one (#2726,
+/// contract E1). Equal to [`WT_UNISTREAM_WRITE_DEADLINE`]: one lane cannot shed
+/// faster, and a whole-map shed smears across at most that.
+pub const WT_SHED_ESCALATION_ROUND: Duration = WT_UNISTREAM_WRITE_DEADLINE;
+
+/// Rounds in [`WT_SHED_ESCALATION_STAGE1_WINDOW`] that arm stage 1.
+pub const WT_SHED_ESCALATION_STAGE1_ROUNDS: usize = 3;
+
+/// Sliding window the stage-1 round count is taken over (#2726).
+pub const WT_SHED_ESCALATION_STAGE1_WINDOW: Duration = Duration::from_secs(10);
+
+/// Rounds stage 1 must have been armed for before stage 2 may fire (#2726,
+/// contract E17). Closing sooner would cut off the recovery stage 1 enables.
+pub const WT_SHED_ESCALATION_STAGE1_RUNWAY_ROUNDS: usize = 4;
+
+/// How long stage 1 holds after the last round (#2726). An ALIAS, not a copy:
+/// one outliving #2718's base level would re-enable non-base layers with no
+/// camera video at all.
+pub const WT_SHED_ESCALATION_HOLD: Duration = RECEIVER_DOWNLINK_RELIEF_WINDOW;
+
+/// Rounds in [`WT_SHED_ESCALATION_STAGE2_WINDOW`] that close the session.
+pub const WT_SHED_ESCALATION_STAGE2_ROUNDS: usize = 10;
+
+/// Memory bound on the retained round history (#2726). NOT the stage-2 bar,
+/// which is a run contiguous within [`WT_SHED_ESCALATION_MAX_ROUND_GAP`].
+pub const WT_SHED_ESCALATION_STAGE2_WINDOW: Duration = Duration::from_secs(30);
+
+/// Largest gap between consecutive rounds still counted as one sustained wedge
+/// (#2726, contract E18). Wide enough to survive one missed round, narrow
+/// enough that a series of transient bursts never reaches the stage-2 bar.
+pub const WT_SHED_ESCALATION_MAX_ROUND_GAP: Duration = Duration::from_secs(2);
+
+/// Consecutive rounds with no lane write completing that reach stage 2 early
+/// (#2726, contract E16). Nothing is being accepted against the peer's credit,
+/// AUDIO included, so stage 1 has nothing left to free.
+pub const WT_SHED_ESCALATION_DELIVERY_STALLED_ROUNDS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Inbound fan-out mailbox headroom (issues #1144 / #1145)
@@ -522,9 +606,9 @@ pub const WT_UNISTREAM_BACKPRESSURE_POLL: Duration = Duration::from_millis(50);
 ///
 /// `2×` doubles the burst-absorption slack while staying modest:
 /// * WS: mailbox = 2 × [`WS_OUTBOUND_CHANNEL_CAPACITY`] (2048 post-#2261).
-/// * WT: mailbox `unistream + datagram` (default 1024) → **2048**
-///   (each channel stays 512; the deep-stale-video bound is on the channel,
-///   so a 2048 mailbox does NOT create a 2048-deep stale-video buffer).
+/// * WT: mailbox `unistream + datagram` (default 1536) → **3072**
+///   (the deep-stale-video bound is the unistream lane's byte budget, so a
+///   4096 mailbox does NOT create a 4096-deep stale-video buffer).
 ///
 /// The factor is intentionally NOT large: this absorbs a single join-fan-out
 /// wave for our target room sizes (10–15 meetings × ≤20 users), not unbounded
@@ -1320,20 +1404,6 @@ pub const PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS: u64 = 1000;
 /// once election completes. So the flush unicasts per candidate session rather
 /// than picking one.
 ///
-/// ## Where a fan of 2–4 actually comes from (post-#2045)
-///
-/// The fan is the client's candidate set — each configured WebSocket URL plus
-/// each WebTransport URL (`build_election_candidates` in `videocall-client`).
-/// Since #2045 made **WebSocket the default** transport, `resolve_transport_config`
-/// (`dioxus-ui/src/context.rs`) returns an EMPTY WebTransport list for the default
-/// preference, so a default-configuration client's candidate set is WS-only. The
-/// surviving driver of a fan ≥ 2 is therefore the **multi-URL WebSocket list**,
-/// not WebTransport: `helm/videocall-ui/values.yaml` ships two (`…-singapore`,
-/// `…-us-east`), giving 2 candidates per joiner. A user who opts into the
-/// experimental WebTransport preference — or carries a legacy `"auto"` value,
-/// which is honoured as WebTransport — gets both lists surfaced and can still
-/// reach 2×WS + 2×WT.
-///
 /// ## Why 4 is still the right cap
 ///
 /// Capping only pays where a broadcast is genuinely cheaper. A broadcast is one
@@ -1459,20 +1529,17 @@ mod tests {
 
     #[test]
     fn resolve_wt_outbound_channel_capacity_valid_value_used_verbatim() {
-        // Sample values intentionally chosen so neither equals
-        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (512) — otherwise the
-        // assertion would pass even if the env value were silently ignored.
-        assert_eq!(resolve_wt_outbound_channel_capacity(Some("1024")), 1024);
+        // Neither equals the default, or a silently-ignored env would pass.
+        assert_eq!(resolve_wt_outbound_channel_capacity(Some("2048")), 2048);
         assert_eq!(resolve_wt_outbound_channel_capacity(Some("8192")), 8192);
+        assert_ne!(2048, WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT);
     }
 
     #[test]
-    fn wt_outbound_channel_capacity_default_is_512() {
-        // Sentinel test pinning the documented fail-fast value (issue #979).
-        // If this needs to change, update the doc comment on
-        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (and any helm overlays /
-        // operator docs) first, then this assertion.
-        assert_eq!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 512);
+    fn wt_outbound_channel_capacity_default_is_1024() {
+        // Sentinel (#979, #2717): change the doc, helm overlays and operator
+        // docs first, then this assertion.
+        assert_eq!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 1024);
     }
 
     #[test]
@@ -1513,6 +1580,44 @@ mod tests {
         // #988 filter is already LIVE in prod; the #1436 kill switch must
         // default to the status quo (filter ON) when unset.
         assert!(resolve_viewport_filter_enabled(None));
+    }
+
+    #[test]
+    fn resolve_audio_downlink_lane_defaults_and_fails_safe() {
+        assert_eq!(
+            resolve_audio_downlink_lane(None),
+            AudioDownlinkLane::Reliable
+        );
+        for unrecognised in [
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("datagrm"),
+            Some("true"),
+        ] {
+            assert_eq!(
+                resolve_audio_downlink_lane(unrecognised),
+                AudioDownlinkLane::Reliable,
+                "{unrecognised:?} must not turn the lossy route back on",
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_audio_downlink_lane_accepts_the_documented_values() {
+        for raw in ["datagram", "DATAGRAM", " datagrams ", "Datagram"] {
+            assert_eq!(
+                resolve_audio_downlink_lane(Some(raw)),
+                AudioDownlinkLane::Datagram,
+                "{raw:?} is the documented revert",
+            );
+        }
+        for raw in ["reliable", "RELIABLE", " stream "] {
+            assert_eq!(
+                resolve_audio_downlink_lane(Some(raw)),
+                AudioDownlinkLane::Reliable,
+            );
+        }
     }
 
     #[test]
@@ -1605,32 +1710,207 @@ mod tests {
         assert!(nonvideo_reached_viewport_drop_branch(Err(999)));
     }
 
+    /// Every per-receiver queue on BOTH transports, at the one-layer rate.
     #[test]
     fn per_receiver_queues_absorb_the_target_room_audio_fanout() {
+        const _: () = assert!(
+            AUDIO_PUBLISHED_LAYER_COUNT < AUDIO_SIMULCAST_RUNGS,
+            "the fan-out multiplier below is the PUBLISHED layer count, not the \
+             dormant ladder depth. If the ladder is re-enabled (#2620/#2621) \
+             every queue below must be re-sized against the new rate rather \
+             than silently absorbing a fraction of it",
+        );
+
         let pps = audio_fanout_packets_per_sec(
             RELAY_SIZING_TARGET_PARTICIPANTS,
-            AUDIO_SIMULCAST_RUNGS,
+            AUDIO_PUBLISHED_LAYER_COUNT,
             AUDIO_PACKETS_PER_SEC_PER_RUNG,
         );
-        assert_eq!(pps, 3_900, "26 peers x 3 rungs x 50 pkt/s");
+        assert_eq!(pps, 1_300, "26 peers x 1 published audio layer x 50 pkt/s");
 
-        let channel_ms = queue_absorption_millis(WS_OUTBOUND_CHANNEL_CAPACITY, pps);
-        assert!(
-            channel_ms >= RELAY_QUEUE_ABSORPTION_TARGET_MS,
-            "WS outbound channel absorbs only {channel_ms}ms of a {pps} pkt/s \
-             audio fan-out; target is {RELAY_QUEUE_ABSORPTION_TARGET_MS}ms",
+        // PURE resolvers, not the memoised getters: a CI host exporting
+        // `WT_OUTBOUND_CHANNEL_CAPACITY` would otherwise swing this test.
+        let wt_unistream = resolve_wt_outbound_channel_capacity(None);
+        let wt_mailbox =
+            (wt_unistream + WT_DATAGRAM_CHANNEL_CAPACITY) * INBOUND_MAILBOX_HEADROOM_FACTOR;
+
+        let queues: [(&str, usize); 5] = [
+            ("WS outbound channel", WS_OUTBOUND_CHANNEL_CAPACITY),
+            ("WS actor mailbox", ws_mailbox_capacity()),
+            ("WT unistream channel", wt_unistream),
+            ("WT datagram channel", WT_DATAGRAM_CHANNEL_CAPACITY),
+            ("WT actor mailbox", wt_mailbox),
+        ];
+
+        for (name, slots) in queues {
+            let ms = queue_absorption_millis(slots, pps);
+            assert!(
+                ms >= RELAY_QUEUE_ABSORPTION_TARGET_MS,
+                "{name} ({slots} slots) absorbs only {ms}ms of a {pps} pkt/s \
+                 audio fan-out; target is {RELAY_QUEUE_ABSORPTION_TARGET_MS}ms",
+            );
+        }
+
+        // The unistream lane must match the WS channel: both are the ordered
+        // media lane. The 250ms floor alone would not pin that.
+        let ws_ms = queue_absorption_millis(WS_OUTBOUND_CHANNEL_CAPACITY, pps);
+        assert_eq!(
+            queue_absorption_millis(wt_unistream, pps),
+            ws_ms,
+            "the WT unistream lane must absorb the same {ws_ms}ms of fan-out \
+             the WS channel does",
         );
 
-        let mailbox_ms = queue_absorption_millis(ws_mailbox_capacity(), pps);
+        // The datagram lane is held to the 250ms target only: it absorbs
+        // scheduling jitter, not receiver congestion.
+        let datagram_ms = queue_absorption_millis(WT_DATAGRAM_CHANNEL_CAPACITY, pps);
         assert!(
-            mailbox_ms >= RELAY_QUEUE_ABSORPTION_TARGET_MS,
-            "WS actor mailbox absorbs only {mailbox_ms}ms of a {pps} pkt/s \
-             audio fan-out; target is {RELAY_QUEUE_ABSORPTION_TARGET_MS}ms",
+            datagram_ms < ws_ms,
+            "the datagram lane holds {datagram_ms}ms against the media lanes' \
+             {ws_ms}ms; if it has been grown to parity, re-read why it is a \
+             jitter absorber and not a congestion buffer",
+        );
+    }
+
+    /// One top-tier audio packet in the shape
+    /// `microphone_encoder::transform_audio_chunk` produces and
+    /// `session_logic::handle_outbound` forwards verbatim.
+    fn representative_audio_wrapper_bytes(e2ee: bool) -> usize {
+        use protobuf::Message as _;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
+        use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let opus_bytes = audio_tier_packet_bytes(
+            videocall_aq::constants::AUDIO_QUALITY_TIERS[0].bitrate_kbps as usize,
+            AUDIO_PACKETS_PER_SEC_PER_RUNG,
+        );
+        assert_eq!(opus_bytes, 120, "top audio tier is 48 kbps at 50 pkt/s");
+
+        let media_packet = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            frame_type: "key".to_string(),
+            data: vec![0xA5; opus_bytes],
+            timestamp: 1_762_000_000_000.0,
+            audio_metadata: Some(AudioMetadata {
+                sequence: 4_000_000,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let inner = media_packet
+            .write_to_bytes()
+            .expect("serialize MediaPacket");
+        // PKCS7 appends a FULL block when already aligned, so not `div_ceil`.
+        let data_len = if e2ee {
+            (inner.len() / 16 + 1) * 16
+        } else {
+            inner.len()
+        };
+
+        PacketWrapper {
+            data: vec![0u8; data_len],
+            user_id: b"participant@example.com".to_vec(),
+            packet_type: PacketType::MEDIA.into(),
+            media_kind: MediaKind::AUDIO.into(),
+            session_id: 0x0123_4567_89AB_CDEF,
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .expect("serialize PacketWrapper")
+        .len()
+    }
+
+    /// LOCKSTEP (#2716): [`WT_DATAGRAM_AUDIO_WIRE_BYTES`] must equal the packet
+    /// the relay really queues, in the E2EE-ON mode it is modelled on.
+    #[test]
+    fn audio_datagram_wire_size_matches_the_model() {
+        let sealed = representative_audio_wrapper_bytes(true);
+        assert_eq!(
+            sealed + WT_DATAGRAM_SESSION_HEADER_BYTES,
+            WT_DATAGRAM_AUDIO_WIRE_BYTES,
+            "an E2EE-sealed top-tier audio PacketWrapper serializes to {sealed}B; \
+             with the {WT_DATAGRAM_SESSION_HEADER_BYTES}B WebTransport session \
+             header that is not the modelled {WT_DATAGRAM_AUDIO_WIRE_BYTES}B",
+        );
+
+        let cleartext = representative_audio_wrapper_bytes(false);
+        assert_eq!(
+            cleartext + WT_DATAGRAM_SESSION_HEADER_BYTES,
+            188,
+            "the cleartext wire size is the OTHER mode the buffer must cover",
+        );
+        assert!(
+            sealed > cleartext,
+            "PKCS7 must grow the wrapper ({cleartext}B -> {sealed}B); if it does \
+             not, the E2EE model is no longer the larger of the two modes",
+        );
+    }
+
+    /// LOCKSTEP (#2716): the queue must hold exactly
+    /// [`RELAY_QUEUE_ABSORPTION_TARGET_MS`] of the fan-out, inverting the
+    /// derivation (bytes -> ms) instead of recomputing it. Bracketed on the
+    /// E2EE-OFF side too, where the smaller unit buys more milliseconds.
+    #[test]
+    fn quinn_datagram_buffer_holds_the_absorption_target() {
+        let pps = audio_fanout_packets_per_sec(
+            RELAY_SIZING_TARGET_PARTICIPANTS,
+            AUDIO_PUBLISHED_LAYER_COUNT,
+            AUDIO_PACKETS_PER_SEC_PER_RUNG,
+        );
+        assert_eq!(pps, 1_300, "26 peers x 1 published audio layer x 50 pkt/s");
+
+        let ms = buffer_absorption_millis(
+            WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES,
+            pps * WT_DATAGRAM_AUDIO_WIRE_BYTES,
+        );
+        assert_eq!(
+            ms, RELAY_QUEUE_ABSORPTION_TARGET_MS,
+            "quinn's datagram queue absorbs {ms}ms of the {pps} pkt/s x \
+             {WT_DATAGRAM_AUDIO_WIRE_BYTES}B audio fan-out; target is \
+             {RELAY_QUEUE_ABSORPTION_TARGET_MS}ms",
+        );
+
+        // E2EE off is the live default and its smaller unit buys MORE time;
+        // bracket the overshoot against NetEq's 40-120ms jitter target.
+        let cleartext_ms = buffer_absorption_millis(WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES, pps * 188);
+        assert!(
+            (RELAY_QUEUE_ABSORPTION_TARGET_MS..=300).contains(&cleartext_ms),
+            "with E2EE off the queue absorbs {cleartext_ms}ms, outside the \
+             {RELAY_QUEUE_ABSORPTION_TARGET_MS}..=300ms band the buffer is sized for",
+        );
+    }
+
+    /// #2716: `send_window` must park `write_all` in seconds without capping a
+    /// downlink at a long-haul RTT.
+    #[test]
+    fn quinn_send_window_bounds_queue_without_capping_bdp() {
+        const LONG_HAUL_RTT_MS: u64 = 200;
+        let sustainable_bits_per_sec = WT_QUIC_SEND_WINDOW_BYTES * 8 * 1000 / LONG_HAUL_RTT_MS;
+        assert!(
+            sustainable_bits_per_sec >= 20_000_000,
+            "a {WT_QUIC_SEND_WINDOW_BYTES}B send window sustains only \
+             {sustainable_bits_per_sec} bps at {LONG_HAUL_RTT_MS}ms RTT, below \
+             the 20 Mbps a receiver taking several publishers needs",
+        );
+
+        let video_bytes_per_sec: u64 = videocall_aq::constants::SIMULCAST_VIDEO_LAYERS
+            .iter()
+            .map(|layer| layer.ideal_bitrate_kbps as u64 * 1000 / 8)
+            .sum();
+        let seconds_queued = WT_QUIC_SEND_WINDOW_BYTES as f64 / video_bytes_per_sec as f64;
+        assert!(
+            seconds_queued <= 5.0,
+            "a {WT_QUIC_SEND_WINDOW_BYTES}B send window holds {seconds_queued:.1}s \
+             of one publisher's {video_bytes_per_sec}B/s three-video-layer \
+             profile before write_all parks; the #1638 shed must arm in seconds",
         );
     }
 
     #[test]
-    fn ws_byte_budgets_track_the_encode_tiers_they_are_derived_from() {
+    fn outbound_byte_budgets_track_the_encode_tiers_they_are_derived_from() {
         assert_eq!(
             tier_frame_bytes(
                 &videocall_aq::constants::VIDEO_QUALITY_TIERS
@@ -1644,11 +1924,11 @@ mod tests {
             55_287,
             "the single SCREEN rung at its encode ceiling, 10 fps",
         );
-        assert_eq!(WS_OUTBOUND_VIDEO_BYTE_BUDGET, 384_000);
-        assert_eq!(WS_OUTBOUND_SCREEN_BYTE_BUDGET, 7_076_736);
+        assert_eq!(OUTBOUND_VIDEO_BYTE_BUDGET, 384_000);
+        assert_eq!(OUTBOUND_SCREEN_BYTE_BUDGET, 7_076_736);
         // Locks for the RelayQueueNearFullWS*Bytes alert exprs (YAML, no import).
-        assert_eq!(WS_OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100, 307_200);
-        assert_eq!(WS_OUTBOUND_SCREEN_BYTE_BUDGET * 90 / 100, 6_369_062);
+        assert_eq!(OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100, 307_200);
+        assert_eq!(OUTBOUND_SCREEN_BYTE_BUDGET * 90 / 100, 6_369_062);
     }
 
     #[test]

@@ -289,3 +289,74 @@ async fn meetings_list_omits_owner_affordances_for_not_owned_row() {
     restore_fetch();
     remove_config();
 }
+
+/// Issue 2702 round 10: a co-host (not the owner) gets the settings entry
+/// point too — they may change meeting OPTIONS there — but never the
+/// owner-only star icon or the delete button. Fails on the old gating, which
+/// showed the edit button only for `is_owner`.
+#[wasm_bindgen_test]
+async fn meetings_list_shows_settings_entry_for_a_co_host_but_not_delete() {
+    inject_minimal_config();
+    let body = r#"{
+        "success": true,
+        "result": {
+            "meetings": [
+                {
+                    "meeting_id": "co-hosted-1",
+                    "state": "active",
+                    "last_active_at": 1714323500000,
+                    "created_at": 1714323000000,
+                    "started_at": 1714323400000,
+                    "host": "alice@example.com",
+                    "host_display_name": "Alice Anderson",
+                    "host_user_id": "alice@example.com",
+                    "is_owner": false,
+                    "is_co_host": true,
+                    "participant_count": 3,
+                    "waiting_count": 0,
+                    "has_password": false,
+                    "allow_guests": false,
+                    "recording_allowed_for_all": false,
+                    "waiting_room_enabled": true,
+                    "admitted_can_admit": false,
+                    "end_on_host_leave": true
+                }
+            ]
+        }
+    }"#;
+    mock_fetch_feed(body);
+
+    let mount = create_mount_point();
+    render_into(&mount, meetings_list_wrapper);
+    wait_for_fetch_to_render().await;
+
+    let items = mount.query_selector_all(".meeting-item").unwrap();
+    assert_eq!(items.length(), 1, "expected exactly one row");
+
+    let edits = mount.query_selector_all(".meeting-edit-btn").unwrap();
+    assert_eq!(
+        edits.length(),
+        1,
+        "a co-host must get the settings entry point; got {}",
+        edits.length()
+    );
+
+    let stars = mount.query_selector_all(".meeting-owner-icon").unwrap();
+    assert_eq!(
+        stars.length(),
+        0,
+        "a co-host is not the owner: no star icon; got {}",
+        stars.length()
+    );
+    let deletes = mount.query_selector_all(".meeting-delete-btn").unwrap();
+    assert_eq!(
+        deletes.length(),
+        0,
+        "a co-host must not get the delete button; got {}",
+        deletes.length()
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_config();
+}

@@ -33,6 +33,8 @@ rustlemania-websocket:
       value: "5"
     - name: TOKIO_WORKER_THREADS
       value: "2"
+    - name: MEMBERSHIP_MIRROR_ENABLED
+      value: "true"
     - name: JWT_SECRET
       valueFrom:
         secretKeyRef:

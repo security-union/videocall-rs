@@ -588,6 +588,7 @@ fn MeetingItem(
     let is_active = meeting.state == "active";
     let is_ended = meeting.state == "ended";
     let is_owner = meeting.is_owner;
+    let can_open_settings = is_owner || meeting.is_co_host;
     let state_class = match meeting.state.as_str() {
         "active" => "state-active",
         "idle" => "state-idle",
@@ -713,13 +714,11 @@ fn MeetingItem(
                     }
                 }
             }
-            // Edit / delete affordances are gated on the server-computed
-            // `is_owner` flag — we never infer ownership from any other field.
-            if is_owner {
+            if can_open_settings {
                 button {
                     class: "meeting-edit-btn",
                     onclick: on_edit_click,
-                    title: "Meeting settings",
+                    title: if is_owner { "Meeting settings" } else { "Meeting settings (co-host)" },
                     svg {
                         xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
                         view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
@@ -728,6 +727,8 @@ fn MeetingItem(
                         path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
                     }
                 }
+            }
+            if is_owner {
                 button {
                     class: if is_ended { "meeting-delete-btn meeting-delete-btn-ended" } else { "meeting-delete-btn" },
                     onclick: on_delete_click,
@@ -1531,6 +1532,7 @@ mod tests {
             host_display_name: Some("Alice Anderson".to_string()),
             host_user_id: Some("alice@example.com".to_string()),
             is_owner,
+            is_co_host: false,
             participant_count: 2,
             waiting_count: 0,
             has_password: false,

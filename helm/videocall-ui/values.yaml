@@ -18,6 +18,14 @@ resources:
     cpu: "50m"
     memory: "64Mi"
 
+readinessProbe:
+  httpGet:
+    path: /version.json
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

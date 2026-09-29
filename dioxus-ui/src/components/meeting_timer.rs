@@ -49,24 +49,21 @@
 //! `MeetingTimerCtx` is deliberately read ONLY inside this module, by exactly
 //! FOUR components — [`MeetingTimerChip`], [`MeetingTimerLiveRegion`],
 //! [`MeetingTimerDockControl`] and [`MeetingTimerPopover`] — and never by
-//! `AttendantsComponent` itself, for the same reason `RaisedHandsBanner` reads
+//! `AttendantsComponent`'s render body, for the same reason `RaisedHandsBanner` reads
 //! `RaisedHandsCtx` rather than taking it as a prop: a context read in the
 //! attendants body would subscribe that ~9,000-line RSX, and every keyed
-//! `PeerTile` under it, to every timer change. Each of the four renders a
-//! handful of nodes, so a transition re-renders only those.
-//!
-//! `AttendantsComponent` owns the signal and PROVIDES it, and touches its value
-//! only through `peek()` (in the inbound callback, the transition helper, and
-//! the reconnect drop) — `peek` does not subscribe. Verified by grep: there is
-//! no `use_context::<MeetingTimerCtx>()` anywhere outside this file.
+//! `PeerTile` under it, to every timer change. That body reads only the bool from
+//! [`use_meeting_timer_band`], which flips on start, cancel and a lapsed drop.
 
 use crate::components::video_control_buttons::MeetingTimerButton;
 use crate::context::DockPositionCtx;
 use dioxus::prelude::*;
-use gloo_timers::callback::Interval;
+use gloo_timers::callback::{Interval, Timeout};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use videocall_client::{clamp_duration_ms, CountdownSample, MeetingTimerState};
+use videocall_client::{
+    clamp_duration_ms, CountdownSample, MeetingTimerState, MEETING_TIMER_HEARTBEAT_MS,
+};
 
 /// Tick period for the visible countdown. One second: the countdown is rendered
 /// at second granularity, so a faster tick would repaint identical text.
@@ -674,10 +671,78 @@ pub fn play_timer_expired_sound() {
     .forget();
 }
 
-/// Shared, room-global timer state. Read by [`MeetingTimerChip`] ONLY — see the
-/// module docs for why nothing else may subscribe to it.
+/// Shared, room-global timer state.
 #[derive(Clone, Copy)]
 pub struct MeetingTimerCtx(pub Signal<Option<MeetingTimerState>>);
+
+/// How long a running timer's band survives the state going `None`: two
+/// heartbeats, the window in which a reconnect's drop is re-acquired.
+pub const MEETING_TIMER_BAND_LINGER_MS: u32 = 2 * MEETING_TIMER_HEARTBEAT_MS as u32;
+
+/// Whether row 1 reserves the band that clears the chip.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum TimerBandLatch {
+    #[default]
+    Off,
+    On,
+    Lingering {
+        since_ms: f64,
+    },
+}
+
+impl TimerBandLatch {
+    pub fn observe(self, state: Option<MeetingTimerState>, now_ms: f64, linger_ms: u32) -> Self {
+        match (state, self) {
+            (Some(s), _) if s.running => Self::On,
+            (Some(_), _) => Self::Off,
+            (None, Self::On) => Self::Lingering { since_ms: now_ms },
+            (None, Self::Lingering { since_ms }) if now_ms - since_ms >= f64::from(linger_ms) => {
+                Self::Off
+            }
+            (None, held) => held,
+        }
+    }
+
+    pub fn shown(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// The band as a bool that flips on start, cancel and a lapsed drop only, so a
+/// render reading it never subscribes to the timer state itself.
+pub fn use_meeting_timer_band(
+    state: Signal<Option<MeetingTimerState>>,
+    linger_ms: u32,
+) -> Signal<bool> {
+    let mut shown = use_signal(|| false);
+    let latch = use_hook(|| Rc::new(Cell::new(TimerBandLatch::Off)));
+    let mut recheck: Signal<Option<Timeout>> = use_signal(|| None);
+    use_effect(move || {
+        let next = latch.get().observe(*state.read(), now_mono_ms(), linger_ms);
+        latch.set(next);
+        if *shown.peek() != next.shown() {
+            shown.set(next.shown());
+        }
+        let lapse = matches!(next, TimerBandLatch::Lingering { .. }).then(|| {
+            let latch = latch.clone();
+            // +100 so the recheck lands past the latch's own deadline.
+            Timeout::new(linger_ms + 100, move || {
+                let Ok(current) = state.try_peek().map(|s| *s) else {
+                    return;
+                };
+                let next = latch.get().observe(current, now_mono_ms(), linger_ms);
+                latch.set(next);
+                if shown.try_peek().is_ok_and(|v| *v != next.shown()) {
+                    if let Ok(mut w) = shown.try_write() {
+                        *w = next.shown();
+                    }
+                }
+            })
+        });
+        recheck.set(lapse);
+    });
+    shown
+}
 
 /// A countdown that is currently being driven, together with the identity of the
 /// state that produced it.
@@ -696,8 +761,7 @@ struct ActiveCountdown {
 
 /// The always-visible countdown, rendered for EVERY participant.
 ///
-/// Takes no props and reads its own context, so a timer transition re-renders
-/// this ~6-node component instead of the attendants RSX. SELF-GATING: it emits
+/// Takes no props and reads its own context. SELF-GATING: it emits
 /// zero element nodes when no timer is running, which matters because several
 /// E2E specs address `#grid-container`'s children positionally.
 #[component]
@@ -865,17 +929,9 @@ pub fn MeetingTimerChip() -> Element {
     let urgency = urgency(remaining, state.duration_ms);
     let label = compose_chip_label(remaining, urgency);
 
-    // The chip is bottom-LEFT anchored, which is the only bottom corner that is
-    // free: bottom-centre at the dock clearance belongs to the decode-paused
-    // pill and the screen-share zoom controls, and bottom-right to the self-view
-    // tile (which widens to 35% on mobile). A VERTICAL dock, though, occupies
-    // exactly that corner's column, so the chip carries the dock position as a
-    // modifier and the stylesheet shifts it clear.
-    let dock_class = dock_position_class();
-
     rsx! {
         div {
-            class: "meeting-timer-chip meeting-timer-chip--{urgency.modifier()} meeting-timer-chip--{dock_class}",
+            class: "meeting-timer-chip meeting-timer-chip--{urgency.modifier()}",
             "data-testid": "meeting-timer-chip",
             // Exposed for the E2E spec and for CSS, so neither has to infer the
             // state from a class name that also carries styling concerns.
@@ -921,9 +977,7 @@ fn now_mono_ms() -> f64 {
 /// [`would_apply_change`] already suppresses), but "small" is a judgement that
 /// decays: the same reasoning is how the raised-hand roster ended up read in the
 /// attendants body once. Scoping the subscription to a component that renders
-/// one button makes the bound STRUCTURAL, and keeps the module's stated
-/// invariant — that nothing outside this module subscribes to the timer — true
-/// as written rather than true-with-an-asterisk.
+/// one button makes the bound STRUCTURAL.
 #[component]
 pub fn MeetingTimerDockControl(
     /// Whether the controls popover is open. Owned by the attendants component,
@@ -950,12 +1004,6 @@ pub fn MeetingTimerDockControl(
 }
 
 /// The active dock's CSS class (`dock-bottom` / `dock-left` / `dock-right`).
-///
-/// Both the chip and the controls popover are `position: fixed` and share no
-/// positioned ancestor with the dock, so neither can anchor to it in CSS alone —
-/// each carries the dock position as a modifier class instead and the stylesheet
-/// places it. `DockPosition` is a stored user preference that changes at most a
-/// handful of times per session, so subscribing to it costs nothing.
 ///
 /// `try_use_context` with a bottom-dock fallback: the customize-mode preview and
 /// any isolated component test render without a provider.
@@ -2402,5 +2450,138 @@ mod tests {
             mods.len(),
             "each urgency needs its own CSS modifier or two states would style alike"
         );
+    }
+
+    const LINGER: u32 = MEETING_TIMER_BAND_LINGER_MS;
+
+    #[test]
+    fn the_band_follows_start_and_cancel_immediately() {
+        let idle = TimerBandLatch::default();
+        assert!(
+            !idle.observe(None, 0.0, LINGER).shown(),
+            "no timer ever seen"
+        );
+        let on = idle.observe(Some(st(true, 60_000, 60_000, 1)), 0.0, LINGER);
+        assert!(on.shown(), "start");
+        assert!(
+            !on.observe(Some(MeetingTimerState::cleared(2)), 1.0, LINGER)
+                .shown(),
+            "an explicit cancel drops the band at once"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_drop_keeps_the_band_until_it_lapses() {
+        let running = Some(st(true, 60_000, 60_000, 1));
+        let deadline = 1_000.0 + f64::from(LINGER);
+        let dropped = TimerBandLatch::On.observe(None, 1_000.0, LINGER);
+        assert!(dropped.shown(), "the drop itself does not reflow");
+        assert!(
+            dropped.observe(None, deadline - 1.0, LINGER).shown(),
+            "inside the linger"
+        );
+        assert_eq!(
+            dropped.observe(running, 6_000.0, LINGER),
+            TimerBandLatch::On,
+            "the heartbeat restores it before the band ever moved"
+        );
+        assert!(
+            !dropped.observe(None, deadline, LINGER).shown(),
+            "a None that outlives two heartbeats is a timer that is gone"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    const LINGER: u32 = 500;
+
+    #[allow(non_snake_case)]
+    fn BandHarness() -> Element {
+        let mut state = use_signal(|| None::<MeetingTimerState>);
+        let band = use_meeting_timer_band(state, LINGER);
+        let running = MeetingTimerState {
+            running: true,
+            ends_at_ms: u64::MAX,
+            duration_ms: 60_000,
+            updated_at_ms: 1,
+        };
+        rsx! {
+            div { id: "band-probe", "data-band": "{band()}" }
+            button { id: "band-start", onclick: move |_| state.set(Some(running)) }
+            button { id: "band-drop", onclick: move |_| state.set(None) }
+        }
+    }
+
+    async fn until(at_ms: f64) {
+        while now_mono_ms() < at_ms {
+            TimeoutFuture::new(10).await;
+        }
+    }
+
+    async fn wait_for(band: &impl Fn() -> Option<String>, want: &str, why: &str) {
+        let give_up = now_mono_ms() + 3_000.0;
+        while band().as_deref() != Some(want) && now_mono_ms() < give_up {
+            TimeoutFuture::new(15).await;
+        }
+        assert_eq!(band().as_deref(), Some(want), "{why}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_mounted_band_lapses_after_a_lasting_drop_and_survives_a_restore() {
+        let doc = gloo_utils::document();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(BandHarness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        let click = |id: &str| {
+            mount
+                .query_selector(&format!("#{id}"))
+                .unwrap()
+                .unwrap()
+                .unchecked_into::<web_sys::HtmlElement>()
+                .click();
+        };
+        let band = || {
+            mount
+                .query_selector("#band-probe")
+                .unwrap()
+                .and_then(|el| el.get_attribute("data-band"))
+        };
+        let linger = f64::from(LINGER);
+        wait_for(&band, "false", "no timer, no band").await;
+
+        click("band-start");
+        wait_for(&band, "true", "start").await;
+
+        click("band-drop");
+        let dropped = now_mono_ms();
+        until(dropped + linger / 2.0).await;
+        let held = band();
+        assert!(now_mono_ms() - dropped < linger, "stalled past the linger");
+        assert_eq!(held.as_deref(), Some("true"), "a drop lingers");
+        wait_for(&band, "false", "a lasting drop lapses").await;
+
+        click("band-start");
+        wait_for(&band, "true", "restart").await;
+        click("band-drop");
+        let dropped = now_mono_ms();
+        until(dropped + linger / 2.0).await;
+        click("band-start");
+        assert!(now_mono_ms() - dropped < linger, "stalled past the linger");
+        until(dropped + linger + 400.0).await;
+        assert_eq!(
+            band().as_deref(),
+            Some("true"),
+            "a restore inside the linger keeps the band past the old deadline"
+        );
+        mount.remove();
     }
 }

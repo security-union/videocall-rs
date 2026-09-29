@@ -8481,6 +8481,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "socket2 0.5.10",
  "sqlx",
  "tempfile",
  "tokio",
@@ -8740,15 +8741,19 @@ name = "videocall-transport"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "console_error_panic_hook",
  "futures",
  "gloo",
  "gloo-console 0.3.0",
+ "gloo-timers 0.2.6",
  "js-sys",
  "log",
+ "protobuf 3.7.2",
  "thiserror 1.0.69",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-bindgen-test",
  "web-sys",
 ]
 

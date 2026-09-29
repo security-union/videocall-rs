@@ -6,6 +6,7 @@ use crate::constants::meeting_api_client;
 use futures::future::{FutureExt, Shared};
 use std::cell::{Cell, RefCell};
 pub use videocall_meeting_client::ApiError as JoinError;
+pub use videocall_meeting_types::responses::CoHostEntry;
 pub use videocall_meeting_types::responses::CreateMeetingResponse;
 pub use videocall_meeting_types::responses::MeetingGuestInfoResponse;
 pub use videocall_meeting_types::responses::MeetingInfoResponse as MeetingInfo;
@@ -403,6 +404,34 @@ pub async fn transfer_host(meeting_id: &str, user_id: &str) -> Result<(), JoinEr
     client()?.transfer_host(meeting_id, user_id).await
 }
 
+pub async fn list_co_hosts(meeting_id: &str) -> Result<Vec<CoHostEntry>, JoinError> {
+    with_refresh_retry(|| async { client()?.list_co_hosts(meeting_id).await })
+        .await
+        .map(|r| r.co_hosts)
+}
+
+/// `persist: None` keeps an existing entry's saved flag and still lifts a suspension.
+pub async fn grant_co_host(
+    meeting_id: &str,
+    user_id: &str,
+    persist: Option<bool>,
+) -> Result<Vec<CoHostEntry>, JoinError> {
+    log::info!("Granting co-host via API: {meeting_id} -> {user_id} (persist: {persist:?})");
+    with_refresh_retry(|| async { client()?.grant_co_host(meeting_id, user_id, persist).await })
+        .await
+        .map(|r| r.co_hosts)
+}
+
+pub async fn revoke_co_host(
+    meeting_id: &str,
+    user_id: &str,
+) -> Result<Vec<CoHostEntry>, JoinError> {
+    log::info!("Revoking co-host via API: {meeting_id} -> {user_id}");
+    with_refresh_retry(|| async { client()?.revoke_co_host(meeting_id, user_id).await })
+        .await
+        .map(|r| r.co_hosts)
+}
+
 pub async fn update_display_name(
     meeting_id: &str,
     display_name: &str,
@@ -433,6 +462,7 @@ pub async fn create_meeting(
         end_on_host_leave: None,
         recording_allowed_for_all: None,
         chat_allowed_for_all: None,
+        co_hosts: vec![],
     };
     let req = &req;
     with_refresh_retry(|| async move { client()?.create_meeting(req).await }).await
@@ -507,6 +537,22 @@ pub async fn leave_meeting_as_guest(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Calls `POST /api/v1/meetings/{meeting_id}/presence/keepalive`;
+/// `Err(JoinError::NotFound(_))` means stop calling.
+pub async fn presence_keepalive(meeting_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.presence_keepalive(meeting_id).await }).await
+}
+
+/// Guest counterpart of [`presence_keepalive`], via the guest's observer token.
+pub async fn presence_keepalive_guest(
+    meeting_id: &str,
+    observer_token: &str,
+) -> Result<(), JoinError> {
+    make_guest_client(observer_token)?
+        .presence_keepalive_guest(meeting_id)
+        .await
 }
 
 #[cfg(test)]

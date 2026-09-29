@@ -1,4 +1,4 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, BrowserContext, Page, Route } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -129,6 +129,38 @@ async function readTransportStorageAfterReload(
   return storage;
 }
 
+// Patches BOTH `config.js` and the `config.local.js` shim served after it.
+// Call before the first navigation.
+async function setRuntimeConfig(
+  context: BrowserContext,
+  keys: Record<string, string>,
+): Promise<void> {
+  const injection = `;window.__APP_CONFIG=Object.assign(window.__APP_CONFIG||{},${JSON.stringify(
+    keys,
+  )});`;
+  const patch = async (route: Route) => {
+    let original = "";
+    try {
+      const response = await route.fetch();
+      if (response.status() === 200) {
+        const body = await response.text();
+        if (body.trim() && body.trim().charAt(0) !== "<") {
+          original = body;
+        }
+      }
+    } catch {
+      /* layer absent on this serve — emit the override alone */
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `window.__APP_CONFIG=window.__APP_CONFIG||{};${original}${injection}`,
+    });
+  };
+  await context.route("**/config.js", patch);
+  await context.route("**/config.local.js", patch);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -142,8 +174,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await injectSessionCookie(context, { baseURL });
   });
 
-  // 1. Network tab shows segmented control with WebSocket selected by default
-  test("Network tab shows only WebSocket and WebTransport with WebSocket selected by default", async ({
+  test("Network tab shows only WebSocket and WebTransport with WebTransport selected by default", async ({
     page,
   }) => {
     const meetingId = `e2e_proto_default_${Date.now()}`;
@@ -152,20 +183,25 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // WebSocket pill should be selected by default (the product default flipped
-    // from WebTransport to WebSocket; WebTransport is now opt-in/experimental).
-    await expect(page.locator('[data-testid="transport-radio-websocket"]')).toHaveAttribute(
+    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
       "aria-checked",
       "true",
     );
-    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
+    await expect(page.locator('[data-testid="transport-radio-websocket"]')).toHaveAttribute(
       "aria-checked",
       "false",
     );
 
-    // The experimental-WebTransport warning must be ABSENT when WebSocket (the
-    // default) is selected — merely opening Settings never warns.
-    await expect(page.locator('[data-testid="transport-webtransport-warning"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="transport-websocket-note"]')).toHaveCount(0);
+
+    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
+      "aria-describedby",
+      "transport-webtransport-desc",
+    );
+    await expect(page.locator('[data-testid="transport-radio-websocket"]')).toHaveAttribute(
+      "aria-describedby",
+      "transport-websocket-desc",
+    );
 
     // Auto option must no longer exist — the simplification removed it
     await expect(page.locator('[data-testid="transport-radio-auto"]')).toHaveCount(0);
@@ -176,45 +212,38 @@ test.describe("Protocol selection (transport preference)", () => {
     // Apply button should not be visible (no pending change)
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
 
-    // Sticky ("Remember protocol choice") toggle is now shown for BOTH protocols
-    // (#1291), including the WebSocket default. It starts unchecked when no
-    // pin is persisted. The full "Remember"-toggle behaviour is exercised in
-    // protocol-switch-override.spec.ts; here we just pin its default visibility.
     await expect(page.locator("#sticky-transport-checkbox")).toBeVisible();
     await expect(page.locator("#sticky-transport-checkbox")).not.toBeChecked();
   });
 
-  // 2. Selecting WebTransport (the non-default) shows the Apply button, the
-  //    sticky toggle, AND the experimental-WebTransport warning.
-  test("selecting WebTransport shows Apply button, sticky toggle, and the experimental warning", async ({
+  test("selecting WebSocket shows Apply button, sticky toggle, and the fallback note", async ({
     page,
   }) => {
-    const meetingId = `e2e_proto_select_wt_${Date.now()}`;
+    const meetingId = `e2e_proto_select_ws_${Date.now()}`;
     await joinMeeting(page, meetingId, "proto-user-2");
 
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // Warning absent before selecting WebTransport (WebSocket default active).
-    await expect(page.locator('[data-testid="transport-webtransport-warning"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="transport-websocket-note"]')).toHaveCount(0);
 
-    await page.locator('[data-testid="transport-radio-webtransport"]').click();
+    await page.locator('[data-testid="transport-radio-websocket"]').click();
 
-    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
+    await expect(page.locator('[data-testid="transport-radio-websocket"]')).toHaveAttribute(
       "aria-checked",
       "true",
     );
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
     await expect(page.locator("#sticky-transport-checkbox")).toBeVisible();
 
-    // The experimental warning appears and names WebTransport as experimental.
-    const warning = page.locator('[data-testid="transport-webtransport-warning"]');
-    await expect(warning).toBeVisible();
-    await expect(warning).toContainText(/experimental/i);
+    const note = page.locator('[data-testid="transport-websocket-note"]');
+    await expect(note).toBeVisible();
+    await expect(note).toContainText(/fallback/i);
+
+    await expect(page.locator("#transport-websocket-desc")).toHaveCount(1);
   });
 
-  // 3. Selecting back to the default WebSocket hides Apply button
-  test("selecting WebSocket (default) hides Apply button when matching active", async ({
+  test("selecting WebTransport (default) hides Apply button when matching active", async ({
     page,
   }) => {
     const meetingId = `e2e_proto_default_hide_${Date.now()}`;
@@ -223,15 +252,12 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // Initially WebSocket (default) is selected, no pending change -> Apply hidden
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
 
-    // Pick WebTransport -> Apply appears
-    await page.locator('[data-testid="transport-radio-webtransport"]').click();
+    await page.locator('[data-testid="transport-radio-websocket"]').click();
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
 
-    // Pick WebSocket again -> Apply disappears (matches current active default)
-    await page.locator('[data-testid="transport-radio-websocket"]').click();
+    await page.locator('[data-testid="transport-radio-webtransport"]').click();
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
   });
 
@@ -243,12 +269,7 @@ test.describe("Protocol selection (transport preference)", () => {
   // ("Remember toggle is visible for both WebTransport and WebSocket") and by
   // the default-visibility assertion in test 1 above.
 
-  // 5. Apply a NON-default (WebTransport) choice without sticky writes to
-  //    sessionStorage, not localStorage. WebSocket is the default now, so a
-  //    session-scoped choice must be the non-default WebTransport to exercise
-  //    the `(false, false)` session arm (selecting the WebSocket default
-  //    without sticky would clear all storage instead — see test 9).
-  test("Apply WebTransport without sticky writes to sessionStorage not localStorage", async ({
+  test("Apply WebSocket without sticky writes to sessionStorage not localStorage", async ({
     page,
   }) => {
     const meetingId = `e2e_proto_session_${Date.now()}`;
@@ -257,7 +278,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    await page.locator('[data-testid="transport-radio-webtransport"]').click();
+    await page.locator('[data-testid="transport-radio-websocket"]').click();
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
 
     await page.locator('[data-testid="transport-apply-button"]').click();
@@ -267,7 +288,7 @@ test.describe("Protocol selection (transport preference)", () => {
     // off-origin SecurityError during the settle window.
     const storage = await readTransportStorageAfterReload(page, meetingId);
 
-    expect(storage.session).toBe("webtransport");
+    expect(storage.session).toBe("websocket");
     expect(storage.preference).toBeNull();
     expect(storage.sticky).toBeNull();
 
@@ -292,11 +313,7 @@ test.describe("Protocol selection (transport preference)", () => {
   //   - "toggling Remember then closing without Apply writes nothing to storage"
   // and the Apply-commit path here remains covered by tests 8 and 9 below.
 
-  // 8. Apply the non-default WebTransport with sticky writes to localStorage and
-  //    survives reload. This is the realistic "remember my experimental choice"
-  //    path post default-flip: an existing user who explicitly opts into
-  //    WebTransport keeps it across browser sessions.
-  test("Apply WebTransport with sticky writes to localStorage and survives reload", async ({
+  test("Apply WebSocket with sticky writes to localStorage and survives reload", async ({
     page,
   }) => {
     const meetingId = `e2e_proto_apply_sticky_${Date.now()}`;
@@ -305,7 +322,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    await page.locator('[data-testid="transport-radio-webtransport"]').click();
+    await page.locator('[data-testid="transport-radio-websocket"]').click();
     await page.locator("#sticky-transport-checkbox").check({ force: true });
 
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
@@ -320,7 +337,7 @@ test.describe("Protocol selection (transport preference)", () => {
       sticky: localStorage.getItem("vc_transport_sticky"),
     }));
 
-    expect(storage.preference).toBe("webtransport");
+    expect(storage.preference).toBe("websocket");
     expect(storage.sticky).toBe("true");
 
     // Clean up so subsequent tests aren't polluted.
@@ -330,19 +347,18 @@ test.describe("Protocol selection (transport preference)", () => {
     });
   });
 
-  // 9. Selecting the default WebSocket without sticky and applying clears all storage
-  test("selecting WebSocket (default) without sticky and applying clears all storage", async ({
+  test("selecting WebTransport (default) without sticky and applying clears all storage", async ({
     page,
   }) => {
     const meetingId = `e2e_proto_default_clear_${Date.now()}`;
 
-    // Pre-seed all three keys so the page boots into the non-default webtransport.
+    // Pre-seed all three keys so the page boots into the non-default websocket.
     await page.goto("/");
     await page.waitForTimeout(1500);
     await page.evaluate(() => {
-      localStorage.setItem("vc_transport_preference", "webtransport");
+      localStorage.setItem("vc_transport_preference", "websocket");
       localStorage.setItem("vc_transport_sticky", "true");
-      sessionStorage.setItem("vc_transport_session", "webtransport");
+      sessionStorage.setItem("vc_transport_session", "websocket");
     });
     await page.reload();
 
@@ -351,11 +367,9 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // Active protocol is webtransport. We need Apply to appear when we switch
-    // back to the default — first un-tick sticky so the apply logic clears
-    // storage instead of writing a fresh sticky=true.
+    // Un-tick sticky first, or Apply writes a fresh sticky=true instead of clearing.
     await page.locator("#sticky-transport-checkbox").uncheck({ force: true });
-    await page.locator('[data-testid="transport-radio-websocket"]').click();
+    await page.locator('[data-testid="transport-radio-webtransport"]').click();
 
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
     await page.locator('[data-testid="transport-apply-button"]').click();
@@ -462,13 +476,7 @@ test.describe("Protocol selection (transport preference)", () => {
     });
   });
 
-  // 9d. Post default-flip: an UNSEEDED session (no stored preference) must
-  // resolve to WebSocket at the primary in-call join site, logged with
-  // `pref=websocket source=default`. This is the resolution-layer proof that
-  // the flipped default actually elects WebSocket (test 1 only checks the
-  // settings-modal selection). Mirrors 9c but with nothing seeded, so it fails
-  // on the pre-flip code (which would log `pref=webtransport`).
-  test("logs default transport preference websocket source=default on an unseeded join", async ({
+  test("logs default transport preference webtransport source=default on an unseeded join", async ({
     page,
   }) => {
     const meetingId = `e2e_proto_default_log_${Date.now()}`;
@@ -478,7 +486,7 @@ test.describe("Protocol selection (transport preference)", () => {
       consoleLines.push(msg.text());
     });
 
-    // No seeding — a fresh (unseeded) session must fall through to the default.
+    // No seeding — a fresh session must fall through to the default.
     await joinMeeting(page, meetingId, "proto-user-9d");
 
     await expect
@@ -489,8 +497,148 @@ test.describe("Protocol selection (transport preference)", () => {
 
     const prefLine = consoleLines.find((l) => l.includes("Transport preference applied:"));
     expect(prefLine).toBeTruthy();
-    expect(prefLine).toContain("pref=websocket");
+    expect(prefLine).toContain("pref=webtransport");
     expect(prefLine).toContain("source=default");
+  });
+
+  test("defaultTransport=websocket preselects WebSocket and moves the (default) marker", async ({
+    page,
+    context,
+  }) => {
+    const meetingId = `e2e_proto_cfg_ws_${Date.now()}`;
+    await setRuntimeConfig(context, { defaultTransport: "websocket" });
+
+    await joinMeeting(page, meetingId, "proto-user-9e");
+
+    // A silently-unpatched config.js would read as a product failure below.
+    expect(
+      await page.evaluate(
+        () =>
+          (window as unknown as Record<string, Record<string, string>>).__APP_CONFIG
+            ?.defaultTransport,
+      ),
+    ).toBe("websocket");
+
+    await openSettingsModal(page);
+    await switchToNetworkTab(page);
+
+    const wsRadio = page.locator('[data-testid="transport-radio-websocket"]');
+    const wtRadio = page.locator('[data-testid="transport-radio-webtransport"]');
+    await expect(wsRadio).toHaveAttribute("aria-checked", "true");
+    await expect(wtRadio).toHaveAttribute("aria-checked", "false");
+    await expect(wsRadio).toHaveText("WebSocket (default)");
+    await expect(wtRadio).toHaveText("WebTransport");
+
+    expect(
+      await page.evaluate(() => ({
+        pref: localStorage.getItem("vc_transport_preference"),
+        sticky: localStorage.getItem("vc_transport_sticky"),
+        session: sessionStorage.getItem("vc_transport_session"),
+      })),
+    ).toEqual({ pref: null, sticky: null, session: null });
+  });
+
+  test("an unrecognised defaultTransport leaves WebTransport as the default", async ({
+    page,
+    context,
+  }) => {
+    const meetingId = `e2e_proto_cfg_junk_${Date.now()}`;
+    await setRuntimeConfig(context, { defaultTransport: "quic" });
+
+    await joinMeeting(page, meetingId, "proto-user-9f");
+    await openSettingsModal(page);
+    await switchToNetworkTab(page);
+
+    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveText(
+      "WebTransport (default)",
+    );
+  });
+
+  test("webTransportEnabled=false marks WebSocket and disables the WebTransport option @bvt1", async ({
+    page,
+    context,
+  }) => {
+    const meetingId = `e2e_proto_cfg_wtoff_${Date.now()}`;
+    await setRuntimeConfig(context, {
+      webTransportEnabled: "false",
+      defaultTransport: "webtransport",
+    });
+
+    await joinMeeting(page, meetingId, "proto-user-9g");
+    await openSettingsModal(page);
+    await switchToNetworkTab(page);
+
+    const wtRadio = page.locator('[data-testid="transport-radio-webtransport"]');
+    const wsRadio = page.locator('[data-testid="transport-radio-websocket"]');
+    await expect(wsRadio).toHaveText("WebSocket (default)");
+    await expect(wtRadio).toHaveText("WebTransport (unavailable)");
+    await expect(wtRadio).toHaveAttribute("aria-disabled", "true");
+    // `toBeEnabled` counts aria-disabled as disabled, so read the attribute.
+    expect(await wtRadio.evaluate((el) => el.hasAttribute("disabled"))).toBe(false);
+    await expect(page.locator("#transport-webtransport-desc")).toHaveText(
+      "Unavailable on this deployment.",
+    );
+
+    // Pinning the MARKED default raises no advisory: there is nothing to
+    // advise. Assert the checkbox really is on, or the absence is vacuous.
+    await page.locator('[data-testid="transport-radio-websocket"]').click();
+    await page.locator("#sticky-transport-checkbox").check({ force: true });
+    await expect(page.locator("#sticky-transport-checkbox")).toBeChecked();
+    await expect(page.locator('[data-testid="transport-pinned-advisory"]')).toHaveCount(0);
+
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    await openDiagnosticsPanel(page);
+    const diagSelect = diagnosticsTransportSelect(page);
+    await expect(diagSelect.locator('option[value="websocket"]')).toHaveText("WebSocket (default)");
+    await expect(diagSelect.locator('option[value="webtransport"]')).toHaveText(
+      "WebTransport (unavailable)",
+    );
+    await expect(diagSelect.locator('option[value="webtransport"]')).toBeDisabled();
+  });
+
+  test("webTransportEnabled=false advises a WebTransport pin against the marked default @bvt1", async ({
+    page,
+    context,
+  }) => {
+    const meetingId = `e2e_proto_cfg_wtoff_pin_${Date.now()}`;
+    await setRuntimeConfig(context, {
+      webTransportEnabled: "false",
+      defaultTransport: "webtransport",
+    });
+    // Seeded before the first navigation: the disabled radio cannot be clicked,
+    // so the only way to reach a WebTransport pin here is a stored one.
+    await context.addInitScript(`(() => {
+      try {
+        localStorage.setItem("vc_transport_preference", "webtransport");
+        localStorage.setItem("vc_transport_sticky", "true");
+      } catch (_) {}
+    })();`);
+
+    await joinMeeting(page, meetingId, "proto-user-9h");
+    await openSettingsModal(page);
+    await switchToNetworkTab(page);
+
+    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await expect(page.locator("#sticky-transport-checkbox")).toBeChecked();
+
+    const advisory = page.locator('[data-testid="transport-pinned-advisory"]');
+    await expect(advisory).toBeVisible();
+    await expect(advisory).toContainText("WebTransport will be used");
+    await expect(advisory).toContainText("switch back to WebSocket");
+    await expect(advisory).not.toContainText("switch back to WebTransport");
+
+    await page.evaluate(() => {
+      localStorage.removeItem("vc_transport_preference");
+      localStorage.removeItem("vc_transport_sticky");
+    });
   });
 
   // 10. Diagnostics panel shows transport preference dropdown
@@ -504,14 +652,18 @@ test.describe("Protocol selection (transport preference)", () => {
     const diagSelect = diagnosticsTransportSelect(page);
     await expect(diagSelect).toBeVisible();
 
-    // Default value should be "websocket" (the flipped default; was
-    // "webtransport", and "auto" before the simplification)
-    await expect(diagSelect).toHaveValue("websocket");
+    await expect(diagSelect).toHaveValue("webtransport");
 
     // Exactly two options must be present (no Auto)
     const options = diagSelect.locator("option");
     await expect(options).toHaveCount(2);
     await expect(diagSelect.locator('option[value="auto"]')).toHaveCount(0);
+
+    // Pin the option TEXT: a hardcoded marker passes every other test here.
+    await expect(diagSelect.locator('option[value="webtransport"]')).toHaveText(
+      "WebTransport (default)",
+    );
+    await expect(diagSelect.locator('option[value="websocket"]')).toHaveText("WebSocket");
   });
 
   // 11. Diagnostics panel protocol change still shows confirm dialog
@@ -528,8 +680,7 @@ test.describe("Protocol selection (transport preference)", () => {
     });
 
     const diagSelect = diagnosticsTransportSelect(page);
-    // Default is now websocket — switch to webtransport to trigger the dialog.
-    await diagSelect.selectOption("webtransport");
+    await diagSelect.selectOption("websocket");
     await page.waitForTimeout(500);
 
     expect(dialogMessage).toContain(
@@ -543,11 +694,11 @@ test.describe("Protocol selection (transport preference)", () => {
   }) => {
     const meetingId = `e2e_proto_sync_${Date.now()}`;
 
-    // Pre-set sticky localStorage with a specific preference
+    // The NON-default preference, so both surfaces must read storage.
     await page.goto("/");
     await page.waitForTimeout(1500);
     await page.evaluate(() => {
-      localStorage.setItem("vc_transport_preference", "webtransport");
+      localStorage.setItem("vc_transport_preference", "websocket");
       localStorage.setItem("vc_transport_sticky", "true");
     });
     await page.reload();
@@ -558,7 +709,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
+    await expect(page.locator('[data-testid="transport-radio-websocket"]')).toHaveAttribute(
       "aria-checked",
       "true",
     );
@@ -571,7 +722,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await openDiagnosticsPanel(page);
 
     const diagSelect = diagnosticsTransportSelect(page);
-    await expect(diagSelect).toHaveValue("webtransport");
+    await expect(diagSelect).toHaveValue("websocket");
 
     // Clean up both keys
     await page.evaluate(() => {

@@ -389,6 +389,11 @@ h3 {
   visibility: visible;
 }
 
+/* Own rule: a browser without :has() drops only this one. */
+.tile-mute-menu-wrapper:has(:focus-visible) .tile-mute-btn {
+  visibility: visible;
+}
+
 .tile-context-menu {
   position: absolute;
   top: calc(100% + 6px);
@@ -499,10 +504,21 @@ h3 {
 
 /* Wrap mode (issue 2700): `height: 100%` resolves against the container here,
    and `aspect-ratio` re-rounds width above the floored track. */
-#grid-container[data-tile-flow="wrap"] > .grid-item:not(.grid-item-pinned),
+#grid-container[data-tile-flow="wrap"] > .grid-item,
+#grid-container[data-tile-flow="wrap"]
+  > .ss-peer-panel
+  > :where(.tile-slot)
+  > .grid-item,
+#grid-container[data-tile-flow="wrap"]
+  > .ss-left-pane
+  > .share-tile:is([data-share-mode="tile"], [data-share-mode="pinned"]),
+#grid-container[data-tile-flow="wrap"]
+  > .ss-peer-panel
+  > .share-tile:is([data-share-mode="tile"], [data-share-mode="pinned"]),
 #grid-container[data-tile-flow="wrap"]
   > .host[data-self-placement="grid"]:not([data-self-hidden="true"]),
-#grid-container[data-tile-flow="wrap"] > .grid-overflow-badge {
+#grid-container[data-tile-flow="wrap"] > .grid-overflow-badge,
+#grid-container[data-tile-flow="wrap"] > .ss-peer-panel > .grid-overflow-badge {
   width: var(--tile-w);
   height: var(--tile-h);
   flex: 0 0 auto;
@@ -1038,6 +1054,11 @@ canvas {
   top: 12px;
 }
 
+/* Ellipsizes before the widest timer chip; the full name stays in `title`. */
+#grid-container.participants-1:has(> .meeting-timer-chip) .grid-item.full-bleed .floating-name {
+  max-width: calc(50% - 100px);
+}
+
 .floating-name[dir="rtl"] {
   left: auto;
   right: 12px;
@@ -1192,7 +1213,6 @@ select {
 
 .pin-icon,
 .crop-icon {
-  visibility: hidden;
   width: min(32px, calc(var(--tile-h, 240px) * 0.15));
   height: min(32px, calc(var(--tile-h, 240px) * 0.15));
   display: flex;
@@ -1207,6 +1227,28 @@ select {
   font: inherit;
   -webkit-appearance: none;
   appearance: none;
+}
+
+.crop-icon {
+  visibility: hidden;
+}
+
+/* issue 2866: opacity, not visibility, so a hidden pin stays in the Tab order
+   and `:focus-visible` below can reveal it. */
+.pin-icon {
+  position: relative;
+  opacity: 0;
+  transition:
+    opacity 0.15s ease,
+    background-color 0.15s ease;
+}
+
+/* Pointer target without growing the visual disc (SC 2.5.8). */
+.pin-icon::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
 }
 
 .pin-icon svg,
@@ -1233,19 +1275,57 @@ select {
   background-color: var(--pin-active-bg-hover);
 }
 
+.pin-icon[aria-pressed="true"] {
+  background-color: var(--pin-pressed-bg);
+}
+
+.pin-icon[aria-pressed="true"]:hover {
+  background-color: var(--pin-pressed-bg-hover);
+}
+
 .pin-icon:focus-visible,
 .crop-icon:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
-.grid-item:hover .pin-icon,
 .grid-item:hover .crop-icon,
-.split-peer-tile:hover .pin-icon,
-.split-peer-tile:hover .crop-icon,
-.split-screen-tile:hover .pin-icon,
-.split-screen-tile:hover .crop-icon {
+.split-peer-tile:hover .crop-icon {
   visibility: visible;
+}
+
+:is(.grid-item, .split-peer-tile):hover .pin-icon,
+.pin-icon:focus-visible,
+.pin-icon[aria-pressed="true"] {
+  opacity: 1;
+}
+
+/* The split panel's icon gap is 3px, so a 6px pad would cover the host menu. */
+.split-peer-tile .pin-icon::after {
+  inset: -3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pin-icon {
+    transition: none;
+  }
+}
+
+/* A share tile's pinned marker; its Pin control lives in the auto-hiding bar. */
+.tile-pin-badge {
+  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background-color: var(--pin-pressed-bg);
+  pointer-events: none;
+}
+
+.tile-pin-badge svg {
+  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
 }
 
 /* ============================================================
@@ -2073,268 +2153,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 }
 
-/* ============================================================
-   Pinned tile
-   ============================================================ */
-
-.grid-item-pinned {
-  position: fixed;
-  top: 0;
-  bottom: var(--meeting-footer-h, 0px);
-  left: var(--drawer-left-reserve, 0px);
-  right: var(--drawer-right-reserve, 0px);
-  width: auto;
-  height: auto;
-  z-index: 10;
-  background-color: var(--surface);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.grid-item-pinned .canvas-container {
-  width: min(100%, calc((100vh - var(--meeting-footer-h, 0px)) * 16 / 9));
-  height: min(
-    100%,
-    calc(
-      (
-          100vw - var(--drawer-left-reserve, 0px) -
-            var(--drawer-right-reserve, 0px)
-        ) * 9 / 16
-    )
-  );
-}
-
-/* Screen-share split layout: a pinned side-panel peer tile must maximize over
-   the shared screen, exactly like `.grid-item-pinned` does in the normal grid.
-   The base `.split-peer-tile` rule is defined LATER in this file than
-   `.grid-item-pinned`, so at equal single-class specificity `.split-peer-tile`
-   would win the `position`/`width`/`height` cascade and cancel the maximize —
-   which is why pinning appeared to do nothing at all during screen share. The
-   compound `.split-peer-tile.grid-item-pinned` selector (specificity 0,2,0)
-   beats the single-class base rule regardless of source order, and resetting
-   `aspect-ratio` lets the explicit `height: 100%` apply. z-index sits above the
-   split-area tiles/handle (max z-index 60 in this region) so the maximized tile
-   covers the share. */
-.split-peer-tile.grid-item-pinned {
-  position: fixed;
-  top: 0;
-  bottom: var(--meeting-footer-h, 0px);
-  left: var(--drawer-left-reserve, 0px);
-  right: var(--drawer-right-reserve, 0px);
-  width: auto;
-  height: auto;
-  aspect-ratio: auto;
-  z-index: 100;
-  /* Drop the tile's 2px thumbnail border when maximized. `.split-peer-tile`
-     is `box-sizing: border-box`, so that border eats INTO the fixed 100% box —
-     the letterboxed canvas below would resolve `100%` against 1276x716 (a
-     4px-smaller content box) instead of the full viewport. The normal-grid
-     `.grid-item-pinned` shows no such inset (its `.grid-item` is content-box,
-     so the border sits OUTSIDE the 100% and is clipped off-screen), so the
-     pinned camera looked measurably smaller during screen share than in a
-     plain meeting. Removing the border here reclaims those 4px so the canvas
-     fills the full viewport identically in both contexts. */
-  border: none;
-  /* Match the maximized backdrop to the normal-grid pin. `.grid-item-pinned`
-     explicitly repaints to `var(--surface)` when maximized, but the base
-     `.split-peer-tile` background (`var(--surface-elevated)`) was never
-     overridden here, so a pinned side-panel tile kept the lighter elevated
-     shade. This is FULLY visible in the camera-OFF (avatar placeholder) case:
-     the `.canvas-container` is transparent, so the outer tile background shows
-     across the whole viewport behind the centered avatar. Repainting to
-     `var(--surface)` makes the screen-share pin's backdrop identical to the
-     plain-meeting pin's (measured: rgb(28,28,30) in both). */
-  background-color: var(--surface);
-}
-
-.split-peer-tile.grid-item-pinned .canvas-container {
-  /* Fill the pinned BOX — since issue 2701 that box is inset by the drawer
-     reserves, so it is no longer the whole viewport. In a
-     2-peer meeting the no-share pin renders as
-     `.grid-item.full-bleed.grid-item-pinned`, whose
-     `.grid-item.full-bleed .canvas-container` (global.css) is
-     `width: 100%; height: 100%`, so the `object-fit: cover` canvas fills it.
-
-     This rule previously used a `min(100%, 100vh * 16 / 9)` / `min(100%,
-     100vw * 9 / 16)` 16:9 box to mirror the BASE `.grid-item-pinned
-     .canvas-container` rule (style.css above). But that base rule is itself
-     overridden by full-bleed in the 2-peer case, so the split (screen-share)
-     pin resolved to a 16:9 box while the no-share pin was full-bleed. On any
-     box WIDER than 16:9 — most desktop/laptop windows — the 16:9 box is
-     narrower, so the dark tile background showed as vertical
-     PILLARBOX bars on the left and right of the live camera during screen share
-     while the no-share pin filled its box (user report, PR
-     #1892 round 4). `object-fit: cover` was never the cause: the canvas always
-     filled its container in both contexts; the CONTAINER geometry differed.
-
-     Both stay `object-fit: cover`, so a 4:3 camera
-     crops top/bottom to fill the width identically in both contexts. This
-     targets only the peer CAMERA tile (`.split-peer-tile`); the screen-share
-     canvas (`.split-screen-tile`) keeps its own aspect-preserving contain rule
-     (global.css `canvas[id^="screen-share-"]`). */
-  width: 100%;
-  height: 100%;
-  /* Corner radius is intentionally NOT overridden: the base
-     `.split-peer-tile .canvas-container` radius (10px) already matches the
-     normal-grid `.grid-item .canvas-container` radius (calc(var(--radius-lg) -
-     2px) = 10px in global.css), so a maximized camera tile keeps the SAME
-     rounded corners with or without screen share. */
-}
-
-/* Camera-OFF (avatar "Video Disabled" placeholder) parity when maximized.
-   The base `.split-peer-tile .placeholder-content …` rules hardcode SMALL,
-   thumbnail-appropriate sizes (40px avatar, `--fs-3` = 12px label, 0.4rem gap)
-   for the compact side-panel tiles. Those fixed sizes do NOT scale up when the
-   tile is pinned to the full viewport, so a maximized camera-OFF tile rendered
-   a tiny centered avatar during screen share while the normal-grid pin renders
-   a large one — the "tile content is not on full screen" field report (the
-   `.canvas-container` box itself already matches via `border: none` above; this
-   is the placeholder-content half the earlier border fix did not touch).
-   These three overrides restore the SAME formulas the normal grid's base
-   `.placeholder-content` rules use (style.css `.placeholder-content` /
-   `.placeholder-content svg` / `.placeholder-text`), so with an equal `--tile-h`
-   (measured 580px in BOTH the grid-pinned and split-pinned contexts) the avatar,
-   label and gap resolve to identical sizes (64px / 1.1rem / 1rem) as the
-   plain-meeting pin. Using the formulas rather than the resolved cap values
-   keeps the two paths in lockstep if `--tile-h` ever changes. Specificity
-   (0,3,1) beats the base `.split-peer-tile .placeholder-content svg` (0,2,1). */
-.split-peer-tile.grid-item-pinned .placeholder-content {
-  gap: min(1rem, calc(var(--tile-h, 240px) * 0.06));
-}
-.split-peer-tile.grid-item-pinned .placeholder-content svg {
-  width: min(64px, calc(var(--tile-h, 240px) * 0.3));
-  height: min(64px, calc(var(--tile-h, 240px) * 0.3));
-}
-.split-peer-tile.grid-item-pinned .placeholder-text {
-  font-size: clamp(0.5rem, calc(var(--tile-h, 240px) * 0.06), 1.1rem);
-}
-
-/* Name badge (top-left) parity when maximized. The base
-   `.split-peer-tile .floating-name` rule hardcodes SMALL, thumbnail-appropriate
-   position and type (top/left 6px, 3px 7px padding, `--fs-4` font, 2px gap,
-   `--radius-sm`) for the compact side-panel tiles. Those fixed values do NOT
-   scale up when the tile is pinned to the full viewport, so a maximized split
-   badge sits inset from the corner with visibly smaller letters than the
-   normal-grid pin's badge (user report: "name of the tile not in left corner
-   and written with smaller letters than … pin without screen share"). These
-   overrides restore the SAME `--tile-h`/`--tile-w`-driven formulas the normal
-   grid's base `.floating-name` rule uses (style.css `.floating-name`), so with
-   equal `--tile-h`/`--tile-w` (measured identical in both pinned contexts) the
-   badge inset, padding, radius, gap and font-size resolve identically to the
-   plain-meeting pin. Using the formulas (not resolved px) keeps the two paths
-   in lockstep if the vars change. Specificity (0,3,0) beats the base
-   `.split-peer-tile .floating-name` (0,2,0). */
-.split-peer-tile.grid-item-pinned .floating-name {
-  top: min(12px, calc(var(--tile-h, 240px) * 0.06));
-  left: min(12px, calc(var(--tile-w, 320px) * 0.04));
-  gap: min(6px, calc(var(--tile-w, 320px) * 0.02));
-  padding: min(6px, calc(var(--tile-h, 240px) * 0.03))
-    min(10px, calc(var(--tile-w, 320px) * 0.03));
-  border-radius: min(12px, calc(var(--tile-h, 240px) * 0.06));
-  font-size: clamp(9px, calc(var(--tile-h, 240px) * 0.07), 14px);
-  max-width: 55%;
-}
-
-/* Top-icon cluster (top-right) parity when maximized. Base
-   `.split-peer-tile .tile-top-icons` pins the cluster at a fixed 4px inset with
-   a 3px gap, and the base icon-button block sizes every button to a fixed
-   22×22 container with a 14×14 svg — thumbnail sizes that stay small when
-   pinned, so the maximized cluster sits inset from the corner with smaller
-   icons than the normal-grid pin (user report: "icons on the right side not in
-   the right corner and … smaller than … pin without screenshare"). Restore the
-   SAME `--tile-h`/`--tile-w` formulas the normal grid's base rules use
-   (`.tile-top-icons`, `.audio-indicator`, `.signal-indicator`,
-   `.pin-icon`/`.crop-icon`, `.tile-mute-btn` and their svgs) so both contexts
-   resolve identically at equal vars. */
-.split-peer-tile.grid-item-pinned .tile-top-icons {
-  top: min(8px, calc(var(--tile-h, 240px) * 0.04));
-  right: min(8px, calc(var(--tile-w, 320px) * 0.03));
-  gap: min(8px, calc(var(--tile-w, 320px) * 0.025));
-}
-/* Fixed-box buttons (signal/pin/crop/mute): normal grid sizes the container to
-   `min(32px, --tile-h*0.15)`; the split base clamps them to 22px. */
-.split-peer-tile.grid-item-pinned .pin-icon,
-.split-peer-tile.grid-item-pinned .crop-icon,
-.split-peer-tile.grid-item-pinned .tile-mute-btn {
-  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
-  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
-  padding: 0;
-}
-
-/* issue 2661: the disc takes the same 28px floor as the grid, so the SVG
-   inside it stops overflowing an 18.89px box. */
-.split-peer-tile.grid-item-pinned .signal-indicator {
-  width: clamp(28px, calc(var(--tile-h, 240px) * 0.15), 32px);
-  height: clamp(28px, calc(var(--tile-h, 240px) * 0.15), 32px);
-  padding: 0;
-}
-/* Audio pill is content-sized in the normal grid (padding + svg, no fixed box);
-   the split base forces a fixed 22px box. Reset to the grid's padding formula. */
-.split-peer-tile.grid-item-pinned .audio-indicator {
-  width: auto;
-  height: auto;
-  padding: min(6px, calc(var(--tile-h, 240px) * 0.025));
-}
-/* Per-button svg sizes match each element's own normal-grid formula (audio/pin/
-   crop 0.1, mute 0.08 of --tile-h; the signal svg is full-bleed); the split base
-   clamps to 14px. */
-.split-peer-tile.grid-item-pinned .audio-indicator svg,
-.split-peer-tile.grid-item-pinned .pin-icon svg,
-.split-peer-tile.grid-item-pinned .crop-icon svg {
-  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
-  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
-}
-.split-peer-tile.grid-item-pinned .tile-mute-btn svg {
-  width: min(16px, calc(var(--tile-h, 240px) * 0.08));
-  height: min(16px, calc(var(--tile-h, 240px) * 0.08));
-}
-
-/* Screen-share split layout: a pinned LEFT-panel screen tile must maximize over
-   the whole split area, mirroring the right-panel `.split-peer-tile` rule above.
-   Same reasoning applies to source order: the base `.split-screen-tile` rule is
-   defined LATER than `.grid-item-pinned`, so a single-class `.grid-item-pinned`
-   would lose the `z-index` cascade to the region's stacked tiles/handle (max
-   z-index 60 here). The compound `.split-screen-tile.grid-item-pinned`
-   (specificity 0,2,0) lifts it to the SAME z-index (100) as a maximized
-   `.split-peer-tile`, so both maximized tile kinds sit at one level. Only ONE of
-   a sharer's two tiles is ever pinned at a time (pin identity is now
-   kind-aware — see `PinnedTile`), so the two never stack against each other.
-   No `.canvas-container` override is emitted here on purpose: the screen tile
-   keeps its base 100%/100% canvas (the shared content sets its own aspect via
-   the zoom viewport), unlike the camera tile which letterboxes 16/9. */
-.split-screen-tile.grid-item-pinned {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: calc(100% - var(--meeting-footer-h, 0px));
-  z-index: 100;
-}
-
-/* Keep the global always-on-top chrome ABOVE a maximized (pinned) tile.
-   `#host-controls-nav.host` (the host self-view corner AND the bottom controls
-   dock live inside it) is `position: absolute; z-index: 10` (see `.host`), so it
-   establishes its OWN stacking context inside `#grid-container` (itself
-   `position: absolute; z-index: 0`). The controls dock's `z-index: 9000` is
-   therefore resolved ONLY within that nav context — relative to `#grid-container`
-   the WHOLE nav subtree stacks at the nav's own z-index (10). A pinned tile is a
-   sibling in the same `#grid-container` context: the normal-grid `.grid-item-pinned`
-   is `z-index: 10` (ties the nav and loses to it by DOM order, since the nav is
-   emitted last — so the dock stays visible), but the screen-share pinned tiles
-   `.split-peer-tile.grid-item-pinned` / `.split-screen-tile.grid-item-pinned` are
-   `z-index: 100` (to clear the split-area tiles/handle), which OUTRANKS the nav's
-   10 and buries the entire controls dock + "Camera Off" self-view badge under the
-   maximized tile — visible in the DOM but not paintable/clickable. Lifting the nav
-   above the pinned-tile ceiling restores the screenshot-2 behavior (dock + badge on
-   top of the pin) in BOTH contexts. Must stay > the pinned-tile z-index (100) and
-   is intentionally LOW (not 9000): sibling overlay drawers (`#peer-list-container`
-   9300, `#diagnostics-sidebar` 9300 desktop / 9301 mobile, device-settings modal)
-   render OUTSIDE `#grid-container`, so they already outrank this whole subtree via
-   `#grid-container`'s z-index:0 and must keep covering the dock when open.
-
-   Corner placement only (issue 66): in grid the nav forms no stacking context,
-   so the dock's 9000 resolves against `#grid-container` without this lift. */
+/* Keeps the corner self view and the controls dock, which sit in the nav's own
+   stacking context, above the grid's overlays (the decode-budget banner is
+   z-index 60). Drawers render outside `#grid-container`, so they still cover
+   it. In grid placement the nav forms no stacking context. (issue 66) */
 #host-controls-nav.host[data-self-placement="corner"] {
   z-index: 200;
 }
@@ -3901,6 +3723,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin-bottom: 2rem;
 }
 
+.error-card p.error-card__reason {
+  margin-bottom: var(--space-3);
+}
+
+.error-card h2:focus {
+  outline: none;
+}
+
 /* ============================================================
    Meeting password prompt (issue 1613)
    ------------------------------------------------------------
@@ -4796,6 +4626,170 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: var(--space-3);
 }
 
+/* Co-hosts section (issue 2702) */
+.co-hosts-section {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--glass-bg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.co-hosts-heading {
+  margin: 0;
+  font-size: var(--fs-6);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.co-hosts-hint,
+.co-hosts-empty,
+.co-hosts-message {
+  margin: 0;
+  font-size: var(--fs-4);
+  color: var(--text-secondary);
+}
+
+.co-hosts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* issue 2702: same row rhythm as .settings-option-row (MeetingOptionsControls)
+   so the Co-hosts card reads like its sibling settings cards. */
+.co-hosts-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 0.625rem 0;
+  border-bottom: 1px solid var(--glass-bg);
+}
+
+.co-hosts-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.co-hosts-row:first-child {
+  padding-top: 0;
+}
+
+.co-hosts-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+.co-hosts-name {
+  font-size: var(--fs-5);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.co-hosts-id {
+  font-size: var(--fs-3);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.co-hosts-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--fs-3);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+}
+
+/* Text stays --text-primary for contrast; the dot carries the colour. */
+.co-hosts-present::before {
+  content: "";
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.co-hosts-details > summary {
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.co-hosts-busy {
+  font-size: var(--fs-3);
+  color: var(--text-secondary);
+}
+
+.co-hosts-section [aria-disabled="true"] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.co-hosts-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.co-hosts-persist-label {
+  font-size: var(--fs-3);
+  color: var(--text-secondary);
+}
+
+/* issue 2702: one compact line — a labelled input plus an Add button, same
+   44px control height, wrapping to two lines on narrow viewports instead of
+   squeezing either control. */
+.co-hosts-add {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.co-hosts-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.co-hosts-input {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.co-hosts-add-btn {
+  flex-shrink: 0;
+}
+
+@media (max-width: 639px) {
+  .co-hosts-add-btn {
+    flex: 1 1 100%;
+  }
+}
+
+.co-hosts-failed {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.co-hosts-section .toggle-error {
+  text-align: left;
+  margin: 0;
+}
+
+.peer-toast.co-host-notice--error {
+  border-color: var(--error);
+}
+
 /* Screen share split-layout tile — fills the entire left share area */
 .split-screen-tile {
   width: 100%;
@@ -4808,6 +4802,65 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .split-screen-tile .canvas-container {
   width: 100%;
   height: 100%;
+}
+
+/* issue 2792: the share wrappers only lay anything out in the split (Enlarged)
+   layout; otherwise their children join the normal grid directly. */
+@property --ss-ratio {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 66.7%;
+}
+
+#grid-container:not(.has-screen-share) > .ss-left-pane,
+#grid-container:not(.has-screen-share) > .ss-peer-panel {
+  display: contents;
+}
+
+/* issue 2866: the keyed wrapper a camera tile moves in; the tile stays the item. */
+.tile-slot {
+  display: contents;
+}
+
+#grid-container:not(.has-screen-share) > .screen-share-resize-handle {
+  display: none;
+}
+
+#grid-container.has-screen-share > .ss-left-pane {
+  width: var(--ss-ratio);
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#grid-container.has-screen-share > .ss-peer-panel {
+  width: calc(100% - var(--ss-ratio) - 0.4%);
+}
+
+/* A share tile in a grid cell is sized like a camera tile. */
+.share-tile:is([data-share-mode="tile"], [data-share-mode="pinned"]) {
+  position: relative;
+  width: auto;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: center;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background-color: var(--surface-elevated);
+  border: 2px solid var(--grid-item-border);
+  border-radius: var(--radius-lg);
+}
+
+#grid-container.has-screen-share > .ss-peer-panel > .share-tile {
+  width: 100%;
+  height: auto;
 }
 
 /* Screen share split-layout — draggable resize handle */
@@ -4968,21 +5021,6 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .split-peer-tile .guest-badge {
   font-size: 0.65em;
   padding: 1px 5px;
-}
-
-/* Local screen-share preview — rendered below camera inside .host */
-.screen-share-preview {
-  width: 100%;
-  max-height: 180px;
-  border-bottom: 1px solid var(--border);
-  /* Bottom corners match ancestor tile .host minus 2px border so the preview's
-     square corners don't peek above the speaking glow at the tile's
-     rounded bottom edge (same pattern as .grid-item .canvas-container). */
-  border-radius: 0 0 calc(var(--radius-lg) - 2px) calc(var(--radius-lg) - 2px);
-  background: var(--bg);
-  object-fit: contain;
-  pointer-events: none;
-  flex-shrink: 0;
 }
 
 .settings-info-icon {
@@ -5496,7 +5534,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    well past 4.5:1, in BOTH themes. */
 .decode-budget-banner {
   position: absolute;
-  top: 12px;
+  top: calc(
+    var(--top-stack-top) + var(--top-stack-timer-slot) +
+      var(--top-stack-hands-slot)
+  );
   left: 50%;
   transform: translateX(-50%);
   z-index: 60;
@@ -5652,50 +5693,51 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
        clear in BOTH themes. The icon deliberately does NOT carry the message:
        the text does, so the icon's tint is decoration, not information. */
 
-/* Top-centre overlay stack geometry (issue 2135).
-   ------------------------------------------------------------------
-   Declared on `#grid-container` — the common ancestor of all three top-centre
-   overlays — and NOT on `.raised-hands-banner`, because a custom property set on
-   the banner is invisible to its SIBLINGS, which are the elements that have to
-   move out of its way.
-
-   `--raised-hands-banner-h` is EXACT, not an estimate. The banner can never wrap
-   (both text spans are `white-space: nowrap` + `text-overflow: ellipsis`), so its
-   height is fully determined by its own box model: the 2px border, the block
-   padding, and the taller of the fixed 18px icon and the 1.3 line box. Every
-   input below is the SAME declaration the banner rule itself consumes, so the
-   two cannot drift the way a hardcoded follower offset did — the `top: 64px`
-   this replaces was a snapshot of that arithmetic at a 16px root font size, and
-   `--space-2` is REM-based, so the banner grew with the root font size while the
-   follower stayed put. Measured: at a 32px root (a 200% OS text setting) the
-   banner reaches 52px, which puts its bottom edge at exactly the 64px the
-   follower was pinned to — gap zero — and anything past that overlaps. The
-   derived value moves the follower to 96px in the same conditions.
-
-   At the default root size this resolves to 12 + 36 + 16 = 64px — byte-identical
-   to the constant it replaces, so nothing moves on a default-configured client. */
+/* Top-centre stack (issues 2135, 2784): timer chip, this banner, then the
+   decode-budget banner or (screen share) the decode-paused pill. A slot is 0px
+   unless its member is a child of `#grid-container`. */
 #grid-container {
-  --raised-hands-banner-top: 12px;
+  --top-stack-top: 12px;
+  --top-stack-gap: var(--space-4);
+  --top-stack-timer-slot: 0px;
+  --top-stack-hands-slot: 0px;
   --raised-hands-banner-h: calc(
     var(--space-2) * 2 + 2px + max(18px, calc(var(--fs-4) * 1.3))
   );
-  /* Where a SECOND top-centre overlay has to start in order to clear the banner.
-     Every follower reads this one value, so adding another top-centre surface
-     means adding it to the sibling selectors below — not re-deriving a number. */
-  --raised-hands-stack-next-top: calc(
-    var(--raised-hands-banner-top) + var(--raised-hands-banner-h) +
-      var(--space-4)
+}
+
+#grid-container:has(> .meeting-timer-chip)
+  > :is(.raised-hands-banner, .decode-budget-banner, .decode-paused-pill) {
+  --top-stack-timer-slot: calc(
+    var(--meeting-timer-chip-h) + var(--top-stack-gap)
   );
+}
+
+#grid-container:has(> .raised-hands-banner)
+  > :is(.decode-budget-banner, .decode-paused-pill) {
+  --top-stack-hands-slot: calc(
+    var(--raised-hands-banner-h) + var(--top-stack-gap)
+  );
+}
+
+/* The recording bar: `STATUS_BAR_RESERVE` / `_MOBILE`, test-pinned. */
+#grid-container.status-bar-active
+  > :is(.meeting-timer-chip, .raised-hands-banner, .decode-budget-banner, .decode-paused-pill) {
+  --top-stack-top: calc(40px + 12px);
+}
+
+@media (max-width: 567px) {
+  #grid-container.status-bar-active
+    > :is(.meeting-timer-chip, .raised-hands-banner, .decode-budget-banner, .decode-paused-pill) {
+    --top-stack-top: calc(32px + 12px);
+  }
 }
 
 .raised-hands-banner {
   position: absolute;
-  top: var(--raised-hands-banner-top);
+  top: calc(var(--top-stack-top) + var(--top-stack-timer-slot));
   left: 50%;
   transform: translateX(-50%);
-  /* One above the decode-budget banner: the two are separated by the sibling
-     rule below, and if that rule ever failed, the actionable social signal
-     should win over the advisory performance one. */
   z-index: 61;
   display: flex;
   align-items: center;
@@ -5756,39 +5798,6 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-/* Every top-centre overlay that can share the screen with the raised-hands
-   banner is pushed below it here. The general-sibling combinator applies ONLY
-   while the banner is actually in the DOM (it renders nothing when no hand is
-   up), so each follower keeps its own position at all other times and no
-   component needs to know about the other. The banner is rendered FIRST in
-   `attendants.rs` for exactly this reason.
-
-   TWO followers, not one. The decode-budget banner is unconditionally
-   top-centre; the decode-paused pill is top-centre ONLY during a screen share
-   (in grid mode it is bottom-anchored above the controls dock and cannot
-   collide), which is why its rule carries the `.has-screen-share` scope and the
-   other does not. Omitting the pill was the issue-2135 defect this fixes: both
-   sat at `top: 12px`, the banner painted over the pill at z-index 61 vs 55, and
-   because the banner is `pointer-events: none` the pill's "Show all" button
-   stayed CLICKABLE while invisible — strictly worse than being either hidden or
-   visible, because a user cannot recover an affordance they cannot see.
-
-   The two never co-exist with each other (the pill suppresses while the budget
-   banner is on screen — see decode_paused_pill.rs), so at most ONE of these
-   rules is ever doing work at a time; they are written as separate selectors
-   only because their scopes differ. */
-.raised-hands-banner ~ .decode-budget-banner {
-  top: var(--raised-hands-stack-next-top);
-}
-
-/* Specificity: (1 id, 3 classes) beats the bare
-   `#grid-container.has-screen-share .decode-paused-pill` (1 id, 2 classes)
-   below, so the pill's screen-share `bottom: auto` still applies while this
-   overrides only its `top`. */
-#grid-container.has-screen-share .raised-hands-banner ~ .decode-paused-pill {
-  top: var(--raised-hands-stack-next-top);
 }
 
 @keyframes raised-hands-banner-enter {
@@ -5955,7 +5964,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    the bare `.decode-paused-pill` and the ≤639px `.decode-paused-pill` rule, so
    it wins on mobile in SS mode too. */
 #grid-container.has-screen-share .decode-paused-pill {
-  top: 12px;
+  top: calc(
+    var(--top-stack-top) + var(--top-stack-timer-slot) +
+      var(--top-stack-hands-slot)
+  );
   bottom: auto;
 }
 
@@ -6075,8 +6087,7 @@ html[data-theme="light"] .decode-paused-pill-action {
    ~12px gap, both measured from the footer. At exactly 640px
    the pill uses the desktop 112px clearance while the dock is already mobile
    (top ~86px), so the pill sits comfortably above it — the 639/640 one-pixel
-   breakpoint offset is harmless. The SS-mode `top:12px` override above has higher
-   specificity, so it still wins in screen-share mode. */
+   breakpoint offset is harmless. */
 @media (max-width: 639px) {
   .decode-paused-pill {
     min-height: 34px;
@@ -6926,28 +6937,9 @@ html[data-theme="light"] .decode-paused-pill-action {
   color: var(--text-secondary);
 }
 
-/* Persistent live-region wrapper for the experimental-WebTransport notice.
-   Always in the DOM so screen readers register the aria-live region once and
-   announce later content changes reliably. `display: contents` removes its own
-   box so it never participates in the Network section's flex `gap` — the empty
-   (WebSocket-default) state adds no stray spacing, and when populated the panel
-   inside flows as a normal section child. */
+/* In the DOM always, so the aria-live region registers once. */
 .transport-warning-live {
   display: contents;
-}
-
-/* Warning-toned variant of the inline info panel (e.g. the experimental
-   WebTransport notice in the Network tab). Reuses the base structure and
-   overrides border / background / accent colour with the shared warning
-   tokens so it stays theme-aware in both light and dark. */
-.settings-info-panel--warning {
-  border-color: var(--btn-warning-border);
-  background: var(--btn-warning-bg);
-}
-
-.settings-info-panel--warning .settings-info-panel-icon,
-.settings-info-panel--warning .settings-info-panel-title {
-  color: var(--warning-text);
 }
 
 /* ── Transport segmented control ───────────────────────────────── */
@@ -7000,7 +6992,8 @@ html[data-theme="light"] .decode-paused-pill-action {
   letter-spacing: 0.01em;
   padding: var(--space-2) var(--space-3);
   text-align: center;
-  white-space: nowrap;
+  /* min-width: 0 lets flex: 1 1 0% share the row evenly. */
+  min-width: 0;
   box-shadow: none;
   transition:
     background 280ms cubic-bezier(0.4, 0, 0.2, 1),
@@ -7043,6 +7036,19 @@ html[data-theme="light"] .decode-paused-pill-action {
 .transport-segmented-option:active:not(.selected) {
   background: rgba(255, 255, 255, 0.05);
   /* @token-exempt: press feedback */
+}
+
+/* LAST of the equal-specificity rules on purpose: `.selected` and `:hover`
+   must both lose to this. Explicit colour, not `opacity`: the control stays
+   focusable, so the string has to clear 4.5:1. */
+.transport-segmented-option.unavailable,
+.transport-segmented-option.unavailable:hover,
+.transport-segmented-option.selected.unavailable {
+  cursor: not-allowed;
+  background: transparent;
+  box-shadow: none;
+  color: rgba(255, 255, 255, 0.72);
+  /* @token-exempt: muted but contrast-checked */
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -7091,6 +7097,16 @@ html[data-theme="light"] .transport-segmented-option.selected:hover {
 html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   background: rgba(0, 0, 0, 0.04);
   /* @token-exempt: press feedback */
+}
+
+/* Last of the light-theme equal-specificity rules, for the reason above. */
+html[data-theme="light"] .transport-segmented-option.unavailable,
+html[data-theme="light"] .transport-segmented-option.unavailable:hover,
+html[data-theme="light"] .transport-segmented-option.selected.unavailable {
+  background: transparent;
+  box-shadow: none;
+  color: rgba(0, 0, 0, 0.66);
+  /* @token-exempt: muted but contrast-checked */
 }
 
 /* ── Transport "Apply" action row ──────────────────────────────── */
@@ -8889,12 +8905,18 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 @media (pointer: coarse) {
-  /* The split-layout rules below are (0,2,0) and (0,3,0), so a bare
-     `.signal-indicator` here never reached those discs — measured at 22px with
+  /* The split-layout rule below is (0,2,0), so a bare
+     `.signal-indicator` here never reached that disc — measured at 22px with
      overlapping hit pads on phone emulation. */
   .signal-indicator,
-  .split-peer-tile .signal-indicator,
-  .split-peer-tile.grid-item-pinned .signal-indicator {
+  .split-peer-tile .signal-indicator {
+    width: 32px;
+    height: 32px;
+  }
+
+  .pin-icon,
+  .split-peer-tile .pin-icon {
+    opacity: 1;
     width: 32px;
     height: 32px;
   }
@@ -8902,6 +8924,42 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   .tile-top-icons,
   .host-tile-chrome {
     gap: 12px;
+  }
+}
+
+/* issue 2866: the pin is always shown on touch screens, so the name stops before
+   the tile's own row: mic, 32px pin and a 12px gap, plus a 4px margin, and the
+   host menu, signal disc or crop button (each with its gap) only where the tile
+   has one. */
+@media (pointer: coarse) {
+  .grid-item:has(.tile-mute-menu-wrapper) {
+    --name-row-menu: calc(min(32px, var(--tile-h, 240px) * 0.15) + 12px);
+  }
+
+  .grid-item:has(.signal-indicator) {
+    --name-row-signal: 44px;
+  }
+
+  .grid-item .floating-name {
+    max-width: min(
+      55%,
+      calc(
+        100% - min(12px, var(--tile-w, 320px) * 0.04) -
+          min(8px, var(--tile-w, 320px) * 0.03) -
+          2 * min(6px, var(--tile-h, 240px) * 0.025) -
+          min(20px, var(--tile-h, 240px) * 0.1) - 32px - 12px - 4px -
+          var(--name-row-menu, 0px) - var(--name-row-signal, 0px) -
+          var(--name-row-crop, 0px)
+      )
+    );
+  }
+}
+
+/* issue 2866: only a phone-width layout drops the crop button; wider, it is
+   visibility-hidden and keeps its slot. */
+@media (pointer: coarse) and (min-width: 768px) {
+  .grid-item:has(.crop-icon) {
+    --name-row-crop: calc(min(32px, var(--tile-h, 240px) * 0.15) + 12px);
   }
 }
 
@@ -8937,6 +8995,21 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 @media (forced-colors: active) {
+  .pin-icon svg {
+    fill: CanvasText;
+  }
+
+  .pin-icon[aria-pressed="true"],
+  .tile-pin-badge {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+
+  .pin-icon[aria-pressed="true"] svg,
+  .tile-pin-badge svg {
+    fill: HighlightText;
+  }
+
   /* Without this, forced-colors drops the SVG strokes and the disc goes blank. */
   .signal-indicator {
     background: Canvas;
@@ -12469,19 +12542,7 @@ details.diag-device {
    Meeting timer (issue 2136)
    ============================================================
 
-   A host-set countdown shown to EVERY participant. Anchored bottom-left
-   rather than joining the top-centre overlay stack, deliberately: that stack
-   (.raised-hands-banner / .decode-budget-banner / .decode-paused-pill) has
-   already produced two collision bugs, and its clearance arithmetic —
-   --raised-hands-stack-next-top — assumes exactly ONE banner above the
-   followers. A third member would need a chained "next-next" variable that
-   does not exist, so this surface stays out of that contention entirely.
-
-   Bottom-LEFT is the only free bottom corner: bottom-centre at the dock
-   clearance is the decode-paused pill (and .ss-zoom-controls), and
-   bottom-right is the self-view .host tile, which widens to 35% on mobile.
-   The one thing that does claim bottom-left is a VERTICAL controls dock, so
-   the chip carries its own dock-position modifier and shifts clear below.
+   A host-set countdown shown to EVERY participant.
 
    FIXED-DARK surface, not a theme-aware one. The chip must read identically
    in both themes over arbitrary video content, and the --fixed-dark family
@@ -12489,26 +12550,6 @@ details.diag-device {
    theme-aware tokens like --text-primary flip to dark in light theme and go
    invisible on this background. */
 
-/* Bottom-centre overlay stack geometry (issue 2136).
-   ------------------------------------------------------------------
-   Declared on `#grid-container` — the common ancestor of the chip and the
-   decode-paused pill — and NOT on `.meeting-timer-chip`, because a custom
-   property set on the chip is invisible to its SIBLINGS, which are the elements
-   that have to move out of its way. Same reasoning, and same shape, as
-   `--raised-hands-stack-next-top` for the top-centre stack.
-
-   `--meeting-timer-chip-h` is EXACT, not an estimate. The chip can never wrap
-   (its two spans are a fixed-size glyph and a tabular-numeric value), so its
-   height is fully determined by its own box model: the border, the block padding,
-   and the value's line box. The border term is 4px, not 2px — the expired state
-   (the tallest) declares `border-width: 2px` and a border has TWO sides. Measured
-   in a browser against the real stylesheets: 37.5px at rest, 39.5px expired, and
-   the formula now yields the latter. The earlier 2px allowance matched the
-   at-rest chip and left the follower 2px short of its intended 16px gap whenever
-   a timer had actually expired.
-   Every input below is the SAME declaration the chip rule itself consumes, so
-   the two cannot drift the way a hardcoded follower offset would — the
-   raised-hands stack has the post-mortem for exactly that failure. */
 /* Width of a VERTICAL controls dock. Issue 2136.
 
    THREE inputs, all mirrored from global.css:
@@ -12535,12 +12576,6 @@ details.diag-device {
    oversight. Second, `--action-bar-dock-gap` is a full `var(--space-4)` (16px),
    which absorbs any plausible drift in these copies many times over.
 
-   Measured in a real browser against these stylesheets: dock 70.8px, chip left
-   edge 102.8px, clearance exactly 16.0px, unchanged across 400-1280px.
-
-   Declared on `html` because both consumers are `position: fixed` and share no
-   closer ancestor.
-
    (For the record, since a stale figure was quoted here: the hardcoded 66px this
    replaced was 2.8px short of the padding+button sum and 4.8px short of the real
    bordered width — not the "1.8px" previously claimed.) */
@@ -12554,37 +12589,21 @@ html {
 
 
 #grid-container {
+  /* The 4px is the expired state's 2px border, both sides. */
   --meeting-timer-chip-h: calc(
     var(--space-2) * 2 + 4px + max(18px, calc(var(--fs-6) * 1.3))
-  );
-  /* Where a follower has to start in order to clear the chip. Every follower
-     reads this ONE value, so adding another bottom-centre surface means adding
-     it to the sibling selector below — not re-deriving a number. */
-  --meeting-timer-stack-next-bottom: calc(
-    var(--controls-dock-clearance) + var(--meeting-timer-chip-h) + var(--space-4)
   );
 }
 
 .meeting-timer-chip {
-  position: fixed;
-  /* Clears the controls dock the same way the decode-paused pill does. */
-  bottom: var(--controls-dock-clearance);
-  left: calc(clamp(0.75rem, 2vw, 1.25rem) + var(--drawer-left-reserve, 0px));
+  position: absolute;
+  top: var(--top-stack-top);
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  /* Below the dock (9000) and its popovers so it can never cover a control, and
-     deliberately ONE BELOW the decode-paused pill (55) rather than equal to it.
-     The two share `bottom: var(--controls-dock-clearance)` in grid mode, and at
-     equal z-index DOM order decides — the chip renders later, so it would win.
-     The pill owns a real BUTTON ("Show all") while this chip is
-     `pointer-events: none`, so a chip painted over it leaves that button
-     CLICKABLE WHILE INVISIBLE: strictly worse than hidden or visible, because a
-     user cannot recover an affordance they cannot see. That is the issue 2135
-     defect recorded above at the raised-hands stack, and it is not repeated here.
-     The stacking rule below separates the two geometrically; this ordering is
-     the fallback if that rule is ever scoped wrong. */
-  z-index: 54;
+  z-index: 150;
   padding: var(--space-2) 12px;
   background: var(--fixed-dark-heavy);
   border: 1px solid var(--glass-border);
@@ -12597,8 +12616,37 @@ html {
   font-size: var(--fs-4);
   font-weight: 500;
   line-height: 1.3;
-  /* Purely informational — never eat a click meant for a tile beneath it. */
-  pointer-events: none;
+  /* Hit-test opaque: never invisible-but-clickable (issue 2135). */
+  pointer-events: auto;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+  animation: meeting-timer-chip-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes meeting-timer-chip-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .meeting-timer-chip {
+    animation: meeting-timer-chip-enter-reduced 0.15s ease-out;
+  }
+  @keyframes meeting-timer-chip-enter-reduced {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
 }
 
 /* The value is tabular so the chip does not resize on every tick: with
@@ -12658,42 +12706,7 @@ html {
   font-weight: 700;
 }
 
-/* ── Dock-position clearance ──────────────────────────────────────────────
-   A bottom or right dock leaves the bottom-left corner alone, so those keep
-   the default. A LEFT dock is a vertical bar at left:16px centred on the
-   viewport; with the 12 default slots that column is roughly 915px tall, so
-   its lower edge reaches the chip's row on essentially every laptop, not just
-   a short viewport. The modifier is therefore unconditional rather than
-   wrapped in a height media query: the chip steps right by the bar's derived
-   width plus a gap. */
-
-.meeting-timer-chip--dock-left {
-  /* Overrides the base `left`, so it has to re-add the reserve term. (2701) */
-  left: calc(
-    16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap) +
-      var(--drawer-left-reserve, 0px)
-  );
-}
-
-/* Mobile: the self-view tile takes 35% of the width at bottom-right and the
-   dock shrinks, so the chip only needs to tighten its own padding. It stays
-   bottom-left, which is still clear. */
-/* 567px, NOT the 639px this block originally used. The chip anchors to
-   `--controls-dock-clearance` and to the dock's own width, and the dock/grid
-   breakpoint is `vw < 568.0` — over integer viewport widths that is exactly
-   `max-width: 567px`, so the chip now shrinks on the same widths its anchor
-   does rather than 72px earlier.
-
-   STATED CONSEQUENCE, because this was originally a silent rider: between 568
-   and 639px the chip keeps DESKTOP padding and font size where it previously
-   shrank. That is the intended direction — at those widths the dock and grid are
-   still in their desktop geometry, so a shrunken chip beside a full-size dock was
-   the inconsistency, not the fix. */
 @media (max-width: 567px) {
-  /* The chip's block padding and value font-size both shrink here, so the
-     derived height has to shrink with them — otherwise the pill would clear a
-     chip taller than the one actually on screen and leave a visible gap.
-     Mirrors the desktop formula with this block's own values. */
   #grid-container {
     --meeting-timer-chip-h: calc(6px * 2 + 4px + max(18px, calc(var(--fs-5) * 1.3)));
   }
@@ -12707,27 +12720,6 @@ html {
   .meeting-timer-chip-value {
     font-size: var(--fs-5);
   }
-}
-
-/* The decode-paused pill shares the chip's row in GRID mode: both sit at
-   `bottom: var(--controls-dock-clearance)`, the pill centred at up to 420px wide
-   and the chip anchored left. They overlap below roughly a 446px viewport — i.e.
-   every phone in portrait, which is exactly where the decode budget bites
-   hardest — so the pill moves up to clear the chip.
-
-   `:has()` rather than a sibling combinator because the pill is rendered BEFORE
-   the chip in `#grid-container` (the chip is mounted last so it shifts no
-   `nth-child` index), and `~` only looks forward. The chip is self-gating, so
-   this matches only while a timer is actually on screen and the pill keeps its
-   own position at every other time.
-
-   `:not(.has-screen-share)` scopes this to GRID mode: in screen-share the pill
-   is top-anchored (`top: 12px; bottom: auto`) and cannot collide with a
-   bottom-anchored chip at all. It also lifts specificity to (1 id, 3 classes)
-   above that rule's (1 id, 2 classes), so the two can never fight. */
-#grid-container:not(.has-screen-share):has(.meeting-timer-chip)
-  .decode-paused-pill {
-  bottom: var(--meeting-timer-stack-next-bottom);
 }
 
 /* ============================================================
@@ -13035,11 +13027,6 @@ html {
   min-height: 0;
 }
 
-/* The local share preview must not crowd out the camera in a grid cell. */
-.host[data-self-placement="grid"] .screen-share-preview {
-  max-height: 35%;
-}
-
 /* Alone in a room: the self tile is the `participants-1` full-bleed tile. */
 .participants-1 .host[data-self-placement="grid"][data-self-full-bleed="true"] {
   width: 100%;
@@ -13082,8 +13069,118 @@ html {
   text-transform: none;
 }
 
-/* Members of `.host-tile-chrome`, mirroring the peers' `.pin-icon` /
-   `.crop-icon`: same clamp, same circular chrome, same `visibility` reveal. */
+/* issue 2794: click the self name to rename inline. The ring is on the chip
+   because the chip's `overflow: hidden` would clip one on the button. */
+.self-tile-name-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin: -4px -6px;
+  padding: 4px 6px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.self-tile-name-button:focus-visible {
+  outline: none;
+}
+
+.self-tile-name:has(.self-tile-name-button:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 6px var(--fixed-dark-heavy);
+}
+
+.self-tile-name-edit-icon {
+  display: none;
+  flex: 0 0 auto;
+  width: 1em;
+  height: 1em;
+}
+
+.self-tile-name-button:hover .self-tile-name-edit-icon,
+.self-tile-name-button:focus-visible .self-tile-name-edit-icon {
+  display: block;
+}
+
+@media (hover: none) {
+  .self-tile-name-edit-icon {
+    display: block;
+  }
+}
+
+.self-tile-name-input {
+  width: 14ch;
+  max-width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0 4px;
+  border: 1px solid var(--on-dark-text-muted);
+  border-radius: var(--radius-sm);
+  background: var(--fixed-dark-strong);
+  color: var(--on-dark-text);
+  font: inherit;
+  user-select: text;
+}
+
+.self-tile-name-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+@media (pointer: coarse) {
+  .self-tile-name-input {
+    font-size: 16px;
+  }
+}
+
+.self-tile-name-input[aria-invalid="true"] {
+  border-color: var(--on-dark-error-text);
+}
+
+.self-tile-name-input[aria-busy="true"] {
+  opacity: 0.7;
+  cursor: progress;
+}
+
+.self-tile-name-error {
+  position: absolute;
+  top: calc(
+    min(12px, calc(var(--tile-h, 240px) * 0.06)) +
+      2 * min(6px, calc(var(--tile-h, 240px) * 0.03)) +
+      1.2 * clamp(9px, calc(var(--tile-h, 240px) * 0.07), 14px) + 2px + 6px
+  );
+  left: min(12px, calc(var(--tile-w, 320px) * 0.04));
+  z-index: 3;
+  max-width: 70%;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--fixed-dark-heavy);
+  color: var(--on-dark-error-text);
+  font-size: var(--fs-3);
+  line-height: 1.3;
+}
+
+/* The coarse-pointer input (16px + 1px borders) is taller than the chip text. */
+@media (pointer: coarse) {
+  .self-tile-name-error {
+    top: calc(
+      min(12px, calc(var(--tile-h, 240px) * 0.06)) +
+        2 * min(6px, calc(var(--tile-h, 240px) * 0.03)) + 1.2 * 16px + 2px + 6px
+    );
+  }
+}
+
+.host[data-self-hidden="true"] .self-tile-name-error {
+  display: none;
+}
+
+/* Members of `.host-tile-chrome`, mirroring the peers' `.crop-icon`: same
+   clamp, same circular chrome, same `visibility` reveal. */
 .self-tile-action {
   flex: 0 0 auto;
   width: min(32px, calc(var(--tile-h, 240px) * 0.15));
@@ -13211,7 +13308,6 @@ html {
 
 .host[data-self-hidden="true"] .host-tile-chrome,
 .host[data-self-hidden="true"] .self-tile-name,
-.host[data-self-hidden="true"] .screen-share-preview,
 .host[data-self-hidden="true"] .device-settings-menu-button,
 .host[data-self-hidden="true"] .guest-badge-preview {
   display: none;
@@ -13348,15 +13444,11 @@ html {
   }
 }
 
-/* `--decode-pill-bottom` mirrors the three rules that set the decode pill's row,
+/* `--decode-pill-bottom` mirrors the two rules that set the decode pill's row,
    at the same relative precedence. 46px = its 44px action plus a 2px border. */
 #grid-container {
   --decode-paused-pill-h: 46px;
   --decode-pill-bottom: var(--controls-dock-clearance);
-}
-
-#grid-container:not(.has-screen-share):has(.meeting-timer-chip) {
-  --decode-pill-bottom: var(--meeting-timer-stack-next-bottom);
 }
 
 @media (max-width: 639px) {
@@ -13379,7 +13471,7 @@ html {
   }
 }
 
-/* Mirrors `.meeting-timer-chip--dock-left`. AFTER the mobile block, which sets
+/* AFTER the mobile block, which sets
    `right` at the same specificity, because a right dock persists at every width. */
 .video-control-button.self-view-hidden-icon--dock-right {
   right: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));

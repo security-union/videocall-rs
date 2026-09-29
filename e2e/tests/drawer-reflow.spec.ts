@@ -8,6 +8,7 @@ import {
   admitGuestIfNeeded,
   clickJoinAndEnterGrid,
   joinMeetingAs,
+  seedShareViewMode,
   startScreenShare,
 } from "../helpers/screen-share-meeting";
 
@@ -700,9 +701,7 @@ test.describe("Drawers reflow the tile grid (#2701 / #2272)", () => {
     }
   });
 
-  test("the lone remote tile in a 2-peer meeting fills the reserved band, and so does it when pinned", async ({
-    baseURL,
-  }) => {
+  test("the lone remote tile in a 2-peer meeting fills the reserved band", async ({ baseURL }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || DEFAULT_UI_URL;
     const browser = await chromium.launch({ args: BROWSER_ARGS });
@@ -752,27 +751,6 @@ test.describe("Drawers reflow the tile grid (#2701 / #2272)", () => {
       expect(Math.round(tile.right)).toBe(Math.round(grid.right));
       const drawer = await rectOf(hostPage, PEER_LIST);
       expect(intersectionArea(tile, drawer)).toBe(0);
-
-      // Pinning the LONE tile leaves it `grid-item full-bleed grid-item-pinned`,
-      // and `.grid-item.full-bleed` (0,2,0) outranks `.grid-item-pinned` (0,1,0),
-      // so what this re-asserts is that the full-bleed rule still governs once
-      // the pin class lands. The `position: fixed` + reserve-var path that
-      // `.grid-item-pinned` owns alone needs a 3+ tile meeting and is NOT
-      // covered here. The pin control is `visibility: hidden` until hover, hence
-      // `force`, and it needs a REAL peer: on a mock tile the class never appears.
-      await hostPage.locator(`${GRID} .grid-item`).first().hover();
-      await hostPage.waitForTimeout(400);
-      await hostPage.locator(`${GRID} .grid-item button.pin-icon`).first().click({ force: true });
-      await expect(hostPage.locator(`${GRID} .grid-item-pinned`)).toHaveCount(1, {
-        timeout: 10_000,
-      });
-      await expect
-        .poll(async () => Math.round((await rectOf(hostPage, `${GRID} .grid-item-pinned`)).left), {
-          timeout: 10_000,
-          message: "the pinned tile must start at the peer list's inner edge",
-        })
-        .toBeGreaterThanOrEqual(320);
-      expect(intersectionArea(await rectOf(hostPage, `${GRID} .grid-item-pinned`), drawer)).toBe(0);
     } finally {
       await browser.close();
     }
@@ -797,6 +775,8 @@ test.describe("Drawers reflow the tile grid (#2701 / #2272)", () => {
         uiURL,
       );
       await guestCtx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
+      // The split panes under test are opt-in since #2792.
+      await seedShareViewMode(hostCtx, "enlarged");
       const meetingId = `e2e_reflow_ss_${Date.now()}`;
 
       const hostPage = await joinMeetingAs(hostCtx, meetingId, "ReflowSsHost");

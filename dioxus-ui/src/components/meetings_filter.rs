@@ -425,6 +425,7 @@ mod tests {
             host_display_name: Some("Alice".to_string()),
             host_user_id: Some("alice@example.com".to_string()),
             is_owner: false,
+            is_co_host: false,
             participant_count: 0,
             waiting_count: 0,
             has_password: false,

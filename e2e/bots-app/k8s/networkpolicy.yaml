@@ -7,7 +7,7 @@
 # runs) can reach them. The bots take no other inbound traffic (they are
 # outbound headless-Chrome clients), so all-other-ingress-denied is safe.
 #
-# Requires a NetworkPolicy-enforcing CNI (qsk8s runs Calico — enforced).
+# Requires a NetworkPolicy-enforcing CNI (the bot-fleet cluster runs Calico — enforced).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

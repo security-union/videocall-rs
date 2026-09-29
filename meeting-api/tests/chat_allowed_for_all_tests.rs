@@ -165,7 +165,6 @@ async fn chat_allowed_for_all_round_trips_through_db() {
     let updated = db_meetings::update_meeting_settings(
         &pool,
         room_id,
-        owner,
         None,
         None,
         None,
@@ -195,7 +194,6 @@ async fn chat_allowed_for_all_round_trips_through_db() {
     let unchanged = db_meetings::update_meeting_settings(
         &pool,
         room_id,
-        owner,
         None,
         None,
         None,
@@ -217,7 +215,6 @@ async fn chat_allowed_for_all_round_trips_through_db() {
     let back_to_false = db_meetings::update_meeting_settings(
         &pool,
         room_id,
-        owner,
         None,
         None,
         None,

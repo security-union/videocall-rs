@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::co_hosts::{can_edit_meeting_options, CoHostsSection, MeetingOwnership};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
@@ -42,8 +43,14 @@ pub const PREVIEW_PERMISSION_PROMPT_TESTID: &str = "prejoin-permission-prompt";
 #[allow(clippy::too_many_arguments)]
 #[component]
 pub fn PreJoinSettingsCard(
-    is_owner: bool,
+    ownership: MeetingOwnership,
+    /// This user's own join-time host-role snapshot; see [`can_edit_meeting_options`].
+    #[props(default)]
+    is_host: bool,
     meeting_id: String,
+    #[props(default)] owner_user_id: Option<String>,
+    #[props(default)] co_host_refresh: Option<Signal<u64>>,
+    meeting_active: bool,
     waiting_room_toggle: Signal<bool>,
     admitted_can_admit_toggle: Signal<bool>,
     end_on_host_leave_toggle: Signal<bool>,
@@ -83,6 +90,8 @@ pub fn PreJoinSettingsCard(
     #[props(default)]
     on_request_permission: EventHandler<()>,
 ) -> Element {
+    let is_owner = ownership.is_owner();
+    let can_edit_options = can_edit_meeting_options(ownership, is_host);
     rsx! {
         div { class: "settings-card",
             if is_owner {
@@ -122,7 +131,7 @@ pub fn PreJoinSettingsCard(
                 on_request_permission,
             }
 
-            if is_owner {
+            if can_edit_options {
                 crate::components::meeting_options_controls::MeetingOptionsControls {
                     meeting_id: meeting_id.clone(),
                     waiting_room_toggle,
@@ -133,6 +142,15 @@ pub fn PreJoinSettingsCard(
                     chat_allowed_for_all_toggle,
                     saving,
                     toggle_error,
+                }
+            }
+            if is_owner {
+                CoHostsSection {
+                    meeting_id: meeting_id.clone(),
+                    owner_user_id,
+                    meeting_active,
+                    refresh: co_host_refresh,
+                    collapsible: true,
                 }
             }
 

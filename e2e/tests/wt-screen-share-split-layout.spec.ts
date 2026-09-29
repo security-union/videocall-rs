@@ -94,6 +94,7 @@ import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-contex
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 type TransportMode = "webtransport" | "websocket";
 
@@ -360,6 +361,8 @@ async function setupTwoUserMeetingWithTransport(
   // Also on the host so a future test variant where the host shares
   // doesn't surprise-fail; cost is negligible (an init-script eval).
   await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+  // The host viewer asserts the split layout, which is opt-in since #2792.
+  await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();

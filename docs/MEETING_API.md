@@ -170,13 +170,15 @@ sequenceDiagram
 
 | State | Description |
 |-------|-------------|
-| `idle` | Meeting created but host hasn't joined yet |
-| `active` | Host has joined, room access token issued, meeting is in progress |
-| `ended` | Meeting has ended (host left or all participants left) |
+| `idle` | Nobody is present: created and not started yet, or everyone left |
+| `active` | Someone is present, room access token issued, meeting is in progress |
+| `ended` | Meeting has ended |
 
 > **Note:** A meeting automatically transitions to `ended` when:
-> - The host leaves the meeting, OR
-> - All admitted participants have left the meeting
+> - The last present host leaves and `end_on_host_leave` is on, OR
+> - The last admitted participant leaves with REST `/leave`
+>
+> Otherwise it goes `idle` once nobody is present.
 
 ## Participant Status
 
@@ -197,7 +199,7 @@ server-side on every join path** (issue #1613); it is not a client-side hint.
 | Endpoint | Enforced? | Notes |
 |----------|-----------|-------|
 | `POST /api/v1/meetings/{id}/join` — meeting owner (`creator_id`) | **Exempt** | Ownership already grants strictly more authority than the password (PATCH settings, end, delete), so the owner is not asked for it. This also keeps a meeting with a corrupt stored hash recoverable. |
-| `POST /api/v1/meetings/{id}/join` — anyone else | **Yes** | Includes a transfer-host target, who is not the `creator_id`. |
+| `POST /api/v1/meetings/{id}/join` — anyone else | **Yes** | Includes co-hosts and a transfer-host target, who are not the `creator_id`. |
 | `POST /api/v1/meetings/{id}/join-guest` | **Yes** | Checked after the `allow_guests` gate. |
 | `POST /api/v1/meetings/{id}/admit`, `/admit-all` | Inherited | These are `UPDATE ... WHERE status = 'waiting'`; they cannot create a participant row, so they can only admit somebody who already cleared the gate on join. |
 | `GET /api/v1/meetings/{id}/status`, `/guest-status` | Inherited | Only mint a `room_token` for an existing `admitted` row, which only a cleared join can produce. |
@@ -205,7 +207,7 @@ server-side on every join path** (issue #1613); it is not a client-side hint.
 **Entry, not continued presence.** The password gates *becoming* a participant.
 Once a row is `admitted`, `GET /status` and `GET /guest-status` re-mint a
 `room_token` for it on demand without re-verifying the password, and the
-`PARTICIPANT_PRESENT` heal (`db_participants::mark_present_by_connect`) restores
+transport presence heal (`db_participants::record_present`) restores
 a `left` row to `admitted` — it mints no token itself, but it restores the state
 those endpoints mint from, and it too runs no password check. Neither is a
 bypass: both require a row that only a cleared join could have created, and the
@@ -287,7 +289,7 @@ The UI's `apiBaseUrl` should point to `http://localhost:8081` for local developm
 
 ### List Meetings (My Meetings)
 
-Lists all meetings **owned by the authenticated user** (excludes deleted meetings, includes ended meetings).
+Lists meetings the authenticated user owns, has participated in, or is a live co-host of (excludes deleted meetings, includes ended meetings).
 
 ```
 GET /api/v1/meetings
@@ -348,6 +350,53 @@ GET /api/v1/meetings
 
 ---
 
+### Home Feed
+
+Meetings the authenticated user owns, has been admitted into, or is a live co-host of, deduplicated to one row per meeting, ordered by `last_active_at` descending. Powers the home page.
+
+```
+GET /api/v1/meetings/feed
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | 200 | Maximum number of meetings to return (1-200) |
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "result": {
+    "meetings": [
+      {
+        "meeting_id": "standup-2024",
+        "state": "active",
+        "last_active_at": 1706918400000,
+        "created_at": 1706918000000,
+        "is_owner": false,
+        "is_co_host": true,
+        "participant_count": 3,
+        "waiting_count": 0
+      }
+    ]
+  }
+}
+```
+
+> **Rust type**: `APIResponse<ListFeedResponse>` (each entry is a `MeetingFeedSummary`)
+
+- `is_co_host`: `true` when the caller holds a live (unsuspended) `meeting_co_hosts` entry for that meeting — independent of `is_owner`, and of whether the caller is currently present. `#[serde(default, skip_serializing_if = "std::ops::Not::not")]`, so it is omitted from the wire (and decodes to `false`) whenever it doesn't apply.
+
+**Errors:**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
+
+---
+
 ### Create Meeting
 
 Creates a new meeting. The authenticated user becomes the host. The meeting starts in `idle` state.
@@ -370,6 +419,7 @@ POST /api/v1/meetings
 | `meeting_id` | string | No | Meeting identifier. Auto-generated (12 chars) if omitted. |
 | `attendees` | string[] | No | Pre-registered attendee emails (max 100). |
 | `password` | string | No | Meeting password (hashed with Argon2 before storage). Enforced server-side on every non-owner join — see [Meeting passwords](#meeting-passwords). An empty string is treated as "no password". |
+| `co_hosts` | string[] | No | User IDs saved as persistent co-hosts (max 100, trimmed and deduplicated; the creator or a `guest:` ID is a 400). Echoed back as `co_hosts` in the response. See [Co-Hosts](#co-hosts). |
 
 **Response (201 Created):**
 ```json
@@ -428,6 +478,8 @@ GET /api/v1/meetings/{meeting_id}
     "host": "host@example.com",
     "host_display_name": "Alice",
     "has_password": false,
+    "viewer_is_owner": false,
+    "viewer_can_edit_options": true,
     "your_status": {
       "email": "attendee@example.com",
       "display_name": "Bob",
@@ -443,12 +495,52 @@ GET /api/v1/meetings/{meeting_id}
 
 > **Rust type**: `APIResponse<MeetingInfoResponse>` (with nested `ParticipantStatusResponse`)
 
+- `viewer_is_owner` (issue #2702): `true` when `creator_id == authenticated_user_id`. **Server-computed** — the authoritative trust signal for owner-only affordances (co-host management, password, delete, end-for-everyone). `#[serde(default)]`, so an older server omitting it decodes to `false`.
+- `viewer_can_edit_options` (issue #2702): whether the caller may `PATCH` this meeting's OPTIONS (see below) — `true` for the owner, a live co-host, or a present host of the active meeting (e.g. a `transfer-host` target). `#[serde(default)]`.
+
 **Errors:**
 
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
+
+---
+
+### Update Meeting Options
+
+Changes meeting OPTIONS: the waiting room, `admitted_can_admit`, `end_on_host_leave`, `allow_guests`, the recording/chat policy flags, and the meeting password.
+
+```
+PATCH /api/v1/meetings/{meeting_id}
+```
+
+**Request body** (all fields optional; only present fields change):
+```json
+{
+  "waiting_room_enabled": false,
+  "admitted_can_admit": true,
+  "end_on_host_leave": false,
+  "allow_guests": false,
+  "recording_allowed_for_all": false,
+  "chat_allowed_for_all": true,
+  "password": "new-password",
+  "remove_password": false
+}
+```
+
+**Authorization**: allowed for the owner, a live (unsuspended) co-host entry, or anyone currently a present host of the active meeting (e.g. a `transfer-host` target) — see `viewer_can_edit_options` above. `password` / `remove_password` are the exception: they stay **owner-only**. A non-owner sending either is rejected with `403 NOT_OWNER` before any hashing or DB write — nothing in the request is applied, even other, otherwise-valid fields in the same body. Granting/revoking co-hosts, ending the meeting for everyone (`/end`), and deleting it (`DELETE`) stay owner-only; listing co-hosts uses this same broader rule (see [Co-Hosts](#co-hosts)).
+
+**Response (200 OK):** `APIResponse<MeetingInfoResponse>` — same shape as [Get Meeting Info](#get-meeting-info).
+
+**Errors:**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `NOT_OWNER` | `password` or `remove_password` sent by a non-owner |
+| 403 | `NOT_HOST` | Caller is none of: owner, live co-host, present host of the active meeting |
+| 404 | `MEETING_NOT_FOUND` | Meeting does not exist (or was soft-deleted) |
 
 ---
 
@@ -493,6 +585,9 @@ Request to join a meeting. If the meeting doesn't exist, it will be **automatica
 - **First user to join** becomes the host; the meeting is created and activated
 - **Hosts** are auto-admitted and receive a `room_token` immediately
 - **Attendees** (non-hosts) enter the waiting room (no `room_token` until admitted)
+- **A live co-host** (issue #2702) skips the waiting room like a host, including
+  starting or restarting a meeting that is idle or ended — see
+  [Co-Hosts](#co-hosts)
 - **Password-protected meetings** require `password` from every joiner except the
   meeting owner — see [Meeting passwords](#meeting-passwords)
 
@@ -833,7 +928,7 @@ The client should use the `room_token` to connect to the Media Server immediatel
 ### Leave Meeting
 
 Leave a meeting. The meeting automatically ends when:
-- The host leaves, OR
+- The last present host leaves and `end_on_host_leave` is on, OR
 - All admitted participants have left
 
 ```
@@ -864,6 +959,61 @@ POST /api/v1/meetings/{meeting_id}/leave
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `NOT_IN_MEETING` | Not a participant in this meeting |
+
+---
+
+### Presence Keepalive
+
+Renews the caller's own presence lease directly, without a relay transport
+session. Exists for the manual pre-join lobby: a client that has admitted
+itself with `/join` but has not yet connected to the Media Server has no
+`live_session_id`, and the REST admission alone only covers
+`PRESENCE_CONNECT_WINDOW_SECS` (60 s) — a user who lingers on the lobby card
+picking a camera, or an owner reviewing settings before entering, would
+otherwise have their lease lapse and get swept: the meeting ends (host,
+`end_on_host_leave`) or goes idle, and waiting-room joins can be refused by
+the host-presence guard, even though the user is right there. Call this on
+an interval under the lease window — every ~30 s — for as long as the lobby
+is shown, and stop once the transport connects and heartbeats take over.
+
+```
+POST /api/v1/meetings/{meeting_id}/presence/keepalive
+POST /api/v1/meetings/{meeting_id}/presence/keepalive-guest
+```
+
+`keepalive` authenticates like every other participant endpoint (session
+cookie or room-token Bearer via `AuthUser`); `keepalive-guest` authenticates
+exactly like `leave-guest` / `guest-status` (observer-token Bearer via
+`GuestObserver`, rejecting a token issued for a different meeting).
+
+Both touch only the caller's own row, and only when it is `admitted`, not
+left, has no live session (`live_session_id` is `0` or `NULL`), and the
+meeting has not ended — a session a relay has already reported present is
+renewed by its heartbeat, never by this endpoint. A single `UPDATE`; no
+meeting row lock, no NATS publish, nothing broadcast to other participants.
+
+No per-user rate limit: unlike a display-name change (which broadcasts to
+every participant and is rate-limited to bound that fan-out), a keepalive
+publishes nothing and updates one indexed row, so there is no cost for a
+client calling it faster than its intended cadence to amplify.
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "result": null
+}
+```
+
+> **Rust type**: `APIResponse<()>`
+
+**Errors:**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 401 | `UNAUTHORIZED` | Invalid or missing session / guest token |
+| 404 | `MEETING_NOT_FOUND` | No such meeting |
+| 404 | `PARTICIPANT_NOT_FOUND` | Caller has no row eligible for renewal — not admitted, already has a live session, or the meeting ended. Stop calling. |
 
 ---
 
@@ -912,6 +1062,84 @@ GET /api/v1/meetings/{meeting_id}/participants
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
+
+---
+
+### Co-Hosts
+
+The **owner** (`creator_id`) is permanent. The **host role** (`meeting_participants.is_host`) is per instance and may be held by several participants at once. A **co-host** is a user the owner designated in `meeting_co_hosts`: `persistent: true` entries apply to every future instance, `persistent: false` entries are deleted when a new instance starts: the meeting ends, or someone starts an `idle` meeting that nobody is present in.
+
+A co-host joining an **active** meeting skips the waiting room and is admitted with `is_host: true` (the meeting password still applies). A co-host admitted any other way (`/admit`, `/admit-all`, turning the waiting room off) becomes host when their transport connects. A co-host who transfers host away or is kicked has their entry **suspended**: re-joining does not make them host again until the next instance or until the owner grants them again. **Grant and revoke** authorize on `creator_id` (`403 NOT_OWNER` otherwise) and return the updated list. **List** (`GET`) is broader: the owner, a live co-host, or a present host of the active meeting (`403 NOT_HOST` otherwise) — the same rule [Update Meeting Options](#update-meeting-options) uses.
+
+**Starting or restarting the meeting.** A live, unsuspended, PERSISTENT co-host joining a meeting that is NOT active — idle, or ended (including one ended by `end_on_host_leave`) — starts a new instance exactly like the owner's join, skipping the waiting room and the `end_on_host_leave` "ended is terminal" rule, and is admitted as host. An instance-only (`persistent: false`) co-host does NOT trigger this: their own entry would be deleted the instant the new instance starts, so they follow the plain-participant path instead. A suspended entry (kicked, or transferred host away) also does not trigger it, and stays suspended through `/end` — only a real new instance lifts a suspension. Guests can never be co-hosts (rejected at grant time). Co-host matching (grant, join, list, feed, search, options) is case-insensitive: the stored `user_id` is canonicalized to lowercase. Ids returned to clients — the co-host list, and the `HOST_GRANTED` / `HOST_REVOKED` events — use the participant's real-case id once they have joined, not the lowercase storage key.
+
+When the owner arrives at an instance a co-host already started, their first join of that instance makes them host too (alongside the co-host — this system allows several simultaneous hosts) — UNLESS the owner already joined this exact instance and transferred host away, in which case rejoining does not reclaim it (today's rule for a mid-instance rejoin). meeting-api tells the two apart by comparing the owner's participant row's `admitted_at` against the meeting's `started_at`: both `upsert_host` and `admit_creator_preserve_host` stamp `admitted_at = NOW()` on every admission, and starting a new instance refreshes `started_at` to that same transaction's `NOW()`, so an owner row with no `admitted_at`, or one from before the current `started_at`, has not been admitted into the current instance under any activation kind.
+
+The meeting ends on `end_on_host_leave` only when the **last present host** leaves. meeting-api decides this from the database, for both REST `/leave` and transport disconnects (see [Transport presence and deploy order](#transport-presence-and-deploy-order)), and broadcasts `MEETING_ENDED`.
+
+```
+GET  /api/v1/meetings/{meeting_id}/co-hosts
+POST /api/v1/meetings/{meeting_id}/co-hosts          {"user_id": "a@example.com", "persist": true}   # persist optional
+POST /api/v1/meetings/{meeting_id}/co-hosts/revoke   {"user_id": "a@example.com"}
+```
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "result": {
+    "co_hosts": [
+      { "user_id": "a@example.com", "persistent": true, "is_present_host": true, "display_name": "Ann",
+        "designated": true, "suspended": false },
+      { "user_id": "t@example.com", "persistent": false, "is_present_host": true,
+        "designated": false, "suspended": false }
+    ]
+  }
+}
+```
+
+> **Rust types**: `GrantCoHostRequest`, `RevokeCoHostRequest`, `APIResponse<ListCoHostsResponse>`
+
+- **List** returns the entries, then any present non-owner host without an entry (e.g. a transfer-host target) with `designated: false`.
+- **Grant** upserts the entry and lifts a suspension. `persist: true` saves the co-host for future instances, `persist: false` limits them to the running instance, and an absent (or `null`) `persist` keeps an existing entry's setting — a NEW entry is then **persistent** by default. In an active meeting an admitted, present target becomes host at once (`HOST_GRANTED`). A target in the waiting room stays there and becomes host once admitted and connected. An explicit instance-only (`persist: false`) grant on a meeting that is not active is a 400.
+- **Revoke** deletes the entry and demotes the target if they hold the host role (any non-owner host, including a transfer target), broadcasting `HOST_REVOKED`. `404 CO_HOST_NOT_FOUND` for a user who is neither.
+- Only the owner may kick another host or a designated co-host; nobody may kick the owner. A kicked host loses the role (`HOST_REVOKED`); kicking a user with no participant row is `404 PARTICIPANT_NOT_FOUND`, and `PARTICIPANT_KICKED` is published only when someone admitted was kicked.
+- `HOST_GRANTED` / `HOST_REVOKED` are published only when the host role actually changes, never for a repeat join.
+
+**Errors:**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 400 | `BAD_REQUEST` | Empty, over 254 chars, the owner, a `guest:` ID, over 100 entries, or an instance-only grant on a non-active meeting |
+| 403 | `NOT_OWNER` | Grant or revoke by a non-owner |
+| 403 | `NOT_HOST` | List by someone who is none of: owner, live co-host, present host |
+| 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
+| 404 | `CO_HOST_NOT_FOUND` | Revoke target is neither a co-host nor a host |
+| 409 | `LAST_PRESENT_HOST` | Revoke would leave the active meeting with no present host |
+
+#### Transport presence and deploy order
+
+Each relay reports, in order and from a single publisher, every participant session it starts or stops counting as present, on `internal.participant_presence` (`{room_id, user_id, session_id, present}`). meeting-api applies a departure only for the participant's live session (`meeting_participants.live_session_id`: set by the latest presence report, reset by every REST join, admit and leave), and ignores a presence report for a session it already saw leave (`left_session_ids`). A departure from before a rejoin therefore cannot mark the participant left or end the meeting. A row written before this tracking existed accepts any departure, so meetings in progress across the deploy keep working.
+
+Presence is a **lease**, not a latch. Every `PRESENCE_HEARTBEAT_INTERVAL_SECS` (30 s) each relay publishes `internal.participant_presence_heartbeat` (`{room_id, sessions: [{user_id, session_id}]}`, at most 256 sessions per message) for the sessions it reports present; one meeting-api replica (queue group `meeting-api-presence-heartbeat`) renews `presence_seen_at` for every admitted, non-tombstoned session it lists for a participant, whether or not that session is the recorded `live_session_id` — a `live_session_id` of `0` (a REST join, admit or leave reset it) or a different, non-tombstoned session is not necessarily abandoned: a relay mid-reconnect-grace can still list a session for it, and a REST call and a live transport session can legitimately be in flight at once for the same user (a second tab or device hitting `/join` while the first stays fully connected). A heartbeat never changes `live_session_id` itself (except adopting a `NULL` row, written by a meeting-api that predates presence tracking) — only a confirmed `PRESENT` report does — because the heartbeat and `LEFT`/`PRESENT` NATS consumers do not preserve relative order under backlog: if a heartbeat could adopt a session onto the row, a `LEFT` for that same session applied afterward would then match and wrongly depart it. A participant counts as present (feeds, settings, idle, end-on-host-leave, the instance boundary) while admitted and either reported within `PRESENCE_LEASE_SECS` (90 s, three heartbeats) or admitted over REST within `PRESENCE_CONNECT_WINDOW_SECS` (60 s) with no session reported yet.
+
+The [Presence Keepalive](#presence-keepalive) endpoints are a third way `presence_seen_at` is renewed, alongside a relay heartbeat: a client sitting in the manual pre-join lobby has no live session for a relay to heartbeat on its behalf, so it renews its own lease directly. The lease check itself does not care which of the two set `presence_seen_at` — a fresh timestamp is a fresh timestamp regardless of `live_session_id` — so the 60 s connect window only ever covers a client that never gets the chance to call either one (it died, or its network dropped, before its first keepalive or its transport's first heartbeat).
+
+Each meeting-api replica sweeps every 30 s, starting one lease after it starts: a participant whose lease ran out (their relay crashed or was killed, their client died before connecting, or an admitted waiter never came) is marked left — keeping its `live_session_id` rather than resetting it, so a later heartbeat or `PRESENT` for that exact session restores the row within the same instance — and the meeting ends if they were its last present host with `end_on_host_leave`, or goes idle if nobody is left. One replica sweeps per tick (`pg_try_advisory_lock`); a row's failure is logged and skipped rather than aborting the batch.
+
+A relay's "room became empty" report only idles a meeting nobody is present in, since the relay sees just its own binary's copy of the room. A new instance (non-owner hosts demoted with `HOST_REVOKED`, the previous instance's admitted participants marked left, instance-only co-hosts removed, suspensions lifted) starts only from `ended`, or when nobody is present, whether the meeting is `idle` or still `active`. A transport reconnecting with a room token from an earlier instance, or to an ended meeting, is never counted or promoted.
+
+##### The heartbeat watermark and degraded (latch) mode
+
+A lease is only as trustworthy as the pipeline that renews it. `presence_heartbeat_watermark` is a singleton row holding the newest time **any** meeting-api replica successfully applied a heartbeat batch — not per meeting, per relay's own connectivity to *some* meeting-api. `db::participants::presence_healthy(pool, nats)` is `true` only when that watermark is fresher than two heartbeat intervals (60 s) **and** the calling replica's own NATS client reports `Connected` (vacuously `true` when no client was even passed in, which is what lets tests exercise routes without wiring a live NATS connection). Every lease-based "nobody present" decision — `present_sql` and everything built on it: `set_idle`, `start_instance_in`, `count_present_hosts`, the waiting-room host guard, and every participant/waiting count — takes this as a parameter and is computed through it, never through a hardcoded assumption of health.
+
+When unhealthy, `present_sql` falls back to latch semantics (`admitted AND left_at IS NULL`, no freshness check at all) and the sweeper (`spawn_presence_sweeper`) skips its tick entirely. This is what keeps a NATS outage, a lagging heartbeat consumer, or a relay fleet that does not yet send heartbeats from departing every connected participant, ending every `end_on_host_leave` meeting, and starting spurious new instances the moment leases would otherwise lapse. Recovery is automatic and non-destructive: once heartbeats resume reaching the database the watermark goes fresh again, normal sweeping resumes, and any row the sweeper wrongly departed while unhealthy — its `live_session_id` was kept, not reset — comes back the moment its own session's heartbeat or `PRESENT` report is seen again, provided the meeting has not ended and no new instance has started since.
+
+**Deploy the relays before meeting-api, and roll back in the reverse order.** Relays publish both the legacy `internal.participant_left` / `internal.participant_present` subjects and the current `internal.participant_presence`; an old meeting-api reads only the legacy pair, so a closed tab does not end an `end_on_host_leave` meeting and no co-hosts exist while it is running. The other deploy order runs the new meeting-api, which reads only `internal.participant_presence`, against old relays that never publish it and that end the meeting whenever a host disconnects, even with co-hosts present.
+
+Rolling relays back to a pre-heartbeat version is **safe** against a meeting-api build that has the watermark: heartbeats simply stop, the watermark goes stale within 60 s, and every presence decision degrades to latch (`admitted AND left_at IS NULL`) instead of sweeping everyone — the same outcome as a genuine NATS outage. It is not safe against a meeting-api build that predates the watermark, which sweeps unconditionally on a lapsed lease with no watermark to consult; roll meeting-api back first, or accept that participants on old-relay rooms will be swept once their lease runs out.
+
+**Known limitation: the watermark is global, not per-relay.** One row answers "has *a* heartbeat reached *some* meeting-api", not "is *this specific* relay's heartbeat path healthy". If one relay's own heartbeat publish path breaks (a bug, a stuck queue, a misconfigured subject) while every other relay in the fleet keeps heartbeating normally, the watermark stays fresh — because it truthfully reflects that *the pipeline as a whole* is fine — and every presence decision keeps using strict lease semantics. That one broken relay's participants still lose their lease after `PRESENCE_LEASE_SECS` and get swept, exactly as if their relay had crashed, because nothing in this design distinguishes "the whole pipeline is down" from "one relay's path is down". Detecting the latter would need a per-relay (or per-room) freshness signal instead of a single global row; nothing here provides one.
 
 ---
 
@@ -1139,10 +1367,20 @@ Single source of truth for participant state. Replaces the legacy `session_parti
 | email | VARCHAR(255) | Participant email |
 | display_name | VARCHAR(255) | Participant's chosen display name |
 | status | VARCHAR(50) | `waiting`, `admitted`, `rejected`, `left` |
-| is_host | BOOLEAN | Whether this is the host |
+| is_host | BOOLEAN | Whether this participant holds the host role (several may) |
 | joined_at | TIMESTAMPTZ | When joined/entered waiting room |
 | admitted_at | TIMESTAMPTZ | When admitted by host |
 | left_at | TIMESTAMPTZ | When left the meeting |
+
+### meeting_co_hosts table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| meeting_id | INTEGER | Foreign key to meetings (`ON DELETE CASCADE`); primary key with `user_id` |
+| user_id | VARCHAR(255) | Designated co-host |
+| persistent | BOOLEAN | Saved for future instances, or this instance only |
+| suspended | BOOLEAN | Set by transfer-host or kick; cleared at the next instance or on re-grant |
+| added_by | VARCHAR(255) | Owner who designated them |
 
 ---
 

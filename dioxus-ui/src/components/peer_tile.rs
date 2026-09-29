@@ -17,22 +17,30 @@
  */
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::components::canvas_generator::{
-    generate_for_peer, AudioLevels, PinnedTile, SignalPopupHandlers, TileMode,
+    generate_for_peer, is_portrait_resolution, AudioLevels, HostPromotionHandlers, PinnedTile,
+    SignalPopupHandlers, TileMode,
 };
+use crate::components::co_hosts::{
+    kick_failure_text, owner_holds_host, peer_holds_host, peer_host_menu, post_co_host_notice,
+    CoHostNoticeCtx, CoHostRequest, CoHostTarget, MeetingOwnership,
+};
+use crate::components::decode_budget::TileRenderMode;
 use crate::components::icons::signal_spark::spark_svg_markup;
 use crate::components::media_metrics_overlay::{
     next_overlay_fps, overlay_audio_kbps, overlay_audio_kbps_display, overlay_painted_fps_sample,
     parse_resolution, MediaMetricsOverlay, MediaMetricsOverlayCtx, ScreenMetricsOverlay,
 };
+use crate::components::share_view::ShareTileView;
 use crate::components::signal_quality::{
     peer_signal_aria, peer_signal_title, prefers_reduced_motion, spark_node_id, PeerSignalHistory,
     SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition, SignalPopupState, SparkPaint,
 };
 use crate::context::{
-    AppearanceSettingsCtx, MeetingTimeCtx, PeerAudioLivenessMap, PeerMetadataCtx,
+    AppearanceSettingsCtx, HostSetCtx, MeetingTimeCtx, PeerAudioLivenessMap, PeerMetadataCtx,
     PeerSignalHistoryMap, RaisedHandsCtx, SignalPopupStateMap, VideoCallClientCtx,
 };
 use dioxus::prelude::*;
@@ -60,7 +68,9 @@ pub fn PeerTile(
     /// sessions (HCL issue 828) are not mis-classified as self.
     #[props(default)]
     my_session_id: Option<String>,
-    #[props(default)] pinned_peer_id: Option<PinnedTile>,
+    /// This tile's rank in the pin list, for its own kind (issue 2866).
+    #[props(default)]
+    pin_rank: Option<usize>,
     #[props(default)] room_id: Option<String>,
     #[props(default = false)] is_current_user_host: bool,
     /// HCL bug #2: scope of the signal-meter popup this tile owns. The
@@ -99,6 +109,9 @@ pub fn PeerTile(
     /// avatar real-peer call sites wire a real handler.
     #[props(default)]
     on_request_decode: EventHandler<String>,
+    /// Issue 2792: view state of the `ScreenOnly` share tile.
+    #[props(default)]
+    share_view: Option<ShareTileView>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -224,6 +237,7 @@ pub fn PeerTile(
     let mut screen_bitrate = use_signal(|| 0.0_f64);
     let mut latency_ms = use_signal(|| 0.0_f64);
     let mut video_resolution = use_signal(String::new);
+    let portrait_source = use_memo(move || is_portrait_resolution(&video_resolution()));
     let mut screen_resolution = use_signal(String::new);
     // Publisher's native source resolution for the screen-share track,
     // delivered via the `video_source_resolution` diag event the decoder
@@ -717,7 +731,7 @@ pub fn PeerTile(
 
     let appearance = use_context::<AppearanceSettingsCtx>().0();
 
-    // Only show mute button when: viewer is host, peer is not self, peer is unmuted.
+    // Mute / disable-video: viewer is host, peer is neither self nor a host, media is on.
     // `is_self_peer` is true either when the tile's session_id matches the local
     // session_id, OR when the tile's user_id matches the current user's user_id —
     // the latter covers sibling sessions of the same account (e.g. a host with two
@@ -728,42 +742,56 @@ pub fn PeerTile(
         .unwrap_or_else(|| peer_id.clone());
     let is_self_peer = my_session_id.as_deref() == Some(peer_id.as_str())
         || peer_uid_for_mute == *client.user_id();
-    let on_mute: Option<EventHandler<()>> =
-        if is_current_user_host && !is_self_peer && audio_enabled() {
-            if let Some(ref meeting_id) = room_id {
+    let peer_is_guest = client.get_peer_is_guest(&peer_id).unwrap_or(false);
+    let host_set = try_use_context::<HostSetCtx>();
+    let co_host_notice = try_use_context::<CoHostNoticeCtx>();
+    let owner = host_user_id.as_deref();
+    let host_menu = peer_host_menu(
+        is_current_user_host,
+        MeetingOwnership::of(owner, Some(client.user_id().as_str())),
+        owner,
+        &CoHostTarget {
+            user_id: &peer_uid_for_mute,
+            is_self: is_self_peer,
+            is_guest: peer_is_guest,
+            is_host: peer_holds_host(host_set.as_ref(), owner, &peer_uid_for_mute),
+            owner_holds_host: owner_holds_host(host_set.as_ref(), owner),
+        },
+    );
+    let on_mute: Option<EventHandler<()>> = if host_menu.mute_and_disable_video && audio_enabled() {
+        if let Some(ref meeting_id) = room_id {
+            let meeting_id = meeting_id.clone();
+            let peer_uid = peer_uid_for_mute.clone();
+            Some(EventHandler::new(move |_: ()| {
                 let meeting_id = meeting_id.clone();
-                let peer_uid = peer_uid_for_mute.clone();
-                Some(EventHandler::new(move |_: ()| {
-                    let meeting_id = meeting_id.clone();
-                    let peer_uid = peer_uid.clone();
-                    let mut audio_enabled = audio_enabled;
-                    audio_enabled.set(false);
-                    spawn(async move {
-                        match crate::constants::meeting_api_client() {
-                            Ok(api_client) => {
-                                if let Err(e) =
-                                    api_client.mute_participant(&meeting_id, &peer_uid).await
-                                {
-                                    log::warn!("mute_participant failed: {e}");
-                                    audio_enabled.set(true);
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("meeting_api_client error: {e}");
+                let peer_uid = peer_uid.clone();
+                let mut audio_enabled = audio_enabled;
+                audio_enabled.set(false);
+                spawn(async move {
+                    match crate::constants::meeting_api_client() {
+                        Ok(api_client) => {
+                            if let Err(e) =
+                                api_client.mute_participant(&meeting_id, &peer_uid).await
+                            {
+                                log::warn!("mute_participant failed: {e}");
                                 audio_enabled.set(true);
                             }
                         }
-                    });
-                }))
-            } else {
-                None
-            }
+                        Err(e) => {
+                            log::warn!("meeting_api_client error: {e}");
+                            audio_enabled.set(true);
+                        }
+                    }
+                });
+            }))
         } else {
             None
-        };
-    // Only show disable-video button when: viewer is host, peer is not self, peer's camera is on.
+        }
+    } else {
+        None
+    };
     let on_disable_video: Option<EventHandler<()>> =
-        if is_current_user_host && !is_self_peer && video_enabled() {
+        if host_menu.mute_and_disable_video && video_enabled() {
             if let Some(ref meeting_id) = room_id {
                 let meeting_id = meeting_id.clone();
                 let peer_uid = peer_uid_for_mute.clone();
@@ -796,14 +824,18 @@ pub fn PeerTile(
         } else {
             None
         };
-    // Show kick button when: viewer is host, peer is not self (no media state check).
-    let on_kick: Option<EventHandler<()>> = if is_current_user_host && !is_self_peer {
+    let peer_display_name = client
+        .get_peer_display_name(&peer_id)
+        .unwrap_or_else(|| peer_uid_for_mute.clone());
+    let on_kick: Option<EventHandler<()>> = if host_menu.kick {
         if let Some(ref meeting_id) = room_id {
             let meeting_id = meeting_id.clone();
             let peer_uid = peer_uid_for_mute.clone();
+            let peer_name = peer_display_name.clone();
             Some(EventHandler::new(move |_: ()| {
                 let meeting_id = meeting_id.clone();
                 let peer_uid = peer_uid.clone();
+                let peer_name = peer_name.clone();
                 spawn(async move {
                     match crate::constants::meeting_api_client() {
                         Ok(api_client) => {
@@ -811,6 +843,13 @@ pub fn PeerTile(
                                 api_client.kick_participant(&meeting_id, &peer_uid).await
                             {
                                 log::warn!("kick_participant failed: {e}");
+                                if let Some(ctx) = co_host_notice {
+                                    post_co_host_notice(
+                                        ctx,
+                                        kick_failure_text(&peer_name, &e),
+                                        true,
+                                    );
+                                }
                             }
                         }
                         Err(e) => log::warn!("meeting_api_client error: {e}"),
@@ -824,13 +863,8 @@ pub fn PeerTile(
         None
     };
 
-    let peer_is_guest = client.get_peer_is_guest(&peer_id).unwrap_or(false);
-
-    // "Transfer host": hand off and step down. Any admitted non-guest peer.
-    let on_transfer_host: Option<EventHandler<()>> = if is_current_user_host
-        && !is_self_peer
-        && !peer_is_guest
-    {
+    // "Transfer host": hand off and step down. Any admitted non-guest non-host peer.
+    let on_transfer_host: Option<EventHandler<()>> = if host_menu.transfer {
         if let Some(ref meeting_id) = room_id {
             let meeting_id = meeting_id.clone();
             let peer_uid = peer_uid_for_mute.clone();
@@ -853,6 +887,19 @@ pub fn PeerTile(
         }
     } else {
         None
+    };
+    let host_promotion = HostPromotionHandlers {
+        on_transfer_host,
+        co_host: room_id
+            .as_ref()
+            .zip(host_menu.co_host)
+            .map(|(meeting_id, action)| CoHostRequest {
+                action,
+                meeting_id: meeting_id.clone(),
+                user_id: peer_uid_for_mute.clone(),
+                display_name: peer_display_name.clone(),
+            }),
+        notice: co_host_notice,
     };
     // Issue 1768: per-tile media-metrics overlay payload. Computed ONLY when the
     // diagnostics "Show diagnostics on tiles" checkbox is on (default off).
@@ -963,8 +1010,8 @@ pub fn PeerTile(
         on_mute,
         on_disable_video,
         on_kick,
-        on_transfer_host,
-        pinned_peer_id.as_ref(),
+        host_promotion,
+        pin_rank,
         on_toggle_pin,
         &appearance,
         on_request_decode,
@@ -972,7 +1019,68 @@ pub fn PeerTile(
         // Reading the memo HERE (not the roster) is what keeps the subscription
         // narrow: this scope depends on one `bool`, not on the whole roster.
         hand_raised(),
+        share_view,
+        portrait_source(),
     )
+}
+
+/// The camera tiles of the grid or the split panel, in render order.
+pub struct CameraTiles<'a> {
+    pub tiles: &'a [(String, TileRenderMode)],
+    pub pin_rank: &'a HashMap<String, usize>,
+    pub full_bleed: &'a dyn Fn(&str) -> bool,
+    pub host_user_id: &'a Option<String>,
+    pub render_mode: &'a TileMode,
+    pub my_session_id: &'a Option<String>,
+    pub room_id: &'a str,
+    pub is_host: bool,
+    pub on_toggle_pin: EventHandler<PinnedTile>,
+    pub on_request_decode: EventHandler<String>,
+    /// Mock layout tiles are not pinnable and have no PLAY.
+    pub mock_on_toggle_pin: EventHandler<PinnedTile>,
+    pub mock_on_request_decode: EventHandler<String>,
+}
+
+pub fn camera_tiles(list: CameraTiles) -> Element {
+    let tile = |tile_id: &String, mode: TileRenderMode| {
+        let force_avatar = mode == TileRenderMode::Avatar;
+        let tile = if tile_id.starts_with("mock-") {
+            rsx! {
+                PeerTile {
+                    peer_id: tile_id.clone(),
+                    full_bleed: false,
+                    force_avatar,
+                    host_user_id: list.host_user_id.clone(),
+                    render_mode: list.render_mode.clone(),
+                    my_session_id: list.my_session_id.clone(),
+                    on_toggle_pin: list.mock_on_toggle_pin,
+                    on_request_decode: list.mock_on_request_decode,
+                }
+            }
+        } else {
+            rsx! {
+                PeerTile {
+                    peer_id: tile_id.clone(),
+                    full_bleed: !force_avatar && (list.full_bleed)(tile_id),
+                    force_avatar,
+                    host_user_id: list.host_user_id.clone(),
+                    render_mode: list.render_mode.clone(),
+                    my_session_id: list.my_session_id.clone(),
+                    pin_rank: list.pin_rank.get(tile_id).copied(),
+                    on_toggle_pin: list.on_toggle_pin,
+                    on_request_decode: list.on_request_decode,
+                    room_id: Some(list.room_id.to_string()),
+                    is_current_user_host: list.is_host,
+                }
+            }
+        };
+        rsx! {
+            div { key: "tile-{tile_id}", class: "tile-slot", {tile} }
+        }
+    };
+    rsx! {
+        {list.tiles.iter().map(|(tile_id, mode)| tile(tile_id, *mode))}
+    }
 }
 
 /// Glow level used when the only evidence a peer is speaking is the heartbeat

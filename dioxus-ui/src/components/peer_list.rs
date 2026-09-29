@@ -16,6 +16,10 @@
  * conditions.
  */
 
+use crate::components::co_hosts::{
+    host_role, kick_failure_text, owner_holds_host, peer_holds_host, peer_host_menu,
+    post_co_host_notice, CoHostNoticeCtx, CoHostRequest, CoHostTarget, HostRole, MeetingOwnership,
+};
 use crate::components::peer_list_item::PeerListItem;
 use crate::components::peer_tile::{
     audio_path_is_live, corroborated_speaking, expire_stale_claim, glow_deadman_ms,
@@ -313,17 +317,21 @@ pub fn PeerList(
     // session, not the user_id — a sibling tab of the same account records
     // independently. Empty when the session has not been assigned yet.
     let current_session_id = client_ctx.get_own_session_id().unwrap_or_default();
-    // Single-host model: the current host comes from the reactive `HostSetCtx`
-    // (updated live on HOST_GRANTED/HOST_REVOKED), with a fallback to the
-    // `host_user_id` prop when the context is absent.
+    // `host_user_id` is the meeting OWNER; the host role comes from `HostSetCtx`.
     let host_set = try_use_context::<HostSetCtx>();
+    let owner_user_id = host_user_id.clone();
     let is_host_uid = move |uid: &str| -> bool {
-        match host_set.as_ref() {
-            Some(hs) => hs.is_host(uid),
-            None => host_user_id.as_deref() == Some(uid),
-        }
+        peer_holds_host(host_set.as_ref(), host_user_id.as_deref(), uid)
     };
     let is_current_user_host = is_host_uid(&current_user_id_val);
+    let ownership = MeetingOwnership::of(owner_user_id.as_deref(), Some(&current_user_id_val));
+    let owner_has_role = owner_holds_host(host_set.as_ref(), owner_user_id.as_deref());
+    let role_of = |is_host: bool, uid: &str| {
+        host_role(is_host, uid, owner_user_id.as_deref(), owner_has_role)
+    };
+    let self_is_co_host =
+        role_of(is_current_user_host, &current_user_id_val) == Some(HostRole::CoHost);
+    let co_host_notice = try_use_context::<CoHostNoticeCtx>();
     // Per-recorder indicator. Unlike `is_host_uid` (per-account role, keyed by
     // user_id), recording is a per-SESSION action, so this keys on `session_id`.
     // Sourced only from the reactive `RecordingSetCtx` (no persisted server state
@@ -518,7 +526,7 @@ pub fn PeerList(
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_recording: is_recording_session(&current_session_id), is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, hand_slot: hand_slot_of(&current_session_id), on_edit_name: on_edit_self_name } }
+                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_co_host: self_is_co_host, is_recording: is_recording_session(&current_session_id), is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, hand_slot: hand_slot_of(&current_session_id), on_edit_name: on_edit_self_name } }
 
                             for peer in filtered_peers.iter() {
                                 {
@@ -561,9 +569,21 @@ pub fn PeerList(
                                         .get(sid)
                                         .copied()
                                         .unwrap_or(false);
+                                    let host_menu = peer_host_menu(
+                                        is_current_user_host,
+                                        ownership,
+                                        owner_user_id.as_deref(),
+                                        &CoHostTarget {
+                                            user_id: &user_id,
+                                            is_self: user_id == current_user_id_val,
+                                            is_guest: peer_is_guest,
+                                            is_host: is_peer_host,
+                                            owner_holds_host: owner_has_role,
+                                        },
+                                    );
                                     // Host actions are per-user: muting any row of a
                                     // multi-session user mutes all their sessions.
-                                    let on_mute = if is_current_user_host && !muted && user_id != current_user_id_val {
+                                    let on_mute = if host_menu.mute_and_disable_video && !muted {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
                                         Some(EventHandler::new(move |_| {
@@ -595,11 +615,8 @@ pub fn PeerList(
                                     } else {
                                         None
                                     };
-                                    // Provide a disable-video callback when the
-                                    // local user is the host and the peer's
-                                    // camera is currently on. Same per-user
-                                    // contract as mute above.
-                                    let on_disable_video = if is_current_user_host && !video_disabled && user_id != current_user_id_val {
+                                    // Same per-user contract as mute above.
+                                    let on_disable_video = if host_menu.mute_and_disable_video && !video_disabled {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
                                         Some(EventHandler::new(move |_| {
@@ -631,13 +648,14 @@ pub fn PeerList(
                                     } else {
                                         None
                                     };
-                                    // Remove from meeting: shown whenever the local user is host.
-                                    let on_kick = if is_current_user_host && user_id != current_user_id_val {
+                                    let on_kick = if host_menu.kick {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
+                                        let peer_name = peer_display_name.clone();
                                         Some(EventHandler::new(move |_| {
                                             let meeting_id = meeting_id.clone();
                                             let peer_user_id = peer_user_id.clone();
+                                            let peer_name = peer_name.clone();
                                             spawn(async move {
                                                 match meeting_api_client() {
                                                     Ok(client) => {
@@ -651,6 +669,13 @@ pub fn PeerList(
                                                             log::warn!(
                                                                 "kick_participant failed: {e}"
                                                             );
+                                                            if let Some(ctx) = co_host_notice {
+                                                                post_co_host_notice(
+                                                                    ctx,
+                                                                    kick_failure_text(&peer_name, &e),
+                                                                    true,
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                     Err(e) => {
@@ -664,11 +689,7 @@ pub fn PeerList(
                                     } else {
                                         None
                                     };
-                                    // Transfer host action is shown when the local user is the host, the peer is not the local user, and the peer is not a guest.
-                                    let on_transfer_host = if is_current_user_host
-                                        && user_id != current_user_id_val
-                                        && !peer_is_guest
-                                    {
+                                    let on_transfer_host = if host_menu.transfer {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
                                         Some(EventHandler::new(move |_| {
@@ -688,6 +709,14 @@ pub fn PeerList(
                                     } else {
                                         None
                                     };
+                                    let co_host_request = host_menu.co_host.map(|action| CoHostRequest {
+                                        action,
+                                        meeting_id: room_id.clone(),
+                                        user_id: user_id.clone(),
+                                        display_name: peer_display_name.clone(),
+                                    });
+                                    let is_peer_co_host =
+                                        role_of(is_peer_host, &user_id) == Some(HostRole::CoHost);
                                     let row_key = peer.session_id.clone();
                                     let tooltip_user_id = user_id.clone();
                                     rsx! {
@@ -697,6 +726,8 @@ pub fn PeerList(
                                                 name: peer_display_name,
                                                 tooltip: tooltip_user_id,
                                                 is_host: is_peer_host,
+                                                is_co_host: is_peer_co_host,
+                                                co_host_request,
                                                 is_recording: is_recording_session(sid),
                                                 hand_slot: hand_slot_of(sid),
                                                 is_guest: peer_is_guest,

@@ -19,11 +19,13 @@
  *     (Document PiP, or the `window.open` fallback forced headless below) that
  *     mirrors the canvas into a `<video>` and hosts its OWN zoom + reattach
  *     controls. The MAIN window then flips to a regular no-share meeting: the
- *     share pane is hidden OFF-SCREEN (`.share-detached` on #grid-container) but
+ *     share tile (`data-share-mode="detached"`, `inert`) is hidden OFF-SCREEN but
  *     stays MOUNTED so the canvas keeps its node identity and keeps painting to
  *     feed the mirror; the peer grid goes full width. REATTACH (popup Reattach
  *     button / Escape / closing the window) restores the split layout and
  *     returns focus to ss-detach.
+ *   - Issue 2792: a share opens as a grid tile by default; the host context is
+ *     seeded with the Enlarged view so the split layout above is what it sees.
  *   - Zoom state survives an unrelated re-render of the tile (v1 defect D7:
  *     imperative zoom reset on every re-render).
  *
@@ -51,14 +53,12 @@
  *     aria-pressed (L2142), gated by `detach_supported()` (screen_share_detach.rs
  *     L208; desktop 1280>768 → rendered). The old `.is-detached` overlay, bring-
  *     back button, and inert `.ss-tile-interior` were removed in 58deca56.
- *   MAIN window while detached (attendants.rs):
- *   - `#grid-container` gains `share-detached` (L5960) → CSS (global.css
- *     L3202-3216) moves `.ss-left-pane` (L6797) to `left:-99999px` (still
- *     MOUNTED + composited, canvas persists) and makes `.ss-peer-panel` (L6825)
- *     100% wide; `.screen-share-resize-handle` display:none. 3cdfc2c5 also adds
- *     `inert="true"` on `.ss-left-pane` while detached (L6797,
- *     `share_detached.then_some("true")`) so the off-screen controls leave the
- *     tab / AT tree.
+ *   MAIN window while detached (issue 2792):
+ *   - the received share tile carries `data-share-mode="detached"` and `inert`;
+ *     `.share-tile[data-share-mode="detached"]` (global.css) moves it to
+ *     `left:-99999px` (still MOUNTED + composited, canvas persists). The split
+ *     goes away (`#grid-container[data-share-layout="tile"]`, no
+ *     `has-screen-share`), so the peer tiles lay out in the normal grid.
  *   - `[data-testid=ss-detach-announce]` visually-hidden role=status aria-live
  *     region at meeting level in #grid-container (canvas_generator.rs
  *     `ScreenDetachAnnouncer`, testid L2182, rendered attendants.rs L6715),
@@ -86,6 +86,7 @@ import { test, expect, chromium, Browser, Locator, Page } from "@playwright/test
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { FORCE_POPUP_DETACH_SCRIPT, seedShareViewMode } from "../helpers/screen-share-meeting";
 
 const SPLIT_LAYOUT_ACTIVATION_TIMEOUT_MS = 15_000;
 
@@ -202,34 +203,6 @@ const STATIC_SHARE_MOCK = `
   })();
 `;
 
-/**
- * Force the detach `window.open` fallback path in headless Chromium by
- * shadowing `documentPictureInPicture` with an own-property getter that returns
- * `undefined`. The Rust side reads it via `Reflect::get` and treats
- * undefined/null as "PiP unsupported" (`screen_share_detach.rs`
- * `document_pip_supported()`), so `open()` takes `open_popup` → `window.open`.
- *
- * Why: Document Picture-in-Picture's `requestWindow` is unreliable headless
- * (it may reject with no compositor), whereas `window.open` is a real, reliably
- * -working production path (Firefox / Safari / older Chromium users hit it) that
- * Playwright's headless Chromium honors and surfaces as a new context page.
- * Forcing this path makes the detached-window contract deterministic so the
- * mirror / zoom / reattach flow is actually exercised. The detach tests still
- * tolerate the revert branch (skip) if a given environment blocks the popup.
- */
-const FORCE_POPUP_DETACH_SCRIPT = `
-  (() => {
-    try {
-      Object.defineProperty(window, 'documentPictureInPicture', {
-        configurable: true,
-        get() { return undefined; },
-      });
-    } catch (e) {
-      /* non-configurable here; the detach test tolerates either window path */
-    }
-  })();
-`;
-
 async function navigateToMeeting(page: Page, meetingId: string, username: string): Promise<void> {
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -320,7 +293,7 @@ async function startScreenShareAndAwaitSplitLayout(
   await shareButton.click();
 
   try {
-    await expect(viewerPage.locator(".split-screen-tile")).toBeVisible({
+    await expect(viewerPage.locator('[data-share-origin="received"]')).toBeVisible({
       timeout: SPLIT_LAYOUT_ACTIVATION_TIMEOUT_MS,
     });
     return true;
@@ -381,6 +354,7 @@ async function setupViewerSeeingSharedScreen(
   if (hostExtraInit) {
     await hostCtx.addInitScript(hostExtraInit);
   }
+  await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
@@ -411,8 +385,9 @@ async function setupViewerSeeingSharedScreen(
       "mock may not have taken effect, or the guest never connected as a peer.",
   ).toBe(true);
 
-  const tile = hostPage.locator(".split-screen-tile").first();
+  const tile = hostPage.locator('[data-share-origin="received"]');
   await expect(tile).toBeVisible({ timeout: 10_000 });
+  await expect(tile).toHaveAttribute("data-share-mode", "enlarged");
   // The received-share canvas must be mounted inside the tile from the start.
   await expect(tile.locator('canvas[id^="screen-share-"]')).toHaveCount(1);
 
@@ -509,10 +484,9 @@ async function findDetachedDocPage(
 
 /**
  * Assert the MAIN window is in the "regular no-share meeting" look while a share
- * is detached: `#grid-container` carries `share-detached`, the share pane is
- * off-screen (left:-99999px) but STILL mounted (canvas keeps its node identity)
- * and `inert` (removed from the tab / AT tree, per 3cdfc2c5), and the peer grid
- * has expanded to (near) full width.
+ * is detached: the split is gone, the share tile is off-screen (left:-99999px)
+ * but STILL mounted (canvas keeps its node identity) and `inert` (removed from
+ * the tab / AT tree), and the peer tile has expanded to (near) full width.
  */
 async function assertMainWindowDetachedLook(
   hostPage: Page,
@@ -520,23 +494,25 @@ async function assertMainWindowDetachedLook(
   canvasId: string,
 ): Promise<void> {
   const grid = hostPage.locator("#grid-container");
-  const leftPane = hostPage.locator(".ss-left-pane");
-  await expect(grid).toHaveClass(/\bshare-detached\b/);
+  const shareTile = hostPage.locator('[data-share-origin="received"]');
+  await expect(shareTile).toHaveAttribute("data-share-mode", "detached");
+  await expect(grid).toHaveAttribute("data-share-layout", "tile");
+  await expect(grid).not.toHaveClass(/\bhas-screen-share\b/);
 
   // Canvas persistence invariant: the split subtree stays MOUNTED (off-screen),
   // so the canvas keeps its node identity and keeps feeding the mirror.
   await expect(canvas).toHaveCount(1);
   expect(await readCanvasIdentity(canvas)).toBe(canvasId);
 
-  // The share pane is moved fully off-screen to the LEFT (position, not
+  // The share tile is moved fully off-screen to the LEFT (position, not
   // display:none — so it stays composited). Its whole box is left of x=0.
-  const leftBox = await leftPane.boundingBox();
-  expect(leftBox, "ss-left-pane must still be laid out (mounted, off-screen)").not.toBeNull();
-  expect(leftBox!.x + leftBox!.width).toBeLessThanOrEqual(0);
+  const tileBox = await shareTile.boundingBox();
+  expect(tileBox, "the share tile must still be laid out (mounted, off-screen)").not.toBeNull();
+  expect(tileBox!.x + tileBox!.width).toBeLessThanOrEqual(0);
 
-  // 3cdfc2c5 a11y guard: the off-screen pane is `inert` while detached, so its
-  // ~7 invisible controls leave the keyboard tab order + AT tree.
-  await expect(leftPane).toHaveAttribute("inert", "true");
+  // a11y guard: the off-screen tile is `inert` while detached, so its invisible
+  // controls leave the keyboard tab order + AT tree.
+  await expect(shareTile).toHaveAttribute("inert", "true");
   // Empirically confirm inert actually blocks focus (not just the attribute):
   // focusing ss-detach inside the inert pane is a no-op, so activeElement does
   // NOT become it. (The detach flow therefore interacts only with the popup
@@ -547,9 +523,12 @@ async function assertMainWindowDetachedLook(
     await hostPage.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? null),
   ).not.toBe("ss-detach");
 
-  // The peer grid expands to (near) full width — the "regular meeting" look.
+  // The lone peer tile expands to (near) full width — the "regular meeting"
+  // look. In the split it sat in the right panel (~a third of the width).
+  const peerTile = grid.locator('[id^="peer-video-"][id$="-div"]').first();
+  await expect(peerTile).toBeVisible({ timeout: 10_000 });
   const gridBox = await grid.boundingBox();
-  const peerBox = await hostPage.locator(".ss-peer-panel").boundingBox();
+  const peerBox = await peerTile.boundingBox();
   expect(gridBox).not.toBeNull();
   expect(peerBox).not.toBeNull();
   expect(peerBox!.width).toBeGreaterThanOrEqual(gridBox!.width * 0.9);
@@ -557,9 +536,8 @@ async function assertMainWindowDetachedLook(
 
 /**
  * Assert the MAIN window has been RESTORED to the split layout after reattach:
- * `#grid-container` no longer carries `share-detached`, the split tile is back
- * on-screen (left pane x >= 0) and no longer `inert`, and the canvas is STILL
- * the same node.
+ * the tile is back in Enlarged mode, on-screen (x >= 0) and no longer `inert`,
+ * and the canvas is STILL the same node.
  */
 async function assertMainWindowRestoredLook(
   hostPage: Page,
@@ -567,17 +545,15 @@ async function assertMainWindowRestoredLook(
   canvas: Locator,
   canvasId: string,
 ): Promise<void> {
-  const leftPane = hostPage.locator(".ss-left-pane");
   // First assertion carries the retry budget for the pagehide → schedule_teardown
   // → teardown → re-render latency after the window closes.
-  await expect(hostPage.locator("#grid-container")).not.toHaveClass(/\bshare-detached\b/, {
-    timeout: 10_000,
-  });
+  await expect(tile).toHaveAttribute("data-share-mode", "enlarged", { timeout: 10_000 });
+  await expect(hostPage.locator("#grid-container")).toHaveClass(/\bhas-screen-share\b/);
   await expect(tile).toBeVisible();
-  await expect(leftPane).not.toHaveAttribute("inert");
-  const leftBox = await leftPane.boundingBox();
-  expect(leftBox).not.toBeNull();
-  expect(leftBox!.x).toBeGreaterThanOrEqual(0);
+  await expect(tile).not.toHaveAttribute("inert");
+  const tileBox = await tile.boundingBox();
+  expect(tileBox).not.toBeNull();
+  expect(tileBox!.x).toBeGreaterThanOrEqual(0);
   await expect(canvas).toHaveCount(1);
   expect(await readCanvasIdentity(canvas)).toBe(canvasId);
 }
@@ -738,7 +714,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
   // Fails-on-unfixed:
   //  - absent feature → no ss-detach testid (locator times out).
   //  - issue #1829 (cross-realm `dyn_into` on the popup <video> / PiP Window
-  //    fails silently): the detached window never builds → `share-detached`
+  //    fails silently): the detached window never builds → the detached mode
   //    reverts (assertMainWindowDetachedLook fails) OR the mirror stays blank →
   //    the pixel-liveness assertion below (non-blank + advancing) fails.
   //  - the detached mirror never PLAYS / freezes: the two pixel samples are
@@ -746,7 +722,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
   //  - a regression that removed the canvas from the main DOM while detached
   //    (instead of hiding the pane off-screen) → canvas count 0 / identity
   //    mismatch.
-  //  - the main window fails to flip (`share-detached` missing) or the popup
+  //  - the main window fails to flip (tile not `detached`) or the popup
   //    zoom controls don't drive the wrapper transform / label / data-zoomed
   //    (the wrapper transform also exercises a cross-realm cast fixed in #1829).
   //  - broken reattach (button → teardown) or EXIT focus handler.
@@ -774,12 +750,11 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       const canvas = tile.locator('canvas[id^="screen-share-"]');
       const detach = tile.locator('[data-testid="ss-detach"]');
       const announce = hostPage.locator('[data-testid="ss-detach-announce"]');
-      const grid = hostPage.locator("#grid-container");
 
       // Detach control offered (desktop viewport). Not detached yet.
       await expect(detach).toBeVisible();
       await expect(detach).toHaveAttribute("aria-pressed", "false");
-      await expect(grid).not.toHaveClass(/\bshare-detached\b/);
+      await expect(tile).not.toHaveAttribute("data-share-mode", "detached");
 
       await expect(canvas).toHaveCount(1);
       const id1 = await tagCanvasIdentity(canvas);
@@ -809,7 +784,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
         // opened). open() reset the optimistic signal; assert that revert and
         // skip the window-dependent half. This branch is NOT reachable for
         // #1829, where the popup opens before the app reverts.
-        await expect(grid).not.toHaveClass(/\bshare-detached\b/);
+        await expect(tile).not.toHaveAttribute("data-share-mode", "detached");
         await expect(detach).toHaveAttribute("aria-pressed", "false");
         await expect(canvas).toHaveCount(1);
         expect(await readCanvasIdentity(canvas)).toBe(id1);
@@ -927,10 +902,10 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
   // The user closing the popup window must return the share to the main window
   // (not strand it off-screen). Closing the window fires `pagehide` on the popup
   // → `schedule_teardown` → `teardown`, which resets the detached signal and
-  // un-flips `.share-detached`.
+  // returns the tile to its pre-detach mode.
   //
   // Fails-on-unfixed: if the close path did not tear down (share left stranded
-  // off-screen), `#grid-container` keeps `share-detached` and the restore
+  // off-screen), the tile stays `data-share-mode="detached"` and the restore
   // assertions time out; if the canvas were rebuilt on restore, identity fails.
   // ──────────────────────────────────────────────────────────────────────────
   test("closing the detached window directly restores the share to the main window", async ({
@@ -1568,7 +1543,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       await popup.keyboard.press("Escape");
       await popup.waitForTimeout(1500);
       expect(popup.isClosed()).toBe(false);
-      await expect(hostPage.locator("#grid-container")).toHaveClass(/\bshare-detached\b/);
+      await expect(tile).toHaveAttribute("data-share-mode", "detached");
       await expect(popup.locator("#ss-detached-viewport")).toHaveCount(1);
 
       // 3. Exit full screen via OUR exit_fullscreen wiring: the Maximize toggle's
@@ -1588,15 +1563,13 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
         .toBe(false);
       // The fullscreenchange listener flips aria-pressed back; still detached.
       await expect(maximize).toHaveAttribute("aria-pressed", "false");
-      await expect(hostPage.locator("#grid-container")).toHaveClass(/\bshare-detached\b/);
+      await expect(tile).toHaveAttribute("data-share-mode", "detached");
       expect(popup.isClosed()).toBe(false);
 
       // 4. Escape while NOT fullscreen → the normal Escape-to-reattach fires: the
       //    detached window closes and the share returns to the meeting tile.
       await popup.keyboard.press("Escape");
-      await expect(hostPage.locator("#grid-container")).not.toHaveClass(/\bshare-detached\b/, {
-        timeout: 10_000,
-      });
+      await expect(tile).toHaveAttribute("data-share-mode", "enlarged", { timeout: 10_000 });
       await expect(tile).toBeVisible();
     } finally {
       await fx.browser1.close();
@@ -1816,7 +1789,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
 
       // 6) The share is STILL detached in the main window — the retired PiP's late
       //    close events did not tear the live popup down (the session guard).
-      await expect(hostPage.locator("#grid-container")).toHaveClass(/\bshare-detached\b/);
+      await expect(tile).toHaveAttribute("data-share-mode", "detached");
 
       // 7) Reattach FROM THE POPUP restores the meeting and closes the popup.
       await popup.locator("#ss-detached-reattach").click();

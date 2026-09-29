@@ -1,8 +1,13 @@
 import { test, expect, chromium, BrowserContext, Page } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { installMediaSocketRecorder, severMediaWebSocket } from "../helpers/media-socket-sever";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 /**
  * Regression coverage for HCL issue #828 — "same authed user multiple times not
@@ -143,6 +148,7 @@ async function openSameUserContext(
 ): Promise<{ context: BrowserContext; page: Page }> {
   const browser = await chromium.launch({ args: BROWSER_ARGS });
   const context = await createAuthenticatedContext(browser, SAME_USER_EMAIL, SAME_USER_NAME, uiURL);
+  await pinWebSocketTransport(context);
   const page = await context.newPage();
   // Keep the browser reachable for cleanup via the context.
   (context as unknown as { _browser?: typeof browser })._browser = browser;
@@ -405,6 +411,10 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
         SAME_USER_NAME,
         uiURL,
       );
+      await pinWebSocketTransport(contextA);
+      await pinWebSocketTransport(contextB);
+      // Session B asserts the split layout, opt-in for a received share since #2792.
+      await seedShareViewMode(contextB, "enlarged");
       const pageA = await contextA.newPage();
       const pageB = await contextB.newPage();
 
@@ -447,9 +457,12 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
       await expect(splitPeerTiles.first()).toBeVisible({ timeout: 10_000 });
 
       // ---- The sharer (Session A) must also see at least their sibling's
-      // video tile in the split right panel — locks in that the same fix
-      // applied symmetrically.
-      await expect(pageA.locator(".split-peer-tile").first()).toBeVisible({ timeout: 10_000 });
+      // video tile — locks in that the same fix applied symmetrically. A
+      // sharer does not get the split for its own share by default, so this is
+      // the grid tile beside its own share tile.
+      await expect(pageA.locator('#grid-container [id^="peer-video-"]').first()).toBeVisible({
+        timeout: 10_000,
+      });
     } finally {
       await browserA.close().catch(() => undefined);
       await browserB.close().catch(() => undefined);

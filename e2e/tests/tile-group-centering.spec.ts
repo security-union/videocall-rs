@@ -25,8 +25,11 @@ const EPS = 1;
 
 const GRID = "#grid-container";
 const PEER_LIST = "#peer-list-container";
-/** Both in-flow tile kinds: remote/mock tiles and the self view when in grid. */
-const IN_FLOW_TILES = "#grid-container > .grid-item, #grid-container > .host";
+/** Both in-flow tile kinds: remote/mock tiles (inside the `display: contents`
+ *  peer panel since #2792, each in a `display: contents` slot since #2866) and
+ *  the self view when in grid. */
+const IN_FLOW_TILES =
+  "#grid-container > .ss-peer-panel > .tile-slot > .grid-item, #grid-container > .host";
 
 interface Rect {
   left: number;

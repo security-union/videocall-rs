@@ -14,7 +14,12 @@
 //! Meeting participant table queries.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+
+use crate::db::meetings::Activation;
+use videocall_meeting_types::presence::{
+    PRESENCE_CONNECT_WINDOW_SECS, PRESENCE_HEARTBEAT_INTERVAL_SECS, PRESENCE_LEASE_SECS,
+};
 
 /// Row returned from the `meeting_participants` table.
 #[derive(Debug, sqlx::FromRow)]
@@ -40,34 +45,20 @@ const PARTICIPANT_COLUMNS: &str = r#"
     joined_at, admitted_at, left_at, created_at, updated_at, display_name
 "#;
 
-/// Insert or update a participant as host (admitted immediately).
-///
-/// **Display-name reconciliation policy on rejoin:** when a row already exists
-/// for `(meeting_id, user_id)` with a non-empty `display_name`, the existing
-/// value is preserved — the request's `display_name` does NOT overwrite it.
-/// This is intentional: rejoin must never silently rename a participant.
-/// Mid-meeting renames go through the rate-limited
-/// [`crate::routes::participants::update_display_name`] endpoint.
-///
-/// The `NULLIF(..., '')` rewrites an empty-string existing value to `NULL` so
-/// the `COALESCE` falls through to the request's value — empty-string is
-/// treated as "no name set yet" (the legitimate first-time case where a
-/// follow-up rejoin should be allowed to fill it in).
-///
-/// See issue #502 for the bug this prevents (manually-typed name "Antonio"
-/// being silently overwritten by an OAuth-derived "Tony" on back-then-rejoin).
-pub async fn upsert_host(
-    pool: &PgPool,
+/// Insert or update a participant as host (admitted immediately). A rejoin never overwrites an existing non-empty `display_name`.
+pub async fn upsert_host<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
 ) -> Result<ParticipantRow, sqlx::Error> {
     let query = format!(
         r#"
-        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at)
-        VALUES ($1, $2, 'admitted', TRUE, FALSE, $3, NOW())
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at, live_session_id)
+        VALUES ($1, $2, 'admitted', TRUE, FALSE, $3, NOW(), 0)
         ON CONFLICT (meeting_id, user_id)
         DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
+                      live_session_id = 0,
                       display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -76,30 +67,61 @@ pub async fn upsert_host(
         .bind(meeting_id)
         .bind(user_id)
         .bind(display_name)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
 }
 
-/// Atomically join a meeting as an attendee, respecting the current `waiting_room_enabled`
-/// setting. Locks the meeting row with `FOR UPDATE` to serialize against concurrent
-/// waiting room toggles via `update_meeting_settings`.
-///
-/// When `check_host_gone_for` is `Some(creator_id)`, verifies within the same transaction
-/// that the host is still admitted. Returns `Ok(None)` if the host has left — callers
-/// should respond with a "joining not allowed" error. This closes the TOCTOU window
-/// that arises when the check is performed outside the transaction.
-///
-/// Returns `Ok(Some((auto_admitted, row, waiting_room_enabled)))` on success, where
-/// `auto_admitted` is `true` when the participant was immediately admitted (waiting room
-/// disabled). The third element is the `waiting_room_enabled` value observed under the
-/// row lock.
+/// Admit a co-host into an active meeting as host, bypassing the waiting room. `Ok(None)` if ineligible.
+pub async fn admit_as_co_host(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<Option<(ParticipantRow, bool)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let active: bool = sqlx::query_scalar(
+        "SELECT state IS NOT DISTINCT FROM 'active' FROM meetings WHERE id = $1 FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !active || !crate::db::co_hosts::has_live_entry(&mut *tx, meeting_id, user_id).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+
+    let (was_host, blocked): (bool, bool) = sqlx::query_as(
+        "SELECT p.is_host, \
+                COALESCE(p.is_guest \
+                    OR (p.status = 'kicked' AND p.left_at >= m.started_at) \
+                    OR (p.status = 'rejected' AND p.updated_at >= m.started_at), FALSE) \
+         FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
+         WHERE p.meeting_id = $1 AND p.user_id = $2 \
+         FOR UPDATE OF p",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or((false, false));
+    if blocked {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let row = upsert_host(&mut *tx, meeting_id, user_id, display_name).await?;
+    tx.commit().await?;
+    Ok(Some((row, !was_host)))
+}
+
+/// Atomically join a meeting as an attendee under the current `waiting_room_enabled`. `Ok(None)` if `require_present_host` and none is present.
 pub async fn join_attendee(
     pool: &PgPool,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
-    check_host_gone_for: Option<&str>,
+    require_present_host: bool,
     is_guest: bool,
+    healthy: bool,
 ) -> Result<Option<(bool, ParticipantRow, bool)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -110,46 +132,20 @@ pub async fn join_attendee(
             .fetch_one(&mut *tx)
             .await?;
 
-    // If requested, verify within the same transaction that the host has not left.
-    // Doing this outside the transaction creates a TOCTOU race: two concurrent
-    // requests can both pass the pre-transaction check, then both insert into a
-    // meeting where no one can admit them.
-    if let Some(creator_id) = check_host_gone_for {
-        let host_status: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2",
-        )
-        .bind(meeting_id)
-        .bind(creator_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let host_is_gone = host_status.map(|(s,)| s != "admitted").unwrap_or(true);
-        if host_is_gone {
-            tx.rollback().await?;
-            return Ok(None);
-        }
+    // Checked in-transaction to close a TOCTOU race.
+    if require_present_host && count_present_hosts(&mut *tx, meeting_id, healthy).await? == 0 {
+        tx.rollback().await?;
+        return Ok(None);
     }
 
-    // Display-name reconciliation policy on rejoin: see [`upsert_host`] for
-    // the rationale. The same `COALESCE(NULLIF(...), $3)` shape applies to
-    // both branches below — non-empty existing names beat the request's
-    // value so rejoin never silently renames a participant. Issue #502.
-    //
-    // Host-flag policy on rejoin: `is_host` is intentionally OMITTED from both
-    // `DO UPDATE SET` branches, so a transient transport reconnect (which does
-    // NOT call REST /leave) never silently demotes the current host. An
-    // EXPLICIT leave is different — `leave_meeting` clears the host flag
-    // before this rejoin runs, so a deliberate Leave + rejoin returns them as a
-    // regular participant. The waiting-room branch inserts `is_host = FALSE`
-    // only for a brand-new row; an existing flag is preserved here and
-    // governed solely by the leave path.
+    // `is_host` is omitted from both DO UPDATE branches so a reconnect never demotes a host.
     let row = if waiting_room_enabled {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name)
-            VALUES ($1, $2, 'waiting', FALSE, $4, $3)
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, live_session_id)
+            VALUES ($1, $2, 'waiting', FALSE, $4, $3, 0)
             ON CONFLICT (meeting_id, user_id)
-            DO UPDATE SET status = 'waiting', left_at = NULL,
+            DO UPDATE SET status = 'waiting', left_at = NULL, live_session_id = 0,
                           display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
@@ -164,10 +160,11 @@ pub async fn join_attendee(
     } else {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at)
-            VALUES ($1, $2, 'admitted', FALSE, $4, $3, NOW())
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at, live_session_id)
+            VALUES ($1, $2, 'admitted', FALSE, $4, $3, NOW(), 0)
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
+                          live_session_id = 0,
                           display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
@@ -214,8 +211,8 @@ pub async fn get_admitted(
 }
 
 /// Get a single participant's status.
-pub async fn get_status(
-    pool: &PgPool,
+pub async fn get_status<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
@@ -225,45 +222,73 @@ pub async fn get_status(
     sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
         .bind(user_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
-/// Admit a single participant.
+/// Admit a single waiting participant and activate the meeting. A designated
+/// co-host gets the host role only once their transport connects
+/// ([`record_present`]).
 pub async fn admit(
     pool: &PgPool,
     meeting_id: i32,
     user_id: &str,
-) -> Result<Option<ParticipantRow>, sqlx::Error> {
-    let query = format!(
-        r#"
-        UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = NOW()
-        WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
-        RETURNING {PARTICIPANT_COLUMNS}
-        "#
-    );
-    sqlx::query_as::<_, ParticipantRow>(&query)
-        .bind(meeting_id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
+    healthy: bool,
+) -> Result<Option<(ParticipantRow, Activation)>, sqlx::Error> {
+    let (mut rows, activation) = admit_waiting(pool, meeting_id, Some(user_id), healthy).await?;
+    Ok(rows.pop().map(|row| (row, activation)))
 }
 
-/// Admit all waiting participants at once.
-pub async fn admit_all(pool: &PgPool, meeting_id: i32) -> Result<Vec<ParticipantRow>, sqlx::Error> {
+/// Admit all waiting participants at once and, when any were, activate the
+/// meeting.
+pub async fn admit_all(
+    pool: &PgPool,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<(Vec<ParticipantRow>, Activation), sqlx::Error> {
+    admit_waiting(pool, meeting_id, None, healthy).await
+}
+
+async fn admit_waiting(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: Option<&str>,
+    healthy: bool,
+) -> Result<(Vec<ParticipantRow>, Activation), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM meetings WHERE id = $1 FOR UPDATE")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+    let anyone_waiting: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants \
+         WHERE meeting_id = $1 AND status = 'waiting' AND ($2::text IS NULL OR user_id = $2))",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !anyone_waiting {
+        tx.rollback().await?;
+        return Ok((Vec::new(), Activation::Unchanged));
+    }
+    // Before admitting: the admitted rows would make an empty meeting look occupied.
+    let activation = crate::db::meetings::start_instance_in(&mut tx, meeting_id, healthy).await?;
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = NOW()
-        WHERE meeting_id = $1 AND status = 'waiting'
+        SET status = 'admitted', admitted_at = NOW(), live_session_id = 0
+        WHERE meeting_id = $1 AND status = 'waiting' AND ($2::text IS NULL OR user_id = $2)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    let rows = sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .fetch_all(pool)
-        .await
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((rows, activation))
 }
 
 /// Reject a participant.
@@ -287,50 +312,111 @@ pub async fn reject(
         .await
 }
 
-/// Kick a participant (set status to 'kicked', record left_at).
-/// Only transitions from 'admitted' — ignores waiting/left/etc.
+/// Outcome of [`kick`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum KickOutcome {
+    /// The target was removed; `was_host` when they held the host role.
+    Kicked { was_host: bool },
+    /// The target has a row but it is not part of the current instance;
+    /// nothing changed.
+    NotAdmitted,
+    /// The target has no participant row.
+    NotFound,
+    /// The caller is not an admitted host.
+    CallerNotHost,
+    /// Only the owner may kick the owner, a host, or a designated co-host.
+    OwnerOnly,
+    /// A caller cannot kick themselves.
+    CannotKickSelf,
+}
+
+/// Kick `target` on behalf of `caller`: mark left, strip host, suspend any co-host entry this instance.
 pub async fn kick(
     pool: &PgPool,
     meeting_id: i32,
-    user_id: &str,
-) -> Result<Option<ParticipantRow>, sqlx::Error> {
-    let query = format!(
-        r#"
-        UPDATE meeting_participants
-        SET status = 'kicked', left_at = NOW()
-        WHERE meeting_id = $1 AND user_id = $2 AND status = 'admitted'
-        RETURNING {PARTICIPANT_COLUMNS}
-        "#
-    );
-    sqlx::query_as::<_, ParticipantRow>(&query)
-        .bind(meeting_id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
+    caller: &str,
+    target: &str,
+) -> Result<KickOutcome, sqlx::Error> {
+    if caller == target {
+        return Ok(KickOutcome::CannotKickSelf);
+    }
+    let mut tx = pool.begin().await?;
+    let (creator_id, started_at): (Option<String>, DateTime<Utc>) =
+        sqlx::query_as("SELECT creator_id, started_at FROM meetings WHERE id = $1 FOR UPDATE")
+            .bind(meeting_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let caller_is_host: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants \
+         WHERE meeting_id = $1 AND user_id = $2 AND status = 'admitted' AND is_host)",
+    )
+    .bind(meeting_id)
+    .bind(caller)
+    .fetch_one(&mut *tx)
+    .await?;
+    let target_row: Option<(String, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT status, is_host, admitted_at FROM meeting_participants \
+         WHERE meeting_id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .bind(target)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let outcome = match target_row {
+        _ if !caller_is_host => KickOutcome::CallerNotHost,
+        None => KickOutcome::NotFound,
+        Some((_, is_host, _))
+            if creator_id.as_deref() != Some(caller)
+                && (creator_id.as_deref() == Some(target)
+                    || is_host
+                    || crate::db::co_hosts::has_live_entry(&mut *tx, meeting_id, target)
+                        .await?) =>
+        {
+            KickOutcome::OwnerOnly
+        }
+        Some((ref status, _, admitted_at))
+            if status != "admitted"
+                && !(status == "left" && admitted_at.is_some_and(|a| a >= started_at)) =>
+        {
+            KickOutcome::NotAdmitted
+        }
+        Some((_, was_host, _)) => {
+            sqlx::query(
+                "UPDATE meeting_participants \
+                 SET status = 'kicked', left_at = NOW(), is_host = FALSE, live_session_id = 0 \
+                 WHERE meeting_id = $1 AND user_id = $2",
+            )
+            .bind(meeting_id)
+            .bind(target)
+            .execute(&mut *tx)
+            .await?;
+            crate::db::co_hosts::suspend(&mut *tx, meeting_id, target).await?;
+            KickOutcome::Kicked { was_host }
+        }
+    };
+    if matches!(outcome, KickOutcome::Kicked { .. }) {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(outcome)
 }
 
-/// Admit the creator on rejoin into an ALREADY-ACTIVE meeting WITHOUT changing
-/// `is_host`.
-///
-/// A transfer-host may have moved host to another participant; the creator
-/// rejoining mid-meeting must NOT reclaim it — the host stays the transfer
-/// target until the meeting ends. So unlike [`upsert_host`], this never sets
-/// `is_host = TRUE` on the existing row (the `DO UPDATE` omits `is_host`), it
-/// only re-admits the creator. The `INSERT` branch's `is_host = FALSE` is a
-/// safety default for the (not-expected) brand-new-row case. Mirrors the
-/// display-name reconciliation policy of [`upsert_host`] / [`join_attendee`].
-pub async fn admit_creator_preserve_host(
-    pool: &PgPool,
+/// Admit the creator on rejoin into an already-active meeting without changing `is_host` (a transfer target keeps it).
+pub async fn admit_creator_preserve_host<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
 ) -> Result<ParticipantRow, sqlx::Error> {
     let query = format!(
         r#"
-        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at)
-        VALUES ($1, $2, 'admitted', FALSE, FALSE, $3, NOW())
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at, live_session_id)
+        VALUES ($1, $2, 'admitted', FALSE, FALSE, $3, NOW(), 0)
         ON CONFLICT (meeting_id, user_id)
         DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
+                      live_session_id = 0,
                       display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -339,26 +425,11 @@ pub async fn admit_creator_preserve_host(
         .bind(meeting_id)
         .bind(user_id)
         .bind(display_name)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
 }
 
-/// Atomically transfer host from `from_user_id` to `to_user_id` (single-host
-/// model: host is handed off, not shared).
-///
-/// Demotes the caller and promotes the target in a single transaction, holding
-/// a row lock on the meeting so concurrent transfers can't produce two hosts.
-///
-/// Returns:
-/// - `Ok(Some(target_row))` on success;
-/// - `Ok(None)` when the caller is no longer the host (lost a concurrent race —
-///   the row lock + `is_host` guard make the loser a clean no-op) OR the target
-///   is not an admitted participant. In both cases nothing is committed, so the
-///   caller is never demoted without a valid successor and a second host can
-///   never be created.
-///
-/// Ordering: the caller is demoted BEFORE the target is promoted, so there is
-/// at most one `is_host` row at any instant.
+/// Atomically hand host from `from_user_id` to `to_user_id`. `Ok(None)` (no-op) if the caller lost the race or the target isn't admitted.
 pub async fn transfer_host(
     pool: &PgPool,
     meeting_id: i32,
@@ -367,19 +438,15 @@ pub async fn transfer_host(
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    // Serialize against concurrent transfers (and `join_attendee`, which locks
-    // the same row): two near-simultaneous transfers from the same host would
-    // otherwise both pass the pre-BEGIN `require_host` check and each promote a
-    // different target — split-brain with two hosts. The lock forces them to
-    // run one-at-a-time so the second sees the post-first state.
+    // Serializes concurrent transfers from the same host.
     sqlx::query("SELECT id FROM meetings WHERE id = $1 FOR UPDATE")
         .bind(meeting_id)
         .fetch_optional(&mut *tx)
         .await?;
 
-    // Demote the caller, but ONLY if they are still the host. A transfer that
+    // Demote the caller, but ONLY if they are still a host. A transfer that
     // lost the race finds the caller already demoted (`is_host = FALSE`) → zero
-    // rows → abort with `None`, so it never goes on to create a second host.
+    // rows → abort with `None`, so one host role is never handed out twice.
     let demoted = sqlx::query(
         "UPDATE meeting_participants SET is_host = FALSE, updated_at = NOW() \
          WHERE meeting_id = $1 AND user_id = $2 AND is_host = TRUE",
@@ -415,29 +482,485 @@ pub async fn transfer_host(
         return Ok(None);
     };
 
+    crate::db::co_hosts::suspend(&mut *tx, meeting_id, from_user_id).await?;
     tx.commit().await?;
     Ok(Some(target_row))
 }
 
-/// Demote every host that is NOT the meeting creator (single-host reset).
-///
-/// In the single-host model the creator is the default host; a transfer-host
-/// may move host to someone else for the current session. This resets to the
-/// creator: called on meeting end (so the next activation starts clean) and on
-/// the creator's (re)join (so the creator reclaims sole host, never coexisting
-/// with a stale transfer target). Idempotent. `IS DISTINCT FROM` is null-safe
-/// against a NULL `creator_id`.
-pub async fn clear_non_creator_hosts(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query(
+/// Demote every host that is NOT the meeting creator, at each instance
+/// boundary, returning the users demoted. Idempotent; `IS DISTINCT FROM` is
+/// null-safe against a NULL `creator_id`.
+pub async fn clear_non_creator_hosts<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
         "UPDATE meeting_participants mp SET is_host = FALSE, updated_at = NOW() \
          FROM meetings m \
          WHERE mp.meeting_id = $1 AND m.id = mp.meeting_id \
-           AND mp.is_host = TRUE AND mp.user_id IS DISTINCT FROM m.creator_id",
+           AND mp.is_host = TRUE AND mp.user_id IS DISTINCT FROM m.creator_id \
+         RETURNING mp.user_id",
     )
     .bind(meeting_id)
+    .fetch_all(executor)
+    .await
+}
+
+/// How a [`depart`] ended the meeting, if it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepartureEnd {
+    /// The last present host left with `end_on_host_leave`; clients must be
+    /// told (`MEETING_ENDED`).
+    LastHostLeft,
+    /// The last admitted participant left.
+    Empty,
+}
+
+/// Mark a participant left, ending or idling the meeting as appropriate. `Ok(None)` if not admitted or waiting.
+pub async fn depart(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    end_when_empty: bool,
+    healthy: bool,
+) -> Result<Option<(ParticipantRow, Option<DepartureEnd>)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let departed = depart_in(&mut tx, meeting_id, user_id, end_when_empty, false, healthy).await?;
+    tx.commit().await?;
+    Ok(departed)
+}
+
+/// `keep_live_session`: true only for a lease-expiry guess, so a later heartbeat can restore the row.
+async fn depart_in(
+    conn: &mut PgConnection,
+    meeting_id: i32,
+    user_id: &str,
+    end_when_empty: bool,
+    keep_live_session: bool,
+    healthy: bool,
+) -> Result<Option<(ParticipantRow, Option<DepartureEnd>)>, sqlx::Error> {
+    let (state, end_on_host_leave): (Option<String>, bool) =
+        sqlx::query_as("SELECT state, end_on_host_leave FROM meetings WHERE id = $1 FOR UPDATE")
+            .bind(meeting_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    let was_present: Option<bool> = sqlx::query_scalar(
+        "SELECT status = 'admitted' AND left_at IS NULL FROM meeting_participants \
+         WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(was_present) = was_present else {
+        return Ok(None);
+    };
+    let query = if keep_live_session {
+        format!(
+            r#"
+            UPDATE meeting_participants
+            SET status = 'left', left_at = NOW()
+            WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')
+            RETURNING {PARTICIPANT_COLUMNS}
+            "#
+        )
+    } else {
+        format!(
+            r#"
+            UPDATE meeting_participants
+            SET status = 'left', left_at = NOW(), live_session_id = 0
+            WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')
+            RETURNING {PARTICIPANT_COLUMNS}
+            "#
+        )
+    };
+    let row = sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+    let mut ended = None;
+    if state.as_deref() != Some(crate::db::meetings::STATE_ENDED) {
+        if row.is_host {
+            if was_present
+                && end_on_host_leave
+                && count_present_hosts(&mut *conn, meeting_id, healthy).await? == 0
+            {
+                ended = Some(DepartureEnd::LastHostLeft);
+            }
+        } else if end_when_empty && count_admitted(&mut *conn, meeting_id, healthy).await? == 0 {
+            ended = Some(DepartureEnd::Empty);
+        }
+    }
+    if ended.is_some() {
+        crate::db::meetings::end_meeting_in(conn, meeting_id).await?;
+    } else if state.as_deref() == Some(crate::db::meetings::STATE_ACTIVE)
+        && count_admitted(&mut *conn, meeting_id, healthy).await? == 0
+    {
+        sqlx::query("UPDATE meetings SET state = 'idle' WHERE id = $1")
+            .bind(meeting_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(Some((row, ended)))
+}
+
+/// Relay session ids a participant row remembers as left.
+const LEFT_SESSIONS_KEPT: i32 = 8;
+
+/// Apply a relay's report that `session_id` of `user_id` left. A stale or already-applied report departs nothing.
+pub async fn record_left(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    session_id: i64,
+    healthy: bool,
+) -> Result<Option<(ParticipantRow, Option<DepartureEnd>)>, sqlx::Error> {
+    // Cheap unlocked pre-check; re-checked for real under the lock below.
+    let maybe_relevant: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants \
+         WHERE meeting_id = $1 AND user_id = $2 AND status <> 'rejected' \
+           AND NOT ($3 = ANY (left_session_ids)))",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    if !maybe_relevant {
+        return Ok(None);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM meetings WHERE id = $1 FOR UPDATE")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+    let is_live: Option<bool> = sqlx::query_scalar(
+        "UPDATE meeting_participants \
+         SET left_session_ids = (ARRAY[$3::BIGINT] || left_session_ids)[1:$4] \
+         WHERE meeting_id = $1 AND user_id = $2 AND status <> 'rejected' \
+           AND NOT ($3 = ANY (left_session_ids)) \
+         RETURNING live_session_id IS NULL OR live_session_id = $3",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .bind(session_id)
+    .bind(LEFT_SESSIONS_KEPT)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let departed = if is_live == Some(true) {
+        depart_in(&mut tx, meeting_id, user_id, false, false, healthy).await?
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(departed)
+}
+
+/// What [`record_present`] changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Presence {
+    /// A left row was restored to present.
+    pub restored: bool,
+    /// The meeting went from idle back to active, within the same instance.
+    pub resumed: bool,
+    /// A designated, unsuspended co-host got the host role.
+    pub promoted: bool,
+}
+
+/// Apply a relay's report that `session_id` of `user_id` is present: restore/resume/promote as applicable.
+pub async fn record_present(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    session_id: i64,
+    healthy: bool,
+) -> Result<Presence, sqlx::Error> {
+    // Cheap unlocked pre-check; re-checked for real under the lock.
+    let maybe_relevant: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
+         WHERE p.meeting_id = $1 AND p.user_id = $2 AND p.admitted_at IS NOT NULL \
+           AND m.state IS DISTINCT FROM 'ended' \
+           AND NOT ($3 = ANY (p.left_session_ids)) \
+           AND ((p.status = 'admitted' AND p.live_session_id IS DISTINCT FROM $3) \
+                OR (p.status = 'left' AND p.admitted_at >= m.started_at)))",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    if !maybe_relevant {
+        return Ok(Presence::default());
+    }
+    let mut tx = pool.begin().await?;
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM meetings WHERE id = $1 FOR UPDATE")
+            .bind(meeting_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if state.as_deref() == Some(crate::db::meetings::STATE_ENDED) {
+        tx.rollback().await?;
+        return Ok(Presence::default());
+    }
+    let prior_status: Option<String> = sqlx::query_scalar(
+        "SELECT p.status FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
+         WHERE p.meeting_id = $1 AND p.user_id = $2 AND p.admitted_at IS NOT NULL \
+           AND NOT ($3 = ANY (p.left_session_ids)) \
+           AND ((p.status = 'admitted' AND p.live_session_id IS DISTINCT FROM $3) \
+                OR (p.status = 'left' AND p.admitted_at >= m.started_at)) \
+         FOR UPDATE OF p",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(prior_status) = prior_status else {
+        tx.rollback().await?;
+        return Ok(Presence::default());
+    };
+    sqlx::query(
+        "UPDATE meeting_participants \
+         SET live_session_id = $3, presence_seen_at = NOW(), status = 'admitted', left_at = NULL \
+         WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let resumed = state.as_deref() == Some(crate::db::meetings::STATE_IDLE)
+        && sqlx::query("UPDATE meetings SET state = 'active' WHERE id = $1 AND state = 'idle'")
+            .bind(meeting_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+    let active = resumed || state.as_deref() == Some(crate::db::meetings::STATE_ACTIVE);
+    let promoted = active
+        && !crate::db::co_hosts::promote_admitted(
+            &mut tx,
+            meeting_id,
+            &[user_id.to_string()],
+            healthy,
+        )
+        .await?
+        .is_empty();
+    tx.commit().await?;
+    Ok(Presence {
+        restored: prior_status == "left",
+        resumed,
+        promoted,
+    })
+}
+
+/// Renew the presence lease of each `(user_id, session_id)` a relay still holds: any non-tombstoned session renews an admitted row without changing `live_session_id`, so a `LEFT` for that exact session can still only match the session `record_present` actually recorded live. Also restores a matching `left` row. A `user_id` with two different session ids in one batch is dropped as ambiguous.
+pub async fn record_heartbeat(
+    pool: &PgPool,
+    room_id: &str,
+    sessions: &[(String, i64)],
+) -> Result<u64, sqlx::Error> {
+    let (user_ids, session_ids): (Vec<String>, Vec<i64>) = sessions.iter().cloned().unzip();
+    // Ascending-`id` lock order matches `start_instance_in`'s retire UPDATE,
+    // so the two can't deadlock; `SKIP LOCKED` is safe since a heartbeat is
+    // best-effort and retried next tick. The watermark upsert is folded into
+    // the same statement (one round trip); a data-modifying CTE always runs,
+    // but both are still referenced by the final SELECT to keep that explicit.
+    let (renewed,): (i64,) = sqlx::query_as(&format!(
+        "WITH hb AS ( \
+            SELECT user_id, MAX(session_id) AS session_id \
+            FROM UNNEST($2::TEXT[], $3::BIGINT[]) AS t(user_id, session_id) \
+            GROUP BY user_id \
+            HAVING COUNT(DISTINCT session_id) = 1 \
+         ), \
+         candidates AS ( \
+            SELECT mp.id, hb.session_id AS hb_session_id \
+            FROM hb \
+            JOIN meetings m ON m.room_id = $1 AND m.deleted_at IS NULL \
+            JOIN meeting_participants mp \
+                ON mp.meeting_id = m.id AND mp.user_id = hb.user_id \
+            WHERE m.state IS DISTINCT FROM 'ended' \
+              AND NOT (hb.session_id = ANY (mp.left_session_ids)) \
+              AND ( \
+                    (mp.status = 'admitted' AND mp.left_at IS NULL) \
+                 OR (mp.status = 'left' AND mp.admitted_at >= m.started_at \
+                     AND mp.live_session_id = hb.session_id) \
+              ) \
+            ORDER BY mp.id \
+            FOR UPDATE OF mp SKIP LOCKED \
+         ), \
+         renewed AS ( \
+            UPDATE meeting_participants mp \
+            SET presence_seen_at = NOW(), \
+                status = 'admitted', \
+                left_at = NULL, \
+                live_session_id = CASE WHEN mp.live_session_id IS NULL \
+                                       THEN candidates.hb_session_id ELSE mp.live_session_id END \
+            FROM candidates \
+            WHERE mp.id = candidates.id \
+            RETURNING 1 \
+         ), \
+         watermark AS ( \
+            INSERT INTO presence_heartbeat_watermark (id, updated_at) \
+            VALUES (TRUE, NOW()) \
+            ON CONFLICT (id) DO UPDATE SET updated_at = NOW() \
+            WHERE presence_heartbeat_watermark.updated_at \
+                  < NOW() - INTERVAL '{WATERMARK_STAMP_MIN_INTERVAL_SECS} seconds' \
+            RETURNING 1 \
+         ) \
+         SELECT (SELECT COUNT(*) FROM renewed)::BIGINT \
+         WHERE (SELECT COUNT(*) FROM watermark) IS NOT NULL"
+    ))
+    .bind(room_id)
+    .bind(&user_ids)
+    .bind(&session_ids)
+    .fetch_one(pool)
+    .await?;
+    Ok(renewed as u64)
+}
+
+/// Watermark staleness threshold for [`presence_healthy`]: two heartbeat
+/// intervals, so one missed beat does not itself trip the fallback.
+const WATERMARK_STALE_SECS: i64 = 2 * PRESENCE_HEARTBEAT_INTERVAL_SECS as i64;
+
+/// How rarely [`record_heartbeat`] actually writes the watermark row: far
+/// below [`WATERMARK_STALE_SECS`] (60s), so detection latency is unaffected,
+/// but well above single-digit-millisecond heartbeat traffic bursts.
+const WATERMARK_STAMP_MIN_INTERVAL_SECS: i64 = 10;
+
+/// Stamp proof that the NATS -> meeting-api -> Postgres pipeline is alive
+/// right now, unconditionally. One singleton row shared by every replica.
+/// Test-only: production stamps go through [`record_heartbeat`]'s own gated
+/// upsert instead.
+#[doc(hidden)]
+pub async fn force_heartbeat_watermark_fresh_for_test(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO presence_heartbeat_watermark (id, updated_at) VALUES (TRUE, NOW()) \
+         ON CONFLICT (id) DO UPDATE SET updated_at = NOW()",
+    )
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Whether a presence heartbeat has reached the database within
+/// [`WATERMARK_STALE_SECS`]. `false` when the row has never been written.
+/// `pub(crate)`: [`crate::state::AppState`] caches this half of the health
+/// check for a short TTL, since the REST call sites are far more frequent
+/// than the watermark actually changes.
+pub(crate) async fn heartbeat_watermark_fresh<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+) -> Result<bool, sqlx::Error> {
+    let updated_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT updated_at FROM presence_heartbeat_watermark WHERE id = TRUE")
+            .fetch_optional(executor)
+            .await?;
+    Ok(
+        updated_at
+            .is_some_and(|t| Utc::now() - t < chrono::Duration::seconds(WATERMARK_STALE_SECS)),
+    )
+}
+
+/// Whether this replica's own NATS client reports `Connected`. Vacuously
+/// `true` with no client (nothing local to check; the watermark still gates).
+/// `pub(crate)`: always checked live, never cached — see
+/// [`heartbeat_watermark_fresh`].
+pub(crate) fn nats_locally_connected(nats: Option<&async_nats::Client>) -> bool {
+    nats.map(|c| c.connection_state() == async_nats::connection::State::Connected)
+        .unwrap_or(true)
+}
+
+/// Whether the presence-lease pipeline is healthy enough to trust for a
+/// "nobody present" decision: a heartbeat reached the database recently AND
+/// this replica's NATS connection is up. `false` degrades [`present_sql`] to
+/// latch semantics and tells the sweeper to skip its tick.
+pub async fn presence_healthy(
+    pool: &PgPool,
+    nats: Option<&async_nats::Client>,
+) -> Result<bool, sqlx::Error> {
+    Ok(nats_locally_connected(nats) && heartbeat_watermark_fresh(pool).await?)
+}
+
+/// SQL condition that row alias `p` is present: a lease check when `healthy`, else latch semantics.
+pub fn present_sql(p: &str, healthy: bool) -> String {
+    if !healthy {
+        return format!("({p}.status = 'admitted' AND {p}.left_at IS NULL)");
+    }
+    format!(
+        "({p}.status = 'admitted' AND {p}.left_at IS NULL \
+          AND (({p}.presence_seen_at IS NOT NULL \
+                AND {p}.presence_seen_at > NOW() - INTERVAL '{PRESENCE_LEASE_SECS} seconds') \
+               OR (COALESCE({p}.live_session_id, 0) = 0 \
+                   AND {p}.admitted_at > NOW() - INTERVAL '{PRESENCE_CONNECT_WINDOW_SECS} seconds')))"
+    )
+}
+
+/// Whether anyone is present (see [`present_sql`]) in the meeting.
+pub async fn any_present<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants p \
+         WHERE p.meeting_id = $1 AND {})",
+        present_sql("p", healthy)
+    ))
+    .bind(meeting_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// Up to `limit` admitted rows whose presence lease ran out, as
+/// `(meeting_id, room_id, user_id)`. Always strict — callers only reach this
+/// after confirming the pipeline is healthy (see [`presence_healthy`]).
+pub async fn expired_presences(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(i32, String, String)>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT p.meeting_id, m.room_id, p.user_id \
+         FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
+         WHERE p.status = 'admitted' AND p.left_at IS NULL AND NOT {} \
+         LIMIT $1",
+        present_sql("p", true)
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Depart a participant whose lease ran out; keeps `live_session_id` since this is a guess, not a confirmed departure.
+pub async fn depart_expired(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<Option<(ParticipantRow, Option<DepartureEnd>)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM meetings WHERE id = $1 FOR UPDATE")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+    let expired: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants p \
+         WHERE p.meeting_id = $1 AND p.user_id = $2 \
+           AND p.status = 'admitted' AND p.left_at IS NULL AND NOT {})",
+        present_sql("p", true)
+    ))
+    .bind(meeting_id)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let departed = if expired {
+        depart_in(&mut tx, meeting_id, user_id, false, true, true).await?
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(departed)
 }
 
 /// Leave a meeting (set status to 'left').
@@ -449,7 +972,7 @@ pub async fn leave(
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'left', left_at = NOW()
+        SET status = 'left', left_at = NOW(), live_session_id = 0
         WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -459,6 +982,24 @@ pub async fn leave(
         .bind(user_id)
         .fetch_optional(pool)
         .await
+}
+
+/// Renew the caller's own presence lease directly (pre-join lobby, no live transport session). Returns whether a row matched.
+pub async fn keepalive(pool: &PgPool, meeting_id: i32, user_id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE meeting_participants mp \
+         SET presence_seen_at = NOW() \
+         FROM meetings m \
+         WHERE m.id = mp.meeting_id AND mp.meeting_id = $1 AND mp.user_id = $2 \
+           AND mp.status = 'admitted' AND mp.left_at IS NULL \
+           AND COALESCE(mp.live_session_id, 0) = 0 \
+           AND m.state IS DISTINCT FROM 'ended'",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Update a participant's display name.
@@ -484,20 +1025,7 @@ pub async fn update_display_name(
         .await
 }
 
-/// Load the participant roster for a SearchV2 index push.
-///
-/// Returns one row per `admitted` or `waiting` participant.  We include
-/// `waiting` users so they become searchable as soon as they enter the
-/// waiting room — they're already visible to Postgres-side searches via
-/// [`crate::db::meetings::list_by_owner`], which JOINs on any participant
-/// row regardless of status.
-///
-/// Shape is mapped into [`crate::search::ParticipantAcl`], which is the
-/// minimal subset needed for both the top-level `participants` / `acls`
-/// arrays and the richer `documentObject.participants` entries.
-///
-/// Ordering: host first (for stable creator-first ACL lists), then by
-/// admission time to keep doc diffs predictable as the roster evolves.
+/// Load the participant roster (admitted or waiting) for a SearchV2 index push, host first.
 pub async fn list_for_search(
     pool: &PgPool,
     meeting_id: i32,
@@ -543,44 +1071,63 @@ pub async fn list_for_search(
         .collect())
 }
 
-/// Count admitted participants who are CURRENTLY present in a meeting.
-///
-/// "Present" is `status = 'admitted' AND left_at IS NULL` — the same predicate
-/// the presence-driven idle transition uses (`db::meetings::set_idle`). The
-/// `left_at IS NULL` guard is what makes the meeting-settings "Activity"
-/// participant count reflect who is currently in the meeting rather than every
-/// participant who was ever admitted (issue #1551): an explicit REST `/leave`
-/// sets `left_at=NOW()` and a transport disconnect is marked left by the
-/// `PARTICIPANT_LEFT` NATS consumer ([`mark_left_by_disconnect`]), so both kinds
-/// of departure drop out of the count. The guard is also defense-in-depth — a
-/// row whose `left_at` was set but whose `status` somehow lagged at `'admitted'`
-/// is still excluded.
-pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM meeting_participants \
-         WHERE meeting_id = $1 AND status = 'admitted' AND left_at IS NULL",
-    )
+/// Count participants who are CURRENTLY present in a meeting (see
+/// [`present_sql`]): the meeting-settings "Activity" count (issue #1551). An
+/// explicit REST `/leave` and a transport departure both set `left_at`, and a
+/// participant whose relay stopped reporting them drops out when the lease
+/// runs out.
+pub async fn count_admitted<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM meeting_participants p WHERE p.meeting_id = $1 AND {}",
+        present_sql("p", healthy)
+    ))
     .bind(meeting_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.0)
+    .fetch_one(executor)
+    .await
 }
 
-/// Count participants still in the waiting room.
-///
-/// Mirrors [`count_admitted`]'s SQL shape: `status = 'waiting' AND left_at IS
-/// NULL`, so a waiter who EXPLICITLY left (REST `/leave`, which sets
-/// `left_at=NOW()`) is no longer counted as waiting. Unlike the admitted count,
-/// the `left_at IS NULL` guard does NOT heal a waiter who merely *transport-*
-/// disconnected: a waiting-room participant connects to the relay as an
-/// `observer` session, and the relay's observer-disconnect path returns BEFORE
-/// the [`PARTICIPANT_LEFT_SUBJECT`](crate::nats_events::PARTICIPANT_LEFT_SUBJECT)
-/// publish — so [`mark_left_by_disconnect`] never fires for a dropped waiter,
-/// who therefore keeps `status='waiting', left_at IS NULL` until they explicitly
-/// leave or are admitted/rejected. This is an accepted known limitation: issue
-/// #1551 is about the admitted participant count, where the relay publishes the
-/// disconnect event; the waiting count is left as the explicit-leave-only
-/// behavior it had before.
+/// Whether `user_id` is a present (see [`present_sql`]) host of the meeting.
+/// Used to authorize a transfer-host target — who holds `is_host` but no
+/// `meeting_co_hosts` entry — to change meeting options (issue #2702 round
+/// 10).
+pub async fn is_present_host<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+    user_id: &str,
+    healthy: bool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants p \
+         WHERE p.meeting_id = $1 AND p.user_id = $2 AND p.is_host AND {})",
+        present_sql("p", healthy)
+    ))
+    .bind(meeting_id)
+    .bind(user_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// Count present participants (see [`present_sql`]) holding the host role.
+pub async fn count_present_hosts<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM meeting_participants p \
+         WHERE p.meeting_id = $1 AND p.is_host AND {}",
+        present_sql("p", healthy)
+    ))
+    .bind(meeting_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// Count participants still in the waiting room (explicit-leave-only; a transport disconnect does not un-count them).
 pub async fn count_waiting(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM meeting_participants \
@@ -590,110 +1137,6 @@ pub async fn count_waiting(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::
     .fetch_one(pool)
     .await?;
     Ok(row.0)
-}
-
-/// Mark a participant `status='left', left_at=NOW()` in response to a transport
-/// disconnect observed by `actix-api` (the `PARTICIPANT_LEFT` NATS event).
-///
-/// This is the backstop for ABNORMAL disconnects — a participant who closed
-/// their tab, dropped their network, or crashed WITHOUT calling the REST
-/// `/leave` endpoint. Normal navigation still goes through REST `/leave`
-/// (`leave`); this keeps the DB roster correct when that beacon never fires.
-///
-/// # Idempotency / reconnect-safety
-///
-/// The `WHERE … status IN ('admitted', 'waiting')` guard makes this a safe
-/// no-op when the participant is already `'left'` / `'kicked'` / `'rejected'`,
-/// or has no row at all (e.g. they only ever observed the waiting room). A
-/// duplicate event (NATS redelivery, multi-replica fan-out) therefore matches
-/// zero rows and does not overwrite the original `left_at`.
-///
-/// The dangerous case is the reconnect race: this UPDATE is keyed by `user_id`,
-/// and a rejoined participant is back at `status='admitted', left_at=NULL` — so
-/// the `status IN (...)` guard alone does NOT stop a late event from re-marking
-/// a now-present participant left. That race is closed UPSTREAM, on the relay,
-/// not here. The relay only publishes `PARTICIPANT_LEFT` after the
-/// `RECONNECT_GRACE_PERIOD` (a timely transport reconnect cancels the pending
-/// departure before `leave_rooms` runs), AND it suppresses the publish entirely
-/// when the departing user still has any live session in the room
-/// (`user_has_remaining_session` / `user_still_present` in
-/// `chat_server.rs::leave_rooms`) — including a different tab that rejoined after
-/// the grace expired. So by the time this UPDATE runs, the relay has confirmed
-/// the user has no present session. This function deliberately does NOT add a
-/// `left_at IS NULL` predicate: a freshly-rejoined row has `left_at IS NULL` and
-/// would still match, so such a predicate would give false safety; the real
-/// guarantee is the relay-side presence check above.
-///
-/// Returns the number of rows updated (0 when the participant was already left,
-/// already kicked/rejected, or has no row for this meeting).
-pub async fn mark_left_by_disconnect(
-    pool: &PgPool,
-    meeting_id: i32,
-    user_id: &str,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE meeting_participants \
-         SET status = 'left', left_at = NOW() \
-         WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')",
-    )
-    .bind(meeting_id)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-/// Restore a previously-admitted participant to `status='admitted', left_at=NULL`
-/// in response to a transport (re)connect observed by `actix-api` (the
-/// `PARTICIPANT_PRESENT` NATS event, issue #1628).
-///
-/// This is the symmetric counterpart to [`mark_left_by_disconnect`]: it heals a
-/// participant whose row was marked `left` by an abnormal disconnect (closed tab
-/// / network drop / >grace transport drop) and who then reconnected over the
-/// TRANSPORT without re-hitting the REST `/join` endpoint. Without it, such a
-/// participant stays `status='left'` (and `participant_count == 0`) even though
-/// they are present in the relay's authoritative `room_members`, leaving the
-/// meeting stuck `idle` with people in it.
-///
-/// # Privilege-escalation safety (load-bearing WHERE clause)
-///
-/// The guard is `status = 'left' AND admitted_at IS NOT NULL`:
-///
-/// - `admitted_at IS NOT NULL` means this user was admitted to the meeting at
-///   some prior point. We NEVER promote a `waiting`, `rejected`, or `kicked`
-///   row to `admitted` — those are admission-control / moderation states that
-///   only the host (via the waiting-room admit / REST path) may change. A relay
-///   `PARTICIPANT_PRESENT` event is, by construction, for a session in
-///   `room_members` (waiters connect as observer sessions and are excluded), but
-///   we still guard defensively so a spurious or forged event can never bypass
-///   the waiting room or un-kick a removed participant.
-/// - `status = 'left'` scopes the heal to exactly the disconnect-marked rows.
-///   An already-present `admitted` row (`status='admitted'`) is left untouched —
-///   we do NOT clobber its `admitted_at`/`left_at`, so a duplicate or redelivered
-///   event is a zero-row no-op and the original admission timestamp is preserved.
-///
-/// We deliberately do NOT touch `admitted_at`: the participant's ORIGINAL
-/// admission time is the stable "first admitted" signal the feed ordering and
-/// the `ever_admitted` flag depend on; only `left_at` is cleared.
-///
-/// Returns the number of rows updated (0 when the participant was already
-/// present, never admitted, kicked/rejected, or has no row for this meeting).
-pub async fn mark_present_by_connect(
-    pool: &PgPool,
-    meeting_id: i32,
-    user_id: &str,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE meeting_participants \
-         SET status = 'admitted', left_at = NULL \
-         WHERE meeting_id = $1 AND user_id = $2 \
-           AND status = 'left' AND admitted_at IS NOT NULL",
-    )
-    .bind(meeting_id)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 // -- Conversions to API response types --

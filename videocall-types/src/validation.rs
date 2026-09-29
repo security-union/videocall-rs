@@ -111,10 +111,85 @@ pub fn is_guid_like(s: &str) -> bool {
     })
 }
 
-/// Returns `true` iff the supplied string is non-empty and contains only
-/// ASCII alphanumerics and underscores. Used for meeting ID validation.
+/// Maximum length of a meeting ID, in bytes.
+pub const MEETING_ID_MAX_LEN: usize = 255;
+
+/// Human-readable description of the characters [`is_allowed_meeting_id_char`] accepts.
+pub const MEETING_ID_ALLOWED_CHARS: &str =
+    "letters (a-z, A-Z), numbers (0-9), underscores (_), hyphens (-) and tildes (~)";
+
+/// Returns `true` for the characters a meeting ID may contain: ASCII letters,
+/// ASCII digits, `_`, `-` and `~`.
+pub fn is_allowed_meeting_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '~')
+}
+
+/// Why [`validate_meeting_id`] rejected a meeting ID.
+///
+/// `Display` renders a predicate meant to follow a subject: `"Meeting ID {err}"`
+/// reads "Meeting ID cannot be empty".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeetingIdError {
+    /// The ID is empty.
+    Empty,
+    /// Every character is allowed, but there are more than [`MEETING_ID_MAX_LEN`] of them.
+    TooLong,
+    /// The disallowed characters, each listed once, in order of first appearance.
+    InvalidChars(Vec<char>),
+}
+
+impl std::fmt::Display for MeetingIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MeetingIdError::Empty => write!(f, "cannot be empty"),
+            MeetingIdError::TooLong => write!(f, "cannot exceed {MEETING_ID_MAX_LEN} characters"),
+            MeetingIdError::InvalidChars(chars) => {
+                let listed: Vec<String> = chars.iter().map(|c| format!("{c:?}")).collect();
+                write!(
+                    f,
+                    "contains characters that are not allowed ({}); use only {MEETING_ID_ALLOWED_CHARS}",
+                    listed.join(", ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MeetingIdError {}
+
+/// Validates a meeting ID exactly as given; it is never trimmed or rewritten.
+///
+/// A valid ID is 1 to [`MEETING_ID_MAX_LEN`] bytes, every character of which
+/// satisfies [`is_allowed_meeting_id_char`]. Disallowed characters are reported
+/// ahead of the length.
+pub fn validate_meeting_id(id: &str) -> Result<(), MeetingIdError> {
+    if id.is_empty() {
+        return Err(MeetingIdError::Empty);
+    }
+    let mut invalid: Vec<char> = Vec::new();
+    // `take` bounds the dedup on over-long input; an ID within the limit has
+    // at most MEETING_ID_MAX_LEN characters, so none are dropped.
+    for c in id
+        .chars()
+        .filter(|c| !is_allowed_meeting_id_char(*c))
+        .take(MEETING_ID_MAX_LEN)
+    {
+        if !invalid.contains(&c) {
+            invalid.push(c);
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(MeetingIdError::InvalidChars(invalid));
+    }
+    if id.len() > MEETING_ID_MAX_LEN {
+        return Err(MeetingIdError::TooLong);
+    }
+    Ok(())
+}
+
+/// Returns `true` iff [`validate_meeting_id`] accepts `id`.
 pub fn is_valid_meeting_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    validate_meeting_id(id).is_ok()
 }
 
 #[cfg(test)]
@@ -193,12 +268,123 @@ mod tests {
 
     #[test]
     fn test_is_valid_meeting_id() {
-        assert!(is_valid_meeting_id("abc123"));
-        assert!(is_valid_meeting_id("meeting_1"));
-        assert!(is_valid_meeting_id("A"));
-        assert!(!is_valid_meeting_id(""));
-        assert!(!is_valid_meeting_id("meeting-1"));
-        assert!(!is_valid_meeting_id("meeting id"));
-        assert!(!is_valid_meeting_id("user@name"));
+        for ok in [
+            "abc123",
+            "meeting_1",
+            "A",
+            "meeting-1",
+            "my-meeting",
+            "a~b",
+            "~",
+            "-",
+            "_",
+            "Mixed_Case-9~x",
+        ] {
+            assert!(is_valid_meeting_id(ok), "{ok:?} should be valid");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a.b",
+            "meeting id",
+            " a",
+            "a ",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a%20b",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a*b",
+            "a>b",
+            "a+b",
+            "a&b",
+            "a=b",
+            "a;b",
+            "a$b",
+            "a'b",
+            "a(b)",
+            "a!b",
+            "a,b",
+            "a:b",
+            "user@name",
+            "caf\u{e9}",
+            "\u{455}ecret",
+            "a\u{202e}b",
+            "\u{ff41}",
+        ] {
+            assert!(!is_valid_meeting_id(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn test_is_allowed_meeting_id_char() {
+        for c in ['a', 'z', 'A', 'Z', '0', '9', '_', '-', '~'] {
+            assert!(is_allowed_meeting_id_char(c), "{c:?} should be allowed");
+        }
+        for c in ['.', ' ', '%', '/', '*', '>', '+', '@', '\u{e9}', '\u{663}'] {
+            assert!(!is_allowed_meeting_id_char(c), "{c:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_validate_meeting_id_length_limit() {
+        assert_eq!(validate_meeting_id(""), Err(MeetingIdError::Empty));
+        assert_eq!(validate_meeting_id(&"a".repeat(255)), Ok(()));
+        assert_eq!(
+            validate_meeting_id(&"a".repeat(256)),
+            Err(MeetingIdError::TooLong)
+        );
+    }
+
+    #[test]
+    fn test_validate_meeting_id_reports_invalid_chars_ahead_of_length() {
+        assert_eq!(
+            validate_meeting_id(&"\u{e9}".repeat(130)),
+            Err(MeetingIdError::InvalidChars(vec!['\u{e9}']))
+        );
+        assert_eq!(
+            validate_meeting_id(&format!("{}.", "a".repeat(300))),
+            Err(MeetingIdError::InvalidChars(vec!['.']))
+        );
+    }
+
+    #[test]
+    fn test_validate_meeting_id_bounds_the_listed_chars_on_overlong_input() {
+        let distinct: String = ('\u{4e00}'..).take(1000).collect();
+        let Err(MeetingIdError::InvalidChars(chars)) = validate_meeting_id(&distinct) else {
+            panic!("1000 distinct CJK characters must be InvalidChars");
+        };
+        assert_eq!(chars.len(), MEETING_ID_MAX_LEN);
+        assert_eq!(chars[0], '\u{4e00}');
+    }
+
+    #[test]
+    fn test_validate_meeting_id_lists_invalid_chars_once_in_order() {
+        assert_eq!(
+            validate_meeting_id("a.b c.d e"),
+            Err(MeetingIdError::InvalidChars(vec!['.', ' ']))
+        );
+        assert_eq!(
+            validate_meeting_id(".."),
+            Err(MeetingIdError::InvalidChars(vec!['.']))
+        );
+    }
+
+    #[test]
+    fn test_meeting_id_error_display() {
+        assert_eq!(MeetingIdError::Empty.to_string(), "cannot be empty");
+        assert_eq!(
+            MeetingIdError::TooLong.to_string(),
+            "cannot exceed 255 characters"
+        );
+        assert_eq!(
+            validate_meeting_id("a.b\nc").unwrap_err().to_string(),
+            "contains characters that are not allowed ('.', '\\n'); \
+             use only letters (a-z, A-Z), numbers (0-9), underscores (_), \
+             hyphens (-) and tildes (~)"
+        );
     }
 }

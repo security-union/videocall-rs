@@ -78,24 +78,25 @@ use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_DATAGRAM_LOSS_PER_SEC, AUDIO_DATAGRAM_RAW_LOSS_PER_SEC,
     AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_CHARGING, BATTERY_LEVEL,
-    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
-    CLIENT_AGENT_MEMORY_BYTES, CLIENT_AUDIO_CONCEALMENT_PCT, CLIENT_CPU_THROTTLED,
-    CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
-    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_NETWORK_DOWNLINK_MAX,
-    CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
-    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
-    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
-    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
-    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL,
-    ENCODER_LAYER_HEIGHT, ENCODER_LAYER_OUTPUT_FPS, ENCODER_LAYER_PIXELS, ENCODER_LAYER_PIXEL_RATE,
-    ENCODER_LAYER_WIDTH, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL,
-    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
-    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
-    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
-    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
-    NON_FINITE_SAMPLES_DROPPED_TOTAL, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER, RTT_PROBE_DROPPED_TOTAL,
+    CALL_QUALITY_SCORE, CAMERA_WS_STALE_DELTA_DROPS_TOTAL, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_AUDIO_CONCEALMENT_PCT,
+    CLIENT_CPU_THROTTLED, CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS, CLIENT_INFO,
+    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    CLIENT_NETWORK_DOWNLINK_MAX, CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
+    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP,
+    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
+    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS,
+    ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL, ENCODER_LAYER_HEIGHT, ENCODER_LAYER_OUTPUT_FPS,
+    ENCODER_LAYER_PIXELS, ENCODER_LAYER_PIXEL_RATE, ENCODER_LAYER_WIDTH, ENCODER_OUTPUT_FPS,
+    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    INBOUND_UNISTREAM_RESETS_TOTAL, KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL,
+    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
+    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
+    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, NON_FINITE_SAMPLES_DROPPED_TOTAL,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    RECEIVED_LAYER, RELIABLE_LANE_STALL_EPISODES_TOTAL, RTT_PROBE_DROPPED_TOTAL,
     RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS, SCREEN_ENCODER_OUTPUT_FPS,
     SCREEN_ENCODER_STALL_EPISODES, SCREEN_KEYFRAME_REQUESTS_PER_SEC, SCREEN_SHARING_ACTIVE,
     SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS,
@@ -106,19 +107,19 @@ use sec_api::metrics::{
     SCREEN_VIDEO_MAX_DECODE_GAP_MS, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
     SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS, SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS,
     SCREEN_VIDEO_SEQ_LOSS_PER_SEC, SCREEN_VIDEO_SEQ_MAX_GAP, SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL,
-    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL,
-    UNISTREAM_BYTES_DRAINED_TOTAL, UNISTREAM_BYTES_OFFERED_TOTAL,
-    UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO, VIDEO_BITRATE_KBPS,
-    VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FPS_DECODER_OUTPUT, VIDEO_FRAMES_DROPPED,
-    VIDEO_FRAMES_EMITTED_TOTAL, VIDEO_FREEZE_EPISODES_TOTAL, VIDEO_FREEZE_SECONDS_TOTAL,
-    VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL, VIDEO_FRESHNESS_EVICTIONS_TOTAL,
-    VIDEO_KEYFRAME_ARRIVALS_TOTAL, VIDEO_MAX_CONTENT_STALENESS_MS, VIDEO_MAX_DECODE_GAP_MS,
-    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SEQ_MAX_GAP, VIDEO_SKIP_TO_LIVE_TOTAL,
-    WEBSOCKET_DROPPED_BYTES_BY_STREAM, WEBSOCKET_DROPS, WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM,
-    WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE, WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM,
-    WEBSOCKET_OFFERED_BYTES_BY_STREAM, WT_INCOMING_DATAGRAM_HIGH_WATER_MARK,
-    WT_INCOMING_DATAGRAM_MAX_AGE_MS,
+    SCREEN_WS_STALE_DELTA_DROPS_TOTAL, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL, UNISTREAM_BYTES_DRAINED_TOTAL,
+    UNISTREAM_BYTES_OFFERED_TOTAL, UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO,
+    VIDEO_BITRATE_KBPS, VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FPS_DECODER_OUTPUT,
+    VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_EMITTED_TOTAL, VIDEO_FREEZE_EPISODES_TOTAL,
+    VIDEO_FREEZE_SECONDS_TOTAL, VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL,
+    VIDEO_FRESHNESS_EVICTIONS_TOTAL, VIDEO_KEYFRAME_ARRIVALS_TOTAL, VIDEO_MAX_CONTENT_STALENESS_MS,
+    VIDEO_MAX_DECODE_GAP_MS, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
+    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SEQ_MAX_GAP,
+    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPPED_BYTES_BY_STREAM, WEBSOCKET_DROPS,
+    WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM, WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE,
+    WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM, WEBSOCKET_OFFERED_BYTES_BY_STREAM,
+    WT_INCOMING_DATAGRAM_HIGH_WATER_MARK, WT_INCOMING_DATAGRAM_MAX_AGE_MS,
 };
 
 async fn metrics_handler(
@@ -305,6 +306,8 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = UNISTREAM_BYTES_OFFERED_TOTAL.remove_label_values(&reporter_labels);
     let _ = UNISTREAM_BYTES_DRAINED_TOTAL.remove_label_values(&reporter_labels);
     let _ = UNISTREAM_STALE_DELTA_DROPS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = CAMERA_WS_STALE_DELTA_DROPS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = SCREEN_WS_STALE_DELTA_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     for label in WS_STREAM_LABELS {
         let stream_labels = [
@@ -349,6 +352,8 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     // session_id label leaves no residual series on disconnect.
     let _ = RTT_PROBE_DROPPED_TOTAL.remove_label_values(&reporter_labels);
     let _ = RTT_PROBE_STALE_SUPPRESSIONS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = RELIABLE_LANE_STALL_EPISODES_TOTAL.remove_label_values(&reporter_labels);
+    let _ = INBOUND_UNISTREAM_RESETS_TOTAL.remove_label_values(&reporter_labels);
     let _ = ENCODER_QUEUE_DEPTH.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
@@ -1291,6 +1296,16 @@ fn process_health_packet_to_metrics_pb(
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }
+        if let Some(drops) = health_packet.camera_ws_stale_delta_drops {
+            CAMERA_WS_STALE_DELTA_DROPS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
+        }
+        if let Some(drops) = health_packet.screen_ws_stale_delta_drops {
+            SCREEN_WS_STALE_DELTA_DROPS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
+        }
         if let Some(drops) = health_packet.websocket_drops_total {
             WEBSOCKET_DROPS
                 .with_label_values(&reporter_labels)
@@ -1387,6 +1402,16 @@ fn process_health_packet_to_metrics_pb(
             RTT_PROBE_STALE_SUPPRESSIONS_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(suppressions as f64);
+        }
+        if let Some(episodes) = health_packet.reliable_lane_stall_episodes_total {
+            RELIABLE_LANE_STALL_EPISODES_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(episodes as f64);
+        }
+        if let Some(resets) = health_packet.inbound_unistream_resets_total {
+            INBOUND_UNISTREAM_RESETS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(resets as f64);
         }
 
         // Encoder decision inputs (P0). NOTE(#1184): encoder_fps_ratio removed
@@ -5904,6 +5929,8 @@ mod tests {
         // #1737 Phase 1: the stale-delta-drops gauge shares the same reporter
         // labels and reap path.
         packet.unistream_stale_delta_drops_total = Some(37);
+        packet.camera_ws_stale_delta_drops = Some(41);
+        packet.screen_ws_stale_delta_drops = Some(7);
         packet.camera_layer_geometry = vec![camera_geometry(0, 320, 180, Some(7))];
         let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
@@ -5942,6 +5969,17 @@ mod tests {
             "videocall_unistream_stale_delta_drops_total",
             &unistream_reporter_labels,
         ));
+        let ws_stale_series = [
+            ("videocall_camera_ws_stale_delta_drops_total", 41.0),
+            ("videocall_screen_ws_stale_delta_drops_total", 7.0),
+        ];
+        for (metric, expected) in ws_stale_series {
+            assert_eq!(
+                series_value(metric, &unistream_reporter_labels),
+                Some(expected),
+                "{metric}"
+            );
+        }
 
         // #1580: peer_info must also be reaped by remove_session_metrics. Its
         // key is (meeting_id, session_id, peer_id=reporting_user_id,
@@ -6016,6 +6054,12 @@ mod tests {
             ),
             "unistream_stale_delta_drops_total must be reaped by remove_session_metrics (#1737)"
         );
+        for (metric, _) in ws_stale_series {
+            assert!(
+                !series_exists(metric, &unistream_reporter_labels),
+                "{metric} must be reaped by remove_session_metrics"
+            );
+        }
         assert!(
             camera_layer_series
                 .iter()
@@ -6036,6 +6080,8 @@ mod tests {
             create_test_health_packet("session_rtt522", "meeting_rtt522", "probeuser", peer_stats);
         packet.rtt_probe_dropped_total = Some(7);
         packet.rtt_probe_stale_suppressions_total = Some(3);
+        packet.reliable_lane_stall_episodes_total = Some(4);
+        packet.inbound_unistream_resets_total = Some(6);
 
         let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
@@ -6076,6 +6122,14 @@ mod tests {
             "videocall_rtt_probe_stale_suppressions_total",
             &suppressions_labels,
         ));
+        assert!(series_exists(
+            "videocall_reliable_lane_stall_episodes_total",
+            &suppressions_labels,
+        ));
+        assert!(series_exists(
+            "videocall_inbound_unistream_resets_total",
+            &suppressions_labels,
+        ));
         assert_eq!(
             gauge_value("videocall_rtt_probe_dropped_total", &dropped_labels),
             Some(7.0),
@@ -6087,8 +6141,25 @@ mod tests {
             ),
             Some(3.0),
         );
+        assert_eq!(
+            gauge_value(
+                "videocall_reliable_lane_stall_episodes_total",
+                &suppressions_labels,
+            ),
+            Some(4.0),
+            "#2720 reliable-lane stall episodes must expand to its own gauge"
+        );
+        assert_eq!(
+            gauge_value(
+                "videocall_inbound_unistream_resets_total",
+                &suppressions_labels,
+            ),
+            Some(6.0),
+            "#2722 inbound-unistream resets must expand to its own gauge, distinct \
+             from the #2720 value so a label or field mix-up is caught"
+        );
 
-        // GC the session and confirm both series disappear.
+        // GC the session and confirm every series disappears.
         let session_key = "meeting_rtt522_session_rtt522_probeuser".to_string();
         let info = {
             let g = tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -6104,6 +6175,18 @@ mod tests {
             "videocall_rtt_probe_stale_suppressions_total",
             &suppressions_labels,
         ));
+        assert!(!series_exists(
+            "videocall_reliable_lane_stall_episodes_total",
+            &suppressions_labels,
+        ));
+        assert!(
+            !series_exists(
+                "videocall_inbound_unistream_resets_total",
+                &suppressions_labels,
+            ),
+            "the reset gauge carries the unbounded session_id label, so a missing \
+             reap leaks one series per disconnect"
+        );
     }
 
     #[test]

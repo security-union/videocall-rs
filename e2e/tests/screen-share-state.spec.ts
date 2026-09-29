@@ -2,6 +2,7 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 /**
  * Screen-share state-machine E2E tests.
@@ -77,6 +78,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 
@@ -141,11 +143,7 @@ test.describe("Screen-share state transitions", () => {
       await page.waitForTimeout(500);
 
       // Find the screen share button
-      const screenShareBtn = page.locator(
-        '.video-controls-container button[title="Screen Share"], ' +
-          '.video-controls-container button[title="Share Screen"], ' +
-          ".video-controls-container .action-bar-slot-wrapper.slot-secondary button:first-child",
-      );
+      const screenShareBtn = page.locator('[data-testid="screen-share-button"]');
 
       // Button should be visible and enabled initially
       await expect(screenShareBtn.first()).toBeVisible({ timeout: 10_000 });
@@ -155,27 +153,13 @@ test.describe("Screen-share state transitions", () => {
       // become disabled while the stream is being acquired.
       await screenShareBtn.first().click();
 
-      // After the mock resolves (~200ms) the state moves to StreamReady/Active.
-      // Wait for the button to show "active" state (has .active class or
-      // aria-pressed="true").
+      // After the mock resolves (~200ms) the state moves to StreamReady/Active;
+      // the button carries `active` only in ScreenShareState::Active.
       await page.waitForTimeout(1000);
+      await expect(screenShareBtn.first()).toHaveClass(/(^|\s)active(\s|$)/, { timeout: 10_000 });
 
-      // Verify screen share is active: the button should have active styling
-      // or the screen-share tile should be visible
-      const isActive = await screenShareBtn.first().evaluate((el) => {
-        return (
-          el.classList.contains("active") ||
-          el.getAttribute("aria-pressed") === "true" ||
-          el.closest(".video-controls-container") !== null
-        );
-      });
-      expect(isActive).toBe(true);
-
-      // The screen share tile should render (our local share)
-      // It may have class "screen-share" or id containing "screen-share"
-      const screenTile = page.locator(
-        '[id*="screen-share"], .screen-share-tile, canvas[id*="screen"]',
-      );
+      // The sharer's own share tile renders (issue 2792).
+      const screenTile = page.locator('[data-testid="own-share-tile"]');
 
       // Give time for the encoder to start and render
       await page.waitForTimeout(2000);
@@ -189,10 +173,9 @@ test.describe("Screen-share state transitions", () => {
 
       // After stopping, screen share state should be Idle
       // The active class should be gone
-      const isActiveAfterStop = await screenShareBtn.first().evaluate((el) => {
-        return el.classList.contains("active");
+      await expect(screenShareBtn.first()).not.toHaveClass(/(^|\s)active(\s|$)/, {
+        timeout: 10_000,
       });
-      expect(isActiveAfterStop).toBe(false);
     } finally {
       await browser.close();
     }

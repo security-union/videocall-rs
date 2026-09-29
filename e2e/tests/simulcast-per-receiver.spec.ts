@@ -180,7 +180,11 @@
  */
 
 import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
-import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
+import {
+  createAuthenticatedContext as createUnpinnedContext,
+  BROWSER_ARGS,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import { enableSimulcastFlag, pinSimulcastMaxLayers } from "../helpers/simulcast-config";
 import {
   routeDownlinkThroughProxy,
@@ -217,6 +221,16 @@ import { waitForServices } from "../helpers/wait-for-services";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// WebSocket-pinned: the relay-metrics scrapes are scoped to the WebSocket
+// relay, so an unpinned peer would sit on a different relay process.
+async function createAuthenticatedContext(
+  ...args: Parameters<typeof createUnpinnedContext>
+): Promise<BrowserContext> {
+  const context = await createUnpinnedContext(...args);
+  await pinWebSocketTransport(context);
+  return context;
+}
 
 /** Transport the publish-suppression (#1108 Stage 3) cases are parameterised over. */
 type Transport = "webtransport" | "websocket";
@@ -825,6 +839,12 @@ async function readVideoLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number } | null> {
   return parseVideoLayerText(await readVideoReadoutText(page, 5_000));
+}
+
+/** The `{w}x{h}` of `#perf-vu-recv-video-readout`, present with or without the chip. */
+function parseReadoutDims(text: string): string | null {
+  const m = text.match(/(\d+)\s*[x×]\s*(\d+)/);
+  return m ? `${m[1]}x${m[2]}` : null;
 }
 
 const VIDEO_POSITION_CHIP_WORDS = ["Low", "Medium", "High", "Single"] as const;
@@ -2416,7 +2436,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 7. Pin/enlarge a peer tile: RECOVERY + SUSTAINED-freeze smoke guard
+  // 7. Size-lid lift: RECOVERY + SUSTAINED-freeze smoke guard
   //    (issue #1702; context: #1695, a regression of #1256, fixed by #1698).
   //
   // ⚠️ SCOPE — READ THIS FIRST. This E2E does NOT and CANNOT catch the ≤5s
@@ -2425,18 +2445,17 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // assertions stay green even on the UNFIXED #1695 build). The DETERMINISTIC
   // #1695 guard is the host test `publish_and_reconcile_pulls_guard_to_rate_
   // limited_wire` (video_call_client.rs:5255). What THIS spec guards is narrower:
-  // (a) a pin-driven layer up-switch RECOVERS (frames resume), and (b) the tile
+  // (a) a lid-lift layer up-switch RECOVERS (frames resume), and (b) the tile
   // shows no SUSTAINED freeze (a permanently-stranded decode guard or a
   // keyframe-starvation regression like the #1662 ~28s class). The "#1695" in the
-  // context below explains the BUG that motivated the pin path; it is NOT a claim
+  // context below explains the BUG that motivated this path; it is NOT a claim
   // that this test reproduces that bug.
   //
   // ## The bug that MOTIVATES this path (the #1695 ≤5s decode-guard freeze)
   //
   // #1256 added a SIZE-AWARE receiver layer cap: a small grid thumbnail is
-  // capped to a low simulcast layer; a pinned/enlarged tile is `TileHint::
-  // Uncapped` so it pulls the FULL layer. Pinning a peer therefore drives an
-  // UP-switch of that peer's decode layer. The UI delivers it via
+  // capped to a low simulcast layer, and growing the tile lifts that cap, which
+  // drives an UP-switch of that peer's decode layer. The UI delivers it via
   // `VideoCallClient::set_peer_tile_hints`
   // (videocall-client/src/client/video_call_client.rs:2319), which calls
   // `apply_size_lid_to_decode_guards` — RAISING the exact-match decode guard to
@@ -2457,14 +2476,14 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // ## What this E2E asserts (and what it deliberately does NOT)
   //
   // FRAME-LIVENESS RECOVERY, not "never holds". The freeze symptom is the tile
-  // PAINTING NO NEW FRAME. We sample the pinned tile's `<canvas>` `getImageData`
+  // PAINTING NO NEW FRAME. We sample the peer tile's `<canvas>` `getImageData`
   // checksum (REUSING the existing frame-liveness primitive from
   // `wt-persistent-streams-freeze-regression.spec.ts:325` — the `ctx.getImageData`
   // 32x32-patch checksum, factored into `helpers/frame-liveness.ts`; the earlier
   // #1698 note that "no frame-liveness primitive exists" is INACCURATE — it has
   // existed in that spec since the WT persistent-streams work).
   //
-  // CALIBRATION DISCOVERED ON THE LIVE STACK (2026-06-27): a pin-driven layer
+  // CALIBRATION DISCOVERED ON THE LIVE STACK (2026-06-27): a lid-lift layer
   // UP-SWITCH legitimately holds the last frame for up to ONE publisher GOP (~5s
   // on camera, jitter_buffer.rs:149) while the newly-requested higher layer's
   // keyframe arrives (the keyframe-less hold, jitter_buffer.rs:155-158). A run
@@ -2487,7 +2506,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // reproduction. The deterministic #1695 guard is the host test cited above.
   //
   // WHAT A PIXEL SIGNAL CAN ENFORCE HERE (and all this spec claims): after the
-  // pin the tile RECOVERS (paints changing frames again by the end of a window
+  // lift the tile RECOVERS (paints changing frames again by the end of a window
   // comfortably longer than one GOP) and never holds for MORE than
   // one-GOP-plus-slack — which separates a healthy up-switch from a SUSTAINED
   // freeze (a permanently-stranded decode guard, or a keyframe-starvation
@@ -2495,7 +2514,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //
   // ### RATE-LIMIT RACE: NOT deterministically forced here — documented lever
   //
-  // The freeze ONLY manifests when the pin's up-switch publish lands < 200ms
+  // The freeze ONLY manifests when the up-switch publish lands < 200ms
   // after a PRIOR accepted publish for the SAME (peer, Video) key, so
   // `take_if_changed` rate-limits it and strands guard>wire. Forcing that window
   // deterministically from a browser is NOT possible on this harness because:
@@ -2505,9 +2524,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //     dioxus-ui/src: the only hooks are capability-score, render-FPS /
   //     longtask injection, and a STANDALONE freshness test-decoder — none read
   //     or drive `last_sent_ms`, the live decode guard, or the wire map). So the
-  //     test cannot OBSERVE the window to fire the pin inside it, nor pin "twice
-  //     <200ms apart" with any guarantee the first pin produced an ACCEPTED
-  //     publish (a no-op/identical map advances no clock).
+  //     test cannot OBSERVE the window to lift the lid inside it, nor lift it
+  //     "twice <200ms apart" with any guarantee the first lift produced an
+  //     ACCEPTED publish (a no-op/identical map advances no clock).
   //   * Sub-200ms action timing across the Playwright→browser→wasm boundary is
   //     not reliable enough to land inside the window on demand without flaking.
   // The DETERMINISTIC proof of the race already lives in the mutation-sensitive
@@ -2516,7 +2535,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // chokepoint at t=1000 (accept L0) → lid-raise guard to L2 → t=1100 (rate-
   // limited up-switch) and asserts the guard is pulled back to L0; it FAILS on
   // either #1698 revert. THIS spec is therefore a SMOKE-LEVEL guard: it exercises
-  // the real UI→client→relay→decode pin path end-to-end and proves the tile
+  // the real UI→client→relay→decode up-switch path end-to-end and proves the tile
   // RECOVERS with no SUSTAINED freeze — value the host test cannot give — but it
   // does NOT reproduce or catch the ≤5s #1695 desync race (per the boundary
   // above; it is untagged → does not run in per-PR CI; the host test is the
@@ -2526,31 +2545,31 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // follow-up, mirroring #1457/#1355's documented-lever outcome): a MOCK_PEERS-
   // gated debug hook `window.__videocall_inject_layer_pref_clock(peer_sid, kind,
   // last_sent_ms)` (or a hook to read it) so the test can prime an accepted
-  // publish, then pin while the 200ms window is provably open and assert the
+  // publish, then lift the lid while the 200ms window is provably open and assert the
   // tile DOES freeze on pre-#1698 / stays live on the fix. Until that hook
   // exists, the host test owns the race and this owns the end-to-end liveness.
   //
   // UN-FIXME rationale matches the SEND tests above: the serial-describe +
   // launch-flag renderer mitigation lets the 2-context join survive on CI, and
-  // `capabilityMaxLayersOverride: 3` forces a >1-layer ladder so the pin's
-  // size-cap → Uncapped up-switch actually has higher layers to move to (a
+  // `capabilityMaxLayersOverride: 3` forces a >1-layer ladder so the lid
+  // lift actually has higher layers to move to (a
   // single-layer runner has nothing to up-switch, so the bug could not arise and
   // the test would prove nothing — hence the `layerCount <= 1` skip guard).
   // -------------------------------------------------------------------------
-  test("pinning a peer tile recovers and shows no SUSTAINED freeze (smoke; #1702 — NOT the ≤5s race)", async ({
+  test("a size-lid lift recovers and shows no SUSTAINED freeze (smoke; #1702 — NOT the ≤5s race)", async ({
     baseURL,
   }) => {
     // Two 60s adaptation polls (baseline climb + shrink cap) + joins + ~11s of
-    // post-pin sampling can approach the describe's 180s budget on a slow runner;
+    // post-lift sampling can approach the describe's 180s budget on a slow runner;
     // give explicit headroom so a slow-but-passing run is not killed mid-assertion.
     test.setTimeout(240_000);
     const uiURL = baseURL || "http://localhost:3001";
-    const meetingId = `e2e_pin_freeze_${Date.now()}`;
+    const meetingId = `e2e_lift_freeze_${Date.now()}`;
 
-    // Frame-liveness sampling across the pin event.
+    // Frame-liveness sampling across the lid lift.
     //
     // CRITICAL CALIBRATION (verified empirically against the #1698-FIXED live
-    // stack, 2026-06-27): a pin-driven layer UP-SWITCH legitimately holds the
+    // stack, 2026-06-27): a lid-lift layer UP-SWITCH legitimately holds the
     // last frame for up to ONE publisher GOP while the newly-requested higher
     // layer's keyframe arrives. The camera GOP is "at most every 5s"
     // (jitter_buffer.rs:149), and the jitter buffer's keyframe-less hold
@@ -2599,7 +2618,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       );
       // Force the full ladder on BOTH ends: the publisher must encode >1 layer,
       // and the receiver must be allowed to climb. Without a multi-layer ladder
-      // the pin's size-cap→Uncapped up-switch has nothing to move to and the
+      // the lid lift has nothing to move to and the
       // #1695 guard>wire desync cannot arise (the freeze is a multi-layer-only
       // bug). The #1093 override replaces the low-core CI capability clamp.
       await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
@@ -2616,18 +2635,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
       // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
       // take effect, BEFORE the skip guard. A clamped single-layer ladder would
-      // make the pin a no-op for the layer cap and the test would prove nothing.
+      // make the lift a no-op for the layer cap and the test would prove nothing.
       await assertCapabilityOverrideActive(pubConsole);
 
-      // The receiver must see the publisher's tile before we can pin it.
+      // The receiver must see the publisher's tile before its lid can move.
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
       });
 
-      // The #1695 freeze only arises when the pin drives a REAL up-switch
-      // (low → high decode layer); pinning an already-top tile moves nothing and
+      // The #1695 freeze only arises when the lift drives a REAL up-switch
+      // (low → high decode layer); lifting an already-top tile moves nothing and
       // never strands guard>wire. So we must FIRST cap the tile to the BASE layer,
-      // then pin to force the L0→top up-switch — the exact #1256/#1695 trigger.
+      // then grow it back to force the L0→top up-switch — the #1256/#1695 trigger.
       // We replicate the proven cap mechanism from the #1256 size-cap test in this
       // same file: a HiDPI runner (dpr 2) would double the tile's device-px height
       // and lift the size cap off the base, masking the trigger — so require dpr 1
@@ -2638,8 +2657,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       expect(
         rxDpr,
         "this test needs devicePixelRatio === 1 so the shrunk receiver viewport caps " +
-          "the tile to the base layer (a HiDPI runner would lift the cap and the pin " +
-          "would not up-switch — no #1695 trigger). See the #1256 size-cap test.",
+          "the tile to the base layer (a HiDPI runner would lift the cap and growing the " +
+          "tile would not up-switch — no #1695 trigger). See the #1256 size-cap test.",
       ).toBe(1);
 
       // Read the layer via the Diagnostics drawer (same readout the SEND tests
@@ -2666,7 +2685,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         !sawHighBaseline,
         "capability ceiling clamped the publisher to a single layer (the large-tile " +
           "receiver never climbed above the base); no ladder headroom for the size cap " +
-          "to be below, so the pin cannot drive the #1695 up-switch. See simulcast-config.ts",
+          "to be below, so growing the tile cannot drive the #1695 up-switch. See simulcast-config.ts",
       );
 
       // PHASE A — SHRINK ⇒ SIZE CAP ENGAGED. Shrink the receiver viewport so its
@@ -2674,6 +2693,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // size lid caps the requested layer to the BASE (index 0) on the healthy
       // link (issue-1768 L0 boundary 180*1.1=198px; 360x270 keeps the tile
       // ~130-180 device-px, safely below it — see the #1256 test's boundary note).
+      const fullViewport = rxPage.viewportSize();
+      expect(fullViewport, "the receiver viewport size is known").not.toBeNull();
       await rxPage.setViewportSize({ width: 360, height: 270 });
       await expect
         .poll(async () => (await readVideoLayer(rxPage))?.layerIndex ?? 99, {
@@ -2681,48 +2702,33 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           intervals: [1000, 2000, 3000],
           message:
             "the shrunk-viewport tile must cap to the base layer (index 0) before the " +
-            "pin, so the pin then drives a real L0→top up-switch (the #1695 trigger)",
+            "lift, so growing it then drives a real L0→top up-switch (the #1695 trigger)",
         })
         .toBe(0);
 
-      // Resolve the pin button. There is exactly ONE remote tile (the publisher;
-      // `display_peers` filters out the receiver's own session, attendants.rs),
-      // so the first `#grid-container .grid-item` is the publisher's tile. The pin
-      // button (`button.pin-icon`, canvas_generator.rs) is `visibility: hidden`
-      // until its `.grid-item` parent is hovered (style.css
-      // `.grid-item:hover .pin-icon`), so a normal hover-then-click is flaky.
-      // REUSE the proven DOM-dispatch click from the #1256 size-cap test in this
-      // same file (which pins this exact button): `el.click()` fires the Dioxus
-      // onclick (`on_toggle_pin`) regardless of CSS visibility/animation.
-      const gridTile = rxPage.locator("#grid-container .grid-item").first();
-      await expect(gridTile).toBeVisible({ timeout: 10_000 });
-      const pinButton = gridTile.locator("button.pin-icon");
-      await expect(pinButton).toHaveCount(1, { timeout: 10_000 });
-
-      // BASELINE: prove the capped tile is still LIVE before the pin (decoding the
-      // base layer, a moving synthetic-camera frame), so a post-pin freeze is
-      // attributable to the pin, not to a tile that never painted. Require MORE
-      // THAN ONE distinct checksum across a short pre-pin window — the pixels are
+      // BASELINE: prove the capped tile is still LIVE before the lift (decoding the
+      // base layer, a moving synthetic-camera frame), so a post-lift freeze is
+      // attributable to the lift, not to a tile that never painted. Require MORE
+      // THAN ONE distinct checksum across a short pre-lift window — the pixels are
       // actually changing. (A frozen-run check over a sub-window would be vacuous:
       // a window shorter than MAX_FROZEN_RUN_MS can never produce a run that long.)
       const preSeries = await sampleChecksumSeries(rxPage, 2_000, SAMPLE_INTERVAL_MS, 0);
       const preDistinct = new Set(preSeries.map((s) => s.checksum).filter((c) => c !== null)).size;
       expect(
         preDistinct,
-        "the capped peer tile must be painting CHANGING frames before the pin (baseline " +
-          "liveness) — if it is already static the post-pin freeze assertion is meaningless",
+        "the capped peer tile must be painting CHANGING frames before the lift (baseline " +
+          "liveness) — if it is already static the post-lift freeze assertion is meaningless",
       ).toBeGreaterThan(1);
 
-      // ACT: pin the peer. This drives toggle_pin → pinned_peer_id → the
-      // attendants.rs render that maps this peer to TileHint::Uncapped, LIFTING the
-      // base-layer size lid and calling set_peer_tile_hints — the #1256 path that
-      // raises the decode guard to the top layer and publishes the up-switch
-      // LAYER_PREFERENCE. If that publish is rate-limited (<200ms after a prior
-      // accepted publish for this key), the guard leads the wire = the #1695 freeze.
-      await pinButton.evaluate((el: HTMLElement) => el.click());
+      // ACT: grow the receiver back to its full viewport. The tile-size hint rises
+      // past the base-layer lid, so set_peer_tile_hints raises the decode guard and
+      // publishes the up-switch LAYER_PREFERENCE — the #1256 path. If that publish
+      // is rate-limited (<200ms after a prior accepted publish for this key), the
+      // guard leads the wire = the #1695 freeze.
+      await rxPage.setViewportSize(fullViewport!);
 
       // Sample the peer tile's pixels across a window LONGER than one publisher
-      // GOP, starting immediately after the pin. The pin up-switches the decode
+      // GOP, starting immediately after the lift. The lift up-switches the decode
       // layer, which legitimately holds the last frame until the new layer's
       // keyframe arrives (≤ one ~5s GOP); we then assert the tile RECOVERS — see
       // the calibration note on the constants above for why a "never holds"
@@ -2734,7 +2740,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       const tailFrom = SAMPLE_WINDOW_MS - RECOVERY_TAIL_MS;
       const tailDistinct = distinctChecksumsInWindow(series, tailFrom, SAMPLE_WINDOW_MS + 1);
       console.log(
-        `[#1702] post-pin liveness: ${sampled}/${series.length} sampled, ` +
+        `[#1702] post-lift liveness: ${sampled}/${series.length} sampled, ` +
           `${distinct} distinct checksums overall, longest frozen run ${frozenRun}ms ` +
           `(sustained-freeze ceiling ${MAX_FROZEN_RUN_MS}ms); recovery-tail ` +
           `[${tailFrom}-${SAMPLE_WINDOW_MS}ms] distinct=${tailDistinct}`,
@@ -2744,7 +2750,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // nothing). Require a healthy majority of non-null samples.
       expect(
         sampled,
-        "the pinned tile must be sampleable across the window (canvas present + readable)",
+        "the peer tile must be sampleable across the window (canvas present + readable)",
       ).toBeGreaterThanOrEqual(Math.ceil(series.length / 2));
 
       // RECOVERY ASSERTION (smoke-level): by the END of the window the tile must
@@ -2756,8 +2762,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // are live.
       expect(
         tailDistinct,
-        `the pinned peer tile did NOT recover: the last ${RECOVERY_TAIL_MS}ms of the ` +
-          `post-pin window showed ${tailDistinct} distinct frame(s) (need > 1 = changing). ` +
+        `the peer tile did NOT recover: the last ${RECOVERY_TAIL_MS}ms of the ` +
+          `post-lift window showed ${tailDistinct} distinct frame(s) (need > 1 = changing). ` +
           "A one-GOP keyframe wait recovers inside this window; a tail still frozen here is a " +
           "SUSTAINED freeze (stranded decode guard / keyframe starvation) — the #1662-class " +
           "regression. (This does NOT catch the self-healing ≤5s #1695 transient, which would " +
@@ -2772,28 +2778,21 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // constants note and the RATE-LIMIT RACE section in the test header).
       expect(
         frozenRun,
-        `the pinned peer tile held identical pixels for ${frozenRun}ms after the pin, ` +
+        `the peer tile held identical pixels for ${frozenRun}ms after the lift, ` +
           `exceeding the one-GOP-plus-slack ceiling (${MAX_FROZEN_RUN_MS}ms) — a SUSTAINED ` +
           "freeze, not the benign single-GOP up-switch keyframe wait.",
       ).toBeLessThan(MAX_FROZEN_RUN_MS);
 
-      // PIN-FIRED CONFIRMATION (mirrors the #1256 size-cap test's PHASE B, same
-      // file): the productive proof the pin actually fired is the received-layer
-      // index up-switching ABOVE the base — i.e. `on_toggle_pin → set_peer_tile_
-      // hints → apply_size_lid_to_decode_guards` lifted the size lid. We assert
-      // this AFTER the liveness sampling so the up-switch poll cannot consume the
-      // ≤5s freeze window before we measure it. We do NOT gate on the
-      // `.grid-item-pinned` CSS class: at the 640px receiver viewport the canvas
-      // div ALSO carries a mobile pin onclick (is_mobile_viewport() < 768,
-      // canvas_generator.rs:1243), so the class is not a reliable single-path
-      // signal; the layer up-switch is the production-meaningful one.
+      // LIFT CONFIRMATION: the received-layer index up-switched ABOVE the base.
+      // Asserted AFTER the liveness sampling so the up-switch poll cannot consume
+      // the ≤5s freeze window before we measure it.
       await expect
         .poll(async () => (await readVideoLayer(rxPage))?.layerIndex ?? -1, {
           timeout: 45_000,
           intervals: [1000, 2000, 3000],
           message:
-            "pinning the peer must lift the size lid and up-switch the received layer " +
-            "ABOVE the base (index >= 1) — proof the pin fired and drove the #1695 up-switch",
+            "growing the tile must lift the size lid and up-switch the received layer " +
+            "ABOVE the base (index >= 1) — proof the lift drove the #1695 up-switch",
         })
         .toBeGreaterThanOrEqual(1);
     } finally {
@@ -3317,9 +3316,10 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //
   // The feature: a receiver LIDs the requested simulcast layer to the rendered
   // tile size. A peer shown as a SMALL grid thumbnail pulls a LOWER layer (the
-  // smallest whose native height covers the tile); when that peer is PINNED the
-  // tile grows, the lid lifts, and the receiver up-switches above the base layer
-  // (and requests a keyframe so it sharpens). The lid rides the EXISTING
+  // smallest whose native height covers the tile); when the tile grows the lid
+  // lifts and the receiver up-switches above the base layer (and requests a
+  // keyframe so it sharpens). A pin does not lift it: a pinned tile is the size
+  // of every other tile (#2866). The lid rides the EXISTING
   // per-receiver LAYER_PREFERENCE clamp seam, so the receiver's per-peer layer
   // SELECTION changes with NO wire/relay change — observable directly via the
   // SAME `readVideoLayer()` received-quality readout the #989/#1434 tests read.
@@ -3331,7 +3331,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // the chooser would otherwise fail open to `highest_available` (the top layer)
   // and the receiver would decode 720p for a tiny thumbnail — the waste #1256
   // fixes. So this test asserts the receiver settles at the BASE layer with ZERO
-  // impairment, then climbs above the base once the peer is pinned.
+  // impairment, stays there when the peer is pinned, then climbs above the
+  // base once the tile grows.
   //
   // PRODUCING A SMALL TILE (verified empirically against this stack — see the
   // observed readouts in the PR notes). `display_peers` (attendants.rs) FILTERS
@@ -3361,9 +3362,10 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // runs only in the default `dioxus` suite (NOT per-PR CI) and is validated on
   // the local docker e2e stack. It needs NO toxiproxy/netsim profile.
   // -------------------------------------------------------------------------
-  test("size-aware cap: a small-grid receiver pulls a LOWER layer than when the peer is pinned; pinning up-switches to the top (#1256)", async ({
+  test("size-aware cap: a small-grid receiver pulls a LOWER layer, a pin keeps it there, and growing the tile up-switches (#1256, #2866)", async ({
     baseURL,
   }) => {
+    test.setTimeout(240_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_1256_size_cap_${Date.now()}`;
 
@@ -3472,6 +3474,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // tile-size lid — the load-bearing #1256 assertion, with NO congestion. We
       // assert on the INDEX (count-independent: the lid pins the lowest rung
       // regardless of how many rungs the publisher currently has active).
+      const fullViewport = rxPage.viewportSize();
+      expect(fullViewport, "the receiver viewport size is known").not.toBeNull();
       await rxPage.setViewportSize({ width: 360, height: 270 });
       await expect
         .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 99, {
@@ -3483,52 +3487,66 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             "(index 0) — the size lid lowered it with no congestion",
         })
         .toBe(0);
+      const baseDims = parseReadoutDims(await readVideoReadoutText(rxPage, 5_000));
+      expect(
+        baseDims,
+        "#1256 PHASE A: the base-layer readout must show its resolution",
+      ).not.toBeNull();
 
-      // PHASE B — PIN ⇒ UP-SWITCH ABOVE THE LID. Pinning the publisher's tile
-      // marks that peer Uncapped (pinned / screen-share / maximized are never
-      // size-capped), so the size lid LIFTS and the receiver up-switches above the
-      // base layer (requesting a keyframe so the higher layer sharpens). We assert
-      // the index climbs to AT LEAST 1 (strictly above the base lid): that is the
-      // unambiguous proof of the lid lift, robust to the publisher's active-layer
-      // count oscillating between 2 and 3 (asserting an exact top index would
-      // flake when the publisher is momentarily down to 2 active layers).
-      //
-      // The pin button (`button.pin-icon`, canvas_generator.rs) is
-      // `visibility: hidden` until its `.grid-item` parent is hovered (style.css
-      // `.grid-item:hover .pin-icon`) AND the full-bleed single tile pulses a
-      // speaking-glow animation, so a normal hover-then-click is flaky. We
-      // dispatch the click directly on the button via the DOM — this fires the
-      // Dioxus onclick (`on_toggle_pin`) regardless of CSS visibility/animation.
-      const gridTile = rxPage.locator("#grid-container .grid-item").first();
-      await expect(gridTile).toBeVisible({ timeout: 10_000 });
-      const pinButton = gridTile.locator("button.pin-icon");
+      // PHASE B — PIN ⇒ THE LID HOLDS (#2866). A pinned tile keeps its grid size,
+      // so it gets no lid exemption and the index must stay at the base for
+      // PIN_LID_HOLD_MS. The DOM-dispatch click fires the pin's onclick whatever
+      // the tile's hover state; aria-pressed proves the pin landed, so the hold
+      // is not measured against a pin that never happened.
+      const pinButton = rxPage.locator(
+        '#grid-container .grid-item [data-testid="tile-pin-button"]',
+      );
       await expect(pinButton).toHaveCount(1, { timeout: 10_000 });
       await pinButton.evaluate((el: HTMLElement) => el.click());
+      await expect(pinButton).toHaveAttribute("aria-pressed", "true", { timeout: 10_000 });
+      // Three ~5s camera GOPs (jitter_buffer.rs), so an up-switch that waits a
+      // GOP for its keyframe still lands inside the hold.
+      const PIN_LID_HOLD_MS = 15_000;
+      const holdUntil = Date.now() + PIN_LID_HOLD_MS;
+      // While the lone receiver sits at the base, the publisher's ladder can drop to
+      // one layer, and the readout then omits the "i/n" chip but keeps the dims.
+      let chipped = 0;
+      while (Date.now() < holdUntil) {
+        const raw = await readVideoReadoutText(rxPage, 5_000);
+        const layer = parseVideoLayerText(raw);
+        if (layer) {
+          expect(
+            layer.layerIndex,
+            "#1256 PHASE B: a pin must not lift the size lid off the base layer",
+          ).toBe(0);
+          chipped += 1;
+        } else {
+          expect(
+            parseReadoutDims(raw),
+            `#1256 PHASE B: a readout without a layer chip must still show the base resolution ("${raw}")`,
+          ).toBe(baseDims);
+        }
+        await rxPage.waitForTimeout(1_000);
+      }
+      expect(
+        chipped,
+        "#1256 PHASE B: the layer chip must be readable for part of the hold",
+      ).toBeGreaterThanOrEqual(3);
 
+      // PHASE C — GROW ⇒ UP-SWITCH ABOVE THE LID. Back at the full viewport the
+      // tile clears the lid and the receiver up-switches. AT LEAST 1 rather than
+      // an exact top index, since the publisher's active-layer count moves
+      // between 2 and 3.
+      await rxPage.setViewportSize(fullViewport!);
       await expect
         .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? -1, {
           timeout: 60_000,
           intervals: [1000, 2000, 3000],
           message:
-            "#1256 PHASE B: pinning the peer must lift the size lid and up-switch the " +
+            "#1256 PHASE C: growing the tile must lift the size lid and up-switch the " +
             "receiver ABOVE the base layer (index >= 1)",
         })
         .toBeGreaterThanOrEqual(1);
-
-      // PHASE C — UNPIN ⇒ CAP BACK DOWN. Unpinning re-applies the size lid (the
-      // tile is a small thumbnail again), so the requested layer drops back to the
-      // base. Same DOM-dispatch click on the (now toggled) pin button.
-      await pinButton.evaluate((el: HTMLElement) => el.click());
-
-      await expect
-        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 99, {
-          timeout: 60_000,
-          intervals: [1000, 2000, 3000],
-          message:
-            "#1256 PHASE C: unpinning must re-apply the size lid and cap the small " +
-            "tile back to the base layer (index 0)",
-        })
-        .toBe(0);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -3824,6 +3842,11 @@ test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
       await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
       await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
       await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
+      // Scrapes the WEBTRANSPORT relay, so it must pin WT explicitly. Runs
+      // after the local wrapper's WebSocket pin and writes unconditionally.
+      await pinTransport(pubCtx, "webtransport");
+      await pinTransport(healthyCtx, "webtransport");
+      await pinTransport(degradedCtx, "webtransport");
 
       const pubPage = await pubCtx.newPage();
       const healthyPage = await healthyCtx.newPage();

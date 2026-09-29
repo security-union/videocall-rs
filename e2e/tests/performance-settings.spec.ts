@@ -364,7 +364,7 @@ async function openPerformanceDrawer(page: Page): Promise<void> {
   const diagButton = page.locator("button", {
     has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
   });
-  await diagButton.click();
+  await diagButton.click({ timeout: 10_000 });
   const sidebar = perfDrawer(page);
   await expect(sidebar).toBeVisible({ timeout: 10_000 });
   // The drawer title renamed to "Performance & Diagnostics" (#1131 §4).
@@ -1210,6 +1210,45 @@ test.describe("Performance settings panel (#961)", () => {
     ).toBeVisible({ timeout: 10_000 });
     // The stale-number form must be gone.
     await expect(panel).not.toContainText("Will send up to 1080p when you share");
+  });
+
+  test("closing the drawer stops the perf meter rAF loops without invoking a freed closure", async ({
+    page,
+  }) => {
+    const DROPPED_CLOSURE = "closure invoked recursively or after being dropped";
+    const errors: string[] = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") {
+        errors.push(msg.text());
+      }
+    });
+
+    await joinMeeting(page, "raf_teardown", { cameraOff: true });
+
+    const sidebar = perfDrawer(page);
+    const meters = [page.locator("#perf-meter-audio"), page.locator("#perf-meter-recv-audio")];
+    const vp = page.viewportSize() ?? { width: 800, height: 600 };
+    for (let cycle = 1; cycle <= 2; cycle++) {
+      await page.mouse.move(Math.floor(vp.width / 2), Math.floor(vp.height / 2));
+      await openPerformanceDrawer(page);
+      for (const meter of meters) {
+        await expect(meter).toHaveCount(1, { timeout: 10_000 });
+      }
+      await page.waitForTimeout(1_000);
+
+      await sidebar.locator("button.close-button").click({ timeout: 10_000 });
+      await expect(sidebar).not.toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      for (const meter of meters) {
+        await expect(meter).toHaveCount(0, { timeout: 10_000 });
+      }
+
+      await page.waitForTimeout(1_500);
+      expect(
+        errors.filter((e) => e.includes(DROPPED_CLOSURE)),
+        `cycle ${cycle}: the browser ran a meter's rAF closure after the drawer freed it`,
+      ).toEqual([]);
+    }
   });
 });
 

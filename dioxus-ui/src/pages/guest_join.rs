@@ -6,6 +6,10 @@
 
 use crate::components::attendants::AttendantsComponent;
 use crate::components::browser_compatibility::BrowserCompatibility;
+use crate::components::hero_orbs::HeroOrbs;
+use crate::components::invalid_meeting_id::{
+    invalid_meeting_id_message, meeting_route_id_error, InvalidMeetingIdNotice,
+};
 use crate::components::meeting_password_prompt::{
     next_prompt_state, password_prompt_reason, MeetingPasswordPrompt, PasswordPromptReason,
     PasswordPromptState,
@@ -15,9 +19,10 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, webtransport_enabled, webtransport_host_base,
 };
 use crate::context::{
-    load_transport_preference_with_source, resolve_transport_config, save_display_name_to_storage,
-    validate_display_name, DisplayNameCtx, TransportPreference, TransportPreferenceCtx,
-    DISPLAY_NAME_MAX_LEN,
+    load_transport_preference_with_source, resolve_transport_config,
+    save_display_name_owner_to_storage, save_display_name_to_storage, validate_display_name,
+    DisplayNameCtx, TransportPreference, TransportPreferenceCtx, DISPLAY_NAME_MAX_LEN,
+    GUEST_DISPLAY_NAME_OWNER,
 };
 use crate::meeting_api::{join_meeting_as_guest, JoinMeetingResponse};
 use crate::theme::color as theme_color;
@@ -57,6 +62,7 @@ enum GuestStatus {
         chat_allowed_for_all: bool,
     },
     Rejected,
+    InvalidMeetingId(String),
     Error(String),
 }
 
@@ -360,6 +366,14 @@ fn start_observer_connection(
 
 #[component]
 pub fn GuestJoinPage(id: String) -> Element {
+    match meeting_route_id_error(&id) {
+        Some(reason) => rsx! { InvalidMeetingIdNotice { reason } },
+        None => rsx! { GuestJoinPageContent { id } },
+    }
+}
+
+#[component]
+fn GuestJoinPageContent(id: String) -> Element {
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut guest_status = use_signal(|| GuestStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
@@ -486,27 +500,35 @@ pub fn GuestJoinPage(id: String) -> Element {
                         }
                         guest_status.set(status);
                     }
-                    Err(e) => match password_prompt_reason(&e, supplied_password) {
-                        Some(reason) => {
-                            // Issue 1613. Note this is driven by the server's
-                            // 403, not by the meeting's `has_password` flag —
-                            // see `components::meeting_password_prompt`.
+                    Err(e) => {
+                        if let Some(reason) = invalid_meeting_id_message(&e) {
                             observer_token_signal.set(None);
                             pending_password.set(None);
-                            let current = *password_prompt.peek();
-                            password_prompt.set(next_prompt_state(
-                                current,
-                                reason,
-                                supplied_password,
-                            ));
-                            guest_status.set(GuestStatus::PasswordRequired);
+                            guest_status.set(GuestStatus::InvalidMeetingId(reason));
+                            return;
                         }
-                        None => {
-                            observer_token_signal.set(None);
-                            pending_password.set(None);
-                            guest_status.set(GuestStatus::Error(e.to_string()));
+                        match password_prompt_reason(&e, supplied_password) {
+                            Some(reason) => {
+                                // Issue 1613. Note this is driven by the server's
+                                // 403, not by the meeting's `has_password` flag —
+                                // see `components::meeting_password_prompt`.
+                                observer_token_signal.set(None);
+                                pending_password.set(None);
+                                let current = *password_prompt.peek();
+                                password_prompt.set(next_prompt_state(
+                                    current,
+                                    reason,
+                                    supplied_password,
+                                ));
+                                guest_status.set(GuestStatus::PasswordRequired);
+                            }
+                            None => {
+                                observer_token_signal.set(None);
+                                pending_password.set(None);
+                                guest_status.set(GuestStatus::Error(e.to_string()));
+                            }
                         }
-                    },
+                    }
                 }
             });
         }
@@ -677,6 +699,10 @@ pub fn GuestJoinPage(id: String) -> Element {
                 }
             },
 
+            GuestStatus::InvalidMeetingId(reason) => rsx! {
+                InvalidMeetingIdNotice { reason: reason.clone() }
+            },
+
             // Error
             GuestStatus::Error(error) => rsx! {
                 div { class: "error-container",
@@ -720,9 +746,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                 rsx! {
                     div { class: "hero-container",
                         BrowserCompatibility {}
-                        div { class: "floating-element floating-element-1" }
-                        div { class: "floating-element floating-element-2" }
-                        div { class: "floating-element floating-element-3" }
+                        HeroOrbs {}
                         div { class: "hero-content",
                             h1 { class: "hero-title text-center", "Join as Guest" }
                             div { class: "content-separator" }
@@ -736,6 +760,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                                             Ok(valid_name) => {
                                                 input_value.set(valid_name.clone());
                                                 save_display_name_to_storage(&valid_name);
+                                                save_display_name_owner_to_storage(GUEST_DISPLAY_NAME_OWNER);
                                                 display_name_ctx.0.set(Some(valid_name));
                                                 // Issue 1613: no password on the first attempt.
                                                 // The prompt only exists once the server has said

@@ -42,7 +42,7 @@
 //! instance B. Two classes of change exist:
 //!
 //! 1. **NATS-consumer-driven** (`internal.meeting_became_empty`,
-//!    `internal.meeting_ended_by_host`, `internal.participant_left`): the
+//!    `internal.meeting_ended_by_host`, `internal.participant_presence`): the
 //!    existing consumers in [`crate::nats_consumers`] use a **plain
 //!    `nats.subscribe()` with NO queue group**, i.e. fan-out — every instance
 //!    already receives every such event and applies the DB write.

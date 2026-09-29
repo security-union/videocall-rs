@@ -15,13 +15,11 @@
 //!
 //! These tests cover:
 //!   1. PATCH /meetings publishes both the public client-facing
-//!      `MEETING_SETTINGS_UPDATED` event AND the new server-internal
-//!      `internal.meeting_settings_updated` event, so chat_server's
-//!      in-memory `room_policy` cache stays fresh after a mid-meeting toggle.
-//!   2. The new `internal.meeting_ended_by_host` consumer transitions the
-//!      DB row to `state='ended'` exactly the way the REST POST /leave
-//!      endpoint does, so back-navigation host disconnects and the legitimate
-//!      hangup flow leave the meetings list in the same state.
+//!      `MEETING_SETTINGS_UPDATED` event AND the server-internal
+//!      `internal.meeting_settings_updated` event that relays predating #2702
+//!      read.
+//!   2. The `internal.meeting_ended_by_host` consumer transitions the DB row
+//!      to `state='ended'`, for a meeting such a relay ended itself.
 //!
 //! Both tests are gated on a live NATS connection. They skip silently when
 //! `NATS_URL` is unset, matching the posture of the existing chat_server
@@ -72,6 +70,7 @@ fn build_app_with_nats(pool: sqlx::PgPool, nats: async_nats::Client) -> axum::Ro
         display_name_rate_limit_disabled: false,
         dev_user: None,
         password_gate: std::sync::Arc::new(meeting_api::password::MeetingPasswordGate::new()),
+        presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     routes::router().with_state(state)
 }
@@ -87,11 +86,7 @@ async fn maybe_connect_nats() -> Option<async_nats::Client> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// TEST 1: PATCH /meetings fires the internal cache-refresh event.
-//
-// This locks in the publisher half of the cache-staleness fix. Without it,
-// chat_server's `room_policy` would never see toggles unless the host
-// reconnected with a fresh JWT.
+// TEST 1: PATCH /meetings fires the internal settings event.
 // ──────────────────────────────────────────────────────────────────────────
 #[tokio::test]
 #[serial]

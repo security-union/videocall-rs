@@ -22,13 +22,17 @@ use crate::auth::{
 };
 use crate::components::about_modal::AboutModal;
 use crate::components::browser_compatibility::BrowserCompatibility;
+use crate::components::hero_orbs::HeroOrbs;
 use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
 use crate::constants::{logout_url, meeting_api_base_url, oauth_enabled};
 use crate::context::{
-    clear_display_name_from_storage, email_to_display_name, is_allowed_display_name_char,
-    is_guid_like, is_valid_meeting_id, load_display_name_from_storage,
-    save_display_name_to_storage, validate_display_name, DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
+    clear_display_name_from_storage, clear_display_name_owner_from_storage,
+    describe_disallowed_chars, display_name_owner_id, email_to_display_name,
+    is_allowed_display_name_char, is_guid_like, load_display_name_from_storage,
+    load_display_name_owner_from_storage, normalize_spaces, save_display_name_owner_to_storage,
+    save_display_name_to_storage, validate_display_name, validate_meeting_id, DisplayNameCtx,
+    MeetingIdError, DISPLAY_NAME_MAX_LEN, MEETING_ID_ALLOWED_CHARS, MEETING_ID_MAX_LEN,
 };
 use crate::meeting_api::create_meeting;
 use crate::routing::Route;
@@ -133,6 +137,93 @@ fn register_tooltip_dismiss_listeners(
     })
 }
 
+fn not_allowed_message(chars: impl IntoIterator<Item = char>) -> String {
+    format!("Not allowed: {}", describe_disallowed_chars(chars))
+}
+
+fn meeting_id_error_text(err: MeetingIdError) -> String {
+    match err {
+        MeetingIdError::Empty => "Enter a meeting ID".to_string(),
+        MeetingIdError::TooLong => format!("Too long: max {MEETING_ID_MAX_LEN} characters"),
+        MeetingIdError::InvalidChars(chars) => not_allowed_message(chars),
+    }
+}
+
+/// The inline error for the display-name field while it is being edited.
+/// Whitespace is judged after [`normalize_spaces`], as submit judges it.
+pub fn display_name_field_error(raw: &str) -> Option<String> {
+    let mut bad: Vec<char> = normalize_spaces(raw)
+        .chars()
+        .filter(|c| !is_allowed_display_name_char(*c))
+        .collect();
+    bad.sort();
+    bad.dedup();
+    (!bad.is_empty()).then(|| not_allowed_message(bad))
+}
+
+/// The normalised display name the form submits for `raw`, or the message
+/// shown beside the field: disallowed characters in the inline format,
+/// otherwise the shared empty / too-long message.
+pub fn display_name_for_submit(raw: &str) -> Result<String, String> {
+    validate_display_name(raw).map_err(|message| display_name_field_error(raw).unwrap_or(message))
+}
+
+/// Whether `stored_owner` records someone other than `profile`.
+pub fn display_name_owned_by_another(stored_owner: Option<&str>, profile: &UserProfile) -> bool {
+    stored_owner.is_some_and(|owner| owner != display_name_owner_id(&profile.user_id))
+}
+
+/// The unvalidated display name a signed-in `profile` starts with: `stored`
+/// unless `stored_owner` is someone else, otherwise the name derived from the
+/// profile; `None` when that is empty.
+pub fn signed_in_display_name(
+    stored: Option<String>,
+    stored_owner: Option<&str>,
+    profile: &UserProfile,
+) -> Option<String> {
+    stored
+        .filter(|_| !display_name_owned_by_another(stored_owner, profile))
+        .or_else(|| {
+            let derived = if profile.name.contains('@') {
+                email_to_display_name(&profile.name)
+            } else if is_guid_like(&profile.name) {
+                if profile.user_id.contains('@') {
+                    email_to_display_name(&profile.user_id)
+                } else {
+                    String::new()
+                }
+            } else {
+                profile.name.clone()
+            };
+            (!derived.is_empty()).then_some(derived)
+        })
+}
+
+/// The meeting ID the form submits for `raw` (outer whitespace trimmed), or
+/// the message shown beside the field when the shared rule rejects it.
+pub fn meeting_id_for_submit(raw: &str) -> Result<String, String> {
+    let id = raw.trim();
+    validate_meeting_id(id)
+        .map(|()| id.to_string())
+        .map_err(meeting_id_error_text)
+}
+
+/// The inline error for the field while it is being edited; blank shows none.
+pub fn meeting_id_field_error(raw: &str) -> Option<String> {
+    let id = raw.trim();
+    if id.is_empty() {
+        None
+    } else {
+        validate_meeting_id(id).err().map(meeting_id_error_text)
+    }
+}
+
+fn focus_input(element: Option<web_sys::Element>) {
+    if let Some(input) = element.and_then(|el| el.dyn_into::<HtmlInputElement>().ok()) {
+        let _ = input.focus();
+    }
+}
+
 #[component]
 pub fn Home() -> Element {
     let navigator = use_navigator();
@@ -142,12 +233,6 @@ pub fn Home() -> Element {
     let mut meeting_id_error = use_signal(|| None::<String>);
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
 
-    // When OAuth is enabled the display name must not be pre-populated from
-    // local storage: the user may be signed out, and showing a stale name
-    // from a previous session is misleading.  The async session-check effect
-    // below restores the stored name once a valid session is confirmed.
-    // When OAuth is disabled there is no sign-out concept, so the stored name
-    // is always shown immediately.
     let existing_username: String = if oauth_enabled().unwrap_or(false) {
         String::new()
     } else if let Some(name) = (display_name_ctx.0)() {
@@ -156,8 +241,10 @@ pub fn Home() -> Element {
         load_display_name_from_storage().unwrap_or_default()
     };
 
+    let mut username_ref = use_signal(|| None::<web_sys::Element>);
     let mut username_value = use_signal(|| existing_username.clone());
     let mut username_error = use_signal(|| None::<String>);
+    let mut failed_submits = use_signal(|| 0u32);
 
     // User profile state (for displaying auth info when OAuth is enabled)
     let mut user_profile = use_signal(|| None::<UserProfile>);
@@ -203,45 +290,39 @@ pub fn Home() -> Element {
     });
 
     // Fetch user profile when OAuth is enabled.
-    //
-    // Because the display name field starts empty for OAuth deployments (see
-    // above), this effect is responsible for restoring it once a valid session
-    // is confirmed.
-    //
-    // Flow:
-    //   • Session valid + stored name  → restore field from storage (user may
-    //     have customised it, so we prefer their choice over the profile name).
-    //   • Session valid + no stored name → derive from provider profile and
-    //     save so subsequent visits don't flash empty.
-    //   • Session invalid / check fails → field stays empty; sign-in button
-    //     is shown.
     use_effect(move || {
         if oauth_enabled().unwrap_or(false) {
-            wasm_bindgen_futures::spawn_local(async move {
+            spawn(async move {
                 if check_session().await.is_ok() {
                     if let Ok(profile) = get_user_profile().await {
                         // Anonymous sessions have no real identity — skip them entirely.
                         // The template also filters them so the sign-in button renders.
                         if !profile.user_id.starts_with("anon-") {
-                            // For authenticated users, always derive the display name from
-                            // the OAuth profile so a real name takes precedence over any
-                            // stale guest-session name stored before the user signed in.
-                            let display_name = if profile.name.contains('@') {
-                                email_to_display_name(&profile.name)
-                            } else if is_guid_like(&profile.name) {
-                                if profile.user_id.contains('@') {
-                                    email_to_display_name(&profile.user_id)
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                profile.name.clone()
-                            };
-                            if !display_name.is_empty() {
-                                if let Ok(valid_name) = validate_display_name(&display_name) {
-                                    save_display_name_to_storage(&valid_name);
-                                    display_name_ctx.0.set(Some(valid_name.clone()));
-                                    username_value.set(valid_name.clone());
+                            let owner = load_display_name_owner_from_storage();
+                            if display_name_owned_by_another(owner.as_deref(), &profile) {
+                                clear_display_name_from_storage();
+                                display_name_ctx.0.set(None);
+                            }
+                            let raw = signed_in_display_name(
+                                load_display_name_from_storage(),
+                                owner.as_deref(),
+                                &profile,
+                            );
+                            if let Some(raw) = raw.filter(|_| username_value.peek().is_empty()) {
+                                match display_name_for_submit(&raw) {
+                                    Ok(name) => {
+                                        save_display_name_to_storage(&name);
+                                        save_display_name_owner_to_storage(&display_name_owner_id(
+                                            &profile.user_id,
+                                        ));
+                                        display_name_ctx.0.set(Some(name.clone()));
+                                        username_error.set(None);
+                                        username_value.set(name);
+                                    }
+                                    Err(message) => {
+                                        username_error.set(Some(message));
+                                        username_value.set(raw);
+                                    }
                                 }
                             }
                             user_profile.set(Some(profile));
@@ -336,6 +417,16 @@ pub fn Home() -> Element {
             .unwrap_or_default()
     };
 
+    let remember_display_name = move |name: &str| {
+        save_display_name_to_storage(name);
+        match user_profile.peek().as_ref() {
+            Some(profile) => {
+                save_display_name_owner_to_storage(&display_name_owner_id(&profile.user_id))
+            }
+            None => clear_display_name_owner_from_storage(),
+        }
+    };
+
     let dropdown_name = user_profile().map(|p| {
         if is_guid_like(&p.name) {
             if p.user_id.contains('@') {
@@ -351,9 +442,7 @@ pub fn Home() -> Element {
     rsx! {
         div { class: "hero-container",
             BrowserCompatibility {}
-            div { class: "floating-element floating-element-1" }
-            div { class: "floating-element floating-element-2" }
-            div { class: "floating-element floating-element-3" }
+            HeroOrbs {}
 
             // Auth dropdown — absolutely positioned in top-right of hero-container
             if oauth_enabled().unwrap_or(false) {
@@ -433,25 +522,28 @@ pub fn Home() -> Element {
                     form {
                         onsubmit: move |e| {
                             e.prevent_default();
-                            username_error.set(None);
-                            let username = username_value();
-                            let meeting_id = get_meeting_id();
-                            if meeting_id.is_empty() || !is_valid_meeting_id(&meeting_id) {
-                                return;
-                            }
-                            match validate_display_name(&username) {
-                                Ok(valid_name) => {
+                            let name = display_name_for_submit(&username_value());
+                            let meeting_id = meeting_id_for_submit(&get_meeting_id());
+                            username_error.set(name.as_ref().err().cloned());
+                            meeting_id_error.set(meeting_id.as_ref().err().cloned());
+                            match (name, meeting_id) {
+                                (Ok(valid_name), Ok(meeting_id)) => {
                                     username_value.set(valid_name.clone());
-                                    save_display_name_to_storage(&valid_name);
-                                    (display_name_ctx.0).set(Some(valid_name.clone()));
+                                    remember_display_name(&valid_name);
+                                    (display_name_ctx.0).set(Some(valid_name));
 
                                     spawn(async move {
                                         gloo_timers::future::TimeoutFuture::new(0).await;
                                         navigator.push(Route::Meeting { id: meeting_id });
                                     });
                                 }
-                                Err(message) => {
-                                    username_error.set(Some(message));
+                                (name, _) => {
+                                    failed_submits += 1;
+                                    focus_input(if name.is_err() {
+                                        username_ref()
+                                    } else {
+                                        meeting_id_ref()
+                                    });
                                 }
                             }
                         },
@@ -522,7 +614,11 @@ pub fn Home() -> Element {
                                     span {
                                         class: "field-label__error",
                                         aria_live: "polite",
-                                        "{username_error().unwrap_or_default()}"
+                                        // Re-keyed per failed submit so an unchanged message is
+                                        // re-inserted into the live region, not diffed in place.
+                                        if let Some(message) = username_error() {
+                                            span { key: "{failed_submits}", "{message}" }
+                                        }
                                     }
                                 }
                                 input {
@@ -539,27 +635,15 @@ pub fn Home() -> Element {
                                     maxlength: DISPLAY_NAME_MAX_LEN as i64,
                                     aria_invalid: username_error().is_some(),
                                     value: "{username_value}",
+                                    onmounted: move |evt| {
+                                        if let Some(elem) = evt.try_as_web_event() {
+                                            username_ref.set(Some(elem));
+                                        }
+                                    },
                                     oninput: move |e: Event<FormData>| {
                                         let v = e.value();
-                                        let mut bad: Vec<char> = v
-                                            .chars()
-                                            .filter(|c| !is_allowed_display_name_char(*c))
-                                            .collect();
-                                        bad.sort();
-                                        bad.dedup();
+                                        username_error.set(display_name_field_error(&v));
                                         username_value.set(v);
-                                        if bad.is_empty() {
-                                            username_error.set(None);
-                                        } else {
-                                            let chars_str: Vec<String> = bad
-                                                .iter()
-                                                .map(|c| format!("'{c}'"))
-                                                .collect();
-                                            username_error.set(Some(format!(
-                                                "{} not allowed",
-                                                chars_str.join(", ")
-                                            )));
-                                        }
                                     },
                                 }
                             }
@@ -619,14 +703,17 @@ pub fn Home() -> Element {
                                                 id: "meeting-id-info-tip",
                                                 class: "field-label__tooltip",
                                                 role: "tooltip",
-                                                "A unique identifier for the meeting. Click \"Generate a New Meeting ID\" to create one, paste an ID shared by a host, or enter your own. Allowed: letters, numbers, and underscores (_)."
+                                                "A unique identifier for the meeting. Click \"Generate a New Meeting ID\" to create one, paste an ID shared by a host, or enter your own. Allowed: {MEETING_ID_ALLOWED_CHARS}. Up to {MEETING_ID_MAX_LEN} characters."
                                             }
                                         }
                                     }
                                     span {
+                                        id: "meeting-id-error",
                                         class: "field-label__error",
                                         aria_live: "polite",
-                                        "{meeting_id_error().unwrap_or_default()}"
+                                        if let Some(message) = meeting_id_error() {
+                                            span { key: "{failed_submits}", "{message}" }
+                                        }
                                     }
                                 }
                                 input {
@@ -639,29 +726,11 @@ pub fn Home() -> Element {
                                     r#type: "text",
                                     placeholder: "Enter meeting ID or generate one",
                                     required: true,
-                                    pattern: "^[a-zA-Z0-9_]*$",
                                     aria_invalid: meeting_id_error().is_some(),
                                     oninput: move |e: Event<FormData>| {
                                         let v = e.value();
-                                        let mut bad: Vec<char> = v
-                                            .chars()
-                                            .filter(|c| !c.is_ascii_alphanumeric() && *c != '_')
-                                            .collect();
-                                        bad.sort();
-                                        bad.dedup();
+                                        meeting_id_error.set(meeting_id_field_error(&v));
                                         meeting_id_value.set(v);
-                                        if bad.is_empty() {
-                                            meeting_id_error.set(None);
-                                        } else {
-                                            let chars_str: Vec<String> = bad
-                                                .iter()
-                                                .map(|c| format!("'{c}'"))
-                                                .collect();
-                                            meeting_id_error.set(Some(format!(
-                                                "{} not allowed",
-                                                chars_str.join(", ")
-                                            )));
-                                        }
                                     },
                                     onmounted: move |evt| {
                                         if let Some(elem) = evt.try_as_web_event() {
@@ -695,10 +764,10 @@ pub fn Home() -> Element {
                                             username_error.set(None);
                                             create_error.set(None);
                                             let username = username_value();
-                                            match validate_display_name(&username) {
+                                            match display_name_for_submit(&username) {
                                                 Ok(valid_name) => {
                                                     username_value.set(valid_name.clone());
-                                                    save_display_name_to_storage(&valid_name);
+                                                    remember_display_name(&valid_name);
                                                     (display_name_ctx.0).set(Some(valid_name.clone()));
                                                     creating.set(true);
 
@@ -751,6 +820,7 @@ pub fn Home() -> Element {
                                         input.set_value(&meeting_id);
                                     }
                                 }
+                                meeting_id_error.set(meeting_id_field_error(&meeting_id));
                                 meeting_id_value.set(meeting_id);
                             },
                         }
@@ -792,5 +862,226 @@ pub fn Home() -> Element {
 
             AboutModal { open: show_about }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_the_shared_rule_accepts_submit_unchanged() {
+        for id in ["abc_123", "my-meeting", "a~b", "-", "~"] {
+            assert_eq!(meeting_id_for_submit(id), Ok(id.to_string()), "{id:?}");
+            assert_eq!(meeting_id_field_error(id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn disallowed_characters_are_named_after_the_verdict() {
+        assert_eq!(
+            meeting_id_field_error("a.b").as_deref(),
+            Some("Not allowed: '.'")
+        );
+        assert_eq!(
+            meeting_id_field_error("a/b").as_deref(),
+            Some("Not allowed: '/'")
+        );
+        assert_eq!(
+            meeting_id_for_submit("x/y.z/w"),
+            Err("Not allowed: '/', '.'".to_string())
+        );
+    }
+
+    #[test]
+    fn hard_to_read_characters_are_named_readably() {
+        assert_eq!(
+            meeting_id_field_error("a b").as_deref(),
+            Some("Not allowed: space")
+        );
+        assert_eq!(
+            meeting_id_field_error("o'brien").as_deref(),
+            Some("Not allowed: apostrophe")
+        );
+        assert_eq!(
+            meeting_id_field_error("a\\b").as_deref(),
+            Some("Not allowed: '\\'")
+        );
+        assert_eq!(
+            meeting_id_field_error("a\tb\u{202e}c\u{a0}d").as_deref(),
+            Some("Not allowed: '\\t', '\\u{202e}', '\\u{a0}'")
+        );
+    }
+
+    #[test]
+    fn pasted_outer_whitespace_is_trimmed_but_inner_whitespace_is_not() {
+        assert_eq!(meeting_id_for_submit("  abc  "), Ok("abc".to_string()));
+        assert_eq!(meeting_id_field_error("  abc  "), None);
+        assert_eq!(
+            meeting_id_for_submit(" a b "),
+            Err("Not allowed: space".to_string())
+        );
+    }
+
+    #[test]
+    fn blank_input_shows_no_field_error_but_cannot_be_submitted() {
+        assert_eq!(meeting_id_field_error(""), None);
+        assert_eq!(meeting_id_field_error("   "), None);
+        assert_eq!(
+            meeting_id_for_submit("   "),
+            Err("Enter a meeting ID".to_string())
+        );
+    }
+
+    #[test]
+    fn ids_longer_than_the_shared_limit_are_refused() {
+        let at_limit = "a".repeat(MEETING_ID_MAX_LEN);
+        assert_eq!(meeting_id_for_submit(&at_limit), Ok(at_limit.clone()));
+        assert_eq!(
+            meeting_id_field_error(&format!("{at_limit}a")),
+            Some(format!("Too long: max {MEETING_ID_MAX_LEN} characters"))
+        );
+    }
+
+    #[test]
+    fn display_name_errors_use_the_meeting_id_format() {
+        assert_eq!(display_name_field_error("O'Brien Smith-Jones_2"), None);
+        assert_eq!(display_name_field_error(""), None);
+        assert_eq!(
+            display_name_field_error("alice@").as_deref(),
+            Some("Not allowed: '@'")
+        );
+        assert_eq!(
+            display_name_field_error("Bob!\t@!").as_deref(),
+            Some("Not allowed: '!', '@'")
+        );
+        assert_eq!(
+            display_name_field_error("a\\b\u{202e}").as_deref(),
+            Some("Not allowed: '\\', '\\u{202e}'")
+        );
+    }
+
+    #[test]
+    fn display_name_whitespace_that_submit_accepts_is_not_flagged() {
+        for raw in ["Ann\tLee", "Ann\u{a0}Lee", "Ann\u{3000}Lee", " Ann  Lee "] {
+            assert_eq!(display_name_field_error(raw), None, "{raw:?}");
+            assert_eq!(
+                display_name_for_submit(raw),
+                Ok("Ann Lee".to_string()),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn submitted_display_name_errors_use_the_inline_format() {
+        assert_eq!(
+            display_name_for_submit("Bob!"),
+            Err("Not allowed: '!'".to_string())
+        );
+        assert_eq!(
+            display_name_for_submit("user@name.com"),
+            Err("Not allowed: '.', '@'".to_string())
+        );
+        let too_long = "a".repeat(DISPLAY_NAME_MAX_LEN + 1);
+        for raw in ["", "   ", too_long.as_str()] {
+            assert_eq!(
+                display_name_for_submit(raw),
+                validate_display_name(raw),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            display_name_for_submit(&format!("{too_long}!")),
+            Err("Not allowed: '!'".to_string())
+        );
+    }
+
+    fn profile(user_id: &str, name: &str) -> UserProfile {
+        UserProfile {
+            user_id: user_id.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    fn tony_gmail() -> Option<String> {
+        Some("Tony gMail".to_string())
+    }
+
+    #[test]
+    fn signed_in_display_name_keeps_a_stored_name_saved_for_this_user() {
+        assert_eq!(
+            signed_in_display_name(
+                tony_gmail(),
+                Some(&display_name_owner_id("antonio@example.com")),
+                &profile("antonio@example.com", "Antonio Estrada"),
+            ),
+            tony_gmail()
+        );
+    }
+
+    #[test]
+    fn signed_in_display_name_keeps_a_stored_name_with_no_recorded_owner() {
+        assert_eq!(
+            signed_in_display_name(
+                tony_gmail(),
+                None,
+                &profile("antonio@example.com", "Antonio Estrada"),
+            ),
+            tony_gmail()
+        );
+    }
+
+    #[test]
+    fn signed_in_display_name_ignores_a_stored_name_saved_for_another_user() {
+        let me = profile("antonio@example.com", "Antonio Estrada");
+        for owner in [
+            display_name_owner_id("someone-else@example.com"),
+            "antonio@example.com".to_string(),
+            crate::context::GUEST_DISPLAY_NAME_OWNER.to_string(),
+        ] {
+            assert!(display_name_owned_by_another(Some(&owner), &me), "{owner}");
+            assert_eq!(
+                signed_in_display_name(tony_gmail(), Some(&owner), &me),
+                Some("Antonio Estrada".to_string()),
+                "{owner}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_in_display_name_derives_from_the_profile_when_nothing_is_stored() {
+        const GUID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let cases = [
+            (
+                profile("a@example.com", "Antonio Estrada"),
+                Some("Antonio Estrada"),
+            ),
+            (
+                profile("jane.doe@example.com", "jane.doe@example.com"),
+                Some("Jane Doe"),
+            ),
+            (profile("jane.doe@example.com", GUID), Some("Jane Doe")),
+            (profile(GUID, GUID), None),
+            (
+                profile("a@example.com", "Antonio Estrada (Tony)"),
+                Some("Antonio Estrada (Tony)"),
+            ),
+        ];
+        for (p, expected) in cases {
+            assert_eq!(
+                signed_in_display_name(None, None, &p),
+                expected.map(str::to_string),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlong_ids_with_disallowed_characters_name_the_characters() {
+        assert_eq!(
+            meeting_id_field_error(&"\u{e9}".repeat(130)).as_deref(),
+            Some("Not allowed: '\u{e9}'")
+        );
     }
 }

@@ -1,7 +1,23 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  getEncoderAudioGumCount,
+  getEncoderAudioTracks,
+  installGetUserMediaMock,
+} from "../helpers/media-mock";
 import { waitForServices } from "../helpers/wait-for-services";
 import { openPeerList } from "../helpers/controls";
+
+async function enableMicAndAwaitCapture(page: Page): Promise<void> {
+  await page.mouse.move(400, 400);
+  const toggle = page.locator('[data-testid="mic-toggle-button"]');
+  await expect(toggle).toBeVisible({ timeout: 15_000 });
+  if (!((await toggle.getAttribute("class")) || "").includes("active")) {
+    await toggle.click();
+  }
+  await expect(toggle).toHaveClass(/\bactive\b/, { timeout: 15_000 });
+  await expect.poll(() => getEncoderAudioGumCount(page), { timeout: 30_000 }).toBeGreaterThan(0);
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -278,6 +294,7 @@ test.describe("Host kick controls", () => {
 
       const hostPage = await hostCtx.newPage();
       const guestPage = await guestCtx.newPage();
+      await installGetUserMediaMock(guestPage);
 
       // ---- Both users join the meeting ----
       await navigateToMeeting(hostPage, meetingId, "KickHost");
@@ -295,6 +312,8 @@ test.describe("Host kick controls", () => {
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
       });
+
+      await enableMicAndAwaitCapture(guestPage);
 
       // ---- Host opens the tile menu and clicks "Remove from meeting" ----
       await hostKickPeerViaTile(hostPage);
@@ -328,6 +347,24 @@ test.describe("Host kick controls", () => {
       await expect(hostPage.locator(".grid-item:has(.tile-mute-btn)")).toHaveCount(0, {
         timeout: 20_000,
       });
+
+      // ---- Issue 2772: `Host` stays mounted behind this overlay and mute only
+      // PARKS, so without the release wire the claim outlives the meeting. ----
+      await expect
+        .poll(
+          async () => {
+            const acquisitions = await getEncoderAudioTracks(guestPage);
+            return acquisitions[acquisitions.length - 1]?.[0]?.readyState;
+          },
+          {
+            timeout: 20_000,
+            message:
+              "issue 2772: after the kicked overlay appears the guest's encoder " +
+              "capture track must be 'ended'. 'live' means the claim outlived the " +
+              "meeting.",
+          },
+        )
+        .toBe("ended");
 
       // ---- Host does NOT see the kicked overlay (host is never kicked by
       // their own kick action — server rejects user_id == caller). ----

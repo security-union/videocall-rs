@@ -30,7 +30,7 @@ use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{
     ws_mailbox_capacity, CLIENT_TIMEOUT, FRAGMENT_ASSEMBLY_IDLE_TIMEOUT,
     FRAGMENT_ASSEMBLY_MAX_LIFETIME, HEARTBEAT_INTERVAL, MAX_FRAME_SIZE,
-    WS_OUTBOUND_CHANNEL_CAPACITY, WS_OUTBOUND_SCREEN_BYTE_BUDGET, WS_OUTBOUND_VIDEO_BYTE_BUDGET,
+    OUTBOUND_SCREEN_BYTE_BUDGET, OUTBOUND_VIDEO_BYTE_BUDGET, WS_OUTBOUND_CHANNEL_CAPACITY,
 };
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
@@ -53,7 +53,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
@@ -110,9 +110,12 @@ pub(crate) struct OutboundFrame {
 /// `0` disables the byte dimension: audio costs slots, not bytes (#2261).
 pub(crate) fn ws_byte_budget_for(priority: OutboundPriority) -> usize {
     match priority {
-        OutboundPriority::Video => WS_OUTBOUND_VIDEO_BYTE_BUDGET,
-        OutboundPriority::Screen => WS_OUTBOUND_SCREEN_BYTE_BUDGET,
-        OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => 0,
+        OutboundPriority::Video => OUTBOUND_VIDEO_BYTE_BUDGET,
+        OutboundPriority::Screen => OUTBOUND_SCREEN_BYTE_BUDGET,
+        OutboundPriority::Audio
+        | OutboundPriority::Critical
+        | OutboundPriority::Control
+        | OutboundPriority::ProbeEcho => 0,
     }
 }
 
@@ -243,7 +246,6 @@ impl WsChatSession {
         observer: bool,
         instance_id: Option<String>,
         is_host: bool,
-        end_on_host_leave: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -258,7 +260,6 @@ impl WsChatSession {
             instance_id,
             "websocket",
             is_host,
-            end_on_host_leave,
         );
 
         let (outbound_tx, outbound_rx) =
@@ -510,7 +511,18 @@ impl Handler<Message> for WsChatSession {
         // The drop path discards `bytes` without sending it.
         let bytes = self.logic.handle_outbound(&msg);
 
-        let priority = OutboundPriority::classify(parse_succeeded, packet_type, media_type);
+        // Cleartext even under E2EE, so it is what keeps the byte bound alive
+        // when the inner parse above yields `None` (#2717).
+        let media_kind = parsed
+            .as_ref()
+            .and_then(|pw| pw.media_kind.enum_value().ok())
+            .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED);
+        let priority = OutboundPriority::classify_sealed_aware(
+            parse_succeeded,
+            packet_type,
+            media_type,
+            media_kind,
+        );
         let free_capacity = self.outbound_tx.capacity();
         if let PriorityDropDecision::Drop { reason } =
             ws_outbound_decision(priority, free_capacity, &self.outbound_bytes)
@@ -805,7 +817,7 @@ impl WsChatSession {
 mod tests {
     use super::*;
     use crate::actors::chat_server::ChatServer;
-    use crate::constants::{INBOUND_MAILBOX_HEADROOM_FACTOR, WS_OUTBOUND_LEGACY_SLOT_CAPACITY};
+    use crate::constants::{INBOUND_MAILBOX_HEADROOM_FACTOR, OUTBOUND_LEGACY_SLOT_CAPACITY};
     use crate::server_diagnostics::ServerDiagnostics;
     use crate::session_manager::SessionManager;
     use actix::Actor;
@@ -920,11 +932,11 @@ mod tests {
     #[test]
     fn camera_shed_point_ignores_screen_bytes_in_the_same_queue() {
         // A receiver's queue is mixed by construction. 6 screen frames is
-        // 331,722 B, past 0.80 x WS_OUTBOUND_VIDEO_BYTE_BUDGET (307,200), so a
+        // 331,722 B, past 0.80 x OUTBOUND_VIDEO_BYTE_BUDGET (307,200), so a
         // SHARED byte counter sheds every camera packet in the room here.
         let mut queue = meter_of(OutboundPriority::Screen, 6, SCREEN_FRAME_BYTES);
         assert!(
-            queue.queued_total() > WS_OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100,
+            queue.queued_total() > OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100,
             "precondition: the screen backlog alone must exceed the camera \
              shed point, or this test proves nothing",
         );
@@ -981,8 +993,8 @@ mod tests {
     ) -> PriorityDropDecision {
         crate::actors::priority_drop::evaluate(
             priority,
-            WS_OUTBOUND_LEGACY_SLOT_CAPACITY - queued,
-            WS_OUTBOUND_LEGACY_SLOT_CAPACITY,
+            OUTBOUND_LEGACY_SLOT_CAPACITY - queued,
+            OUTBOUND_LEGACY_SLOT_CAPACITY,
         )
     }
 
@@ -1202,7 +1214,6 @@ mod tests {
                                     false, // tests use non-observer sessions
                                     None,  // no instance_id
                                     false, // is_host
-                                    false, // end_on_host_leave
                                 );
                                 ws::start(actor, &req, stream)
                                     .map_err(actix_web::error::ErrorInternalServerError)

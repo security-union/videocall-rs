@@ -2,6 +2,7 @@ import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwrig
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { createMeeting, joinMeeting, deleteAllOwnedMeetings } from "../helpers/meeting-api";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 
@@ -60,6 +61,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 

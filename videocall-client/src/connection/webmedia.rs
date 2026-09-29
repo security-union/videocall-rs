@@ -29,11 +29,19 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
 
+/// Re-exported from the transport crate, which owns it since #2728 moved the
+/// inbound framing into a module the session Worker also links.
+pub use videocall_transport::inbound::{InboundLane, ReceivedAtMs};
+
 #[derive(Clone)]
 pub struct ConnectOptions {
     pub websocket_url: String,
     pub webtransport_url: String,
-    pub on_inbound_media: Callback<PacketWrapper>,
+    /// Every inbound packet, with the lane that carried it and the instant
+    /// the TRANSPORT received it. #2728 made that instant distinct from "now":
+    /// under a main-thread stall the Worker received the packet seconds before
+    /// this callback runs.
+    pub on_inbound_media: Callback<(PacketWrapper, InboundLane, ReceivedAtMs)>,
     pub on_connected: Callback<()>,
     pub on_connection_lost: Callback<ConnectionLostReason>,
     pub peer_monitor: Callback<()>,
@@ -86,6 +94,29 @@ impl MediaStreamKey {
 
     /// Highest currently assigned `MediaStreamKey` wire value.
     pub const MAX_WIRE_VALUE: u8 = videocall_types::limits::MAX_MEDIA_STREAM_KEY;
+
+    /// QUIC scheduling hint for this key's persistent uplink unistream, passed
+    /// as `WebTransportSendStreamOptions.sendOrder` at stream creation (#2722).
+    /// The W3C spec defines a HIGHER value as sent first; with no value the
+    /// four streams carry no relative priority at all, so one screen keyframe
+    /// competes with a second of audio on a constrained uplink.
+    ///
+    /// Audio first (unconcealable delay), then Control (mostly tiny packets that
+    /// gate something large — the #2721 RTT probe, KEYFRAME_REQUEST, AES_KEY —
+    /// though oversized datagrams also fall back onto it), then Screen, then
+    /// camera Video LAST: camera is the adaptive source, stepping its own tier
+    /// down on its own stream's stalls, while screen has neither a send-side
+    /// drop nor an age-out on WebTransport and is the content when someone is
+    /// presenting. Values are spaced so a future lane can be inserted between
+    /// any two; only their ORDER is load-bearing.
+    pub const fn send_order(self) -> i32 {
+        match self {
+            MediaStreamKey::Audio => 300,
+            MediaStreamKey::Control => 200,
+            MediaStreamKey::Screen => 150,
+            MediaStreamKey::Video => 100,
+        }
+    }
 }
 
 const _: () = assert!(MediaStreamKey::Control.as_u8() == MediaStreamKey::MAX_WIRE_VALUE);
@@ -163,6 +194,71 @@ pub(super) trait WebMedia<TASK> {
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
                 error!("error sending {packet_type} packet via datagram: {e:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Highest first. Only the ORDER is a contract, so the tests assert the
+    const RANKED_HIGHEST_FIRST: [MediaStreamKey; 4] = [
+        MediaStreamKey::Audio,
+        MediaStreamKey::Control,
+        MediaStreamKey::Screen,
+        MediaStreamKey::Video,
+    ];
+
+    #[test]
+    fn send_order_is_strictly_descending_from_audio_to_camera_video() {
+        assert_eq!(
+            RANKED_HIGHEST_FIRST.len(),
+            MediaStreamKey::MAX_WIRE_VALUE as usize,
+            "every MediaStreamKey must be ranked; a new variant belongs in this list"
+        );
+        for pair in RANKED_HIGHEST_FIRST.windows(2) {
+            assert!(
+                pair[0].send_order() > pair[1].send_order(),
+                "{:?} must be scheduled before {:?}, got {} vs {}",
+                pair[0],
+                pair[1],
+                pair[0].send_order(),
+                pair[1].send_order(),
+            );
+        }
+    }
+
+    #[test]
+    fn every_media_stream_key_has_its_own_send_order() {
+        let mut orders: Vec<i32> = RANKED_HIGHEST_FIRST
+            .iter()
+            .map(|k| k.send_order())
+            .collect();
+        orders.sort_unstable();
+        orders.dedup();
+        assert_eq!(
+            orders.len(),
+            RANKED_HIGHEST_FIRST.len(),
+            "each persistent uplink stream needs a sendOrder of its own"
+        );
+    }
+
+    #[test]
+    fn audio_outranks_and_camera_video_yields_to_every_other_stream() {
+        for key in RANKED_HIGHEST_FIRST {
+            if key != MediaStreamKey::Audio {
+                assert!(
+                    MediaStreamKey::Audio.send_order() > key.send_order(),
+                    "audio must outrank {key:?}"
+                );
+            }
+            if key != MediaStreamKey::Video {
+                assert!(
+                    MediaStreamKey::Video.send_order() < key.send_order(),
+                    "camera video must yield to {key:?}"
+                );
             }
         }
     }

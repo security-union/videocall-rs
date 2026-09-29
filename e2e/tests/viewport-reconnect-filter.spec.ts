@@ -102,10 +102,7 @@ async function seedStandardDensity(context: BrowserContext) {
 /**
  * Pin a BrowserContext to a specific media transport BEFORE its first
  * navigation by seeding the sticky preference the UI reads from localStorage at
- * boot (context.rs). `createAuthenticatedContext` only sets a WS default when no
- * preference exists, so seeding here (added AFTER that init script, but it sets
- * unconditionally) wins. Mirrors the cross-transport pin in
- * cross-transport-display-name.spec.ts.
+ * boot (context.rs). This pin is the only thing deciding the transport.
  */
 async function pinTransport(context: BrowserContext, t: Transport) {
   const pref = t === "webtransport" ? "webtransport" : "websocket";

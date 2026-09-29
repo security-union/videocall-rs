@@ -2,12 +2,14 @@
 
 pub mod about_modal;
 pub mod action_bar_layout;
+pub mod animation_frame;
 pub mod appearance_settings_panel;
 pub mod attendants;
 mod attendants_layout;
 pub mod browser_compatibility;
 pub mod call_timer;
 pub mod capability_check;
+pub mod co_hosts;
 pub mod color_picker;
 pub mod config_error;
 pub mod connection_quality_indicator;
@@ -23,19 +25,23 @@ pub mod density;
 pub mod device_selector;
 pub mod device_settings_modal;
 pub mod diagnostics;
+pub mod display_name_edit;
 pub mod freshness_inject;
 pub mod google_sign_in_button;
 pub mod grid_overflow_badge;
 pub mod handler_cell;
+pub mod hero_orbs;
 pub mod host;
 pub mod host_controls;
 pub mod icons;
+pub mod invalid_meeting_id;
 pub mod login;
 pub mod media_metrics_overlay;
 pub mod meeting_ended_overlay;
 pub mod meeting_footer;
 pub mod meeting_format;
 pub mod meeting_options_controls;
+pub mod wt_receive_inject;
 // Issue 1613: the meeting-password prompt. The error-code -> prompt mapping and
 // the prompt's attempt bookkeeping are pure and host-testable; the component is
 // a thin driver over them.
@@ -52,6 +58,7 @@ pub mod neteq_chart;
 pub mod okta_sign_in_button;
 pub mod peer_list_item;
 pub mod performance_settings;
+pub mod pin_order;
 pub mod preferences_settings_panel;
 // Issue 2135: the raised-hand roster (ordering + copy) and its persistent
 // banner. Pure helpers are host-testable; the banner is a thin driver.
@@ -81,6 +88,7 @@ pub mod screen_share_detach;
 pub mod search_modal;
 pub mod self_view;
 pub mod self_view_hidden_pill;
+pub mod share_view;
 pub mod signal_quality;
 pub mod toggle_switch;
 
@@ -94,3 +102,8 @@ mod peer_list;
 pub mod peer_tile;
 pub mod pre_join_preview;
 pub mod pre_join_settings_card;
+// Issue 2702: keeps the manual pre-join lobby's presence lease alive while
+// admitted (REST `/join`) but not yet transport-connected. Pure scheduling
+// state is host-testable; the component is a thin driver, directly mountable
+// on its own so a wasm test does not need the whole `AttendantsComponent`.
+pub mod presence_keepalive;

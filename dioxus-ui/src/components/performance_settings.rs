@@ -46,6 +46,7 @@
 //! (bypassing the Dioxus diff). Send and receive meters use DISTINCT DOM ids so
 //! the two drivers never fight over the same node.
 
+use crate::components::animation_frame::AnimationFrame;
 use crate::constants::audio_published_layer_count;
 use dioxus::prelude::*;
 use std::rc::Rc;
@@ -2205,8 +2206,7 @@ fn PerfMeter(
 /// `data-level` + readout straight to the DOM nodes **by id** (so the meters can
 /// live anywhere in the tree, e.g. each inside its own per-kind card).
 ///
-/// Direct DOM writes mean no per-frame re-render. The loop self-cancels when the
-/// driver unmounts (the `use_drop` clears the closure cell).
+/// Direct DOM writes mean no per-frame re-render.
 #[component]
 fn QualityVuMeterDriver(
     /// Reads the current video/audio live snapshot. `None` → those meters reset
@@ -2216,21 +2216,14 @@ fn QualityVuMeterDriver(
     /// screen meter shows level 0 + "Screen — not sharing".
     read_screen_snapshot: ScreenSnapshotReader,
 ) -> Element {
-    // Shared cell holds the rAF closure so it can reschedule itself, and so the
-    // component's `use_drop` can drop it on unmount (stopping the loop).
-    type RafCell = Rc<std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
-    let cb: RafCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
-
     // Start the throttled rAF loop once on mount.
     {
-        let cb = cb.clone();
         let reader = read_snapshot.clone();
         let screen_reader = read_screen_snapshot.clone();
         use_hook(move || {
-            let cb_clone = cb.clone();
             // Last-write throttle: only touch the DOM ~4x/sec.
             let last_ms = Rc::new(std::cell::Cell::new(0.0_f64));
-            let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+            let raf = AnimationFrame::new_loop(move || {
                 let now = web_sys::window()
                     .and_then(|w| w.performance())
                     .map(|p| p.now())
@@ -2251,25 +2244,9 @@ fn QualityVuMeterDriver(
                     write_readout_text(AUDIO_READOUT_ID, &state.audio_text);
                     write_readout_text(SCREEN_READOUT_ID, &state.screen_text);
                 }
-                // Reschedule only while the cell still holds the closure (i.e. the
-                // component is still mounted). `use_drop` clears it to stop us.
-                if let (Some(win), Some(c)) = (web_sys::window(), cb_clone.borrow().as_ref()) {
-                    let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
-                }
-            }) as Box<dyn FnMut()>);
-
-            *cb.borrow_mut() = Some(closure);
-            if let (Some(win), Some(c)) = (web_sys::window(), cb.borrow().as_ref()) {
-                let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
-            }
-        });
-    }
-
-    // Stop the loop and drop the closure when the driver unmounts.
-    {
-        let cb = cb.clone();
-        use_drop(move || {
-            *cb.borrow_mut() = None;
+            });
+            raf.request();
+            raf
         });
     }
 
@@ -3586,6 +3563,7 @@ pub mod receive {
         quality_state_modifier, reason_chip_modifier, reason_chip_text, reason_chip_title,
         tick_offsets, write_meter_level, write_readout_text, PeerKindSnap,
     };
+    use crate::components::animation_frame::AnimationFrame;
     use dioxus::prelude::*;
     // issue 1164: `WebEventExt::as_web_event` lets the <details> ontoggle handler
     // read the native open-state back off the event target. Same import path used
@@ -4205,16 +4183,11 @@ pub mod receive {
     /// per kind and writing each meter's `data-level` + readout to the DOM by id.
     #[component]
     pub fn ReceivedQualityDriver(reader: ReceivedReader) -> Element {
-        type RafCell = Rc<std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
-        let cb: RafCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
-
         {
-            let cb = cb.clone();
             let reader = reader.clone();
             use_hook(move || {
-                let cb_clone = cb.clone();
                 let last_ms = Rc::new(std::cell::Cell::new(0.0_f64));
-                let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+                let raf = AnimationFrame::new_loop(move || {
                     let now = web_sys::window()
                         .and_then(|w| w.performance())
                         .map(|p| p.now())
@@ -4233,23 +4206,9 @@ pub mod receive {
                             write_readout_text(readout_id, &state.text);
                         }
                     }
-                    if let (Some(win), Some(c)) = (web_sys::window(), cb_clone.borrow().as_ref()) {
-                        let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
-                    }
-                })
-                    as Box<dyn FnMut()>);
-
-                *cb.borrow_mut() = Some(closure);
-                if let (Some(win), Some(c)) = (web_sys::window(), cb.borrow().as_ref()) {
-                    let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
-                }
-            });
-        }
-
-        {
-            let cb = cb.clone();
-            use_drop(move || {
-                *cb.borrow_mut() = None;
+                });
+                raf.request();
+                raf
             });
         }
 

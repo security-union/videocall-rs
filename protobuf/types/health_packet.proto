@@ -210,10 +210,21 @@ message PeerStats {
   // Per-peer receive-side audio DATAGRAM loss rate (lost audio packets/sec,
   // windowed) observed for this peer while THIS client is on WebTransport
   // (#1878). The audio sibling of video_seq_loss_per_sec (field 15). Nonzero
-  // only when audio riding unreliable QUIC datagrams is being dropped (e.g. the
+  // when audio riding unreliable QUIC datagrams is being dropped (e.g. the
   // browser's incoming-datagram queue overflowing during a main-thread stall) —
   // a pathology previously invisible in every dashboard. ~0 on WebSocket and on
   // E2EE-on WebTransport (both reliable paths).
+  //
+  // #2724 put E2EE-off WebTransport audio on a reliable stream too, so for a
+  // ds=1 receiver on a modern relay this reads ~0 BY DESIGN, as it already did
+  // under E2EE-on, and is no longer a proxy for "this receiver's audio is bad".
+  // The tracker is gated on the transport rather than the lane, so it keeps
+  // running there: what can still lift it is a gap the RELAY made, chiefly an
+  // audio-lane tail drop, and the #2029 WebSocket latch and the #1924 demotion
+  // stay reachable through that — they are NOT confined to legacy populations.
+  // What is gone is the browser datagram drop this field is NAMED for, and that
+  // returns only on a pre-#2723 client, a pre-#2724 relay, or a cluster set to
+  // WT_AUDIO_DOWNLINK_LANE=datagram.
   //
   // A contiguous gap is booked as its positions shift off the 64-slot reorder
   // window, so the ones still inside it — which may yet arrive — are not
@@ -258,7 +269,11 @@ message HealthPacket {
   optional uint64 memory_total_bytes = 13; // JS heap memory limit (Chrome only)
   optional double avg_encode_latency_ms = 14; // Average encode latency in ms
   bool is_tab_throttled = 15; // Browser tab throttling state
-  optional uint64 send_queue_bytes = 16; // Bytes queued in send buffer
+  // Bytes queued in the ACTIVE transport's uplink, as an instantaneous GAUGE —
+  // chart it as-is, never with rate()/increase(). WebSocket reports the
+  // browser's bufferedAmount; since #2722 WebTransport reports
+  // unistream_queue_depth_bytes (videocall-transport).
+  optional uint64 send_queue_bytes = 16;
   optional double packets_received_per_sec = 17; // Inbound packet rate
   optional double packets_sent_per_sec = 18; // Outbound packet rate
   // Display name as entered by the user in the UI (e.g. "Jay at work").
@@ -688,6 +703,30 @@ message HealthPacket {
   // keyframe_arrivals_total convention (field 10).
   optional uint64 ws_inactive_dropped_frames_by_state_closing = 129;
   optional uint64 ws_inactive_dropped_frames_by_state_closed = 130;
+
+  // Cumulative episodes where the client's re-election watchdog saw the active
+  // connection's RELIABLE downlink lane silent for over 2.5 peer-heartbeat
+  // periods (~12.5 s) while its DATAGRAM lane was still delivering. One per
+  // contiguous episode. Cumulative, > 0-gated, relay-.set(), as fields 85-86.
+  optional uint64 reliable_lane_stall_episodes_total = 131; // (#2720)
+
+  // Cumulative inbound WebTransport unistreams this client lost: a read
+  // rejection, or a queued stream superseded before any reader saw it. The relay
+  // produces both by resetting the wedged downlink stream on a #1638
+  // write-deadline shed; a session teardown also rejects the pending read.
+  // Cumulative, > 0-gated, relay-.set(), as field 131.
+  //
+  // BASELINE CHANGED BY #2723. The relay now holds one downlink stream per
+  // (publisher, media kind), and the byte dimension of its shed predicate is
+  // receiver-wide, so connection-level congestion parks every stream above the
+  // ratio at once and ONE congestion event resets up to the per-receiver stream
+  // cap where it used to reset one. A step up across that deploy is the design,
+  // not a fault: re-baseline in the same traffic profile before comparing.
+  optional uint64 inbound_unistream_resets_total = 132; // (#2722, #2723)
+
+  // WS freshness-gate delta drops since page load, never reset.
+  optional uint64 camera_ws_stale_delta_drops = 144;
+  optional uint64 screen_ws_stale_delta_drops = 145;
 }
 
 // One active camera rung's FITTED geometry and measured output rate.

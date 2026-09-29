@@ -16,6 +16,17 @@
  * conditions.
  */
 
+const _: () = assert!(
+    videocall_transport::worker_proto::STALE_DELIVERY_CEILING_MS
+        == videocall_codecs::jitter_buffer::MAX_PLAYOUT_AGE_MS,
+    "videocall-transport's stale-frame ceiling drifted from videocall-codecs (#2728)"
+);
+const _: () = assert!(
+    videocall_transport::worker_proto::SCREEN_STALE_DELIVERY_CEILING_MS
+        == videocall_aq::constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+    "videocall-transport's screen silence ceiling drifted from videocall-aq (#2728)"
+);
+
 // This submodule implements our WebMedia trait for WebTransportTask
 //
 // Sets up all the stream handling to support the callbacks on_connected, on_connection_lost, and
@@ -24,37 +35,27 @@
 use super::connection_lost_reason::ConnectionLostReason;
 use super::url_log::strip_query_for_log;
 use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
-use js_sys::Boolean;
-use js_sys::JsString;
-use js_sys::Reflect;
-use js_sys::Uint8Array;
 use log::debug;
-use log::error;
 use log::info;
-use log::warn;
-use protobuf::Message;
+use videocall_transport::inbound::{emit_packet, InboundFrame, InboundLane, MessageType};
 use videocall_transport::webtransport::{
-    FrameDropMeta, WebTransportService, WebTransportStatus, WebTransportTask,
+    FrameDropMeta, WebTransportCloseInfo, WebTransportService, WebTransportStatus, WebTransportTask,
 };
-use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::wt_close::WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE;
 use videocall_types::Callback;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::ReadableStreamDefaultReader;
-use web_sys::WebTransportBidirectionalStream;
-use web_sys::WebTransportReceiveStream;
 
-/// Maximum size for an inbound stream buffer (4 MB), matching the server's MAX_FRAME_SIZE.
-/// Prevents a malicious or misbehaving peer from consuming all WASM memory by sending
-/// an arbitrarily large stream payload.
-const MAX_INBOUND_STREAM_SIZE: usize = 4_000_000;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MessageType {
-    Datagram,
-    UnidirectionalStream,
-    BidirectionalStream,
-    // Unknown,
+/// Map a server close code on an established session to a loss reason. Every
+/// other code, `0` included, keeps today's generic session-dropped path.
+pub(super) fn lost_reason_for_close_code(info: &WebTransportCloseInfo) -> ConnectionLostReason {
+    let message = format!(
+        "server closed the session: code {} reason {:?}",
+        info.code, info.reason
+    );
+    if info.code == WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE {
+        ConnectionLostReason::DownlinkUnrecoverable(message)
+    } else {
+        ConnectionLostReason::SessionDropped(message)
+    }
 }
 
 impl WebMedia<WebTransportTask> for WebTransportTask {
@@ -69,24 +70,19 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
         // `connection/netsim_hook.rs` for the full design (Option A —
         // thread-local hook + re-entrancy flag).
 
-        let on_datagram = {
+        let on_frame = {
             let callback = options.on_inbound_media.clone();
-            Callback::from(move |bytes: Vec<u8>| {
-                emit_packet(bytes, MessageType::Datagram, callback.clone())
-            })
-        };
-
-        let on_unidirectional_stream = {
-            let callback = options.on_inbound_media.clone();
-            Callback::from(move |stream: WebTransportReceiveStream| {
-                handle_unidirectional_stream(stream, callback.clone())
-            })
-        };
-
-        let on_bidirectional_stream = {
-            let callback = options.on_inbound_media.clone();
-            Callback::from(move |stream: WebTransportBidirectionalStream| {
-                handle_bidirectional_stream(stream, callback.clone())
+            Callback::from(move |frame: InboundFrame| {
+                let message_type = match frame.lane {
+                    InboundLane::Datagram => MessageType::Datagram,
+                    InboundLane::Reliable => MessageType::UnidirectionalStream,
+                };
+                emit_packet(
+                    frame.bytes,
+                    message_type,
+                    frame.received_at,
+                    callback.clone(),
+                )
             })
         };
 
@@ -100,6 +96,9 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 }
                 WebTransportStatus::ClosedAfterReady(msg) => {
                     connection_lost_callback.emit(ConnectionLostReason::SessionDropped(msg));
+                }
+                WebTransportStatus::ClosedAfterReadyWithCode(info) => {
+                    connection_lost_callback.emit(lost_reason_for_close_code(&info));
                 }
                 // Legacy variants — these should no longer fire with the updated
                 // transport, but keep them as a defensive fallback.
@@ -117,13 +116,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             "WebTransport connecting to {}",
             strip_query_for_log(&options.webtransport_url)
         );
-        let task = WebTransportService::connect(
-            &options.webtransport_url,
-            on_datagram,
-            on_unidirectional_stream,
-            on_bidirectional_stream,
-            notification,
-        )?;
+        let task = WebTransportService::connect(&options.webtransport_url, on_frame, notification)?;
         info!("WebTransport connection success");
         Ok(task)
     }
@@ -157,9 +150,10 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             }
         }
         WebTransportTask::send_on_persistent_stream(
-            self.transport.clone(),
+            self.host.clone(),
             self.persistent_streams.clone(),
             stream_key.as_u8(),
+            stream_key.send_order(),
             bytes,
             meta,
         );
@@ -182,7 +176,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             // for lower latency and no head-of-line blocking.  Datagrams are
             // on a separate primitive from persistent streams and are NOT
             // length-prefix framed.
-            WebTransportTask::send_datagram(self.transport.clone(), bytes);
+            WebTransportTask::send_datagram(self.host.clone(), bytes);
         } else {
             // Packet exceeds datagram size limit (e.g., a keyframe).
             // Fall back to the Control persistent stream so the server's
@@ -194,9 +188,10 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 DATAGRAM_MAX_SIZE
             );
             WebTransportTask::send_on_persistent_stream(
-                self.transport.clone(),
+                self.host.clone(),
                 self.persistent_streams.clone(),
                 MediaStreamKey::Control.as_u8(),
+                MediaStreamKey::Control.send_order(),
                 bytes,
                 None,
             );
@@ -204,209 +199,99 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     }
 }
 
-/// Reads from a **persistent length-prefixed unidirectional QUIC stream**
-/// (server -> client) and emits each complete frame to `on_inbound_media`.
-///
-/// The server keeps the stream open and prefixes every packet with a 4-byte
-/// big-endian length header (see `actix-api/src/webtransport/bridge.rs::
-/// spawn_unistream_writer`).  This reader accumulates chunks across QUIC
-/// chunk boundaries and extracts complete `[length][payload]` frames as
-/// they arrive, emitting each immediately.
-///
-/// **Framed-only.** Issue #776: the legacy per-packet "emit raw buffer on
-/// done" fallback was removed alongside the rest of PR #772 — both ends of
-/// the WebTransport unidirectional path are framed-only.  A truncated
-/// frame at EOF (server crash mid-write, or a corrupt-length break) leaves
-/// `pending` with bytes that cannot be parsed as a `PacketWrapper`; we
-/// drop them on the floor with a warning rather than emit garbage to the
-/// decoder.
-fn handle_unidirectional_stream(
-    stream: WebTransportReceiveStream,
-    on_inbound_media: Callback<PacketWrapper>,
-) {
-    if stream.is_undefined() {
-        debug!("stream is undefined");
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_arch = "wasm32")]
+    use js_sys::Reflect;
+
+    fn close_info(code: u32, reason: &str) -> WebTransportCloseInfo {
+        WebTransportCloseInfo {
+            code,
+            reason: reason.to_string(),
+        }
     }
-    let incoming_unistreams: ReadableStreamDefaultReader = stream.get_reader().unchecked_into();
-    let callback = Callback::from(move |d: Vec<u8>| {
-        emit_packet(
-            d,
-            MessageType::UnidirectionalStream,
-            on_inbound_media.clone(),
+
+    #[test]
+    fn the_downlink_unrecoverable_code_maps_to_its_own_reason() {
+        let relay_reason =
+            std::str::from_utf8(videocall_types::wt_close::WT_CLOSE_REASON_DOWNLINK_UNRECOVERABLE)
+                .unwrap();
+        let reason = lost_reason_for_close_code(&close_info(
+            WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE,
+            relay_reason,
+        ));
+        assert!(
+            matches!(reason, ConnectionLostReason::DownlinkUnrecoverable(_)),
+            "code {WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE} must not read as a generic drop"
+        );
+        assert_eq!(reason.label(), "downlink_unrecoverable");
+        assert!(
+            reason.message().contains("1001")
+                && reason.message().contains("downlink-shed-escalation"),
+            "the decision the relay made must survive into the log line: {}",
+            reason.message()
+        );
+    }
+
+    #[test]
+    fn a_clean_or_unknown_close_code_stays_on_the_generic_path() {
+        for code in [0, 1, 1000, 1002, 4242, u32::MAX] {
+            let reason = lost_reason_for_close_code(&close_info(code, "bye"));
+            assert!(
+                matches!(reason, ConnectionLostReason::SessionDropped(_)),
+                "close code {code} is not the downlink-unrecoverable code and must \
+                 take the generic session-dropped path"
+            );
+            assert_eq!(reason.label(), "session_dropped");
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn a_resolved_close_info_object_yields_its_code_and_reason() {
+        let settled = js_sys::Object::new();
+        Reflect::set(&settled, &"closeCode".into(), &1001_u32.into()).unwrap();
+        Reflect::set(
+            &settled,
+            &"reason".into(),
+            &"downlink-shed-escalation".into(),
         )
-    });
-    wasm_bindgen_futures::spawn_local(async move {
-        // Buffer for accumulating partial reads across QUIC chunk boundaries.
-        // May span multiple length-prefixed frames within a single chunk,
-        // or split a single frame across multiple chunks.
-        let mut pending: Vec<u8> = Vec::new();
+        .unwrap();
 
-        loop {
-            let read_result = JsFuture::from(incoming_unistreams.read()).await;
-            match read_result {
-                Err(e) => {
-                    warn!("Unistream read error: {:?}", e);
-                    break;
-                }
-                Ok(result) => {
-                    let done = Reflect::get(&result, &JsString::from("done"))
-                        .map(|v| v.unchecked_into::<Boolean>().is_truthy())
-                        .unwrap_or(true);
-
-                    if let Ok(value) = Reflect::get(&result, &JsString::from("value")) {
-                        if !value.is_undefined() {
-                            let chunk: Uint8Array = value.unchecked_into();
-                            append_uint8_array_to_vec(&mut pending, &chunk);
-                        }
-                    }
-
-                    // Try to extract complete length-prefixed frames:
-                    //   [4-byte big-endian length][payload of that length]
-                    while pending.len() >= 4 {
-                        let len =
-                            u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]])
-                                as usize;
-
-                        if len == 0 || len > MAX_INBOUND_STREAM_SIZE {
-                            // Corrupt or oversized length header on a
-                            // framed-only stream — the server should
-                            // never emit this.  Drop the rest of the
-                            // buffer and stop reading from this stream.
-                            error!(
-                                "Frame length {} invalid (max {}), dropping framed unistream",
-                                len, MAX_INBOUND_STREAM_SIZE
-                            );
-                            return;
-                        }
-
-                        if pending.len() < 4 + len {
-                            break; // need more data from the next read
-                        }
-
-                        // Extract the complete packet payload, advance the buffer.
-                        // drain() avoids a second Vec allocation for the remainder.
-                        let packet_data: Vec<u8> = pending.drain(..4 + len).skip(4).collect();
-                        callback.emit(packet_data);
-                    }
-
-                    if done {
-                        // Stream finished.  With both ends framed-only, a
-                        // non-empty `pending` here means either (a) the
-                        // server crashed mid-frame leaving a truncated
-                        // `[len][partial-payload]` on the wire, or (b) the
-                        // loop above broke out of frame extraction because
-                        // pending.len() < 4 + len for the current header.
-                        // In either case the bytes are not a complete
-                        // `PacketWrapper`; drop them and log.  Issue #776
-                        // removed the legacy "emit raw buffer" fallback —
-                        // emitting truncated bytes would only have produced
-                        // a downstream parse failure.
-                        if !pending.is_empty() {
-                            warn!(
-                                "Framed unistream EOF with {} unconsumed bytes (truncated frame); dropping",
-                                pending.len()
-                            );
-                        }
-                        break;
-                    }
-
-                    // Guard against unbounded buffer growth on a persistent
-                    // stream that stops yielding valid frames.
-                    if pending.len() > MAX_INBOUND_STREAM_SIZE {
-                        error!(
-                            "Inbound unistream buffer exceeded {} bytes (got {}), dropping stream",
-                            MAX_INBOUND_STREAM_SIZE,
-                            pending.len()
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn handle_bidirectional_stream(
-    stream: WebTransportBidirectionalStream,
-    on_inbound_media: Callback<PacketWrapper>,
-) {
-    debug!("OnBidiStream: {:?}", &stream);
-    if stream.is_undefined() {
-        debug!("stream is undefined");
-        return;
+        assert_eq!(
+            videocall_transport::webtransport::read_close_info(&settled),
+            Some(close_info(1001, "downlink-shed-escalation")),
+        );
     }
-    let readable: ReadableStreamDefaultReader = stream.readable().get_reader().unchecked_into();
-    let callback = Callback::from(move |d| {
-        emit_packet(
-            d,
-            MessageType::BidirectionalStream,
-            on_inbound_media.clone(),
-        )
-    });
-    wasm_bindgen_futures::spawn_local(async move {
-        let mut buffer: Vec<u8> = vec![];
-        loop {
-            debug!("reading from stream");
-            let read_result = JsFuture::from(readable.read()).await;
 
-            match read_result {
-                Err(_) => {
-                    // Expected when the transport is closed (Drop or network
-                    // failure).
-                    break;
-                }
-                Ok(result) => {
-                    let done = match Reflect::get(&result, &JsString::from("done")) {
-                        Ok(val) => val.unchecked_into::<Boolean>(),
-                        Err(e) => {
-                            warn!("Failed to read 'done' from bidistream result: {:?}", e);
-                            break;
-                        }
-                    };
-                    let value = match Reflect::get(&result, &JsString::from("value")) {
-                        Ok(val) => val,
-                        Err(e) => {
-                            warn!("Failed to read 'value' from bidistream result: {:?}", e);
-                            break;
-                        }
-                    };
-                    if !value.is_undefined() {
-                        let value: Uint8Array = value.unchecked_into();
-                        append_uint8_array_to_vec(&mut buffer, &value);
-                        if buffer.len() > MAX_INBOUND_STREAM_SIZE {
-                            error!(
-                                "Inbound bidistream exceeded {} bytes (got {}), dropping",
-                                MAX_INBOUND_STREAM_SIZE,
-                                buffer.len()
-                            );
-                            break;
-                        }
-                    }
-                    if done.is_truthy() {
-                        callback.emit(buffer);
-                        break;
-                    }
-                }
-            }
-        }
-        debug!("readable stream closed");
-    });
-}
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn a_rejection_yields_no_close_info() {
+        let rejected = js_sys::Error::new("network error");
+        assert_eq!(
+            videocall_transport::webtransport::read_close_info(&rejected),
+            None,
+            "a WebTransportError has no closeCode and must not be read as a coded close"
+        );
 
-fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<PacketWrapper>) {
-    match PacketWrapper::parse_from_bytes(&bytes) {
-        Ok(media_packet) => callback.emit(media_packet),
-        Err(_) => {
-            let message_type = format!("{message_type:?}");
-            error!("failed to parse media packet {message_type:?}");
-        }
+        assert_eq!(
+            videocall_transport::webtransport::read_close_info(&wasm_bindgen::JsValue::from_str(
+                "closed"
+            )),
+            None,
+            "Reflect::get throws on a primitive; that must not panic or fabricate a code"
+        );
     }
-}
 
-fn append_uint8_array_to_vec(rust_vec: &mut Vec<u8>, js_array: &Uint8Array) {
-    let start = rust_vec.len();
-    let len = js_array.length() as usize;
-    rust_vec.resize(start + len, 0);
-    js_array.copy_to(&mut rust_vec[start..]);
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn a_clean_close_parses_and_defaults_its_missing_reason() {
+        let settled = js_sys::Object::new();
+        Reflect::set(&settled, &"closeCode".into(), &0_u32.into()).unwrap();
+        assert_eq!(
+            videocall_transport::webtransport::read_close_info(&settled),
+            Some(close_info(0, "")),
+        );
+    }
 }

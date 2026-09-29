@@ -2,7 +2,7 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import {
   BROWSER_ARGS,
-  DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
+  PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
   createAuthenticatedContext,
 } from "../helpers/auth-context";
 import { waitForVisibleState } from "../helpers/visible-state";
@@ -93,7 +93,7 @@ async function guestJoinsToGrid(
   uiURL: string,
 ): Promise<Page> {
   const ctx = await browser.newContext({ baseURL: uiURL, ignoreHTTPSErrors: true });
-  await ctx.addInitScript(DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
+  await ctx.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   const page = await ctx.newPage();
 
   await page.goto(`/meeting/${meetingId}/guest`);

@@ -13,27 +13,16 @@ import { waitForServices } from "../helpers/wait-for-services";
  *      instead of the authenticated UI. This allows anonymous sessions to be
  *      handled gracefully.
  *
- *   2. OAuth display name pre-fill (home.rs)
- *      The profile fetch effect now always derives the display name from the
- *      OAuth provider profile for authenticated users, pre-filling the
- *      `#username` input with the profile name.
- *
- *   3. Display name pre-fill on direct navigation (meeting.rs)
+ *   2. Display name pre-fill on direct navigation (meeting.rs)
  *      The profile fetch effect in the meeting page now pre-fills the meeting
  *      display name input from the OAuth profile when navigating directly to
  *      `/meeting/<id>` without going through the home page first.
  *
- *   4. Guest fast-path fix (auth.rs)
+ *   3. Guest fast-path fix (auth.rs)
  *      The `check_session()` guest fast-path (the `vc_guest_*` keys in
  *      sessionStorage) now only short-circuits when `is_pkce_flow()` is true.
  *      In server-side OAuth mode, it clears the stale marker and falls through
  *      to the normal backend session check.
- *
- * IMPORTANT COVERAGE NOTE:
- * All four changes above are guarded by `oauth_enabled()` checks and only
- * execute when the deployment has OAuth configured. The E2E test stack runs
- * with ENABLE_OAUTH=false, so these OAuth-specific code paths cannot be
- * exercised directly.
  *
  * What we CAN test in the non-OAuth E2E environment:
  *   1. The `#username` input is empty on initial page load when localStorage
@@ -42,11 +31,6 @@ import { waitForServices } from "../helpers/wait-for-services";
  *      `#username` input on page load.
  *   3. Navigating directly to `/meeting/<id>` when a display name is already
  *      in localStorage pre-fills the meeting page input.
- *
- * For full OAuth coverage (anonymous profile filtering, OAuth profile pre-fill,
- * OAuth-based direct navigation pre-fill, and sessionStorage-based guest fast-
- * path behavior), an OAuth-enabled E2E stack is required. This is tracked as a
- * known coverage gap.
  */
 
 test.describe("Auth-based display name handling", () => {

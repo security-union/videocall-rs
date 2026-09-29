@@ -4465,9 +4465,6 @@ mod tests {
 
     #[test]
     fn popup_clamps_vertically_when_button_is_near_bottom() {
-        // Anchor at the bottom of the viewport — the downward Y_FRAC
-        // shift would push the popup off-screen, so the clamp pulls
-        // it back above the meeting footer.
         let anchor = rect_from(100.0, 950.0, 32.0, 32.0);
         let popup_h = 500.0;
         let viewport_h = 1000.0;
@@ -4620,8 +4617,6 @@ mod tests {
 
     #[test]
     fn clamp_free_bottom_overflow_clamps_to_max_top() {
-        // Target top that would push the popup off the bottom edge or under
-        // the meeting footer -> clamp to just above the footer.
         let viewport_h = 1080.0;
         let popup_h = 400.0;
         let (_, t) = super::clamp_free_position(100.0, 2000.0, 420.0, popup_h, 1920.0, viewport_h);

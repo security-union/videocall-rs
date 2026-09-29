@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 import {
   classifyTierChangeKeyframe,
   FORCED_KEYFRAME_LOG,
+  PERIODIC_KEYFRAME_LOG,
   SCREEN_SHARE_COORDINATION_LOG,
   TIER_CHANGE_CAUSE,
   TIER_CHANGE_LOG,
@@ -46,6 +47,7 @@ describe("camera tier-change keyframe log mirrors (issue 2567)", () => {
 
     expect(src).toContain(TIER_CHANGE_LOG);
     expect(src).toContain(FORCED_KEYFRAME_LOG);
+    expect(src).toContain(PERIODIC_KEYFRAME_LOG);
   });
 
   it("composes the coordination substring from the format string and its interpolated word", () => {

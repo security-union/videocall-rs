@@ -1,6 +1,7 @@
 import { test, expect, Page, chromium, Locator } from "@playwright/test";
 import { injectSessionCookie, generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 test.describe("Meeting settings – Options toggles", () => {
   test.beforeAll(async () => {
@@ -413,6 +414,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 

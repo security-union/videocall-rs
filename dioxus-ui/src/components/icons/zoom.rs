@@ -119,3 +119,62 @@ pub fn DetachIcon() -> Element {
         }
     }
 }
+
+/// Issue 2792: a large pane beside a sidebar of two small panes — enlarge.
+#[component]
+pub fn EnlargeIcon() -> Element {
+    rsx! {
+        svg {
+            class: "w-8",
+            xmlns: "http://www.w3.org/2000/svg",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            rect { x: "2", y: "4", width: "13", height: "16", rx: "1.5" }
+            rect { x: "17", y: "4", width: "5", height: "7", rx: "1" }
+            rect { x: "17", y: "13", width: "5", height: "7", rx: "1" }
+        }
+    }
+}
+
+#[component]
+pub fn MonitorIcon() -> Element {
+    rsx! {
+        svg {
+            class: "w-8",
+            xmlns: "http://www.w3.org/2000/svg",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            rect { x: "2", y: "3", width: "20", height: "14", rx: "2" }
+            path { d: "M8 21h8" }
+            path { d: "M12 17v4" }
+        }
+    }
+}
+
+#[component]
+pub fn PreviewOffIcon() -> Element {
+    rsx! {
+        svg {
+            class: "w-8",
+            xmlns: "http://www.w3.org/2000/svg",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M2 12s3.5-7 10-7c2 0 3.8.7 5.2 1.6" }
+            path { d: "M22 12s-3.5 7-10 7c-2 0-3.8-.7-5.2-1.6" }
+            path { d: "M3 3l18 18" }
+        }
+    }
+}

@@ -22,29 +22,16 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::validation::is_valid_meeting_id;
 use videocall_types::SYSTEM_USER_ID;
 
-/// NATS subject for fanning out per-meeting policy flag changes to every
-/// `actix-api` chat_server instance. The chat_server caches these flags at
-/// JoinRoom time from the JWT, so without this fanout a mid-meeting PATCH
-/// would not take effect until the host reconnected.
-///
-/// Mirrors the public `MEETING_SETTINGS_UPDATED` protobuf event but uses
-/// JSON over a separate internal subject so the wire format for clients
-/// stays untouched. The corresponding consumer lives in
-/// `actix-api/src/actors/chat_server.rs` (search for
-/// `MEETING_SETTINGS_UPDATE_SUBJECT`).
+/// NATS subject carrying per-meeting policy flag changes. Only relays
+/// predating #2702 read it, to refresh the end-on-host-leave decision they
+/// made themselves.
 pub const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated";
 
-/// NATS subject consumed by `meeting-api` to write `state='ended'` to the
-/// `meetings` table when `actix-api` broadcasts MEETING_ENDED on a host
-/// disconnect with `end_on_host_leave=true`. Mirrors the REST POST /leave
-/// flow's `db_meetings::end_meeting` call so the meetings list stays
-/// consistent with the broadcast clients receive.
-///
-/// The corresponding publisher lives in
-/// `actix-api/src/actors/chat_server.rs` (search for
-/// `MEETING_ENDED_BY_HOST_SUBJECT`).
+/// Subject on which a relay predating #2702 reports a meeting it ended itself;
+/// consumed (`state='ended'`) so the DB agrees if such a relay is rolled back to.
 pub const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 
 /// NATS subject consumed by `meeting-api` to write `state='idle'` to the
@@ -52,89 +39,30 @@ pub const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host"
 /// present participant disconnected/left) for a meeting that did NOT end.
 /// Defines the presence-driven everyone-left → idle transition.
 ///
-/// `actix-api` fires this ONCE per room-becomes-empty (when its in-memory
-/// per-room member count reaches zero), never per-disconnect, so the consumer
-/// is not subjected to an O(n) storm during a mass-disconnect. The consumer's
-/// `db_meetings::set_idle` guards on `state='active'`, so it is a no-op on an
-/// already-ended (terminal) or already-idle meeting — making the end-vs-idle
-/// race safe in either ordering.
+/// Each relay binary fires this ONCE when its own in-memory copy of the room
+/// empties, never per-disconnect. The consumer's `db_meetings::set_idle` only
+/// idles an `active` meeting with nobody present in the DB, so another
+/// binary's participants keep it active and an `ended` meeting stays ended.
 ///
 /// The corresponding publisher lives in
 /// `actix-api/src/actors/chat_server.rs` (search for
 /// `MEETING_BECAME_EMPTY_SUBJECT`).
 pub const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 
-/// NATS subject consumed by `meeting-api` to mark a single participant
-/// `status='left', left_at=NOW()` when `actix-api` observes that participant's
-/// session leave a room (an ABNORMAL disconnect — closed tab / network drop /
-/// crash — that does NOT go through the REST `/leave` endpoint, OR an explicit
-/// transport leave). This is the backstop that keeps the DB
-/// `meeting_participants` roster in sync with live presence so the
-/// meeting-settings "Activity" participant count reflects who is CURRENTLY in
-/// the meeting (issue #1551).
-///
-/// `actix-api` fires this from the SAME point it broadcasts the per-peer
-/// `PARTICIPANT_LEFT` packet — inside `ChatServer::leave_rooms`, which only runs
-/// after the [`RECONNECT_GRACE_PERIOD`] (a timely reconnect cancels the pending
-/// departure first) or on an explicit `Leave`.
-///
-/// ## Reconnect-race safety (relay-side, NOT a DB guard)
-///
-/// The consumer's UPDATE ([`crate::db::participants::mark_left_by_disconnect`])
-/// is keyed by `user_id` and intentionally does NOT add a `left_at IS NULL`
-/// predicate — that would be false safety, since a freshly-rejoined row already
-/// has `left_at IS NULL` and such a predicate would still MATCH it. The real
-/// protection lives entirely on the relay, BEFORE the publish:
-///
-/// - The 3s [`RECONNECT_GRACE_PERIOD`] debounce: a brief disconnect+reconnect
-///   cancels the pending departure, so `leave_rooms` (and therefore this
-///   publish) never runs.
-/// - A presence check: the relay publishes only when the departing user has NO
-///   remaining live session in the room (`user_has_remaining_session` /
-///   `user_still_present` in `chat_server.rs::leave_rooms`), which also covers a
-///   different tab that rejoined after the grace expired.
-///
-/// So by the time the consumer's UPDATE runs, the relay has already confirmed
-/// the user is no longer present. The matching rationale lives on
-/// [`crate::db::participants::mark_left_by_disconnect`]; keep the two in sync.
-///
-/// The corresponding publisher lives in
-/// `actix-api/src/actors/chat_server.rs` (search for
-/// `PARTICIPANT_LEFT_SUBJECT`).
-pub const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
-
-/// NATS subject carrying chat_server → meeting-api "a participant became
-/// PRESENT" notifications (issue #1628). The symmetric counterpart to
-/// [`PARTICIPANT_LEFT_SUBJECT`].
-///
-/// Sent by chat_server when a session is elected Testing→Active in a room (a
-/// fresh join or a transport reconnect-after-grace). The `meeting-api` consumer
-/// looks the meeting up by `room_id`, marks `(meeting_id, user_id)` as
-/// `status='admitted', left_at=NULL` via
-/// [`crate::db::participants::mark_present_by_connect`], and re-activates the
-/// meeting (`idle -> active`) via [`crate::db::meetings::reactivate_from_idle`].
-///
-/// This closes the presence asymmetry: before #1628, re-activation only fired
-/// on a REST `/join`, so a transport-only reconnect left the meeting stuck
-/// `idle` with a present participant (and `participant_count == 0`). With this
-/// event the DB roster tracks the relay's authoritative `room_members`
-/// symmetrically with the empty→idle path.
-///
-/// Idempotent and `ended`-safe: `mark_present_by_connect` only flips rows that
-/// are not already present, and `reactivate_from_idle` is an atomic
-/// `UPDATE … WHERE state='idle'`, so an `ended` (terminal) meeting matches zero
-/// rows and is never resurrected — even if a late present event races a
-/// host-end. The corresponding publisher lives in
-/// `actix-api/src/actors/chat_server.rs` (search for
-/// `PARTICIPANT_PRESENT_SUBJECT`).
-pub const PARTICIPANT_PRESENT_SUBJECT: &str = "internal.participant_present";
+/// NATS subject on which each relay reports, in order, every participant
+/// session it starts or stops counting as present (issue #2702). Consumed by
+/// [`crate::nats_consumers::apply_participant_presence`]: the DB roster, the
+/// idle transition, end-on-host-leave and promote-on-connect all follow it.
+/// Relays also publish the pre-#2702 `internal.participant_left` /
+/// `internal.participant_present` subjects, which this service ignores.
+pub const PARTICIPANT_PRESENCE_SUBJECT: &str = "internal.participant_presence";
 
 /// NATS subject for fanning out per-participant host-flag changes to every
 /// `actix-api` chat_server instance. The chat_server caches each member's
 /// `is_host` at JoinRoom time from the JWT, so without this fanout a
 /// mid-meeting transfer-host would not take effect in the in-memory presence
-/// map until the affected user reconnected — and the host-leave→end continuity
-/// check reads that cached flag.
+/// map until the affected user reconnected — and the relay's host-only packet
+/// gate reads that cached flag.
 ///
 /// JSON over an internal subject, mirroring
 /// [`MEETING_SETTINGS_UPDATE_SUBJECT`]. The corresponding consumer lives in
@@ -142,12 +70,8 @@ pub const PARTICIPANT_PRESENT_SUBJECT: &str = "internal.participant_present";
 /// `MEETING_HOST_CHANGE_SUBJECT`).
 pub const MEETING_HOST_CHANGE_SUBJECT: &str = "internal.meeting_host_changed";
 
-/// Payload published on [`MEETING_SETTINGS_UPDATE_SUBJECT`].
-///
-/// Carries the five per-meeting policy flags so chat_server can refresh
-/// its full `RoomPolicy` snapshot without a DB round-trip. All flags are
-/// always populated — the consumer overwrites the cache wholesale rather
-/// than merging field-by-field.
+/// Payload published on [`MEETING_SETTINGS_UPDATE_SUBJECT`]: the full set of
+/// post-update policy flags, never a partial delta.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeetingSettingsUpdatePayload {
     pub room_id: String,
@@ -160,10 +84,6 @@ pub struct MeetingSettingsUpdatePayload {
 }
 
 /// Payload consumed on [`MEETING_ENDED_BY_HOST_SUBJECT`].
-///
-/// Sent by chat_server when the host-leave broadcast fires. The `meeting-api`
-/// consumer looks up the meeting by `room_id` and transitions its DB row
-/// to `state='ended'`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeetingEndedByHostPayload {
     pub room_id: String,
@@ -180,33 +100,14 @@ pub struct MeetingBecameEmptyPayload {
     pub room_id: String,
 }
 
-/// Payload consumed on [`PARTICIPANT_LEFT_SUBJECT`].
-///
-/// Sent by chat_server when a single participant's session leaves a room (the
-/// per-peer departure that also produces the client-facing `PARTICIPANT_LEFT`
-/// packet). The `meeting-api` consumer looks the meeting up by `room_id` and
-/// marks `(meeting_id, user_id)` as `status='left', left_at=NOW()` so a
-/// participant who dropped without calling REST `/leave` stops being counted as
-/// present. Idempotent and reconnect-safe — see
-/// [`crate::db::participants::mark_left_by_disconnect`].
+/// Payload consumed on [`PARTICIPANT_PRESENCE_SUBJECT`]: relay session
+/// `session_id` of `user_id` in `room_id` became present, or left.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ParticipantLeftPayload {
+pub struct ParticipantPresencePayload {
     pub room_id: String,
     pub user_id: String,
-}
-
-/// Payload consumed on [`PARTICIPANT_PRESENT_SUBJECT`] (issue #1628).
-///
-/// Sent by chat_server when a participant's session became present in a room (a
-/// fresh join or a transport reconnect). The `meeting-api` consumer looks the
-/// meeting up by `room_id`, marks `(meeting_id, user_id)` as
-/// `status='admitted', left_at=NULL`, and re-activates the meeting. Mirrors
-/// [`ParticipantLeftPayload`] — carries the `(room_id, user_id)` the
-/// `meeting_participants` rows are keyed by.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ParticipantPresentPayload {
-    pub room_id: String,
-    pub user_id: String,
+    pub session_id: u64,
+    pub present: bool,
 }
 
 /// Payload published on [`MEETING_HOST_CHANGE_SUBJECT`].
@@ -234,20 +135,15 @@ fn build_meeting_wrapper(meeting_packet: &MeetingPacket) -> Vec<u8> {
     wrapper.write_to_bytes().unwrap_or_default()
 }
 
-/// Sanitize a room ID for use in NATS subjects by replacing special characters.
-fn sanitize_room_id(room_id: &str) -> String {
-    room_id
-        .chars()
-        .map(|c| match c {
-            '.' | '*' | '>' | ' ' | '\t' | '\n' | '\r' => '_',
-            _ => c,
-        })
-        .collect()
-}
-
-/// NATS subject for system messages in a room.
-fn room_system_subject(room_id: &str) -> String {
-    format!("room.{}.system", sanitize_room_id(room_id))
+/// NATS subject for system messages in a room, or `None` (with a warning) when
+/// `room_id` is not a valid meeting ID.
+fn room_system_subject(room_id: &str) -> Option<String> {
+    if is_valid_meeting_id(room_id) {
+        Some(format!("room.{room_id}.system"))
+    } else {
+        tracing::warn!("Not publishing room system event: invalid room id {room_id:?}");
+        None
+    }
 }
 
 /// Publish a serialized packet to NATS subject. Logs errors but never fails.
@@ -266,17 +162,25 @@ pub async fn publish_meeting_activated(nats: Option<&async_nats::Client>, room_i
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    publish(nats, room_system_subject(room_id), bytes).await;
+    let Some(subject) = room_system_subject(room_id) else {
+        return;
+    };
+    publish(nats, subject, bytes).await;
     tracing::debug!("Published MEETING_ACTIVATED for room {room_id}");
 }
 
+/// `MEETING_ENDED` message: the last present host left, or the owner
+/// explicitly ended the meeting from settings. Both read the same to a
+/// participant still on the call, so they share one message.
+pub const HOST_LEFT_MESSAGE: &str = "The host has ended the meeting";
+
 /// Publish `MEETING_ENDED` to every client in a room so they show the
-/// meeting-ended overlay and disconnect. Used by the REST `/leave` path when
-/// the meeting OWNER (creator, while still host) leaves with
-/// `end_on_host_leave=true`: that path ends the meeting immediately when the
-/// host leaves, so the transport-layer host-leave broadcast (which only
-/// fires when no host remains) would not notify clients. Mirrors the packet the
-/// transport path builds via `SessionManager::build_meeting_ended_packet`.
+/// meeting-ended overlay and disconnect. Used whenever meeting-api ends a
+/// meeting a client might still be connected to: the last present host
+/// leaving with `end_on_host_leave=true` (REST `/leave`, or a transport
+/// departure reported on [`PARTICIPANT_PRESENCE_SUBJECT`]), and an explicit
+/// owner `POST .../end`. Same packet as
+/// `SessionManager::build_meeting_ended_packet` in the relay.
 pub async fn publish_meeting_ended(
     nats: Option<&async_nats::Client>,
     room_id: &str,
@@ -290,7 +194,10 @@ pub async fn publish_meeting_ended(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    publish(nats, room_system_subject(room_id), bytes).await;
+    let Some(subject) = room_system_subject(room_id) else {
+        return;
+    };
+    publish(nats, subject, bytes).await;
     tracing::debug!("Published MEETING_ENDED for room {room_id}");
 }
 
@@ -311,7 +218,10 @@ pub async fn publish_participant_admitted(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    publish(nats, room_system_subject(room_id), bytes).await;
+    let Some(subject) = room_system_subject(room_id) else {
+        return;
+    };
+    publish(nats, subject, bytes).await;
     tracing::debug!("Published PARTICIPANT_ADMITTED for {target_user_id} in room {room_id}");
 }
 
@@ -329,7 +239,10 @@ pub async fn publish_participant_rejected(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    publish(nats, room_system_subject(room_id), bytes).await;
+    let Some(subject) = room_system_subject(room_id) else {
+        return;
+    };
+    publish(nats, subject, bytes).await;
     tracing::debug!("Published PARTICIPANT_REJECTED for {target_user_id} in room {room_id}");
 }
 
@@ -342,7 +255,10 @@ pub async fn publish_waiting_room_updated(nats: Option<&async_nats::Client>, roo
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    publish(nats, room_system_subject(room_id), bytes).await;
+    let Some(subject) = room_system_subject(room_id) else {
+        return;
+    };
+    publish(nats, subject, bytes).await;
     tracing::debug!("Published WAITING_ROOM_UPDATED for room {room_id}");
 }
 
@@ -371,7 +287,10 @@ pub async fn publish_participant_display_name_changed(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    publish(nats, room_system_subject(room_id), bytes).await;
+    let Some(subject) = room_system_subject(room_id) else {
+        return;
+    };
+    publish(nats, subject, bytes).await;
     tracing::debug!(
         "Published PARTICIPANT_DISPLAY_NAME_CHANGED for {target_user_id} in room {room_id} \
          (session_id={}): {}",
@@ -404,8 +323,8 @@ pub async fn publish_host_mute(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    nats.publish(room_system_subject(room_id), bytes.into())
-        .await?;
+    let subject = room_system_subject(room_id).ok_or("room id is not a valid meeting ID")?;
+    nats.publish(subject, bytes.into()).await?;
     tracing::debug!(
         "Published HOST_MUTE_PARTICIPANT for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\""
     );
@@ -437,8 +356,8 @@ pub async fn publish_host_disable_video(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    nats.publish(room_system_subject(room_id), bytes.into())
-        .await?;
+    let subject = room_system_subject(room_id).ok_or("room id is not a valid meeting ID")?;
+    nats.publish(subject, bytes.into()).await?;
     tracing::debug!("Published HOST_DISABLE_VIDEO for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\"");
     Ok(())
 }
@@ -457,14 +376,14 @@ pub async fn publish_host_kick(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    nats.publish(room_system_subject(room_id), bytes.into())
-        .await?;
+    let subject = room_system_subject(room_id).ok_or("room id is not a valid meeting ID")?;
+    nats.publish(subject, bytes.into()).await?;
     tracing::debug!("Published PARTICIPANT_KICKED for room {room_id} target=\"{target_user_id}\"");
     Ok(())
 }
 
 /// Publish `HOST_GRANTED` to tell every client a participant was promoted to
-/// host (the promotion half of a transfer-host).
+/// host (a transfer-host target, or a co-host granted or joining).
 pub async fn publish_host_granted(
     nats: Option<&async_nats::Client>,
     room_id: &str,
@@ -480,8 +399,8 @@ pub async fn publish_host_granted(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    nats.publish(room_system_subject(room_id), bytes.into())
-        .await?;
+    let subject = room_system_subject(room_id).ok_or("room id is not a valid meeting ID")?;
+    nats.publish(subject, bytes.into()).await?;
     tracing::debug!(
         "Published HOST_GRANTED for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\""
     );
@@ -505,12 +424,56 @@ pub async fn publish_host_revoked(
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    nats.publish(room_system_subject(room_id), bytes.into())
-        .await?;
+    let subject = room_system_subject(room_id).ok_or("room id is not a valid meeting ID")?;
+    nats.publish(subject, bytes.into()).await?;
     tracing::debug!(
         "Published HOST_REVOKED for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\""
     );
     Ok(())
+}
+
+/// Announce a real host-role change for `user_id`: `HOST_GRANTED` or
+/// `HOST_REVOKED` to clients, plus the [`MEETING_HOST_CHANGE_SUBJECT`] fanout
+/// to every relay. Publish failures are logged, not returned.
+pub async fn announce_host_change(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    user_id: &str,
+    changed_by: &str,
+    is_host: bool,
+) {
+    let result = if is_host {
+        publish_host_granted(nats, room_id, user_id, changed_by).await
+    } else {
+        publish_host_revoked(nats, room_id, user_id, changed_by).await
+    };
+    if let Err(e) = result {
+        tracing::error!(
+            "NATS publish failed for host change (user={user_id}, is_host={is_host}) in room {room_id}: {e}"
+        );
+    }
+    publish_internal_host_change(
+        nats,
+        &MeetingHostChangePayload {
+            room_id: room_id.to_string(),
+            user_id: user_id.to_string(),
+            is_host,
+        },
+    )
+    .await;
+}
+
+/// [`announce_host_change`] (`is_host = false`) for each host a new meeting
+/// instance demoted.
+pub async fn announce_demotions(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    user_ids: &[String],
+    changed_by: &str,
+) {
+    for user_id in user_ids {
+        announce_host_change(nats, room_id, user_id, changed_by, false).await;
+    }
 }
 
 /// Publish a server-internal [`MEETING_HOST_CHANGE_SUBJECT`] event so every
@@ -520,8 +483,7 @@ pub async fn publish_host_revoked(
 ///
 /// Distinct from [`publish_host_granted`] / [`publish_host_revoked`]: those
 /// tell **clients** about the change; this one tells **servers** to refresh
-/// their in-memory presence map so the host-leave continuity check stays
-/// correct without a DB lookup.
+/// their in-memory presence map.
 pub async fn publish_internal_host_change(
     nats: Option<&async_nats::Client>,
     payload: &MeetingHostChangePayload,
@@ -567,19 +529,16 @@ pub async fn publish_meeting_settings_updated(nats: Option<&async_nats::Client>,
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
-    publish(nats, room_system_subject(room_id), bytes).await;
+    let Some(subject) = room_system_subject(room_id) else {
+        return;
+    };
+    publish(nats, subject, bytes).await;
     tracing::debug!("Published MEETING_SETTINGS_UPDATED for room {room_id}");
 }
 
-/// Publish a server-internal [`MEETING_SETTINGS_UPDATE_SUBJECT`] event so
-/// every `actix-api` chat_server instance refreshes its in-memory
-/// `room_policy` cache. Caller passes the post-update authoritative flag
-/// values (typically the `MeetingRow` fields after a successful
-/// `update_meeting_settings` call).
-///
-/// Distinct from [`publish_meeting_settings_updated`]: that one tells
-/// **clients** to re-fetch settings via REST, this one tells **servers**
-/// to refresh their cache without any DB lookup.
+/// Publish a server-internal [`MEETING_SETTINGS_UPDATE_SUBJECT`] event with
+/// the post-update authoritative flag values. Distinct from
+/// [`publish_meeting_settings_updated`], which tells **clients** to re-fetch.
 pub async fn publish_internal_meeting_settings_update(
     nats: Option<&async_nats::Client>,
     payload: &MeetingSettingsUpdatePayload,
@@ -918,44 +877,57 @@ mod tests {
     }
 
     #[test]
-    fn test_room_system_subject() {
-        assert_eq!(room_system_subject("my-room"), "room.my-room.system");
+    fn test_room_system_subject_uses_valid_ids_unchanged() {
         assert_eq!(
-            room_system_subject("room with spaces"),
-            "room.room_with_spaces.system"
+            room_system_subject("my-room").as_deref(),
+            Some("room.my-room.system")
+        );
+        assert_eq!(
+            room_system_subject("victim_room").as_deref(),
+            Some("room.victim_room.system")
+        );
+        assert_eq!(
+            room_system_subject("abc123def456").as_deref(),
+            Some("room.abc123def456.system")
+        );
+        assert_eq!(
+            room_system_subject("a~b").as_deref(),
+            Some("room.a~b.system")
         );
     }
 
     #[test]
-    fn test_sanitize_room_id() {
-        assert_eq!(sanitize_room_id("simple"), "simple");
-        assert_eq!(sanitize_room_id("has spaces"), "has_spaces");
-        assert_eq!(sanitize_room_id("has.dots"), "has_dots");
-        assert_eq!(sanitize_room_id("has*stars"), "has_stars");
-        assert_eq!(sanitize_room_id("has>gt"), "has_gt");
-        assert_eq!(sanitize_room_id("a.b*c>d e"), "a_b_c_d_e");
+    fn test_room_system_subject_refuses_invalid_ids() {
+        for room_id in [
+            "victim.room",
+            "victim room",
+            "victim*room",
+            "victim>room",
+            "victim\troom",
+            "victim\nroom",
+            "..",
+            "",
+            "room.>",
+            "caf\u{e9}",
+        ] {
+            assert_eq!(room_system_subject(room_id), None, "{room_id:?}");
+        }
     }
 
     #[test]
-    fn test_participant_left_payload_json_wire_format() {
-        // The relay (`actix-api`) and this consumer are SEPARATE crates that do
-        // NOT share this struct — they agree only on the JSON field names
-        // `room_id` and `user_id` over `internal.participant_left`. Pin that
-        // exact shape so a rename on either side is caught here rather than
-        // silently dropping disconnect events (issue #1551).
-        let payload = ParticipantLeftPayload {
-            room_id: "test-room".to_string(),
-            user_id: "ghost@example.com".to_string(),
-        };
-        let json = serde_json::to_string(&payload).unwrap();
+    fn test_participant_presence_payload_json_wire_format() {
+        let wire = r#"{"room_id":"test-room","user_id":"ghost@example.com","session_id":18446744073709551615,"present":false}"#;
+        let payload: ParticipantPresencePayload = serde_json::from_str(wire).unwrap();
         assert_eq!(
-            json,
-            r#"{"room_id":"test-room","user_id":"ghost@example.com"}"#
+            payload,
+            ParticipantPresencePayload {
+                room_id: "test-room".to_string(),
+                user_id: "ghost@example.com".to_string(),
+                session_id: u64::MAX,
+                present: false,
+            }
         );
-
-        // And it round-trips from the wire bytes the relay would publish.
-        let back: ParticipantLeftPayload = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, payload);
+        assert_eq!(serde_json::to_string(&payload).unwrap(), wire);
     }
 
     #[tokio::test]

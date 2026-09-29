@@ -38,8 +38,8 @@
  * about the join flow is re-invented here.
  *
  * CAMERA: intentionally NOT seeded camera-on (`vc_prejoin_camera_on`). Every
- * surface asserted here — the action-bar control, the popover, the fixed-
- * position countdown chip, the live region — renders over the camera-off
+ * surface asserted here — the action-bar control, the popover, the
+ * countdown chip, the live region — renders over the camera-off
  * placeholder tile exactly as it does over video, and the harness already waits
  * on `.canvas-container` for peer connectivity.
  *
@@ -48,8 +48,15 @@
  * `/config.local.js` that would clobber such an override on a local serve.
  */
 
-import { test, expect, chromium, Page } from "@playwright/test";
+import { test, expect, chromium, Locator, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { openPeerList, setHandRaised, setMockPeers, wakeActionBar } from "../helpers/controls";
+import {
+  MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT,
+  type ShareViewMode,
+  seedShareViewMode,
+  startScreenShare,
+} from "../helpers/screen-share-meeting";
 import { waitForServices } from "../helpers/wait-for-services";
 import {
   enterMeetingAsHost,
@@ -244,20 +251,6 @@ const AUDIO_TONE_SPY = `
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Wake the auto-hiding video-controls bar so a subsequent visibility PROBE
- * (`isVisible()`, which takes a snapshot and does not auto-wait) reads the real
- * layout rather than a bar mid-hide. Copied verbatim from `raise-hand.spec.ts`,
- * which took it from `drawer-resize.spec.ts` — including its reason for deriving
- * the centre point from the measured viewport rather than a fixed (400, 400).
- */
-async function wakeControls(page: Page): Promise<void> {
-  await page.locator(".video-controls-container").hover();
-  const vp = page.viewportSize() ?? { width: 800, height: 600 };
-  await page.mouse.move(Math.floor(vp.width / 2), Math.floor(vp.height / 2));
-  await page.waitForTimeout(300);
-}
-
 /** Launch a browser + authenticated context + page in one step. */
 async function newParticipant(
   browser: Awaited<ReturnType<typeof chromium.launch>>,
@@ -290,11 +283,11 @@ async function newParticipant(
  */
 async function openTimerPopover(page: Page): Promise<void> {
   const trigger = page.locator(TRIGGER);
-  await wakeControls(page);
+  await wakeActionBar(page);
   await expect(trigger).toBeVisible({ timeout: 15_000 });
 
   if ((await trigger.getAttribute("data-open")) !== "true") {
-    await trigger.click();
+    await trigger.click({ timeout: 10_000 });
   }
 
   await expect(page.locator(POPOVER)).toBeVisible({ timeout: 10_000 });
@@ -421,7 +414,7 @@ test.describe("Meeting timer (issue 2136)", () => {
       // timer exists and again after it is running (below), because "hidden while
       // idle" and "hidden while a timer runs" are different renders — the
       // button's `running` prop feeds a `data-` hook and its tooltip copy.
-      await wakeControls(guestPage);
+      await wakeActionBar(guestPage);
       await expect(guestPage.locator(TRIGGER_ANY)).toHaveCount(0);
       await expect(guestPage.locator(SLOT)).toHaveCount(0);
       await expect(guestPage.locator(POPOVER)).toHaveCount(0);
@@ -430,7 +423,7 @@ test.describe("Meeting timer (issue 2136)", () => {
       // control was missing for EVERYONE — a far more likely breakage than a
       // leak to the guest — fails here rather than passing the absence check
       // above for the wrong reason.
-      await wakeControls(hostPage);
+      await wakeActionBar(hostPage);
       await expect(hostPage.locator(SLOT)).toHaveCount(1);
       const hostTrigger = hostPage.locator(TRIGGER);
       await expect(hostTrigger).toBeVisible({ timeout: 15_000 });
@@ -636,7 +629,7 @@ test.describe("Meeting timer (issue 2136)", () => {
       ).toBeLessThan(5_000);
 
       // The late joiner is still not the host, so it still gets no control.
-      await wakeControls(guestPage);
+      await wakeActionBar(guestPage);
       await expect(guestPage.locator(TRIGGER_ANY)).toHaveCount(0);
     } finally {
       await hostBrowser.close();
@@ -820,7 +813,7 @@ test.describe("Meeting timer (issue 2136)", () => {
       // assertion below would pass against the wrong thing.
       await expect(page.locator(TRIGGER)).toBeHidden();
 
-      await wakeControls(page);
+      await wakeActionBar(page);
       await page.locator("#overflow-menu-trigger").click();
       const item = page.locator(".overflow-item", { hasText: "Meeting timer" });
       await expect(item).toBeVisible();
@@ -1372,5 +1365,401 @@ test.describe("Meeting timer — typed custom duration (issue 2172)", () => {
     } finally {
       await browser.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Placement — issue 2784: row 1 of the top-centre overlay stack
+// ---------------------------------------------------------------------------
+
+const GRID = "#grid-container";
+const STACK_CHIP = `${GRID} > ${CHIP}`;
+const STACK_BANNER = `${GRID} > [data-testid="raised-hands-banner"]`;
+const STACK_PILL = `${GRID} > [data-testid="decode-paused-pill"]`;
+const PILL_ACTION = `${STACK_PILL} [data-testid="decode-paused-pill-show-all"]`;
+const RECEIVED_SHARE_TILE = `${GRID} [data-testid="received-share-tile"]`;
+const TILE = `${GRID} .grid-item[data-tile-root="true"]`;
+const TILE_CHROME = [".floating-name", ".tile-top-icons"];
+// `grid_padding(DockPosition::Bottom, desktop)`'s top.
+const BASE_PAD_TOP_PX = 20;
+const FULL_BLEED_NAME = `${GRID} .grid-item.full-bleed .floating-name`;
+// 41 characters: valid for `validate_display_name` (ASCII, at most 50).
+const LONG_HOST_NAME = "Presenter With A Really Long Display Name";
+// `parse_decode_budget_override` reads "1" as `Fixed(1)`.
+const FORCED_BUDGET_SEED = `localStorage.setItem("vc_decode_budget_override", "1");`;
+const MOCK_PEERS = 8;
+const MOBILE = { width: 375, height: 667 };
+const CENTRE_TOLERANCE_PX = 2;
+const TOP_BAND_PX = { min: 8, max: 16 };
+
+interface Box {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+const centreX = (b: Box): number => b.x + b.width / 2;
+const bottomOf = (b: Box): number => b.y + b.height;
+
+function overlapArea(a: Box, b: Box): number {
+  const w = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+  const h = Math.min(bottomOf(a), bottomOf(b)) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+interface Tile {
+  locator: Locator;
+  box: Box;
+}
+
+async function rowOneTiles(page: Page): Promise<Tile[]> {
+  const tiles: Tile[] = [];
+  for (const locator of await page.locator(TILE).all()) {
+    const box = await locator.boundingBox();
+    expect(box, "every tile must have a layout box").not.toBeNull();
+    tiles.push({ locator, box: box! });
+  }
+  expect(tiles.length, "tiles must be rendered").toBeGreaterThan(0);
+  const top = Math.min(...tiles.map((t) => t.box.y));
+  const row = tiles.filter((t) => t.box.y - top <= 2);
+  expect(row.length, "row 1 must hold 2+ tiles").toBeGreaterThanOrEqual(2);
+  return row;
+}
+
+// Wrap flow puts row 1 exactly at the grid's top padding.
+async function expectRowOneAtBasePad(page: Page, grid: Box, when: string): Promise<void> {
+  await expect(async () => {
+    for (const t of await rowOneTiles(page)) {
+      expect(Math.abs(t.box.y - grid.y - BASE_PAD_TOP_PX), `row 1 ${when}`).toBeLessThanOrEqual(2);
+    }
+  }).toPass({ timeout: 10_000 });
+}
+
+interface TimerRoom {
+  hostPage: Page;
+  guestPage: Page;
+}
+
+async function inTimerRoom(
+  baseURL: string | undefined,
+  label: string,
+  opts: {
+    hostName?: string;
+    hostScripts?: string[];
+    guestScripts?: string[];
+    guestShareView?: ShareViewMode;
+  },
+  body: (room: TimerRoom) => Promise<void>,
+): Promise<void> {
+  const uiURL = baseURL || "http://localhost:3001";
+  const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+  const guestBrowser = await chromium.launch({ args: BROWSER_ARGS });
+  try {
+    const hostPage = await newParticipant(
+      hostBrowser,
+      "host@videocall.rs",
+      opts.hostName ?? "HostUser",
+      uiURL,
+      opts.hostScripts,
+    );
+    const guestPage = await newParticipant(
+      guestBrowser,
+      "guest@videocall.rs",
+      "GuestUser",
+      uiURL,
+      opts.guestScripts,
+    );
+    if (opts.guestShareView) {
+      await seedShareViewMode(guestPage, opts.guestShareView);
+    }
+    await enterTwoUserMeeting(
+      hostPage,
+      guestPage,
+      `e2e_meeting_timer_${label}_${Date.now()}`,
+      opts.hostName,
+    );
+    await body({ hostPage, guestPage });
+  } finally {
+    await hostBrowser.close();
+    await guestBrowser.close();
+  }
+}
+
+// A 15-minute timer stays Normal for the whole test.
+async function startTimerSeenByGuest(hostPage: Page, guestPage: Page): Promise<Locator> {
+  await openTimerPopover(hostPage);
+  await hostPage.locator(preset(FIFTEEN_MIN_MS)).click({ timeout: 10_000 });
+  const chip = guestPage.locator(STACK_CHIP);
+  await expect(chip).toBeVisible({ timeout: CROSS_PEER_TIMEOUT });
+  return chip;
+}
+
+// Waits out the one-shot entrance animation, so no box is read mid-slide.
+async function settledBox(locator: Locator, what: string): Promise<Box> {
+  await expect(locator, `${what} must be visible before it is measured`).toBeVisible({
+    timeout: 10_000,
+  });
+  await locator.evaluate(async (el) => {
+    await Promise.all(el.getAnimations().map((a) => a.finished));
+  });
+  const box = await locator.boundingBox();
+  expect(box, `${what} must have a layout box`).not.toBeNull();
+  return box!;
+}
+
+async function hitAtCentreOf(page: Page, box: Box): Promise<string> {
+  return page.evaluate(
+    ({ x, y, chip }) => {
+      const hit = document.elementFromPoint(x, y);
+      if (hit?.closest(chip)) {
+        return "chip";
+      }
+      return hit ? `${hit.tagName.toLowerCase()}.${hit.getAttribute("class") ?? ""}` : "nothing";
+    },
+    { x: centreX(box), y: box.y + box.height / 2, chip: CHIP },
+  );
+}
+
+function expectCentredInTopBand(chip: Box, grid: Box, viewportWidth: number): void {
+  expect(Math.abs(centreX(chip) - centreX(grid)), "centred on the stage").toBeLessThanOrEqual(
+    CENTRE_TOLERANCE_PX,
+  );
+  expect(
+    Math.abs(centreX(chip) - viewportWidth / 2),
+    "centred in the viewport",
+  ).toBeLessThanOrEqual(CENTRE_TOLERANCE_PX);
+  expect(chip.y - grid.y, "in the stage's top band").toBeGreaterThanOrEqual(TOP_BAND_PX.min);
+  expect(chip.y - grid.y, "in the stage's top band").toBeLessThanOrEqual(TOP_BAND_PX.max);
+}
+
+test.describe("Meeting timer chip placement (issue 2784)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("top-centre: the guest's chip is centred at the top of the grid and hit-test opaque", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    await inTimerRoom(baseURL, "place_grid", {}, async ({ hostPage, guestPage }) => {
+      const chip = await startTimerSeenByGuest(hostPage, guestPage);
+      const viewport = guestPage.viewportSize();
+      expect(viewport, "viewport size is known").not.toBeNull();
+      const grid = await settledBox(guestPage.locator(GRID), "grid");
+      const box = await settledBox(chip, "chip");
+
+      expectCentredInTopBand(box, grid, viewport!.width);
+      await expect
+        .poll(() => hitAtCentreOf(guestPage, box), {
+          timeout: 10_000,
+          message: "the chip must be what a pointer at its centre hits",
+        })
+        .toBe("chip");
+    });
+  });
+
+  test("top-centre: a raised hand stacks below the chip in one column without moving it", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    await inTimerRoom(baseURL, "place_hand", {}, async ({ hostPage, guestPage }) => {
+      const chip = await startTimerSeenByGuest(hostPage, guestPage);
+      const before = await settledBox(chip, "chip");
+
+      await setHandRaised(guestPage, true);
+      const banner = await settledBox(guestPage.locator(STACK_BANNER), "raised-hands banner");
+      const raised = await settledBox(chip, "chip with a hand up");
+
+      expect(Math.abs(raised.y - before.y), "row 1 never moves").toBeLessThanOrEqual(1);
+      expect(banner.y - bottomOf(raised), "the banner clears the chip").toBeGreaterThanOrEqual(12);
+      expect(Math.abs(centreX(banner) - centreX(raised)), "one column").toBeLessThanOrEqual(
+        CENTRE_TOLERANCE_PX,
+      );
+
+      await setHandRaised(guestPage, false);
+      await expect(guestPage.locator(STACK_BANNER)).toHaveCount(0, { timeout: 10_000 });
+      const lowered = await settledBox(chip, "chip after the hand is lowered");
+      expect(Math.abs(lowered.y - before.y), "row 1 never moves").toBeLessThanOrEqual(1);
+    });
+  });
+
+  test("top-centre: during a screen share the chip, hand banner and paused pill form one column", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    await inTimerRoom(
+      baseURL,
+      "place_share",
+      {
+        hostScripts: [MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT],
+        guestScripts: [FORCED_BUDGET_SEED],
+        guestShareView: "enlarged",
+      },
+      async ({ hostPage, guestPage }) => {
+        expect(await setMockPeers(guestPage, MOCK_PEERS), "Mock Peers must be enabled").toBe(true);
+        const chip = await startTimerSeenByGuest(hostPage, guestPage);
+        expect(
+          await startScreenShare(hostPage, guestPage),
+          "the guest must receive the share",
+        ).toBe(true);
+        // In grid mode the pill is bottom-anchored and clears the chip for free.
+        await expect(guestPage.locator(GRID)).toHaveClass(/\bhas-screen-share\b/, {
+          timeout: 15_000,
+        });
+        const pill = guestPage.locator(STACK_PILL);
+        await expect(pill).toBeVisible({ timeout: 30_000 });
+
+        const chipAlone = await settledBox(chip, "chip");
+        const pillAlone = await settledBox(pill, "paused pill");
+        expect(pillAlone.y, "the pill starts below the chip").toBeGreaterThanOrEqual(
+          bottomOf(chipAlone) + 12,
+        );
+
+        const share = guestPage.locator(RECEIVED_SHARE_TILE);
+        await expect(share).toHaveAttribute("data-share-mode", "enlarged");
+        await expect(share).toBeVisible();
+        await expect(async () => {
+          const box = await share.boundingBox();
+          expect(box, "the share tile must have a layout box").not.toBeNull();
+          expect(box!.y, "the split starts below the chip").toBeGreaterThanOrEqual(
+            bottomOf(chipAlone),
+          );
+        }).toPass({ timeout: 10_000 });
+
+        await setHandRaised(guestPage, true);
+        const banner = await settledBox(guestPage.locator(STACK_BANNER), "raised-hands banner");
+        const chipBox = await settledBox(chip, "chip");
+        const pillBox = await settledBox(pill, "paused pill");
+        const actionBox = await settledBox(guestPage.locator(PILL_ACTION), "pill Show all");
+
+        expect(bottomOf(chipBox), "chip above the banner").toBeLessThanOrEqual(banner.y);
+        expect(bottomOf(banner), "banner above the pill").toBeLessThanOrEqual(pillBox.y);
+        expect(actionBox.y, "Show all clear of the banner").toBeGreaterThanOrEqual(
+          bottomOf(banner),
+        );
+        expect(Math.abs(centreX(banner) - centreX(chipBox)), "banner column").toBeLessThanOrEqual(
+          CENTRE_TOLERANCE_PX,
+        );
+        expect(Math.abs(centreX(pillBox) - centreX(chipBox)), "pill column").toBeLessThanOrEqual(
+          CENTRE_TOLERANCE_PX,
+        );
+      },
+    );
+  });
+
+  test("top-centre: on a 375px phone the chip is centred inside the stage", async ({ baseURL }) => {
+    test.setTimeout(180_000);
+    await inTimerRoom(baseURL, "place_mobile", {}, async ({ hostPage, guestPage }) => {
+      await guestPage.setViewportSize(MOBILE);
+      const chip = await startTimerSeenByGuest(hostPage, guestPage);
+      const grid = await settledBox(guestPage.locator(GRID), "grid");
+      const box = await settledBox(chip, "chip");
+      expect(grid.width, "the stage took the phone width").toBeLessThanOrEqual(MOBILE.width);
+
+      expectCentredInTopBand(box, grid, MOBILE.width);
+      expect(box.x, "inside the stage's left edge").toBeGreaterThanOrEqual(grid.x + 8);
+      expect(box.x + box.width, "inside the stage's right edge").toBeLessThanOrEqual(
+        grid.x + grid.width - 8,
+      );
+    });
+  });
+
+  test("top-centre: with the peer list open the chip centres on the narrowed stage", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    await inTimerRoom(baseURL, "place_drawer", {}, async ({ hostPage, guestPage }) => {
+      const chip = await startTimerSeenByGuest(hostPage, guestPage);
+      const viewport = guestPage.viewportSize();
+      expect(viewport, "viewport size is known").not.toBeNull();
+
+      await openPeerList(guestPage);
+      const gridLocator = guestPage.locator(GRID);
+      await expect(async () => {
+        const g = await gridLocator.boundingBox();
+        expect(g, "grid must have a layout box").not.toBeNull();
+        expect(centreX(g!), "the peer list must reserve its width").toBeGreaterThanOrEqual(
+          viewport!.width / 2 + 100,
+        );
+      }).toPass({ timeout: 10_000 });
+      const grid = await settledBox(gridLocator, "grid with the peer list open");
+      const box = await settledBox(chip, "chip");
+
+      expect(Math.abs(centreX(box) - centreX(grid)), "centred on the stage").toBeLessThanOrEqual(
+        CENTRE_TOLERANCE_PX,
+      );
+    });
+  });
+
+  test("top-centre: while a timer runs row 1 starts below the chip, clear of tile names and mic badges", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    await inTimerRoom(baseURL, "place_row1", {}, async ({ hostPage, guestPage }) => {
+      // The host tile plus one mock: two columns in one row, no full-bleed tile.
+      expect(await setMockPeers(guestPage, 1), "Mock Peers must be enabled").toBe(true);
+      await expect(guestPage.locator(TILE)).toHaveCount(2, { timeout: 15_000 });
+      const grid = await settledBox(guestPage.locator(GRID), "grid");
+      await expectRowOneAtBasePad(guestPage, grid, "before the timer");
+
+      const chip = await startTimerSeenByGuest(hostPage, guestPage);
+      const chipBox = await settledBox(chip, "chip");
+      await expect(async () => {
+        for (const t of await rowOneTiles(guestPage)) {
+          expect(t.box.y, "row 1 starts below the chip").toBeGreaterThanOrEqual(bottomOf(chipBox));
+        }
+      }).toPass({ timeout: 10_000 });
+
+      for (const t of await rowOneTiles(guestPage)) {
+        for (const part of TILE_CHROME) {
+          const box = await settledBox(t.locator.locator(part), `row-1 tile ${part}`);
+          expect(
+            overlapArea(chipBox, box),
+            `the chip ${JSON.stringify(chipBox)} covers ${part} ${JSON.stringify(box)}`,
+          ).toBe(0);
+        }
+      }
+
+      await openTimerPopover(hostPage);
+      await hostPage.locator(CANCEL).click({ timeout: 10_000 });
+      await expect(chip).toHaveCount(0, { timeout: CROSS_PEER_TIMEOUT });
+      await expectRowOneAtBasePad(guestPage, grid, "after the cancel");
+    });
+  });
+
+  test("top-centre: on a 375px phone a long remote name in a 1-on-1 stops short of the chip", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    await inTimerRoom(
+      baseURL,
+      "place_long_name",
+      { hostName: LONG_HOST_NAME },
+      async ({ hostPage, guestPage }) => {
+        await guestPage.setViewportSize(MOBILE);
+        await expect(guestPage.locator(GRID)).toHaveClass(/\bparticipants-1\b/);
+        await expect(guestPage.locator(`${GRID} .grid-item.full-bleed`)).toHaveCount(1);
+        const nameText = guestPage.locator(`${FULL_BLEED_NAME} .floating-name-text`);
+        await expect(nameText).toHaveText(LONG_HOST_NAME, { timeout: 10_000 });
+
+        const chip = await startTimerSeenByGuest(hostPage, guestPage);
+        const chipBox = await settledBox(chip, "chip");
+        const nameBox = await settledBox(guestPage.locator(FULL_BLEED_NAME), "host name label");
+        const text = await nameText.evaluate((el) => ({
+          scroll: el.scrollWidth,
+          client: el.clientWidth,
+        }));
+        expect(text.scroll, "the name must be long enough to be truncated").toBeGreaterThan(
+          text.client,
+        );
+        expect(nameBox.y, "the label shares the chip's row").toBeLessThan(bottomOf(chipBox));
+
+        expect(
+          nameBox.x + nameBox.width,
+          "the label stops 8px short of the chip",
+        ).toBeLessThanOrEqual(chipBox.x - 8);
+      },
+    );
   });
 });

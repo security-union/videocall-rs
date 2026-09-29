@@ -49,10 +49,33 @@ interface GumSide {
   calls: number;
 }
 
+/** Only the encoders name BOTH keys — mic `video: false`, camera `audio: false`;
+ * the permission probes and pre-join previews each set one key. */
+interface GumAcquisition {
+  hadVideoKey: boolean;
+  hadAudioKey: boolean;
+  wantedVideo: boolean;
+  wantedAudio: boolean;
+  audioTracks: MediaStreamTrack[];
+  videoTracks: MediaStreamTrack[];
+}
+
+/** Stand-in for `MediaDeviceInfo`; the wasm side reads `deviceId` and `kind`. */
+interface SyntheticDeviceInfo {
+  deviceId: string;
+  kind: string;
+  label: string;
+  groupId: string;
+}
+
 interface GumState {
   errorName: string;
   video: GumSide;
   audio: GumSide;
+  acquisitions: GumAcquisition[];
+  /** Appended to every `enumerateDevices()` result. */
+  extraDevices: SyntheticDeviceInfo[];
+  enumerateCalls: number;
 }
 
 type GumWindow = Window & {
@@ -88,8 +111,19 @@ export async function installGetUserMediaMock(page: Page): Promise<void> {
       errorName: "NotReadableError",
       video: { failRemaining: 0, calls: 0 },
       audio: { failRemaining: 0, calls: 0 },
+      acquisitions: [],
+      extraDevices: [],
+      enumerateCalls: 0,
     };
     w.__gum = state;
+
+    const origEnumerate = md.enumerateDevices.bind(md);
+    md.enumerateDevices = (): Promise<MediaDeviceInfo[]> => {
+      state.enumerateCalls += 1;
+      return origEnumerate().then((list) =>
+        list.concat(state.extraDevices as unknown as MediaDeviceInfo[]),
+      );
+    };
 
     const wantsVideo = (c: MediaStreamConstraints): boolean => Boolean(c.video);
     const wantsAudio = (c: MediaStreamConstraints): boolean => Boolean(c.audio);
@@ -120,7 +154,19 @@ export async function installGetUserMediaMock(page: Page): Promise<void> {
       if (failV || failA) {
         return Promise.reject(new DOMException("mock " + state.errorName, state.errorName));
       }
-      return orig(c);
+      const hadVideoKey = "video" in c;
+      const hadAudioKey = "audio" in c;
+      return orig(c).then((stream) => {
+        state.acquisitions.push({
+          hadVideoKey,
+          hadAudioKey,
+          wantedVideo: v,
+          wantedAudio: a,
+          audioTracks: stream.getAudioTracks(),
+          videoTracks: stream.getVideoTracks(),
+        });
+        return stream;
+      });
     };
   });
 }
@@ -146,6 +192,81 @@ export async function setGumFail(page: Page, opts: GumFailOpts): Promise<void> {
       s.audio.failRemaining = o.audio;
     }
   }, opts);
+}
+
+export interface GumTrackSnapshot {
+  readyState: string;
+  enabled: boolean;
+}
+
+export async function getEncoderAudioTracks(page: Page): Promise<GumTrackSnapshot[][]> {
+  return page.evaluate(() => {
+    const w = window as GumWindow;
+    const s = w.__gum;
+    if (!s) {
+      throw new Error("getUserMedia mock not installed (call installGetUserMediaMock first)");
+    }
+    return s.acquisitions
+      .filter((a) => a.hadVideoKey && a.wantedAudio)
+      .map((a) =>
+        a.audioTracks.map((t) => ({ readyState: t.readyState as string, enabled: t.enabled })),
+      );
+  });
+}
+
+export async function getEncoderAudioGumCount(page: Page): Promise<number> {
+  return (await getEncoderAudioTracks(page)).length;
+}
+
+/** Capture tracks from the CAMERA ENCODER's own acquisitions, newest last. */
+export async function getEncoderVideoTracks(page: Page): Promise<GumTrackSnapshot[][]> {
+  return page.evaluate(() => {
+    const w = window as GumWindow;
+    const s = w.__gum;
+    if (!s) {
+      throw new Error("getUserMedia mock not installed (call installGetUserMediaMock first)");
+    }
+    return s.acquisitions
+      .filter((a) => a.hadAudioKey && a.wantedVideo && !a.wantedAudio)
+      .map((a) =>
+        a.videoTracks.map((t) => ({ readyState: t.readyState as string, enabled: t.enabled })),
+      );
+  });
+}
+
+export async function getEncoderVideoGumCount(page: Page): Promise<number> {
+  return (await getEncoderVideoTracks(page)).length;
+}
+
+/** `media_device_list.rs` emits `on_devices_changed` only when the enumerated
+ * device-ID lists differ from the previous enumeration. */
+export async function addSyntheticAudioInput(page: Page, deviceId: string): Promise<string> {
+  await page.evaluate((id: string) => {
+    const w = window as GumWindow;
+    const s = w.__gum;
+    if (!s) {
+      throw new Error("getUserMedia mock not installed (call installGetUserMediaMock first)");
+    }
+    s.extraDevices.push({
+      deviceId: id,
+      kind: "audioinput",
+      label: `E2E synthetic microphone ${id}`,
+      groupId: `e2e-synthetic-${id}`,
+    });
+  }, deviceId);
+  return deviceId;
+}
+
+/** How many `enumerateDevices()` calls the page has made so far. */
+export async function getEnumerateDeviceCalls(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const w = window as GumWindow;
+    const s = w.__gum;
+    if (!s) {
+      throw new Error("getUserMedia mock not installed (call installGetUserMediaMock first)");
+    }
+    return s.enumerateCalls;
+  });
 }
 
 /** Read the number of getUserMedia calls that requested each side so far. */

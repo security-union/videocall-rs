@@ -4,6 +4,7 @@ import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-ind
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 /**
  * Per-peer screen-share `(static)` / `(no frames)` tooltip behaviour
@@ -265,6 +266,9 @@ test.describe("Peer screen-share static-FPS tooltip", () => {
         await ctx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
         // Here, not `joinMeetingAs`: seeding the late joiners pinned their canvas mean at 0.
         await enableDiagnosticsTileIndicators(ctx);
+        // `openSignalPopup` reaches the camera disc through the split layout's
+        // `.split-peer-tile`, which is opt-in since #2792.
+        await seedShareViewMode(ctx, "enlarged");
         members.push({
           page: null as unknown as Page,
           context: ctx,
@@ -408,10 +412,7 @@ type LateJoinerTransport = "websocket" | "webtransport";
 /**
  * Seed sticky transport preference so the wasm boot elects `mode` before any
  * signaling. Mirrors `wt-screen-share-split-layout.spec.ts`'s
- * `forceTransportSticky` (the storage shape the device-settings Network tab
- * writes: `vc_transport_preference` + `vc_transport_sticky`). Added AFTER
- * `createAuthenticatedContext` so this init script runs last and wins over the
- * helper's default (`websocket`); a seed page also persists it for reloads.
+ * `forceTransportSticky` (`vc_transport_preference` + `vc_transport_sticky`).
  */
 async function forceTransportSticky(
   context: BrowserContext,

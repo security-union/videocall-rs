@@ -114,7 +114,7 @@ async fn test_set_idle_active_flips_state_and_preserves_timestamps() {
     // see a forward jump.
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    db_meetings::set_idle(&pool, row.id)
+    db_meetings::set_idle(&pool, row.id, true)
         .await
         .expect("set_idle must not error");
 
@@ -166,7 +166,7 @@ async fn test_set_idle_is_noop_on_ended_meeting() {
     );
     let ended_at_before = ended.ended_at.expect("end_meeting must stamp ended_at");
 
-    db_meetings::set_idle(&pool, row.id)
+    db_meetings::set_idle(&pool, row.id, true)
         .await
         .expect("set_idle on ended must not error (it is a no-op)");
 
@@ -202,7 +202,7 @@ async fn test_set_idle_is_idempotent_on_already_idle() {
     db_meetings::activate(&pool, row.id)
         .await
         .expect("activate must succeed");
-    db_meetings::set_idle(&pool, row.id)
+    db_meetings::set_idle(&pool, row.id, true)
         .await
         .expect("first set_idle must succeed");
 
@@ -213,7 +213,7 @@ async fn test_set_idle_is_idempotent_on_already_idle() {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Duplicate empty event.
-    db_meetings::set_idle(&pool, row.id)
+    db_meetings::set_idle(&pool, row.id, true)
         .await
         .expect("idempotent set_idle must not error");
 
@@ -253,7 +253,7 @@ async fn test_idle_active_idle_active_round_trip() {
     let started_first = after_first_join.started_at;
 
     // Everyone leaves: active -> idle.
-    db_meetings::set_idle(&pool, row.id).await.unwrap();
+    db_meetings::set_idle(&pool, row.id, true).await.unwrap();
     let after_leave = refetch(&pool, room_id).await;
     assert_eq!(after_leave.state.as_deref(), Some("idle"));
     assert!(

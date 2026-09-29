@@ -37,6 +37,24 @@ GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD 2>/dev/null || echo no
 DATE="$(date -u +%Y%m%d)"
 TAG="${TAG:-${VERSION}-${DATE}-${GIT_SHA}}"
 
+# Locked to prepull-image.sh's DRIFT_PATHS by image-pin-drift.test.ts.
+REVISION_PATHS=(
+  e2e
+  .dockerignore
+  ':(exclude)e2e/bots-app/k8s'
+  ':(exclude)e2e/bots-app/dashboard'
+  ':(exclude)e2e/tests'
+  ':(exclude)*.test.ts'
+  ':(exclude)*.md'
+)
+if GIT_REVISION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+  if [ -n "$(git -C "${REPO_ROOT}" status --porcelain -- "${REVISION_PATHS[@]}")" ]; then
+    GIT_REVISION="${GIT_REVISION}-dirty"
+  fi
+else
+  GIT_REVISION=unknown
+fi
+
 IMAGE="${REGISTRY}/${IMAGE_NAME}"
 IMAGE_TAGGED="${IMAGE}:${TAG}"
 IMAGE_LATEST="${IMAGE}:latest"
@@ -72,6 +90,7 @@ echo "==> Building ${IMAGE_TAGGED}"
 echo "    context:    ${REPO_ROOT}"
 echo "    dockerfile: ${DOCKERFILE}"
 echo "    builder:    ${BUILD[*]}"
+echo "    revision:   ${GIT_REVISION}"
 
 # --platform linux/amd64 is pinned so a build from an arm64 host (e.g. an
 # Apple-silicon Mac using the local docker/podman fallback) can't publish an
@@ -85,6 +104,7 @@ fi
 
 "${BUILD[@]}" \
   --platform linux/amd64 \
+  --build-arg "GIT_SHA=${GIT_REVISION}" \
   "${TAGS[@]}" \
   -f "${DOCKERFILE}" \
   "${REPO_ROOT}"
@@ -160,6 +180,17 @@ if [ "${PUSH:-0}" = "1" ]; then
     DIGEST="$(skopeo inspect --retry-times 3 ${SKOPEO_AUTH[@]+"${SKOPEO_AUTH[@]}"} \
       --format '{{.Digest}}' "docker://${IMAGE_TAGGED}" || true)"
     [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || DIGEST=""
+  fi
+  if [ -n "${DIGEST}" ]; then
+    WANT_REVISION="${EXPECT_REVISION:-${GIT_REVISION}}"
+    GOT_REVISION="$(skopeo inspect --retry-times 3 ${SKOPEO_AUTH[@]+"${SKOPEO_AUTH[@]}"} \
+      --format '{{ index .Labels "org.opencontainers.image.revision" }}' \
+      "docker://${IMAGE}@${DIGEST}" || true)"
+    if [ "${GOT_REVISION}" != "${WANT_REVISION}" ]; then
+      echo "==> FATAL: ${IMAGE}@${DIGEST} is labelled revision '${GOT_REVISION}', expected '${WANT_REVISION}'." >&2
+      exit 1
+    fi
+    echo "==> OK: registry image is labelled revision ${GOT_REVISION}"
   fi
   echo "==> Pushed. This tag is reused by a later build at the same HEAD on the same"
   echo "    day, so pin it BY DIGEST in ALL of"

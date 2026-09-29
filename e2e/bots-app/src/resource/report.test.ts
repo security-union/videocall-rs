@@ -47,6 +47,7 @@ function base(over: Partial<ReportInput> = {}): ReportInput {
     sysstatMissing: false,
     rawCsvPath: "/run/resource/x-raw.csv",
     derivedCsvPath: "/run/resource/x-derived.csv",
+    imageRevision: null,
     ...over,
   };
 }
@@ -264,5 +265,37 @@ describe("formatResourceReport", () => {
       expect(text).toContain("only 1 local join observed");
       expect(text).not.toContain(PRE_JOIN_NOTE);
     });
+  });
+});
+
+describe("image revision line (#2293)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const NOT_RECORDED =
+    "[resource] image revision: not recorded — not running a build.sh-stamped fleet image;" +
+    " figures are not attributable to a source SHA";
+  const lines = (over: Partial<ReportInput>): string[] =>
+    formatResourceReport(base(over)).split("\n");
+
+  it("names the revision the fleet image was built from", () => {
+    expect(lines({ imageRevision: SHA })).toContain(`[resource] image revision: ${SHA}`);
+  });
+
+  it.each([null, "", "unknown"])("says a run with revision %j is not attributable", (rev) => {
+    expect(lines({ imageRevision: rev })).toContain(NOT_RECORDED);
+  });
+
+  it("says a dirty-tree build is not attributable to the SHA it names", () => {
+    expect(lines({ imageRevision: `${SHA}-dirty` })).toContain(
+      `[resource] image revision: ${SHA}-dirty — built from an uncommitted tree;` +
+        " figures are not attributable to that SHA",
+    );
+  });
+
+  it.each([
+    ["unsupported", { supported: false }],
+    ["no-samples", { summary: { ...SUMMARY, sampleCount: 0 } }],
+  ])("records provenance on the %s path too", (_name, over) => {
+    expect(lines({ ...over, imageRevision: SHA })).toContain(`[resource] image revision: ${SHA}`);
+    expect(lines({ ...over, imageRevision: null })).toContain(NOT_RECORDED);
   });
 });

@@ -45,7 +45,7 @@ use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -809,6 +809,8 @@ pub struct VideoCallClient {
     /// forces a window re-seed, so a reconnect's counter bump is never read as a
     /// fresh-session distress delta.
     audio_detector_reconnect_reseed: Arc<AtomicBool>,
+    /// Shared with the peer decode manager; see [`Self::set_room_host_user_ids`].
+    room_host_user_ids: Rc<RefCell<HashSet<String>>>,
 }
 
 // `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
@@ -1799,6 +1801,8 @@ impl VideoCallClient {
             Rc::new(RefCell::new(None));
 
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "netsim")]
+        crate::connection::register_camera_force_keyframe_for_netsim(force_camera_keyframe.clone());
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
         let screen_congestion_step_down_requested = Arc::new(AtomicBool::new(false));
@@ -1838,8 +1842,10 @@ impl VideoCallClient {
             );
         }
 
+        let room_host_user_ids: Rc<RefCell<HashSet<String>>> = Rc::default();
         let client = Self {
             options: options.clone(),
+            room_host_user_ids: room_host_user_ids.clone(),
             last_send_queue_depth: Rc::new(Cell::new(None)),
             last_active_transport: Rc::new(Cell::new(None)),
             inner: Rc::new(RefCell::new(Inner {
@@ -1879,10 +1885,12 @@ impl VideoCallClient {
                 own_session_ids: Rc::new(RefCell::new(SessionIdHistory::default())),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
-                peer_decode_manager: Self::create_peer_decoder_manager(
-                    &options,
-                    diagnostics.clone(),
-                ),
+                peer_decode_manager: {
+                    let mut manager =
+                        Self::create_peer_decoder_manager(&options, diagnostics.clone());
+                    manager.share_room_host_user_ids(room_host_user_ids);
+                    manager
+                },
                 layer_preference_sender: LayerPreferenceSender::new(),
                 receive_layer_bounds: {
                     // #2068 cap. FREEZE-SAFETY rests on a cross-repo relay invariant
@@ -2533,15 +2541,16 @@ impl VideoCallClient {
     }
 
     /// This client's active-connection WebSocket send-queue depth
-    /// (`bufferedAmount`, bytes), or `None` on WebTransport — which exposes no
-    /// such counter because screen rides its own reliable QUIC unistream with no
-    /// cross-media head-of-line queue — or when no connection is elected yet.
+    /// (`bufferedAmount`, bytes).
     ///
-    /// Read once per screen frame by the issue #1921 WS send-side freshness
-    /// gate. A cheap synchronous getter forwarded to the currently-elected
+    /// A cheap synchronous getter forwarded to the currently-elected
     /// connection, so it tracks election, reconnect, and WT↔WS fallback: a fresh
     /// socket after a reconnect reports `Some(0)`, below any drop threshold.
     pub(crate) fn send_queue_depth(&self) -> Option<u64> {
+        #[cfg(feature = "netsim")]
+        if let Some(bytes) = crate::connection::ws_buffered_override_for_netsim() {
+            return Some(bytes);
+        }
         let read = self
             .connection_controller
             .try_borrow()
@@ -2675,6 +2684,15 @@ impl VideoCallClient {
     /// This compatibility hook intentionally does not alter decode allocation:
     /// recordings follow the same local visibility/budget set as the UI, so an
     /// opt-in recording cannot force off-screen decode work or publisher PLIs.
+    /// The users currently holding the host role. A room-wide mute or
+    /// disable-video leaves their tiles unchanged, since their own clients
+    /// ignore it. Needs no `Inner` borrow.
+    pub fn set_room_host_user_ids(&self, hosts: HashSet<String>) {
+        if let Ok(mut slot) = self.room_host_user_ids.try_borrow_mut() {
+            *slot = hosts;
+        }
+    }
+
     pub fn set_recording_active(&self, active: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
             inner.peer_decode_manager.set_recording_active(active);
@@ -5943,12 +5961,28 @@ impl VideoCallClient {
         let _guard = self.inner.borrow_mut();
         f()
     }
+
+    /// Test-only: add a connected peer with no-op decoders.
+    pub fn insert_peer_for_test(&self, session_id: u64, user_id: &str) {
+        self.inner
+            .borrow_mut()
+            .peer_decode_manager
+            .insert_peer_for_test(session_id, user_id);
+    }
+
+    /// Test-only: set whether a test peer publishes camera video and a screen share.
+    pub fn set_peer_media_for_test(&self, session_id: u64, video: bool, screen: bool) {
+        self.inner
+            .borrow_mut()
+            .peer_decode_manager
+            .set_peer_media_for_test(session_id, video, screen);
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
-mod disconnect_tests {
+pub(crate) mod disconnect_tests {
     //! Regression tests for the cc7tp meeting incident on 2026-05-01
-    //! (github01.hclpnp.com/labs-projects/videocall/discussions/502).
+    //! (discussion 502).
     //!
     //! Before the fix, dropping every UI-side clone of `VideoCallClient` did
     //! NOT actually drop the underlying `Inner` because three internal
@@ -5963,7 +5997,7 @@ mod disconnect_tests {
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-    fn build_test_options() -> VideoCallClientOptions {
+    pub(crate) fn build_test_options() -> VideoCallClientOptions {
         VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
@@ -6578,6 +6612,40 @@ mod cooldown_reset_hardening_tests {
         assert_eq!(client.active_transport(), None, "{no_controller}");
         assert_eq!(client.last_send_queue_depth.get(), None, "{no_controller}");
         assert_eq!(client.last_active_transport.get(), None, "{no_controller}");
+    }
+
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn netsim_ws_buffered_override_replaces_send_queue_depth_only() {
+        use crate::connection::set_ws_buffered_override_for_netsim;
+
+        let client = build_test_client_with(None, true);
+        client.last_send_queue_depth.set(Some(64_000));
+        client.last_active_transport.set(Some("websocket"));
+        let held = client.connection_controller.borrow_mut();
+
+        set_ws_buffered_override_for_netsim(Some(200_000));
+        assert_eq!(client.send_queue_depth(), Some(200_000));
+        assert_eq!(
+            client.uplink_sensors(),
+            (Some("websocket"), Some(64_000)),
+            "the screen uplink sensor pair must keep the real read"
+        );
+        assert_eq!(client.last_send_queue_depth.get(), Some(64_000));
+
+        set_ws_buffered_override_for_netsim(None);
+        assert_eq!(client.send_queue_depth(), Some(64_000));
+        drop(held);
+    }
+
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn netsim_force_camera_keyframe_raises_this_clients_pli_flag() {
+        let client = build_test_client_with(None, true);
+        assert!(crate::connection::force_camera_keyframe_for_netsim());
+        assert!(client
+            .force_camera_keyframe_flag()
+            .load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// #2068 P1-C: the `maxReceivedLayer` config knob (VideoCallClientOptions)
@@ -7848,20 +7916,12 @@ fn suppresses_peer_creation(
 ///
 /// `CONGESTION` and `LAYER_HINT` are relay-authored control packets stamped with
 /// the RECIPIENT's own session_id; the connection-layer self-filter
-/// (`connection_manager.rs::should_filter_self_packet`) whitelists exactly these
-/// two so AQ can act on them, so they reach this path even though they are
+/// (`connection_manager.rs::should_filter_self_packet`) whitelists them so AQ can
+/// act on them, so they reach this path even though they are
 /// "self" — but they must never spawn a peer tile. `SESSION_ASSIGNED` carries our
 /// own session_id and is likewise suppressed purely on packet type (see the
 /// detailed rationale on [`suppresses_peer_creation`] and at the call site).
 ///
-/// `DOWNLINK_CONGESTION` is intentionally NOT in this set even though the relay
-/// classifies it as a self-addressed control packet too: the transport self-filter
-/// does NOT whitelist it, so a self-addressed `DOWNLINK_CONGESTION` is dropped one
-/// layer up (in `should_filter_self_packet`) and never reaches here once our own
-/// session_id is known. The pre-`SESSION_ASSIGNED` window where it could slip
-/// through unfiltered is the subject of the open #1481 investigation; do not add it
-/// to this set without first reconciling it with the transport-filter whitelist
-/// (the two gates must agree), which is exactly what #1481 tracks.
 fn suppresses_peer_creation_for_packet(response: &PacketWrapper, decode_media: bool) -> bool {
     // #1884: a REACTION is a room-wide ephemeral broadcast rendered as a floating
     // overlay, NOT a participant tile. It must never spawn a peer — a camera-off
@@ -7891,7 +7951,8 @@ fn suppresses_peer_creation_for_packet(response: &PacketWrapper, decode_media: b
         return true;
     }
     let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
-        || response.packet_type == PacketType::LAYER_HINT.into();
+        || response.packet_type == PacketType::LAYER_HINT.into()
+        || response.packet_type == PacketType::DOWNLINK_CONGESTION.into();
     suppresses_peer_creation(
         response.user_id == SYSTEM_USER_ID.as_bytes(),
         response.session_id,
@@ -7996,6 +8057,43 @@ mod self_peer_suppression_tests {
         assert!(
             suppresses_peer_creation_for_packet(&p, true),
             "LAYER_HINT must be suppressed purely on packet type (self-addressed control)"
+        );
+    }
+
+    #[test]
+    fn wiring_downlink_congestion_packet_is_suppressed() {
+        let p = packet(PacketType::DOWNLINK_CONGESTION, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "DOWNLINK_CONGESTION must be suppressed purely on packet type \
+             (self-addressed control)"
+        );
+    }
+
+    #[test]
+    fn every_self_whitelisted_packet_type_is_suppressed_from_peer_creation() {
+        use crate::connection::{should_filter_self_packet, SessionIdHistory};
+        const OWN: u64 = 42;
+        let mut history = SessionIdHistory::default();
+        history.record(OWN);
+        let mut whitelisted = 0;
+        for packet_type in <PacketType as protobuf::Enum>::VALUES {
+            let p = packet(*packet_type, OWN, b"alice@example.com");
+            if should_filter_self_packet(&p, Some(OWN), &history) {
+                continue;
+            }
+            whitelisted += 1;
+            assert!(
+                suppresses_peer_creation_for_packet(&p, true),
+                "{packet_type:?} survives the transport self-filter on our own \
+                 session id, so it must be suppressed from peer creation or it \
+                 renders us as our own ghost peer"
+            );
+        }
+        assert_eq!(
+            whitelisted, 3,
+            "expected exactly the three self-addressed control types to survive \
+             the self-filter; the two gates are enumerated together on purpose"
         );
     }
 

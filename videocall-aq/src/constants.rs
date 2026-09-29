@@ -933,6 +933,20 @@ pub const AQ_TICK_INTERVAL_MS: u64 = 1000;
 /// detailed rationale for empirical validation.
 pub const LAYER_PROBE_CLEAR_WINDOW_MS: f64 = 6_000.0;
 
+/// AQ ticks the probe-hold gate looks back over for uplink-axis advances (issue 2811).
+pub const LAYER_PROBE_UPLINK_TICK_WINDOW: u32 = 3;
+
+/// Ticks in that window that must see an advance before the hold stamps; one
+/// advancing tick per window never parks the probe.
+pub const LAYER_PROBE_UPLINK_HOLD_TICKS: u32 = 2;
+
+const _: () = assert!(
+    LAYER_PROBE_UPLINK_HOLD_TICKS >= 2
+        && LAYER_PROBE_UPLINK_HOLD_TICKS <= LAYER_PROBE_UPLINK_TICK_WINDOW
+        && LAYER_PROBE_UPLINK_TICK_WINDOW <= 8,
+    "uplink hold needs >= 2 advancing ticks, within a window that fits the u8 tick mask"
+);
+
 /// Minimum RELATIVE benefit the rung being added must carry, as a fraction of
 /// the egress already flowing, before a probe-up is allowed (issue #1141).
 ///
@@ -959,14 +973,7 @@ pub const LAYER_PROBE_CLEAR_WINDOW_MS: f64 = 6_000.0;
 ///
 /// **What actually guards the +5000 kbps marginal rung** is the tier-QUIET
 /// precondition added alongside this note: the probe refuses to add a rung
-/// within [`LAYER_PROBE_CLEAR_WINDOW_MS`] of a video step-DOWN. A step-down is
-/// stamped by sustained encoder backpressure AND by the out-of-band
-/// `force_video_step_down` that the WS send-buffer, WS stale-delta and WT
-/// unistream drop axes call — the three axes the probe's other gates are blind
-/// to, because none of them touches `encode_queue_size()`. (The fifth axis,
-/// a self-targeted server CONGESTION cut, deliberately does not stamp it — see
-/// `AdaptiveQualityManager::force_congestion_cut` — and is instead covered by
-/// the probe's existing congestion-hold gate.) See
+/// within [`LAYER_PROBE_CLEAR_WINDOW_MS`] of a video step-DOWN. See
 /// `EncoderBitrateController::probe_add_allowed`.
 pub const LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC: f64 = 0.0;
 
@@ -1118,6 +1125,9 @@ const _: () = assert!(
     REELECTION_CEILING_SUPPRESSION_MS > 0.0,
     "re-election suppression must be positive"
 );
+
+// The tick after a transition must still land inside that guard window.
+const _: () = assert!(AQ_TICK_INTERVAL_MS < MIN_TIER_TRANSITION_INTERVAL_MS);
 
 // Congestion feedback thresholds must be positive.
 const _: () = assert!(
@@ -1751,14 +1761,6 @@ pub const WS_SELF_CONGESTION_WINDOW_MS: f64 = 1000.0;
 //   within the window before shedding. The window is widened to 2000ms so the
 //   evidence must persist across at least ~2 AQ ticks rather than a single
 //   spike, and the threshold is set so an isolated reset cannot trip it.
-//
-// Double-shed avoidance:
-//   A saturated WT uplink will eventually also raise the server CONGESTION
-//   signal (relay drops -> CONGESTION back to sender). The encoder maintains
-//   an INDEPENDENT window/snapshot for this counter (separate from the WS
-//   window and from the server-congestion flag), and each axis sheds at most
-//   one layer per window, so the paths cannot compound into a runaway
-//   double step-down within a single window.
 
 /// Number of client-side WebTransport persistent-unistream media-frame drops
 /// (see `videocall_transport::webtransport::unistream_drop_count`) within
@@ -1899,6 +1901,32 @@ const _: () = assert!(
     "camera WT stale-delta drops can be prolific under congestion, so the \
      sustained-cluster threshold must exceed the WS overflow threshold."
 );
+
+/// Camera WS freshness-gate drops per window that force an AQ step-down (issue 2809).
+pub const CAMERA_WS_STALE_DROP_THRESHOLD: u64 = 12;
+
+pub const CAMERA_WS_STALE_DROP_WINDOW_MS: f64 = 2000.0;
+
+const _: () = assert!(
+    CAMERA_WS_STALE_DROP_WINDOW_MS >= WS_SELF_CONGESTION_WINDOW_MS,
+    "camera WS stale-drop window must be at least as wide as the WS overflow \
+     window: gate drops are softer and more frequent than hard send failures, \
+     so they must persist longer before shedding."
+);
+const _: () = assert!(
+    CAMERA_WS_STALE_DROP_THRESHOLD > WS_SELF_CONGESTION_DROP_THRESHOLD,
+    "camera WS freshness-gate drops can be prolific under congestion, so the \
+     sustained-cluster threshold must exceed the WS overflow threshold."
+);
+
+/// Converted to bytes against the CONFIGURED ladder's nominal bitrate, then
+/// floored by `CAMERA_WS_MIN_THRESHOLD_BYTES`; not a measured delay bound.
+pub const CAMERA_WS_FRESHNESS_DELAY_MS: u64 = 250;
+
+pub const CAMERA_WS_MIN_THRESHOLD_BYTES: u64 = 16_384;
+
+/// Keyframes bypass the camera WS gate; this hold bounds their rate while the queue is over it.
+pub const CAMERA_WS_CONGESTED_KEYFRAME_COOLDOWN_MS: f64 = 2000.0;
 
 // ---------------------------------------------------------------------------
 // Single-Layer AUDIO Uplink-Distress Self-Detection (#1398)
@@ -3396,6 +3424,20 @@ mod tests {
             ms < RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS,
             "the screen-share camera ceiling tier over WebSocket resolves {ms}ms, which must \
              stay under the receiver's {RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS}ms escalation (#2199)"
+        );
+    }
+
+    #[test]
+    fn camera_ws_stale_drop_constants_match_the_sibling_axes() {
+        assert_eq!(CAMERA_WS_STALE_DROP_THRESHOLD, 12);
+        assert_eq!(CAMERA_WS_STALE_DROP_WINDOW_MS, 2000.0);
+        assert_eq!(
+            CAMERA_WS_STALE_DROP_THRESHOLD,
+            CAMERA_WT_STALE_DROP_THRESHOLD
+        );
+        assert_eq!(
+            CAMERA_WS_STALE_DROP_WINDOW_MS,
+            CAMERA_WT_STALE_DROP_WINDOW_MS
         );
     }
 }

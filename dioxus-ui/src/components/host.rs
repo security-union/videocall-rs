@@ -50,9 +50,6 @@ use videocall_client::{
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::MediaStream;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -164,6 +161,8 @@ pub fn Host(
     /// Issue 66: hidden; the `<video>` stays mounted, only its box collapses.
     #[props(default)]
     self_hidden: bool,
+    /// Level-triggered: false releases the mic claim on EVERY render.
+    in_call: bool,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -253,14 +252,6 @@ pub fn Host(
         let screen_settings_cb = screen_settings_handler.callback();
         let screen_state_forward = screen_state_handler.callback();
         let screen_state_cb = VcCallback::from(move |event: ScreenShareEvent| {
-            match &event {
-                ScreenShareEvent::Started(stream) => {
-                    attach_screen_preview(stream);
-                }
-                _ => {
-                    detach_screen_preview();
-                }
-            }
             screen_state_forward.emit(event);
         });
         let mut screen = ScreenEncoder::new(
@@ -451,6 +442,7 @@ pub fn Host(
             prev_mic_enabled: false,
             prev_video_enabled: false,
             prev_device_settings_open: false,
+            prev_in_call: true,
             initialized: false,
             last_reload_counter: 0,
         }))
@@ -470,6 +462,7 @@ pub fn Host(
         }
     });
     use_aq_loop_teardown(aq_cancel);
+    use_media_release_teardown(state.clone());
 
     // Update the indirection cells so encoder callbacks route to the current EventHandlers.
     // This runs on every render to keep them in sync with the latest prop values.
@@ -737,7 +730,6 @@ pub fn Host(
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();
-                detach_screen_preview();
                 s.encoder_settings.screen = None;
             }
         }
@@ -779,6 +771,18 @@ pub fn Host(
             }
             client.set_video_enabled(video_enabled);
         }
+
+        if !in_call {
+            // `stop()` emits `on_speaking_changed`; its `Signal::set` would loop.
+            if s.prev_in_call {
+                log::info!("Host render: no longer in call, stopping the microphone");
+                s.microphone.set_enabled(false);
+                s.microphone.stop();
+                s.encoder_settings.microphone = None;
+            }
+            s.microphone.release_device();
+        }
+        s.prev_in_call = in_call;
 
         drop(s);
     }
@@ -1223,18 +1227,6 @@ pub fn Host(
             // LED + signal meter) in attendants.rs, so it no longer overlaps
             // the LED and persists through camera on/off from a single site.
         }
-        // Always-mounted screen share preview — toggled via style so the element
-        // exists in the DOM before attach_screen_preview() runs.
-        // Positioned AFTER the camera so the preview appears below it.
-        video {
-            id: "screen-share-preview",
-            class: "screen-share-preview",
-            style: if share_screen { "display:block;" } else { "display:none;" },
-            autoplay: true,
-            muted: true,
-            playsinline: "true",
-            controls: false,
-        }
         if show_camera_off_placeholder(video_enabled, self_hidden) {
             if self_in_grid {
                 div {
@@ -1319,6 +1311,24 @@ fn use_aq_loop_teardown(tokens: AqLoopCancelTokens) {
     use_drop(move || tokens.cancel_all());
 }
 
+fn use_media_release_teardown(state: Rc<RefCell<HostState>>) {
+    use_drop(move || state.borrow_mut().release_all_media());
+}
+
+impl HostState {
+    /// The enable flags go with the devices: `on_loaded` outlives this component
+    /// and would re-enable from them, clearing the mic's terminal release latch.
+    fn release_all_media(&mut self) {
+        self.microphone.shutdown();
+        self.camera.set_enabled(false);
+        self.camera.stop();
+        self.screen.set_enabled(false);
+        self.screen.shutdown();
+        self.prev_mic_enabled = false;
+        self.prev_video_enabled = false;
+    }
+}
+
 struct HostState {
     camera: CameraEncoder,
     microphone: Box<dyn MicrophoneEncoderTrait>,
@@ -1329,44 +1339,9 @@ struct HostState {
     prev_mic_enabled: bool,
     prev_video_enabled: bool,
     prev_device_settings_open: bool,
+    prev_in_call: bool,
     initialized: bool,
     last_reload_counter: u32,
-}
-
-fn attach_screen_preview(stream: &MediaStream) {
-    if let Some(el) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("screen-share-preview"))
-    {
-        let video: web_sys::HtmlVideoElement = el.unchecked_into();
-        // Explicitly set the muted property (not just the HTML attribute) so that
-        // Chrome's autoplay policy recognises the element as muted and allows play().
-        video.set_muted(true);
-        video.set_src_object(Some(stream));
-        // Properly await the play() Promise via spawn_local.
-        // Dropping the Promise with `let _` causes Chrome to silently abort
-        // playback for display-capture streams; Edge is more lenient.
-        wasm_bindgen_futures::spawn_local(async move {
-            match video.play() {
-                Ok(promise) => {
-                    if let Err(e) = JsFuture::from(promise).await {
-                        log::warn!("Screen preview play() rejected: {:?}", e);
-                    }
-                }
-                Err(e) => log::warn!("Screen preview play() error: {:?}", e),
-            }
-        });
-    }
-}
-
-fn detach_screen_preview() {
-    if let Some(el) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("screen-share-preview"))
-    {
-        let video: web_sys::HtmlVideoElement = el.unchecked_into();
-        video.set_src_object(None);
-    }
 }
 
 #[cfg(test)]
@@ -1498,6 +1473,20 @@ mod tests {
         assert!(
             screen_seen_by_loop.is_cancelled(),
             "issue 2458: unmount must cancel the screen AQ loop"
+        );
+    }
+
+    #[test]
+    fn unmount_teardown_forgets_the_enable_flags() {
+        assert!(
+            include_str!("host.rs").contains(concat!(
+                "        self.screen.shutdown();\n",
+                "        self.prev_mic_enabled = false;\n",
+                "        self.prev_video_enabled = false;\n",
+                "    }\n"
+            )),
+            "issue 2772: release_all_media must clear the enable flags with the \
+             devices, or a leaked on_loaded re-enables from stale state"
         );
     }
 

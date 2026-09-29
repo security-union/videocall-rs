@@ -252,8 +252,10 @@
   var _prevMicOn = null;
   /** MediaStreamSourceNode for local screen-share audio (null when not active). */
   var _ssAudioSource = null;
-  /** The srcObject previously seen on #screen-share-preview; used to detect changes. */
+  /** The srcObject previously seen on the own share video; used to detect changes. */
   var _prevSsObject = null;
+  /** The own share video a frame tick un-paused. */
+  var _kickedShareVideo = null;
   /**
    * AES-256-GCM CryptoKey generated at recording start for E2EE file
    * encryption.  null when the WebCrypto API is unavailable or key generation
@@ -1663,15 +1665,23 @@
   }
 
   /**
+   * The presenter's own share tile video (issue 2792). Its srcObject is the
+   * local capture stream, video and any shared tab audio.
+   */
+  function localShareVideo() {
+    return document.getElementById("own-screen-share-video");
+  }
+
+  /**
    * Dynamically connect or disconnect local screen-share audio from the mixer.
-   * Detects changes to #screen-share-preview.srcObject so that screen sharing
+   * Detects changes to the own share video's srcObject so that screen sharing
    * started or stopped AFTER recording began is still captured correctly.
    * Remote screen-share audio travels through WebRTC → Rust's SharedAudioContext
    * → audioStream and is already included in the remote audio mix.
    */
   function updateScreenShareAudio() {
     if (!_audioMixerCtx || !_mixDest) return;
-    var ssEl = document.getElementById("screen-share-preview");
+    var ssEl = localShareVideo();
     var currentSrc = ssEl ? ssEl.srcObject : null;
     if (currentSrc === _prevSsObject) return;
     // srcObject changed — disconnect the old source first.
@@ -2096,32 +2106,12 @@
     return true; // default: show whatever video content the peer has
   }
 
-  function drawFrame() {
-    if (!_offCtx) return;
-    _dbgFrameCount++;
-
-    // ── Phase 1: Audio bookkeeping (always runs, no canvas drawing) ───────
-    // Re-check master_gain connection on every frame.  If the initial
-    // connect() in start() was missed (masterGain null at that moment), this
-    // establishes it the first time window.__vcMasterGain is available.
-    ensureMasterGainConnected();
-
-    // Update local mic connection state so mute/unmute during recording is captured.
-    updateMicConnection();
-    // Update screen-share audio so sharing started/stopped during recording is captured.
-    updateScreenShareAudio();
-
-    var w = RECORD_WIDTH;
-    var h = RECORD_HEIGHT;
-
-    // Ensure bg image is loading (no-op after first call)
-    ensureBgImage();
-
-    // ── Phase 2: Gather meeting state (no canvas drawing yet) ────────────
-    var grid = document.getElementById("grid-container");
-    if (!grid) return;
-
-    // ── Screen-share source and sharer name ─────────────────────────
+  /**
+   * The screen-share source drawFrame() composites, and the sharer name to
+   * label it with: a remote decoder canvas first, then the received share
+   * tile's canvas, then the presenter's own capture.
+   */
+  function resolveScreenSource(grid) {
     var screenSource = null;
     var screenShareName = "";
 
@@ -2156,7 +2146,9 @@
       }
     }
 
-    var splitTile = grid.querySelector(".split-screen-tile");
+    var splitTile = grid.querySelector(
+      '.split-screen-tile:not([data-share-origin="own"])',
+    );
     if (splitTile) {
       if (!screenSource) {
         var sc = splitTile.querySelector("canvas");
@@ -2172,7 +2164,7 @@
       // leaving remote screen-share tiles unlabelled in the recording.
       screenShareName = getTileName(splitTile);
     }
-    var localScreenEl = document.getElementById("screen-share-preview");
+    var localScreenEl = localShareVideo();
     if (!screenSource && localScreenEl) {
       // Detect local screen share by checking srcObject directly — more reliable
       // than style.display (which may lag behind Dioxus re-renders) or videoWidth
@@ -2185,13 +2177,13 @@
           return t.readyState === "live";
         });
       if (hasLiveScreenTrack) {
-        // The <video> element is styled `display:none` while off and toggled
-        // to `display:block` when sharing; hidden elements can pause their
-        // playback in some browsers, leaving videoWidth stuck at 0 so the
-        // recording sees a blank source.  Kick play() every frame while the
+        // The own share video is paused while its preview is hidden (mirror
+        // guard) or detached, leaving videoWidth stuck at 0 so the recording
+        // would see a blank source.  Kick play() every frame while the
         // element is present but paused, and safely swallow the promise since
         // autoplay may reject without user gesture.
         if (localScreenEl.paused && typeof localScreenEl.play === "function") {
+          _kickedShareVideo = localScreenEl;
           var pp = localScreenEl.play();
           if (pp && typeof pp.catch === "function") {
             pp.catch(function () {});
@@ -2209,6 +2201,43 @@
         }
       }
     }
+    return {
+      source: screenSource,
+      name: screenShareName,
+      decoderMap: screenDecoderMap,
+    };
+  }
+
+  function drawFrame() {
+    if (!_offCtx) return;
+    _dbgFrameCount++;
+
+    // ── Phase 1: Audio bookkeeping (always runs, no canvas drawing) ───────
+    // Re-check master_gain connection on every frame.  If the initial
+    // connect() in start() was missed (masterGain null at that moment), this
+    // establishes it the first time window.__vcMasterGain is available.
+    ensureMasterGainConnected();
+
+    // Update local mic connection state so mute/unmute during recording is captured.
+    updateMicConnection();
+    // Update screen-share audio so sharing started/stopped during recording is captured.
+    updateScreenShareAudio();
+
+    var w = RECORD_WIDTH;
+    var h = RECORD_HEIGHT;
+
+    // Ensure bg image is loading (no-op after first call)
+    ensureBgImage();
+
+    // ── Phase 2: Gather meeting state (no canvas drawing yet) ────────────
+    var grid = document.getElementById("grid-container");
+    if (!grid) return;
+
+    // ── Screen-share source and sharer name ─────────────────────────
+    var resolvedScreen = resolveScreenSource(grid);
+    var screenSource = resolvedScreen.source;
+    var screenShareName = resolvedScreen.name;
+    var screenDecoderMap = resolvedScreen.decoderMap;
 
     // ── Read actual control states from DOM ──────────────────────────
     // Must happen before the local tile is collected so !micOn is correct.
@@ -2616,6 +2645,16 @@
     if (_animFrameId !== null) {
       clearInterval(_animFrameId);
       _animFrameId = null;
+    }
+    var kicked = _kickedShareVideo;
+    _kickedShareVideo = null;
+    var tile = kicked && kicked.closest(".share-tile");
+    if (
+      tile &&
+      (tile.getAttribute("data-guard") === "true" ||
+        tile.getAttribute("data-share-mode") === "detached")
+    ) {
+      kicked.pause();
     }
   }
 
@@ -3362,6 +3401,10 @@
 
     /** Issue #2264 accessors: the production overflow/roster path, unwrapped. */
     _readGridOverflowCount: readGridOverflowCount,
+    /** Issue 2792 accessors: the production screen-share source lookups. */
+    _resolveScreenSource: resolveScreenSource,
+    _localShareVideo: localShareVideo,
+    _stopFrameLoop: stopRafLoop,
     _buildFrameParticipants: buildFrameParticipants,
     _composeTileOrder: composeTileOrder,
   };

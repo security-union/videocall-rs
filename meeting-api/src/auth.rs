@@ -429,6 +429,7 @@ mod tests {
             display_name_rate_limit_disabled: false,
             dev_user: None,
             password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
+            presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -949,6 +950,7 @@ mod tests {
             display_name_rate_limit_disabled: false,
             dev_user: None,
             password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
+            presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

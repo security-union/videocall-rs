@@ -32,16 +32,28 @@ use actix_web::web::Bytes;
 use actix_web::{get, web, Error, HttpRequest, HttpResponse};
 use actix_web_actors::ws::{handshake, WebsocketContext};
 use tracing::{debug, error};
+use videocall_types::validation::is_valid_meeting_id;
 use videocall_types::FeatureFlags;
 
 use crate::actors::transports::ws_chat_session::WsChatSession;
-use crate::constants::{MAX_FRAME_SIZE, VALID_ID_PATTERN};
+use crate::constants::{MAX_FRAME_SIZE, VALID_USER_ID_PATTERN};
 use crate::models::AppState;
 use crate::token_validator;
 
 lazy_static::lazy_static! {
-    /// Compiled regex for validating user_id and room in the deprecated path-based endpoint.
-    static ref VALID_ID_RE: regex::Regex = regex::Regex::new(VALID_ID_PATTERN).expect("VALID_ID_PATTERN is a valid regex");
+    static ref VALID_USER_ID_RE: regex::Regex = regex::Regex::new(VALID_USER_ID_PATTERN).expect("VALID_USER_ID_PATTERN is a valid regex");
+}
+
+/// Resolves the `(user_id, room)` of the deprecated `/lobby/{user_id}/{room}`
+/// path (WebSocket and WebTransport), or `None` if either is rejected.
+///
+/// Spaces in `user_id` become `_`; `room` must be a valid meeting ID as given.
+pub fn deprecated_path_identity(user_id: &str, room: &str) -> Option<(String, String)> {
+    let user_id = user_id.replace(' ', "_");
+    if !VALID_USER_ID_RE.is_match(&user_id) || !is_valid_meeting_id(room) {
+        return None;
+    }
+    Some((user_id, room.to_string()))
 }
 
 /// Query parameters for the token-based lobby endpoint.
@@ -112,7 +124,6 @@ pub async fn ws_connect_authenticated(
     let observer = claims.observer;
     let display_name = claims.display_name;
     let is_host = claims.is_host;
-    let end_on_host_leave = claims.end_on_host_leave;
     let is_guest = claims.is_guest;
 
     debug!(
@@ -135,7 +146,6 @@ pub async fn ws_connect_authenticated(
         observer,
         instance_id,
         is_host,
-        end_on_host_leave,
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
@@ -162,15 +172,13 @@ pub async fn ws_connect(
 
     let (user_id, room) = session.into_inner();
 
-    let user_id_clean = user_id.replace(' ', "_");
-    let room_clean = room.replace(' ', "_");
-    if !VALID_ID_RE.is_match(&user_id_clean) || !VALID_ID_RE.is_match(&room_clean) {
+    let Some((user_id_clean, room_clean)) = deprecated_path_identity(&user_id, &room) else {
         error!(
-            "Invalid user_id or room format: user_id={}, room={}",
+            "Invalid user_id or room format: user_id={:?}, room={:?}",
             user_id, room
         );
         return Ok(HttpResponse::BadRequest().body("Invalid user_id or room format"));
-    }
+    };
 
     debug!(
         "socket connected (deprecated path-based) for user_id={}, room={}",
@@ -192,8 +200,52 @@ pub async fn ws_connect(
         false, // deprecated path-based endpoint: never observer
         None,  // no instance_id for deprecated endpoint
         false, // deprecated path: not a host
-        true,  // default end_on_host_leave
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deprecated_path_identity;
+
+    #[test]
+    fn deprecated_path_accepts_valid_meeting_ids_unchanged() {
+        assert_eq!(
+            deprecated_path_identity("alice", "a~b"),
+            Some(("alice".to_string(), "a~b".to_string()))
+        );
+        assert_eq!(
+            deprecated_path_identity("alice", "my-room_1"),
+            Some(("alice".to_string(), "my-room_1".to_string()))
+        );
+    }
+
+    #[test]
+    fn deprecated_path_rejects_a_room_with_a_space_instead_of_rewriting_it() {
+        assert_eq!(deprecated_path_identity("alice", "a b"), None);
+    }
+
+    #[test]
+    fn deprecated_path_rejects_rooms_that_are_not_valid_meeting_ids() {
+        for room in ["", "a.b", "..", "a*b", "a>b", "a/b", "a%20b", "caf\u{e9}"] {
+            assert_eq!(deprecated_path_identity("alice", room), None, "{room:?}");
+        }
+        assert_eq!(deprecated_path_identity("alice", &"a".repeat(256)), None);
+    }
+
+    #[test]
+    fn deprecated_path_user_id_rule_is_unchanged() {
+        assert_eq!(
+            deprecated_path_identity("alice bob", "room"),
+            Some(("alice_bob".to_string(), "room".to_string()))
+        );
+        for user_id in ["alice~x", "alice.evil", "alice@example.com"] {
+            assert_eq!(
+                deprecated_path_identity(user_id, "room"),
+                None,
+                "{user_id:?}"
+            );
+        }
+    }
 }

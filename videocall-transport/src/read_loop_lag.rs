@@ -16,11 +16,17 @@
 //!
 //! The WebTransport incoming-datagram reader
 //! ([`crate::webtransport::WebTransportService::start_listening_incoming_datagrams`])
-//! runs as a `spawn_local` task on the MAIN thread. When the main thread stalls
-//! (a long task), that task cannot re-enter `.read()`, the browser's network
-//! process age-drops the OLDEST queued datagrams, and audio is silently lost.
-//! The gap between two successive `.read()` resolutions is therefore the direct
-//! causal signal for reader starvation.
+//! runs as a `spawn_local` task on whichever thread owns the session. When that
+//! thread stalls (a long task), the task cannot re-enter `.read()`, the
+//! browser's network process age-drops the OLDEST queued datagrams, and audio is
+//! silently lost. The gap between two successive `.read()` resolutions is
+//! therefore the direct causal signal for reader starvation.
+//!
+//! Since #2728 the session runs in a dedicated Worker by default, so the thread
+//! at risk is the Worker's, not main's — which is the point of that issue: a
+//! main-thread long task no longer starves this reader. The legacy in-page path
+//! (`wtReceiveWorker` off) still puts it on main, and the tracker measures both,
+//! folded with `max` in [`crate::webtransport::take_datagram_read_loop_max_gap_ms`].
 //!
 //! This module holds ONLY the arithmetic — no `web_sys`, no wasm — so it can be
 //! unit-tested natively (`cargo test -p videocall-transport --lib`). The wasm

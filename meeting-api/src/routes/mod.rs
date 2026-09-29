@@ -13,6 +13,7 @@
 
 //! Axum router configuration for the Meeting Backend API.
 
+pub mod co_hosts;
 pub mod console_logs;
 pub mod dev;
 pub mod feed_stream;
@@ -20,6 +21,7 @@ pub mod host;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
+pub mod valid_meeting_id;
 pub mod waiting_room;
 
 use axum::{
@@ -179,6 +181,14 @@ pub fn router() -> Router<AppState> {
             post(participants::leave_meeting_as_guest),
         )
         .route(
+            "/api/v1/meetings/{meeting_id}/presence/keepalive",
+            post(participants::presence_keepalive),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/presence/keepalive-guest",
+            post(participants::presence_keepalive_guest),
+        )
+        .route(
             "/api/v1/meetings/{meeting_id}/status",
             get(participants::get_my_status),
         )
@@ -234,6 +244,19 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/transfer-host",
             post(host::transfer_host),
+        )
+        // Co-host management (owner only)
+        .route(
+            "/api/v1/meetings/{meeting_id}/co-hosts",
+            get(co_hosts::list_co_hosts),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/co-hosts",
+            post(co_hosts::grant_co_host),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/co-hosts/revoke",
+            post(co_hosts::revoke_co_host),
         )
         // Console log uploads
         .route(

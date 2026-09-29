@@ -116,3 +116,5 @@ CLAUDE.local.md
 # Python bytecode
 __pycache__/
 *.pyc
+
+.promtool-tmp-*

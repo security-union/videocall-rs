@@ -1,0 +1,24 @@
+{{- if (.Values.service).annotations }}
+{{- fail "rustlemania-webtransport: .Values.service.annotations is never rendered. Load balancer annotations belong under .Values.loadBalancerAnnotations, which templates/loadbalancer.yaml reads. See issue #2719." }}
+{{- end }}
+{{- $replicaGuard := "rustlemania-webtransport: more than one WT relay replica is not supported yet. The teardown it was added for (#1202: a replica idling or ending a meeting when only its own copy of a split room emptied) is gone since #2702: relays never end meetings, and meeting-api idles or ends one only from per-session presence leases. A room split across WT replicas then behaves like one split across the WS and WT relays, but more than one WT replica has never been run, so lifting this guard is a human decision. Keep replicaCount at 1, and autoscaling.maxReplicas at 1 when autoscaling.enabled. Two things are dormant until this guard lifts and must be restored in the same change: templates/pdb.yaml renders no PodDisruptionBudget at one replica (#2719), and service.externalTrafficPolicy is pinned to Cluster because every benefit of Local needs a second replica while it costs a reschedule window on multi-node clusters (#2727)." }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail (printf "%s Got replicaCount=%d." $replicaGuard (int .Values.replicaCount)) }}
+{{- end }}
+{{- if and .Values.autoscaling.enabled (gt (int .Values.autoscaling.maxReplicas) 1) }}
+{{- fail (printf "%s Got autoscaling.enabled=true with maxReplicas=%d." $replicaGuard (int .Values.autoscaling.maxReplicas)) }}
+{{- end }}
+{{- $policy := (.Values.service).externalTrafficPolicy | default "" }}
+{{- if and $policy (not (has $policy (list "Local" "Cluster"))) }}
+{{- fail (printf "rustlemania-webtransport: service.externalTrafficPolicy=%q. The Service API accepts only Local or Cluster, and a rejected Service leaves the relay unreachable. See issue #2727." $policy) }}
+{{- end }}
+{{- $affinity := (.Values.service).sessionAffinity | default "" }}
+{{- if and $affinity (not (has $affinity (list "ClientIP" "None"))) }}
+{{- fail (printf "rustlemania-webtransport: service.sessionAffinity=%q. The Service API accepts only ClientIP or None. See issue #2727." $affinity) }}
+{{- end }}
+{{- if eq $affinity "ClientIP" }}
+{{- $timeout := int ((.Values.service).sessionAffinityTimeoutSeconds | default 0) }}
+{{- if or (lt $timeout 1) (gt $timeout 86400) }}
+{{- fail (printf "rustlemania-webtransport: service.sessionAffinityTimeoutSeconds=%d is outside 1..86400. The API rejects anything above MaxClientIPServiceAffinitySeconds (86400), and an unset value renders an empty timeoutSeconds the API also rejects. See issue #2727." $timeout) }}
+{{- end }}
+{{- end }}

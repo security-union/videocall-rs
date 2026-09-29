@@ -49,7 +49,7 @@ use actix::Addr;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -110,19 +110,183 @@ pub fn downlink_congested_epoch_now() -> u64 {
     (PROCESS_START.elapsed().as_millis() as u64).saturating_add(1)
 }
 
+/// `source` label for a stamp made by [`SessionLogic::on_outbound_drop`].
+pub const RELIEF_SOURCE_OUTBOUND_DROP: &str = "outbound_drop";
+
+/// `source` label for a stamp made by the #1638 shed in `webtransport::bridge`.
+pub const RELIEF_SOURCE_UNISTREAM_SHED: &str = "unistream_shed";
+
+/// The write half of the #1219 relief signal, and its only stamp site today.
+pub fn stamp_downlink_congested_epoch(epoch: &AtomicU64, source: &'static str) {
+    epoch.store(downlink_congested_epoch_now(), Ordering::Relaxed);
+    crate::metrics::RELAY_DOWNLINK_RELIEF_STAMPS_TOTAL
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Write handle on one receiver's relief epoch, for a producer that is not a
+/// [`SessionLogic`] — the #1638 shed runs in a bridge writer task that has
+/// neither an actor address nor a `SessionLogic`. Newtyped because that writer
+/// already takes an unrelated `Arc<AtomicU64>` (#2712) it must not be swapped
+/// with.
+#[derive(Clone, Debug)]
+pub struct DownlinkReliefSignal(Arc<AtomicU64>);
+
+impl DownlinkReliefSignal {
+    /// Wrap the `Arc` the receiver's fan-out closure reads.
+    pub fn new(epoch: Arc<AtomicU64>) -> Self {
+        Self(epoch)
+    }
+
+    /// Stamp the epoch exactly as `on_outbound_drop` does.
+    pub fn stamp(&self, source: &'static str) {
+        stamp_downlink_congested_epoch(&self.0, source);
+    }
+}
+
+/// Whether this session's `relay_session_drops_total` series may still be
+/// written. Shared between the actor, which removes the series when it stops,
+/// and the dispatcher, which runs on its own task and can still be holding a
+/// frame at that moment.
+///
+/// The actor's `ctx.stop()` is not tied to the bridge's teardown — the
+/// heartbeat timeout stops it while the QUIC session is still open — so without
+/// this gate a tail drop landing after the sweep would re-create the series
+/// with no owner left to remove it again.
+#[derive(Clone)]
+pub struct SessionDropBooking(Arc<RwLock<bool>>);
+
+impl Default for SessionDropBooking {
+    fn default() -> Self {
+        Self::open()
+    }
+}
+
+impl SessionDropBooking {
+    pub fn open() -> Self {
+        Self(Arc::new(RwLock::new(true)))
+    }
+
+    /// Close the gate and remove the series under the SAME write guard, so a
+    /// concurrent [`DownlinkDropSink::record`] either finishes before the
+    /// removal or is refused after it — never in between.
+    pub fn close_and_forget(&self, room: &str, transport: &str, session_id: &str) {
+        let mut open = self.0.write().unwrap_or_else(|p| p.into_inner());
+        *open = false;
+        crate::metrics::forget_session_drops(room, transport, session_id);
+    }
+
+    fn booking_guard(&self) -> Option<std::sync::RwLockReadGuard<'_, bool>> {
+        let open = self.0.read().unwrap_or_else(|p| p.into_inner());
+        if *open {
+            Some(open)
+        } else {
+            None
+        }
+    }
+}
+
+/// Everything [`SessionLogic::on_outbound_drop`] and its two call-site counters
+/// do, for the #2723 dispatcher, which drops frames off the actor thread.
+///
+/// NOT the #2726 escalation: that counts `write_timeout` shed ROUNDS toward a
+/// stage-2 session close, and a tail drop is neither a shed nor a round (#2745).
+#[derive(Clone)]
+pub struct DownlinkDropSink {
+    room: Arc<str>,
+    session_id: Arc<str>,
+    transport: &'static str,
+    relief: DownlinkReliefSignal,
+    congestion: Arc<Mutex<CongestionTracker>>,
+    booking: SessionDropBooking,
+}
+
+impl DownlinkDropSink {
+    pub fn new(
+        room: &str,
+        session_id: u64,
+        transport: &'static str,
+        relief: DownlinkReliefSignal,
+        congestion: Arc<Mutex<CongestionTracker>>,
+        booking: SessionDropBooking,
+    ) -> Self {
+        Self {
+            room: Arc::from(room),
+            session_id: Arc::from(session_id.to_string().as_str()),
+            transport,
+            relief,
+            congestion,
+            booking,
+        }
+    }
+
+    /// The relief half alone, for the #1638 shed's own `source`.
+    pub fn relief(&self) -> &DownlinkReliefSignal {
+        &self.relief
+    }
+
+    /// Book one drop on `relay_packet_drops_total{room}`,
+    /// `relay_session_drops_total` and the sender-keyed tracker behind #979's
+    /// keyframe relax. A `sender_session_id` of `0` skips the tracker alone.
+    /// NOT the relief epoch: the caller decides when the run is long enough
+    /// ([`Self::stamp_relief`]).
+    pub fn record(&self, sender_session_id: u64, reason: &'static str, kind: &'static str) {
+        // Ungated: this series is keyed by ROOM, so the per-session sweep never
+        // removes it. The loss is real either way.
+        crate::metrics::RELAY_PACKET_DROPS_TOTAL
+            .with_label_values(&[&self.room, self.transport, reason])
+            .inc();
+        {
+            // Held across the session-keyed increment: this is the window in
+            // which the actor's sweep must not run.
+            let Some(_open) = self.booking.booking_guard() else {
+                return;
+            };
+            crate::metrics::RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[&self.room, self.transport, &self.session_id, kind])
+                .inc();
+        }
+        if sender_session_id == 0 {
+            return;
+        }
+        let crossed = lock_congestion(&self.congestion).record_drop(sender_session_id);
+        if let Some(sender_sid) = crossed {
+            warn!(
+                "Receiver-downlink overflow: session {} dropping packets from sender {} at the \
+                 downlink dispatcher; CONGESTION cut SUPPRESSED (#1219 Half 1)",
+                self.session_id, sender_sid,
+            );
+        }
+    }
+
+    /// Arm the #1219 relief epoch for a sustained run of drops.
+    pub fn stamp_relief(&self) {
+        self.relief.stamp(RELIEF_SOURCE_OUTBOUND_DROP);
+    }
+}
+
+pub(crate) fn lock_congestion(
+    tracker: &Mutex<CongestionTracker>,
+) -> std::sync::MutexGuard<'_, CongestionTracker> {
+    tracker
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Whether a receiver whose last downlink-congestion crossing was stamped at
-/// `epoch` (a value produced by [`downlink_congested_epoch_now`], or
-/// [`DOWNLINK_EPOCH_NEVER`]) is still inside the relief window `window` as of
-/// now. This is the READ side of the shared signal used by the fan-out closure:
-/// it makes shed-entry and shed-exit BOTH a time-based decay of the most recent
-/// real receiver-downlink drop, so a healthy link recovers automatically once
-/// `window` elapses with no fresh crossing (no consecutive-success counter that
-/// a single stray drop could reset — the #1219 Half-2 B2 wedge).
+/// `epoch` is still inside the relief window `window`. Shed entry and exit are
+/// BOTH a time-based decay, so a healthy link recovers on its own with no
+/// consecutive-success counter to wedge it.
 pub fn downlink_epoch_is_active(epoch: u64, window: std::time::Duration) -> bool {
+    downlink_epoch_is_active_at(epoch, window, downlink_congested_epoch_now())
+}
+
+/// [`downlink_epoch_is_active`] with `now` injected, so #2726's escalation
+/// decays off the SAME implementation rather than a copy.
+pub fn downlink_epoch_is_active_at(epoch: u64, window: std::time::Duration, now: u64) -> bool {
     if epoch == DOWNLINK_EPOCH_NEVER {
         return false;
     }
-    let now = downlink_congested_epoch_now();
     now.saturating_sub(epoch) <= window.as_millis() as u64
 }
 
@@ -444,11 +608,9 @@ pub struct SessionLogic {
     pub transport: String,
     /// Whether this participant is the meeting host.
     pub is_host: bool,
-    /// Whether the meeting should end when the host leaves.
-    pub end_on_host_leave: bool,
     /// Tracks this receiver's outbound packet drops per sender; feeds the
     /// #979 keyframe-relax path (no longer a CONGESTION emit, see #1219).
-    pub congestion_tracker: CongestionTracker,
+    pub congestion_tracker: Arc<Mutex<CongestionTracker>>,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
     /// Per-session rate limiter for client-authored REACTION broadcasts (#1884).
@@ -481,6 +643,9 @@ pub struct SessionLogic {
     /// time-decaying window to it, so this is a level (not edge) signal: it
     /// never needs an explicit "clear" write when the link recovers.
     pub downlink_congested_epoch: Arc<AtomicU64>,
+    /// Gate closed by [`SessionLogic::on_stopping`] before it removes this
+    /// session's drop series, so the #2723 dispatcher cannot re-create them.
+    pub downlink_drop_booking: SessionDropBooking,
     /// Last publisher-to-relay inbound VIDEO/SCREEN arrivals for this session.
     ///
     /// Fresh `SessionLogic` actors are constructed on reconnect/re-election, so
@@ -504,7 +669,6 @@ impl SessionLogic {
         instance_id: Option<String>,
         transport: &str,
         is_host: bool,
-        end_on_host_leave: bool,
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
@@ -526,13 +690,13 @@ impl SessionLogic {
             instance_id,
             transport: transport.to_string(),
             is_host,
-            end_on_host_leave,
-            congestion_tracker: CongestionTracker::new(),
+            congestion_tracker: Arc::new(Mutex::new(CongestionTracker::new())),
             keyframe_limiter: KeyframeRequestLimiter::new(),
             reaction_limiter: ReactionRateLimiter::new(),
             raise_hand_limiter: RaiseHandRateLimiter::new(),
             meeting_timer_limiter: MeetingTimerRateLimiter::new(),
             downlink_congested_epoch: Arc::new(AtomicU64::new(DOWNLINK_EPOCH_NEVER)),
+            downlink_drop_booking: SessionDropBooking::open(),
             publisher_inbound_frame_gap_tracker: PublisherInboundFrameGapTracker::default(),
         }
     }
@@ -661,7 +825,6 @@ impl SessionLogic {
             observer: self.observer,
             instance_id: self.instance_id.clone(),
             is_host: self.is_host,
-            end_on_host_leave: self.end_on_host_leave,
             transport: self.transport.clone(),
             // #1219 Half 2: hand the per-receiver downlink-congestion signal to
             // the fan-out closure. The closure reads it to drive emergency
@@ -752,24 +915,13 @@ impl SessionLogic {
             .with_label_values(&[&self.room, &self.transport])
             .dec();
 
-        // GC the per-session drop series (Tier B #1). `relay_session_drops_total`
-        // carries an unbounded-over-time `session_id` label; removing every
-        // `(room, transport, session_id, kind)` tuple the moment this session
-        // disconnects keeps the live series count bounded to active sessions.
-        //
-        // LEAK-PROOF (issue #1090): `forget_session_drops` iterates the FULL fixed
-        // `kind` taxonomy [`crate::metrics::RELAY_DROP_KINDS`] UNCONDITIONALLY
-        // rather than a per-session "kinds I emitted" tracking set, so a session
-        // that only ever incremented a subset of kinds is still fully cleaned.
-        // The sweep lives in `metrics` as the single source of truth (issue #1186)
-        // so the #1090 GC test pins the HELPER's full-taxonomy behavior rather than
-        // an inline copy. NOTE (issue #1380): that test calls `forget_session_drops`
-        // directly and does NOT exercise this call site — reverting THIS line to an
-        // inline per-session-subset loop would still pass CI. Keep this call wired to
-        // the full-taxonomy helper; it is the only thing standing between #1090 and a
-        // re-regression here.
+        // GC the per-session drop series: `relay_session_drops_total` carries an
+        // unbounded-over-time `session_id` label. `forget_session_drops` sweeps the
+        // FULL fixed `kind` taxonomy unconditionally (#1090), and no test covers
+        // THIS call site (#1380), so keep it wired to that helper.
         let session_id = self.id.to_string();
-        crate::metrics::forget_session_drops(&self.room, &self.transport, &session_id);
+        self.downlink_drop_booking
+            .close_and_forget(&self.room, &self.transport, &session_id);
         crate::metrics::forget_outbound_queue_depth_by_session(
             &self.room,
             &self.transport,
@@ -788,8 +940,6 @@ impl SessionLogic {
             display_name: self.display_name.clone(),
             is_guest: self.is_guest,
             observer: self.observer,
-            is_host: self.is_host,
-            end_on_host_leave: self.end_on_host_leave,
         });
     }
 
@@ -965,7 +1115,7 @@ impl SessionLogic {
                 // hold the receiver frozen. The global per-receiver ceiling
                 // is unchanged, so the keyframe-storm risk (OSS #814) stays
                 // bounded — the cap is relaxed, not removed.
-                let congested = self.congestion_tracker.is_actively_congested();
+                let congested = lock_congestion(&self.congestion_tracker).is_actively_congested();
                 // #1124: key the limiter by the target SESSION when the client
                 // populated it (independent budgets for concurrent sessions of
                 // one identity), else fall back to the target user_id (older
@@ -1395,15 +1545,14 @@ impl SessionLogic {
     /// shed works → drops stop → tracker decays below threshold → gate closes →
     /// epoch ages → shed off → buffer refills → repeat (#1481).
     pub fn on_outbound_drop(&mut self, sender_session_id: u64, sender_user_id: &[u8]) {
-        let crossed = self.congestion_tracker.record_drop(sender_session_id);
+        let crossed = lock_congestion(&self.congestion_tracker).record_drop(sender_session_id);
 
         // #1481: stamp on EVERY drop unconditionally. The relief window provides
         // decay — shedding turns off after RECEIVER_DOWNLINK_RELIEF_WINDOW with
         // no fresh drops. The is_actively_congested() gate caused the shed to
         // flap on WT where drops cluster then go quiet (shed works → drops stop
         // → gate closes → epoch decays → shed off → buffer refills → repeat).
-        self.downlink_congested_epoch
-            .store(downlink_congested_epoch_now(), Ordering::Relaxed);
+        stamp_downlink_congested_epoch(&self.downlink_congested_epoch, RELIEF_SOURCE_OUTBOUND_DROP);
 
         if let Some(sender_sid) = crossed {
             // #1219 (Half 1): intentionally do NOT publish a sender-keyed
@@ -1428,6 +1577,78 @@ mod tests {
     fn test_inbound_action_debug() {
         let action = InboundAction::KeepAlive;
         assert_eq!(format!("{action:?}"), "KeepAlive");
+    }
+
+    /// The actor's `ctx.stop()` is not tied to the bridge's teardown (the
+    /// heartbeat timeout fires it while the QUIC session is still open), so a
+    /// tail drop can reach the sink after the sweep. Re-creating the series
+    /// then leaks it for the process lifetime: the only thing that removes it
+    /// is the sweep, and the actor that runs it is gone. BITES: drop the guard
+    /// from `record`, or the `*open = false` in `close_and_forget`.
+    #[test]
+    fn a_tail_drop_after_the_session_sweep_cannot_re_create_its_series() {
+        const ROOM: &str = "late-tail-drop-room";
+        const SESSION: u64 = 91_002;
+        let session_id = SESSION.to_string();
+        let booking = SessionDropBooking::open();
+        let sink = DownlinkDropSink::new(
+            ROOM,
+            SESSION,
+            "webtransport",
+            DownlinkReliefSignal::new(Arc::new(AtomicU64::new(DOWNLINK_EPOCH_NEVER))),
+            Arc::default(),
+            booking.clone(),
+        );
+        let series = || {
+            crate::metrics::RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[ROOM, "webtransport", &session_id, "video"])
+                .get()
+        };
+        let room_series = || {
+            crate::metrics::RELAY_PACKET_DROPS_TOTAL
+                .with_label_values(&[ROOM, "webtransport", "channel_full"])
+                .get()
+        };
+
+        sink.record(0, "channel_full", "video");
+        assert_eq!(series(), 1.0, "setup failed: the sink never booked a drop");
+        assert_eq!(room_series(), 1.0, "setup failed: no room-scoped drop");
+
+        booking.close_and_forget(ROOM, "webtransport", &session_id);
+        assert_eq!(series(), 0.0, "the sweep must remove the series");
+        assert_eq!(
+            room_series(),
+            1.0,
+            "the per-session sweep must leave the ROOM series alone: it removes \
+             only relay_session_drops_total",
+        );
+
+        sink.record(0, "channel_full", "video");
+        assert_eq!(
+            series(),
+            0.0,
+            "a drop booked after the sweep must be refused, not resurrect a \
+             series nothing is left to remove",
+        );
+        assert_eq!(
+            room_series(),
+            2.0,
+            "the room series is keyed by ROOM, is swept by the room drain and \
+             never by this gate, so a post-sweep drop must still book it — \
+             gating it would silence real loss for the rest of the room's life",
+        );
+
+        let _ = crate::metrics::RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
+            ROOM,
+            "webtransport",
+            &session_id,
+            "video",
+        ]);
+        let _ = crate::metrics::RELAY_PACKET_DROPS_TOTAL.remove_label_values(&[
+            ROOM,
+            "webtransport",
+            "channel_full",
+        ]);
     }
 
     #[test]
@@ -2224,7 +2445,6 @@ mod tests {
             None,
             "websocket",
             false,
-            false,
         )
     }
 
@@ -2390,7 +2610,7 @@ mod tests {
         // (record_drop still ran and crossed the threshold). This proves we did
         // not gut record_drop — only the emit.
         assert!(
-            logic.congestion_tracker.is_actively_congested(),
+            lock_congestion(&logic.congestion_tracker).is_actively_congested(),
             "#979 keyframe-relax path must survive: record_drop still flags active congestion"
         );
 
@@ -2452,7 +2672,7 @@ mod tests {
 
         // Premise: the tracker must NOT be congested after a single drop.
         assert!(
-            !logic.congestion_tracker.is_actively_congested(),
+            !lock_congestion(&logic.congestion_tracker).is_actively_congested(),
             "test premise: a single drop must NOT cross the threshold"
         );
 

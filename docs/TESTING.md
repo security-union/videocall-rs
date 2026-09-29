@@ -1,6 +1,6 @@
 # Testing Overview
 
-This repository uses three main automated test layers for the product, plus a
+This repository uses four main automated test layers for the product, plus a
 separate suite for the `bots-app` operator tool. They serve different purposes
 and are intentionally designed with different tradeoffs.
 
@@ -374,10 +374,33 @@ cargo test --target wasm32-unknown-unknown --test device_integration
 cargo test --target wasm32-unknown-unknown --test home_integration
 cargo test --target wasm32-unknown-unknown --test login_provider_logo
 cargo test --target wasm32-unknown-unknown --test meeting_ended_overlay
+cargo test --target wasm32-unknown-unknown --test meeting_footer
 cargo test --target wasm32-unknown-unknown --test meetings_list_owner_gating
+cargo test --target wasm32-unknown-unknown --test meeting_password_prompt
+cargo test --target wasm32-unknown-unknown --test grid_overflow_badge
+cargo test --target wasm32-unknown-unknown --test screen_share_detach
 cargo test --target wasm32-unknown-unknown --test screen_share_state
 cargo test --target wasm32-unknown-unknown --test speaking_indicators
 cargo test --target wasm32-unknown-unknown --test video_control_buttons
+cargo test --target wasm32-unknown-unknown --test send_pinned_floor_valuetext
+cargo test --target wasm32-unknown-unknown --test send_video_readout_unknown_dims
+cargo test --target wasm32-unknown-unknown --test peer_audio_rung_readout
+cargo test --target wasm32-unknown-unknown --test audio_publish_layer_count
+cargo test --target wasm32-unknown-unknown --test audio_send_layer_control_absent
+cargo test --target wasm32-unknown-unknown --test send_help_body_single_layer
+cargo test --target wasm32-unknown-unknown --test reception_max_gap_readout
+cargo test --target wasm32-unknown-unknown --test handler_cell_teardown
+cargo test --target wasm32-unknown-unknown --test pkce_refresh_token_endpoint
+cargo test --target wasm32-unknown-unknown --test guest_session_persistence
+cargo test --target wasm32-unknown-unknown --test signal_disc_refresh
+cargo test --target wasm32-unknown-unknown --test peer_tile_liveness_remount
+cargo test --target wasm32-unknown-unknown --test tile_indicators_diagnostics_gate
+cargo test --target wasm32-unknown-unknown --test self_tile_placement
+cargo test --target wasm32-unknown-unknown --test tile_border_reset
+cargo test --target wasm32-unknown-unknown --test popup_transport_pill_colors
+cargo test --target wasm32-unknown-unknown --test speaker_highlight_panel
+cargo test --target wasm32-unknown-unknown --test self_tile_inline_rename
+cargo test --target wasm32-unknown-unknown --test portrait_camera_fit
 ```
 
 If you want to match the CI workflow even more closely, kill leftover browser
@@ -424,7 +447,53 @@ They validate:
 Use this layer when the bug is fundamentally backend state or API semantics and
 does not require a browser.
 
-## 4. bots-app operator-tool tests
+## 4. Rust browser suites (`wasm-pack test --headless --chrome`)
+
+Rust unit tests that need real browser objects — `ReadableStream`,
+`WebTransport`, a `Worker` — rather than a DOM. They live beside the code in
+`src/`, not in `tests/`, and are marked `#[wasm_bindgen_test]`.
+
+Location:
+
+- `videocall-client/src/**` — decode, encode and client-lifecycle cases
+- `videocall-transport/src/inbound.rs` — the inbound WebTransport framing:
+  admission, per-key reader hand-over, and the length-prefix drain over real
+  `ReadableStream`s (moved here from `videocall-client` by issue #2728)
+
+CI: `.github/workflows/pr-check-rust-hcl.yaml`, job `wasm-pack tests`, one
+headless-Chrome step per crate.
+
+### The trap this layer keeps setting
+
+`wasm_bindgen_test_configure!(run_in_browser)` applies once per test **binary**,
+not per module. A crate that declares it has its whole lib test binary marked
+browser-only, so `wasm-pack test --node` SKIPS every `#[wasm_bindgen_test]` in it
+and still **exits 0**. That is how #2104 sat green while covering none of
+`videocall-client/src/`, and why neither crate has a `--node` companion step.
+
+The mirror image is just as quiet: a crate with `#[wasm_bindgen_test]` fns and no
+wasm-pack step at all compiles them and never runs them. Both crates above are in
+the job's `paths:` filter; if you add a third, add its step in the same commit.
+
+Plain `#[test]` fns are NOT discovered by either wasm-pack mode. They run in the
+separate native `cargo test -p <crate> --lib` steps in the same workflow.
+
+### Running locally
+
+```bash
+export CHROMEDRIVER=/path/to/chrome-for-testing/chromedriver
+cd videocall-transport && wasm-pack test --headless --chrome
+```
+
+A Homebrew `chromedriver` is often a dangling symlink on macOS and the version
+must match the installed Chrome; a Chrome-for-Testing driver avoids both. The
+runner leaves `chromedriver` and a Chrome tree behind if it is interrupted —
+check with `pgrep -f chromedriver` and kill them, or the next run binds a stale
+port.
+
+---
+
+## 5. bots-app operator-tool tests
 
 `e2e/bots-app/` is **not** the product. It is a separate operator tool — a
 load-test bot fleet CLI plus its own React dashboard — and it has its own suite.
@@ -507,19 +576,27 @@ Use Playwright E2E when:
 - the behavior crosses UI, backend, and realtime boundaries
 - the scenario involves multiple participants or true browser flows
 
+Use the Rust browser suites when the behavior needs a real browser object —
+`ReadableStream`, `WritableStream`, `WebTransport`, a `MessagePort` — but no DOM
+and no running stack.
+
 Use the bots-app suites when the change is in `e2e/bots-app/` — that tool is not
 covered by any product layer above.
 
 ## CI mapping
 
-- Playwright E2E:
-  - `.github/workflows/push-e2e-hcl.yaml`
-- Dioxus browser integration:
-  - `.github/workflows/pr-check-dioxus-ui-hcl.yaml`
-- backend and crate-specific integration checks:
-  - crate-specific PR workflows under `.github/workflows/`
-- bots-app (CLI, control server, dashboard):
-  - `.github/workflows/pr-check-e2e-lint-hcl.yaml`
+All four product layers, plus bots-app as the fifth:
+
+1. backend and crate-specific integration checks:
+   - crate-specific PR workflows under `.github/workflows/`
+2. Dioxus browser integration:
+   - `.github/workflows/pr-check-dioxus-ui-hcl.yaml`
+3. Playwright E2E:
+   - `.github/workflows/push-e2e-hcl.yaml`
+4. Rust browser suites (`wasm-pack test --headless --chrome`), one step per crate:
+   - `.github/workflows/pr-check-rust-hcl.yaml`, job `wasm-pack tests`
+5. bots-app (CLI, control server, dashboard):
+   - `.github/workflows/pr-check-e2e-lint-hcl.yaml`
 
 ## Practical rule
 

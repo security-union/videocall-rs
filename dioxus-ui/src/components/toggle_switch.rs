@@ -15,12 +15,17 @@ pub fn ToggleSwitch(
     #[props(default = 44)] width: u32,
     #[props(default = 24)] height: u32,
     #[props(default = false)] disabled: bool,
+    #[props(default)] aria_label: Option<String>,
+    /// Inert but still focusable (`aria-disabled`), so focus survives a busy spell.
+    #[props(default)]
+    soft_disabled: bool,
 ) -> Element {
     let knob_size = height.saturating_sub(4);
     let knob_left_on = width.saturating_sub(knob_size + 2);
     let border_radius = height / 2;
+    let inert = disabled || soft_disabled;
 
-    let disabled_style = if disabled {
+    let disabled_style = if inert {
         " opacity: 0.5; cursor: not-allowed;"
     } else {
         " opacity: 1;"
@@ -31,6 +36,8 @@ pub fn ToggleSwitch(
             r#type: "button",
             role: "switch",
             aria_checked: "{enabled}",
+            "aria-label": aria_label,
+            "aria-disabled": soft_disabled.then_some("true"),
             disabled: disabled,
             style: format!(
                 "position: relative; width: {width}px; height: {height}px; border-radius: {border_radius}px; \
@@ -38,7 +45,7 @@ pub fn ToggleSwitch(
                 if enabled { "#34c759" } else { "#636366" }
             ),
             onclick: move |_| {
-                if disabled {
+                if inert {
                     return;
                 }
                 on_toggle.call(!enabled);

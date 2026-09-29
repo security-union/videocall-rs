@@ -56,17 +56,6 @@ pub struct SessionStartResult {
     pub session_id: u64,
 }
 
-/// Result of ending a session
-#[derive(Debug, Clone, PartialEq)]
-pub enum SessionEndResult {
-    /// Regular participant left, meeting continues
-    MeetingContinues { remaining_count: i64 },
-    /// Host left, meeting ended for everyone (determined by JWT role in future)
-    HostEndedMeeting,
-    /// Last participant left, meeting ended
-    LastParticipantLeft,
-}
-
 /// SessionManager handles session lifecycle for both WebSocket and WebTransport.
 /// Meeting lifecycle is managed by meeting-api; authorization via JWT.
 /// No database dependency -- all meeting state lives in meeting-api.
@@ -109,16 +98,6 @@ impl SessionManager {
             creator_id: user_id.to_string(),
             session_id: id,
         })
-    }
-
-    /// Called when a user disconnects from a room.
-    pub async fn end_session(
-        &self,
-        room_id: &str,
-        user_id: &str,
-    ) -> Result<SessionEndResult, Box<dyn std::error::Error + Send + Sync>> {
-        info!("Session ended for {} in room {}", user_id, room_id);
-        Ok(SessionEndResult::MeetingContinues { remaining_count: 0 })
     }
 
     /// Build SESSION_ASSIGNED packet: server sends immediately after connect.
@@ -408,16 +387,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reserved system user ID"));
-    }
-
-    #[tokio::test]
-    async fn test_end_session_returns_result() {
-        let manager = SessionManager::new();
-        let result = manager.end_session("room-1", "alice").await.unwrap();
-        assert_eq!(
-            result,
-            SessionEndResult::MeetingContinues { remaining_count: 0 }
-        );
     }
 
     #[tokio::test]

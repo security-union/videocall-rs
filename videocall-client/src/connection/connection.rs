@@ -22,7 +22,11 @@
 ///
 use super::task::Task;
 use super::url_log::strip_query_for_log;
+#[cfg(feature = "netsim")]
+use super::webmedia::InboundLane;
 use super::webmedia::MediaStreamKey;
+#[cfg(feature = "netsim")]
+use super::webmedia::ReceivedAtMs;
 use super::ConnectOptions;
 use crate::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
@@ -459,6 +463,16 @@ impl Connection {
     pub fn get_send_queue_depth(&self) -> Option<u64> {
         self.task.get_send_queue_depth()
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_send_queue_depth_for_test(&self, bytes: u64) {
+        self.task.set_send_queue_depth_for_test(bytes);
+    }
+
+    /// Forwards to [`Task::uplink_queue_depth_bytes`] (#2722).
+    pub fn uplink_queue_depth_bytes(&self) -> Option<u64> {
+        self.task.uplink_queue_depth_bytes()
+    }
 }
 
 impl Drop for Connection {
@@ -501,13 +515,26 @@ impl Connection {
     /// logic (e.g. the #1179 local-WT early-seed gate) can be exercised without a
     /// browser. `new_for_test` defaults to WEBSOCKET.
     pub(crate) fn new_for_test_with_transport(webtransport: bool) -> Self {
+        Self::new_for_test_with_uplink(webtransport, None)
+    }
+
+    /// Plus the `bufferedAmount` a WebSocket stub reports (#2722).
+    pub(crate) fn new_for_test_with_uplink(
+        webtransport: bool,
+        ws_buffered_amount: Option<u64>,
+    ) -> Self {
         let mut conn = Self::new_for_test();
         conn.transport_type = if webtransport {
             TransportType::TRANSPORT_WEBTRANSPORT
         } else {
             TransportType::TRANSPORT_WEBSOCKET
         };
+        conn.task = Rc::new(Task::stub_for_transport(webtransport, ws_buffered_amount));
         conn
+    }
+
+    pub(super) fn take_sends_for_test(&self) -> Vec<(super::task::StubSendKind, MediaStreamKey)> {
+        self.task.take_sends_for_test()
     }
 
     /// Test-only: a connection whose status is NOT `Connected`, so
@@ -607,38 +634,29 @@ fn tap_callback<IN: 'static, OUT: 'static>(
 /// the full rationale (single shared path for both transports; scoped to
 /// VIDEO/SCREEN for lifecycle safety).
 #[cfg(feature = "netsim")]
-fn wrap_inbound_with_netsim(inner: Callback<PacketWrapper>) -> Callback<PacketWrapper> {
+fn wrap_inbound_with_netsim(
+    inner: Callback<(PacketWrapper, InboundLane, ReceivedAtMs)>,
+) -> Callback<(PacketWrapper, InboundLane, ReceivedAtMs)> {
     use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
 
-    Callback::from(move |packet: PacketWrapper| {
-        // Only VIDEO / SCREEN media packets are eligible for inbound
-        // shaping. AUDIO and every non-MEDIA control/heartbeat/RTT/
-        // SESSION_ASSIGNED packet is delivered unconditionally so the
-        // shaping cannot destabilize the connection lifecycle (election,
-        // reconnection) or silence audio. `media_kind` defaults to
-        // UNSPECIFIED for non-media packets, so the match below naturally
-        // fails open for them.
-        let eligible = packet.packet_type.enum_value_or_default() == PacketType::MEDIA
-            && matches!(
-                packet.media_kind.enum_value_or_default(),
-                MediaKind::VIDEO | MediaKind::SCREEN
-            );
+    Callback::from(
+        move |(packet, lane, at): (PacketWrapper, InboundLane, ReceivedAtMs)| {
+            let eligible = packet.packet_type.enum_value_or_default() == PacketType::MEDIA
+                && matches!(
+                    packet.media_kind.enum_value_or_default(),
+                    MediaKind::VIDEO | MediaKind::SCREEN
+                );
 
-        if eligible {
-            // Size the admission decision on the encrypted media payload,
-            // the same bytes that actually traversed the downlink. This is
-            // what the token-bucket bandwidth limiter would have metered.
-            let size = packet.data.len();
-            if super::netsim_hook::shape_inbound(size) {
-                // Dropped: a real gap in this source's sequence stream,
-                // which the receive-side SequenceTracker counts toward
-                // loss_per_sec and drives the LayerChooser step-down.
-                return;
+            if eligible {
+                let size = packet.data.len();
+                if super::netsim_hook::shape_inbound(size) {
+                    return;
+                }
             }
-        }
 
-        inner.emit(packet);
-    })
+            inner.emit((packet, lane, at));
+        },
+    )
 }
 
 #[cfg(test)]

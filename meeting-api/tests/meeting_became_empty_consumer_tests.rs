@@ -62,6 +62,7 @@ fn build_app_with_nats(pool: sqlx::PgPool, nats: async_nats::Client) -> axum::Ro
         display_name_rate_limit_disabled: false,
         dev_user: None,
         password_gate: std::sync::Arc::new(meeting_api::password::MeetingPasswordGate::new()),
+        presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     routes::router().with_state(state)
 }
@@ -148,6 +149,15 @@ async fn became_empty_consumer_marks_active_meeting_idle() {
         row.0, "active",
         "Test precondition: meeting should be active before the simulated empty event"
     );
+    // Nobody is present any more, but the state still says active.
+    sqlx::query(
+        "UPDATE meeting_participants SET status = 'left', left_at = NOW() \
+         WHERE meeting_id = (SELECT id FROM meetings WHERE room_id = $1)",
+    )
+    .bind(room_id)
+    .execute(&pool)
+    .await
+    .expect("mark the host left");
 
     // Spawn the consumer with the ready-signal variant so we know the
     // subscription is live before publishing (no publish-before-subscribe race).
@@ -185,6 +195,70 @@ async fn became_empty_consumer_marks_active_meeting_idle() {
         "Consumer must transition meeting to state='idle' within 5s of receiving \
          the {MEETING_BECAME_EMPTY_SUBJECT} event"
     );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+/// One relay binary's copy of the room emptying must not idle a meeting
+/// someone is still present in (through the other binary).
+#[tokio::test]
+#[serial]
+async fn became_empty_consumer_keeps_a_meeting_with_someone_present_active() {
+    let Some(nats) = maybe_connect_nats().await else {
+        eprintln!("NATS_URL not set — skipping became_empty integration test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-became-empty-someone-present";
+    cleanup_test_data(&pool, room_id).await;
+    let app = build_app_with_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "meeting_id": room_id, "attendees": [] }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    let app = build_app_with_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        "host@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (feed_tx, _feed_rx) = meeting_api::feed_events::new_feed_channel();
+    let _handle = meeting_api::nats_consumers::spawn_meeting_became_empty_consumer_inner(
+        Some(nats.clone()),
+        pool.clone(),
+        feed_tx,
+        Some(ready_tx),
+    )
+    .expect("Consumer should be spawned when NATS is available");
+    ready_rx
+        .await
+        .expect("Consumer must signal subscription readiness");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    nats.publish(
+        MEETING_BECAME_EMPTY_SUBJECT,
+        serde_json::to_vec(&MeetingBecameEmptyPayload {
+            room_id: room_id.to_string(),
+        })
+        .unwrap()
+        .into(),
+    )
+    .await
+    .expect("Should publish");
+
+    let state = poll_state(&pool, room_id, "idle").await;
+    assert_eq!(state.as_deref(), Some("active"));
 
     cleanup_test_data(&pool, room_id).await;
 }

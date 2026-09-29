@@ -56,7 +56,8 @@ use crate::auth::{
 };
 use crate::constants::{meeting_api_base_url, oauth_client_id, oauth_redirect_url};
 use crate::context::{
-    email_to_display_name, is_guid_like, save_display_name_to_storage, validate_display_name,
+    display_name_owner_id, email_to_display_name, is_guid_like, save_display_name_owner_to_storage,
+    save_display_name_to_storage, validate_display_name,
 };
 use crate::id_token::decode_and_validate_id_token;
 use crate::pkce::exchange_code_with_provider;
@@ -295,6 +296,33 @@ pub fn OAuthCallback(query_params: String) -> Element {
     }
 }
 
+/// Save the display name derived from the id_token claims and, when
+/// `user_id` is known, record it as the name's owner.
+fn save_claims_display_name(raw_display_name: &str, user_id: &str) {
+    if raw_display_name.is_empty() {
+        return;
+    }
+    let display_name = if raw_display_name.contains('@') {
+        email_to_display_name(raw_display_name)
+    } else if is_guid_like(raw_display_name) {
+        if user_id.contains('@') {
+            email_to_display_name(user_id)
+        } else {
+            String::new()
+        }
+    } else {
+        raw_display_name.to_string()
+    };
+    if !display_name.is_empty() {
+        if let Ok(valid) = validate_display_name(&display_name) {
+            save_display_name_to_storage(&valid);
+            if !user_id.is_empty() {
+                save_display_name_owner_to_storage(&display_name_owner_id(user_id));
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core callback logic (extracted so errors can be returned cleanly)
 // ---------------------------------------------------------------------------
@@ -409,24 +437,7 @@ async fn run_callback(query_params: String) -> Result<(), String> {
     // get_user_profile() can return them immediately without a network call.
     crate::auth::store_user_profile(&user_id, &raw_display_name);
 
-    if !raw_display_name.is_empty() {
-        let display_name = if raw_display_name.contains('@') {
-            email_to_display_name(&raw_display_name)
-        } else if is_guid_like(&raw_display_name) {
-            if user_id.contains('@') {
-                email_to_display_name(&user_id)
-            } else {
-                String::new()
-            }
-        } else {
-            raw_display_name.clone()
-        };
-        if !display_name.is_empty() {
-            if let Ok(valid) = validate_display_name(&display_name) {
-                save_display_name_to_storage(&valid);
-            }
-        }
-    }
+    save_claims_display_name(&raw_display_name, &user_id);
 
     log::info!(
         "OAuth callback complete for user '{}' (display: '{}')",
@@ -615,5 +626,32 @@ mod tests {
             validate_return_to("https://app.example.com:3001/meeting/1", ORIGIN_WITH_PORT),
             Some("https://app.example.com:3001/meeting/1".to_string())
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dom_tests {
+    use super::*;
+    use crate::context::{
+        clear_display_name_from_storage, load_display_name_from_storage,
+        load_display_name_owner_from_storage,
+    };
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn the_callback_saves_the_claims_name_with_its_owner() {
+        clear_display_name_from_storage();
+
+        save_claims_display_name("Antonio Estrada", "antonio@example.com");
+
+        assert_eq!(
+            load_display_name_from_storage().as_deref(),
+            Some("Antonio Estrada")
+        );
+        assert_eq!(
+            load_display_name_owner_from_storage(),
+            Some(display_name_owner_id("antonio@example.com"))
+        );
+        clear_display_name_from_storage();
     }
 }

@@ -1,5 +1,9 @@
 import { test, expect, Page, BrowserContext, Browser, chromium } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
 import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
@@ -251,6 +255,7 @@ async function standUpTwoPeerCall(
       profiles[i].name,
       uiURL,
     );
+    await pinWebSocketTransport(ctx);
     members.push({
       page: null as unknown as Page,
       context: ctx,
@@ -334,6 +339,7 @@ async function standUpHostAndCameraOffGuest(
       profiles[i].name,
       uiURL,
     );
+    await pinWebSocketTransport(ctx);
     members.push({
       page: null as unknown as Page,
       context: ctx,
@@ -440,9 +446,8 @@ const FORGED_USER_ID = "victim@videocall.rs";
  *   `WebSocket::new` on the MAIN thread (`websocket.rs`), and the wasm-bindgen
  *   glue resolves the free `WebSocket` binding from the global at CALL time —
  *   so an `addInitScript` shim installed before the wasm module boots is seen.
- *   `createAuthenticatedContext` already pins the transport to WebSocket
- *   (`vc_transport_preference=websocket`), which since #2045 is also the product
- *   default, so this covers the primary transport.
+ *   The meeting contexts call `pinWebSocketTransport` so the client cannot
+ *   elect WebTransport and bypass the shim.
  * * **Append rather than rewrite in place.** protobuf takes LAST-wins for a
  *   repeated scalar, so appending `user_id` (field 2, wire type 2) and
  *   `session_id` (field 4, wire type 0) overrides whatever the client wrote —

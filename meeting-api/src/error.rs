@@ -22,6 +22,7 @@ use axum::{
     Json,
 };
 use videocall_meeting_types::{APIError, APIResponse};
+use videocall_types::validation::MeetingIdError;
 
 /// Application-level error that pairs an HTTP status code with an [`APIError`].
 #[derive(Debug)]
@@ -92,6 +93,24 @@ impl AppError {
 
     pub fn not_owner() -> Self {
         Self::new(StatusCode::FORBIDDEN, APIError::not_owner())
+    }
+
+    /// `409` — the revoke would leave the active meeting with no present host.
+    pub fn last_present_host() -> Self {
+        Self::new(StatusCode::CONFLICT, APIError::last_present_host())
+    }
+
+    /// `404` — the revoke target is neither a co-host nor a host.
+    pub fn co_host_not_found(user_id: &str) -> Self {
+        Self::new(StatusCode::NOT_FOUND, APIError::co_host_not_found(user_id))
+    }
+
+    /// `404` — the target user has no participant row in the meeting.
+    pub fn participant_not_in_meeting(user_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            APIError::participant_not_in_meeting(user_id),
+        )
     }
 
     pub fn participant_not_found(user_id: &str) -> Self {
@@ -188,6 +207,12 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let body = APIResponse::error(self.body);
         (self.status, Json(body)).into_response()
+    }
+}
+
+impl From<MeetingIdError> for AppError {
+    fn from(err: MeetingIdError) -> Self {
+        Self::invalid_meeting_id(&err.to_string())
     }
 }
 

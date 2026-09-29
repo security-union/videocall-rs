@@ -180,6 +180,12 @@ pub struct AdaptiveQualityManager {
     /// `YOYO_DETECTION_WINDOW_MS`.
     last_step_down_ms: Option<f64>,
 
+    /// Stamped only by the controller's `note_forced_layer_shed`; read only by `no_video_step_down_within`.
+    last_layer_shed_ms: Option<f64>,
+
+    #[cfg(test)]
+    layer_restore_total: u64,
+
     /// Whether any step-up has occurred since the crash ceiling was armed.
     /// Distinguishes cascades (rapid step-downs without recovery) from
     /// re-crashes (step-down after recovery to the ceiling level).
@@ -322,6 +328,9 @@ impl AdaptiveQualityManager {
             ceiling_expires_at_ms: 0.0,
             ceiling_decay_ms: CLIMB_COOLDOWN_BASE_MS,
             last_step_down_ms: None,
+            last_layer_shed_ms: None,
+            #[cfg(test)]
+            layer_restore_total: 0,
             recovered_since_ceiling: false,
             slowdown_activated_at_ms: None,
             reelection_completed_at_ms: None,
@@ -1149,9 +1158,8 @@ impl AdaptiveQualityManager {
         self.source_ceiling_index
     }
 
-    /// Whether the video tier has been QUIET — no step-DOWN — for at least
-    /// `window_ms` (issue #2179 review). `true` when no step-down has ever been
-    /// recorded (or the crash memory was reset).
+    /// Whether the video tier and the forced layer axis have been quiet for at
+    /// least `window_ms` (issue #2179 review).
     ///
     /// This is the closest thing this controller has to "my uplink is currently
     /// coping": a video step-down is driven by the sender's own congestion axes
@@ -1168,10 +1176,15 @@ impl AdaptiveQualityManager {
     /// quiet window cannot wedge — it re-opens `window_ms` after the last
     /// step-down, with no consecutive-success counter to reset.
     pub fn no_video_step_down_within(&self, now_ms: f64, window_ms: f64) -> bool {
-        match self.last_step_down_ms {
-            None => true,
-            Some(last) => now_ms - last >= window_ms,
-        }
+        [self.last_step_down_ms, self.last_layer_shed_ms]
+            .into_iter()
+            .flatten()
+            .all(|last| now_ms - last >= window_ms)
+    }
+
+    /// Both forced layer sheds stamp this; the tier-floor return in `force_video_step_down` stamps nothing.
+    pub fn record_forced_layer_shed(&mut self, now_ms: f64) {
+        self.last_layer_shed_ms = Some(now_ms);
     }
 
     /// Set user-configurable quality bounds for the **audio** tier (issue #961).
@@ -1463,6 +1476,11 @@ impl AdaptiveQualityManager {
         self.simulcast_layer_count > 1
     }
 
+    #[cfg(test)]
+    pub(crate) fn layer_restore_total(&self) -> u64 {
+        self.layer_restore_total
+    }
+
     /// Shed the top active simulcast layer (decrement `active_layer_count`,
     /// floored at 1).
     ///
@@ -1501,6 +1519,10 @@ impl AdaptiveQualityManager {
         }
         let from = self.active_layer_count;
         self.active_layer_count += 1;
+        #[cfg(test)]
+        {
+            self.layer_restore_total += 1;
+        }
         log::info!(
             "AdaptiveQuality: simulcast restored TOP layer ({from} -> {} active of {})",
             self.active_layer_count,

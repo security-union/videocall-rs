@@ -58,7 +58,7 @@
  *
  * CI deployment note
  * ------------------
- * Per PR #752 review: the `pull_request` workflow on github01 does NOT
+ * Per PR #752 review: the `pull_request` workflow on GHES does NOT
  * include the Playwright stack. Only `push-e2e-hcl.yaml` runs Playwright
  * on push to PR-staging / hcl-main. This regression test therefore only
  * runs POST-MERGE. Reviewers cannot use it as a pre-merge gate; the

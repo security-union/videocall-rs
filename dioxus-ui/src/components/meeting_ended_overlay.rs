@@ -82,6 +82,8 @@ pub fn MeetingEndedOverlay(
                 button {
                     class: "btn-apple btn-primary meeting-ended-home-btn",
                     onclick: move |_| {
+                        #[cfg(target_arch = "wasm32")]
+                        crate::components::screen_share_detach::close_all();
                         if let Some(window) = web_sys::window() {
                             let _ = window.location().set_href("/");
                         }

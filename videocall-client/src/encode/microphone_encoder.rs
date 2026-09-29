@@ -40,6 +40,7 @@ use gloo::timers::callback::Interval;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
+use js_sys::Object;
 use js_sys::Uint8Array;
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
@@ -61,6 +62,7 @@ use web_sys::EncodedAudioChunkType;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
+use web_sys::MediaStreamTrackState;
 use web_sys::MessageEvent;
 use web_time::SystemTime;
 
@@ -978,6 +980,118 @@ pub fn transform_audio_chunk(
     }
 }
 
+/// The device id PASSED TO `getUserMedia` plus the stream it returned — the
+/// request id, never `getSettings().deviceId`.
+type HeldCapture = Rc<RefCell<Option<(String, MediaStream)>>>;
+
+fn held_audio_track(stream: &MediaStream) -> Option<MediaStreamTrack> {
+    let tracks = stream.get_audio_tracks();
+    if tracks.length() == 0 {
+        return None;
+    }
+    Some(tracks.get(0).unchecked_into::<MediaStreamTrack>())
+}
+
+/// Silence the capture without releasing the device claim.
+pub(crate) fn park_mic_track(track: &MediaStreamTrack) {
+    track.set_enabled(false);
+}
+
+/// Per the MediaStreamTrack spec a `muted` track keeps `readyState == Live`
+/// while its source cannot supply samples, so reusing one yields silence.
+fn track_state_usable(ready_state: MediaStreamTrackState, muted: bool) -> bool {
+    ready_state == MediaStreamTrackState::Live && !muted
+}
+
+fn capture_track_usable(stream: &MediaStream) -> bool {
+    held_audio_track(stream)
+        .map(|t| track_state_usable(t.ready_state(), t.muted()))
+        .unwrap_or(false)
+}
+
+fn stop_held_capture(holder: &HeldCapture) {
+    if let Some((_, stream)) = holder.borrow_mut().take() {
+        if let Some(track) = held_audio_track(&stream) {
+            track.stop();
+        }
+    }
+}
+
+fn holder_owns_stream(holder: &HeldCapture, stream: &MediaStream) -> bool {
+    holder
+        .borrow()
+        .as_ref()
+        .map(|(_, held)| {
+            Object::is(
+                held.unchecked_ref::<JsValue>(),
+                stream.unchecked_ref::<JsValue>(),
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Refuses, and stops `stream`, when `release_device` ran mid-acquisition.
+///
+/// FOOTGUN: `MediaStream` has an inherent binding to the JS
+/// `MediaStream.prototype.clone()` that SHADOWS `Clone::clone` and returns a
+/// new stream of newly-cloned tracks — a second device claim. Duplicate a bare
+/// `MediaStream` with `Clone::clone(s)` anywhere in this file (`Option` is safe).
+fn store_fresh_capture(
+    holder: &HeldCapture,
+    released: &Rc<Cell<bool>>,
+    id: &str,
+    stream: &MediaStream,
+) -> bool {
+    if released.get() {
+        if let Some(track) = held_audio_track(stream) {
+            track.stop();
+        }
+        return false;
+    }
+    let displaced = holder
+        .borrow_mut()
+        .replace((id.to_string(), Clone::clone(stream)));
+    if let Some((_, old)) = displaced {
+        if let Some(track) = held_audio_track(&old) {
+            track.stop();
+        }
+    }
+    true
+}
+
+fn held_capture_reusable(held_device_id: Option<&str>, want: &str, track_usable: bool) -> bool {
+    !want.is_empty() && track_usable && held_device_id == Some(want)
+}
+
+/// Releases a half-built session's capture on an early return; `park` keeps a
+/// REUSED capture's claim.
+struct CaptureGuard {
+    stream: MediaStream,
+    park: bool,
+    armed: bool,
+}
+
+impl CaptureGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(track) = held_audio_track(&self.stream) {
+            if self.park {
+                park_mic_track(&track);
+            } else {
+                track.stop();
+            }
+        }
+    }
+}
+
 pub struct MicrophoneEncoder {
     client: VideoCallClient,
     state: EncoderState,
@@ -1263,6 +1377,11 @@ pub struct MicrophoneEncoder {
     /// Defaults to `false` (no reconnect pending) when unwired (tests) — the safe
     /// value that leaves the FIX-1 `!was_active` reseed behaviour unchanged.
     reconnect_reseed: Arc<AtomicBool>,
+    /// The monitor loop reads this to check ownership, and must not write it.
+    held_capture: HeldCapture,
+    /// TERMINAL until an explicit [`Self::set_enabled`]`(true)`: `start()` must
+    /// never clear it — a queued restart is not a user request.
+    released: Rc<Cell<bool>>,
 }
 
 impl MicrophoneEncoder {
@@ -1352,7 +1471,38 @@ impl MicrophoneEncoder {
             // `set_reconnect_reseed_signal`; the client sets it true on every
             // (re)connect and the detector tick consumes it.
             reconnect_reseed: Arc::new(AtomicBool::new(false)),
+            held_capture: Rc::new(RefCell::new(None)),
+            released: Rc::new(Cell::new(false)),
         }
+    }
+
+    pub fn release_device(&mut self) {
+        self.released.set(true);
+        stop_held_capture(&self.held_capture);
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn is_released_for_test(&self) -> bool {
+        self.released.get()
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn seed_held_capture_for_test(&self, id: &str, stream: &MediaStream) {
+        *self.held_capture.borrow_mut() = Some((id.to_string(), Clone::clone(stream)));
+    }
+
+    /// Unmount-only [`Self::stop`] + release, minus its `set_speaking` /
+    /// `set_audio_level` writes.
+    pub fn shutdown(&mut self) {
+        self.state.stop();
+        for codec in &self.codecs {
+            codec.destroy();
+        }
+        self.vad_interval.borrow_mut().take();
+        self.congestion_recovery_interval.borrow_mut().take();
+        self.fec_reconfig_interval.borrow_mut().take();
+        self.is_speaking.store(false, Ordering::Relaxed);
+        self.release_device();
     }
 
     /// Set the user's SEND audio layer-ceiling from the performance panel — the
@@ -1509,6 +1659,10 @@ impl MicrophoneEncoder {
 
     // delegates to self.state
     pub fn set_enabled(&mut self, value: bool) -> bool {
+        if value {
+            // The ONLY un-latch; queued `Timeout` restarts outlive an unmount.
+            self.released.set(false);
+        }
         let is_changed = self.state.set_enabled(value);
         if is_changed {
             if value {
@@ -1544,6 +1698,18 @@ impl MicrophoneEncoder {
     }
 
     pub fn select(&mut self, device: String) -> bool {
+        // Only while DISABLED: when enabled, `start()`'s displace path owns the
+        // handover and stopping early would kill a live session.
+        if !self.state.is_enabled() {
+            let stale = self
+                .held_capture
+                .borrow()
+                .as_ref()
+                .is_some_and(|(id, _)| id != &device);
+            if stale {
+                stop_held_capture(&self.held_capture);
+            }
+        }
         self.state.select(device)
     }
     pub fn stop(&mut self) {
@@ -1854,8 +2020,14 @@ impl MicrophoneEncoder {
         // the reconnect, so the transport counters bumped by teardown/rebuild are
         // never read as a cross-reconnect distress delta on the fresh session.
         let detector_reconnect_reseed = self.reconnect_reseed.clone();
+        let held_capture = self.held_capture.clone();
+        let released = self.released.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
+            if released.get() {
+                log::info!("MicrophoneEncoder: start refused, the device was released");
+                return;
+            }
             let navigator = window().navigator();
             let media_devices = match navigator.media_devices() {
                 Ok(md) => md,
@@ -1900,31 +2072,73 @@ impl MicrophoneEncoder {
             constraints.set_audio(&media_info.into());
 
             constraints.set_video(&Boolean::from(false));
-            let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
-                Ok(p) => p,
-                Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Microphone access failed: {e:?}"));
-                    }
-                    return;
+            let (held_id, held_stream, held_usable) = {
+                let held = held_capture.borrow();
+                match held.as_ref() {
+                    Some((id, stream)) => (
+                        Some(id.clone()),
+                        Some(Clone::clone(stream)),
+                        capture_track_usable(stream),
+                    ),
+                    None => (None, None, false),
                 }
             };
-            let device = match JsFuture::from(devices_query).await {
-                Ok(ok) => ok.unchecked_into::<MediaStream>(),
-                Err(e) => {
-                    // Classify the rejection (e.g. NotReadableError → DeviceInUse)
-                    // so the UI can show a specific reason and auto-retry. We emit
-                    // ONLY the classified permission callback here — NOT the
-                    // generic string `on_error` — because the UI raises a
-                    // dedicated modal for the classified error, and firing both
-                    // would stack two modals for the same failure. The raw error
-                    // is still logged for diagnostics.
-                    log::error!("Failed to get microphone stream: {e:?}");
-                    if let Some(cb) = &on_permission_error {
-                        cb.emit(classify_get_user_media_error(&e));
+            let reusable = held_capture_reusable(held_id.as_deref(), &device_id, held_usable);
+            let reused = if reusable { held_stream.clone() } else { None };
+            let is_reused = reused.is_some();
+            let device = match reused {
+                Some(stream) => {
+                    if let Some(track) = held_audio_track(&stream) {
+                        track.set_enabled(true);
                     }
-                    return;
+                    log::info!("MicrophoneEncoder: reusing held capture for {}", device_id);
+                    stream
                 }
+                None => {
+                    let devices_query =
+                        match media_devices.get_user_media_with_constraints(&constraints) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                if let Some(cb) = &on_error {
+                                    cb.emit(format!("Microphone access failed: {e:?}"));
+                                }
+                                return;
+                            }
+                        };
+                    let fresh = match JsFuture::from(devices_query).await {
+                        Ok(ok) => ok.unchecked_into::<MediaStream>(),
+                        Err(e) => {
+                            // Classify the rejection (e.g. NotReadableError → DeviceInUse)
+                            // so the UI can show a specific reason and auto-retry. We emit
+                            // ONLY the classified permission callback here — NOT the
+                            // generic string `on_error` — because the UI raises a
+                            // dedicated modal for the classified error, and firing both
+                            // would stack two modals for the same failure. The raw error
+                            // is still logged for diagnostics.
+                            log::error!("Failed to get microphone stream: {e:?}");
+                            // We decided to RE-ACQUIRE, so the held capture is
+                            // either the wrong device or unusable (a `muted`
+                            // Bluetooth flip on the same id counts). Drop it —
+                            // unless a newer session already republished the
+                            // holder, whose live capture is not ours to stop.
+                            if let Some(stale) = held_stream.as_ref() {
+                                if holder_owns_stream(&held_capture, stale) {
+                                    stop_held_capture(&held_capture);
+                                }
+                            }
+                            if let Some(cb) = &on_permission_error {
+                                cb.emit(classify_get_user_media_error(&e));
+                            }
+                            return;
+                        }
+                    };
+                    fresh
+                }
+            };
+            let mut capture_guard = CaptureGuard {
+                stream: Clone::clone(&device),
+                park: is_reused,
+                armed: true,
             };
 
             let audio_track = Box::new(
@@ -2135,6 +2349,23 @@ impl MicrophoneEncoder {
                 let _ = context.close();
                 return;
             }
+
+            let kept = if is_reused {
+                // A switch may have republished the holder while we awaited.
+                !released.get() && holder_owns_stream(&held_capture, &device)
+            } else {
+                store_fresh_capture(&held_capture, &released, &device_id, &device)
+            };
+            if !kept {
+                log::info!("MicrophoneEncoder: released mid-acquisition, abandoning this start");
+                // `create_node` ran, so a later start() would early-return and wedge.
+                for codec in &all_codecs_for_teardown {
+                    codec.destroy();
+                }
+                let _ = context.close();
+                return;
+            }
+            capture_guard.disarm();
 
             // --- Audio simulcast HIGHER layers (issue #989, Phase 3c → #1082) ---
             // For each rung above the base, build an additional AudioWorkletNode
@@ -2749,8 +2980,12 @@ impl MicrophoneEncoder {
                         drop(interval);
                     }
 
-                    // Stop the media track
-                    audio_track.stop();
+                    if holder_owns_stream(&held_capture, &device) {
+                        park_mic_track(&audio_track);
+                    } else {
+                        // Superseded; with reuse this may be the SAME track object.
+                        audio_track.stop();
+                    }
 
                     // Close the AudioContext
                     if let Err(e) = context.close() {
@@ -4381,5 +4616,376 @@ mod tests {
         assert_eq!(unpacked_primary, primary);
         assert_eq!(unpacked_seq, 12345);
         assert_eq!(unpacked_redundant, redundant.data);
+    }
+
+    /// Needs `--use-fake-device-for-media-stream` (`videocall-client/webdriver.json`).
+    async fn acquire_fake_mic() -> MediaStream {
+        let media_devices = window()
+            .navigator()
+            .media_devices()
+            .expect("mediaDevices available");
+        let constraints = MediaStreamConstraints::new();
+        constraints.set_audio(&JsValue::TRUE);
+        constraints.set_video(&Boolean::from(false));
+        let query = media_devices
+            .get_user_media_with_constraints(&constraints)
+            .expect("getUserMedia dispatched");
+        JsFuture::from(query)
+            .await
+            .expect("fake audio device resolves")
+            .unchecked_into::<MediaStream>()
+    }
+
+    #[wasm_bindgen_test]
+    async fn park_mic_track_silences_but_keeps_the_track_live() {
+        let stream = acquire_fake_mic().await;
+        let track = held_audio_track(&stream).expect("captured audio track");
+        assert!(track.enabled());
+        assert_eq!(track.ready_state(), MediaStreamTrackState::Live);
+
+        park_mic_track(&track);
+
+        assert!(!track.enabled(), "a parked track must stop producing audio");
+        assert_eq!(
+            track.ready_state(),
+            MediaStreamTrackState::Live,
+            "a parked track must still hold the device claim"
+        );
+    }
+
+    fn graph_on(stream: &MediaStream) -> (AudioContext, web_sys::AnalyserNode) {
+        let ctx = AudioContext::new().expect("AudioContext");
+        let src = ctx
+            .create_media_stream_source(stream)
+            .expect("media stream source");
+        let analyser = ctx.create_analyser().expect("analyser");
+        analyser.set_fft_size(2048);
+        src.connect_with_audio_node(&analyser).expect("connect");
+        (ctx, analyser)
+    }
+
+    /// 31 ms, NOT a 100 ms grid: 100 ms phase-locks against the fake device's
+    /// 500 ms beep period and reads ~0 on a perfectly live track.
+    async fn peak_over(analyser: &web_sys::AnalyserNode, frames: usize) -> f32 {
+        let mut buf = vec![0f32; analyser.fft_size() as usize];
+        let mut peak = 0f32;
+        for _ in 0..frames {
+            gloo_timers::future::TimeoutFuture::new(31).await;
+            analyser.get_float_time_domain_data(&mut buf);
+            peak = peak.max(buf.iter().fold(0f32, |a, v| a.max(v.abs())));
+        }
+        peak
+    }
+
+    /// The premise the reuse design rests on; a browser regression here breaks
+    /// the fix with no other symptom.
+    #[wasm_bindgen_test]
+    async fn a_reused_capture_feeds_a_fresh_audio_context() {
+        let stream = acquire_fake_mic().await;
+        let track = held_audio_track(&stream).expect("captured audio track");
+
+        let (ctx1, an1) = graph_on(&stream);
+        assert!(
+            peak_over(&an1, 24).await > 0.1,
+            "the first session must carry audio"
+        );
+
+        park_mic_track(&track);
+        // The analyser still holds ~43ms of PRE-park audio and `peak_over` maxes.
+        let _drain = peak_over(&an1, 4).await;
+        assert!(
+            peak_over(&an1, 24).await < 1e-3,
+            "a parked track must go silent"
+        );
+        let _ = ctx1.close();
+
+        track.set_enabled(true);
+        let (ctx2, an2) = graph_on(&stream);
+        let reused_peak = peak_over(&an2, 24).await;
+        let _ = ctx2.close();
+        assert!(
+            reused_peak > 0.1,
+            "re-enabled stream must feed a fresh AudioContext, got peak {reused_peak}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn store_fresh_capture_discards_a_late_acquisition_after_release() {
+        let stream = acquire_fake_mic().await;
+        let track = held_audio_track(&stream).expect("captured audio track");
+        let holder: HeldCapture = Rc::new(RefCell::new(None));
+        let released = Rc::new(Cell::new(true));
+
+        let stored = store_fresh_capture(&holder, &released, "mic-1", &stream);
+
+        assert!(!stored, "a released device must not be re-claimed");
+        assert!(holder.borrow().is_none(), "holder must stay empty");
+        assert_eq!(
+            track.ready_state(),
+            MediaStreamTrackState::Ended,
+            "the late stream must be stopped, not leaked"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn store_fresh_capture_publishes_and_stops_the_displaced_capture() {
+        let old = acquire_fake_mic().await;
+        let new = acquire_fake_mic().await;
+        let old_track = held_audio_track(&old).expect("old track");
+        let holder: HeldCapture = Rc::new(RefCell::new(Some(("mic-0".to_string(), old))));
+        let released = Rc::new(Cell::new(false));
+
+        let stored = store_fresh_capture(&holder, &released, "mic-1", &new);
+
+        assert!(stored);
+        assert!(holder_owns_stream(&holder, &new));
+        assert_eq!(old_track.ready_state(), MediaStreamTrackState::Ended);
+    }
+
+    #[wasm_bindgen_test]
+    async fn holder_owns_stream_compares_object_identity_not_device_id() {
+        let mine = acquire_fake_mic().await;
+        let other = acquire_fake_mic().await;
+        let holder: HeldCapture = Rc::new(RefCell::new(Some((
+            "mic-1".to_string(),
+            Clone::clone(&mine),
+        ))));
+
+        assert!(holder_owns_stream(&holder, &mine));
+        assert!(
+            !holder_owns_stream(&holder, &other),
+            "a superseded session shares the device id but not the claim"
+        );
+        assert!(!holder_owns_stream(&Rc::new(RefCell::new(None)), &mine));
+    }
+
+    #[wasm_bindgen_test]
+    async fn capture_guard_releases_on_an_early_return_unless_disarmed() {
+        let dropped = acquire_fake_mic().await;
+        let dropped_track = held_audio_track(&dropped).expect("track");
+        drop(CaptureGuard {
+            stream: dropped,
+            park: false,
+            armed: true,
+        });
+        assert_eq!(dropped_track.ready_state(), MediaStreamTrackState::Ended);
+
+        let kept = acquire_fake_mic().await;
+        let kept_track = held_audio_track(&kept).expect("track");
+        let mut guard = CaptureGuard {
+            stream: kept,
+            park: false,
+            armed: true,
+        };
+        guard.disarm();
+        drop(guard);
+        assert_eq!(kept_track.ready_state(), MediaStreamTrackState::Live);
+    }
+
+    #[wasm_bindgen_test]
+    async fn capture_guard_parks_a_reused_capture() {
+        let stream = acquire_fake_mic().await;
+        let track = held_audio_track(&stream).expect("track");
+        drop(CaptureGuard {
+            stream,
+            park: true,
+            armed: true,
+        });
+        assert_eq!(track.ready_state(), MediaStreamTrackState::Live);
+        assert!(!track.enabled());
+    }
+
+    // `build_test_options` lives in a `target_arch = "wasm32"` test module,
+    // and the native `cargo test --lib` job compiles this file too.
+    #[cfg(target_arch = "wasm32")]
+    mod encoder_lifecycle {
+        use super::*;
+
+        fn test_encoder() -> MicrophoneEncoder {
+            let client = crate::VideoCallClient::new(
+                crate::client::video_call_client::disconnect_tests::build_test_options(),
+            );
+            MicrophoneEncoder::new(
+                client,
+                48,
+                Callback::noop(),
+                Callback::noop(),
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+        }
+
+        /// The latch is TERMINAL: a queued `Timeout` restart firing after unmount
+        /// must not re-claim the device.
+        #[wasm_bindgen_test]
+        async fn start_does_not_clear_the_release_latch() {
+            let mut enc = test_encoder();
+            enc.select("mic-1".to_string());
+            enc.set_enabled(true);
+            enc.release_device();
+            assert!(enc.is_released_for_test());
+
+            enc.start();
+
+            assert!(
+                enc.is_released_for_test(),
+                "start() must not un-latch a release"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        async fn set_enabled_true_is_the_only_un_latch() {
+            let mut enc = test_encoder();
+            enc.release_device();
+            assert!(enc.is_released_for_test());
+
+            enc.set_enabled(false);
+            assert!(
+                enc.is_released_for_test(),
+                "disabling must not un-latch a release"
+            );
+
+            enc.set_enabled(true);
+            assert!(
+                !enc.is_released_for_test(),
+                "an explicit enable is the user asking for the mic"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        async fn shutdown_disables_the_encoder_and_releases_the_device() {
+            let stream = acquire_fake_mic().await;
+            let track = held_audio_track(&stream).expect("captured audio track");
+            let mut enc = test_encoder();
+            enc.set_enabled(true);
+            enc.seed_held_capture_for_test("mic-1", &stream);
+
+            enc.shutdown();
+
+            assert_eq!(track.ready_state(), MediaStreamTrackState::Ended);
+            assert!(
+                enc.is_released_for_test(),
+                "shutdown must latch, or a queued restart re-claims"
+            );
+            assert!(!enc.state.is_enabled(), "shutdown must clear `enabled`");
+        }
+
+        /// While DISABLED there is no session to hand the device over, so picking a
+        /// different mic must release the old one now, not at the next unmute.
+        #[wasm_bindgen_test]
+        async fn select_while_disabled_releases_a_deselected_device() {
+            let stream = acquire_fake_mic().await;
+            let track = held_audio_track(&stream).expect("captured audio track");
+            let mut enc = test_encoder();
+            enc.seed_held_capture_for_test("mic-1", &stream);
+
+            enc.select("mic-2".to_string());
+
+            assert_eq!(track.ready_state(), MediaStreamTrackState::Ended);
+        }
+
+        #[wasm_bindgen_test]
+        async fn select_keeps_the_capture_for_the_same_device() {
+            let stream = acquire_fake_mic().await;
+            let track = held_audio_track(&stream).expect("captured audio track");
+            let mut enc = test_encoder();
+            enc.seed_held_capture_for_test("mic-1", &stream);
+
+            enc.select("mic-1".to_string());
+
+            assert_eq!(track.ready_state(), MediaStreamTrackState::Live);
+        }
+
+        /// When ENABLED, `start()`'s displace path owns the handover; releasing here
+        /// would kill the live session.
+        #[wasm_bindgen_test]
+        async fn select_while_enabled_leaves_the_live_capture_alone() {
+            let stream = acquire_fake_mic().await;
+            let track = held_audio_track(&stream).expect("captured audio track");
+            let mut enc = test_encoder();
+            enc.set_enabled(true);
+            enc.seed_held_capture_for_test("mic-1", &stream);
+
+            enc.select("mic-2".to_string());
+
+            assert_eq!(track.ready_state(), MediaStreamTrackState::Live);
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn stop_held_capture_ends_the_track_and_clears_the_holder() {
+        let stream = acquire_fake_mic().await;
+        let track = held_audio_track(&stream).expect("captured audio track");
+        let holder: HeldCapture = Rc::new(RefCell::new(Some(("mic-1".to_string(), stream))));
+
+        stop_held_capture(&holder);
+
+        assert_eq!(
+            track.ready_state(),
+            MediaStreamTrackState::Ended,
+            "release must give the device back"
+        );
+        assert!(holder.borrow().is_none());
+    }
+}
+
+#[cfg(test)]
+mod held_capture_tests {
+    use super::{held_capture_reusable, track_state_usable};
+    use web_sys::MediaStreamTrackState;
+
+    #[test]
+    fn only_a_live_unmuted_track_is_usable() {
+        assert!(track_state_usable(MediaStreamTrackState::Live, false));
+        assert!(
+            !track_state_usable(MediaStreamTrackState::Live, true),
+            "a muted track stays Live while its source cannot supply samples"
+        );
+        assert!(!track_state_usable(MediaStreamTrackState::Ended, false));
+        assert!(!track_state_usable(MediaStreamTrackState::Ended, true));
+    }
+
+    #[test]
+    fn an_unusable_track_is_not_reusable() {
+        assert!(!held_capture_reusable(
+            Some("mic-1"),
+            "mic-1",
+            track_state_usable(MediaStreamTrackState::Live, true)
+        ));
+        assert!(held_capture_reusable(
+            Some("mic-1"),
+            "mic-1",
+            track_state_usable(MediaStreamTrackState::Live, false)
+        ));
+    }
+
+    #[test]
+    fn no_held_capture_is_not_reusable() {
+        assert!(!held_capture_reusable(None, "mic-1", true));
+    }
+
+    #[test]
+    fn an_unknown_wanted_device_is_not_reusable() {
+        assert!(!held_capture_reusable(Some("mic-1"), "", true));
+        assert!(!held_capture_reusable(Some(""), "", true));
+        assert!(!held_capture_reusable(None, "", true));
+    }
+
+    #[test]
+    fn a_different_device_is_not_reusable() {
+        assert!(!held_capture_reusable(Some("mic-1"), "mic-2", true));
+    }
+
+    #[test]
+    fn a_dead_track_on_the_same_device_is_not_reusable() {
+        assert!(!held_capture_reusable(Some("mic-1"), "mic-1", false));
+    }
+
+    #[test]
+    fn the_same_device_with_a_live_track_is_reusable() {
+        assert!(held_capture_reusable(Some("mic-1"), "mic-1", true));
     }
 }

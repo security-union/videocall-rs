@@ -18,7 +18,7 @@
  * A SECOND `describe` follows for issue 2329 — the AUDIBLE cue for the same
  * transitions. It is a separate block because what it pins is disjoint from the
  * above (an audio graph, not a rendered surface) while the harness is identical,
- * so it reuses `setHandRaised` / `wakeControls` / `newParticipantWithInit`
+ * so it reuses `setHandRaised` / `wakeActionBar` / `newParticipantWithInit`
  * outright rather than forking a second copy that would drift. See that block's
  * own header for what it proves and what it deliberately does not.
  *
@@ -65,6 +65,8 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 import { waitForServices } from "../helpers/wait-for-services";
+import { RECEIVED_SHARE_VIEW_KEY } from "../helpers/screen-share-meeting";
+import { setHandRaised, setMockPeers, wakeActionBar } from "../helpers/controls";
 import {
   enterMeetingAsHost,
   enterTwoUserMeeting,
@@ -107,6 +109,10 @@ const PAUSED_PILL_ACTION = '[data-testid="decode-paused-pill-show-all"]';
 // `pressured` FALSE, so the decode-budget BANNER never appears and therefore
 // never suppresses the pill (the two are mutually exclusive).
 const FORCED_BUDGET_SEED = `localStorage.setItem("vc_decode_budget_override", "1");`;
+
+// The pill collision lives in the split layout, which a received share opens
+// in only by preference since #2792.
+const ENLARGED_SHARE_VIEW_SEED = `localStorage.setItem("${RECEIVED_SHARE_VIEW_KEY}", "enlarged");`;
 
 // Mock peers needed to push the shed count above zero. Any number > the forced
 // budget works; 8 keeps the SS panel small enough to render quickly.
@@ -161,75 +167,20 @@ const CROSS_PEER_TIMEOUT = 20_000;
 // ---------------------------------------------------------------------------
 
 /**
- * Wake the auto-hiding video-controls bar so a subsequent visibility PROBE
- * (`isVisible()`, which takes a snapshot and does not auto-wait) reads the real
- * layout rather than a bar that happens to be mid-hide. Copied from `openDrawer`
- * in drawer-resize.spec.ts, including its reason for deriving the centre point
- * from the measured viewport rather than a fixed (400, 400).
- */
-async function wakeControls(page: Page): Promise<void> {
-  await page.locator(".video-controls-container").hover();
-  const vp = page.viewportSize() ?? { width: 800, height: 600 };
-  await page.mouse.move(Math.floor(vp.width / 2), Math.floor(vp.height / 2));
-  await page.waitForTimeout(300);
-}
-
-/**
- * Flip the raise/lower-hand toggle and wait for the local state to settle on
- * `want`.
- *
- * Width-robust in the same shape as `ensureReactionsPaletteOpen` in
- * `two-users-meeting.spec.ts`: the RaiseHand slot is `DEFAULT_SLOTS` index 3 and
- * is NOT sacred (only Mic/Camera/HangUp never overflow), so on a narrow action
- * bar it moves into the "More actions" menu and its own button is hidden. At the
- * 1280x720 Desktop Chrome viewport these specs run at nothing overflows (see
- * action-bar-overflow.spec.ts), so the direct path is the one exercised here.
- *
- * The overflow branch is live: writing this spec surfaced that `attendants.rs`'s
- * overflow `match slot` had no `ActionBarSlot::RaiseHand` arm, so the menu item
- * rendered and did nothing but close the menu. That arm now exists (it calls the
- * same `toggle_raise_hand` handler as the action-bar button). It matters more
- * than it looks: existing users get the new slot APPENDED to the end of their
- * saved action-bar layout by the forward-compat migration, so overflow is their
- * most likely first encounter with the control.
- *
- * Asserting `data-raised` BEFORE and AFTER makes the helper self-checking: every
- * call site declares the state it expects to be in, and a click that goes
- * nowhere — an overflow item that loses its handler again, a `customize_mode`
- * early return — fails here rather than one confusing assertion later.
- * `data-raised` comes from the same `self_hand_raised` signal that drives the
- * button's class, so it is the local truth and not a proxy for it.
- */
-async function setHandRaised(page: Page, want: boolean): Promise<void> {
-  const trigger = page.locator(TRIGGER);
-  await expect(trigger).toHaveAttribute("data-raised", want ? "false" : "true");
-
-  await wakeControls(page);
-  if (await trigger.isVisible().catch(() => false)) {
-    await trigger.click();
-  } else {
-    await page.locator("#overflow-menu-trigger").click();
-    await page.locator(".overflow-item", { hasText: "Raise hand" }).click();
-  }
-
-  await expect(trigger).toHaveAttribute("data-raised", want ? "true" : "false");
-}
-
-/**
  * Open the participants roster. Uses the class-based open marker
  * (`#peer-list-container.visible`) that drawer-resize.spec.ts proves, rather
  * than `toBeVisible` — the container div renders in BOTH states, so only the
  * class discriminates open from closed.
  */
 async function openRoster(page: Page): Promise<void> {
-  await wakeControls(page);
+  await wakeActionBar(page);
   await page.locator("#peer-list-trigger").click();
   await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 10_000 });
 }
 
 /** Close the roster again (the trigger is a toggle). */
 async function closeRoster(page: Page): Promise<void> {
-  await wakeControls(page);
+  await wakeActionBar(page);
   await page.locator("#peer-list-trigger").click();
   await expect(page.locator("#peer-list-container")).not.toHaveClass(/visible/, {
     timeout: 10_000,
@@ -267,38 +218,6 @@ async function newParticipantWithInit(
 }
 
 /**
- * Set the mock-peer count via the Mock Peers popover. Returns false when the
- * control is absent (MOCK_PEERS_ENABLED off in this stack), so the caller can
- * skip rather than fail.
- *
- * Same interaction decode-budget.spec.ts drives, including the "click the grid
- * to dismiss the popover" close. Call it BEFORE a screen share starts: in grid
- * mode that dismiss click lands on empty container, whereas in the split layout
- * the same point is inside the shared-screen pane.
- */
-async function setMockPeers(page: Page, count: number): Promise<boolean> {
-  await page.locator(".video-controls-container").hover();
-  const mockBtn = page
-    .locator(".video-controls-container button")
-    .filter({ has: page.locator('.tooltip:has-text("Mock Peers")') });
-
-  if ((await mockBtn.count()) === 0) {
-    return false;
-  }
-
-  await mockBtn.first().click();
-  await expect(page.locator(".mock-peers-popover")).toBeVisible({ timeout: 5_000 });
-  const input = page.locator("#mock-count-input");
-  await input.fill(String(count));
-  await input.dispatchEvent("input");
-  await page.waitForTimeout(300);
-
-  await page.locator("#grid-container").click({ position: { x: 10, y: 10 } });
-  await expect(page.locator(".mock-peers-popover")).not.toBeVisible({ timeout: 3_000 });
-  return true;
-}
-
-/**
  * Start a screen share on `sharerPage` and resolve true once `viewerPage` has
  * switched to the split layout. False (rather than a failure) when the share
  * could not be established, so the caller can skip.
@@ -310,7 +229,7 @@ async function setMockPeers(page: Page, count: number): Promise<boolean> {
  * viewer.
  */
 async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boolean> {
-  await wakeControls(sharerPage);
+  await wakeActionBar(sharerPage);
   await sharerPage.waitForTimeout(300);
   const shareButton = sharerPage.locator("button.video-control-button", {
     has: sharerPage.locator(".tooltip", { hasText: "Share Screen" }),
@@ -634,7 +553,7 @@ test.describe("Raise hand (issue 2135)", () => {
       await expect(compact).toHaveText("You");
 
       // ── 2. The overflow item reflects the state it can change.
-      await wakeControls(page);
+      await wakeActionBar(page);
       await page.locator("#overflow-menu-trigger").click();
       const overflowItem = page.locator(".overflow-item", { hasText: "Raise hand" });
       await expect(overflowItem).toHaveAttribute("aria-pressed", "true");
@@ -647,7 +566,7 @@ test.describe("Raise hand (issue 2135)", () => {
       // ── Down again, and the state follows in both directions.
       await setHandRaised(page, false);
       await expect(page.locator(BANNER)).toHaveCount(0);
-      await wakeControls(page);
+      await wakeActionBar(page);
       await page.locator("#overflow-menu-trigger").click();
       await expect(page.locator(".overflow-item", { hasText: "Raise hand" })).toHaveAttribute(
         "aria-pressed",
@@ -791,7 +710,7 @@ test.describe("Raise hand (issue 2135)", () => {
 
       // Guest hangs up. Same control guest-leave.spec.ts drives: the toolbar's
       // only `.danger` button, which has no title (its tooltip is a child span).
-      await wakeControls(guestPage);
+      await wakeActionBar(guestPage);
       const hangUp = guestPage.locator("button.video-control-button.danger").first();
       await expect(hangUp).toBeVisible({ timeout: 10_000 });
       await hangUp.click();
@@ -927,9 +846,7 @@ test.describe("Raise hand (issue 2135)", () => {
    *
    * WHY IT BITES: on the un-fixed stylesheet both elements resolve to
    * `top: 12px`, so the pill's top (12) is far above the banner's bottom (~48)
-   * and the `toBeGreaterThanOrEqual` fails. Revert the `.decode-paused-pill`
-   * arm of the sibling rule in `style.css` and this test goes red; the
-   * ~16px separation the fix produces leaves no room for a sub-pixel pass.
+   * and the `toBeGreaterThanOrEqual` fails.
    *
    * HARNESS NOTES:
    *  - The split layout is a property of the VIEWER (`attendants.rs` skips self
@@ -970,7 +887,7 @@ test.describe("Raise hand (issue 2135)", () => {
         "guest@videocall.rs",
         "GuestUser",
         uiURL,
-        [FORCED_BUDGET_SEED],
+        [FORCED_BUDGET_SEED, ENLARGED_SHARE_VIEW_SEED],
       );
 
       await enterTwoUserMeeting(hostPage, guestPage, meetingId);
@@ -1304,12 +1221,12 @@ async function participantJoins(
  * announcement matrix (and the hand-chime switch) lives.
  *
  * The sequence is the one join-leave-notifications.spec.ts and
- * meeting-settings.spec.ts both drive; only the leading `wakeControls` is local,
+ * meeting-settings.spec.ts both drive; only the leading `wakeActionBar` is added here,
  * because these pages have been sitting idle long enough for the action bar to
  * auto-hide.
  */
 async function openPreferencesTab(page: Page): Promise<void> {
-  await wakeControls(page);
+  await wakeActionBar(page);
   await page.locator('[data-testid="open-settings"]').click();
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
   await page.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();

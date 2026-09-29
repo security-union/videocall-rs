@@ -35,10 +35,9 @@ import { wakeControls } from "../helpers/controls";
  *     while sharing), latches pressure, and sheds tiles → off-budget tiles
  *     appear. This is the presenter bias.
  *
- * The local sharer stays in the NORMAL grid (the split layout deliberately skips
- * SELF — `attendants.rs` `active_screen_sharer` excludes the local user), so the
- * `#grid-container` off-budget tiles are the assertion surface, identical to
- * `decode-budget.spec.ts`.
+ * The local sharer stays in the NORMAL grid (its own share opens as a grid tile
+ * beside the peers: the own-share view defaults to Tile, #2792), so the `#grid-container` off-budget tiles are the assertion
+ * surface, identical to `decode-budget.spec.ts`.
  *
  * MUTATION SENSITIVITY: if the presenter bias were removed, the SHARING phase
  * would also Hold at BAND_FPS (no off-budget tiles), so the "off-budget tiles
@@ -156,8 +155,8 @@ test.describe("Presenter-aware decode shedding (#1559)", () => {
     await page.locator(".video-controls-container").hover();
     await page.locator('[data-testid="open-settings"]').click();
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-    await page.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-    await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
+    await page.locator('[data-testid="settings-nav-preferences"]').click();
+    await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",

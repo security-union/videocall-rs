@@ -2,6 +2,7 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
@@ -38,6 +39,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 

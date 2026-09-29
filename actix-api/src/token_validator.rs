@@ -19,18 +19,11 @@
 //! room and identity match the connection request.
 
 use jsonwebtoken::{DecodingKey, Validation};
-use regex::Regex;
 use std::fmt;
 use videocall_meeting_types::token::{check_token_type, RoomAccessTokenClaims, TokenTypeCheck};
+use videocall_types::validation::is_valid_meeting_id;
 
-use crate::constants::VALID_ID_PATTERN;
 use crate::metrics::{AUTH_REJECTIONS_TOTAL, LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL};
-
-lazy_static::lazy_static! {
-    /// Compiled regex for validating room identifiers against NATS-safe characters.
-    /// Only allows alphanumeric characters, underscores, and hyphens.
-    static ref VALID_ID_RE: Regex = Regex::new(VALID_ID_PATTERN).expect("VALID_ID_PATTERN is a valid regex");
-}
 
 /// Errors that can occur during room token validation.
 #[derive(Debug)]
@@ -257,11 +250,10 @@ fn decode_room_token_inner(secret: &str, token: &str) -> Result<RoomAccessTokenC
 
     // Reject room names containing NATS-unsafe characters (dots, wildcards,
     // spaces, etc.). A room like "foo.>" would let an attacker subscribe to
-    // arbitrary NATS subjects. Only alphanumeric, underscore, and hyphen are
-    // allowed. We do NOT validate `sub` (email) here because email addresses
-    // naturally contain `.` and `@`; the `sub` field is not interpolated raw
-    // into NATS subjects the same way `room` is.
-    if !VALID_ID_RE.is_match(&claims.room) {
+    // arbitrary NATS subjects. We do NOT validate `sub` (email) here because
+    // email addresses naturally contain `.` and `@`; the `sub` field is not
+    // interpolated raw into NATS subjects the same way `room` is.
+    if !is_valid_meeting_id(&claims.room) {
         return Err(TokenError::UnsafeIdentifier {
             field: "room".to_string(),
             value: claims.room,
@@ -609,6 +601,28 @@ mod tests {
         let result = decode_room_token(TEST_SECRET, &token);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().room, "My_Room-123");
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn room_with_tilde_is_accepted() {
+        let token = make_token("alice@test.com", "a~b", true, 600);
+        let claims = decode_room_token(TEST_SECRET, &token).expect("a~b is a valid room");
+        assert_eq!(claims.room, "a~b");
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn empty_or_overlong_room_is_rejected() {
+        for room in [String::new(), "a".repeat(256)] {
+            let token = make_token("alice@test.com", &room, true, 600);
+            let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
+            assert!(
+                matches!(err, TokenError::UnsafeIdentifier { .. }),
+                "room of {} bytes: {err}",
+                room.len()
+            );
+        }
     }
 
     #[test]

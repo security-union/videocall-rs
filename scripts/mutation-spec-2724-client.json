@@ -1,0 +1,122 @@
+{
+  "_comment": [
+    "Mutation receipts for the #2724 client half. Each arm is a way the reliable",
+    "audio downlink could be broken on the CLIENT side, and names the test that",
+    "must catch it:",
+    "  scripts/mutation-check.py run scripts/mutation-spec-2724-client.json",
+    "",
+    "The two parser arms are the failure modes the issue names explicitly — the",
+    "class byte being REJECTED, or COLLAPSED onto a neighbouring lane."
+  ],
+  "runner": "cargo",
+  "cwd": ".",
+  "command": [
+    "cargo",
+    "test",
+    "--no-fail-fast",
+    "-p",
+    "videocall-transport",
+    "-p",
+    "videocall-client",
+    "--lib"
+  ],
+  "baseline_tests": 1263,
+  "mutations": [
+    {
+      "name": "parser REJECTS the audio class (a relay class the client refuses)",
+      "file": "videocall-transport/src/downlink_stream.rs",
+      "find": "    let mut session_id = [0u8; 8];\n    session_id.copy_from_slice(&payload[6..14]);",
+      "replace": "    if payload[5] > 2 {\n        return Prelude::Legacy;\n    }\n    let mut session_id = [0u8; 8];\n    session_id.copy_from_slice(&payload[6..14]);",
+      "occurrences": 1,
+      "expect_kills": [
+        "downlink_stream::tests::the_audio_class_parses_on_v1_and_keys_apart_from_every_other_lane",
+        "downlink_stream::tests::the_audio_class_needs_no_version_bump_to_reach_a_shipped_client",
+        "connection::webtransport::tests::a_five_second_stall_delivers_every_audio_frame_in_order_and_complete_at_the_transport"
+      ]
+    },
+    {
+      "name": "parser COLLAPSES the audio class onto control",
+      "file": "videocall-transport/src/downlink_stream.rs",
+      "find": "            class: payload[5],",
+      "replace": "            class: if payload[5] == 3 { 0 } else { payload[5] },",
+      "occurrences": 1,
+      "expect_kills": [
+        "downlink_stream::tests::the_audio_class_parses_on_v1_and_keys_apart_from_every_other_lane",
+        "connection::webtransport::tests::a_five_second_stall_delivers_every_audio_frame_in_order_and_complete_at_the_transport"
+      ]
+    },
+    {
+      "name": "a reset key is held open, so its re-opened stream queues behind a dead reader",
+      "file": "videocall-client/src/connection/webtransport.rs",
+      "find": "            None => {\n                self.keys.remove(&key);\n                None\n            }",
+      "replace": "            None => None,",
+      "occurrences": 1,
+      "expect_kills": [
+        "connection::webtransport::tests::an_audio_stream_reopened_after_a_reset_starts_at_once_and_repeats_nothing",
+        "connection::webtransport::tests::a_finished_key_is_retired_so_a_later_same_key_stream_starts_at_once",
+        "connection::webtransport::tests::the_key_map_empties_as_readers_end"
+      ]
+    },
+    {
+      "name": "the consumed stream header is left in the buffer and emitted as a packet",
+      "file": "videocall-client/src/connection/webtransport.rs",
+      "find": "    fn skip(&mut self, n: usize) {\n        self.consumed = (self.consumed + n).min(self.buf.len());\n    }",
+      "replace": "    fn skip(&mut self, _n: usize) {}",
+      "occurrences": 1,
+      "expect_kills": [
+        "connection::webtransport::tests::a_five_second_stall_delivers_every_audio_frame_in_order_and_complete_at_the_transport",
+        "connection::webtransport::tests::the_stream_header_is_consumed_and_only_the_packets_behind_it_are_emitted"
+      ]
+    },
+    {
+      "name": "one frame per drain, so a stall's backlog is delivered a frame at a time",
+      "file": "videocall-client/src/connection/webtransport.rs",
+      "find": "        emit(pending.take_frame(len));\n    }\n    FrameDrain::NeedMore",
+      "replace": "        emit(pending.take_frame(len));\n        break;\n    }\n    FrameDrain::NeedMore",
+      "occurrences": 1,
+      "expect_kills": [
+        "connection::webtransport::tests::a_five_second_stall_delivers_every_audio_frame_in_order_and_complete_at_the_transport",
+        "connection::webtransport::tests::the_reframe_yields_exact_payloads_at_odd_lengths",
+        "connection::webtransport::tests::draining_a_chunk_of_frames_moves_no_bytes"
+      ]
+    },
+    {
+      "name": "every lane serialises onto one reader, so audio waits behind control",
+      "file": "videocall-client/src/connection/webtransport.rs",
+      "find": "        if let Some(state) = self.keys.get_mut(&key) {",
+      "replace": "        if let Some(state) = self.keys.values_mut().next() {",
+      "occurrences": 1,
+      "expect_kills": [
+        "connection::webtransport::tests::the_audio_class_reads_concurrently_with_every_other_lane",
+        "connection::webtransport::tests::streams_with_distinct_keys_all_start_immediately",
+        "connection::webtransport::tests::the_overflow_class_is_scheduled_like_any_other_key",
+        "connection::webtransport::tests::one_publishers_media_kinds_do_not_serialise_against_each_other",
+        "connection::webtransport::tests::the_key_map_empties_as_readers_end",
+        "connection::webtransport::tests::readers_cannot_exceed_the_concurrent_reader_ceiling",
+        "connection::webtransport::tests::a_grace_timer_cannot_release_another_keys_queued_stream",
+        "connection::webtransport::tests::a_grace_timer_refused_at_the_ceiling_hands_its_stream_back_and_frees_the_slot"
+      ]
+    },
+    {
+      "name": "the reliable unistream is stamped as the datagram lane (#2720 liveness)",
+      "file": "videocall-client/src/connection/webtransport.rs",
+      "find": "            MessageType::UnidirectionalStream | MessageType::BidirectionalStream => {\n                InboundLane::Reliable\n            }",
+      "replace": "            MessageType::UnidirectionalStream | MessageType::BidirectionalStream => {\n                InboundLane::Datagram\n            }",
+      "occurrences": 1,
+      "expect_kills": [
+        "connection::webtransport::tests::every_webtransport_primitive_maps_to_its_lane",
+        "connection::webtransport::tests::a_five_second_stall_delivers_every_audio_frame_in_order_and_complete_at_the_transport"
+      ]
+    },
+    {
+      "name": "the datagram staleness bound outlives the 5s stall, erasing the contrast",
+      "file": "videocall-transport/src/webtransport.rs",
+      "find": "const INCOMING_DATAGRAM_MAX_AGE_MS: f64 = 3000.0;",
+      "replace": "const INCOMING_DATAGRAM_MAX_AGE_MS: f64 = 6000.0;",
+      "occurrences": 1,
+      "expect_kills": [
+        "webtransport::framing_tests::a_five_second_stall_outlives_the_incoming_datagram_queues_bounds"
+      ]
+    }
+  ]
+}

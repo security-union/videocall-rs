@@ -5,9 +5,11 @@
 //! These functions are algorithmically non-trivial but have zero WASM / DOM /
 //! Dioxus dependencies, so they can be unit-tested under plain `cargo test`.
 
+use super::decode_budget::{build_decoded_bucket, expand_decoded_for_requested, pin_first_window};
 use super::density::{DensityMode, MOBILE_WIDTH_BREAKPOINT_PX};
+use crate::constants::CANVAS_LIMIT;
 use crate::context::DockPosition;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Tile aspect ratio (width / height) — 3 : 2.
 pub(crate) const TILE_AR: f64 = 3.0 / 2.0;
@@ -79,29 +81,9 @@ pub(crate) fn screen_share_flow_style() -> &'static str {
      grid-template-columns: none; grid-template-rows: none;"
 }
 
-/// Nominal camera-tile geometry (`--tile-w`, `--tile-h`) for the screen-share
-/// split layout's *maximized* (pinned) tile.
-///
-/// During screen share the participant panel renders small side-panel
-/// thumbnails, but a PINNED side-panel tile is `position: fixed` with its
-/// insets from the drawer reserves (style.css
-/// `.split-peer-tile.grid-item-pinned`) — it maximizes over the shared screen,
-/// exactly like `.grid-item-pinned` in the normal grid. That pinned tile's
-/// chrome (name badge, top-icon cluster,
-/// camera-off placeholder) is sized from the `--tile-w`/`--tile-h` custom
-/// properties on `#grid-container`, so those vars must describe the MAXIMIZED
-/// tile — NOT the compact side-panel thumbnail and NOT an N-tile grid cell
-/// (whose height shrinks as the participant count grows).
-///
-/// Returns the largest 3:2 tile that fits the available meeting area
-/// (`avail_w` × `avail_h`). This is intentionally the single-full-area tile —
-/// numerically identical to `compute_layout(1, avail_w, avail_h, _)` — and is
-/// a distinct, self-documenting function so the call site cannot be mistaken
-/// for the participant-count-dependent grid packing math that this value must
-/// NEVER reuse (PR #1946: reusing the grid cell size froze the pinned chrome
-/// at a stale, count-dependent size). Depends only on the viewport-derived
-/// available area, so it is deterministic across clients for a given viewport.
-pub(crate) fn screen_share_pinned_tile_size(avail_w: f64, avail_h: f64) -> (f64, f64) {
+/// `--tile-w` / `--tile-h` for the screen-share split: the largest 3:2 tile in
+/// the meeting area, never the participant-count-dependent cell (PR #1946).
+pub(crate) fn screen_share_stage_tile_size(avail_w: f64, avail_h: f64) -> (f64, f64) {
     // Width of a 3:2 tile whose height fills `avail_h`, capped so it never
     // exceeds `avail_w` (mirrors the height-vs-width constraint in
     // `compute_layout`'s single-tile case for tall/narrow viewports).
@@ -137,12 +119,15 @@ fn recent_speech(
 
 /// Rank the roster BEFORE the `CANVAS_LIMIT` cut and return the capped
 /// `(session_id, camera_on)` list `attendants.rs` feeds to
-/// `partition_camera_tiles` (issue #2273). Returns the input order untouched
-/// when `capped_real` covers the whole roster.
+/// `partition_camera_tiles` (issue #2273). Pinned peers rank first, by pin rank
+/// (issue 2866). Returns the input order untouched when `capped_real` covers the
+/// whole roster.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn select_display_candidates(
     display_peers: &[String],
     capped_real: usize,
     camera_on: impl Fn(&str) -> bool,
+    pin_rank: impl Fn(&str) -> Option<usize>,
     speech_map: &HashMap<String, f64>,
     join_map: &HashMap<String, f64>,
     now_ms: f64,
@@ -161,6 +146,7 @@ pub(crate) fn select_display_candidates(
             let cam_on = camera_on(peer);
             let speech = recent_speech(peer, speech_map, now_ms, active_ms);
             let key = (
+                pin_rank(peer).unwrap_or(usize::MAX),
                 selection_tier(cam_on, speech.is_some()),
                 speech.map_or(0.0, |ts| -ts), // negated: freshest speaker first
                 join_map.get(peer).copied().unwrap_or(0.0),
@@ -170,9 +156,10 @@ pub(crate) fn select_display_candidates(
         .collect();
 
     ranked.sort_by(|a, b| {
-        let ((ta, sa, ja), pa, _) = a;
-        let ((tb, sb, jb), pb, _) = b;
-        ta.cmp(tb)
+        let ((ra, ta, sa, ja), pa, _) = a;
+        let ((rb, tb, sb, jb), pb, _) = b;
+        ra.cmp(rb)
+            .then(ta.cmp(tb))
             .then(sa.partial_cmp(sb).unwrap_or(std::cmp::Ordering::Equal))
             .then(ja.partial_cmp(jb).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| pa.cmp(pb))
@@ -297,6 +284,87 @@ pub(crate) fn promote_speakers(
     }
 }
 
+pub(crate) struct SpeakerInputs<'a> {
+    pub speech_map: &'a HashMap<String, f64>,
+    pub join_map: &'a HashMap<String, f64>,
+    pub now_ms: f64,
+    pub active_ms: f64,
+}
+
+pub(crate) struct CameraWindowInput<'a> {
+    /// Camera-pinned session_ids in rank order.
+    pub pins: &'a [String],
+    /// Join-sorted.
+    pub camera_on: Vec<String>,
+    pub camera_off: Vec<String>,
+    pub displayed: usize,
+    /// Decoded tiles before any PLAY request.
+    pub budget: usize,
+    pub device_ceiling: Option<usize>,
+    pub requested: &'a HashSet<String>,
+}
+
+pub(crate) struct CameraWindow {
+    pub tiles: Vec<String>,
+    pub camera_off: Vec<String>,
+    pub decoded: usize,
+    pub on_cells: usize,
+    pub bucket: HashSet<u64>,
+}
+
+/// The camera-on decode pipeline the grid and the split panel share: pins
+/// first, the budget window widened for PLAY requests on displayed tiles
+/// (#1466), speaker promotion behind the pins, then the PLAY promotion, which
+/// keeps off only the pins the budget itself decodes.
+pub(crate) fn plan_camera_window(
+    input: CameraWindowInput,
+    speakers: &SpeakerInputs,
+) -> CameraWindow {
+    let w = pin_first_window(
+        input.pins,
+        input.camera_on,
+        input.camera_off,
+        input.displayed,
+    );
+    let mut tiles = w.all_tiles;
+    let base = w.on_cells.min(input.budget);
+    let requested_off_budget = tiles
+        .iter()
+        .take(w.on_cells)
+        .skip(base)
+        .filter(|t| input.requested.contains(*t))
+        .count();
+    let decoded = expand_decoded_for_requested(
+        base,
+        requested_off_budget,
+        input.device_ceiling,
+        CANVAS_LIMIT,
+    )
+    .min(w.on_cells);
+    promote_speakers(
+        &mut tiles[w.pinned_on..],
+        decoded.saturating_sub(w.pinned_on),
+        speakers.speech_map,
+        speakers.join_map,
+        speakers.now_ms,
+        speakers.active_ms,
+    );
+    let bucket = build_decoded_bucket(
+        &mut tiles,
+        decoded,
+        w.on_cells,
+        w.pinned_on.min(base),
+        input.requested,
+    );
+    CameraWindow {
+        tiles,
+        camera_off: w.camera_off,
+        decoded,
+        on_cells: w.on_cells,
+        bucket,
+    }
+}
+
 /// Determine the effective density mode by auto-escalating from the user's
 /// chosen mode until every active speaker fits on-screen.
 ///
@@ -386,10 +454,42 @@ pub(crate) const ACTION_BAR_EDGE_MARGIN: f64 = 40.0;
 /// Must equal `--meeting-footer-h` in global.css.
 pub(crate) const MEETING_FOOTER_RESERVE: f64 = 32.0;
 
+/// Where row 1 must start, below any status-bar reserve, while the meeting-timer
+/// chip is up: its `--top-stack-top`, its expired height and a gap. Pinned
+/// against style.css by a test.
+pub(crate) const MEETING_TIMER_BAND_CLEARANCE: f64 = 60.0;
+pub(crate) const MEETING_TIMER_BAND_CLEARANCE_MOBILE: f64 = 56.0;
+
+const SCREEN_SHARE_PAD_TOP: f64 = 16.0;
+
+/// Extra top padding that clears the meeting-timer chip over a `base_top` pad.
+pub(crate) fn meeting_timer_band(shown: bool, vw: f64, base_top: f64) -> f64 {
+    if !shown {
+        return 0.0;
+    }
+    let clearance = if vw < MOBILE_WIDTH_BREAKPOINT_PX {
+        MEETING_TIMER_BAND_CLEARANCE_MOBILE
+    } else {
+        MEETING_TIMER_BAND_CLEARANCE
+    };
+    (clearance - base_top).max(0.0)
+}
+
+/// `#grid-container`'s top padding in the grid layout.
+pub(crate) fn grid_pad_top(base_top: f64, vw: f64, status_bar_reserve: f64, timer: bool) -> f64 {
+    base_top + status_bar_reserve + meeting_timer_band(timer, vw, base_top)
+}
+
 /// `(top, right, bottom, left)` for `#grid-container` in the screen-share layout.
-pub(crate) fn screen_share_padding(status_bar_reserve: f64) -> (f64, f64, f64, f64) {
+pub(crate) fn screen_share_padding(
+    status_bar_reserve: f64,
+    timer: bool,
+    vw: f64,
+) -> (f64, f64, f64, f64) {
     (
-        16.0 + status_bar_reserve,
+        SCREEN_SHARE_PAD_TOP
+            + status_bar_reserve
+            + meeting_timer_band(timer, vw, SCREEN_SHARE_PAD_TOP),
         16.0,
         80.0 + MEETING_FOOTER_RESERVE,
         16.0,
@@ -817,21 +917,18 @@ mod tests {
         assert_eq!(names(&lone), names(screen_share_flow_style()));
     }
 
-    // -- screen_share_pinned_tile_size --------------------------------
+    // -- screen_share_stage_tile_size ---------------------------------
 
     #[test]
-    fn ss_pinned_tile_matches_single_maximized_tile() {
+    fn ss_stage_tile_matches_the_single_full_area_tile() {
         // Landscape meeting area (1280x720 viewport minus grid padding:
         // avail_w = 1280-40 = 1240, avail_h = 720-140 = 580 — the exact
         // dimensions the screen-share E2E harness runs at).
-        let (tw, th) = screen_share_pinned_tile_size(1240.0, 580.0);
+        let (tw, th) = screen_share_stage_tile_size(1240.0, 580.0);
         // A 3:2 tile filling the 580px height is 870px wide, which fits in
         // 1240px, so height is the binding constraint.
         assert!((th - 580.0).abs() < 0.5, "th was {th}");
         assert!((tw - 870.0).abs() < 0.5, "tw was {tw}");
-        // Must equal the single full-area grid tile (the `tile_count == 1`
-        // pin), the value the normal-grid pin uses — this is the parity the
-        // pinned split-tile chrome depends on.
         let (_c, _r, grid_tw) = compute_layout(1, 1240.0, 580.0, 16.0);
         let grid_th = grid_tw / TILE_AR;
         assert!((tw - grid_tw).abs() < 0.5, "tw {tw} != grid_tw {grid_tw}");
@@ -839,43 +936,34 @@ mod tests {
     }
 
     #[test]
-    fn ss_pinned_tile_is_independent_of_participant_count() {
-        // The whole point of the fix: the pinned split-tile size must NOT
-        // track the grid cell size, which shrinks as tiles are added. At 9
-        // tiles the grid cell height collapses well below the maximized
-        // height, so if this value ever tracked the grid it would regress.
-        let (_tw, th_pin) = screen_share_pinned_tile_size(1240.0, 580.0);
+    fn ss_stage_tile_is_independent_of_participant_count() {
+        let (_tw, th_stage) = screen_share_stage_tile_size(1240.0, 580.0);
         let (_c, _r, grid_tw_9) = compute_layout(9, 1240.0, 580.0, 16.0);
         let grid_th_9 = grid_tw_9 / TILE_AR;
-        // Sanity: 9-tile grid cell is far smaller than the maximized pin, and
-        // below the 293px chrome-saturation threshold the pin must stay above.
         assert!(
             grid_th_9 < 250.0,
             "9-tile grid th unexpectedly large: {grid_th_9}"
         );
         assert!(
-            th_pin > grid_th_9 + 100.0,
-            "pinned th {th_pin} not clearly larger than 9-tile grid th {grid_th_9}"
+            th_stage > grid_th_9 + 100.0,
+            "stage th {th_stage} not clearly larger than 9-tile grid th {grid_th_9}"
         );
-        assert!(
-            th_pin >= 293.0,
-            "pinned th {th_pin} below chrome-saturation threshold"
-        );
+        assert!(th_stage >= 293.0, "stage th {th_stage}");
     }
 
     #[test]
-    fn ss_pinned_tile_caps_width_in_tall_narrow_viewport() {
+    fn ss_stage_tile_caps_width_in_tall_narrow_viewport() {
         // Portrait/narrow area: a 3:2 tile of full height would overflow the
         // width, so width binds and height derives from it.
-        let (tw, th) = screen_share_pinned_tile_size(300.0, 1000.0);
+        let (tw, th) = screen_share_stage_tile_size(300.0, 1000.0);
         assert!((tw - 300.0).abs() < 0.5, "tw was {tw}");
         assert!((th - 200.0).abs() < 0.5, "th was {th}");
     }
 
     #[test]
-    fn ss_pinned_tile_never_negative() {
+    fn ss_stage_tile_never_negative() {
         // Degenerate collapsed viewport must not produce negative sizes.
-        let (tw, th) = screen_share_pinned_tile_size(0.0, 0.0);
+        let (tw, th) = screen_share_stage_tile_size(0.0, 0.0);
         assert!(tw >= 0.0 && th >= 0.0, "got ({tw}, {th})");
     }
 
@@ -1329,6 +1417,7 @@ mod tests {
             &peers,
             CUT,
             |p| cameras_on.contains(&p),
+            |_| None,
             &speech,
             &join,
             now,
@@ -1378,6 +1467,7 @@ mod tests {
             &peers,
             peers.len(),
             |p| p == "11" || p == "12",
+            |_| None,
             &speech,
             &join,
             now,
@@ -1401,8 +1491,16 @@ mod tests {
         speech.insert("7".to_string(), now - 25_000.0); // frozen, still inside 30 s
         speech.insert("88".to_string(), now - 300.0); // live speaker
 
-        let selected =
-            select_display_candidates(&peers, 1, |_| false, &speech, &join, now, ACTIVE_MS);
+        let selected = select_display_candidates(
+            &peers,
+            1,
+            |_| false,
+            |_| None,
+            &speech,
+            &join,
+            now,
+            ACTIVE_MS,
+        );
 
         assert_eq!(
             selected.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
@@ -1419,6 +1517,7 @@ mod tests {
             &peers,
             CUT,
             |p| p == "46",
+            |_| None,
             &HashMap::new(),
             &join,
             now,
@@ -1430,6 +1529,190 @@ mod tests {
             !ids.contains(&"30"),
             "the silent camera-off tail is what gets shed. {ids:?}"
         );
+    }
+
+    #[test]
+    fn selection_keeps_every_pin_ahead_of_speakers_and_cameras() {
+        let (peers, join) = bloated_roster();
+        let now = 1_000_000.0;
+        let mut speech = HashMap::new();
+        speech.insert("45".to_string(), now - 100.0);
+        let rank = |p: &str| match p {
+            "46" => Some(0),
+            "44" => Some(1),
+            _ => None,
+        };
+        let selected = select_display_candidates(
+            &peers,
+            2,
+            |p| p == "45",
+            rank,
+            &speech,
+            &join,
+            now,
+            ACTIVE_MS,
+        );
+        let ids: Vec<&str> = selected.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["46", "44"],
+            "a silent camera-off pin outranks a speaking camera-on peer at the cut"
+        );
+    }
+
+    fn window(
+        pins: &[&str],
+        on: &[&str],
+        budget: usize,
+        requested: &[&str],
+        ceiling: Option<usize>,
+        speech: &HashMap<String, f64>,
+    ) -> CameraWindow {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let join: HashMap<String, f64> = on
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.to_string(), 1.0 + i as f64))
+            .collect();
+        let requested: HashSet<String> = requested.iter().map(|s| s.to_string()).collect();
+        plan_camera_window(
+            CameraWindowInput {
+                pins: &ids(pins),
+                camera_on: ids(on),
+                camera_off: Vec::new(),
+                displayed: on.len(),
+                budget,
+                device_ceiling: ceiling,
+                requested: &requested,
+            },
+            &SpeakerInputs {
+                speech_map: speech,
+                join_map: &join,
+                now_ms: 1_000_000.0,
+                active_ms: ACTIVE_MS,
+            },
+        )
+    }
+
+    fn decoded(ids: &[u64]) -> HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn play_decodes_the_requested_tile_when_pins_fill_the_budget() {
+        let quiet = HashMap::new();
+        let w = window(
+            &["11", "12", "13"],
+            &["11", "12", "13", "15"],
+            1,
+            &["15"],
+            None,
+            &quiet,
+        );
+        assert_eq!(w.bucket, decoded(&[11, 15]));
+        let w = window(
+            &["11", "12", "13", "14"],
+            &["11", "12", "13", "14", "15"],
+            2,
+            &["14"],
+            None,
+            &quiet,
+        );
+        assert_eq!(
+            w.bucket,
+            decoded(&[11, 12, 14]),
+            "PLAY on a paused pin decodes that pin"
+        );
+        assert_eq!(w.decoded, 3);
+    }
+
+    #[test]
+    fn a_play_request_never_takes_a_budget_decoded_pin() {
+        let w = window(
+            &["11", "12"],
+            &["11", "12", "13", "14", "15"],
+            2,
+            &["14", "15"],
+            Some(3),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            w.bucket,
+            decoded(&[11, 12, 14]),
+            "the device ceiling admits one request, and it is not a pin's slot"
+        );
+    }
+
+    #[test]
+    fn an_overflow_speaker_never_takes_a_pin_decode() {
+        let speech: HashMap<String, f64> = [("13".to_string(), 1_000_000.0 - 100.0)].into();
+        let w = window(&["11"], &["11", "12", "13"], 2, &[], None, &speech);
+        assert_eq!(w.tiles[0], "11");
+        assert_eq!(
+            w.bucket,
+            decoded(&[11, 13]),
+            "the speaker displaces the silent unpinned tile"
+        );
+    }
+
+    #[test]
+    fn a_play_request_in_the_overflow_does_not_widen_the_window() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let plan = |requested: &[&str]| {
+            plan_camera_window(
+                CameraWindowInput {
+                    pins: &[],
+                    camera_on: ids(&["1", "2", "3", "4", "5"]),
+                    camera_off: Vec::new(),
+                    displayed: 3,
+                    budget: 2,
+                    device_ceiling: None,
+                    requested: &requested.iter().map(|s| s.to_string()).collect(),
+                },
+                &SpeakerInputs {
+                    speech_map: &HashMap::new(),
+                    join_map: &HashMap::new(),
+                    now_ms: 0.0,
+                    active_ms: ACTIVE_MS,
+                },
+            )
+        };
+        let folded = plan(&["5"]);
+        assert_eq!(
+            folded.decoded, 2,
+            "tile 5 is in the +N overflow (issue 1466)"
+        );
+        assert_eq!(folded.bucket, decoded(&[1, 2]));
+        assert_eq!(
+            plan(&["3"]).decoded,
+            3,
+            "premise: a displayed avatar does widen it"
+        );
+    }
+
+    #[test]
+    fn a_camera_off_pin_takes_a_cell_from_the_camera_on_window() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let w = plan_camera_window(
+            CameraWindowInput {
+                pins: &ids(&["8"]),
+                camera_on: ids(&["1", "2", "3"]),
+                camera_off: ids(&["9", "8"]),
+                displayed: 3,
+                budget: 3,
+                device_ceiling: None,
+                requested: &HashSet::new(),
+            },
+            &SpeakerInputs {
+                speech_map: &HashMap::new(),
+                join_map: &HashMap::new(),
+                now_ms: 0.0,
+                active_ms: ACTIVE_MS,
+            },
+        );
+        assert_eq!(w.camera_off, ids(&["8", "9"]));
+        assert_eq!((w.on_cells, w.decoded), (2, 2));
+        assert_eq!(w.bucket, decoded(&[1, 2]));
     }
 
     #[test]
@@ -1460,6 +1743,7 @@ mod tests {
             &peers,
             CUT,
             |p| cams.iter().any(|c| c == p),
+            |_| None,
             &speech,
             &join,
             now,
@@ -2084,12 +2368,95 @@ mod tests {
 
     #[test]
     fn screen_share_padding_reserves_the_meeting_footer() {
-        assert_eq!(screen_share_padding(0.0), (16.0, 16.0, 112.0, 16.0));
         assert_eq!(
-            screen_share_padding(36.0),
+            screen_share_padding(0.0, false, 1280.0),
+            (16.0, 16.0, 112.0, 16.0)
+        );
+        assert_eq!(
+            screen_share_padding(36.0, false, 1280.0),
             (52.0, 16.0, 112.0, 16.0),
             "the recording bar adds to the top only"
         );
+    }
+
+    #[test]
+    fn row_one_starts_below_the_meeting_timer_chip_only_while_it_is_up() {
+        for (dock, vw, base, band_top) in [
+            (DockPosition::Bottom, 1280.0, 20.0, 60.0),
+            (DockPosition::Left, 1280.0, 20.0, 60.0),
+            (DockPosition::Right, 568.0, 20.0, 60.0),
+            (DockPosition::Bottom, 567.0, 8.0, 56.0),
+            (DockPosition::Left, 375.0, 8.0, 56.0),
+        ] {
+            let (_, top, ..) = grid_padding(dock, vw);
+            assert_eq!(top, base, "premise: {dock:?} at {vw}px");
+            assert_eq!(grid_pad_top(top, vw, 0.0, false), base, "{dock:?} idle");
+            assert_eq!(grid_pad_top(top, vw, 0.0, true), band_top, "{dock:?} timer");
+            assert_eq!(
+                grid_pad_top(top, vw, 40.0, true),
+                band_top + 40.0,
+                "the band stacks under the recording bar"
+            );
+            assert_eq!(screen_share_padding(0.0, false, vw).0, 16.0);
+            assert_eq!(screen_share_padding(0.0, true, vw).0, band_top);
+            assert_eq!(screen_share_padding(32.0, true, vw).0, band_top + 32.0);
+        }
+    }
+
+    #[test]
+    fn unbanded_tile_names_ellipsize_before_the_meeting_timer_chip() {
+        let flat = include_str!("../../static/style.css")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rule = "#grid-container.participants-1:has(> .meeting-timer-chip) \
+                    .grid-item.full-bleed .floating-name \
+                    { max-width: calc(50% - 100px); }";
+        assert!(
+            flat.contains(rule),
+            "a full-bleed tile has no band, so this cap is all that keeps a long name off \
+             the chip"
+        );
+    }
+
+    #[test]
+    fn the_meeting_timer_band_clears_the_expired_chip_at_both_widths() {
+        let style = include_str!("../../static/style.css");
+        let global = include_str!("../../static/global.css");
+        let px = |css: &str, name: &str| -> f64 {
+            let at = css
+                .find(&format!("{name}:"))
+                .unwrap_or_else(|| panic!("no `{name}`"))
+                + name.len()
+                + 1;
+            let v = css[at..at + css[at..].find(';').unwrap()].trim();
+            match v.strip_suffix("rem") {
+                Some(rem) => rem.parse::<f64>().unwrap() * 16.0,
+                None => v.trim_end_matches("px").parse().unwrap(),
+            }
+        };
+        let flat = style.split_whitespace().collect::<Vec<_>>().join(" ");
+        for formula in [
+            "--meeting-timer-chip-h: calc( var(--space-2) * 2 + 4px + max(18px, calc(var(--fs-6) * 1.3)) );",
+            "@media (max-width: 567px) { #grid-container { --meeting-timer-chip-h: \
+             calc(6px * 2 + 4px + max(18px, calc(var(--fs-5) * 1.3)));",
+        ] {
+            assert!(flat.contains(formula), "re-derive the band: `{formula}` changed");
+        }
+
+        let top = px(style, "--top-stack-top");
+        let desktop = px(global, "--space-2") * 2.0 + 4.0 + (px(global, "--fs-6") * 1.3).max(18.0);
+        let mobile = 6.0 * 2.0 + 4.0 + (px(global, "--fs-5") * 1.3).max(18.0);
+        for (clearance, chip) in [
+            (MEETING_TIMER_BAND_CLEARANCE, desktop),
+            (MEETING_TIMER_BAND_CLEARANCE_MOBILE, mobile),
+        ] {
+            let gap = clearance - (top + chip);
+            assert!(
+                (8.0..=12.0).contains(&gap),
+                "row 1 must start 8-12px below the expired chip, not {gap}px"
+            );
+        }
     }
 
     #[test]

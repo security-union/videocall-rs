@@ -140,9 +140,18 @@ async fn setup_ws_and_wt_server(ws_port: u16, wt_port: u16) {
                 .into(),
         },
     };
+    // #2727: two shards, so these run on real arbiters, not the single-shard arm.
+    let shards = std::sync::Arc::new(sec_api::relay_shards::SessionShards::new(2));
     actix_rt::spawn(async move {
-        if let Err(e) =
-            webtransport::start(opt, chat, nats_client, tracker_sender, session_manager).await
+        if let Err(e) = webtransport::start(
+            opt,
+            chat,
+            nats_client,
+            tracker_sender,
+            session_manager,
+            shards,
+        )
+        .await
         {
             eprintln!("WT server error: {e}");
         }

@@ -42,6 +42,24 @@ export interface ReportInput {
   sysstatMissing: boolean;
   rawCsvPath: string;
   derivedCsvPath: string;
+  /** `BOTS_IMAGE_REVISION` baked in by build.sh; `null` outside the fleet image. */
+  imageRevision: string | null;
+}
+
+function revisionLine(rev: string | null): string {
+  if (rev === null || rev === "" || rev === "unknown") {
+    return (
+      "[resource] image revision: not recorded — not running a build.sh-stamped fleet image;" +
+      " figures are not attributable to a source SHA"
+    );
+  }
+  if (rev.endsWith("-dirty")) {
+    return (
+      `[resource] image revision: ${rev} — built from an uncommitted tree;` +
+      " figures are not attributable to that SHA"
+    );
+  }
+  return `[resource] image revision: ${rev}`;
 }
 
 function arrivalLines(spread: ArrivalSpread | null, withAggregates: boolean): string[] {
@@ -91,6 +109,7 @@ export function formatResourceReport(input: ReportInput): string {
   lines.push("──────────────────────────────────────────────────────────────");
   const withoutHostCapture = (note: string): string => {
     lines.push(`${bannerFor(verdict)} (${note})`);
+    lines.push(revisionLine(input.imageRevision));
     if (verdict.starved) for (const r of verdict.reasons) lines.push(`[resource]   - ${r}`);
     lines.push(...arrivalLines(input.arrival, false));
     lines.push("──────────────────────────────────────────────────────────────");
@@ -102,6 +121,7 @@ export function formatResourceReport(input: ReportInput): string {
   if (s.sampleCount === 0) return withoutHostCapture("no resource samples captured");
 
   lines.push(bannerFor(verdict));
+  lines.push(revisionLine(input.imageRevision));
   lines.push(...arrivalLines(input.arrival, true));
   lines.push(
     `[resource] run resource capture — ${s.sampleCount} samples over ${Math.round(s.durationSec)}s`,

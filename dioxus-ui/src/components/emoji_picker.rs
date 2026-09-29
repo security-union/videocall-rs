@@ -138,9 +138,8 @@ const EMOJI_SEARCH_INPUT_ID: &str = "emoji-search-input";
 /// failure, not a cosmetic one) and the first-option focus selector.
 const EMOJI_GRID_ID: &str = "emoji-picker-grid";
 
-/// Viewport width (px) below which the device is treated as a phone. Mirrors
-/// `canvas_generator::is_mobile_viewport`'s threshold so "narrow" means one
-/// thing across the UI.
+/// Viewport width (px) below which the device is treated as a phone, matching
+/// the stylesheets' `max-width: 767px` queries.
 const AUTOFOCUS_MIN_VIEWPORT_WIDTH_PX: f64 = 768.0;
 
 /// Viewport height (px) below which `.reactions-palette` hits its
@@ -430,10 +429,7 @@ fn focus_search_input() {
 /// keyboard nobody asked for.
 ///
 /// FALSE also on a viewport too small to hold the palette comfortably — checked
-/// on BOTH axes, which is the actual bug fixed here. The previous gate was
-/// `!is_mobile_viewport()`, and that helper tests WIDTH only (< 768px): a
-/// landscape phone is 844x390, so it classified as *desktop* and DID autofocus,
-/// into a 390px-tall viewport. That is the worst case, not an exempt one.
+/// on BOTH axes.
 ///
 /// A laptop with a touchscreen reports `(any-pointer: coarse)` but
 /// `(pointer: fine)`, so `pointer_coarse` is false there and it keeps the
@@ -1216,12 +1212,8 @@ mod tests {
         assert!(should_autofocus_search_field(false, 1440.0, 900.0));
         assert!(should_autofocus_search_field(false, 1280.0, 720.0));
 
-        // LANDSCAPE PHONE — the regression this predicate was written for.
-        // 844x390: width alone (the pre-review gate, `!is_mobile_viewport()`,
-        // was `width >= 768`) calls this a DESKTOP and autofocuses into a 390px
-        // viewport, which is the worst case rather than an exempt one. Both the
-        // coarse pointer and the short viewport must independently veto it, so
-        // deleting either clause fails here.
+        // LANDSCAPE PHONE, 844x390: the coarse pointer and the short viewport
+        // must each veto it alone, so deleting either clause fails here.
         assert!(!should_autofocus_search_field(true, 844.0, 390.0));
         assert!(
             !should_autofocus_search_field(false, 844.0, 390.0),
@@ -1300,9 +1292,6 @@ mod tests {
 
     #[test]
     fn palette_is_height_bounded_and_the_keyboard_resizes_the_layout_viewport() {
-        // The palette is `position: fixed`, bottom-anchored, and grows UPWARD, so
-        // without a cap the ~400px picker column runs off the top of a short
-        // viewport and clips the search field, which is first in the column.
         let css = strip_css_comments(SHIPPED_CSS);
         let at = css.get_or_panic(".reactions-palette {");
         let rest = &css[at..];

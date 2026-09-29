@@ -1464,8 +1464,8 @@ pub fn max_layers_for_kind(kind: PrefMediaKind) -> u32 {
 /// A per-peer rendered-tile-size hint pushed by the UI (issue #1256 Phase 1).
 /// `Capped { device_px_h }` = the tile is a fixed-size grid thumbnail of this
 /// device-pixel height, so the receiver may LID the requested simulcast layer to
-/// the smallest layer whose native height covers the tile. `Uncapped` = the tile
-/// is pinned / a screen-share panel (or the peer is unknown), so no size lid is
+/// the smallest layer whose native height covers the tile. `Uncapped` = a
+/// screen-share panel tile (or the peer is unknown), so no size lid is
 /// applied and the chooser's full downlink-driven selection stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileHint {

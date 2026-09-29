@@ -11,14 +11,9 @@
  * at your option.
  */
 
-//! Host-only meeting controls.
-//! Mute, disable video, or kick a single participant; mute/disable-video for all.
-//! Only the meeting host may call these endpoints.
+//! Host-only meeting controls: mute, disable video, kick.
 
-use axum::{
-    extract::{Path, State},
-    Json,
-};
+use axum::{extract::State, Json};
 use videocall_meeting_types::{
     requests::{
         DisableVideoParticipantRequest, KickParticipantRequest, MuteParticipantRequest,
@@ -29,10 +24,12 @@ use videocall_meeting_types::{
 };
 
 use crate::auth::AuthUser;
+use crate::db::participants::KickOutcome;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
+use crate::routes::valid_meeting_id::ValidMeetingId;
 use crate::state::AppState;
 
 /// Strict host-only authorization. Checks that the user is a participant in the meeting with
@@ -55,7 +52,7 @@ async fn require_host(state: &AppState, meeting_id: i32, user_id: &str) -> Resul
 pub async fn mute_participant(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<MuteParticipantRequest>,
 ) -> Result<Json<APIResponse<()>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -101,7 +98,7 @@ pub async fn mute_participant(
 pub async fn mute_all(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
 ) -> Result<Json<APIResponse<()>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -127,7 +124,7 @@ pub async fn mute_all(
 pub async fn disable_video_participant(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<DisableVideoParticipantRequest>,
 ) -> Result<Json<APIResponse<()>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -176,7 +173,7 @@ pub async fn disable_video_participant(
 pub async fn disable_video_all(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
 ) -> Result<Json<APIResponse<()>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -197,19 +194,11 @@ pub async fn disable_video_all(
     Ok(Json(APIResponse::ok(())))
 }
 
-/// `POST /api/v1/meetings/{meeting_id}/kick`.
-///
-/// Host removes a single participant from the meeting. The server:
-///   1. Marks the participant's DB row as `status='kicked'`.
-///   2. Publishes a `PARTICIPANT_KICKED` NATS event with the target user ID.
-///
-/// The kicked participant's client receives the event, shows a toast, and
-/// disconnects. They may rejoin by navigating to the meeting URL again (they
-/// go through the normal join/waiting-room flow).
+/// `POST /api/v1/meetings/{meeting_id}/kick`. Only the owner may kick a host or co-host; a kicked host's entry is suspended.
 pub async fn kick_participant(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<KickParticipantRequest>,
 ) -> Result<Json<APIResponse<()>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -231,8 +220,7 @@ pub async fn kick_participant(
     if body.user_id == user_id {
         return Err(AppError::bad_request("cannot kick yourself"));
     }
-
-    db_participants::kick(&state.db, meeting.id, &body.user_id)
+    let was_host = match db_participants::kick(&state.db, meeting.id, &user_id, &body.user_id)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -240,7 +228,24 @@ pub async fn kick_participant(
                 body.user_id
             );
             AppError::internal("failed to update participant status")
-        })?;
+        })? {
+        KickOutcome::Kicked { was_host } => was_host,
+        KickOutcome::NotAdmitted => return Ok(Json(APIResponse::ok(()))),
+        KickOutcome::NotFound => return Err(AppError::participant_not_in_meeting(&body.user_id)),
+        KickOutcome::CallerNotHost => return Err(AppError::not_host()),
+        KickOutcome::OwnerOnly => return Err(AppError::not_owner()),
+        KickOutcome::CannotKickSelf => return Err(AppError::bad_request("cannot kick yourself")),
+    };
+    if was_host {
+        nats_events::announce_host_change(
+            state.nats.as_ref(),
+            &meeting_id,
+            &body.user_id,
+            &user_id,
+            false,
+        )
+        .await;
+    }
 
     nats_events::publish_host_kick(state.nats.as_ref(), &meeting_id, &body.user_id)
         .await
@@ -276,7 +281,7 @@ const MAX_USER_ID_LEN: usize = 254;
 pub async fn transfer_host(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<TransferHostRequest>,
 ) -> Result<Json<APIResponse<()>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)

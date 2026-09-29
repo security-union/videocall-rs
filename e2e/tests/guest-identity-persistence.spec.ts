@@ -2,7 +2,7 @@ import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwrig
 import { generateSessionToken } from "../helpers/auth";
 import {
   BROWSER_ARGS,
-  DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
+  PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
   createAuthenticatedContext,
 } from "../helpers/auth-context";
 import { waitForVisibleState } from "../helpers/visible-state";
@@ -206,7 +206,7 @@ test.describe("Guest per-meeting identity persistence", () => {
         baseURL: uiURL,
         ignoreHTTPSErrors: true,
       });
-      await guestContext.addInitScript(DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
+      await guestContext.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
       // A second meeting's id, which nothing in this session can rewrite: only
       // the prefix sweep the fix removed can make it disappear.
       const decoyKey = idKey(`${meetingId}_other`);

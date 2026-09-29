@@ -34,7 +34,7 @@ use crate::{
         session::Message,
     },
     models::build_subject_and_queue,
-    session_manager::{SessionEndResult, SessionManager},
+    session_manager::SessionManager,
 };
 
 use actix::{
@@ -65,6 +65,10 @@ use crate::metrics::{
     RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL, RELAY_VIEWPORT_SET_SIZE,
     RELAY_VIEWPORT_UPDATES_TOTAL,
 };
+use videocall_meeting_types::presence::{
+    HeartbeatSession, PresenceHeartbeat, PRESENCE_HEARTBEAT_INTERVAL_SECS,
+    PRESENCE_HEARTBEAT_MAX_SESSIONS, PRESENCE_HEARTBEAT_SUBJECT,
+};
 use videocall_types::protos::downlink_congestion_packet::DownlinkCongestionPacket;
 use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry as LayerHintEntry;
 use videocall_types::protos::layer_hint_packet::LayerHintPacket;
@@ -92,46 +96,22 @@ struct ExecutePendingDeparture {
     /// is not unique across same-user multi-session participants.
     instance_key: String,
     display_name: String,
-    is_host: bool,
-    end_on_host_leave: bool,
 }
 
 /// NATS subject for cross-server stale session eviction.
 const EVICT_INSTANCE_SUBJECT: &str = "internal.evict_instance";
 
-/// NATS subject for fanout of per-meeting policy flag changes from
-/// `meeting-api`. Mirrors [`EVICT_INSTANCE_SUBJECT`]: JSON payload over a
-/// non-protobuf internal channel, consumed by every chat_server instance to
-/// keep the in-memory `room_policy` cache fresh after PATCH /meetings.
-///
-/// This is intentionally a **separate** subject from the client-facing
-/// `MEETING_SETTINGS_UPDATED` protobuf event published in
-/// `meeting-api/src/nats_events.rs`: that one tells clients to re-fetch
-/// settings via REST, this one tells servers to refresh their cached
-/// policy without a DB round-trip on host disconnect.
-const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated";
-
 /// NATS subject (meeting-api -> chat_server) carrying per-participant host-flag
-/// changes from transfer-host. `is_host` is cached per member at JoinRoom, so
-/// without this fanout a mid-meeting change leaves the presence map stale — and
-/// the host-leave→end continuity check (which counts present hosts from that
-/// map) reads the wrong flag. JSON over an internal subject, like
-/// [`MEETING_SETTINGS_UPDATE_SUBJECT`]; publisher in `meeting-api/src/nats_events.rs`.
+/// changes (transfer-host, co-host grant/revoke/kick). `is_host` is cached per
+/// member at JoinRoom, so without this fanout a mid-meeting change leaves the
+/// presence map — and the host-only packet gate [`session_is_room_host`] — stale.
+/// JSON over an internal subject; publisher in `meeting-api/src/nats_events.rs`.
 const MEETING_HOST_CHANGE_SUBJECT: &str = "internal.meeting_host_changed";
 
-/// NATS subject for chat_server -> meeting-api notifications that a host
-/// just left a meeting whose `end_on_host_leave=true` policy fired. The
-/// meeting-api consumer writes `state='ended'` to the DB so the meetings
-/// list reflects the same authoritative outcome the clients see in their
-/// MEETING_ENDED broadcast.
-///
-/// This event ONLY fires on the legitimate broadcast path inside
-/// [`ChatServer::leave_rooms`] — never from the [`Disconnect`] handler
-/// directly, and never from the deferred-departure timer callback before
-/// it has actually decided to broadcast. The reconnect grace period is
-/// honored automatically: if the host reconnects within
-/// [`RECONNECT_GRACE_PERIOD`], `ExecutePendingDeparture` is cancelled
-/// before `leave_rooms` runs, so this event is never published.
+/// Legacy subject for a relay reporting that it ended a meeting on a host
+/// departure. This relay never publishes it — meeting-api decides from
+/// [`PARTICIPANT_PRESENCE_SUBJECT`] instead; tests subscribe to prove that.
+#[cfg(test)]
 const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 
 /// NATS subject for chat_server -> meeting-api notifications that a room just
@@ -147,92 +127,29 @@ const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 /// In both cases the event is emitted only when the in-memory `room_members`
 /// count for the room reaches zero — exactly once per room-becomes-empty, not
 /// once per disconnect (the actor is single-threaded, so only the departure that
-/// drains the Vec to empty observes `is_empty()`). It is deliberately NOT
-/// emitted on the host-leave-ends-meeting path, where MEETING_ENDED +
-/// [`MEETING_ENDED_BY_HOST_SUBJECT`] fire instead and `ended` (terminal) must
-/// win. A non-ending host leave (`end_on_host_leave=false`) is treated as a
-/// normal departure and DOES contribute to this transition.
+/// drains the Vec to empty observes `is_empty()`). A host's departure is a
+/// normal departure here too.
 ///
-/// The consumer's `set_idle` guards on `state='active'`, so an idle event that
-/// races a host-leave END is harmless in either ordering.
+/// meeting-api keeps the meeting active while anyone is present, since this
+/// relay sees only its own binary's copy of the room.
 const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 
-/// NATS subject for chat_server -> meeting-api notifications that a SINGLE
-/// participant's session left a room. The meeting-api consumer marks that
-/// participant `status='left', left_at=NOW()` in the `meeting_participants`
-/// table so a participant who disconnected WITHOUT calling the REST `/leave`
-/// endpoint (closed tab / network drop / crash) stops being counted as present
-/// by the meeting-settings "Activity" participant count (issue #1551).
-///
-/// Fired from the per-peer departure point inside [`ChatServer::leave_rooms`] —
-/// the same place that broadcasts the client-facing `PARTICIPANT_LEFT` packet —
-/// so it inherits that path's lifecycle guarantees:
-///   - It runs ONLY after the [`RECONNECT_GRACE_PERIOD`] (via
-///     `ExecutePendingDeparture`, which a timely reconnect cancels) or on an
-///     explicit `Leave`, so a brief disconnect+reconnect never reaches it.
-///   - It is suppressed when the departing user still has ANOTHER live session
-///     in the room (multi-tab, or a different tab that reconnected after the
-///     grace expired): we publish only when `room_members` for the room — the
-///     actor-synchronous authoritative presence map — has NO remaining session
-///     for that `user_id`. This closes the late-event race where a per-user
-///     mark-left could otherwise stomp a still-present session, because the DB
-///     row is keyed by `user_id`, not session.
-///
-/// Scale / fan-out cost. Unlike [`MEETING_BECAME_EMPTY_SUBJECT`] — which is
-/// COALESCED to fire exactly once per room-drain — this is per departing user
-/// and is NOT coalesced. A mass disconnect of N participants is therefore an
-/// O(N) fan-out: N publishes on this subject (matching the per-peer
-/// `PARTICIPANT_LEFT` client broadcast volume the relay already sustains) PLUS,
-/// on the meeting-api side, N additional DB round-trips the client broadcast
-/// does NOT incur — one `get_by_room_id` SELECT and one single-row UPDATE per
-/// event, processed serially by the single-subscriber consumer. This is bounded
-/// and acceptable at realistic room sizes (the per-event work is two indexed
-/// queries), and per-event delivery is required because each row is keyed by a
-/// distinct `user_id` — a single coalesced room event could not carry which
-/// users to mark left. It is a deliberate, defensible design choice, not a
-/// zero-incremental-cost one; batching is intentionally out of scope here.
+/// Pre-#2702 per-user departure report, still published for a meeting-api
+/// that predates [`PARTICIPANT_PRESENCE_SUBJECT`]. Sent only when the user has
+/// no other local session left in the room.
 const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
 
-/// NATS subject for chat_server -> meeting-api notifications that a SINGLE
-/// participant's session became PRESENT in a room (issue #1628). This is the
-/// symmetric counterpart to [`PARTICIPANT_LEFT_SUBJECT`]: the meeting-api
-/// consumer marks that participant `status='admitted', left_at=NULL` in the
-/// `meeting_participants` table AND re-activates the meeting
-/// (`idle -> active`), so a participant who (re)connected over the TRANSPORT
-/// without re-hitting the REST `/join` endpoint is correctly counted as
-/// present and the meeting is not left stuck `idle` with people in it.
-///
-/// ## Why this is needed (the asymmetry it closes)
-///
-/// Before #1628 the presence model was asymmetric: the transport
-/// disconnect path published [`PARTICIPANT_LEFT_SUBJECT`] (→ DB mark-left +
-/// empty→`set_idle`), but RE-activation only ever happened on a REST
-/// `/join`. After a >grace transport drop the room goes empty
-/// (→ `set_idle` → `idle`) and the participant row is marked `left`; a
-/// transport-only reconnect repopulates the relay's in-memory `room_members`
-/// but writes NOTHING to the DB — so the meeting stayed `idle` with a present
-/// participant and a `participant_count` of 0. This event makes the DB roster
-/// track the relay's authoritative `room_members` SYMMETRICALLY.
-///
-/// Fired from the [`ActivateConnection`] handler — the point a session is
-/// elected Testing→Active and announces itself with `PARTICIPANT_JOINED`. It
-/// fires for genuine first joins AND for reconnections-after-grace (a
-/// reconnection runs `JoinRoom` + `ActivateConnection` under a fresh
-/// `session_id`). Unlike the client-facing `PARTICIPANT_JOINED` broadcast,
-/// which is SUPPRESSED for reconnections, this DB-present mark fires on
-/// reconnection too — that is precisely the stuck-idle case it heals.
-///
-/// Idempotent and race-safe on the consumer side: `mark_present_by_connect`
-/// only flips rows that are not already present, and the re-activation calls
-/// `reactivate_from_idle` (an atomic `UPDATE … SET state='active' WHERE
-/// state='idle'`), NOT `activate()`. `activate()` would re-open an `ended`
-/// meeting; `reactivate_from_idle`'s `WHERE state='idle'` predicate matches
-/// zero rows when the row is `ended`, so a late present event racing a host
-/// `end_meeting` can never resurrect it — `ended` is terminal and wins the
-/// end-vs-present race in either ordering. Like [`PARTICIPANT_LEFT_SUBJECT`]
-/// it is per-user and NOT coalesced; a join wave is an O(N) fan-out, matching
-/// the per-peer `PARTICIPANT_JOINED` volume the relay already sustains.
+/// Pre-#2702 per-user presence report (issue #1628), still published for a
+/// meeting-api that predates [`PARTICIPANT_PRESENCE_SUBJECT`].
 const PARTICIPANT_PRESENT_SUBJECT: &str = "internal.participant_present";
+
+/// NATS subject on which this relay reports, per session, that a participant
+/// became present or left (issue #2702). Every report goes through the single
+/// ordered publisher (`ChatServer::presence_tx`), so a session's PRESENT always
+/// precedes its LEFT on the wire. When the session a relay last reported for a
+/// user departs while another of that user's local sessions remains, the relay
+/// reports the remaining session PRESENT instead of a LEFT.
+const PARTICIPANT_PRESENCE_SUBJECT: &str = "internal.participant_presence";
 
 /// Payload published to NATS for cross-server stale session eviction.
 /// When a client reconnects (possibly to a different server), the new server
@@ -245,72 +162,39 @@ struct EvictInstancePayload {
     new_session_id: SessionId,
 }
 
-/// Payload for [`MEETING_SETTINGS_UPDATE_SUBJECT`].
-///
-/// Carries the four per-meeting policy flags that determine server-side
-/// behavior (host-leave handling, waiting room admission gating, guest
-/// access). Each field is present so a single payload can refresh the
-/// full policy snapshot — the chat_server consumer overwrites all of
-/// them rather than merging field-by-field, so the meeting-api publisher
-/// must always send the post-update authoritative values.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct MeetingSettingsUpdatePayload {
-    room_id: String,
-    end_on_host_leave: bool,
-    admitted_can_admit: bool,
-    waiting_room_enabled: bool,
-    allow_guests: bool,
-}
-
-/// Payload for [`MEETING_ENDED_BY_HOST_SUBJECT`].
-///
-/// Sent from chat_server to meeting-api when a host leaves a meeting whose
-/// `end_on_host_leave=true` policy fired and `MEETING_ENDED` was broadcast
-/// to peers. The meeting-api consumer writes `state='ended'` for the
-/// matching `room_id` so the meetings list stays consistent with the
-/// clients' view of the meeting.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct MeetingEndedByHostPayload {
-    room_id: String,
-}
-
 /// Payload for [`MEETING_BECAME_EMPTY_SUBJECT`].
 ///
 /// Sent from chat_server to meeting-api when the last present participant left a
 /// room whose meeting did NOT end. The meeting-api consumer looks up the meeting
 /// by `room_id` and transitions its DB row to `state='idle'` (no-op if the
-/// meeting already ended). Mirrors [`MeetingEndedByHostPayload`] — a single
-/// `room_id` field, JSON over an internal subject.
+/// meeting already ended). A single `room_id` field, JSON over an internal
+/// subject.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MeetingBecameEmptyPayload {
     room_id: String,
 }
 
 /// Payload for [`PARTICIPANT_LEFT_SUBJECT`].
-///
-/// Sent from chat_server to meeting-api when a single participant's session left
-/// a room and that participant has no other live session in the room. The
-/// meeting-api consumer marks `(room_id, user_id)` as `status='left',
-/// left_at=NOW()` so the DB roster reflects live presence. Carries `user_id`
-/// (which the `meeting_participants` rows are keyed by, alongside `meeting_id`).
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct ParticipantLeftPayload {
     room_id: String,
     user_id: String,
 }
 
-/// Payload for [`PARTICIPANT_PRESENT_SUBJECT`] (issue #1628).
-///
-/// Sent from chat_server to meeting-api when a participant's session became
-/// PRESENT in a room (a fresh join or a transport reconnect). The meeting-api
-/// consumer marks `(room_id, user_id)` as `status='admitted', left_at=NULL`
-/// and re-activates the meeting (`idle -> active`). Mirrors
-/// [`ParticipantLeftPayload`] — carries the `(room_id, user_id)` the
-/// `meeting_participants` rows are keyed by.
+/// Payload for [`PARTICIPANT_PRESENT_SUBJECT`].
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct ParticipantPresentPayload {
     room_id: String,
     user_id: String,
+}
+
+/// Payload for [`PARTICIPANT_PRESENCE_SUBJECT`].
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+struct ParticipantPresencePayload {
+    room_id: String,
+    user_id: String,
+    session_id: SessionId,
+    present: bool,
 }
 
 /// Payload for [`MEETING_HOST_CHANGE_SUBJECT`]: one per-user host-flag delta
@@ -331,18 +215,10 @@ struct EvictInstance(EvictInstancePayload);
 
 /// Internal actix message for a [`MEETING_HOST_CHANGE_SUBJECT`] payload. Flips
 /// the cached `is_host` on every session of the affected user so host-gated
-/// logic and the host-leave continuity check see the fresh value without a DB
-/// round-trip.
+/// logic sees the fresh value without a DB round-trip.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct UpdateMemberHostFlag(MeetingHostChangePayload);
-
-/// Internal actix message delivered when a `MEETING_SETTINGS_UPDATE_SUBJECT`
-/// payload is received. Updates the `room_policy` cache so the next host
-/// disconnect reads the freshest policy values without hitting the DB.
-#[derive(ActixMessage)]
-#[rtype(result = "()")]
-struct UpdateRoomPolicy(MeetingSettingsUpdatePayload);
 
 /// Internal actix message to update a room member's display name.
 /// Sent from the per-session NATS subscription loop when a
@@ -391,8 +267,8 @@ struct PendingDepartureState {
 /// INERT roster observer mirrored from the OTHER relay binary's PARTICIPANT_
 /// JOINED broadcast (Stage A). Remote rows participate ONLY in the Stage-B
 /// layer-union computation; every other decision site filters to `Local` so the
-/// presence of a remote row never alters teardown, host-leave, DB mark-left, or
-/// announce behaviour. Defaults to `Local` so every existing constructor (the
+/// presence of a remote row never alters teardown, the host gate, DB mark-left,
+/// or announce behaviour. Defaults to `Local` so every existing constructor (the
 /// `JoinRoom` add-site and all test seeds) keeps producing local rows with no
 /// code change — `Remote` is created ONLY by the mirror handler.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -412,13 +288,6 @@ struct RoomMemberInfo {
     /// Whether this row was seeded locally (`JoinRoom`) or mirrored from the
     /// other relay binary over NATS (issue #1202). See [`MemberOrigin`].
     origin: MemberOrigin,
-    /// **Note:** this field is captured from the JWT at JoinRoom time and is
-    /// retained for backward compatibility with [`Disconnect`] / [`Leave`]
-    /// handlers that still propagate the per-session value. It can become
-    /// stale if the host PATCHes meeting settings mid-call. The freshest
-    /// value lives in [`ChatServer::room_policy`] and is read at
-    /// host-disconnect time inside [`ChatServer::leave_rooms`].
-    end_on_host_leave: bool,
 }
 
 /// Apply a host-flag change to every session of a user in a room's member slice
@@ -494,12 +363,6 @@ fn apply_member_host_flag(members: &mut [RoomMemberInfo], user_id: &str, is_host
 /// `internal.meeting_host_changed` fanout, which no client can publish to — so
 /// once a transfer has been observed for a user, no amount of reconnecting with
 /// a stale token can talk this gate out of it.
-///
-/// Deliberately scoped to THIS gate rather than applied to the `JoinRoom` seed
-/// itself: rewriting that seed would also change `was_last_present_host`, and
-/// therefore the host-leave → MEETING_ENDED decision, which is a much larger
-/// blast radius than this feature should carry. The seed keeps its existing
-/// behaviour; only the authorization answer consults the override.
 fn session_is_room_host(
     members: &[RoomMemberInfo],
     session: SessionId,
@@ -516,15 +379,6 @@ fn session_is_room_host(
         })
 }
 
-/// Whether a departing session was the LAST present host, given the room's
-/// members AFTER the departing session was removed. A host may hold several
-/// sessions; "ends when the host leaves" must fire only when none remain.
-/// `was_host` is the departing session's own flag. Factored out of
-/// [`ChatServer::leave_rooms`] for unit tests.
-fn was_last_present_host(remaining_members: &[RoomMemberInfo], was_host: bool) -> bool {
-    was_host && !remaining_members.iter().any(|m| m.is_host)
-}
-
 /// Whether `user_id` still has at least one live session in the room AFTER the
 /// departing session was removed from `remaining_members`. Used to SUPPRESS the
 /// per-participant `PARTICIPANT_LEFT` DB mark-left (issue #1551) when a user has
@@ -534,6 +388,30 @@ fn was_last_present_host(remaining_members: &[RoomMemberInfo], was_host: bool) -
 /// [`ChatServer::leave_rooms`] for unit tests.
 fn user_has_remaining_session(remaining_members: &[RoomMemberInfo], user_id: &str) -> bool {
     remaining_members.iter().any(|m| m.user_id == user_id)
+}
+
+/// The heartbeats renewing every reported session, one or more per room: a
+/// room larger than [`PRESENCE_HEARTBEAT_MAX_SESSIONS`] is split.
+fn presence_heartbeats(
+    reported: &HashMap<String, HashMap<String, SessionId>>,
+) -> Vec<PresenceHeartbeat> {
+    let mut heartbeats = Vec::new();
+    for (room, users) in reported {
+        let sessions: Vec<HeartbeatSession> = users
+            .iter()
+            .map(|(user_id, session)| HeartbeatSession {
+                user_id: user_id.clone(),
+                session_id: *session,
+            })
+            .collect();
+        for chunk in sessions.chunks(PRESENCE_HEARTBEAT_MAX_SESSIONS) {
+            heartbeats.push(PresenceHeartbeat {
+                room_id: room.clone(),
+                sessions: chunk.to_vec(),
+            });
+        }
+    }
+    heartbeats
 }
 
 /// Whether a room's member slice holds NO LOCAL-origin row (issue #1705 / #1202).
@@ -549,38 +427,15 @@ fn slice_is_locally_empty(members: &[RoomMemberInfo]) -> bool {
     !members.iter().any(|m| m.origin == MemberOrigin::Local)
 }
 
-/// Cached per-room policy flags. Populated at first JoinRoom for the room and
-/// refreshed on `MEETING_SETTINGS_UPDATE_SUBJECT` NATS events from
-/// `meeting-api`.
-///
-/// This cache exists so the host-disconnect path can read the current
-/// `end_on_host_leave` (and the other three flags, for future use) without a
-/// DB round-trip — `actix-api` has no `sqlx::PgPool` at runtime, all
-/// authoritative meeting state lives in `meeting-api`. See
-/// [`MEETING_SETTINGS_UPDATE_SUBJECT`].
-#[derive(Clone, Debug)]
-struct RoomPolicy {
-    end_on_host_leave: bool,
-    #[allow(dead_code)]
-    admitted_can_admit: bool,
-    #[allow(dead_code)]
-    waiting_room_enabled: bool,
-    #[allow(dead_code)]
-    allow_guests: bool,
-}
-
 /// Context passed to [`ChatServer::leave_rooms`] describing the session that
-/// is departing and the policies that govern what side-effects should fire.
-/// Bundling these into a struct avoids a long positional argument list and
-/// makes each call site self-documenting.
+/// is departing. Bundling these into a struct avoids a long positional
+/// argument list and makes each call site self-documenting.
 pub struct LeaveContext<'a> {
     pub session_id: &'a SessionId,
     pub room: Option<&'a str>,
     pub user_id: Option<&'a str>,
     pub display_name: Option<&'a str>,
     pub observer: bool,
-    pub is_host: bool,
-    pub end_on_host_leave: bool,
 }
 
 /// Per-session viewport state (HCL issue #988): the set of source
@@ -1349,7 +1204,7 @@ pub struct ChatServer {
     connection_states: HashMap<SessionId, ConnectionState>,
     /// Track which sessions are in which room, with their user_id, display_name,
     /// and host status. Used to send PARTICIPANT_JOINED for existing peers to
-    /// new joiners and to determine host-leave behavior.
+    /// new joiners and to gate host-only packets.
     room_members: HashMap<String, Vec<RoomMemberInfo>>,
     /// Persistent round-robin index for the bounded room-metric sweep (#1284).
     ///
@@ -1381,12 +1236,21 @@ pub struct ChatServer {
     /// prior periodic snapshot semantics while bounded continuations add only the
     /// cycle's mailbox scheduling time.
     layer_preference_sweep_remaining: usize,
-    /// Per-room policy flag cache. Refreshed by
-    /// [`MEETING_SETTINGS_UPDATE_SUBJECT`] events so toggles like
-    /// `end_on_host_leave` take effect mid-meeting without requiring a host
-    /// reconnect. Read by [`ChatServer::leave_rooms`] when deciding whether
-    /// to broadcast `MEETING_ENDED`. See [`RoomPolicy`].
-    room_policy: HashMap<String, RoomPolicy>,
+    /// Sender half of the FIFO feeding the single task that publishes
+    /// [`PARTICIPANT_PRESENCE_SUBJECT`] and the departure reports, so NATS
+    /// sees them in the order this actor produced them.
+    presence_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+    /// Publishes queued on [`Self::presence_tx`] not yet drained by the
+    /// publisher task. The heartbeat tick skips queuing more while this is
+    /// above zero, instead of piling onto an already-backed-up channel.
+    presence_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Per room, per user: the local session this relay last reported present
+    /// on [`PARTICIPANT_PRESENCE_SUBJECT`]. Only that session's departure is
+    /// reported, and each heartbeat renews these sessions.
+    reported_present: HashMap<String, HashMap<String, SessionId>>,
+    /// Period of the [`PRESENCE_HEARTBEAT_SUBJECT`] heartbeat, armed in
+    /// [`Actor::started`].
+    presence_heartbeat_interval: std::time::Duration,
     /// Authoritative per-`(room, user_id)` host flags observed on the
     /// `internal.meeting_host_changed` fanout (issue #2136).
     ///
@@ -1399,8 +1263,14 @@ pub struct ChatServer {
     /// Absent entry = "no transfer observed for this user", which correctly
     /// falls back to the JoinRoom-seeded flag. Evicted with the rest of a room's
     /// caches in [`ChatServer::forget_room_if_empty`], so it is bounded by live
-    /// rooms exactly as `room_policy` is.
+    /// rooms.
     room_host_overrides: HashMap<String, HashMap<String, bool>>,
+    /// Rooms in which THIS binary has taken a local session `Testing -> Active`
+    /// since the room's `room_members` entry was created (issue #2711). Written
+    /// only by [`Handler<ActivateConnection>`], read only by the
+    /// never-activated-expiry branch of [`Handler<ExecutePendingDeparture>`],
+    /// and evicted on both edges that drop a `room_members` entry.
+    rooms_with_activated_local_member: HashSet<String>,
     /// Pending departures keyed by `(room_id, user_id, instance_key)`, where
     /// `instance_key` is the client's `instance_id` if it supplied one, else the
     /// sentinel `"__session__:<session_id>"`. `instance_id` is client-supplied,
@@ -1577,7 +1447,27 @@ pub struct ChatServer {
 
 impl ChatServer {
     pub async fn new(nats_connection: async_nats::client::Client) -> Self {
+        let (presence_tx, mut presence_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+        let presence_pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let publisher = nats_connection.clone();
+        let drain_pending = presence_pending.clone();
+        tokio::spawn(async move {
+            while let Some((subject, payload)) = presence_rx.recv().await {
+                if let Err(e) = publisher.publish(subject.clone(), payload.into()).await {
+                    error!("Failed to publish ordered {}: {}", subject, e);
+                }
+                // Decremented either way: the message left the queue.
+                drain_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
         ChatServer {
+            presence_tx,
+            presence_pending,
+            reported_present: HashMap::new(),
+            presence_heartbeat_interval: std::time::Duration::from_secs(
+                PRESENCE_HEARTBEAT_INTERVAL_SECS,
+            ),
             nats_connection,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
@@ -1587,8 +1477,8 @@ impl ChatServer {
             layer_preference_sweep_rooms: VecDeque::new(),
             layer_preference_sweep_queued: HashSet::new(),
             layer_preference_sweep_remaining: 0,
-            room_policy: HashMap::new(),
             room_host_overrides: HashMap::new(),
+            rooms_with_activated_local_member: HashSet::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
             instance_index: HashMap::new(),
@@ -1620,8 +1510,6 @@ impl ChatServer {
             user_id,
             display_name,
             observer,
-            is_host,
-            end_on_host_leave,
         } = leave_ctx;
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
@@ -1652,41 +1540,11 @@ impl ChatServer {
             }
         }
 
-        // Resolve the freshest `end_on_host_leave` value BEFORE we mutate
-        // `room_members`. Reading from `room_policy` here closes the
-        // cache-staleness window left open by the JoinRoom-time JWT capture:
-        // mid-meeting PATCH /meetings updates land via
-        // `MEETING_SETTINGS_UPDATE_SUBJECT` and refresh `room_policy`, so this
-        // lookup sees the post-toggle value even though the host's session
-        // still carries the old JWT-time flag in `Disconnect`.
-        //
-        // Falls back to the per-session parameter (which is itself set from
-        // the JWT) only when the cache has no entry — the cache is populated
-        // at first JoinRoom for the room, so the only realistic gap is the
-        // `Leave` handler in tests / synthetic flows where no policy has
-        // ever been pushed. The result is "no worse than today" in that
-        // window.
-        let effective_end_on_host_leave = match room {
-            Some(r) => self
-                .room_policy
-                .get(r)
-                .map(|p| p.end_on_host_leave)
-                .unwrap_or(end_on_host_leave),
-            None => end_on_host_leave,
-        };
-
-        // Remove from room_members tracking, then defer the empty-room
-        // policy-cache cleanup to the shared helper. We deliberately do NOT
-        // treat "no entry in room_members" as room-empty-now: the cache may
-        // have been seeded by a `MEETING_SETTINGS_UPDATE_SUBJECT` event
-        // before the first JoinRoom, and a stale `Leave` / `Disconnect` for
-        // that room must not wipe the legitimately-cached policy.
         self.session_room.remove(session_id);
 
         // Track whether THIS removal drained the room to empty. We read the
         // count from `room_members` — the in-memory, actor-synchronous presence
-        // map — which is the same authoritative source the host-leave→end path
-        // uses. Because the chat_server actor processes one message at a time,
+        // map. Because the chat_server actor processes one message at a time,
         // exactly one `leave_rooms` call can observe the Vec transition from
         // non-empty to empty: during a mass-disconnect (reconnection wave) the
         // N departures are serialized, and only the last one sees
@@ -1694,28 +1552,10 @@ impl ChatServer {
         // fire ONCE per room-becomes-empty rather than once per disconnect, so
         // there is no O(n) NATS storm.
         let mut room_became_empty = false;
-        // Whether THIS departure was the last present host. Computed AFTER
-        // `members.retain(...)` removes the departing session, so a host with
-        // another live session keeps `is_host` in the remaining set and the
-        // meeting stays alive (multi-session).
-        //
-        // This path runs only via `ExecutePendingDeparture` (post grace) or an
-        // explicit `Leave`, so a timely reconnect cancels it first. The actor is
-        // single-threaded, so exactly one departure sees the host count hit zero
-        // and the end-meeting broadcast fires once.
-        let mut was_last_host = false;
-        // Whether the departing user STILL has another live session in this room
-        // AFTER removing the departing session. Computed from the same
-        // post-removal `room_members` slice as `was_last_host`. When true, the
-        // user is still present (another tab / multi-session) and the
-        // per-participant `PARTICIPANT_LEFT` DB mark-left (issue #1551) MUST be
-        // suppressed — the DB row is keyed by `user_id`, so marking it left
-        // would wrongly drop a still-present user from the participant count.
-        // `true` is the SAFE default (suppress) when we can't read membership;
-        // we only ever publish mark-left when we positively observe no remaining
-        // session for this user. Defaults `false` here and is set to `true` only
-        // when a remaining same-user session is found.
+        // Whether the departing user still has another local session in this
+        // room, which suppresses the legacy per-user PARTICIPANT_LEFT_SUBJECT.
         let mut user_still_present = false;
+        let mut presence_report = None;
         if let Some(room_id) = room {
             if self.room_members.contains_key(room_id) {
                 // Remove the departing session FIRST (a write; session ids are
@@ -1723,22 +1563,18 @@ impl ChatServer {
                 if let Some(members) = self.room_members.get_mut(room_id) {
                     members.retain(|m| m.session != *session_id);
                 }
-                // c1/c2/c3 (#1202): these reads must see ONLY local-origin rows —
+                // c1/c3 (#1202): these reads must see ONLY local-origin rows —
                 // a mirrored Remote row from the other relay binary must never
-                // suppress teardown (c1), flip the host-leave decision (c2), or
-                // suppress the per-user DB mark-left (c3). All three route through
-                // the `local_members`/`local_is_empty` chokepoint so "filter to
-                // Local" is the centralized default, not a per-site choice. c2/c3
-                // keep their `&[RoomMemberInfo]` helper signatures (the production
-                // fns called here) fed the local-only slice via `.collect()`.
+                // suppress teardown (c1) or the per-user DB mark-left (c3). Both
+                // route through the `local_members`/`local_is_empty` chokepoint.
                 room_became_empty = self.local_is_empty(room_id);
                 let local: Vec<RoomMemberInfo> = self.local_members(room_id).cloned().collect();
-                was_last_host = was_last_present_host(&local, is_host);
                 if let Some(departing_uid) = user_id {
                     user_still_present = user_has_remaining_session(&local, departing_uid);
                 }
-            } else {
-                was_last_host = is_host;
+            }
+            if let (false, Some(departing_uid)) = (observer, user_id) {
+                presence_report = self.presence_after_departure(room_id, departing_uid);
             }
             self.forget_room_if_empty(room_id);
 
@@ -1771,259 +1607,154 @@ impl ChatServer {
             }
         }
 
-        // End session using SessionManager
         if let (Some(room_id), Some(uid)) = (room, user_id) {
-            let room_id = room_id.to_string();
-            let user_id = uid.to_string();
-            let display_name = display_name.unwrap_or(uid).to_string();
+            let display_name = display_name.unwrap_or(uid);
             let is_guest = self.session_is_guest.remove(session_id).unwrap_or(false);
-            let session_manager = self.session_manager.clone();
-            let nc = self.nats_connection.clone();
-            let session_id_val = *session_id;
 
             // Observer sessions (waiting room) should not publish PARTICIPANT_LEFT
             // since they were never real participants in the meeting.
             if observer {
                 info!(
                     "Observer session {} for {} leaving room {} - skipping PARTICIPANT_LEFT",
-                    session_id_val, user_id, room_id
+                    session_id, uid, room_id
                 );
-                tokio::spawn(async move {
-                    if let Err(e) = session_manager.end_session(&room_id, &user_id).await {
-                        error!("Error ending observer session for room {}: {}", room_id, e);
-                    }
-                });
                 return;
             }
 
-            if let Some(state) = self.connection_states.get(session_id) {
-                if *state != ConnectionState::Active {
-                    info!(
-                        "Skipping PARTICIPANT_LEFT for non-active session {}",
-                        session_id
-                    );
-                    return;
-                }
-            }
-
-            tokio::spawn(async move {
-                // Per-participant DB mark-left backstop (issue #1551). Tell
-                // meeting-api to set this participant `status='left',
-                // left_at=NOW()` so a disconnect that did NOT go through the
-                // REST `/leave` endpoint (closed tab / network drop / crash)
-                // stops being counted as present by the meeting-settings
-                // "Activity" participant count. Fired here — at the same
-                // post-grace, active-session departure point as the
-                // client-facing PARTICIPANT_LEFT broadcast below — so it
-                // inherits the reconnect-grace debounce. SUPPRESSED when the
-                // user still has another live session in the room
-                // (`user_still_present`), because the DB row is keyed by
-                // user_id and marking it left would drop a still-present user.
-                // Fires on every real departure branch (including the
-                // host-leave-ends-meeting path, where the host must also be
-                // recorded as no longer present). Best-effort: a publish error
-                // is logged and does not block the rest of the teardown. The
-                // consumer's UPDATE is idempotent and reconnect-safe (see
-                // db::participants::mark_left_by_disconnect).
-                if !user_still_present {
-                    let payload = ParticipantLeftPayload {
-                        room_id: room_id.clone(),
-                        user_id: user_id.clone(),
-                    };
-                    match serde_json::to_vec(&payload) {
-                        Ok(json) => {
-                            if let Err(e) = nc.publish(PARTICIPANT_LEFT_SUBJECT, json.into()).await
-                            {
-                                error!(
-                                    "Failed to publish {} for room {} user {}: {}",
-                                    PARTICIPANT_LEFT_SUBJECT, room_id, user_id, e
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize ParticipantLeftPayload: {}", e);
-                        }
-                    }
-                } else {
+            let active = self
+                .connection_states
+                .get(session_id)
+                .is_none_or(|state| *state == ConnectionState::Active);
+            if active {
+                info!("Participant {} left room {}", uid, room_id);
+                // Client PARTICIPANT_LEFT first: any MEETING_ENDED meeting-api
+                // sends in response then reaches subscribers after the tile removal.
+                self.publish_ordered(
+                    format!("room.{}.system", room_id.replace(' ', "_")),
+                    SessionManager::build_peer_left_packet(
+                        room_id,
+                        uid,
+                        *session_id,
+                        display_name,
+                        is_guest,
+                    ),
+                );
+                if user_still_present {
                     info!(
                         "Suppressing {} for user {} in room {} - another live session remains",
-                        PARTICIPANT_LEFT_SUBJECT, user_id, room_id
+                        PARTICIPANT_LEFT_SUBJECT, uid, room_id
                     );
-                }
-
-                // If the LAST present host is leaving and end_on_host_leave is
-                // set, end the meeting for all. `was_last_host` was computed
-                // above from the post-removal roster, so multi-session hosts
-                // keep the meeting alive.
-                if was_last_host && effective_end_on_host_leave {
-                    info!(
-                        "Host {} left room {} - ending meeting for all",
-                        user_id, room_id
-                    );
-                    let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-                    // First emit PARTICIPANT_LEFT so clients remove the host's video tile
-                    // before the MEETING_ENDED overlay renders. Without this, the host's
-                    // tile remains as a ghost until teardown ordering resolves it.
-                    let left_bytes = SessionManager::build_peer_left_packet(
-                        &room_id,
-                        &user_id,
-                        session_id_val,
-                        &display_name,
-                        is_guest,
-                    );
-                    if let Err(e) = nc.publish(subject.clone(), left_bytes.into()).await {
-                        error!("Error publishing PARTICIPANT_LEFT for host: {}", e);
-                    }
-                    // Then end the meeting for all remaining participants.
-                    let ended_bytes = SessionManager::build_meeting_ended_packet(
-                        &room_id,
-                        "The host has ended the meeting",
-                    );
-                    if let Err(e) = nc.publish(subject, ended_bytes.into()).await {
-                        error!("Error publishing MEETING_ENDED: {}", e);
-                    }
-                    if let Err(e) = session_manager.end_session(&room_id, &user_id).await {
-                        error!("Error ending host session for room {}: {}", room_id, e);
-                    }
-                    // Notify meeting-api so it can transition the meeting's
-                    // DB row to `state='ended'`. This mirrors the REST
-                    // POST /leave flow's `db_meetings::end_meeting` call so
-                    // the meetings list stays consistent with the
-                    // MEETING_ENDED broadcast clients just received. We
-                    // only fire this on the legitimate broadcast path —
-                    // never when `effective_end_on_host_leave=false` —
-                    // and the reconnect grace period is already honored
-                    // because this code only runs from
-                    // `ExecutePendingDeparture` (or explicit `Leave`),
-                    // both of which are cancelled by a timely reconnect.
-                    let payload = MeetingEndedByHostPayload {
-                        room_id: room_id.clone(),
-                    };
-                    match serde_json::to_vec(&payload) {
-                        Ok(json) => {
-                            if let Err(e) =
-                                nc.publish(MEETING_ENDED_BY_HOST_SUBJECT, json.into()).await
-                            {
-                                error!(
-                                    "Failed to publish {} for room {}: {}",
-                                    MEETING_ENDED_BY_HOST_SUBJECT, room_id, e
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize MeetingEndedByHostPayload: {}", e);
-                        }
-                    }
                 } else {
-                    // Normal participant departure
-                    match session_manager.end_session(&room_id, &user_id).await {
-                        Ok(SessionEndResult::HostEndedMeeting) => {
-                            // SessionManager indicated host ended meeting
-                            // (future-proofing for server-side tracking)
-                            info!(
-                                "Host {} left room {} - ending meeting for all (via SessionManager)",
-                                user_id, room_id
-                            );
-                            let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-                            // Emit PARTICIPANT_LEFT first so clients clean up the host's tile.
-                            let left_bytes = SessionManager::build_peer_left_packet(
-                                &room_id,
-                                &user_id,
-                                session_id_val,
-                                &display_name,
-                                is_guest,
-                            );
-                            if let Err(e) = nc.publish(subject.clone(), left_bytes.into()).await {
-                                error!("Error publishing PARTICIPANT_LEFT for host: {}", e);
-                            }
-                            let ended_bytes = SessionManager::build_meeting_ended_packet(
-                                &room_id,
-                                "The host has ended the meeting",
-                            );
-                            if let Err(e) = nc.publish(subject, ended_bytes.into()).await {
-                                error!("Error publishing MEETING_ENDED: {}", e);
-                            }
-                        }
-                        Ok(SessionEndResult::LastParticipantLeft) => {
-                            info!("Last participant {} left room {}", user_id, room_id);
-                        }
-                        Ok(SessionEndResult::MeetingContinues { remaining_count }) => {
-                            info!(
-                                "Participant {} left room {}, {} remaining",
-                                user_id, room_id, remaining_count
-                            );
-                            // Notify remaining peers about the departed session
-                            let bytes = SessionManager::build_peer_left_packet(
-                                &room_id,
-                                &user_id,
-                                session_id_val,
-                                &display_name,
-                                is_guest,
-                            );
-                            let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-                            if let Err(e) = nc.publish(subject, bytes.into()).await {
-                                error!("Error publishing PARTICIPANT_LEFT: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error ending session for room {}: {}", room_id, e);
-                        }
-                    }
-
-                    // Presence-driven empty→idle transition (everyone left a
-                    // meeting that did NOT end). We only reach here on the
-                    // normal-departure path — NOT the host-leave-ends-meeting
-                    // path above, where END must win and emitting an idle event
-                    // would be wrong. A non-ending host leave
-                    // (`end_on_host_leave=false`) flows through here too and is
-                    // treated as a normal departure that contributes to the
-                    // empty→idle transition, exactly as required.
-                    //
-                    // `room_became_empty` was computed synchronously in the
-                    // actor BEFORE this spawn, from the `room_members` count
-                    // reaching zero, so this publishes ONCE per
-                    // room-becomes-empty (not once per disconnect). meeting-api
-                    // resolves room_id->meeting and calls `set_idle`, which
-                    // no-ops on an already-ended meeting — so even if a stray
-                    // END races this idle event, ended (terminal) still wins.
-                    //
-                    // Multi-replica note: `room_members` is per-replica, the
-                    // same assumption the host-leave→end detection already
-                    // makes. "Empty" here means "empty on this replica". We do
-                    // not introduce a stronger cross-replica guarantee than the
-                    // existing host-leave path has.
-                    if room_became_empty {
-                        info!(
-                            "Room {} became empty after {} left - notifying meeting-api (empty->idle)",
-                            room_id, user_id
-                        );
-                        let payload = MeetingBecameEmptyPayload {
-                            room_id: room_id.clone(),
-                        };
-                        match serde_json::to_vec(&payload) {
-                            Ok(json) => {
-                                if let Err(e) =
-                                    nc.publish(MEETING_BECAME_EMPTY_SUBJECT, json.into()).await
-                                {
-                                    error!(
-                                        "Failed to publish {} for room {}: {}",
-                                        MEETING_BECAME_EMPTY_SUBJECT, room_id, e
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to serialize MeetingBecameEmptyPayload: {}", e);
-                            }
-                        }
-                    }
+                    self.publish_json_ordered(
+                        PARTICIPANT_LEFT_SUBJECT,
+                        &ParticipantLeftPayload {
+                            room_id: room_id.to_string(),
+                            user_id: uid.to_string(),
+                        },
+                    );
                 }
-            });
+            } else {
+                info!(
+                    "Skipping PARTICIPANT_LEFT for non-active session {}",
+                    session_id
+                );
+            }
+            if let Some(report) = presence_report {
+                self.publish_json_ordered(PARTICIPANT_PRESENCE_SUBJECT, &report);
+            }
+            // Empty->idle, once per room-becomes-empty on this binary.
+            if active && room_became_empty {
+                info!(
+                    "Room {} became empty after {} left - notifying meeting-api (empty->idle)",
+                    room_id, uid
+                );
+                self.publish_json_ordered(
+                    MEETING_BECAME_EMPTY_SUBJECT,
+                    &MeetingBecameEmptyPayload {
+                        room_id: room_id.to_string(),
+                    },
+                );
+            }
         }
     }
 
     /// Get the session manager (for use by chat_session)
     pub fn session_manager(&self) -> &SessionManager {
         &self.session_manager
+    }
+
+    /// Queue a publish on the ordered publisher (see [`Self::presence_tx`]).
+    fn publish_ordered(&self, subject: String, payload: Vec<u8>) {
+        self.presence_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.presence_tx.send((subject, payload)).is_err() {
+            error!("Ordered NATS publisher has stopped; dropping a publish");
+            // Nothing will decrement this slot now; undo the increment.
+            self.presence_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn publish_json_ordered<T: serde::Serialize>(&self, subject: &str, payload: &T) {
+        match serde_json::to_vec(payload) {
+            Ok(json) => self.publish_ordered(subject.to_string(), json),
+            Err(e) => error!("Failed to serialize {} payload: {}", subject, e),
+        }
+    }
+
+    /// Record `session` as the one reported (or no longer reported) present
+    /// for `user_id` in `room`, returning the report to publish.
+    fn mark_reported(
+        &mut self,
+        room: &str,
+        user_id: &str,
+        session: SessionId,
+        present: bool,
+    ) -> ParticipantPresencePayload {
+        if present {
+            self.reported_present
+                .entry(room.to_string())
+                .or_default()
+                .insert(user_id.to_string(), session);
+        } else if let Some(users) = self.reported_present.get_mut(room) {
+            users.remove(user_id);
+            if users.is_empty() {
+                self.reported_present.remove(room);
+            }
+        }
+        ParticipantPresencePayload {
+            room_id: room.to_string(),
+            user_id: user_id.to_string(),
+            session_id: session,
+            present,
+        }
+    }
+
+    /// After a session of `user_id` left `room`'s members: if the session last
+    /// reported present for the user is gone, report the user's remaining
+    /// local session present (an Active one first) or, when none remains,
+    /// report the gone session left.
+    fn presence_after_departure(
+        &mut self,
+        room: &str,
+        user_id: &str,
+    ) -> Option<ParticipantPresencePayload> {
+        let reported = *self.reported_present.get(room)?.get(user_id)?;
+        let remaining: Vec<SessionId> = self
+            .local_members(room)
+            .filter(|m| m.user_id == user_id)
+            .map(|m| m.session)
+            .collect();
+        if remaining.contains(&reported) {
+            return None;
+        }
+        let successor = remaining
+            .into_iter()
+            .max_by_key(|s| self.connection_states.get(s) == Some(&ConnectionState::Active));
+        Some(match successor {
+            Some(next) => self.mark_reported(room, user_id, next, true),
+            None => self.mark_reported(room, user_id, reported, false),
+        })
     }
 
     /// Evict a stale session for the given `instance_id`, if present locally.
@@ -2176,21 +1907,10 @@ impl ChatServer {
         }
     }
 
-    /// Drop the cached `room_policy` entry for `room` when the room has been
-    /// drained to empty. Centralises the empty-room cleanup rule shared by
-    /// `leave_rooms` and `ExecutePendingDeparture`'s `was_active=false` branch.
-    ///
-    /// Policy eviction fires only when `room_members.get(room)` exists and is
-    /// empty — i.e. we (or our caller) just removed the last member. If the
-    /// room has no `room_members` entry at all, that means the cache was
-    /// seeded by a `MEETING_SETTINGS_UPDATE_SUBJECT` event before any
-    /// JoinRoom (the `UpdateRoomPolicy` handler accepts events for empty
-    /// rooms). Wiping the legitimately-cached policy in that window would be
-    /// a regression, so the helper is a no-op for the "no entry" case.
     /// Iterator over only the LOCAL-origin members of `room` (issue #1202).
     ///
     /// The single chokepoint feeding every category-(c) read (teardown / empty /
-    /// host-leave / DB-write / announce): a mirrored `Remote` row is an inert
+    /// DB-write / announce): a mirrored `Remote` row is an inert
     /// roster observer that must never influence these decisions. A missing room
     /// entry yields an empty iterator.
     fn local_members(&self, room: &str) -> impl Iterator<Item = &RoomMemberInfo> {
@@ -2215,6 +1935,9 @@ impl ChatServer {
             .is_none_or(|m| slice_is_locally_empty(m))
     }
 
+    /// Drop `room`'s per-room caches once its members have drained to empty.
+    /// A room with no `room_members` entry at all is left alone: a host-change
+    /// fanout may have seeded [`Self::room_host_overrides`] before any JoinRoom.
     fn forget_room_if_empty(&mut self, room: &str) {
         // c4 (#1202): keep the outer `get(room)` guard so a room with NO entry is
         // still a no-op, but flip the inner emptiness test to LOCAL-only via the
@@ -2223,11 +1946,12 @@ impl ChatServer {
         // of truth in `local_is_empty`).
         if self.room_members.contains_key(room) && self.local_is_empty(room) {
             self.room_members.remove(room);
-            self.room_policy.remove(room);
+            self.reported_present.remove(room);
             // #2136: the host-override map is per-room and must be evicted on
-            // exactly the same edge as `room_policy`, or it leaks one entry per
-            // transfer-host for the process lifetime.
+            // this edge, or it leaks one entry per transfer-host for the process
+            // lifetime.
             self.room_host_overrides.remove(room);
+            self.rooms_with_activated_local_member.remove(room);
             // Bound room-labeled relay series to LIVE rooms (issue #996):
             // remove every `{room=...}` CounterVec/GaugeVec series for this
             // drained room (was previously just the #988 viewport gauge).
@@ -2260,19 +1984,31 @@ impl ChatServer {
         // so the lookup still finds this session's instance_id.
         let instance_key = self.pending_departure_instance_key(session_id);
 
-        let mut room_still_populated = false;
         if let Some(members) = self.room_members.get_mut(room) {
             members.retain(|m| m.session != session_id);
+        }
+        // Only a hand-off is published: the evicting session reports itself
+        // present, so a LEFT here could overtake it from the other binary.
+        if let Some(report) = self.presence_after_departure(room, user_id) {
+            if report.present {
+                self.publish_json_ordered(PARTICIPANT_PRESENCE_SUBJECT, &report);
+            }
+        }
+        let mut room_still_populated = false;
+        if let Some(members) = self.room_members.get(room) {
             // c5 (#1202): LOCAL-only emptiness — a room left holding only mirrored
             // Remote rows is locally drained and must still GC. Now CALLS the shared
             // `slice_is_locally_empty` free fn (the single definition of "locally
             // empty"; #1705) rather than an inlined copy.
             if slice_is_locally_empty(members) {
                 self.room_members.remove(room);
+                self.reported_present.remove(room);
                 // Mirror forget_room_if_empty: release ALL per-room relay series
                 // so the eviction teardown path also cannot leak room-labeled
-                // series for a drained room (HCL #988 + #996).
+                // series for a drained room (HCL #988 + #996), and the #2711
+                // local-activation record.
                 crate::metrics::forget_room_metrics(room);
+                self.rooms_with_activated_local_member.remove(room);
             } else {
                 room_still_populated = true;
             }
@@ -2572,9 +2308,10 @@ impl ChatServer {
         };
 
         // The publisher's own self-subject, sanitized identically to every other
-        // room subject (room ids match `^[a-zA-Z0-9_-]*$`, the session is a
-        // u64). This is exactly the subject the publisher subscribes to and the
-        // same one the server's CONGESTION/system self-packets are published on.
+        // room subject (room ids pass `videocall_types::validation::is_valid_meeting_id`,
+        // so contain no `.`; the session is a u64). This is exactly the subject
+        // the publisher subscribes to and the same one the server's
+        // CONGESTION/system self-packets are published on.
         let subject = format!("room.{room}.{publisher}").replace(' ', "_");
 
         // Account every emitted entry by its direction BEFORE the async publish
@@ -2801,7 +2538,7 @@ impl Actor for ChatServer {
     fn started(&mut self, ctx: &mut Self::Context) {
         info!(
             "ChatServer started — subscribing to {} and {}",
-            EVICT_INSTANCE_SUBJECT, MEETING_SETTINGS_UPDATE_SUBJECT
+            EVICT_INSTANCE_SUBJECT, MEETING_HOST_CHANGE_SUBJECT
         );
 
         // Subscribe to the cross-server eviction subject.
@@ -2837,52 +2574,9 @@ impl Actor for ChatServer {
             }
         });
 
-        // Subscribe to per-meeting policy updates from meeting-api so the
-        // `room_policy` cache stays fresh after PATCH /meetings. Each
-        // chat_server instance subscribes independently (no queue group)
-        // because every server holds its own room_policy cache and must
-        // receive every update — this is the same fan-out semantics as
-        // EVICT_INSTANCE_SUBJECT.
-        let nc_settings = self.nats_connection.clone();
-        let addr_settings = ctx.address();
-        tokio::spawn(async move {
-            loop {
-                match nc_settings.subscribe(MEETING_SETTINGS_UPDATE_SUBJECT).await {
-                    Ok(mut sub) => {
-                        while let Some(msg) = sub.next().await {
-                            match serde_json::from_slice::<MeetingSettingsUpdatePayload>(
-                                &msg.payload,
-                            ) {
-                                Ok(payload) => {
-                                    addr_settings.do_send(UpdateRoomPolicy(payload));
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize {} payload: {}",
-                                        MEETING_SETTINGS_UPDATE_SUBJECT, e
-                                    );
-                                }
-                            }
-                        }
-                        warn!(
-                            "{} subscription stream ended, re-subscribing in 1s",
-                            MEETING_SETTINGS_UPDATE_SUBJECT
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to subscribe to {}: {}, retrying in 1s",
-                            MEETING_SETTINGS_UPDATE_SUBJECT, e
-                        );
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
-
         // Subscribe to per-participant host-flag changes so each `RoomMemberInfo`'s
-        // cached `is_host` stays fresh after a transfer-host. Like the two
-        // subscriptions above, every instance subscribes independently (no queue
+        // cached `is_host` stays fresh after a transfer-host. Like the eviction
+        // subscription above, every instance subscribes independently (no queue
         // group): each has its own presence map and must see every change.
         let nc_host = self.nats_connection.clone();
         let addr_host = ctx.address();
@@ -2926,6 +2620,21 @@ impl Actor for ChatServer {
         // single actor turn remains.
         ctx.run_interval(LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, |_act, ctx| {
             ctx.address().do_send(SweepLayerPreferenceGauge::StartCycle);
+        });
+
+        ctx.run_interval(self.presence_heartbeat_interval, |act, _ctx| {
+            // Skip rather than queue more while the last batch hasn't
+            // drained — otherwise an outage piles up an unbounded backlog.
+            let pending = act
+                .presence_pending
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if pending > 0 {
+                warn!("Skipping presence heartbeat tick: {pending} publish(es) still queued");
+                return;
+            }
+            for heartbeat in presence_heartbeats(&act.reported_present) {
+                act.publish_json_ordered(PRESENCE_HEARTBEAT_SUBJECT, &heartbeat);
+            }
         });
     }
 
@@ -2978,8 +2687,7 @@ impl Handler<Disconnect> for ChatServer {
             display_name,
             is_guest,
             observer,
-            is_host,
-            end_on_host_leave,
+            ..
         }: Disconnect,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -3021,8 +2729,6 @@ impl Handler<Disconnect> for ChatServer {
                     user_id: Some(&user_id),
                     display_name: Some(&display_name),
                     observer: true,
-                    is_host: false,
-                    end_on_host_leave: true,
                 },
                 ctx,
             );
@@ -3081,8 +2787,6 @@ impl Handler<Disconnect> for ChatServer {
                 user_id: user_id.clone(),
                 instance_key: instance_key.clone(),
                 display_name,
-                is_host,
-                end_on_host_leave,
             },
             RECONNECT_GRACE_PERIOD,
         );
@@ -3126,16 +2830,11 @@ impl Handler<Leave> for ChatServer {
             );
         }
 
-        // Look up is_host, end_on_host_leave, and display_name from room_members.
-        // The Leave message carries no host info; we must resolve it from the
-        // in-memory member table so the host-leave path in leave_rooms fires
-        // correctly when the host explicitly leaves.
-        let (is_host, end_on_host_leave, display_name) = self
+        let display_name = self
             .room_members
             .get(&room)
             .and_then(|members| members.iter().find(|m| m.session == session))
-            .map(|m| (m.is_host, m.end_on_host_leave, Some(m.display_name.clone())))
-            .unwrap_or((false, true, None));
+            .map(|m| m.display_name.clone());
 
         // Leave is always a real participant, never an observer.
         self.leave_rooms(
@@ -3145,8 +2844,6 @@ impl Handler<Leave> for ChatServer {
                 user_id: Some(&user_id),
                 display_name: display_name.as_deref(),
                 observer: false,
-                is_host,
-                end_on_host_leave,
             },
             ctx,
         );
@@ -3226,6 +2923,11 @@ impl Handler<ActivateConnection> for ChatServer {
             }
         }
 
+        if let Some((room_id, _)) = &room_user {
+            self.rooms_with_activated_local_member
+                .insert(room_id.clone());
+        }
+
         // --- Cross-server eviction broadcast ---
         // Deferred from JoinRoom to here so that only the elected connection
         // (the winner of RTT election) publishes. Testing connections that
@@ -3260,49 +2962,26 @@ impl Handler<ActivateConnection> for ChatServer {
             }
         }
 
-        // Presence-driven DB mark-present + re-activation (issue #1628).
-        // Symmetric counterpart to the PARTICIPANT_LEFT publish in
-        // `leave_rooms`. Tell meeting-api this participant is PRESENT so it can
-        // mark the `meeting_participants` row `status='admitted', left_at=NULL`
-        // and re-activate the meeting (`idle -> active`). We use `room_user`
-        // (resolved above from `room_members` on the Testing→Active transition)
-        // rather than the join-broadcast's `found` lookup so this fires even
-        // when the client-facing PARTICIPANT_JOINED is SUPPRESSED — i.e. on a
-        // RECONNECTION, which is exactly the stuck-`idle`-with-people case this
-        // heals. Observers are never in `room_members`, so `room_user` is
-        // `None` for them and they are correctly excluded (an observer is a
-        // waiting-room watcher, not a present participant). Best-effort: a
-        // publish error is logged and never blocks activation. The consumer's
-        // writes are idempotent and `ended`-safe: it re-activates via an atomic
-        // `UPDATE … WHERE state='idle'` (meeting-api `reactivate_from_idle`), so
-        // a late present event racing a host-end can never resurrect `ended`.
+        // Report the newly Active session present — on reconnections too, where
+        // the client-facing PARTICIPANT_JOINED is suppressed. Observers are never
+        // in `room_members`, so `room_user` is `None` for them.
         if was_testing {
             if let Some((room_id, user_id)) = &room_user {
-                let payload = ParticipantPresentPayload {
-                    room_id: room_id.clone(),
-                    user_id: user_id.clone(),
-                };
-                match serde_json::to_vec(&payload) {
-                    Ok(json) => {
-                        let nc = self.nats_connection.clone();
-                        let room_id_log = room_id.clone();
-                        let user_id_log = user_id.clone();
-                        let fut = async move {
-                            if let Err(e) =
-                                nc.publish(PARTICIPANT_PRESENT_SUBJECT, json.into()).await
-                            {
-                                error!(
-                                    "Failed to publish {} for room {} user {}: {}",
-                                    PARTICIPANT_PRESENT_SUBJECT, room_id_log, user_id_log, e
-                                );
-                            }
-                        };
-                        let fut = actix::fut::wrap_future::<_, Self>(fut);
-                        ctx.spawn(fut);
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize ParticipantPresentPayload: {}", e);
-                    }
+                self.publish_json_ordered(
+                    PARTICIPANT_PRESENT_SUBJECT,
+                    &ParticipantPresentPayload {
+                        room_id: room_id.clone(),
+                        user_id: user_id.clone(),
+                    },
+                );
+                let already_reported = self
+                    .reported_present
+                    .get(room_id)
+                    .and_then(|users| users.get(user_id))
+                    == Some(&session);
+                if !already_reported {
+                    let report = self.mark_reported(room_id, user_id, session, true);
+                    self.publish_json_ordered(PARTICIPANT_PRESENCE_SUBJECT, &report);
                 }
             }
         }
@@ -3623,7 +3302,6 @@ impl Handler<TestSeedActiveMember> for ChatServer {
                 user_id: msg.user_id,
                 display_name: msg.display_name,
                 is_host: false,
-                end_on_host_leave: false,
                 origin: MemberOrigin::Local,
             });
         self.connection_states
@@ -3727,8 +3405,6 @@ impl Handler<TestLeaveRooms> for ChatServer {
                 user_id: Some(&msg.user_id),
                 display_name: Some(&msg.user_id),
                 observer: false,
-                is_host: false,
-                end_on_host_leave: false,
             },
             ctx,
         );
@@ -3944,17 +3620,15 @@ impl Handler<MirrorRemoteMembership> for ChatServer {
                         session: msg.session,
                         user_id: msg.user_id,
                         display_name: msg.display_name,
-                        // is_host cannot come off the wire. Safe because EVERY
-                        // is_host reader is local-only: `was_last_present_host`
-                        // (host-leave) and, since #2136, `session_is_room_host`
-                        // (the host-only packet gate), which requires
+                        // is_host cannot come off the wire. Safe because the only
+                        // is_host reader, `session_is_room_host` (the host-only
+                        // packet gate, #2136), requires
                         // `origin == Local` explicitly rather than leaning on
                         // this hard-coded `false`. A host connected to the OTHER
                         // relay binary is authorized by THAT binary, where its
                         // row is Local. Any future is_host reader must keep that
                         // property or this `false` becomes a silent wrong answer.
                         is_host: false,
-                        end_on_host_leave: false,
                         origin: MemberOrigin::Remote,
                     });
                 self.schedule_coalesced_recompute(&msg.room, ctx);
@@ -4164,85 +3838,13 @@ impl Handler<TestSeedPrefAndRecompute> for ChatServer {
     }
 }
 
-/// Handle per-room policy updates fanned out by `meeting-api` over
-/// [`MEETING_SETTINGS_UPDATE_SUBJECT`].
-///
-/// Refreshes `room_policy[room_id]` so subsequent host disconnects read the
-/// post-toggle authoritative `end_on_host_leave` (and the other three flags)
-/// without a DB round-trip. We also mirror the new `end_on_host_leave` into
-/// every member's per-session `RoomMemberInfo.end_on_host_leave` so legacy
-/// code paths that still consult the per-member field (e.g. the `Disconnect`
-/// handler's lookup for a session that has already been removed from
-/// `connection_states`) see the fresh value too.
-///
-/// We accept the event even when no room members are currently tracked: a
-/// PATCH may arrive in the brief window between meeting creation and the
-/// first JoinRoom, and dropping it would re-introduce the very staleness
-/// this handler exists to fix once members do join. The cache entry is
-/// reaped lazily by [`ChatServer::leave_rooms`] when the room becomes empty.
-impl Handler<UpdateRoomPolicy> for ChatServer {
-    type Result = ();
-
-    fn handle(&mut self, msg: UpdateRoomPolicy, _ctx: &mut Self::Context) -> Self::Result {
-        let MeetingSettingsUpdatePayload {
-            room_id,
-            end_on_host_leave,
-            admitted_can_admit,
-            waiting_room_enabled,
-            allow_guests,
-        } = msg.0;
-
-        // Defensive bounds — payload comes off the NATS wire from meeting-api,
-        // which is trusted, but we still cap the room_id length to match
-        // the EvictInstance handler's posture and avoid accidental memory
-        // pressure from a misconfigured publisher.
-        if room_id.is_empty() || room_id.len() > 256 {
-            warn!(
-                "Ignoring {} with invalid room_id length: {}",
-                MEETING_SETTINGS_UPDATE_SUBJECT,
-                room_id.len()
-            );
-            return;
-        }
-
-        info!(
-            "Refreshing room_policy for {} (end_on_host_leave={}, admitted_can_admit={}, \
-             waiting_room_enabled={}, allow_guests={})",
-            room_id, end_on_host_leave, admitted_can_admit, waiting_room_enabled, allow_guests
-        );
-
-        self.room_policy.insert(
-            room_id.clone(),
-            RoomPolicy {
-                end_on_host_leave,
-                admitted_can_admit,
-                waiting_room_enabled,
-                allow_guests,
-            },
-        );
-
-        // Mirror the freshest `end_on_host_leave` onto every existing room
-        // member so callers that still read the per-member field (notably
-        // the `Leave` handler's `room_members` lookup at the bottom of the
-        // file) see the updated value too. This is belt-and-suspenders:
-        // `leave_rooms` itself reads `room_policy` first, but keeping the
-        // two views consistent prevents future regressions if someone
-        // adds a new code path that consults `RoomMemberInfo` directly.
-        if let Some(members) = self.room_members.get_mut(&room_id) {
-            for member in members.iter_mut() {
-                member.end_on_host_leave = end_on_host_leave;
-            }
-        }
-    }
-}
-
 /// Handle per-participant host-flag changes fanned out by `meeting-api` over
-/// [`MEETING_HOST_CHANGE_SUBJECT`] (transfer-host).
+/// [`MEETING_HOST_CHANGE_SUBJECT`].
 ///
 /// Flips the cached `is_host` on every `RoomMemberInfo` whose `user_id` matches
-/// (all of that user's sessions), so the host-leave check and host-gated logic
-/// see the post-change value without a DB round-trip. Idempotent; a no-op when
-/// no members are tracked (same create-before-join window as [`UpdateRoomPolicy`]).
+/// (all of that user's sessions), so host-gated logic sees the post-change
+/// value without a DB round-trip. Idempotent; a no-op when
+/// no members are tracked (the create-before-join window).
 impl Handler<UpdateMemberHostFlag> for ChatServer {
     type Result = ();
 
@@ -4360,8 +3962,6 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             user_id,
             instance_key,
             display_name,
-            is_host,
-            end_on_host_leave,
         }: ExecutePendingDeparture,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -4393,31 +3993,17 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                     user_id, session, room
                 );
                 // Still clean up room_members and instance_index for the old
-                // session. Use the shared `forget_room_if_empty` helper so the
-                // empty-room policy-cache eviction rule stays in lockstep with
-                // the `leave_rooms` path (both paths must drop `room_policy`
-                // when, and only when, this removal drained the room to empty).
+                // session, through the same `forget_room_if_empty` as `leave_rooms`.
                 //
-                // We still check empty→idle here even though this never-active
-                // session never broadcast a JOIN: if it was the LAST member it
-                // could be draining the room to empty while an earlier active
-                // participant already left (that earlier departure saw this
-                // testing session still present, so it did NOT emit the
-                // empty event). Without this branch the meeting could stay
-                // `active` despite being empty. We do NOT emit on the
-                // host-leave-ends path here because a never-active session is
-                // never the host's ending session (that goes through
-                // `leave_rooms`). meeting-api's `set_idle` guards on
-                // `state='active'`, so if the meeting was never activated this
-                // is a harmless no-op.
+                // empty→idle only for a room this binary activated someone in:
+                // otherwise the drain is just an election loser retiring (#2711).
+                // Read BEFORE `forget_room_if_empty`, which clears the record.
+                let announced_locally = self.rooms_with_activated_local_member.contains(&room);
                 let mut room_became_empty = false;
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|m| m.session != session);
-                    // c6 (#1202): LOCAL-only emptiness — a never-activated last
-                    // local member draining the room must fire empty->idle even if
-                    // mirrored Remote rows remain. Now CALLS the shared
-                    // `slice_is_locally_empty` free fn (the single definition of
-                    // "locally empty"; #1705) rather than an inlined copy.
+                    // c6 (#1202): LOCAL-only emptiness — mirrored Remote rows must
+                    // not suppress the transition.
                     room_became_empty = slice_is_locally_empty(members);
                 }
                 // Unlike `leave_rooms` / `forget_session`, this branch does NOT
@@ -4430,40 +4016,35 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 // for it as a source. It therefore holds no entry in either map —
                 // there is nothing to reap, and the per-`(source, kind)` recheck
                 // invariant is not stranded.
+                if let Some(report) = self.presence_after_departure(&room, &user_id) {
+                    self.publish_json_ordered(PARTICIPANT_PRESENCE_SUBJECT, &report);
+                }
                 self.forget_room_if_empty(&room);
                 if let Some(iid) = self.session_instance.remove(&session) {
                     if self.instance_index.get(&iid).copied() == Some(session) {
                         self.instance_index.remove(&iid);
                     }
                 }
-                if room_became_empty {
-                    let nc = self.nats_connection.clone();
-                    let room_id = room.clone();
-                    tokio::spawn(async move {
-                        info!(
-                            "Room {} became empty after a never-activated session expired - \
-                             notifying meeting-api (empty->idle)",
-                            room_id
-                        );
-                        let payload = MeetingBecameEmptyPayload {
-                            room_id: room_id.clone(),
-                        };
-                        match serde_json::to_vec(&payload) {
-                            Ok(json) => {
-                                if let Err(e) =
-                                    nc.publish(MEETING_BECAME_EMPTY_SUBJECT, json.into()).await
-                                {
-                                    error!(
-                                        "Failed to publish {} for room {}: {}",
-                                        MEETING_BECAME_EMPTY_SUBJECT, room_id, e
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to serialize MeetingBecameEmptyPayload: {}", e);
-                            }
-                        }
-                    });
+                if room_became_empty && !announced_locally {
+                    info!(
+                        "Room {} drained on this binary after a never-activated session \
+                         expired, but no local session was ever activated here - \
+                         NOT notifying meeting-api (empty->idle)",
+                        room
+                    );
+                }
+                if room_became_empty && announced_locally {
+                    info!(
+                        "Room {} became empty after a never-activated session expired - \
+                         notifying meeting-api (empty->idle)",
+                        room
+                    );
+                    self.publish_json_ordered(
+                        MEETING_BECAME_EMPTY_SUBJECT,
+                        &MeetingBecameEmptyPayload {
+                            room_id: room.clone(),
+                        },
+                    );
                 }
                 return;
             }
@@ -4482,8 +4063,6 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                     user_id: Some(&user_id),
                     display_name: Some(&display_name),
                     observer: false,
-                    is_host,
-                    end_on_host_leave,
                 },
                 ctx,
             );
@@ -4644,7 +4223,6 @@ impl Handler<JoinRoom> for ChatServer {
             observer,
             instance_id,
             is_host,
-            end_on_host_leave,
             transport,
             downlink_congested_epoch,
         }: JoinRoom,
@@ -4738,8 +4316,8 @@ impl Handler<JoinRoom> for ChatServer {
         // fast cached-URL transport reconnect re-presents that SAME token, so a
         // demoted ex-host reconnecting after a transfer-host would otherwise
         // re-seed `is_host=true` and override the authoritative
-        // `internal.meeting_host_changed` fanout — a phantom host that corrupts
-        // the transport host-leave→end decision. The prior entry already reflects
+        // `internal.meeting_host_changed` fanout — a phantom host in the
+        // presence map. The prior entry already reflects
         // that fanout (correct in BOTH directions: demoted→false, promoted→true),
         // so we prefer it ONLY on a reconnection. When no transfer occurred the
         // prior entry equals the JWT claim, so this is a strict no-op; it diverges
@@ -4859,8 +4437,8 @@ impl Handler<JoinRoom> for ChatServer {
         // Snapshot `is_guest` per existing session here (inside the handler,
         // where `self` is in scope) so the spawned task can build accurate
         // PARTICIPANT_JOINED packets without needing to re-enter the actor.
-        // The tuple preserves the full RoomMemberInfo (needed for host-leave
-        // tracking) alongside the server-authoritative guest flag.
+        // The tuple preserves the full RoomMemberInfo alongside the
+        // server-authoritative guest flag.
         let existing_members: Vec<(RoomMemberInfo, bool)> = if !observer {
             self.room_members
                 .get(&room)
@@ -4913,34 +4491,8 @@ impl Handler<JoinRoom> for ChatServer {
                     // On a reconnection, prefer the fanout-reconciled flag from
                     // the prior entry over the (same, possibly stale) JWT seed.
                     is_host: reconnect_is_host.unwrap_or(is_host),
-                    end_on_host_leave,
                     // The sole production add-site: a session this actor owns.
                     origin: MemberOrigin::Local,
-                });
-
-            // Seed the room_policy cache with the JWT-time `end_on_host_leave`
-            // if we have nothing fresher. A subsequent
-            // `MEETING_SETTINGS_UPDATE_SUBJECT` event from meeting-api
-            // overwrites this; until then the JWT value is the best
-            // approximation we have. The other three flags default to the
-            // `meetings` table defaults (waiting_room_enabled=true,
-            // admitted_can_admit=false, allow_guests=false) — these are not
-            // currently consulted by chat_server, but seeding them keeps the
-            // shape of the cache consistent so future readers don't see
-            // partially-populated entries.
-            //
-            // We use `entry().or_insert_with(...)` so a previously-pushed
-            // policy update is NOT clobbered by a later joiner whose JWT
-            // still carries the pre-update flag value. Without this, a
-            // toggle that landed before the second participant joined
-            // would silently regress.
-            self.room_policy
-                .entry(room.clone())
-                .or_insert_with(|| RoomPolicy {
-                    end_on_host_leave,
-                    admitted_can_admit: false,
-                    waiting_room_enabled: true,
-                    allow_guests: false,
                 });
 
             // Publish-side suppression restore (#1108, Stage 3). A newly-joined
@@ -6101,7 +5653,7 @@ fn try_intercept_display_name_change(
 ///
 /// [`SessionLogic::on_outbound_drop`]: crate::actors::session_logic::SessionLogic::on_outbound_drop
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-struct DownlinkRelayState {
+pub(crate) struct DownlinkRelayState {
     /// Whether the receiver was congested on the previous observation. Used to
     /// detect the healthy→congested rising edge (emit the one-shot signal +
     /// count an episode) and the congested→healthy falling edge (count a
@@ -6112,17 +5664,17 @@ struct DownlinkRelayState {
 /// Outcome of feeding the current windowed congestion level to
 /// [`DownlinkRelayState::observe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-struct RelayTransition {
+pub(crate) struct RelayTransition {
     /// The receiver just crossed healthy → congested. Emit the one-shot
     /// DOWNLINK_CONGESTION signal and count a new shedding episode.
-    entered_congestion: bool,
+    pub(crate) entered_congestion: bool,
     /// The receiver just crossed congested → healthy (the relief window
     /// elapsed). Count a recovery.
-    recovered: bool,
+    pub(crate) recovered: bool,
 }
 
 impl DownlinkRelayState {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             was_congested: false,
         }
@@ -6142,6 +5694,24 @@ impl DownlinkRelayState {
         self.was_congested = congested_now;
         transition
     }
+}
+
+/// THE read half of the #1219 relief signal: shared epoch -> windowed level ->
+/// episode edge. Returns `(congested_now, transition)`. Extracted so the one
+/// composition of window, level and edge has a single definition the #2718
+/// bridge test can call.
+pub(crate) fn observe_downlink_relief(
+    relay_state: &std::cell::Cell<DownlinkRelayState>,
+    downlink_congested_epoch: &std::sync::atomic::AtomicU64,
+) -> (bool, RelayTransition) {
+    let congested_now = crate::actors::session_logic::downlink_epoch_is_active(
+        downlink_congested_epoch.load(std::sync::atomic::Ordering::Relaxed),
+        crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW,
+    );
+    let mut state = relay_state.get();
+    let transition = state.observe(congested_now);
+    relay_state.set(state);
+    (congested_now, transition)
 }
 
 /// Priority-ordered classifier for the #1219 receiver-downlink emergency shed
@@ -6277,8 +5847,6 @@ fn handle_msg(
     // The only per-receiver state held HERE is the edge bookkeeping in
     // `DownlinkRelayState` (a pure, unit-tested debouncer for the once-per-episode
     // metrics + emit).
-    use crate::actors::session_logic::downlink_epoch_is_active;
-    use crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW;
     use crate::metrics::{
         RELAY_DOWNLINK_SHED_TOTAL, RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL,
         RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL,
@@ -6610,10 +6178,10 @@ fn handle_msg(
         // stamping invariant. The subject — `room.{room}.{publisher_session}` — is set by
         // the relay from the authenticated connection and cannot be forged by a
         // peer, exactly as relied on for `subject_self` and VIEWPORT ownership.
-        // Room IDs match `^[a-zA-Z0-9_-]*$` (no dots) and the session is a
-        // pure-digit u64, so the part after the LAST `.` is the publisher
-        // session. If it does not parse (shouldn't happen for normal media),
-        // FAIL OPEN — never drop on an unparseable source.
+        // Room IDs pass `videocall_types::validation::is_valid_meeting_id` (no
+        // dots) and the session is a pure-digit u64, so the part after the LAST
+        // `.` is the publisher session. If it does not parse (shouldn't happen
+        // for normal media), FAIL OPEN — never drop on an unparseable source.
         if let Some(pw) = parsed {
             use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
             let wire_media_kind = pw.media_kind.enum_value();
@@ -6854,18 +6422,14 @@ fn handle_msg(
         // Recovery therefore can NOT be wedged by an occasional stray drop (the
         // old strictly-consecutive-success exit could be, pinning a healthy link
         // at base-layer-only video indefinitely).
-        let relief_epoch = downlink_congested_epoch.load(AtomicOrdering::Relaxed);
-        let congested_now = downlink_epoch_is_active(relief_epoch, RECEIVER_DOWNLINK_RELIEF_WINDOW);
-
         // Edge-detect the episode so the metrics + the one-shot DOWNLINK_CONGESTION
         // emit each fire exactly once per congested episode. Running this on every
         // packet (not only when congested) is what lets the falling edge —
         // recovery — be observed once the window decays while traffic still flows.
-        {
-            let mut state = relay_state.get();
-            let transition = state.observe(congested_now);
-            relay_state.set(state);
+        let (congested_now, transition) =
+            observe_downlink_relief(&relay_state, &downlink_congested_epoch);
 
+        {
             if transition.entered_congestion {
                 RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL
                     .with_label_values(&[&transport])
@@ -7383,7 +6947,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -7461,7 +7024,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -7524,7 +7086,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -7561,7 +7122,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -7626,7 +7186,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -7647,7 +7206,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -7700,7 +7258,6 @@ mod tests {
             None, // no instance_id
             "websocket",
             false, // is_host
-            false, // end_on_host_leave
         );
 
         let session2 = SessionLogic::new(
@@ -7716,7 +7273,6 @@ mod tests {
             None, // no instance_id
             "websocket",
             false, // is_host
-            false, // end_on_host_leave
         );
 
         // Verify they have different session IDs
@@ -8304,7 +7860,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -8418,7 +7973,6 @@ mod tests {
                 observer: true,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -8518,7 +8072,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -8624,7 +8177,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -8694,7 +8246,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -8741,8 +8292,6 @@ mod tests {
                 display_name: "testing-dc@example.com".to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -8809,7 +8358,6 @@ mod tests {
                 observer: true,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -8857,8 +8405,6 @@ mod tests {
                 display_name: "observer-dc@example.com".to_string(),
                 is_guest: false,
                 observer: true,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -8925,7 +8471,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -8965,8 +8510,7 @@ mod tests {
                     <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
                 {
                     if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
-                        // Accept any meeting lifecycle event (PARTICIPANT_LEFT or MEETING_ENDED)
-                        // depending on how end_session categorizes this session
+                        // Accept any meeting lifecycle event (PARTICIPANT_LEFT or MEETING_ENDED).
                         if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into()
                             || inner.event_type == MeetingEventType::MEETING_ENDED.into()
                         {
@@ -8988,8 +8532,6 @@ mod tests {
                 display_name: "real-dc@example.com".to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -8999,8 +8541,7 @@ mod tests {
         // execution and NATS publish time to complete.
         sleep(Duration::from_secs(4)).await;
 
-        // The non-observer path should have attempted to publish via the full
-        // end_session flow after the grace period expired.
+        // The non-observer path publishes after the grace period expired.
         assert!(
             meeting_event_received.load(Ordering::Relaxed),
             "Non-observer disconnect should publish a meeting event after grace period \
@@ -9054,7 +8595,6 @@ mod tests {
                 observer: true,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -9077,7 +8617,6 @@ mod tests {
                 observer: true,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -11318,6 +10857,25 @@ mod tests {
         }
     }
 
+    /// Read the #2711 record the c6 empty→idle gate consults.
+    #[derive(ActixMessage)]
+    #[rtype(result = "bool")]
+    struct RoomHasActivatedLocalMember {
+        room: String,
+    }
+
+    impl Handler<RoomHasActivatedLocalMember> for ChatServer {
+        type Result = bool;
+
+        fn handle(
+            &mut self,
+            msg: RoomHasActivatedLocalMember,
+            _ctx: &mut Self::Context,
+        ) -> Self::Result {
+            self.rooms_with_activated_local_member.contains(&msg.room)
+        }
+    }
+
     /// Force the #1202 membership-mirror flag ON/OFF for a test, deterministically.
     /// Preferred over the `MEMBERSHIP_MIRROR_ENABLED` env var because tests run in
     /// parallel and a shared env var is racy. Drives the SAME field the production
@@ -11422,7 +10980,6 @@ mod tests {
                 observer: false,
                 instance_id,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12013,7 +11570,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12115,7 +11671,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12210,7 +11765,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12305,7 +11859,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12355,27 +11908,7 @@ mod tests {
     }
 
     // ==========================================================================
-    // BUG FIX (#502): host disconnect + end_on_host_leave cache staleness
-    // ==========================================================================
-    //
-    // The chat_server caches `end_on_host_leave` at JoinRoom time from the JWT
-    // claim. Mid-meeting PATCH /meetings updates the DB but the cached value
-    // stayed stale until the host reconnected, so back-navigating after
-    // toggling to `false` still kicked everyone out.
-    //
-    // The fix introduces a per-room `room_policy` cache refreshed by the
-    // `internal.meeting_settings_updated` NATS event. The host-disconnect
-    // path now reads `room_policy[room]` instead of the per-session JWT
-    // capture. The legitimate broadcast path also publishes
-    // `internal.meeting_ended_by_host` so meeting-api can mark the DB
-    // `state='ended'` to mirror what clients see.
-    //
-    // The five tests below cover:
-    //   1. Stable end_on_host_leave=true, host disconnects -> MEETING_ENDED + DB event.
-    //   2. Stable end_on_host_leave=false, host disconnects -> no broadcast, no DB event.
-    //   3. Mid-meeting toggle (true -> false), host disconnects -> no broadcast.
-    //   4. Reconnect within grace period -> no broadcast, no DB event.
-    //   5. Mid-meeting toggle, non-host disconnects -> host's cached policy is fresh.
+    // Host departures: the relay reports, meeting-api decides (#502, #2702)
     // ==========================================================================
 
     /// Test fixture: dummy session actor that ignores all messages.
@@ -12517,15 +12050,15 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // TEST 1: Stable end_on_host_leave=true, host disconnects ->
-    //         MEETING_ENDED broadcast AND internal.meeting_ended_by_host
-    //         payload. Verifies the legitimate broadcast path still works
-    //         after the refactor.
+    // TEST 1 (#2702): a host with end_on_host_leave=true disconnects. The
+    //         relay never ends the meeting itself; it reports the departure
+    //         to meeting-api after the client-facing PARTICIPANT_LEFT.
     // ──────────────────────────────────────────────────────────────────────
     #[actix_rt::test]
     #[serial]
-    async fn test_host_disconnect_eohl_true_broadcasts_and_publishes_db_event() {
-        use tokio::time::{sleep, Duration};
+    async fn test_host_disconnect_defers_meeting_end_to_meeting_api() {
+        use tokio::time::{sleep, Duration, Instant};
+        use videocall_types::protos::meeting_packet::MeetingPacket;
 
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
@@ -12536,19 +12069,16 @@ mod tests {
         let dummy = EohlDummySession.start();
         let session_id = 9_500u64;
         let room = "test-eohl-true-broadcast";
+        let host = "host-true@example.com";
 
-        // Subscribe BEFORE the disconnect runs so we don't miss the publish.
+        // One wildcard subscription sees both subjects in server order.
         let system_subject = format!("room.{}.system", room.replace(' ', "_"));
-        let mut system_sub = nats_client
-            .subscribe(system_subject)
-            .await
-            .expect("Failed to subscribe to system subject");
+        let mut all_sub = nats_client.subscribe(">").await.expect("subscribe >");
         let mut db_sub = nats_client
             .subscribe(MEETING_ENDED_BY_HOST_SUBJECT)
             .await
             .expect("Failed to subscribe to internal subject");
 
-        // Connect + JoinRoom as host with end_on_host_leave=true.
         chat_server
             .send(Connect {
                 id: session_id,
@@ -12560,13 +12090,12 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "host-true@example.com".to_string(),
-                display_name: "host-true@example.com".to_string(),
+                user_id: host.to_string(),
+                display_name: host.to_string(),
                 is_guest: false,
                 observer: false,
                 instance_id: None,
                 is_host: true,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12581,64 +12110,339 @@ mod tests {
             .expect("ActivateConnection should succeed");
         sleep(Duration::from_millis(300)).await;
 
-        // Disconnect the host. The broadcast happens after the grace period.
         chat_server
             .send(Disconnect {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "host-true@example.com".to_string(),
-                display_name: "host-true@example.com".to_string(),
+                user_id: host.to_string(),
+                display_name: host.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: true,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
 
-        // Grace is 3s; allow 5s for publish to land on both subscribers.
-        let (saw_ended, _saw_left) =
-            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
+        // Grace is 3s; collect for 5s.
+        let mut order: Vec<&'static str> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) =
+            tokio::time::timeout_at(deadline, futures::StreamExt::next(&mut all_sub)).await
+        {
+            if msg.subject.as_str() == system_subject {
+                let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                else {
+                    continue;
+                };
+                let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) else {
+                    continue;
+                };
+                if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                    order.push("peer_left");
+                } else if inner.event_type == MeetingEventType::MEETING_ENDED.into() {
+                    order.push("meeting_ended");
+                }
+            } else if msg.subject.as_str() == PARTICIPANT_LEFT_SUBJECT {
+                if let Ok(p) = serde_json::from_slice::<ParticipantLeftPayload>(&msg.payload) {
+                    if p.room_id == room && p.user_id == host {
+                        order.push("internal_left");
+                    }
+                }
+            } else if msg.subject.as_str() == PARTICIPANT_PRESENCE_SUBJECT {
+                let p: ParticipantPresencePayload =
+                    serde_json::from_slice(&msg.payload).expect("presence payload");
+                if p.room_id == room && p.user_id == host && p.session_id == session_id {
+                    order.push(if p.present {
+                        "presence_present"
+                    } else {
+                        "presence_left"
+                    });
+                }
+            }
+        }
+
+        assert_eq!(
+            order,
+            vec![
+                "presence_present",
+                "peer_left",
+                "internal_left",
+                "presence_left"
+            ],
+            "the relay must report the session present, publish the client \
+             PARTICIPANT_LEFT, then report the departure to meeting-api, and never \
+             broadcast MEETING_ENDED itself"
+        );
         assert!(
-            saw_ended,
-            "MEETING_ENDED must be broadcast when end_on_host_leave=true and host disconnects"
+            wait_for_first(&mut db_sub, Duration::from_secs(1))
+                .await
+                .is_none(),
+            "internal.meeting_ended_by_host must never be published by this relay"
+        );
+    }
+
+    async fn join_and_activate(
+        chat_server: &Addr<ChatServer>,
+        dummy: &Addr<EohlDummySession>,
+        session: SessionId,
+        room: &str,
+        user_id: &str,
+    ) {
+        chat_server
+            .send(Connect {
+                id: session,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom should deliver")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection { session })
+            .await
+            .expect("ActivateConnection should succeed");
+    }
+
+    /// `(session_id, present)` of every presence report for `room`.
+    async fn presence_reports(
+        sub: &mut async_nats::Subscriber,
+        room: &str,
+        deadline: tokio::time::Duration,
+    ) -> Vec<(SessionId, bool)> {
+        drain_all(sub, deadline)
+            .await
+            .iter()
+            .map(|bytes| {
+                serde_json::from_slice::<ParticipantPresencePayload>(bytes)
+                    .expect("presence payload")
+            })
+            .filter(|p| p.room_id == room)
+            .map(|p| (p.session_id, p.present))
+            .collect()
+    }
+
+    /// Only the session last reported present is reported on departure; while
+    /// the user keeps another local session it is handed the presence instead
+    /// of a LEFT (#2702).
+    #[actix_rt::test]
+    #[serial]
+    async fn presence_reports_follow_the_reported_session_and_hand_off() {
+        use tokio::time::Duration;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-2702-presence-handoff";
+        let user = "multi-tab@example.com";
+        let (s1, s2, s3): (SessionId, SessionId, SessionId) = (9_801, 9_802, 9_803);
+        let mut sub = nats_client
+            .subscribe(PARTICIPANT_PRESENCE_SUBJECT)
+            .await
+            .expect("subscribe presence");
+
+        for session in [s1, s2, s3] {
+            join_and_activate(&chat_server, &dummy, session, room, user).await;
+        }
+        for session in [s1, s3, s2] {
+            chat_server
+                .send(Leave {
+                    session,
+                    room: room.to_string(),
+                    user_id: user.to_string(),
+                })
+                .await
+                .expect("Leave should succeed");
+        }
+
+        assert_eq!(
+            presence_reports(&mut sub, room, Duration::from_secs(2)).await,
+            vec![(s1, true), (s2, true), (s3, true), (s2, true), (s2, false)],
+            "s1 was never the reported session; s3 hands off to s2; s2 leaves last"
+        );
+    }
+
+    #[test]
+    fn presence_heartbeats_cover_every_reported_session_once_and_split_large_rooms() {
+        let mut reported: HashMap<String, HashMap<String, SessionId>> = HashMap::new();
+        let big: HashMap<String, SessionId> = (0..300u64)
+            .map(|i| (format!("u{i}@example.com"), 1_000 + i))
+            .collect();
+        reported.insert("big".to_string(), big.clone());
+        reported.insert(
+            "small".to_string(),
+            HashMap::from([("a@example.com".to_string(), 7)]),
         );
 
-        let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(2)).await;
-        let db_payload = db_payload.expect(
-            "internal.meeting_ended_by_host must be published when MEETING_ENDED is broadcast",
+        let heartbeats = presence_heartbeats(&reported);
+        let mut per_room: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut seen: HashMap<(String, String), SessionId> = HashMap::new();
+        for heartbeat in &heartbeats {
+            per_room
+                .entry(heartbeat.room_id.clone())
+                .or_default()
+                .push(heartbeat.sessions.len());
+            for s in &heartbeat.sessions {
+                let duplicate =
+                    seen.insert((heartbeat.room_id.clone(), s.user_id.clone()), s.session_id);
+                assert!(duplicate.is_none(), "{} listed twice", s.user_id);
+            }
+        }
+        let mut big_sizes = per_room.remove("big").expect("big room heartbeats");
+        big_sizes.sort_unstable();
+        assert_eq!(
+            big_sizes,
+            vec![
+                300 - PRESENCE_HEARTBEAT_MAX_SESSIONS,
+                PRESENCE_HEARTBEAT_MAX_SESSIONS
+            ]
         );
-        let parsed: MeetingEndedByHostPayload =
-            serde_json::from_slice(&db_payload).expect("Payload should deserialize");
-        assert_eq!(parsed.room_id, room);
+        assert_eq!(per_room.remove("small"), Some(vec![1]));
+        assert_eq!(seen.len(), 301);
+        for (user, session) in &big {
+            assert_eq!(seen.get(&("big".to_string(), user.clone())), Some(session));
+        }
+    }
+
+    /// Each heartbeat lists exactly the sessions the relay reported present,
+    /// on the heartbeat period, and stops listing a session once it left.
+    #[actix_rt::test]
+    #[serial]
+    async fn presence_heartbeat_lists_the_reported_sessions_on_its_cadence() {
+        use std::collections::BTreeSet;
+        use tokio::time::Duration;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        assert_eq!(
+            ChatServer::new(nats_client.clone())
+                .await
+                .presence_heartbeat_interval,
+            Duration::from_secs(PRESENCE_HEARTBEAT_INTERVAL_SECS)
+        );
+        let mut server = ChatServer::new(nats_client.clone()).await;
+        server.presence_heartbeat_interval = Duration::from_millis(200);
+        let chat_server = server.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-2702-presence-heartbeat";
+        let (s1, s2, s3): (SessionId, SessionId, SessionId) = (9_821, 9_822, 9_823);
+        join_and_activate(&chat_server, &dummy, s1, room, "a@example.com").await;
+        join_and_activate(&chat_server, &dummy, s2, room, "a@example.com").await;
+        join_and_activate(&chat_server, &dummy, s3, room, "b@example.com").await;
+
+        let mut sub = nats_client
+            .subscribe(PRESENCE_HEARTBEAT_SUBJECT)
+            .await
+            .expect("subscribe heartbeat");
+        let heartbeats = |payloads: Vec<Vec<u8>>| -> Vec<BTreeSet<(String, SessionId)>> {
+            payloads
+                .iter()
+                .map(|bytes| {
+                    serde_json::from_slice::<PresenceHeartbeat>(bytes).expect("heartbeat payload")
+                })
+                .filter(|h| h.room_id == room)
+                .map(|h| {
+                    h.sessions
+                        .into_iter()
+                        .map(|s| (s.user_id, s.session_id))
+                        .collect()
+                })
+                .collect()
+        };
+        let both = heartbeats(drain_all(&mut sub, Duration::from_millis(1_000)).await);
+        assert!(
+            (3..=7).contains(&both.len()),
+            "one heartbeat per 200 ms over 1 s, got {}",
+            both.len()
+        );
+        let expected: BTreeSet<(String, SessionId)> = [
+            ("a@example.com".to_string(), s2),
+            ("b@example.com".to_string(), s3),
+        ]
+        .into_iter()
+        .collect();
+        assert!(both.iter().all(|h| *h == expected), "{both:?}");
+
+        chat_server
+            .send(Leave {
+                session: s3,
+                room: room.to_string(),
+                user_id: "b@example.com".to_string(),
+            })
+            .await
+            .expect("Leave should succeed");
+        let after = heartbeats(drain_all(&mut sub, Duration::from_millis(600)).await);
+        let last = after.last().expect("heartbeats continue after a departure");
+        assert_eq!(
+            *last,
+            [("a@example.com".to_string(), s2)]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// An evicted session is replaced by a session that reports itself, so its
+    /// eviction publishes no LEFT, which could overtake that report.
+    #[actix_rt::test]
+    #[serial]
+    async fn eviction_reports_no_departure() {
+        use tokio::time::Duration;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-2702-presence-eviction";
+        let user = "evicted@example.com";
+        let session: SessionId = 9_811;
+        let mut sub = nats_client
+            .subscribe(PARTICIPANT_PRESENCE_SUBJECT)
+            .await
+            .expect("subscribe presence");
+
+        join_and_activate(&chat_server, &dummy, session, room, user).await;
+        chat_server
+            .send(TestForgetSession {
+                session,
+                room: room.to_string(),
+                user_id: user.to_string(),
+            })
+            .await
+            .expect("forget should succeed");
+
+        assert_eq!(
+            presence_reports(&mut sub, room, Duration::from_secs(2)).await,
+            vec![(session, true)]
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────
     // Demoted ex-host whose transport reconnects with a stale (pre-demotion) room
-    // must NOT re-poison the relay's in-memory host flag.
-    // Otherwise that phantom host keeps the meeting alive when the
-    // REAL (transfer-target) host leaves — `was_last_present_host` counts the
-    // phantom as a present host and suppresses MEETING_ENDED.
-    //
-    // Flow: C joins as host (eohl=true); P joins as attendee; host transfers
-    // C→P via the `internal.meeting_host_changed` fanout; C's transport drops
-    // and RECONNECTS with the same instance_id + the stale token (is_host=true);
-    // then P (the real host) leaves. With the fix the relay re-seeds C from the
-    // fanout-reconciled prior entry (is_host=false), so P's departure is the
-    // last host leaving → MEETING_ENDED fires. Reverting the JoinRoom reconnect
-    // reconciliation (`reconnect_is_host.unwrap_or(is_host)` → `is_host`) makes C
-    // a phantom host → MEETING_ENDED is suppressed → this test fails.
-    //
-    // Observed on the explicit-Leave path because the `Leave` handler resolves
-    // `is_host` from `room_members` (so the departing host is correctly seen as
-    // host) and the only remaining member is the reconnected C — making the
-    // phantom flag the sole thing that decides whether the meeting ends.
+    // token must NOT re-poison the relay's in-memory host flag (#1241).
     // ──────────────────────────────────────────────────────────────────────
     #[actix_rt::test]
     #[serial]
-    async fn test_demoted_exhost_reconnect_does_not_phantom_block_meeting_end() {
-        use tokio::time::{sleep, Duration};
-
+    async fn test_demoted_exhost_reconnect_is_not_reseeded_as_host() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
@@ -12669,7 +12473,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("c-iid".to_string()),
                 is_host: true,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12702,7 +12505,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("p-iid".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12743,8 +12545,6 @@ mod tests {
                 display_name: creator.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: true,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect C should succeed");
@@ -12767,7 +12567,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("c-iid".to_string()), // same instance → reconnection
                 is_host: true,                          // STALE pre-demotion claim
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12781,41 +12580,31 @@ mod tests {
             .await
             .expect("Activate reconnected C should succeed");
 
-        // Subscribe AFTER the reconnect but BEFORE P leaves so we capture the
-        // broadcast; small sleep lets the subscription propagate.
-        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
-        let mut system_sub = nats_client
-            .subscribe(system_subject)
-            .await
-            .expect("subscribe system subject");
-        sleep(Duration::from_millis(200)).await;
-
-        // The REAL host (P) leaves. The relay's `Leave` handler resolves is_host
-        // from room_members (P=true); the only remaining member is reconnected C.
-        // With the fix C is is_host=false → last host left → MEETING_ENDED.
-        chat_server
-            .send(Leave {
-                session: p_session,
+        let members = chat_server
+            .send(GetRoomMembers {
                 room: room.to_string(),
-                user_id: target.to_string(),
             })
             .await
-            .expect("Leave P should succeed");
-
-        let (saw_ended, _saw_left) =
-            collect_meeting_events(&mut system_sub, Duration::from_secs(3)).await;
+            .expect("GetRoomMembers");
+        let reconnected_c = members
+            .iter()
+            .find(|m| m.session == c_session_2)
+            .expect("reconnected C row present");
         assert!(
-            saw_ended,
-            "MEETING_ENDED must fire when the real host leaves; a demoted ex-host \
-             reconnecting with a stale token must not phantom-block the end (#1241)"
+            !reconnected_c.is_host,
+            "a demoted ex-host reconnecting with a stale token must not be re-seeded \
+             as host in the presence map (#1241)"
         );
+        let p_row = members
+            .iter()
+            .find(|m| m.session == p_session)
+            .expect("P row present");
+        assert!(p_row.is_host, "the transfer target keeps the host flag");
     }
 
     // ──────────────────────────────────────────────────────────────────────
     // TEST 2: Stable end_on_host_leave=false, host disconnects ->
-    //         no MEETING_ENDED, no DB event. Verifies the policy gate
-    //         still suppresses the broadcast for hosts who never wanted
-    //         end-on-leave.
+    //         no MEETING_ENDED, no DB event.
     // ──────────────────────────────────────────────────────────────────────
     #[actix_rt::test]
     #[serial]
@@ -12859,7 +12648,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: true,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -12882,8 +12670,6 @@ mod tests {
                 display_name: "host-false@example.com".to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: true,
-                end_on_host_leave: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -12949,7 +12735,6 @@ mod tests {
                     observer: false,
                     instance_id: None,
                     is_host: false,
-                    end_on_host_leave: false,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                 })
@@ -12973,8 +12758,6 @@ mod tests {
                 display_name: "p1@example.com".to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -12997,8 +12780,6 @@ mod tests {
                 display_name: "p2@example.com".to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -13275,7 +13056,6 @@ mod tests {
             observer: false,
             instance_id: None,
             is_host: false,
-            end_on_host_leave: false,
             transport: "websocket".to_string(),
             downlink_congested_epoch: never_epoch(),
         })
@@ -13309,8 +13089,6 @@ mod tests {
             display_name: "L".to_string(),
             is_guest: false,
             observer: false,
-            is_host: false,
-            end_on_host_leave: false,
         })
         .await
         .expect("Disconnect L");
@@ -13733,13 +13511,12 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // EMPTY->IDLE TEST B: host leaves with end_on_host_leave=true. END must
-    //         win — the meeting ends, so the became-empty (idle) event must
-    //         NOT fire even though the room drained to empty.
+    // EMPTY->IDLE TEST B (#2702): a host draining the room is a normal
+    //         departure on the relay, so became-empty fires once.
     // ──────────────────────────────────────────────────────────────────────
     #[actix_rt::test]
     #[serial]
-    async fn test_host_leave_eohl_true_does_not_emit_idle_event() {
+    async fn test_host_leave_emits_idle_event_like_any_departure() {
         use tokio::time::{sleep, Duration};
 
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
@@ -13774,7 +13551,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: true,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -13797,31 +13573,111 @@ mod tests {
                 display_name: "host@example.com".to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: true,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
 
-        // END wins: the host-leave path fires MEETING_ENDED + the ended-by-host
-        // event, NOT the became-empty idle event.
-        let events = drain_all(&mut empty_sub, Duration::from_secs(6)).await;
-        assert!(
-            events.is_empty(),
-            "became-empty (idle) must NOT fire when end_on_host_leave=true ends the meeting; \
-             got {} event(s)",
-            events.len()
+        let events = drain_empty_events_for(&mut empty_sub, room, Duration::from_secs(6)).await;
+        assert_eq!(
+            events,
+            vec![room.to_string()],
+            "a host draining the room must emit became-empty exactly once"
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
-    // TEST 3: Mid-meeting toggle (true at JoinRoom, then NATS-pushed false)
-    //         + host disconnects -> no MEETING_ENDED. This is the actual
-    //         bug from discussion #502.
-    // ──────────────────────────────────────────────────────────────────────
+    /// The subject is global, so filter the drain to this room's events.
+    async fn drain_empty_events_for(
+        sub: &mut async_nats::Subscriber,
+        room: &str,
+        deadline: tokio::time::Duration,
+    ) -> Vec<String> {
+        drain_all(sub, deadline)
+            .await
+            .into_iter()
+            .filter_map(|p| serde_json::from_slice::<MeetingBecameEmptyPayload>(&p).ok())
+            .map(|p| p.room_id)
+            .filter(|r| r == room)
+            .collect()
+    }
+
+    /// Real `Connect` + `JoinRoom`. Withholding `ActivateConnection` is what
+    /// makes a session an election loser.
+    async fn connect_and_join_2711(
+        chat_server: &actix::Addr<ChatServer>,
+        dummy: &actix::Addr<EohlDummySession>,
+        session: SessionId,
+        room: &str,
+        user_id: &str,
+        instance_id: &str,
+    ) {
+        chat_server
+            .send(Connect {
+                id: session,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(instance_id.to_string()),
+                is_host: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+    }
+
+    async fn disconnect_2711(
+        chat_server: &actix::Addr<ChatServer>,
+        session: SessionId,
+        room: &str,
+        user_id: &str,
+    ) {
+        chat_server
+            .send(Disconnect {
+                session,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                is_guest: false,
+                observer: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+    }
+
+    async fn room_member_count_2711(chat_server: &actix::Addr<ChatServer>, room: &str) -> usize {
+        chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed")
+            .len()
+    }
+
+    async fn has_activation_record_2711(chat_server: &actix::Addr<ChatServer>, room: &str) -> bool {
+        chat_server
+            .send(RoomHasActivatedLocalMember {
+                room: room.to_string(),
+            })
+            .await
+            .expect("RoomHasActivatedLocalMember should succeed")
+    }
+
+    // TEST C (#2711, the defect): the only local session this binary ever saw
+    // was a never-activated election loser, so its expiry must publish nothing.
     #[actix_rt::test]
     #[serial]
-    async fn test_mid_meeting_toggle_to_false_suppresses_broadcast() {
+    async fn unannounced_room_publishes_no_empty_event_when_its_candidate_expires() {
         use tokio::time::{sleep, Duration};
 
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
@@ -13831,107 +13687,301 @@ mod tests {
 
         let chat_server = ChatServer::new(nats_client.clone()).await.start();
         let dummy = EohlDummySession.start();
-        let session_id = 9_502u64;
-        let room = "test-eohl-toggle-to-false";
+        let room = "test-2711-unannounced-room";
+        let user = "wt-host@example.com";
+        let candidate: SessionId = 9_711;
 
-        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
-        let mut system_sub = nats_client
-            .subscribe(system_subject)
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
             .await
-            .expect("Failed to subscribe to system subject");
-        let mut db_sub = nats_client
-            .subscribe(MEETING_ENDED_BY_HOST_SUBJECT)
-            .await
-            .expect("Failed to subscribe to internal subject");
+            .expect("Failed to subscribe to became-empty subject");
 
-        // Host joins with end_on_host_leave=true (the JWT-time value).
-        chat_server
-            .send(Connect {
-                id: session_id,
-                addr: dummy.recipient(),
-            })
+        connect_and_join_2711(&chat_server, &dummy, candidate, room, user, "iid-2711-c").await;
+        // No ActivateConnection: this candidate lost the RTT election.
+        sleep(Duration::from_millis(300)).await;
+
+        // Control: otherwise the drain below could be vacuously green.
+        assert_eq!(
+            room_member_count_2711(&chat_server, room).await,
+            1,
+            "the losing candidate must be in room_members before it disconnects"
+        );
+
+        disconnect_2711(&chat_server, candidate, room, user).await;
+
+        let events = drain_empty_events_for(&mut empty_sub, room, Duration::from_secs(7)).await;
+
+        // Control: proves the expiry branch ran, so the silence above is real.
+        assert_eq!(
+            room_member_count_2711(&chat_server, room).await,
+            0,
+            "the grace period must have expired and drained the candidate's row"
+        );
+        assert!(
+            events.is_empty(),
+            "a room this binary never activated anyone in must not publish \
+             empty->idle when its candidate expires; got {} event(s)",
+            events.len()
+        );
+    }
+
+    // TEST D (#2711): the pre-existing c6 contract, which passes before the fix
+    // too — this is the over-suppression guard.
+    #[actix_rt::test]
+    #[serial]
+    async fn testing_expiry_after_an_active_departure_still_publishes_empty_once() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
             .await
-            .expect("Connect should succeed");
-        chat_server
-            .send(JoinRoom {
-                session: session_id,
-                room: room.to_string(),
-                user_id: "host-toggle@example.com".to_string(),
-                display_name: "host-toggle@example.com".to_string(),
-                is_guest: false,
-                observer: false,
-                instance_id: None,
-                is_host: true,
-                end_on_host_leave: true,
-                transport: "websocket".to_string(),
-                downlink_congested_epoch: never_epoch(),
-            })
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-2711-c6-contract";
+        let active_user = "elected@example.com";
+        let testing_user = "loser@example.com";
+        let active: SessionId = 9_712;
+        let testing: SessionId = 9_713;
+
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
             .await
-            .expect("Message delivery should succeed")
-            .expect("JoinRoom should return Ok");
+            .expect("Failed to subscribe to became-empty subject");
+
+        connect_and_join_2711(
+            &chat_server,
+            &dummy,
+            active,
+            room,
+            active_user,
+            "iid-2711-d1",
+        )
+        .await;
         chat_server
-            .send(ActivateConnection {
-                session: session_id,
-            })
+            .send(ActivateConnection { session: active })
+            .await
+            .expect("ActivateConnection should succeed");
+        connect_and_join_2711(
+            &chat_server,
+            &dummy,
+            testing,
+            room,
+            testing_user,
+            "iid-2711-d2",
+        )
+        .await;
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            room_member_count_2711(&chat_server, room).await,
+            2,
+            "both the elected session and the testing session must be present"
+        );
+
+        disconnect_2711(&chat_server, active, room, active_user).await;
+        let during = drain_empty_events_for(&mut empty_sub, room, Duration::from_secs(7)).await;
+        assert!(
+            during.is_empty(),
+            "no empty->idle while the testing session still holds the room; got {} event(s)",
+            during.len()
+        );
+
+        // This binary DID activate someone here, so the drain must complete it.
+        disconnect_2711(&chat_server, testing, room, testing_user).await;
+        let after = drain_empty_events_for(&mut empty_sub, room, Duration::from_secs(7)).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "the testing session's expiry must finish the empty->idle transition \
+             exactly once; got {} event(s)",
+            after.len()
+        );
+    }
+
+    // TEST E (#2711): the record must not outlive the room, or the next meeting
+    // reusing the name inherits it and re-opens the defect.
+    #[actix_rt::test]
+    #[serial]
+    async fn activation_record_does_not_leak_into_a_later_occupancy() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-2711-room-reuse";
+        let first_user = "first@example.com";
+        let second_user = "second@example.com";
+        let first: SessionId = 9_714;
+        let second: SessionId = 9_715;
+
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("Failed to subscribe to became-empty subject");
+
+        // Occupancy 1: activate, then leave. The drain must take the record.
+        connect_and_join_2711(&chat_server, &dummy, first, room, first_user, "iid-2711-e1").await;
+        chat_server
+            .send(ActivateConnection { session: first })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+        disconnect_2711(&chat_server, first, room, first_user).await;
+        let occupancy_one =
+            drain_empty_events_for(&mut empty_sub, room, Duration::from_secs(7)).await;
+        assert_eq!(
+            occupancy_one.len(),
+            1,
+            "control: the first occupancy's active departure must idle the meeting; \
+             got {} event(s)",
+            occupancy_one.len()
+        );
+
+        // Occupancy 2: same name, election loser only — must be silent.
+        connect_and_join_2711(
+            &chat_server,
+            &dummy,
+            second,
+            room,
+            second_user,
+            "iid-2711-e2",
+        )
+        .await;
+        sleep(Duration::from_millis(300)).await;
+        disconnect_2711(&chat_server, second, room, second_user).await;
+        let occupancy_two =
+            drain_empty_events_for(&mut empty_sub, room, Duration::from_secs(7)).await;
+        assert!(
+            occupancy_two.is_empty(),
+            "a stale record from the previous occupancy must not publish \
+             empty->idle; got {} event(s)",
+            occupancy_two.len()
+        );
+    }
+
+    // TEST F (#2711): set at activation, held across an in-tab reconnect inside
+    // the grace window, released on the room drain.
+    #[actix_rt::test]
+    #[serial]
+    async fn activation_record_holds_across_reconnect_and_clears_on_drain() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-2711-record-lifecycle";
+        let user = "reconnector@example.com";
+        let iid = "iid-2711-f";
+        let before: SessionId = 9_716;
+        let after: SessionId = 9_717;
+
+        assert!(
+            !has_activation_record_2711(&chat_server, room).await,
+            "a room nobody has joined must have no activation record"
+        );
+
+        connect_and_join_2711(&chat_server, &dummy, before, room, user, iid).await;
+        assert!(
+            !has_activation_record_2711(&chat_server, room).await,
+            "joining alone must not record an activation — a candidate has joined too"
+        );
+        chat_server
+            .send(ActivateConnection { session: before })
+            .await
+            .expect("ActivateConnection should succeed");
+        assert!(
+            has_activation_record_2711(&chat_server, room).await,
+            "the Testing -> Active transition must record the room"
+        );
+
+        // JoinRoom cancels the pending departure and retains the old row out
+        // (#1311), transiently emptying the Vec outside either drain site.
+        disconnect_2711(&chat_server, before, room, user).await;
+        sleep(Duration::from_millis(800)).await;
+        connect_and_join_2711(&chat_server, &dummy, after, room, user, iid).await;
+        // Before the replacement activates and re-inserts the record.
+        assert!(
+            has_activation_record_2711(&chat_server, room).await,
+            "the #1311 reconnect path must not clear the record"
+        );
+        chat_server
+            .send(ActivateConnection { session: after })
             .await
             .expect("ActivateConnection should succeed");
         sleep(Duration::from_millis(300)).await;
 
-        // Simulate meeting-api publishing the post-toggle policy snapshot.
-        // The chat_server's `started()` task is already subscribed to this
-        // subject; we publish here and wait long enough for the actor to
-        // process the inbound NATS message and apply the UpdateRoomPolicy.
-        let toggle_payload = MeetingSettingsUpdatePayload {
-            room_id: room.to_string(),
-            end_on_host_leave: false,
-            admitted_can_admit: false,
-            waiting_room_enabled: true,
-            allow_guests: false,
-        };
-        let toggle_bytes =
-            serde_json::to_vec(&toggle_payload).expect("Should serialize toggle payload");
-        nats_client
-            .publish(MEETING_SETTINGS_UPDATE_SUBJECT, toggle_bytes.into())
-            .await
-            .expect("Should publish toggle");
-        // Allow time for the NATS message to be received by chat_server's
-        // subscription loop and for the UpdateRoomPolicy actor message to
-        // be handled. 800ms is well above NATS RTT on a healthy bus.
-        sleep(Duration::from_millis(800)).await;
-
-        // Now disconnect. The Disconnect message itself still carries
-        // end_on_host_leave=true (the stale JWT-time capture), but
-        // leave_rooms should consult the freshest room_policy entry
-        // and decide NOT to broadcast.
-        chat_server
-            .send(Disconnect {
-                session: session_id,
-                room: room.to_string(),
-                user_id: "host-toggle@example.com".to_string(),
-                display_name: "host-toggle@example.com".to_string(),
-                is_guest: false,
-                observer: false,
-                is_host: true,
-                end_on_host_leave: true, // STALE — must NOT win
-            })
-            .await
-            .expect("Disconnect should succeed");
-
-        let (saw_ended, _saw_left) =
-            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
-        assert!(
-            !saw_ended,
-            "MEETING_ENDED must NOT be broadcast after mid-meeting toggle to end_on_host_leave=false"
+        disconnect_2711(&chat_server, after, room, user).await;
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            room_member_count_2711(&chat_server, room).await,
+            0,
+            "the grace period must have expired and drained the room"
         );
-
-        let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(1)).await;
         assert!(
-            db_payload.is_none(),
-            "internal.meeting_ended_by_host must NOT fire when policy was toggled off"
+            !has_activation_record_2711(&chat_server, room).await,
+            "draining the room must release its activation record"
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
+    // TEST G (#2711): the other drain edge. `forget_session` removes the entry
+    // itself when a cross-server `EvictInstance` takes the last local session.
+    #[actix_rt::test]
+    #[serial]
+    async fn eviction_drain_also_releases_the_activation_record() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-2711-eviction-drain";
+        let user = "evicted@example.com";
+        let session: SessionId = 9_718;
+
+        connect_and_join_2711(&chat_server, &dummy, session, room, user, "iid-2711-g").await;
+        chat_server
+            .send(ActivateConnection { session })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            has_activation_record_2711(&chat_server, room).await,
+            "control: activation must record the room before the eviction"
+        );
+
+        chat_server
+            .send(TestForgetSession {
+                session,
+                room: room.to_string(),
+                user_id: user.to_string(),
+            })
+            .await
+            .expect("TestForgetSession should succeed");
+
+        assert_eq!(
+            room_member_count_2711(&chat_server, room).await,
+            0,
+            "control: forget_session must have drained the room"
+        );
+        assert!(
+            !has_activation_record_2711(&chat_server, room).await,
+            "the eviction drain must release the activation record, or a later \
+             meeting in this room name inherits it"
+        );
+    }
+
     // TEST 4: Reconnect within grace period -> no broadcast, no DB event.
     //         The reconnect cancels the deferred ExecutePendingDeparture
     //         before it can call leave_rooms, so neither the MEETING_ENDED
@@ -13984,7 +14034,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14008,8 +14057,6 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: true,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -14035,7 +14082,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14115,7 +14161,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-rename-reconnect".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14151,8 +14196,6 @@ mod tests {
                 display_name: "Alice".to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -14179,7 +14222,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-rename-reconnect".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14232,7 +14274,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14272,180 +14313,6 @@ mod tests {
         assert!(
             found_alice,
             "Bob should have received PARTICIPANT_JOINED for Alice"
-        );
-    }
-
-    // ──────────────────────────────────────────────────────────────────────
-    // TEST 5: Mid-meeting toggle, NON-host disconnect -> the host's
-    //         RoomMemberInfo.end_on_host_leave field gets updated by the
-    //         settings-update consumer. Locks in the cache-update path
-    //         independently from the broadcast logic, so a future change
-    //         to the leave_rooms gate can't silently resurrect the bug.
-    // ──────────────────────────────────────────────────────────────────────
-    #[actix_rt::test]
-    #[serial]
-    async fn test_settings_update_refreshes_room_policy_for_existing_host() {
-        use tokio::time::{sleep, Duration};
-
-        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-        let nats_client = async_nats::connect(&nats_url)
-            .await
-            .expect("Failed to connect to NATS");
-
-        let chat_server = ChatServer::new(nats_client.clone()).await.start();
-        let dummy = EohlDummySession.start();
-        let host_id = 9_505u64;
-        let other_id = 9_506u64;
-        let room = "test-eohl-toggle-other-leaves";
-
-        // Host joins with end_on_host_leave=true.
-        chat_server
-            .send(Connect {
-                id: host_id,
-                addr: dummy.clone().recipient(),
-            })
-            .await
-            .expect("Connect should succeed");
-        chat_server
-            .send(JoinRoom {
-                session: host_id,
-                room: room.to_string(),
-                user_id: "host-multi@example.com".to_string(),
-                display_name: "host-multi@example.com".to_string(),
-                is_guest: false,
-                observer: false,
-                instance_id: None,
-                is_host: true,
-                end_on_host_leave: true,
-                transport: "websocket".to_string(),
-                downlink_congested_epoch: never_epoch(),
-            })
-            .await
-            .expect("Message delivery should succeed")
-            .expect("JoinRoom should return Ok");
-        chat_server
-            .send(ActivateConnection { session: host_id })
-            .await
-            .expect("ActivateConnection should succeed");
-
-        // A non-host participant joins.
-        chat_server
-            .send(Connect {
-                id: other_id,
-                addr: dummy.recipient(),
-            })
-            .await
-            .expect("Connect should succeed");
-        chat_server
-            .send(JoinRoom {
-                session: other_id,
-                room: room.to_string(),
-                user_id: "other-multi@example.com".to_string(),
-                display_name: "other-multi@example.com".to_string(),
-                is_guest: false,
-                observer: false,
-                instance_id: None,
-                is_host: false,
-                end_on_host_leave: true,
-                transport: "websocket".to_string(),
-                downlink_congested_epoch: never_epoch(),
-            })
-            .await
-            .expect("Message delivery should succeed")
-            .expect("JoinRoom should return Ok");
-        chat_server
-            .send(ActivateConnection { session: other_id })
-            .await
-            .expect("ActivateConnection should succeed");
-        sleep(Duration::from_millis(300)).await;
-
-        // Toggle end_on_host_leave to false via the internal NATS event.
-        let toggle = MeetingSettingsUpdatePayload {
-            room_id: room.to_string(),
-            end_on_host_leave: false,
-            admitted_can_admit: false,
-            waiting_room_enabled: true,
-            allow_guests: false,
-        };
-        nats_client
-            .publish(
-                MEETING_SETTINGS_UPDATE_SUBJECT,
-                serde_json::to_vec(&toggle).unwrap().into(),
-            )
-            .await
-            .expect("Should publish toggle");
-        sleep(Duration::from_millis(800)).await;
-
-        // Inspect the host's per-member end_on_host_leave field via a
-        // synthetic actor message we add only for tests below.
-        let observed = chat_server
-            .send(GetRoomMemberEndOnHostLeave {
-                room: room.to_string(),
-                session: host_id,
-            })
-            .await
-            .expect("Query should succeed");
-        assert_eq!(
-            observed,
-            Some(false),
-            "UpdateRoomPolicy must mirror end_on_host_leave onto every member of the room"
-        );
-
-        // Sanity: also the room_policy cache itself should reflect the toggle.
-        let policy = chat_server
-            .send(GetRoomPolicyEndOnHostLeave {
-                room: room.to_string(),
-            })
-            .await
-            .expect("Query should succeed");
-        assert_eq!(
-            policy,
-            Some(false),
-            "room_policy cache must hold the post-toggle end_on_host_leave value"
-        );
-
-        // Now disconnect the non-host. This exercises leave_rooms for a
-        // non-host (no MEETING_ENDED expected regardless of policy) and
-        // confirms the host's cache survives.
-        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
-        let mut system_sub = nats_client
-            .subscribe(system_subject)
-            .await
-            .expect("Failed to subscribe to system subject");
-        chat_server
-            .send(Disconnect {
-                session: other_id,
-                room: room.to_string(),
-                user_id: "other-multi@example.com".to_string(),
-                display_name: "other-multi@example.com".to_string(),
-                is_guest: false,
-                observer: false,
-                is_host: false,
-                end_on_host_leave: true,
-            })
-            .await
-            .expect("Disconnect should succeed");
-
-        let (saw_ended, _saw_left) =
-            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
-        assert!(
-            !saw_ended,
-            "Non-host disconnect must not broadcast MEETING_ENDED regardless of policy"
-        );
-
-        // Final sanity: the host's policy still reads false after the
-        // other participant left.
-        let still = chat_server
-            .send(GetRoomMemberEndOnHostLeave {
-                room: room.to_string(),
-                session: host_id,
-            })
-            .await
-            .expect("Query should succeed");
-        assert_eq!(
-            still,
-            Some(false),
-            "Host's cached end_on_host_leave must persist after a non-host departure"
         );
     }
 
@@ -14523,7 +14390,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("inst-A".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14556,7 +14422,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("inst-B".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14684,7 +14549,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("inst-laptop".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14710,7 +14574,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("inst-phone".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14755,7 +14618,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("inst-carol".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14824,7 +14686,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14851,7 +14712,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14930,7 +14790,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(iid.clone()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -14964,7 +14823,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(iid),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15072,7 +14930,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-A".to_string()),
                 is_host: true,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15093,8 +14950,6 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: true,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -15122,7 +14977,6 @@ mod tests {
                 // a pending departure after the #852 rekey.
                 instance_id: Some("iid-A".to_string()),
                 is_host: true,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15241,7 +15095,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-laptop".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15270,7 +15123,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-phone".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15296,8 +15148,6 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect B");
@@ -15371,7 +15221,6 @@ mod tests {
                     observer: false,
                     instance_id: Some(iid.to_string()),
                     is_host: false,
-                    end_on_host_leave: true,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                 })
@@ -15395,8 +15244,6 @@ mod tests {
                     display_name: user.to_string(),
                     is_guest: false,
                     observer: false,
-                    is_host: false,
-                    end_on_host_leave: true,
                 })
                 .await
                 .expect("Disconnect");
@@ -15460,7 +15307,6 @@ mod tests {
                     observer: false,
                     instance_id: Some(iid.to_string()),
                     is_host: false,
-                    end_on_host_leave: true,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                 })
@@ -15483,8 +15329,6 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect A");
@@ -15570,7 +15414,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-A".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15591,8 +15434,6 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect A");
@@ -15615,7 +15456,6 @@ mod tests {
                 observer: false,
                 instance_id: Some("iid-B-fresh".to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15696,7 +15536,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(stolen_iid.to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15719,8 +15558,6 @@ mod tests {
                 display_name: victim.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect victim");
@@ -15744,7 +15581,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(stolen_iid.to_string()),
                 is_host: false,
-                end_on_host_leave: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -15849,7 +15685,6 @@ mod tests {
                     // Both sessions claim the same instance_id.
                     instance_id: Some(stolen_iid.to_string()),
                     is_host: false,
-                    end_on_host_leave: true,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                 })
@@ -15871,8 +15706,6 @@ mod tests {
                 display_name: victim.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect victim");
@@ -15884,8 +15717,6 @@ mod tests {
                 display_name: attacker.to_string(),
                 is_guest: false,
                 observer: false,
-                is_host: false,
-                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect attacker");
@@ -16160,51 +15991,6 @@ mod tests {
              survive untouched, and Alice's row must NOT silently fall \
              through to the user-id-wide path"
         );
-    }
-
-    // ──────────────────────────────────────────────────────────────────────
-    // Test-only actor messages used to peek at chat_server internals
-    // without exposing them in the production API surface.
-    // ──────────────────────────────────────────────────────────────────────
-
-    #[derive(ActixMessage)]
-    #[rtype(result = "Option<bool>")]
-    struct GetRoomMemberEndOnHostLeave {
-        room: String,
-        session: SessionId,
-    }
-
-    impl Handler<GetRoomMemberEndOnHostLeave> for ChatServer {
-        type Result = MessageResult<GetRoomMemberEndOnHostLeave>;
-        fn handle(
-            &mut self,
-            msg: GetRoomMemberEndOnHostLeave,
-            _ctx: &mut Self::Context,
-        ) -> Self::Result {
-            MessageResult(
-                self.room_members
-                    .get(&msg.room)
-                    .and_then(|members| members.iter().find(|m| m.session == msg.session))
-                    .map(|m| m.end_on_host_leave),
-            )
-        }
-    }
-
-    #[derive(ActixMessage)]
-    #[rtype(result = "Option<bool>")]
-    struct GetRoomPolicyEndOnHostLeave {
-        room: String,
-    }
-
-    impl Handler<GetRoomPolicyEndOnHostLeave> for ChatServer {
-        type Result = MessageResult<GetRoomPolicyEndOnHostLeave>;
-        fn handle(
-            &mut self,
-            msg: GetRoomPolicyEndOnHostLeave,
-            _ctx: &mut Self::Context,
-        ) -> Self::Result {
-            MessageResult(self.room_policy.get(&msg.room).map(|p| p.end_on_host_leave))
-        }
     }
 
     // ======================================================================
@@ -16836,7 +16622,6 @@ mod tests {
             user_id: format!("u{session}"),
             display_name: format!("d{session}"),
             is_host: false,
-            end_on_host_leave: false,
             origin: MemberOrigin::Local,
         };
 
@@ -16979,7 +16764,6 @@ mod tests {
                     user_id: format!("u{session}"),
                     display_name: format!("d{session}"),
                     is_host: false,
-                    end_on_host_leave: false,
                     origin: MemberOrigin::Local,
                 }],
             );
@@ -17086,7 +16870,6 @@ mod tests {
                     user_id: format!("u{idx}"),
                     display_name: format!("d{idx}"),
                     is_host: false,
-                    end_on_host_leave: false,
                     origin: MemberOrigin::Local,
                 }],
             );
@@ -19797,7 +19580,6 @@ mod tests {
             user_id: user_id.to_string(),
             display_name: user_id.to_string(),
             is_host,
-            end_on_host_leave: true,
             origin: MemberOrigin::Local,
         }
     }
@@ -19832,37 +19614,6 @@ mod tests {
         assert_eq!(
             apply_member_host_flag(&mut members, "nobody@example.com", true),
             0
-        );
-    }
-
-    #[test]
-    fn test_last_host_leave_fires_only_when_no_host_remains() {
-        // A host leaving with no remaining host sessions triggers the end-meeting
-        // path; a host leaving while another of their sessions remains does NOT.
-        let after_a_leaves = vec![member(2, "bob@example.com", true)];
-        assert!(
-            !was_last_present_host(&after_a_leaves, /* departing was_host */ true),
-            "a non-last host leaving must not end the meeting"
-        );
-
-        // B (the remaining host) leaves: no host remains → last-host departure →
-        // end-meeting branch fires.
-        let after_b_leaves: Vec<RoomMemberInfo> = vec![member(3, "carol@example.com", false)];
-        assert!(
-            was_last_present_host(&after_b_leaves, true),
-            "the last present host leaving must end the meeting"
-        );
-
-        // A plain attendee (was_host=false) leaving never triggers host-leave,
-        // regardless of remaining hosts.
-        assert!(!was_last_present_host(&after_b_leaves, false));
-
-        // Multi-session host: the host has two sessions; one leaves but the
-        // other remains, so it is NOT the last host departure.
-        let host_other_session_remains = vec![member(2, "alice@example.com", true)];
-        assert!(
-            !was_last_present_host(&host_other_session_remains, true),
-            "a host with another live session must keep the meeting alive"
         );
     }
 
@@ -20001,7 +19752,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(instance_id.to_string()),
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -20201,7 +19951,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(instance_id.to_string()),
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -20338,7 +20087,6 @@ mod tests {
                 observer: false,
                 instance_id: Some(iid.to_string()),
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -20445,7 +20193,6 @@ mod tests {
             user_id: user_id.to_string(),
             display_name: user_id.to_string(),
             is_host,
-            end_on_host_leave: false,
             origin,
         }
     }
@@ -20749,7 +20496,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: true,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -20791,7 +20537,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: true, // <-- the stale claim
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -20920,7 +20665,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: false,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })
@@ -21039,7 +20783,6 @@ mod tests {
                 observer: false,
                 instance_id: None,
                 is_host: true,
-                end_on_host_leave: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
             })

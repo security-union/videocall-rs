@@ -40,19 +40,19 @@ rustlemania-webtransport:
       value: webtransport
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
-    # TOKIO_WORKER_THREADS intentionally omitted: webtransport_server is
-    # `#[actix_rt::main]` (single-threaded current-thread runtime) and never
-    # reads it — the WtChatSession actor needs the LocalSet/spawn_local, so a
-    # multi-threaded runtime cannot host it. Inert env removed in issue #1639
-    # (option c); multi-core rearchitecture (#1639 a/b) is gated on #1637.
-    - name: TOKIO_BLOCKING_THREADS
-      value: "2"
+    - name: MEMBERSHIP_MIRROR_ENABLED
+      value: "true"
+    # TOKIO_WORKER_THREADS stays omitted, and MUST: tokio DOES read it for the
+    # multi-threaded runtime #2727 builds and PANICS on 0 or garbage (the relay
+    # passes its pool size explicitly). WT_SESSION_ARBITERS is the knob.
     - name: JWT_SECRET
       valueFrom:
         secretKeyRef:
           name: jwt-secret
           key: secret
 
+  # available_parallelism() FLOORS the quota, so 3500m gives 3 cores (#2727) and
+  # the trailing 500m is unusable. Rounding to 4000m is an ops decision.
   resources:
     limits:
       cpu: "3500m"
@@ -65,6 +65,11 @@ rustlemania-webtransport:
     type: LoadBalancer
     port: 443
     healthPort: 444
+    # Local belongs here once the #1202 guard lifts; at one replica it only costs
+    # a 10-15s partial-loss window per reschedule, from the thresholds set below.
+    externalTrafficPolicy: Cluster
+    sessionAffinity: ClientIP
+    sessionAffinityTimeoutSeconds: 86400
 
   podAnnotations:
     prometheus.io/scrape: "true"
@@ -78,10 +83,10 @@ rustlemania-webtransport:
     service.beta.kubernetes.io/do-loadbalancer-type: "REGIONAL_NETWORK"
     service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "3"
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "4"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "5"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "3"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "5"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
 

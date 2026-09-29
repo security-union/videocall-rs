@@ -4,6 +4,7 @@ import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-ind
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 /**
  * Per-peer screen-share diagnostics (HCL issue #883).
@@ -187,6 +188,9 @@ test.describe("Peer screen-share diagnostics", () => {
         // Mock getDisplayMedia on both sides so the guest's share button does
         // not open a real system picker.
         await ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+        // The viewer stays on the split layout this spec was written against;
+        // a share opens as a grid tile by default since #2792.
+        await seedShareViewMode(ctx, "enlarged");
         members.push({
           page: null as unknown as Page,
           context: ctx,

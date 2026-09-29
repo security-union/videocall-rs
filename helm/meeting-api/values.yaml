@@ -91,6 +91,22 @@ resources:
   requests:
     cpu: "250m"
     memory: "128Mi"
+migrate:
+  resources:
+    limits:
+      cpu: "250m"
+      memory: "128Mi"
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+# Port must match the Service targetPort and LISTEN_ADDR.
+readinessProbe:
+  httpGet:
+    path: /version
+    port: 8081
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

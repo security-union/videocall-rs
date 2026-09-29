@@ -48,10 +48,15 @@
 
 .active-connection { margin-bottom: var(--space-4); padding: var(--space-3); background: #2C2C2E; border-radius: var(--radius-md); border-left: 4px solid #0A84FF; } /* @token-exempt: CM dark-surface */
 .connection-details { display: grid; gap: 6px; }
-.detail-item { display: flex; justify-content: space-between; align-items: center; }
+.detail-item { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); }
+.detail-item-url { flex-wrap: wrap; align-items: baseline; row-gap: var(--space-1); }
 .detail-label { font-weight: 500; color: #FFFFFF; }
 .detail-value { font-weight: 600; }
-.server-url { font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; font-size: var(--fs-2); background: #1C1C1E; padding: 2px 6px; border-radius: 3px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* @token-exempt: CM dark-surface */
+.server-url { font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; font-size: var(--fs-2); color: #AEAEB2; background: #1C1C1E; padding: 2px 6px; border-radius: 3px; overflow-wrap: anywhere; } /* @token-exempt: CM dark-surface */
+a.server-url { color: #6EA8FE; text-decoration: underline; text-decoration-color: rgba(110,168,254,.4); text-underline-offset: 2px; } /* @token-exempt: CM dark-surface */
+a.server-url:hover, a.server-url:focus-visible { text-decoration-color: currentColor; }
+a.server-url:focus-visible { outline: 2px solid #6EA8FE; outline-offset: 2px; } /* @token-exempt: CM dark-surface */
+a.server-url::after { content: "\2197" / ""; display: inline-block; margin-left: 4px; }
 
 /* `.connection-type` / `.type-websocket` / `.type-webtransport` lifted to global
  * scope in static/style.css (issue 551 / issue 552). Defined once there now;
@@ -78,7 +83,7 @@
 .active-indicator { color: #30D158; }
 .status-indicator { font-size: var(--fs-5); }
 .server-details { font-size: var(--fs-2); }
-.server-url { color: #AEAEB2; margin-bottom: var(--space-1); font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; word-break: break-all; } /* @token-exempt: CM dark-surface */
+.server-card-url { display: block; width: fit-content; margin-bottom: var(--space-1); }
 .server-info { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
 .server-type { padding: 2px 6px; border-radius: 3px; font-size: var(--fs-1); font-weight: 600; background: #2C2C2E; border: 1px solid #38383A; color: #0A84FF; } /* @token-exempt: CM dark-surface */
 .server-rtt { padding: 2px 6px; border-radius: 3px; font-size: var(--fs-1); font-weight: 600; }

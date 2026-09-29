@@ -247,6 +247,12 @@ pub struct RuntimeConfig {
     #[serde(rename = "logLevel")]
     #[serde(default)]
     pub log_level: Option<String>,
+    /// Operator override for the transport a user with NO stored preference
+    /// gets. `#[serde(default)]` so a stale bind-mounted `config.js` that
+    /// predates the key parses to `None` instead of bricking startup.
+    #[serde(rename = "defaultTransport")]
+    #[serde(default)]
+    pub default_transport: Option<String>,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -397,6 +403,16 @@ pub fn test_capability_max_layers_override() -> Option<u32> {
 
 pub fn max_received_layer() -> Option<u32> {
     app_config().ok().and_then(|c| c.max_received_layer)
+}
+
+/// The raw `defaultTransport`, or `None` when absent / empty / unreadable.
+/// [`crate::context::resolve_default_transport`] owns the mapping.
+pub fn default_transport_config_value() -> Option<String> {
+    let raw = app_config().ok()?.default_transport?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(raw)
 }
 
 pub fn skip_canvas_paint() -> bool {
@@ -961,6 +977,26 @@ mod simulcast_default_tests {
 #[cfg(test)]
 mod runtime_config_tests {
     use super::RuntimeConfig;
+
+    #[test]
+    fn an_unknown_key_does_not_break_the_parse() {
+        let parsed: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "apiBaseUrl": "http://test:8080",
+            "wsUrl": "ws://test:8080",
+            "webTransportHost": "https://test:4433",
+            "oauthEnabled": "false",
+            "e2eeEnabled": "false",
+            "webTransportEnabled": "false",
+            "usersAllowedToStream": "",
+            "serverElectionPeriodMs": 2000,
+            "wtReceiveWorker": "0"
+        }))
+        .expect("a chart that sets a key this struct does not name must still parse");
+        assert_eq!(
+            parsed.web_transport_enabled, "false",
+            "and the keys it DOES name must survive alongside the stranger"
+        );
+    }
 
     /// Issue #1193: bitrate targets are owned by the centralized AQ tables, so
     /// runtime configuration no longer requires the legacy audio/video/screen

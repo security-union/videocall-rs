@@ -1,5 +1,9 @@
 import { test, expect, chromium, Page, BrowserContext, Browser } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { routeDownlinkThroughProxy, impairUplink, healUplink } from "../helpers/downlink-impair";
@@ -188,6 +192,7 @@ test.describe("Screen-share uplink backoff (#2343)", () => {
       await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
       // The GUEST shares, so its uplink is the one shaped. Must precede nav.
       await routeDownlinkThroughProxy(guestCtx);
+      await pinWebSocketTransport(hostCtx);
       await guestCtx.addInitScript(ANIMATED_SHARE_MOCK);
 
       const hostPage = await hostCtx.newPage();

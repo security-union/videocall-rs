@@ -4,12 +4,14 @@
 //! Forked from yew-webtransport (MIT licensed, Copyright (c) 2022 Security Union),
 //! adapted to use `videocall_types::Callback` instead of `yew::Callback`.
 
+use crate::downlink_stream::StreamKey;
+use crate::inbound::{InboundFrame, InboundLane, ReceivedAtMs};
 use anyhow::{anyhow, Error};
 use futures::channel::oneshot::channel;
 use futures::lock::Mutex as AsyncMutex;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
@@ -22,8 +24,22 @@ use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
     WebTransportDatagramDuplexStream, WebTransportHash, WebTransportOptions,
-    WebTransportReceiveStream, WritableStream, WritableStreamDefaultWriter,
+    WebTransportReceiveStream, WebTransportSendStreamOptions, WritableStream,
+    WritableStreamDefaultWriter,
 };
+
+thread_local! {
+    static KEY_DONE: JsString = JsString::from("done");
+    static KEY_VALUE: JsString = JsString::from("value");
+}
+
+fn reflect_done(result: &JsValue) -> Result<JsValue, JsValue> {
+    KEY_DONE.with(|key| Reflect::get(result, key))
+}
+
+fn reflect_value(result: &JsValue) -> Result<JsValue, JsValue> {
+    KEY_VALUE.with(|key| Reflect::get(result, key))
+}
 
 /// Cumulative count of datagrams dropped because the writable stream was locked.
 static DATAGRAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -42,15 +58,13 @@ static READ_LOOP_LAG: StdMutex<crate::read_loop_lag::DatagramReadLoopLagTracker>
     StdMutex::new(crate::read_loop_lag::DatagramReadLoopLagTracker::new());
 
 /// Drain and return the max gap (ms) between successive incoming-datagram
-/// `.read()` resolutions since the previous call (read-and-reset window). A
-/// sustained high value is main-thread reader starvation — the direct causal
-/// signal for the issue-1878 audio-loss class. Returns 0.0 if the lock is
-/// poisoned (never in practice on single-threaded wasm).
+/// `.read()` resolutions since the previous call (read-and-reset window).
 pub fn take_datagram_read_loop_max_gap_ms() -> f64 {
-    READ_LOOP_LAG
+    let in_page = READ_LOOP_LAG
         .lock()
         .map(|mut t| t.take_max_gap_ms())
-        .unwrap_or(0.0)
+        .unwrap_or(0.0);
+    in_page.max(crate::worker_session::take_read_loop_max_gap_ms())
 }
 
 /// Issue 2031: observed post-set incoming-datagram queue parameters
@@ -66,7 +80,11 @@ static INCOMING_QUEUE_READBACK: StdMutex<Option<(f64, f64)>> = StdMutex::new(Non
 /// configured yet. Empirically answers, per browser, whether Chromium honored
 /// the issue-1878 `incomingHighWaterMark` / `incomingMaxAge` setters.
 pub fn incoming_datagram_queue_readback() -> Option<(f64, f64)> {
-    INCOMING_QUEUE_READBACK.lock().ok().and_then(|g| *g)
+    INCOMING_QUEUE_READBACK
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .or_else(crate::worker_session::incoming_queue_readback)
 }
 
 /// Resolve the `performance` object ONCE for the read-loop clock. Hoisted out of
@@ -75,7 +93,7 @@ pub fn incoming_datagram_queue_readback() -> Option<(f64, f64)> {
 /// the read loop resolves this before its `spawn_local` and reuses the handle.
 /// `None` where `performance` is unavailable (falls back to `Date.now()`).
 fn resolve_read_loop_clock() -> Option<web_sys::Performance> {
-    web_sys::window().and_then(|w| w.performance())
+    crate::clock::resolve_performance()
 }
 
 /// Read the monotonic clock (ms) from a pre-resolved `performance` handle for the
@@ -108,35 +126,11 @@ const INCOMING_DATAGRAM_HIGH_WATER_MARK: f64 = 2048.0;
 /// 3 s — a NetEQ-friendly staleness cap, since audio more than ~3 s stale is
 /// unusable for real-time playout anyway (NetEQ would discard it), so retaining
 /// it would only waste queue capacity fresher audio needs. This is therefore a
-/// TIGHTENING of the default, not a raise: that 3 s cap is exactly what age-drops
-/// the OLDEST audio during a stall LONGER than 3 s (only PARTIALLY mitigated) —
-/// the full fix is carrying audio on a reliable/partially-reliable stream, a
-/// relay+client protocol change (follow-up).
+/// TIGHTENING of the default, not a raise.
 const INCOMING_DATAGRAM_MAX_AGE_MS: f64 = 3000.0;
 
 /// Widen the browser's INCOMING QUIC-datagram receive queue so a main-thread
 /// stall does not silently drop audio (issue #1878).
-///
-/// Under E2EE-off WebTransport the relay routes small Opus AUDIO frames onto
-/// unreliable datagrams. Our incoming-datagram reader
-/// ([`WebTransportService::start_listening_incoming_datagrams`]) runs as a
-/// `spawn_local` task on the MAIN thread. When the main thread stalls (a long
-/// task — the #1878 trigger, correlated in the field with the "CPU-stall
-/// suppression budget exhausted" log), the reader cannot drain and the browser
-/// drops the OLDEST queued datagrams — silently, because the relay's
-/// `send_datagram` is best-effort (returns `Ok`) and the client's
-/// [`datagram_drop_count`] is SEND-side only. That is a contiguous audio
-/// burst-loss NetEQ cannot conceal (56% vs 2% concealment WT-vs-WS in the field).
-///
-/// Raising `incomingHighWaterMark` (queue capacity) and `incomingMaxAge`
-/// (staleness bound) lets the network process HOLD the backlog across a bounded
-/// stall and deliver it late-but-COMPLETE once the main thread frees up —
-/// mirroring how TCP kernel buffering lets WebSocket survive the identical stall.
-/// The reader living on the stalled main thread does not prevent this: the
-/// buffering happens off-thread in the network process. Steady-state adds no
-/// latency (the queue drains immediately); only during a stall is audio
-/// delivered later, which NetEQ absorbs (it tolerates late audio; it cannot
-/// conceal a multi-second gap).
 ///
 /// The two knobs are tuned in OPPOSITE directions, deliberately:
 /// `incomingHighWaterMark` is only ever RAISED (we never lower a UA default that
@@ -260,8 +254,18 @@ pub fn unistream_stale_delta_drop_count() -> u64 {
     UNISTREAM_STALE_DELTA_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// While a screen share is live, additionally floored at the slow-`ready()`
+/// threshold (#2755): a `ready()` wait the saturation governor calls healthy
+/// must not also be grounds for dropping the frame that waited it. Read from
+/// [`ReadyStallThresholdOwner`]. With no screen share live, unchanged.
 fn camera_age_drop_budget_ms() -> f64 {
-    compose_stall_threshold_ms(CAMERA_AGE_DROP_BUDGET_MS_FLOOR, uplink_rtt_baseline_ms())
+    let base =
+        compose_stall_threshold_ms(CAMERA_AGE_DROP_BUDGET_MS_FLOOR, uplink_rtt_baseline_ms());
+    if raised_threshold_owner_count() > 0 {
+        base.max(effective_stall_threshold_ms())
+    } else {
+        base
+    }
 }
 
 /// Whether this frame should be age-dropped on the WT send path (#1737 Phase 1).
@@ -324,6 +328,68 @@ pub fn unistream_bytes_drained_total() -> u64 {
 
 fn record_bytes_drained(n: u64) {
     UNISTREAM_BYTES_DRAINED.fetch_add(n, Ordering::Relaxed);
+}
+
+static UNISTREAM_BYTES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative framed bytes offered but never written (teardown, stream reset,
+/// re-election draining) — [`unistream_drop_count`] in bytes rather than frames.
+pub fn unistream_bytes_dropped_total() -> u64 {
+    UNISTREAM_BYTES_DROPPED.load(Ordering::Relaxed)
+}
+
+fn record_bytes_dropped(n: u64) {
+    UNISTREAM_BYTES_DROPPED.fetch_add(n, Ordering::Relaxed);
+}
+
+static UNISTREAM_BYTES_AGE_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative framed bytes of camera deltas age-dropped by the #1737 Phase-1
+/// budget — [`unistream_stale_delta_drop_count`] in bytes rather than frames.
+pub fn unistream_bytes_age_dropped_total() -> u64 {
+    UNISTREAM_BYTES_AGE_DROPPED.load(Ordering::Relaxed)
+}
+
+fn record_bytes_age_dropped(n: u64) {
+    UNISTREAM_BYTES_AGE_DROPPED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Bytes currently buried in the WebTransport uplink — the analogue of the
+/// WebSocket `bufferedAmount`, reported on the same `send_queue_bytes` health
+/// field. An INSTANTANEOUS GAUGE in bytes, NOT a monotonic total: do not chart
+/// it with `rate()`/`increase()`. Every frame in `offered` is retired by exactly
+/// one subtrahend when its write future completes, so the raw `offered -
+/// drained` gap's growing floor is subtracted back out; a send future whose JS
+/// promise never settles keeps its bytes counted until it does.
+pub fn unistream_queue_depth_bytes() -> u64 {
+    compose_queue_depth_bytes(
+        unistream_bytes_offered_total(),
+        unistream_bytes_drained_total(),
+        unistream_bytes_dropped_total(),
+        unistream_bytes_age_dropped_total(),
+    )
+}
+
+fn compose_queue_depth_bytes(offered: u64, drained: u64, dropped: u64, age_dropped: u64) -> u64 {
+    offered
+        .saturating_sub(drained)
+        .saturating_sub(dropped)
+        .saturating_sub(age_dropped)
+}
+
+/// Cumulative inbound unistreams this client stopped reading.
+static INBOUND_UNISTREAM_RESET_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// See [`INBOUND_UNISTREAM_RESET_COUNT`].
+pub fn inbound_unistream_reset_count() -> u64 {
+    INBOUND_UNISTREAM_RESET_COUNT.load(Ordering::Relaxed)
+        + crate::worker_session::inbound_unistream_reset_count()
+}
+
+/// Single write path for [`INBOUND_UNISTREAM_RESET_COUNT`], called from the
+/// inbound reader's read-rejection arm in `videocall-client`.
+pub fn record_inbound_unistream_reset() {
+    INBOUND_UNISTREAM_RESET_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record one dropped persistent-unistream media frame: increment
@@ -593,10 +659,15 @@ static RTT_BASELINE_MS: AtomicU64 = AtomicU64::new(0);
 /// live owner's value, not the last value written.
 ///
 /// The mutex makes register/update/release plus max recomputation one atomic
-/// state transition. Runtime calls are infrequent (screen start/stop or a tier
-/// change), so this is not on the per-frame media path.
+/// state transition. It is taken only on register/update/release, never on the
+/// per-frame media path: [`raised_threshold_owner_count`] reads
+/// [`READY_STALL_THRESHOLD_OWNER_COUNT`] instead.
 static READY_STALL_THRESHOLD_OWNERS: OnceLock<StdMutex<HashMap<u64, u64>>> = OnceLock::new();
 static NEXT_READY_STALL_THRESHOLD_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Lock-free mirror of `READY_STALL_THRESHOLD_OWNERS.len()`, republished under
+/// the registry lock by [`publish_ready_stall_threshold_owner_max`].
+static READY_STALL_THRESHOLD_OWNER_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn ready_stall_threshold_owners() -> StdMutexGuard<'static, HashMap<u64, u64>> {
     READY_STALL_THRESHOLD_OWNERS
@@ -620,6 +691,10 @@ fn publish_ready_stall_threshold_owner_max(owners: &HashMap<u64, u64>) {
         .map(f64::from_bits)
         .fold(READY_STALL_THRESHOLD_MS_FLOOR, f64::max);
     READY_STALL_THRESHOLD_MS.store(threshold.to_bits(), Ordering::Relaxed);
+    READY_STALL_THRESHOLD_OWNER_COUNT.store(
+        owners.len().min(u32::MAX as usize) as u32,
+        Ordering::Relaxed,
+    );
 }
 
 /// RAII ownership of one encoder's dual-stream slow-`ready()` threshold.
@@ -659,8 +734,9 @@ impl Drop for ReadyStallThresholdOwner {
 }
 
 /// Live count of encoders currently holding a dual-stream threshold owner.
+/// Reads the cached mirror, taking no lock.
 pub fn raised_threshold_owner_count() -> u32 {
-    ready_stall_threshold_owners().len().min(u32::MAX as usize) as u32
+    READY_STALL_THRESHOLD_OWNER_COUNT.load(Ordering::Relaxed)
 }
 
 /// PURE predicate: may a newly-constructed encoder reset the uplink-saturation
@@ -892,8 +968,9 @@ fn cert_hash_override_has_usable_entry(decoded_count: u32) -> bool {
 /// a `WebTransportOptions` dictionary suitable for `new_with_options`.
 ///
 /// Returns `None` when:
-///   - There is no `window` (non-browser environment),
-///   - `window.__VC_WT_CERT_HASHES__` is undefined / null,
+///   - `__VC_WT_CERT_HASHES__` is absent from this global (it is read off
+///     `js_sys::global()`, so it works in a Worker as well as a window),
+///   - it is undefined / null,
 ///   - The value is not an array, or
 ///   - The array is empty.
 ///
@@ -904,8 +981,7 @@ fn cert_hash_override_has_usable_entry(decoded_count: u32) -> bool {
 /// global is dev-only plumbing; a misconfigured E2E harness should still
 /// fail with a clear browser-side error rather than killing the wasm.
 fn read_wt_cert_hash_options() -> Option<WebTransportOptions> {
-    let window = web_sys::window()?;
-    let raw = Reflect::get(&window, &JsValue::from_str(WT_CERT_HASHES_GLOBAL)).ok()?;
+    let raw = global_property(WT_CERT_HASHES_GLOBAL)?;
     if raw.is_undefined() || raw.is_null() {
         return None;
     }
@@ -982,8 +1058,7 @@ fn truncate_utf16_units_to_bytes(units: impl Iterator<Item = u16>) -> Vec<u8> {
 /// from the `JsString` and truncate each to a `u8` via
 /// [`truncate_utf16_units_to_bytes`].
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let window = web_sys::window()?;
-    let atob = Reflect::get(&window, &JsValue::from_str("atob")).ok()?;
+    let atob = global_property("atob")?;
     let atob_fn: js_sys::Function = atob.dyn_into().ok()?;
     let decoded = atob_fn.call1(&JsValue::NULL, &JsValue::from_str(s)).ok()?;
     let js_str: JsString = decoded.dyn_into().ok()?;
@@ -1045,6 +1120,94 @@ pub type PersistentStreamMap = Rc<AsyncMutex<HashMap<u8, PersistentSendStream>>>
 /// and threaded through `send_on_persistent_stream`.
 pub fn new_persistent_stream_map() -> PersistentStreamMap {
     Rc::new(AsyncMutex::new(HashMap::new()))
+}
+
+static SEND_ORDER_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Times [`create_persistent_unistream`] retried without the `sendOrder`
+/// option. CANARY FOR A CASE NEVER YET SEEN, narrower than "the engine lacks
+/// sendOrder": WebIDL IGNORES an unknown dictionary member and the with-options
+/// binding is the same JS method, so only a reject the bare call would not also
+/// hit moves this.
+pub fn send_order_fallback_count() -> u64 {
+    SEND_ORDER_FALLBACK_COUNT.load(Ordering::Relaxed)
+        + crate::worker_session::send_order_fallback_count()
+}
+
+fn record_send_order_fallback() {
+    SEND_ORDER_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Open one persistent uplink unistream carrying a QUIC scheduling hint.
+/// `send_order` goes on the W3C `WebTransportSendStreamOptions.sendOrder`
+/// member, which that spec defines as "higher is sent first" within a session.
+/// The retry on rejection is belt-and-braces; see [`send_order_fallback_count`].
+pub async fn create_persistent_unistream(
+    transport: &WebTransport,
+    stream_key: u8,
+    send_order: i32,
+) -> Result<WritableStream, Error> {
+    let options = WebTransportSendStreamOptions::new();
+    options.set_send_order(Some(f64::from(send_order)));
+    let created =
+        match JsFuture::from(transport.create_unidirectional_stream_with_options(&options)).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                record_send_order_fallback();
+                log!(
+                "createUnidirectionalStream(sendOrder) rejected, retrying without options for key",
+                stream_key as u32,
+                format!("{e:?}")
+            );
+                JsFuture::from(transport.create_unidirectional_stream())
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "failed to create unidirectional stream for key {}: {:?}",
+                            stream_key,
+                            e
+                        )
+                    })?
+            }
+        };
+    Ok(created.unchecked_into())
+}
+
+/// The identity transform that carries one uplink stream across the #2728
+/// Worker hop: main writes to `writable`, the Worker pipes the matching readable
+/// into the QUIC send stream.
+pub struct UplinkTransform {
+    /// Transferred to main. Every frame for this stream key is written here.
+    pub writable: WritableStream,
+    /// Settles when the pipe finishes, rejects when it breaks.
+    pub pipe: js_sys::Promise,
+}
+
+/// Build the uplink transform for one send stream.
+///
+/// `pipe_to` is called with DEFAULT options on purpose, so `preventAbort`,
+/// `preventClose` and `preventCancel` are all false: a QUIC RESET_STREAM errors
+/// `sink`, which errors the readable, which errors the transform, which errors
+/// the writable main holds, so main's next `write_with_chunk` rejects and the
+/// dead entry is evicted. Setting any of the three would leave that entry in the
+/// map with no counter and no log, and that media kind's uplink would stop.
+pub fn build_uplink_transform(sink: &WritableStream) -> Result<UplinkTransform, JsValue> {
+    let transform = web_sys::TransformStream::new()?;
+    let writable = transform.writable();
+    let pipe = transform.readable().pipe_to(sink);
+    Ok(UplinkTransform { writable, pipe })
+}
+
+/// Whether a failed send should evict the map entry it wrote through.
+fn evict_after_failed_send<V: HasIdentityToken>(
+    map: &mut HashMap<u8, V>,
+    stream_key: u8,
+    captured_token: Option<&Rc<()>>,
+) -> bool {
+    match captured_token {
+        Some(token) => remove_if_token_matches(map, stream_key, token),
+        None => false,
+    }
 }
 
 /// Internal abstraction so [`remove_if_token_matches`] can be unit-tested in
@@ -1193,6 +1356,49 @@ pub type Text = Result<String, Error>;
 /// A representation of a value which can be stored and restored as a binary.
 pub type Binary = Result<Vec<u8>, Error>;
 
+/// The `closeCode` and `reason` carried by the W3C `WebTransportCloseInfo`
+/// dictionary that a graceful server close resolves `closed()` with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebTransportCloseInfo {
+    /// The application close code the server sent.
+    pub code: u32,
+    /// The server's close reason, empty when it sent none.
+    pub reason: String,
+}
+
+/// Read a [`WebTransportCloseInfo`] off the value `closed()` settled with.
+///
+/// A graceful server close resolves with a close-info object; an abrupt one
+/// rejects with a `WebTransportError`, which carries no `closeCode`. A readable
+/// numeric `closeCode` is therefore the resolve-versus-reject discriminator.
+pub fn read_close_info(value: &JsValue) -> Option<WebTransportCloseInfo> {
+    let code = Reflect::get(value, &JsValue::from_str("closeCode"))
+        .ok()?
+        .as_f64()
+        .filter(|code| code.is_finite() && *code >= 0.0)?;
+    let reason = Reflect::get(value, &JsValue::from_str("reason"))
+        .ok()
+        .and_then(|reason| reason.as_string())
+        .unwrap_or_default();
+    Some(WebTransportCloseInfo {
+        code: code as u32,
+        reason,
+    })
+}
+
+/// Pick the status a settled `closed()` maps to.
+fn close_status(
+    handshake_complete: bool,
+    info: Option<WebTransportCloseInfo>,
+    described: String,
+) -> WebTransportStatus {
+    match (handshake_complete, info) {
+        (true, Some(info)) => WebTransportStatus::ClosedAfterReadyWithCode(info),
+        (true, None) => WebTransportStatus::ClosedAfterReady(described),
+        (false, _) => WebTransportStatus::ClosedBeforeReady(described),
+    }
+}
+
 /// The status of a WebTransport connection. Used for status notifications.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WebTransportStatus {
@@ -1204,14 +1410,170 @@ pub enum WebTransportStatus {
     Error(JsValue),
     /// Closed/errored before `ready()` resolved — handshake never completed.
     ClosedBeforeReady(String),
-    /// Closed/errored after `ready()` resolved — session was established first.
+    /// Closed/errored after `ready()` resolved, with no readable close code.
     ClosedAfterReady(String),
+    /// Closed after `ready()` resolved by a server close carrying a close code.
+    ClosedAfterReadyWithCode(WebTransportCloseInfo),
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum WebTransportError {
     #[error("{0}")]
     CreationError(String),
+}
+
+/// Read a property off THIS global, whether it is a window or a Worker scope.
+fn global_property(name: &str) -> Option<JsValue> {
+    Reflect::get(&js_sys::global(), &JsValue::from_str(name)).ok()
+}
+
+/// Devtools / e2e override for where the WebTransport session runs.
+pub const WT_RECEIVE_WORKER_GLOBAL: &str = "__VC_WT_RECEIVE_WORKER";
+
+/// What the #2728 Worker writes to [`WT_RECEIVE_WORKER_GLOBAL`] on its own
+/// global at boot, so a nested `connect` cannot spawn another Worker.
+pub const WT_RECEIVE_WORKER_SELF_DISABLE: &str = "0";
+
+const APP_CONFIG_GLOBAL: &str = "__APP_CONFIG";
+const WT_RECEIVE_WORKER_CONFIG_KEY: &str = "wtReceiveWorker";
+
+pub fn worker_disabled_by_flag(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+fn flag_text(value: JsValue) -> Option<String> {
+    if value.is_undefined() || value.is_null() {
+        None
+    } else if let Some(b) = value.as_bool() {
+        Some(if b { "1" } else { "0" }.to_string())
+    } else {
+        value
+            .as_string()
+            .or_else(|| value.as_f64().map(|n| n.to_string()))
+    }
+}
+
+/// Decide from the two sources. Split out so the PRECEDENCE is pinned by a
+/// native test; the JS reads either side of it stay browser-only.
+pub fn resolve_worker_flag(devtools: Option<&str>, config: Option<&str>) -> bool {
+    match devtools {
+        Some(value) => !worker_disabled_by_flag(Some(value)),
+        None => !worker_disabled_by_flag(config),
+    }
+}
+
+/// Where the WebTransport session runs. Default ON.
+fn wt_receive_worker_enabled() -> bool {
+    let global = js_sys::global();
+    let from_override = Reflect::get(&global, &JsValue::from_str(WT_RECEIVE_WORKER_GLOBAL))
+        .ok()
+        .and_then(flag_text);
+    let from_config = Reflect::get(&global, &JsValue::from_str(APP_CONFIG_GLOBAL))
+        .ok()
+        .filter(|config| !config.is_undefined() && !config.is_null())
+        .and_then(|config| {
+            Reflect::get(&config, &JsValue::from_str(WT_RECEIVE_WORKER_CONFIG_KEY)).ok()
+        })
+        .and_then(flag_text);
+    resolve_worker_flag(from_override.as_deref(), from_config.as_deref())
+}
+
+fn read_wt_cert_hash_strings() -> Vec<String> {
+    let Some(raw) = global_property(WT_CERT_HASHES_GLOBAL) else {
+        return Vec::new();
+    };
+    let Ok(array) = raw.dyn_into::<Array>() else {
+        return Vec::new();
+    };
+    array.iter().filter_map(|v| v.as_string()).collect()
+}
+
+/// Where the QUIC session actually lives.
+///
+/// The uplink runs on main either way: `Worker` holds `WritableStream`s the
+/// Worker created and transferred, so every uplink counter keeps its site.
+#[derive(Clone)]
+pub enum SessionHost {
+    /// Legacy path: the session is on this thread.
+    InPage(Rc<WebTransport>),
+    /// #2728 path: the session is in a dedicated Worker.
+    Worker(Rc<crate::worker_session::WorkerSession>),
+}
+
+impl SessionHost {
+    pub fn in_page(&self) -> Option<&Rc<WebTransport>> {
+        match self {
+            SessionHost::InPage(transport) => Some(transport),
+            SessionHost::Worker(_) => None,
+        }
+    }
+
+    pub fn worker(&self) -> Option<&Rc<crate::worker_session::WorkerSession>> {
+        match self {
+            SessionHost::InPage(_) => None,
+            SessionHost::Worker(session) => Some(session),
+        }
+    }
+
+    /// `None` on the Worker path until READY lands.
+    pub fn datagram_writable(&self) -> Option<WritableStream> {
+        match self {
+            SessionHost::InPage(transport) => Some(transport.datagrams().writable()),
+            SessionHost::Worker(session) => session.datagram_writable(),
+        }
+    }
+
+    pub fn close(&self) {
+        match self {
+            SessionHost::InPage(transport) => transport.close(),
+            SessionHost::Worker(session) => {
+                session.request_close();
+                let session = session.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let mut waited = 0u32;
+                    while waited < crate::worker_proto::WORKER_CLOSE_GRACE_MS
+                        && !session.closed_ack()
+                    {
+                        gloo_timers::future::TimeoutFuture::new(
+                            crate::worker_proto::WORKER_CLOSE_POLL_MS,
+                        )
+                        .await;
+                        waited += crate::worker_proto::WORKER_CLOSE_POLL_MS;
+                    }
+                    session.terminate();
+                });
+            }
+        }
+    }
+
+    async fn wait_ready(&self) -> Result<(), Error> {
+        match self {
+            SessionHost::InPage(transport) => JsFuture::from(transport.ready())
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow!("transport.ready() failed: {:?}", e)),
+            SessionHost::Worker(_) => Ok(()),
+        }
+    }
+
+    async fn open_persistent_unistream(
+        &self,
+        stream_key: u8,
+        send_order: i32,
+    ) -> Result<WritableStream, Error> {
+        match self {
+            SessionHost::InPage(transport) => {
+                create_persistent_unistream(transport, stream_key, send_order).await
+            }
+            SessionHost::Worker(session) => session
+                .create_send_stream(stream_key, send_order)
+                .await
+                .map_err(|e| anyhow!("worker could not open stream {}: {}", stream_key, e)),
+        }
+    }
 }
 
 /// A handle to control the WebTransport connection.
@@ -1221,7 +1583,7 @@ pub enum WebTransportError {
 /// their `reader.read()` futures resolve with errors on a closed transport.
 #[must_use = "the connection will be closed when the task is dropped"]
 pub struct WebTransportTask {
-    pub transport: Rc<WebTransport>,
+    pub host: SessionHost,
     #[allow(dead_code)]
     notification: Callback<WebTransportStatus>,
     #[allow(dead_code)]
@@ -1243,14 +1605,14 @@ pub struct WebTransportTask {
 
 impl WebTransportTask {
     fn new(
-        transport: Rc<WebTransport>,
+        host: SessionHost,
         notification: Callback<WebTransportStatus>,
         listeners: [Promise; 2],
         opened_closure: Closure<dyn FnMut(JsValue)>,
         closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
     ) -> WebTransportTask {
         WebTransportTask {
-            transport,
+            host,
             notification,
             listeners,
             opened_closure,
@@ -1258,16 +1620,30 @@ impl WebTransportTask {
             persistent_streams: new_persistent_stream_map(),
         }
     }
+
+    fn new_worker(
+        session: Rc<crate::worker_session::WorkerSession>,
+        notification: Callback<WebTransportStatus>,
+    ) -> WebTransportTask {
+        WebTransportTask {
+            host: SessionHost::Worker(session),
+            notification,
+            listeners: [
+                Promise::resolve(&JsValue::UNDEFINED),
+                Promise::resolve(&JsValue::UNDEFINED),
+            ],
+            opened_closure: Closure::wrap(Box::new(|_: JsValue| {}) as Box<dyn FnMut(JsValue)>),
+            closed_closure: Rc::new(Closure::wrap(
+                Box::new(|_: JsValue| {}) as Box<dyn FnMut(JsValue)>
+            )),
+            persistent_streams: new_persistent_stream_map(),
+        }
+    }
 }
 
 impl Drop for WebTransportTask {
     fn drop(&mut self) {
-        // Close the underlying WebTransport session. This causes the reader
-        // loops (datagrams, unidirectional streams, bidirectional streams) to
-        // break out of their `reader.read()` await — the futures resolve with
-        // errors on a closed transport, allowing the spawn_local tasks and
-        // their captured Rc<WebTransport> clones to be cleaned up.
-        self.transport.close();
+        self.host.close();
     }
 }
 
@@ -1286,14 +1662,86 @@ impl WebTransportService {
     /// datagrams, unidirectional streams, bidirectional streams, and status notifications.
     pub fn connect(
         url: &str,
-        on_datagram: Callback<Vec<u8>>,
-        on_unidirectional_stream: Callback<WebTransportReceiveStream>,
-        on_bidirectional_stream: Callback<WebTransportBidirectionalStream>,
+        on_frame: Callback<InboundFrame>,
+        notification: Callback<WebTransportStatus>,
+    ) -> Result<WebTransportTask, WebTransportError> {
+        if wt_receive_worker_enabled() {
+            return Self::connect_via_worker(url, on_frame, notification);
+        }
+        Self::connect_in_page(url, on_frame, notification)
+    }
+
+    fn connect_in_page(
+        url: &str,
+        on_frame: Callback<InboundFrame>,
+        notification: Callback<WebTransportStatus>,
+    ) -> Result<WebTransportTask, WebTransportError> {
+        Self::connect_here(
+            url,
+            Callback::from(move |(_key, frame): (Option<StreamKey>, InboundFrame)| {
+                on_frame.emit(frame)
+            }),
+            notification,
+        )
+    }
+
+    pub fn connect_here(
+        url: &str,
+        on_frame: Callback<(Option<StreamKey>, InboundFrame)>,
         notification: Callback<WebTransportStatus>,
     ) -> Result<WebTransportTask, WebTransportError> {
         let ConnectCommon(transport, listeners, opened_closure, closed_closure) =
             Self::connect_common(url, &notification)?;
         let transport = Rc::new(transport);
+        crate::inbound::reset_audio_lane_anchor();
+
+        let on_datagram = {
+            let sink = on_frame.clone();
+            Callback::from(move |bytes: Vec<u8>| {
+                sink.emit((
+                    None,
+                    InboundFrame {
+                        bytes,
+                        lane: InboundLane::Datagram,
+                        received_at: ReceivedAtMs(crate::clock::now_ms()),
+                    },
+                ));
+            })
+        };
+        let on_unidirectional_stream = {
+            let sink = on_frame.clone();
+            let session: crate::inbound::InboundSessionRef =
+                Rc::new(crate::inbound::InboundSession::default());
+            let keyed = Callback::from(move |(key, bytes): (StreamKey, Vec<u8>)| {
+                sink.emit((
+                    Some(key),
+                    InboundFrame {
+                        bytes,
+                        lane: InboundLane::Reliable,
+                        received_at: ReceivedAtMs(crate::clock::now_ms()),
+                    },
+                ));
+            });
+            Callback::from(move |stream: WebTransportReceiveStream| {
+                crate::inbound::handle_unidirectional_stream(stream, keyed.clone(), session.clone())
+            })
+        };
+        let on_bidirectional_stream = {
+            let sink = on_frame.clone();
+            let frames = Callback::from(move |bytes: Vec<u8>| {
+                sink.emit((
+                    None,
+                    InboundFrame {
+                        bytes,
+                        lane: InboundLane::Reliable,
+                        received_at: ReceivedAtMs(crate::clock::now_ms()),
+                    },
+                ));
+            });
+            Callback::from(move |stream: WebTransportBidirectionalStream| {
+                crate::inbound::handle_bidirectional_stream(stream, frames.clone())
+            })
+        };
 
         Self::start_listening_incoming_datagrams(transport.datagrams(), on_datagram);
         Self::start_listening_incoming_unidirectional_streams(
@@ -1306,12 +1754,35 @@ impl WebTransportService {
         );
 
         Ok(WebTransportTask::new(
-            transport,
+            SessionHost::InPage(transport),
             notification,
             listeners,
             opened_closure,
             closed_closure,
         ))
+    }
+
+    fn connect_via_worker(
+        url: &str,
+        on_frame: Callback<InboundFrame>,
+        notification: Callback<WebTransportStatus>,
+    ) -> Result<WebTransportTask, WebTransportError> {
+        let session = crate::worker_session::WorkerSession::start(
+            url,
+            read_wt_cert_hash_strings(),
+            crate::worker_session::WorkerSessionCallbacks {
+                on_frame: Callback::from(move |frame: crate::worker_session::WorkerFrame| {
+                    on_frame.emit(InboundFrame {
+                        bytes: frame.bytes,
+                        lane: frame.lane,
+                        received_at: ReceivedAtMs(frame.received_at_ms),
+                    });
+                }),
+                notification: notification.clone(),
+            },
+        )
+        .map_err(WebTransportError::CreationError)?;
+        Ok(WebTransportTask::new_worker(session, notification))
     }
 
     fn start_listening_incoming_unidirectional_streams(
@@ -1332,7 +1803,7 @@ impl WebTransportService {
                         break;
                     }
                     Ok(result) => {
-                        let done = match Reflect::get(&result, &JsString::from("done")) {
+                        let done = match reflect_done(&result) {
                             Ok(val) => val.unchecked_into::<Boolean>(),
                             Err(e) => {
                                 log!(
@@ -1342,7 +1813,7 @@ impl WebTransportService {
                                 break;
                             }
                         };
-                        if let Ok(value) = Reflect::get(&result, &JsString::from("value")) {
+                        if let Ok(value) = reflect_value(&result) {
                             if value.is_undefined() {
                                 break;
                             }
@@ -1399,7 +1870,7 @@ impl WebTransportService {
                         break;
                     }
                     Ok(result) => {
-                        let done = match Reflect::get(&result, &JsString::from("done")) {
+                        let done = match reflect_done(&result) {
                             Ok(val) => val.unchecked_into::<Boolean>(),
                             Err(e) => {
                                 log!("Failed to read 'done' from datagram result", &e);
@@ -1409,14 +1880,13 @@ impl WebTransportService {
                         if done.is_truthy() {
                             break;
                         }
-                        let value: Uint8Array =
-                            match Reflect::get(&result, &JsString::from("value")) {
-                                Ok(val) => val.unchecked_into(),
-                                Err(e) => {
-                                    log!("Failed to read 'value' from datagram result", &e);
-                                    break;
-                                }
-                            };
+                        let value: Uint8Array = match reflect_value(&result) {
+                            Ok(val) => val.unchecked_into(),
+                            Err(e) => {
+                                log!("Failed to read 'value' from datagram result", &e);
+                                break;
+                            }
+                        };
                         process_binary(&value, &callback);
                     }
                 }
@@ -1439,14 +1909,14 @@ impl WebTransportService {
                         break;
                     }
                     Ok(result) => {
-                        let done = match Reflect::get(&result, &JsString::from("done")) {
+                        let done = match reflect_done(&result) {
                             Ok(val) => val.unchecked_into::<Boolean>(),
                             Err(e) => {
                                 log!("Failed to read 'done' from bidirectional stream result", &e);
                                 break;
                             }
                         };
-                        if let Ok(value) = Reflect::get(&result, &JsString::from("value")) {
+                        if let Ok(value) = reflect_value(&result) {
                             if value.is_undefined() {
                                 break;
                             }
@@ -1513,12 +1983,12 @@ impl WebTransportService {
             if fired_closed.replace(true) {
                 return; // already emitted
             }
-            let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
-            if hs_flag_closed.get() {
-                notify.emit(WebTransportStatus::ClosedAfterReady(msg));
-            } else {
-                notify.emit(WebTransportStatus::ClosedBeforeReady(msg));
-            }
+            let described = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+            notify.emit(close_status(
+                hs_flag_closed.get(),
+                read_close_info(&e),
+                described,
+            ));
         }) as Box<dyn FnMut(JsValue)>));
         let ready = transport
             .ready()
@@ -1560,10 +2030,12 @@ impl WebTransportTask {
     /// the packet is silently dropped instead of killing the entire transport
     /// connection. Only fatal errors (transport closed, write failure after
     /// acquiring the lock) close the transport.
-    pub fn send_datagram(transport: Rc<WebTransport>, data: Vec<u8>) {
+    pub fn send_datagram(host: SessionHost, data: Vec<u8>) {
         wasm_bindgen_futures::spawn_local(async move {
-            let stream = transport.datagrams();
-            let writable: WritableStream = stream.writable();
+            let Some(writable) = host.datagram_writable() else {
+                DATAGRAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
             if writable.locked() {
                 DATAGRAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                 log!("datagram dropped (stream busy)");
@@ -1573,7 +2045,7 @@ impl WebTransportTask {
                 Ok(w) => w,
                 Err(e) => {
                     log!("error: ", format!("{e:?}"));
-                    transport.close();
+                    host.close();
                     return;
                 }
             };
@@ -1588,7 +2060,7 @@ impl WebTransportTask {
                     "datagram write failed, closing transport:",
                     format!("{e:?}")
                 );
-                transport.close();
+                host.close();
             }
         });
     }
@@ -1633,10 +2105,14 @@ impl WebTransportTask {
     /// (via EOF) and discards any partial buffer; framing guarantees that a
     /// truncated frame becomes a clean stream-closed event rather than a
     /// silently-corrupted payload.
+    ///
+    /// `send_order` is the scheduling hint applied when this key's stream is
+    /// (re-)created; the caller owns that ranking, as it owns `stream_key`.
     pub fn send_on_persistent_stream(
-        transport: Rc<WebTransport>,
+        host: SessionHost,
         streams: PersistentStreamMap,
         stream_key: u8,
+        send_order: i32,
         data: Vec<u8>,
         meta: Option<FrameDropMeta>,
     ) {
@@ -1661,6 +2137,12 @@ impl WebTransportTask {
         }
 
         wasm_bindgen_futures::spawn_local(async move {
+            let chunk = {
+                let framed = frame_persistent_stream_payload(&data);
+                Uint8Array::from(framed.as_slice())
+            };
+            let frame_bytes = 4 + data.len() as u64;
+            drop(data);
             // Captured alongside the writer when we acquire it from the
             // map; passed into the error handler so a stale failing send
             // can only evict the entry it actually used.  See the eviction
@@ -1671,9 +2153,7 @@ impl WebTransportTask {
                 // ready() resolves once the underlying QUIC session is
                 // established.  Calling create_unidirectional_stream() before
                 // ready() resolves throws.
-                JsFuture::from(transport.ready())
-                    .await
-                    .map_err(|e| anyhow!("transport.ready() failed: {:?}", e))?;
+                host.wait_ready().await?;
 
                 // --- Ensure a writer exists for this stream_key --------------
                 // Lock the map across the create-or-reuse decision so two
@@ -1683,17 +2163,9 @@ impl WebTransportTask {
                     use std::collections::hash_map::Entry;
                     let mut map = streams.lock().await;
                     if let Entry::Vacant(entry) = map.entry(stream_key) {
-                        let stream: WritableStream =
-                            JsFuture::from(transport.create_unidirectional_stream())
-                                .await
-                                .map_err(|e| {
-                                    anyhow!(
-                                        "failed to create unidirectional stream for key {}: {:?}",
-                                        stream_key,
-                                        e
-                                    )
-                                })?
-                                .unchecked_into();
+                        let stream = host
+                            .open_persistent_unistream(stream_key, send_order)
+                            .await?;
                         let writer = stream
                             .get_writer()
                             .map_err(|e| anyhow!("error getting writer: {:?}", e))?;
@@ -1715,14 +2187,8 @@ impl WebTransportTask {
                     entry.writer.clone()
                 };
 
-                // --- Build the framed payload --------------------------------
-                // [u32 BE length][payload] in a single Uint8Array so the
-                // browser cannot split the header off from its body.
-                let framed = frame_persistent_stream_payload(&data);
-                let chunk = Uint8Array::from(framed.as_slice());
-                let framed_len = framed.len() as u64;
                 if captured_token.is_some() {
-                    record_bytes_offered(framed_len);
+                    record_bytes_offered(frame_bytes);
                 }
 
                 // --- Write the frame ----------------------------------------
@@ -1809,6 +2275,7 @@ impl WebTransportTask {
                     if let Some(now_ms) = ready_resolved_ms {
                         if should_age_drop(meta, now_ms, camera_age_drop_budget_ms()) {
                             record_stale_delta_drop();
+                            record_bytes_age_dropped(frame_bytes);
                             return Ok(());
                         }
                     }
@@ -1816,38 +2283,8 @@ impl WebTransportTask {
                 JsFuture::from(writer.write_with_chunk(&chunk))
                     .await
                     .map_err(|e| anyhow!("write_with_chunk failed: {:?}", e))?;
-                // "Drained" means accepted past the WritableStream backpressure
-                // gate and handed to QUIC, not wire-ACK; the JS API exposes no
-                // byte ACK.
-                //
-                // SIGNAL SEMANTICS (read before building a consumer): both
-                // counters are MONOTONIC process-lifetime totals, so the relay
-                // charts them with `rate()`/`increase()`. `offered` is bumped
-                // for every established-path frame (below/above); `drained` only
-                // when the write RESOLVES OK. A frame that FAILS at `ready()` /
-                // `write_with_chunk` (teardown, reset, re-election draining) was
-                // counted in `offered` but never in `drained` — so
-                // `offered - drained` = (bytes currently buried in the
-                // WritableStream + spawn_local fan-out) + (cumulative bytes of
-                // frames that ever failed to write) + (#1737 Phase 1: cumulative
-                // bytes of camera DELTA frames intentionally AGE-DROPPED before
-                // `write_with_chunk` — these were `offered` above, then skipped
-                // via `return Ok(())`, so they never reach `drained` and are NOT
-                // counted by `unistream_drop_count()`). The RATE of the gap is
-                // the buried-queue backpressure signal; the absolute gap has a
-                // growing floor equal to cumulative teardown drops PLUS cumulative
-                // age-drops. Those two dropped components are separately observable
-                // as FRAME counts (not bytes) via `unistream_drop_count()`
-                // (teardown/failed writes) and `unistream_stale_delta_drop_count()`
-                // (#1737 age-drops). We deliberately do NOT `fetch_sub` `offered`
-                // on either drop path: that would make the counter non-monotonic
-                // and `increase()` would read the decrease as a counter reset. If
-                // a future phase needs pure buried-backlog in BYTES, add monotonic
-                // `UNISTREAM_BYTES_{DROPPED,AGE_DROPPED}` counters and compute
-                // `offered - drained - dropped - age_dropped` — do not roll back
-                // `offered`.
                 if captured_token.is_some() {
-                    record_bytes_drained(framed_len);
+                    record_bytes_drained(frame_bytes);
                 }
                 Ok(())
             }
@@ -1874,6 +2311,7 @@ impl WebTransportTask {
                 // frame regardless of the eviction race outcome below.
                 if captured_token.is_some() {
                     record_unistream_drop(stream_key);
+                    record_bytes_dropped(frame_bytes);
                 }
                 // Stream is broken — remove it from the map so the next
                 // send for this key opens a fresh stream.  We compare
@@ -1886,16 +2324,8 @@ impl WebTransportTask {
                 // above to acquire the writer was scoped and has been
                 // released — we cannot hold it across the write await.
                 let mut map = streams.lock().await;
-                let removed = match captured_token {
-                    Some(token) => remove_if_token_matches(&mut map, stream_key, &token),
-                    None => {
-                        // We failed before acquiring a writer (e.g.
-                        // transport.ready() or create_unidirectional_stream
-                        // failed), so no entry was ever inserted on our
-                        // behalf — nothing to evict.
-                        false
-                    }
-                };
+                let removed =
+                    evict_after_failed_send(&mut map, stream_key, captured_token.as_ref());
                 log!(
                     "persistent stream send failed (stream reset, frame dropped):",
                     e.to_string(),
@@ -1996,7 +2426,7 @@ impl WebTransportTask {
                                 }
                                 Ok(result) => {
                                     let done =
-                                        match Reflect::get(&result, &JsString::from("done")) {
+                                        match reflect_done(&result) {
                                             Ok(val) => val.unchecked_into::<Boolean>(),
                                             Err(e) => {
                                                 log!(
@@ -2010,7 +2440,7 @@ impl WebTransportTask {
                                         break;
                                     }
                                     let value: Uint8Array =
-                                        match Reflect::get(&result, &JsString::from("value")) {
+                                        match reflect_value(&result) {
                                             Ok(val) => val.unchecked_into(),
                                             Err(e) => {
                                                 log!(
@@ -2070,8 +2500,75 @@ impl WebTransportTask {
 // unit tests.
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
+mod close_status_tests {
+    use super::*;
+
+    fn escalation_close() -> WebTransportCloseInfo {
+        WebTransportCloseInfo {
+            code: 1001,
+            reason: "downlink-shed-escalation".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_graceful_close_after_ready_carries_the_code_and_reason() {
+        assert_eq!(
+            close_status(
+                true,
+                Some(escalation_close()),
+                "[object Object]".to_string()
+            ),
+            WebTransportStatus::ClosedAfterReadyWithCode(escalation_close()),
+            "a resolved close info must reach the client as a code, not a Debug blob"
+        );
+    }
+
+    #[test]
+    fn a_rejected_close_after_ready_stays_on_the_string_path() {
+        assert_eq!(
+            close_status(true, None, "WebTransportError: network error".to_string()),
+            WebTransportStatus::ClosedAfterReady("WebTransportError: network error".to_string()),
+            "a rejection carries no close code and must not fabricate one"
+        );
+    }
+
+    #[test]
+    fn a_close_before_ready_is_a_handshake_failure_whatever_it_carries() {
+        assert_eq!(
+            close_status(false, Some(escalation_close()), "refused".to_string()),
+            WebTransportStatus::ClosedBeforeReady("refused".to_string()),
+            "a session that never opened cannot be a mid-session downlink failure"
+        );
+        assert_eq!(
+            close_status(false, None, "refused".to_string()),
+            WebTransportStatus::ClosedBeforeReady("refused".to_string()),
+        );
+    }
+}
+
+#[cfg(test)]
 mod framing_tests {
     use super::*;
+
+    #[test]
+    fn a_five_second_stall_outlives_the_incoming_datagram_queues_bounds() {
+        let stall_ms = 5_000.0_f64;
+        assert!(
+            INCOMING_DATAGRAM_MAX_AGE_MS < stall_ms,
+            "the #2724 acceptance contrast: the queue holds only \
+             {INCOMING_DATAGRAM_MAX_AGE_MS}ms, so a {stall_ms}ms stall loses the \
+             first {}ms of datagram audio outright, where the age-bound-free \
+             class-3 stream loses none",
+            stall_ms - INCOMING_DATAGRAM_MAX_AGE_MS
+        );
+
+        let queued_in_the_age_window = 50.0 * 25.0 * (INCOMING_DATAGRAM_MAX_AGE_MS / 1000.0);
+        assert!(
+            INCOMING_DATAGRAM_HIGH_WATER_MARK < queued_in_the_age_window,
+            "and at 25 speakers x 50 pkt/s CAPACITY binds first, so the loss \
+             starts before even that window is up"
+        );
+    }
 
     #[test]
     fn frame_round_trips_byte_for_byte() {
@@ -2151,6 +2648,65 @@ mod framing_tests {
                 assert_eq!(missing, 50);
             }
             other => panic!("expected NeedMorePayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_devtools_override_beats_the_runtime_config_key() {
+        assert!(
+            !resolve_worker_flag(Some("0"), None),
+            "an operator who set nothing still gets the devtools override"
+        );
+        assert!(
+            !resolve_worker_flag(None, Some("0")),
+            "and the config key alone turns it off, which is the rollback lever"
+        );
+        assert!(
+            resolve_worker_flag(Some("1"), Some("0")),
+            "a spec must be able to turn the Worker ON in an environment that \
+             shipped with it off"
+        );
+        assert!(
+            !resolve_worker_flag(Some("0"), Some("1")),
+            "and OFF in one that shipped with it on"
+        );
+        assert!(
+            resolve_worker_flag(None, None),
+            "neither set is the production default: ON"
+        );
+        assert!(
+            resolve_worker_flag(Some("1"), Some("1")),
+            "both on is the Worker"
+        );
+    }
+
+    #[test]
+    fn the_worker_disables_its_own_session_worker_flag() {
+        assert!(
+            worker_disabled_by_flag(Some(WT_RECEIVE_WORKER_SELF_DISABLE)),
+            "the value the Worker publishes must be one this resolver treats as OFF"
+        );
+        assert!(
+            !resolve_worker_flag(Some(WT_RECEIVE_WORKER_SELF_DISABLE), Some("1")),
+            "and it must win over an environment whose config turns the Worker ON"
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_off_value_disables_the_session_worker() {
+        for off in ["0", "false", "off", "no", "FALSE", " Off "] {
+            assert!(
+                worker_disabled_by_flag(Some(off)),
+                "{off:?} must select the legacy in-page path — it is the \
+                 rollback lever and the control arm of the #2728 e2e receipt"
+            );
+        }
+        for on in [None, Some("1"), Some("true"), Some(""), Some("yes")] {
+            assert!(
+                !worker_disabled_by_flag(on),
+                "{on:?} must leave the Worker ON; an unset global is the \
+                 production default"
+            );
         }
     }
 
@@ -2261,6 +2817,46 @@ mod framing_tests {
         fn identity_token(&self) -> &Rc<()> {
             &self.token
         }
+    }
+
+    /// The wiring `remove_if_token_matches` sits behind, which was inline in the
+    /// send path's error handler and therefore unreachable from a test.
+    #[test]
+    fn a_failed_send_evicts_only_when_it_actually_held_a_writer() {
+        let token = Rc::new(());
+        let mut map: HashMap<u8, TestEntry> = HashMap::new();
+        map.insert(
+            7,
+            TestEntry {
+                token: token.clone(),
+            },
+        );
+
+        assert!(
+            !evict_after_failed_send(&mut map, 7, None),
+            "a failure before the writer existed (transport.ready, or \
+             createUnidirectionalStream) has no entry of ours to evict"
+        );
+        assert!(
+            map.contains_key(&7),
+            "and it must leave the entry a concurrent sender is using"
+        );
+
+        assert!(
+            evict_after_failed_send(&mut map, 7, Some(&token)),
+            "a write that failed through THIS entry must evict it, so the next \
+             send for the key opens a fresh stream"
+        );
+        assert!(map.is_empty());
+
+        let stale = Rc::new(());
+        map.insert(7, TestEntry { token: Rc::new(()) });
+        assert!(
+            !evict_after_failed_send(&mut map, 7, Some(&stale)),
+            "and a stale failure must not evict the fresh entry that replaced \
+             the one it wrote through (#773)"
+        );
+        assert!(map.contains_key(&7));
     }
 
     /// Baseline: a matching token evicts; a non-matching token does not.
@@ -2991,6 +3587,57 @@ mod framing_tests {
     }
 
     #[test]
+    fn camera_age_drop_budget_takes_the_dual_stream_term_only_while_screen_is_live() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+
+        assert_eq!(
+            raised_threshold_owner_count(),
+            0,
+            "anti-vacuity: no screen share may be live at the start of this arm"
+        );
+        assert_eq!(
+            camera_age_drop_budget_ms(),
+            CAMERA_AGE_DROP_BUDGET_MS_FLOOR,
+            "camera-only: the budget stays at its own 200ms floor and must NOT \
+             adopt the 250ms ready-stall floor — they measure different quantities"
+        );
+
+        let owner = ReadyStallThresholdOwner::new(800.0);
+        assert_eq!(
+            camera_age_drop_budget_ms(),
+            800.0,
+            "a live screen share must widen the camera age-drop budget to the \
+             dual-stream slow-ready() threshold, or the park behind every screen \
+             keyframe age-drops the camera GOP"
+        );
+
+        owner.set_threshold_ms(1600.0);
+        assert_eq!(
+            camera_age_drop_budget_ms(),
+            1600.0,
+            "a degraded screen tier must widen the budget with it"
+        );
+
+        set_uplink_rtt_baseline_ms(Some(900.0));
+        assert_eq!(
+            camera_age_drop_budget_ms(),
+            1800.0,
+            "the dual-stream term must not lower a larger RTT-relative budget"
+        );
+        set_uplink_rtt_baseline_ms(None);
+
+        drop(owner);
+        assert_eq!(
+            camera_age_drop_budget_ms(),
+            CAMERA_AGE_DROP_BUDGET_MS_FLOOR,
+            "the widening must retire with the screen share, so #1737's \
+             minutes-behind pathology is unchanged on a camera-only publisher"
+        );
+        reset_threshold_to_floor();
+    }
+
+    #[test]
     fn should_age_drop_is_keyframe_exempt_and_fail_open() {
         let budget = 200.0;
         let now = 1_000.0;
@@ -3131,6 +3778,89 @@ mod framing_tests {
             unistream_bytes_drained_total() - drained_before
                 <= unistream_bytes_offered_total() - offered_before,
             "drained must never exceed offered — an offered/drained transposition inverts this",
+        );
+    }
+
+    #[test]
+    fn queue_depth_retires_offered_bytes_on_every_path() {
+        assert_eq!(
+            compose_queue_depth_bytes(9000, 0, 0, 0),
+            9000,
+            "offered-but-unretired bytes are the buried backlog",
+        );
+        assert_eq!(
+            compose_queue_depth_bytes(9000, 4000, 0, 0),
+            5000,
+            "a drained frame leaves the queue",
+        );
+        assert_eq!(
+            compose_queue_depth_bytes(9000, 4000, 3000, 0),
+            2000,
+            "a frame that failed to write leaves the queue too",
+        );
+        assert_eq!(
+            compose_queue_depth_bytes(9000, 4000, 3000, 2000),
+            0,
+            "an age-dropped camera delta leaves the queue, so the depth returns to zero",
+        );
+    }
+
+    #[test]
+    fn queue_depth_saturates_instead_of_wrapping() {
+        assert_eq!(compose_queue_depth_bytes(100, 400, 0, 0), 0);
+        assert_eq!(compose_queue_depth_bytes(100, 0, 400, 0), 0);
+        assert_eq!(compose_queue_depth_bytes(100, 0, 0, 400), 0);
+    }
+
+    #[test]
+    fn record_bytes_dropped_and_age_dropped_write_their_own_counters() {
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let dropped_before = unistream_bytes_dropped_total();
+        let age_dropped_before = unistream_bytes_age_dropped_total();
+        let drained_before = unistream_bytes_drained_total();
+
+        record_bytes_dropped(700);
+        record_bytes_age_dropped(1300);
+
+        assert_eq!(
+            unistream_bytes_dropped_total() - dropped_before,
+            700,
+            "the failed-write seam must book only the bytes it was given",
+        );
+        assert_eq!(
+            unistream_bytes_age_dropped_total() - age_dropped_before,
+            1300,
+            "the #1737 age-drop seam must book only the bytes it was given",
+        );
+        assert_eq!(
+            unistream_bytes_drained_total() - drained_before,
+            0,
+            "neither drop seam may be mistaken for a successful drain",
+        );
+    }
+
+    #[test]
+    fn inbound_unistream_reset_counter_increments_through_its_write_path() {
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = inbound_unistream_reset_count();
+        record_inbound_unistream_reset();
+        record_inbound_unistream_reset();
+        assert_eq!(
+            inbound_unistream_reset_count() - before,
+            2,
+            "each inbound-unistream read rejection must count exactly once",
+        );
+    }
+
+    #[test]
+    fn send_order_fallback_counter_increments_through_its_write_path() {
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = send_order_fallback_count();
+        record_send_order_fallback();
+        assert_eq!(
+            send_order_fallback_count() - before,
+            1,
+            "a fallback to the option-less create call must be observable",
         );
     }
 
@@ -3385,5 +4115,280 @@ mod framing_tests {
         assert_eq!(ready_stall_threshold_ms(), 800.0);
         drop(second);
         assert_eq!(ready_stall_threshold_ms(), READY_STALL_THRESHOLD_MS_FLOOR);
+    }
+
+    /// `camera_age_drop_budget_ms` calls `raised_threshold_owner_count()` on
+    /// every camera frame, so that read must not touch the registry mutex.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn owner_count_read_does_not_take_the_registry_lock() {
+        use std::sync::mpsc::channel;
+        use std::thread;
+        use std::time::Duration;
+
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+
+        let owner = ReadyStallThresholdOwner::new(800.0);
+        assert_eq!(raised_threshold_owner_count(), 1);
+
+        let (held_tx, held_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let holder = thread::spawn(move || {
+            let guard = ready_stall_threshold_owners();
+            let _ = held_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(guard);
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder thread must acquire the registry lock");
+
+        let (count_tx, count_rx) = channel::<u32>();
+        let reader = thread::spawn(move || {
+            let _ = count_tx.send(raised_threshold_owner_count());
+        });
+        let count = count_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("raised_threshold_owner_count() must answer while the registry lock is held");
+        assert_eq!(count, 1, "the cached count must track registration");
+
+        let _ = release_tx.send(());
+        holder.join().expect("holder thread must not panic");
+        reader.join().expect("reader thread must not panic");
+
+        drop(owner);
+        assert_eq!(
+            raised_threshold_owner_count(),
+            0,
+            "the cached count must track release",
+        );
+    }
+}
+
+/// Contract D2 / §4: the uplink's error and abort propagation across the
+/// transform and the port, plus the Init round-trip.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod uplink_propagation_tests {
+    use super::*;
+    use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
+    use std::cell::RefCell;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+    use web_sys::{MessageChannel, MessageEvent, WritableStream};
+
+    /// A sink that accepts every chunk, recording how many it took.
+    fn accepting_sink() -> (WritableStream, Rc<Cell<u32>>) {
+        let taken = Rc::new(Cell::new(0_u32));
+        let counter = taken.clone();
+        let write = Closure::wrap(Box::new(move |_chunk: JsValue| -> JsValue {
+            counter.set(counter.get() + 1);
+            Promise::resolve(&JsValue::UNDEFINED).into()
+        }) as Box<dyn FnMut(JsValue) -> JsValue>);
+        let underlying = Object::new();
+        Reflect::set(&underlying, &"write".into(), write.as_ref()).unwrap();
+        write.forget();
+        (
+            WritableStream::new_with_underlying_sink(&underlying).unwrap(),
+            taken,
+        )
+    }
+
+    /// A sink that rejects its first write, which is what a QUIC RESET_STREAM
+    /// looks like from this side of the pipe.
+    fn resetting_sink() -> WritableStream {
+        let write = Closure::wrap(Box::new(move |_chunk: JsValue| -> JsValue {
+            Promise::reject(&JsValue::from_str("RESET_STREAM")).into()
+        }) as Box<dyn FnMut(JsValue) -> JsValue>);
+        let underlying = Object::new();
+        Reflect::set(&underlying, &"write".into(), write.as_ref()).unwrap();
+        write.forget();
+        WritableStream::new_with_underlying_sink(&underlying).unwrap()
+    }
+
+    fn chunk() -> Uint8Array {
+        Uint8Array::from(&[1_u8, 2, 3, 4][..])
+    }
+
+    /// Hand `writable` through a real `MessagePort` and get it back on the other
+    /// end, so the value under test has been through `[[Transfer]]` exactly as it
+    /// is between the Worker and main.
+    async fn across_a_port(writable: WritableStream) -> WritableStream {
+        let channel = MessageChannel::new().unwrap();
+        let (tx, rx) = futures::channel::oneshot::channel::<WritableStream>();
+        let tx = Rc::new(RefCell::new(Some(tx)));
+        let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Some(tx) = tx.borrow_mut().take() {
+                let _ = tx.send(event.data().unchecked_into::<WritableStream>());
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        channel
+            .port2()
+            .set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        on_message.forget();
+        channel.port2().start();
+
+        let transfer = Array::new();
+        transfer.push(&writable);
+        channel
+            .port1()
+            .post_message_with_transferable(&writable, &transfer)
+            .unwrap();
+        rx.await.expect("the port must deliver the writable")
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_transferred_writable_accepts_a_write() {
+        let (sink, taken) = accepting_sink();
+        let transform = build_uplink_transform(&sink).expect("transform");
+        let writable = across_a_port(transform.writable).await;
+
+        let writer = writable.get_writer().expect("writer");
+        JsFuture::from(writer.write_with_chunk(&chunk()))
+            .await
+            .expect("a healthy uplink must accept a frame after the port hop");
+        JsFuture::from(writer.close())
+            .await
+            .expect("and close cleanly");
+        JsFuture::from(transform.pipe)
+            .await
+            .expect("the pipe must finish rather than reject");
+        assert_eq!(
+            taken.get(),
+            1,
+            "the frame must reach the send stream, not stop inside the transform"
+        );
+    }
+
+    /// Ceiling on how many writes main may still issue after the send stream
+    /// resets, before the rejection reaches it.
+    const REJECTION_ARRIVES_WITHIN_WRITES: u32 = 16;
+
+    /// Which write number rejects, or `None` if none does within the ceiling.
+    async fn writes_until_rejected(writable: &WritableStream) -> Option<u32> {
+        let writer = writable.get_writer().expect("writer");
+        for attempt in 1..=REJECTION_ARRIVES_WITHIN_WRITES {
+            if JsFuture::from(writer.write_with_chunk(&chunk()))
+                .await
+                .is_err()
+            {
+                return Some(attempt);
+            }
+        }
+        None
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_reset_send_stream_rejects_the_write_main_holds() {
+        let transform = build_uplink_transform(&resetting_sink()).expect("transform");
+        let writable = across_a_port(transform.writable).await;
+
+        let rejected_on = writes_until_rejected(&writable).await;
+        assert!(
+            rejected_on.is_some(),
+            "a reset on the send stream must reject a write on the writable main \
+             holds. Without it the map keeps a dead writer for this stream key, \
+             and that media kind's uplink stops with no counter and no log"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_port_hop_delays_the_rejection_but_does_not_swallow_it() {
+        let direct = build_uplink_transform(&resetting_sink()).expect("transform");
+        let direct_on = writes_until_rejected(&direct.writable)
+            .await
+            .expect("the transform alone must propagate the reset");
+
+        let hopped = build_uplink_transform(&resetting_sink()).expect("transform");
+        let hopped_writable = across_a_port(hopped.writable).await;
+        let hopped_on = writes_until_rejected(&hopped_writable)
+            .await
+            .expect("and so must the transferred writable");
+
+        assert!(
+            hopped_on <= direct_on + 4,
+            "the port hop cost {hopped_on} writes against {direct_on} direct. A \
+             large gap would mean frames keep being accepted long after the \
+             uplink is dead, which is the window in which they are lost silently"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_reset_send_stream_errors_the_writable_itself() {
+        let transform = build_uplink_transform(&resetting_sink()).expect("transform");
+        let writable = across_a_port(transform.writable).await;
+        let writer = writable.get_writer().expect("writer");
+        let _ = JsFuture::from(writer.write_with_chunk(&chunk())).await;
+
+        assert!(
+            JsFuture::from(writer.closed()).await.is_err(),
+            "the writable must end up ERRORED, so every later write for this \
+             stream key fails too rather than only the one that raced the reset"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_abort_reaches_the_send_stream() {
+        let (sink, _taken) = accepting_sink();
+        let transform = build_uplink_transform(&sink).expect("transform");
+        let writable = across_a_port(transform.writable).await;
+        let writer = writable.get_writer().expect("writer");
+
+        JsFuture::from(writer.abort())
+            .await
+            .expect("abort resolves");
+        assert!(
+            JsFuture::from(transform.pipe).await.is_err(),
+            "aborting main's writer must break the Worker's pipe; `preventAbort` \
+             would leave it piping from a dead source"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_init_message_round_trips_across_a_port() {
+        let channel = MessageChannel::new().unwrap();
+        let (tx, rx) = futures::channel::oneshot::channel::<Array>();
+        let tx = Rc::new(RefCell::new(Some(tx)));
+        let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Some(tx) = tx.borrow_mut().take() {
+                let _ = tx.send(event.data().unchecked_into::<Array>());
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        channel
+            .port2()
+            .set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        on_message.forget();
+        channel.port2().start();
+
+        let hashes = Array::new();
+        hashes.push(&JsValue::from_str("aGFzaA=="));
+        let init = Array::new();
+        init.push(&JsValue::from_f64(f64::from(
+            crate::worker_proto::to_worker::INIT,
+        )));
+        init.push(&JsValue::from_str(
+            "https://example.invalid:4433/lobby?ds=1",
+        ));
+        init.push(&hashes);
+        channel.port1().post_message(&init).unwrap();
+
+        let got = rx.await.expect("INIT must cross the port");
+        assert_eq!(
+            got.get(0).as_f64().unwrap() as u8,
+            crate::worker_proto::to_worker::INIT
+        );
+        let url = got.get(1).as_string().unwrap();
+        assert!(
+            url.contains("ds=1"),
+            "the #2723 downlink-streams query must survive the hop verbatim; \
+             without it the relay sends one legacy stream, got {url}"
+        );
+        assert_eq!(
+            got.get(2).unchecked_into::<Array>().length(),
+            1,
+            "and the cert hashes must arrive as an array, not flattened"
+        );
     }
 }

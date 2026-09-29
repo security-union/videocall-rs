@@ -157,14 +157,17 @@ use super::classify_encode_error::{
 };
 use super::dimensions::{corrected_source_dims, resolve_capture_dimensions};
 use super::encoder_state::{
-    keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
+    keyframe_tick_decision, periodic_keyframe_due, EncoderState, ForcedStepDownBudget,
+    KeyframeTickInput,
 };
+use super::orientation::FrameUprighter;
 use super::transform::transform_video_chunk;
 use super::AqControlLoopCancel;
 
 use crate::adaptive_quality_constants::{
     camera_periodic_keyframe_max_interval_ms, simulcast_layers, AUDIO_QUALITY_TIERS,
-    BITRATE_CHANGE_THRESHOLD, SIMULCAST_LAYER_FPS_THROTTLE_SLACK, VIDEO_QUALITY_TIERS,
+    BITRATE_CHANGE_THRESHOLD, CAMERA_WS_FRESHNESS_DELAY_MS, CAMERA_WS_MIN_THRESHOLD_BYTES,
+    SIMULCAST_LAYER_FPS_THROTTLE_SLACK, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -974,10 +977,16 @@ struct CameraTierChangeTargets<'a> {
     keyframe_cooldown_reset: &'a AtomicBool,
 }
 
+fn congested_tier_change_keeps_cooldown(ws_buffered: Option<u64>, threshold_bytes: u64) -> bool {
+    matches!(ws_buffered, Some(buffered) if buffered > threshold_bytes)
+}
+
 fn apply_camera_tier_change(
     targets: CameraTierChangeTargets<'_>,
     tier: &videocall_aq::constants::VideoQualityTier,
     tier_index: usize,
+    ws_buffered: Option<u64>,
+    threshold_bytes: u64,
 ) {
     targets
         .tier_max_width
@@ -992,9 +1001,11 @@ fn apply_camera_tier_change(
         .shared_video_tier_index
         .store(tier_index as u32, Ordering::Relaxed);
     targets.tier_change_keyframe.store(true, Ordering::Release);
-    targets
-        .keyframe_cooldown_reset
-        .store(true, Ordering::Release);
+    if !congested_tier_change_keeps_cooldown(ws_buffered, threshold_bytes) {
+        targets
+            .keyframe_cooldown_reset
+            .store(true, Ordering::Release);
+    }
 }
 
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
@@ -1503,6 +1514,21 @@ fn should_teardown_shed_layer(
 /// coalesces more but adds recovery latency. Tune/validate via performance-reviewer.
 const FORCED_KEYFRAME_COOLDOWN_MS: f64 = 250.0;
 
+const _: () = assert!(
+    crate::adaptive_quality_constants::CAMERA_WS_CONGESTED_KEYFRAME_COOLDOWN_MS
+        > FORCED_KEYFRAME_COOLDOWN_MS,
+    "the congested cooldown must HOLD forced keyframes longer than the default one."
+);
+
+/// Forced-keyframe cooldown for this tick; widens while the WS queue is over the gate threshold.
+fn forced_keyframe_cooldown_ms(ws_buffered: Option<u64>, threshold_bytes: u64) -> f64 {
+    if congested_tier_change_keeps_cooldown(ws_buffered, threshold_bytes) {
+        crate::adaptive_quality_constants::CAMERA_WS_CONGESTED_KEYFRAME_COOLDOWN_MS
+    } else {
+        FORCED_KEYFRAME_COOLDOWN_MS
+    }
+}
+
 /// Decide whether a just-encoded frame counts as "healthy" for the purpose of
 /// resetting the encoder restart counter.
 ///
@@ -1776,14 +1802,20 @@ fn wt_drop_step_down_decision(
     )
 }
 
+/// Slow-`ready()` events on the CAMERA's own unistream, not the aggregate
+#[inline]
+fn camera_ready_stall_count() -> u64 {
+    videocall_transport::webtransport::unistream_ready_stall_count_for_stream(
+        MediaStreamKey::Video.as_u8(),
+    )
+}
+
 /// One AQ tick of the camera's WebTransport uplink-SATURATION self-congestion
 /// axis (#1219 prerequisite). Mirrors [`wt_drop_step_down_decision`] but applies
 /// the SATURATION window/threshold (`WT_SATURATION_WINDOW_MS` /
 /// `WT_SATURATION_STALL_THRESHOLD`) over the slow-`ready()` counter. The wasm
 /// loop calls this with
-/// `videocall_transport::webtransport::unistream_ready_stall_count()` as
-/// `current`, so a mutation that fed the drop counter / drop constants here is
-/// caught by the native test (the saturation boundary differs).
+/// [`camera_ready_stall_count`] as `current`.
 #[inline]
 fn wt_saturation_step_down_decision(
     current_stalls: u64,
@@ -1898,6 +1930,172 @@ fn camera_wt_stale_drop_step_down_decision(
         CAMERA_WT_STALE_DROP_WINDOW_MS,
         CAMERA_WT_STALE_DROP_THRESHOLD,
     )
+}
+
+/// Offered NOMINAL bitrate of the CONFIGURED ladder.
+fn camera_ws_ladder_kbps(n_layers: usize) -> u32 {
+    simulcast_layers(n_layers)
+        .iter()
+        .map(|t| t.ideal_bitrate_kbps)
+        .sum()
+}
+
+/// `bufferedAmount` (bytes) above which a camera DELTA is dropped.
+fn camera_ws_freshness_threshold_bytes(kbps: u32) -> u64 {
+    let bytes = (kbps as u64)
+        .saturating_mul(125)
+        .saturating_mul(CAMERA_WS_FRESHNESS_DELAY_MS)
+        / 1000;
+    bytes.max(CAMERA_WS_MIN_THRESHOLD_BYTES)
+}
+
+/// Reads the CONFIGURED ladder depth only, so the AQ loop this gate's drops feed
+/// cannot move the sensor. `screen_ws_gate_threshold_bytes` holds the same rule.
+fn camera_ws_gate_threshold_bytes(depth: ConfiguredLayerDepth) -> u64 {
+    camera_ws_freshness_threshold_bytes(camera_ws_ladder_kbps(depth.get()))
+}
+
+mod configured_layer_depth {
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct ConfiguredLayerDepth(usize);
+
+    impl ConfiguredLayerDepth {
+        pub(super) fn of(encoder: &super::CameraEncoder) -> Self {
+            Self(encoder.effective_layer_count() as usize)
+        }
+
+        pub(super) fn get(self) -> usize {
+            self.0
+        }
+
+        #[cfg(test)]
+        pub(super) fn for_test(n_layers: usize) -> Self {
+            Self(n_layers)
+        }
+    }
+}
+use configured_layer_depth::ConfiguredLayerDepth;
+
+/// Whether video layer 0 is exempt from the WS gate. At one ACTIVE layer, layer 0
+/// is the whole picture and exempting it makes the gate a no-op.
+fn camera_ws_base_layer_exempt(active_layers: &AtomicU32, layer_id: u32) -> bool {
+    active_layers.load(Ordering::Relaxed) > 1 && layer_id == 0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraWsSend {
+    Send,
+    DropStaleDelta,
+}
+
+/// A `None` `buffered_amount` always sends. Keyframes always send — the receiver
+/// resumes only on them.
+fn camera_ws_send_decision(
+    buffered_amount: Option<u64>,
+    is_keyframe: bool,
+    is_simulcast_base_layer: bool,
+    threshold_bytes: u64,
+) -> CameraWsSend {
+    match buffered_amount {
+        None => CameraWsSend::Send,
+        Some(_) if is_keyframe => CameraWsSend::Send,
+        // The relay forwards video layer 0 to every receiver whatever it asked for.
+        Some(_) if is_simulcast_base_layer => CameraWsSend::Send,
+        Some(buffered) if buffered > threshold_bytes => CameraWsSend::DropStaleDelta,
+        Some(_) => CameraWsSend::Send,
+    }
+}
+
+static CAMERA_WS_STALE_DELTA_DROPS: AtomicU64 = AtomicU64::new(0);
+
+static CAMERA_WS_STALE_DROP_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static CAMERA_WS_STALE_DROP_LOG_LAST_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+const CAMERA_WS_STALE_DROP_LOG_THROTTLE_MS: u64 = 1000;
+
+/// Camera DELTAS dropped by the WS freshness gate since page load; never reset.
+pub fn camera_ws_stale_delta_drops() -> u64 {
+    CAMERA_WS_STALE_DELTA_DROPS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn set_camera_ws_stale_delta_drops_for_test(n: u64) {
+    CAMERA_WS_STALE_DELTA_DROPS.store(n, Ordering::Relaxed);
+}
+
+#[cfg(feature = "netsim")]
+pub(crate) fn bump_camera_ws_stale_delta_drops_for_netsim(n: u64) {
+    CAMERA_WS_STALE_DELTA_DROPS.fetch_add(n.min(10_000), Ordering::Relaxed);
+}
+
+fn record_camera_ws_stale_drop(buffered_bytes: u64, threshold_bytes: u64) {
+    let total = CAMERA_WS_STALE_DELTA_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let now_ms = js_sys::Date::now() as u64;
+    let last_ms = CAMERA_WS_STALE_DROP_LOG_LAST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) >= CAMERA_WS_STALE_DROP_LOG_THROTTLE_MS {
+        CAMERA_WS_STALE_DROP_LOG_LAST_MS.store(now_ms, Ordering::Relaxed);
+        let prev_total = CAMERA_WS_STALE_DROP_LOG_LAST_TOTAL.swap(total, Ordering::Relaxed);
+        let dropped_in_window = total.saturating_sub(prev_total);
+        log::warn!(
+            "CameraEncoder: dropping stale camera delta(s) under WS backpressure (issue 2809) — \
+             dropped={dropped_in_window} in last window, buffered={buffered_bytes}, \
+             threshold={threshold_bytes}"
+        );
+    }
+}
+
+/// One AQ tick of the WS freshness-GATE axis (issue 2809). Separate from the WS
+/// overflow axis, whose counter goes quiet once this gate holds.
+#[inline]
+fn camera_ws_stale_drop_step_down_decision(
+    current_drops: u64,
+    snapshot_drops: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, CAMERA_WS_STALE_DROP_THRESHOLD, CAMERA_WS_STALE_DROP_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_drops,
+        snapshot_drops,
+        elapsed_ms,
+        CAMERA_WS_STALE_DROP_WINDOW_MS,
+        CAMERA_WS_STALE_DROP_THRESHOLD,
+    )
+}
+
+/// One AQ tick's readings of the five uplink axis counters (issue 2811).
+/// `ws_drops`/`wt_drops` count every stream (audio, screen, control); the other three are camera-fed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UplinkAxisCounters {
+    ws_drops: u64,
+    wt_drops: u64,
+    wt_ready_stalls: u64,
+    wt_stale_delta_drops: u64,
+    ws_stale_delta_drops: u64,
+}
+
+#[cfg(test)]
+impl UplinkAxisCounters {
+    fn axes_mut(&mut self) -> [&mut u64; 5] {
+        [
+            &mut self.ws_drops,
+            &mut self.wt_drops,
+            &mut self.wt_ready_stalls,
+            &mut self.wt_stale_delta_drops,
+            &mut self.ws_stale_delta_drops,
+        ]
+    }
+}
+
+/// Any uplink axis counter advanced since the previous AQ tick (issue 2811).
+#[inline]
+fn uplink_axis_counters_advanced(prev: &UplinkAxisCounters, now: &UplinkAxisCounters) -> bool {
+    now.ws_drops > prev.ws_drops
+        || now.wt_drops > prev.wt_drops
+        || now.wt_ready_stalls > prev.wt_ready_stalls
+        || now.wt_stale_delta_drops > prev.wt_stale_delta_drops
+        || now.ws_stale_delta_drops > prev.ws_stale_delta_drops
 }
 
 /// Should the encode loop REPUBLISH its layers' geometry on this frame (issue
@@ -2183,6 +2381,8 @@ impl CameraEncoder {
         // encoder control loop — clone both sides' shared state.
         let quality_bounds = self.quality_bounds.clone();
         let n_layers = self.effective_layer_count() as usize;
+        let ws_gate_threshold_bytes =
+            camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::of(self));
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         // Sender encoder backpressure (issue #1108, Phase B): the control loop
@@ -2265,11 +2465,9 @@ impl CameraEncoder {
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
-            // Independent sliding window for the WebTransport uplink-backpressure
-            // self-trigger (#1104). Kept SEPARATE from the WS window above so the
-            // two transports' signals never interfere; on a WS connection the WT
-            // counter stays flat at 0 (no unistream sends) and this block is a
-            // no-op, symmetric to how the WS block is a no-op under WebTransport.
+            // Sliding window for the WebTransport uplink-backpressure
+            // self-trigger (#1104). On a WS connection the WT counter stays flat
+            // at 0 (no unistream sends).
             let mut last_wt_drop_snapshot: u64 =
                 videocall_transport::webtransport::unistream_drop_count();
             let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
@@ -2278,12 +2476,20 @@ impl CameraEncoder {
             // above: the drop counter only moves on stream teardown, whereas this
             // counts slow `writer.ready()` events (a slow-but-alive uplink). Both
             // are WT-only and flat at 0 on WebSocket, so this is a no-op there.
-            let mut last_wt_stall_snapshot: u64 =
-                videocall_transport::webtransport::unistream_ready_stall_count();
+            let mut last_wt_stall_snapshot: u64 = camera_ready_stall_count();
             let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
             let mut last_wt_stale_drop_snapshot: u64 =
                 videocall_transport::webtransport::unistream_stale_delta_drop_count();
             let mut wt_stale_drop_window_start_ms: f64 = js_sys::Date::now();
+            let mut last_camera_ws_stale_drop_snapshot: u64 = camera_ws_stale_delta_drops();
+            let mut camera_ws_stale_drop_window_start_ms: f64 = js_sys::Date::now();
+            let mut prev_axis_counters = UplinkAxisCounters {
+                ws_drops: last_ws_drop_snapshot,
+                wt_drops: last_wt_drop_snapshot,
+                wt_ready_stalls: last_wt_stall_snapshot,
+                wt_stale_delta_drops: last_wt_stale_drop_snapshot,
+                ws_stale_delta_drops: last_camera_ws_stale_drop_snapshot,
+            };
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning CameraEncoder.
@@ -2303,6 +2509,9 @@ impl CameraEncoder {
                     break;
                 }
                 let now = js_sys::Date::now();
+                // At most ONE forced step-down per tick; the server cut counts as
+                // the tick's step-down.
+                let mut step_down_budget = ForcedStepDownBudget::new();
                 // #2060 idle-decay: `last_layer0_chunk_ms` is stamped in the layer-0 callback
                 // with performance().now() (monotonic), so the staleness check MUST use a fresh
                 // performance().now() here — NOT the loop's `now` above (js_sys::Date::now(),
@@ -2430,7 +2639,29 @@ impl CameraEncoder {
                         "CameraEncoder: server CONGESTION signal received, forcing aggressive congestion cut"
                     );
                     encoder_control.force_congestion_cut();
+                    step_down_budget.spend();
                 }
+
+                let axis_counters = UplinkAxisCounters {
+                    ws_drops: videocall_transport::websocket::websocket_drop_count(),
+                    wt_drops: videocall_transport::webtransport::unistream_drop_count(),
+                    wt_ready_stalls: camera_ready_stall_count(),
+                    wt_stale_delta_drops:
+                        videocall_transport::webtransport::unistream_stale_delta_drop_count(),
+                    ws_stale_delta_drops: camera_ws_stale_delta_drops(),
+                };
+                encoder_control.observe_uplink_axis_tick(
+                    now,
+                    uplink_axis_counters_advanced(&prev_axis_counters, &axis_counters),
+                );
+                prev_axis_counters = axis_counters;
+                let UplinkAxisCounters {
+                    ws_drops: current_ws_drops,
+                    wt_drops: current_wt_drops,
+                    wt_ready_stalls: current_wt_stalls,
+                    wt_stale_delta_drops: current_wt_stale_drops,
+                    ws_stale_delta_drops: current_camera_ws_stale_drops,
+                } = axis_counters;
 
                 // Client-side WebSocket backpressure detection.
                 // When the browser's TCP send buffer is full, outbound packets
@@ -2440,15 +2671,15 @@ impl CameraEncoder {
                 // users, websocket_drop_count() always returns 0 so this is a
                 // no-op.
                 {
-                    let current_ws_drops = videocall_transport::websocket::websocket_drop_count();
                     let elapsed_ms = now - ws_drop_window_start_ms;
 
                     if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
                     {
                         let delta = current_ws_drops.saturating_sub(last_ws_drop_snapshot);
-                        if delta
-                            >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_DROP_THRESHOLD
-                        {
+                        let axis_wants = delta
+                            >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_DROP_THRESHOLD;
+                        let outcome = step_down_budget.admit(axis_wants, true);
+                        if outcome.permitted {
                             log::warn!(
                                 "CameraEncoder: client WS backpressure detected ({} drops in {:.0}ms), \
                                  forcing video step-down",
@@ -2457,8 +2688,10 @@ impl CameraEncoder {
                             );
                             encoder_control.force_video_step_down();
                         }
-                        last_ws_drop_snapshot = current_ws_drops;
-                        ws_drop_window_start_ms = now;
+                        if outcome.roll_window {
+                            last_ws_drop_snapshot = current_ws_drops;
+                            ws_drop_window_start_ms = now;
+                        }
                     }
                 }
 
@@ -2476,14 +2709,9 @@ impl CameraEncoder {
                 // datagram_drop_count() is NOT used here.) When a SUSTAINED
                 // cluster of drops accumulates within the window we self-shed a
                 // layer without waiting for the slower, indirect server
-                // CONGESTION signal. The window/snapshot are independent of the
-                // WS window and the server-congestion flag, and each axis sheds
-                // at most one layer per window, so the paths cannot compound
-                // into a runaway double step-down. For WebSocket users this
-                // counter stays flat at 0, so the block is a true no-op.
+                // CONGESTION signal. For WebSocket users this counter stays flat
+                // at 0, so the block is a true no-op.
                 {
-                    let current_wt_drops =
-                        videocall_transport::webtransport::unistream_drop_count();
                     let elapsed_ms = now - wt_drop_window_start_ms;
                     // Decision + WT-drop constants live in the host-testable
                     // `wt_drop_step_down_decision` helper so a mutation to the
@@ -2493,7 +2721,8 @@ impl CameraEncoder {
                         last_wt_drop_snapshot,
                         elapsed_ms,
                     );
-                    if decision.step_down {
+                    let outcome = step_down_budget.admit(decision.step_down, decision.roll_window);
+                    if outcome.permitted {
                         log::warn!(
                             "CameraEncoder: client WT uplink backpressure detected ({} unistream \
                              media-frame drops in {:.0}ms), forcing video step-down",
@@ -2502,7 +2731,7 @@ impl CameraEncoder {
                         );
                         encoder_control.force_video_step_down();
                     }
-                    if decision.roll_window {
+                    if outcome.roll_window {
                         last_wt_drop_snapshot = decision.new_snapshot;
                         wt_drop_window_start_ms = now;
                     }
@@ -2517,7 +2746,7 @@ impl CameraEncoder {
                 // by rejecting the write. So a genuine bandwidth cliff (link slow,
                 // ACKs flowing, no reset) would NEVER self-shed on the drop
                 // counter. The transport therefore also exposes
-                // `unistream_ready_stall_count()`, incremented once per slow
+                // `unistream_ready_stall_count_for_stream()`, incremented per slow
                 // `writer.ready().await` (> producer-side READY_STALL_THRESHOLD_MS)
                 // on the established media path. A SUSTAINED cluster of those
                 // within the window means the uplink is saturated, so we self-shed
@@ -2526,17 +2755,12 @@ impl CameraEncoder {
                 // publisher's OWN gradual uplink adaptation, where one rung per
                 // window is the right granularity; the hard multi-tier cut is
                 // reserved for the server-authored CONGESTION path, which is a
-                // stronger, externally-corroborated signal. Window/snapshot are
-                // INDEPENDENT of the WT drop, WS, and server-congestion paths;
-                // each axis sheds at most one layer per its own window, so they
-                // cannot compound into a runaway double step-down. WS users hold
-                // this counter flat at 0 → true no-op. This is the signal that
+                // stronger, externally-corroborated signal.
+                // WS users hold this counter flat at 0 → true no-op. This is the signal that
                 // lets the relay's room-wide sender-keyed CONGESTION (bug #1219)
                 // be removed: a WT publisher now sees its own uplink saturation
                 // directly.
                 {
-                    let current_wt_stalls =
-                        videocall_transport::webtransport::unistream_ready_stall_count();
                     let elapsed_ms = now - wt_stall_window_start_ms;
                     // Decision + WT-saturation constants live in the host-testable
                     // `wt_saturation_step_down_decision` helper (#509 item #2).
@@ -2545,7 +2769,8 @@ impl CameraEncoder {
                         last_wt_stall_snapshot,
                         elapsed_ms,
                     );
-                    if decision.step_down {
+                    let outcome = step_down_budget.admit(decision.step_down, decision.roll_window);
+                    if outcome.permitted {
                         log::warn!(
                             "CameraEncoder: client WT uplink saturation detected ({} slow ready() \
                              events in {:.0}ms), forcing video step-down",
@@ -2554,7 +2779,7 @@ impl CameraEncoder {
                         );
                         encoder_control.force_video_step_down();
                     }
-                    if decision.roll_window {
+                    if outcome.roll_window {
                         last_wt_stall_snapshot = decision.new_snapshot;
                         wt_stall_window_start_ms = now;
                     }
@@ -2568,15 +2793,14 @@ impl CameraEncoder {
                 // independent axis steps the camera down instead of silently
                 // eating frames at full encode rate.
                 {
-                    let current_wt_stale_drops =
-                        videocall_transport::webtransport::unistream_stale_delta_drop_count();
                     let elapsed_ms = now - wt_stale_drop_window_start_ms;
                     let decision = camera_wt_stale_drop_step_down_decision(
                         current_wt_stale_drops,
                         last_wt_stale_drop_snapshot,
                         elapsed_ms,
                     );
-                    if decision.step_down {
+                    let outcome = step_down_budget.admit(decision.step_down, decision.roll_window);
+                    if outcome.permitted {
                         log::warn!(
                             "CameraEncoder: client WT stale-delta backpressure detected ({} \
                              camera deltas dropped in {:.0}ms), forcing video step-down",
@@ -2585,10 +2809,40 @@ impl CameraEncoder {
                         );
                         encoder_control.force_video_step_down();
                     }
-                    if decision.roll_window {
+                    if outcome.roll_window {
                         last_wt_stale_drop_snapshot = decision.new_snapshot;
                         wt_stale_drop_window_start_ms = now;
                     }
+                }
+
+                // WS freshness-GATE axis (issue 2809): the signal that remains
+                // once the gate holds the queue under the overflow axis' cap.
+                {
+                    let elapsed_ms = now - camera_ws_stale_drop_window_start_ms;
+                    let decision = camera_ws_stale_drop_step_down_decision(
+                        current_camera_ws_stale_drops,
+                        last_camera_ws_stale_drop_snapshot,
+                        elapsed_ms,
+                    );
+                    let outcome = step_down_budget.admit(decision.step_down, decision.roll_window);
+                    if outcome.permitted {
+                        log::warn!(
+                            "CameraEncoder: client WS stale-delta backpressure detected ({} \
+                             camera deltas dropped in {:.0}ms), forcing video step-down",
+                            current_camera_ws_stale_drops
+                                .saturating_sub(last_camera_ws_stale_drop_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if outcome.roll_window {
+                        last_camera_ws_stale_drop_snapshot = decision.new_snapshot;
+                        camera_ws_stale_drop_window_start_ms = now;
+                    }
+                }
+
+                if step_down_budget.spent() {
+                    log::debug!("CameraEncoder: forced video step-down cashed this AQ tick");
                 }
 
                 // Sender encoder backpressure (issue #1108). Feed the depth the
@@ -2743,6 +2997,8 @@ impl CameraEncoder {
                         },
                         tier,
                         tier_index,
+                        peer_count_client.send_queue_depth(),
+                        ws_gate_threshold_bytes,
                     );
                     log::info!(
                         "CameraEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
@@ -3356,6 +3612,8 @@ impl CameraEncoder {
         // under congestion.
         let n_layers = self.effective_layer_count() as usize;
         let simulcast = n_layers > 1;
+        let ws_gate_threshold_bytes =
+            camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::of(self));
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         // Fitted per-layer encode dims (issue #2170). The encode loop publishes
@@ -4028,6 +4286,7 @@ impl CameraEncoder {
                         // frame body and must not hold a borrow of the outer binding.
                         let loop_epoch_fps = loop_epoch.clone();
                         let enabled_fps = enabled.clone();
+                        let active_layers_gate = shared_active_layer_count.clone();
                         let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
                         // Capture this layer's current sequence by value; we read
                         // the updated value back after the encode loop exits.
@@ -4100,46 +4359,51 @@ impl CameraEncoder {
                                     last_chunk_time = now;
                                 }
 
-                                // Ensure the backing buffer is large enough for this chunk
-                                let byte_length = chunk.byte_length() as usize;
-                                if buffer.len() < byte_length {
-                                    buffer.resize(byte_length, 0);
-                                }
+                                let ws_buffered = client.send_queue_depth();
+                                match camera_ws_send_decision(
+                                    ws_buffered,
+                                    is_keyframe,
+                                    camera_ws_base_layer_exempt(&active_layers_gate, layer_id),
+                                    ws_gate_threshold_bytes,
+                                ) {
+                                    CameraWsSend::Send => {
+                                        let byte_length = chunk.byte_length() as usize;
+                                        if buffer.len() < byte_length {
+                                            buffer.resize(byte_length, 0);
+                                        }
 
-                                let packet: PacketWrapper = transform_video_chunk(
-                                    chunk,
-                                    local_seq,
-                                    buffer.as_mut_slice(),
-                                    &userid,
-                                    aes.clone(),
-                                    source_width_for_handler.load(Ordering::Relaxed),
-                                    source_height_for_handler.load(Ordering::Relaxed),
-                                    layer_id,
-                                );
-                                // Phase 2 of WT freeze fix: route camera video on
-                                // its dedicated persistent QUIC stream so a stall
-                                // on a video keyframe never blocks audio.
-                                //
-                                // #1737 SCOPE (camera-only, deliberate): only the
-                                // camera attaches `FrameDropMeta` to opt into
-                                // sender-side age-drop. Screen share rides its own
-                                // WT persistent unistream and suffers the SAME
-                                // minutes-behind pile-up unmitigated — but it is
-                                // deferred on purpose: screen needs its own, more
-                                // generous age budget (longer GOP / static content
-                                // tolerates more latency than the 200ms camera
-                                // budget), so reusing the camera value would be a
-                                // regression. The screen encoder passes `None`
-                                // (see screen_encoder.rs) pending screen-specific
-                                // budget tuning. Do NOT unify the two.
-                                client.send_media_packet_with_drop_meta(
-                                    packet,
-                                    MediaStreamKey::Video,
-                                    Some(FrameDropMeta {
-                                        enqueue_ms: now,
-                                        is_keyframe,
-                                    }),
-                                );
+                                        let packet: PacketWrapper = transform_video_chunk(
+                                            chunk,
+                                            local_seq,
+                                            buffer.as_mut_slice(),
+                                            &userid,
+                                            aes.clone(),
+                                            source_width_for_handler.load(Ordering::Relaxed),
+                                            source_height_for_handler.load(Ordering::Relaxed),
+                                            layer_id,
+                                        );
+                                        // Camera video rides its own persistent QUIC
+                                        // stream, and camera ALONE opts into sender-side
+                                        // age-drop. Screen passes `None` and needs a more
+                                        // generous budget — do NOT unify the two.
+                                        client.send_media_packet_with_drop_meta(
+                                            packet,
+                                            MediaStreamKey::Video,
+                                            Some(FrameDropMeta {
+                                                enqueue_ms: now,
+                                                is_keyframe,
+                                            }),
+                                        );
+                                    }
+                                    CameraWsSend::DropStaleDelta => {
+                                        record_camera_ws_stale_drop(
+                                            ws_buffered.unwrap_or(0),
+                                            ws_gate_threshold_bytes,
+                                        );
+                                    }
+                                }
+                                // Advances on a DROP too: the gap holds the receiver
+                                // on its last good frame, not a wrong-reference delta.
                                 local_seq += 1;
                                 seq_out_inner.set(local_seq);
                             }) as Box<dyn FnMut(JsValue)>,
@@ -4333,6 +4597,7 @@ impl CameraEncoder {
                     .readable()
                     .get_reader()
                     .unchecked_into::<ReadableStreamDefaultReader>();
+                let mut frame_uprighter = FrameUprighter::new();
 
                 // Start encoding video and audio.
                 let mut video_frame_counter: u32 = 0;
@@ -4986,9 +5251,11 @@ impl CameraEncoder {
                             // frame data on `encode`), then closed EXACTLY ONCE
                             // after all layers have encoded — see the single
                             // `video_frame.close()` at the end of this arm.
-                            let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                                .unwrap()
-                                .unchecked_into::<VideoFrame>();
+                            let video_frame = frame_uprighter.upright(
+                                Reflect::get(&js_frame, &JsString::from("value"))
+                                    .unwrap()
+                                    .unchecked_into::<VideoFrame>(),
+                            );
 
                             // Resolve the PLI keyframe request ONCE per frame and
                             // apply the SAME keyframe flag to every layer (reading
@@ -5050,7 +5317,10 @@ impl CameraEncoder {
                                 cooldown_reset: keyframe_cooldown_reset
                                     .swap(false, Ordering::AcqRel),
                                 last_keyframe_emit_ms,
-                                cooldown_ms: FORCED_KEYFRAME_COOLDOWN_MS,
+                                cooldown_ms: forced_keyframe_cooldown_ms(
+                                    client.send_queue_depth(),
+                                    ws_gate_threshold_bytes,
+                                ),
                                 tier_change_pending: tier_change_keyframe.load(Ordering::Acquire),
                             });
                             let want_keyframe = decision.want_keyframe;
@@ -5070,6 +5340,12 @@ impl CameraEncoder {
                                     "CameraEncoder: forcing keyframe at frame {} ({})",
                                     video_frame_counter,
                                     cause.label()
+                                );
+                            }
+                            #[cfg(feature = "netsim")]
+                            if decision.want_keyframe && decision.forced_cause.is_none() {
+                                log::debug!(
+                                    "CameraEncoder: periodic keyframe at frame {video_frame_counter}"
                                 );
                             }
 
@@ -5455,23 +5731,29 @@ mod tests {
     use super::{
         bitrate_attempt_allowed, build_simulcast_layers, camera_encoder_restarts_closed_codec,
         camera_encoder_restarts_configure, camera_encoder_restarts_memory,
-        camera_encoder_restarts_other, camera_wt_stale_drop_step_down_decision, clamp_layer_count,
-        clear_video_at_floor_on_enable_edge, encoders_to_build, format_layer_transition,
-        frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        keyframe_tick_decision, layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin,
-        periodic_keyframe_due, plan_single_stream_reconfigure, record_camera_restart,
-        republish_geometry_on_tick, resolve_capture_dimensions,
-        screen_ready_stall_threshold_update, shed_reason, should_encode_layer_frame,
-        should_pin_single_layer_low, should_teardown_shed_layer, simulcast_layer_encode_params,
-        video_at_floor_on_tick, wt_drop_step_down_decision, wt_saturation_step_down_decision,
-        CameraTierChangeTargets, KeyframeTickInput, LayerView, ScreenReadyStallThresholdTracker,
-        SimulcastLayerInfo, SingleStreamReconfigure, FORCED_KEYFRAME_COOLDOWN_MS,
-        SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        camera_encoder_restarts_other, camera_ws_base_layer_exempt, camera_ws_gate_threshold_bytes,
+        camera_ws_ladder_kbps, camera_ws_send_decision, camera_ws_stale_drop_step_down_decision,
+        camera_wt_stale_drop_step_down_decision, clamp_layer_count,
+        clear_video_at_floor_on_enable_edge, encoders_to_build, forced_keyframe_cooldown_ms,
+        format_layer_transition, frame_is_healthy, initial_active_layer_count,
+        is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
+        loop_is_superseded, next_single_layer_pin, periodic_keyframe_due,
+        plan_single_stream_reconfigure, record_camera_restart, republish_geometry_on_tick,
+        resolve_capture_dimensions, screen_ready_stall_threshold_update, shed_reason,
+        should_encode_layer_frame, should_pin_single_layer_low, should_teardown_shed_layer,
+        simulcast_layer_encode_params, uplink_axis_counters_advanced, video_at_floor_on_tick,
+        wt_drop_step_down_decision, wt_saturation_step_down_decision, CameraTierChangeTargets,
+        CameraWsSend, ConfiguredLayerDepth, KeyframeTickInput, LayerView,
+        ScreenReadyStallThresholdTracker, SimulcastLayerInfo, SingleStreamReconfigure,
+        UplinkAxisCounters, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::encode::encoder_state::ForcedKeyframeCause;
 
     use crate::adaptive_quality_constants::{
+        CAMERA_WS_CONGESTED_KEYFRAME_COOLDOWN_MS, CAMERA_WS_MIN_THRESHOLD_BYTES,
+        CAMERA_WS_STALE_DROP_THRESHOLD, CAMERA_WS_STALE_DROP_WINDOW_MS,
         CAMERA_WT_STALE_DROP_THRESHOLD, CAMERA_WT_STALE_DROP_WINDOW_MS,
         WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
         WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS, WT_SELF_CONGESTION_DROP_THRESHOLD,
@@ -5491,6 +5773,38 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::Ordering;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+
+    /// Issue 2811: every axis alone fires; an unchanged or lower reading does not.
+    #[test]
+    fn uplink_axis_counters_advanced_fires_on_any_single_axis() {
+        let prev = UplinkAxisCounters {
+            ws_drops: 7,
+            wt_drops: 4,
+            wt_ready_stalls: 3,
+            wt_stale_delta_drops: 9,
+            ws_stale_delta_drops: 12,
+        };
+        assert!(!uplink_axis_counters_advanced(&prev, &prev));
+        for axis in 0..5 {
+            let mut up = prev;
+            *up.axes_mut()[axis] += 1;
+            assert!(
+                uplink_axis_counters_advanced(&prev, &up),
+                "axis {axis} advanced alone and was not seen"
+            );
+            let mut down = prev;
+            *down.axes_mut()[axis] -= 1;
+            assert!(
+                !uplink_axis_counters_advanced(&prev, &down),
+                "axis {axis} read lower and was taken as an advance"
+            );
+        }
+        let mut all_up = prev;
+        for c in all_up.axes_mut() {
+            *c += 5;
+        }
+        assert!(uplink_axis_counters_advanced(&prev, &all_up));
+    }
 
     #[test]
     fn camera_keyframe_ceiling_stays_inside_receiver_hold_ceiling_2199() {
@@ -7307,6 +7621,8 @@ mod tests {
             },
             tier,
             5,
+            None,
+            0,
         );
 
         assert_eq!(tier_max_width.load(Ordering::Relaxed), tier.max_width);
@@ -7342,6 +7658,75 @@ mod tests {
         assert!(!keyframe_cooldown_reset.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn congested_tier_change_keeps_the_congested_keyframe_cooldown() {
+        let threshold = camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3));
+        let run = |ws_buffered: Option<u64>, probe_ms: f64| {
+            let cd = forced_keyframe_cooldown_ms(ws_buffered, threshold);
+            let tier_change_keyframe = AtomicBool::new(false);
+            let keyframe_cooldown_reset = AtomicBool::new(false);
+            let first = keyframe_tick_decision(KeyframeTickInput {
+                now_ms: 0.0,
+                pli_pending: true,
+                is_periodic: false,
+                cooldown_reset: false,
+                last_keyframe_emit_ms: None,
+                cooldown_ms: cd,
+                tier_change_pending: false,
+            });
+            assert!(first.want_keyframe);
+            apply_camera_tier_change(
+                CameraTierChangeTargets {
+                    tier_max_width: &AtomicU32::new(0),
+                    tier_max_height: &AtomicU32::new(0),
+                    tier_keyframe_interval: &AtomicU32::new(0),
+                    shared_video_tier_index: &AtomicU32::new(0),
+                    tier_change_keyframe: &tier_change_keyframe,
+                    keyframe_cooldown_reset: &keyframe_cooldown_reset,
+                },
+                &VIDEO_QUALITY_TIERS[5],
+                5,
+                ws_buffered,
+                threshold,
+            );
+            let at = |now_ms: f64, last: Option<f64>| {
+                keyframe_tick_decision(KeyframeTickInput {
+                    now_ms,
+                    pli_pending: false,
+                    is_periodic: false,
+                    cooldown_reset: keyframe_cooldown_reset.swap(false, Ordering::AcqRel),
+                    last_keyframe_emit_ms: last,
+                    cooldown_ms: cd,
+                    tier_change_pending: tier_change_keyframe.load(Ordering::Acquire),
+                })
+            };
+            let held = at(probe_ms, first.last_keyframe_emit_ms);
+            let later = at(cd, held.last_keyframe_emit_ms);
+            (held, later)
+        };
+
+        let (held, later) = run(Some(threshold + 1), 500.0);
+        assert!(
+            !held.want_keyframe,
+            "a tier change while the WS queue is over threshold must not reset the cooldown"
+        );
+        assert_eq!(
+            later.forced_cause,
+            Some(ForcedKeyframeCause::TierChange),
+            "the tier-change keyframe still fires once the cooldown allows it"
+        );
+
+        assert!(
+            forced_keyframe_cooldown_ms(Some(threshold), threshold) > 100.0,
+            "test premise: the control probe lands inside the default cooldown"
+        );
+        let (control, _) = run(Some(threshold), 100.0);
+        assert!(
+            control.want_keyframe,
+            "under threshold the tier change resets the cooldown as before"
+        );
+    }
+
     /// A forced camera keyframe must be attributed to what actually requested it:
     /// a receiver's PLI, the publisher's tier change, or both. The three `label()`
     /// values ARE the text of the encode loop's forced-keyframe log line.
@@ -7364,6 +7749,8 @@ mod tests {
             },
             &VIDEO_QUALITY_TIERS[5],
             5,
+            None,
+            0,
         );
         let tick = |pli_pending: bool, tier_change_pending: bool| {
             keyframe_tick_decision(KeyframeTickInput {
@@ -7738,6 +8125,245 @@ mod tests {
         assert!(
             !decision.roll_window,
             "an open camera stale-drop window must not roll"
+        );
+    }
+
+    #[test]
+    fn camera_ws_delta_boundary_is_strict_greater_than() {
+        let t = camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3));
+        assert_eq!(
+            camera_ws_send_decision(Some(t), false, false, t),
+            CameraWsSend::Send,
+            "a delta at EXACTLY the threshold must still be sent"
+        );
+        assert_eq!(
+            camera_ws_send_decision(Some(t + 1), false, false, t),
+            CameraWsSend::DropStaleDelta,
+            "one byte over the threshold must drop"
+        );
+    }
+
+    #[test]
+    fn camera_ws_keyframe_is_always_sent() {
+        assert_eq!(
+            camera_ws_send_decision(Some(u64::MAX), true, false, 1),
+            CameraWsSend::Send
+        );
+    }
+
+    #[test]
+    fn a_camera_ws_queue_over_the_gate_threshold_holds_forced_keyframes() {
+        let t = camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3));
+        assert_eq!(
+            forced_keyframe_cooldown_ms(None, t),
+            FORCED_KEYFRAME_COOLDOWN_MS,
+            "WebTransport / pre-election reports no shared queue"
+        );
+        assert_eq!(
+            forced_keyframe_cooldown_ms(Some(t), t),
+            FORCED_KEYFRAME_COOLDOWN_MS,
+            "AT the threshold matches the send gate: not congested"
+        );
+        assert_eq!(
+            forced_keyframe_cooldown_ms(Some(t + 1), t),
+            CAMERA_WS_CONGESTED_KEYFRAME_COOLDOWN_MS
+        );
+    }
+
+    #[test]
+    fn camera_ws_simulcast_base_layer_delta_is_exempt() {
+        let t = camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3));
+        assert_eq!(
+            camera_ws_send_decision(Some(t + 1), false, true, t),
+            CameraWsSend::Send,
+            "video layer 0 is forwarded to every receiver, so gating it buys nothing"
+        );
+    }
+
+    #[test]
+    fn camera_ws_base_layer_exemption_needs_a_higher_active_layer_to_carry_the_picture() {
+        let one_active = AtomicU32::new(1);
+        let three_active = AtomicU32::new(3);
+        assert!(
+            !camera_ws_base_layer_exempt(&one_active, 0),
+            "at one ACTIVE layer, layer 0 IS the picture, so exempting it \
+             would make the gate unreachable"
+        );
+        assert!(camera_ws_base_layer_exempt(&three_active, 0));
+        assert!(!camera_ws_base_layer_exempt(&three_active, 1));
+        assert!(!camera_ws_base_layer_exempt(&three_active, 2));
+    }
+
+    /// Cold start: 1 active layer against the production default of 3 configured.
+    #[test]
+    fn a_cold_started_three_layer_publisher_gates_its_only_active_layer() {
+        let configured = 3;
+        let active = AtomicU32::new(initial_active_layer_count());
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            1,
+            "cold start earns layers at runtime, not at join"
+        );
+        let t = camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(configured));
+        assert_eq!(
+            camera_ws_send_decision(
+                Some(t + 1),
+                false,
+                camera_ws_base_layer_exempt(&active, 0),
+                t
+            ),
+            CameraWsSend::DropStaleDelta,
+            "reading the CONFIGURED depth here exempts every delta and makes the gate inert"
+        );
+    }
+
+    #[test]
+    fn a_single_stream_camera_delta_over_the_threshold_is_dropped() {
+        let n_layers = 1;
+        let active_layers = AtomicU32::new(initial_active_layer_count());
+        let t = camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(n_layers));
+        assert_eq!(
+            camera_ws_send_decision(
+                Some(t + 1),
+                false,
+                camera_ws_base_layer_exempt(&active_layers, 0),
+                t,
+            ),
+            CameraWsSend::DropStaleDelta,
+            "the default single-layer posture must be gateable"
+        );
+        assert_eq!(
+            camera_ws_send_decision(
+                Some(t + 1),
+                true,
+                camera_ws_base_layer_exempt(&active_layers, 0),
+                t,
+            ),
+            CameraWsSend::Send,
+            "a single-stream keyframe still leaves, so the freeze is bounded by the GOP"
+        );
+    }
+
+    #[test]
+    fn camera_ws_none_depth_never_drops() {
+        assert_eq!(
+            camera_ws_send_decision(None, false, false, 0),
+            CameraWsSend::Send,
+            "WebTransport / pre-election reports no shared queue and must send"
+        );
+    }
+
+    #[test]
+    fn camera_ws_threshold_is_floored_for_a_shallow_configured_ladder() {
+        assert_eq!(
+            camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(1)),
+            CAMERA_WS_MIN_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(2)),
+            50_625
+        );
+    }
+
+    #[test]
+    fn camera_ws_threshold_sums_the_production_ladder() {
+        let ladder_kbps: u32 = videocall_aq::constants::simulcast_layers(3)
+            .iter()
+            .map(|t| t.ideal_bitrate_kbps)
+            .sum();
+        assert_eq!(
+            camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3)),
+            (ladder_kbps as u64) * 125 * 250 / 1000
+        );
+        assert_eq!(
+            camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3)),
+            61_562
+        );
+    }
+
+    /// The threshold must not move when the AQ loop sheds layers: it writes
+    /// `shared_active_layer_count`, and this gate's drops feed that loop.
+    #[test]
+    fn camera_ws_threshold_depends_only_on_the_configured_ladder_depth() {
+        let ladder_top_kbps = videocall_aq::constants::simulcast_layers(3)
+            .last()
+            .expect("3-layer ladder is non-empty")
+            .ideal_bitrate_kbps;
+        assert!(
+            camera_ws_ladder_kbps(3) > ladder_top_kbps,
+            "the threshold must sum the whole ladder, not an active prefix"
+        );
+        assert_eq!(
+            camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3)),
+            61_562
+        );
+    }
+
+    /// Design constraint: threshold + a gate-exempt keyframe must drain inside
+    /// the receiver's 1000 ms NetEq resync ceiling at the measured uplink.
+    #[test]
+    fn camera_ws_threshold_plus_keyframe_drains_inside_one_second_at_median_uplink() {
+        const MEASURED_P50_3_LAYER_KEYFRAME_640X480_BYTES: u64 = 125_329;
+        const MEASURED_MEDIAN_SHED_UPLINK_BYTES_PER_SEC: u64 = 195_665;
+        let worst_instant = camera_ws_gate_threshold_bytes(ConfiguredLayerDepth::for_test(3))
+            + MEASURED_P50_3_LAYER_KEYFRAME_640X480_BYTES;
+        assert!(
+            worst_instant < MEASURED_MEDIAN_SHED_UPLINK_BYTES_PER_SEC,
+            "{worst_instant} B must drain in under 1s at \
+             {MEASURED_MEDIAN_SHED_UPLINK_BYTES_PER_SEC} B/s"
+        );
+    }
+
+    #[test]
+    fn camera_ws_stale_drop_axis_holds_an_open_window() {
+        let decision = camera_ws_stale_drop_step_down_decision(
+            CAMERA_WS_STALE_DROP_THRESHOLD,
+            0,
+            CAMERA_WS_STALE_DROP_WINDOW_MS - 1.0,
+        );
+        assert!(!decision.step_down, "an open window must not fire");
+        assert!(!decision.roll_window, "an open window must not roll");
+    }
+
+    #[test]
+    fn camera_ws_stale_drop_axis_fires_at_threshold_and_rolls() {
+        let below = camera_ws_stale_drop_step_down_decision(
+            CAMERA_WS_STALE_DROP_THRESHOLD - 1,
+            0,
+            CAMERA_WS_STALE_DROP_WINDOW_MS,
+        );
+        assert!(!below.step_down, "below threshold must not fire");
+        assert!(below.roll_window, "a closed window rolls regardless");
+
+        let at = camera_ws_stale_drop_step_down_decision(
+            CAMERA_WS_STALE_DROP_THRESHOLD,
+            0,
+            CAMERA_WS_STALE_DROP_WINDOW_MS,
+        );
+        assert!(at.step_down, "delta == threshold in a closed window fires");
+        assert!(at.roll_window);
+        assert_eq!(at.new_snapshot, CAMERA_WS_STALE_DROP_THRESHOLD);
+    }
+
+    #[test]
+    fn camera_ws_stale_drop_axis_ignores_a_backwards_counter() {
+        let decision =
+            camera_ws_stale_drop_step_down_decision(1, 99, CAMERA_WS_STALE_DROP_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a counter reading below the snapshot must saturate, not fire"
+        );
+    }
+
+    #[test]
+    fn camera_ws_stale_drop_axis_is_not_wired_to_the_ws_overflow_threshold() {
+        let delta = WS_SELF_CONGESTION_DROP_THRESHOLD + 2;
+        assert!(delta < CAMERA_WS_STALE_DROP_THRESHOLD, "test premise");
+        let decision =
+            camera_ws_stale_drop_step_down_decision(delta, 0, CAMERA_WS_STALE_DROP_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "{delta} drops clears the WS overflow threshold but must not fire this axis"
         );
     }
 
@@ -8431,6 +9057,40 @@ mod wasm_tests {
         assert_eq!(
             layer.last_failed_bitrate, None,
             "an accepted bitrate-only configure() must retire a latch on another value (#2550)",
+        );
+    }
+
+    /// See [`super::camera_ready_stall_count`].
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn screen_stalls_do_not_move_the_camera_saturation_axis() {
+        let _tx_guard = crate::test_serial::lock_transport_stream_counters();
+        let camera_before = super::camera_ready_stall_count();
+        let aggregate_before = videocall_transport::webtransport::unistream_ready_stall_count();
+
+        videocall_transport::webtransport::force_unistream_ready_stall_for_stream(
+            MediaStreamKey::Screen.as_u8(),
+            crate::adaptive_quality_constants::WT_SATURATION_STALL_THRESHOLD + 1,
+        );
+
+        assert!(
+            videocall_transport::webtransport::unistream_ready_stall_count() - aggregate_before
+                > crate::adaptive_quality_constants::WT_SATURATION_STALL_THRESHOLD,
+            "the aggregate MUST move, or this test proves nothing"
+        );
+        assert_eq!(
+            super::camera_ready_stall_count(),
+            camera_before,
+            "screen's by-design stalls must leave the camera axis flat"
+        );
+        assert!(
+            !super::wt_saturation_step_down_decision(
+                super::camera_ready_stall_count(),
+                camera_before,
+                crate::adaptive_quality_constants::WT_SATURATION_WINDOW_MS,
+            )
+            .step_down,
+            "and therefore must not step the camera tier down"
         );
     }
 }

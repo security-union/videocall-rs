@@ -26,8 +26,19 @@ pub mod health_processor {
 
     // Health data structure matching RFC design
     // Use protobuf HealthPacket on the wire; keep simple structs only if needed internally.
+    use crate::service_identity::{region_from_env, service_type_from_env};
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
     use videocall_types::to_user_id_bytes;
+
+    /// The only subject-producing path for client `HealthPacket`s, so a test
+    /// that calls it asserts on the subject the relay actually publishes.
+    pub(crate) fn health_diagnostics_topic(
+        region: &str,
+        service_type: &str,
+        server_id: &str,
+    ) -> String {
+        format!("health.diagnostics.{region}.{service_type}.{server_id}")
+    }
 
     /// The relay-authenticated identity of the session publishing a
     /// `HealthPacket` (issue 2047).
@@ -101,12 +112,11 @@ pub mod health_processor {
         client: async_nats::client::Client,
         reporter: &AuthenticatedReporter,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
+        let region = region_from_env();
         let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| "server-1".to_string());
-        let service_type =
-            std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
+        let service_type = service_type_from_env();
 
-        let topic = format!("health.diagnostics.{region}.{service_type}.{server_id}");
+        let topic = health_diagnostics_topic(region, service_type, &server_id);
 
         // Every server-authority transformation lives in
         // `build_health_payload_for_publish`, so the bytes published here are
@@ -373,6 +383,34 @@ pub mod health_processor {
                     .unwrap_or_else(|_| data.to_vec())
             }
             Err(_) => data.to_vec(),
+        }
+    }
+
+    #[cfg(test)]
+    mod subject_tests {
+        use super::health_diagnostics_topic;
+        use crate::service_identity::{resolve_region, resolve_service_type};
+
+        #[test]
+        fn webtransport_relay_without_env_publishes_under_webtransport() {
+            let topic = health_diagnostics_topic(
+                &resolve_region(None),
+                &resolve_service_type(None, Some("/usr/bin/webtransport_server")),
+                "server-1",
+            );
+
+            assert_eq!(topic, "health.diagnostics.unknown.webtransport.server-1");
+        }
+
+        #[test]
+        fn configured_relay_subject_is_unchanged() {
+            let topic = health_diagnostics_topic(
+                &resolve_region(Some("singapore")),
+                &resolve_service_type(Some("websocket"), Some("/usr/bin/websocket_server")),
+                "relay-7",
+            );
+
+            assert_eq!(topic, "health.diagnostics.singapore.websocket.relay-7");
         }
     }
 

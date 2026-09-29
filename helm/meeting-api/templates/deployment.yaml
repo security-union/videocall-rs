@@ -55,6 +55,8 @@ spec:
               protocol: TCP
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
           {{- if .Values.consoleLogs.enabled }}
           volumeMounts:
             - name: console-logs

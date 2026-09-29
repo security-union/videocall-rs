@@ -68,5 +68,21 @@ if (window.__APP_CONFIG) {
     // for the first-party SameSite=Lax SSE cookie. Set to an absolute origin
     // only when chat is served from a different origin.
     // jmapBaseUrl: "",
+
+    // Issue #2728 rollback lever. The WebTransport session runs in a dedicated
+    // Worker so a main-thread stall cannot starve the receive path. Set to "0"
+    // to put it back on the main thread without a rebuild. Production default is
+    // ON. In a cluster the route differs per environment — see
+    // `docs/DEPLOYMENT_CONFIG_MAP.md`; only us-east uses a values file, and an
+    // out-of-band `helm upgrade` on HCL or ascend needs `--reuse-values`.
+    // wtReceiveWorker: "0",
+
+    // Epic #2711 rollback lever. WebTransport is the default transport, with
+    // WebSocket as its automatic fallback. Set to "websocket" to hand every
+    // user who has not picked a protocol in Settings a WebSocket-only
+    // connection, without a rebuild. A user's own stored choice still wins.
+    // Absent or unrecognised means "webtransport". Per-cluster route: see
+    // `docs/DEPLOYMENT_CONFIG_MAP.md`.
+    // defaultTransport: "websocket",
   });
 }

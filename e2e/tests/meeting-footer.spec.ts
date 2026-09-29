@@ -36,7 +36,9 @@ const COPY_BUTTON = `[data-testid="${COPY_TESTID}"]`;
 const COPY_FAILED_ANNOUNCEMENT = "Couldn't copy — select the link text";
 const DOCK = ".video-controls-container";
 const GRID = "#grid-container";
-const GRID_TILES = "#grid-container > .grid-item";
+// Issue 2792: peer tiles sit in the `display: contents` peer panel, each in its
+// own `display: contents` slot since #2866.
+const GRID_TILES = "#grid-container > .ss-peer-panel > .tile-slot > .grid-item";
 const PEER_LIST = "#peer-list-container";
 const TIMER_RE = /^\d{2}:\d{2}(:\d{2})?$/;
 

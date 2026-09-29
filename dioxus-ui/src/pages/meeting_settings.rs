@@ -3,6 +3,11 @@
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
 use crate::auth::{check_session, redirect_to_login};
+use crate::components::co_hosts::CoHostsSection;
+use crate::components::hero_orbs::HeroOrbs;
+use crate::components::invalid_meeting_id::{
+    meeting_route_id_error, InvalidMeetingIdNotice, SETTINGS_HINT,
+};
 use crate::components::meeting_format::{
     format_datetime_zoned, format_duration, meeting_activity_duration_ms,
 };
@@ -12,15 +17,69 @@ use crate::routing::Route;
 use dioxus::prelude::*;
 use web_sys::window;
 
+/// `options_editable` gates the Options card and the Co-hosts card's presence
+/// (read-only when not `owner_only`); `owner_only` gates full Co-hosts
+/// management, End Meeting, and Delete Meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsVisibility {
+    options_editable: bool,
+    owner_only: bool,
+}
+
+fn settings_visibility(viewer_is_owner: bool, viewer_can_edit_options: bool) -> SettingsVisibility {
+    SettingsVisibility {
+        options_editable: viewer_can_edit_options,
+        owner_only: viewer_is_owner,
+    }
+}
+
+/// What the Details card's Owner row shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerRow {
+    name: Option<String>,
+    contact_id: Option<String>,
+}
+
+fn non_empty(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn owner_row(host_display_name: Option<&str>, host_user_id: Option<&str>) -> Option<OwnerRow> {
+    let name = non_empty(host_display_name);
+    let contact_id = non_empty(host_user_id);
+    if name.is_none() && contact_id.is_none() {
+        return None;
+    }
+    Some(OwnerRow { name, contact_id })
+}
+
+/// A `mailto:` link when `id` looks like an email, else plain text.
+fn owner_contact_node(id: &str) -> Element {
+    if id.contains('@') {
+        rsx! {
+            a {
+                class: "co-hosts-id",
+                href: "mailto:{id}",
+                "aria-label": "Email the meeting owner, {id}",
+                "{id}"
+            }
+        }
+    } else {
+        rsx! {
+            span { class: "co-hosts-id", "{id}" }
+        }
+    }
+}
+
 /// Shared page shell — hero-container with floating gradient orbs, matching
 /// the homepage layout.  All early-return states use this wrapper so the page
 /// always looks consistent.
 fn page_shell(inner: Element) -> Element {
     rsx! {
         div { class: "hero-container",
-            div { class: "floating-element floating-element-1" }
-            div { class: "floating-element floating-element-2" }
-            div { class: "floating-element floating-element-3" }
+            HeroOrbs {}
             div { class: "hero-content", {inner} }
         }
     }
@@ -28,6 +87,14 @@ fn page_shell(inner: Element) -> Element {
 
 #[component]
 pub fn MeetingSettingsPage(id: String) -> Element {
+    match meeting_route_id_error(&id) {
+        Some(reason) => rsx! { InvalidMeetingIdNotice { reason, hint: SETTINGS_HINT } },
+        None => rsx! { MeetingSettingsPageContent { id } },
+    }
+}
+
+#[component]
+fn MeetingSettingsPageContent(id: String) -> Element {
     let navigator = use_navigator();
     let mut auth_checked = use_signal(|| false);
     let mut meeting = use_signal(|| None::<MeetingInfo>);
@@ -41,6 +108,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let mut chat_allowed_for_all_toggle = use_signal(|| true);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
+    let mut co_host_refresh = use_signal(|| 0u64);
     let mut ending = use_signal(|| false);
     let mut deleting = use_signal(|| false);
 
@@ -153,6 +221,12 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                             // never stomped by a stale server snapshot.
                             let current = meeting.peek().clone();
                             if let Some(mut current) = current {
+                                if current.participant_count != fresh.participant_count
+                                    || current.state != fresh.state
+                                {
+                                    let next = co_host_refresh.peek().wrapping_add(1);
+                                    co_host_refresh.set(next);
+                                }
                                 current.state = fresh.state;
                                 current.participant_count = fresh.participant_count;
                                 current.waiting_count = fresh.waiting_count;
@@ -239,6 +313,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     };
     let is_ended = info.state == "ended";
     let is_active = info.state == "active";
+    let visibility = settings_visibility(info.viewer_is_owner, info.viewer_can_edit_options);
 
     // Compute display strings for stats.
     // issue 1672: duration is shown for EVERY state — running (now - started)
@@ -260,6 +335,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let meeting_id_delete = id.clone();
     let meeting_id_guest_link = id.clone();
     let meeting_id_options = id.clone();
+    let meeting_id_co_hosts = id.clone();
 
     let on_join = move |_| {
         navigator.push(Route::Meeting {
@@ -363,10 +439,21 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 span { class: "meeting-state {state_class}", "{info.state}" }
             }
 
-            if let Some(host) = &info.host_display_name {
+            if let Some(owner) = owner_row(
+                info.host_display_name.as_deref(),
+                info.host_user_id.as_deref(),
+            ) {
                 div { class: "settings-field-compact",
-                    span { class: "settings-field-label", "Host" }
-                    span { class: "settings-field-value", "{host}" }
+                    span { class: "settings-field-label", "Owner" }
+                    div {
+                        style: "display: flex; flex-direction: column; align-items: flex-end; gap: var(--space-1); min-width: 0;",
+                        if let Some(name) = &owner.name {
+                            span { class: "settings-field-value", "{name}" }
+                        }
+                        if let Some(id) = &owner.contact_id {
+                            {owner_contact_node(id)}
+                        }
+                    }
                 }
             }
         }
@@ -454,40 +541,71 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         div { class: "settings-card",
             h3 { class: "settings-card-title", "Options" }
 
-            crate::components::meeting_options_controls::MeetingOptionsControls {
-                meeting_id: meeting_id_options.clone(),
-                waiting_room_toggle,
-                admitted_can_admit_toggle,
-                end_on_host_leave_toggle,
-                allow_guests_toggle,
-                recording_allowed_for_all_toggle,
-                chat_allowed_for_all_toggle,
-                saving,
-                toggle_error,
-            }
+            if visibility.options_editable {
+                crate::components::meeting_options_controls::MeetingOptionsControls {
+                    meeting_id: meeting_id_options.clone(),
+                    waiting_room_toggle,
+                    admitted_can_admit_toggle,
+                    end_on_host_leave_toggle,
+                    allow_guests_toggle,
+                    recording_allowed_for_all_toggle,
+                    chat_allowed_for_all_toggle,
+                    saving,
+                    toggle_error,
+                }
 
-            if allow_guests_toggle() {
-                div { class: "settings-option-row",
-                    style: "flex-direction: column; align-items: flex-start; gap: var(--space-1);",
-                    span {
-                        class: "settings-option-label",
-                        // @token-exempt: 0.8rem falls between --fs-3 (12px) and --fs-4 (13px)
-                        style: "font-size: 0.8rem; color: var(--text-subtle, rgba(255,255,255,0.5));",
-                        "Guest join link:"
-                    }
-                    {
-                        let guest_link = window()
-                            .and_then(|w| w.location().origin().ok())
-                            .map(|origin| format!("{origin}/meeting/{meeting_id_guest_link}/guest"))
-                            .unwrap_or_default();
-                        rsx! {
-                            span {
-                                class: "settings-field-value settings-field-mono settings-guest-link",
-                                style: "user-select: all;",
-                                "{guest_link}"
+                if allow_guests_toggle() {
+                    div { class: "settings-option-row",
+                        style: "flex-direction: column; align-items: flex-start; gap: var(--space-1);",
+                        span {
+                            class: "settings-option-label",
+                            // @token-exempt: 0.8rem falls between --fs-3 (12px) and --fs-4 (13px)
+                            style: "font-size: 0.8rem; color: var(--text-subtle, rgba(255,255,255,0.5));",
+                            "Guest join link:"
+                        }
+                        {
+                            let guest_link = window()
+                                .and_then(|w| w.location().origin().ok())
+                                .map(|origin| format!("{origin}/meeting/{meeting_id_guest_link}/guest"))
+                                .unwrap_or_default();
+                            rsx! {
+                                span {
+                                    class: "settings-field-value settings-field-mono settings-guest-link",
+                                    style: "user-select: all;",
+                                    "{guest_link}"
+                                }
                             }
                         }
                     }
+                }
+            } else {
+                p {
+                    class: "co-hosts-empty",
+                    "data-testid": "settings-options-forbidden",
+                    "Only the meeting owner or a co-host can change these options."
+                }
+            }
+        }
+
+        if visibility.owner_only {
+            div { class: "settings-card",
+                CoHostsSection {
+                    meeting_id: meeting_id_co_hosts,
+                    owner_user_id: info.host_user_id.clone(),
+                    meeting_active: is_active,
+                    refresh: co_host_refresh,
+                    card_title: true,
+                }
+            }
+        } else if visibility.options_editable {
+            div { class: "settings-card",
+                CoHostsSection {
+                    meeting_id: meeting_id_co_hosts,
+                    owner_user_id: info.host_user_id.clone(),
+                    meeting_active: is_active,
+                    refresh: co_host_refresh,
+                    card_title: true,
+                    read_only: true,
                 }
             }
         }
@@ -523,61 +641,89 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 }
             }
 
-            // End Meeting — only when meeting is active or idle
-            if !is_ended {
+            if visibility.owner_only {
+                if !is_ended {
+                    div { class: "settings-action-row",
+                        button {
+                            class: "btn-apple btn-warning settings-action-btn",
+                            disabled: ending(),
+                            onclick: on_end_meeting,
+                            if ending() {
+                                span { class: "loading-spinner" }
+                                span { "Ending..." }
+                            } else {
+                                svg {
+                                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                                    rect { x: "3", y: "3", width: "18", height: "18", rx: "2" }
+                                }
+                                span { "End Meeting" }
+                            }
+                        }
+                    }
+                }
+
+                if !is_ended {
+                    div { class: "settings-danger-zone",
+                        div { class: "settings-danger-divider" }
+                        span { class: "settings-danger-label", "Danger Zone" }
+                        div { class: "settings-danger-divider" }
+                    }
+                }
+
                 div { class: "settings-action-row",
                     button {
-                        class: "btn-apple btn-warning settings-action-btn",
-                        disabled: ending(),
-                        onclick: on_end_meeting,
-                        if ending() {
+                        class: "btn-apple btn-danger settings-action-btn",
+                        disabled: deleting(),
+                        onclick: on_delete,
+                        if deleting() {
                             span { class: "loading-spinner" }
-                            span { "Ending..." }
+                            span { "Deleting..." }
                         } else {
                             svg {
                                 xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
                                 view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
                                 stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                rect { x: "3", y: "3", width: "18", height: "18", rx: "2" }
+                                polyline { points: "3 6 5 6 21 6" }
+                                path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
+                                line { x1: "10", y1: "11", x2: "10", y2: "17" }
+                                line { x1: "14", y1: "11", x2: "14", y2: "17" }
                             }
-                            span { "End Meeting" }
+                            span { "Delete Meeting" }
                         }
-                    }
-                }
-            }
-
-            // Danger zone divider — only show when there are actions above it
-            if !is_ended {
-                div { class: "settings-danger-zone",
-                    div { class: "settings-danger-divider" }
-                    span { class: "settings-danger-label", "Danger Zone" }
-                    div { class: "settings-danger-divider" }
-                }
-            }
-
-            // Delete — always available, but visually separated
-            div { class: "settings-action-row",
-                button {
-                    class: "btn-apple btn-danger settings-action-btn",
-                    disabled: deleting(),
-                    onclick: on_delete,
-                    if deleting() {
-                        span { class: "loading-spinner" }
-                        span { "Deleting..." }
-                    } else {
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                            polyline { points: "3 6 5 6 21 6" }
-                            path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
-                            line { x1: "10", y1: "11", x2: "10", y2: "17" }
-                            line { x1: "14", y1: "11", x2: "14", y2: "17" }
-                        }
-                        span { "Delete Meeting" }
                     }
                 }
             }
         }
     })
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    #[test]
+    fn owner_can_edit_options_and_sees_owner_only_controls() {
+        let v = settings_visibility(true, true);
+        assert!(v.options_editable);
+        assert!(v.owner_only);
+    }
+
+    #[test]
+    fn a_co_host_edits_options_but_not_owner_only_controls() {
+        let v = settings_visibility(false, true);
+        assert!(v.options_editable, "a co-host may edit meeting options");
+        assert!(
+            !v.owner_only,
+            "co-host management, End Meeting, and Delete stay owner-only"
+        );
+    }
+
+    #[test]
+    fn a_plain_participant_gets_neither() {
+        let v = settings_visibility(false, false);
+        assert!(!v.options_editable);
+        assert!(!v.owner_only);
+    }
 }

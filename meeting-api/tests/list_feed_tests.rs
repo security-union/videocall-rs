@@ -563,7 +563,9 @@ async fn test_participant_count_matches_legacy() {
         .expect("meeting must appear in the feed");
 
     let pk = lookup_meeting_pk(&pool, room_id).await;
-    let legacy_admitted = db_participants::count_admitted(&pool, pk).await.unwrap();
+    let legacy_admitted = db_participants::count_admitted(&pool, pk, true)
+        .await
+        .unwrap();
     let legacy_waiting = db_participants::count_waiting(&pool, pk).await.unwrap();
 
     assert_eq!(
@@ -582,7 +584,7 @@ async fn test_participant_count_matches_legacy() {
 
     // ── Present-only semantics (issue #1551) ──────────────────────────────
     // Simulate the disconnect-without-/leave backstop directly at the DB layer
-    // (the path the `internal.participant_left` consumer drives): mark the
+    // (the path the participant presence consumer drives): mark the
     // admitted_user `status='left', left_at=NOW()`. Both the folded feed count
     // AND the legacy helper must now exclude them — pinning that a departed
     // participant drops out of BOTH counts and that the two paths stay in
@@ -593,11 +595,11 @@ async fn test_participant_count_matches_legacy() {
     // NOT, by itself, pin the defense-in-depth `AND left_at IS NULL` guard. That
     // guard (which defends the pathological `status='admitted' AND left_at IS NOT
     // NULL` row) is pinned separately by
-    // `participant_left_consumer_tests::admitted_with_left_at_is_excluded_from_count`,
+    // `participant_presence_consumer_tests::admitted_with_left_at_is_excluded_from_count`,
     // which would fail if `AND left_at IS NULL` were reverted.
-    db_participants::mark_left_by_disconnect(&pool, pk, admitted_user)
+    db_participants::depart(&pool, pk, admitted_user, false, true)
         .await
-        .expect("mark_left_by_disconnect must succeed");
+        .expect("depart must succeed");
 
     let body = list_feed(&pool, host, None).await;
     let m = body
@@ -606,7 +608,9 @@ async fn test_participant_count_matches_legacy() {
         .iter()
         .find(|m| m.meeting_id == room_id)
         .expect("meeting must still appear in the feed");
-    let legacy_admitted_after = db_participants::count_admitted(&pool, pk).await.unwrap();
+    let legacy_admitted_after = db_participants::count_admitted(&pool, pk, true)
+        .await
+        .unwrap();
     assert_eq!(
         m.participant_count, legacy_admitted_after,
         "folded participant_count must still match the legacy helper after a disconnect"
@@ -910,4 +914,131 @@ async fn test_feed_unauthenticated_returns_401() {
          route is gone and `feed` was absorbed by the `/api/v1/meetings/{{meeting_id}}` \
          route, which would make the 401 asserted above a vacuous pass"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_is_co_host_flag_reflects_a_live_co_host_entry() {
+    let pool = get_test_pool().await;
+    let room_id = "feed-is-co-host";
+    let owner = "feed-cohost-owner@example.com";
+    let co_host = "feed-cohost-member@example.com";
+    create_meeting_wr_off(&pool, owner, room_id).await;
+    join_meeting(&pool, room_id, owner).await;
+    join_meeting(&pool, room_id, co_host).await;
+
+    let pk = lookup_meeting_pk(&pool, room_id).await;
+    meeting_api::db::co_hosts::grant(&pool, pk, co_host, Some(true), owner, 100, true)
+        .await
+        .expect("grant must succeed");
+
+    let feed = list_feed(&pool, co_host, None).await;
+    let row = feed
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("meeting present in the co-host's feed");
+    assert!(row.is_co_host, "a live co-host entry must set is_co_host");
+
+    let owner_feed = list_feed(&pool, owner, None).await;
+    let owner_row = owner_feed
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("meeting present in the owner's feed");
+    assert!(
+        !owner_row.is_co_host,
+        "the owner holds no co-host entry for their own meeting"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_never_joined_co_host_sees_the_meeting_suspended_or_revoked_does_not() {
+    let pool = get_test_pool().await;
+    let room_id = "feed-never-joined-cohost";
+    let owner = "feed-r11-owner@example.com";
+    let co_host = "feed-r11-cohost@example.com";
+    let stranger = "feed-r11-stranger@example.com";
+    create_meeting_wr_off(&pool, owner, room_id).await;
+    join_meeting(&pool, room_id, owner).await;
+
+    let pk = lookup_meeting_pk(&pool, room_id).await;
+    meeting_api::db::co_hosts::grant(&pool, pk, co_host, Some(true), owner, 100, true)
+        .await
+        .expect("grant must succeed");
+
+    let feed = list_feed(&pool, co_host, None).await;
+    let row = feed
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("a never-joined co-host must see the meeting in their feed");
+    assert!(row.is_co_host);
+
+    let stranger_feed = list_feed(&pool, stranger, None).await;
+    assert!(
+        !stranger_feed
+            .result
+            .meetings
+            .iter()
+            .any(|m| m.meeting_id == room_id),
+        "a plain stranger must not see the meeting"
+    );
+
+    sqlx::query(
+        "UPDATE meeting_co_hosts SET suspended = TRUE WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(pk)
+    .bind(co_host)
+    .execute(&pool)
+    .await
+    .expect("suspend");
+    let suspended_feed = list_feed(&pool, co_host, None).await;
+    assert!(
+        !suspended_feed
+            .result
+            .meetings
+            .iter()
+            .any(|m| m.meeting_id == room_id),
+        "a suspended co-host must not see the meeting via the co-host branch"
+    );
+
+    sqlx::query(
+        "UPDATE meeting_co_hosts SET suspended = FALSE WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(pk)
+    .bind(co_host)
+    .execute(&pool)
+    .await
+    .expect("unsuspend");
+    assert!(
+        list_feed(&pool, co_host, None)
+            .await
+            .result
+            .meetings
+            .iter()
+            .any(|m| m.meeting_id == room_id),
+        "sanity: lifting the suspension must restore visibility"
+    );
+
+    meeting_api::db::co_hosts::revoke(&pool, pk, co_host, true)
+        .await
+        .expect("revoke must succeed");
+    let revoked_feed = list_feed(&pool, co_host, None).await;
+    assert!(
+        !revoked_feed
+            .result
+            .meetings
+            .iter()
+            .any(|m| m.meeting_id == room_id),
+        "a revoked co-host must not see the meeting"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
 }

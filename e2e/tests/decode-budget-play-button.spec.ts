@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 /**
  * Per-tile decode-budget PLAY button E2E coverage (issue #1466).
@@ -85,6 +86,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 

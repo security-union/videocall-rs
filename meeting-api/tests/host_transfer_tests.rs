@@ -11,15 +11,15 @@
  * at your option.
  */
 
-//! Integration tests for transfer-host (single-host model) and the host-leave
-//! continuity it implies.
+//! Integration tests for transfer-host and the host-leave continuity it
+//! implies.
 //!
 //! Covers:
 //! - `POST /api/v1/meetings/{meeting_id}/transfer-host` — atomic host handoff
-//! - host-leave end rules: the (single) host leaving ends the meeting when
+//! - host-leave end rules: the last present host leaving ends the meeting when
 //!   `end_on_host_leave=true`; a transferred-away ex-creator leaving does not
-//! - single-host reset: the transfer target is demoted on meeting end, and the
-//!   creator reclaims sole host on rejoin
+//! - reset: the transfer target is demoted on meeting end, and the creator
+//!   is host again on reactivation
 //!
 //! NATS is `None` in [`build_app`]; publish calls are no-ops. Requires a live
 //! Postgres via `DATABASE_URL`; tests are `#[serial]`.
@@ -370,21 +370,18 @@ async fn transferred_target_status_returns_host_token() {
     cleanup_test_data(&pool, room_id).await;
 }
 
-/// After a transfer the new host CAN remove the ex-creator — the creator has no
-/// special kick immunity in the single-host model (the host is the authority).
+/// After a transfer the new host still cannot remove the creator: the owner
+/// outranks every host (issue #2702).
 #[tokio::test]
 #[serial]
-async fn new_host_can_kick_ex_creator() {
+async fn new_host_cannot_kick_ex_creator() {
     let pool = get_test_pool().await;
     let room_id = "test-new-host-kicks-ex-creator";
     setup_with_admitted_participant(&pool, room_id).await;
-    // Transfer host to PARTICIPANT — now PARTICIPANT is the host and HOST is a
-    // plain participant.
     let _ = post_host_action(&pool, room_id, "transfer-host", HOST, PARTICIPANT).await;
 
-    // The new host removes the ex-creator — allowed.
     let resp = post_host_action(&pool, room_id, "kick", PARTICIPANT, HOST).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let meeting = db_meetings::get_by_room_id(&pool, room_id)
         .await
@@ -394,10 +391,7 @@ async fn new_host_can_kick_ex_creator() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        row.status, "kicked",
-        "the ex-creator must be removable by the new host"
-    );
+    assert_eq!(row.status, "admitted", "the creator must not be kicked");
 
     cleanup_test_data(&pool, room_id).await;
 }

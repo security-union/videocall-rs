@@ -50,6 +50,20 @@ resources:
   requests:
     cpu: "100m"
     memory: "32Mi"
+# /version shares the HttpServer with the WS sessions; there is no /healthz here.
+# No liveness probe: /version proves only that one worker of many routed a request.
+readinessProbe:
+  httpGet:
+    path: /version
+    port: ws-api
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+# Must stay above actix-server's 30s default shutdown_timeout (worker.rs:259).
+terminationGracePeriodSeconds: 45
+podDisruptionBudget:
+  minAvailable: 1
 podAnnotations:
   prometheus.io/scrape: "true"
   prometheus.io/port: "8080"

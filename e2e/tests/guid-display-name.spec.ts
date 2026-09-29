@@ -52,6 +52,8 @@ const SAMPLE_GUID_UPPER = "ABCDEF01-2345-6789-ABCD-EF0123456789";
 // The all-zeros UUID -- edge case that is still GUID-like.
 const SAMPLE_GUID_ZEROS = "00000000-0000-0000-0000-000000000000";
 
+const USERNAME_ERROR = 'label[for="username"] .field-label__error';
+
 test.describe("GUID display name handling", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -76,13 +78,13 @@ test.describe("GUID display name handling", () => {
     await page.locator("#username").fill("");
     await page.locator("#username").pressSequentially(SAMPLE_GUID, { delay: 30 });
     await page.waitForTimeout(500);
+    await expect(page.locator("#username")).toHaveValue(SAMPLE_GUID);
+    await expect(page.locator(USERNAME_ERROR)).toHaveText("");
+    await expect(page.locator("#username")).toHaveAttribute("aria-invalid", "false");
 
     // Submit the form -- should navigate to the meeting page without error.
     await page.locator("#username").press("Enter");
     await expect(page).toHaveURL(/\/meeting\/e2e_guid_valid/, { timeout: 10_000 });
-
-    // No validation error should be visible.
-    await expect(page.locator("text=Invalid character")).not.toBeVisible();
   });
 
   // FIXME(#741): Peer discovery in the 2-user E2E env is too slow —
@@ -268,8 +270,9 @@ test.describe("GUID display name handling", () => {
     // Should stay on the home page.
     await expect(page).toHaveURL("/");
 
-    // A validation error message should appear.
-    await expect(page.locator("text=Invalid character")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(USERNAME_ERROR)).toHaveText("Not allowed: '.', '@'", {
+      timeout: 5_000,
+    });
   });
 
   test("empty display name is rejected with validation error", async ({ page }) => {

@@ -49,6 +49,7 @@ use crate::config::SearchConfig;
 use crate::db::meetings::MeetingRow;
 use serde_json::json;
 use sqlx::PgPool;
+use videocall_types::validation::is_valid_meeting_id;
 
 /// SearchV2 content source that holds CC / videocall meeting documents.
 /// Shared with the built-in `VideocallCrawlerDriver` — both pull and push
@@ -140,6 +141,18 @@ pub fn spawn_repush(state: &crate::state::AppState, meeting_id: i32, room_id: St
     });
 }
 
+/// Content-push URL of a meeting's document, or `None` when `room_id` is not a
+/// valid meeting ID.
+fn document_url(base_url: &str, room_id: &str) -> Option<String> {
+    if !is_valid_meeting_id(room_id) {
+        return None;
+    }
+    Some(format!(
+        "{}/contentsources/{CONTENT_SOURCE_ID}/documents/{DOC_TYPE}:{room_id}",
+        base_url.trim_end_matches('/'),
+    ))
+}
+
 /// Push a meeting document to SearchV2 after create / update / end / participant-change.
 ///
 /// Fire-and-forget: failures are logged at WARN and never block the API
@@ -155,13 +168,13 @@ pub async fn push_meeting(
         return;
     };
 
-    let doc_id = format!("{DOC_TYPE}:{}", meeting.room_id);
-    let url = format!(
-        "{}/contentsources/{}/documents/{}",
-        cfg.base_url.trim_end_matches('/'),
-        CONTENT_SOURCE_ID,
-        doc_id,
-    );
+    let Some(url) = document_url(&cfg.base_url, &meeting.room_id) else {
+        tracing::warn!(
+            "SearchV2 push skipped: invalid room id {:?}",
+            meeting.room_id
+        );
+        return;
+    };
 
     let body = build_meeting_body(meeting, participants);
 
@@ -205,13 +218,10 @@ pub async fn delete_meeting_doc(cfg: Option<&SearchConfig>, http: &reqwest::Clie
         return;
     };
 
-    let doc_id = format!("{DOC_TYPE}:{room_id}");
-    let url = format!(
-        "{}/contentsources/{}/documents/{}",
-        cfg.base_url.trim_end_matches('/'),
-        CONTENT_SOURCE_ID,
-        doc_id,
-    );
+    let Some(url) = document_url(&cfg.base_url, room_id) else {
+        tracing::warn!("SearchV2 delete skipped: invalid room id {room_id:?}");
+        return;
+    };
 
     let result = http
         .delete(&url)
@@ -546,6 +556,59 @@ mod tests {
         assert_eq!(ps[0]["email"], "alice@example.com");
         assert_eq!(ps[0]["isHost"], true);
         assert_eq!(ps[0]["status"], "admitted");
+    }
+
+    #[test]
+    fn document_url_for_a_valid_room_id() {
+        assert_eq!(
+            document_url("https://search.example/api/", "a~b_c-1").as_deref(),
+            Some(
+                "https://search.example/api/contentsources/cs-cc-meetings/documents/cc-meetings:a~b_c-1"
+            )
+        );
+    }
+
+    #[test]
+    fn document_url_refuses_room_ids_that_are_not_valid_meeting_ids() {
+        for room_id in [
+            "../../../admin/x",
+            "..%2F..%2Fadmin",
+            "a/b",
+            "a?x=1",
+            "a#b",
+            "a b",
+            "a.b",
+            "",
+        ] {
+            assert_eq!(
+                document_url("https://search.example", room_id),
+                None,
+                "{room_id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn push_and_delete_send_nothing_for_an_invalid_room_id() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let cfg = SearchConfig {
+            base_url: format!("{}/api", mock.uri()),
+            token: "test-admin-token".to_string(),
+        };
+        let http = reqwest::Client::new();
+        let mut meeting = sample_meeting();
+        meeting.room_id = "../../admin/x".to_string();
+
+        push_meeting(Some(&cfg), &http, &meeting, &[]).await;
+        delete_meeting_doc(Some(&cfg), &http, &meeting.room_id).await;
+
+        mock.verify().await;
     }
 
     #[tokio::test]

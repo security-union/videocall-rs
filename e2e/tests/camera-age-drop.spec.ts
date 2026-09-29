@@ -11,13 +11,8 @@ function collectConsole(page: Page): string[] {
   return lines;
 }
 
-// The #1737 age-drop is a WebTransport-ONLY mechanism (it lives on the WT
-// persistent-unistream send path). `createAuthenticatedContext` seeds
-// `vc_transport_preference=websocket` by default, so without this the publisher
-// would run on WS and `bumpStaleDeltaDrop` — a process-global counter — could
-// still trip the AQ step-down log, yielding a FALSE GREEN that never exercised
-// the WT path. Force sticky WebTransport before any page loads the wasm, exactly
-// like wt-persistent-streams-freeze-regression.spec.ts.
+// The #1737 age-drop is WebTransport-only, and an unseeded context can still
+// land on WS when the local WT cert or UDP path is unavailable.
 async function forceWebTransportSticky(context: BrowserContext, baseURL: string): Promise<void> {
   await context.addInitScript(() => {
     try {

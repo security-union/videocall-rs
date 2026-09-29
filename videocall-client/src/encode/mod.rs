@@ -21,6 +21,7 @@ pub(crate) mod classify_encode_error;
 mod dimensions;
 mod encoder_state;
 mod microphone_encoder;
+mod orientation;
 mod screen_encoder;
 mod transform;
 
@@ -37,9 +38,9 @@ pub use camera_encoder::{
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
     camera_encoder_frames_submitted_ok, camera_encoder_layers_torn_down,
     camera_encoder_restarts_closed_codec, camera_encoder_restarts_configure,
-    camera_encoder_restarts_memory, camera_encoder_restarts_other, CameraEncoder,
-    CameraLayerMetricSource, LiveQualitySnapshot, QualityTierBounds, SimulcastLayerInfo,
-    SimulcastSendSnapshot,
+    camera_encoder_restarts_memory, camera_encoder_restarts_other, camera_ws_stale_delta_drops,
+    CameraEncoder, CameraLayerMetricSource, LiveQualitySnapshot, QualityTierBounds,
+    SimulcastLayerInfo, SimulcastSendSnapshot,
 };
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
@@ -54,6 +55,9 @@ pub use screen_encoder::{
     ScreenQualityTierBounds, ScreenShareEvent,
 };
 
+#[cfg(test)]
+pub(crate) use camera_encoder::set_camera_ws_stale_delta_drops_for_test;
+
 /// **TEST-ONLY** re-export of the stall-counter setter (issue #2147), so
 /// `health_reporter`'s tests can drive the two process-global statics that the
 /// encode loop's tick-starvation detector normally owns. Without it the health
@@ -66,6 +70,8 @@ pub use screen_encoder::{
 /// isolation contract for what each of the two actually buys (#2160).
 #[cfg(test)]
 pub(crate) use screen_encoder::set_screen_encoder_stall_counters_for_test;
+#[cfg(test)]
+pub(crate) use screen_encoder::set_screen_ws_stale_delta_drops_for_test;
 
 /// Idle-decay decision for the encoder output-fps atomic (#2060). Returns
 /// `Some(0)` when a nonzero fps has gone stale (no layer-0 chunk within
@@ -172,6 +178,10 @@ pub trait MicrophoneEncoderTrait {
     fn set_screen_sharing_active_signal(&mut self, flag: Arc<AtomicBool>);
     /// Returns the effective audio simulcast layer count (#1561).
     fn effective_audio_layers(&self) -> u32;
+    /// See [`MicrophoneEncoder::release_device`] (issue 2772).
+    fn release_device(&mut self);
+    /// See [`MicrophoneEncoder::shutdown`] — unmount-only.
+    fn shutdown(&mut self);
 }
 
 // Implement trait for Safari microphone encoder
@@ -241,6 +251,14 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn effective_audio_layers(&self) -> u32 {
         self.effective_audio_layers()
+    }
+
+    fn release_device(&mut self) {
+        self.release_device()
+    }
+
+    fn shutdown(&mut self) {
+        self.shutdown()
     }
 }
 

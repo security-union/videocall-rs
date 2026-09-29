@@ -1,5 +1,9 @@
 import { test, expect, chromium } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 
 /**
  * The relay echoes an RTT probe back byte-identical (`ws_chat_session.rs`
@@ -31,6 +35,8 @@ test("election with no RTT samples keeps testing instead of failing the join", a
     "NoRttUser",
     UI_URL,
   );
+  // The RTT famine below intercepts ws://localhost:8080 only.
+  await pinWebSocketTransport(context);
   const page = await context.newPage();
 
   try {

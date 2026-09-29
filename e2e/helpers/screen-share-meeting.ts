@@ -124,22 +124,97 @@ export async function admitGuestIfNeeded(hostPage: Page, guestPage: Page): Promi
   }
 }
 
-// True once the VIEWER shows the split layout, confirming encoded screen frames
-// actually reached it.
+/**
+ * Force the detach `window.open` fallback path in headless Chromium by
+ * shadowing `documentPictureInPicture` with an own-property getter that returns
+ * `undefined`. The Rust side reads it via `Reflect::get` and treats
+ * undefined/null as "PiP unsupported" (`screen_share_detach.rs`
+ * `document_pip_supported()`), so `open()` takes `open_popup` → `window.open`.
+ *
+ * Why: Document Picture-in-Picture's `requestWindow` is unreliable headless
+ * (it may reject with no compositor), whereas `window.open` is a real, reliably
+ * -working production path (Firefox / Safari / older Chromium users hit it) that
+ * Playwright's headless Chromium honors and surfaces as a new context page.
+ * Forcing this path makes the detached-window contract deterministic so the
+ * mirror / zoom / reattach flow is actually exercised. The detach tests still
+ * tolerate the revert branch (skip) if a given environment blocks the popup.
+ */
+export const FORCE_POPUP_DETACH_SCRIPT = `
+  (() => {
+    try {
+      Object.defineProperty(window, 'documentPictureInPicture', {
+        configurable: true,
+        get() { return undefined; },
+      });
+    } catch (e) {
+      /* non-configurable here; the detach test tolerates either window path */
+    }
+  })();
+`;
+
+// Issue 2792: the view a new share opens in is read from these keys when the
+// share starts (share_view.rs `ShareOrigin::pref_key`). The default is "tile";
+// the pre-2792 split layout is "enlarged".
+export type ShareViewMode = "tile" | "enlarged" | "pinned" | "detached";
+export const RECEIVED_SHARE_VIEW_KEY = "vc_share_view_mode";
+export const OWN_SHARE_VIEW_KEY = "vc_own_share_view_mode";
+
+// Re-applied on every navigation, so a spec asserting that an in-page choice
+// persists must not reload after seeding.
+export async function seedShareViewMode(
+  target: BrowserContext | Page,
+  mode: ShareViewMode,
+  key: string = RECEIVED_SHARE_VIEW_KEY,
+): Promise<void> {
+  await target.addInitScript(
+    ([k, v]) => {
+      try {
+        window.localStorage.setItem(k, v);
+      } catch {
+        /* no storage on this document */
+      }
+    },
+    [key, mode],
+  );
+}
+
+export function shareButton(page: Page) {
+  return page.locator("button.video-control-button", {
+    has: page.locator(".tooltip", { hasText: "Share Screen" }),
+  });
+}
+
+export function stopShareButton(page: Page) {
+  return page.locator("button.video-control-button", {
+    has: page.locator(".tooltip", { hasText: /Stop.*Shar/ }),
+  });
+}
+
+// True once the VIEWER renders the received share tile, confirming encoded
+// screen frames actually reached it.
 export async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boolean> {
   await wakeControls(sharerPage);
   await sharerPage.waitForTimeout(300);
-  const shareButton = sharerPage.locator("button.video-control-button", {
-    has: sharerPage.locator(".tooltip", { hasText: "Share Screen" }),
-  });
+  const button = shareButton(sharerPage);
 
-  await expect(shareButton).toBeVisible({ timeout: 10_000 });
-  await shareButton.click();
+  await expect(button).toBeVisible({ timeout: 10_000 });
+  await button.click();
 
   try {
-    await expect(viewerPage.locator(".split-screen-tile")).toBeVisible({ timeout: 15_000 });
+    await expect(viewerPage.locator('[data-share-origin="received"]')).toBeVisible({
+      timeout: 15_000,
+    });
     return true;
   } catch {
     return false;
   }
+}
+
+export async function stopScreenShare(sharerPage: Page): Promise<void> {
+  await wakeControls(sharerPage);
+  await sharerPage.waitForTimeout(300);
+  await sharerPage.locator(".video-controls-container").hover();
+  const button = stopShareButton(sharerPage);
+  await expect(button).toBeVisible({ timeout: 10_000 });
+  await button.click();
 }

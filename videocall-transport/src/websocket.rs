@@ -161,6 +161,12 @@ fn ready_state_is_active(ready_state: u16) -> bool {
     matches!(ready_state, WebSocket::CONNECTING | WebSocket::OPEN)
 }
 
+/// `bufferedAmount` as a SEND-QUEUE DEPTH. `None` once the socket leaves
+/// CONNECTING/OPEN, where [`bill_send`] admits nothing further to that queue.
+fn active_buffered_amount(ready_state: u16, buffered: u32) -> Option<u64> {
+    ready_state_is_active(ready_state).then_some(buffered as u64)
+}
+
 /// Bills one frame and decides its fate. Offered is billed before either gate,
 /// so it stays live through an overflow.
 fn bill_send(
@@ -544,7 +550,7 @@ impl WebSocketTask {
 
     /// Get the amount of data in bytes queued to be transmitted (bufferedAmount)
     pub fn get_buffered_amount(&self) -> Option<u64> {
-        Some(self.ws.buffered_amount() as u64)
+        active_buffered_amount(self.ws.ready_state(), self.ws.buffered_amount())
     }
 
     /// Sends binary data to a WebSocket connection.
@@ -616,6 +622,25 @@ impl Drop for WebSocketTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closing_socket_reports_no_send_queue_depth() {
+        assert_eq!(active_buffered_amount(WebSocket::CONNECTING, 0), Some(0));
+        assert_eq!(
+            active_buffered_amount(WebSocket::OPEN, 262_144),
+            Some(262_144)
+        );
+        assert_eq!(
+            active_buffered_amount(WebSocket::CLOSING, 262_144),
+            None,
+            "a CLOSING socket's residual must not pin the gate"
+        );
+        assert_eq!(
+            active_buffered_amount(WebSocket::CLOSED, 262_144),
+            None,
+            "a CLOSED socket's residual must not pin the gate"
+        );
+    }
 
     #[test]
     fn screen_backpressure_drops_do_not_increment_audio_counter() {

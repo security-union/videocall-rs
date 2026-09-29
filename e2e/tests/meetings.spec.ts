@@ -1,5 +1,13 @@
 import { test, expect, Page } from "@playwright/test";
-import { injectSessionCookie } from "../helpers/auth";
+import { injectSessionCookie, generateSessionToken } from "../helpers/auth";
+import {
+  CERT_HASH_INIT_SCRIPT,
+  PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
+} from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
+import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+import { setTransportBadgeFlag } from "../helpers/transport-badge-config";
+import { joinMeetingFromPage } from "../helpers/two-user-meeting";
 import { waitForServices } from "../helpers/wait-for-services";
 import {
   createMeeting,
@@ -12,9 +20,9 @@ import {
 // Selectors for the inline label-row error pattern. The error <span> lives
 // INSIDE the <label> (right-aligned, sharing the row with the field name +
 // info icon), not adjacent to the input. The span is always present in the
-// DOM; CSS hides it via `:empty` when there's nothing to show.
+// DOM; the message is a child <span>, absent when there's nothing to show.
 const usernameErrorSelector = 'label[for="username"] .field-label__error';
-const meetingIdErrorSelector = 'label[for="meeting-id"] .field-label__error';
+const meetingIdErrorSelector = 'label[for="meeting-id"] > #meeting-id-error';
 
 // Selectors for the info-icon tooltip pattern. The trigger is a focusable
 // <span role="button"> immediately after the field name; the tooltip is a
@@ -24,6 +32,38 @@ const usernameInfoTriggerSelector = 'label[for="username"] .field-label__info';
 const usernameInfoTooltipSelector = "#username-info-tip";
 const meetingIdInfoTriggerSelector = 'label[for="meeting-id"] .field-label__info';
 const meetingIdInfoTooltipSelector = "#meeting-id-info-tip";
+
+// Meeting ID tooltip copy, rendered from `MEETING_ID_ALLOWED_CHARS` and
+// `MEETING_ID_MAX_LEN` in videocall-types/src/validation.rs.
+const MEETING_ID_TOOLTIP_ALLOWED =
+  "Allowed: letters (a-z, A-Z), numbers (0-9), underscores (_), hyphens (-) and tildes (~).";
+const MEETING_ID_TOOLTIP_MAX_LEN = "Up to 255 characters.";
+
+// "Invalid meeting ID" notice (components/invalid_meeting_id.rs): the card is a
+// direct child of the `meeting-error` container that bots-app also keys on.
+const INVALID_MEETING_ID_NOTICE =
+  '[data-testid="meeting-error"] > [data-testid="meeting-invalid-id"]';
+
+function recordMeetingApiCalls(page: Page): string[] {
+  const calls: string[] = [];
+  page.on("request", (req) => {
+    const { pathname } = new URL(req.url());
+    if (pathname.startsWith("/api/v1/meetings/")) {
+      calls.push(`${req.method()} ${decodeURIComponent(pathname)}`);
+    }
+  });
+  return calls;
+}
+
+const COOKIE_NAME = process.env.COOKIE_NAME || "session";
+const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
+
+const PIN_WEBTRANSPORT_INIT_SCRIPT = `(() => {
+  try {
+    localStorage.setItem("vc_transport_preference", "webtransport");
+    localStorage.setItem("vc_transport_sticky", "true");
+  } catch (_) {}
+})();`;
 
 // Selectors for the merged "Meetings" section on the home page. The previous
 // design rendered two separate lists ("My Meetings" + "Previously Joined")
@@ -225,8 +265,8 @@ test.describe("Meetings", () => {
     // Inline label-row error pattern: typing a disallowed character flips
     // the input to the --invalid state (red border + aria-invalid="true")
     // and surfaces a short error message right-aligned in the label row.
-    // The error span is always in the DOM; it's hidden via :empty CSS when
-    // there's no message, so we assert against its text content.
+    // The error span is always in the DOM and empty when there's no
+    // message, so we assert against its text content.
     await page.goto("/");
     await page.waitForTimeout(1500);
 
@@ -242,10 +282,7 @@ test.describe("Meetings", () => {
     await usernameInput.pressSequentially("alice@", { delay: 80 });
     await page.waitForTimeout(500);
 
-    // Error must be the new short form, e.g. exactly "'@' not allowed".
-    // We assert the regex form so future shape-preserving tweaks don't
-    // break this test, but the current copy must match exactly here.
-    await expect(errorLocator).toHaveText(/^'@' not allowed$/);
+    await expect(errorLocator).toHaveText(/^Not allowed: '@'$/);
     // Visual error state: red-border class + ARIA hook for assistive tech.
     await expect(usernameInput).toHaveClass(/input-apple--invalid/);
     await expect(usernameInput).toHaveAttribute("aria-invalid", "true");
@@ -261,10 +298,9 @@ test.describe("Meetings", () => {
   test("meeting-id field shows inline validation error when invalid char is typed", async ({
     page,
   }) => {
-    // Hyphens are NOT allowed in meeting IDs (the field permits only
-    // alphanumerics + underscore). The inline error appears on invalid
-    // keystrokes, the input gets the --invalid class + aria-invalid="true",
-    // and the error clears once the field is valid again.
+    // The inline error appears on an invalid keystroke, the input gets the
+    // --invalid class + aria-invalid="true", and the error clears once the
+    // field is valid again.
     await page.goto("/");
     await page.waitForTimeout(1500);
 
@@ -276,16 +312,15 @@ test.describe("Meetings", () => {
     await expect(meetingIdInput).not.toHaveClass(/input-apple--invalid/);
 
     await meetingIdInput.click();
-    await meetingIdInput.pressSequentially("my-room", { delay: 80 });
+    await meetingIdInput.pressSequentially("my.room", { delay: 80 });
     await page.waitForTimeout(500);
 
-    // Short-form error: exactly "'-' not allowed".
-    await expect(errorLocator).toHaveText(/^'-' not allowed$/);
+    await expect(errorLocator).toHaveText(/^Not allowed: '\.'$/);
     await expect(meetingIdInput).toHaveClass(/input-apple--invalid/);
     await expect(meetingIdInput).toHaveAttribute("aria-invalid", "true");
 
     // Fix the field — error text clears, --invalid class drops.
-    await meetingIdInput.fill("myroom");
+    await meetingIdInput.fill("my-room");
     await page.waitForTimeout(500);
     await expect(errorLocator).toHaveText("");
     await expect(meetingIdInput).not.toHaveClass(/input-apple--invalid/);
@@ -385,7 +420,8 @@ test.describe("Meetings", () => {
 
     await trigger.hover();
     await expect(tooltip).toBeVisible({ timeout: 3000 });
-    await expect(tooltip).toContainText("Allowed: letters, numbers, and underscores");
+    await expect(tooltip).toContainText(MEETING_ID_TOOLTIP_ALLOWED);
+    await expect(tooltip).toContainText(MEETING_ID_TOOLTIP_MAX_LEN);
     await expect(tooltip).toContainText("Generate a New Meeting ID");
 
     await page.mouse.move(0, 0);
@@ -418,7 +454,8 @@ test.describe("Meetings", () => {
       if (focused) break;
     }
     await expect(tooltip).toBeVisible({ timeout: 3000 });
-    await expect(tooltip).toContainText("Allowed: letters, numbers, and underscores");
+    await expect(tooltip).toContainText(MEETING_ID_TOOLTIP_ALLOWED);
+    await expect(tooltip).toContainText(MEETING_ID_TOOLTIP_MAX_LEN);
     await expect(tooltip).toContainText("Generate a New Meeting ID");
 
     await page.keyboard.press("Tab");
@@ -588,7 +625,7 @@ test.describe("Meetings", () => {
 
     // Error is now visible — confirm so the test fails meaningfully if the
     // error never rendered (otherwise the height check passes vacuously).
-    await expect(page.locator(usernameErrorSelector)).toHaveText(/^'@' not allowed$/);
+    await expect(page.locator(usernameErrorSelector)).toHaveText(/^Not allowed: '@'$/);
 
     const heightAfter = await form.evaluate((el) => el.getBoundingClientRect().height);
 
@@ -606,14 +643,336 @@ test.describe("Meetings", () => {
     const heightBefore = await form.evaluate((el) => el.getBoundingClientRect().height);
 
     await meetingIdInput.click();
-    await meetingIdInput.pressSequentially("my-room", { delay: 80 });
+    await meetingIdInput.pressSequentially("my.room", { delay: 80 });
     await page.waitForTimeout(500);
 
-    await expect(page.locator(meetingIdErrorSelector)).toHaveText(/^'-' not allowed$/);
+    await expect(page.locator(meetingIdErrorSelector)).toHaveText(/^Not allowed: '\.'$/);
 
     const heightAfter = await form.evaluate((el) => el.getBoundingClientRect().height);
 
     expect(Math.abs(heightAfter - heightBefore)).toBeLessThanOrEqual(1);
+  });
+});
+
+// Issue 2832: one meeting ID rule, `^[A-Za-z0-9_~-]{1,255}$`, shared by the UI,
+// meeting-api and the relay.
+test.describe("Meeting ID character rule (issue 2832)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test.describe("in the browser", () => {
+    test.beforeEach(async ({ context, baseURL }) => {
+      await injectSessionCookie(context, { baseURL });
+    });
+
+    test("the meeting ID field accepts '-' and '~', and names '.', ' ' and '/' without submitting them", async ({
+      page,
+    }) => {
+      // The input has no `pattern` attribute; only the submit gate stops a bad ID.
+      await page.goto("/");
+      const meetingIdInput = page.locator("#meeting-id");
+      const usernameInput = page.locator("#username");
+      const errorLocator = page.locator(meetingIdErrorSelector);
+      await expect(meetingIdInput).toBeVisible();
+
+      await meetingIdInput.click();
+      await meetingIdInput.pressSequentially("team-sync~2", { delay: 30 });
+      await expect(meetingIdInput).toHaveValue("team-sync~2");
+      await expect(errorLocator).toHaveText("");
+      await expect(meetingIdInput).toHaveAttribute("aria-invalid", "false");
+
+      for (const [id, char] of [
+        ["a.b", "'.'"],
+        ["a b", "space"],
+        ["a/b", "'/'"],
+      ]) {
+        await meetingIdInput.fill(id);
+        await expect(errorLocator).toHaveText(`Not allowed: ${char}`);
+        await expect(meetingIdInput).toHaveAttribute("aria-invalid", "true");
+
+        await usernameInput.fill("GateUser");
+        await page.getByRole("button", { name: "Start or Join Meeting" }).click();
+        await expect(
+          meetingIdInput.waitFor({ state: "detached", timeout: 3_000 }),
+        ).rejects.toThrow();
+        expect(new URL(page.url()).pathname).toBe("/");
+        await expect(errorLocator).toHaveText(`Not allowed: ${char}`);
+      }
+    });
+
+    test("an over-long meeting ID is kept whole and refused, not truncated", async ({ page }) => {
+      await page.goto("/");
+      const meetingIdInput = page.locator("#meeting-id");
+      await expect(meetingIdInput).toBeVisible();
+
+      const overLong = "a".repeat(256);
+      await meetingIdInput.fill(overLong);
+
+      await expect(meetingIdInput).toHaveValue(overLong);
+      await expect(page.locator(meetingIdErrorSelector)).toHaveText("Too long: max 255 characters");
+      await expect(meetingIdInput).toHaveAttribute("aria-invalid", "true");
+    });
+
+    test("a refused submit focuses the meeting ID field and re-inserts its unchanged error", async ({
+      page,
+    }) => {
+      // The live region stays; its message node is replaced on every refused
+      // submit, including Enter from inside the field, where focus cannot move.
+      await page.goto("/");
+      const meetingIdInput = page.locator("#meeting-id");
+      const errorLocator = page.locator(meetingIdErrorSelector);
+      await expect(meetingIdInput).toBeVisible();
+
+      await page.locator("#username").fill("FocusUser");
+      await meetingIdInput.fill("a.b");
+      await expect(errorLocator).not.toHaveText("");
+      const liveRegion = await page.evaluateHandle(() =>
+        document.getElementById("meeting-id-error"),
+      );
+      const typedMessage = await page.evaluateHandle(() =>
+        document.querySelector("#meeting-id-error > span"),
+      );
+
+      await page.getByRole("button", { name: "Start or Join Meeting" }).click();
+
+      await expect(meetingIdInput).toBeFocused();
+      await expect(errorLocator).toHaveText("Not allowed: '.'");
+      await expect.poll(() => typedMessage.evaluate((el) => el?.isConnected === false)).toBe(true);
+      const clickMessage = await page.evaluateHandle(() =>
+        document.querySelector("#meeting-id-error > span"),
+      );
+
+      await meetingIdInput.press("Enter");
+
+      await expect.poll(() => clickMessage.evaluate((el) => el?.isConnected === false)).toBe(true);
+      await expect(errorLocator).toHaveText("Not allowed: '.'");
+      await expect(meetingIdInput).toBeFocused();
+      expect(
+        await liveRegion.evaluate((el) => el === document.getElementById("meeting-id-error")),
+      ).toBe(true);
+      expect(new URL(page.url()).pathname).toBe("/");
+    });
+
+    test("Generate with an invalid saved display name names the character in the inline format", async ({
+      page,
+    }) => {
+      // The saved name fills the field without an input event, so the error
+      // shown is Generate's own.
+      await page.addInitScript(() => {
+        localStorage.setItem("vc_display_name", "Bob!");
+      });
+      await page.goto("/");
+      const usernameInput = page.locator("#username");
+      const usernameError = page.locator(usernameErrorSelector);
+      await expect(usernameInput).toHaveValue("Bob!");
+      await expect(usernameError).toHaveText("");
+
+      await page.getByRole("button", { name: "Generate a New Meeting ID" }).click();
+
+      await expect(usernameError).toHaveText("Not allowed: '!'");
+      await expect(usernameInput).toHaveAttribute("aria-invalid", "true");
+    });
+
+    test("a refused submit with both fields invalid keeps both errors and focuses the display name", async ({
+      page,
+    }) => {
+      await page.goto("/");
+      const usernameInput = page.locator("#username");
+      const meetingIdInput = page.locator("#meeting-id");
+      const usernameError = page.locator(usernameErrorSelector);
+      const meetingIdError = page.locator(meetingIdErrorSelector);
+      await expect(meetingIdInput).toBeVisible();
+
+      await usernameInput.fill("Bob!");
+      await meetingIdInput.fill("a.b");
+      await expect(usernameError).not.toHaveText("");
+      await expect(meetingIdError).not.toHaveText("");
+
+      await page.getByRole("button", { name: "Start or Join Meeting" }).click();
+
+      await expect(usernameError).toHaveText("Not allowed: '!'");
+      await expect(usernameInput).toBeFocused();
+      await expect(usernameInput).toHaveAttribute("aria-invalid", "true");
+      await expect(meetingIdError).toHaveText("Not allowed: '.'");
+      await expect(meetingIdInput).toHaveAttribute("aria-invalid", "true");
+      expect(new URL(page.url()).pathname).toBe("/");
+    });
+
+    test("a pasted meeting ID is trimmed at both ends before it is joined", async ({ page }) => {
+      const meetingId = `pasted-id~${Date.now()}`;
+      await page.goto("/");
+      const meetingIdInput = page.locator("#meeting-id");
+      await expect(meetingIdInput).toBeVisible();
+
+      await meetingIdInput.fill(`  ${meetingId}  `);
+      await expect(page.locator(meetingIdErrorSelector)).toHaveText("");
+      await page.locator("#username").fill("PasteUser");
+      await page.getByRole("button", { name: "Start or Join Meeting" }).click();
+
+      await expect(meetingIdInput).toHaveCount(0, { timeout: 20_000 });
+      await expect
+        .poll(() => new URL(page.url()).pathname, { timeout: 10_000 })
+        .toBe(`/meeting/${meetingId}`);
+    });
+
+    for (const { transport, pin } of [
+      { transport: "WebSocket", pin: PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT },
+      { transport: "WebTransport", pin: PIN_WEBTRANSPORT_INIT_SCRIPT },
+    ]) {
+      test(`a meeting ID with '-' and '~' is joined from the home form and accepted by the ${transport} relay`, async ({
+        context,
+        page,
+      }) => {
+        test.setTimeout(120_000);
+        const meetingId = `team-sync~${transport.toLowerCase()}-${Date.now()}`;
+        await context.addInitScript(CERT_HASH_INIT_SCRIPT);
+        await context.addInitScript(pin);
+        await setTransportBadgeFlag(context);
+        await enableDiagnosticsTileIndicators(context);
+
+        await fillAndSubmitJoinForm(page, meetingId, "TildeUser");
+        expect(await joinMeetingFromPage(page)).toBe("in-meeting");
+        await expect
+          .poll(() => new URL(page.url()).pathname, { timeout: 10_000 })
+          .toBe(`/meeting/${meetingId}`);
+
+        // Election needs RTT echoes from the relay, so it must have accepted the room token.
+        await expect(
+          page.locator(`.transport-badge[aria-label="Your connection transport: ${transport}"]`),
+        ).toHaveCount(1, { timeout: 30_000 });
+      });
+    }
+
+    test("opening /meeting/<ID with '.'> shows the Invalid meeting ID notice without calling meeting-api", async ({
+      page,
+    }) => {
+      await page.addInitScript(() => {
+        localStorage.setItem("vc_display_name", "DirectNavUser");
+      });
+      const meetingApiCalls = recordMeetingApiCalls(page);
+
+      await page.goto("/meeting/bad.id");
+
+      const notice = page.locator(INVALID_MEETING_ID_NOTICE);
+      await expect(notice).toBeVisible({ timeout: 15_000 });
+      await expect(notice.getByRole("heading", { name: "Invalid meeting ID" })).toBeVisible();
+      await expect(notice.getByRole("heading", { name: "Invalid meeting ID" })).toBeFocused();
+      await expect(notice.getByTestId("meeting-invalid-id-hint")).toContainText("ask the host");
+      await expect(notice.getByTestId("meeting-invalid-id-reason")).toContainText("('.')");
+      expect(meetingApiCalls.filter((call) => call.includes("/api/v1/meetings/bad.id"))).toEqual(
+        [],
+      );
+
+      await notice.getByRole("button", { name: "Return to Home" }).click();
+      await expect(page.locator("#meeting-id")).toBeVisible({ timeout: 15_000 });
+      await expect.poll(() => new URL(page.url()).pathname).toBe("/");
+    });
+
+    test("opening /meeting/<ID with a space>/guest shows the Invalid meeting ID notice instead of the guest form", async ({
+      page,
+    }) => {
+      await page.goto("/meeting/a%20b/guest");
+
+      const notice = page.locator(INVALID_MEETING_ID_NOTICE);
+      await expect(notice).toBeVisible({ timeout: 15_000 });
+      await expect(notice.getByRole("heading", { name: "Invalid meeting ID" })).toBeFocused();
+      await expect(notice.getByTestId("meeting-invalid-id-hint")).toBeVisible();
+      await expect(notice.getByTestId("meeting-invalid-id-reason")).toContainText("(space)");
+      await expect(page.locator("#guest-name")).toHaveCount(0);
+    });
+
+    test("opening /meeting/<ID with '.'>/settings shows the Invalid meeting ID notice without calling meeting-api", async ({
+      page,
+    }) => {
+      const meetingApiCalls = recordMeetingApiCalls(page);
+
+      await page.goto("/meeting/a.b/settings");
+
+      const notice = page.locator(INVALID_MEETING_ID_NOTICE);
+      await expect(notice).toBeVisible({ timeout: 15_000 });
+      await expect(notice.getByRole("heading", { name: "Invalid meeting ID" })).toBeFocused();
+      await expect(notice.getByTestId("meeting-invalid-id-reason")).toContainText("('.')");
+      await expect(notice.getByTestId("meeting-invalid-id-hint")).toContainText(
+        "open the meeting from your list on the home page",
+      );
+      expect(meetingApiCalls.filter((call) => call.includes("/api/v1/meetings/a.b"))).toEqual([]);
+    });
+
+    test("a meeting-api INVALID_MEETING_ID refusal is explained like the client-side refusal", async ({
+      page,
+    }) => {
+      // The join of a valid ID is answered with meeting-api's real refusal of
+      // an invalid one, as a newer API rejecting an ID this UI allows would.
+      const stamp = Date.now();
+      const invalidId = `e2e-2832.${stamp}`;
+      const validId = `e2e-2832-refused${stamp}`;
+      await page.addInitScript(() => {
+        localStorage.setItem("vc_display_name", "ServerRefusalUser");
+      });
+      const notice = page.locator(INVALID_MEETING_ID_NOTICE);
+      const reason = notice.getByTestId("meeting-invalid-id-reason");
+
+      await page.goto(`/meeting/${invalidId}`);
+      await expect(reason).toContainText("('.')", { timeout: 15_000 });
+      const clientReason = (await reason.textContent()) ?? "";
+      expect(clientReason).toMatch(/^Meeting ID .+\.$/);
+
+      await page.route(`**/api/v1/meetings/${validId}/join`, async (route) => {
+        const response = await route.fetch({
+          url: route.request().url().replace(validId, invalidId),
+        });
+        await route.fulfill({ response });
+      });
+      await page.goto(`/meeting/${validId}`);
+
+      await expect(reason).toHaveText(clientReason, { timeout: 15_000 });
+      await expect(notice.getByRole("heading", { name: "Invalid meeting ID" })).toBeFocused();
+    });
+  });
+
+  test("meeting-api join and guest join refuse an ID outside the rule without creating it, and join admits '-' and '~' @bvt1", async ({
+    request,
+  }) => {
+    const stamp = Date.now();
+    const email = `meeting-id-rule-${stamp}@videocall.rs`;
+    const name = "MeetingIdRuleUser";
+    const headers = {
+      "Content-Type": "application/json",
+      Cookie: `${COOKIE_NAME}=${generateSessionToken(email, name)}`,
+    };
+
+    const invalidId = `e2e-2832.${stamp}`;
+    const refused = await request.post(`${API_URL}/api/v1/meetings/${invalidId}/join`, {
+      headers,
+      data: { display_name: name },
+    });
+    expect(refused.status()).toBe(400);
+    const refusedBody = await refused.json();
+    expect(refusedBody.result.code).toBe("INVALID_MEETING_ID");
+    expect(refusedBody.result.message).toContain("('.')");
+
+    const guestRefused = await request.post(`${API_URL}/api/v1/meetings/${invalidId}/join-guest`, {
+      headers: { "Content-Type": "application/json" },
+      data: { display_name: "Guest User" },
+    });
+    expect(guestRefused.status()).toBe(400);
+    expect((await guestRefused.json()).result.code).toBe("INVALID_MEETING_ID");
+    expect(await fetchMeetingState(email, name, invalidId)).toBeNull();
+
+    const validId = `e2e-2832-x~y${stamp}`;
+    const admitted = await request.post(`${API_URL}/api/v1/meetings/${validId}/join`, {
+      headers,
+      data: { display_name: name },
+    });
+    expect(admitted.status()).toBe(200);
+    const admittedBody = await admitted.json();
+    expect(admittedBody.result.status).toBe("admitted");
+    expect(admittedBody.result.is_host).toBe(true);
+    expect(admittedBody.result.room_token).toBeTruthy();
+    expect(await fetchMeetingState(email, name, validId)).not.toBeNull();
+
+    await deleteAllOwnedMeetings(email, name);
   });
 });
 

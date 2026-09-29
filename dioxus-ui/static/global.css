@@ -620,6 +620,8 @@ html[data-theme="dark"] {
 
   /* Pin/crop active hover */
   --pin-active-bg-hover: rgba(0, 0, 0, 0.8);
+  --pin-pressed-bg: var(--accent);
+  --pin-pressed-bg-hover: var(--accent-hover);
 
   /* Diag info border (peer-toast inner divider) */
   --diag-info-border: rgba(255, 255, 255, 0.04);
@@ -962,6 +964,8 @@ html[data-theme="light"] {
   --float-orb-green: rgba(48, 209, 88, 0.14);
 
   --pin-active-bg-hover: rgba(0, 0, 0, 0.6);
+  --pin-pressed-bg: var(--accent);
+  --pin-pressed-bg-hover: var(--accent-hover);
 
   --diag-info-border: rgba(0, 0, 0, 0.04);
 
@@ -1468,6 +1472,8 @@ html[data-theme="light"] #invite-overlay p {
   --overlay-strong: rgba(0, 0, 0, 0.5);
   --overlay-heavy: rgba(0, 0, 0, 0.6);
   --overlay-opaque: rgba(0, 0, 0, 0.8);
+  /* Letterbox bars around fitted video, the same in every theme. */
+  --video-letterbox: #000000;
   /* Derived from --text-primary via color-mix for brand coherence */
   --field-bg: rgba(255, 255, 255, 0.05); /* fallback: color-mix below */
   --field-bg: color-mix(in oklch, var(--text-primary) 5%, transparent);
@@ -1854,7 +1860,7 @@ html[data-theme="light"] #invite-overlay p {
   left: 50%;
   transform: translate(-50%, -50%);
   z-index: 100;
-  background: rgba(0, 0, 0, 0.8);
+  background: var(--error-container-bg);
   -webkit-backdrop-filter: blur(var(--glass-blur));
   backdrop-filter: blur(var(--glass-blur));
   padding: 1.5rem;
@@ -1869,7 +1875,7 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .error-message {
-  color: var(--error);
+  color: var(--error-text);
   font-weight: 600;
   margin-bottom: var(--space-4);
   font-size: var(--fs-6);
@@ -2911,6 +2917,13 @@ html[data-theme="light"] #invite-overlay p {
    Large, softly blurred color orbs that drift behind the glass card,
    providing rich chromatic content for the backdrop-filter to refract. */
 
+.hero-orbs {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .floating-element {
   position: absolute;
   pointer-events: none;
@@ -3131,7 +3144,11 @@ html[data-theme="light"] #invite-overlay p {
   display: block;
 }
 
-.hero-content form input {
+/* issue 2702: excludes `[type="checkbox"]` — this rule targets the hero
+   form's TEXT fields, but as a bare `input` selector it was also matching
+   any checkbox in the same form (e.g. co_hosts.rs's now-removed "Save for
+   future meetings" box), stretching it to a 44px-tall, full-width block. */
+.hero-content form input:not([type="checkbox"]) {
   height: 44px;
   padding: 0 0.875rem;
   font-size: var(--fs-6);
@@ -3144,12 +3161,12 @@ html[data-theme="light"] #invite-overlay p {
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.hero-content form input:hover {
+.hero-content form input:not([type="checkbox"]):hover {
   border-color: var(--border-emphasis);
   background: rgba(255, 255, 255, 0.07);
 }
 
-.hero-content form input:focus {
+.hero-content form input:not([type="checkbox"]):focus {
   outline: none;
   border-color: var(--accent);
   background: rgba(255, 255, 255, 0.07);
@@ -3176,10 +3193,12 @@ html[data-theme="light"] #invite-overlay p {
  * Pattern:
  *   <label class="field-label">
  *     <span class="field-label__name">Display Name</span>
- *     <span class="field-label__error" role="alert">'@' not allowed</span>
+ *     <span class="field-label__error" aria-live="polite"><span>Not allowed: '@'</span></span>
  *   </label>
  *
- * The error span is hidden until populated.  When present it truncates with
+ * The error span stays rendered while empty (never display:none) so its live
+ * region is already in the accessibility tree when the first error arrives
+ * (issue 2832); empty, it takes no space.  When present it truncates with
  * an ellipsis on viewports that cannot fit it next to the label, and the
  * input's red border + warning glyph still convey the invalid state.
  */
@@ -3331,12 +3350,15 @@ html[data-theme="light"] #invite-overlay p {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  /* Subtle fade-in keeps the error from appearing jarringly on every keystroke */
-  animation: field-error-in 160ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.field-label__error:empty {
-  display: none;
+/* On the message child, which home.rs re-inserts on every failed submit, so a
+   repeated message fades in again. Block-level so the transform applies. */
+.field-label__error > span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: field-error-in 160ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 @keyframes field-error-in {
@@ -3351,7 +3373,7 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .field-label__error {
+  .field-label__error > span {
     animation: none;
   }
 }
@@ -3460,9 +3482,7 @@ html[data-theme="light"] #invite-overlay p {
   font-size: var(--fs-4);
 }
 
-/* Hide pin/crop on mobile -- tap tile to pin instead */
 @media (max-width: 767px) {
-  .pin-icon,
   .crop-icon {
     display: none !important;
   }
@@ -3479,10 +3499,10 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .grid-item .canvas-container canvas.uncropped,
-.split-screen-tile .canvas-container canvas.uncropped,
 .split-peer-tile .canvas-container canvas.uncropped {
   object-fit: contain !important;
   object-position: center center !important;
+  background-color: var(--video-letterbox);
 }
 
 /* ============================================================
@@ -3527,27 +3547,14 @@ html[data-theme="light"] #invite-overlay p {
    viewport clips the scaled wrapper (overflow hidden) and is the
    focusable pan group.
    ============================================================ */
-/* issue 1175: while a received share is detached into a separate window, the
-   main window looks like a regular no-share meeting. The split layout stays
-   MOUNTED (canvas keeps its node identity + keeps painting to feed the detached
-   mirror), but the share pane is moved OFF-SCREEN (position, NOT display:none —
-   display:none can drop a canvas from compositing and stall captureStream; a
-   still-composited off-screen canvas keeps delivering frames) and the peer grid
-   expands to full width. */
-.share-detached .ss-left-pane {
+/* issue 2792: a detached share tile stays mounted and composited (display:none
+   stalls captureStream) but leaves the grid flow for an off-screen box. */
+.share-tile[data-share-mode="detached"] {
   position: absolute !important;
   left: -99999px !important;
   top: 0 !important;
   width: 640px !important;
   height: 360px !important;
-}
-
-.share-detached .screen-share-resize-handle {
-  display: none !important;
-}
-
-.share-detached .ss-peer-panel {
-  width: 100% !important;
 }
 
 .ss-zoom-viewport {
@@ -3627,6 +3634,15 @@ html[data-theme="light"] #invite-overlay p {
   pointer-events: auto;
 }
 
+/* issue 2792: in a grid cell the bar sits in the name/mic chrome lane. */
+.share-tile:is([data-share-mode="tile"], [data-share-mode="pinned"]) .ss-zoom-controls {
+  bottom: 8px;
+}
+
+.share-tile[data-guard="true"] .ss-zoom-controls {
+  display: none;
+}
+
 .ss-zoom-btn {
   appearance: none;
   border: none;
@@ -3668,8 +3684,29 @@ html[data-theme="light"] #invite-overlay p {
 /* issue 1821: the actual-size (1:1) toggle shares the detach toggle's engaged
    highlight so a "pinned" control reads the same across the bar. */
 .ss-detach-btn[aria-pressed="true"],
-.ss-actual-btn[aria-pressed="true"] {
+.ss-actual-btn[aria-pressed="true"],
+.ss-mode-btn[aria-pressed="true"] {
   background: rgba(76, 139, 245, 0.35);
+}
+
+/* issue 2792: pressed view buttons also carry a non-colour cue. */
+.ss-mode-btn[aria-pressed="true"] {
+  box-shadow: inset 0 -2px 0 var(--focus-ring, #4c8bf5);
+}
+
+.ss-detach-btn[data-suggested="true"] {
+  position: relative;
+}
+
+.ss-detach-btn[data-suggested="true"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #4c8bf5);
 }
 
 .ss-zoom-label {
@@ -3701,6 +3738,274 @@ html[data-theme="light"] #invite-overlay p {
   .ss-zoom-controls {
     opacity: 0.9;
     pointer-events: auto;
+  }
+}
+
+/* issue 2792: the bar sheds controls by the tile's width, not the viewport's.
+   The container sits on `.canvas-container`, never the tile root, so the root's
+   fixed-position signal popup gains no containing block. */
+.share-tile .canvas-container {
+  container: share-tile / inline-size;
+}
+
+@container share-tile (width < 480px) {
+  .ss-zoom-controls .ss-tier-l {
+    display: none;
+  }
+}
+
+@container share-tile (width < 320px) {
+  .ss-zoom-controls .ss-zoom-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    min-width: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+@container share-tile (width < 200px) {
+  .ss-zoom-controls {
+    gap: 2px;
+    padding: 4px;
+  }
+
+  .ss-zoom-controls .ss-tier-s {
+    display: none;
+  }
+}
+
+@container share-tile (width >= 320px) {
+  .ss-zoom-btn {
+    width: 32px;
+    height: 32px;
+  }
+
+  .ss-zoom-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+@media (pointer: coarse) {
+  .ss-zoom-btn {
+    width: 32px;
+    height: 32px;
+  }
+
+  @container share-tile (width >= 320px) {
+    .ss-zoom-btn {
+      width: 44px;
+      height: 44px;
+    }
+  }
+
+  @container share-tile (width < 320px) {
+    .ss-zoom-controls {
+      gap: 2px;
+    }
+
+    .ss-zoom-controls .ss-zoom-sep {
+      display: none;
+    }
+  }
+}
+
+/* issue 2792: the one-click route back to a sticky Detached view. */
+.ss-detach-cta {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 7;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--accent, #4c8bf5);
+  border-radius: var(--radius-md, 8px);
+  background: rgba(20, 22, 28, 0.82);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ss-detach-cta svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+@container share-tile (width < 320px) {
+  .ss-detach-cta {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border-width: 2px;
+    border-radius: 50%;
+  }
+
+  .ss-detach-cta-text {
+    display: none;
+  }
+}
+
+@media (pointer: coarse) {
+  @container share-tile (width < 320px) {
+    .ss-detach-cta {
+      width: 40px;
+      height: 40px;
+    }
+  }
+}
+
+.ss-detach-cta:focus-visible,
+.ss-preview-toggle:focus-visible,
+.ss-mirror-guard-show:focus-visible {
+  outline: 2px solid var(--focus-ring, #4c8bf5);
+  outline-offset: 2px;
+}
+
+.share-tile .own-screen-share-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.ss-preview-toggle {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md, 8px);
+  background: rgba(20, 22, 28, 0.82);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.ss-preview-toggle svg {
+  width: 18px;
+  height: 18px;
+}
+
+.split-screen-tile:hover .ss-preview-toggle,
+.split-screen-tile:focus-within .ss-preview-toggle {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .ss-preview-toggle {
+    opacity: 0.9;
+    pointer-events: auto;
+  }
+}
+
+@media (pointer: coarse) {
+  .ss-preview-toggle {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ss-preview-toggle {
+    transition: none;
+  }
+}
+
+.ss-mirror-guard {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px;
+  text-align: center;
+  background: var(--surface-elevated);
+  color: var(--text-primary);
+}
+
+.ss-mirror-guard svg {
+  width: 32px;
+  height: 32px;
+}
+
+.ss-mirror-guard-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.ss-mirror-guard-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.ss-mirror-guard-show {
+  margin-top: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* issue 2792: a share arrives as one small cell, so it marks its arrival. */
+.share-tile {
+  outline-offset: -2px;
+  animation:
+    share-tile-arrive 160ms ease-out,
+    share-tile-ring 1.8s linear;
+}
+
+@keyframes share-tile-arrive {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes share-tile-ring {
+  0%,
+  83% {
+    outline: 2px solid var(--accent, #4c8bf5);
+  }
+
+  100% {
+    outline: 2px solid transparent;
+  }
+}
+
+@keyframes share-tile-ring-static {
+  0% {
+    outline: 2px solid var(--accent, #4c8bf5);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .share-tile {
+    animation: share-tile-ring-static 1.5s step-end;
   }
 }
 

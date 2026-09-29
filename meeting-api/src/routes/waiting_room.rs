@@ -27,6 +27,7 @@ use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
+use crate::routes::valid_meeting_id::ValidMeetingId;
 use crate::search;
 use crate::state::AppState;
 
@@ -87,7 +88,7 @@ pub async fn get_waiting_room(
 pub async fn admit_participant(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -96,19 +97,19 @@ pub async fn admit_participant(
 
     require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
-    let row = db_participants::admit(&state.db, meeting.id, &body.user_id)
+    // The same transaction activates the meeting: admitting adds a present
+    // participant (see `db_meetings::start_instance`).
+    let healthy = state.presence_healthy().await?;
+    let (row, activation) = db_participants::admit(&state.db, meeting.id, &body.user_id, healthy)
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.user_id))?;
-
-    // Admitting a participant adds a present participant to the call, so the
-    // meeting must be `active` (idle->active). `activate` is idempotent — on an
-    // already-active meeting it touches nothing — so calling it on every admit
-    // is safe and closes the gap where a meeting that briefly went `idle`
-    // (e.g. a stale empty event) would otherwise stay idle even though a
-    // participant just entered. It never resurrects an `ended` meeting in a way
-    // that surprises the admit flow because an ended meeting would not have a
-    // waiting participant to admit. See `db_meetings::activate`.
-    db_meetings::activate(&state.db, meeting.id).await?;
+    nats_events::announce_demotions(
+        state.nats.as_ref(),
+        &meeting_id,
+        activation.demoted(),
+        &user_id,
+    )
+    .await;
 
     // Notify the admitted participant via NATS. The client will fetch its room
     // token via HTTP after receiving this notification.
@@ -120,7 +121,7 @@ pub async fn admit_participant(
 
     // Live homepage-feed nudge (issue #1081): admitting a participant changes
     // the present-participant count and may have reactivated the meeting
-    // (idle->active via the `activate` above) — both shown in the feed.
+    // (idle->active) — both shown in the feed.
     feed_events::publish_feed_change(
         state.nats.as_ref(),
         &state.feed_tx,
@@ -135,7 +136,7 @@ pub async fn admit_participant(
 pub async fn admit_all(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
 ) -> Result<Json<APIResponse<AdmitAllResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -143,15 +144,16 @@ pub async fn admit_all(
 
     require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
-    let rows = db_participants::admit_all(&state.db, meeting.id).await?;
+    let healthy = state.presence_healthy().await?;
+    let (rows, activation) = db_participants::admit_all(&state.db, meeting.id, healthy).await?;
     let admitted_count = rows.len();
-
-    // If we admitted anyone, the meeting now has present participants and must
-    // be `active` (idle->active). Idempotent on an already-active meeting; one
-    // call covers the whole batch (no per-row activate, no NATS/DB storm).
-    if admitted_count > 0 {
-        db_meetings::activate(&state.db, meeting.id).await?;
-    }
+    nats_events::announce_demotions(
+        state.nats.as_ref(),
+        &meeting_id,
+        activation.demoted(),
+        &user_id,
+    )
+    .await;
 
     // Notify all admitted participants via NATS in parallel. Clients will fetch
     // their room tokens via HTTP after receiving the notification.
@@ -191,7 +193,7 @@ pub async fn admit_all(
 pub async fn reject_participant(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)

@@ -47,6 +47,8 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
+import { startScreenShare, stopScreenShare } from "../helpers/screen-share-meeting";
 
 declare global {
   interface Window {
@@ -59,7 +61,16 @@ declare global {
       // feeds into the recording name chips. Used to guard the "remote peer
       // names missing from the recording" regression.
       readTileNames(): Array<{ id: string | null; name: string }>;
+      // Issue 2792: the production screen-source lookup drawFrame() uses, and
+      // the local share element it reads.
+      _resolveScreenSource(grid: Element): {
+        source: HTMLCanvasElement | HTMLVideoElement | null;
+        name: string;
+      };
+      _localShareVideo(): HTMLVideoElement | null;
     };
+    // `displaySurface` reported by SHARE_WITH_AUDIO_MOCK's next share.
+    __e2eShareSurface?: string;
     // Test-only override for the in-memory fallback byte ceiling (see below).
     __VC_RECORDING_MAX_FALLBACK_BYTES__?: number;
     // File System Access API entry point (not in the TS DOM lib); we probe and
@@ -126,6 +137,58 @@ const FORCE_FALLBACK_SCRIPT = `window.showSaveFilePicker = undefined;`;
 const FALLBACK_CAP_BYTES = 2000;
 const INJECT_FALLBACK_CAP_SCRIPT = `window.__VC_RECORDING_MAX_FALLBACK_BYTES__ = ${FALLBACK_CAP_BYTES};`;
 
+/**
+ * getDisplayMedia mock for a shared tab WITH audio: an animated canvas track
+ * whose `getSettings().displaySurface` reads `window.__e2eShareSurface`
+ * ("browser" unless a test changes it; "monitor" turns the mirror guard on),
+ * plus an oscillator audio track.
+ */
+const SHARE_WITH_AUDIO_MOCK = `
+  (() => {
+    const md = navigator.mediaDevices;
+    if (!md) return;
+    window.__e2eShareSurface = "browser";
+    const makeStream = () => {
+      const c = document.createElement('canvas');
+      c.width = 1280; c.height = 720;
+      const ctx = c.getContext('2d');
+      let n = 0;
+      const paint = () => {
+        n++;
+        ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 1280, 720);
+        ctx.fillStyle = '#4fd1c5'; ctx.fillRect((n * 8) % 1120, 280, 160, 160);
+      };
+      paint();
+      setInterval(paint, 100);
+      const stream = c.captureStream(10);
+      const track = stream.getVideoTracks()[0];
+      const settings = track.getSettings.bind(track);
+      track.getSettings = () =>
+        Object.assign({}, settings(), { displaySurface: window.__e2eShareSurface });
+      const audio = new AudioContext();
+      const tone = audio.createOscillator();
+      const sink = audio.createMediaStreamDestination();
+      tone.connect(sink);
+      tone.start();
+      stream.addTrack(sink.stream.getAudioTracks()[0]);
+      return stream;
+    };
+    Object.defineProperty(md, 'getDisplayMedia', {
+      configurable: true, value: async () => makeStream(),
+    });
+  })();
+`;
+
+/** Id (or tag) of the element the recording would draw as the shared screen. */
+function resolvedScreenSource(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const grid = document.getElementById("grid-container");
+    if (!grid) return null;
+    const source = window.__vcRecording._resolveScreenSource(grid).source;
+    return source ? source.id || source.tagName : null;
+  });
+}
+
 async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
   email: string,
@@ -150,6 +213,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   // Seed camera-on so both peers publish video and the record button is visible.
   await context.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
   // Stub out the OS file picker so recording.js doesn't block on a dialog.
@@ -739,6 +803,9 @@ test.describe("Recording feature", () => {
       );
 
       const hostPage = await hostCtx.newPage();
+      // The open peer list carves 320px out of the dock's band; below 1172px
+      // the Recording slot overflows into the menu (issue 2701).
+      await hostPage.setViewportSize({ width: 1600, height: 900 });
       const guestPage = await guestCtx.newPage();
 
       // ── Join meeting ──────────────────────────────────────────────────
@@ -1261,6 +1328,132 @@ test.describe("Recording feature", () => {
       await guestPage.waitForTimeout(3000);
       await expect(guestPage.locator(".meeting-status-bar")).toHaveCount(0);
       await expect(hostPage.locator(".meeting-status-bar")).toHaveCount(0);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // Issue 2792: the local share renders only in the own share tile
+  // (`video#own-screen-share-video`); `#screen-share-preview` is gone.
+  test("recording draws the local share from the own share tile, with its audio and with the preview hidden", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_rec_share_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-share@videocall.rs",
+        "RecShareHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-rec-share@videocall.rs",
+        "RecShareGuest",
+        uiURL,
+      );
+      await hostCtx.addInitScript(SHARE_WITH_AUDIO_MOCK);
+      await guestCtx.addInitScript(SHARE_WITH_AUDIO_MOCK);
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      await fillAndSubmitJoinForm(hostPage, meetingId, "RecShareHost");
+      await hostPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+      await fillAndSubmitJoinForm(guestPage, meetingId, "RecShareGuest");
+      await guestPage.waitForTimeout(1500);
+      if ((await joinMeetingFromPage(guestPage)) === "waiting") {
+        const admitButton = hostPage.getByTitle("Admit").first();
+        await expect(admitButton).toBeVisible({ timeout: 20_000 });
+        await admitButton.dispatchEvent("click");
+        await guestPage.locator("#grid-container").waitFor({ timeout: 20_000 });
+      }
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // (a) + (b): a shared tab with audio, recorded.
+      expect(
+        await startScreenShare(hostPage, guestPage),
+        "the host's share must reach the guest",
+      ).toBe(true);
+      const ownTile = hostPage.locator('[data-testid="own-share-tile"]');
+      await expect(ownTile).toBeVisible({ timeout: 15_000 });
+      await expect(ownTile).not.toHaveAttribute("data-guard", "true");
+
+      const recordBtn = hostPage.getByTestId("record-button");
+      await expect(recordBtn).toBeVisible({ timeout: 10_000 });
+      await recordBtn.click({ timeout: 10_000 });
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 15_000 })
+        .toBe("recording");
+
+      await expect
+        .poll(() => resolvedScreenSource(hostPage), { timeout: 15_000 })
+        .toBe("own-screen-share-video");
+      expect(
+        await hostPage.evaluate(() => {
+          const video = window.__vcRecording._localShareVideo();
+          return (
+            video !== null &&
+            video === document.querySelector('[data-testid="own-share-tile"] video')
+          );
+        }),
+        "the recording must read the own share tile's <video>",
+      ).toBe(true);
+      expect(
+        await hostPage.evaluate(() => {
+          const stream = window.__vcRecording._localShareVideo()?.srcObject;
+          return stream instanceof MediaStream ? stream.getAudioTracks().length : 0;
+        }),
+        "the shared tab's audio must be on the element the recording mixes from",
+      ).toBeGreaterThanOrEqual(1);
+
+      // (c) An entire-screen share hides the preview (mirror guard); the
+      // recording still draws the local share.
+      await stopScreenShare(hostPage);
+      await expect(ownTile).toHaveCount(0, { timeout: 15_000 });
+      await hostPage.evaluate(() => {
+        window.__e2eShareSurface = "monitor";
+      });
+      expect(await startScreenShare(hostPage, guestPage), "the re-share must reach the guest").toBe(
+        true,
+      );
+      await expect(ownTile).toHaveAttribute("data-guard", "true", { timeout: 15_000 });
+      await expect(ownTile.locator('[data-testid="ss-show-preview"]')).toBeVisible({
+        timeout: 5_000,
+      });
+      await expect
+        .poll(() => resolvedScreenSource(hostPage), { timeout: 15_000 })
+        .toBe("own-screen-share-video");
+
+      // (d) A received share outranks the local one.
+      expect(
+        await startScreenShare(guestPage, hostPage),
+        "the guest's share must reach the host",
+      ).toBe(true);
+      await expect
+        .poll(
+          () =>
+            hostPage.evaluate(() => {
+              const grid = document.getElementById("grid-container");
+              if (!grid) return false;
+              const source = window.__vcRecording._resolveScreenSource(grid).source;
+              const received = document.querySelector(
+                '[data-share-origin="received"] canvas[id^="screen-share-"]',
+              );
+              return source !== null && source === received;
+            }),
+          { timeout: 20_000 },
+        )
+        .toBe(true);
     } finally {
       await browser1.close();
       await browser2.close();

@@ -20,40 +20,91 @@ mod bridge;
 mod cert_preflight;
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::transports::wt_chat_session::{WtChatSession, WT_HEARTBEAT_INTERVAL};
-use crate::constants::VALID_ID_PATTERN;
+use crate::actors::priority_drop::SharedQueueByteMeter;
+use crate::actors::shed_escalation::DownlinkShedEscalation;
+use crate::actors::transports::wt_chat_session::{
+    WtChatSession, WtOutboundFrame, WT_HEARTBEAT_INTERVAL,
+};
+use crate::constants::{
+    wt_audio_downlink_lane, AudioDownlinkLane, WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES,
+    WT_QUIC_KEEP_ALIVE_DEFAULT_SECS, WT_QUIC_MAX_IDLE_TIMEOUT_DEFAULT_SECS,
+    WT_QUIC_SEND_WINDOW_BYTES, WT_QUIC_UDP_BUFFER_DEFAULT_BYTES,
+};
 use crate::metrics::{
     duration_to_millis_f64, forget_connection_path_stats, publish_connection_path_stats,
+    ConnectionPathSample, RELAY_UDP_SOCKET_RECV_BUFFER_BYTES, RELAY_UDP_SOCKET_SEND_BUFFER_BYTES,
+    RELAY_WT_AUDIO_DOWNLINK_SESSIONS_TOTAL,
 };
+use crate::relay_shards::SessionShards;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use crate::token_validator;
 use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
-use bridge::WebTransportBridge;
+use bridge::{DownlinkStreamMode, WebTransportBridge};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace_span, warn};
 
-lazy_static::lazy_static! {
-    static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-
-    static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 = std::env::var("QUIC_KEEP_ALIVE_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+/// Resolve one positive-integer `QUIC_*` override, loudly (#2742).
+///
+/// Every one of these is unusable at `0`, and an unparsable value used to take
+/// the default in silence.
+pub(crate) fn resolve_positive_quic_override(var: &str, raw: Option<&str>, default: u64) -> u64 {
+    let Some(text) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return default;
+    };
+    match text.parse::<u64>() {
+        Ok(0) => {
+            warn!("{var}=0 is not a usable QUIC setting; using {default}");
+            default
+        }
+        Ok(value) => value,
+        Err(_) => {
+            warn!("{var}={text:?} is not a positive integer; using {default}");
+            default
+        }
+    }
 }
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::Arc;
+fn quic_override_u64(var: &str, default: u64) -> u64 {
+    resolve_positive_quic_override(var, std::env::var(var).ok().as_deref(), default)
+}
+
+fn quic_override_usize(var: &str, default: usize) -> usize {
+    let resolved = quic_override_u64(var, default as u64);
+    usize::try_from(resolved).unwrap_or(default)
+}
+
+lazy_static::lazy_static! {
+    static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 =
+        quic_override_u64("QUIC_MAX_IDLE_TIMEOUT_SECS", WT_QUIC_MAX_IDLE_TIMEOUT_DEFAULT_SECS);
+
+    static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 =
+        quic_override_u64("QUIC_KEEP_ALIVE_INTERVAL_SECS", WT_QUIC_KEEP_ALIVE_DEFAULT_SECS);
+
+    static ref QUIC_UDP_RECV_BUFFER_BYTES: usize =
+        quic_override_usize("QUIC_UDP_RECV_BUFFER_BYTES", WT_QUIC_UDP_BUFFER_DEFAULT_BYTES);
+
+    static ref QUIC_UDP_SEND_BUFFER_BYTES: usize =
+        quic_override_usize("QUIC_UDP_SEND_BUFFER_BYTES", WT_QUIC_UDP_BUFFER_DEFAULT_BYTES);
+
+    static ref QUIC_CONGESTION_CONTROLLER: CongestionController =
+        CongestionController::resolve(std::env::var("QUIC_CONGESTION_CONTROLLER").ok().as_deref());
+
+    static ref QUIC_SEND_WINDOW_BYTES: u64 =
+        quic_override_u64("QUIC_SEND_WINDOW_BYTES", WT_QUIC_SEND_WINDOW_BYTES);
+
+    static ref QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = quic_override_usize(
+        "QUIC_DATAGRAM_SEND_BUFFER_BYTES",
+        WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES,
+    );
+}
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -120,6 +171,167 @@ pub struct Certs {
     pub key: PathBuf,
 }
 
+/// `QUIC_CONGESTION_CONTROLLER` (#2716). BBR is wired up for a shaped-link A/B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CongestionController {
+    Cubic,
+    Bbr,
+}
+
+impl CongestionController {
+    pub(crate) fn resolve(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("cubic") => Self::Cubic,
+            Some("bbr") => Self::Bbr,
+            Some(other) => {
+                warn!(
+                    "QUIC_CONGESTION_CONTROLLER={other:?} is not one of cubic|bbr; \
+                     using cubic"
+                );
+                Self::Cubic
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Bbr => "bbr",
+        }
+    }
+
+    fn apply(self, transport_config: &mut quinn::TransportConfig) {
+        match self {
+            Self::Cubic => transport_config
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+            Self::Bbr => transport_config
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UdpBufferSizes {
+    pub(crate) requested_recv: usize,
+    pub(crate) effective_recv: usize,
+    pub(crate) requested_send: usize,
+    pub(crate) effective_send: usize,
+}
+
+/// Bind the relay's one UDP socket with explicit `SO_RCVBUF`/`SO_SNDBUF` and
+/// publish requested-vs-effective as gauges (#2716). A failed `setsockopt` is
+/// not fatal.
+pub(crate) fn bind_udp_socket(
+    addr: SocketAddr,
+    requested_recv: usize,
+    requested_send: usize,
+) -> Result<(std::net::UdpSocket, UdpBufferSizes)> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .with_context(|| format!("creating UDP socket for {addr}"))?;
+
+    if let Err(e) = socket.set_recv_buffer_size(requested_recv) {
+        warn!("SO_RCVBUF={requested_recv} rejected ({e}); keeping the kernel default");
+    }
+    if let Err(e) = socket.set_send_buffer_size(requested_send) {
+        warn!("SO_SNDBUF={requested_send} rejected ({e}); keeping the kernel default");
+    }
+
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("binding UDP socket to {addr}"))?;
+
+    let effective_recv = socket.recv_buffer_size().unwrap_or(0);
+    let effective_send = socket.send_buffer_size().unwrap_or(0);
+
+    let sizes = UdpBufferSizes {
+        requested_recv,
+        effective_recv,
+        requested_send,
+        effective_send,
+    };
+    publish_udp_buffer_sizes(&sizes);
+
+    let doubles = kernel_doubles_buffer_readback(std::env::consts::OS);
+    let granted_recv = granted_buffer_bytes(effective_recv, doubles);
+    let granted_send = granted_buffer_bytes(effective_send, doubles);
+    if granted_recv < requested_recv || granted_send < requested_send {
+        warn!(
+            "UDP socket buffers were clamped by the kernel: requested \
+             rcv={requested_recv} snd={requested_send}, granted \
+             rcv={granted_recv} snd={granted_send} (read back as \
+             rcv={effective_recv} snd={effective_send}). Raise net.core.rmem_max \
+             and net.core.wmem_max on the host to make the request stick."
+        );
+    }
+
+    Ok((socket.into(), sizes))
+}
+
+/// Linux's `getsockopt` reports DOUBLE the accepted buffer (`man 7 socket`).
+/// Takes the OS name so the mapping is testable on any host.
+fn kernel_doubles_buffer_readback(target_os: &str) -> bool {
+    target_os == "linux"
+}
+
+/// Bytes the kernel granted. Without it a Linux host whose `rmem_max` is above
+/// half the request reads back MORE than it asked and no clamp warning fires.
+fn granted_buffer_bytes(readback: usize, kernel_doubles: bool) -> usize {
+    if kernel_doubles {
+        readback / 2
+    } else {
+        readback
+    }
+}
+
+/// Build the relay's quinn [`quinn::TransportConfig`]. Extracted from `start`
+/// (#2716) so `transport_config_pins_the_2716_values` can read it back.
+fn build_transport_config() -> Result<quinn::TransportConfig> {
+    let mut transport_config = quinn::TransportConfig::default();
+
+    // Detect disconnection after inactivity (configurable via QUIC_MAX_IDLE_TIMEOUT_SECS)
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(*QUIC_MAX_IDLE_TIMEOUT_SECS).try_into()?,
+    ));
+
+    // Send keep-alive pings to maintain connection (configurable via QUIC_KEEP_ALIVE_INTERVAL_SECS)
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+        *QUIC_KEEP_ALIVE_INTERVAL_SECS,
+    )));
+
+    // #2716: quinn's 1 MiB default holds seconds of a full room's audio
+    // fan-out, and a late datagram is discarded by the receiver's NetEq anyway.
+    transport_config.datagram_send_buffer_size(*QUIC_DATAGRAM_SEND_BUFFER_BYTES);
+
+    // #2716: quinn's 10 MB default holds tens of seconds of video unacked
+    // before `write_all` parks, which is what the #1638 shed keys on.
+    transport_config.send_window(*QUIC_SEND_WINDOW_BYTES);
+
+    QUIC_CONGESTION_CONTROLLER.apply(&mut transport_config);
+
+    // Pinned to quinn's current default: the bridge spawns one reader task per
+    // accepted uni stream, each holding up to `MAX_FRAME_SIZE`.
+    transport_config.max_concurrent_uni_streams(100u32.into());
+
+    Ok(transport_config)
+}
+
+fn publish_udp_buffer_sizes(sizes: &UdpBufferSizes) {
+    RELAY_UDP_SOCKET_RECV_BUFFER_BYTES
+        .with_label_values(&["requested"])
+        .set(sizes.requested_recv as f64);
+    RELAY_UDP_SOCKET_RECV_BUFFER_BYTES
+        .with_label_values(&["effective"])
+        .set(sizes.effective_recv as f64);
+    RELAY_UDP_SOCKET_SEND_BUFFER_BYTES
+        .with_label_values(&["requested"])
+        .set(sizes.requested_send as f64);
+    RELAY_UDP_SOCKET_SEND_BUFFER_BYTES
+        .with_label_values(&["effective"])
+        .set(sizes.effective_send as f64);
+}
+
 fn get_key_and_cert_chain<'a>(
     certs: Certs,
 ) -> anyhow::Result<(PrivateKeyDer<'a>, Vec<CertificateDer<'a>>)> {
@@ -158,12 +370,14 @@ fn get_key_and_cert_chain<'a>(
 /// * `pool` - Optional database pool
 /// * `tracker_sender` - Server diagnostics tracker
 /// * `session_manager` - Session lifecycle manager
+/// * `shards` - Session arbiters each accepted connection is placed on (#2727)
 pub async fn start(
     opt: WebTransportOpt,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
+    shards: Arc<SessionShards>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
@@ -211,63 +425,48 @@ pub async fn start(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto_config)?,
     ));
 
-    // Configure transport with aggressive timeouts for fast disconnect detection
-    let mut transport_config = quinn::TransportConfig::default();
+    server_config.transport_config(std::sync::Arc::new(build_transport_config()?));
 
-    // Detect disconnection after inactivity (configurable via QUIC_MAX_IDLE_TIMEOUT_SECS)
-    transport_config.max_idle_timeout(Some(
-        std::time::Duration::from_secs(*QUIC_MAX_IDLE_TIMEOUT_SECS).try_into()?,
-    ));
-
-    // Send keep-alive pings to maintain connection (configurable via QUIC_KEEP_ALIVE_INTERVAL_SECS)
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-        *QUIC_KEEP_ALIVE_INTERVAL_SECS,
-    )));
-
-    // Cap the number of concurrent peer-initiated unidirectional streams per
-    // session. The bridge spawns one reader task per accepted uni stream
-    // (see `bridge::read_framed_packets_loop`), and each reader can hold a
-    // payload buffer up to `MAX_FRAME_SIZE` (4 MB). Together these bound
-    // transient memory per malicious session to roughly
-    // `MAX_CONCURRENT_UNI_STREAMS * MAX_FRAME_SIZE` ≈ 400 MB worst case;
-    // QUIC connection-level flow control caps it much lower in practice.
-    //
-    // This is intentionally pinned to quinn's current default (100). The
-    // explicit setting protects the invariant against a future quinn
-    // upgrade that changes the default, or against an operator who raises
-    // the limit without re-evaluating the worst-case memory footprint.
-    // If you raise this value, also re-evaluate `MAX_FRAME_SIZE` and the
-    // reader-task spawn pattern in `bridge.rs`.
-    transport_config.max_concurrent_uni_streams(100u32.into());
-
-    server_config.transport_config(std::sync::Arc::new(transport_config));
-
-    // Create Quinn endpoint with our custom config
-    let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
+    // #2716: `Endpoint::server` would bind on the kernel default instead.
+    let (socket, udp_buffers) = bind_udp_socket(
+        opt.listen,
+        *QUIC_UDP_RECV_BUFFER_BYTES,
+        *QUIC_UDP_SEND_BUFFER_BYTES,
+    )?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
 
     let mut server = web_transport_quinn::Server::new(endpoint);
 
     info!(
-        "listening on {} with {}s idle timeout and {}s keep-alive",
-        opt.listen, *QUIC_MAX_IDLE_TIMEOUT_SECS, *QUIC_KEEP_ALIVE_INTERVAL_SECS
+        "listening on {} with {}s idle timeout, {}s keep-alive, {} congestion \
+         control, {}B datagram send buffer, {}B send window, UDP buffers \
+         rcv {}->{} snd {}->{} (requested->effective)",
+        opt.listen,
+        *QUIC_MAX_IDLE_TIMEOUT_SECS,
+        *QUIC_KEEP_ALIVE_INTERVAL_SECS,
+        QUIC_CONGESTION_CONTROLLER.label(),
+        *QUIC_DATAGRAM_SEND_BUFFER_BYTES,
+        *QUIC_SEND_WINDOW_BYTES,
+        udp_buffers.requested_recv,
+        udp_buffers.effective_recv,
+        udp_buffers.requested_send,
+        udp_buffers.effective_send,
     );
 
-    // Accept new WebTransport connections
-    // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
-    // actor requires the actix LocalSet context for spawn_local. This is also why
-    // the binary is `#[actix_rt::main]` (single-threaded current-thread runtime):
-    // a multi-threaded runtime cannot host these `!Send`, spawn_local-bound tasks.
-    // Because the runtime is current-thread, `TOKIO_WORKER_THREADS` is INERT for
-    // this relay — tuning it does nothing and cannot relieve outbound back-pressure.
-    // Multi-core scaling (multi-Arbiter sharding / off-thread parse — issue #1639
-    // options a/b) is future work gated on the #1637 scheduler-lag instrumentation.
+    // #2727: the connection is placed on a session arbiter and everything it owns
+    // stays there for the session's life; `ShardLease` releases the slot.
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let chat_server = chat_server.clone();
         let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
-        actix_rt::spawn(async move {
+        let placed = shards.spawn_session(move |lease| async move {
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
                 chat_server,
@@ -279,7 +478,11 @@ pub async fn start(
             {
                 error!("Failed to handle WebTransport connection: {err:?}");
             }
+            drop(lease);
         });
+        if !placed {
+            error!("Session arbiter is gone; dropped an inbound WebTransport connection");
+        }
     }
 
     Ok(())
@@ -294,7 +497,6 @@ struct WtConnectIdentity {
     display_name: String,
     is_guest: bool,
     is_host: bool,
-    end_on_host_leave: bool,
 }
 
 /// Resolve who is connecting, from the JWT when one is presented and otherwise
@@ -327,7 +529,6 @@ fn resolve_wt_connect_identity(
             display_name: claims.display_name,
             is_guest: claims.is_guest,
             is_host: claims.is_host,
-            end_on_host_leave: claims.end_on_host_leave,
         });
     }
 
@@ -343,12 +544,8 @@ fn resolve_wt_connect_identity(
             "Invalid path: expected /lobby/{{user_id}}/{{room}} (deprecated) or /lobby?token=<JWT>"
         ));
     }
-    let username = parts[1].replace(' ', "_");
-    let lobby_id = parts[2].replace(' ', "_");
-    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&username) || !re.is_match(&lobby_id) {
-        return Err(anyhow!("Invalid path input chars"));
-    }
+    let (username, lobby_id) = crate::lobby::deprecated_path_identity(parts[1], parts[2])
+        .ok_or_else(|| anyhow!("Invalid path input chars"))?;
     info!(
         "WT deprecated path-based connection: user_id={}, room={}",
         username, lobby_id
@@ -361,8 +558,68 @@ fn resolve_wt_connect_identity(
         display_name,
         is_guest: false,
         is_host: false,
-        end_on_host_leave: true,
     })
+}
+
+/// Query-parameter name a client uses to advertise the #2723 per-publisher
+/// downlink protocol it speaks. See `2723-contract.md` §1.
+const DOWNLINK_STREAMS_QUERY_PARAM: &str = "ds";
+
+/// Resolve the downlink topology from the connect URL's `ds` parameter (#2723).
+///
+/// The value is a PROTOCOL VERSION, not a count: `>= 1` selects the highest
+/// version this relay implements, and anything else keeps
+/// [`DownlinkStreamMode::Single`]. Read from the URL, the EARLIEST point a
+/// capability can be observed.
+fn resolve_downlink_stream_mode(ds: Option<&str>) -> DownlinkStreamMode {
+    match ds.and_then(|raw| raw.parse::<u32>().ok()) {
+        Some(version) if version >= 1 => DownlinkStreamMode::PerPublisherV1,
+        _ => DownlinkStreamMode::Single,
+    }
+}
+
+/// Which primitive this receiver's audio takes (#2724). A `Single`-mode
+/// receiver keeps datagrams: its one reliable stream carries video, and
+/// sharing it would be the cross-media head-of-line blocking #622 rejected.
+/// `configured` can only move a `ds=1` receiver BACK to datagrams.
+fn resolve_session_audio_lane(
+    mode: DownlinkStreamMode,
+    configured: AudioDownlinkLane,
+) -> AudioDownlinkLane {
+    match mode {
+        DownlinkStreamMode::PerPublisherV1 => configured,
+        DownlinkStreamMode::Single => AudioDownlinkLane::Datagram,
+    }
+}
+
+/// Resolve one session's audio lane and book it, once, at accept (#2724).
+/// `mode` separates a legacy client from a `ds=1` one on a reverted cluster,
+/// which both book `lane="datagram"` (#2763).
+fn book_audio_downlink_session(
+    mode: DownlinkStreamMode,
+    configured: AudioDownlinkLane,
+) -> AudioDownlinkLane {
+    let lane = resolve_session_audio_lane(mode, configured);
+    RELAY_WT_AUDIO_DOWNLINK_SESSIONS_TOTAL
+        .with_label_values(&[audio_lane_label(lane), downlink_mode_label(mode)])
+        .inc();
+    lane
+}
+
+/// `mode` label for `videocall_relay_wt_audio_downlink_sessions_total`.
+fn downlink_mode_label(mode: DownlinkStreamMode) -> &'static str {
+    match mode {
+        DownlinkStreamMode::Single => "single",
+        DownlinkStreamMode::PerPublisherV1 => "per_publisher_v1",
+    }
+}
+
+/// Label for `videocall_relay_wt_audio_downlink_sessions_total`.
+fn audio_lane_label(lane: AudioDownlinkLane) -> &'static str {
+    match lane {
+        AudioDownlinkLane::Reliable => "reliable",
+        AudioDownlinkLane::Datagram => "datagram",
+    }
 }
 
 /// Format the "received WebTransport request" line with the URL's query string
@@ -404,6 +661,14 @@ async fn run_webtransport_connection_from_request(
         .find(|(key, _)| key == "instance_id")
         .map(|(_, val)| val.into_owned());
 
+    // #2723: read BEFORE the session is accepted. Unauthenticated by design — a
+    // client that lies only breaks its own downlink, and the relay's cap holds.
+    let downlink_streams: Option<String> = uri
+        .query_pairs()
+        .find(|(key, _)| key == DOWNLINK_STREAMS_QUERY_PARAM)
+        .map(|(_, val)| val.into_owned());
+    let downlink_mode = resolve_downlink_stream_mode(downlink_streams.as_deref());
+
     let identity = resolve_wt_connect_identity(&parts, token.as_deref())?;
     let WtConnectIdentity {
         username,
@@ -412,7 +677,6 @@ async fn run_webtransport_connection_from_request(
         display_name,
         is_guest,
         is_host,
-        end_on_host_leave,
     } = identity;
 
     // `instance_id` binds reconnect adoption to identity; this path has no verified one.
@@ -436,7 +700,7 @@ async fn run_webtransport_connection_from_request(
         observer,
         instance_id,
         is_host,
-        end_on_host_leave,
+        downlink_mode,
     )
     .await
     {
@@ -484,12 +748,15 @@ fn set_path_stat_sample_interval_for_test(d: std::time::Duration) {
 /// ~every `sample_interval` (production passes [`path_stat_sample_interval`] =
 /// [`WT_HEARTBEAT_INTERVAL`], 5s; the param exists so the integration test can
 /// drive a faster cadence and observe a tick within its window). On each tick it
-/// reads ONE quinn `stats()` snapshot and hands the four scalars to
-/// [`publish_connection_path_stats`], which sets the four per-`session_id` gauges
+/// reads ONE quinn `stats()` snapshot and hands the sample to
+/// [`publish_connection_path_stats`], which sets every per-`session_id` gauge
 /// — the LEAD signal set for epic #1636's B-vs-C discrimination (see the metric
 /// docs in `metrics.rs` for the full reading: rtt/loss/congestion freeze under a
 /// downlink collapse, `sent_packets` keeps climbing, so the two together separate
 /// a network collapse from a relay thread stall).
+///
+/// `datagram_send_calls` is loaded BEFORE the `stats()` snapshot so it cannot run
+/// ahead of `frame_tx.datagram` and fake a silent drop (#2712).
 ///
 /// `conn` is a CLONE of the session's `quinn::Connection` (Arc-backed, cheap to
 /// clone), taken BEFORE the owning `Session` is moved into the bridge. A
@@ -514,6 +781,7 @@ async fn sample_connection_path_stats(
     room: String,
     session_id: String,
     sample_interval: std::time::Duration,
+    datagram_send_calls: Arc<AtomicU64>,
 ) {
     let mut interval = tokio::time::interval(sample_interval);
     // Skip the immediate first tick: on a brand-new connection RTT/stats are not
@@ -526,9 +794,8 @@ async fn sample_connection_path_stats(
         // If quinn has closed the connection, stop sampling. The teardown path
         // also aborts us + removes the series; this just avoids one stale sample
         // and an idle task between close and abort. This `close_reason()` check is
-        // a separate cheap lock acquisition; the four gauge reads below then share
-        // a SINGLE `stats()` snapshot (one more acquisition) — two short reads per
-        // ~5s tick, not four.
+        // a separate cheap lock acquisition; the gauge reads below share a SINGLE
+        // `stats()` snapshot plus one `datagram_send_buffer_space()`.
         if conn.close_reason().is_some() {
             debug!(
                 "WT path-stat sampler stopping (connection closed) for session {} in {}",
@@ -537,69 +804,65 @@ async fn sample_connection_path_stats(
             break;
         }
 
-        // Read all four values from ONE `stats()` snapshot so they reflect a single
+        // Read every path/frame value from ONE `stats()` snapshot so they reflect a single
         // consistent connection state. `ConnectionStats.path.rtt` is the SAME value
         // as `Connection::rtt()` — both return `self.path.rtt.get()`
         // (quinn-proto-0.11.13 connection/mod.rs:1269 vs :1381), the current
         // smoothed round-trip estimate. `lost_packets` / `congestion_events` /
         // `sent_packets` are CUMULATIVE for the connection; the gauges publish the
-        // running totals (chart with rate()/increase()). The scalar→gauge mapping
+        // running totals (chart with rate()/increase()). The field→gauge mapping
         // lives in `publish_connection_path_stats` so a host unit test can pin it.
-        let path = conn.stats().path;
-        publish_connection_path_stats(
-            &room,
-            &session_id,
-            duration_to_millis_f64(path.rtt),
-            path.lost_packets,
-            path.congestion_events,
-            path.sent_packets,
-        );
+        let calls = datagram_send_calls.load(Ordering::Relaxed);
+        let stats = conn.stats();
+        let sample = ConnectionPathSample {
+            rtt_ms: duration_to_millis_f64(stats.path.rtt),
+            lost_packets: stats.path.lost_packets,
+            congestion_events: stats.path.congestion_events,
+            sent_packets: stats.path.sent_packets,
+            cwnd: stats.path.cwnd,
+            current_mtu: stats.path.current_mtu,
+            black_holes_detected: stats.path.black_holes_detected,
+            max_data: stats.frame_rx.max_data,
+            max_stream_data: stats.frame_rx.max_stream_data,
+            datagram_frames_sent: stats.frame_tx.datagram,
+            datagram_send_calls: calls,
+            datagram_send_buffer_space: conn.datagram_send_buffer_space() as u64,
+        };
+        publish_connection_path_stats(&room, &session_id, &sample);
     }
 }
 
 /// Spawn the per-connection path-health sampler for one WT connection and return
 /// its task handle (#1637).
 ///
-/// This is the SPAWN half of the sampler lifecycle, extracted from
-/// `handle_webtransport_session` so the runtime wiring is exercisable by a host
-/// test WITHOUT NATS: the `path_stat_sampler_emits_and_gcs_over_loopback_quinn`
-/// test stands up a real loopback `quinn` connection and calls THIS function (and
-/// [`stop_connection_path_sampler`]) directly — the same functions production
-/// calls — so deleting the spawn here, or the GC in the stop half, fails that
-/// test. Routing through these helpers (rather than re-implementing the spawn in
-/// the test) is what makes the test guard the real wiring.
+/// The SPAWN half of the sampler lifecycle, extracted so a host test can drive
+/// the real wiring without NATS.
 ///
-/// `actix_rt::spawn` keeps the sampler on the relay's single-thread runtime
-/// (consistent with the rest of WT handling). The cadence is resolved INTERNALLY
-/// via [`path_stat_sample_interval`] (NOT a parameter) so the `#[cfg(test)]`
-/// override flows through this production call. `conn` is the caller's
-/// already-obtained `quinn::Connection` clone (taken before the owning `Session`
-/// is moved into the bridge).
+/// `actix_rt::spawn` keeps the sampler on the arbiter that owns this session
+/// (#2727). The cadence is resolved INTERNALLY via [`path_stat_sample_interval`]
+/// so the `#[cfg(test)]` override flows through this production call.
 pub(crate) fn spawn_connection_path_sampler(
     conn: quinn::Connection,
     room: &str,
     session_id: &str,
+    datagram_send_calls: Arc<AtomicU64>,
 ) -> actix_rt::task::JoinHandle<()> {
     actix_rt::spawn(sample_connection_path_stats(
         conn,
         room.to_string(),
         session_id.to_string(),
         path_stat_sample_interval(),
+        datagram_send_calls,
     ))
 }
 
 /// Stop the per-connection path-health sampler and remove its per-session gauges
 /// (#1637) — the TEARDOWN half of the sampler lifecycle.
 ///
-/// The sampler also self-exits when quinn reports the connection closed, but we
-/// `abort()` UNCONDITIONALLY here so the task cannot outlive the session under any
-/// path, then GC the `session_id`-labeled series via [`forget_connection_path_stats`]
-/// so it does not leak for the process lifetime (issue #996 pattern). This GC is
-/// co-located with the sampler spawn/abort in the WT entry point — NOT in
-/// `SessionLogic::on_stopping` where `forget_session_drops` lives — because the
-/// sampler is WT-only (it needs the quinn connection). Both run on every normal
-/// disconnect. Extracted alongside [`spawn_connection_path_sampler`] so a host
-/// test drives the real GC, not a replica.
+/// The sampler also self-exits on a closed connection, but this `abort()`s
+/// UNCONDITIONALLY so the task cannot outlive the session, then GCs the
+/// `session_id`-labeled series. The GC lives here rather than in
+/// `SessionLogic::on_stopping` because the sampler is WT-only.
 pub(crate) fn stop_connection_path_sampler(
     sampler_handle: actix_rt::task::JoinHandle<()>,
     room: &str,
@@ -628,22 +891,30 @@ async fn handle_webtransport_session(
     observer: bool,
     instance_id: Option<String>,
     is_host: bool,
-    end_on_host_leave: bool,
+    downlink_mode: DownlinkStreamMode,
 ) -> anyhow::Result<()> {
     // Create two channels for actor → WebTransport I/O — one per QUIC
     // primitive. Phase 2 split (discussion #756): a stalled persistent
     // uni-stream cannot back up the datagram path because the two
     // channels are drained by independent writer tasks.
-    //
-    // * UniStream channel: env-tunable via `WT_OUTBOUND_CHANNEL_CAPACITY`,
-    //   defaults to 512 (fail-fast per issue #979). Carries video / screen /
-    //   oversized audio/control. Where QUIC flow control surfaces.
-    // * Datagram channel: small, fixed `WT_DATAGRAM_CHANNEL_CAPACITY`.
-    //   Carries small audio media + non-media control under MTU.
     let (unistream_tx, unistream_rx) =
-        mpsc::channel::<bytes::Bytes>(crate::constants::wt_outbound_channel_capacity());
+        mpsc::channel::<WtOutboundFrame>(crate::constants::wt_outbound_channel_capacity());
     let (datagram_tx, datagram_rx) =
-        mpsc::channel::<bytes::Bytes>(crate::constants::WT_DATAGRAM_CHANNEL_CAPACITY);
+        mpsc::channel::<WtOutboundFrame>(crate::constants::WT_DATAGRAM_CHANNEL_CAPACITY);
+
+    // #2717: credited on enqueue, debited by the writer's drain.
+    let unistream_bytes = Arc::new(SharedQueueByteMeter::default());
+
+    // #2726: owned by this session and dropped with it.
+    let escalation = DownlinkShedEscalation::new();
+
+    // #2724: booked once per session, because nothing else tells an operator
+    // whether the deploy or a revert took effect on this cluster.
+    let audio_lane = book_audio_downlink_session(downlink_mode, wt_audio_downlink_lane());
+
+    // #2716: the datagram writer drops this clone when its loop ends, so the
+    // unistream writer still sees the channel close at teardown.
+    let unistream_fallback_tx = unistream_tx.clone();
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -654,19 +925,23 @@ async fn handle_webtransport_session(
         is_guest,
         unistream_tx,
         datagram_tx,
+        unistream_bytes.clone(),
         nats_client,
         tracker_sender,
         session_manager,
         observer,
         instance_id,
         is_host,
-        end_on_host_leave,
+        audio_lane,
+        escalation.clone(),
     );
     // Capture the canonical per-session id BEFORE `start()` consumes the actor.
     // It is the SAME id `relay_session_drops_total` uses, so the #1637 relay RTT
     // gauge joins with the per-session drop series for this connection.
     let metrics_session_id = actor.session_id().to_string();
     let metrics_room = lobby_id.to_string();
+    // #2718: same capture-before-`start()` rule as the session id above.
+    let downlink_drops = actor.downlink_drop_sink();
 
     let actor_addr = actor.start();
 
@@ -677,8 +952,14 @@ async fn handle_webtransport_session(
     // handle. The spawn + teardown live in `spawn_connection_path_sampler` /
     // `stop_connection_path_sampler` so the WIRING is exercised by a host test
     // (a loopback-quinn test drives the same helpers without NATS); see those fns.
-    let sampler_handle =
-        spawn_connection_path_sampler((*session).clone(), &metrics_room, &metrics_session_id);
+    // #2712: the datagram writer and the sampler share one call counter.
+    let datagram_send_calls = Arc::new(AtomicU64::new(0));
+    let sampler_handle = spawn_connection_path_sampler(
+        (*session).clone(),
+        &metrics_room,
+        &metrics_session_id,
+        datagram_send_calls.clone(),
+    );
 
     // Create bridge (with test callback if in test mode)
     #[cfg(test)]
@@ -697,7 +978,13 @@ async fn handle_webtransport_session(
         actor_addr.clone(),
         unistream_rx,
         datagram_rx,
+        unistream_fallback_tx,
+        unistream_bytes,
         on_packet_sent,
+        datagram_send_calls,
+        downlink_drops,
+        downlink_mode,
+        escalation,
     );
     bridge.wait_for_disconnect().await;
     bridge.shutdown().await;
@@ -783,6 +1070,8 @@ mod tests {
             },
         };
 
+        // One shard: this harness needs no arbiter threads.
+        let shards = std::sync::Arc::new(crate::relay_shards::SessionShards::new(1));
         actix_rt::spawn(async move {
             if let Err(e) = webtransport::start(
                 opt,
@@ -790,6 +1079,7 @@ mod tests {
                 nats_client,
                 tracker_sender,
                 session_manager,
+                shards,
             )
             .await
             {
@@ -2667,7 +2957,12 @@ mod tests {
             let session_id = "loopback-session-1";
 
             // Drive the REAL production spawn helper against the live server conn.
-            let handle = spawn_connection_path_sampler(server_conn.clone(), room, session_id);
+            let handle = spawn_connection_path_sampler(
+                server_conn.clone(),
+                room,
+                session_id,
+                Arc::new(AtomicU64::new(0)),
+            );
 
             // Wait for a sampler tick to publish the gauge (skips first tick, so
             // earliest emit is ~2 * 50ms; poll generously for slow CI).
@@ -2746,6 +3041,471 @@ mod tests {
     // Tokenless-join guard for the deprecated WT path (issue #2298)
     // =====================================================================
 
+    fn default_udp_buffer_sizes() -> (usize, usize) {
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind plain UDP socket");
+        let sock = socket2::SockRef::from(&plain);
+        (
+            sock.recv_buffer_size().expect("read default SO_RCVBUF"),
+            sock.send_buffer_size().expect("read default SO_SNDBUF"),
+        )
+    }
+
+    /// #2716. BITES: it reads 786896, not 4194304.
+    #[test]
+    #[serial_test::serial]
+    fn udp_socket_buffers_are_raised_and_published() {
+        let (default_recv, default_send) = default_udp_buffer_sizes();
+        let requested = WT_QUIC_UDP_BUFFER_DEFAULT_BYTES;
+
+        let (_socket, sizes) =
+            bind_udp_socket("127.0.0.1:0".parse().unwrap(), requested, requested)
+                .expect("bind the relay UDP socket");
+
+        assert_eq!(sizes.requested_recv, requested);
+        assert_eq!(sizes.requested_send, requested);
+
+        assert!(
+            sizes.effective_recv >= requested || sizes.effective_recv > default_recv,
+            "SO_RCVBUF stayed at the kernel default: requested {requested}, \
+             effective {}, default-bound socket {default_recv}. The relay is \
+             running on the default buffer — `set_recv_buffer_size` did not take.",
+            sizes.effective_recv,
+        );
+        assert!(
+            sizes.effective_send >= requested || sizes.effective_send > default_send,
+            "SO_SNDBUF stayed at the kernel default: requested {requested}, \
+             effective {}, default-bound socket {default_send}. The relay is \
+             running on the default buffer — `set_send_buffer_size` did not take.",
+            sizes.effective_send,
+        );
+
+        let gauge = |metric: &prometheus::GaugeVec, setting: &str| {
+            metric.with_label_values(&[setting]).get()
+        };
+        assert_eq!(
+            gauge(&RELAY_UDP_SOCKET_RECV_BUFFER_BYTES, "effective"),
+            sizes.effective_recv as f64,
+            "the effective SO_RCVBUF gauge must publish the kernel read-back",
+        );
+        assert_eq!(
+            gauge(&RELAY_UDP_SOCKET_RECV_BUFFER_BYTES, "requested"),
+            requested as f64,
+        );
+        assert_eq!(
+            gauge(&RELAY_UDP_SOCKET_SEND_BUFFER_BYTES, "effective"),
+            sizes.effective_send as f64,
+            "the effective SO_SNDBUF gauge must publish the kernel read-back",
+        );
+        assert_eq!(
+            gauge(&RELAY_UDP_SOCKET_SEND_BUFFER_BYTES, "requested"),
+            requested as f64,
+        );
+    }
+
+    /// #2716: quinn must accept the socket2-built socket.
+    #[actix_rt::test]
+    async fn bound_udp_socket_builds_a_quinn_endpoint() {
+        let (socket, _sizes) = bind_udp_socket(
+            "127.0.0.1:0".parse().unwrap(),
+            WT_QUIC_UDP_BUFFER_DEFAULT_BYTES,
+            WT_QUIC_UDP_BUFFER_DEFAULT_BYTES,
+        )
+        .expect("bind the relay UDP socket");
+
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .expect("quinn must accept the socket bind_udp_socket produced");
+
+        assert!(
+            endpoint.local_addr().expect("local addr").port() > 0,
+            "the endpoint must be bound to a real ephemeral port",
+        );
+    }
+
+    /// #2716: the values must reach the `TransportConfig` the server installs,
+    /// not merely exist as constants. BITES: drop the `send_window` call.
+    #[test]
+    fn transport_config_pins_the_2716_values() {
+        let rendered = format!(
+            "{:?}",
+            build_transport_config().expect("the idle timeout must convert")
+        );
+
+        for expected in [
+            format!(
+                "datagram_send_buffer_size: {}",
+                *QUIC_DATAGRAM_SEND_BUFFER_BYTES
+            ),
+            format!("send_window: {}", *QUIC_SEND_WINDOW_BYTES),
+            format!(
+                "keep_alive_interval: Some({}s)",
+                *QUIC_KEEP_ALIVE_INTERVAL_SECS
+            ),
+            format!("max_concurrent_uni_streams: {}", 100),
+        ] {
+            assert!(
+                rendered.contains(&expected),
+                "the relay TransportConfig is missing {expected:?}; quinn rendered {rendered}",
+            );
+        }
+    }
+
+    /// #2763, through the production booking call. BITES: drop the `mode` label.
+    #[test]
+    #[serial_test::serial]
+    fn the_audio_lane_counter_separates_a_legacy_client_from_a_reverted_one() {
+        fn booked(lane: &str, mode: &str) -> f64 {
+            RELAY_WT_AUDIO_DOWNLINK_SESSIONS_TOTAL
+                .with_label_values(&[lane, mode])
+                .get()
+        }
+
+        let legacy_before = booked("datagram", "single");
+        let reverted_before = booked("datagram", "per_publisher_v1");
+        let reliable_before = booked("reliable", "per_publisher_v1");
+
+        assert_eq!(
+            book_audio_downlink_session(DownlinkStreamMode::Single, AudioDownlinkLane::Reliable),
+            AudioDownlinkLane::Datagram,
+            "a single-stream receiver's one reliable stream carries video, so \
+             audio must stay on datagrams whatever the cluster is set to",
+        );
+        assert_eq!(
+            book_audio_downlink_session(
+                DownlinkStreamMode::PerPublisherV1,
+                AudioDownlinkLane::Datagram,
+            ),
+            AudioDownlinkLane::Datagram,
+        );
+        assert_eq!(
+            book_audio_downlink_session(
+                DownlinkStreamMode::PerPublisherV1,
+                AudioDownlinkLane::Reliable,
+            ),
+            AudioDownlinkLane::Reliable,
+        );
+
+        assert_eq!(booked("datagram", "single") - legacy_before, 1.0);
+        assert_eq!(
+            booked("datagram", "per_publisher_v1") - reverted_before,
+            1.0,
+            "a ds=1 client on a reverted cluster must be readable apart from a \
+             legacy build",
+        );
+        assert_eq!(
+            booked("reliable", "per_publisher_v1") - reliable_before,
+            1.0
+        );
+    }
+
+    /// #2742 item 4. BITES: restore `.parse().ok().unwrap_or(default)`.
+    #[test]
+    fn a_quic_override_rejects_zero_and_unparsable_values() {
+        const VAR: &str = "QUIC_SEND_WINDOW_BYTES";
+        const DEFAULT: u64 = WT_QUIC_SEND_WINDOW_BYTES;
+
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_positive_quic_override(VAR, absent, DEFAULT),
+                DEFAULT,
+                "{absent:?} means the operator set nothing",
+            );
+        }
+        assert_eq!(
+            resolve_positive_quic_override(VAR, Some("0"), DEFAULT),
+            DEFAULT,
+            "a zero send window makes quinn's write_limit() zero, so every \
+             stream write on the relay parks forever from startup",
+        );
+        for garbage in ["1MiB", "-1", "1_048_576", "0x100"] {
+            assert_eq!(
+                resolve_positive_quic_override(VAR, Some(garbage), DEFAULT),
+                DEFAULT,
+                "{garbage:?} must take the default, loudly",
+            );
+        }
+        assert_eq!(
+            resolve_positive_quic_override(VAR, Some(" 2097152 "), DEFAULT),
+            2_097_152,
+            "a valid override must still take effect",
+        );
+    }
+
+    /// #2716: the keep-alive must stay inside a typical UDP conntrack timeout,
+    /// fire several times within `max_idle_timeout`, and not out-wake the app
+    /// heartbeat. Reads the resolved values, so env overrides too.
+    #[test]
+    fn keep_alive_default_is_nat_safe_and_inside_the_idle_timeout() {
+        const SHORTEST_COMMON_UDP_CONNTRACK_SECS: u64 = 30;
+        let keep_alive = *QUIC_KEEP_ALIVE_INTERVAL_SECS;
+        let idle = *QUIC_MAX_IDLE_TIMEOUT_SECS;
+
+        assert!(
+            keep_alive * 2 <= SHORTEST_COMMON_UDP_CONNTRACK_SECS,
+            "a {keep_alive}s keep-alive leaves no margin against a \
+             {SHORTEST_COMMON_UDP_CONNTRACK_SECS}s UDP conntrack timeout",
+        );
+        assert!(
+            keep_alive * 3 <= idle,
+            "a {keep_alive}s keep-alive must fire at least three times inside \
+             the {idle}s idle timeout so one lost PING cannot close a live \
+             connection",
+        );
+        assert!(
+            keep_alive >= 5,
+            "a {keep_alive}s keep-alive wakes a mobile radio more often than \
+             the session's own {:?} application heartbeat does",
+            WT_HEARTBEAT_INTERVAL,
+        );
+    }
+
+    /// #2716 review: comparing the raw read-back to the request hides a real
+    /// clamp on Linux. Drives both branches, which `cfg!` cannot from one host.
+    #[test]
+    fn granted_buffer_bytes_undoes_the_linux_doubling() {
+        const REQUESTED: usize = 4 * 1024 * 1024;
+        let clamped_readback = 5 * 1024 * 1024;
+
+        assert_eq!(granted_buffer_bytes(clamped_readback, true), 2_621_440);
+        assert!(
+            granted_buffer_bytes(clamped_readback, true) < REQUESTED,
+            "a Linux read-back of {clamped_readback} means a 2.5 MiB grant \
+             against a {REQUESTED} request — the clamp warning must fire",
+        );
+        assert_eq!(granted_buffer_bytes(REQUESTED, false), REQUESTED);
+
+        assert!(kernel_doubles_buffer_readback("linux"));
+        for other in ["macos", "freebsd", "netbsd", "windows"] {
+            assert!(
+                !kernel_doubles_buffer_readback(other),
+                "{other} reports the granted SO_RCVBUF/SO_SNDBUF as-is; halving \
+                 it would under-report the buffer by 2x",
+            );
+        }
+    }
+
+    /// #2716: the two gauges replacing the dead `frame_tx_*_blocked` pair must be
+    /// REACHABLE. The client's windows are small on purpose: a default quinn peer
+    /// never sends MAX_DATA at all, while browsers do.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn peer_credit_grant_stats_are_reachable_over_loopback() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        set_path_stat_sample_interval_for_test(Duration::from_millis(50));
+        let _interval_guard = PathStatIntervalGuard;
+
+        const STREAM_WINDOW: u32 = 64 * 1024;
+        const CONNECTION_WINDOW: u32 = 128 * 1024;
+        // Several windows' worth, so the peer must replenish credit repeatedly.
+        const PAYLOAD: usize = 2 * 1024 * 1024;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let cert_der = rustls::pki_types::CertificateDer::from(
+                std::fs::read("certs/localhost.der").expect("read certs/localhost.der"),
+            );
+            let key_der = rustls::pki_types::PrivateKeyDer::try_from(
+                std::fs::read("certs/localhost_key.der").expect("read certs/localhost_key.der"),
+            )
+            .expect("parse localhost_key.der");
+
+            let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("server tls13")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .expect("server single cert");
+            server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+            let server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                    .expect("quic server config"),
+            ));
+            let server_endpoint =
+                quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+                    .expect("server endpoint");
+            let server_addr = server_endpoint.local_addr().expect("server addr");
+
+            let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("client tls13")
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification(
+                    provider.clone(),
+                )))
+                .with_no_client_auth();
+            client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+            let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+                quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                    .expect("quic client config"),
+            ));
+            let mut client_transport = quinn::TransportConfig::default();
+            client_transport.stream_receive_window(STREAM_WINDOW.into());
+            client_transport.receive_window(CONNECTION_WINDOW.into());
+            client_config.transport_config(Arc::new(client_transport));
+
+            let mut client_endpoint =
+                quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+            client_endpoint.set_default_client_config(client_config);
+
+            let server_establish = async {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("server incoming")
+                    .await
+                    .expect("server established")
+            };
+            let client_connect = async {
+                client_endpoint
+                    .connect(server_addr, "localhost")
+                    .expect("client connect")
+                    .await
+                    .expect("client established")
+            };
+            let (server_conn, client_conn) = tokio::join!(server_establish, client_connect);
+
+            // Client drains everything, which is what makes it issue credit. The
+            // drainer gets a CLONE so the connection outlives it.
+            let drainer_conn = client_conn.clone();
+            let drainer = tokio::spawn(async move {
+                let mut recv = drainer_conn.accept_uni().await.expect("accept uni");
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut read = 0usize;
+                while let Ok(Some(n)) = recv.read(&mut buf).await {
+                    read += n;
+                }
+                read
+            });
+
+            let mut send = server_conn.open_uni().await.expect("open uni");
+            send.write_all(&vec![0x5A; PAYLOAD])
+                .await
+                .expect("write payload");
+            send.finish().expect("finish stream");
+
+            let drained = drainer.await.expect("join drainer");
+            assert_eq!(
+                drained, PAYLOAD,
+                "test setup failed: the peer must drain the whole transfer, or it \
+                 never replenishes flow-control credit",
+            );
+
+            // The final grants can land a round trip after the last read.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut frame_rx = server_conn.stats().frame_rx;
+            while (frame_rx.max_data == 0 || frame_rx.max_stream_data == 0)
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                frame_rx = server_conn.stats().frame_rx;
+            }
+
+            assert!(
+                frame_rx.max_stream_data > 0,
+                "frame_rx.max_stream_data stayed 0 after draining {PAYLOAD}B \
+                 through a {STREAM_WINDOW}B stream window — the gauge replacing \
+                 frame_tx_stream_data_blocked would be just as dead",
+            );
+            assert!(
+                frame_rx.max_data > 0,
+                "frame_rx.max_data stayed 0 after draining {PAYLOAD}B through a \
+                 {CONNECTION_WINDOW}B connection window — the gauge replacing \
+                 frame_tx_data_blocked would be just as dead",
+            );
+
+            // quinn-proto has no TX construction site for the frames this pair
+            // replaces, so frame_tx stays 0 even here.
+            let frame_tx = server_conn.stats().frame_tx;
+            assert_eq!(
+                (frame_tx.data_blocked, frame_tx.stream_data_blocked),
+                (0, 0),
+                "quinn-proto started transmitting DATA_BLOCKED/STREAM_DATA_BLOCKED; \
+                 the #2716 rationale for dropping those gauges no longer holds",
+            );
+
+            // Drive the PRODUCTION sampler over the same connection: a gauge that
+            // stays 0 here was sampled from the dead `frame_tx` side.
+            let room = "credit-grants-2716";
+            let session_id = "credit-session-1";
+            let sampler = spawn_connection_path_sampler(
+                server_conn.clone(),
+                room,
+                session_id,
+                Arc::new(AtomicU64::new(0)),
+            );
+
+            let published_deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut conn_credit = 0.0_f64;
+            let mut stream_credit = 0.0_f64;
+            while (conn_credit <= 0.0 || stream_credit <= 0.0)
+                && std::time::Instant::now() < published_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                conn_credit = crate::metrics::RELAY_CONNECTION_FRAME_RX_MAX_DATA
+                    .with_label_values(&[room, session_id])
+                    .get();
+                stream_credit = crate::metrics::RELAY_CONNECTION_FRAME_RX_MAX_STREAM_DATA
+                    .with_label_values(&[room, session_id])
+                    .get();
+            }
+            stop_connection_path_sampler(sampler, room, session_id);
+
+            // Cumulative and still climbing, so the gauges are >= the snapshot
+            // taken above rather than equal to it.
+            assert!(
+                conn_credit >= frame_rx.max_data as f64
+                    && stream_credit >= frame_rx.max_stream_data as f64
+                    && conn_credit > 0.0
+                    && stream_credit > 0.0,
+                "the sampler must publish the frame_RX credit grants (read \
+                 conn={conn_credit} stream={stream_credit}, snapshot \
+                 conn={} stream={}); reading the frame_tx side leaves both at 0",
+                frame_rx.max_data,
+                frame_rx.max_stream_data,
+            );
+
+            drop(client_conn);
+            drop(server_conn);
+            server_endpoint.wait_idle().await;
+        })
+        .await;
+
+        outcome.expect("credit-grant reachability test timed out after 30s");
+    }
+
+    /// #2716: BBR only on an exact opt-in, never on a typo.
+    #[test]
+    fn congestion_controller_defaults_to_cubic_unless_bbr_is_requested() {
+        assert_eq!(
+            CongestionController::resolve(None),
+            CongestionController::Cubic
+        );
+        assert_eq!(
+            CongestionController::resolve(Some("")),
+            CongestionController::Cubic
+        );
+        assert_eq!(
+            CongestionController::resolve(Some("cubic")),
+            CongestionController::Cubic
+        );
+        assert_eq!(
+            CongestionController::resolve(Some("reno")),
+            CongestionController::Cubic,
+            "an unrecognised controller must fall back to cubic, not fail startup",
+        );
+        assert_eq!(
+            CongestionController::resolve(Some(" BBR ")),
+            CongestionController::Bbr,
+            "the opt-in must survive surrounding whitespace and case",
+        );
+        assert_eq!(CongestionController::Bbr.label(), "bbr");
+        assert_eq!(CongestionController::Cubic.label(), "cubic");
+    }
+
     const TOKENLESS_JWT_SECRET: &str = "test-secret-for-wt-identity-tests";
 
     #[test]
@@ -2778,7 +3538,6 @@ mod tests {
         assert!(!identity.is_host);
         assert!(!identity.is_guest);
         assert!(!identity.observer);
-        assert!(identity.end_on_host_leave);
     }
 
     #[test]
@@ -2793,6 +3552,47 @@ mod tests {
             err.is_err(),
             "a dot in the identity must not reach the deprecated WT path"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wt_deprecated_path_rejects_a_spaced_room_and_accepts_a_tilde_room() {
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let spaced = resolve_wt_connect_identity(&["lobby", "alice", "a b"], None);
+        let tilde = resolve_wt_connect_identity(&["lobby", "alice", "a~b"], None);
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+        assert!(
+            spaced.is_err(),
+            "a space in the room must be rejected, not rewritten to '_'"
+        );
+        assert_eq!(tilde.expect("a~b is a valid room").lobby_id, "a~b");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wt_token_path_accepts_a_tilde_room() {
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+        std::env::set_var("JWT_SECRET", TOKENLESS_JWT_SECRET);
+
+        let token = meeting_api::token::generate_room_token(
+            TOKENLESS_JWT_SECRET,
+            60,
+            "carol",
+            "a~b",
+            false,
+            "Carol",
+            true,
+            false,
+        )
+        .expect("should generate a room token");
+        let identity = resolve_wt_connect_identity(&["lobby"], Some(&token));
+
+        std::env::remove_var("JWT_SECRET");
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        assert_eq!(identity.expect("a~b is a valid room").lobby_id, "a~b");
     }
 
     #[test]
@@ -2822,6 +3622,85 @@ mod tests {
         let identity = identity.expect("a valid token must be accepted with FF=on");
         assert_eq!(identity.username, "carol");
         assert_eq!(identity.lobby_id, "claimed-room");
+    }
+
+    /// Serving per-publisher streams to a client that cannot read them breaks
+    /// its downlink, so anything uninterpretable must stay on one stream.
+    #[test]
+    fn only_a_parseable_ds_version_selects_per_publisher_streams() {
+        assert_eq!(
+            resolve_downlink_stream_mode(Some("1")),
+            DownlinkStreamMode::PerPublisherV1,
+        );
+        assert_eq!(
+            resolve_downlink_stream_mode(Some("2")),
+            DownlinkStreamMode::PerPublisherV1,
+            "a newer client than this relay is served the highest version the \
+             relay implements",
+        );
+        for absent_or_bad in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("yes"),
+            Some("1.0"),
+        ] {
+            assert_eq!(
+                resolve_downlink_stream_mode(absent_or_bad),
+                DownlinkStreamMode::Single,
+                "{absent_or_bad:?} must leave the client on the pre-#2723 downlink",
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_ds1_receiver_can_take_the_reliable_audio_stream() {
+        assert_eq!(
+            resolve_session_audio_lane(
+                DownlinkStreamMode::PerPublisherV1,
+                AudioDownlinkLane::Reliable
+            ),
+            AudioDownlinkLane::Reliable,
+        );
+        assert_eq!(
+            resolve_session_audio_lane(
+                DownlinkStreamMode::PerPublisherV1,
+                AudioDownlinkLane::Datagram
+            ),
+            AudioDownlinkLane::Datagram,
+            "the operator revert must reach a ds=1 receiver",
+        );
+        for configured in [AudioDownlinkLane::Reliable, AudioDownlinkLane::Datagram] {
+            assert_eq!(
+                resolve_session_audio_lane(DownlinkStreamMode::Single, configured),
+                AudioDownlinkLane::Datagram,
+                "a legacy receiver keeps datagram audio whatever {configured:?} says",
+            );
+        }
+    }
+
+    #[test]
+    fn the_audio_lane_labels_name_their_primitive() {
+        assert_eq!(audio_lane_label(AudioDownlinkLane::Reliable), "reliable");
+        assert_eq!(audio_lane_label(AudioDownlinkLane::Datagram), "datagram");
+    }
+
+    /// Renaming it on one side silently downgrades every session.
+    #[test]
+    fn the_capability_parameter_is_named_ds() {
+        assert_eq!(DOWNLINK_STREAMS_QUERY_PARAM, "ds");
+        let url = url::Url::parse("https://relay.example.com/lobby?token=t&ds=1&instance_id=i")
+            .expect("parse url");
+        let value = url
+            .query_pairs()
+            .find(|(key, _)| key == DOWNLINK_STREAMS_QUERY_PARAM)
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(value.as_deref(), Some("1"));
+        assert_eq!(
+            resolve_downlink_stream_mode(value.as_deref()),
+            DownlinkStreamMode::PerPublisherV1,
+        );
     }
 
     #[test]

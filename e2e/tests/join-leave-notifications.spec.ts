@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 
 /**
  * E2E tests for the participant announcement toggles in the device-settings
@@ -62,6 +63,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 

@@ -869,17 +869,13 @@ const SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS: u64 = 1000;
 
 /// Cumulative count of stale screen DELTAS dropped at the WS send-side freshness
 /// gate (issue #1921). See [`screen_ws_send_decision`].
-///
-/// DIAGNOSTIC-ONLY pending telemetry wiring: this counter is NOT yet surfaced in
-/// the health/stats packet. The sibling encoder counters (e.g.
-/// `screen_encoder_errors_generic`) are NAMED protobuf fields on the stats
-/// packet, so surfacing this one requires a NEW proto field + Docker codegen (a
-/// cross-crate change deferred out of this PR). Until then it is observable via
-/// the throttled `info!` at the drop site (see [`record_screen_ws_stale_drop`])
-/// and drives the #1921 AQ freshness axis
-/// ([`screen_ws_stale_drop_step_down_decision`]).
 pub fn screen_ws_stale_delta_drops() -> u64 {
     SCREEN_WS_STALE_DELTA_DROPS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn set_screen_ws_stale_delta_drops_for_test(n: u64) {
+    SCREEN_WS_STALE_DELTA_DROPS.store(n, Ordering::Relaxed);
 }
 
 /// Record one #1921 freshness-gate drop: bump the cumulative counter and, at most
@@ -972,9 +968,7 @@ fn screen_ws_gate_threshold_bytes(baseline: ScreenBaselineKbps) -> u64 {
 }
 
 /// Pick the sample from the ACTIVE transport, never from the `Option`-ness of
-/// the depth: `send_queue_depth()` is also `None` with no elected connection or
-/// a borrowed controller cell, where the WT counters cannot advance and so read
-/// as relief on every tick.
+/// the depth.
 fn screen_uplink_sample(
     active_transport: Option<&str>,
     ws_buffered: Option<u64>,
@@ -1015,9 +1009,8 @@ enum ScreenWsSend {
 
 /// Send-side freshness decision for one screen frame on a WebSocket publisher.
 ///
-/// * `buffered_amount` — the WS `bufferedAmount`, or `None` when the active
-///   transport is WebTransport (screen has its own QUIC unistream, no shared
-///   queue) or no connection is elected yet. `None` ⇒ always [`ScreenWsSend::Send`].
+/// * `buffered_amount` — the WS `bufferedAmount`. `None` ⇒ always
+///   [`ScreenWsSend::Send`].
 /// * `is_keyframe` — keyframes are ALWAYS sent; the decode chain and the #1908
 ///   keyframe floor depend on them arriving.
 /// * `threshold_bytes` — from [`screen_ws_freshness_threshold_bytes`].
@@ -1032,7 +1025,6 @@ fn screen_ws_send_decision(
     threshold_bytes: u64,
 ) -> ScreenWsSend {
     match buffered_amount {
-        // WebTransport / no elected connection: no shared queue to shorten.
         None => ScreenWsSend::Send,
         // Keyframes are never dropped — the receiver resumes on them.
         Some(_) if is_keyframe => ScreenWsSend::Send,
@@ -1885,12 +1877,18 @@ fn wt_drop_step_down_decision(
     )
 }
 
+#[inline]
+fn screen_ready_stall_count() -> u64 {
+    videocall_transport::webtransport::unistream_ready_stall_count_for_stream(
+        MediaStreamKey::Screen.as_u8(),
+    )
+}
+
 /// One AQ tick of the screen share's WebTransport uplink-SATURATION axis (#1219
 /// prerequisite). Mirrors [`wt_drop_step_down_decision`] but applies the
 /// SATURATION window/threshold (`WT_SATURATION_WINDOW_MS` /
 /// `WT_SATURATION_STALL_THRESHOLD`) over the slow-`ready()` counter. The loop
-/// calls this with
-/// `videocall_transport::webtransport::unistream_ready_stall_count()`.
+/// calls this with [`screen_ready_stall_count`].
 #[inline]
 fn wt_saturation_step_down_decision(
     current_stalls: u64,
@@ -2577,38 +2575,13 @@ impl ScreenEncoder {
                 encoder_control.set_video_quality_bounds(shared.bounds.best, shared.bounds.worst);
                 shared.generation
             };
-
-            // Client-side uplink-backpressure self-trigger windows (issue #1199,
-            // mirroring the camera AQ loop). The WS send-buffer drop counter and
-            // the WT unistream drop counter are TRANSPORT-GLOBAL statics
-            // (`websocket::websocket_drop_count()` /
-            // `webtransport::unistream_drop_count()`), shared by the camera,
-            // screen, and microphone egress on the SAME connection.
-            //
-            // DROP-COUNTER ATTRIBUTION DECISION (issue #1199, requirement 3):
-            // each controller keeps its OWN baseline snapshot + sliding window
-            // against the aggregate counters. The transport also exposes
-            // per-stream attribution, but camera and screen intentionally read
-            // aggregate distress because a single browser TCP send buffer / QUIC
-            // connection is the shared bottleneck. A drop burst is therefore
-            // observed independently by BOTH loops, and BOTH may shed a layer.
-            // The baselines are SEPARATE only so the loops' sliding windows roll
-            // on their own cadence and neither clears the other's accounting;
-            // they are not a partition of the drops.
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
             let mut last_wt_drop_snapshot: u64 =
                 videocall_transport::webtransport::unistream_drop_count();
             let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
-            // Independent sliding window for the WebTransport uplink-SATURATION
-            // self-trigger (#1219 prerequisite); SEPARATE from the WT drop window
-            // above (drops = teardown; stalls = slow-but-alive uplink). Per the
-            // attribution note above, this is the screen loop's OWN baseline
-            // against the shared global stall counter — the camera loop has its
-            // own. WS users hold the counter flat at 0 → no-op.
-            let mut last_wt_stall_snapshot: u64 =
-                videocall_transport::webtransport::unistream_ready_stall_count();
+            let mut last_wt_stall_snapshot: u64 = screen_ready_stall_count();
             let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
             // Issue #1921: independent sliding window for the WS FRESHNESS-GATE
             // self-trigger (axis #5). SEPARATE from the WS overflow window above
@@ -2840,13 +2813,7 @@ impl ScreenEncoder {
                 // the WS send-buffer drop. A sustained cluster self-sheds a layer
                 // without waiting for the slower server CONGESTION signal. The
                 // window/snapshot are independent of the WS window and the
-                // congestion flag, and each axis sheds at most one layer per
-                // ITS OWN window. (Note: distinct axes are NOT cross-gated within
-                // a single tick — a co-occurring server CONGESTION and a WS/WT
-                // drop-burst can each shed a layer in the same tick, because a
-                // floor-case `force_congestion_cut` does not stamp the shared
-                // min-interval guard. Collapsing toward base under correlated
-                // severe distress is acceptable; this matches the camera loop.)
+                // congestion flag.
                 // For WebSocket users this counter stays flat at 0 (no-op).
                 {
                     let current_wt_drops =
@@ -2883,7 +2850,7 @@ impl ScreenEncoder {
                 // a WritableStream signals backpressure by leaving
                 // `writer.ready()` PENDING (the `.await`-blocking media send path
                 // never sees a write rejection). The transport exposes
-                // `unistream_ready_stall_count()` — incremented once per slow
+                // `unistream_ready_stall_count_for_stream()` — one per slow
                 // `writer.ready().await` on the established media path — so a
                 // SUSTAINED cluster of slow readys self-sheds a layer here. We use
                 // the gentle single-rung `force_video_step_down` (NOT
@@ -2895,8 +2862,7 @@ impl ScreenEncoder {
                 // egress, so detecting its own uplink saturation here is at least
                 // as important as on the camera.
                 {
-                    let current_wt_stalls =
-                        videocall_transport::webtransport::unistream_ready_stall_count();
+                    let current_wt_stalls = screen_ready_stall_count();
                     let elapsed_ms = now - wt_stall_window_start_ms;
                     // Decision + WT-saturation constants live in the host-testable
                     // `wt_saturation_step_down_decision` helper (#509 item #2).
@@ -3164,6 +3130,24 @@ impl ScreenEncoder {
         self.state.set_enabled(value)
     }
 
+    /// Unmount-only [`Self::stop`]: clears `self`'s emitter, which is the only
+    /// one [`Self::stop`] reads, so this teardown sends no `Stopped`. The
+    /// encoding tasks hold their own clone of it.
+    pub fn shutdown(&mut self) {
+        self.on_state_change = None;
+        self.stop();
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn is_enabled_for_test(&self) -> bool {
+        self.state.is_enabled()
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn has_state_emitter_for_test(&self) -> bool {
+        self.on_state_change.is_some()
+    }
+
     /// Stops encoding and MediaStream after it has been started.
     ///
     /// This is the authoritative cleanup path when the UI triggers a stop.
@@ -3314,9 +3298,15 @@ impl ScreenEncoder {
     /// satisfied regardless of any async boundaries that follow.
     ///
     /// The stream is consumed: this method takes ownership and will stop its
-    /// tracks when encoding ends or `stop()` is called.
-    ///
+    /// tracks when encoding ends, when `stop()` is called, or when the call is
+    /// refused because [`set_enabled(true)`](Self::set_enabled) was not called.
     pub fn start_with_stream(&mut self, stream: MediaStream) {
+        if !self.state.is_enabled() {
+            log::debug!("ScreenEncoder::start_with_stream() called but the encoder is not enabled");
+            // We own it: dropping it would leave the sharing indicator up.
+            stop_media_stream_tracks(&stream);
+            return;
+        }
         crate::encode::reset_output_fps(&self.current_fps);
         let tier_targets = self.initial_tier_targets();
         let (src_w, src_h) = screen_stream_source_dims(&stream);
@@ -3412,7 +3402,7 @@ impl ScreenEncoder {
     /// Start encoding and sending the data to the client connection (if it's currently connected).
     /// The user is prompted by the browser to select which window or screen to encode.
     ///
-    /// This will toggle the enabled state of the encoder.
+    /// Does nothing if [`set_enabled(true)`](Self::set_enabled) was not called.
     ///
     /// NOTE: On Safari, `getDisplayMedia()` must be called synchronously within a
     /// user-gesture handler.  If the call to `start()` is deferred (e.g. via a
@@ -3420,6 +3410,11 @@ impl ScreenEncoder {
     /// use [`start_with_stream`](Self::start_with_stream) instead, obtaining the
     /// stream directly in the click handler.
     pub fn start(&mut self) {
+        // Before any side effect: no tier arming, no ceiling log, on a refusal.
+        if !self.state.is_enabled() {
+            log::debug!("ScreenEncoder::start() called but the encoder is not enabled");
+            return;
+        }
         crate::encode::reset_output_fps(&self.current_fps);
         self.shared_capture_width.store(0, Ordering::Relaxed);
         self.shared_capture_height.store(0, Ordering::Relaxed);
@@ -3431,7 +3426,6 @@ impl ScreenEncoder {
         let EncoderState {
             enabled, switching, ..
         } = self.state.clone();
-        // enable the encoder
         enabled.store(true, Ordering::Release);
 
         let client = self.client.clone();
@@ -4476,7 +4470,7 @@ impl ScreenEncoder {
                 );
             }
             if let Some(ref callback) = on_state_change {
-                callback.emit(ScreenShareEvent::Started(stream_ref.clone()));
+                callback.emit(ScreenShareEvent::Started(Clone::clone(stream_ref)));
             }
 
             let screen_reader = match screen_processor
@@ -8502,6 +8496,89 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    #[cfg(target_arch = "wasm32")]
+    fn test_screen_encoder() -> ScreenEncoder {
+        let client = crate::VideoCallClient::new(
+            crate::client::video_call_client::disconnect_tests::build_test_options(),
+        );
+        ScreenEncoder::new(
+            client,
+            2500,
+            Callback::noop(),
+            Callback::noop(),
+            Rc::new(AtomicBool::new(false)),
+            1,
+        )
+    }
+
+    /// Needs `--use-fake-device-for-media-stream` (`videocall-client/webdriver.json`).
+    #[cfg(target_arch = "wasm32")]
+    async fn fake_capture_stream() -> MediaStream {
+        let media_devices = window()
+            .navigator()
+            .media_devices()
+            .expect("mediaDevices available");
+        let constraints = web_sys::MediaStreamConstraints::new();
+        constraints.set_video(&JsValue::TRUE);
+        constraints.set_audio(&JsValue::FALSE);
+        let query = media_devices
+            .get_user_media_with_constraints(&constraints)
+            .expect("getUserMedia dispatched");
+        wasm_bindgen_futures::JsFuture::from(query)
+            .await
+            .expect("fake device resolves")
+            .unchecked_into::<MediaStream>()
+    }
+
+    /// A refused `start_with_stream` still owns the stream (issue 2772).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn start_with_stream_releases_a_refused_stream() {
+        let stream = fake_capture_stream().await;
+        let track = stream
+            .get_tracks()
+            .get(0)
+            .unchecked_into::<web_sys::MediaStreamTrack>();
+        let mut enc = test_screen_encoder();
+        assert!(!enc.is_enabled_for_test());
+
+        enc.start_with_stream(stream);
+
+        assert_eq!(
+            track.ready_state(),
+            web_sys::MediaStreamTrackState::Ended,
+            "a refused start_with_stream must stop the stream it was handed"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn shutdown_drops_the_state_emitter() {
+        let mut enc = test_screen_encoder();
+        assert!(enc.has_state_emitter_for_test());
+
+        enc.shutdown();
+
+        assert!(
+            !enc.has_state_emitter_for_test(),
+            "shutdown must not put the emitter back"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn start_is_refused_while_disabled() {
+        let mut enc = test_screen_encoder();
+        assert!(!enc.is_enabled_for_test());
+
+        enc.start();
+
+        assert!(
+            !enc.is_enabled_for_test(),
+            "start() must not enable a disabled screen encoder"
+        );
+    }
+
     fn built_screen_layer(width: u32, height: u32, bitrate_bps: u32) -> LayerEncoder {
         let error_closure = Closure::wrap(Box::new(|_e: JsValue| {}) as Box<dyn FnMut(JsValue)>);
         let output_closure = Closure::wrap(Box::new(|_c: JsValue| {}) as Box<dyn FnMut(JsValue)>);
@@ -8573,6 +8650,30 @@ mod wasm_tests {
                 .ok()
                 .and_then(|v| v.as_f64()),
             Some(400_000.0),
+        );
+    }
+
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn camera_stalls_do_not_move_the_screen_saturation_axis() {
+        let _tx_guard = crate::test_serial::lock_transport_stream_counters();
+        let screen_before = super::screen_ready_stall_count();
+        let aggregate_before = videocall_transport::webtransport::unistream_ready_stall_count();
+
+        videocall_transport::webtransport::force_unistream_ready_stall_for_stream(
+            MediaStreamKey::Video.as_u8(),
+            crate::adaptive_quality_constants::WT_SATURATION_STALL_THRESHOLD + 1,
+        );
+
+        assert!(
+            videocall_transport::webtransport::unistream_ready_stall_count() - aggregate_before
+                > crate::adaptive_quality_constants::WT_SATURATION_STALL_THRESHOLD,
+            "the aggregate MUST move, or this test proves nothing"
+        );
+        assert_eq!(
+            super::screen_ready_stall_count(),
+            screen_before,
+            "camera's by-design stalls must leave the screen axis flat"
         );
     }
 }

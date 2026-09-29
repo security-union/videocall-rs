@@ -2,6 +2,8 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 /**
  * Screen-share split-layout E2E tests.
@@ -88,6 +90,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 
@@ -226,6 +229,8 @@ async function setupTwoUserMeeting(
     await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
     await guestCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
   }
+  // The split layout under test is opt-in since #2792.
+  await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
@@ -304,8 +309,9 @@ test.describe("Screen-share split-layout", () => {
     );
 
     try {
-      // No resize handle
-      await expect(hostPage.locator(".screen-share-resize-handle")).toHaveCount(0);
+      // No resize handle on screen (issue 2792: it is always mounted, display:none
+      // outside the split).
+      await expect(hostPage.locator(".screen-share-resize-handle")).toBeHidden();
 
       // No split-screen tiles (TileMode::ScreenOnly renders with this class)
       await expect(hostPage.locator(".split-screen-tile")).toHaveCount(0);

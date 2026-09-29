@@ -10,19 +10,15 @@
  * `#grid-container .canvas-container canvas`, sums every 17th byte, and asserts
  * the checksum CHANGES between two samples 40s apart — identical buffers prove a
  * frozen tile. This module lifts that exact logic into a reusable helper so a
- * second freeze spec (issue #1702, the #1695 pin/enlarge ≤5s decode-guard
+ * second freeze spec (issue #1702, the #1695 layer up-switch ≤5s decode-guard
  * freeze) can REUSE it rather than duplicate it.
  *
  * Two additions over the original (both backward-compatible refinements, not a
  * new mechanism):
  *   1. `nth` — sample a SPECIFIC tile by index (the original always took the
- *      first). The #1702 spec pins/enlarges a peer tile, so it must sample THAT
- *      tile, which after pinning becomes `.grid-item-pinned` (full-screen) — but
- *      its `<canvas>` node is REUSED in place (Dioxus diffs the tile by template
- *      identity; see canvas_generator.rs issue #508 note), so the first
- *      `.canvas-container canvas` remains the pinned peer's canvas in a 2-peer
- *      call where the only remote tile is the publisher. We keep `nth=0` as the
- *      default to match the original behaviour.
+ *      first). In the #1702 spec's 2-peer call the only remote tile is the
+ *      publisher's, so the default `nth=0` is that tile, matching the original
+ *      behaviour.
  *   2. `sampleChecksumSeries` — sample the SAME tile repeatedly at a fine cadence
  *      and return the ordered series, so a caller can detect a SHORT (≤5s)
  *      transient freeze (a run of identical samples) rather than only a sustained

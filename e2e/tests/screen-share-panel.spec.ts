@@ -1,8 +1,9 @@
 import { test, expect, chromium, Page } from "@playwright/test";
-import { generateSessionToken } from "../helpers/auth";
+import { createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 /**
  * Screen-share right panel layout E2E tests.
@@ -28,8 +29,6 @@ import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
  * `mockPeersEnabled: "true"` in config.js.
  */
 
-const COOKIE_NAME = process.env.COOKIE_NAME || "session";
-
 const BROWSER_ARGS = [
   "--ignore-certificate-errors",
   "--origin-to-force-quic-on=127.0.0.1:4433",
@@ -40,32 +39,6 @@ const BROWSER_ARGS = [
   // Auto-accept getDisplayMedia() system picker for screen sharing.
   "--auto-select-desktop-capture-source=Entire screen",
 ];
-
-async function createAuthenticatedContext(
-  browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
-  email: string,
-  name: string,
-  uiURL: string,
-) {
-  const context = await browser.newContext({
-    baseURL: uiURL,
-    ignoreHTTPSErrors: true,
-  });
-  const token = generateSessionToken(email, name);
-  const url = new URL(uiURL);
-  await context.addCookies([
-    {
-      name: COOKIE_NAME,
-      value: token,
-      domain: url.hostname,
-      path: "/",
-      httpOnly: true,
-      secure: false,
-      sameSite: "Lax",
-    },
-  ]);
-  return context;
-}
 
 async function navigateToMeeting(page: Page, meetingId: string, username: string) {
   // Hydration-robust submit (see helpers/join-meeting.ts): gates submission on
@@ -198,6 +171,8 @@ async function setupTwoUserMeeting(
     await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
     await guestCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
   }
+  // Every test here measures the split layout, which is opt-in since #2792.
+  await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
@@ -490,6 +465,7 @@ test.describe("Screen share right panel layout", () => {
       localStorage.setItem("vc_decode_budget_override", "${FORCED_BUDGET}");
     `);
     await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+    await seedShareViewMode(hostCtx, "enlarged");
 
     const guest1Ctx = await createAuthenticatedContext(
       browser2,
@@ -1134,38 +1110,16 @@ test.describe("Screen share right panel layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 9. Pinned split-tile chrome vars are MAXIMIZED, not a stale grid cell
-  //    (PR #1946 regression).
+  // 9. The split container's `--tile-w`/`--tile-h` are the stage size, not a
+  //    stale grid cell (PR #1946 regression).
   //
-  // Bug: `container_style`'s `has_screen_share` branch never set
-  // `--tile-w`/`--tile-h`. Those vars drive the pinned split-tile chrome
-  // (`.split-peer-tile.grid-item-pinned .floating-name / .tile-top-icons /
-  // .placeholder-content` in style.css). A pinned side-panel tile maximizes to
-  // the full viewport (`position: fixed; 100%×100%`), so its chrome should be
-  // sized off the maximized tile. Because the branch omitted the vars, Dioxus's
-  // `set_attribute.ts` silently PRESERVED whatever `--tile-h` the last pre-share
-  // grid render wrote — a value that SHRINKS as the pre-share participant count
-  // grows. Two clients could freeze different pinned-chrome sizes for the same
-  // meeting state (nondeterministic by join/render order).
-  //
-  // The existing 2-peer parity tests (speaker-highlight.spec.ts 5h/5i/5j)
-  // STRUCTURALLY cannot catch this: with a single remote tile the pre-share
-  // grid `--tile-h` is already the large single-tile value (~580px at 1280×720),
-  // so the frozen leftover equals the correct maximized value and the bug is
-  // invisible. This test forces a MANY-tile pre-share grid (via mock peers) so
-  // the grid `--tile-h` collapses well below the maximized value, exposing the
-  // stale-leftover divergence.
-  //
-  // Mutation sensitivity: with ~11 tiles the pre-share grid `--tile-h` is
-  // ~183px (< the 293px chrome-saturation threshold). After the fix, the
-  // screen-share `--tile-h` jumps to the maximized single-tile height (~580px);
-  // on the un-fixed code it stays frozen at ~183px. The assertions require the
-  // screen-share `--tile-h` to (a) exceed the 293px saturation threshold and
-  // (b) be far larger than the pre-share grid value and near viewport height —
-  // all THREE fail on the un-fixed code (frozen ~183px), and reverting the
-  // `--tile-w`/`--tile-h` declaration in `container_style` re-breaks them.
+  // Dioxus keeps a style property that a later `style` string omits, so a
+  // split-layout container style without `--tile-w`/`--tile-h` keeps the last
+  // pre-share grid value, which shrinks as the pre-share tile count grows. Mock
+  // peers force a many-tile pre-share grid so that leftover falls below the
+  // 293px chrome-saturation threshold the stage value clears.
   // ──────────────────────────────────────────────────────────────────────
-  test("pinned split-tile chrome var is maximized regardless of pre-share tile count @bvt1", async ({
+  test("the split container's tile-size vars are the stage size regardless of pre-share tile count @bvt1", async ({
     baseURL,
   }) => {
     test.setTimeout(120_000);
@@ -1202,7 +1156,7 @@ test.describe("Screen share right panel layout", () => {
       ).toBe(true);
 
       // Inflate the host's grid to many tiles (1 real guest + 10 mocks = 11),
-      // so the grid `--tile-h` collapses below the maximized value.
+      // so the grid `--tile-h` collapses below the stage value.
       await addMockPeers(hostPage, 10);
       await hostPage.waitForTimeout(2000);
 
@@ -1233,24 +1187,22 @@ test.describe("Screen share right panel layout", () => {
       await expect(hostPage.locator(".split-peer-tile").first()).toBeVisible({ timeout: 15_000 });
       await hostPage.waitForTimeout(1500);
 
-      // During screen share `--tile-h` must describe the MAXIMIZED pinned tile,
-      // not the frozen many-tile grid cell.
+      // During screen share `--tile-h` must describe the stage, not the frozen
+      // many-tile grid cell.
       const shareTileH = await readTileH();
       const innerH = await hostPage.evaluate(() => window.innerHeight);
 
-      // (a) Chrome-saturation regime: pinned chrome renders at full size.
-      //     Un-fixed code freezes ~183px here → fails.
+      // (a) Chrome-saturation regime.
       expect(
         shareTileH,
-        "screen-share --tile-h must reach the maximized (saturated) regime, not stay at the frozen grid cell size",
+        "screen-share --tile-h must reach the stage (saturated) regime, not stay at the frozen grid cell size",
       ).toBeGreaterThanOrEqual(293);
 
       // (b) Clearly larger than the frozen pre-share grid value. Un-fixed code
       //     keeps them equal (Dioxus preserves the omitted property) → fails.
       expect(shareTileH - preShareTileH).toBeGreaterThan(150);
 
-      // (c) Viewport-scale: the maximized tile fills most of the height.
-      //     (~580px vs 720px inner height at the default viewport.)
+      // (c) Viewport-scale: the stage fills most of the height.
       expect(shareTileH).toBeGreaterThanOrEqual(innerH * 0.6);
       expect(shareTileH).toBeLessThanOrEqual(innerH);
     } finally {

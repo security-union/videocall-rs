@@ -30,6 +30,7 @@
 //! here takes effect live for everyone via the existing
 //! `on_meeting_settings_updated` push, with no client-side coordination.
 
+use crate::components::co_hosts::{can_edit_meeting_options, CoHostsSection, MeetingOwnership};
 use crate::components::toggle_switch::ToggleSwitch;
 use dioxus::prelude::*;
 use std::rc::Rc;
@@ -390,6 +391,231 @@ pub fn MeetingOptionsControls(
 
         if let Some(err) = toggle_error() {
             p { class: "toggle-error", "{err}" }
+        }
+    }
+}
+
+const MEETING_OPTIONS_OPENER: &str = "[data-testid='open-meeting-options']";
+const DIALOG_ID: &str = "meeting-options-dialog";
+const FOCUSABLE: &str = "button:not([disabled]), [href], input:not([disabled]), \
+     select:not([disabled]), textarea:not([disabled]), summary, \
+     [tabindex]:not([tabindex='-1'])";
+
+/// Keeps Tab inside the modal: wraps from the last control to the first and,
+/// with Shift, from the first (or the title) to the last. `true` when it moved
+/// focus, so the caller cancels the browser's own move.
+fn wrap_tab_in(container_id: &str, backwards: bool) -> bool {
+    use wasm_bindgen::JsCast;
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    let Some(container) = doc.get_element_by_id(container_id) else {
+        return false;
+    };
+    let Ok(nodes) = container.query_selector_all(FOCUSABLE) else {
+        return false;
+    };
+    let items: Vec<web_sys::HtmlElement> = (0..nodes.length())
+        .filter_map(|i| nodes.item(i))
+        .filter_map(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+        .collect();
+    let (Some(first), Some(last)) = (items.first(), items.last()) else {
+        return false;
+    };
+    let active = doc.active_element();
+    let is_active = |el: &web_sys::HtmlElement| {
+        active
+            .as_ref()
+            .is_some_and(|a| a.is_same_node(Some(el.as_ref())))
+    };
+    let target = if backwards {
+        (is_active(first) || !items.iter().any(is_active)).then_some(last)
+    } else {
+        let inside = active
+            .as_ref()
+            .is_some_and(|a| container.contains(Some(a.as_ref())));
+        (is_active(last) || !inside).then_some(first)
+    };
+    match target {
+        Some(el) => el.focus().is_ok(),
+        None => false,
+    }
+}
+
+fn focused_element() -> Option<web_sys::HtmlElement> {
+    use wasm_bindgen::JsCast;
+    let doc = web_sys::window()?.document()?;
+    let active = doc.active_element()?;
+    if doc
+        .body()
+        .is_some_and(|body| active.is_same_node(Some(&body)))
+    {
+        return None;
+    }
+    active.dyn_into::<web_sys::HtmlElement>().ok()
+}
+
+/// Back to the element that opened the dialog, else the action-bar opener.
+fn restore_focus(opener: Option<web_sys::HtmlElement>) {
+    use wasm_bindgen::JsCast;
+    let target = opener.filter(|el| el.is_connected()).or_else(|| {
+        web_sys::window()?
+            .document()?
+            .query_selector(MEETING_OPTIONS_OPENER)
+            .ok()??
+            .dyn_into::<web_sys::HtmlElement>()
+            .ok()
+    });
+    if let Some(el) = target {
+        let _ = el.focus();
+    }
+}
+
+/// The in-call Meeting Options dialog. Renders nothing unless `open` and the
+/// local user may edit meeting options — the OWNER, or anyone CURRENTLY
+/// holding the host role (issue 2702 round 10: a co-host may start/restart
+/// the meeting and change its OPTIONS). Co-host management stays
+/// owner-only — see `MeetingOptionsDialog`'s own `ownership.is_owner()` gate
+/// around `CoHostsSection`, never this function's `is_host` fallback.
+#[component]
+pub fn MeetingOptionsPanel(
+    ownership: MeetingOwnership,
+    /// Whether this user CURRENTLY holds the host role (e.g. the live host
+    /// set, falling back to a join-time snapshot). See
+    /// [`can_edit_meeting_options`].
+    #[props(default)]
+    is_host: bool,
+    open: Signal<bool>,
+    meeting_id: String,
+    #[props(default)] owner_user_id: Option<String>,
+    #[props(default = true)] meeting_active: bool,
+    waiting_room_toggle: Signal<bool>,
+    admitted_can_admit_toggle: Signal<bool>,
+    end_on_host_leave_toggle: Signal<bool>,
+    allow_guests_toggle: Signal<bool>,
+    recording_allowed_for_all_toggle: Signal<bool>,
+    chat_allowed_for_all_toggle: Signal<bool>,
+    saving: Signal<bool>,
+    toggle_error: Signal<Option<String>>,
+    #[props(default)] co_host_refresh: Option<Signal<u64>>,
+) -> Element {
+    if !(open() && can_edit_meeting_options(ownership, is_host)) {
+        return rsx! {};
+    }
+    rsx! {
+        MeetingOptionsDialog {
+            ownership,
+            open,
+            meeting_id,
+            owner_user_id,
+            meeting_active,
+            waiting_room_toggle,
+            admitted_can_admit_toggle,
+            end_on_host_leave_toggle,
+            allow_guests_toggle,
+            recording_allowed_for_all_toggle,
+            chat_allowed_for_all_toggle,
+            saving,
+            toggle_error,
+            co_host_refresh,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[component]
+fn MeetingOptionsDialog(
+    ownership: MeetingOwnership,
+    open: Signal<bool>,
+    meeting_id: String,
+    owner_user_id: Option<String>,
+    meeting_active: bool,
+    waiting_room_toggle: Signal<bool>,
+    admitted_can_admit_toggle: Signal<bool>,
+    end_on_host_leave_toggle: Signal<bool>,
+    allow_guests_toggle: Signal<bool>,
+    recording_allowed_for_all_toggle: Signal<bool>,
+    chat_allowed_for_all_toggle: Signal<bool>,
+    saving: Signal<bool>,
+    toggle_error: Signal<Option<String>>,
+    co_host_refresh: Option<Signal<u64>>,
+) -> Element {
+    let mut open = open;
+    let opener = use_hook(|| Rc::new(std::cell::RefCell::new(focused_element())));
+    use_drop(move || restore_focus(opener.borrow_mut().take()));
+    rsx! {
+        div {
+            class: "glass-backdrop",
+            onclick: move |_| open.set(false),
+            onkeydown: move |e: Event<KeyboardData>| {
+                if e.key() == Key::Escape {
+                    open.set(false);
+                } else if e.key() == Key::Tab && wrap_tab_in(DIALOG_ID, e.modifiers().shift()) {
+                    e.prevent_default();
+                }
+            },
+            div {
+                id: DIALOG_ID,
+                class: "card-apple",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-labelledby": "meeting-options-title",
+                "data-testid": "meeting-options-panel",
+                style: "width: 380px; max-width: 92vw; max-height: 90vh; overflow-y: auto;",
+                onclick: move |e| e.stop_propagation(),
+
+                div {
+                    style: "display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-2);",
+                    h3 {
+                        id: "meeting-options-title",
+                        style: "margin:0;",
+                        tabindex: "-1",
+                        onmounted: move |e| {
+                            spawn(async move {
+                                let _ = e.data().set_focus(true).await;
+                            });
+                        },
+                        "Meeting Options"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn-apple btn-secondary btn-sm",
+                        "aria-label": "Close meeting options",
+                        onclick: move |_| open.set(false),
+                        "Done"
+                    }
+                }
+                p {
+                    style: "color: var(--text-secondary); margin-top:0; margin-bottom:var(--space-3); font-size:0.85rem;",
+                    "Changes apply to everyone immediately."
+                }
+
+                MeetingOptionsControls {
+                    meeting_id: meeting_id.clone(),
+                    waiting_room_toggle,
+                    admitted_can_admit_toggle,
+                    end_on_host_leave_toggle,
+                    allow_guests_toggle,
+                    recording_allowed_for_all_toggle,
+                    chat_allowed_for_all_toggle,
+                    saving,
+                    toggle_error,
+                }
+                // `MeetingOptionsPanel`'s outer gate admits the owner OR any
+                // current host (see `can_edit_meeting_options`), so co-host
+                // management — owner-only — needs its own explicit check
+                // here rather than relying on the outer gate. Mounting
+                // `CoHostsSection` only for the owner also keeps its
+                // `list_co_hosts` GET from firing for a non-owner host.
+                if ownership.is_owner() {
+                    CoHostsSection {
+                        meeting_id,
+                        owner_user_id,
+                        meeting_active,
+                        refresh: co_host_refresh,
+                    }
+                }
+            }
         }
     }
 }

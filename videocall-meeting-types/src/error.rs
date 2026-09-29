@@ -126,6 +126,33 @@ impl APIError {
         }
     }
 
+    /// Demoting this host would leave the active meeting with no present host.
+    pub fn last_present_host() -> Self {
+        Self {
+            code: "LAST_PRESENT_HOST".to_string(),
+            message: "Cannot remove the only host present in the meeting.".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// The revoke target is neither a co-host nor a host of the meeting.
+    pub fn co_host_not_found(user_id: &str) -> Self {
+        Self {
+            code: "CO_HOST_NOT_FOUND".to_string(),
+            message: format!("'{user_id}' is not a co-host or host of this meeting"),
+            engineering_error: None,
+        }
+    }
+
+    /// The target user has no participant row in the meeting.
+    pub fn participant_not_in_meeting(user_id: &str) -> Self {
+        Self {
+            code: "PARTICIPANT_NOT_FOUND".to_string(),
+            message: format!("Participant '{user_id}' is not in this meeting"),
+            engineering_error: None,
+        }
+    }
+
     pub fn participant_not_found(email: &str) -> Self {
         Self {
             code: "PARTICIPANT_NOT_FOUND".to_string(),

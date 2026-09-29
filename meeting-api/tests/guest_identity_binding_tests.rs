@@ -205,7 +205,7 @@ async fn harvested_guest_session_id_cannot_demote_an_admitted_guest_to_waiting()
     assert_eq!(victim.status, "waiting");
 
     let meeting_db_id = meeting_db_id(&pool, room_id).await;
-    db_participants::admit(&pool, meeting_db_id, &victim_id)
+    db_participants::admit(&pool, meeting_db_id, &victim_id, true)
         .await
         .unwrap()
         .expect("host admits the victim");

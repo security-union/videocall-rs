@@ -2,6 +2,8 @@ import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 /**
  * Screen-share panel decode-budget render-wiring E2E coverage (issue #1471,
@@ -102,6 +104,7 @@ async function createAuthenticatedContext(
       sameSite: "Lax",
     },
   ]);
+  await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   return context;
 }
 
@@ -246,6 +249,8 @@ test.describe("Screen-share panel decode-budget wiring (#1471)", () => {
       "SSDBHost",
       uiURL,
     );
+    // The SS right panel under test is the split layout, opt-in since #2792.
+    await seedShareViewMode(hostCtx, "enlarged");
 
     // The camera-ON guest is the SHARER: it publishes video AND shares its
     // screen, so it carries the getDisplayMedia shim.
@@ -357,6 +362,7 @@ test.describe("Screen-share panel decode-budget wiring (#1471)", () => {
     await hostCtx.addInitScript(
       `localStorage.setItem("vc_decode_budget_override", "${FORCED_BUDGET}");`,
     );
+    await seedShareViewMode(hostCtx, "enlarged");
 
     const mkOn = async (
       browser: typeof browserOn1,

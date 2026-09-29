@@ -18,6 +18,7 @@
 
 //! Connection tracking module for server-side metrics via NATS
 
+use crate::service_identity::{region_from_env, service_type_from_env};
 use async_nats::Client;
 use protobuf::Message;
 use std::collections::HashMap;
@@ -131,6 +132,16 @@ fn get_reporting_interval() -> Duration {
     Duration::from_secs(interval_secs)
 }
 
+/// The only subject-producing path for `ServerConnectionPacket`, so a test that
+/// calls it asserts on the subject the relay actually publishes.
+pub(crate) fn server_connections_topic(
+    region: &str,
+    service_type: &str,
+    server_instance: &str,
+) -> String {
+    format!("server.connections.{region}.{service_type}.{server_instance}")
+}
+
 #[derive(Debug)]
 pub struct ServerDiagnostics {
     connections: Mutex<HashMap<u64, ConnectionInfo>>,
@@ -147,9 +158,8 @@ impl ServerDiagnostics {
         let server_instance = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("SERVER_ID"))
             .unwrap_or_else(|_| "server-unknown".to_string());
-        let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
-        let service_type =
-            std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
+        let region = region_from_env().to_string();
+        let service_type = service_type_from_env().to_string();
 
         ServerDiagnostics {
             connections: Mutex::new(HashMap::new()),
@@ -202,10 +212,8 @@ impl ServerDiagnostics {
 
     /// Publish event to NATS
     async fn publish_event(&self, packet: ServerConnectionPacket) {
-        let topic = format!(
-            "server.connections.{}.{}.{}",
-            self.region, self.service_type, self.server_instance
-        );
+        let topic =
+            server_connections_topic(&self.region, &self.service_type, &self.server_instance);
 
         match packet.write_to_bytes() {
             Ok(payload) => {
@@ -283,7 +291,7 @@ impl ServerDiagnostics {
         let server_instance = self.server_instance.clone();
 
         tokio::spawn(async move {
-            let topic = format!("server.connections.{region}.{service_type}.{server_instance}");
+            let topic = server_connections_topic(&region, &service_type, &server_instance);
 
             match packet.write_to_bytes() {
                 Ok(payload) => {
@@ -339,7 +347,7 @@ impl ServerDiagnostics {
             let server_instance = self.server_instance.clone();
 
             tokio::spawn(async move {
-                let topic = format!("server.connections.{region}.{service_type}.{server_instance}");
+                let topic = server_connections_topic(&region, &service_type, &server_instance);
 
                 match packet.write_to_bytes() {
                     Ok(payload) => {
@@ -470,5 +478,33 @@ impl ServerDiagnostics {
                 self.publish_event(packet).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod subject_tests {
+    use super::server_connections_topic;
+    use crate::service_identity::{resolve_region, resolve_service_type};
+
+    #[test]
+    fn webtransport_relay_without_env_publishes_under_webtransport() {
+        let topic = server_connections_topic(
+            &resolve_region(None),
+            &resolve_service_type(None, Some("/usr/bin/webtransport_server")),
+            "relay-3",
+        );
+
+        assert_eq!(topic, "server.connections.unknown.webtransport.relay-3");
+    }
+
+    #[test]
+    fn configured_relay_subject_is_unchanged() {
+        let topic = server_connections_topic(
+            &resolve_region(Some("us-east")),
+            &resolve_service_type(Some("websocket"), Some("/usr/bin/websocket_server")),
+            "relay-3",
+        );
+
+        assert_eq!(topic, "server.connections.us-east.websocket.relay-3");
     }
 }

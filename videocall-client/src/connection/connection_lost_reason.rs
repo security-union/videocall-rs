@@ -29,13 +29,19 @@ pub enum ConnectionLostReason {
     /// Connection was fully established (`ready`/`open` fired) before it
     /// was lost.
     SessionDropped(String),
+    /// The relay closed an established WebTransport session with the
+    /// downlink-unrecoverable application close code: it gave up on delivering
+    /// this receiver's downlink and wants the client to elect another path.
+    DownlinkUnrecoverable(String),
 }
 
 impl ConnectionLostReason {
     /// Human-readable message carried by this reason.
     pub fn message(&self) -> &str {
         match self {
-            Self::HandshakeFailed(m) | Self::SessionDropped(m) => m,
+            Self::HandshakeFailed(m) | Self::SessionDropped(m) | Self::DownlinkUnrecoverable(m) => {
+                m
+            }
         }
     }
 
@@ -44,6 +50,7 @@ impl ConnectionLostReason {
         match self {
             Self::HandshakeFailed(_) => "handshake_failed",
             Self::SessionDropped(_) => "session_dropped",
+            Self::DownlinkUnrecoverable(_) => "downlink_unrecoverable",
         }
     }
 }
@@ -64,6 +71,18 @@ mod tests {
         let r = ConnectionLostReason::SessionDropped("idle timeout".to_string());
         assert_eq!(r.label(), "session_dropped");
         assert_eq!(r.message(), "idle timeout");
+    }
+
+    #[test]
+    fn downlink_unrecoverable_label_and_message() {
+        let r = ConnectionLostReason::DownlinkUnrecoverable("code 1001".to_string());
+        assert_eq!(r.label(), "downlink_unrecoverable");
+        assert_eq!(r.message(), "code 1001");
+        assert_ne!(
+            r.label(),
+            ConnectionLostReason::SessionDropped(String::new()).label(),
+            "the relay's give-up close must be distinguishable from a generic drop"
+        );
     }
 
     #[test]

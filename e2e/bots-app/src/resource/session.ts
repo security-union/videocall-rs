@@ -223,6 +223,7 @@ export class ResourceCaptureSession {
       fpsByBot,
       arrival,
       joinedBots,
+      imageRevision: localImageRevision(),
     });
   }
 
@@ -237,6 +238,11 @@ export class ResourceCaptureSession {
     }
     await waitForExit(child, 3_000);
   }
+}
+
+/** The revision build.sh stamped into this process's image; `null` outside it. */
+export function localImageRevision(): string | null {
+  return process.env.BOTS_IMAGE_REVISION ?? null;
 }
 
 /**
@@ -255,6 +261,8 @@ export async function deriveReport(args: {
   arrival: ArrivalSpread | null;
   /** Bots seen to join; `null` when this process does not observe joins. */
   joinedBots: number | null;
+  /** Revision of the image the SAMPLED host ran; a remote host's is unknown here. */
+  imageRevision: string | null;
 }): Promise<ResourceCaptureResult> {
   const parsed = parseRawCsv(args.rawCsvText);
   const derived = deriveSamples(parsed);
@@ -269,6 +277,7 @@ export async function deriveReport(args: {
     sysstatMissing: parsed.meta ? !(parsed.meta.haveMpstat && parsed.meta.havePidstat) : false,
     rawCsvPath: args.rawCsvPath,
     derivedCsvPath: args.derivedCsvPath,
+    imageRevision: args.imageRevision,
   };
   const reportText = formatResourceReport(reportInput);
   await writeFile(args.derivedCsvPath, formatDerivedCsv(derived), "utf8").catch(() => {});
@@ -714,6 +723,7 @@ export class RemoteResourceManager {
           // A remote box's bots join out of this process, like its fps.
           arrival: null,
           joinedBots: null,
+          imageRevision: null,
         });
         console.log(resourceLine(`remote host ${hostLabel}:`));
         console.log(result.reportText);

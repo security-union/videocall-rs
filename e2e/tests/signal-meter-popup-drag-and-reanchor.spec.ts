@@ -5,6 +5,7 @@ import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-ind
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { CAMERA_PEER_SIGNAL_DISC, PEER_SIGNAL_DISC } from "../helpers/signal-meter";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 /**
  * HCL follow-up 952: addInitScript payload that replaces
@@ -301,7 +302,9 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       // tile's right edge (within the `POPUP_GAP_PX = 8` gap +
       // VIEWPORT_MARGIN_PX clamps; we allow a generous tolerance because
       // viewport sizes can force the flip-left / clamp paths).
-      const tile = hostPage.locator("#grid-container > div[id^='peer-video-']").first();
+      const tile = hostPage
+        .locator("#grid-container > .ss-peer-panel > .tile-slot > div[id^='peer-video-']")
+        .first();
       await expect(tile).toBeVisible();
       const tileBox = await tile.boundingBox();
       const reanchoredBox = await popup.boundingBox();
@@ -385,7 +388,9 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       await members[0].page.waitForTimeout(10_000);
       const hostPage = members[0].page;
 
-      const tile = hostPage.locator("#grid-container > div[id^='peer-video-']").first();
+      const tile = hostPage
+        .locator("#grid-container > .ss-peer-panel > .tile-slot > div[id^='peer-video-']")
+        .first();
       // Tile-scoped to a camera tile, so the bare testid cannot reach the screen disc.
       const signalButton = tile.locator(PEER_SIGNAL_DISC);
       await expect(signalButton).toBeVisible({ timeout: 30_000 });
@@ -589,6 +594,10 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
         if (i === 1) {
           // Guest will start the share, so they need the mocked picker.
           await ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+        } else {
+          // The host views the share in the split layout (its right-strip
+          // popup is the case under test), opt-in since #2792.
+          await seedShareViewMode(ctx, "enlarged");
         }
         members.push({
           page: null as unknown as Page,

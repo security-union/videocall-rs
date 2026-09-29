@@ -464,6 +464,30 @@ impl ConnectionController {
         }
     }
 
+    /// Forwards to [`ConnectionManager::uplink_queue_depth_bytes`] (#2722).
+    pub fn uplink_queue_depth_bytes(&self) -> Option<u64> {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.uplink_queue_depth_bytes()
+        } else {
+            None
+        }
+    }
+
+    /// The value one health tick reports as `send_queue_bytes` (#2722). MUST be
+    /// the transport-agnostic depth: [`Self::get_send_queue_depth`] is WS-only
+    /// for the #1921 screen gate and leaves WT sessions empty.
+    pub fn health_send_queue_bytes(&self) -> Option<u64> {
+        self.uplink_queue_depth_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_manager_for_test(manager: ConnectionManager) -> Self {
+        Self {
+            manager: Rc::new(RefCell::new(manager)),
+            _timers: Vec::new(),
+        }
+    }
+
     /// Forwards to [`ConnectionManager::rtt_probe_dropped_total`] (#522).
     pub fn rtt_probe_dropped_total(&self) -> u64 {
         if let Ok(mgr) = self.manager.try_borrow() {
@@ -477,6 +501,15 @@ impl ConnectionController {
     pub fn rtt_probe_stale_suppressions_total(&self) -> u64 {
         if let Ok(mgr) = self.manager.try_borrow() {
             mgr.rtt_probe_stale_suppressions_total()
+        } else {
+            0
+        }
+    }
+
+    /// Forwards to [`ConnectionManager::reliable_lane_stall_episodes_total`] (#2720).
+    pub fn reliable_lane_stall_episodes_total(&self) -> u64 {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.reliable_lane_stall_episodes_total()
         } else {
             0
         }
@@ -615,5 +648,50 @@ mod tests {
             let _state = controller.get_connection_state();
             let _measurements = controller.get_rtt_measurements_clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod uplink_depth_tests {
+    use super::*;
+
+    fn controller_over(webtransport: bool, ws_buffered: Option<u64>) -> ConnectionController {
+        let mut mgr = ConnectionManager::new_for_test();
+        mgr.insert_active_connection_for_test(
+            "active",
+            super::super::connection::Connection::new_for_test_with_uplink(
+                webtransport,
+                ws_buffered,
+            ),
+        );
+        ConnectionController::from_manager_for_test(mgr)
+    }
+
+    #[test]
+    fn health_send_queue_bytes_reports_a_depth_on_a_webtransport_session() {
+        let cc = controller_over(true, None);
+        assert_eq!(
+            cc.get_send_queue_depth(),
+            None,
+            "the WS-only accessor the #1921 screen gate reads must stay empty on WT"
+        );
+        assert_eq!(
+            cc.health_send_queue_bytes(),
+            Some(videocall_transport::webtransport::unistream_queue_depth_bytes()),
+            "telemetry must report the unistream buried backlog instead"
+        );
+    }
+
+    #[test]
+    fn health_send_queue_bytes_reports_buffered_amount_on_a_websocket_session() {
+        let cc = controller_over(false, Some(48_000));
+        assert_eq!(cc.get_send_queue_depth(), Some(48_000));
+        assert_eq!(cc.health_send_queue_bytes(), Some(48_000));
+    }
+
+    #[test]
+    fn health_send_queue_bytes_is_empty_with_no_elected_connection() {
+        let cc = ConnectionController::from_manager_for_test(ConnectionManager::new_for_test());
+        assert_eq!(cc.health_send_queue_bytes(), None);
     }
 }

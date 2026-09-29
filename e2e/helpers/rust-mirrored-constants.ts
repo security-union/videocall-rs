@@ -62,10 +62,33 @@ export const MEETING_FOOTER = {
   MEETING_FOOTER_RESERVE: 32,
 } as const;
 
+/** Camera AQ forced-step-down axes: per-axis drop thresholds, windows, and the tick they are served on. */
+export const CAMERA_AQ_AXES = {
+  AQ_TICK_INTERVAL_MS: 1000,
+  WT_SELF_CONGESTION_DROP_THRESHOLD: 3,
+  WS_SELF_CONGESTION_DROP_THRESHOLD: 3,
+  CAMERA_WT_STALE_DROP_THRESHOLD: 12,
+  CAMERA_WS_STALE_DROP_THRESHOLD: 12,
+  WS_SELF_CONGESTION_WINDOW_MS: 1000,
+  WT_SELF_CONGESTION_WINDOW_MS: 2000,
+  CAMERA_WT_STALE_DROP_WINDOW_MS: 2000,
+  CAMERA_WS_STALE_DROP_WINDOW_MS: 2000,
+  WT_SATURATION_STALL_THRESHOLD: 3,
+  WT_SATURATION_WINDOW_MS: 2000,
+} as const;
+
+/** Camera keyframe hold under WS congestion (issue 2834). */
+export const CAMERA_WS_KEYFRAME_HOLD = {
+  MIN_TIER_TRANSITION_INTERVAL_MS: 1500,
+  CAMERA_WS_CONGESTED_KEYFRAME_COOLDOWN_MS: 2000,
+} as const;
+
 export const RUST_MIRRORS: Record<string, Record<string, number>> = {
   "videocall-aq/src/constants.rs": {
     HEARTBEAT_KEEPALIVE_INTERVAL_MS,
     LAYER_AVAILABILITY_WINDOW_MS,
+    ...CAMERA_AQ_AXES,
+    ...CAMERA_WS_KEYFRAME_HOLD,
   },
   "videocall-codecs/src/jitter_buffer.rs": {
     MAX_PLAYOUT_AGE_MS,

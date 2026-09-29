@@ -36,6 +36,17 @@ before a client's re-election can complete, stranding users with
 code default is also `86400`. Any reasonable deployment should pass a value
 ≥ 3600. See [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
 
+## Migrations must be backward compatible
+
+`templates/migrate-job.yaml` runs `dbmate up` in a `pre-install,pre-upgrade` hook
+Job while the previous pod is still serving; the Deployment is updated only after
+it succeeds. Migrations must work with the previous release's code: add columns,
+tables and indexes; never drop or rename in the release that stops using them.
+`PGOPTIONS=-c lock_timeout=5s` fails a migration that waits over 5 s for a lock.
+A failed Job fails the release and stays for seven days; read its pods with
+`kubectl logs -l job-name=<fullname>-migrate-<revision> --prefix --tail=-1`
+(a pod killed by the 240 s deadline leaves no log).
+
 ## Values
 
 See [`values.yaml`](values.yaml) for all options. Notable:

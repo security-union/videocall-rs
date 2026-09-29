@@ -81,6 +81,10 @@ pub struct CreateMeetingRequest {
     /// where only hosts should be able to post, and can flip it back ON live.
     #[serde(default)]
     pub chat_allowed_for_all: Option<bool>,
+
+    /// User IDs to designate as persistent co-hosts (max 100).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub co_hosts: Vec<String>,
 }
 
 impl std::fmt::Debug for CreateMeetingRequest {
@@ -95,6 +99,7 @@ impl std::fmt::Debug for CreateMeetingRequest {
             .field("allow_guests", &self.allow_guests)
             .field("recording_allowed_for_all", &self.recording_allowed_for_all)
             .field("chat_allowed_for_all", &self.chat_allowed_for_all)
+            .field("co_hosts", &self.co_hosts)
             .finish()
     }
 }
@@ -346,6 +351,21 @@ pub struct TransferHostRequest {
     pub user_id: String,
 }
 
+/// Request body for `POST /api/v1/meetings/{meeting_id}/co-hosts` (owner only).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GrantCoHostRequest {
+    pub user_id: String,
+    /// Absent keeps an existing entry's setting, defaults a new one to persistent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<bool>,
+}
+
+/// Request body for `POST /api/v1/meetings/{meeting_id}/co-hosts/revoke`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RevokeCoHostRequest {
+    pub user_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +390,7 @@ mod tests {
             allow_guests: None,
             recording_allowed_for_all: None,
             chat_allowed_for_all: None,
+            co_hosts: vec![],
         };
         let join = JoinMeetingRequest {
             display_name: Some("Alice".into()),
@@ -515,6 +536,43 @@ mod tests {
         };
         let wire = serde_json::to_string(&toggle_only).expect("serializing an update request");
         assert_eq!(wire, r#"{"waiting_room_enabled":false}"#);
+    }
+
+    #[test]
+    fn create_body_co_hosts_are_optional_and_omitted_when_empty() {
+        let legacy: CreateMeetingRequest =
+            serde_json::from_str(r#"{"meeting_id":"standup"}"#).expect("legacy create body");
+        assert!(legacy.co_hosts.is_empty());
+        let wire = serde_json::to_string(&legacy).expect("serializing a create request");
+        assert!(!wire.contains("co_hosts"), "{wire}");
+
+        let with: CreateMeetingRequest =
+            serde_json::from_str(r#"{"co_hosts":["a@example.com"]}"#).expect("create body");
+        assert_eq!(with.co_hosts, vec!["a@example.com".to_string()]);
+    }
+
+    #[test]
+    fn grant_co_host_persist_is_optional_on_the_wire() {
+        for body in [
+            r#"{"user_id":"a@example.com"}"#,
+            r#"{"user_id":"a@example.com","persist":null}"#,
+        ] {
+            let grant: GrantCoHostRequest = serde_json::from_str(body).expect("grant body");
+            assert_eq!(grant.persist, None, "{body}");
+        }
+        let grant: GrantCoHostRequest =
+            serde_json::from_str(r#"{"user_id":"a@example.com","persist":false}"#)
+                .expect("grant body");
+        assert_eq!(grant.persist, Some(false));
+
+        let unset = GrantCoHostRequest {
+            user_id: "a@example.com".to_string(),
+            persist: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&unset).expect("serialize"),
+            r#"{"user_id":"a@example.com"}"#
+        );
     }
 
     #[test]

@@ -899,15 +899,6 @@ const _: () = assert!(
 /// publishes a windowed lost-packets/sec rate, so the datagram loss surfaces on
 /// the diagnostics bus / health reporter exactly like `video_seq_loss_per_sec`.
 ///
-/// ## Scoping (why it reads ~0 except under the pathology)
-///
-/// Fed only when THIS receiver's active transport is WebTransport (see
-/// `Peer::receiver_on_webtransport`). On WebSocket audio rides one ordered TCP
-/// stream, and on E2EE-on WebTransport it rides the reliable audio unistream;
-/// neither produces sequence gaps under the identical stall (they buffer and
-/// deliver late-but-complete), so this rate is ~0 there and nonzero only when
-/// audio is actually losing datagrams.
-///
 /// ## Known limitations
 ///
 /// 1. **[`Self::loss_per_sec`] trails [`Self::raw_loss_per_sec`] on a burst.**
@@ -4308,6 +4299,8 @@ pub struct PeerDecodeManager {
     receiver_on_webtransport: bool,
     /// Applied to every camera/screen decoder created now or after a reset.
     skip_canvas_paint: bool,
+    /// Users holding the host role; excluded from mute-all/disable-all.
+    room_host_user_ids: Rc<RefCell<HashSet<String>>>,
     /// Test-only count of how many times `log_peer_leave_decode_snapshot`
     /// actually emitted, so #1399 coalescing can be asserted directly
     /// (O(N) -> constant under a within-window cascade). `Cell` because the
@@ -4348,6 +4341,7 @@ impl PeerDecodeManager {
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
             skip_canvas_paint: false,
+            room_host_user_ids: Rc::new(RefCell::new(HashSet::new())),
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -4378,6 +4372,7 @@ impl PeerDecodeManager {
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
             skip_canvas_paint: false,
+            room_host_user_ids: Rc::new(RefCell::new(HashSet::new())),
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -4397,6 +4392,21 @@ impl PeerDecodeManager {
     pub(crate) fn insert_zero_loss_top_peer_for_test(&mut self, session_id: u64) {
         self.connected_peers
             .insert(session_id, make_zero_loss_top_peer(session_id));
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn insert_peer_for_test(&mut self, session_id: u64, user_id: &str) {
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.user_id = user_id.to_string();
+        self.connected_peers.insert(session_id, peer);
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn set_peer_media_for_test(&mut self, session_id: u64, video: bool, screen: bool) {
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.video_enabled = video;
+            peer.screen_enabled = screen;
+        }
     }
 
     /// TEST-ONLY: count of peers still awaiting existing-member confirmation.
@@ -4549,7 +4559,7 @@ impl PeerDecodeManager {
     /// to break the `client -> peer_decode_manager.send_packet -> client`
     /// `Rc` cycle that otherwise keeps `Inner` alive after the UI scope
     /// holding the client has unmounted (issue: cc7tp meeting incident
-    /// 2026-05-01, github01.hclpnp.com/labs-projects/videocall/discussions/502).
+    /// 2026-05-01, discussion 502).
     ///
     /// Also drops every peer decoder's proactive keyframe-request route (#1025):
     /// each route closure captured a CLONE of this same `send_packet` `Callback`
@@ -6656,6 +6666,8 @@ impl PeerDecodeManager {
     ///
     /// Safe no-op for `audio_off == video_off == false`. The exclusion is by
     /// `user_id`, so all of the host's own sessions/tabs are excluded.
+    ///
+    /// Every user in the shared room-host set is skipped too.
     pub fn force_all_peers_media_off_except(
         &mut self,
         except_user_id: &str,
@@ -6666,12 +6678,14 @@ impl PeerDecodeManager {
             return;
         }
         let diagnostics = self.diagnostics.clone();
+        let room_hosts = self.room_host_user_ids.clone();
+        let room_hosts = room_hosts.borrow();
         let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {
                 // Skip the issuing host's own tile(s) entirely — a mute-all
                 // must not mute the host that issued it (#1036).
-                if peer.user_id == except_user_id {
+                if peer.user_id == except_user_id || room_hosts.contains(&peer.user_id) {
                     continue;
                 }
                 if peer.force_media_off(audio_off, video_off) {
@@ -6688,6 +6702,11 @@ impl PeerDecodeManager {
                 }
             }
         }
+    }
+
+    /// Shares `hosts` as the room-host set [`Self::force_all_peers_media_off_except`] skips.
+    pub fn share_room_host_user_ids(&mut self, hosts: Rc<RefCell<HashSet<String>>>) {
+        self.room_host_user_ids = hosts;
     }
 
     /// Get the display name for a peer by session_id string.
@@ -6822,13 +6841,13 @@ impl PeerDecodeManager {
 }
 
 // ---------------------------------------------------------------------------
-// Shared test fixtures (parent-module scope, still `#[cfg(test)]`)
+// Shared test fixtures (parent-module scope, `#[cfg(test)]` or `testing`)
 // ---------------------------------------------------------------------------
 // These were hoisted out of `mod tests` so the production-only test seam
 // `PeerDecodeManager::insert_zero_loss_top_peer_for_test` (a `#[cfg(test)]`
 // method on the main impl) can build the same host-safe peer without
-// duplicating the 50-field `Peer` literal. They never compile into a non-test
-// build. `mod tests` re-imports them via its `use super::*;`, so every existing
+// duplicating the 50-field `Peer` literal. They compile only for tests and the
+// `testing` feature. `mod tests` re-imports them via its `use super::*;`, so every existing
 // bare-name call site there keeps working unchanged.
 
 /// Ordered log of the lifecycle calls a [`MockAudioDecoder`] received, shared
@@ -6836,20 +6855,20 @@ impl PeerDecodeManager {
 /// both WHICH decoder was called and in WHAT ORDER — which is the whole point
 /// for decoder replacement (issue 2174 follow-up), where `retire_for_replacement`
 /// must land strictly before the `Drop` it disarms.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 type MockAudioLog = Rc<RefCell<Vec<String>>>;
 
 /// No-op audio decoder for unit tests.
 /// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
 /// after handing ownership to `Peer`.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 struct MockAudioDecoder {
     muted: Rc<std::cell::Cell<bool>>,
     tag: &'static str,
     log: MockAudioLog,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl MockAudioDecoder {
     fn new() -> (Self, Rc<std::cell::Cell<bool>>) {
         Self::tagged("mock", Rc::new(RefCell::new(Vec::new())))
@@ -6874,7 +6893,7 @@ impl MockAudioDecoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl AudioPeerDecoderTrait for MockAudioDecoder {
     fn decode(&mut self, _packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         Ok(DecodeStatus::SKIPPED)
@@ -6893,7 +6912,7 @@ impl AudioPeerDecoderTrait for MockAudioDecoder {
 /// `speaking: 0`. Recording the drop is what lets a test distinguish
 /// replacement (retire, then a disarmed drop) from teardown (a drop that still
 /// has to announce silence).
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Drop for MockAudioDecoder {
     fn drop(&mut self) {
         self.record("drop");
@@ -6903,7 +6922,7 @@ impl Drop for MockAudioDecoder {
 /// Create a `Peer` with no-op decoders (no browser APIs required).
 /// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
 /// decoder's muted state for test assertions.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
     let sid_str = session_id.to_string();
     let (mock_audio, muted_handle) = MockAudioDecoder::new();
@@ -17709,6 +17728,32 @@ mod tests {
             alice_muted.get() && bob_muted.get(),
             "non-host audio decoders must be muted so no expand/hiss plays after force-off"
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_skips_every_room_host() {
+        let mut manager = PeerDecodeManager::new();
+        let hosts: Rc<RefCell<HashSet<String>>> = Rc::default();
+        manager.share_room_host_user_ids(hosts.clone());
+        let _owner = insert_fresh_enabled_peer(&mut manager, 2100, "owner@hcl");
+        let _co_host = insert_fresh_enabled_peer(&mut manager, 2101, "cohost@hcl");
+        let _alice = insert_fresh_enabled_peer(&mut manager, 2102, "alice@hcl");
+        *hosts.borrow_mut() = ["owner@hcl", "cohost@hcl"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        manager.force_all_peers_media_off_except("owner@hcl", true, true);
+
+        for sid in [2100u64, 2101u64] {
+            let host = manager.connected_peers.get(&sid).unwrap();
+            assert!(
+                host.audio_enabled && host.video_enabled,
+                "host session {sid} must keep audio+video ON after another host's mute-all"
+            );
+        }
+        let alice = manager.connected_peers.get(&2102).unwrap();
+        assert!(!alice.audio_enabled && !alice.video_enabled);
     }
 
     #[test]

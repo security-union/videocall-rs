@@ -256,12 +256,9 @@ prometheus:
                 summary: "NATS publish latency p99 > 50ms"
                 description: "NATS publish p99 latency is {{ $value | printf \"%.1f\" }}ms"
 
-            # These four MUST read the *_by_session series: the room-level
+            # These MUST read the *_by_session series: the room-level
             # relay_outbound_queue_{depth,bytes} are last-writer-wins across a
             # room's sessions, so an idle peer erases a stalled one (#2593).
-            # Thresholds are ~80% of each queue's OWN capacity — WS 819/1024,
-            # WT 410/512 per `channel`, never on a uni+datagram sum, so the WT
-            # rule is strictly LESS sensitive than the summed form it replaced.
             - alert: RelayQueueNearFullWS
               expr: max by (room, transport, channel, pod) (min_over_time(videocall_relay_outbound_queue_depth_by_session{transport="websocket",channel="ws"}[1m])) > 819
               for: 15s
@@ -271,7 +268,7 @@ prometheus:
                 summary: "Relay WS outbound queue near capacity (slots)"
                 description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held a queue depth of at least {{ $value }} of 1024 slots across every sample in the last minute. This is a max over that room's receivers, not a room total — one stalled receiver is enough. Attribute it to a session_id on the 'Relay Outbound Queue Depth by Session' panel in the meeting-investigation dashboard"
 
-            # 0.80 x WS_OUTBOUND_VIDEO_BYTE_BUDGET / 0.90 x WS_OUTBOUND_SCREEN_BYTE_BUDGET, pinned by constants.rs tests.
+            # 0.80 x OUTBOUND_VIDEO_BYTE_BUDGET / 0.90 x OUTBOUND_SCREEN_BYTE_BUDGET, pinned by constants.rs tests.
             - alert: RelayQueueNearFullWSVideoBytes
               expr: max by (room, transport, kind, pod) (min_over_time(relay_outbound_queue_bytes_by_session{transport="websocket",kind="video"}[1m])) > 307200
               for: 15s
@@ -279,7 +276,7 @@ prometheus:
                 severity: warning
               annotations:
                 summary: "Relay WS camera-video queue at its byte shed point"
-                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held at least {{ $value }} queued camera bytes across every sample in the last minute — past 0.80 x WS_OUTBOUND_VIDEO_BYTE_BUDGET (307,200), so camera VIDEO is being shed to that receiver. This is a max over the room's receivers, not a room total. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held at least {{ $value }} queued camera bytes across every sample in the last minute — past 0.80 x OUTBOUND_VIDEO_BYTE_BUDGET (307,200), so camera VIDEO is being shed to that receiver. This is a max over the room's receivers, not a room total. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
 
             - alert: RelayQueueNearFullWSScreenBytes
               expr: max by (room, transport, kind, pod) (min_over_time(relay_outbound_queue_bytes_by_session{transport="websocket",kind="screen"}[1m])) > 6369062
@@ -288,16 +285,44 @@ prometheus:
                 severity: warning
               annotations:
                 summary: "Relay WS screen queue at its byte shed point"
-                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held at least {{ $value }} queued screen bytes across every sample in the last minute — past 0.90 x WS_OUTBOUND_SCREEN_BYTE_BUDGET (6,369,062), so SCREEN is being shed to that receiver. That is ~115 queued frames at the 1440p encode ceiling, and more at lower share resolutions, where frames are smaller. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held at least {{ $value }} queued screen bytes across every sample in the last minute — past 0.90 x OUTBOUND_SCREEN_BYTE_BUDGET (6,369,062), so SCREEN is being shed to that receiver. That is ~115 queued frames at the 1440p encode ceiling, and more at lower share resolutions, where frames are smaller. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
 
-            - alert: RelayQueueNearFullWT
-              expr: max by (room, transport, channel, pod) (min_over_time(videocall_relay_outbound_queue_depth_by_session{transport="webtransport"}[1m])) > 410
+            - alert: RelayQueueNearFullWTUnistream
+              expr: max by (room, transport, channel, pod) (min_over_time(videocall_relay_outbound_queue_depth_by_session{transport="webtransport",channel="unistream"}[1m])) > 819
               for: 15s
               labels:
                 severity: warning
               annotations:
-                summary: "Relay WT {{ $labels.channel }} queue near capacity"
-                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (webtransport) {{ $labels.channel }}: one receiver held a queue depth of at least {{ $value }} across every sample in the last minute, past ~80% of that queue's capacity (datagram is a fixed 512; unistream defaults to 512 and is overridable at deploy time via WT_OUTBOUND_CHANNEL_CAPACITY). A unistream fire is receiver downlink; a datagram fire is runtime starvation, not downlink. This is a max over the room's receivers, not a room total, and per-channel rather than the uni+datagram sum it replaces. Attribute it to a session_id on the 'Relay Outbound Queue Depth by Session' panel in the meeting-investigation dashboard"
+                summary: "Relay WT unistream queue near slot capacity"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (webtransport) unistream: one receiver held a queue depth of at least {{ $value }} of 1024 slots across every sample in the last minute (default; overridable at deploy time via WT_OUTBOUND_CHANNEL_CAPACITY). NOTE (#2717): with E2EE OFF this cannot fire on media -- the byte shed caps camera and screen at roughly 219 slots between them, so use the WTVideoBytes/WTScreenBytes alerts for a backed-up media lane. Reaching 819 slots here means control traffic, or E2EE-sealed media whose byte budget the relay could not attribute. Attribute it to a session_id on the 'Relay Outbound Queue Depth by Session' panel in the meeting-investigation dashboard"
+
+            - alert: RelayQueueNearFullWTDatagram
+              expr: max by (room, transport, channel, pod) (min_over_time(videocall_relay_outbound_queue_depth_by_session{transport="webtransport",channel="datagram"}[1m])) > 410
+              for: 15s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay WT datagram queue near capacity"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (webtransport) datagram: one receiver held a queue depth of at least {{ $value }} of 512 slots across every sample in the last minute, past ~80% of the lane. This lane carries audio and sub-MTU control and has its own writer, so a fire is runtime starvation, NOT receiver downlink -- send_datagram does not block on flow control. It is held at 512 deliberately (#2717): the lane absorbs scheduling jitter, and deeper only flushes a bigger burst of audio NetEq has already concealed. This is a max over the room's receivers, not a room total. Attribute it to a session_id on the 'Relay Outbound Queue Depth by Session' panel in the meeting-investigation dashboard"
+
+            # Same budgets as the WS byte alerts: identical encode, identical bytes (#2717).
+            - alert: RelayQueueNearFullWTVideoBytes
+              expr: max by (room, transport, kind, pod) (min_over_time(relay_outbound_queue_bytes_by_session{transport="webtransport",kind="video"}[1m])) > 307200
+              for: 15s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay WT camera-video queue at its byte shed point"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (webtransport): one receiver held at least {{ $value }} queued camera bytes on the unistream lane across every sample in the last minute -- past 0.80 x OUTBOUND_VIDEO_BYTE_BUDGET (307,200), so camera VIDEO is being shed to that receiver. This is the WT media-backpressure signal: the slot alert cannot reach 819 while this shed is holding. Sustained firing also arms the #1638 writer shed, which resets and reopens the wedged stream. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
+
+            - alert: RelayQueueNearFullWTScreenBytes
+              expr: max by (room, transport, kind, pod) (min_over_time(relay_outbound_queue_bytes_by_session{transport="webtransport",kind="screen"}[1m])) > 6369062
+              for: 15s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay WT screen queue at its byte shed point"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (webtransport): one receiver held at least {{ $value }} queued screen bytes on the unistream lane across every sample in the last minute -- past 0.90 x OUTBOUND_SCREEN_BYTE_BUDGET (6,369,062), so SCREEN is being shed to that receiver. That is ~115 queued frames at the 1440p encode ceiling, and more at lower share resolutions, where frames are smaller. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
 
             # =====================================================================
             # relay viewport alerts (#1437)
@@ -314,7 +339,7 @@ prometheus:
             # relay_viewport_nonvideo_at_drop_branch_total is the #1437 invariant
             # tripwire — it must ALWAYS be 0; any increase means the #988 is_video
             # guard regressed. All three metrics are scraped from the relay pods
-            # via the kubernetes-pods prometheus.io/scrape annotation job above.
+            # via the kubernetes-pods prometheus.io/scrape annotation job.
             # =====================================================================
             - alert: ViewportBlackout
               expr: rate(relay_viewport_filtered_total[5m]) > 0 and rate(relay_viewport_forwarded_total[5m]) < 0.1
@@ -336,30 +361,35 @@ prometheus:
                 summary: "Viewport non-VIDEO invariant breach in room {{ $labels.room }}"
                 description: "A non-VIDEO packet reached the viewport drop branch in room {{ $labels.room }} — the #988 is_video guard regressed (#1437). This counter must ALWAYS be 0; observed increase {{ $value }}."
 
-        - name: videocall_quality_alerts
-          rules:
-            - alert: MeetingQualityDegraded
-              expr: avg by (meeting_id)(videocall_call_quality_score) < 50
-              for: 2m
-              labels:
-                severity: warning
-              annotations:
-                summary: "Meeting quality degraded"
-                description: "Meeting {{ $labels.meeting_id }} avg quality: {{ $value | printf \"%.0f\" }}/100"
-
-            - alert: LowAudioConnectivity
-              expr: videocall_peer_can_listen < 0.5
+            - alert: RelaySchedulerLagHigh
+              expr: histogram_quantile(0.99, sum by (le, pod) (rate(videocall_relay_scheduler_lag_ms_bucket[5m]))) > 100
               for: 1m
               labels:
                 severity: critical
+                component: relay-runtime
               annotations:
-                summary: "Peer cannot receive audio"
-                description: "{{ $labels.from_peer }} cannot hear {{ $labels.to_peer }}"
+                summary: "WT relay scheduler lag p99 > 100ms on {{ $labels.pod }}"
+                description: "Pod {{ $labels.pod }}: a fixed-interval probe running ON one of the WebTransport relay's runtimes (#2727: the main one plus each session arbiter, all feeding this one unlabelled histogram, so a spike names the relay and not which arbiter) was polled {{ $value | printf \"%.0f\" }}ms past its scheduled deadline at p99. Some future is holding one of those threads without yielding — epic #1636 mechanism B. Confirm against the per-connection path_sent_packets gauges: flat there too means the relay stalled rather than the network. Only webtransport_server spawns this probe, so a WebSocket pod never contributes."
+
+            # RelayRoomMembershipDivergent: retired, true for every mixed room. Panel 118.
+
+        - name: videocall_quality_alerts
+          rules:
+            # MeetingQualityDegraded: held, not ported. #2256 (decision), #2249 (why).
+
+            - alert: PeerAudioStatsStalled
+              expr: videocall_peer_can_listen < 0.5
+              for: 1m
+              labels:
+                severity: warning
+              annotations:
+                summary: "NetEq stats stalled for a peer's audio decoder"
+                description: "{{ $labels.from_peer }} has had no NetEq stats sample for {{ $labels.to_peer }} in over 5s. Its audio decoder worker is absent, dead or being swapped. This does NOT mean the listener cannot hear: a silent or muted speaker still reports fresh stats."
 
         - name: videocall_resource_alerts
           rules:
             - alert: ContainerCPUHigh
-              expr: 100 * sum by (container)(rate(container_cpu_usage_seconds_total{namespace="videocall",container=~"rustlemania-.*|nats"}[2m])) / sum by (container)(kube_pod_container_resource_limits{namespace="videocall",resource="cpu"}) > 85
+              expr: 100 * sum by (container)(rate(container_cpu_usage_seconds_total{namespace="videocall",container=~".*-us-east|metrics-api.*|nats"}[2m])) / sum by (container)(kube_pod_container_resource_limits{namespace="videocall",resource="cpu"}) > 85
               for: 3m
               labels:
                 severity: warning
@@ -368,7 +398,7 @@ prometheus:
                 description: "{{ $labels.container }} at {{ $value | printf \"%.0f\" }}% CPU"
 
             - alert: ContainerMemoryHigh
-              expr: 100 * container_memory_working_set_bytes{namespace="videocall",container=~"rustlemania-.*|nats|prometheus-server"} / on(container,pod,namespace) kube_pod_container_resource_limits{namespace="videocall",resource="memory"} > 85
+              expr: 100 * container_memory_working_set_bytes{namespace="videocall",container=~".*-us-east|metrics-api.*|nats|prometheus-server"} / on(container,pod,namespace) kube_pod_container_resource_limits{namespace="videocall",resource="memory"} > 85
               for: 3m
               labels:
                 severity: warning
@@ -386,19 +416,15 @@ prometheus:
         # =====================================================================
         - name: videocall_client_stability_alerts
           rules:
-            # Client JS heap has at least doubled vs. its first-seen value in
-            # the last 5 minutes. The cumulative gauge is per
-            # (meeting_id, session_id, peer_id) so each line
-            # is compared against its own meeting-preamble baseline.
             - alert: ClientHeapGrowthHigh
-              expr: videocall_client_memory_used_bytes / on(meeting_id, session_id, peer_id) first_over_time(videocall_client_memory_used_bytes[5m]) > 2
+              expr: videocall_client_memory_used_bytes / on(meeting_id, session_id, peer_id) (videocall_client_memory_used_bytes offset 5m) > 2
               for: 60s
               labels:
                 severity: critical
                 page: "true"
               annotations:
-                summary: "Client heap >2x preamble during active meeting"
-                description: "peer {{ $labels.peer_id }} (session {{ $labels.session_id }}) in meeting {{ $labels.meeting_id }} heap is {{ $value | printf \"%.2f\" }}x its first-seen value. Likely leak or unbounded buffer. Resolve name via videocall_peer_info{meeting_id=\"{{ $labels.meeting_id }}\",session_id=\"{{ $labels.session_id }}\"}."
+                summary: "Client heap >2x its value 5m earlier during active meeting"
+                description: "peer {{ $labels.peer_id }} (session {{ $labels.session_id }}) in meeting {{ $labels.meeting_id }} heap is {{ $value | printf \"%.2f\" }}x its value 5 minutes earlier. Likely leak or unbounded buffer. A session younger than 5 minutes has no t-5m sample, so it cannot fire yet. Resolve name via videocall_peer_info{meeting_id=\"{{ $labels.meeting_id }}\",session_id=\"{{ $labels.session_id }}\"}."
 
             # Any client is dropping its own outbound datagrams (writable stream
             # locked / backpressured). videocall_datagram_drops is a

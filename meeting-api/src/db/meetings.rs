@@ -15,7 +15,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::password::PasswordUpdate;
 
@@ -27,43 +27,7 @@ pub const STATE_ACTIVE: &str = "active";
 /// The "exists but nobody is currently present" state.
 pub const STATE_IDLE: &str = "idle";
 
-/// Derive the *displayed* meeting state from the raw `meetings.state` column and
-/// the live present-participant count (issue #1628).
-///
-/// The raw `state` column is presence-driven but advanced by SEPARATE, partially
-/// asymmetric writers: `activate()` (REST join/admit only), `set_idle()` (the
-/// transport "room became empty" NATS event), and `end_meeting()` (host-leave /
-/// explicit end). Because re-activation historically only fired on a REST join,
-/// the column could be left at `'idle'` while live participants were present —
-/// e.g. a participant whose transport briefly dropped (room→empty→`set_idle`)
-/// then reconnected over the *transport* without re-hitting REST `/join`. The
-/// column also lags during the brief windows between a presence change and the
-/// NATS event that updates it.
-///
-/// This function makes the invariant the issue requires hold *by construction at
-/// read time*, independent of which writer last touched the column and of event
-/// ordering across reconnects, multi-tab, both transports, and multiple replicas:
-///
-/// > **`idle` ⟺ zero present participants (and the meeting has not ended).**
-///
-/// Rules, in priority order:
-/// 1. `ended` is **terminal** and always wins — a participant row that is still
-///    `admitted AND left_at IS NULL` at the instant the meeting ended (an
-///    in-flight roster write racing `end_meeting`) must NOT flip the display back
-///    to `active`. The end-vs-presence race always resolves to `ended`.
-/// 2. Otherwise, `participant_count > 0` ⇒ `active` (someone is present).
-/// 3. Otherwise (no one present) ⇒ `idle`.
-///
-/// `raw_state` is the column value (`None` is treated as the INSERT default
-/// `idle`). `participant_count` is the live present count
-/// (`status='admitted' AND left_at IS NULL`), the same definition the feed/list
-/// `participant_count` field is computed from, so the returned `state` and
-/// `participant_count` can never contradict each other.
-///
-/// Note this derives the DISPLAYED state only; the raw column still drives the
-/// server-side join/auto-activate gating (which must distinguish a never-started
-/// `idle` from an `ended` meeting the host opted to close). We never write the
-/// derived value back to the column.
+/// Derive the displayed meeting state: `ended` wins if raw state is `ended`, else `active` iff `participant_count > 0`, else `idle`.
 pub fn display_state(raw_state: Option<&str>, participant_count: i64) -> String {
     match raw_state {
         Some(STATE_ENDED) => STATE_ENDED.to_string(),
@@ -134,8 +98,8 @@ pub async fn create(
 
 /// Create a new meeting with explicit waiting_room_enabled setting.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_with_options(
-    pool: &PgPool,
+pub async fn create_with_options<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     room_id: &str,
     creator_id: &str,
     password_hash: Option<&str>,
@@ -166,7 +130,7 @@ pub async fn create_with_options(
     .bind(allow_guests)
     .bind(recording_allowed_for_all)
     .bind(chat_allowed_for_all)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -189,8 +153,11 @@ pub async fn get_by_room_id(
     .await
 }
 
-/// List meetings the user owns OR has participated in (non-deleted),
-/// ordered by created_at DESC.
+/// List meetings the user owns, has participated in, or is a live co-host of
+/// (non-deleted), ordered by created_at DESC. The co-host branch depends on
+/// `meeting_co_hosts_user_id_idx` (see that migration) to stay an index
+/// lookup rather than a full-table scan. [`search_by_owner`] shares this
+/// query shape and the same index.
 pub async fn list_by_owner(
     pool: &PgPool,
     creator_id: &str,
@@ -205,7 +172,9 @@ pub async fn list_by_owner(
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $1
         WHERE m.deleted_at IS NULL
-          AND (m.creator_id = $1 OR p.user_id IS NOT NULL)
+          AND (m.creator_id = $1 OR p.user_id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM meeting_co_hosts c
+                          WHERE c.meeting_id = m.id AND c.user_id = LOWER($1) AND NOT c.suspended))
         ORDER BY m.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -217,7 +186,8 @@ pub async fn list_by_owner(
     .await
 }
 
-/// Count meetings the user owns OR has participated in (non-deleted).
+/// Count meetings the user owns, has participated in, or is a live co-host
+/// of (non-deleted). See [`list_by_owner`].
 pub async fn count_by_owner(pool: &PgPool, creator_id: &str) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         r#"
@@ -225,7 +195,9 @@ pub async fn count_by_owner(pool: &PgPool, creator_id: &str) -> Result<i64, sqlx
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $1
         WHERE m.deleted_at IS NULL
-          AND (m.creator_id = $1 OR p.user_id IS NOT NULL)
+          AND (m.creator_id = $1 OR p.user_id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM meeting_co_hosts c
+                          WHERE c.meeting_id = m.id AND c.user_id = LOWER($1) AND NOT c.suspended))
         "#,
     )
     .bind(creator_id)
@@ -251,8 +223,9 @@ fn escape_like(input: &str) -> String {
         .replace('_', r"\_")
 }
 
-/// Search non-deleted meetings the user owns OR has participated in,
-/// matching a keyword against `room_id`, `state`, and `host_display_name`
+/// Search non-deleted meetings the user owns, has participated in, or is a
+/// live co-host of (issue #2702 round 11 — see [`list_by_owner`]), matching
+/// a keyword against `room_id`, `state`, and `host_display_name`
 /// (case-insensitive).
 pub async fn search_by_owner(
     pool: &PgPool,
@@ -270,7 +243,9 @@ pub async fn search_by_owner(
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $2
         WHERE m.deleted_at IS NULL
-          AND (m.creator_id = $2 OR p.user_id IS NOT NULL)
+          AND (m.creator_id = $2 OR p.user_id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM meeting_co_hosts c
+                          WHERE c.meeting_id = m.id AND c.user_id = LOWER($2) AND NOT c.suspended))
           AND (m.room_id ILIKE $1 OR m.state ILIKE $1 OR m.host_display_name ILIKE $1)
         ORDER BY m.created_at DESC
         LIMIT $3 OFFSET $4
@@ -284,8 +259,8 @@ pub async fn search_by_owner(
     .await
 }
 
-/// Count non-deleted meetings the user owns OR has participated in,
-/// matching a keyword.
+/// Count non-deleted meetings the user owns, has participated in, or is a
+/// live co-host of, matching a keyword. See [`search_by_owner`].
 pub async fn count_search_by_owner(
     pool: &PgPool,
     creator_id: &str,
@@ -298,7 +273,9 @@ pub async fn count_search_by_owner(
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $2
         WHERE m.deleted_at IS NULL
-          AND (m.creator_id = $2 OR p.user_id IS NOT NULL)
+          AND (m.creator_id = $2 OR p.user_id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM meeting_co_hosts c
+                          WHERE c.meeting_id = m.id AND c.user_id = LOWER($2) AND NOT c.suspended))
           AND (m.room_id ILIKE $1 OR m.state ILIKE $1 OR m.host_display_name ILIKE $1)
         "#,
     )
@@ -309,16 +286,7 @@ pub async fn count_search_by_owner(
     Ok(row.0)
 }
 
-/// Row returned from [`list_joined_by_user`] — a meeting the user has been
-/// admitted into, with the join-time metadata used for ordering.
-///
-/// The `last_joined_at` value is `p.admitted_at`. The query filters on
-/// `admitted_at IS NOT NULL`, so this column is always populated.
-///
-/// Counts are folded into the same SELECT (LEFT JOIN LATERAL) so the route
-/// handler does not need to issue per-row queries to assemble
-/// participant_count / waiting_count. Status semantics match the legacy
-/// `db_participants::count_admitted` / `count_waiting` helpers byte-for-byte.
+/// Row returned from [`list_joined_by_user`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct JoinedMeetingRow {
@@ -335,21 +303,14 @@ pub struct JoinedMeetingRow {
     pub waiting_count: i64,
 }
 
-/// List meetings the user has been admitted into at least once, including
-/// meetings they own. Ordered by `last_joined_at` descending, with `m.id DESC`
-/// as a deterministic tiebreaker for same-microsecond admissions.
-///
-/// The filter `admitted_at IS NOT NULL` is the canonical "ever admitted" check:
-/// `admitted_at` is set on every admission (initial waiting-room admit, host
-/// upsert, or auto-admit when the waiting room is off) and is never cleared
-/// when a participant leaves. Pure-`waiting` rows and waiting-then-rejected
-/// rows have `admitted_at IS NULL` and are excluded.
+/// List meetings the user has been admitted into at least once (including owned), ordered by `last_joined_at` DESC. No live-co-host branch: the contract is join history.
 pub async fn list_joined_by_user(
     pool: &PgPool,
     user_id: &str,
     limit: i64,
+    healthy: bool,
 ) -> Result<Vec<JoinedMeetingRow>, sqlx::Error> {
-    sqlx::query_as::<_, JoinedMeetingRow>(
+    sqlx::query_as::<_, JoinedMeetingRow>(&format!(
         r#"
         SELECT m.id,
                m.room_id,
@@ -367,10 +328,9 @@ pub async fn list_joined_by_user(
             ON p.meeting_id = m.id AND p.user_id = $1
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS admitted_count
-            FROM meeting_participants
-            WHERE meeting_id = m.id
-              AND status = 'admitted'
-              AND left_at IS NULL
+            FROM meeting_participants mp
+            WHERE mp.meeting_id = m.id
+              AND {present}
         ) pc ON TRUE
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS waiting_count
@@ -384,31 +344,15 @@ pub async fn list_joined_by_user(
         ORDER BY p.admitted_at DESC, m.id DESC
         LIMIT $2
         "#,
-    )
+        present = crate::db::participants::present_sql("mp", healthy)
+    ))
     .bind(user_id)
     .bind(limit)
     .fetch_all(pool)
     .await
 }
 
-/// Row returned from [`list_feed_for_user`] — the deduplicated home-feed
-/// entry that backs `GET /api/v1/meetings/feed`.
-///
-/// Carries the meeting's settings + counts plus the join-time metadata used
-/// for ordering. Counts are folded into the same SELECT (LEFT JOIN LATERAL)
-/// so the route handler does not need to issue per-row queries to assemble
-/// participant_count / waiting_count.
-///
-/// `last_active_at` is `COALESCE(p.last_admit, m.started_at, m.created_at)`
-/// and is therefore always non-null. `started_at` may be earlier than
-/// `last_active_at` when the user has joined a re-activated meeting since
-/// the most recent activation refreshed `started_at`.
-///
-/// `ever_admitted` is `true` when the user has at least one
-/// `meeting_participants` row with `admitted_at IS NOT NULL` — equivalent to
-/// `p.last_admit IS NOT NULL`. The route handler uses it for nothing today
-/// but it's exposed in case future call sites want a quick "has the user
-/// actually joined this meeting before" check without going back to the DB.
+/// Row returned from [`list_feed_for_user`], backing `GET /api/v1/meetings/feed`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct FeedMeetingRow {
@@ -429,54 +373,33 @@ pub struct FeedMeetingRow {
     pub admitted_can_admit: bool,
     pub last_active_at: DateTime<Utc>,
     pub ever_admitted: bool,
-    /// The requesting user's most recent admission to this meeting: the raw
-    /// `p.last_admit` = `MAX(admitted_at)` over their own
-    /// `meeting_participants` rows, WITHOUT the `last_active_at` COALESCE
-    /// fallbacks. Strictly user-scoped (`user_id = $1`). `NULL` when the user
-    /// has never been admitted (e.g. they own the meeting but never joined).
-    /// Surfaced as `MeetingFeedSummary::user_last_attended_at`.
+    /// The requesting user's most recent admission, or `None` if never admitted.
     pub last_admit: Option<DateTime<Utc>>,
     pub participant_count: i64,
     pub waiting_count: i64,
+    /// Whether the requesting user holds a live co-host entry for this meeting.
+    pub is_co_host: bool,
 }
 
-/// List meetings the user owns OR has been admitted into, deduplicated to
-/// one row per meeting. Powers `GET /api/v1/meetings/feed`.
+/// List meetings the user owns, has been admitted into, or is a live
+/// co-host of, deduplicated to one row per meeting and ordered by
+/// `last_active_at` DESC (`m.id DESC` tiebreaker). Powers
+/// `GET /api/v1/meetings/feed`. `participant_count` / `waiting_count` /
+/// `is_co_host` are folded in via `LEFT JOIN LATERAL` so the route handler
+/// issues one round-trip regardless of feed length.
 ///
-/// ## Membership predicate
-///
-/// A meeting `m` appears in the feed when either:
-///   - `m.creator_id = user_id` (the user owns it), regardless of whether
-///     they have ever joined; or
-///   - the user has at least one `meeting_participants` row for `m` with
-///     `admitted_at IS NOT NULL` — i.e. they were actually admitted at some
-///     point. Pure-`waiting` rows (`admitted_at IS NULL`) are excluded.
-///
-/// ## Ordering
-///
-/// `last_active_at = COALESCE(p.last_admit, m.started_at, m.created_at)`,
-/// descending. `m.id DESC` is the deterministic tiebreaker for rows that
-/// share the same `last_active_at` (e.g. two meetings activated in the same
-/// microsecond on a busy host).
-///
-/// ## Folded counts
-///
-/// `participant_count` (rows with `status = 'admitted' AND left_at IS NULL`) and
-/// `waiting_count` (rows with `status = 'waiting' AND left_at IS NULL`) are
-/// computed inside the same query via LEFT JOIN LATERAL subqueries so the route
-/// handler issues exactly one round-trip regardless of feed length. The
-/// `left_at IS NULL` guard restricts both counts to participants who are
-/// CURRENTLY present (issue #1551) — a departed participant (explicit REST
-/// `/leave` or a transport disconnect marked by the `PARTICIPANT_LEFT` consumer)
-/// is excluded. Status + presence semantics match the legacy
-/// `db_participants::count_admitted` / `count_waiting` so the /feed counts stay
-/// byte-for-byte identical to the per-row helpers.
+/// `is_co_host` is computed once, via the same `LEFT JOIN LATERAL` the WHERE
+/// clause tests for co-host membership, so the two can't disagree. That
+/// LATERAL forces a per-row nested loop, which `meeting_co_hosts_pkey`
+/// already serves — unlike [`list_by_owner`], this query needs no
+/// additional index.
 pub async fn list_feed_for_user(
     pool: &PgPool,
     user_id: &str,
     limit: i64,
+    healthy: bool,
 ) -> Result<Vec<FeedMeetingRow>, sqlx::Error> {
-    sqlx::query_as::<_, FeedMeetingRow>(
+    sqlx::query_as::<_, FeedMeetingRow>(&format!(
         r#"
         SELECT m.id,
                m.room_id,
@@ -497,7 +420,8 @@ pub async fn list_feed_for_user(
                (p.last_admit IS NOT NULL) AS ever_admitted,
                p.last_admit AS last_admit,
                COALESCE(pc.admitted_count, 0) AS participant_count,
-               COALESCE(wc.waiting_count, 0) AS waiting_count
+               COALESCE(wc.waiting_count, 0) AS waiting_count,
+               COALESCE(ch.is_co_host, FALSE) AS is_co_host
         FROM meetings m
         LEFT JOIN LATERAL (
             SELECT MAX(admitted_at) AS last_admit
@@ -508,10 +432,9 @@ pub async fn list_feed_for_user(
         ) p ON TRUE
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS admitted_count
-            FROM meeting_participants
-            WHERE meeting_id = m.id
-              AND status = 'admitted'
-              AND left_at IS NULL
+            FROM meeting_participants mp
+            WHERE mp.meeting_id = m.id
+              AND {present}
         ) pc ON TRUE
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS waiting_count
@@ -520,12 +443,19 @@ pub async fn list_feed_for_user(
               AND status = 'waiting'
               AND left_at IS NULL
         ) wc ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT TRUE AS is_co_host
+            FROM meeting_co_hosts c
+            WHERE c.meeting_id = m.id AND c.user_id = LOWER($1) AND NOT c.suspended
+            LIMIT 1
+        ) ch ON TRUE
         WHERE m.deleted_at IS NULL
-          AND (m.creator_id = $1 OR p.last_admit IS NOT NULL)
+          AND (m.creator_id = $1 OR p.last_admit IS NOT NULL OR ch.is_co_host)
         ORDER BY last_active_at DESC, m.id DESC
         LIMIT $2
         "#,
-    )
+        present = crate::db::participants::present_sql("mp", healthy)
+    ))
     .bind(user_id)
     .bind(limit)
     .fetch_all(pool)
@@ -560,7 +490,10 @@ pub async fn soft_delete(
 /// refreshes `started_at = NOW()` and clears `ended_at = NULL` so the row
 /// reflects the most recent activation. When the meeting is already
 /// `active` the call is idempotent — no timestamps are touched.
-pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
+pub async fn activate<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         UPDATE meetings
@@ -571,132 +504,195 @@ pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error>
         "#,
     )
     .bind(meeting_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
-/// Re-activate a meeting `idle -> active` because a participant became present
-/// again (issue #1628) — the presence-driven counterpart to [`set_idle`].
-///
-/// Unlike [`activate`], the `WHERE id = $1 AND state = 'idle'` guard is
-/// **load-bearing for terminal-`ended` safety**:
-///
-/// 1. **Never resurrects `ended`.** `activate` deliberately re-opens an `ended`
-///    meeting (the REST host-restart path: a host clicking "join" on a meeting
-///    they previously ended legitimately reopens it). The presence-driven
-///    `internal.participant_present` consumer must NOT do that — a late
-///    reconnect racing a host-`end` must let `ended` win. Scoping the UPDATE to
-///    `state = 'idle'` makes this ATOMIC: an `ended` (or already-`active`) row
-///    matches zero rows, so the read-then-write race ("snapshot said idle, host
-///    ended in the gap, my activate resurrected it") cannot occur.
-/// 2. **Idempotent.** An already-`active` meeting matches zero rows — a
-///    duplicate present event is a harmless no-op.
-///
-/// Refreshes `started_at = NOW()` / clears `ended_at = NULL` on the
-/// `idle -> active` flip, matching `activate`'s idle-branch timestamp behavior
-/// (`ended_at` is already NULL for an idle row, so the clear is a no-op there;
-/// it is set defensively for shape parity). Returns the number of rows updated
-/// (`1` on a real `idle -> active` flip, `0` when the meeting was `active`,
-/// `ended`, or absent).
-pub async fn reactivate_from_idle(pool: &PgPool, meeting_id: i32) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE meetings \
-         SET state = 'active', started_at = NOW(), ended_at = NULL \
-         WHERE id = $1 AND state = 'idle'",
-    )
-    .bind(meeting_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+/// End a meeting, demote non-creator hosts, and reset co-host entries. Idempotent: a re-fire is a no-op.
+pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    end_meeting_in(&mut tx, meeting_id).await?;
+    tx.commit().await
 }
 
-/// End a meeting (set state to 'ended', set ended_at if not already set) and
-/// reset host to the creator for the next activation.
-///
-/// Idempotent at the SQL level: `state <> 'ended'` short-circuits zero-row
-/// UPDATEs on re-fire, and `COALESCE(ended_at, NOW())` preserves the original
-/// `ended_at` so the "when did this meeting end" signal is stable across
-/// duplicate triggers (e.g. NATS re-subscribe after disconnect, or multi-replica
-/// fan-out without a queue group). Callers do not inspect rows-affected, so the
-/// no-op second call is intentionally indistinguishable from a fresh end.
-///
-/// In the single-host model the creator is the default host; a transfer-host
-/// may have moved host to another participant during the session.
-/// [`crate::db::participants::clear_non_creator_hosts`] demotes any such
-/// transfer target on end so the next activation starts with the creator as the
-/// sole host. Both statements are independently idempotent, so a re-fire (NATS
-/// re-subscribe, multi-replica) reconciles any state left by a partial run.
-pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
+/// [`end_meeting`] on the caller's transaction.
+pub async fn end_meeting_in(conn: &mut PgConnection, meeting_id: i32) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE meetings \
          SET state = 'ended', ended_at = COALESCE(ended_at, NOW()) \
          WHERE id = $1 AND state <> 'ended'",
     )
     .bind(meeting_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-
-    crate::db::participants::clear_non_creator_hosts(pool, meeting_id).await?;
-    Ok(())
+    crate::db::participants::clear_non_creator_hosts(&mut *conn, meeting_id).await?;
+    // Suspensions stay through End; only a real new instance lifts them.
+    crate::db::co_hosts::clear_instance_only_entries(conn, meeting_id).await
 }
 
-/// Transition a meeting to `state='idle'` because every participant has left
-/// a meeting that has NOT ended (presence-driven empty→idle transition).
+/// How [`start_instance`] left a meeting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activation {
+    /// Nothing written: active with someone present, or nothing to activate.
+    Unchanged,
+    /// Idle with someone present: set active, still the same instance.
+    Resumed,
+    /// Ended, or nobody present: a new instance started, demoting these non-owner hosts.
+    NewInstance { demoted: Vec<String> },
+}
+
+impl Activation {
+    /// Whether the meeting went from not active to active.
+    pub fn activated(&self) -> bool {
+        !matches!(self, Activation::Unchanged)
+    }
+
+    /// The non-owner hosts a new instance demoted.
+    pub fn demoted(&self) -> &[String] {
+        match self {
+            Activation::NewInstance { demoted } => demoted,
+            _ => &[],
+        }
+    }
+}
+
+/// Activate the locked meeting; a new instance starts only from `ended` or when nobody is present.
+pub(crate) async fn start_instance_in(
+    conn: &mut PgConnection,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<Activation, sqlx::Error> {
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM meetings WHERE id = $1 FOR UPDATE")
+            .bind(meeting_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    let ended = state.as_deref() == Some(STATE_ENDED);
+    if !ended && crate::db::participants::any_present(&mut *conn, meeting_id, healthy).await? {
+        if state.as_deref() == Some(STATE_ACTIVE) {
+            return Ok(Activation::Unchanged);
+        }
+        sqlx::query("UPDATE meetings SET state = 'active' WHERE id = $1")
+            .bind(meeting_id)
+            .execute(&mut *conn)
+            .await?;
+        return Ok(Activation::Resumed);
+    }
+    let demoted = crate::db::participants::clear_non_creator_hosts(&mut *conn, meeting_id).await?;
+    // Ascending-id lock order avoids deadlock with `record_heartbeat`'s CTE.
+    sqlx::query(
+        "WITH victims AS ( \
+            SELECT id FROM meeting_participants \
+            WHERE meeting_id = $1 AND status = 'admitted' AND left_at IS NULL \
+            ORDER BY id FOR UPDATE \
+         ) \
+         UPDATE meeting_participants mp \
+         SET status = 'left', left_at = NOW(), live_session_id = 0 \
+         FROM victims WHERE mp.id = victims.id",
+    )
+    .bind(meeting_id)
+    .execute(&mut *conn)
+    .await?;
+    crate::db::co_hosts::reset_for_new_instance(&mut *conn, meeting_id).await?;
+    sqlx::query(
+        "UPDATE meetings SET state = 'active', started_at = NOW(), ended_at = NULL WHERE id = $1",
+    )
+    .bind(meeting_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(Activation::NewInstance { demoted })
+}
+
+/// Activate a meeting (see [`start_instance_in`]).
+pub async fn start_instance(
+    pool: &PgPool,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<Activation, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let activation = start_instance_in(&mut tx, meeting_id, healthy).await?;
+    tx.commit().await?;
+    Ok(activation)
+}
+
+/// Admit the creator, activating the meeting. Their first join of the
+/// CURRENT instance makes them host; a rejoin of an instance they already
+/// joined leaves their host flag alone (a transfer may have moved it).
 ///
-/// "Idle" means the meeting still exists and has not ended, but currently has
-/// no present participants — either everyone left, or it was created and no one
-/// has joined yet (the latter is handled by the `INSERT … state='idle'` at
-/// creation time). This function covers the everyone-left case, driven by the
-/// `actix-api` "room became empty" NATS event (see
-/// `MEETING_BECAME_EMPTY_SUBJECT`).
-///
-/// # Race / idempotency reasoning
-///
-/// The guard `state = 'active'` is load-bearing in three ways:
-///
-/// 1. **Never overwrites `ended` (terminal).** If the meeting already ended —
-///    e.g. the host left with `end_on_host_leave=true` and `end_meeting` landed
-///    first — `state` is `'ended'`, the `WHERE` matches zero rows, and this is a
-///    no-op. `ended` is terminal and must win the end-vs-idle race.
-/// 2. **Idempotent on repeat.** If the meeting is already `'idle'` (duplicate
-///    empty event from a NATS re-subscribe, or two replicas observing the same
-///    drain) the `WHERE` matches zero rows — a harmless no-op. Callers do not
-///    inspect rows-affected, so a no-op is indistinguishable from a fresh idle.
-/// 3. **Both race orders are safe.** If the empty event lands first we set
-///    `'idle'`; a later `end_meeting` (whose guard is `state <> 'ended'`) then
-///    overwrites `'idle'` with `'ended'`. If `end_meeting` lands first, this
-///    no-ops. Either ordering converges on the correct terminal/idle state.
-///
-/// We deliberately do NOT touch `started_at` / `ended_at`: an idle meeting that
-/// was previously active retains its original `started_at` so the "when did this
-/// meeting first start" signal is stable, and `activate()` is solely responsible
-/// for refreshing those timestamps on the idle→active re-activation.
-///
-/// ## Belt-and-suspenders participant re-check (intentionally omitted)
-///
-/// We considered an extra `AND NOT EXISTS (SELECT 1 FROM meeting_participants …
-/// WHERE status='admitted' AND left_at IS NULL)` guard to defend against a stale
-/// empty event racing a fast rejoin. We omit it because:
-///
-/// - The trigger in `actix-api` is the in-memory `room_members` count reaching
-///   zero, mutated synchronously in the single-threaded chat_server actor — the
-///   same authoritative presence source the host-leave→end detection uses. It is
-///   strictly fresher than the `meeting_participants` table (which is only
-///   written on REST join/admit/leave, not on transport disconnect — the very
-///   gap this feature closes).
-/// - The join path calls `activate()` on every admit, which is idempotent and
-///   flips `idle`→`active`. So even if a stale empty event briefly sets `idle`
-///   while a participant is mid-rejoin, the next join immediately re-activates.
-///   The worst case is a transient `active`→`idle`→`active` flicker that
-///   self-heals — acceptable, and not worth coupling this write to the
-///   participant table's write-skew.
-pub async fn set_idle(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE meetings SET state = 'idle' WHERE id = $1 AND state = 'active'")
+/// "First join of this instance" means `admitted_at` is absent or older than
+/// `started_at` — true whether the instance is brand new or one a co-host
+/// already started, since both stamp `admitted_at`/`started_at` from the
+/// same transaction's `NOW()`.
+pub async fn owner_join(
+    pool: &PgPool,
+    meeting_id: i32,
+    creator_id: &str,
+    display_name: Option<&str>,
+    healthy: bool,
+) -> Result<(crate::db::participants::ParticipantRow, Activation), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let activation = start_instance_in(&mut tx, meeting_id, healthy).await?;
+
+    let joined_this_instance: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM meeting_participants p
+            JOIN meetings m ON m.id = p.meeting_id
+            WHERE p.meeting_id = $1 AND p.user_id = $2
+              AND p.admitted_at IS NOT NULL AND p.admitted_at >= m.started_at
+        )",
+    )
+    .bind(meeting_id)
+    .bind(creator_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let row = if joined_this_instance {
+        crate::db::participants::admit_creator_preserve_host(
+            &mut *tx,
+            meeting_id,
+            creator_id,
+            display_name,
+        )
+        .await?
+    } else {
+        if let Some(dn) = display_name {
+            sqlx::query(
+                "UPDATE meetings SET host_display_name = $1 \
+                 WHERE id = $2 AND COALESCE(host_display_name, '') = ''",
+            )
+            .bind(dn)
+            .bind(meeting_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        crate::db::participants::upsert_host(&mut *tx, meeting_id, creator_id, display_name).await?
+    };
+    tx.commit().await?;
+    Ok((row, activation))
+}
+
+/// Transition an un-ended meeting to `idle` once every participant has left. Returns whether it went idle.
+pub async fn set_idle(pool: &PgPool, meeting_id: i32, healthy: bool) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let active: Option<bool> = sqlx::query_scalar(
+        "SELECT state IS NOT DISTINCT FROM 'active' FROM meetings WHERE id = $1 FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if active != Some(true)
+        || crate::db::participants::any_present(&mut *tx, meeting_id, healthy).await?
+    {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query("UPDATE meetings SET state = 'idle' WHERE id = $1")
         .bind(meeting_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Update the cached host display name.
@@ -731,19 +727,11 @@ fn password_binds(update: &PasswordUpdate) -> (bool, Option<&str>) {
     }
 }
 
-/// Atomically update the waiting_room_enabled, admitted_can_admit, end_on_host_leave,
-/// allow_guests, recording_allowed_for_all, chat_allowed_for_all, and password settings
-/// for a meeting.
-/// When disabling the waiting room, auto-admits all currently waiting participants
-/// within the same transaction to prevent race conditions.
-///
-/// `password` arrives already hashed (issue #2207); this layer never sees a
-/// plaintext.
+/// Atomically update meeting settings and password; auto-admits waiting participants if the waiting room is disabled. Authorization is the caller's job.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_meeting_settings(
     pool: &PgPool,
     room_id: &str,
-    creator_id: &str,
     waiting_room_enabled: Option<bool>,
     admitted_can_admit: Option<bool>,
     end_on_host_leave: Option<bool>,
@@ -759,21 +747,20 @@ pub async fn update_meeting_settings(
     let updated = sqlx::query_as::<_, MeetingRow>(
         r#"
         UPDATE meetings
-        SET waiting_room_enabled = COALESCE($3, waiting_room_enabled),
-            admitted_can_admit = COALESCE($4, admitted_can_admit),
-            end_on_host_leave = COALESCE($5, end_on_host_leave),
-            allow_guests = COALESCE($6, allow_guests),
-            recording_allowed_for_all = COALESCE($7, recording_allowed_for_all),
-            chat_allowed_for_all = COALESCE($8, chat_allowed_for_all),
-            password_hash = CASE WHEN $9 THEN NULL ELSE COALESCE($10, password_hash) END
-        WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+        SET waiting_room_enabled = COALESCE($2, waiting_room_enabled),
+            admitted_can_admit = COALESCE($3, admitted_can_admit),
+            end_on_host_leave = COALESCE($4, end_on_host_leave),
+            allow_guests = COALESCE($5, allow_guests),
+            recording_allowed_for_all = COALESCE($6, recording_allowed_for_all),
+            chat_allowed_for_all = COALESCE($7, chat_allowed_for_all),
+            password_hash = CASE WHEN $8 THEN NULL ELSE COALESCE($9, password_hash) END
+        WHERE room_id = $1 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
                   waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all
         "#,
     )
     .bind(room_id)
-    .bind(creator_id)
     .bind(waiting_room_enabled)
     .bind(admitted_can_admit)
     .bind(end_on_host_leave)
@@ -790,7 +777,8 @@ pub async fn update_meeting_settings(
     if let Some(ref row) = updated {
         if waiting_room_enabled == Some(false) {
             auto_admitted_user_ids = sqlx::query_scalar::<_, String>(
-                "UPDATE meeting_participants SET status = 'admitted', admitted_at = NOW() \
+                "UPDATE meeting_participants \
+                 SET status = 'admitted', admitted_at = NOW(), live_session_id = 0 \
                  WHERE meeting_id = $1 AND status = 'waiting' RETURNING user_id",
             )
             .bind(row.id)

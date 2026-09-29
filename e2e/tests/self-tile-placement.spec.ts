@@ -1,9 +1,11 @@
-import { test, expect, chromium, Browser, Page } from "@playwright/test";
+import { test, expect, chromium, Browser, Locator, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { openPeerList } from "../helpers/controls";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 import {
   MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT,
+  RECEIVED_SHARE_VIEW_KEY,
   startScreenShare,
 } from "../helpers/screen-share-meeting";
 import { enterTwoUserMeeting } from "../helpers/two-user-meeting";
@@ -645,13 +647,14 @@ test.describe("Self-view placement (issue 66)", () => {
   });
 
   // Fails un-fixed: `effective_self_placement` does not exist, so nothing reads corner-over-grid.
-  test("a remote screen share pins a grid self view to the corner, preference intact @bvt1", async ({
+  // Issue 2792: only the split (Enlarged) layout forces the corner; a share tile does not.
+  test("an enlarged remote screen share pins a grid self view to the corner, preference intact @bvt1", async ({
     baseURL,
   }) => {
     test.setTimeout(240_000);
     const meeting = await openTwoUserMeeting(baseURL || "http://localhost:3001", "share", {
       host: MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT,
-      guest: seedScript(PLACEMENT_KEY, "grid"),
+      guest: seedScript(PLACEMENT_KEY, "grid") + seedScript(RECEIVED_SHARE_VIEW_KEY, "enlarged"),
     });
     try {
       const { hostPage, guestPage } = meeting;
@@ -945,5 +948,222 @@ test.describe("Self-view hidden indicator (issue 2693)", () => {
     await expect(nav).toHaveAttribute("data-self-hidden", "false");
     expect(await readStored(page, VISIBLE_KEY)).toBe("true");
     await expect(show).toHaveCount(0, { timeout: 10_000 });
+  });
+});
+
+/** Issue 2794 — rename yourself by clicking your own name on the grid self tile. */
+const NAME_BTN = "self-tile-name-button";
+const NAME_INPUT = "self-tile-name-input";
+const NAME_ERROR = "self-tile-name-error";
+const DISPLAY_NAME_KEY = "vc_display_name";
+const RENAME_PATH = /^\/api\/v1\/meetings\/[^/]+\/display-name$/;
+/** The name `joinSoloMeeting` types into the home form. */
+const SOLO_NAME = "SelfViewUser";
+
+function isRenameRequest(method: string, url: string): boolean {
+  return method === "PUT" && RENAME_PATH.test(new URL(url).pathname);
+}
+
+/** Counts every rename PUT the page sends from now on. */
+function countRenameRequests(page: Page): () => number {
+  let sent = 0;
+  page.on("request", (req) => {
+    if (isRenameRequest(req.method(), req.url())) sent += 1;
+  });
+  return () => sent;
+}
+
+function selfNameChip(page: Page): Locator {
+  return page.locator(`${SELF_NAV} h4.floating-name.self-tile-name`);
+}
+
+function selfNameButton(page: Page): Locator {
+  return selfNameChip(page).locator(
+    `:scope > button.self-tile-name-button[data-testid="${NAME_BTN}"]`,
+  );
+}
+
+function selfNameInput(page: Page): Locator {
+  return selfNameChip(page).locator(
+    `:scope > input.self-tile-name-input[data-testid="${NAME_INPUT}"]`,
+  );
+}
+
+async function expectSelfNameShown(page: Page, name: string): Promise<void> {
+  const button = selfNameButton(page);
+  await expect(button).toHaveCount(1, { timeout: 15_000 });
+  await expect(selfNameInput(page)).toHaveCount(0);
+  await expect(button).toHaveAttribute("type", "button");
+  await expect(button).toHaveAttribute("aria-label", `Edit display name, ${name}`);
+  await expect(button.locator(":scope > span.floating-name-text")).toHaveText(name);
+  await expect(selfNameChip(page).locator(":scope > span.self-indicator")).toHaveText("You");
+}
+
+/** Click the name and prove the editor opened focused, prefilled and fully selected. */
+async function openInlineEditor(page: Page, currentName: string): Promise<Locator> {
+  await expect(page.locator(SELF_NAV)).toHaveAttribute("data-self-placement", "grid");
+  await expectSelfNameShown(page, currentName);
+  await selfNameButton(page).click();
+
+  const input = selfNameInput(page);
+  await expect(input).toHaveCount(1);
+  await expect(selfNameButton(page)).toHaveCount(0);
+  await expect(input).toHaveAttribute("type", "text");
+  await expect(input).toHaveAttribute("aria-label", "Display name");
+  await expect(input).toHaveValue(currentName);
+  await expectFocusedTestId(page, NAME_INPUT);
+  const selection = await input.evaluate((el) => {
+    const field = el as HTMLInputElement;
+    return [field.selectionStart, field.selectionEnd];
+  });
+  expect(selection, "the prefilled name must be fully selected").toEqual([0, currentName.length]);
+  return input;
+}
+
+async function joinSoloGridMeeting(
+  page: Page,
+  context: Parameters<typeof injectSessionCookie>[0],
+  baseURL: string | undefined,
+  label: string,
+): Promise<void> {
+  await injectSessionCookie(context, {
+    baseURL,
+    email: `self-rename-${label}-${Date.now()}@videocall.rs`,
+  });
+  await context.addInitScript(seedScript(PLACEMENT_KEY, "grid"));
+  await joinSoloMeeting(page, label);
+  await expect(page.locator(SELF_NAV)).toHaveAttribute("data-self-placement", "grid");
+}
+
+test.describe("Self-tile inline rename (issue 2794)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  // Fails un-fixed: the self-tile name is a plain span, so `self-tile-name-button` finds zero nodes.
+  test("click the self-tile name, type, Enter: tile, roster and the other participant all update @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const oldName = "HostUser";
+    const newName = "Renamed Chair";
+    const meeting = await openTwoUserMeeting(
+      baseURL || "http://localhost:3001",
+      `rename${Date.now()}`,
+      { host: seedScript(PLACEMENT_KEY, "grid") },
+    );
+    try {
+      const { hostPage, guestPage } = meeting;
+      const renames = countRenameRequests(hostPage);
+      const guestNames = guestPage.locator("#grid-container .floating-name .floating-name-text");
+      await expect(guestNames.filter({ hasText: oldName })).toHaveCount(1, { timeout: 20_000 });
+
+      const input = await openInlineEditor(hostPage, oldName);
+      await input.fill(newName);
+      const response = hostPage.waitForResponse((r) =>
+        isRenameRequest(r.request().method(), r.url()),
+      );
+      await input.press("Enter");
+      expect((await response).ok(), "the rename PUT must succeed").toBe(true);
+
+      await expectSelfNameShown(hostPage, newName);
+      await expectFocusedTestId(hostPage, NAME_BTN);
+      expect(renames()).toBe(1);
+      expect(await readStored(hostPage, DISPLAY_NAME_KEY)).toBe(newName);
+
+      await expect(guestNames.filter({ hasText: newName })).toHaveCount(1, { timeout: 20_000 });
+      await expect(guestNames.filter({ hasText: oldName })).toHaveCount(0);
+
+      await openPeerList(hostPage);
+      const selfRow = hostPage.locator(
+        "#peer-list-container .peer_item_name_container:has(> button.peer_item_edit_btn)",
+      );
+      await expect(selfRow).toHaveCount(1);
+      await expect(selfRow).toContainText(newName);
+      await expect(selfRow).not.toContainText(oldName);
+    } finally {
+      await meeting.close();
+    }
+  });
+
+  // Fails un-fixed: there is no name button to open the editor, so the presence assertion finds zero.
+  test("Escape discards the edit, sends no rename and returns focus to the name @bvt1", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
+    const renames = countRenameRequests(page);
+    await joinSoloGridMeeting(page, context, baseURL, "renameesc");
+
+    const input = await openInlineEditor(page, SOLO_NAME);
+    await input.fill("Discarded Name");
+    await input.press("Escape");
+
+    await expectSelfNameShown(page, SOLO_NAME);
+    await expectFocusedTestId(page, NAME_BTN);
+    await expect(page.locator(SELF_NAV)).toHaveAttribute("data-self-placement", "grid");
+    expect(await readStored(page, DISPLAY_NAME_KEY)).toBe(SOLO_NAME);
+
+    // Positive control: requests are counted in order, so exactly one after a
+    // real commit proves the Escape above sent none.
+    const committed = "Escape Survivor";
+    const again = await openInlineEditor(page, SOLO_NAME);
+    await again.fill(committed);
+    const response = page.waitForResponse((r) => isRenameRequest(r.request().method(), r.url()));
+    await again.press("Enter");
+    expect((await response).ok()).toBe(true);
+    await expectSelfNameShown(page, committed);
+    expect(renames()).toBe(1);
+  });
+
+  // Fails un-fixed: there is no name button to open the editor, so the presence assertion finds zero.
+  test("blur with a blank or unchanged name cancels without a request; an invalid name stays open @bvt1", async ({
+    page,
+    context,
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
+    const renames = countRenameRequests(page);
+    await joinSoloGridMeeting(page, context, baseURL, "renameblur");
+    const grid = page.locator("#grid-container");
+
+    const blank = await openInlineEditor(page, SOLO_NAME);
+    await blank.fill("   ");
+    await grid.focus();
+    await expectSelfNameShown(page, SOLO_NAME);
+    // A blur-cancel must not pull focus back from where the user moved it.
+    expect(await page.evaluate(() => document.activeElement?.id ?? null)).toBe("grid-container");
+
+    await openInlineEditor(page, SOLO_NAME);
+    await grid.focus();
+    await expectSelfNameShown(page, SOLO_NAME);
+
+    const invalid = await openInlineEditor(page, SOLO_NAME);
+    await invalid.fill("Bad<Name>");
+    await invalid.press("Enter");
+    const error = page.locator(`[data-testid="${NAME_ERROR}"]`);
+    await expect(error).toHaveCount(1);
+    await expect(error).toHaveAttribute("role", "alert");
+    await expect(error).toHaveAttribute("id", NAME_ERROR);
+    await expect(error).toContainText("Invalid character");
+    await expect(invalid).toHaveAttribute("aria-invalid", "true");
+    await expect(invalid).toHaveAttribute("aria-describedby", NAME_ERROR);
+    await expect(invalid).toHaveValue("Bad<Name>");
+    await invalid.press("Escape");
+    await expectSelfNameShown(page, SOLO_NAME);
+    await expect(error).toHaveCount(0);
+    expect(await readStored(page, DISPLAY_NAME_KEY)).toBe(SOLO_NAME);
+
+    // Positive control: a valid name committed by blur is the first and only request.
+    const committed = "Blur Committed";
+    const valid = await openInlineEditor(page, SOLO_NAME);
+    await valid.fill(committed);
+    const response = page.waitForResponse((r) => isRenameRequest(r.request().method(), r.url()));
+    await grid.focus();
+    expect((await response).ok()).toBe(true);
+    await expectSelfNameShown(page, committed);
+    expect(renames()).toBe(1);
+    expect(await readStored(page, DISPLAY_NAME_KEY)).toBe(committed);
   });
 });

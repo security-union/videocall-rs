@@ -37,6 +37,10 @@
 //! window.__vcNetsim.bumpWsDrop(6);      // WS send-buffer drops
 //! window.__vcNetsim.bumpWtDrop(6);      // WT write-drop (teardown) events
 //! window.__vcNetsim.bumpStaleDeltaDrop(15); // camera stale-delta age-drops
+//! window.__vcNetsim.bumpWsStaleDeltaDrop(15); // camera WS freshness-gate drops
+//! window.__vcNetsim.bumpCameraUplinkStall(8); // camera WT slow-ready() events
+//! window.__vcNetsim.setWsBufferedOverride(131072); // stand-in WS bufferedAmount; null clears
+//! window.__vcNetsim.forceCameraKeyframe(); // raise the camera PLI flag
 //! ```
 //!
 //! ### Why `window.*` registration, not a `#[wasm_bindgen]` export
@@ -62,6 +66,8 @@
 //! plumbing. Default builds never register the hook and never touch
 //! `window`.
 
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use log::{info, warn};
@@ -70,6 +76,35 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 
 use super::netsim_hook::{clear_hook, install_hook_for_direction};
+use super::webmedia::MediaStreamKey;
+
+thread_local! {
+    static WS_BUFFERED_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+    static CAMERA_FORCE_KEYFRAME: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// Registered by `VideoCallClient::new`; the last registration wins.
+pub(crate) fn register_camera_force_keyframe_for_netsim(flag: Arc<AtomicBool>) {
+    CAMERA_FORCE_KEYFRAME.with(|cell| *cell.borrow_mut() = Some(flag));
+}
+
+pub(crate) fn force_camera_keyframe_for_netsim() -> bool {
+    CAMERA_FORCE_KEYFRAME.with(|cell| match cell.borrow().as_ref() {
+        Some(flag) => {
+            flag.store(true, Ordering::Release);
+            true
+        }
+        None => false,
+    })
+}
+
+pub(crate) fn ws_buffered_override_for_netsim() -> Option<u64> {
+    WS_BUFFERED_OVERRIDE.with(Cell::get)
+}
+
+pub(crate) fn set_ws_buffered_override_for_netsim(bytes: Option<u64>) {
+    WS_BUFFERED_OVERRIDE.with(|cell| cell.set(bytes));
+}
 
 /// Parse the `"up"` / `"down"` direction string. Case-insensitive,
 /// trimmed. Returns `None` for anything else.
@@ -249,6 +284,78 @@ fn register_on_window() -> bool {
             }
         });
 
+    let bump_ws_stale_delta_drop =
+        Closure::<dyn Fn(JsValue) -> JsValue>::new(|n: JsValue| -> JsValue {
+            let count = n.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64);
+            match count {
+                Some(c) => {
+                    crate::encode::camera_encoder::bump_camera_ws_stale_delta_drops_for_netsim(c);
+                    info!("__vcNetsim.bumpWsStaleDeltaDrop: +{c} camera WS freshness-gate drops");
+                    JsValue::from_bool(true)
+                }
+                None => {
+                    warn!(
+                        "__vcNetsim.bumpWsStaleDeltaDrop: argument must be a non-negative number"
+                    );
+                    JsValue::from_bool(false)
+                }
+            }
+        });
+
+    let bump_camera_uplink_stall =
+        Closure::<dyn Fn(JsValue) -> JsValue>::new(|n: JsValue| -> JsValue {
+            let count = n.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64);
+            match count {
+                Some(c) => {
+                    videocall_transport::webtransport::force_unistream_ready_stall_for_stream(
+                        MediaStreamKey::Video.as_u8(),
+                        c,
+                    );
+                    info!("__vcNetsim.bumpCameraUplinkStall: +{c} camera WT ready-stall events");
+                    JsValue::from_bool(true)
+                }
+                None => {
+                    warn!(
+                        "__vcNetsim.bumpCameraUplinkStall: argument must be a non-negative number"
+                    );
+                    JsValue::from_bool(false)
+                }
+            }
+        });
+
+    let set_ws_buffered_override = Closure::<dyn Fn(JsValue) -> JsValue>::new(
+        |bytes: JsValue| -> JsValue {
+            if bytes.is_null() || bytes.is_undefined() {
+                set_ws_buffered_override_for_netsim(None);
+                info!("__vcNetsim.setWsBufferedOverride: cleared");
+                return JsValue::from_bool(true);
+            }
+            match bytes.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64) {
+                Some(b) => {
+                    set_ws_buffered_override_for_netsim(Some(b));
+                    info!("__vcNetsim.setWsBufferedOverride: {b} bytes");
+                    JsValue::from_bool(true)
+                }
+                None => {
+                    warn!(
+                        "__vcNetsim.setWsBufferedOverride: argument must be a non-negative number or null"
+                    );
+                    JsValue::from_bool(false)
+                }
+            }
+        },
+    );
+
+    let force_camera_keyframe = Closure::<dyn Fn() -> JsValue>::new(|| -> JsValue {
+        let raised = force_camera_keyframe_for_netsim();
+        if raised {
+            info!("__vcNetsim.forceCameraKeyframe: camera PLI flag raised");
+        } else {
+            warn!("__vcNetsim.forceCameraKeyframe: no VideoCallClient has registered its flag");
+        }
+        JsValue::from_bool(raised)
+    });
+
     let set_ok = js_sys::Reflect::set(
         &obj,
         &JsValue::from_str("install"),
@@ -289,6 +396,34 @@ fn register_on_window() -> bool {
             bump_stale_delta_drop.as_ref().unchecked_ref(),
         )
     })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("bumpWsStaleDeltaDrop"),
+            bump_ws_stale_delta_drop.as_ref().unchecked_ref(),
+        )
+    })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("bumpCameraUplinkStall"),
+            bump_camera_uplink_stall.as_ref().unchecked_ref(),
+        )
+    })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("setWsBufferedOverride"),
+            set_ws_buffered_override.as_ref().unchecked_ref(),
+        )
+    })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("forceCameraKeyframe"),
+            force_camera_keyframe.as_ref().unchecked_ref(),
+        )
+    })
     .and_then(|_| js_sys::Reflect::set(&window, &JsValue::from_str("__vcNetsim"), &obj))
     .is_ok();
 
@@ -299,7 +434,7 @@ fn register_on_window() -> bool {
 
     // Leak the closures so they outlive this function for the tab's
     // lifetime — the window object now holds them and may call back at
-    // any time. This is a one-time, bounded leak (six closures per tab,
+    // any time. This is a one-time, bounded leak (ten closures per tab,
     // installed once via the `Once` in `install_window_hook`).
     install.forget();
     clear.forget();
@@ -307,9 +442,13 @@ fn register_on_window() -> bool {
     bump_ws_drop.forget();
     bump_wt_drop.forget();
     bump_stale_delta_drop.forget();
+    bump_ws_stale_delta_drop.forget();
+    bump_camera_uplink_stall.forget();
+    set_ws_buffered_override.forget();
+    force_camera_keyframe.forget();
 
     info!(
-        "netsim: window.__vcNetsim installed (install/clear/bumpUplinkStall/bumpWsDrop/bumpWtDrop/bumpStaleDeltaDrop)"
+        "netsim: window.__vcNetsim installed (install/clear/bumpUplinkStall/bumpWsDrop/bumpWtDrop/bumpStaleDeltaDrop/bumpWsStaleDeltaDrop/bumpCameraUplinkStall/setWsBufferedOverride/forceCameraKeyframe)"
     );
     true
 }
@@ -330,5 +469,25 @@ mod tests {
         assert_eq!(parse_direction(""), None);
         assert_eq!(parse_direction("sideways"), None);
         assert_eq!(parse_direction("updown"), None);
+    }
+
+    #[test]
+    fn force_camera_keyframe_raises_the_registered_flag() {
+        assert!(!force_camera_keyframe_for_netsim());
+        let flag = Arc::new(AtomicBool::new(false));
+        register_camera_force_keyframe_for_netsim(flag.clone());
+        assert!(force_camera_keyframe_for_netsim());
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn force_camera_keyframe_raises_only_the_last_registered_flag() {
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        register_camera_force_keyframe_for_netsim(first.clone());
+        register_camera_force_keyframe_for_netsim(second.clone());
+        assert!(force_camera_keyframe_for_netsim());
+        assert!(!first.load(Ordering::Acquire));
+        assert!(second.load(Ordering::Acquire));
     }
 }

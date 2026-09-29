@@ -8,13 +8,14 @@
 
 use crate::context::{DockPosition, SelfViewPlacement};
 
-/// Falls back to `Corner` while a share is on screen. Presentation-time only:
-/// the stored preference is untouched, so the tile returns by itself.
+/// Falls back to `Corner` while the split (Enlarged) share layout is on
+/// screen. Presentation-time only: the stored preference is untouched, so the
+/// tile returns by itself.
 pub fn effective_self_placement(
     preference: SelfViewPlacement,
-    has_screen_share: bool,
+    split_layout: bool,
 ) -> SelfViewPlacement {
-    if has_screen_share {
+    if split_layout {
         SelfViewPlacement::Corner
     } else {
         preference
@@ -28,7 +29,9 @@ pub struct SelfTileCounts {
     pub self_in_grid: bool,
     /// Tiles that own a decoder. Remote peers and mocks; never the self tile.
     pub decode_count: usize,
-    /// Grid cells to lay out: `decode_count` plus the self cell.
+    /// Share tiles laid out as grid cells (issue 2792); like self, no decoder.
+    pub share_cells: usize,
+    /// Grid cells to lay out: `decode_count` plus the self and share cells.
     pub layout_count: usize,
 }
 
@@ -38,15 +41,17 @@ pub fn self_tile_counts(
     mock_count: usize,
     placement: SelfViewPlacement,
     visible: bool,
-    has_screen_share: bool,
+    split_layout: bool,
+    share_cells: usize,
 ) -> SelfTileCounts {
-    let effective = effective_self_placement(placement, has_screen_share);
+    let effective = effective_self_placement(placement, split_layout);
     let self_in_grid = visible && effective == SelfViewPlacement::Grid;
     let decode_count = remote_count + mock_count;
     SelfTileCounts {
         self_in_grid,
         decode_count,
-        layout_count: decode_count + usize::from(self_in_grid),
+        share_cells,
+        layout_count: decode_count + usize::from(self_in_grid) + share_cells,
     }
 }
 
@@ -57,13 +62,13 @@ pub fn remote_capacity(cells_that_fit: usize, counts: &SelfTileCounts) -> usize 
         return 0;
     }
     cells_that_fit
-        .saturating_sub(usize::from(counts.self_in_grid))
+        .saturating_sub(usize::from(counts.self_in_grid) + counts.share_cells)
         .max(1)
 }
 
-/// A lone remote fills the grid only while self is not taking a cell.
+/// A lone remote fills the grid only while no self or share tile takes a cell.
 pub fn remote_full_bleed(sole_real_tile: bool, counts: &SelfTileCounts) -> bool {
-    sole_real_tile && !counts.self_in_grid
+    sole_real_tile && !counts.self_in_grid && counts.share_cells == 0
 }
 
 /// The self tile fills the grid when it is the only cell in it.
@@ -218,7 +223,7 @@ mod tests {
 
     #[test]
     fn corner_placement_leaves_both_counts_remote_only() {
-        let c = self_tile_counts(3, 0, SelfViewPlacement::Corner, true, false);
+        let c = self_tile_counts(3, 0, SelfViewPlacement::Corner, true, false, 0);
         assert_eq!(c.decode_count, 3);
         assert_eq!(c.layout_count, 3);
         assert!(!c.self_in_grid);
@@ -226,7 +231,7 @@ mod tests {
 
     #[test]
     fn grid_placement_adds_a_cell_but_never_a_decoder() {
-        let c = self_tile_counts(3, 0, SelfViewPlacement::Grid, true, false);
+        let c = self_tile_counts(3, 0, SelfViewPlacement::Grid, true, false, 0);
         assert_eq!(c.decode_count, 3, "self has no decoder");
         assert_eq!(c.layout_count, 4, "self takes a grid cell");
         assert!(c.self_in_grid);
@@ -234,7 +239,7 @@ mod tests {
 
     #[test]
     fn mock_peers_count_toward_both_populations() {
-        let c = self_tile_counts(2, 3, SelfViewPlacement::Grid, true, false);
+        let c = self_tile_counts(2, 3, SelfViewPlacement::Grid, true, false, 0);
         assert_eq!(c.decode_count, 5);
         assert_eq!(c.layout_count, 6);
     }
@@ -242,7 +247,7 @@ mod tests {
     #[test]
     fn hidden_self_takes_no_cell_in_either_placement() {
         for placement in [SelfViewPlacement::Corner, SelfViewPlacement::Grid] {
-            let c = self_tile_counts(2, 0, placement, false, false);
+            let c = self_tile_counts(2, 0, placement, false, false, 0);
             assert!(!c.self_in_grid, "hidden self never occupies a cell");
             assert_eq!(c.layout_count, 2);
             assert_eq!(c.decode_count, 2);
@@ -251,7 +256,7 @@ mod tests {
 
     #[test]
     fn screen_share_returns_a_grid_self_to_the_corner_counts() {
-        let c = self_tile_counts(2, 0, SelfViewPlacement::Grid, true, true);
+        let c = self_tile_counts(2, 0, SelfViewPlacement::Grid, true, true, 0);
         assert!(!c.self_in_grid);
         assert_eq!(c.layout_count, 2);
         assert_eq!(c.decode_count, 2);
@@ -259,14 +264,14 @@ mod tests {
 
     #[test]
     fn one_remote_is_full_bleed_only_while_self_is_in_the_corner() {
-        let corner = self_tile_counts(1, 0, SelfViewPlacement::Corner, true, false);
+        let corner = self_tile_counts(1, 0, SelfViewPlacement::Corner, true, false, 0);
         assert!(
             remote_full_bleed(true, &corner),
             "1 remote + corner self = a lone tile"
         );
         assert!(!self_full_bleed(&corner));
 
-        let grid = self_tile_counts(1, 0, SelfViewPlacement::Grid, true, false);
+        let grid = self_tile_counts(1, 0, SelfViewPlacement::Grid, true, false, 0);
         assert!(
             !remote_full_bleed(true, &grid),
             "1 remote + self in grid = two tiles, neither full-bleed"
@@ -276,7 +281,7 @@ mod tests {
 
     #[test]
     fn solo_in_grid_makes_the_self_tile_the_full_bleed_one() {
-        let grid = self_tile_counts(0, 0, SelfViewPlacement::Grid, true, false);
+        let grid = self_tile_counts(0, 0, SelfViewPlacement::Grid, true, false, 0);
         assert_eq!(grid.layout_count, 1);
         assert!(self_full_bleed(&grid), "self alone fills the grid");
         assert!(
@@ -284,7 +289,7 @@ mod tests {
             "there is no remote tile to fill it"
         );
 
-        let corner = self_tile_counts(0, 0, SelfViewPlacement::Corner, true, false);
+        let corner = self_tile_counts(0, 0, SelfViewPlacement::Corner, true, false, 0);
         assert_eq!(corner.layout_count, 0);
         assert!(!self_full_bleed(&corner));
         assert!(!remote_full_bleed(false, &corner));
@@ -293,7 +298,7 @@ mod tests {
     #[test]
     fn a_grid_self_beside_remotes_is_not_the_lone_cell() {
         for remotes in [1usize, 2, 5] {
-            let c = self_tile_counts(remotes, 0, SelfViewPlacement::Grid, true, false);
+            let c = self_tile_counts(remotes, 0, SelfViewPlacement::Grid, true, false, 0);
             assert!(
                 !self_full_bleed(&c),
                 "{remotes} remotes share the grid with self"
@@ -304,10 +309,47 @@ mod tests {
 
     #[test]
     fn a_hidden_or_share_suppressed_self_leaves_the_lone_remote_full_bleed() {
-        let hidden = self_tile_counts(1, 0, SelfViewPlacement::Grid, false, false);
+        let hidden = self_tile_counts(1, 0, SelfViewPlacement::Grid, false, false, 0);
         assert!(remote_full_bleed(true, &hidden));
-        let shared = self_tile_counts(1, 0, SelfViewPlacement::Grid, true, true);
+        let shared = self_tile_counts(1, 0, SelfViewPlacement::Grid, true, true, 0);
         assert!(remote_full_bleed(true, &shared));
+    }
+
+    #[test]
+    fn share_cells_take_grid_cells_but_no_decoder() {
+        let c = self_tile_counts(3, 0, SelfViewPlacement::Corner, true, false, 2);
+        assert_eq!(c.decode_count, 3);
+        assert_eq!(c.layout_count, 5);
+        assert_eq!(
+            remote_capacity(4, &c),
+            2,
+            "share cells are reserved before remotes, never pushed into +N"
+        );
+    }
+
+    #[test]
+    fn a_share_cell_stops_a_lone_remote_going_full_bleed() {
+        let c = self_tile_counts(1, 0, SelfViewPlacement::Corner, true, false, 1);
+        assert!(!remote_full_bleed(true, &c));
+        assert!(!self_full_bleed(&self_tile_counts(
+            0,
+            0,
+            SelfViewPlacement::Grid,
+            true,
+            false,
+            1
+        )));
+    }
+
+    #[test]
+    fn only_the_split_layout_forces_the_corner() {
+        let tile_layout = self_tile_counts(2, 0, SelfViewPlacement::Grid, true, false, 1);
+        assert!(
+            tile_layout.self_in_grid,
+            "a share tile alone keeps the grid self"
+        );
+        let split = self_tile_counts(2, 0, SelfViewPlacement::Grid, true, true, 0);
+        assert!(!split.self_in_grid);
     }
 
     #[test]
@@ -318,20 +360,20 @@ mod tests {
 
     #[test]
     fn a_one_cell_viewport_still_leaves_room_for_one_remote() {
-        let grid = self_tile_counts(1, 0, SelfViewPlacement::Grid, true, false);
+        let grid = self_tile_counts(1, 0, SelfViewPlacement::Grid, true, false, 0);
         assert_eq!(
             remote_capacity(1, &grid),
             1,
             "a zero here starves the decode limit and avatars every peer"
         );
 
-        let corner = self_tile_counts(1, 0, SelfViewPlacement::Corner, true, false);
+        let corner = self_tile_counts(1, 0, SelfViewPlacement::Corner, true, false, 0);
         assert_eq!(remote_capacity(1, &corner), 1);
     }
 
     #[test]
     fn remote_capacity_subtracts_the_self_cell_when_there_is_room() {
-        let grid = self_tile_counts(5, 0, SelfViewPlacement::Grid, true, false);
+        let grid = self_tile_counts(5, 0, SelfViewPlacement::Grid, true, false, 0);
         assert_eq!(remote_capacity(6, &grid), 5);
         assert_eq!(
             remote_capacity(4, &grid),
@@ -339,7 +381,7 @@ mod tests {
             "a shrunken grid sheds remotes"
         );
 
-        let corner = self_tile_counts(5, 0, SelfViewPlacement::Corner, true, false);
+        let corner = self_tile_counts(5, 0, SelfViewPlacement::Corner, true, false, 0);
         assert_eq!(
             remote_capacity(4, &corner),
             4,
@@ -349,7 +391,7 @@ mod tests {
 
     #[test]
     fn an_empty_grid_has_no_remote_capacity_to_floor() {
-        let empty = self_tile_counts(0, 0, SelfViewPlacement::Corner, true, false);
+        let empty = self_tile_counts(0, 0, SelfViewPlacement::Corner, true, false, 0);
         assert_eq!(empty.layout_count, 0);
         assert_eq!(
             remote_capacity(0, &empty),

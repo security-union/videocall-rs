@@ -16,6 +16,9 @@ use crate::auth::{
     UserProfile,
 };
 use crate::components::attendants::AttendantsComponent;
+use crate::components::invalid_meeting_id::{
+    invalid_meeting_id_message, meeting_route_id_error, InvalidMeetingIdNotice,
+};
 use crate::components::meeting_password_prompt::{
     next_prompt_state, password_prompt_reason, MeetingPasswordPrompt, PasswordPromptReason,
     PasswordPromptState,
@@ -25,10 +28,10 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
 };
 use crate::context::{
-    email_to_display_name, get_or_create_local_user_id, is_guid_like,
+    display_name_owner_id, email_to_display_name, get_or_create_local_user_id, is_guid_like,
     load_display_name_from_storage, load_transport_preference_with_source,
-    resolve_transport_config, save_display_name_to_storage, validate_display_name, DisplayNameCtx,
-    HostRefreshNonceCtx, TransportPreferenceCtx,
+    resolve_transport_config, save_display_name_owner_to_storage, save_display_name_to_storage,
+    validate_display_name, DisplayNameCtx, HostRefreshNonceCtx, TransportPreferenceCtx,
 };
 use crate::meeting_api::{
     get_meeting_guest_info, get_meeting_info, join_meeting, JoinError, JoinMeetingResponse,
@@ -67,11 +70,20 @@ pub enum MeetingStatus {
         chat_allowed_for_all: bool,
     },
     Rejected,
+    InvalidMeetingId(String),
     Error(String),
 }
 
 #[component]
 pub fn MeetingPage(id: String) -> Element {
+    match meeting_route_id_error(&id) {
+        Some(reason) => rsx! { InvalidMeetingIdNotice { reason } },
+        None => rsx! { MeetingPageContent { id } },
+    }
+}
+
+#[component]
+fn MeetingPageContent(id: String) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
@@ -159,6 +171,9 @@ pub fn MeetingPage(id: String) -> Element {
                             if !display_name.is_empty() {
                                 if let Ok(valid_name) = validate_display_name(&display_name) {
                                     save_display_name_to_storage(&valid_name);
+                                    save_display_name_owner_to_storage(&display_name_owner_id(
+                                        &profile.user_id,
+                                    ));
                                     display_name_ctx.0.set(Some(valid_name.clone()));
                                     input_value_state.set(valid_name);
                                 }
@@ -613,6 +628,10 @@ pub fn MeetingPage(id: String) -> Element {
                     Err(e) => {
                         observer_token_signal.set(None);
                         pending_password.set(None);
+                        if let Some(reason) = invalid_meeting_id_message(&e) {
+                            meeting_status.set(MeetingStatus::InvalidMeetingId(reason));
+                            return;
+                        }
                         match password_prompt_reason(&e, supplied_password) {
                             // Issue 1613. Driven by the server's answer, not by
                             // the meeting's `has_password` flag — see
@@ -934,6 +953,9 @@ pub fn MeetingPage(id: String) -> Element {
                     }
                 }
             },
+            (_, MeetingStatus::InvalidMeetingId(reason)) => rsx! {
+                InvalidMeetingIdNotice { reason: reason.clone() }
+            },
             (Some(_), MeetingStatus::Error(error)) => rsx! {
                 // `data-testid` for bots-app meeting-error detection
                 // (see e2e/bots-app/src/meeting-join.ts). The base
@@ -1013,6 +1035,9 @@ pub fn MeetingPage(id: String) -> Element {
                                         match validate_display_name(&raw) {
                                             Ok(valid_name) => {
                                                 save_display_name_to_storage(&valid_name);
+                                                if let Some(profile) = user_profile.peek().as_ref() {
+                                                    save_display_name_owner_to_storage(&display_name_owner_id(&profile.user_id));
+                                                }
                                                 (display_name_ctx.0).set(Some(valid_name));
                                             }
                                             Err(msg) => {

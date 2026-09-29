@@ -29,13 +29,22 @@ targets = ["wasm32-unknown-unknown"]
 # dioxus-ui e2e build sets `TRUNK_BUILD_FEATURES=netsim`).
 netsim = []
 
+[[bin]]
+name = "wt_session_worker"
+path = "src/bin/wt_session_worker.rs"
+# The bin holds no tests; without this a wasm32 `cargo test` links a second
+# test executable from it.
+test = false
+
 [dependencies]
 anyhow = { workspace = true }
 futures = "0.3"
 gloo = "0.8.0"
 gloo-console = "0.3"
+gloo-timers = { version = "0.2", features = ["futures"] }
 js-sys = "0.3"
 log = "0.4"
+protobuf = "3.3.0"
 thiserror = "1.0"
 videocall-types = { path = "../videocall-types", version = "5.0.0" }
 wasm-bindgen = { workspace = true }
@@ -46,21 +55,42 @@ version = "0.3"
 features = [
     "BinaryType",
     "CloseEvent",
+    "DedicatedWorkerGlobalScope",
+    "ErrorEvent",
     "Event",
     "MessageEvent",
     "Performance",
+    "MessageChannel",
+    "MessageEvent",
+    "MessagePort",
     "ReadableStream",
+    "TransformStream",
     "ReadableStreamDefaultReader",
     "WebSocket",
+    "Worker",
+    "WorkerGlobalScope",
+    "WorkerOptions",
+    "WorkerType",
     "WebTransport",
     "WebTransportBidirectionalStream",
     "WebTransportDatagramDuplexStream",
     "WebTransportHash",
     "WebTransportOptions",
     "WebTransportReceiveStream",
+    "WebTransportSendStreamOptions",
     "WritableStream",
     "WritableStreamDefaultWriter",
     "ReadableStreamReadResult",
     "WebTransportSendStream",
     "Window",
 ]
+
+# Only the wasm session-worker bin installs the panic hook.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+# The inbound framing tests moved here from videocall-client with #2728 and
+# include browser-only cases; this matches that crate's dev-dependency so the
+# move is behaviour-preserving.
+wasm-bindgen-test = "0.3.20"

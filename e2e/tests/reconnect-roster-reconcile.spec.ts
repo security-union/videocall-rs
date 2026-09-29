@@ -1,5 +1,9 @@
 import { test, expect, chromium, Page } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 import { joinMeetingFromPage } from "../helpers/two-user-meeting";
@@ -78,18 +82,21 @@ test.describe("Reconnect roster reconcile (#2267)", () => {
         OBSERVER_NAME,
         uiURL,
       );
+      await pinWebSocketTransport(observerCtx);
       const resumerCtx = await createAuthenticatedContext(
         resumerBrowser,
         RESUMER_EMAIL,
         RESUMER_NAME,
         uiURL,
       );
+      await pinWebSocketTransport(resumerCtx);
       const stayerCtx = await createAuthenticatedContext(
         stayerBrowser,
         STAYER_EMAIL,
         STAYER_NAME,
         uiURL,
       );
+      await pinWebSocketTransport(stayerCtx);
 
       // Camera defaults OFF in e2e; these two need it ON so RESUMER's successor tile
       // appears. STAYER stays OFF: publishing no media is the case (b) guards, and

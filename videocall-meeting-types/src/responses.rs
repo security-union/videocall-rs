@@ -88,6 +88,28 @@ pub struct CreateMeetingResponse {
     pub recording_allowed_for_all: bool,
     #[serde(default = "default_true")]
     pub chat_allowed_for_all: bool,
+    #[serde(default)]
+    pub co_hosts: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct CoHostEntry {
+    pub user_id: String,
+    pub persistent: bool,
+    pub is_present_host: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// `false` for a present host with no co-host entry (e.g. a transfer target).
+    #[serde(default = "default_true")]
+    pub designated: bool,
+    /// Won't re-grant the host role until the next instance.
+    #[serde(default)]
+    pub suspended: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListCoHostsResponse {
+    pub co_hosts: Vec<CoHostEntry>,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -120,6 +142,10 @@ pub struct MeetingInfoResponse {
     pub recording_allowed_for_all: bool,
     #[serde(default = "default_true")]
     pub chat_allowed_for_all: bool,
+    #[serde(default)]
+    pub viewer_is_owner: bool,
+    #[serde(default)]
+    pub viewer_can_edit_options: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings`.
@@ -245,14 +271,11 @@ pub struct MeetingFeedSummary {
     /// The host's `user_id` (i.e. `creator_id`). Canonical alias of `host`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_user_id: Option<String>,
-    /// `true` when `creator_id == authenticated_user_id`.
-    ///
-    /// **Server-computed.** This is the authoritative trust signal the UI
-    /// must use to decide whether to render owner-only affordances
-    /// (Owner pill, edit, delete, end-meeting). Do not infer ownership from
-    /// any other field.
+    /// Server-computed; the authoritative ownership signal.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_owner: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_co_host: bool,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub participant_count: i64,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
@@ -530,6 +553,7 @@ mod tests {
             host_display_name: None,
             host_user_id: Some("host@example.com".to_string()),
             is_owner: false,
+            is_co_host: false,
             participant_count: 0,
             waiting_count: 0,
             has_password: false,
@@ -555,6 +579,7 @@ mod tests {
             host_display_name: Some("Owner Name".to_string()),
             host_user_id: Some("owner@example.com".to_string()),
             is_owner: true,
+            is_co_host: true,
             participant_count: 5,
             waiting_count: 3,
             has_password: true,
@@ -580,6 +605,7 @@ mod tests {
         // 4. For the all-default instance, the default-valued scalar fields
         // must be OMITTED from the wire (bandwidth win for the home feed).
         assert!(!json_default.contains("\"is_owner\""));
+        assert!(!json_default.contains("\"is_co_host\""));
         assert!(!json_default.contains("\"participant_count\""));
         assert!(!json_default.contains("\"waiting_room_enabled\""));
         assert!(!json_default.contains("\"end_on_host_leave\""));
@@ -589,6 +615,7 @@ mod tests {
         // be PRESENT. `waiting_room_enabled` is `false` (non-default for a
         // default-true field) so it MUST be emitted; `is_owner` is `true`.
         assert!(json_non_default.contains("\"waiting_room_enabled\""));
+        assert!(json_non_default.contains("\"is_co_host\""));
         assert!(json_non_default.contains("\"is_owner\""));
     }
 }

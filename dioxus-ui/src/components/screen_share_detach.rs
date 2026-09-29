@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Issue 1175: imperative glue for detaching RECEIVED shared content into a
-//! separate window. wasm-only.
+//! Issue 1175: imperative glue for detaching shared content into a separate
+//! window: a received share's canvas, or (issue 2792) the local capture stream.
+//! wasm-only.
 //!
 //! ## Why this never fights Dioxus (the whole point of the v2 rewrite)
 //!
@@ -16,8 +17,8 @@
 //!
 //! ## Refined behaviour (issue 1175, user test round)
 //!
-//! While detached, the MAIN window renders as a regular no-share meeting: the
-//! split share pane is hidden off-screen (canvas kept mounted + painting so the
+//! While detached, the MAIN window shows the normal grid without the share
+//! tile: that tile is moved off-screen (canvas kept mounted + painting so the
 //! mirror stays live — an off-screen, still-composited canvas keeps delivering
 //! `captureStream` frames, and the active sharer is unconditionally in
 //! `active_decode_set` so decode never stops). ALL detach affordances — zoom
@@ -81,6 +82,7 @@ const METRICS_ID: &str = "ss-detached-metrics";
 /// peer-controlled text must not reach OS window chrome (security), and a fixed
 /// string also fixes the blank `about:blank` popup title.
 const DETACHED_WINDOW_TITLE: &str = "Shared content";
+const OWN_WINDOW_TITLE: &str = "Your shared content";
 
 // ---------------------------------------------------------------------------
 // Detached-window sizing (issue #1842): the pure aspect-fit / clamp math lives in
@@ -112,6 +114,8 @@ struct DetachState {
     peer: String,
     win: Window,
     mirror: Mirror,
+    source: DetachSource,
+    title: &'static str,
     /// Reattach callback (flips the Dioxus `DetachedShareCtx` to `None`).
     on_reattach: Box<dyn Fn()>,
     /// Per-detached-window zoom/pan state (independent of main-window zoom).
@@ -159,10 +163,14 @@ enum ClosureKind {
     Wheel(Closure<dyn FnMut(WheelEvent)>),
 }
 
+type PageLeaveListener = Closure<dyn FnMut(web_sys::Event)>;
+
 thread_local! {
     static DETACH: RefCell<Option<DetachState>> = const { RefCell::new(None) };
     /// A `requestWindow` promise is in flight (Document PiP is async).
     static PENDING: Cell<bool> = const { Cell::new(false) };
+    /// The key whose open is `PENDING`.
+    static PENDING_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Set by [`reattach`] while an open is still `PENDING`, so the async
     /// resolution self-closes instead of stranding a cancelled window.
     static CANCEL_PENDING: Cell<bool> = const { Cell::new(false) };
@@ -174,10 +182,64 @@ thread_local! {
     /// stopped; it is dropped on the next migration or on [`teardown`]. Holds at
     /// most one entry (one-at-a-time detach).
     static RETIRED: RefCell<Vec<DetachState>> = const { RefCell::new(Vec::new()) };
+    /// Main-window `pagehide` listener, armed while a detached window is open.
+    static PAGE_LEAVE: RefCell<Option<PageLeaveListener>> = const { RefCell::new(None) };
 }
 
-fn is_busy() -> bool {
+pub fn is_busy() -> bool {
     DETACH.with(|d| d.borrow().is_some()) || PENDING.with(|p| p.get())
+}
+
+/// Whether `key`'s open is still waiting on `requestWindow`.
+pub fn is_pending(key: &str) -> bool {
+    PENDING.with(|p| p.get()) && PENDING_KEY.with(|k| k.borrow().as_deref() == Some(key))
+}
+
+/// Close every detached window without a reattach, for a page that is being
+/// left (the leave paths navigate away without unmounting any tile).
+pub fn close_all() {
+    listen_for_page_leave(false);
+    if PENDING.with(|p| p.get()) {
+        CANCEL_PENDING.with(|c| c.set(true));
+    }
+    RETIRED.with(|r| r.borrow_mut().clear());
+    let Some(mut state) = DETACH.with(|d| d.borrow_mut().take()) else {
+        return;
+    };
+    if let Some(id) = state.close_poll_id.take() {
+        state.win.clear_interval_with_handle(id);
+    }
+    if let Some(id) = state.metrics_poll_id.take() {
+        state.win.clear_interval_with_handle(id);
+    }
+    let _ = state.win.close();
+    state.mirror.stop();
+}
+
+/// `persisted`: the page goes into the back/forward cache and may be shown again.
+fn leave_page(event: web_sys::Event) {
+    let persisted =
+        js_sys::Reflect::get(&event, &JsValue::from_str("persisted")).is_ok_and(|p| p.is_truthy());
+    if !persisted {
+        close_all();
+    } else if let Some(key) = DETACH.with(|d| d.borrow().as_ref().map(|s| s.peer.clone())) {
+        super::share_view::teardown_with_cause(&key, super::share_view::TeardownCause::System);
+    }
+}
+
+fn listen_for_page_leave(on: bool) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    PAGE_LEAVE.with(|l| {
+        let mut l = l.borrow_mut();
+        let cb = l.get_or_insert_with(|| PageLeaveListener::new(leave_page));
+        let _ = if on {
+            win.add_event_listener_with_callback("pagehide", cb.as_ref().unchecked_ref())
+        } else {
+            win.remove_event_listener_with_callback("pagehide", cb.as_ref().unchecked_ref())
+        };
+    });
 }
 
 /// Next monotonic detached-session id.
@@ -249,8 +311,17 @@ fn teardown_if_session(peer: &str, session: u64) {
 // Mirror seam.
 // ---------------------------------------------------------------------------
 
+/// What the detached window shows: a received share's decoder canvas, or the
+/// local capture itself (issue 2792).
+#[derive(Clone)]
+enum DetachSource {
+    Canvas(HtmlCanvasElement),
+    Stream(MediaStream),
+}
+
 struct Mirror {
     stream: MediaStream,
+    owned: bool,
 }
 
 impl Mirror {
@@ -258,8 +329,19 @@ impl Mirror {
     /// fails (e.g. a tainted canvas — never expected here). Explicit `play()` is
     /// what actually makes frames appear; the `autoplay` attribute alone is
     /// unreliable for a programmatically-built srcObject video.
-    fn start(source: &HtmlCanvasElement, video: &HtmlVideoElement) -> Option<Mirror> {
-        let stream = match source.capture_stream() {
+    fn start(source: &DetachSource, video: &HtmlVideoElement) -> Option<Mirror> {
+        let canvas = match source {
+            DetachSource::Canvas(c) => c,
+            DetachSource::Stream(stream) => {
+                video.set_src_object(Some(stream));
+                play_video(video);
+                return Some(Mirror {
+                    stream: Clone::clone(stream),
+                    owned: false,
+                });
+            }
+        };
+        let stream = match canvas.capture_stream() {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("issue 1175: canvas.captureStream failed, cannot detach: {e:?}");
@@ -274,11 +356,17 @@ impl Mirror {
         // (the decoder repaints only on new decoded frames, issue #1783) — so the
         // capture is starved and the popup mirror never receives a frame. Force a
         // no-op source-canvas repaint so captureStream emits the current bitmap.
-        prime_static_source(source);
-        Some(Mirror { stream })
+        prime_static_source(canvas);
+        Some(Mirror {
+            stream,
+            owned: true,
+        })
     }
 
     fn stop(&self) {
+        if !self.owned {
+            return;
+        }
         let tracks = self.stream.get_tracks();
         for i in 0..tracks.length() {
             if let Ok(track) = tracks.get(i).dyn_into::<web_sys::MediaStreamTrack>() {
@@ -389,7 +477,12 @@ fn is_narrow_viewport() -> bool {
 /// canvas. `on_reattach` is invoked exactly once when detaching ends for ANY
 /// reason. No-op (with `on_reattach` invoked so the caller can reset) if already
 /// open/opening, the source canvas is missing, or no window type is available.
-pub fn open(peer: &str, display_name: &str, on_reattach: Box<dyn Fn()>) {
+pub fn open(
+    peer: &str,
+    display_name: &str,
+    on_opened: Box<dyn FnOnce()>,
+    on_reattach: Box<dyn Fn()>,
+) {
     if is_busy() {
         on_reattach();
         return;
@@ -438,29 +531,103 @@ pub fn open(peer: &str, display_name: &str, on_reattach: Box<dyn Fn()>) {
         detached_window_inner_dims(content_w, content_h, avail_w, avail_h, DETACHED_BAR_H_PX)
     };
 
+    open_source(
+        &win,
+        OpenRequest {
+            peer: peer.to_string(),
+            name: display_name.to_string(),
+            title: DETACHED_WINDOW_TITLE,
+            source: DetachSource::Canvas(source),
+            size: (w, h),
+        },
+        on_opened,
+        on_reattach,
+    );
+}
+
+/// Detach the local user's own share: the window plays `stream` directly.
+pub fn open_stream(
+    key: &str,
+    stream: MediaStream,
+    on_opened: Box<dyn FnOnce()>,
+    on_reattach: Box<dyn Fn()>,
+) {
+    if is_busy() {
+        on_reattach();
+        return;
+    }
+    let Some(win) = web_sys::window() else {
+        on_reattach();
+        return;
+    };
+    let (content_w, content_h) = stream_dims(&stream).unwrap_or((1280, 720));
+    let (avail_w, avail_h) = available_screen(&win);
+    let size =
+        detached_window_inner_dims(content_w, content_h, avail_w, avail_h, DETACHED_BAR_H_PX);
+    open_source(
+        &win,
+        OpenRequest {
+            peer: key.to_string(),
+            name: OWN_WINDOW_TITLE.to_string(),
+            title: OWN_WINDOW_TITLE,
+            source: DetachSource::Stream(stream),
+            size,
+        },
+        on_opened,
+        on_reattach,
+    );
+}
+
+fn stream_dims(stream: &MediaStream) -> Option<(i32, i32)> {
+    let track = stream.get_video_tracks().get(0);
+    let get_settings = js_sys::Reflect::get(&track, &JsValue::from_str("getSettings")).ok()?;
+    let settings = get_settings
+        .dyn_ref::<js_sys::Function>()?
+        .call0(&track)
+        .ok()?;
+    let dim = |k: &str| {
+        js_sys::Reflect::get(&settings, &JsValue::from_str(k))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .filter(|v| *v > 0.0)
+            .map(|v| v as i32)
+    };
+    Some((dim("width")?, dim("height")?))
+}
+
+struct OpenRequest {
+    peer: String,
+    name: String,
+    title: &'static str,
+    source: DetachSource,
+    size: (i32, i32),
+}
+
+fn open_source(
+    win: &Window,
+    req: OpenRequest,
+    on_opened: Box<dyn FnOnce()>,
+    on_reattach: Box<dyn Fn()>,
+) {
     PENDING.with(|p| p.set(true));
+    PENDING_KEY.with(|k| *k.borrow_mut() = Some(req.peer.clone()));
     CANCEL_PENDING.with(|c| c.set(false));
 
     if document_pip_supported() {
-        open_document_pip(peer, display_name, source, w, h, on_reattach);
+        open_document_pip(req, on_opened, on_reattach);
     } else {
-        open_popup(&win, peer, display_name, &source, w, h, on_reattach);
+        open_popup(win, req, on_opened, on_reattach);
     }
 }
 
 fn finish_pending() -> bool {
     PENDING.with(|p| p.set(false));
+    PENDING_KEY.with(|k| k.borrow_mut().take());
     CANCEL_PENDING.with(|c| c.replace(false))
 }
 
-fn open_document_pip(
-    peer: &str,
-    display_name: &str,
-    source: HtmlCanvasElement,
-    w: i32,
-    h: i32,
-    on_reattach: Box<dyn Fn()>,
-) {
+fn open_document_pip(req: OpenRequest, on_opened: Box<dyn FnOnce()>, on_reattach: Box<dyn Fn()>) {
+    let (w, h) = req.size;
     let win = match web_sys::window() {
         Some(w) => w,
         None => {
@@ -519,8 +686,6 @@ fn open_document_pip(
         }
     };
 
-    let peer = peer.to_string();
-    let name = display_name.to_string();
     wasm_bindgen_futures::spawn_local(async move {
         match wasm_bindgen_futures::JsFuture::from(promise).await {
             Ok(v) => {
@@ -548,7 +713,7 @@ fn open_document_pip(
                     on_reattach();
                     return;
                 }
-                finish_open(pip_win, &peer, &name, &source, true, on_reattach);
+                finish_open(pip_win, req, true, on_opened, on_reattach);
             }
             Err(e) => {
                 log::warn!("issue 1175: documentPictureInPicture.requestWindow failed: {e:?}");
@@ -561,13 +726,11 @@ fn open_document_pip(
 
 fn open_popup(
     win: &Window,
-    peer: &str,
-    display_name: &str,
-    source: &HtmlCanvasElement,
-    w: i32,
-    h: i32,
+    req: OpenRequest,
+    on_opened: Box<dyn FnOnce()>,
     on_reattach: Box<dyn Fn()>,
 ) {
+    let (w, h) = req.size;
     let features = format!("popup=yes,width={w},height={h}");
     let popup = match win.open_with_url_and_target_and_features("", "_blank", &features) {
         Ok(Some(p)) => p,
@@ -583,7 +746,13 @@ fn open_popup(
         on_reattach();
         return;
     }
-    finish_open(popup, peer, display_name, source, false, on_reattach);
+    let opener_holder = popup.clone();
+    finish_open(popup, req, false, on_opened, on_reattach);
+    sever_opener(&opener_holder);
+}
+
+fn sever_opener(popup: &Window) {
+    let _ = js_sys::Reflect::set(popup, &JsValue::from_str("opener"), &JsValue::NULL);
 }
 
 /// Build the detached document (mirror video + zoom controls), start the mirror,
@@ -592,25 +761,24 @@ fn open_popup(
 /// the share snaps back to the main window (reattach).
 fn finish_open(
     detached_win: Window,
-    peer: &str,
-    display_name: &str,
-    source: &HtmlCanvasElement,
+    req: OpenRequest,
     via_pip: bool,
+    on_opened: Box<dyn FnOnce()>,
     on_reattach: Box<dyn Fn()>,
 ) {
-    match build_and_start_mirror(&detached_win, display_name, source, via_pip) {
+    match build_and_start_mirror(&detached_win, &req.name, req.title, &req.source, via_pip) {
         Some((doc, video, mirror, show_metrics)) => {
             install_detached(
                 detached_win,
                 doc,
                 video,
                 mirror,
-                peer,
-                display_name,
+                &req,
                 via_pip,
                 show_metrics,
                 on_reattach,
             );
+            on_opened();
         }
         None => {
             // Silent-abort guard (issue 1829): every detach bail-out logs so a
@@ -632,7 +800,8 @@ fn finish_open(
 fn build_and_start_mirror(
     detached_win: &Window,
     display_name: &str,
-    source: &HtmlCanvasElement,
+    title: &str,
+    source: &DetachSource,
     via_pip: bool,
 ) -> Option<(Document, HtmlVideoElement, Mirror, bool)> {
     let doc = detached_win.document()?;
@@ -643,7 +812,7 @@ fn build_and_start_mirror(
         super::media_metrics_overlay::MEDIA_METRICS_OVERLAY_KEY,
         false,
     );
-    let video = build_detached_dom(&doc, display_name, via_pip, show_metrics)?;
+    let video = build_detached_dom(&doc, display_name, title, via_pip, show_metrics)?;
     let mirror = Mirror::start(source, &video)?;
     Some((doc, video, mirror, show_metrics))
 }
@@ -658,12 +827,13 @@ fn install_detached(
     doc: Document,
     video: HtmlVideoElement,
     mirror: Mirror,
-    peer: &str,
-    display_name: &str,
+    req: &OpenRequest,
     via_pip: bool,
     show_metrics: bool,
     on_reattach: Box<dyn Fn()>,
 ) {
+    let peer = req.peer.as_str();
+    let display_name = req.name.as_str();
     // A fresh session id: the parked close/poll closures below capture it so a
     // retired window (e.g. a migrated-away PiP) cannot tear this one down.
     let session = next_session();
@@ -680,6 +850,8 @@ fn install_detached(
             peer: peer.to_string(),
             win: detached_win.clone(),
             mirror,
+            source: req.source.clone(),
+            title: req.title,
             on_reattach,
             zoom: zoom_state.clone(),
             _listeners: Vec::new(),
@@ -689,6 +861,7 @@ fn install_detached(
             session,
         });
     });
+    listen_for_page_leave(true);
 
     let mut listeners = Vec::new();
 
@@ -793,11 +966,12 @@ fn install_detached(
 fn build_detached_dom(
     doc: &Document,
     display_name: &str,
+    title: &str,
     via_pip: bool,
     show_metrics: bool,
 ) -> Option<HtmlVideoElement> {
     let body = doc.body()?;
-    doc.set_title(DETACHED_WINDOW_TITLE);
+    doc.set_title(title);
     body.set_inner_html("");
     let _ = body.set_attribute("class", "ss-detached-body");
 
@@ -1150,16 +1324,18 @@ fn migrate_pip_to_maximized_popup(doc: &Document, peer: &str, display_name: &str
     // that currently holds focus is about to close, so nudge the OS to raise the
     // new maximized window.
     let _ = popup.focus();
+    let popup_for_opener = popup.clone();
 
-    // Re-fetch the source canvas from the MAIN window: it stays mounted + painting
-    // there (the detached windows only ever MIRROR it), so its fresh
+    // Re-use the MAIN window's source: a canvas stays mounted + painting there
+    // (the detached windows only ever MIRROR it), so its fresh
     // `capture_stream()` is independent of the retiring PiP's mirror. Do this BEFORE
     // touching the current state so a missing source aborts with the PiP still up.
-    let source = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id(&zoom::screen_canvas_id(peer)))
-        .and_then(|e| e.dyn_into::<HtmlCanvasElement>().ok());
-    let Some(source) = source else {
+    let current = DETACH.with(|d| d.borrow().as_ref().map(|s| (s.source.clone(), s.title)));
+    let source = current.filter(|(src, _)| match src {
+        DetachSource::Canvas(c) => c.is_connected(),
+        DetachSource::Stream(s) => s.active(),
+    });
+    let Some((source, title)) = source else {
         let _ = popup.close();
         log::warn!(
             "issue 1821: source canvas gone; cannot migrate to a maximized popup, keeping the \
@@ -1171,7 +1347,7 @@ fn migrate_pip_to_maximized_popup(doc: &Document, peer: &str, display_name: &str
     // Build the popup's DOM + mirror FIRST (via_pip=false → its Maximize becomes a
     // real fullscreen toggle). If this fails, keep the PiP intact.
     let Some((pdoc, pvideo, pmirror, show_metrics)) =
-        build_and_start_mirror(&popup, display_name, &source, false)
+        build_and_start_mirror(&popup, display_name, title, &source, false)
     else {
         let _ = popup.close();
         log::warn!("issue 1821: could not build the maximized popup DOM; keeping the PiP window");
@@ -1211,12 +1387,18 @@ fn migrate_pip_to_maximized_popup(doc: &Document, peer: &str, display_name: &str
         pdoc,
         pvideo,
         pmirror,
-        peer,
-        display_name,
+        &OpenRequest {
+            peer: peer.to_string(),
+            name: display_name.to_string(),
+            title,
+            source,
+            size: (avail_w, avail_h),
+        },
         false,
         show_metrics,
         on_reattach,
     );
+    sever_opener(&popup_for_opener);
     log::info!("detached content migrated to maximized popup (issue 1821)");
 }
 
@@ -1783,6 +1965,9 @@ fn wire_zoom_controls(
 /// reattach callback exactly once. Idempotent; `win.close()` is a no-op on an
 /// already-closed window.
 pub fn teardown(peer: &str) {
+    if is_pending(peer) {
+        CANCEL_PENDING.with(|c| c.set(true));
+    }
     let state = DETACH.with(|d| {
         let matches = d.borrow().as_ref().map(|s| s.peer == peer).unwrap_or(false);
         if matches {
@@ -1794,6 +1979,7 @@ pub fn teardown(peer: &str) {
     let Some(mut state) = state else {
         return;
     };
+    listen_for_page_leave(false);
     // Issue #1821: drop any PiP retired during a Maximize→popup migration. By now
     // it is long closed (its mirror stopped, intervals cleared), so dropping its
     // parked listeners is safe.

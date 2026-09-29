@@ -24,16 +24,22 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
 use crate::actors::priority_drop::{
-    evaluate as evaluate_priority_drop, OutboundPriority, PriorityDropDecision,
+    dimension_fill, evaluate as evaluate_priority_drop,
+    evaluate_dual as evaluate_priority_drop_dual, OutboundPriority, PriorityDropDecision,
+    SharedQueueByteMeter,
 };
-use crate::actors::session_logic::{InboundAction, SessionLogic};
+use crate::actors::session_logic::{
+    DownlinkDropSink, DownlinkReliefSignal, InboundAction, SessionLogic,
+};
+use crate::actors::shed_escalation::DownlinkShedEscalation;
 use crate::constants::{
-    wt_mailbox_capacity, wt_outbound_channel_capacity, CLIENT_TIMEOUT, WT_DATAGRAM_CHANNEL_CAPACITY,
+    wt_mailbox_capacity, wt_outbound_channel_capacity, AudioDownlinkLane, CLIENT_TIMEOUT,
+    OUTBOUND_SCREEN_BYTE_BUDGET, OUTBOUND_VIDEO_BYTE_BUDGET, WT_DATAGRAM_CHANNEL_CAPACITY,
 };
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
-    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH,
+    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_DOWNLINK_SHED_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH,
     RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION, RELAY_PACKET_DROPS_TOTAL,
 };
 use crate::server_diagnostics::TrackerSender;
@@ -43,13 +49,15 @@ use actix::{
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
+use protobuf::Enum as ProtobufEnum;
 use protobuf::Message as ProtobufMessage;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
@@ -80,14 +88,400 @@ const KEEP_ALIVE_PING: &[u8] = b"ping";
 /// unistream writer is parked. See discussion #756 for the full analysis.
 #[derive(Debug, Clone)]
 pub enum WtOutbound {
-    /// Send via the persistent unidirectional QUIC stream (reliable, ordered,
-    /// length-prefix framed). Used for video, screen, and oversized
-    /// audio/control packets.
+    /// Send via a reliable, ordered, length-prefix framed unidirectional QUIC
+    /// stream. Used for video, screen, audio (#2724) and oversized control.
     UniStream(Bytes),
-    /// Send via QUIC datagram (unreliable, unordered, low latency).
-    /// Used for small audio media (Opus frames) and non-media control that
-    /// fits within `DATAGRAM_MAX_SIZE`.
+    /// Send via QUIC datagram (unreliable, unordered, low latency). Used for
+    /// non-media control under `DATAGRAM_MAX_SIZE`, and for audio only on the
+    /// legacy arm of [`AudioDownlinkLane`].
     Datagram(Bytes),
+}
+
+/// The per-publisher media kinds that get a downlink stream of their own
+/// (#2723). AUDIO is absent on purpose: it is receiver-scoped, one stream for
+/// every speaker, not one per publisher (#2724; `2724-contract.md` A1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublisherStreamKind {
+    Video,
+    Screen,
+}
+
+impl PublisherStreamKind {
+    /// The wire byte for this kind in the #2723 stream header — the proto
+    /// `MediaKind` value, so a renumbered proto cannot silently desync the
+    /// header from the packets on the stream.
+    pub fn media_kind_code(self) -> u8 {
+        let kind = match self {
+            PublisherStreamKind::Video => MediaKind::VIDEO,
+            PublisherStreamKind::Screen => MediaKind::SCREEN,
+        };
+        kind.value() as u8
+    }
+}
+
+/// The wire byte for AUDIO in a #2724 class-3 stream header, read off the proto
+/// enum for the same reason [`PublisherStreamKind::media_kind_code`] is.
+pub fn audio_media_kind_code() -> u8 {
+    MediaKind::AUDIO.value() as u8
+}
+
+/// Which downlink QUIC stream one outbound unistream frame belongs on (#2723).
+///
+/// `Control` is the single receiver-scoped stream: Critical control (#2718), the
+/// #2721 probe echoes, and sub-MTU media the relay cannot attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DownlinkStreamKey {
+    Control,
+    Publisher {
+        session_id: u64,
+        kind: PublisherStreamKind,
+    },
+    /// Every audio frame, both E2EE modes: one receiver-scoped stream, NOT one per
+    /// publisher (#2724, contract A1).
+    Audio,
+    /// Bulk media the relay cannot attribute: it rides the SHARED overflow stream.
+    Shared,
+}
+
+impl DownlinkStreamKey {
+    /// Derive the key from the ALREADY-parsed outer `PacketWrapper` fields the
+    /// fan-out handler extracts — no second protobuf parse on the hot path.
+    ///
+    /// `MEDIA_KIND_UNSPECIFIED` is the fail-open bucket, and SIZE separates what
+    /// lands in it: sub-MTU frames are control-shaped and keep the lifecycle
+    /// lane, while anything larger is unattributable media that must NOT sit in
+    /// front of Critical control, so it takes the shared overflow stream.
+    ///
+    /// Audio is recognised from EITHER signal, which fail in opposite directions
+    /// (#2724, contract A4). `audio_lane` gates the ONLY arm returning
+    /// [`Self::Audio`], so the revert restores the pre-#2724 key. Above
+    /// `DATAGRAM_MAX_SIZE` it is not an Opus frame whatever it claims, and
+    /// excluding it is what bounds the lane in bytes (A19).
+    pub fn for_media(
+        is_media: bool,
+        is_audio: bool,
+        publisher_session_id: u64,
+        media_kind: MediaKind,
+        len: usize,
+        audio_lane: AudioDownlinkLane,
+    ) -> Self {
+        if !is_media {
+            return Self::Control;
+        }
+        let is_audio_frame = is_audio || media_kind == MediaKind::AUDIO;
+        if audio_lane == AudioDownlinkLane::Reliable && is_audio_frame && len <= DATAGRAM_MAX_SIZE {
+            return Self::Audio;
+        }
+        match media_kind {
+            MediaKind::VIDEO if publisher_session_id != 0 => Self::Publisher {
+                session_id: publisher_session_id,
+                kind: PublisherStreamKind::Video,
+            },
+            MediaKind::SCREEN if publisher_session_id != 0 => Self::Publisher {
+                session_id: publisher_session_id,
+                kind: PublisherStreamKind::Screen,
+            },
+            MediaKind::AUDIO => Self::Control,
+            _ if len > DATAGRAM_MAX_SIZE => Self::Shared,
+            _ => Self::Control,
+        }
+    }
+}
+
+/// One queued outbound WT packet. The priority rides WITH the payload so the
+/// drain knows which [`SharedQueueByteMeter`] bucket to credit (#2717); the key
+/// rides with it so the drain knows which downlink stream to write it on (#2723).
+#[derive(Debug, Clone)]
+pub struct WtOutboundFrame {
+    pub priority: OutboundPriority,
+    pub bytes: Bytes,
+    pub key: DownlinkStreamKey,
+}
+
+impl WtOutboundFrame {
+    /// A receiver-scoped frame: it rides the control stream. Media must use
+    /// [`Self::keyed`] so it reaches its publisher's own stream.
+    pub fn new(priority: OutboundPriority, bytes: Bytes) -> Self {
+        Self::keyed(priority, bytes, DownlinkStreamKey::Control)
+    }
+
+    pub fn keyed(priority: OutboundPriority, bytes: Bytes, key: DownlinkStreamKey) -> Self {
+        Self {
+            priority,
+            bytes,
+            key,
+        }
+    }
+
+    pub fn control(bytes: Bytes) -> Self {
+        Self::new(OutboundPriority::Control, bytes)
+    }
+
+    /// A relay-generated RTT echo (#2721). See [`OutboundPriority::ProbeEcho`].
+    pub fn probe_echo(bytes: Bytes) -> Self {
+        Self::new(OutboundPriority::ProbeEcho, bytes)
+    }
+}
+
+/// `kind` for every relay-side failure to echo an RTT probe, whichever surface
+/// dropped it — the admission gate, a full channel, or the bridge's wedged-lane
+/// shed. One series, because the client sees one outcome: a probe timeout.
+/// Never `overflow_critical`: an echo is not a lifecycle packet (#2721).
+pub(crate) const ECHO_DROP_KIND: &str = "rtt";
+
+/// `0` disables the byte dimension: audio and control cost slots (#2261).
+pub(crate) fn wt_unistream_byte_budget_for(priority: OutboundPriority) -> usize {
+    match priority {
+        OutboundPriority::Video => OUTBOUND_VIDEO_BYTE_BUDGET,
+        OutboundPriority::Screen => OUTBOUND_SCREEN_BYTE_BUDGET,
+        OutboundPriority::Audio
+        | OutboundPriority::Critical
+        | OutboundPriority::Control
+        | OutboundPriority::ProbeEcho => 0,
+    }
+}
+
+/// The fullest budgeted media dimension as a `(queued_bytes, budget)` pair, for
+/// a priority judged on the media's byte pressure rather than its own (#2721).
+fn fullest_media_byte_dimension(queued: &SharedQueueByteMeter) -> (usize, usize) {
+    [OutboundPriority::Video, OutboundPriority::Screen]
+        .into_iter()
+        .map(|p| (queued.queued_for(p), wt_unistream_byte_budget_for(p)))
+        .max_by(|a, b| dimension_fill(a.0, a.1).total_cmp(&dimension_fill(b.0, b.1)))
+        .expect("the budgeted-media list is non-empty")
+}
+
+pub(crate) fn wt_unistream_decision(
+    priority: OutboundPriority,
+    free_capacity: usize,
+    queued: &SharedQueueByteMeter,
+) -> PriorityDropDecision {
+    let (queued_bytes, budget) = if priority == OutboundPriority::ProbeEcho {
+        fullest_media_byte_dimension(queued)
+    } else {
+        let budget = wt_unistream_byte_budget_for(priority);
+        let queued_bytes = if budget == 0 {
+            0
+        } else {
+            queued.queued_for(priority)
+        };
+        (queued_bytes, budget)
+    };
+    evaluate_priority_drop_dual(
+        priority,
+        free_capacity,
+        wt_outbound_channel_capacity(),
+        queued_bytes,
+        budget,
+    )
+}
+
+pub(crate) enum WtAdmission {
+    Enqueued,
+    PriorityDropped {
+        reason: &'static str,
+        free: usize,
+        total: usize,
+    },
+    /// #2726 stage 1. Its own variant because `PriorityDropped` pages (E19).
+    EscalationShed,
+    /// Real overflow. The priority separates a Critical drop from a media one.
+    Full {
+        priority: OutboundPriority,
+    },
+    Closed,
+}
+
+/// THE credit site: a frame is charged iff `try_send` accepted it (#2717).
+pub(crate) fn enqueue_unistream(
+    tx: &mpsc::Sender<WtOutboundFrame>,
+    queued: &SharedQueueByteMeter,
+    frame: WtOutboundFrame,
+) -> Result<(), mpsc::error::TrySendError<WtOutboundFrame>> {
+    let priority = frame.priority;
+    let len = frame.bytes.len();
+    tx.try_send(frame)?;
+    queued.on_enqueue(priority, len);
+    Ok(())
+}
+
+/// Evaluate BOTH of the unistream lane's dimensions, then enqueue through
+/// [`enqueue_unistream`]. Tests go through this too, so none can build a lane
+/// state the policy would never produce (#2717).
+pub(crate) fn wt_unistream_admit(
+    tx: &mpsc::Sender<WtOutboundFrame>,
+    queued: &SharedQueueByteMeter,
+    priority: OutboundPriority,
+    bytes: Bytes,
+    key: DownlinkStreamKey,
+) -> WtAdmission {
+    let free = tx.capacity();
+    if let PriorityDropDecision::Drop { reason } = wt_unistream_decision(priority, free, queued) {
+        return WtAdmission::PriorityDropped {
+            reason,
+            free,
+            total: wt_outbound_channel_capacity(),
+        };
+    }
+    match enqueue_unistream(tx, queued, WtOutboundFrame::keyed(priority, bytes, key)) {
+        Ok(()) => WtAdmission::Enqueued,
+        Err(mpsc::error::TrySendError::Full(_)) => WtAdmission::Full { priority },
+        Err(mpsc::error::TrySendError::Closed(_)) => WtAdmission::Closed,
+    }
+}
+
+/// Classify a packet, route it to its lane, and offer it there — the whole of
+/// [`WtChatSession::send_auto`] except the drop metrics. The pre-check runs
+/// against the DESTINATION lane, which is why each lane has its own decision fn.
+///
+/// Free so a test can drive the real path; a `WtChatSession` needs NATS.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wt_route_and_admit(
+    unistream_tx: &mpsc::Sender<WtOutboundFrame>,
+    datagram_tx: &mpsc::Sender<WtOutboundFrame>,
+    unistream_bytes: &SharedQueueByteMeter,
+    data: Vec<u8>,
+    is_media: bool,
+    is_audio: bool,
+    parsed: bool,
+    packet_type: PacketType,
+    media_type: Option<MediaType>,
+    media_kind: MediaKind,
+    publisher_session_id: u64,
+    audio_lane: AudioDownlinkLane,
+    escalation: &DownlinkShedEscalation,
+) -> WtAdmission {
+    let priority =
+        OutboundPriority::classify_sealed_aware(parsed, packet_type, media_type, media_kind);
+    // #2726 stage 1, decayed and never latched.
+    if priority == OutboundPriority::Video && escalation.camera_video_is_shed() {
+        return WtAdmission::EscalationShed;
+    }
+    let key = DownlinkStreamKey::for_media(
+        is_media,
+        is_audio,
+        publisher_session_id,
+        media_kind,
+        data.len(),
+        audio_lane,
+    );
+    match build_outbound(data, is_media, is_audio, priority, audio_lane) {
+        WtOutbound::UniStream(bytes) => {
+            wt_unistream_admit(unistream_tx, unistream_bytes, priority, bytes, key)
+        }
+        WtOutbound::Datagram(bytes) => wt_datagram_admit(datagram_tx, priority, bytes),
+    }
+}
+
+/// No byte meter — see [`wt_datagram_decision`].
+pub(crate) fn wt_datagram_admit(
+    tx: &mpsc::Sender<WtOutboundFrame>,
+    priority: OutboundPriority,
+    bytes: Bytes,
+) -> WtAdmission {
+    let free = tx.capacity();
+    if let PriorityDropDecision::Drop { reason } = wt_datagram_decision(priority, free) {
+        return WtAdmission::PriorityDropped {
+            reason,
+            free,
+            total: WT_DATAGRAM_CHANNEL_CAPACITY,
+        };
+    }
+    match tx.try_send(WtOutboundFrame::new(priority, bytes)) {
+        Ok(()) => WtAdmission::Enqueued,
+        Err(mpsc::error::TrySendError::Full(_)) => WtAdmission::Full { priority },
+        Err(mpsc::error::TrySendError::Closed(_)) => WtAdmission::Closed,
+    }
+}
+
+/// Offer a relay-generated RTT echo on the primitive its probe arrived on.
+///
+/// UniStream echoes face the full unistream admission — slots AND the media byte
+/// dimension — so the lane cannot shed video while still echoing the probe that
+/// measures it (#2721). Datagram echoes keep the bare `try_send`: that lane is
+/// metered on slots only and has no media shed for an echo to under-report.
+pub(crate) fn wt_echo_admit(
+    unistream_tx: &mpsc::Sender<WtOutboundFrame>,
+    datagram_tx: &mpsc::Sender<WtOutboundFrame>,
+    unistream_bytes: &SharedQueueByteMeter,
+    source: WtInboundSource,
+    bytes: Bytes,
+) -> WtAdmission {
+    match source {
+        WtInboundSource::UniStream => wt_unistream_admit(
+            unistream_tx,
+            unistream_bytes,
+            OutboundPriority::ProbeEcho,
+            bytes,
+            DownlinkStreamKey::Control,
+        ),
+        WtInboundSource::Datagram => match datagram_tx.try_send(WtOutboundFrame::probe_echo(bytes))
+        {
+            Ok(()) => WtAdmission::Enqueued,
+            Err(mpsc::error::TrySendError::Full(_)) => WtAdmission::Full {
+                priority: OutboundPriority::ProbeEcho,
+            },
+            Err(mpsc::error::TrySendError::Closed(_)) => WtAdmission::Closed,
+        },
+    }
+}
+
+/// Book one un-echoed RTT probe: the room-tagged reason for per-room triage,
+/// and the protocol-wide [`ECHO_DROP_KIND`] for alerting.
+pub(crate) fn record_echo_drop(room: &str, reason: &'static str) {
+    RELAY_PACKET_DROPS_TOTAL
+        .with_label_values(&[room, "webtransport", reason])
+        .inc();
+    OUTBOUND_CHANNEL_DROPS_TOTAL
+        .with_label_values(&["webtransport", ECHO_DROP_KIND])
+        .inc();
+}
+
+pub(crate) fn wt_echo_route_and_book(
+    unistream_tx: &mpsc::Sender<WtOutboundFrame>,
+    datagram_tx: &mpsc::Sender<WtOutboundFrame>,
+    unistream_bytes: &SharedQueueByteMeter,
+    room: &str,
+    session_id: SessionId,
+    source: WtInboundSource,
+    bytes: Bytes,
+) -> bool {
+    match wt_echo_admit(unistream_tx, datagram_tx, unistream_bytes, source, bytes) {
+        WtAdmission::Enqueued => false,
+        WtAdmission::Closed => {
+            warn!("Outbound channel closed while echoing RTT for session {session_id}");
+            true
+        }
+        WtAdmission::PriorityDropped {
+            reason,
+            free,
+            total,
+        } => {
+            record_echo_drop(room, reason);
+            debug!("Shed RTT echo for session {session_id} ({reason}): free={free}/{total}");
+            false
+        }
+        WtAdmission::Full { .. } => {
+            record_echo_drop(room, "channel_full");
+            debug!("Outbound channel full, dropping RTT echo for session {session_id}");
+            false
+        }
+        // Unreachable, but exhaustive so a new producer is a compile error.
+        WtAdmission::EscalationShed => {
+            record_echo_drop(room, ECHO_DROP_KIND);
+            false
+        }
+    }
+}
+
+/// The WT datagram lane's bound: SLOTS only. Only control, critical and — on
+/// the legacy arm — audio route here, and each has a zero byte budget under
+/// #2261 (#2717).
+pub(crate) fn wt_datagram_decision(
+    priority: OutboundPriority,
+    free_capacity: usize,
+) -> PriorityDropDecision {
+    evaluate_priority_drop(priority, free_capacity, WT_DATAGRAM_CHANNEL_CAPACITY)
 }
 
 /// Result of attempting to send an outbound message to the WebTransport channel.
@@ -148,18 +542,21 @@ pub struct StopSession;
 /// persistent uni-stream writer task and one feeding the datagram writer
 /// task. The split mirrors the QUIC primitives:
 ///
-/// * `unistream_tx` (capacity = [`wt_outbound_channel_capacity`], default 512)
-///   absorbs video, screen, and any oversized audio/control. This is where
-///   QUIC flow control surfaces; the priority-drop policy applies here.
-/// * `datagram_tx` (capacity = [`WT_DATAGRAM_CHANNEL_CAPACITY`], 512) carries
-///   audio media (Opus, ~80B) and non-media control under MTU. Datagrams
+/// * `unistream_tx` absorbs video, screen, audio, oversized control and a
+///   unistream probe echo. QUIC flow control surfaces here, so the
+///   priority-drop policy applies on BOTH dimensions ([`wt_unistream_decision`]).
+/// * `datagram_tx` (capacity = [`WT_DATAGRAM_CHANNEL_CAPACITY`]) carries
+///   non-media control under MTU, the echo of a datagram probe, and audio on
+///   the legacy arm of [`AudioDownlinkLane`]. Datagrams
 ///   are independent of stream flow control, so the channel exists only to
 ///   absorb scheduling jitter.
 ///
 /// Previously a single channel multiplexed both. When QUIC stalled the
 /// uni-stream, the writer task parked on `write_all`, and audio datagrams
 /// queued behind the stalled video write in the same channel. The split
-/// removes that coupling: a stalled stream cannot starve datagrams.
+/// removes that coupling: a stalled stream cannot starve datagrams. Since #2723
+/// the reliable side is a lane per key, so audio's lane is likewise not behind
+/// a stalled video write.
 pub struct WtChatSession {
     /// Shared session logic (business logic)
     logic: SessionLogic,
@@ -167,15 +564,22 @@ pub struct WtChatSession {
     /// Heartbeat tracking (transport-specific timing)
     heartbeat: actix::clock::Instant,
 
-    /// Channel to the persistent unidirectional QUIC stream writer task.
-    /// Used for video, screen, and oversized audio/control packets. The
-    /// priority-drop policy is evaluated against this channel's fill ratio.
-    unistream_tx: mpsc::Sender<Bytes>,
+    /// Channel to the reliable downlink writer, against whose fill ratio the
+    /// priority-drop policy is evaluated.
+    unistream_tx: mpsc::Sender<WtOutboundFrame>,
 
-    /// Channel to the datagram writer task. Used for audio media (when it
-    /// fits MTU) and small non-media control. Independent of `unistream_tx`
-    /// so a stalled uni-stream cannot block datagram delivery.
-    datagram_tx: mpsc::Sender<Bytes>,
+    /// Channel to the datagram writer task, independent of `unistream_tx` so a
+    /// stalled uni stream cannot block datagram delivery.
+    datagram_tx: mpsc::Sender<WtOutboundFrame>,
+
+    /// Live byte occupancy of `unistream_tx`, shared with its drain (#2717).
+    unistream_bytes: Arc<SharedQueueByteMeter>,
+
+    /// Which primitive this receiver's audio takes (#2724), resolved once per
+    /// session from the `ds` capability and `WT_AUDIO_DOWNLINK_LANE`.
+    audio_lane: AudioDownlinkLane,
+
+    escalation: DownlinkShedEscalation,
 
     /// Track if ActivateConnection has been sent
     activated: bool,
@@ -188,16 +592,28 @@ pub struct WtChatSession {
 /// `SessionLogic`, which requires NATS, addresses, etc.).
 ///
 /// Routing rules (priority order):
+/// 0. [`OutboundPriority::Critical`] → reliable unidirectional stream,
+///    whatever the size (#2718). `classify_sealed_aware` never returns
+///    `Critical` for a `MEDIA` packet, so this moves non-media control only.
 /// 1. Non-media, fits MTU → datagram (control / heartbeats / RTT).
-/// 2. Media + audio + fits MTU → datagram (Opus frames are 50-200B,
-///    well below the ~1200B MTU; avoids per-receiver UniStream HOL
-///    blocking when a single UDP segment is lost).
+/// 2. Media + audio + fits MTU → datagram, but ONLY while `audio_lane` is the
+///    legacy [`AudioDownlinkLane::Datagram`] (#2724). Under the default the
+///    frame takes the reliable stream and [`DownlinkStreamKey::Audio`]'s lane.
 /// 3. Everything else (video, screen, oversized audio, oversized
 ///    control) → reliable unidirectional stream.
-fn build_outbound(data: Vec<u8>, is_media: bool, is_audio: bool) -> WtOutbound {
+fn build_outbound(
+    data: Vec<u8>,
+    is_media: bool,
+    is_audio: bool,
+    priority: OutboundPriority,
+    audio_lane: AudioDownlinkLane,
+) -> WtOutbound {
+    if priority == OutboundPriority::Critical {
+        return WtOutbound::UniStream(data.into());
+    }
     let fits_datagram = data.len() <= DATAGRAM_MAX_SIZE;
     if is_media {
-        if is_audio && fits_datagram {
+        if is_audio && fits_datagram && audio_lane == AudioDownlinkLane::Datagram {
             WtOutbound::Datagram(data.into())
         } else {
             WtOutbound::UniStream(data.into())
@@ -207,6 +623,15 @@ fn build_outbound(data: Vec<u8>, is_media: bool, is_audio: bool) -> WtOutbound {
     } else {
         WtOutbound::UniStream(data.into())
     }
+}
+
+/// Book one #2726 stage-1 shed on the same non-alerting series #2718 uses, and
+/// deliberately NOT the `PriorityDropped` arm's two, which would PAGE for a
+/// bounded remedy working as designed (E19).
+pub(crate) fn book_escalation_shed() {
+    RELAY_DOWNLINK_SHED_TOTAL
+        .with_label_values(&["webtransport"])
+        .inc();
 }
 
 /// Classify a dropped outbound packet for the
@@ -260,15 +685,17 @@ impl WtChatSession {
         user_id: String,
         display_name: String,
         is_guest: bool,
-        unistream_tx: mpsc::Sender<Bytes>,
-        datagram_tx: mpsc::Sender<Bytes>,
+        unistream_tx: mpsc::Sender<WtOutboundFrame>,
+        datagram_tx: mpsc::Sender<WtOutboundFrame>,
+        unistream_bytes: Arc<SharedQueueByteMeter>,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
         instance_id: Option<String>,
         is_host: bool,
-        end_on_host_leave: bool,
+        audio_lane: AudioDownlinkLane,
+        escalation: DownlinkShedEscalation,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -283,7 +710,6 @@ impl WtChatSession {
             instance_id,
             "webtransport",
             is_host,
-            end_on_host_leave,
         );
 
         WtChatSession {
@@ -291,20 +717,40 @@ impl WtChatSession {
             heartbeat: actix::clock::Instant::now(),
             unistream_tx,
             datagram_tx,
+            unistream_bytes,
+            audio_lane,
+            escalation,
             activated: false,
         }
     }
 
     /// The canonical per-session id for this connection (`SessionLogic::id`).
     ///
-    /// This is the SAME `u64` that `record_session_drop` / `forget_session_drops`
-    /// stringify for the `session_id` label on `relay_session_drops_total`, so a
-    /// caller reading it here (e.g. to label the #1637 relay RTT gauge) produces a
-    /// series that JOINS with the per-session drop series for this connection.
-    /// Read on the constructed actor value BEFORE `start()` consumes it —
-    /// `SessionLogic` assigns the id in `new`, so it is stable from construction.
+    /// The SAME `u64` the `session_id` label on `relay_session_drops_total`
+    /// carries, so a series labelled with it JOINS that one. Read on the
+    /// constructed actor value BEFORE `start()` consumes it.
     pub fn session_id(&self) -> SessionId {
         self.logic.id
+    }
+
+    /// Write handle on THIS receiver's #1219 relief epoch, for the #1638 shed in
+    /// the bridge writer task (#2718). Read BEFORE `start()`, like
+    /// [`Self::session_id`].
+    pub fn downlink_relief_signal(&self) -> DownlinkReliefSignal {
+        DownlinkReliefSignal::new(Arc::clone(&self.logic.downlink_congested_epoch))
+    }
+
+    /// The drop-booking half for the #2723 dispatcher (#2745). Read BEFORE
+    /// `start()`, like [`Self::session_id`].
+    pub fn downlink_drop_sink(&self) -> DownlinkDropSink {
+        DownlinkDropSink::new(
+            &self.logic.room,
+            self.logic.id,
+            "webtransport",
+            self.downlink_relief_signal(),
+            Arc::clone(&self.logic.congestion_tracker),
+            self.logic.downlink_drop_booking.clone(),
+        )
     }
 
     /// Send outbound message via the channel (reliable unidirectional stream).
@@ -324,7 +770,11 @@ impl WtChatSession {
         // routes via the reliable uni-stream channel by design — these packets
         // are not idempotent and must arrive in order. They never use the
         // datagram path even though they typically fit MTU.
-        match self.unistream_tx.try_send(data.into()) {
+        match enqueue_unistream(
+            &self.unistream_tx,
+            &self.unistream_bytes,
+            WtOutboundFrame::control(data.into()),
+        ) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!(
@@ -362,15 +812,10 @@ impl WtChatSession {
     ///    AES key exchange, …) that fit within `DATAGRAM_MAX_SIZE` use
     ///    unreliable datagrams. They are periodic and expendable, so lower
     ///    overhead matters more than guaranteed delivery.
-    /// 2. **Audio media** packets (Opus frames are typically 50-200B,
-    ///    well below the ~1200B datagram MTU) also use datagrams so a
-    ///    single dropped UDP segment does not head-of-line block every
-    ///    subsequent audio frame on a shared per-receiver UniStream.
-    ///    Lossy audio is far less perceptible than a multi-hundred-ms
-    ///    audio gap waiting on QUIC retransmit.
-    /// 3. **Video / screen media**, oversized audio, and any other media
-    ///    use the reliable unidirectional stream — keeping ordered delivery
-    ///    avoids visual artifacts and matches encoder expectations.
+    /// 2. **Audio media** takes the reliable stream and its own
+    ///    [`DownlinkStreamKey::Audio`] lane (#2724), falling back to datagrams
+    ///    only on the legacy arm `self.audio_lane` carries.
+    /// 3. **Video / screen media** and any other media use the reliable stream.
     ///
     /// The `is_media` and `is_audio` hints are pre-computed by the caller
     /// from an already-parsed `PacketWrapper` / `MediaPacket`, avoiding a
@@ -388,8 +833,8 @@ impl WtChatSession {
     /// the drop-counter `kind` label into `audio`/`video`/`screen` — the
     /// 2026-05-08 production storm dropped 25,081 packets to one slow
     /// receiver and the metric had no way to tell audio from video. This
-    /// hint does NOT influence routing; routing is decided by `is_audio`,
-    /// which preserves the original behaviour for encrypted inner payloads.
+    /// hint does NOT influence routing.
+    #[allow(clippy::too_many_arguments)]
     fn send_auto(
         &self,
         data: Vec<u8>,
@@ -398,73 +843,58 @@ impl WtChatSession {
         parsed: bool,
         packet_type: PacketType,
         media_type: Option<MediaType>,
+        media_kind: MediaKind,
+        publisher_session_id: u64,
     ) -> WtSendResult {
-        // Classify the packet first — both the routing decision (datagram
-        // vs unistream) and the priority-drop pre-check depend on it.
-        let outbound = build_outbound(data, is_media, is_audio);
-        let priority = OutboundPriority::classify(parsed, packet_type, media_type);
+        let admission = wt_route_and_admit(
+            &self.unistream_tx,
+            &self.datagram_tx,
+            &self.unistream_bytes,
+            data,
+            is_media,
+            is_audio,
+            parsed,
+            packet_type,
+            media_type,
+            media_kind,
+            publisher_session_id,
+            self.audio_lane,
+            &self.escalation,
+        );
 
-        // Priority-drop pre-check is evaluated against the destination
-        // channel's fill, not a single unified queue. After the channel
-        // split, audio media routes via `datagram_tx` and never collides
-        // with video on `unistream_tx`, so audio's 95% drop threshold
-        // applies to the datagram channel and video's 80% threshold
-        // applies to the unistream channel. Critical / Control never
-        // preempt on either channel — `evaluate_priority_drop` enforces
-        // that internally.
-        //
-        // Lifecycle note: a reconnection wave that needs to deliver
-        // SESSION_ASSIGNED + MEETING_STARTED still goes through —
-        // Critical packets are never preempted by this layer regardless
-        // of channel fill.
-        let (target_total_capacity, free_capacity) = match &outbound {
-            WtOutbound::UniStream(_) => {
-                (wt_outbound_channel_capacity(), self.unistream_tx.capacity())
+        match admission {
+            WtAdmission::PriorityDropped {
+                reason,
+                free,
+                total,
+            } => {
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[&self.logic.room, "webtransport", reason])
+                    .inc();
+                OUTBOUND_CHANNEL_DROPS_TOTAL
+                    .with_label_values(&["webtransport", reason])
+                    .inc();
+                // Per-session attribution (Tier B #1): name the slow receiver.
+                self.logic.record_session_drop(reason);
+                trace!(
+                    "Priority-drop {reason} on WT session {}: free={free}/{total}",
+                    self.logic.id,
+                );
+                WtSendResult::PriorityDropped
             }
-            WtOutbound::Datagram(_) => (WT_DATAGRAM_CHANNEL_CAPACITY, self.datagram_tx.capacity()),
-        };
-
-        if let PriorityDropDecision::Drop { reason } =
-            evaluate_priority_drop(priority, free_capacity, target_total_capacity)
-        {
-            // Mirror the legacy drop-counter pair so per-room and
-            // protocol-wide series both observe the preempt. The
-            // protocol-wide counter uses the priority-specific reason
-            // label so dashboards can distinguish a policy-driven drop
-            // from a genuine channel-overflow drop.
-            RELAY_PACKET_DROPS_TOTAL
-                .with_label_values(&[&self.logic.room, "webtransport", reason])
-                .inc();
-            OUTBOUND_CHANNEL_DROPS_TOTAL
-                .with_label_values(&["webtransport", reason])
-                .inc();
-            // Per-session attribution (Tier B #1): name the slow receiver.
-            self.logic.record_session_drop(reason);
-            trace!(
-                "Priority-drop {reason} on WT session {}: free={free_capacity}/{target_total_capacity}",
-                self.logic.id,
-            );
-            return WtSendResult::PriorityDropped;
-        }
-
-        // Phase 2 split: route the bytes to the dedicated per-primitive
-        // channel. The bridge writer tasks drain these independently — a
-        // stalled unistream writer cannot back up the datagram channel.
-        let try_send_result = match outbound {
-            WtOutbound::UniStream(bytes) => self.unistream_tx.try_send(bytes),
-            WtOutbound::Datagram(bytes) => self.datagram_tx.try_send(bytes),
-        };
-
-        match try_send_result {
-            Ok(()) => WtSendResult::Sent,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            WtAdmission::EscalationShed => {
+                book_escalation_shed();
+                WtSendResult::PriorityDropped
+            }
+            WtAdmission::Enqueued => WtSendResult::Sent,
+            WtAdmission::Closed => {
                 warn!(
                     "Outbound channel closed for session {}, connection dead",
                     self.logic.id
                 );
                 WtSendResult::Dead
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            WtAdmission::Full { priority } => {
                 // #1638 PART 2 — congestion signal, and why this is a TAIL drop
                 // (newest dropped), NOT a drop-oldest:
                 //
@@ -480,31 +910,6 @@ impl WtChatSession {
                 // claim otherwise (per the adversarial-self-review rule, a
                 // "drops oldest" comment over tail-drop code is a shippable
                 // defect).
-                //
-                // Queue depth is STILL the congestion signal — it is just
-                // delivered through two mechanisms that compose, NOT through
-                // sender-side eviction:
-                //   (i) the `evaluate_priority_drop` PRE-check above already shed
-                //       camera VIDEO at 80% fill, SCREEN at 90% (issue 1977), and
-                //       AUDIO at 95% BEFORE this
-                //       `try_send` ran (priority_drop.rs), so by the time we
-                //       reach `Full` the policy has already had its say and the
-                //       packets still arriving are the protected/critical ones;
-                //  (ii) the #1638 backpressure-gated writer shed
-                //       (`bridge.rs::spawn_unistream_writer`) prevents the queue
-                //       from STAYING full: the shed arms precisely when the
-                //       channel is backed up (it gates on channel depth crossing
-                //       `WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`), and a `Full`
-                //       channel — the state at THIS arm — is unambiguously past
-                //       that gate, so a stalled receiver's wedged stream is reset
-                //       within `WT_UNISTREAM_WRITE_DEADLINE` of continuous
-                //       backpressure and the writer resumes draining instead of
-                //       pinning the channel full indefinitely (the #1631 M1
-                //       cascade). The shed deliberately does NOT fire on a healthy
-                //       (non-backed-up) stream merely slow to be polled, so it
-                //       cannot spuriously reset a low-traffic receiver. The
-                //       deep-stale-frame hazard #979 warns about is bounded by the
-                //       shallow 512 cap plus that shed, not by evicting the oldest.
                 //
                 // Phase 8b TELEM-8: this drop site previously lacked any
                 // counter increment, so a flood of media drops only surfaced
@@ -598,6 +1003,12 @@ impl WtChatSession {
             RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
                 .with_label_values(&[&act.logic.room, "webtransport", &session_id, "datagram"])
                 .set(dgram_depth as f64);
+            crate::metrics::record_outbound_queue_bytes(
+                &act.logic.room,
+                "webtransport",
+                &session_id,
+                &act.unistream_bytes.snapshot(),
+            );
 
             // Check if connection is dead (channel closed)
             if act.is_connection_dead() {
@@ -645,8 +1056,8 @@ impl Actor for WtChatSession {
         //
         // The WT actor fronts TWO independent policy-aware outbound
         // channels — `unistream_tx` (cap `wt_outbound_channel_capacity()`,
-        // env-tunable, default 512) and `datagram_tx` (cap
-        // `WT_DATAGRAM_CHANNEL_CAPACITY`, fixed 512) — but a single shared
+        // env-tunable) and `datagram_tx` (cap
+        // `WT_DATAGRAM_CHANNEL_CAPACITY`, fixed) — but a single shared
         // mailbox. A `Message` only splits into unistream vs datagram
         // *after* it leaves the mailbox (in `Handler<Message>` /
         // `handle_outbound`), so the mailbox holds a MIX of both. To keep
@@ -764,14 +1175,10 @@ impl Actor for WtChatSession {
 /// Uses `send_auto` to route packets across two QUIC primitives:
 ///
 /// * Datagrams — non-media control packets (heartbeats, RTT, diagnostics,
-///   AES key exchange) **and** small audio media packets that fit within
-///   the datagram MTU. Routing audio over datagrams avoids head-of-line
-///   blocking on the shared per-receiver UniStream when a single UDP
-///   segment is lost: the next audio frame still arrives on time even
-///   though QUIC has not yet retransmitted the lost one.
-/// * Reliable unidirectional streams — video/screen media (which would
-///   show visual artifacts under loss) and any oversized audio/control
-///   that exceeds the datagram MTU.
+///   AES key exchange), and sub-MTU audio only on the legacy arm of
+///   [`AudioDownlinkLane`].
+/// * Reliable unidirectional streams — video/screen media, audio (#2724), and
+///   any oversized control that exceeds the datagram MTU.
 ///
 /// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it
 /// once to extract the sender's `session_id` (for congestion tracking),
@@ -817,7 +1224,8 @@ impl Handler<Message> for WtChatSession {
 
         // For MEDIA packets, peek at the inner MediaType. We use the
         // resolved `MediaType` enum twice:
-        //   * `is_audio` controls per-frame routing (audio uses datagrams).
+        //   * `is_audio` selects the audio lane, and a datagram only on the
+        //     legacy arm (#2724).
         //   * `media_type` (Some/None) refines the drop-counter `kind`
         //     label into `audio`/`video`/`screen` so a storm can be
         //     attributed to a specific media stream. The 2026-05-08
@@ -838,6 +1246,11 @@ impl Handler<Message> for WtChatSession {
             None
         };
         let is_audio = matches!(inner_media_type, Some(MediaType::AUDIO));
+        // Cleartext even under E2EE, so it keeps the byte bound alive (#2717).
+        let media_kind = parsed
+            .as_ref()
+            .and_then(|pw| pw.media_kind.enum_value().ok())
+            .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED);
 
         match self.send_auto(
             bytes,
@@ -846,6 +1259,8 @@ impl Handler<Message> for WtChatSession {
             parse_succeeded,
             packet_type,
             inner_media_type,
+            media_kind,
+            sender_session_id,
         ) {
             WtSendResult::Sent => self.logic.observe_outbound_delivery(&msg),
             WtSendResult::Dead => {
@@ -894,41 +1309,16 @@ impl Handler<WtInbound> for WtChatSession {
 
         match action {
             InboundAction::Echo(data) => {
-                // RTT echo is routed onto the same primitive it arrived on
-                // so the round-trip measurement reflects that primitive's
-                // path — a UniStream probe measures stream RTT (which can
-                // be inflated by flow-control stalls), a Datagram probe
-                // measures the unframed datagram RTT.
-                let echo_bytes = Bytes::from(data.as_ref().clone());
-                let try_send_result = match msg.source {
-                    WtInboundSource::UniStream => self.unistream_tx.try_send(echo_bytes),
-                    WtInboundSource::Datagram => self.datagram_tx.try_send(echo_bytes),
-                };
-                match try_send_result {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!(
-                            "Outbound channel closed while echoing RTT for session {}",
-                            self.logic.id
-                        );
-                        ctx.stop();
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        RELAY_PACKET_DROPS_TOTAL
-                            .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
-                            .inc();
-                        // Phase 8b TELEM-8: protocol-wide aggregate. RTT echo
-                        // gets its own `kind` so we can distinguish probe
-                        // congestion (early signal) from media congestion
-                        // (already-degraded call) in the alerting layer.
-                        OUTBOUND_CHANNEL_DROPS_TOTAL
-                            .with_label_values(&["webtransport", "rtt"])
-                            .inc();
-                        error!(
-                            "Outbound channel full, dropping RTT echo for session {}",
-                            self.logic.id
-                        );
-                    }
+                if wt_echo_route_and_book(
+                    &self.unistream_tx,
+                    &self.datagram_tx,
+                    &self.unistream_bytes,
+                    &self.logic.room,
+                    self.logic.id,
+                    msg.source,
+                    Bytes::from(data.as_ref().clone()),
+                ) {
+                    ctx.stop();
                 }
             }
             InboundAction::Forward(data) => {
@@ -1009,10 +1399,12 @@ impl WtChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actors::priority_drop::PRIORITY_DROP_RTT_ECHO_REASON;
     use crate::constants::{
         resolve_wt_mailbox_capacity, INBOUND_MAILBOX_HEADROOM_FACTOR,
-        WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
+        WT_DOWNLINK_AUDIO_CHANNEL_CAPACITY, WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
     };
+    use protobuf::Enum as ProtobufEnum;
 
     // -----------------------------------------------------------------------
     // Issue #1057 (+ PR #1060 review) + #1144 headroom + #1062 shared binding:
@@ -1077,8 +1469,7 @@ mod tests {
             (WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT + WT_DATAGRAM_CHANNEL_CAPACITY)
                 * INBOUND_MAILBOX_HEADROOM_FACTOR,
         );
-        // Default WT mailbox is (512 + 512) × 2 = 2048.
-        assert_eq!(resolve_wt_mailbox_capacity(None), 2048);
+        assert_eq!(resolve_wt_mailbox_capacity(None), 3072);
         // The mailbox must be >= BOTH channels individually AND their sum —
         // the PR #1060 review invariant (a `max()`-sized mailbox would still
         // drop datagram traffic once the unistream cap is tuned up). With a
@@ -1122,17 +1513,53 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Sub-change B: audio-via-datagram routing
+    // Audio routing: reliable by default (#2724), datagram on the legacy arm
     // -----------------------------------------------------------------------
 
+    /// FAILS on the un-fixed code, which sent every sub-MTU cleartext audio
+    /// frame to a datagram.
     #[test]
-    fn audio_media_under_mtu_routes_via_datagram() {
-        // Opus frames are typically 50-200B; 100B sits comfortably below the
-        // ~1200B datagram MTU, so audio should now travel by datagram.
+    fn audio_media_under_mtu_takes_the_reliable_stream_by_default() {
         let out = build_outbound(
             audio_bytes(100),
             /*is_media=*/ true,
             /*is_audio=*/ true,
+            OutboundPriority::Audio,
+            AudioDownlinkLane::Reliable,
+        );
+        assert!(
+            is_unistream(&out),
+            "a ds=1 receiver's audio must ride the reliable stream, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn every_audio_size_takes_the_reliable_stream_by_default() {
+        for len in [1usize, 100, DATAGRAM_MAX_SIZE - 1, DATAGRAM_MAX_SIZE, 1500] {
+            let out = build_outbound(
+                audio_bytes(len),
+                /*is_media=*/ true,
+                /*is_audio=*/ true,
+                OutboundPriority::Audio,
+                AudioDownlinkLane::Reliable,
+            );
+            assert!(
+                is_unistream(&out),
+                "{len}B audio must ride the reliable stream, got {:?}",
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn audio_media_under_mtu_routes_via_datagram_on_the_legacy_arm() {
+        let out = build_outbound(
+            audio_bytes(100),
+            /*is_media=*/ true,
+            /*is_audio=*/ true,
+            OutboundPriority::Audio,
+            AudioDownlinkLane::Datagram,
         );
         assert!(
             is_datagram(&out),
@@ -1142,12 +1569,14 @@ mod tests {
     }
 
     #[test]
-    fn audio_media_at_mtu_routes_via_datagram() {
+    fn audio_media_at_mtu_routes_via_datagram_on_the_legacy_arm() {
         // Boundary case: payload exactly at the MTU still uses datagram.
         let out = build_outbound(
             audio_bytes(DATAGRAM_MAX_SIZE),
             /*is_media=*/ true,
             /*is_audio=*/ true,
+            OutboundPriority::Audio,
+            AudioDownlinkLane::Datagram,
         );
         assert!(
             is_datagram(&out),
@@ -1157,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_media_over_mtu_falls_back_to_unistream() {
+    fn audio_media_over_mtu_falls_back_to_unistream_on_the_legacy_arm() {
         // Oversized audio (rare — e.g. concatenated frames) must use the
         // reliable stream because datagrams above MTU would be rejected
         // by the QUIC layer.
@@ -1165,12 +1594,63 @@ mod tests {
             audio_bytes(1500),
             /*is_media=*/ true,
             /*is_audio=*/ true,
+            OutboundPriority::Audio,
+            AudioDownlinkLane::Datagram,
         );
         assert!(
             is_unistream(&out),
             "oversized audio must fall back to UniStream, got {:?}",
             out
         );
+    }
+
+    #[test]
+    fn sealed_audio_is_reliable_on_both_arms() {
+        for lane in [AudioDownlinkLane::Reliable, AudioDownlinkLane::Datagram] {
+            let out = build_outbound(
+                audio_bytes(203),
+                /*is_media=*/ true,
+                /*is_audio=*/ false,
+                OutboundPriority::Audio,
+                lane,
+            );
+            assert!(
+                is_unistream(&out),
+                "E2EE-sealed audio must stay on the reliable stream under {lane:?}, got {:?}",
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn the_legacy_arm_is_byte_for_byte_the_pre_2724_route() {
+        // Critical short-circuits before the audio branch, so it belongs in the
+        // sweep (N2): the revert must not move it either.
+        for (is_media, is_audio) in [(true, true), (true, false), (false, false)] {
+            for len in [1usize, DATAGRAM_MAX_SIZE, DATAGRAM_MAX_SIZE + 1] {
+                let priority = if is_audio {
+                    OutboundPriority::Audio
+                } else if is_media {
+                    OutboundPriority::Video
+                } else {
+                    OutboundPriority::Control
+                };
+                let fits = len <= DATAGRAM_MAX_SIZE;
+                let want_datagram = if is_media { is_audio && fits } else { fits };
+                let out = build_outbound(
+                    audio_bytes(len),
+                    is_media,
+                    is_audio,
+                    priority,
+                    AudioDownlinkLane::Datagram,
+                );
+                assert_eq!(
+                    is_datagram(&out),
+                    want_datagram,
+                    "({is_media}, {is_audio}, {len}B) diverged from the pre-#2724 route",
+                );
+            }
+        }
     }
 
     #[test]
@@ -1181,6 +1661,8 @@ mod tests {
             other_bytes(100),
             /*is_media=*/ true,
             /*is_audio=*/ false,
+            OutboundPriority::Video,
+            AudioDownlinkLane::Reliable,
         );
         assert!(
             is_unistream(&out),
@@ -1196,6 +1678,8 @@ mod tests {
             other_bytes(50_000),
             /*is_media=*/ true,
             /*is_audio=*/ false,
+            OutboundPriority::Video,
+            AudioDownlinkLane::Reliable,
         );
         assert!(
             is_unistream(&out),
@@ -1215,6 +1699,8 @@ mod tests {
             other_bytes(100),
             /*is_media=*/ false,
             /*is_audio=*/ false,
+            OutboundPriority::Control,
+            AudioDownlinkLane::Reliable,
         );
         assert!(
             is_datagram(&out),
@@ -1229,6 +1715,8 @@ mod tests {
             other_bytes(DATAGRAM_MAX_SIZE + 1),
             /*is_media=*/ false,
             /*is_audio=*/ false,
+            OutboundPriority::Control,
+            AudioDownlinkLane::Reliable,
         );
         assert!(
             is_unistream(&out),
@@ -1246,12 +1734,116 @@ mod tests {
             audio_bytes(100),
             /*is_media=*/ false,
             /*is_audio=*/ true,
+            OutboundPriority::Control,
+            AudioDownlinkLane::Reliable,
         );
         assert!(
             is_datagram(&out),
             "is_audio without is_media should fall through to control routing, got {:?}",
             out
         );
+    }
+
+    /// Enumerated from `PacketType::VALUES` and classified by production, so a
+    /// later promotion to `Critical` is covered the moment it lands.
+    #[test]
+    fn every_critical_packet_type_routes_to_the_unistream_at_any_size() {
+        let sizes = [
+            1usize,
+            200,
+            DATAGRAM_MAX_SIZE - 1,
+            DATAGRAM_MAX_SIZE,
+            DATAGRAM_MAX_SIZE + 1,
+        ];
+
+        let mut critical_types = Vec::new();
+        for packet_type in PacketType::VALUES.iter().copied() {
+            let priority = OutboundPriority::classify_sealed_aware(
+                true,
+                packet_type,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            );
+            if priority != OutboundPriority::Critical {
+                continue;
+            }
+            critical_types.push(packet_type);
+            for size in sizes {
+                let out = build_outbound(
+                    other_bytes(size),
+                    /*is_media=*/ false,
+                    /*is_audio=*/ false,
+                    priority,
+                    AudioDownlinkLane::Reliable,
+                );
+                assert!(
+                    is_unistream(&out),
+                    "{packet_type:?} at {size}B is Critical but routed to {out:?}; \
+                     on a datagram it can be lost on the wire or evicted by quinn \
+                     with no retransmit, which is how a DOWNLINK_CONGESTION \
+                     step-down instruction disappears exactly when the link is \
+                     congested",
+                );
+            }
+        }
+
+        assert_eq!(
+            critical_types.len(),
+            6,
+            "the Critical set changed ({critical_types:?}); confirm each new \
+             member should take the reliable lane, then update this count",
+        );
+    }
+
+    /// BITES on an over-correction that routes all control to the unistream.
+    #[test]
+    fn small_non_critical_traffic_still_routes_to_the_datagram_lane() {
+        let cases = [
+            (
+                PacketType::DIAGNOSTICS,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (PacketType::HEALTH, None, MediaKind::MEDIA_KIND_UNSPECIFIED),
+            (
+                PacketType::PEER_EVENT,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (
+                PacketType::CONNECTION,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (PacketType::MEDIA, Some(MediaType::AUDIO), MediaKind::AUDIO),
+        ];
+
+        for (packet_type, media_type, media_kind) in cases {
+            let is_media = packet_type == PacketType::MEDIA;
+            let is_audio = matches!(media_type, Some(MediaType::AUDIO));
+            let priority =
+                OutboundPriority::classify_sealed_aware(true, packet_type, media_type, media_kind);
+            assert_ne!(
+                priority,
+                OutboundPriority::Critical,
+                "test setup: {packet_type:?} is Critical, so it belongs in the \
+                 sibling test instead",
+            );
+            // Driven on the LEGACY arm: the lane is inert for every non-audio
+            // case, and it keeps the AUDIO row asserting what it always did.
+            let out = build_outbound(
+                other_bytes(200),
+                is_media,
+                is_audio,
+                priority,
+                AudioDownlinkLane::Datagram,
+            );
+            assert!(
+                is_datagram(&out),
+                "{packet_type:?} ({priority:?}) is not Critical and fits the MTU, \
+                 so it must stay on the low-latency datagram lane; got {out:?}",
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1632,12 +2224,12 @@ mod tests {
     //
     // These tests pin that honest contract against the REAL production paths —
     // they do NOT re-implement the decision logic inline:
-    //   * the priority pre-check is `evaluate_priority_drop` (the production
-    //     re-export of `priority_drop::evaluate`), which `send_auto` calls
-    //     BEFORE `try_send`;
-    //   * the channel is a real `tokio::sync::mpsc` of `Bytes` at the production
-    //     unistream capacity, whose sender-side `try_send` is exactly what the
-    //     `Full` arm runs.
+    //   * the unistream pre-check is `wt_unistream_decision`, called by
+    //     `wt_route_and_admit` BEFORE the enqueue;
+    //   * the channel is a real `mpsc` of `WtOutboundFrame` whose `try_send` is
+    //     what the `Full` arm runs. The pre-check test evaluates against the
+    //     production capacity; the tail-drop test uses a 4-slot cap so it can
+    //     fill the lane and reach `Full` in four pushes.
     // -----------------------------------------------------------------------
 
     /// The priority pre-check (the REAL shedding surface) sheds VIDEO before the
@@ -1650,24 +2242,26 @@ mod tests {
         // 85% full: above the 80% video threshold, below the 95% audio one.
         let used = total * 85 / 100;
         let free = total - used;
+        let no_bytes = SharedQueueByteMeter::default();
 
-        // VIDEO is shed by the PRE-CHECK (before try_send) — this is the real
-        // congestion response, not the Full arm.
         assert!(
             matches!(
-                evaluate_priority_drop(OutboundPriority::Video, free, total),
+                wt_unistream_decision(OutboundPriority::Video, free, &no_bytes),
                 PriorityDropDecision::Drop {
                     reason: "priority_drop_video"
                 }
             ),
-            "VIDEO must be shed by the priority pre-check at 85% fill"
+            "VIDEO must be shed by the unistream pre-check at 85% slot fill"
         );
-        // AUDIO is still protected at the same fill — the pre-check does NOT
-        // shed it, so audio only ever risks the (tail) Full drop.
         assert_eq!(
-            evaluate_priority_drop(OutboundPriority::Audio, free, total),
+            wt_unistream_decision(OutboundPriority::Audio, free, &no_bytes),
             PriorityDropDecision::Admit,
-            "AUDIO must be protected by the priority pre-check at 85% fill"
+            "AUDIO must be protected by the unistream pre-check at 85% slot fill"
+        );
+        let dgram_free = WT_DATAGRAM_CHANNEL_CAPACITY - WT_DATAGRAM_CHANNEL_CAPACITY * 85 / 100;
+        assert_eq!(
+            wt_datagram_decision(OutboundPriority::Audio, dgram_free),
+            PriorityDropDecision::Admit,
         );
     }
 
@@ -1682,39 +2276,48 @@ mod tests {
     #[tokio::test]
     async fn part2_full_arm_is_tail_drop_not_drop_oldest() {
         const CAP: usize = 4;
-        let (tx, mut rx) = mpsc::channel::<Bytes>(CAP);
+        let (tx, mut rx) = mpsc::channel::<WtOutboundFrame>(CAP);
+        let queued = SharedQueueByteMeter::default();
 
-        // Fill the channel with identifiable OLDEST..=newest frames.
         for i in 0..CAP {
-            tx.try_send(Bytes::from(vec![i as u8]))
-                .unwrap_or_else(|_| panic!("pre-fill slot {i} must accept"));
+            enqueue_unistream(
+                &tx,
+                &queued,
+                WtOutboundFrame::new(OutboundPriority::Video, Bytes::from(vec![i as u8])),
+            )
+            .unwrap_or_else(|_| panic!("pre-fill slot {i} must accept"));
         }
         assert_eq!(tx.capacity(), 0, "channel must be full before the Full arm");
+        assert_eq!(
+            queued.queued_for(OutboundPriority::Video),
+            CAP,
+            "each 1-byte frame must be charged exactly once"
+        );
 
-        // The "new" packet that arrives while Full. With a TAIL drop this is the
-        // one rejected; with a (non-existent) drop-oldest the head (0) would be
-        // evicted to make room for it.
-        let newest = Bytes::from(vec![0xFFu8]);
-        match tx.try_send(newest) {
+        let newest = WtOutboundFrame::new(OutboundPriority::Video, Bytes::from(vec![0xFFu8]));
+        match enqueue_unistream(&tx, &queued, newest) {
             Err(mpsc::error::TrySendError::Full(rejected)) => {
                 // The newest packet is what the channel handed back as rejected —
                 // i.e. it is the tail drop. The sender did NOT evict the oldest.
                 assert_eq!(
-                    rejected.as_ref(),
+                    rejected.bytes.as_ref(),
                     &[0xFFu8],
                     "the NEWEST packet must be the one rejected (tail drop)"
                 );
             }
-            other => panic!("expected Full(newest), got {other:?}"),
+            other => panic!("expected Full(newest), got {:?}", other.is_err()),
         }
+        assert_eq!(
+            queued.queued_for(OutboundPriority::Video),
+            CAP,
+            "a REFUSED frame must not be charged — the meter would then bound \
+             the lane on bytes that were never queued"
+        );
 
-        // The oldest queued frame (0) is still at the HEAD, untouched — no
-        // drop-oldest occurred. Drain and confirm strict FIFO of the original
-        // CAP frames.
         for expected in 0..CAP {
             let got = rx.try_recv().expect("queued frame must still be present");
             assert_eq!(
-                got.as_ref(),
+                got.bytes.as_ref(),
                 &[expected as u8],
                 "queued frames must survive a Full try_send in FIFO order \
                  (oldest first); a drop-oldest would have evicted frame 0"
@@ -1725,5 +2328,1075 @@ mod tests {
             "exactly the CAP pre-filled frames should remain; the newest was \
              tail-dropped and never enqueued"
         );
+    }
+
+    fn fill_media_bytes_to(meter: &SharedQueueByteMeter, priority: OutboundPriority, pct: usize) {
+        let budget = wt_unistream_byte_budget_for(priority);
+        assert!(budget > 0, "{priority:?} has no byte budget to fill");
+        meter.on_enqueue(priority, budget * pct / 100);
+    }
+
+    fn outbound_drops(kind: &str) -> f64 {
+        crate::metrics::OUTBOUND_CHANNEL_DROPS_TOTAL
+            .with_label_values(&["webtransport", kind])
+            .get()
+    }
+
+    fn room_drops(room: &str, reason: &str) -> f64 {
+        crate::metrics::RELAY_PACKET_DROPS_TOTAL
+            .with_label_values(&[room, "webtransport", reason])
+            .get()
+    }
+
+    /// #2721. BITES: admit the echo as `Control` (or `Critical`).
+    #[tokio::test]
+    async fn a_unistream_probe_is_echoed_on_the_unistream_with_the_probe_echo_class() {
+        let (uni_tx, mut uni_rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let (dgram_tx, _dgram_rx) = mpsc::channel::<WtOutboundFrame>(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let meter = SharedQueueByteMeter::default();
+
+        assert!(matches!(
+            wt_echo_admit(
+                &uni_tx,
+                &dgram_tx,
+                &meter,
+                WtInboundSource::UniStream,
+                Bytes::from_static(b"probe"),
+            ),
+            WtAdmission::Enqueued
+        ));
+
+        let echoed = uni_rx
+            .try_recv()
+            .expect("the echo must be on the unistream");
+        assert_eq!(echoed.bytes.as_ref(), b"probe");
+        assert_eq!(
+            echoed.priority,
+            OutboundPriority::ProbeEcho,
+            "the echo must carry the probe-echo class: `Control` is exempt from \
+             the byte dimension (S3) and `Critical` books overflow_critical on a \
+             bridge shed (S2)",
+        );
+        assert_eq!(
+            meter.queued_for(OutboundPriority::Video),
+            0,
+            "the echo witnesses the media budget, it must not be charged to it",
+        );
+        assert_eq!(
+            meter.queued_for(OutboundPriority::ProbeEcho),
+            b"probe".len(),
+            "the echo's own bytes still ride the unbudgeted bucket",
+        );
+    }
+
+    /// #2721 S3. BITES: give `ProbeEcho` the `Control` byte-dimension exemption;
+    /// book the drop on any other kind.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn byte_pressure_that_sheds_video_sheds_the_echo_onto_the_rtt_kind() {
+        let (uni_tx, mut uni_rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let (dgram_tx, _dgram_rx) = mpsc::channel::<WtOutboundFrame>(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let meter = SharedQueueByteMeter::default();
+        fill_media_bytes_to(&meter, OutboundPriority::Video, 81);
+        let free = uni_tx.capacity();
+        let slot_fill = (wt_outbound_channel_capacity() - free) as f32;
+        assert_eq!(
+            slot_fill, 0.0,
+            "test setup: the SLOT dimension must be idle"
+        );
+
+        assert!(
+            matches!(
+                wt_unistream_decision(OutboundPriority::Video, free, &meter),
+                PriorityDropDecision::Drop { .. }
+            ),
+            "test setup: this fill must be a fill that sheds camera video",
+        );
+
+        let room = "room-2721-echo-shed";
+        let rtt_before = outbound_drops(ECHO_DROP_KIND);
+        let critical_before = outbound_drops("overflow_critical");
+        let reason_before = room_drops(room, PRIORITY_DROP_RTT_ECHO_REASON);
+
+        assert_eq!(
+            ECHO_DROP_KIND, "rtt",
+            "the alert and the client's probe-timeout story both cite this \
+             literal series name",
+        );
+        let dead = wt_echo_route_and_book(
+            &uni_tx,
+            &dgram_tx,
+            &meter,
+            room,
+            7,
+            WtInboundSource::UniStream,
+            Bytes::from_static(b"probe"),
+        );
+        assert!(!dead, "a shed echo must not kill the session");
+        assert!(
+            uni_rx.try_recv().is_err(),
+            "the echo must be shed alongside the video it measures, not queued",
+        );
+
+        assert_eq!(
+            outbound_drops(ECHO_DROP_KIND) - rtt_before,
+            1.0,
+            "an unechoed probe belongs on the rtt kind",
+        );
+        assert_eq!(
+            outbound_drops("overflow_critical") - critical_before,
+            0.0,
+            "overflow_critical PAGES and must stay lifecycle-only",
+        );
+        assert_eq!(
+            room_drops(room, PRIORITY_DROP_RTT_ECHO_REASON) - reason_before,
+            1.0,
+            "the room-tagged counter carries the finer shed reason",
+        );
+    }
+
+    /// BITES: subject the datagram arm of `wt_echo_admit` to a media shed.
+    #[tokio::test]
+    async fn a_datagram_probe_is_still_echoed_under_the_same_byte_pressure() {
+        let (uni_tx, _uni_rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let (dgram_tx, mut dgram_rx) =
+            mpsc::channel::<WtOutboundFrame>(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let meter = SharedQueueByteMeter::default();
+        fill_media_bytes_to(&meter, OutboundPriority::Video, 81);
+
+        assert!(
+            matches!(
+                wt_echo_admit(
+                    &uni_tx,
+                    &dgram_tx,
+                    &meter,
+                    WtInboundSource::UniStream,
+                    Bytes::from_static(b"probe"),
+                ),
+                WtAdmission::PriorityDropped { .. }
+            ),
+            "test setup: this fill must shed the unistream echo",
+        );
+
+        assert!(
+            matches!(
+                wt_echo_admit(
+                    &uni_tx,
+                    &dgram_tx,
+                    &meter,
+                    WtInboundSource::Datagram,
+                    Bytes::from_static(b"probe"),
+                ),
+                WtAdmission::Enqueued
+            ),
+            "the datagram lane is independent of stream flow control and has no \
+             media byte budget — its echo must not inherit the unistream shed",
+        );
+        assert_eq!(
+            dgram_rx
+                .try_recv()
+                .expect("the datagram echo must be on the datagram lane")
+                .bytes
+                .as_ref(),
+            b"probe",
+        );
+    }
+
+    /// BITES: move the arm to `PRIORITY_DROP_AUDIO_FILL_RATIO`; drop `Screen`
+    /// from `fullest_media_byte_dimension`.
+    #[test]
+    fn the_echo_sheds_at_the_video_threshold_on_the_fullest_media_bucket() {
+        let free = wt_outbound_channel_capacity();
+
+        let just_below = SharedQueueByteMeter::default();
+        fill_media_bytes_to(&just_below, OutboundPriority::Video, 79);
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::ProbeEcho, free, &just_below),
+            PriorityDropDecision::Admit,
+            "below the camera shed point the lane is delivering media, so the \
+             probe must be delivered too",
+        );
+
+        let just_above = SharedQueueByteMeter::default();
+        fill_media_bytes_to(&just_above, OutboundPriority::Video, 81);
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::ProbeEcho, free, &just_above),
+            PriorityDropDecision::Drop {
+                reason: PRIORITY_DROP_RTT_ECHO_REASON
+            },
+        );
+
+        let screen_only = SharedQueueByteMeter::default();
+        fill_media_bytes_to(&screen_only, OutboundPriority::Screen, 81);
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::ProbeEcho, free, &screen_only),
+            PriorityDropDecision::Drop {
+                reason: PRIORITY_DROP_RTT_ECHO_REASON
+            },
+            "a screen-only lane under pressure must shed the probe too",
+        );
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::Audio, free, &screen_only),
+            PriorityDropDecision::Admit,
+            "test setup: nothing else sheds at this fill, so the probe arm is \
+             what this asserts",
+        );
+    }
+
+    /// BITES: return `ProbeEcho` from any `classify_sealed_aware` arm.
+    #[test]
+    fn no_fanned_out_packet_classifies_as_a_probe_echo() {
+        for &packet_type in PacketType::VALUES {
+            for &media_kind in MediaKind::VALUES {
+                for media_type in
+                    std::iter::once(None).chain(MediaType::VALUES.iter().copied().map(Some))
+                {
+                    for parsed in [false, true] {
+                        assert_ne!(
+                            OutboundPriority::classify_sealed_aware(
+                                parsed,
+                                packet_type,
+                                media_type,
+                                media_kind,
+                            ),
+                            OutboundPriority::ProbeEcho,
+                            "({parsed}, {packet_type:?}, {media_type:?}, {media_kind:?}) \
+                             classified as a probe echo",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn fill_unistream(
+        meter: &SharedQueueByteMeter,
+        priority: OutboundPriority,
+        count: usize,
+        frame_bytes: usize,
+    ) -> usize {
+        for _ in 0..count {
+            meter.on_enqueue(priority, frame_bytes);
+        }
+        wt_outbound_channel_capacity() - count
+    }
+
+    /// Few LARGE frames use few slots and most of the budget, so bytes trip
+    /// first. BITES on `evaluate`, which admits.
+    #[test]
+    fn few_large_video_frames_trip_the_byte_dimension_before_the_slot_one() {
+        let frame_bytes = crate::constants::tier_frame_bytes(
+            &videocall_aq::constants::VIDEO_QUALITY_TIERS
+                [videocall_aq::constants::DEFAULT_VIDEO_TIER_INDEX],
+        );
+        let count = (OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100) / frame_bytes + 1;
+        let meter = SharedQueueByteMeter::default();
+        let free = fill_unistream(&meter, OutboundPriority::Video, count, frame_bytes);
+
+        let slot_fill =
+            (wt_outbound_channel_capacity() - free) as f32 / wt_outbound_channel_capacity() as f32;
+        assert!(
+            slot_fill < 0.20,
+            "test setup: {count} frames must leave the SLOT dimension far below \
+             its 0.80 shed point, or this proves nothing about bytes \
+             (slot fill {slot_fill})",
+        );
+
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::Video, free, &meter),
+            PriorityDropDecision::Drop {
+                reason: "priority_drop_video"
+            },
+            "{count} x {frame_bytes}B of queued camera video is past 80% of the \
+             {OUTBOUND_VIDEO_BYTE_BUDGET}B budget and must shed, even though \
+             only {count} of the lane's slots are used",
+        );
+
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::Screen, free, &meter),
+            PriorityDropDecision::Admit,
+            "camera bytes must not be charged against the screen budget",
+        );
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::Audio, free, &meter),
+            PriorityDropDecision::Admit,
+            "audio costs slots, not bytes (#2261)",
+        );
+    }
+
+    #[test]
+    fn screen_sheds_on_its_own_byte_budget_at_the_screen_threshold() {
+        let frame_bytes =
+            crate::constants::tier_frame_bytes(&videocall_aq::constants::SCREEN_QUALITY_TIERS[0]);
+        let meter = SharedQueueByteMeter::default();
+
+        let below = (OUTBOUND_SCREEN_BYTE_BUDGET * 85 / 100) / frame_bytes;
+        let free = fill_unistream(&meter, OutboundPriority::Screen, below, frame_bytes);
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::Screen, free, &meter),
+            PriorityDropDecision::Admit,
+            "at 85% of its byte budget SCREEN is still held — it sheds at 90%, \
+             a full 10 points after camera video",
+        );
+
+        let to_ninety = (OUTBOUND_SCREEN_BYTE_BUDGET * 90 / 100) / frame_bytes + 1 - below;
+        let free = fill_unistream(&meter, OutboundPriority::Screen, to_ninety, frame_bytes);
+        assert_eq!(
+            wt_unistream_decision(OutboundPriority::Screen, free, &meter),
+            PriorityDropDecision::Drop {
+                reason: "priority_drop_video"
+            },
+            "past 90% of the screen byte budget SCREEN must shed",
+        );
+    }
+
+    /// The unmetered lane is sound only while every priority reaching it has a
+    /// zero byte budget.
+    #[test]
+    fn the_datagram_lane_carries_no_priority_with_a_byte_budget() {
+        let cases = [
+            (
+                80usize,
+                PacketType::MEDIA,
+                Some(MediaType::AUDIO),
+                MediaKind::AUDIO,
+            ),
+            (
+                200,
+                PacketType::MEDIA,
+                Some(MediaType::VIDEO),
+                MediaKind::VIDEO,
+            ),
+            (
+                200,
+                PacketType::MEDIA,
+                Some(MediaType::SCREEN),
+                MediaKind::SCREEN,
+            ),
+            (200, PacketType::MEDIA, None, MediaKind::VIDEO),
+            (
+                200,
+                PacketType::MEDIA,
+                Some(MediaType::HEARTBEAT),
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (
+                200,
+                PacketType::AES_KEY,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (
+                200,
+                PacketType::DIAGNOSTICS,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (
+                200,
+                PacketType::HEALTH,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (
+                200,
+                PacketType::PEER_EVENT,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            (
+                DATAGRAM_MAX_SIZE,
+                PacketType::MEDIA,
+                Some(MediaType::AUDIO),
+                MediaKind::AUDIO,
+            ),
+            (
+                DATAGRAM_MAX_SIZE + 1,
+                PacketType::MEDIA,
+                Some(MediaType::AUDIO),
+                MediaKind::AUDIO,
+            ),
+        ];
+
+        let mut datagram_routed = 0;
+        for (len, packet_type, media_type, media_kind) in cases {
+            let is_media = packet_type == PacketType::MEDIA;
+            let is_audio = matches!(media_type, Some(MediaType::AUDIO));
+            let priority =
+                OutboundPriority::classify_sealed_aware(true, packet_type, media_type, media_kind);
+            if matches!(
+                build_outbound(
+                    vec![0u8; len],
+                    is_media,
+                    is_audio,
+                    priority,
+                    AudioDownlinkLane::Datagram,
+                ),
+                WtOutbound::UniStream(_)
+            ) {
+                continue;
+            }
+            datagram_routed += 1;
+            assert_eq!(
+                wt_unistream_byte_budget_for(priority),
+                0,
+                "a {len}B {packet_type:?}/{media_type:?}/{media_kind:?} packet routes to the \
+                 datagram lane as {priority:?}; giving that priority a byte budget means the \
+                 lane needs a meter too (#2717)",
+            );
+        }
+        assert!(
+            datagram_routed >= 4,
+            "only {datagram_routed} cases routed to the datagram lane; the \
+             routing changed and this test no longer exercises it",
+        );
+        // Driven on the LEGACY arm on purpose: that is the widest datagram
+        // surface, so the invariant is checked against every priority that can
+        // still reach the lane (#2724).
+    }
+
+    /// BITES: drop the `on_enqueue` and the meter never rises, so neither the
+    /// byte shed nor the #1638 gate ever fires.
+    #[tokio::test]
+    async fn the_credit_site_charges_accepted_frames_and_only_those() {
+        let (tx, mut rx) = mpsc::channel::<WtOutboundFrame>(2);
+        let queued = SharedQueueByteMeter::default();
+
+        enqueue_unistream(
+            &tx,
+            &queued,
+            WtOutboundFrame::new(OutboundPriority::Video, Bytes::from(vec![0u8; 900])),
+        )
+        .expect("first slot is free");
+        enqueue_unistream(
+            &tx,
+            &queued,
+            WtOutboundFrame::new(OutboundPriority::Screen, Bytes::from(vec![0u8; 700])),
+        )
+        .expect("second slot is free");
+
+        assert_eq!(queued.queued_for(OutboundPriority::Video), 900);
+        assert_eq!(queued.queued_for(OutboundPriority::Screen), 700);
+
+        assert!(enqueue_unistream(
+            &tx,
+            &queued,
+            WtOutboundFrame::new(OutboundPriority::Video, Bytes::from(vec![0u8; 5_000])),
+        )
+        .is_err());
+        assert_eq!(
+            queued.snapshot().queued_total(),
+            1_600,
+            "a frame the lane refused must not be charged",
+        );
+
+        rx.close();
+        while rx.try_recv().is_ok() {}
+        assert!(enqueue_unistream(
+            &tx,
+            &queued,
+            WtOutboundFrame::new(OutboundPriority::Video, Bytes::from(vec![0u8; 11])),
+        )
+        .is_err());
+        assert_eq!(queued.snapshot().queued_total(), 1_600);
+    }
+
+    /// The admission step must HONOUR its pre-check, not merely compute it.
+    #[tokio::test]
+    async fn the_admission_step_refuses_what_its_pre_check_sheds() {
+        let (tx, _rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let queued = SharedQueueByteMeter::default();
+        queued.on_enqueue(
+            OutboundPriority::Video,
+            OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100,
+        );
+
+        let admitted = wt_unistream_admit(
+            &tx,
+            &queued,
+            OutboundPriority::Video,
+            Bytes::from(vec![0u8; 3_000]),
+            DownlinkStreamKey::Control,
+        );
+        assert!(
+            matches!(admitted, WtAdmission::PriorityDropped { .. }),
+            "a frame past the camera byte budget must be refused",
+        );
+        assert_eq!(
+            tx.capacity(),
+            wt_outbound_channel_capacity(),
+            "a shed frame must never reach the channel",
+        );
+        assert_eq!(
+            queued.queued_for(OutboundPriority::Video),
+            OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100,
+            "and must never be charged",
+        );
+
+        assert!(matches!(
+            wt_unistream_admit(
+                &tx,
+                &queued,
+                OutboundPriority::Critical,
+                Bytes::from(vec![0u8; 3_000]),
+                DownlinkStreamKey::Control,
+            ),
+            WtAdmission::Enqueued
+        ));
+    }
+
+    fn armed_stage_one() -> DownlinkShedEscalation {
+        let escalation = DownlinkShedEscalation::new();
+        let base = crate::actors::session_logic::downlink_congested_epoch_now();
+        let step = crate::constants::WT_SHED_ESCALATION_ROUND.as_millis() as u64;
+        for round in 0..crate::constants::WT_SHED_ESCALATION_STAGE1_ROUNDS as u64 {
+            escalation.record_shed_at(base + round * step, 40 + round);
+        }
+        assert!(
+            escalation.camera_video_is_shed(),
+            "test setup failed: stage 1 is not armed",
+        );
+        escalation
+    }
+
+    fn admit_one(
+        escalation: &DownlinkShedEscalation,
+        media_type: MediaType,
+        media_kind: MediaKind,
+    ) -> WtAdmission {
+        let (uni_tx, _uni_rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let (dgram_tx, _dgram_rx) = mpsc::channel::<WtOutboundFrame>(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let queued = SharedQueueByteMeter::default();
+        wt_route_and_admit(
+            &uni_tx,
+            &dgram_tx,
+            &queued,
+            vec![0u8; 4_096],
+            true,
+            media_type == MediaType::AUDIO,
+            true,
+            PacketType::MEDIA,
+            Some(media_type),
+            media_kind,
+            7,
+            AudioDownlinkLane::Reliable,
+            escalation,
+        )
+    }
+
+    /// FAILS on the un-fixed code, which has no gate and enqueues the camera
+    /// frame. BITES: widen the gate to SCREEN or AUDIO, or return
+    /// `PriorityDropped` — that arm books the two series that page (E19).
+    #[test]
+    fn stage_one_drops_camera_video_at_admission_and_protects_screen_and_audio() {
+        let escalation = armed_stage_one();
+
+        assert!(
+            matches!(
+                admit_one(&escalation, MediaType::VIDEO, MediaKind::VIDEO),
+                WtAdmission::EscalationShed
+            ),
+            "an escalated receiver must be sent no camera video at all",
+        );
+        assert!(
+            matches!(
+                admit_one(&escalation, MediaType::SCREEN, MediaKind::SCREEN),
+                WtAdmission::Enqueued
+            ),
+            "SCREEN outranks cameras under #1977 and must survive stage 1",
+        );
+        assert!(
+            matches!(
+                admit_one(&escalation, MediaType::AUDIO, MediaKind::AUDIO),
+                WtAdmission::Enqueued
+            ),
+            "AUDIO is never a shed candidate",
+        );
+    }
+
+    /// BITES: point `book_escalation_shed` at `OUTBOUND_CHANNEL_DROPS_TOTAL` or
+    /// `RELAY_PACKET_DROPS_TOTAL`.
+    #[test]
+    #[serial_test::serial]
+    fn a_stage_one_shed_books_only_the_non_alerting_series() {
+        let before = RELAY_DOWNLINK_SHED_TOTAL
+            .with_label_values(&["webtransport"])
+            .get();
+        book_escalation_shed();
+        assert_eq!(
+            RELAY_DOWNLINK_SHED_TOTAL
+                .with_label_values(&["webtransport"])
+                .get()
+                - before,
+            1.0,
+            "relay_downlink_shed_total is the series with no alert rule in any \
+             of the three prometheus values files",
+        );
+    }
+
+    #[test]
+    fn an_unescalated_receiver_keeps_its_camera_video() {
+        let escalation = DownlinkShedEscalation::new();
+        assert!(
+            !escalation.camera_video_is_shed(),
+            "a receiver that has never shed is not escalated",
+        );
+        assert!(matches!(
+            admit_one(&escalation, MediaType::VIDEO, MediaKind::VIDEO),
+            WtAdmission::Enqueued
+        ));
+    }
+
+    /// The real classify-route-enqueue path must charge the lane. Everything
+    /// `send_auto` does except the drop metrics; it needs NATS to call directly.
+    #[tokio::test]
+    async fn a_routed_video_send_charges_the_unistream_meter() {
+        // PRODUCTION capacity: a short test channel reads ~99% full.
+        let (uni_tx, _uni_rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let (dgram_tx, _dgram_rx) = mpsc::channel::<WtOutboundFrame>(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let queued = SharedQueueByteMeter::default();
+
+        let admitted = wt_route_and_admit(
+            &uni_tx,
+            &dgram_tx,
+            &queued,
+            vec![0u8; 4_096],
+            true,
+            false,
+            true,
+            PacketType::MEDIA,
+            Some(MediaType::VIDEO),
+            MediaKind::VIDEO,
+            7,
+            AudioDownlinkLane::Reliable,
+            &DownlinkShedEscalation::new(),
+        );
+        assert!(matches!(admitted, WtAdmission::Enqueued));
+        assert_eq!(
+            queued.queued_for(OutboundPriority::Video),
+            4_096,
+            "a routed camera frame must be charged to the camera bucket",
+        );
+
+        let admitted = wt_route_and_admit(
+            &uni_tx,
+            &dgram_tx,
+            &queued,
+            vec![0u8; 200],
+            true,
+            true,
+            true,
+            PacketType::MEDIA,
+            Some(MediaType::AUDIO),
+            MediaKind::AUDIO,
+            7,
+            AudioDownlinkLane::Datagram,
+            &DownlinkShedEscalation::new(),
+        );
+        assert!(matches!(admitted, WtAdmission::Enqueued));
+        assert_eq!(
+            queued.snapshot().queued_total(),
+            4_096,
+            "the datagram lane has no meter; charging it here would bound the \
+             unistream lane on bytes that are not in it",
+        );
+
+        // #2724: the SAME packet on the default arm takes the reliable lane and
+        // IS charged, with a budget of 0 so it can never be byte-shed.
+        let admitted = wt_route_and_admit(
+            &uni_tx,
+            &dgram_tx,
+            &queued,
+            vec![0u8; 200],
+            true,
+            true,
+            true,
+            PacketType::MEDIA,
+            Some(MediaType::AUDIO),
+            MediaKind::AUDIO,
+            7,
+            AudioDownlinkLane::Reliable,
+            &DownlinkShedEscalation::new(),
+        );
+        assert!(matches!(admitted, WtAdmission::Enqueued));
+        assert_eq!(
+            queued.queued_for(OutboundPriority::Audio),
+            200,
+            "reliable audio is charged to the receiver's meter like every other \
+             reliable frame (#2717)",
+        );
+        assert_eq!(
+            wt_unistream_byte_budget_for(OutboundPriority::Audio),
+            0,
+            "audio must keep a zero byte budget: a budget is what makes a class \
+             byte-sheddable, and audio must never be",
+        );
+
+        // E2EE on: the inner parse fails; the outer kind holds the bucket.
+        let admitted = wt_route_and_admit(
+            &uni_tx,
+            &dgram_tx,
+            &queued,
+            vec![0u8; 1_000],
+            true,
+            false,
+            true,
+            PacketType::MEDIA,
+            None,
+            MediaKind::VIDEO,
+            7,
+            AudioDownlinkLane::Reliable,
+            &DownlinkShedEscalation::new(),
+        );
+        assert!(matches!(admitted, WtAdmission::Enqueued));
+        assert_eq!(
+            queued.queued_for(OutboundPriority::Video),
+            5_096,
+            "a sealed camera frame must be charged to the camera bucket, not \
+             left uncounted as control",
+        );
+    }
+
+    #[test]
+    fn only_identified_video_and_screen_get_a_publisher_key() {
+        const BULK: usize = DATAGRAM_MAX_SIZE + 1;
+        const SMALL: usize = 64;
+
+        assert_eq!(
+            DownlinkStreamKey::for_media(
+                true,
+                false,
+                42,
+                MediaKind::VIDEO,
+                BULK,
+                AudioDownlinkLane::Reliable
+            ),
+            DownlinkStreamKey::Publisher {
+                session_id: 42,
+                kind: PublisherStreamKind::Video
+            },
+        );
+        assert_eq!(
+            DownlinkStreamKey::for_media(
+                true,
+                false,
+                42,
+                MediaKind::SCREEN,
+                BULK,
+                AudioDownlinkLane::Reliable
+            ),
+            DownlinkStreamKey::Publisher {
+                session_id: 42,
+                kind: PublisherStreamKind::Screen
+            },
+        );
+        // Camera and screen from the SAME publisher are different streams — a
+        // screen keyframe must not block that peer's camera.
+        assert_ne!(
+            DownlinkStreamKey::for_media(
+                true,
+                false,
+                42,
+                MediaKind::VIDEO,
+                BULK,
+                AudioDownlinkLane::Reliable
+            ),
+            DownlinkStreamKey::for_media(
+                true,
+                false,
+                42,
+                MediaKind::SCREEN,
+                BULK,
+                AudioDownlinkLane::Reliable
+            ),
+        );
+        // FAILS on the un-fixed code, where every audio frame keyed `Control`.
+        assert_eq!(
+            DownlinkStreamKey::for_media(
+                true,
+                false,
+                42,
+                MediaKind::AUDIO,
+                SMALL,
+                AudioDownlinkLane::Reliable
+            ),
+            DownlinkStreamKey::Audio,
+            "E2EE-sealed audio reaches the audio lane through the OUTER cleartext \
+             media_kind (#2724)",
+        );
+        for len in [1usize, SMALL, DATAGRAM_MAX_SIZE] {
+            assert_eq!(
+                DownlinkStreamKey::for_media(
+                    true,
+                    true,
+                    42,
+                    MediaKind::AUDIO,
+                    len,
+                    AudioDownlinkLane::Reliable
+                ),
+                DownlinkStreamKey::Audio,
+                "cleartext audio keys the audio lane at {len}B",
+            );
+            // The rollout case: a pre-`media_kind` publisher's cleartext audio
+            // carries no outer kind, so the inner signal is the only one.
+            assert_eq!(
+                DownlinkStreamKey::for_media(
+                    true,
+                    true,
+                    42,
+                    MediaKind::MEDIA_KIND_UNSPECIFIED,
+                    len,
+                    AudioDownlinkLane::Reliable
+                ),
+                DownlinkStreamKey::Audio,
+                "a pre-media_kind publisher's cleartext audio keys the audio lane \
+                 at {len}B",
+            );
+        }
+        assert_eq!(
+            DownlinkStreamKey::for_media(
+                false,
+                true,
+                42,
+                MediaKind::AUDIO,
+                SMALL,
+                AudioDownlinkLane::Reliable
+            ),
+            DownlinkStreamKey::Control,
+            "is_audio is meaningful only for media; a non-media frame keys control",
+        );
+        assert_eq!(
+            DownlinkStreamKey::for_media(
+                false,
+                false,
+                42,
+                MediaKind::VIDEO,
+                BULK,
+                AudioDownlinkLane::Reliable
+            ),
+            DownlinkStreamKey::Control,
+            "non-media never keys a publisher stream, whatever media_kind says",
+        );
+
+        // The fail-open bucket, split by size. Sub-MTU frames here are HEARTBEAT
+        // and KEYFRAME_REQUEST, which are MEDIA packets that leave media_kind
+        // unset: they are control-shaped and belong on the lifecycle lane.
+        for (session_id, kind) in [
+            (42u64, MediaKind::MEDIA_KIND_UNSPECIFIED),
+            (0, MediaKind::MEDIA_KIND_UNSPECIFIED),
+            (0, MediaKind::VIDEO),
+            (0, MediaKind::SCREEN),
+        ] {
+            assert_eq!(
+                DownlinkStreamKey::for_media(
+                    true,
+                    false,
+                    session_id,
+                    kind,
+                    SMALL,
+                    AudioDownlinkLane::Reliable
+                ),
+                DownlinkStreamKey::Control,
+                "sub-MTU unattributable media is control-shaped: ({session_id}, {kind:?})",
+            );
+            assert_eq!(
+                DownlinkStreamKey::for_media(
+                    true,
+                    false,
+                    session_id,
+                    kind,
+                    BULK,
+                    AudioDownlinkLane::Reliable
+                ),
+                DownlinkStreamKey::Shared,
+                "BULK unattributable media must NOT sit in front of #2718 Critical \
+                 control on the room's aggregation lane: ({session_id}, {kind:?})",
+            );
+        }
+        assert_eq!(
+            DownlinkStreamKey::for_media(
+                true,
+                false,
+                42,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+                DATAGRAM_MAX_SIZE,
+                AudioDownlinkLane::Reliable
+            ),
+            DownlinkStreamKey::Control,
+            "the split is strictly ABOVE the datagram MTU",
+        );
+    }
+
+    /// FAILS on bdc8935e: `for_media` took no lane, so sealed audio kept the
+    /// no-shed stream under the revert. Expectations are literals, not a second
+    /// copy of the rule.
+    #[test]
+    fn the_datagram_revert_restores_the_pre_2724_key_for_every_audio_class() {
+        const SMALL: usize = 64;
+        const BULK: usize = DATAGRAM_MAX_SIZE + 1;
+
+        // (is_audio, media_kind, len) -> the key the pre-#2724 `for_media` gave.
+        let pre_2724 = [
+            // E2EE-sealed audio: inner parse failed, outer kind is AUDIO.
+            (false, MediaKind::AUDIO, SMALL, DownlinkStreamKey::Control),
+            (false, MediaKind::AUDIO, BULK, DownlinkStreamKey::Control),
+            // Cleartext audio, both sides of the MTU.
+            (true, MediaKind::AUDIO, SMALL, DownlinkStreamKey::Control),
+            (true, MediaKind::AUDIO, BULK, DownlinkStreamKey::Control),
+            // A publisher older than `media_kind` sending cleartext audio.
+            (
+                true,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+                SMALL,
+                DownlinkStreamKey::Control,
+            ),
+            (
+                true,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+                BULK,
+                DownlinkStreamKey::Shared,
+            ),
+        ];
+
+        for (is_audio, media_kind, len, want) in pre_2724 {
+            assert_eq!(
+                DownlinkStreamKey::for_media(
+                    true,
+                    is_audio,
+                    42,
+                    media_kind,
+                    len,
+                    AudioDownlinkLane::Datagram
+                ),
+                want,
+                "({is_audio}, {media_kind:?}, {len}B) must key exactly as it did \
+                 before #2724 under the revert",
+            );
+        }
+
+        // And the revert must not touch video or screen.
+        assert_eq!(
+            DownlinkStreamKey::for_media(
+                true,
+                false,
+                42,
+                MediaKind::VIDEO,
+                BULK,
+                AudioDownlinkLane::Datagram
+            ),
+            DownlinkStreamKey::Publisher {
+                session_id: 42,
+                kind: PublisherStreamKind::Video
+            },
+        );
+    }
+
+    /// The lane is bounded in SLOTS, so what may enter decides its byte worst
+    /// case (A19).
+    #[test]
+    fn only_a_frame_that_fits_the_mtu_may_enter_the_audio_lane() {
+        for (is_audio, media_kind) in [
+            (true, MediaKind::AUDIO),
+            (false, MediaKind::AUDIO),
+            (true, MediaKind::MEDIA_KIND_UNSPECIFIED),
+        ] {
+            assert_eq!(
+                DownlinkStreamKey::for_media(
+                    true,
+                    is_audio,
+                    42,
+                    media_kind,
+                    DATAGRAM_MAX_SIZE,
+                    AudioDownlinkLane::Reliable
+                ),
+                DownlinkStreamKey::Audio,
+                "at the MTU it is still an Opus frame",
+            );
+            assert_ne!(
+                DownlinkStreamKey::for_media(
+                    true,
+                    is_audio,
+                    42,
+                    media_kind,
+                    DATAGRAM_MAX_SIZE + 1,
+                    AudioDownlinkLane::Reliable
+                ),
+                DownlinkStreamKey::Audio,
+                "one byte over the MTU it is not, whatever it claims — \
+                 ({is_audio}, {media_kind:?})",
+            );
+        }
+
+        // The worst case the lane can hold, which is what A7 must state.
+        assert_eq!(
+            WT_DOWNLINK_AUDIO_CHANNEL_CAPACITY * DATAGRAM_MAX_SIZE,
+            614_400,
+            "512 slots x the MTU is the audio lane's byte bound",
+        );
+    }
+
+    #[test]
+    fn the_publisher_kind_wire_bytes_match_the_proto() {
+        assert_eq!(PublisherStreamKind::Video.media_kind_code(), 1);
+        assert_eq!(PublisherStreamKind::Screen.media_kind_code(), 3);
+        assert_eq!(audio_media_kind_code(), 2);
+        assert_eq!(audio_media_kind_code() as i32, MediaKind::AUDIO.value());
+        assert_eq!(
+            PublisherStreamKind::Video.media_kind_code() as i32,
+            MediaKind::VIDEO.value(),
+        );
+        assert_eq!(
+            PublisherStreamKind::Screen.media_kind_code() as i32,
+            MediaKind::SCREEN.value(),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_routed_frame_carries_its_publisher_key() {
+        let (uni_tx, mut uni_rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let (dgram_tx, _dgram_rx) = mpsc::channel::<WtOutboundFrame>(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let queued = SharedQueueByteMeter::default();
+
+        wt_route_and_admit(
+            &uni_tx,
+            &dgram_tx,
+            &queued,
+            vec![0u8; 4_096],
+            true,
+            false,
+            true,
+            PacketType::MEDIA,
+            Some(MediaType::VIDEO),
+            MediaKind::VIDEO,
+            909,
+            AudioDownlinkLane::Reliable,
+            &DownlinkShedEscalation::new(),
+        );
+        let queued_frame = uni_rx.try_recv().expect("the frame must be queued");
+        assert_eq!(
+            queued_frame.key,
+            DownlinkStreamKey::Publisher {
+                session_id: 909,
+                kind: PublisherStreamKind::Video
+            },
+            "the bridge routes on this key; a control key here would put every \
+             publisher back on one stream",
+        );
+    }
+
+    #[test]
+    fn the_byte_meter_returns_to_empty_when_the_lane_drains() {
+        let meter = SharedQueueByteMeter::default();
+        meter.on_enqueue(OutboundPriority::Video, 4_000);
+        meter.on_enqueue(OutboundPriority::Screen, 9_000);
+        assert_eq!(meter.queued_for(OutboundPriority::Video), 4_000);
+        assert_eq!(meter.snapshot().queued_total(), 13_000);
+
+        meter.on_dequeue(OutboundPriority::Video, 4_000);
+        meter.on_dequeue(OutboundPriority::Screen, 9_000);
+        assert_eq!(meter.snapshot().queued_total(), 0);
+
+        meter.on_dequeue(OutboundPriority::Video, 1);
+        assert_eq!(meter.queued_for(OutboundPriority::Video), 0);
     }
 }

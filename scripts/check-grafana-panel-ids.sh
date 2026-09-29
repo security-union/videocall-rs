@@ -19,8 +19,10 @@ set -euo pipefail
 #
 # Detection: every object anywhere in the dashboard tree that has BOTH an `id`
 # and a `gridPos` is a panel or a row (verified against the real dashboards: the
-# only matching types are row/table/timeseries — never datasource/target/etc.,
-# which carry no gridPos). We collect those ids per file and assert uniqueness.
+# matching types are heatmap/row/stat/table/timeseries — never
+# datasource/target/etc., which carry no gridPos). The test is structural, not a
+# type allow-list, so a new panel type is covered without editing this script.
+# We collect those ids per file and assert uniqueness.
 #
 # Usage:
 #   scripts/check-grafana-panel-ids.sh                 # lint the tracked dashboards

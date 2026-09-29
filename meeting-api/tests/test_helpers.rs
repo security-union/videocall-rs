@@ -59,18 +59,44 @@ pub async fn cleanup_test_data(pool: &PgPool, room_id: &str) {
 /// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
 /// `dev_user` is `None` — the auto-login endpoint returns 404.
 pub fn build_app(pool: PgPool) -> Router {
-    build_app_inner(pool, None)
+    build_app_inner(pool, None, None)
 }
 
 /// Build the Axum router with a specific `DEV_USER` identity configured.
 /// Allows integration tests to exercise the auto-login happy path without
 /// setting an environment variable.
 pub fn build_app_with_dev_user(pool: PgPool, dev_user: DevUser) -> Router {
-    build_app_inner(pool, Some(dev_user))
+    build_app_inner(pool, Some(dev_user), None)
 }
 
-fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
-    let state = AppState {
+pub fn build_app_on_nats(pool: PgPool, nats: async_nats::Client) -> Router {
+    build_app_inner(pool, None, Some(nats))
+}
+
+pub async fn maybe_nats() -> Option<async_nats::Client> {
+    let url = std::env::var("NATS_URL").ok()?;
+    Some(
+        async_nats::connect(&url)
+            .await
+            .expect("Failed to connect to NATS"),
+    )
+}
+
+fn build_app_inner(
+    pool: PgPool,
+    dev_user: Option<DevUser>,
+    nats: Option<async_nats::Client>,
+) -> Router {
+    build_app_from_state(build_state(pool, dev_user, nats))
+}
+
+/// Build a standalone `AppState` for tests that call state methods directly.
+pub fn build_state(
+    pool: PgPool,
+    dev_user: Option<DevUser>,
+    nats: Option<async_nats::Client>,
+) -> AppState {
+    AppState {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),
         session_jwt_secret: TEST_JWT_SECRET.to_string(),
@@ -85,7 +111,7 @@ fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
         cookie_domain: None,
         cookie_name: "session".to_string(),
         cookie_secure: false,
-        nats: None,
+        nats,
         feed_tx: meeting_api::feed_events::new_feed_channel().0,
         service_version_urls: Vec::new(),
         http_client: reqwest::Client::new(),
@@ -97,8 +123,8 @@ fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
         display_name_rate_limit_disabled: false,
         dev_user,
         password_gate: std::sync::Arc::new(meeting_api::password::MeetingPasswordGate::new()),
-    };
-    build_app_from_state(state)
+        presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+    }
 }
 
 pub fn build_app_from_state(state: AppState) -> Router {

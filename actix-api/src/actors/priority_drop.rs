@@ -52,10 +52,14 @@
 //!    handshake (RSA_PUB_KEY + AES_KEY) are Critical because dropping
 //!    either silently breaks encrypted communication for the affected
 //!    peer pair with no page-able alert.
+//! 5. The relay's own **RTT echo** ([`OutboundPriority::ProbeEcho`], #2721)
+//!    sheds with camera VIDEO, so a lane cannot shed media and still answer
+//!    the probe that measures it.
 //!
 //! The decision is per-session: no global state is introduced, and the
 //! drop policy is identical for the WebTransport and WebSocket transports.
-//! WT calls [`evaluate`]; WS calls [`evaluate_dual`] (#2261).
+//! Every queue that can hold video or screen calls [`evaluate_dual`] (#2261,
+//! #2717); WT's datagram lane, which carries neither, calls [`evaluate`].
 //!
 //! ### Why drop at the enqueue site instead of inside the bridge?
 //!
@@ -78,6 +82,7 @@
 //! faster. So the preempt-drop here still feeds a per-receiver response — it
 //! just no longer drives the removed sender-keyed CONGESTION path.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 
@@ -108,6 +113,11 @@ pub const PRIORITY_DROP_SCREEN_FILL_RATIO: f32 = 0.90;
 /// frames is catastrophic for the call experience.
 pub const PRIORITY_DROP_AUDIO_FILL_RATIO: f32 = 0.95;
 
+/// `drop_reason` / `kind` label for an RTT echo shed by the priority policy.
+/// One binding so [`OutboundPriority::priority_drop_label`] and the
+/// [`evaluate_dual`] arm cannot drift.
+pub const PRIORITY_DROP_RTT_ECHO_REASON: &str = "priority_drop_rtt_echo";
+
 /// Classification of an outbound packet for priority-drop purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundPriority {
@@ -132,6 +142,16 @@ pub enum OutboundPriority {
     /// presented content outranks every camera under channel pressure (issue
     /// 1977).
     Screen,
+    /// Relay-generated RTT echo (#2721). Never from [`Self::classify_sealed_aware`].
+    /// Shed at [`PRIORITY_DROP_VIDEO_FILL_RATIO`], the FIRST media shed point;
+    /// its own bytes ride the unbudgeted `other` bucket.
+    ///
+    /// Since #2723 a unistream echo keys to the receiver's CONTROL stream, which
+    /// opens at the highest QUIC send priority, so it reports a control-plane
+    /// RTT. Read it as the connection's path health, NOT as end-to-end media
+    /// latency. Its LOSS is unaffected: it is still admitted against the fullest
+    /// MEDIA byte bucket.
+    ProbeEcho,
 }
 
 impl OutboundPriority {
@@ -223,6 +243,29 @@ impl OutboundPriority {
         }
     }
 
+    /// [`classify`], falling back to the cleartext outer [`MediaKind`] when the
+    /// inner parse could not type a `MEDIA` packet.
+    ///
+    /// E2EE seals the inner `MediaPacket`, so [`classify`] alone buckets every
+    /// sealed media frame as `Control`; `PacketWrapper.media_kind` stays
+    /// cleartext and recovers the bucket.
+    ///
+    /// It can only ever RAISE a packet OUT of `Control`: a decisive inner
+    /// classification is returned untouched, and HEARTBEAT and RTT leave
+    /// `media_kind` unset.
+    pub fn classify_sealed_aware(
+        parsed: bool,
+        packet_type: PacketType,
+        media_type: Option<MediaType>,
+        media_kind: MediaKind,
+    ) -> Self {
+        let inner = Self::classify(parsed, packet_type, media_type);
+        if inner != OutboundPriority::Control || packet_type != PacketType::MEDIA {
+            return inner;
+        }
+        Self::classify_outer(parsed, packet_type, media_kind)
+    }
+
     /// Critical/Control classification for every NON-`MEDIA` [`PacketType`].
     ///
     /// Shared by [`classify`] and [`classify_outer`] so the Critical set is
@@ -279,6 +322,7 @@ impl OutboundPriority {
         match self {
             OutboundPriority::Audio => Some("priority_drop_audio"),
             OutboundPriority::Video | OutboundPriority::Screen => Some("priority_drop_video"),
+            OutboundPriority::ProbeEcho => Some(PRIORITY_DROP_RTT_ECHO_REASON),
             OutboundPriority::Critical | OutboundPriority::Control => None,
         }
     }
@@ -323,7 +367,8 @@ pub fn evaluate(
     evaluate_dual(priority, free_capacity, total_capacity, 0, 0)
 }
 
-fn dimension_fill(used: usize, budget: usize) -> f32 {
+/// One dimension's fill. `budget == 0` means "does not apply", never "full".
+pub(crate) fn dimension_fill(used: usize, budget: usize) -> f32 {
     if budget == 0 {
         return 0.0;
     }
@@ -386,6 +431,15 @@ pub fn evaluate_dual(
                 PriorityDropDecision::Admit
             }
         }
+        OutboundPriority::ProbeEcho => {
+            if fill_ratio >= PRIORITY_DROP_VIDEO_FILL_RATIO {
+                PriorityDropDecision::Drop {
+                    reason: PRIORITY_DROP_RTT_ECHO_REASON,
+                }
+            } else {
+                PriorityDropDecision::Admit
+            }
+        }
         OutboundPriority::Critical | OutboundPriority::Control => {
             // Already handled above; pattern is unreachable but
             // exhaustive matching guards against future variants.
@@ -408,9 +462,10 @@ impl QueueByteMeter {
         match priority {
             OutboundPriority::Video => self.video,
             OutboundPriority::Screen => self.screen,
-            OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => {
-                self.other
-            }
+            OutboundPriority::Audio
+            | OutboundPriority::Critical
+            | OutboundPriority::Control
+            | OutboundPriority::ProbeEcho => self.other,
         }
     }
 
@@ -434,9 +489,67 @@ impl QueueByteMeter {
         match priority {
             OutboundPriority::Video => &mut self.video,
             OutboundPriority::Screen => &mut self.screen,
-            OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => {
-                &mut self.other
-            }
+            OutboundPriority::Audio
+            | OutboundPriority::Critical
+            | OutboundPriority::Control
+            | OutboundPriority::ProbeEcho => &mut self.other,
+        }
+    }
+}
+
+/// [`QueueByteMeter`] for a queue whose enqueue and drain run on DIFFERENT
+/// tasks (#2717): the WT lanes are drained by the bridge writer tasks.
+#[derive(Debug, Default)]
+pub struct SharedQueueByteMeter {
+    video: AtomicUsize,
+    screen: AtomicUsize,
+    other: AtomicUsize,
+}
+
+impl SharedQueueByteMeter {
+    pub fn queued_for(&self, priority: OutboundPriority) -> usize {
+        self.bucket(priority).load(Ordering::Relaxed)
+    }
+
+    /// `fetch_add`, not a CAS loop: slots x `MAX_FRAME_SIZE` cannot wrap.
+    pub fn on_enqueue(&self, priority: OutboundPriority, len: usize) {
+        self.bucket(priority).fetch_add(len, Ordering::Relaxed);
+    }
+
+    /// Highest fill across the buckets that HAVE a budget; zero budget = 0.0.
+    pub fn max_budget_fill(&self, budget_for: impl Fn(OutboundPriority) -> usize) -> f32 {
+        QUEUE_BYTE_KIND_PRIORITIES
+            .iter()
+            .map(|&p| dimension_fill(self.queued_for(p), budget_for(p)))
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Saturating: a lost pairing must under-report, never wrap to "full".
+    pub fn on_dequeue(&self, priority: OutboundPriority, len: usize) {
+        self.bucket(priority)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(len))
+            })
+            .expect("fetch_update closure returns Some");
+    }
+
+    /// All three buckets as a plain [`QueueByteMeter`], for the gauge path.
+    pub fn snapshot(&self) -> QueueByteMeter {
+        QueueByteMeter {
+            video: self.video.load(Ordering::Relaxed),
+            screen: self.screen.load(Ordering::Relaxed),
+            other: self.other.load(Ordering::Relaxed),
+        }
+    }
+
+    fn bucket(&self, priority: OutboundPriority) -> &AtomicUsize {
+        match priority {
+            OutboundPriority::Video => &self.video,
+            OutboundPriority::Screen => &self.screen,
+            OutboundPriority::Audio
+            | OutboundPriority::Critical
+            | OutboundPriority::Control
+            | OutboundPriority::ProbeEcho => &self.other,
         }
     }
 }
@@ -446,7 +559,10 @@ pub fn queue_byte_kind_label(priority: OutboundPriority) -> &'static str {
     match priority {
         OutboundPriority::Video => "video",
         OutboundPriority::Screen => "screen",
-        OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => "other",
+        OutboundPriority::Audio
+        | OutboundPriority::Critical
+        | OutboundPriority::Control
+        | OutboundPriority::ProbeEcho => "other",
     }
 }
 
@@ -493,6 +609,76 @@ mod tests {
         assert_eq!(
             OutboundPriority::classify(true, PacketType::CONGESTION, None),
             OutboundPriority::Critical,
+        );
+    }
+
+    /// BITES on plain `classify`: every sealed case returns `Control`.
+    #[test]
+    fn sealed_media_is_classified_from_the_cleartext_outer_kind() {
+        // E2EE on: the inner parse yields None.
+        for (kind, expected) in [
+            (MediaKind::VIDEO, OutboundPriority::Video),
+            (MediaKind::SCREEN, OutboundPriority::Screen),
+            (MediaKind::AUDIO, OutboundPriority::Audio),
+        ] {
+            assert_eq!(
+                OutboundPriority::classify(true, PacketType::MEDIA, None),
+                OutboundPriority::Control,
+                "precondition: the inner classifier cannot type a sealed packet",
+            );
+            assert_eq!(
+                OutboundPriority::classify_sealed_aware(true, PacketType::MEDIA, None, kind),
+                expected,
+                "a sealed {kind:?} frame must be shed against its own budget",
+            );
+        }
+    }
+
+    /// The fallback may only ever RAISE a packet out of `Control`.
+    #[test]
+    fn the_sealed_fallback_never_demotes_or_sheds_relay_control_traffic() {
+        // A decisive inner classification wins over a contradictory outer.
+        assert_eq!(
+            OutboundPriority::classify_sealed_aware(
+                true,
+                PacketType::MEDIA,
+                Some(MediaType::AUDIO),
+                MediaKind::VIDEO,
+            ),
+            OutboundPriority::Audio,
+        );
+
+        // HEARTBEAT and RTT leave `media_kind` UNSPECIFIED, so they stay Control.
+        for inner in [MediaType::HEARTBEAT, MediaType::RTT] {
+            assert_eq!(
+                OutboundPriority::classify_sealed_aware(
+                    true,
+                    PacketType::MEDIA,
+                    Some(inner),
+                    MediaKind::MEDIA_KIND_UNSPECIFIED,
+                ),
+                OutboundPriority::Control,
+            );
+        }
+
+        assert_eq!(
+            OutboundPriority::classify_sealed_aware(
+                true,
+                PacketType::AES_KEY,
+                None,
+                MediaKind::VIDEO,
+            ),
+            OutboundPriority::Critical,
+        );
+
+        assert_eq!(
+            OutboundPriority::classify_sealed_aware(
+                false,
+                PacketType::MEDIA,
+                None,
+                MediaKind::VIDEO,
+            ),
+            OutboundPriority::Control,
         );
     }
 

@@ -28,10 +28,11 @@ const tileByName = (page: Page, name: string) =>
 
 const gridTiles = (page: Page) => page.locator("#grid-container .grid-item");
 
-// `>` is deliberate: the badge (attendants.rs:10549-10554) is a direct sibling
-// of the tile loop inside `#grid-container` (attendants.rs:10237), so pinning
-// the direct-child edge fails loudly if a wrapper element ever appears.
-const overflowBadge = (page: Page) => page.locator("#grid-container > .grid-overflow-badge");
+// `>` is deliberate: the badge is a direct sibling of the tile loop inside the
+// `.ss-peer-panel` child of `#grid-container` (issue 2792), so pinning the
+// direct-child edges fails loudly if another wrapper element ever appears.
+const overflowBadge = (page: Page) =>
+  page.locator("#grid-container > .ss-peer-panel > .grid-overflow-badge");
 
 async function waitForNamedTileToSpeak(page: Page, name: string): Promise<void> {
   const tile = tileByName(page, name);

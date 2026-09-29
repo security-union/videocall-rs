@@ -17,6 +17,7 @@ mod test_helpers;
 
 use axum::body::Body;
 use axum::http::StatusCode;
+use futures::StreamExt;
 use serial_test::serial;
 use test_helpers::*;
 use tower::ServiceExt;
@@ -24,6 +25,8 @@ use videocall_meeting_types::{
     responses::{APIResponse, MeetingInfoResponse},
     APIError,
 };
+use videocall_types::protos::meeting_packet::{meeting_packet::MeetingEventType, MeetingPacket};
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 // ── End Meeting ─────────────────────────────────────────────────────────
 
@@ -188,6 +191,222 @@ async fn test_end_meeting_idempotent() {
     assert_eq!(body2.result.ended_at, ended_at_1);
 
     cleanup_test_data(&pool, room_id).await;
+}
+
+/// Count `MEETING_ENDED` packets published within `window`.
+async fn count_meeting_ended(
+    system: &mut async_nats::Subscriber,
+    window: std::time::Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut n = 0;
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, system.next()).await {
+        let wrapper = <PacketWrapper as protobuf::Message>::parse_from_bytes(&msg.payload)
+            .expect("packet wrapper");
+        let packet = <MeetingPacket as protobuf::Message>::parse_from_bytes(&wrapper.data)
+            .expect("meeting packet");
+        if packet.event_type == MeetingEventType::MEETING_ENDED.into() {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[tokio::test]
+#[serial]
+async fn end_meeting_publishes_meeting_ended_to_the_room_once() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping MEETING_ENDED publish test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-end-meeting-publishes-meeting-ended";
+    cleanup_test_data(&pool, room_id).await;
+    let host = "host-end-publishes@example.com";
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", host)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "meeting_id": room_id, "attendees": [] }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), host)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let mut system = nats
+        .subscribe(format!("room.{room_id}.system"))
+        .await
+        .expect("subscribe to room system subject");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/end"), host)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        count_meeting_ended(&mut system, std::time::Duration::from_secs(2)).await,
+        1,
+        "a real /end must publish exactly one MEETING_ENDED to the room"
+    );
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/end"), host)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        count_meeting_ended(&mut system, std::time::Duration::from_secs(1)).await,
+        0,
+        "the idempotent second /end must publish nothing"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_should_broadcast_gates_on_the_soft_delete_option() {
+    let pool = get_test_pool().await;
+    let active_room = "test-delete-broadcast-active";
+    let idle_room = "test-delete-broadcast-idle";
+    cleanup_test_data(&pool, active_room).await;
+    cleanup_test_data(&pool, idle_room).await;
+    let host = "host-delete-broadcast@example.com";
+
+    let row =
+        meeting_api::db::meetings::create(&pool, active_room, host, None, &serde_json::json!([]))
+            .await
+            .expect("create must succeed");
+    meeting_api::db::meetings::activate(&pool, row.id)
+        .await
+        .expect("activate must succeed");
+
+    let winner = meeting_api::db::meetings::soft_delete(&pool, active_room, host)
+        .await
+        .expect("soft_delete must succeed");
+    assert!(
+        meeting_api::routes::meetings::delete_should_broadcast(&winner),
+        "the winning delete of an active meeting must broadcast"
+    );
+
+    let loser = meeting_api::db::meetings::soft_delete(&pool, active_room, host)
+        .await
+        .expect("soft_delete must succeed even when nothing matched");
+    assert!(
+        loser.is_none(),
+        "a second soft_delete on an already-deleted meeting must match nothing"
+    );
+    assert!(
+        !meeting_api::routes::meetings::delete_should_broadcast(&loser),
+        "the losing concurrent delete must not broadcast a duplicate"
+    );
+
+    meeting_api::db::meetings::create(&pool, idle_room, host, None, &serde_json::json!([]))
+        .await
+        .expect("create must succeed");
+    let idle_deleted = meeting_api::db::meetings::soft_delete(&pool, idle_room, host)
+        .await
+        .expect("soft_delete must succeed");
+    assert!(
+        !meeting_api::routes::meetings::delete_should_broadcast(&idle_deleted),
+        "deleting a meeting that was never activated must not broadcast"
+    );
+
+    cleanup_test_data(&pool, active_room).await;
+    cleanup_test_data(&pool, idle_room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_meeting_publishes_meeting_ended_only_for_an_active_meeting() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping delete-meeting MEETING_ENDED test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let active_room = "test-delete-meeting-publishes-active";
+    let idle_room = "test-delete-meeting-publishes-idle";
+    cleanup_test_data(&pool, active_room).await;
+    cleanup_test_data(&pool, idle_room).await;
+    let host = "host-delete-publishes@example.com";
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", host)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "meeting_id": active_room, "attendees": [] }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{active_room}/join"),
+        host,
+    )
+    .body(Body::empty())
+    .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", host)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "meeting_id": idle_room, "attendees": [] }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let mut active_system = nats
+        .subscribe(format!("room.{active_room}.system"))
+        .await
+        .expect("subscribe to active room system subject");
+    let mut idle_system = nats
+        .subscribe(format!("room.{idle_room}.system"))
+        .await
+        .expect("subscribe to idle room system subject");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("DELETE", &format!("/api/v1/meetings/{active_room}"), host)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        count_meeting_ended(&mut active_system, std::time::Duration::from_secs(2)).await,
+        1,
+        "deleting an active meeting must publish exactly one MEETING_ENDED"
+    );
+
+    let app = build_app_on_nats(pool.clone(), nats.clone());
+    let req = request_with_cookie("DELETE", &format!("/api/v1/meetings/{idle_room}"), host)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        count_meeting_ended(&mut idle_system, std::time::Duration::from_secs(1)).await,
+        0,
+        "deleting a never-activated meeting must publish nothing"
+    );
+
+    cleanup_test_data(&pool, active_room).await;
+    cleanup_test_data(&pool, idle_room).await;
 }
 
 // ── Meeting Stats Fields ────────────────────────────────────────────────

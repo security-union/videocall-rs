@@ -33,37 +33,22 @@ use videocall_meeting_types::{
 };
 
 use crate::auth::AuthUser;
-use crate::db::{meetings as db_meetings, participants as db_participants};
+use crate::db::{
+    co_hosts as db_co_hosts, meetings as db_meetings, participants as db_participants,
+};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
 use crate::password;
+use crate::routes::co_hosts;
+use crate::routes::valid_meeting_id::ValidMeetingId;
 use crate::state::AppState;
+use videocall_types::validation::validate_meeting_id;
 
 const MAX_ATTENDEES: usize = 100;
-const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]+$";
 
-/// Hard cap for `GET /api/v1/meetings/feed`. Meeting counts above this should
-/// be reached via the search modal (`GET /api/v1/meetings?q=...`) rather than
-/// expanding the home-feed payload — that endpoint is paginated and indexed
-/// for arbitrary search.
+/// Hard cap for `GET /api/v1/meetings/feed`; use the search modal beyond this.
 const MAX_FEED_LIMIT: i64 = 200;
-
-fn validate_meeting_id(meeting_id: &str) -> Result<(), AppError> {
-    if meeting_id.is_empty() {
-        return Err(AppError::invalid_meeting_id("cannot be empty"));
-    }
-    if meeting_id.len() > 255 {
-        return Err(AppError::invalid_meeting_id("cannot exceed 255 characters"));
-    }
-    let re = regex::Regex::new(VALID_ID_PATTERN).expect("valid regex");
-    if !re.is_match(meeting_id) {
-        return Err(AppError::invalid_meeting_id(&format!(
-            "must match pattern: {VALID_ID_PATTERN}"
-        )));
-    }
-    Ok(())
-}
 
 fn generate_meeting_id() -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -96,6 +81,7 @@ pub async fn create_meeting(
             MAX_ATTENDEES,
         ));
     }
+    let co_hosts = co_hosts::normalize_create_list(&body.co_hosts, &user_id)?;
 
     let password_hash = match &body.password {
         Some(pw) if !pw.is_empty() => Some(state.password_gate.hash(pw).await?),
@@ -112,8 +98,9 @@ pub async fn create_meeting(
     let recording_allowed_for_all = body.recording_allowed_for_all.unwrap_or(false);
     let chat_allowed_for_all = body.chat_allowed_for_all.unwrap_or(true);
 
+    let mut tx = state.db.begin().await?;
     let row = db_meetings::create_with_options(
-        &state.db,
+        &mut *tx,
         &meeting_id,
         &user_id,
         password_hash.as_deref(),
@@ -132,15 +119,11 @@ pub async fn create_meeting(
         }
         other => AppError::from(other),
     })?;
+    db_co_hosts::insert_persistent(&mut tx, row.id, &co_hosts, &user_id).await?;
+    tx.commit().await?;
 
-    // Fire-and-forget push to SearchV2.  See `search::spawn_repush` for the
-    // full fire-and-forget contract (no-op when disabled, re-fetches the
-    // meeting row, loads the participant roster).
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
-    // Live homepage-feed nudge (issue #1081): a new meeting appears in the
-    // owner's feed. Published AFTER the successful INSERT; cross-instance via
-    // NATS `internal.feed_changed` (or the local broadcast when NATS is absent).
     feed_events::publish_feed_change(
         state.nats.as_ref(),
         &state.feed_tx,
@@ -161,6 +144,7 @@ pub async fn create_meeting(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        co_hosts,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -191,9 +175,10 @@ pub async fn list_meetings(
         (rows, total)
     };
 
+    let healthy = state.presence_healthy().await?;
     let mut meetings = Vec::with_capacity(rows.len());
     for row in &rows {
-        let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+        let participant_count = db_participants::count_admitted(&state.db, row.id, healthy).await?;
         let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
 
         meetings.push(MeetingSummary {
@@ -228,23 +213,12 @@ pub async fn list_meetings(
     })))
 }
 
-/// GET /api/v1/meetings/joined
-///
-/// Returns the most recent meetings the authenticated user has been admitted
-/// into, ordered by their last admission time descending. Includes meetings
-/// the user owns (which they always have a participant row for once they
-/// host-join) as well as meetings owned by others.
-///
-/// Query parameters:
-/// - `limit` (default 5, max 50, must be positive): how many rows to return.
+/// GET /api/v1/meetings/joined — meetings admitted into, ordered by last admission. `limit` default 5, max 50.
 pub async fn list_joined_meetings(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
     Query(params): Query<ListJoinedMeetingsQuery>,
 ) -> Result<Json<APIResponse<ListJoinedMeetingsResponse>>, AppError> {
-    // Reject negatives explicitly (per the API contract). A positive limit
-    // greater than 50 is silently clamped — that's the standard "be generous
-    // with input" behaviour the existing list endpoint also follows.
     if params.limit < 1 {
         return Err(AppError::invalid_input(
             "limit must be a positive integer between 1 and 50",
@@ -252,12 +226,10 @@ pub async fn list_joined_meetings(
     }
     let limit = params.limit.min(50);
 
-    let rows = db_meetings::list_joined_by_user(&state.db, &user_id, limit).await?;
+    let healthy = state.presence_healthy().await?;
+    let rows = db_meetings::list_joined_by_user(&state.db, &user_id, limit, healthy).await?;
 
     let mut meetings = Vec::with_capacity(rows.len());
-    // participant_count / waiting_count are folded into the same SELECT
-    // (LEFT JOIN LATERAL) in `list_joined_by_user`, so the whole list is a
-    // single round-trip regardless of length.
     for row in &rows {
         meetings.push(JoinedMeetingSummary {
             meeting_id: row.room_id.clone(),
@@ -281,22 +253,7 @@ pub async fn list_joined_meetings(
     })))
 }
 
-/// GET /api/v1/meetings/feed
-///
-/// Home-page meeting feed: returns meetings the authenticated user owns OR
-/// has been admitted into, deduplicated to one row per meeting and ordered
-/// by `last_active_at` descending (`m.id DESC` as tiebreaker).
-///
-/// Replaces the home page's prior use of `GET /api/v1/meetings` (which
-/// returned owned-or-joined meetings without an `is_owner` flag) and
-/// `GET /api/v1/meetings/joined` (admitted-only). With both lists collapsed
-/// into one feed where every row carries server-computed `is_owner`, the UI
-/// no longer has to infer ownership.
-///
-/// Query parameters:
-/// - `limit` (default 200, max 200, must be positive): how many rows to
-///   return. Datasets larger than 200 should be reached via the search
-///   modal (`GET /api/v1/meetings?q=...`).
+/// GET /api/v1/meetings/feed — home-page feed, deduplicated and ordered by `last_active_at` DESC. `limit` default/max 200.
 pub async fn list_feed(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
@@ -309,7 +266,8 @@ pub async fn list_feed(
     }
     let limit = params.limit.min(MAX_FEED_LIMIT);
 
-    let rows = db_meetings::list_feed_for_user(&state.db, &user_id, limit).await?;
+    let healthy = state.presence_healthy().await?;
+    let rows = db_meetings::list_feed_for_user(&state.db, &user_id, limit, healthy).await?;
 
     let meetings = rows
         .into_iter()
@@ -347,6 +305,7 @@ pub async fn list_feed(
                 host_display_name: row.host_display_name,
                 host_user_id: row.creator_id.clone(),
                 is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
+                is_co_host: row.is_co_host,
                 participant_count: row.participant_count,
                 waiting_count: row.waiting_count,
                 has_password: row.password_hash.is_some(),
@@ -377,12 +336,15 @@ pub async fn get_meeting(
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    let viewer_is_owner = row.creator_id.as_deref() == Some(user_id.as_str());
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
-    let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+    let healthy = state.presence_healthy().await?;
+    let participant_count = db_participants::count_admitted(&state.db, row.id, healthy).await?;
     let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
+    let viewer_can_edit_options = can_edit_options(&state, &row, &user_id, healthy).await?;
 
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
@@ -403,7 +365,14 @@ pub async fn get_meeting(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        viewer_is_owner,
+        viewer_can_edit_options,
     })))
+}
+
+/// Whether a delete should broadcast MEETING_ENDED: only a real (non-race) delete of an active meeting.
+pub fn delete_should_broadcast(deleted: &Option<db_meetings::MeetingRow>) -> bool {
+    matches!(deleted, Some(m) if m.state.as_deref() == Some("active"))
 }
 
 /// DELETE /api/v1/meetings/{meeting_id}
@@ -421,7 +390,16 @@ pub async fn delete_meeting(
         return Err(AppError::not_owner());
     }
 
-    db_meetings::soft_delete(&state.db, &meeting_id, &user_id).await?;
+    let deleted = db_meetings::soft_delete(&state.db, &meeting_id, &user_id).await?;
+
+    if delete_should_broadcast(&deleted) {
+        nats_events::publish_meeting_ended(
+            state.nats.as_ref(),
+            &meeting_id,
+            nats_events::HOST_LEFT_MESSAGE,
+        )
+        .await;
+    }
 
     // Fire-and-forget: remove from SearchV2
     tokio::spawn({
@@ -456,7 +434,9 @@ pub async fn end_meeting_handler(
         let your_status = db_participants::get_status(&state.db, meeting.id, &user_id).await?;
         let your_status = your_status.map(|p| p.into_participant_status(None));
 
-        let participant_count = db_participants::count_admitted(&state.db, meeting.id).await?;
+        let healthy = state.presence_healthy().await?;
+        let participant_count =
+            db_participants::count_admitted(&state.db, meeting.id, healthy).await?;
         let waiting_count = db_participants::count_waiting(&state.db, meeting.id).await?;
 
         return Ok(Json(APIResponse::ok(MeetingInfoResponse {
@@ -477,6 +457,8 @@ pub async fn end_meeting_handler(
             allow_guests: meeting.allow_guests,
             recording_allowed_for_all: meeting.recording_allowed_for_all,
             chat_allowed_for_all: meeting.chat_allowed_for_all,
+            viewer_is_owner: true,
+            viewer_can_edit_options: true,
         })));
     }
 
@@ -486,14 +468,15 @@ pub async fn end_meeting_handler(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    // Fire-and-forget push of the ended state so search results mark the
-    // meeting as completed promptly.
+    nats_events::publish_meeting_ended(
+        state.nats.as_ref(),
+        &meeting_id,
+        nats_events::HOST_LEFT_MESSAGE,
+    )
+    .await;
+
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
-    // Live homepage-feed nudge (issue #1081): the meeting's state flipped to
-    // `ended`, which the feed shows. Only reached on a real end (the idempotent
-    // already-`ended` branch returns earlier without mutating, so it does not
-    // nudge — no change, no nudge).
     feed_events::publish_feed_change(
         state.nats.as_ref(),
         &state.feed_tx,
@@ -504,7 +487,8 @@ pub async fn end_meeting_handler(
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
-    let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+    let healthy = state.presence_healthy().await?;
+    let participant_count = db_participants::count_admitted(&state.db, row.id, healthy).await?;
     let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
 
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
@@ -527,14 +511,35 @@ pub async fn end_meeting_handler(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        // `end_meeting_handler` is owner-only (checked above), on both its
+        // idempotent and real-end response.
+        viewer_is_owner: true,
+        viewer_can_edit_options: true,
     })))
+}
+
+/// Whether `user_id` may change meeting OPTIONS or list co-hosts: owner, live co-host, or present host of the active meeting.
+pub(crate) async fn can_edit_options(
+    state: &AppState,
+    meeting: &db_meetings::MeetingRow,
+    user_id: &str,
+    healthy: bool,
+) -> Result<bool, AppError> {
+    if meeting.creator_id.as_deref() == Some(user_id) {
+        return Ok(true);
+    }
+    if db_co_hosts::has_live_entry(&state.db, meeting.id, user_id).await? {
+        return Ok(true);
+    }
+    Ok(meeting.state.as_deref() == Some(db_meetings::STATE_ACTIVE)
+        && db_participants::is_present_host(&state.db, meeting.id, user_id, healthy).await?)
 }
 
 /// PATCH /api/v1/meetings/{meeting_id}
 pub async fn update_meeting(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Path(meeting_id): Path<String>,
+    ValidMeetingId(meeting_id): ValidMeetingId,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
     let toggles_updated = body.waiting_room_enabled.is_some()
@@ -546,34 +551,29 @@ pub async fn update_meeting(
 
     let mut auto_admitted_user_ids: Vec<String> = Vec::new();
 
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    let is_owner = meeting.creator_id.as_deref() == Some(user_id.as_str());
+
     let intent = password::parse_password_update(body.password.as_deref(), body.remove_password)?;
     let password_updated = intent.is_change();
     let settings_updated = toggles_updated || password_updated;
 
-    // Hashing costs ~19 MiB and tens of ms of Argon2. The UPDATE's
-    // `WHERE creator_id = $2` is the authoritative ownership check, but it runs
-    // *after* the hash, so a non-owner would otherwise buy that work with a
-    // request they were always going to be refused. This makes them pay the 403
-    // first; the 404/403 split is the same one the UPDATE's own failure produces.
-    if matches!(intent, password::PasswordIntent::Set(_)) {
-        let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
-            .await?
-            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-        if row.creator_id.as_deref() != Some(user_id.as_str()) {
-            return Err(AppError::not_owner());
-        }
+    if password_updated && !is_owner {
+        return Err(AppError::not_owner());
+    }
+    let healthy = state.presence_healthy().await?;
+    if !can_edit_options(&state, &meeting, &user_id, healthy).await? {
+        return Err(AppError::not_host());
     }
 
     let password_update = state.password_gate.hash_intent(intent).await?;
 
     let row = if settings_updated {
-        // Atomically update both settings within a single transaction.
-        // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
-        // so we only fetch separately on failure to distinguish 404 vs 403.
         match db_meetings::update_meeting_settings(
             &state.db,
             &meeting_id,
-            &user_id,
             body.waiting_room_enabled,
             body.admitted_can_admit,
             body.end_on_host_leave,
@@ -588,28 +588,16 @@ pub async fn update_meeting(
                 auto_admitted_user_ids = update.auto_admitted_user_ids;
                 update.row
             }
-            None => {
-                return Err(
-                    match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
-                        Some(_) => AppError::not_owner(),
-                        None => AppError::meeting_not_found(&meeting_id),
-                    },
-                );
-            }
+            // The caller was already authorized above against a row that
+            // existed moments ago; only a concurrent delete explains a miss.
+            None => return Err(AppError::meeting_not_found(&meeting_id)),
         }
     } else {
-        // No updates requested — fetch and verify ownership.
-        let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
-            .await?
-            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-        if row.creator_id.as_deref() != Some(user_id.as_str()) {
-            return Err(AppError::not_owner());
-        }
-        row
+        // No updates requested — the row already fetched (and authorized
+        // above) is the response.
+        meeting
     };
 
-    // Fire-and-forget push of the updated settings so search results reflect
-    // the new waiting-room / admitted_can_admit state quickly.
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
     if settings_updated {
@@ -626,18 +614,12 @@ pub async fn update_meeting(
         if !auto_admitted_user_ids.is_empty() {
             nats_events::publish_waiting_room_updated(state.nats.as_ref(), &row.room_id).await;
         }
-
         // Notify clients (REST refetch trigger); `has_password` is on every
         // meeting payload, so a password change has to reach them too.
         nats_events::publish_meeting_settings_updated(state.nats.as_ref(), &row.room_id).await;
     }
 
     if toggles_updated {
-        // Notify every chat_server instance so its in-memory room_policy
-        // cache picks up the toggle without waiting for a host reconnect.
-        // This is the server-side counterpart that closes the
-        // cache-staleness bug where back-navigating after toggling
-        // `end_on_host_leave=false` still kicked everyone out.
         let internal_payload = nats_events::MeetingSettingsUpdatePayload {
             room_id: row.room_id.clone(),
             end_on_host_leave: row.end_on_host_leave,
@@ -665,7 +647,7 @@ pub async fn update_meeting(
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
-    let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+    let participant_count = db_participants::count_admitted(&state.db, row.id, healthy).await?;
     let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
 
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
@@ -689,18 +671,14 @@ pub async fn update_meeting(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        viewer_is_owner: is_owner,
+        // Reaching here means `can_edit_options` already authorized this
+        // caller above (owner, live co-host, or present host).
+        viewer_can_edit_options: true,
     })))
 }
 
-/// GET /api/v1/meetings/{meeting_id}/guest-info
-///
-/// Public (no authentication required). Returns whether guests are allowed
-/// to join this meeting. Used by the frontend to decide whether to redirect
-/// an unauthenticated user to the guest join page.
-///
-/// NOTE: intentionally returns `{ allow_guests: false }` for both missing and
-/// guest-disabled meetings rather than a 404, to prevent meeting enumeration
-/// by unauthenticated callers.
+/// GET /api/v1/meetings/{meeting_id}/guest-info — public; `false` for both missing and guest-disabled meetings, never 404 (avoids enumeration).
 pub async fn get_meeting_guest_info(
     State(state): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -718,34 +696,46 @@ pub async fn get_meeting_guest_info(
 mod tests {
     use super::*;
 
+    fn app_error_for(meeting_id: &str) -> AppError {
+        AppError::from(validate_meeting_id(meeting_id).expect_err("id should be rejected"))
+    }
+
     #[test]
     fn validate_accepts_simple_alphanumeric() {
         assert!(validate_meeting_id("standup2024").is_ok());
     }
 
     #[test]
-    fn validate_accepts_hyphens_and_underscores() {
+    fn validate_accepts_hyphens_underscores_and_tildes() {
         assert!(validate_meeting_id("my-meeting_123").is_ok());
+        assert!(validate_meeting_id("a~b").is_ok());
     }
 
     #[test]
     fn validate_rejects_empty_id() {
-        let err = validate_meeting_id("").unwrap_err();
+        let err = app_error_for("");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.code, "INVALID_MEETING_ID");
+        assert_eq!(err.body.message, "Invalid meeting ID: cannot be empty");
+    }
+
+    #[test]
+    fn validate_rejects_too_long_id() {
+        let err = app_error_for(&"a".repeat(256));
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.body.code, "INVALID_MEETING_ID");
     }
 
     #[test]
-    fn validate_rejects_too_long_id() {
-        let long_id = "a".repeat(256);
-        let err = validate_meeting_id(&long_id).unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
     fn validate_rejects_special_characters() {
-        let err = validate_meeting_id("room id with spaces").unwrap_err();
+        let err = app_error_for("room id with spaces");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.code, "INVALID_MEETING_ID");
+        assert!(
+            err.body.message.contains("' '"),
+            "message should name the rejected character: {}",
+            err.body.message
+        );
     }
 
     #[test]

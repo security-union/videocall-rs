@@ -1,4 +1,4 @@
-# namespace.yaml — the dedicated bot-fleet namespace on qsk8s (#2035/#2072).
+# namespace.yaml — the dedicated bot-fleet namespace (#2035/#2072).
 #
 # `bot-load` is intentionally created WITHOUT a pod-security `enforce` label:
 # a baseline/restricted level would block the NET_ADMIN capability the bots

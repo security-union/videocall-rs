@@ -13,7 +13,7 @@ import { wakeControls } from "../helpers/controls";
  *
  *   - The TARGET re-fetches its status so the `is_owner` prop flips and host UI
  *     appears WITHOUT a reload or rejoin (the meeting view re-renders in place —
- *     no remount), including a one-shot "You are now a host" toast.
+ *     no remount), including a one-shot "You now have host controls" toast.
  *   - EVERY client (incl. the target) updates the live host set so the
  *     promoted peer's `(Host)` indicator / crown appears immediately.
  *

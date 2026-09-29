@@ -1,5 +1,9 @@
 import { test, expect, chromium, Page } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { enterTwoUserMeeting } from "../helpers/two-user-meeting";
 import { installMediaSocketRecorder, severMediaWebSocket } from "../helpers/media-socket-sever";
@@ -65,6 +69,8 @@ test.describe("Session resumption across a transport reconnect (#2269)", () => {
     try {
       const hostCtx = await createAuthenticatedContext(hostBrowser, HOST_EMAIL, HOST_NAME, uiURL);
       const peerCtx = await createAuthenticatedContext(peerBrowser, PEER_EMAIL, PEER_NAME, uiURL);
+      await pinWebSocketTransport(hostCtx);
+      await pinWebSocketTransport(peerCtx);
       // Camera defaults OFF in E2E; without this seed neither side publishes
       // video and every tile assertion below would be vacuous.
       await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);

@@ -20,6 +20,7 @@
 pub mod error;
 #[cfg(feature = "mint")]
 pub mod mint;
+pub mod presence;
 pub mod requests;
 pub mod responses;
 pub mod token;

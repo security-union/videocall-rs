@@ -1025,39 +1025,6 @@ pub fn merge_user_requested_decode(
     }
 }
 
-/// Merge the pinned peer into the active decode set — but ONLY when it actually
-/// landed in the decoded bucket this render (issue #1489).
-///
-/// Phase 3 of `active_decode_set` construction force-adds the pinned peer. The
-/// pin-swap ([`promote_pinned_into_decoded`]) earlier in the render moves a pin
-/// ranked in the displayed off-budget window `[visible_tile_count,
-/// displayed_tile_count)` INWARD into a decoded slot, so a promotable pin is
-/// already in `decoded_bucket` and passes this gate. But a pin in the
-/// true-overflow region (`pinned_idx >= displayed_tile_count`) is deliberately
-/// NOT promoted (it would evict a displayed tile off-grid — #1470), so it stays
-/// in the +N badge with no decoded slot. Force-adding such a pin would decode it
-/// while it renders in no grid bucket — the "decode but show nothing" waste
-/// #1489 removes. Gating the insert on `decoded_bucket` membership keeps phase 3
-/// in agreement with render, EXACTLY mirroring the phase-4 PLAY-path
-/// [`merge_user_requested_decode`].
-///
-/// `pinned_session_id` is the pinned peer's resolved `session_id` (the caller
-/// maps the user_id-keyed pin to a session_id via `client.get_peer_user_id`,
-/// which is not host-testable, so it is passed in). Kept pure / DOM-free /
-/// signal-free so the decode⇄render invariant is host-unit-testable.
-pub fn merge_pinned_decode(
-    active: &mut std::collections::HashSet<u64>,
-    pinned_session_id: u64,
-    decoded_bucket: &std::collections::HashSet<u64>,
-) {
-    // Only force-decode the pin when it actually got a decoded slot this render
-    // (decode⇄render must agree — #1489). A true-overflow pin (#1470) has no
-    // decoded slot and so must not be decoded while rendering in no grid bucket.
-    if decoded_bucket.contains(&pinned_session_id) {
-        active.insert(pinned_session_id);
-    }
-}
-
 /// The LOCAL decode gate and the REMOTE viewport filter, each `Some` only when its
 /// own input changed.
 #[derive(Debug, Default, PartialEq)]
@@ -1095,7 +1062,7 @@ pub const AVATAR_TILE_HINT_PX: u32 = 1;
 /// fail-open and forwards the whole ladder — the downlink flood the decode-budget clamp is
 /// supposed to be relieving. Such peers are floored at [`AVATAR_TILE_HINT_PX`].
 ///
-/// `uncapped` names peers exempt from any lid (the pin and the active screen sharer).
+/// `uncapped` names peers exempt from any lid (the active screen sharer in the split).
 pub fn build_peer_tile_hints(
     viewport_sessions: &[u64],
     decoded_sessions: &std::collections::HashSet<u64>,
@@ -1135,27 +1102,43 @@ pub fn build_peer_tile_hints(
 /// Screen-share path: `ss_viewport_tiles`, unchanged from before this fix. The SS panel
 /// renders every participant behind a vertical scroll, so its render list is NOT an
 /// on-screen set and publishing it would disable the filter for the whole share.
+///
+/// The split publishes the sharer; outside it the relay never viewport-gates
+/// SCREEN, so the sharer's camera follows the grid like any peer (issue 2792).
 pub fn viewport_roster(
-    has_screen_share: bool,
+    split_layout: bool,
     unified_tiles: &[(String, TileRenderMode)],
     ss_viewport_tiles: &[String],
+    sharer: Option<&str>,
 ) -> Vec<String> {
     // Mock tiles (`mock-N`) publish nothing and do not parse; dropping them yields an
     // EMPTY roster the relay fails open on, not an unparseable one.
     let numeric = |id: &String| id.parse::<u64>().is_ok();
-    if has_screen_share {
-        return ss_viewport_tiles
+    let mut roster: Vec<String> = if split_layout {
+        ss_viewport_tiles
             .iter()
             .filter(|id| numeric(id))
             .cloned()
-            .collect();
+            .collect()
+    } else {
+        unified_tiles
+            .iter()
+            .map(|(id, _)| id)
+            .filter(|id| numeric(id))
+            .cloned()
+            .collect()
+    };
+    if let Some(s) = sharer.map(str::to_string).filter(numeric) {
+        if split_layout && !roster.contains(&s) {
+            roster.push(s);
+        }
     }
-    unified_tiles
-        .iter()
-        .map(|(id, _)| id)
-        .filter(|id| numeric(id))
-        .cloned()
-        .collect()
+    roster
+}
+
+/// Sessions exempt from the tile-size lid: the sharer in the split layout.
+pub fn tile_hint_exemptions(sharer: Option<u64>, split_layout: bool) -> Vec<u64> {
+    sharer.filter(|_| split_layout).into_iter().collect()
 }
 
 /// Promote user-requested ("PLAY") peers that are still ranked beyond the
@@ -1165,9 +1148,9 @@ pub fn viewport_roster(
 /// `all_tiles` is the unified, display-ordered tile list. `visible_tile_count`
 /// is the (already-expanded) decoded-window size; `displayed_tile_count` is the
 /// number of real grid cells (everything past it folds into the +N badge).
-/// `requested` is the set of force-decode `session_id`s. `pinned_slot`, if
-/// `Some`, is the decoded-slot index the pinned peer occupies after the pin
-/// swap — the cursor skips it so a promotion never evicts the pin.
+/// `requested` is the set of force-decode `session_id`s. The first
+/// `protected_prefix` slots hold the pinned tiles, and the cursor stops before
+/// them so a promotion never evicts a pin's decode.
 ///
 /// ## Bounded by `displayed_tile_count` (PR #1467 review B1)
 ///
@@ -1186,21 +1169,18 @@ pub fn viewport_roster(
 /// phase-4 merge keeps them out of `active_decode_set` and decode⇄render still
 /// agree).
 ///
-/// Kept pure / DOM-free / signal-free so it is host-unit-testable; the caller
-/// resolves `pinned_slot` (via `client.get_peer_user_id`) before calling.
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable.
 pub fn promote_requested_into_decoded(
     all_tiles: &mut [String],
     visible_tile_count: usize,
     displayed_tile_count: usize,
     requested: &std::collections::HashSet<String>,
-    pinned_slot: Option<usize>,
+    protected_prefix: usize,
 ) {
     if visible_tile_count == 0 || visible_tile_count >= all_tiles.len() || requested.is_empty() {
         return;
     }
-    // Cursor: the next free decoded slot, walking down from the last one.
-    // `isize` so the "ran out of slots" boundary (-1) is representable.
-    let mut next_free_slot: isize = visible_tile_count as isize - 1;
+    let mut next_free_slot = visible_tile_count;
     // Collect the indices to promote first (an immutable borrow), then perform
     // the swaps, so we never alias `all_tiles`. `take(displayed_tile_count)`
     // bounds eligibility to the renderable window — see the B1 note above.
@@ -1213,152 +1193,89 @@ pub fn promote_requested_into_decoded(
         .map(|(idx, _)| idx)
         .collect();
     for idx in promote_indices {
-        // Advance the cursor past the pinned slot (never evict the pin) and
-        // stop if we have exhausted the decoded slots.
-        while next_free_slot >= 0 && Some(next_free_slot as usize) == pinned_slot {
-            next_free_slot -= 1;
-        }
-        if next_free_slot < 0 {
+        if next_free_slot <= protected_prefix {
             break;
         }
-        all_tiles.swap(next_free_slot as usize, idx);
         next_free_slot -= 1;
+        all_tiles.swap(next_free_slot, idx);
     }
 }
 
-/// Promote a pinned peer ranked beyond the decoded window INWARD into the last
-/// decoded slot, so it renders live video instead of decoded-but-shown-paused
-/// (HCL #987 review FIX 7). A pin promoted into the decoded window is force-added
-/// to `active_decode_set` (phase 3, intersected with the decoded bucket — see the
-/// note below and [`merge_pinned_decode`]); without this swap an off-budget pin in
-/// the displayed window would be decoded yet rendered as a "Video paused" avatar
-/// — wasted decode AND a misleading UI.
-///
-/// `all_tiles` is the unified, display-ordered tile list. `visible_tile_count`
-/// is the decoded-window size; `displayed_tile_count` is the number of real grid
-/// cells (everything past it folds into the +N badge). `pinned_idx` is the
-/// pinned peer's index in `all_tiles` (the caller resolves it via
-/// `client.get_peer_user_id`, which is not host-testable, so it is passed in).
-///
-/// ## Bounded by `displayed_tile_count` (issue #1470)
-///
-/// Only a pin in the DISPLAYED off-budget window
-/// `[visible_tile_count, displayed_tile_count)` is swapped inward. A pin in the
-/// true-overflow region (`pinned_idx >= displayed_tile_count` — e.g. a pinned,
-/// silent, late-joiner in a meeting whose camera-ON + mock tiles exceed
-/// `layout_limit`) is NOT promoted: swapping it inward would evict the peer at
-/// `visible_tile_count - 1` OUT to `pinned_idx >= displayed_tile_count`, where
-/// neither the off-budget `avatar_tiles` slice (capped at `displayed_tile_count`)
-/// nor the `camera_off_tiles` group renders it — the evicted peer would silently
-/// vanish from the grid while the +N badge count stayed unchanged. This is the
-/// exact defect bounded on the PLAY path in
-/// [`promote_requested_into_decoded`] (PR #1467 review B1); the pin path shares
-/// the mechanism and is bounded identically here. A true-overflow pin correctly
-/// stays in the +N badge with no decoded slot — consistent with the
-/// POST-EXPANSION INVARIANT documented for the PLAY path. Phase 3 then
-/// intersects the pin's decode admission with the decoded bucket (issue #1489 —
-/// [`merge_pinned_decode`]), so a true-overflow pin that got no decoded slot here
-/// is NOT decoded either: decode and render agree (neither decoded nor shown).
-///
-/// Kept pure / DOM-free / signal-free so it is host-unit-testable.
-pub fn promote_pinned_into_decoded(
-    all_tiles: &mut [String],
-    visible_tile_count: usize,
-    displayed_tile_count: usize,
-    pinned_idx: usize,
-) {
-    if visible_tile_count == 0 || visible_tile_count >= all_tiles.len() {
-        return;
-    }
-    // Only promote a pin in the displayed off-budget window. A pin already inside
-    // the decoded window (`< visible_tile_count`) needs no swap; a pin in true
-    // overflow (`>= displayed_tile_count`) must not evict a displayed tile
-    // off-grid — see the B1 note above.
-    if pinned_idx >= visible_tile_count && pinned_idx < displayed_tile_count {
-        all_tiles.swap(visible_tile_count - 1, pinned_idx);
-    }
-}
-
-/// Run the in-order decoded-window promotions on `all_tiles` (pinned peer FIRST,
-/// then user-requested "PLAY" peers) and return the resulting `decoded_bucket` —
-/// the set of `session_id`s that occupy a decoded slot and so render live video
-/// this frame. `all_tiles` is mutated in place (the promotion swaps); the caller
-/// slices `visible_tiles` / `avatar_tiles` from it afterward.
-///
-/// ## Load-bearing partition ORDER (issues #1489 / #1509)
-///
-/// The correctness of the pinned-peer decode admission depends on this exact
-/// order, which previously lived only as inline statements at the render
-/// callsite (`attendants.rs`) and was pinned by no test — a future refactor
-/// could silently reorder it. The order is:
-///
-/// 1. **Pin-swap FIRST** ([`promote_pinned_into_decoded`]). An avatar-region pin
-///    (`[visible_tile_count, displayed_tile_count)`) is swapped INTO the decoded
-///    window BEFORE the bucket below is built, so it is a member of the returned
-///    `decoded_bucket` and the phase-3 [`merge_pinned_decode`] admits it. If the
-///    bucket were built BEFORE the swap, an avatar-region pin would be absent
-///    from `decoded_bucket`, the #1489 intersection would drop it, and a pinned,
-///    on-grid peer would render a stuck "Video paused" avatar despite being
-///    decoded — the exact regression #1509 guards against.
-/// 2. **Requested promotion SECOND** ([`promote_requested_into_decoded`]), which
-///    walks a cursor down from `visible_tile_count - 1` and SKIPS the pin's slot
-///    (`pinned_slot`) so a PLAY promotion never evicts the pin. Running it before
-///    the pin-swap would let a requested peer claim the last decoded slot the pin
-///    needs; running it after the bucket build would leave PLAY-requested peers
-///    out of `decoded_bucket` (breaking the phase-4 merge).
-/// 3. **Bucket build LAST**: `session_id`s of the (now fully promoted) decoded
-///    window `[0, visible_tile_count)`. `.parse::<u64>()` drops `mock-N`.
-///
-/// A true-overflow pin (`pinned_idx >= displayed_tile_count`) is deliberately NOT
-/// promoted (#1470 — it would evict a displayed tile off-grid), gets no decoded
-/// slot, and so is correctly absent from the returned bucket.
-///
-/// `pinned_idx` is the pin's index in `all_tiles` after speaker promotion,
-/// resolved by the caller via `client.get_peer_user_id` (not host-testable, so
-/// passed in). The pin's post-swap decoded slot is derived here purely from
-/// `pinned_idx`: an in-window pin keeps its index; a promoted avatar-region pin
-/// is now at `visible_tile_count - 1`; a true-overflow pin has no slot. This
-/// matches the swap's actual effect because `pinned_idx` is the FIRST tile
-/// matching the pinned user, so no earlier same-user tile can sit in the decoded
-/// window ahead of it. Kept pure / DOM-free / signal-free so the ordering
-/// invariant is host-unit-testable without a DOM.
+/// Promote the PLAY-requested peers, keeping off the pinned `protected_prefix`,
+/// then return the `session_id`s of the decoded window. The bucket is read
+/// AFTER the promotion so PLAY peers are in it for the phase-4 merge (#1509).
 pub fn build_decoded_bucket(
     all_tiles: &mut [String],
     visible_tile_count: usize,
     displayed_tile_count: usize,
-    pinned_idx: Option<usize>,
+    protected_prefix: usize,
     requested: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<u64> {
-    // 1. Pin-swap FIRST — an avatar-region pin lands in the decoded window before
-    //    the bucket below reads it (issues #1489 / #1509).
-    if let Some(idx) = pinned_idx {
-        promote_pinned_into_decoded(all_tiles, visible_tile_count, displayed_tile_count, idx);
-    }
-    // The pin's decoded slot after the swap (so requested promotion skips it).
-    let pinned_slot = pinned_idx.and_then(|idx| {
-        if idx < visible_tile_count {
-            Some(idx)
-        } else if idx < displayed_tile_count && visible_tile_count > 0 {
-            Some(visible_tile_count - 1)
-        } else {
-            None
-        }
-    });
-    // 2. Requested ("PLAY") promotion SECOND — swaps requested off-budget peers
-    //    into distinct decoded slots, skipping the pinned slot.
     promote_requested_into_decoded(
         all_tiles,
         visible_tile_count,
         displayed_tile_count,
         requested,
-        pinned_slot,
+        protected_prefix,
     );
-    // 3. Build the decoded bucket LAST from the fully promoted decoded window.
     all_tiles
         .iter()
         .take(visible_tile_count)
         .filter_map(|id| id.parse::<u64>().ok())
         .collect()
+}
+
+/// The camera tile groups with the shown pins, in rank order, at their front.
+#[derive(Debug, PartialEq)]
+pub struct PinWindow {
+    pub all_tiles: Vec<String>,
+    pub camera_off: Vec<String>,
+    /// How many pins lead `all_tiles`.
+    pub pinned_on: usize,
+    /// Displayed cells left for camera-on tiles after the camera-off pins.
+    pub on_cells: usize,
+}
+
+/// Issue 2866: the first `displayed_tile_count` present pins (session_ids in
+/// rank order) get the first cells; older pins keep their place and can fold
+/// into the +N badge.
+pub fn pin_first_window(
+    pins: &[String],
+    camera_on: Vec<String>,
+    camera_off: Vec<String>,
+    displayed_tile_count: usize,
+) -> PinWindow {
+    let shown: Vec<&String> = pins
+        .iter()
+        .filter(|p| camera_on.contains(*p) || camera_off.contains(*p))
+        .take(displayed_tile_count)
+        .collect();
+    if shown.is_empty() {
+        return PinWindow {
+            all_tiles: camera_on,
+            camera_off,
+            pinned_on: 0,
+            on_cells: displayed_tile_count,
+        };
+    }
+    let lead = |group: Vec<String>| -> (Vec<String>, usize) {
+        let mut out: Vec<String> = shown
+            .iter()
+            .filter(|p| group.contains(**p))
+            .map(|p| (*p).clone())
+            .collect();
+        let led = out.len();
+        out.extend(group.into_iter().filter(|t| !shown.contains(&t)));
+        (out, led)
+    };
+    let (all_tiles, pinned_on) = lead(camera_on);
+    let (camera_off, pinned_off) = lead(camera_off);
+    PinWindow {
+        all_tiles,
+        camera_off,
+        pinned_on,
+        on_cells: displayed_tile_count - pinned_off,
+    }
 }
 
 /// Render mode for a tile in the unified grid render list.
@@ -1381,23 +1298,24 @@ pub enum TileRenderMode {
     CameraOff,
 }
 
-/// Build a unified, join-time-ordered render list from the three tile buckets.
+/// Build a unified render list from the three tile buckets.
 ///
 /// The caller has already computed:
 /// - `visible_tiles`: camera-on peers within the decode budget (Decoded)
 /// - `avatar_tiles`: camera-on peers beyond the decode budget (Avatar)
 /// - `camera_off_tiles`: camera-off peers to render (CameraOff)
 ///
-/// This function merges them into a single list sorted by `peer_join_time`,
-/// preserving stable grid positions regardless of camera state. Toggling a
-/// camera changes WHAT renders in a grid cell (live video vs placeholder)
-/// but NOT WHERE in the grid the peer appears.
+/// This function merges them into a single list: the pinned sessions first, by
+/// `pin_rank`, then everyone by `peer_join_time`. Toggling a camera changes
+/// WHAT renders in a grid cell (live video vs placeholder) but NOT WHERE in the
+/// grid the peer appears.
 ///
 /// Kept pure / DOM-free / signal-free so it is host-unit-testable.
 pub fn build_unified_render_list(
     visible_tiles: &[String],
     avatar_tiles: &[String],
     camera_off_tiles: &[String],
+    pin_rank: &std::collections::HashMap<String, usize>,
     peer_join_times: &std::collections::HashMap<String, f64>,
 ) -> Vec<(String, TileRenderMode)> {
     let total = visible_tiles.len() + avatar_tiles.len() + camera_off_tiles.len();
@@ -1411,12 +1329,13 @@ pub fn build_unified_render_list(
     for tile_id in camera_off_tiles {
         unified.push((tile_id.clone(), TileRenderMode::CameraOff));
     }
-    // Stable sort by join time (earliest first). Ties preserve insertion
-    // order (Decoded before Avatar before CameraOff for same join time).
     unified.sort_by(|(a, _), (b, _)| {
+        let rank = |id: &String| pin_rank.get(id).copied().unwrap_or(usize::MAX);
         let jt_a = peer_join_times.get(a).copied().unwrap_or(0.0);
         let jt_b = peer_join_times.get(b).copied().unwrap_or(0.0);
-        jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
+        rank(a)
+            .cmp(&rank(b))
+            .then(jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal))
     });
     unified
 }
@@ -3754,7 +3673,7 @@ mod tests {
 
     // ── issue #1466: user-requested force-decode merge ────────────────────────
 
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// Build a `HashSet<u64>` decoded-bucket from a slice of ids (test helper).
     fn bucket(ids: &[u64]) -> HashSet<u64> {
@@ -3854,63 +3773,6 @@ mod tests {
         expected.insert(7);
         expected.insert(42);
         assert_eq!(active, expected, "empty request set is a no-op");
-    }
-
-    // ── issue #1489: pinned-peer decode-admission merge ───────────────────────
-
-    /// A pin that got a decoded slot (it IS in the decoded bucket) is force-added.
-    /// This is the promotable-pin case (`[visible_tile_count,
-    /// displayed_tile_count)`), where the pin-swap already placed it in
-    /// `decoded_bucket`.
-    ///
-    /// MUTATION SENSITIVITY: if `merge_pinned_decode` dropped the insert (made a
-    /// no-op) the set stays empty and this fails. The literal (321) is
-    /// independent.
-    #[test]
-    fn merge_pinned_inserts_pin_in_decoded_bucket() {
-        let mut active: HashSet<u64> = HashSet::new();
-        merge_pinned_decode(&mut active, 321, &bucket(&[321]));
-        assert!(active.contains(&321), "a decoded pin is force-added");
-        assert_eq!(active.len(), 1, "exactly the one decoded pin was inserted");
-    }
-
-    /// A true-overflow pin (#1470) that got NO decoded slot — it is not in the
-    /// decoded bucket — must NOT be force-decoded. This is the #1489
-    /// decode⇄render invariant: a pin rendered in the +N badge (no grid bucket)
-    /// is never decoded-but-invisible.
-    ///
-    /// MUTATION SENSITIVITY: if the helper dropped the `decoded_bucket.contains`
-    /// gate (reverting to the old unconditional `active.insert(pin)`), id 555
-    /// would be added and this fails — this is the exact regression #1489 fixes.
-    #[test]
-    fn merge_pinned_skips_pin_not_in_decoded_bucket() {
-        let mut active: HashSet<u64> = HashSet::new();
-        // Decoded bucket holds a DIFFERENT peer (777); the pin (555) is in the
-        // true-overflow +N badge with no decoded slot.
-        merge_pinned_decode(&mut active, 555, &bucket(&[777]));
-        assert!(
-            active.is_empty(),
-            "an off-grid (true-overflow) pin must not enter active_decode_set"
-        );
-    }
-
-    /// The merge is a UNION (pre-seeded ids survive) and idempotent.
-    ///
-    /// MUTATION SENSITIVITY: if the helper cleared/replaced `active`, the
-    /// pre-seeded 999 would vanish and the first assert fails.
-    #[test]
-    fn merge_pinned_is_union_and_idempotent() {
-        let mut active: HashSet<u64> = HashSet::new();
-        active.insert(999);
-        merge_pinned_decode(&mut active, 321, &bucket(&[321]));
-        assert!(
-            active.contains(&999),
-            "pre-existing entry preserved (union)"
-        );
-        assert!(active.contains(&321), "decoded pin added");
-        let after_first: HashSet<u64> = active.clone();
-        merge_pinned_decode(&mut active, 321, &bucket(&[321]));
-        assert_eq!(active, after_first, "re-merging the same pin is a no-op");
     }
 
     // ── issue #1466 / #1286: expand_decoded_for_requested ─────────────────────
@@ -4078,7 +3940,7 @@ mod tests {
     fn promote_skips_true_overflow_request_and_keeps_displaced_renderable() {
         let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
         let before = all.clone();
-        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p9"]), None);
+        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p9"]), 0);
         // True-overflow request was ignored: list is completely unchanged.
         assert_eq!(
             all, before,
@@ -4110,7 +3972,7 @@ mod tests {
     #[test]
     fn promote_admits_in_window_request() {
         let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
-        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p6"]), None);
+        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p6"]), 0);
         assert_eq!(
             all[3], "p6",
             "in-window request promoted into last decoded slot"
@@ -4139,7 +4001,7 @@ mod tests {
         let len = all.len();
         // visible (ss_budget) = 2, displayed = len (no +N region). Request the two deepest
         // off-budget peers; both must be pulled into the decoded window [0, 2).
-        promote_requested_into_decoded(&mut all, 2, len, &req(&["p4", "p5"]), None);
+        promote_requested_into_decoded(&mut all, 2, len, &req(&["p4", "p5"]), 0);
         // Cursor walks down from slot 1: first eligible (p4) → slot 1, next (p5) → slot 0.
         assert_eq!(
             all[1], "p4",
@@ -4151,22 +4013,22 @@ mod tests {
         );
     }
 
-    /// The promotion cursor skips the pinned slot so a PLAY promotion never evicts
-    /// the pinned peer. With `visible = 3`, `displayed = 6`, pin at slot 2, and
-    /// "p4" requested, the request must land in slot 1 (slot 2 is skipped) and the
-    /// pinned tile at slot 2 must be preserved.
-    ///
-    /// MUTATION SENSITIVITY: dropping the `pinned_slot` skip swaps "p4" into slot 2,
-    /// evicting the pin — the `all[2] == "p2"` assertion fails.
     #[test]
-    fn promote_skips_pinned_slot() {
+    fn promote_never_evicts_the_pinned_prefix() {
         let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5"]);
-        promote_requested_into_decoded(&mut all, 3, 6, &req(&["p4"]), Some(2));
-        assert_eq!(all[2], "p2", "pinned slot is never evicted by a promotion");
+        promote_requested_into_decoded(&mut all, 3, 6, &req(&["p4", "p5"]), 2);
         assert_eq!(
-            all[1], "p4",
-            "request lands in the next free slot below the pin"
+            &all[..2],
+            &["p0", "p1"],
+            "the pinned prefix keeps its decode"
         );
+        assert_eq!(all[2], "p4", "the request lands in the first free slot");
+        assert_eq!(all[5], "p5", "no slot is left for the second request");
+
+        let mut all = tiles(&["p0", "p1", "p2", "p3"]);
+        let before = all.clone();
+        promote_requested_into_decoded(&mut all, 2, 4, &req(&["p3"]), 2);
+        assert_eq!(all, before, "a window of only pins promotes nobody");
     }
 
     /// Empty request set is a no-op (the unpressured / no-PLAY path).
@@ -4174,222 +4036,69 @@ mod tests {
     fn promote_empty_request_is_noop() {
         let mut all = tiles(&["p0", "p1", "p2", "p3"]);
         let before = all.clone();
-        promote_requested_into_decoded(&mut all, 2, 4, &HashSet::new(), None);
+        promote_requested_into_decoded(&mut all, 2, 4, &HashSet::new(), 0);
         assert_eq!(all, before, "no requests ⇒ list unchanged");
     }
 
-    /// #1470: a pinned peer ranked in the true-overflow region
-    /// (`pinned_idx >= displayed_tile_count`) must NOT be promoted, and no
-    /// previously-displayed tile may be pushed off the grid past
-    /// `displayed_tile_count`. Mirrors
-    /// `promote_skips_true_overflow_request_and_keeps_displaced_renderable` for the
-    /// PLAY path.
-    ///
-    /// Setup: 10 tiles, `visible_tile_count = 4`, `displayed_tile_count = 8`. The
-    /// pin sits at index 9 (true overflow, beyond the 8 grid cells). The bounded
-    /// swap must leave the list untouched.
-    ///
-    /// MUTATION SENSITIVITY: with the bug (the `pinned_idx < displayed_tile_count`
-    /// bound dropped, i.e. the old unconditional `idx >= visible_tile_count` swap),
-    /// the pin at 9 is swapped into slot 3 and the slot-3 peer "p3" is evicted to
-    /// index 9 (off the grid). Both the decoded-window and index-9 assertions fail
-    /// under that mutation.
     #[test]
-    fn promote_pinned_skips_true_overflow_and_keeps_displaced_renderable() {
-        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
-        let before = all.clone();
-        promote_pinned_into_decoded(&mut all, 4, 8, 9);
-        assert_eq!(
-            all, before,
-            "a pin at idx 9 (>= displayed_tile_count=8) must not be promoted"
-        );
-        assert_eq!(
-            all[9], "p9",
-            "true-overflow pin stays at its overflow index"
-        );
-        assert_eq!(
-            &all[0..4],
-            &["p0", "p1", "p2", "p3"],
-            "the decoded window is undisturbed"
-        );
-    }
-
-    /// #1470: a pin INSIDE the displayed off-budget window
-    /// (`visible <= pinned_idx < displayed`) IS swapped into the last decoded slot
-    /// — the bound must not be so tight that it suppresses the legitimate promotion
-    /// the swap exists for.
-    ///
-    /// Setup: same 10 tiles, `visible = 4`, `displayed = 8`. The pin sits at index 6
-    /// (inside the displayed window). It must move into the last decoded slot
-    /// (index 3), and the displaced "p3" must remain renderable (idx < 8).
-    ///
-    /// MUTATION SENSITIVITY: if the swap were dropped the list is unchanged and the
-    /// `all[3] == "p6"` assertion fails; if the displaced tile went past index 8 the
-    /// `displaced < 8` assertion fails.
-    #[test]
-    fn promote_pinned_admits_in_window() {
-        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
-        promote_pinned_into_decoded(&mut all, 4, 8, 6);
-        assert_eq!(
-            all[3], "p6",
-            "in-window pin promoted into last decoded slot"
-        );
-        let displaced = all.iter().position(|t| t == "p3").unwrap();
-        assert!(
-            displaced < 8,
-            "the displaced tile stays in the renderable window, not the +N overflow (was {displaced})"
-        );
-    }
-
-    /// #1470: a pin ALREADY inside the decoded window (`pinned_idx <
-    /// visible_tile_count`) needs no swap and must be left in place.
-    ///
-    /// MUTATION SENSITIVITY: if the lower bound (`pinned_idx >= visible_tile_count`)
-    /// were dropped, the pin at slot 1 would swap with slot 3
-    /// (`visible_tile_count - 1`), reordering the decoded window — the
-    /// `all == before` assertion fails.
-    #[test]
-    fn promote_pinned_already_decoded_is_noop() {
-        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5"]);
-        let before = all.clone();
-        promote_pinned_into_decoded(&mut all, 4, 6, 1);
-        assert_eq!(
-            all, before,
-            "a pin already in the decoded window is left untouched"
-        );
-    }
-
-    // ── issue #1509: partition-ordering across the three pin index regions ────
-    //
-    // The `promote_pinned_into_decoded` / `merge_pinned_decode` helpers are
-    // already unit-tested in ISOLATION above. These tests pin the load-bearing
-    // COMPOSITION ORDER that the real callsite (`attendants.rs`) depends on and
-    // that `build_decoded_bucket` now owns: pin-swap → decoded-window slice →
-    // `decoded_bucket` build → phase-3 `merge_pinned_decode`. The concern (#1509):
-    // a future refactor that reordered those steps — building the bucket before
-    // the swap — would strand an avatar-region pin as a stuck "Video paused"
-    // avatar on a pinned, on-grid peer, and no isolated-helper test would catch it.
-
-    /// Pin the ordering across all three pin index regions, reproducing the
-    /// callsite tail (bucket build → `active = bucket.clone()` → phase-3 merge).
-    ///
-    /// Layout: 6 camera-on tiles, decoded window `[0, 3)`, displayed grid `[0, 5)`
-    /// (index 5 folds into the +N badge). Avatar region = `[3, 5)`.
-    ///
-    /// MUTATION SENSITIVITY: moving the pin-swap to run AFTER the bucket build
-    /// inside `build_decoded_bucket` (the #1509 regression) leaves the
-    /// avatar-region pin (region 2) out of `decoded_bucket`; `merge_pinned_decode`
-    /// then drops it and the region-2 `contains(&13)` / `admitted` asserts fail.
-    /// Verified by actually reordering the two statements in the helper.
-    #[test]
-    fn build_decoded_bucket_partition_ordering_across_pin_regions() {
-        // Mirrors attendants.rs: `build_decoded_bucket` owns swap → window →
-        // bucket; the render then seeds `active_decode_set` from the bucket and
-        // runs the phase-3 `merge_pinned_decode`. Returns (bucket, pin admitted?).
-        fn admits(
-            all: &[&str],
-            visible: usize,
-            displayed: usize,
-            pinned_idx: usize,
-            pin_sid: u64,
-        ) -> (HashSet<u64>, bool) {
-            let mut all_tiles = tiles(all);
-            let decoded_bucket = build_decoded_bucket(
-                &mut all_tiles,
-                visible,
-                displayed,
-                Some(pinned_idx),
-                &req(&[]),
-            );
-            let mut active = decoded_bucket.clone();
-            merge_pinned_decode(&mut active, pin_sid, &decoded_bucket);
-            (decoded_bucket, active.contains(&pin_sid))
-        }
-
-        // Region 1 — in-window pin (idx 1 < visible 3): already decoded, admitted.
-        let (bucket1, admitted1) = admits(&["10", "11", "12", "13", "14", "15"], 3, 5, 1, 11);
-        assert_eq!(
-            bucket1,
-            bucket(&[10, 11, 12]),
-            "region 1: in-window pin leaves the decoded window unchanged"
-        );
-        assert!(
-            admitted1,
-            "region 1: an in-window pin is admitted to the decode set"
-        );
-
-        // Region 2 — avatar-region pin (idx 3 in [3,5)): swapped INTO the window
-        // BEFORE the bucket is read, so it is a member and is admitted. This is the
-        // ordering-sensitive case #1509 guards.
-        let (bucket2, admitted2) = admits(&["10", "11", "12", "13", "14", "15"], 3, 5, 3, 13);
-        assert!(
-            bucket2.contains(&13),
-            "region 2: avatar-region pin swapped into decoded_bucket BEFORE it is read"
-        );
-        assert_eq!(
-            bucket2,
-            bucket(&[10, 11, 13]),
-            "region 2: pin (13) took the last decoded slot, displacing tile 12"
-        );
-        assert!(
-            admitted2,
-            "region 2: avatar-region pin is admitted — FAILS if the swap runs after the bucket build"
-        );
-
-        // Region 3 — true-overflow pin (idx 5 >= displayed 5): NOT promoted, absent
-        // from the bucket, NOT admitted (stays in the +N badge — #1470 / #1489).
-        let (bucket3, admitted3) = admits(&["10", "11", "12", "13", "14", "15"], 3, 5, 5, 15);
-        assert!(
-            !bucket3.contains(&15),
-            "region 3: true-overflow pin gets no decoded slot"
-        );
-        assert_eq!(
-            bucket3,
-            bucket(&[10, 11, 12]),
-            "region 3: decoded window unchanged by a true-overflow pin"
-        );
-        assert!(
-            !admitted3,
-            "region 3: a true-overflow pin is NOT force-decoded (decode⇄render agree)"
-        );
-    }
-
-    /// With BOTH a pinned peer AND a PLAY-requested peer in the avatar region, the
-    /// pin-swap must run BEFORE requested promotion, and requested promotion must
-    /// SKIP the pin's derived slot — so neither evicts the other and both land in
-    /// `decoded_bucket`. `build_decoded_bucket` owns that order and derives the
-    /// pin's post-swap slot.
-    ///
-    /// Layout: window `[0, 3)`, displayed `[0, 5)`. Pin at idx 3 (session 13),
-    /// PLAY-requested peer "14" at idx 4 — both in the avatar region.
-    ///
-    /// MUTATION SENSITIVITY: if the derived `pinned_slot` were wrong (e.g. `None`),
-    /// requested promotion would reuse slot 2 and evict the pin (13) out of the
-    /// decoded window, so `contains(&13)` fails. If requested promotion ran BEFORE
-    /// the pin-swap, "14" would claim the last decoded slot the pin needs.
-    #[test]
-    fn build_decoded_bucket_pin_and_requested_coexist() {
+    fn build_decoded_bucket_decodes_the_pins_and_the_requests() {
         let mut all_tiles = tiles(&["10", "11", "12", "13", "14", "15"]);
-        let decoded_bucket = build_decoded_bucket(
-            &mut all_tiles,
-            3,
-            5,
-            Some(3),       // pin at avatar-region idx 3 (session 13)
-            &req(&["14"]), // PLAY-requested peer at avatar-region idx 4
-        );
-        assert!(
-            decoded_bucket.contains(&13),
-            "pinned peer kept its decoded slot (requested promotion skipped it)"
-        );
-        assert!(
-            decoded_bucket.contains(&14),
-            "requested peer promoted into a decoded slot"
-        );
+        let decoded_bucket = build_decoded_bucket(&mut all_tiles, 2, 5, 1, &req(&["14"]));
         assert_eq!(
             decoded_bucket,
-            bucket(&[10, 13, 14]),
-            "pin + requested both decoded; peer 11 displaced to the avatar region"
+            bucket(&[10, 14]),
+            "pin 10 kept its slot and the request took the other one"
         );
+    }
+
+    #[test]
+    fn pins_lead_their_group_in_rank_order() {
+        let w = pin_first_window(
+            &tiles(&["c", "a"]),
+            tiles(&["a", "b", "c", "d"]),
+            tiles(&["x"]),
+            4,
+        );
+        assert_eq!(w.all_tiles, tiles(&["c", "a", "b", "d"]));
+        assert_eq!(w.pinned_on, 2);
+        assert_eq!(w.camera_off, tiles(&["x"]));
+        assert_eq!(w.on_cells, 4);
+    }
+
+    #[test]
+    fn a_pinned_camera_off_peer_gets_a_cell_the_camera_on_peers_cannot_take() {
+        let w = pin_first_window(
+            &tiles(&["x"]),
+            tiles(&["a", "b", "c"]),
+            tiles(&["y", "x"]),
+            3,
+        );
+        assert_eq!(w.camera_off, tiles(&["x", "y"]));
+        assert_eq!(w.on_cells, 2, "the camera-off pin keeps one of the 3 cells");
+        assert_eq!(w.pinned_on, 0);
+        assert_eq!(w.all_tiles, tiles(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn pins_beyond_the_displayed_cells_fold_like_any_tile() {
+        let w = pin_first_window(
+            &tiles(&["z", "gone", "y", "x"]),
+            tiles(&["a", "x"]),
+            tiles(&["y", "z"]),
+            2,
+        );
+        assert_eq!(
+            w.camera_off,
+            tiles(&["z", "y"]),
+            "the absent pin takes no cell, so the two most recent present pins win"
+        );
+        assert_eq!(w.on_cells, 0);
+        assert_eq!(
+            w.all_tiles,
+            tiles(&["a", "x"]),
+            "the oldest pin keeps its join position and folds into +N"
+        );
+        assert_eq!(w.pinned_on, 0);
     }
 
     // ── issue #1559: presenter-aware decode shedding ─────────────────────────
@@ -5070,7 +4779,8 @@ mod tests {
         let avatar = vec![];
         let camera_off = vec!["peer-b".to_string(), "peer-c".to_string()];
 
-        let result = build_unified_render_list(&visible, &avatar, &camera_off, &join_times);
+        let result =
+            build_unified_render_list(&visible, &avatar, &camera_off, &HashMap::new(), &join_times);
 
         assert_eq!(result.len(), 3);
         // Sorted by join time: peer-b (100), peer-c (200), peer-a (300)
@@ -5093,7 +4803,8 @@ mod tests {
         let avatar = vec!["a".to_string()];
         let camera_off = vec!["c".to_string()];
 
-        let result = build_unified_render_list(&visible, &avatar, &camera_off, &join_times);
+        let result =
+            build_unified_render_list(&visible, &avatar, &camera_off, &HashMap::new(), &join_times);
 
         assert_eq!(result[0], ("d".to_string(), TileRenderMode::Decoded));
         assert_eq!(result[1], ("a".to_string(), TileRenderMode::Avatar));
@@ -5113,6 +4824,7 @@ mod tests {
             &["A".to_string(), "B".to_string(), "C".to_string()],
             &[],
             &[],
+            &HashMap::new(),
             &join_times,
         );
         assert_eq!(result_before[0].0, "A");
@@ -5124,6 +4836,7 @@ mod tests {
             &["A".to_string(), "C".to_string()],
             &[],
             &["B".to_string()],
+            &HashMap::new(),
             &join_times,
         );
         // Grid ORDER must be the same: A, B, C
@@ -5137,9 +4850,33 @@ mod tests {
     }
 
     #[test]
+    fn unified_render_list_leads_with_the_pins_by_rank() {
+        let join_times: HashMap<String, f64> = [("A", 1.0), ("B", 2.0), ("C", 3.0), ("D", 4.0)]
+            .map(|(id, t)| (id.to_string(), t))
+            .into();
+        let ranks: HashMap<String, usize> = [("D", 0), ("B", 1)]
+            .map(|(id, r)| (id.to_string(), r))
+            .into();
+        let result = build_unified_render_list(
+            &["A".to_string(), "B".to_string()],
+            &["C".to_string()],
+            &["D".to_string()],
+            &ranks,
+            &join_times,
+        );
+        let order: Vec<&str> = result.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, ["D", "B", "A", "C"]);
+        assert_eq!(
+            result[0].1,
+            TileRenderMode::CameraOff,
+            "the mode rides along"
+        );
+    }
+
+    #[test]
     fn unified_render_list_empty_inputs() {
         let join_times = std::collections::HashMap::new();
-        let result = build_unified_render_list(&[], &[], &[], &join_times);
+        let result = build_unified_render_list(&[], &[], &[], &HashMap::new(), &join_times);
         assert!(result.is_empty());
     }
 
@@ -5150,7 +4887,7 @@ mod tests {
     /// Drives the real EMERGENCY path. Returns `(layout_roster, active_decode_set)`.
     fn emergency_latched(
         ids: &[&str],
-        pinned_idx: Option<usize>,
+        protected_prefix: usize,
         requested: &std::collections::HashSet<String>,
     ) -> (Vec<String>, std::collections::HashSet<u64>) {
         let layout = roster(ids);
@@ -5166,23 +4903,24 @@ mod tests {
         );
         assert_eq!(cap, MIN_CAP, "the emergency clamp must reach the floor");
         let mut all_tiles = layout.clone();
-        let decoded_bucket =
-            build_decoded_bucket(&mut all_tiles, cap, layout.len(), pinned_idx, requested);
+        let decoded_bucket = build_decoded_bucket(
+            &mut all_tiles,
+            cap,
+            layout.len(),
+            protected_prefix,
+            requested,
+        );
         let mut active = decoded_bucket.clone();
-        if let Some(idx) = pinned_idx {
-            let pinned: u64 = layout[idx].parse().unwrap();
-            merge_pinned_decode(&mut active, pinned, &decoded_bucket);
-        }
         merge_user_requested_decode(&mut active, requested, &decoded_bucket);
         // Route through the PRODUCTION roster fn — a raw layout Vec stays green when
         // `viewport_roster` is mutated to re-narrow by cap.
-        let published = viewport_roster(false, &render_list(ids, ids.len(), cap), &[]);
+        let published = viewport_roster(false, &render_list(ids, ids.len(), cap), &[], None);
         (published, active)
     }
 
     #[test]
     fn emergency_cap_never_narrows_the_published_viewport() {
-        let (layout, active) = emergency_latched(&["11", "22", "33"], None, &Default::default());
+        let (layout, active) = emergency_latched(&["11", "22", "33"], 0, &Default::default());
         assert_eq!(
             active.len(),
             1,
@@ -5201,7 +4939,7 @@ mod tests {
 
     #[test]
     fn emergency_cap_still_narrows_the_local_decode_gate() {
-        let (layout, active) = emergency_latched(&["11", "22", "33"], None, &Default::default());
+        let (layout, active) = emergency_latched(&["11", "22", "33"], 0, &Default::default());
         let plan = plan_decode_publish(&Default::default(), &active, &[], &layout);
         assert_eq!(
             plan.decode,
@@ -5251,7 +4989,7 @@ mod tests {
     #[test]
     fn pinned_and_requested_peers_survive_in_the_published_viewport() {
         let requested: std::collections::HashSet<String> = ["33".to_string()].into_iter().collect();
-        let (layout, active) = emergency_latched(&["11", "22", "33", "44"], Some(3), &requested);
+        let (layout, active) = emergency_latched(&["44", "11", "22", "33"], 1, &requested);
         assert!(
             !active.contains(&33) || !active.contains(&44),
             "fixture precondition: the emergency floor cannot decode both"
@@ -5283,22 +5021,22 @@ mod tests {
             .enumerate()
             .map(|(i, id)| (id.clone(), i as f64))
             .collect();
-        build_unified_render_list(&visible, &avatars, &[], &join_times)
+        build_unified_render_list(&visible, &avatars, &[], &HashMap::new(), &join_times)
     }
 
     /// Routes through the PRODUCTION `viewport_roster` — a test-local re-map would
     /// stay green when its body is mutated.
     fn roster_ids(list: &[(String, TileRenderMode)]) -> Vec<String> {
-        viewport_roster(false, list, &[])
+        viewport_roster(false, list, &[], None)
     }
 
     #[test]
     fn screen_share_publishes_its_own_source_not_the_grid_roster() {
         let grid = render_list(&["11", "22", "33", "44"], 3, MIN_CAP);
         let ss = roster(&["11", "22"]);
-        assert_eq!(viewport_roster(true, &grid, &ss), ss);
+        assert_eq!(viewport_roster(true, &grid, &ss, None), ss);
         assert_eq!(
-            viewport_roster(false, &grid, &ss),
+            viewport_roster(false, &grid, &ss, None),
             roster(&["11", "22", "33"])
         );
     }
@@ -5339,17 +5077,42 @@ mod tests {
     }
 
     #[test]
+    fn viewport_roster_keeps_an_overflowed_sharer_out_of_the_tile_layout() {
+        let grid = vec![("7".to_string(), TileRenderMode::Decoded)];
+        assert_eq!(
+            viewport_roster(false, &grid, &[], Some("42")),
+            roster(&["7"]),
+            "SCREEN is never viewport-gated, so this would only forward a +N camera"
+        );
+        assert_eq!(
+            viewport_roster(true, &[], &roster(&["7"]), Some("42")),
+            roster(&["7", "42"])
+        );
+        assert_eq!(
+            viewport_roster(true, &[], &roster(&["7"]), Some("mock-1")),
+            roster(&["7"])
+        );
+    }
+
+    #[test]
+    fn only_the_split_exempts_the_sharer_from_the_tile_lid() {
+        assert_eq!(tile_hint_exemptions(Some(42), false), Vec::<u64>::new());
+        assert_eq!(tile_hint_exemptions(Some(42), true), vec![42]);
+        assert_eq!(tile_hint_exemptions(None, true), Vec::<u64>::new());
+    }
+
+    #[test]
     fn viewport_roster_drops_non_numeric_mock_ids_on_both_branches() {
         let mock_only = vec![("mock-0".to_string(), TileRenderMode::Avatar)];
         // Grid branch.
         assert_eq!(
-            viewport_roster(false, &mock_only, &[]),
+            viewport_roster(false, &mock_only, &[], None),
             Vec::<String>::new(),
             "a mock tile carries no session_id and must never enter the published viewport"
         );
         // Screen-share branch — the filter has to be applied symmetrically.
         assert_eq!(
-            viewport_roster(true, &[], &roster(&["mock-1"])),
+            viewport_roster(true, &[], &roster(&["mock-1"]), None),
             Vec::<String>::new()
         );
         // Mixed: the real peer survives, the mock does not.
@@ -5357,9 +5120,9 @@ mod tests {
             ("mock-0".to_string(), TileRenderMode::Avatar),
             ("42".to_string(), TileRenderMode::Decoded),
         ];
-        assert_eq!(viewport_roster(false, &mixed, &[]), roster(&["42"]));
+        assert_eq!(viewport_roster(false, &mixed, &[], None), roster(&["42"]));
         assert_eq!(
-            viewport_roster(true, &[], &roster(&["mock-1", "42"])),
+            viewport_roster(true, &[], &roster(&["mock-1", "42"]), None),
             roster(&["42"])
         );
     }

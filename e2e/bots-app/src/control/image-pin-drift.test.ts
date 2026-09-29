@@ -16,7 +16,9 @@ import { tmpdir } from "node:os";
 import { relative, resolve } from "node:path";
 
 import { parseAllDocuments, parse as parseYaml } from "yaml";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+import { deriveReport, localImageRevision } from "../resource/session";
 
 /** Drift lock over every k8s manifest that runs the bots-app image (#2294). */
 
@@ -796,6 +798,11 @@ function writeStubs(bin: string, log: string): void {
       "  exit 0",
       "fi",
       'if [ "$1" = inspect ]; then',
+      '  case "$*" in *Labels*)',
+      // The registry serves back whatever revision the stubbed build was handed.
+      '    if [ -n "${STUB_LABEL:-}" ]; then printf \'%s\\n\' "${STUB_LABEL}"; exit 0; fi',
+      `    sed -n 's/.*--build-arg GIT_SHA=\\([^ ]*\\).*/\\1/p' '${log}'; exit 0 ;;`,
+      "  esac",
       '  if [ -n "${STUB_NO_DIGEST:-}" ]; then exit 1; fi',
       '  if [ -n "${STUB_BAD_DIGEST:-}" ]; then printf \'%s\\n\' "${STUB_BAD_DIGEST}"; exit 0; fi',
       `  printf 'sha256:%s\\n' '${"b".repeat(64)}'`,
@@ -830,7 +837,10 @@ function buildEnv(
  * REGISTRY and the credentials are pinned so an operator's exported ones cannot
  * decide which branch runs.
  */
-function runBuild(extraEnv: Record<string, string>): {
+function runBuild(
+  extraEnv: Record<string, string>,
+  script: string = BUILD_SH,
+): {
   status: number | null;
   calls: string[];
   pinnedRef: string | null;
@@ -841,7 +851,7 @@ function runBuild(extraEnv: Record<string, string>): {
   const pin = resolve(bin, "pinned-ref");
   writeStubs(bin, log);
   try {
-    const r = spawnSync("bash", [BUILD_SH], {
+    const r = spawnSync("bash", [script], {
       encoding: "utf8",
       env: buildEnv(bin, pin, extraEnv),
     });
@@ -1151,6 +1161,175 @@ describe("pinned image ↔ the source it ships (#2293)", () => {
   });
 });
 
+/** Instructions after the last FROM, as `[keyword, rest]`, continuation lines joined. */
+function finalStageInstructions(): Array<[string, string]> {
+  const joined = readFileSync(DOCKERFILE, "utf8").replace(/\\\n/g, " ");
+  const all = joined
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"))
+    .map((l): [string, string] => {
+      const m = /^(\S+)\s+(.*)$/.exec(l)!;
+      return [m[1].toUpperCase(), m[2]];
+    });
+  return all.slice(all.map(([k]) => k).lastIndexOf("FROM") + 1);
+}
+
+/** The ARG feeding the revision LABEL, and the ENV name the running bot reads it from. */
+function revisionStamp(): { arg: string; env: string } {
+  const ins = finalStageInstructions();
+  const at = (kw: string, re: RegExp) => ins.findIndex(([k, v]) => k === kw && re.test(v));
+  const label = ins.find(
+    ([k, v]) => k === "LABEL" && v.includes("org.opencontainers.image.revision="),
+  );
+  expect(label, "Dockerfile has no org.opencontainers.image.revision LABEL").toBeDefined();
+  const arg = /org\.opencontainers\.image\.revision=\$\{(\w+)\}/.exec(label![1])?.[1];
+  expect(arg, "the revision LABEL is not taken from a build arg").toBeDefined();
+  const argAt = at("ARG", new RegExp(`^${arg}(=|$)`));
+  expect(argAt, `no ARG ${arg} in the final stage`).toBeGreaterThanOrEqual(0);
+  const envIns = ins.find(([k, v]) => k === "ENV" && v.endsWith(`=\${${arg}}`));
+  expect(envIns, `no ENV carries \${${arg}} into the running container`).toBeDefined();
+  const env = envIns![1].split("=")[0];
+  expect(
+    at("ENV", new RegExp(`^${env}=`)),
+    "the ENV reads the ARG before it is declared",
+  ).toBeGreaterThan(argAt);
+  expect(
+    at("LABEL", /image\.revision=/),
+    "the LABEL reads the ARG before it is declared",
+  ).toBeGreaterThan(argAt);
+  return { arg: arg!, env };
+}
+
+/** A repo holding only build.sh and a few files on each side of the image boundary. */
+function buildFixture(): { root: string; script: string; head: string } {
+  const root = mkdtempSync(resolve(tmpdir(), "build-rev-"));
+  const script = resolve(root, "e2e", "bots-app", "build.sh");
+  mkdirSync(resolve(root, "e2e", "bots-app", "src"), { recursive: true });
+  mkdirSync(resolve(root, "e2e", "bots-app", "k8s"), { recursive: true });
+  copyFileSync(BUILD_SH, script);
+  writeFileSync(resolve(root, "e2e", "bots-app", "src", "cli.ts"), "export {};\n");
+  writeFileSync(resolve(root, "e2e", "bots-app", "k8s", "statefulset.yaml"), "a: 1\n");
+  writeFileSync(resolve(root, "e2e", "README.md"), "x\n");
+  writeFileSync(resolve(root, CONTEXT_FILTER), "**/node_modules\n");
+  git(root, "init", "-b", "main");
+  git(root, "add", "-A");
+  git(root, "commit", "-m", "fixture");
+  return { root, script, head: git(root, "rev-parse", "HEAD").trim() };
+}
+
+function builtRevision(calls: string[], arg: string): string | undefined {
+  const build = calls.find((c) => c.startsWith("build "));
+  return new RegExp(`--build-arg ${arg}=(\\S+)`).exec(build ?? "")?.[1];
+}
+
+describe("image revision stamp (#2293)", () => {
+  it("labels the image and sets the runtime ENV from one build arg", () => {
+    const { arg, env } = revisionStamp();
+    expect(env).not.toBe(arg);
+  });
+
+  it("prints the ENV the Dockerfile sets on every run receipt", async () => {
+    const { env } = revisionStamp();
+    const dir = mkdtempSync(resolve(tmpdir(), "rev-receipt-"));
+    vi.stubEnv(env, "c0ffee".padEnd(40, "0"));
+    try {
+      const { reportText } = await deriveReport({
+        rawCsvText: "",
+        rawCsvPath: resolve(dir, "raw.csv"),
+        derivedCsvPath: resolve(dir, "derived.csv"),
+        reportPath: resolve(dir, "report.txt"),
+        fpsByBot: new Map(),
+        arrival: null,
+        joinedBots: null,
+        imageRevision: localImageRevision(),
+      });
+      expect(reportText).toContain(`[resource] image revision: ${"c0ffee".padEnd(40, "0")}\n`);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("builds a clean tree with the full commit as the revision", () => {
+    const { arg } = revisionStamp();
+    const { script, head } = buildFixture();
+    const r = runBuild({ PUSH_LATEST: "0" }, script);
+    expect(r.status, r.out).toBe(0);
+    expect(builtRevision(r.calls, arg)).toBe(head);
+  });
+
+  it.each([
+    [
+      "a modified shipped file",
+      (root: string) => writeFileSync(resolve(root, "e2e", "bots-app", "src", "cli.ts"), "x\n"),
+    ],
+    [
+      "an untracked shipped file",
+      (root: string) => writeFileSync(resolve(root, "e2e", "bots-app", "src", "new.ts"), "x\n"),
+    ],
+    ["a moved .dockerignore", (root: string) => writeFileSync(resolve(root, CONTEXT_FILTER), "\n")],
+  ])("marks the revision dirty over %s", (_name, dirty) => {
+    const { arg } = revisionStamp();
+    const { root, script, head } = buildFixture();
+    dirty(root);
+    expect(builtRevision(runBuild({ PUSH_LATEST: "0" }, script).calls, arg)).toBe(`${head}-dirty`);
+  });
+
+  it("keeps the revision clean when only files outside the image changed", () => {
+    const { arg } = revisionStamp();
+    const { root, script, head } = buildFixture();
+    writeFileSync(resolve(root, "e2e", "bots-app", "k8s", "statefulset.yaml"), "a: 2\n");
+    writeFileSync(resolve(root, "e2e", "README.md"), "y\n");
+    expect(builtRevision(runBuild({ PUSH_LATEST: "0" }, script).calls, arg)).toBe(head);
+  });
+
+  it("judges dirtiness over exactly the paths the pre-pull gate calls shipped", () => {
+    const found = readFileSync(BUILD_SH, "utf8").match(/REVISION_PATHS=\(\n([\s\S]*?)\n\)/);
+    expect(found, "REVISION_PATHS not found in build.sh").not.toBeNull();
+    const paths = found![1]
+      .split("\n")
+      .map((l) => l.trim().replace(/^'(.*)'$/, "$1"))
+      .filter((l) => l.length > 0 && !l.startsWith("#"))
+      .sort();
+    expect(paths).toEqual(driftPathsFromScript());
+  });
+
+  it("refuses a pushed image whose registry label is not the revision it built", () => {
+    const r = runBuild({ PUSH_LATEST: "0", STUB_LABEL: "0".repeat(40) });
+    expect(r.status, "a mislabelled image exited 0").not.toBe(0);
+    expect(r.pinnedRef, "a mislabelled image was offered for pinning").toBeNull();
+    expect(r.out).toMatch(/FATAL: .* is labelled revision '0{40}'/);
+  });
+
+  it("reads the label of the digest it pins, not whatever the tag now names", () => {
+    const { calls, pinnedRef } = runBuild({ PUSH_LATEST: "0" });
+    const read = calls.find((c) => c.startsWith("skopeo inspect") && c.includes("Labels"));
+    expect(read, "build.sh never read the pushed image's revision label").toBeDefined();
+    const [repo, digest] = [pinnedRef!.split(":")[0], pinnedRef!.split("@")[1]];
+    expect(read).toContain(`docker://${repo}@${digest}`);
+  });
+
+  it("refuses a push whose revision is not the commit CI asked for", () => {
+    const r = runBuild({ PUSH_LATEST: "0", EXPECT_REVISION: "f".repeat(40) });
+    expect(r.status).not.toBe(0);
+    expect(r.out).toMatch(/FATAL: .* is labelled revision/);
+    expect(r.pinnedRef).toBeNull();
+  });
+
+  it("accepts a push whose label is the commit CI asked for", () => {
+    const { script, head } = buildFixture();
+    const r = runBuild({ PUSH_LATEST: "0", EXPECT_REVISION: head }, script);
+    expect(r.status, r.out).toBe(0);
+    expect(r.out).toContain(`labelled revision ${head}`);
+    expect(r.pinnedRef).not.toBeNull();
+  });
+
+  it("has CI demand the pushed image carry the commit it checked out", () => {
+    const step = (buildWorkflow().job.steps ?? []).find((s) => s.id === "build");
+    expect(step?.env?.EXPECT_REVISION).toBe("${{ github.sha }}");
+  });
+});
+
 describe("build.sh tag and digest handling (#2293)", () => {
   it("leaves :latest untagged and unpushed when told not to move it", () => {
     const { calls } = runBuild({ PUSH_LATEST: "0" });
@@ -1202,9 +1381,9 @@ describe("build.sh tag and digest handling (#2293)", () => {
     const { calls } = runBuild({ PUSH_LATEST: "0", REGISTRY_USER: "u", REGISTRY_PASS: "p" });
     const authfile = /--authfile (\S+)/.exec(calls.find((c) => c.startsWith("skopeo login"))!);
     expect(authfile, "no skopeo login wrote an authfile").not.toBeNull();
-    expect(calls.find((c) => c.startsWith("skopeo inspect"))).toContain(
-      `--authfile ${authfile![1]}`,
-    );
+    const inspects = calls.filter((c) => c.startsWith("skopeo inspect"));
+    expect(inspects, "digest read and label read").toHaveLength(2);
+    for (const c of inspects) expect(c).toContain(`--authfile ${authfile![1]}`);
     expect(existsSync(authfile![1]), "the credential outlived the script").toBe(false);
   });
 

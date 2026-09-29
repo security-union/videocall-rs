@@ -16,6 +16,11 @@
  * conditions.
  */
 
+use crate::components::animation_frame::AnimationFrame;
+use crate::components::co_hosts::{
+    host_role, owner_holds_host, peer_holds_host, run_co_host_request, CoHostMenuIcon,
+    CoHostNoticeCtx, CoHostRequest, HostRole,
+};
 use crate::components::icons::crop::CropIcon;
 use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::mic::MicIcon;
@@ -25,10 +30,18 @@ use crate::components::icons::raised_hand::RaisedHandIcon;
 use crate::components::icons::recording::RecordingIcon;
 use crate::components::icons::signal_spark::SignalSparkIcon;
 use crate::components::icons::zoom::{
-    ActualSizeIcon, DetachIcon, ZoomInIcon, ZoomOutIcon, ZoomResetIcon,
+    ActualSizeIcon, DetachIcon, EnlargeIcon, MonitorIcon, PreviewOffIcon, ZoomInIcon, ZoomOutIcon,
+    ZoomResetIcon,
 };
-use crate::components::media_metrics_overlay::{media_metrics_overlay, screen_metrics_overlay};
+use crate::components::media_metrics_overlay::{
+    media_metrics_overlay, parse_resolution, screen_metrics_overlay,
+};
+use crate::components::pin_order;
 use crate::components::screen_share_zoom;
+use crate::components::share_view::{
+    self, share_dom_id, CtaState, ShareAction, ShareOrigin, ShareTarget, ShareTileView,
+    ShareViewCtx, ShareViewMode, OWN_SHARE_KEY,
+};
 use crate::components::signal_quality::{
     peer_signal_aria, peer_signal_title, spark_node_id, SignalInfo, SignalQualityPopup,
 };
@@ -214,12 +227,6 @@ pub fn speak_style(
         p.inner_alpha,
         p.border_alpha,
     )
-}
-
-/// Returns `true` when the peer's speaking glow should be suppressed because
-/// a different peer is currently pinned.
-pub(crate) fn is_speaking_suppressed(is_pinned: bool, pinned_peer_id: Option<&str>) -> bool {
-    pinned_peer_id.is_some() && !is_pinned
 }
 
 /// Compute the inline CSS for the mic icon glow.
@@ -462,19 +469,19 @@ pub enum TileMode {
     ScreenOnly,
     /// Split-layout right panel — renders only the peer video tile (no screen-share canvas).
     VideoOnly,
+    /// Normal-grid tile beside a share tile: the camera only, never the screen.
+    GridVideoOnly,
 }
 
-/// Which of a peer's tiles is pinned/maximized.
+/// Which of a peer's tiles is pinned.
 ///
 /// During a screen share ONE peer renders as TWO tiles that share a single
 /// `user_id`: their shared SCREEN (`TileMode::ScreenOnly` → `.split-screen-tile`)
 /// and their CAMERA/avatar (`TileMode::VideoOnly` → `.split-peer-tile`). Pin
 /// identity therefore cannot be a bare `user_id`: keyed by user_id alone,
-/// pinning EITHER tile would maximize BOTH (both tiles derive `is_pinned` from
-/// the same id), and the viewer would have no way to express "maximize the
-/// screen" vs "maximize the camera". `PinnedTileKind` is the discriminator that
-/// separates those two intents. Outside screen share every peer has exactly one
-/// tile and it is always `Camera`.
+/// pinning EITHER tile would pin BOTH. `PinnedTileKind` is the discriminator
+/// that separates those two intents. Outside screen share every peer has
+/// exactly one tile and it is always `Camera`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinnedTileKind {
     /// The peer's camera/avatar tile — the normal-grid tile and the split
@@ -483,10 +490,12 @@ pub enum PinnedTileKind {
     /// The peer's shared-screen tile — the split layout's left-panel
     /// `.split-screen-tile`.
     Screen,
+    /// The local user's own share tile (issue 2792).
+    OwnScreen,
 }
 
-/// Identity of the single maximized ("pinned") tile: WHICH peer and WHICH of
-/// their tiles. See [`PinnedTileKind`] for why the kind is load-bearing.
+/// Identity of a pinned tile: WHICH peer and WHICH of their tiles. See
+/// [`PinnedTileKind`] for why the kind is load-bearing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedTile {
     pub user_id: String,
@@ -509,50 +518,12 @@ impl PinnedTile {
             kind: PinnedTileKind::Screen,
         }
     }
-}
 
-/// The pin-tile kind a given render mode produces. `ScreenOnly` renders the
-/// shared screen (`.split-screen-tile`); every other mode renders the peer's
-/// camera/avatar tile. This is the single source of truth mapping a tile's
-/// `TileMode` to the [`PinnedTileKind`] its pin button must carry, so a tile's
-/// `is_pinned` state matches only its OWN kind.
-pub(crate) fn tile_pin_kind(mode: &TileMode) -> PinnedTileKind {
-    match mode {
-        TileMode::ScreenOnly => PinnedTileKind::Screen,
-        TileMode::Full | TileMode::VideoOnly => PinnedTileKind::Camera,
-    }
-}
-
-/// Whether the tile identified by `(this_user_id, this_kind)` is the currently
-/// maximized ("pinned") tile. A tile matches ONLY when the pinned identity
-/// agrees on BOTH the peer's user_id AND the tile kind — this is what lets a
-/// screen-share sharer's two tiles (their `.split-screen-tile` and
-/// `.split-peer-tile`, which share one user_id) be pinned independently. This
-/// is the production predicate `generate_for_peer` uses to derive `is_pinned`.
-pub(crate) fn is_tile_pinned(
-    pinned: Option<&PinnedTile>,
-    this_user_id: &str,
-    this_kind: PinnedTileKind,
-) -> bool {
-    pinned
-        .map(|p| p.kind == this_kind && p.user_id.as_str() == this_user_id)
-        .unwrap_or(false)
-}
-
-/// Pure pin toggle/switch reducer. Given the currently pinned tile and the tile
-/// just clicked, returns the next pin state:
-///   - clicking the SAME (peer, kind) that is pinned → `None` (release);
-///   - clicking anything ELSE — a different peer, OR the SAME peer's OTHER tile
-///     kind (their screen while their camera is pinned, or vice versa) →
-///     `Some(clicked)` (switch the spotlight to it).
-///
-/// Equality is by `(user_id, kind)`, so the same peer's screen and camera are
-/// distinct pin targets and switch between each other rather than toggling off.
-pub(crate) fn next_pin_target(cur: Option<&PinnedTile>, clicked: PinnedTile) -> Option<PinnedTile> {
-    if cur == Some(&clicked) {
-        None
-    } else {
-        Some(clicked)
+    pub fn own_screen(user_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            kind: PinnedTileKind::OwnScreen,
+        }
     }
 }
 
@@ -589,7 +560,7 @@ pub(crate) fn split_layout_decision(
             }
         }
         TileMode::VideoOnly => TileDecision::RenderVideo,
-        TileMode::Full => TileDecision::FallThrough,
+        TileMode::Full | TileMode::GridVideoOnly => TileDecision::FallThrough,
     }
 }
 
@@ -695,21 +666,56 @@ fn kick_menu_item(on_kick: Option<EventHandler<()>>, mut show_tile_menu: Signal<
     }
 }
 
-/// Render the transfer-host menu item for a video tile's host-actions menu.
-/// Factored out so the same markup is shared by all three tile render paths
-/// (grid / split / full-bleed) instead of being triplicated inline. The handler
-/// is `Some` only when the action is permitted for this peer (gating lives in
-/// `peer_tile.rs`).
+/// Host-role menu items for a tile; each is `Some` only when permitted for
+/// this peer (gating lives in `peer_tile.rs`).
+#[derive(Clone, Default)]
+pub struct HostPromotionHandlers {
+    pub on_transfer_host: Option<EventHandler<()>>,
+    pub co_host: Option<CoHostRequest>,
+    pub notice: Option<CoHostNoticeCtx>,
+}
+
+impl HostPromotionHandlers {
+    fn any(&self) -> bool {
+        self.on_transfer_host.is_some() || self.co_host.is_some()
+    }
+}
+
+fn tile_menu_trigger_id(key: &str) -> String {
+    format!("tile-host-actions-{key}")
+}
+
+/// Shared by the grid and split tile render paths.
 fn host_promotion_menu_items(
-    on_transfer_host: Option<EventHandler<()>>,
+    handlers: HostPromotionHandlers,
     mut show_tile_menu: Signal<bool>,
+    trigger_id: String,
 ) -> Element {
+    let co_host_trigger = trigger_id.clone();
+    let notice = handlers.notice;
     rsx! {
-        if let Some(cb) = on_transfer_host {
+        if let Some(request) = handlers.co_host {
+            button {
+                class: "tile-context-menu-item",
+                "data-testid": "tile-co-host-action",
+                onclick: {
+                    let request = request.clone();
+                    move |_| {
+                        show_tile_menu.set(false);
+                        focus_element_by_id(&co_host_trigger);
+                        run_co_host_request(request.clone(), notice);
+                    }
+                },
+                CoHostMenuIcon { action: request.action, size: 14 }
+                "{request.action.label()}"
+            }
+        }
+        if let Some(cb) = handlers.on_transfer_host {
             button {
                 class: "tile-context-menu-item",
                 onclick: move |_| {
                     show_tile_menu.set(false);
+                    focus_element_by_id(&trigger_id);
                     cb.call(());
                 },
                 svg {
@@ -772,7 +778,7 @@ pub struct SignalPopupHandlers {
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
 /// the video tile will occupy the full grid area. The `audio_levels.raw` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
-/// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
+/// `host_user_id` is the meeting owner; it decides "(Host)" vs "(Co-host)".
 ///
 /// `my_session_id` is the LOCAL session_id (from `VideoCallClient::get_own_session_id`). It is
 /// compared against `key` (the peer's session_id) to detect the local user's own tile. Prior
@@ -795,8 +801,8 @@ pub fn generate_for_peer(
     on_mute: Option<EventHandler<()>>,
     on_disable_video: Option<EventHandler<()>>,
     on_kick: Option<EventHandler<()>>,
-    on_transfer_host: Option<EventHandler<()>>,
-    pinned_peer_id: Option<&PinnedTile>,
+    host_promotion: HostPromotionHandlers,
+    pin_rank: Option<usize>,
     on_toggle_pin: EventHandler<PinnedTile>,
     appearance: &AppearanceSettings,
     // Issue #1466: fired when the user clicks the per-tile PLAY button on a
@@ -836,6 +842,8 @@ pub fn generate_for_peer(
     // It lives on the roster row (one component, one subscription) and in the
     // banner.
     hand_raised: bool,
+    share_view: Option<ShareTileView>,
+    portrait_source: bool,
 ) -> Element {
     let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
         try_use_context::<CroppedTilesCtx>().map(|c| c.0);
@@ -923,15 +931,20 @@ pub fn generate_for_peer(
     };
 
     // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
-    // to prevent spoofing the host crown icon. The current host can change via
-    // transfer-host, so prefer the reactive `HostSetCtx` (updated live on
-    // HOST_GRANTED/HOST_REVOKED) and fall back to the `host_user_id` prop only
-    // when no provider is present (e.g. isolated tests).
+    // to prevent spoofing the host crown icon.
     let host_set = try_use_context::<HostSetCtx>();
-    let is_host = match host_set.as_ref() {
-        Some(hs) => hs.is_host(&peer_user_id),
-        None => host_user_id.map(|h| h == peer_user_id).unwrap_or(false),
+    let host_role = host_role(
+        peer_holds_host(host_set.as_ref(), host_user_id, &peer_user_id),
+        &peer_user_id,
+        host_user_id,
+        owner_holds_host(host_set.as_ref(), host_user_id),
+    );
+    let host_title = match host_role {
+        Some(role) => format!("{}: {peer_user_id}", role.label()),
+        None => peer_user_id.clone(),
     };
+    let crown_is_co_host = host_role == Some(HostRole::CoHost);
+    let tile_menu_trigger = tile_menu_trigger_id(key);
     // Per-recorder indicator: recording is a per-SESSION action, so key on the
     // tile's session `key` (NOT `peer_user_id`) — a sibling tab of the same
     // account must be able to differ. This path only ever renders REMOTE peers
@@ -963,38 +976,11 @@ pub fn generate_for_peer(
     // behaviour is unchanged.
     let show_canvas = is_video_enabled_for_peer && !force_avatar;
 
-    // A tile is maximized only when the pinned identity matches BOTH this peer
-    // AND this tile's kind. Deriving `is_pinned` from `(user_id, kind)` — not
-    // `user_id` alone — is what keeps a screen-share sharer's two tiles (their
-    // `.split-screen-tile` and their `.split-peer-tile`, which share one
-    // `user_id`) independently pinnable: pinning the screen maximizes ONLY the
-    // screen, pinning the camera maximizes ONLY the camera.
-    let this_pin_kind = tile_pin_kind(&mode);
-    let is_pinned = is_tile_pinned(pinned_peer_id, peer_user_id.as_str(), this_pin_kind);
+    let is_pinned = pin_rank.is_some();
+    let camera_default_letterboxed = default_letterboxed(portrait_source, full_bleed);
+    let pinned_class = if is_pinned { " tile-pinned" } else { "" };
 
-    // Glow suppression only needs to know whether ANY tile is pinned (a
-    // non-pinned tile's speaking glow is suppressed while a spotlight is
-    // active), so collapse the pin identity to its user_id for the predicate.
-    let is_suppressed =
-        is_speaking_suppressed(is_pinned, pinned_peer_id.map(|p| p.user_id.as_str()));
-
-    // The maximize/spotlight ("pin") state is rendered as a REACTIVE class on the
-    // tile root so it is part of the `class` attribute Dioxus manages. A prior
-    // implementation toggled `grid-item-pinned` imperatively via
-    // `element.class_list().add(...)`, but Dioxus rewrites the tile's `class`
-    // attribute whenever the reactive class STRING changes — e.g. the pinned peer
-    // starts speaking, appending `speaking-tile`. That rewrite silently dropped the
-    // imperatively-added `grid-item-pinned`, un-maximizing the tile the instant the
-    // pinned peer spoke (the pinned peer is exempt from glow suppression, so only
-    // THEY toggle their own `speaking-tile` and wipe their own pin). Deriving the
-    // class from `is_pinned` keeps it inside the managed value so it survives every
-    // re-render. `pinned_class` is the shared source of truth for all tile arms.
-    let pinned_class = if is_pinned { " grid-item-pinned" } else { "" };
-
-    let visible_audio_level = if is_suppressed { 0.0 } else { audio_level };
-    let visible_mic_level = if is_suppressed { 0.0 } else { mic_audio_level };
-
-    let is_speaking = visible_mic_level > 0.0;
+    let is_speaking = mic_audio_level > 0.0;
     let speaking_class = if is_speaking { " speaking-tile" } else { "" };
 
     let audio_speaking_class = if is_speaking {
@@ -1003,8 +989,8 @@ pub fn generate_for_peer(
         "audio-indicator"
     };
 
-    let tile_style = speak_style(visible_audio_level, is_speaking, appearance);
-    let mic_inline_style = mic_style(visible_mic_level, visible_audio_level, appearance);
+    let tile_style = speak_style(audio_level, is_speaking, appearance);
+    let mic_inline_style = mic_style(mic_audio_level, audio_level, appearance);
 
     // ---- Split-layout: screen-share left panel --------------------------------
     // Self-identification keys on session_id, not user_id: two tabs/devices of
@@ -1027,9 +1013,7 @@ pub fn generate_for_peer(
 
     // ---- Split-layout: screen-share left panel --------------------------------
     if decision == TileDecision::RenderScreenShare {
-        let ss_canvas_crop = screen_share_zoom::screen_canvas_id(key);
-        let ss_div_id = Rc::new(format!("screen-share-{}-div", &key));
-        let peer_user_id_for_pin_ss = peer_user_id.clone();
+        let ss_div_id = Rc::new(share_dom_id(key, "div"));
         let ss_name = format!("{}-screen", peer_display_name);
         let ss_name_title = ss_name.clone();
         // HCL bug #2: the shared-content tile gets its own signal-meter
@@ -1050,26 +1034,27 @@ pub fn generate_for_peer(
         // `position: fixed` portal that escapes the tile's `overflow: hidden`,
         // so the legacy `signal-popup-open` overflow-visible toggle is dead and
         // its class is no longer emitted.
-        // Issue 1175 (user-test round): while detached the WHOLE share pane is
-        // hidden off-screen at the layout level (`.share-detached` on the grid
-        // container), so this tile needs no detached-state markup — no overlay,
-        // no inert wrapper. The canvas stays mounted + painting (feeding the
-        // detached-window mirror); the pane is just moved off-screen. Detach /
-        // zoom / reattach affordances all live in the detached window.
-        // The maximize ("pin") state is rendered as a REACTIVE class here, exactly
-        // like the split-peer / normal-grid tiles (see `pinned_class`, derived from
-        // this tile's OWN `(user_id, Screen)` identity above). This replaced an
-        // earlier imperative `toggle_pinned_div` DOM toggle, which desynced from
-        // `pinned_peer_id`: the imperative class was never cleared when the pin was
-        // released from another surface, leaving the screen tile stuck maximized
-        // while `pinned_peer_id == None`. A single reactive source of truth removes
-        // that desync.
-        let ss_split_class = "split-screen-tile";
+        let view = share_view.unwrap_or_else(|| ShareTileView {
+            target: ShareTarget {
+                origin: ShareOrigin::Received,
+                key: key.clone(),
+                pin: PinnedTile::screen(peer_user_id.clone()),
+                name: peer_display_name.clone(),
+            },
+            mode: if is_pinned {
+                ShareViewMode::Pinned
+            } else {
+                ShareViewMode::Tile
+            },
+            cta: CtaState::Hidden,
+            guard: false,
+            pin_rank,
+        });
         return rsx! {
-            div {
-                id: "{ss_div_id}",
-                class: "{ss_split_class}{pinned_class}",
-                "data-tile-root": "true",
+            ShareTileRoot {
+                view: view.clone(),
+                root_id: (*ss_div_id).clone(),
+                label: format!("Shared content from {peer_display_name}"),
                 div {
                     class: "canvas-container video-on",
                     // Issue 1175: zoom/pan viewport wrapping the SAME decoder
@@ -1091,6 +1076,9 @@ pub fn generate_for_peer(
                             span { class: "guest-badge", "Guest" }
                         }
                     }
+                    if view.cta == CtaState::Shown {
+                        ShareDetachCta { target: view.target.clone() }
+                    }
                     // Issue 1175: zoom / reset / detach controls for the ATTACHED
                     // state (in-window). All handlers are ordinary main-document
                     // Dioxus handlers, so they are always live. Issue 1821 adds the
@@ -1098,8 +1086,10 @@ pub fn generate_for_peer(
                     // re-derive when the presenter's resolution changes.
                     ScreenShareZoomControls {
                         peer_id: key.clone(),
-                        name: peer_display_name.clone(),
                         content_res: screen_resolution,
+                        target: view.target.clone(),
+                        mode: view.mode,
+                        suggested: view.cta == CtaState::Suggested,
                     }
                     div {
                         class: "tile-top-icons",
@@ -1130,37 +1120,8 @@ pub fn generate_for_peer(
                         // meter. Renders nothing unless the flag is on AND the
                         // transport is known (gated upstream → `badge_transport`).
                         {transport_badge(badge_transport, false)}
-                        button {
-                            onclick: move |e: MouseEvent| {
-                                // stop_propagation: tile-overlay control, not a grid
-                                // click — must not light-dismiss a side panel (#1790).
-                                e.stop_propagation();
-                                // Pin the SCREEN tile specifically (Screen kind). The
-                                // maximize is owned entirely by the reactive
-                                // `pinned_class` above — there is no imperative DOM
-                                // toggle here, so the screen tile can never get stuck
-                                // maximized out of sync with `pinned_peer_id`.
-                                on_toggle_pin.call(PinnedTile::screen(peer_user_id_for_pin_ss.clone()));
-                            },
-                            class: "pin-icon",
-                            "aria-pressed": "{is_pinned}",
-                            "aria-label": "Pin screen share",
-                            PushPinIcon {}
-                        }
-                        {
-                            let ss_crop_class = ss_canvas_crop.clone();
-                            rsx! {
-                                button {
-                                    onclick: move |e: MouseEvent| {
-                                        // stop_propagation: tile-overlay control, not a
-                                        // grid click — must not light-dismiss a panel (#1790).
-                                        e.stop_propagation();
-                                        toggle_canvas_crop(&ss_canvas_crop, cropped_tiles);
-                                    },
-                                    class: if is_canvas_letterboxed(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
-                                    CropIcon {}
-                                }
-                            }
+                        if view.mode == ShareViewMode::Pinned {
+                            ShareTilePinBadge {}
                         }
                     }
                 }
@@ -1197,323 +1158,9 @@ pub fn generate_for_peer(
         };
     }
 
-    // ---- Split-layout: peer video right panel ---------------------------------
-    if decision == TileDecision::RenderVideo {
-        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
-        let peer_user_id_for_pin_vo = peer_user_id.clone();
-        let peer_user_id_for_mobile_vo = peer_user_id.clone();
-        let pv_canvas_crop = key.clone();
-        let key_clone = key.clone();
-        let peer_display_name_vo = peer_display_name.clone();
-        let title_vo = if is_host {
-            format!("Host: {peer_user_id}")
-        } else {
-            peer_user_id.clone()
-        };
-        let vo_tile_style = tile_style.clone();
-        let vo_mic_style = mic_inline_style.clone();
-        let vo_audio_class = audio_speaking_class;
-        let vo_speaking = speaking_class;
-        let grid_class = if is_video_enabled_for_peer {
-            "canvas-container video-on"
-        } else {
-            "canvas-container"
-        };
-        // issue 932 (follow-up to PR 931): popup floats via a fixed-position
-        // portal, so the dead `signal-popup-open` overflow toggle is gone.
-        let split_peer_class = "split-peer-tile";
-        // HCL follow-up 957 (@token-exempt): the signal-meter popup
-        // anchors directly on the signal-quality button (id below) so
-        // the popup overlays the button's top-left corner on first open.
-        // The portal positioner reads the button's bounding rect through
-        // ResizeObserver / window listeners so the popup stays glued to
-        // the button through grid reflows. `split_name_id` is still
-        // emitted on the `<h4>` so the fallback walker has a stable
-        // tile-relative anchor if the button id lookup ever misses.
-        let split_name_id = format!("{}-name", &*peer_video_div_id);
-        let split_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
-        let split_anchor_id = split_signal_btn_id.clone();
-        return rsx! {
-            div {
-                class: "{split_peer_class}{vo_speaking}{pinned_class}",
-                id: "{peer_video_div_id}",
-                "data-tile-root": "true",
-                style: "{vo_tile_style}",
-                div {
-                    class: "{grid_class}",
-                    onclick: move |_| {
-                        // Mobile tap-to-spotlight routes through the reactive pin
-                        // signal (not an imperative class toggle) so the maximize is
-                        // owned by `is_pinned` and cannot be wiped by a class rewrite.
-                        if is_mobile_viewport() {
-                            on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_mobile_vo.clone()));
-                        }
-                    },
-                    if show_canvas {
-                        UserVideo { id: key_clone.clone(), hidden: false }
-                    } else if force_avatar && is_video_enabled_for_peer {
-                        // Device-paused avatar: peer's camera is on but our
-                        // decode budget excluded this tile. Mirror the grid
-                        // path's paused placeholder, with a real PLAY button
-                        // (issue #1466) so the user can opt this one peer back
-                        // into decode. Camera-OFF tiles never reach this arm
-                        // (`is_video_enabled_for_peer` is false for them) — they
-                        // fall into the plain `else` below — so the PLAY button
-                        // only ever appears on a recoverable "paused" tile.
-                        div {
-                            // Issue #1466 (B1/B2): the paused placeholder no longer
-                            // carries `role="img"` + `aria-label`. A `role="img"`
-                            // wrapper collapses its whole subtree into one graphic and
-                            // can drop the descendant PLAY <button> from the
-                            // accessibility tree. The "paused by your device" reason
-                            // now lives on the BUTTON itself (`title` + per-button
-                            // `aria-label`), keeping the interactive control fully
-                            // exposed to AT while still explaining WHY the tile paused.
-                            class: "placeholder-content placeholder-content--paused",
-                            // Issue #1466 (B1): PLAY control is now a CENTERED overlay
-                            // over the PeerIcon, not a corner badge. The old corner
-                            // badge (top/right -6px, 44px via negative margin) grew UP
-                            // and RIGHT into the tile corner where
-                            // `.canvas-container { overflow: hidden }` CLIPPED it, and
-                            // its right edge ran under `.tile-top-icons` (z-index:3,
-                            // holds the interactive signal button) — so the real tap
-                            // area was well under 44px and ambiguous taps hit the
-                            // signal button. A button centered on the placeholder
-                            // (which is itself centered in the tile via the flex
-                            // `.canvas-container`) gives a full, unclipped ≥44px target
-                            // that is far from the corner-pinned `.tile-top-icons`.
-                            // `stop_propagation()` runs FIRST so a tap does NOT also
-                            // hit the parent `.canvas-container` mobile-pin handler
-                            // (mirrors the host-menu button pattern), then request
-                            // force-decode for THIS peer's session_id (`key`).
-                            {
-                                // Owned session_id clone for the `move` onclick:
-                                // event handlers must be `'static`, so we cannot
-                                // capture the borrowed `key: &String` directly.
-                                let request_decode_key = key.clone();
-                                rsx! {
-                                    button {
-                                        r#type: "button",
-                                        class: "decode-play-overlay",
-                                        // #1466: stable E2E hook for the per-tile
-                                        // un-pause (PLAY) control on a
-                                        // decode-budget-paused tile.
-                                        "data-testid": "decode-play-btn",
-                                        "aria-label": format!("Play {peer_display_name}'s video"),
-                                        // #1466 (B2): explanatory reason moved off the
-                                        // role=img wrapper onto the interactive control
-                                        // so it stays accessible without hiding the
-                                        // button from AT.
-                                        title: "Paused by your device to keep the call smooth. Audio is still on.",
-                                        onclick: move |e: MouseEvent| {
-                                            e.stop_propagation();
-                                            on_request_decode.call(request_decode_key.clone());
-                                        },
-                                        svg {
-                                            width: "20",
-                                            height: "20",
-                                            view_box: "0 0 24 24",
-                                            fill: "currentColor",
-                                            stroke: "none",
-                                            polygon { points: "8 5 19 12 8 19 8 5" }
-                                        }
-                                    }
-                                }
-                            }
-                            PeerIcon {}
-                            span { class: "placeholder-text", "Video paused" }
-                        }
-                    } else {
-                        div {
-                            class: "placeholder-content",
-                            PeerIcon {}
-                            span { class: "placeholder-text", "Video Disabled" }
-                        }
-                    }
-                    // Issue 1768: media-metrics overlay (bottom-anchored, passive,
-                    // pointer-events:none). Empty node when the checkbox is off.
-                    {media_metrics_overlay(metrics_overlay.as_ref())}
-                    h4 {
-                        id: "{split_name_id}",
-                        class: "floating-name",
-                        title: "{title_vo}",
-                        dir: "auto",
-                        span { class: "floating-name-text", "{peer_display_name_vo}" }
-                        if is_host {
-                            CrownIcon {}
-                        }
-                        if is_recording {
-                            RecordingIcon {}
-                        }
-                        // Issue 2135. The label is the bare state ("Hand
-                        // raised") — no name, no ordinal. The badge is a child of
-                        // this same `.floating-name`, whose first child is the
-                        // peer's name, so naming the peer again made AT read
-                        // "Alice ... Alice raised their hand". The ordinal is
-                        // omitted for a second, harder reason: see `hand_raised`
-                        // on `generate_for_peer`.
-                        if hand_raised {
-                            span {
-                                class: "raised-hand-badge",
-                                "data-testid": "peer-raised-hand-badge",
-                                "data-session-id": "{key}",
-                                RaisedHandIcon { decorative: false }
-                            }
-                        }
-                        if is_guest {
-                            span { class: "guest-badge", "Guest" }
-                        }
-                    }
-                    div {
-                        class: "tile-top-icons",
-                        // Mic icon (rightmost via row-reverse, always visible)
-                        div {
-                            class: "{vo_audio_class}",
-                            style: "{vo_mic_style}",
-                            "data-mic-muted": if is_audio_enabled_for_peer { "false" } else { "true" },
-                            MicIcon { muted: !is_audio_enabled_for_peer }
-                        }
-                        if show_signal_meter {
-                            button {
-                                id: "{split_signal_btn_id}",
-                                class: "signal-indicator",
-                                "aria-label": "{signal_aria}",
-                                title: "{signal_title}",
-                                "data-signal-state": "{signal_state}",
-                                "data-signal-level": format!("{}", signal_level.bars()),
-                                "data-signal-lost": format!("{}", signal_level.is_lost()),
-                                "data-signal-samples": "{signal_samples}",
-                                "data-testid": "peer-signal-indicator",
-                                onclick: move |e: MouseEvent| {
-                                    e.stop_propagation();
-                                    on_toggle_signal_popup.call(());
-                                },
-                                SignalSparkIcon {
-                                    paint: signal_spark.clone(),
-                                    spark_id: signal_spark_node.clone(),
-                                }
-                            }
-                        }
-                        {transport_badge(badge_transport, false)}
-                        // Crop (visible on hover only, hidden when video disabled)
-                        if is_video_enabled_for_peer {
-                            {
-                                let pv_crop_class = pv_canvas_crop.clone();
-                                rsx! {
-                                    button {
-                                        onclick: move |e: MouseEvent| {
-                                            // stop_propagation: tile-overlay control, not a
-                                            // grid click — must not light-dismiss a panel (#1790).
-                                            e.stop_propagation();
-                                            toggle_canvas_crop(&pv_canvas_crop, cropped_tiles);
-                                        },
-                                        class: if is_canvas_letterboxed(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
-                                        CropIcon {}
-                                    }
-                                }
-                            }
-                        }
-                        // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some()
-                            || on_disable_video.is_some()
-                            || on_kick.is_some()
-                            || on_transfer_host.is_some()
-                        {
-                            {
-                                rsx! {
-                                    div { class: "tile-mute-menu-wrapper",
-                                        button {
-                                            class: "tile-mute-btn",
-                                            title: "Host actions",
-                                            "aria-label": "Host actions",
-                                            onclick: move |e: MouseEvent| {
-                                                e.stop_propagation();
-                                                show_tile_menu.set(!show_tile_menu());
-                                            },
-                                            svg {
-                                                xmlns: "http://www.w3.org/2000/svg",
-                                                width: "16",
-                                                height: "16",
-                                                view_box: "0 0 24 24",
-                                                fill: "none",
-                                                stroke: "currentColor",
-                                                stroke_width: "2",
-                                                stroke_linecap: "round",
-                                                stroke_linejoin: "round",
-                                                circle { cx: "12", cy: "12", r: "1" }
-                                                circle { cx: "12", cy: "5", r: "1" }
-                                                circle { cx: "12", cy: "19", r: "1" }
-                                            }
-                                        }
-                                        if show_tile_menu() {
-                                            div {
-                                                style: "position: fixed; inset: 0; z-index: 99;",
-                                                onclick: move |_| show_tile_menu.set(false),
-                                            }
-                                            div { class: "tile-context-menu",
-                                                {mute_menu_item(on_mute, show_tile_menu)}
-                                                {disable_video_menu_item(on_disable_video, show_tile_menu)}
-                                                {kick_menu_item(on_kick, show_tile_menu)}
-                                                {host_promotion_menu_items(on_transfer_host, show_tile_menu)}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Pin (visible on hover / when speaking)
-                        button {
-                            onclick: move |e: MouseEvent| {
-                                // stop_propagation: tile-overlay control, not a grid
-                                // click — must not light-dismiss a side panel (#1790).
-                                e.stop_propagation();
-                                on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_pin_vo.clone()));
-                            },
-                            class: "pin-icon",
-                            "aria-pressed": "{is_pinned}",
-                            "aria-label": "Pin this participant",
-                            PushPinIcon {}
-                        }
-                    }
-                }
-                // Signal-quality popup rendered as a sibling of
-                // `.canvas-container` (rather than a child) so the
-                // tile's `overflow: hidden` border-radius clip from
-                // PR #923 cannot cut it off. The popup itself is // @token-exempt: PR ref, not a color
-                // `position: fixed` (see `.signal-quality-popup-portal`
-                // in style.css) and anchors to this tile by id.
-                if show_signal_popup {
-                    {
-                        let h = signal_history.clone();
-                        let popup_peer_id = key.clone();
-                        let popup_peer_name = peer_display_name.clone();
-                        let popup_transport = signal_transport.clone();
-                        let popup_receive_diag = signal_receive_diag.clone();
-                        let popup_device_info = signal_device_info.clone();
-                        let popup_anchor = split_anchor_id.clone();
-                        rsx! {
-                            SignalQualityPopup {
-                                peer_id: popup_peer_id,
-                                peer_name: popup_peer_name,
-                                history: h,
-                                decode_paused_locally: signal_unmeasured,
-                                meeting_start_ms,
-                                transport: popup_transport,
-                                anchor_id: popup_anchor,
-                                meter_mode: signal_meter_mode,
-                                receive_diag: popup_receive_diag,
-                                device_info: popup_device_info,
-                                free_position: signal_free_position,
-                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
-                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
-                                on_close: move |_| on_close_signal_popup.call(()),
-                            }
-                        }
-                    }
-                }
-            }
-        };
-    }
+    // The split panel renders its peers through the grid template below, so a
+    // Tile <-> Enlarged switch keeps every camera canvas node.
+    let split_tile = decision == TileDecision::RenderVideo;
 
     // Regular grid tile, optionally with screen share tile
     let screen_share_css = if client.is_awaiting_peer_screen_frame(key) {
@@ -1524,28 +1171,21 @@ pub fn generate_for_peer(
     let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
     let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
 
-    let ss_div_mobile = (*screen_share_div_id).clone();
-    let ss_div_pin = (*screen_share_div_id).clone();
-    let ss_canvas_crop = screen_share_zoom::screen_canvas_id(key);
     let ss_name = format!("{}-screen", peer_display_name);
 
-    let peer_user_id_for_mobile = peer_user_id.clone();
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
     let peer_display_name_grid = peer_display_name.clone();
     let peer_user_id_for_pin = peer_user_id.clone();
     let peer_user_id_for_pin_ss = peer_user_id.clone();
-    let title_grid = if is_host {
-        format!("Host: {peer_user_id}")
-    } else {
-        peer_user_id.clone()
-    };
+    let title_grid = host_title;
 
     // Derive flat &str values so the rsx! condition is a simple != comparison.
     // Self-identification keys on session_id (`key`), not user_id, so sibling
     // same-user sessions get their own screen-share canvas (HCL issue 828).
     let peer_session_id = key.as_str();
     let my_session_id_str = my_session_id.unwrap_or("");
+    let grid_shows_screen = !matches!(mode, TileMode::GridVideoOnly | TileMode::VideoOnly);
 
     rsx! {
         // Canvas for Screen share.
@@ -1553,33 +1193,15 @@ pub fn generate_for_peer(
         // Issue 1175: this grid-arm (`TileMode::Full`) screen-share render is
         // UNREACHABLE for a RECEIVED (non-self) share, so it deliberately carries
         // no zoom/detach — that's not an asymmetry with the split-layout tile.
-        // Any displayed non-self sharer forces `has_screen_share = true` in
-        // `AttendantsComponent` (the `active_screen_sharer` stack and this arm's
-        // `is_screen_share_enabled_for_peer` prop derive from the SAME
-        // `client.is_screen_share_enabled_for_peer`), which routes the sharer to
-        // the split layout (`TileMode::ScreenOnly` → `RenderScreenShare`, the
-        // zoom/detach-enhanced arm above). This arm is only reached when
-        // `has_screen_share = false`, i.e. no displayed non-self peer is sharing.
-        //
-        // WARNING for whoever changes that routing invariant: `class:
-        // "{screen_share_css}"` below IS reactive (flips between
-        // `is_awaiting_peer_screen_frame` states), so if this arm ever becomes
-        // reachable again, `toggle_pinned_div`'s imperative `grid-item-pinned`
-        // class would be silently erased on the next reactive class rewrite —
-        // the exact bug fixed for the normal grid and split-peer tiles (see
-        // `pinned_class` there). Route pin through a reactive class here too,
-        // not the imperative DOM toggle, if this arm becomes reachable.
-        if peer_session_id != my_session_id_str && is_screen_share_enabled_for_peer {
+        // Any displayed non-self sharer puts a share tile on screen, and while
+        // one exists no peer renders `TileMode::Full`, so `grid_shows_screen`
+        // skips this arm.
+        if grid_shows_screen && peer_session_id != my_session_id_str && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
                 id: "{screen_share_div_id}",
                 div {
                     class: "canvas-container video-on",
-                    onclick: move |_| {
-                        if is_mobile_viewport() {
-                            toggle_pinned_div(&ss_div_mobile);
-                        }
-                    },
                     ScreenCanvas { peer_id: key.clone() }
                     h4 {
                         class: "floating-name",
@@ -1590,36 +1212,11 @@ pub fn generate_for_peer(
                             span { class: "guest-badge", "Guest" }
                         }
                     }
-                    {
-                        let ss_crop_class = ss_canvas_crop.clone();
-                        rsx! {
-                            button {
-                                onclick: move |e: MouseEvent| {
-                                    // stop_propagation: tile-overlay control, not a grid
-                                    // click — must not light-dismiss a side panel (#1790).
-                                    e.stop_propagation();
-                                    toggle_canvas_crop(&ss_canvas_crop, cropped_tiles);
-                                },
-                                class: if is_canvas_letterboxed(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
-                                CropIcon {}
-                            }
-                        }
-                    }
                     button {
                         onclick: move |e: MouseEvent| {
                             // stop_propagation: tile-overlay control, not a grid
                             // click — must not light-dismiss a side panel (#1790).
                             e.stop_propagation();
-                            // NOTE: this whole `TileMode::Full` screen-share arm is
-                            // UNREACHABLE for a received share (see the WARNING above —
-                            // a displayed non-self sharer always routes to the split
-                            // layout). The imperative `toggle_pinned_div` is retained
-                            // only because this arm's root class IS reactive; if it ever
-                            // becomes reachable, mirror the split-screen-tile fix
-                            // (reactive `pinned_class`, drop this toggle). The pin
-                            // carries Screen kind so it stays consistent with the
-                            // split-layout screen tile if reached.
-                            toggle_pinned_div(&ss_div_pin);
                             on_toggle_pin.call(PinnedTile::screen(peer_user_id_for_pin_ss.clone()));
                         },
                         class: "pin-icon",
@@ -1631,12 +1228,17 @@ pub fn generate_for_peer(
             }
         }
         {
-            let grid_class = if show_canvas {
+            let has_video = if split_tile {
+                is_video_enabled_for_peer
+            } else {
+                show_canvas
+            };
+            let grid_class = if has_video {
                 "canvas-container video-on"
             } else {
                 "canvas-container"
             };
-            let grid_tile_style = tile_style.clone();
+            let grid_tile_style = tile_root_style(&tile_style, pin_rank);
             let grid_mic_style = mic_inline_style.clone();
             let grid_speaking = speaking_class;
             // issue 508: the surviving single peer (full_bleed) is now rendered
@@ -1666,6 +1268,8 @@ pub fn generate_for_peer(
             let grid_name_id = format!("{}-name", &*peer_video_div_id);
             let grid_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
             let grid_anchor_id = grid_signal_btn_id.clone();
+            let pin_btn_id = format!("{}-pin-btn", &*peer_video_div_id);
+            let pin_btn_focus = pin_btn_id.clone();
             // Placeholder wording reflects WHY there is no video:
             //   - camera genuinely off               → "Video Disabled" (unchanged)
             //   - camera on but decode budget-paused  → "Video paused" (task 1a.4)
@@ -1699,6 +1303,12 @@ pub fn generate_for_peer(
             } else {
                 ""
             };
+            let tile_root_class = if split_tile {
+                format!("split-peer-tile{grid_speaking}{pinned_class}")
+            } else {
+                format!("{grid_item_class}{grid_speaking}{off_budget_class}{pinned_class}")
+            };
+            let off_budget_attr = (!split_tile).then_some(if force_avatar { "true" } else { "false" });
             let placeholder_label = if paused_by_device {
                 "Video paused"
             } else {
@@ -1725,24 +1335,22 @@ pub fn generate_for_peer(
             };
             rsx! {
                 div {
-                    class: "{grid_item_class}{grid_speaking}{off_budget_class}{pinned_class}",
+                    class: "{tile_root_class}",
                     id: "{peer_video_div_id}",
                     "data-tile-root": "true",
-                    "data-off-budget": if force_avatar { "true" } else { "false" },
+                    "data-off-budget": off_budget_attr,
+                    "data-pinned": is_pinned.then_some("true"),
+                    "data-pin-rank": pin_rank.map(|r| r.to_string()),
                     style: "{grid_tile_style}",
                     // One canvas for the User Video
                     div {
                         class: "{grid_class}",
-                        onclick: move |_| {
-                            // Mobile tap-to-spotlight routes through the reactive pin
-                            // signal (not an imperative class toggle) so the maximize
-                            // is owned by `is_pinned` and survives class rewrites.
-                            if is_mobile_viewport() {
-                                on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_mobile.clone()));
-                            }
-                        },
                         if show_canvas {
-                            UserVideo { id: key_clone.clone(), hidden: false }
+                            UserVideo {
+                                id: key_clone.clone(),
+                                hidden: false,
+                                default_letterboxed: camera_default_letterboxed,
+                            }
                         } else if paused_by_device {
                             // Device-paused avatar: PeerIcon + a PLAY button so it
                             // reads as "paused by us, click to resume", not "camera
@@ -1770,10 +1378,7 @@ pub fn generate_for_peer(
                                 // real tap area was sub-44px and ambiguous. Centering
                                 // over the placeholder (itself centered in the tile)
                                 // yields a full, unclipped ≥44px target clear of the
-                                // corner icons. `stop_propagation` runs FIRST so a
-                                // mobile tap does not also fire the parent
-                                // `.canvas-container` pin handler, then force-decode
-                                // THIS peer via its session_id (`key`).
+                                // corner icons.
                                 {
                                     // Owned session_id clone for the `move`
                                     // onclick (handlers must be `'static`; the
@@ -1825,8 +1430,8 @@ pub fn generate_for_peer(
                             title: "{title_grid}",
                             dir: "auto",
                             span { class: "floating-name-text", "{peer_display_name_grid}" }
-                            if is_host {
-                                CrownIcon {}
+                            if host_role.is_some() {
+                                CrownIcon { co_host: crown_is_co_host }
                             }
                             if is_recording {
                                 RecordingIcon {}
@@ -1879,7 +1484,7 @@ pub fn generate_for_peer(
                             // Crop (visible on hover only). Gated on `show_canvas`
                             // so off-budget avatar tiles — which have no canvas —
                             // don't show a no-op crop button (task 1a.4).
-                            if show_canvas {
+                            if has_video {
                                 {
                                     let pv_crop_class = pv_canvas_crop.clone();
                                     rsx! {
@@ -1888,9 +1493,9 @@ pub fn generate_for_peer(
                                                 // stop_propagation: tile-overlay control, not a
                                                 // grid click — must not light-dismiss a panel (#1790).
                                                 e.stop_propagation();
-                                                toggle_canvas_crop(&pv_canvas_crop, cropped_tiles);
+                                                toggle_canvas_crop(&pv_canvas_crop, cropped_tiles, camera_default_letterboxed);
                                             },
-                                            class: if is_canvas_letterboxed(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                            class: if is_canvas_letterboxed(&pv_crop_class, &cropped_tiles, camera_default_letterboxed) { "crop-icon" } else { "crop-icon active" },
                                             CropIcon {}
                                         }
                                     }
@@ -1900,15 +1505,17 @@ pub fn generate_for_peer(
                             if on_mute.is_some()
                                 || on_disable_video.is_some()
                                 || on_kick.is_some()
-                                || on_transfer_host.is_some()
+                                || host_promotion.any()
                             {
                                 {
                                     rsx! {
                                         div { class: "tile-mute-menu-wrapper",
                                             button {
                                                 class: "tile-mute-btn",
+                                                id: "{tile_menu_trigger}",
                                                 title: "Host actions",
                                                 "aria-label": "Host actions",
+                                                "aria-expanded": if show_tile_menu() { "true" } else { "false" },
                                                 onclick: move |e: MouseEvent| {
                                                     e.stop_propagation();
                                                     show_tile_menu.set(!show_tile_menu());
@@ -1936,25 +1543,30 @@ pub fn generate_for_peer(
                                                 div { class: "tile-context-menu",
                                                     {mute_menu_item(on_mute, show_tile_menu)}
                                                     {disable_video_menu_item(on_disable_video, show_tile_menu)}
+                                                    {host_promotion_menu_items(host_promotion.clone(), show_tile_menu, tile_menu_trigger.clone())}
                                                     {kick_menu_item(on_kick, show_tile_menu)}
-                                                    {host_promotion_menu_items(on_transfer_host, show_tile_menu)}
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            // Pin (visible on hover / when speaking)
                             button {
+                                r#type: "button",
+                                id: "{pin_btn_id}",
+                                class: "pin-icon",
+                                "data-testid": "tile-pin-button",
+                                "aria-label": "Pin {peer_display_name}",
+                                "aria-pressed": if is_pinned { "true" } else { "false" },
+                                title: if is_pinned { "Unpin" } else { "Pin" },
                                 onclick: move |e: MouseEvent| {
                                     // stop_propagation: tile-overlay control, not a grid
                                     // click — must not light-dismiss a side panel (#1790).
                                     e.stop_propagation();
                                     on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_pin.clone()));
+                                    // The keyed reorder blurs the moved button.
+                                    focus_after_render(pin_btn_focus.clone());
                                 },
-                                class: "pin-icon",
-                                "aria-pressed": "{is_pinned}",
-                                "aria-label": "Pin this participant",
                                 PushPinIcon {}
                             }
                         }
@@ -1997,7 +1609,7 @@ pub fn generate_for_peer(
 }
 
 #[component]
-fn UserVideo(id: String, hidden: bool) -> Element {
+fn UserVideo(id: String, hidden: bool, default_letterboxed: bool) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let cropped_tiles = try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let id_for_effect = id.clone();
@@ -2015,7 +1627,7 @@ fn UserVideo(id: String, hidden: bool) -> Element {
         }
     });
 
-    let crop_class = if is_canvas_letterboxed(&id_for_class, &cropped_tiles) {
+    let crop_class = if is_canvas_letterboxed(&id_for_class, &cropped_tiles, default_letterboxed) {
         "uncropped"
     } else {
         "cropped"
@@ -2033,11 +1645,9 @@ fn UserVideo(id: String, hidden: bool) -> Element {
 #[component]
 fn ScreenCanvas(peer_id: String) -> Element {
     let client = use_context::<VideoCallClientCtx>();
-    let cropped_tiles = try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     // Single source of truth (shared with the detach path + client callback).
     let canvas_id = screen_share_zoom::screen_canvas_id(&peer_id);
     let canvas_id_for_effect = canvas_id.clone();
-    let canvas_id_for_class = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 
     use_effect(move || {
@@ -2052,16 +1662,10 @@ fn ScreenCanvas(peer_id: String) -> Element {
         }
     });
 
-    let crop_class = if is_canvas_letterboxed(&canvas_id_for_class, &cropped_tiles) {
-        "uncropped"
-    } else {
-        "cropped"
-    };
-
     rsx! {
         canvas {
             id: "{canvas_id}",
-            class: crop_class,
+            class: "cropped",
         }
     }
 }
@@ -2104,7 +1708,7 @@ fn viewport_half_dims(viewport_id: &str) -> Option<(f64, f64)> {
 /// Move keyboard focus to the element with `id`, if present and focusable.
 /// Used to keep focus with the detach/reattach mode change so it never drops to
 /// `<body>` (the a11y blocker class). No-op if the element is gone.
-fn focus_element_by_id(id: &str) {
+pub(crate) fn focus_element_by_id(id: &str) {
     if let Some(el) = window()
         .and_then(|w| w.document())
         .and_then(|d| d.get_element_by_id(id))
@@ -2254,19 +1858,25 @@ fn actual_size_target_for(peer: &str, viewport_id: &str) -> f64 {
     screen_share_zoom::actual_size_target(bw, bh, hw * 2.0, hh * 2.0, dpr)
 }
 
-/// Issue 1175: the zoom/pan viewport for a RECEIVED shared-content tile. Wraps
-/// the SAME decoder `<canvas>` (via [`ScreenCanvas`]) in a `.ss-zoom-wrapper`
+/// Issue 1175: the zoom/pan viewport for a shared-content tile. Wraps the SAME
+/// decoder `<canvas>` (via [`ScreenCanvas`]; the own share's `<video>` with
+/// `own`, issue 2792) in a `.ss-zoom-wrapper`
 /// whose CSS `transform` is driven declaratively from [`ScreenZoomCtx`], so a
 /// zoom/pan change only patches an attribute and never recreates the canvas the
 /// decoder paints into. The viewport is a focusable group; arrow / page / Home /
 /// End keys and drag pan it when zoomed (no-op at fit, so keys aren't trapped).
 #[component]
-fn ScreenShareZoomable(peer_id: String) -> Element {
+pub fn ScreenShareZoomable(
+    peer_id: String,
+    #[props(default)] own: bool,
+    #[props(default)] hidden: bool,
+    #[props(default)] paused: bool,
+) -> Element {
     let zoom_ctx = use_context::<ScreenZoomCtx>().0;
     // Issue 1821: wheel / pinch gestures leave the actual-size (1:1) intent, so
     // the gesture handlers clear it (like the button steppers do).
     let actual_ctx = use_context::<ScreenActualSizeCtx>().0;
-    let viewport_id = format!("screen-share-{}-viewport", peer_id);
+    let viewport_id = share_dom_id(&peer_id, "viewport");
 
     // Declarative transform from current state (subscribes this tile to zoom).
     let zoom_state = read_zoom_state(&zoom_ctx, &peer_id);
@@ -2285,13 +1895,13 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
     // drag re-renders this single tile ~once/frame — the canvas node is retained,
     // so each re-render only patches the wrapper's `transform`.
     let drag = use_hook(|| Rc::new(RefCell::new(ScreenPanDrag::default())));
-    let raf: Rc<Closure<dyn FnMut()>> = use_hook({
+    let raf: Rc<AnimationFrame> = use_hook({
         let drag = drag.clone();
         let peer = peer_id.clone();
         let vp = viewport_id.clone();
         let mut ctx = zoom_ctx;
         move || {
-            Rc::new(Closure::<dyn FnMut()>::new(move || {
+            Rc::new(AnimationFrame::new(move || {
                 let (dx, dy, pending_zoom) = {
                     let mut d = drag.borrow_mut();
                     d.raf_scheduled = false;
@@ -2318,21 +1928,6 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
             }))
         }
     });
-
-    // Clear the drag accumulator on unmount so a late rAF flush is a no-op.
-    {
-        let drag = drag.clone();
-        use_drop(move || {
-            let mut d = drag.borrow_mut();
-            d.active = false;
-            d.pending_dx = 0.0;
-            d.pending_dy = 0.0;
-            d.pointers.clear();
-            d.pinching = false;
-            d.pinch_half = None;
-            d.pending_zoom = None;
-        });
-    }
 
     // Issue 1821: Ctrl+wheel / trackpad-pinch zoom. Dioxus-web `onwheel` is
     // PASSIVE (root-delegated), so `preventDefault()` there is a no-op and a
@@ -2537,10 +2132,7 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
                 clear_actual_size(&mut actual_ctx, &peer);
             }
             if schedule {
-                if let Some(win) = window() {
-                    let cb: &js_sys::Function = (*raf).as_ref().unchecked_ref();
-                    let _ = win.request_animation_frame(cb);
-                }
+                raf.request();
             }
         }
     };
@@ -2607,6 +2199,7 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
             tabindex: "0",
             role: "group",
             "aria-label": "Shared content. Zoom with the controls, then drag or use the arrow keys to pan.",
+            hidden,
             onpointerdown: on_down,
             onpointermove: on_move,
             onpointerup: on_up,
@@ -2616,14 +2209,315 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
             div {
                 class: "ss-zoom-wrapper",
                 style: "transform: {transform};",
-                ScreenCanvas { peer_id: peer_id.clone() }
+                if own {
+                    OwnShareVideo { paused }
+                } else {
+                    ScreenCanvas { peer_id: peer_id.clone() }
+                }
             }
         }
     }
 }
 
-/// Issue 1175: zoom / reset / detach controls for a RECEIVED shared-content
-/// tile. Always-present markup (its shape never changes with zoom/detach state)
+const OWN_SHARE_VIDEO_ID: &str = "own-screen-share-video";
+
+/// The local capture, attached from [`ShareViewCtx::own_stream`].
+#[component]
+fn OwnShareVideo(paused: ReadSignal<bool>) -> Element {
+    let ctx = use_context::<ShareViewCtx>();
+    let node: Rc<RefCell<Option<web_sys::HtmlVideoElement>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    let mut mounted = use_signal(|| false);
+    {
+        let node = node.clone();
+        use_drop(move || {
+            if let Some(video) = node.borrow_mut().take() {
+                video.set_src_object(None);
+            }
+        });
+    }
+    let effect_node = node.clone();
+    use_effect(move || {
+        let stream = ctx.own_stream.read().clone();
+        let paused = paused();
+        if !mounted() {
+            return;
+        }
+        let Some(video) = effect_node.borrow().clone() else {
+            return;
+        };
+        let current = video.src_object();
+        if current.as_ref().map(AsRef::<wasm_bindgen::JsValue>::as_ref)
+            != stream.as_ref().map(AsRef::<wasm_bindgen::JsValue>::as_ref)
+        {
+            // The property, not just the attribute: Chrome's autoplay policy reads it.
+            video.set_muted(true);
+            video.set_src_object(stream.as_ref());
+        }
+        if paused {
+            let _ = video.pause();
+        } else if let Ok(promise) = video.play() {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                    log::warn!("own share preview play() rejected: {e:?}");
+                }
+            });
+        }
+    });
+    rsx! {
+        video {
+            id: OWN_SHARE_VIDEO_ID,
+            class: "own-screen-share-video",
+            autoplay: true,
+            muted: true,
+            playsinline: "true",
+            controls: false,
+            onmounted: move |e: MountedEvent| {
+                *node.borrow_mut() = e.try_as_web_event().and_then(|el| el.dyn_into().ok());
+                mounted.set(true);
+            },
+        }
+    }
+}
+
+/// Root of a share tile of either origin; its mode is an attribute change.
+#[component]
+fn ShareTileRoot(
+    view: ShareTileView,
+    root_id: String,
+    label: String,
+    children: Element,
+) -> Element {
+    let inside = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+    let root_el: Rc<RefCell<Option<web_sys::Element>>> = use_hook(|| Rc::new(RefCell::new(None)));
+    {
+        let inside = inside.clone();
+        let root_el = root_el.clone();
+        use_drop(move || {
+            if focus_lost_with(root_el.borrow().as_ref(), inside.get()) {
+                focus_element_by_id("grid-container");
+            }
+        });
+    }
+    let mode = view.mode;
+    let origin = view.target.origin;
+    let is_pinned = mode == ShareViewMode::Pinned;
+    let pinned_class = if is_pinned { " tile-pinned" } else { "" };
+    let inert = mode == ShareViewMode::Detached;
+    let style = view.root_style();
+    let pin_rank = view.pin_rank.filter(|_| is_pinned);
+    let region = share_view::region_label(&label, mode);
+    let inside_out = inside.clone();
+    rsx! {
+        div {
+            id: "{root_id}",
+            class: "split-screen-tile share-tile{pinned_class}",
+            "data-tile-root": "true",
+            "data-share-origin": origin.as_str(),
+            "data-share-mode": mode.as_str(),
+            "data-pinned": is_pinned.then_some("true"),
+            "data-pin-rank": pin_rank.map(|r| r.to_string()),
+            "data-guard": view.guard.then_some("true"),
+            "data-testid": if origin == ShareOrigin::Own { "own-share-tile" } else { "received-share-tile" },
+            role: "region",
+            "aria-label": "{region}",
+            "inert": inert.then_some("true"),
+            style: "{style}",
+            onmounted: move |e: MountedEvent| {
+                *root_el.borrow_mut() = e.try_as_web_event();
+            },
+            onfocusin: move |_| inside.set(true),
+            onfocusout: move |e: FocusEvent| {
+                if e.as_web_event().related_target().is_some() {
+                    inside_out.set(false);
+                }
+            },
+            {children}
+        }
+    }
+}
+
+/// Decorative: the bar's Pin button carries the state for assistive tech.
+#[component]
+fn ShareTilePinBadge() -> Element {
+    rsx! {
+        span {
+            class: "tile-pin-badge",
+            "data-testid": "tile-pin-badge",
+            "aria-hidden": "true",
+            PushPinIcon {}
+        }
+    }
+}
+
+/// Whether focus goes down with a share tile that is being removed: nowhere
+/// or on the body after focus was inside it, or still inside `root`.
+fn focus_lost_with(root: Option<&web_sys::Element>, was_inside: bool) -> bool {
+    let Some(doc) = window().and_then(|w| w.document()) else {
+        return false;
+    };
+    match doc.active_element() {
+        None => was_inside,
+        Some(active) => {
+            if doc.body().is_some_and(|b| b.is_same_node(Some(&active))) {
+                was_inside
+            } else {
+                root.is_some_and(|r| r.contains(Some(&active)))
+            }
+        }
+    }
+}
+
+/// Section 6.1: one-click route back to a sticky Detached view. Its timer is
+/// signal-owned so it dies with the button.
+#[component]
+fn ShareDetachCta(target: ShareTarget) -> Element {
+    let ctx = use_context::<ShareViewCtx>();
+    let mut timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
+    let origin = target.origin;
+    let mut arm = move || {
+        timer.set(Some(gloo_timers::callback::Timeout::new(
+            share_view::CTA_TIMEOUT_MS,
+            move || {
+                let mut slots = ctx.slots;
+                let Ok(mut s) = slots.try_write() else {
+                    return;
+                };
+                let slot = s.get_mut(origin);
+                if slot.cta == CtaState::Shown {
+                    slot.cta = CtaState::Suggested;
+                }
+            },
+        )));
+    };
+    use_effect(arm);
+    let cta_id = share_dom_id(&target.key, "cta");
+    let hint_id = share_dom_id(&target.key, "cta-hint");
+    rsx! {
+        button {
+            r#type: "button",
+            id: "{cta_id}",
+            class: "ss-detach-cta",
+            "data-testid": "ss-detach-cta",
+            title: "Open in separate window",
+            "aria-label": "Open in separate window",
+            "aria-describedby": "{hint_id}",
+            onfocusin: move |_| timer.set(None),
+            onfocusout: move |_| arm(),
+            onclick: move |e: MouseEvent| {
+                e.stop_propagation();
+                share_view::dispatch(ctx, &target, ShareAction::Detach);
+            },
+            DetachIcon {}
+            span { class: "ss-detach-cta-text", "Open in separate window" }
+        }
+        span { id: "{hint_id}", class: "visually-hidden",
+            "You last viewed shared content in a separate window."
+        }
+    }
+}
+
+fn focus_after_render(id: String) {
+    gloo_timers::callback::Timeout::new(0, move || share_view::focus_first(&[id])).forget();
+}
+
+/// Issue 2792: the local user's own share, as a tile with the same controls
+/// as a received one.
+#[component]
+pub fn OwnShareTile(view: ShareTileView) -> Element {
+    let ctx = use_context::<ShareViewCtx>();
+    let key = OWN_SHARE_KEY.to_string();
+    #[cfg(target_arch = "wasm32")]
+    let can_detach = crate::components::screen_share_detach::detach_supported();
+    #[cfg(not(target_arch = "wasm32"))]
+    let can_detach = false;
+    let show_id = share_dom_id(&key, "show-preview");
+    let hide_id = share_dom_id(&key, "hide-preview");
+    let guard = view.guard;
+    let on_hide = {
+        let target = view.target.clone();
+        let show_id = show_id.clone();
+        move |e: MouseEvent| {
+            e.stop_propagation();
+            share_view::set_mirror_guard(ctx, &target, true, can_detach);
+            focus_after_render(show_id.clone());
+        }
+    };
+    let on_show = {
+        let target = view.target.clone();
+        let hide_id = hide_id.clone();
+        move |e: MouseEvent| {
+            e.stop_propagation();
+            share_view::set_mirror_guard(ctx, &target, false, can_detach);
+            focus_after_render(hide_id.clone());
+        }
+    };
+    rsx! {
+        ShareTileRoot {
+            view: view.clone(),
+            root_id: share_dom_id(&key, "div"),
+            label: "Your shared content".to_string(),
+            div {
+                class: "canvas-container video-on",
+                ScreenShareZoomable {
+                    peer_id: key.clone(),
+                    own: true,
+                    hidden: guard,
+                    paused: guard || view.mode == ShareViewMode::Detached,
+                }
+                h4 { class: "floating-name",
+                    span { class: "floating-name-text", "You are presenting" }
+                }
+                if guard {
+                    div { class: "ss-mirror-guard",
+                        MonitorIcon {}
+                        p { class: "ss-mirror-guard-title", "You're presenting your entire screen" }
+                        p { class: "ss-mirror-guard-note", "Preview hidden to avoid a mirror effect" }
+                        button {
+                            r#type: "button",
+                            id: "{show_id}",
+                            class: "ss-mirror-guard-show",
+                            "data-testid": "ss-show-preview",
+                            "aria-label": "Show preview of your shared content",
+                            onclick: on_show,
+                            "Show preview"
+                        }
+                    }
+                } else if view.cta == CtaState::Shown {
+                    ShareDetachCta { target: view.target.clone() }
+                }
+                ScreenShareZoomControls {
+                    peer_id: key.clone(),
+                    content_res: None,
+                    target: view.target.clone(),
+                    mode: view.mode,
+                    suggested: view.cta == CtaState::Suggested,
+                }
+                if !guard {
+                    div { class: "tile-top-icons",
+                        button {
+                            r#type: "button",
+                            id: "{hide_id}",
+                            class: "ss-preview-toggle",
+                            "data-testid": "ss-hide-preview",
+                            title: "Hide preview",
+                            "aria-label": "Hide preview of your shared content",
+                            onclick: on_hide,
+                            PreviewOffIcon {}
+                        }
+                        if view.mode == ShareViewMode::Pinned {
+                            ShareTilePinBadge {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Issue 1175: zoom / reset / detach controls for a shared-content tile (both
+/// origins, plus the view buttons, issue 2792). Always-present markup (its shape
+/// never changes with zoom/detach state)
 /// so re-renders never tear down the canvas. Every handler is an ordinary
 /// main-document Dioxus handler, so they are always live — unlike v1's dead
 /// in-PiP delegated handlers. The detach button is omitted where no separate
@@ -2631,18 +2525,22 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
 #[component]
 fn ScreenShareZoomControls(
     peer_id: String,
-    name: String,
     // Issue 1821: the decoded shared-content resolution, threaded as a reactive
     // prop so the actual-size (1:1) live-tracking effect re-runs when the
     // presenter's resolution changes (and re-derives the 1:1 scale from the
     // new decoded dims). `None` pre-decode.
     content_res: ReadSignal<Option<(u32, u32)>>,
+    target: ShareTarget,
+    mode: ReadSignal<ShareViewMode>,
+    #[props(default)] suggested: bool,
 ) -> Element {
     let zoom_ctx = use_context::<ScreenZoomCtx>().0;
     let detached_ctx = use_context::<DetachedShareCtx>().0;
     // Issue 1821: the actual-size (1:1) engaged-peer intent.
     let actual_ctx = use_context::<ScreenActualSizeCtx>().0;
-    let viewport_id = format!("screen-share-{}-viewport", peer_id);
+    let share_ctx = use_context::<ShareViewCtx>();
+    let viewport_id = share_dom_id(&peer_id, "viewport");
+    let own = target.origin == ShareOrigin::Own;
 
     // Issue 1175 (item 4): read ONLY the scale, through a memo, so an offset-only
     // pan write (scale + offsets share the one `ScreenZoomCtx` map) does NOT
@@ -2691,10 +2589,29 @@ fn ScreenShareZoomControls(
         });
     }
 
+    {
+        let peer = peer_id.clone();
+        let vp = viewport_id.clone();
+        let mut ctx = zoom_ctx;
+        use_effect(move || {
+            let _mode = mode();
+            let Some((hw, hh)) = viewport_half_dims(&vp) else {
+                return;
+            };
+            let cur = ctx.peek().get(&peer).copied().unwrap_or_default();
+            let next = screen_share_zoom::zoom_to(cur, cur.scale, hw, hh);
+            if next != cur {
+                write_zoom_state(&mut ctx, &peer, next);
+            }
+        });
+    }
+
     // Stable, peer-scoped ids so focus management can find the detach toggle and
     // the overlay's "Bring it back" button (which lives in `generate_for_peer`,
     // a sibling subtree of this component) across the mode change.
-    let detach_btn_dom_id = format!("screen-share-{}-detach-btn", peer_id);
+    let detach_btn_dom_id = share_dom_id(&peer_id, "detach-btn");
+    let pin_btn_id = share_dom_id(&peer_id, "pin-btn");
+    let enlarge_btn_id = share_dom_id(&peer_id, "enlarge-btn");
 
     #[cfg(target_arch = "wasm32")]
     let can_detach = crate::components::screen_share_detach::detach_supported();
@@ -2714,18 +2631,27 @@ fn ScreenShareZoomControls(
     // transitions act. Presenter-stops-while-detached unmounts this tile (no
     // toggle to focus) and is handled in `use_drop` below.
     {
-        let detach_target = detach_btn_dom_id.clone();
+        let exit_chain = vec![
+            share_dom_id(&peer_id, "cta"),
+            detach_btn_dom_id.clone(),
+            pin_btn_id.clone(),
+        ];
         let peer_fx = peer_id.clone();
         let detached_fx = detached_ctx;
-        let prev = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        let prev = use_hook(|| {
+            Rc::new(std::cell::Cell::new(
+                detached_ctx.peek().as_deref() == Some(peer_id.as_str()),
+            ))
+        });
         use_effect(move || {
-            let now = detached_fx.read().as_deref() == Some(peer_fx.as_str());
+            let cur = detached_fx.read().clone();
+            let now = cur.as_deref() == Some(peer_fx.as_str());
             if now != prev.get() {
                 prev.set(now);
                 if now {
                     focus_element_by_id("grid-container");
-                } else {
-                    focus_element_by_id(&detach_target);
+                } else if cur.is_none() {
+                    share_view::focus_first(&exit_chain);
                 }
             }
         });
@@ -2733,18 +2659,21 @@ fn ScreenShareZoomControls(
 
     // If this shared-content tile unmounts while detached (presenter stops
     // sharing, receiver reconnects, meeting ends), close the detached window so
-    // it can't linger showing a now-frozen mirror, and move focus to the meeting
-    // grid — the detach toggle that would otherwise receive it is gone with the
-    // tile, so without this focus would drop to <body>. `teardown` is a no-op
-    // when this peer isn't the detached one.
+    // it can't linger showing a now-frozen mirror. `teardown` is a no-op when
+    // this peer isn't the detached one.
     #[cfg(target_arch = "wasm32")]
     {
         let peer_drop = peer_id.clone();
         let detached_drop = detached_ctx;
         use_drop(move || {
-            let was_detached = detached_drop.peek().as_deref() == Some(peer_drop.as_str());
-            crate::components::screen_share_detach::teardown(&peer_drop);
-            if was_detached {
+            let was_detached = detached_drop
+                .try_peek()
+                .is_ok_and(|d| d.as_deref() == Some(peer_drop.as_str()));
+            share_view::teardown_with_cause(&peer_drop, share_view::TeardownCause::System);
+            let root = window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id(&share_dom_id(&peer_drop, "div")));
+            if was_detached && focus_lost_with(root.as_ref(), true) {
                 focus_element_by_id("grid-container");
             }
         });
@@ -2821,55 +2750,45 @@ fn ScreenShareZoomControls(
             }
         }
     };
-    let on_detach = {
-        let peer = peer_id.clone();
-        let name = name.clone();
+    let view_action = |action: ShareAction, refocus: Option<String>| {
+        let target = target.clone();
         move |e: MouseEvent| {
             e.stop_propagation();
-            #[cfg(target_arch = "wasm32")]
-            {
-                use crate::components::screen_share_detach as ssd;
-                let mut dctx = detached_ctx;
-                if dctx.read().as_deref() == Some(peer.as_str()) {
-                    // Already detached → reattach (teardown flips the signal).
-                    ssd::reattach(&peer);
-                } else {
-                    // Optimistically mark detached, then open. Every failure /
-                    // close path calls the callback below to reset the signal.
-                    dctx.set(Some(peer.clone()));
-                    let dctx_cb = detached_ctx;
-                    ssd::open(
-                        &peer,
-                        &name,
-                        Box::new(move || {
-                            // `Signal` is `Copy`, so copy into a local to satisfy
-                            // the `Fn` callback (`set` needs `&mut self`).
-                            let mut d = dctx_cb;
-                            d.set(None);
-                        }),
-                    );
-                }
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let _ = (&peer, &name, &detached_ctx);
+            share_view::dispatch(share_ctx, &target, action);
+            if let Some(id) = refocus.clone() {
+                focus_after_render(id);
             }
         }
     };
+    let on_detach = view_action(ShareAction::Detach, None);
+    let on_enlarge = view_action(ShareAction::Enlarge, Some(enlarge_btn_id.clone()));
+    let on_pin = view_action(ShareAction::Pin, Some(pin_btn_id.clone()));
+    let current_mode = mode();
+    let is_enlarged = current_mode == ShareViewMode::Enlarged;
+    let is_pinned = current_mode == ShareViewMode::Pinned;
+    let group_label = if own {
+        "Your shared content controls"
+    } else {
+        "Shared content controls"
+    };
 
     let out_class = if at_min {
-        "ss-zoom-btn ss-zoom-btn--disabled"
+        "ss-zoom-btn ss-tier-s ss-zoom-btn--disabled"
     } else {
-        "ss-zoom-btn"
+        "ss-zoom-btn ss-tier-s"
     };
     let in_class = if at_max {
-        "ss-zoom-btn ss-zoom-btn--disabled"
+        "ss-zoom-btn ss-tier-s ss-zoom-btn--disabled"
     } else {
-        "ss-zoom-btn"
+        "ss-zoom-btn ss-tier-s"
     };
 
     rsx! {
-        div { class: "ss-zoom-controls", "data-testid": "ss-zoom-controls",
+        div {
+            class: "ss-zoom-controls",
+            "data-testid": "ss-zoom-controls",
+            role: "group",
+            "aria-label": group_label,
             // aria-disabled (not the native `disabled`) at the clamps: the pure
             // step helpers already saturate, so a click at the limit is a
             // harmless no-op — and keeping the button focusable means a keyboard
@@ -2901,10 +2820,10 @@ fn ScreenShareZoomControls(
                 onclick: on_zoom_in,
                 ZoomInIcon {}
             }
-            span { class: "ss-zoom-sep", "aria-hidden": "true" }
+            span { class: "ss-zoom-sep ss-tier-l", "aria-hidden": "true" }
             button {
                 r#type: "button",
-                class: "ss-zoom-btn",
+                class: "ss-zoom-btn ss-tier-l",
                 "data-testid": "ss-zoom-reset",
                 title: "Reset zoom to 100%",
                 "aria-label": "Reset shared content zoom to 100 percent",
@@ -2912,22 +2831,48 @@ fn ScreenShareZoomControls(
                 ZoomResetIcon {}
             }
             // Issue 1821: actual-size (1:1) toggle — after Reset, before Detach.
+            if !own {
+                button {
+                    r#type: "button",
+                    class: "ss-zoom-btn ss-actual-btn ss-tier-l",
+                    "data-testid": "ss-zoom-actual",
+                    title: "Actual size (1:1 pixels)",
+                    "aria-label": "Show shared content at actual size, one-to-one pixels",
+                    "aria-pressed": if is_actual { "true" } else { "false" },
+                    onclick: on_actual,
+                    ActualSizeIcon {}
+                }
+            }
+            span { class: "ss-zoom-sep ss-tier-s", "aria-hidden": "true" }
             button {
                 r#type: "button",
-                class: "ss-zoom-btn ss-actual-btn",
-                "data-testid": "ss-zoom-actual",
-                title: "Actual size (1:1 pixels)",
-                "aria-label": "Show shared content at actual size, one-to-one pixels",
-                "aria-pressed": if is_actual { "true" } else { "false" },
-                onclick: on_actual,
-                ActualSizeIcon {}
+                id: "{enlarge_btn_id}",
+                class: "ss-zoom-btn ss-mode-btn",
+                "data-testid": "ss-enlarge",
+                title: if is_enlarged { "Exit enlarged view" } else { "Enlarge" },
+                "aria-label": "Enlarge shared content",
+                "aria-pressed": if is_enlarged { "true" } else { "false" },
+                onclick: on_enlarge,
+                EnlargeIcon {}
+            }
+            button {
+                r#type: "button",
+                id: "{pin_btn_id}",
+                class: "ss-zoom-btn ss-mode-btn",
+                "data-testid": "ss-pin",
+                title: if is_pinned { "Unpin" } else { "Pin" },
+                "aria-label": "Pin shared content",
+                "aria-pressed": if is_pinned { "true" } else { "false" },
+                onclick: on_pin,
+                PushPinIcon {}
             }
             if can_detach {
                 button {
                     r#type: "button",
                     id: "{detach_btn_dom_id}",
-                    class: "ss-zoom-btn ss-detach-btn",
+                    class: "ss-zoom-btn ss-mode-btn ss-detach-btn ss-tier-s",
                     "data-testid": "ss-detach",
+                    "data-suggested": suggested.then_some("true"),
                     title: if is_detached { "Return shared content to the meeting window" } else { "Open shared content in a separate window" },
                     "aria-label": if is_detached { "Return shared content to the meeting window" } else { "Open shared content in a separate window" },
                     "aria-pressed": if is_detached { "true" } else { "false" },
@@ -2939,81 +2884,54 @@ fn ScreenShareZoomControls(
     }
 }
 
-/// Issue 1175: a visually-hidden polite live region that announces detach /
-/// reattach to screen-reader users. Rendered ONCE at the meeting level (by
-/// `AttendantsComponent`), OUTSIDE the share pane that gets hidden off-screen
-/// while detached, so it stays in the a11y tree and is read. Announces on REAL
-/// transitions only (a prev-state cell): focus-land alone under-announces (on
-/// ENTER the OS focus moves to the new window; on EXIT the detach toggle's label
-/// describes its function, not the outcome). One detached share at a time, so it
-/// keys off `DetachedShareCtx` being Some vs None, not a specific peer.
+/// The meeting-level polite region for share-view changes (issue 2792),
+/// rendered outside every share tile so it stays in the a11y tree.
 #[component]
 pub fn ScreenDetachAnnouncer() -> Element {
-    let detached_ctx = use_context::<DetachedShareCtx>().0;
-    let mut message = use_signal(String::new);
-    let prev = use_hook(|| Rc::new(std::cell::Cell::new(false)));
-    use_effect(move || {
-        let now = detached_ctx.read().is_some();
-        if now != prev.get() {
-            prev.set(now);
-            message.set(
-                if now {
-                    "Shared content opened in a separate window"
-                } else {
-                    "Shared content returned to the meeting"
-                }
-                .to_string(),
-            );
-        }
-    });
-
+    let ctx = use_context::<ShareViewCtx>();
+    let text = {
+        let a = ctx.announce.read();
+        crate::components::attendants::action_bar_announce_text(&a.0, a.1)
+    };
     rsx! {
         div {
             class: "visually-hidden",
             "data-testid": "ss-detach-announce",
             role: "status",
             "aria-live": "polite",
-            "{message}"
+            "{text}"
         }
     }
 }
 
-fn toggle_pinned_div(div_id: &str) {
-    if let Some(div) = window()
-        .and_then(|w| w.document())
-        .and_then(|doc| doc.get_element_by_id(div_id))
-    {
-        if !div.class_list().contains("grid-item-pinned") {
-            div.class_list().add_1("grid-item-pinned").unwrap();
-        } else {
-            div.class_list().remove_1("grid-item-pinned").unwrap();
-        }
-    }
+/// Whether a decoded `WxH` resolution is taller than it is wide.
+pub(crate) fn is_portrait_resolution(resolution: &str) -> bool {
+    parse_resolution(resolution).is_some_and(|(width, height)| height > width)
 }
 
-/// Is the viewport narrow enough to be treated as a phone?
-///
-/// WIDTH ONLY, by design for its callers here — all three are tap-to-spotlight
-/// handlers, where the question is whether tiles are small enough to want a tap
-/// affordance. It is therefore NOT a general "is this a phone" predicate: a
-/// landscape phone is 844x390 and classifies as desktop. Issue 2141 tried to
-/// borrow it to gate the emoji-search autofocus and had to stop; see
-/// `emoji_picker::should_autofocus_search_field` for a both-axes predicate.
-fn is_mobile_viewport() -> bool {
-    if let Some(win) = window() {
-        if let Ok(width) = win.inner_width() {
-            let px = width.as_f64().unwrap_or(1024.0);
-            return px < 768.0;
-        }
-    }
-    false
+/// The fit a camera tile shows until the user picks one: a portrait source is
+/// letterboxed on the full-bleed stage and filled everywhere else.
+fn default_letterboxed(portrait_source: bool, full_bleed: bool) -> bool {
+    portrait_source && full_bleed
 }
 
-fn toggle_canvas_crop(canvas_id: &str, cropped_tiles: Option<Signal<HashMap<String, bool>>>) {
+/// Always emits `order`: Dioxus keeps a property a later `style` string omits.
+fn tile_root_style(speak_style: &str, pin_rank: Option<usize>) -> String {
+    format!(
+        "{speak_style} order: {};",
+        pin_order::tile_order(pin_rank, 0)
+    )
+}
+
+fn toggle_canvas_crop(
+    canvas_id: &str,
+    cropped_tiles: Option<Signal<HashMap<String, bool>>>,
+    default_letterboxed: bool,
+) {
     if let Some(mut ct) = cropped_tiles {
         ct.with_mut(|map| {
-            let entry = map.entry(canvas_id.to_string()).or_insert(false);
-            *entry = !*entry;
+            let current = map.get(canvas_id).copied().unwrap_or(default_letterboxed);
+            map.insert(canvas_id.to_string(), !current);
         });
     }
 }
@@ -3024,11 +2942,12 @@ fn toggle_canvas_crop(canvas_id: &str, cropped_tiles: Option<Signal<HashMap<Stri
 fn is_canvas_letterboxed(
     canvas_id: &str,
     cropped_tiles: &Option<Signal<HashMap<String, bool>>>,
+    default_letterboxed: bool,
 ) -> bool {
     cropped_tiles
         .as_ref()
         .and_then(|ct| ct.read().get(canvas_id).copied())
-        .unwrap_or(false)
+        .unwrap_or(default_letterboxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -3137,144 +3056,6 @@ mod tests {
     #[test]
     fn tile_mode_default_is_full() {
         assert_eq!(TileMode::default(), TileMode::Full);
-    }
-
-    // -- is_speaking_suppressed -----------------------------------------------
-
-    /// No peer is pinned → glow is never suppressed.
-    #[test]
-    fn suppressed_no_pin_returns_false() {
-        assert!(!is_speaking_suppressed(false, None));
-    }
-
-    /// The pinned peer itself → glow is NOT suppressed.
-    #[test]
-    fn suppressed_pinned_peer_returns_false() {
-        assert!(!is_speaking_suppressed(true, Some("alice")));
-    }
-
-    /// A non-pinned peer while another peer is pinned → glow IS suppressed.
-    #[test]
-    fn suppressed_non_pinned_while_pin_active_returns_true() {
-        assert!(is_speaking_suppressed(false, Some("alice")));
-    }
-
-    // -- tile_pin_kind: TileMode → PinnedTileKind -----------------------------
-
-    #[test]
-    fn tile_pin_kind_screen_only_is_screen() {
-        assert_eq!(tile_pin_kind(&TileMode::ScreenOnly), PinnedTileKind::Screen);
-    }
-
-    #[test]
-    fn tile_pin_kind_video_only_is_camera() {
-        assert_eq!(tile_pin_kind(&TileMode::VideoOnly), PinnedTileKind::Camera);
-    }
-
-    #[test]
-    fn tile_pin_kind_full_is_camera() {
-        assert_eq!(tile_pin_kind(&TileMode::Full), PinnedTileKind::Camera);
-    }
-
-    // -- is_tile_pinned: the kind-aware maximize predicate --------------------
-    //
-    // These pin the CORE regression: during a screen share the sharer's screen
-    // tile and camera tile share ONE user_id. A user_id-only predicate (the old
-    // bug) maximizes BOTH when either is pinned. `is_tile_pinned` must match
-    // ONLY the tile whose kind agrees, so the two are independently pinnable.
-
-    #[test]
-    fn is_tile_pinned_nothing_pinned_is_false() {
-        assert!(!is_tile_pinned(None, "alice", PinnedTileKind::Camera));
-        assert!(!is_tile_pinned(None, "alice", PinnedTileKind::Screen));
-    }
-
-    #[test]
-    fn is_tile_pinned_screen_pinned_matches_only_screen_tile() {
-        let pinned = PinnedTile::screen("alice");
-        // The SCREEN tile of alice is maximized...
-        assert!(is_tile_pinned(
-            Some(&pinned),
-            "alice",
-            PinnedTileKind::Screen
-        ));
-        // ...but alice's CAMERA tile (SAME user_id) is NOT — this is the exact
-        // assertion that fails on the user_id-only bug.
-        assert!(!is_tile_pinned(
-            Some(&pinned),
-            "alice",
-            PinnedTileKind::Camera
-        ));
-    }
-
-    #[test]
-    fn is_tile_pinned_camera_pinned_matches_only_camera_tile() {
-        let pinned = PinnedTile::camera("alice");
-        assert!(is_tile_pinned(
-            Some(&pinned),
-            "alice",
-            PinnedTileKind::Camera
-        ));
-        assert!(!is_tile_pinned(
-            Some(&pinned),
-            "alice",
-            PinnedTileKind::Screen
-        ));
-    }
-
-    #[test]
-    fn is_tile_pinned_different_peer_is_false() {
-        let pinned = PinnedTile::camera("alice");
-        assert!(!is_tile_pinned(
-            Some(&pinned),
-            "bob",
-            PinnedTileKind::Camera
-        ));
-    }
-
-    // -- next_pin_target: toggle / switch reducer -----------------------------
-
-    #[test]
-    fn next_pin_target_from_none_pins_clicked() {
-        assert_eq!(
-            next_pin_target(None, PinnedTile::screen("alice")),
-            Some(PinnedTile::screen("alice"))
-        );
-    }
-
-    #[test]
-    fn next_pin_target_same_tile_releases() {
-        let cur = PinnedTile::screen("alice");
-        assert_eq!(
-            next_pin_target(Some(&cur), PinnedTile::screen("alice")),
-            None
-        );
-    }
-
-    #[test]
-    fn next_pin_target_same_peer_other_kind_switches() {
-        // Screen is pinned; clicking alice's CAMERA must SWITCH the spotlight to
-        // the camera (not toggle off) — the two tile kinds are distinct targets.
-        let cur = PinnedTile::screen("alice");
-        assert_eq!(
-            next_pin_target(Some(&cur), PinnedTile::camera("alice")),
-            Some(PinnedTile::camera("alice"))
-        );
-        // ...and symmetrically the other way.
-        let cur = PinnedTile::camera("alice");
-        assert_eq!(
-            next_pin_target(Some(&cur), PinnedTile::screen("alice")),
-            Some(PinnedTile::screen("alice"))
-        );
-    }
-
-    #[test]
-    fn next_pin_target_different_peer_switches() {
-        let cur = PinnedTile::camera("alice");
-        assert_eq!(
-            next_pin_target(Some(&cur), PinnedTile::camera("bob")),
-            Some(PinnedTile::camera("bob"))
-        );
     }
 
     fn assert_border_reset_is_longhands(style: &str) {
@@ -3597,55 +3378,101 @@ mod tests {
 
     // -- Crop state: HashMap toggle/lookup logic ---------------------------------
 
-    #[test]
-    fn crop_toggle_roundtrip() {
-        let mut map = HashMap::<String, bool>::new();
-        let id = "peer-abc";
-
-        // Initially not letterboxed (fill/cropped is the default)
-        assert!(!map.get(id).copied().unwrap_or(false));
-
-        // First toggle → letterboxed (uncropped, preserves aspect ratio)
-        let entry = map.entry(id.to_string()).or_insert(false);
-        *entry = !*entry;
-        assert!(map.get(id).copied().unwrap_or(false));
-
-        // Second toggle → back to fill/cropped
-        let entry = map.entry(id.to_string()).or_insert(false);
-        *entry = !*entry;
-        assert!(!map.get(id).copied().unwrap_or(false));
+    /// Runs `check` against a real `CroppedTilesCtx`-shaped signal.
+    fn with_crop_map(check: impl FnOnce(Option<Signal<HashMap<String, bool>>>)) {
+        thread_local! {
+            static CROP_MAP: RefCell<Option<Signal<HashMap<String, bool>>>> =
+                const { RefCell::new(None) };
+        }
+        #[allow(non_snake_case)]
+        fn CropMapProbe() -> Element {
+            let map = use_signal(HashMap::<String, bool>::new);
+            use_hook(move || CROP_MAP.with(|m| *m.borrow_mut() = Some(map)));
+            rsx! { div {} }
+        }
+        let mut vdom = VirtualDom::new(CropMapProbe);
+        vdom.rebuild_in_place();
+        let map = CROP_MAP.with(|m| m.borrow_mut().take());
+        assert!(map.is_some(), "probe must publish its map");
+        vdom.in_runtime(|| check(map));
     }
 
     #[test]
-    fn crop_cleanup_on_peer_removal() {
-        let mut map = HashMap::<String, bool>::new();
-        let peer_id = "session-123";
-
-        // Set crop state for both video and screen-share canvases. The
-        // screen-share key is built via the production single-source-of-truth
-        // getter (issue 1175), so this test tracks the real id format instead of
-        // re-hardcoding the literal.
-        map.insert(peer_id.to_string(), true);
-        map.insert(screen_share_zoom::screen_canvas_id(peer_id), true);
-        assert_eq!(map.len(), 2);
-
-        // Simulate on_peer_removed cleanup (same getter the production path uses).
-        map.remove(peer_id);
-        map.remove(&screen_share_zoom::screen_canvas_id(peer_id));
-        assert!(map.is_empty());
+    fn only_a_portrait_source_on_the_stage_defaults_to_letterboxed() {
+        // (portrait_source, full_bleed) -> letterboxed
+        let cases = [
+            ((true, true), true),
+            ((true, false), false),
+            ((false, true), false),
+            ((false, false), false),
+        ];
+        for ((portrait, full_bleed), expected) in cases {
+            assert_eq!(
+                default_letterboxed(portrait, full_bleed),
+                expected,
+                "portrait={portrait} full_bleed={full_bleed}"
+            );
+        }
     }
 
     #[test]
-    fn crop_missing_id_returns_false() {
-        let map = HashMap::<String, bool>::new();
-        assert!(!map.get("nonexistent").copied().unwrap_or(false));
+    fn a_camera_tile_style_always_carries_its_order() {
+        let speak = speak_style(0.0, false, &AppearanceSettings::default());
+        let pinned = tile_root_style(&speak, Some(0));
+        let unpinned = tile_root_style(&speak, None);
+        assert!(pinned.starts_with(&speak) && pinned.ends_with(" order: -1000;"));
+        assert!(
+            unpinned.ends_with(" order: 0;"),
+            "an unpin that drops `order` would keep the tile at the front: {unpinned}"
+        );
     }
 
     #[test]
-    fn crop_none_context_returns_false() {
-        let ct: Option<&HashMap<String, bool>> = None;
-        let result = ct.and_then(|m| m.get("any-id").copied()).unwrap_or(false);
-        assert!(!result);
+    fn portrait_means_strictly_taller_than_wide() {
+        assert!(is_portrait_resolution("480x640"));
+        assert!(!is_portrait_resolution("640x480"));
+        assert!(!is_portrait_resolution("640x640"));
+        assert!(!is_portrait_resolution(""));
+        assert!(!is_portrait_resolution("0x640"));
+    }
+
+    #[test]
+    fn an_untouched_tile_follows_the_default_fit() {
+        with_crop_map(|map| {
+            assert!(is_canvas_letterboxed("peer-a", &map, true));
+            assert!(!is_canvas_letterboxed("peer-a", &map, false));
+            assert!(is_canvas_letterboxed("peer-a", &None, true));
+            assert!(!is_canvas_letterboxed("peer-a", &None, false));
+        });
+    }
+
+    #[test]
+    fn the_first_click_flips_the_fit_the_viewer_sees() {
+        with_crop_map(|map| {
+            toggle_canvas_crop("peer-a", map, true);
+            assert!(
+                !is_canvas_letterboxed("peer-a", &map, true),
+                "a letterboxed portrait stage tile must switch to fill on the first click"
+            );
+            toggle_canvas_crop("peer-a", map, true);
+            assert!(is_canvas_letterboxed("peer-a", &map, true));
+
+            toggle_canvas_crop("peer-b", map, false);
+            assert!(is_canvas_letterboxed("peer-b", &map, false));
+        });
+    }
+
+    #[test]
+    fn an_explicit_choice_survives_an_orientation_flip() {
+        with_crop_map(|map| {
+            toggle_canvas_crop("peer-a", map, false);
+            assert!(is_canvas_letterboxed("peer-a", &map, true));
+            assert!(
+                is_canvas_letterboxed("peer-a", &map, false),
+                "the viewer chose letterbox, so flipping back to landscape must keep it"
+            );
+            assert!(!is_canvas_letterboxed("peer-b", &map, false));
+        });
     }
 
     // -- Issue #1483: transport badge string → enum mapping -------------------

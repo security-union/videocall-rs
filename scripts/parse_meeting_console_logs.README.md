@@ -58,9 +58,9 @@ _Cores/Platform sourced from "level":"preamble" in first chunk. ⚠ flags client
 
 | Email | Name | Start | Transport | RTT Base | Reelect | Chunks | Implaus RTT | Errors | End | Cores | Platform |
 |-------|------|-------|-----------|----------|---------|--------|-------------|--------|-----|-------|----------|
-| jason.gary@hcl-software.com | Jason Gary | 15:48:25 | websocket(ws_0) | 1072ms | 1 | 8 | 7 | 1 | **LOST** | 2 ⚠ | macOS 14.8.3 |
-| kent.holtshouser@hcl-software.com | Kent | 15:49:49 | websocket(ws_0) | 101ms | 2 | 106 | 92 | 0 | ? | 6 ⚠ | macOS 15.3.1 |
-| antonio.estrada@hcl-software.com | Tony Estrada | 15:01:01 | websocket(ws_0) | 73ms | 1 | 175 | 0 | 3 | clean | 12 | macOS 26.4.1 |
+| alice.example@example.com | Alice Example | 15:48:25 | websocket(ws_0) | 1072ms | 1 | 8 | 7 | 1 | **LOST** | 2 ⚠ | macOS 14.8.3 |
+| bob.example@example.com | Bob | 15:49:49 | websocket(ws_0) | 101ms | 2 | 106 | 92 | 0 | ? | 6 ⚠ | macOS 15.3.1 |
+| carol.example@example.com | Carol Example | 15:01:01 | websocket(ws_0) | 73ms | 1 | 175 | 0 | 3 | clean | 12 | macOS 26.4.1 |
 ```
 
 Also prints sections for: **Error Census**, **Re-election Events**, **Implausible RTT Discards**, **Client Hardware Warnings**, **Concurrent Session Overlaps**, **Slow-drain Receivers** (when `--relay-wt=` is provided), **WS Mailbox-Full Drops** (when `--relay-ws=` is provided), **Peer ID → Email Map**, and a **Prometheus Copy-Paste** block with START/END epoch parameters pre-filled.

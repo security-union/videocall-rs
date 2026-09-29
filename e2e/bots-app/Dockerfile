@@ -29,8 +29,7 @@ FROM mcr.microsoft.com/playwright:v1.58.2-noble
 # not populate — so `ip` is exec'd through this setcap'd COPY of setpriv, which
 # raises it first (#2428). A copy, not /usr/bin/setpriv, keeps the grant off
 # every other caller of setpriv in the image.
-# Targets go through `readlink -f` because setcap refuses a symlink, and the
-# loop re-reads each cap because no CI builds this image (#2293).
+# Targets go through `readlink -f` because setcap refuses a symlink.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends iproute2 libcap2-bin curl \
     && cp "$(readlink -f /usr/bin/setpriv)" /usr/local/bin/netem-setpriv \
@@ -69,5 +68,10 @@ RUN npm ci --include=dev
 COPY --chown=pwuser:pwuser e2e/ ./
 
 RUN chmod +x bots-app/docker-entrypoint.sh
+
+# LABEL for the registry, ENV for the run receipt (src/resource/session.ts).
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=${GIT_SHA}
+ENV BOTS_IMAGE_REVISION=${GIT_SHA}
 
 ENTRYPOINT ["/app/e2e/bots-app/docker-entrypoint.sh"]

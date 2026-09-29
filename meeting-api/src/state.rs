@@ -90,6 +90,8 @@ pub struct AppState {
     /// throttle. Shared across all handlers on this instance — the bound is
     /// meaningless if each request gets its own.
     pub password_gate: Arc<crate::password::MeetingPasswordGate>,
+    /// Cached watermark-freshness half of [`Self::presence_healthy`].
+    pub presence_watermark_cache: Arc<Mutex<Option<(Instant, bool)>>>,
 }
 
 impl AppState {
@@ -146,6 +148,7 @@ impl AppState {
             display_name_rate_limit_disabled: config.display_name_rate_limit_disabled,
             dev_user: config.dev_user.clone(),
             password_gate: Arc::new(crate::password::MeetingPasswordGate::new()),
+            presence_watermark_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -155,4 +158,30 @@ impl AppState {
             .as_deref()
             .filter(|_| now < self.session_previous_secret_expires_at)
     }
+
+    /// Whether the presence-lease pipeline is currently trusted (cached for
+    /// [`PRESENCE_HEALTH_CACHE_TTL`]); see [`crate::db::participants::presence_healthy`].
+    pub async fn presence_healthy(&self) -> Result<bool, sqlx::Error> {
+        if !crate::db::participants::nats_locally_connected(self.nats.as_ref()) {
+            return Ok(false);
+        }
+        if let Some((cached_at, fresh)) = *self
+            .presence_watermark_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            if cached_at.elapsed() < PRESENCE_HEALTH_CACHE_TTL {
+                return Ok(fresh);
+            }
+        }
+        let fresh = crate::db::participants::heartbeat_watermark_fresh(&self.db).await?;
+        *self
+            .presence_watermark_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), fresh));
+        Ok(fresh)
+    }
 }
+
+/// How long [`AppState::presence_healthy`] caches the watermark-freshness check.
+const PRESENCE_HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);

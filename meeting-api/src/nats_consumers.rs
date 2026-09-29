@@ -15,42 +15,39 @@
 //!
 //! These run as long-lived `tokio::spawn` tasks alongside the Axum HTTP
 //! server. They listen for cross-service events that drive DB writes the
-//! HTTP layer cannot observe directly — for example, a host disconnecting
-//! from the media server (`actix-api`) needs to mark the meeting as
-//! `state='ended'` in the DB, but the disconnect event lives on a
-//! WebSocket / WebTransport handler in a different process. Symmetrically, a
-//! room becoming empty (last participant left a meeting that did not end)
-//! drives the meeting to `state='idle'`.
+//! HTTP layer cannot observe directly — for example, a participant's transport
+//! connecting to or leaving the media server (`actix-api`), which lives on a
+//! WebSocket / WebTransport handler in a different process.
 //!
 //! Each consumer follows the same pattern as
 //! `actix-api/src/actors/chat_server.rs::started`: subscribe in a loop,
 //! deserialize from JSON, dispatch to a handler, and re-subscribe on stream
-//! end. The shared loop lives in [`spawn_room_state_consumer`]; each public
-//! spawn function supplies its subject, a human-readable description, and the
-//! per-meeting DB transition to apply. The functions are no-ops when NATS is
-//! not configured.
+//! end. The functions are no-ops when NATS is not configured.
 
 use crate::db::meetings as db_meetings;
 use crate::db::participants as db_participants;
 use crate::feed_events::{FeedChange, FeedChangeReason};
 use crate::nats_events::{
-    ParticipantLeftPayload, ParticipantPresentPayload, MEETING_BECAME_EMPTY_SUBJECT,
-    MEETING_ENDED_BY_HOST_SUBJECT, PARTICIPANT_LEFT_SUBJECT, PARTICIPANT_PRESENT_SUBJECT,
+    ParticipantPresencePayload, MEETING_BECAME_EMPTY_SUBJECT, MEETING_ENDED_BY_HOST_SUBJECT,
+    PARTICIPANT_PRESENCE_SUBJECT,
 };
 use futures::future::BoxFuture;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use videocall_meeting_types::presence::{
+    PresenceHeartbeat, PRESENCE_HEARTBEAT_INTERVAL_SECS, PRESENCE_HEARTBEAT_MAX_SESSIONS,
+    PRESENCE_HEARTBEAT_SUBJECT, PRESENCE_LEASE_SECS,
+};
 
 /// Spawn the consumer for [`MEETING_ENDED_BY_HOST_SUBJECT`].
 ///
-/// When `actix-api` broadcasts MEETING_ENDED on a host disconnect with
-/// `end_on_host_leave=true`, it publishes a `MeetingEndedByHostPayload`
-/// on this subject. We look the meeting up by `room_id` and set
-/// `state='ended'` so the meetings list reflects the same outcome the
-/// connected clients just received.
+/// A relay predating #2702 (only present after a relay rollback) that
+/// broadcast MEETING_ENDED on a host disconnect publishes a
+/// `MeetingEndedByHostPayload` here; we set `state='ended'` so the meetings
+/// list matches what its clients received.
 ///
 /// Idempotent: if the meeting is already ended (e.g. because the host
 /// also clicked Hangup, or another chat_server replica racing on the
@@ -76,10 +73,10 @@ pub fn spawn_meeting_ended_by_host_consumer(
 /// `room_id` and call [`db_meetings::set_idle`], transitioning it to
 /// `state='idle'` (everyone-left → idle).
 ///
-/// Idempotent and race-safe: `set_idle` guards on `state='active'`, so it is a
-/// no-op on an already-`idle` meeting (duplicate empty event, multi-replica
-/// fan-out) and on an already-`ended` meeting (ended is terminal and must win
-/// the end-vs-idle race). See [`db_meetings::set_idle`] for the full reasoning.
+/// Idempotent and race-safe: `set_idle` only moves an `active` meeting with
+/// nobody present, so it is a no-op on an already-`idle` or `ended` meeting and
+/// on one whose other relay binary still holds participants. See
+/// [`db_meetings::set_idle`].
 ///
 /// Graceful degradation: when `nats` is `None`, this returns without spawning.
 pub fn spawn_meeting_became_empty_consumer(
@@ -123,6 +120,9 @@ pub fn spawn_meeting_became_empty_consumer_inner(
     feed_tx: broadcast::Sender<FeedChange>,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // Cloned before `nats` moves into `spawn_room_state_consumer`, so the
+    // per-message closure can compute presence health on its own copy.
+    let nats_for_health = nats.clone();
     spawn_room_state_consumer::<crate::nats_events::MeetingBecameEmptyPayload, _>(
         nats,
         pool,
@@ -131,272 +131,91 @@ pub fn spawn_meeting_became_empty_consumer_inner(
         ready_tx,
         MEETING_BECAME_EMPTY_SUBJECT,
         "room-empty DB-write fanout (empty->idle)",
-        |pool, meeting_id| Box::pin(async move { db_meetings::set_idle(&pool, meeting_id).await }),
+        move |pool, meeting_id| {
+            let nats_for_health = nats_for_health.clone();
+            Box::pin(async move {
+                let healthy = db_participants::presence_healthy(&pool, nats_for_health.as_ref())
+                    .await
+                    .unwrap_or(false);
+                db_meetings::set_idle(&pool, meeting_id, healthy)
+                    .await
+                    .map(|_| ())
+            })
+        },
     )
 }
 
-/// Spawn the consumer for [`PARTICIPANT_LEFT_SUBJECT`].
+/// Spawn the consumer for [`PARTICIPANT_PRESENCE_SUBJECT`], applying each
+/// report with [`apply_participant_presence`].
 ///
-/// When `actix-api` observes a single participant's session leave a room (a
-/// transport disconnect that did NOT go through REST `/leave`, or an explicit
-/// transport leave), it publishes a [`ParticipantLeftPayload`]. We look the
-/// meeting up by `room_id` and mark `(meeting_id, user_id)` as `status='left',
-/// left_at=NOW()` via [`db_participants::mark_left_by_disconnect`], so the
-/// participant stops being counted as present (issue #1551).
-///
-/// Idempotent and reconnect-safe: the UPDATE only matches rows currently
-/// `status IN ('admitted','waiting')`, so it is a no-op on a participant who has
-/// already left, been kicked, or has no row. The relay only publishes after the
-/// reconnect grace period AND when the user has no other live session, so a
-/// brief disconnect+reconnect (or a multi-tab user) never marks a present
-/// participant left.
+/// Every replica subscribes (fan-out, no queue group): one subscription sees a
+/// relay's reports in publish order, which a queue group would split across
+/// replicas. The meeting row lock and the session guards in
+/// [`db_participants::record_present`] / [`db_participants::record_left`] make
+/// the second replica's application a no-op.
 ///
 /// Graceful degradation: when `nats` is `None`, this returns without spawning.
-/// The DB then stays consistent only via the REST `/leave` endpoint, matching
-/// the pre-fix behavior (an abnormal disconnect leaves a stale `admitted` row,
-/// the very gap this consumer closes when NATS is configured).
-pub fn spawn_participant_left_consumer(
+pub fn spawn_participant_presence_consumer(
     nats: Option<async_nats::Client>,
     pool: PgPool,
     feed_tx: broadcast::Sender<FeedChange>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_participant_left_consumer_inner(nats, pool, feed_tx, None)
+    spawn_participant_presence_consumer_inner(nats, pool, feed_tx, None)
 }
 
 /// Internal variant used by tests to eliminate the publish-before-subscribe
 /// race (see [`spawn_meeting_ended_by_host_consumer_inner`]).
 #[doc(hidden)]
-pub fn spawn_participant_left_consumer_inner(
+pub fn spawn_participant_presence_consumer_inner(
     nats: Option<async_nats::Client>,
     pool: PgPool,
     feed_tx: broadcast::Sender<FeedChange>,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let nats = nats?;
-    let subject = PARTICIPANT_LEFT_SUBJECT;
-    let description = "participant-disconnect DB-write fanout (mark left)";
+    let subject = PARTICIPANT_PRESENCE_SUBJECT;
     let handle = tokio::spawn(async move {
         let mut ready_tx = ready_tx;
         loop {
             match nats.subscribe(subject).await {
                 Ok(mut sub) => {
-                    tracing::info!("Subscribed to {} ({})", subject, description);
+                    tracing::info!("Subscribed to {} (participant presence)", subject);
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(());
                     }
                     while let Some(msg) = sub.next().await {
-                        let payload =
-                            match serde_json::from_slice::<ParticipantLeftPayload>(&msg.payload) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!("Dropping malformed {} payload: {e}", subject);
-                                    continue;
-                                }
-                            };
-
-                        // Defensive bounds, matching the room-state consumers.
-                        if payload.room_id.is_empty() || payload.room_id.len() > 256 {
-                            tracing::warn!(
-                                "Ignoring {} with invalid room_id length: {}",
-                                subject,
-                                payload.room_id.len()
-                            );
-                            continue;
-                        }
-                        if payload.user_id.is_empty() || payload.user_id.len() > 256 {
-                            tracing::warn!(
-                                "Ignoring {} with invalid user_id length: {}",
-                                subject,
-                                payload.user_id.len()
-                            );
-                            continue;
-                        }
-
-                        match db_meetings::get_by_room_id(&pool, &payload.room_id).await {
-                            Ok(Some(meeting)) => {
-                                match db_participants::mark_left_by_disconnect(
-                                    &pool,
-                                    meeting.id,
-                                    &payload.user_id,
-                                )
-                                .await
-                                {
-                                    Ok(rows) => {
-                                        tracing::info!(
-                                            "Applied {} for meeting {} (id={}) user {} \
-                                             (rows_affected={})",
-                                            subject,
-                                            payload.room_id,
-                                            meeting.id,
-                                            payload.user_id,
-                                            rows
-                                        );
-                                        // Nudge the local SSE clients only when a
-                                        // row actually flipped to 'left' — a
-                                        // duplicate/redelivered event matches zero
-                                        // rows (the participant is already gone) and
-                                        // changes nothing in the feed, so we skip it
-                                        // to keep nudge cardinality tight. This
-                                        // consumer runs on EVERY instance (fan-out,
-                                        // no queue group), so feeding the LOCAL
-                                        // broadcast here — rather than re-publishing
-                                        // to NATS — nudges each instance's own SSE
-                                        // clients exactly once and avoids an echo
-                                        // loop on `internal.feed_changed`.
-                                        if rows > 0 {
-                                            let _ = feed_tx.send(FeedChange::new(
-                                                payload.room_id.clone(),
-                                                FeedChangeReason::ParticipantLeft,
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to mark participant {} left for meeting {} \
-                                             (id={}) on {}: {e}",
-                                            payload.user_id,
-                                            payload.room_id,
-                                            meeting.id,
-                                            subject
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                tracing::warn!(
-                                    "Received {} for unknown room {}; ignoring",
-                                    subject,
-                                    payload.room_id
-                                );
-                            }
+                        let report = match serde_json::from_slice::<ParticipantPresencePayload>(
+                            &msg.payload,
+                        ) {
+                            Ok(p) => p,
                             Err(e) => {
-                                tracing::error!(
-                                    "DB error looking up room {} for {} event: {e}",
-                                    payload.room_id,
-                                    subject
-                                );
+                                tracing::warn!("Dropping malformed {} payload: {e}", subject);
+                                continue;
                             }
-                        }
-                    }
-                    tracing::warn!(
-                        "{} subscription stream ended, re-subscribing in 1s",
-                        subject
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("Failed to subscribe to {}: {e}, retrying in 1s", subject);
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    });
-    Some(handle)
-}
-
-/// Spawn the consumer for [`PARTICIPANT_PRESENT_SUBJECT`] (issue #1628).
-///
-/// When `actix-api` observes a participant's session become PRESENT in a room (a
-/// fresh join or a transport reconnect-after-grace), it publishes a
-/// [`ParticipantPresentPayload`]. We look the meeting up by `room_id`, mark
-/// `(meeting_id, user_id)` as `status='admitted', left_at=NULL` via
-/// [`db_participants::mark_present_by_connect`] (so the participant is counted as
-/// present again — issue #1628), and RE-ACTIVATE the meeting via
-/// [`db_meetings::reactivate_from_idle`] (`idle -> active`). This is the
-/// symmetric counterpart to the empty→`set_idle` path and closes the asymmetry
-/// where re-activation previously only happened on a REST `/join`.
-///
-/// Ordering / nudge: the nudge is fired AFTER both DB writes succeed. A nudge is
-/// emitted when EITHER the participant row flipped to present (`rows > 0`) OR the
-/// meeting re-activated out of `idle` — both change what the feed shows. A
-/// duplicate event (the user is already present and the meeting already active)
-/// is a zero-effect no-op and emits no nudge, keeping nudge cardinality tight.
-///
-/// `ended`-safety: we must NEVER resurrect a meeting the host deliberately
-/// ended (`end_on_host_leave=true`). The relay only publishes
-/// `PARTICIPANT_PRESENT` for a session that reached Active in `room_members`; a
-/// host-ended meeting tears those sessions down (MEETING_ENDED), so in practice
-/// no present event races an end. The consumer does NOT read the meeting state
-/// and does NOT call `activate()` (which would UNCONDITIONALLY re-open an
-/// `ended` meeting). It unconditionally calls
-/// [`db_meetings::reactivate_from_idle`], an atomic `UPDATE … SET state='active'
-/// WHERE state='idle'`: when the host ended the meeting, the `state='idle'`
-/// predicate matches zero rows, so the re-activation is a no-op and the terminal
-/// `ended` state is preserved — even against a read-then-write race. The
-/// mark-present write is still applied (harmless: it only heals a `left` row and
-/// never changes meeting state).
-///
-/// Idempotent and reconnect-safe: `mark_present_by_connect` only flips a `left`,
-/// previously-admitted row, so it is a no-op on an already-present participant,
-/// a waiter, or a kicked/rejected participant (it can NEVER bypass the waiting
-/// room or un-kick — see that function's privilege-escalation note).
-///
-/// Graceful degradation: when `nats` is `None`, this returns without spawning.
-pub fn spawn_participant_present_consumer(
-    nats: Option<async_nats::Client>,
-    pool: PgPool,
-    feed_tx: broadcast::Sender<FeedChange>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_participant_present_consumer_inner(nats, pool, feed_tx, None)
-}
-
-/// Internal variant used by tests to eliminate the publish-before-subscribe
-/// race (see [`spawn_meeting_ended_by_host_consumer_inner`]).
-#[doc(hidden)]
-pub fn spawn_participant_present_consumer_inner(
-    nats: Option<async_nats::Client>,
-    pool: PgPool,
-    feed_tx: broadcast::Sender<FeedChange>,
-    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let nats = nats?;
-    let subject = PARTICIPANT_PRESENT_SUBJECT;
-    let description = "participant-connect DB-write fanout (mark present + reactivate)";
-    let handle = tokio::spawn(async move {
-        let mut ready_tx = ready_tx;
-        loop {
-            match nats.subscribe(subject).await {
-                Ok(mut sub) => {
-                    tracing::info!("Subscribed to {} ({})", subject, description);
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    while let Some(msg) = sub.next().await {
-                        let payload =
-                            match serde_json::from_slice::<ParticipantPresentPayload>(&msg.payload)
-                            {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!("Dropping malformed {} payload: {e}", subject);
-                                    continue;
-                                }
-                            };
-
-                        // Defensive bounds, matching the other consumers.
-                        if payload.room_id.is_empty() || payload.room_id.len() > 256 {
+                        };
+                        if report.room_id.is_empty()
+                            || report.room_id.len() > 256
+                            || report.user_id.is_empty()
+                            || report.user_id.len() > 256
+                            || report.session_id == 0
+                        {
                             tracing::warn!(
-                                "Ignoring {} with invalid room_id length: {}",
+                                "Ignoring {} with invalid fields (room_id={}, user_id={}, session_id={})",
                                 subject,
-                                payload.room_id.len()
+                                report.room_id.len(),
+                                report.user_id.len(),
+                                report.session_id
                             );
                             continue;
                         }
-                        if payload.user_id.is_empty() || payload.user_id.len() > 256 {
-                            tracing::warn!(
-                                "Ignoring {} with invalid user_id length: {}",
-                                subject,
-                                payload.user_id.len()
-                            );
-                            continue;
-                        }
-
-                        match db_meetings::get_by_room_id(&pool, &payload.room_id).await {
+                        match db_meetings::get_by_room_id(&pool, &report.room_id).await {
                             Ok(Some(meeting)) => {
-                                apply_participant_present(
+                                apply_participant_presence(
                                     &pool,
+                                    Some(&nats),
                                     &feed_tx,
-                                    subject,
                                     &meeting,
-                                    &payload.user_id,
+                                    &report,
                                 )
                                 .await;
                             }
@@ -404,13 +223,13 @@ pub fn spawn_participant_present_consumer_inner(
                                 tracing::warn!(
                                     "Received {} for unknown room {}; ignoring",
                                     subject,
-                                    payload.room_id
+                                    report.room_id
                                 );
                             }
                             Err(e) => {
                                 tracing::error!(
                                     "DB error looking up room {} for {} event: {e}",
-                                    payload.room_id,
+                                    report.room_id,
                                     subject
                                 );
                             }
@@ -431,99 +250,344 @@ pub fn spawn_participant_present_consumer_inner(
     Some(handle)
 }
 
-/// Apply the presence-driven mark-present + re-activate transition for a single
-/// participant, then emit at most one feed nudge (issue #1628). Factored out of
-/// [`spawn_participant_present_consumer_inner`] so the DB-touching logic is unit-
-/// testable against a live pool without standing up NATS.
-///
-/// Steps, in order:
-/// 1. `mark_present_by_connect` — restore a `left`, previously-admitted row to
-///    `admitted`. Returns rows-affected (0 = already present / not eligible).
-/// 2. Re-activate the meeting `idle -> active` atomically via
-///    [`db_meetings::reactivate_from_idle`] (guarded `WHERE state = 'idle'`).
-///    `ended` is terminal and must never be resurrected; an already-`active`
-///    meeting needs no write. The SQL guard makes the terminal-`ended` race
-///    impossible without relying on the (possibly stale) snapshot state.
-/// 3. Nudge the LOCAL SSE clients with [`FeedChangeReason::Joined`] when EITHER
-///    the participant flipped to present OR the meeting re-activated — both
-///    change the feed. No change ⇒ no nudge.
-///
-/// Exposed (`pub`) so the integration tests in
-/// `meeting-api/tests/participant_present_consumer_tests.rs` exercise the REAL
-/// transition logic against a live pool without standing up NATS.
-pub async fn apply_participant_present(
+/// Apply one relay presence report: [`db_participants::record_present`] or
+/// [`db_participants::record_left`], then publish what changed — HOST_GRANTED
+/// for a co-host promoted on connect, MEETING_ENDED when the last present host
+/// left with `end_on_host_leave` — and nudge the local feed.
+pub async fn apply_participant_presence(
     pool: &PgPool,
+    nats: Option<&async_nats::Client>,
     feed_tx: &broadcast::Sender<FeedChange>,
-    subject: &str,
     meeting: &db_meetings::MeetingRow,
-    user_id: &str,
+    report: &ParticipantPresencePayload,
 ) {
-    // Step 1: restore the participant's presence row.
-    let marked_present =
-        match db_participants::mark_present_by_connect(pool, meeting.id, user_id).await {
-            Ok(rows) => {
-                tracing::info!(
-                    "Applied {} (mark present) for meeting {} (id={}) user {} (rows_affected={})",
-                    subject,
-                    meeting.room_id,
-                    meeting.id,
-                    user_id,
-                    rows
-                );
-                rows > 0
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to mark participant {} present for meeting {} (id={}) on {}: {e}",
-                    user_id,
-                    meeting.room_id,
-                    meeting.id,
-                    subject
-                );
-                false
-            }
-        };
-
-    // Step 2: re-activate the meeting `idle -> active` ATOMICALLY. We use
-    // `reactivate_from_idle` (guarded `WHERE state = 'idle'`) rather than the
-    // snapshotted `meeting.state` + `activate()` so the terminal-`ended` guard
-    // cannot be lost to a read-then-write race: if the host ended the meeting
-    // between this consumer's `get_by_room_id` snapshot and this write, the
-    // `state = 'idle'` predicate matches zero rows and `ended` (terminal) wins.
-    // `activate()` would instead UNCONDITIONALLY set `state='active'` for the
-    // id (it intentionally re-opens `ended` on the REST host-restart path),
-    // which must NEVER happen for a presence-driven reconnect.
-    let reactivated = match db_meetings::reactivate_from_idle(pool, meeting.id).await {
-        Ok(rows) => {
-            if rows > 0 {
-                tracing::info!(
-                    "Re-activated meeting {} (id={}) idle->active on {} for user {}",
-                    meeting.room_id,
-                    meeting.id,
-                    subject,
-                    user_id
-                );
-            }
-            rows > 0
+    // A failed health check is itself treated as unhealthy — latch present
+    // rather than risk fabricating "nobody present".
+    let healthy = db_participants::presence_healthy(pool, nats)
+        .await
+        .unwrap_or(false);
+    // Relay session ids are u64; the column stores the same 64 bits.
+    let session_id = report.session_id as i64;
+    if !report.present {
+        match db_participants::record_left(pool, meeting.id, &report.user_id, session_id, healthy)
+            .await
+        {
+            Ok(Some((_, end))) => announce_departure(nats, feed_tx, &meeting.room_id, end).await,
+            Ok(None) => {}
+            Err(e) => tracing::error!(
+                "Failed to record {} left meeting {} (session {}): {e}",
+                report.user_id,
+                meeting.room_id,
+                report.session_id
+            ),
         }
+        return;
+    }
+    let presence = match db_participants::record_present(
+        pool,
+        meeting.id,
+        &report.user_id,
+        session_id,
+        healthy,
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(e) => {
             tracing::error!(
-                "Failed to re-activate meeting {} (id={}) on {}: {e}",
+                "Failed to record {} present in meeting {} (session {}): {e}",
+                report.user_id,
                 meeting.room_id,
-                meeting.id,
-                subject
+                report.session_id
             );
-            false
+            return;
         }
     };
-
-    // Step 3: nudge only when something the feed shows actually changed.
-    if marked_present || reactivated {
+    if presence.promoted {
+        crate::nats_events::announce_host_change(
+            nats,
+            &meeting.room_id,
+            &report.user_id,
+            meeting.creator_id.as_deref().unwrap_or_default(),
+            true,
+        )
+        .await;
+    }
+    if presence.restored || presence.resumed || presence.promoted {
         let _ = feed_tx.send(FeedChange::new(
             meeting.room_id.clone(),
             FeedChangeReason::Joined,
         ));
     }
+}
+
+/// After a participant departed `room_id`: broadcast MEETING_ENDED when the
+/// departure ended the meeting, and nudge the local feed.
+pub async fn announce_departure(
+    nats: Option<&async_nats::Client>,
+    feed_tx: &broadcast::Sender<FeedChange>,
+    room_id: &str,
+    end: Option<db_participants::DepartureEnd>,
+) {
+    let reason = if end.is_some() {
+        crate::nats_events::publish_meeting_ended(
+            nats,
+            room_id,
+            crate::nats_events::HOST_LEFT_MESSAGE,
+        )
+        .await;
+        FeedChangeReason::Ended
+    } else {
+        FeedChangeReason::ParticipantLeft
+    };
+    let _ = feed_tx.send(FeedChange::new(room_id.to_string(), reason));
+}
+
+/// Queue group of the heartbeat consumer: a heartbeat only renews leases, so
+/// one replica applying it is enough.
+pub const PRESENCE_HEARTBEAT_QUEUE: &str = "meeting-api-presence-heartbeat";
+
+/// Spawn the consumer for [`PRESENCE_HEARTBEAT_SUBJECT`] (queue group
+/// [`PRESENCE_HEARTBEAT_QUEUE`]), applying each with
+/// [`apply_presence_heartbeat`]. No-op when NATS is not configured.
+pub fn spawn_presence_heartbeat_consumer(
+    nats: Option<async_nats::Client>,
+    pool: PgPool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_presence_heartbeat_consumer_inner(nats, pool, None)
+}
+
+/// Internal variant used by tests to eliminate the publish-before-subscribe
+/// race (see [`spawn_meeting_ended_by_host_consumer_inner`]).
+#[doc(hidden)]
+pub fn spawn_presence_heartbeat_consumer_inner(
+    nats: Option<async_nats::Client>,
+    pool: PgPool,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let nats = nats?;
+    let subject = PRESENCE_HEARTBEAT_SUBJECT;
+    let handle = tokio::spawn(async move {
+        let mut ready_tx = ready_tx;
+        loop {
+            match nats
+                .queue_subscribe(subject, PRESENCE_HEARTBEAT_QUEUE.to_string())
+                .await
+            {
+                Ok(sub) => {
+                    tracing::info!("Subscribed to {} (presence heartbeats)", subject);
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    // Up to 8 in flight: each is an independent per-room
+                    // UPDATE, so one slow write can't backlog the rest.
+                    sub.for_each_concurrent(8, |msg| {
+                        let pool = pool.clone();
+                        async move {
+                            let heartbeat =
+                                match serde_json::from_slice::<PresenceHeartbeat>(&msg.payload) {
+                                    Ok(h) => h,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Dropping malformed {} payload: {e}",
+                                            subject
+                                        );
+                                        return;
+                                    }
+                                };
+                            if heartbeat.room_id.is_empty()
+                                || heartbeat.room_id.len() > 256
+                                || heartbeat.sessions.len() > PRESENCE_HEARTBEAT_MAX_SESSIONS
+                            {
+                                tracing::warn!(
+                                    "Ignoring {} with invalid room_id length {} or {} sessions",
+                                    subject,
+                                    heartbeat.room_id.len(),
+                                    heartbeat.sessions.len()
+                                );
+                                return;
+                            }
+                            apply_presence_heartbeat(&pool, &heartbeat).await;
+                        }
+                    })
+                    .await;
+                    tracing::warn!(
+                        "{} subscription stream ended, re-subscribing in 1s",
+                        subject
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to subscribe to {}: {e}, retrying in 1s", subject);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    Some(handle)
+}
+
+/// Renew the presence lease of every well-formed session in `heartbeat` via
+/// [`db_participants::record_heartbeat`] (which resolves the room itself, no
+/// separate lookup). Returns the rows renewed.
+pub async fn apply_presence_heartbeat(pool: &PgPool, heartbeat: &PresenceHeartbeat) -> u64 {
+    // Relay session ids are u64; the column stores the same 64 bits.
+    let sessions: Vec<(String, i64)> = heartbeat
+        .sessions
+        .iter()
+        .filter(|s| !s.user_id.is_empty() && s.user_id.len() <= 256 && s.session_id != 0)
+        .map(|s| (s.user_id.clone(), s.session_id as i64))
+        .collect();
+    match db_participants::record_heartbeat(pool, &heartbeat.room_id, &sessions).await {
+        Ok(renewed) => renewed,
+        Err(e) => {
+            tracing::error!(
+                "Failed to renew presence in meeting {}: {e}",
+                heartbeat.room_id
+            );
+            0
+        }
+    }
+}
+
+/// How often [`spawn_presence_sweeper`] looks for lapsed presence leases.
+pub const PRESENCE_SWEEP_INTERVAL: Duration = Duration::from_secs(PRESENCE_HEARTBEAT_INTERVAL_SECS);
+
+/// Most lapsed leases one sweep departs.
+const PRESENCE_SWEEP_BATCH: i64 = 500;
+
+/// Spawn the sweeper that departs participants whose presence lease ran out —
+/// a relay that crashed or was killed sends no departure — ending the meeting
+/// when the last present host went. The first sweep waits one lease, so leases
+/// that lapsed while no meeting-api replica consumed heartbeats are renewed
+/// first. No-op when NATS is not configured: no relay reports presence then.
+pub fn spawn_presence_sweeper(
+    nats: Option<async_nats::Client>,
+    pool: PgPool,
+    feed_tx: broadcast::Sender<FeedChange>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let nats = nats?;
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(PRESENCE_LEASE_SECS)).await;
+        let mut ticks = tokio::time::interval(PRESENCE_SWEEP_INTERVAL);
+        loop {
+            ticks.tick().await;
+            sweep_tick(&pool, &nats, &feed_tx).await;
+        }
+    }))
+}
+
+/// One scheduler tick: sweeps only while [`presence_healthy`](db_participants::presence_healthy)
+/// holds, so a heartbeat outage can't make the sweeper depart everyone it can
+/// no longer hear from. `None` means skipped (including a failed health
+/// check — unhealthy is the safe default). Split out so a test can drive one
+/// tick synchronously instead of waiting on the real interval.
+async fn sweep_tick(
+    pool: &PgPool,
+    nats: &async_nats::Client,
+    feed_tx: &broadcast::Sender<FeedChange>,
+) -> Option<usize> {
+    match db_participants::presence_healthy(pool, Some(nats)).await {
+        Ok(true) => match sweep_presence(pool, Some(nats), feed_tx).await {
+            Ok(departed) => Some(departed),
+            Err(e) => {
+                tracing::error!("Presence sweep failed: {e}");
+                None
+            }
+        },
+        Ok(false) => {
+            tracing::warn!(
+                "Presence heartbeat pipeline unhealthy (stale watermark or NATS down); \
+                 skipping this sweep tick"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!("Presence health check failed, skipping sweep tick: {e}");
+            None
+        }
+    }
+}
+
+/// Test-only: drive one [`sweep_tick`] synchronously. Takes a live client
+/// rather than `Option`: the real scheduler never ticks without one, so a
+/// `None` client would test a never-reached branch instead of the gate.
+#[doc(hidden)]
+pub async fn sweep_tick_for_test(
+    pool: &PgPool,
+    nats: &async_nats::Client,
+    feed_tx: &broadcast::Sender<FeedChange>,
+) -> Option<usize> {
+    sweep_tick(pool, nats, feed_tx).await
+}
+
+/// Advisory lock key for [`sweep_presence`], scoped to this one purpose.
+const PRESENCE_SWEEP_ADVISORY_LOCK: i64 = 2_702_005;
+
+/// One sweep: [`db_participants::depart_expired`] every participant whose
+/// presence lease ran out, announcing each departure. Returns how many
+/// departed. Holds a Postgres advisory lock so only one replica's tick
+/// actually sweeps; a losing replica returns `Ok(0)` immediately. A single
+/// row's failure is logged and skipped rather than aborting the batch.
+pub async fn sweep_presence(
+    pool: &PgPool,
+    nats: Option<&async_nats::Client>,
+    feed_tx: &broadcast::Sender<FeedChange>,
+) -> Result<usize, sqlx::Error> {
+    // Advisory lock/unlock are session-scoped: both must run on the same
+    // physical connection.
+    let mut lock_conn = pool.acquire().await?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(PRESENCE_SWEEP_ADVISORY_LOCK)
+        .fetch_one(&mut *lock_conn)
+        .await?;
+    if !acquired {
+        return Ok(0);
+    }
+    // Unlock the same connection whether the sweep finishes, errors, or
+    // panics: without `catch_unwind` here, a panic mid-sweep would unwind
+    // past the unlock below, and the connection would return to the pool
+    // (not closed) still holding the session-scoped advisory lock — wedging
+    // every future sweep tick that draws that connection.
+    let result = std::panic::AssertUnwindSafe(sweep_presence_locked(pool, nats, feed_tx))
+        .catch_unwind()
+        .await;
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(PRESENCE_SWEEP_ADVISORY_LOCK)
+        .execute(&mut *lock_conn)
+        .await;
+    match result {
+        Ok(departed) => departed,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn sweep_presence_locked(
+    pool: &PgPool,
+    nats: Option<&async_nats::Client>,
+    feed_tx: &broadcast::Sender<FeedChange>,
+) -> Result<usize, sqlx::Error> {
+    let mut departed = 0;
+    for (meeting_id, room_id, user_id) in
+        db_participants::expired_presences(pool, PRESENCE_SWEEP_BATCH).await?
+    {
+        match db_participants::depart_expired(pool, meeting_id, &user_id).await {
+            Ok(Some((_, end))) => {
+                tracing::info!(
+                    "Presence lease of {user_id} in meeting {room_id} ran out (ended={end:?})"
+                );
+                announce_departure(nats, feed_tx, &room_id, end).await;
+                departed += 1;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Retried next tick either way; don't abort the batch.
+                tracing::error!(
+                    "Failed to depart expired presence for {user_id} in meeting {room_id}: {e}"
+                );
+            }
+        }
+    }
+    Ok(departed)
 }
 
 /// Extract the `room_id` from a deserialized internal payload.
@@ -717,15 +781,14 @@ mod tests {
         );
     }
 
-    /// Same graceful-degradation contract for the participant-left (mark-left)
-    /// consumer (issue #1551).
+    /// Same graceful-degradation contract for the participant presence consumer.
     #[tokio::test]
-    async fn spawn_participant_left_returns_none_when_nats_disabled() {
+    async fn spawn_participant_presence_returns_none_when_nats_disabled() {
         let lazy_pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://stub")
             .expect("connect_lazy should not contact the database");
         let (feed_tx, _feed_rx) = crate::feed_events::new_feed_channel();
-        let handle = spawn_participant_left_consumer(None, lazy_pool, feed_tx);
+        let handle = spawn_participant_presence_consumer(None, lazy_pool, feed_tx);
         assert!(
             handle.is_none(),
             "spawn must return None when NATS is not configured"

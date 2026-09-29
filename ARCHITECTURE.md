@@ -264,9 +264,14 @@ The diagnostics and adaptation system uses Protocol Buffers for efficient messag
 
 When a sender streams to multiple receivers, each with potentially different network conditions and capabilities, an adaptation strategy is needed to determine optimal encoding parameters.
 
-#### Lowest Common Denominator Approach
+#### Lowest Common Denominator Approach (SUPERSEDED — see Simulcast below)
 
-The initial implementation uses a "lowest common denominator" approach:
+> ⚠ **This describes the ORIGINAL implementation and is no longer how the system works.** It is kept
+> for historical context. It was superseded by **simulcast** — each sender producing several
+> independent quality layers concurrently, with per-receiver selection at the relay. See
+> [`docs/SIMULCAST.md`](docs/SIMULCAST.md) for the shipped design.
+
+The initial implementation used a "lowest common denominator" approach:
 
 1. **Collection Phase**: The sender collects diagnostics from all receivers.
 2. **Analysis Phase**: The sender identifies the most constrained receiver by selecting:
@@ -305,13 +310,30 @@ sequenceDiagram
     Note over S,R3: All receivers can now<br/>consume the stream reliably
 ```
 
+#### Simulcast — the shipped design
+
+Simulcast replaced the lowest-common-denominator approach: **each sender encodes up to three
+independent video quality layers at once** (the depth is a per-device *ceiling*; the runtime operating
+point starts at one video layer and ramps under `videocall-aq`), and the relay forwards each
+receiver, per source and media kind, the base layer plus only the non-base layer that receiver selected
+(camera video is further subject to a viewport filter and a congestion shed). A receiver with no
+recorded preference for a source gets every layer. One constrained receiver no longer drags quality
+down for the room.
+
+The encodes are **independent simulcast layers, not nested SVC**, and the receiver's layer guard is
+exact-match: a packet from another layer is dropped.
+
+**Full reference: [`docs/SIMULCAST.md`](docs/SIMULCAST.md)** — the ladder and its bitrates, the
+ceiling-vs-operating-point distinction, the dense wire-id model, the four relay filters and their
+base-layer exemptions, what a receiver can and cannot request, where the bandwidth saving comes from,
+and the measurement traps.
+
 #### Future Enhancements (Future Work)
 
-While the lowest common denominator approach ensures accessibility for all participants, future implementations will explore:
+Alternatives to both approaches above, not sub-features of simulcast:
 
 1. **Tiered Quality Levels**: Group receivers into quality tiers based on their network conditions
-2. **Simulcast**: Encode multiple quality levels simultaneously for optimal experience
-3. **Weighted Prioritization**: Prioritize quality for active speakers or specified participants
+2. **Weighted Prioritization**: Prioritize quality for active speakers or specified participants
 
 ## Security Architecture
 

@@ -5055,7 +5055,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Per-receiver relay outbound channel depth (slots occupied), keyed by session and split by channel (#1737). Labeled by room (== meeting name), transport, session_id, channel. The per-rx bound on WS is 1024 slots plus a per-kind byte budget (#2261): camera VIDEO sheds at 80% of 384,000 B, SCREEN at 90% of 7,076,736 B, audio on slots only. See relay_outbound_queue_bytes_by_session{kind=video|screen|other} for the byte dimension this slot gauge cannot show; each kind is judged against its own budget. WT is 512 slots per channel by default, shedding at ~80% (#979). Sustained high depth means the receiver's downlink cannot drain as fast as the relay fans in. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,channel} metric.",
+      "description": "Per-receiver relay outbound channel depth (slots occupied), keyed by session and split by channel (#1737). Labeled by room (== meeting name), transport, session_id, channel. The per-rx bound on WS is 1024 slots plus a per-kind byte budget (#2261): camera VIDEO sheds at 80% of 384,000 B, SCREEN at 90% of 7,076,736 B, audio on slots only. See relay_outbound_queue_bytes_by_session{kind=video|screen|other} for the byte dimension this slot gauge cannot show; each kind is judged against its own budget. WT unistream is 1024 slots by default and WT datagram a fixed 512, each shedding at ~80% (#979, #2717); the unistream lane also carries the same per-kind byte budgets as WS, which cap camera+screen near 219 slots, so its slot reading stays low while its BYTE reading is the real signal. Sustained high depth means the receiver's downlink cannot drain as fast as the relay fans in. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,channel} metric.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -5248,7 +5248,7 @@
       },
       "id": 104,
       "title": "Relay Outbound Datagram Send Failures /sec — FLEET-WIDE (issue 2030)",
-      "description": "Server-side view of WebTransport outbound datagram loss (issue 2030): datagrams the relay failed to hand to quinn, counted in spawn_datagram_writer's send_datagram error branch, broken down by failure reason. FLEET-WIDE — relay_outbound_bridge_datagram_send_failures_total carries only 'transport' (always webtransport) and 'reason' labels (no room/meeting), so this is NOT filtered by $meeting. reason=connection_lost is benign teardown churn; a sustained too_large / unsupported / disabled is an actionable MTU or datagram-config bug. Server-side sibling of the receiver-side Audio Datagram Loss panel above — this signal survives a wedged client. Does NOT count datagrams quinn accepts (returns Ok) and then silently evicts when its bounded send buffer (datagram_send_buffer_size) overflows — quinn pops the oldest queued datagram and still returns Ok, so this call site can't see it (pacing/cwnd only set the drain rate). That class needs a quinn-level hook, out of scope for issue 2030.",
+      "description": "Server-side view of WebTransport outbound datagrams quinn REFUSED (issue 2030): send_datagram returned Err in spawn_datagram_writer, broken down by failure reason. A refusal is not automatically a lost packet. Since #2716 reason=too_large and reason=unsupported are counted here AND diverted to the reliable uni stream, so they mark the datagram lane refusing the packet, not the packet vanishing — pair them with videocall_relay_datagram_unistream_fallbacks_total to see whether that lane carried it (outcome=unistream) or was full (outcome=dropped). reason=connection_lost is benign teardown churn and IS loss; reason=disabled and reason=webtransport are loss too. A sustained too_large / unsupported / disabled is an actionable MTU or datagram-config bug either way. FLEET-WIDE — relay_outbound_bridge_datagram_send_failures_total carries only 'transport' (always webtransport) and 'reason' labels (no room/meeting), so this is NOT filtered by $meeting. Server-side sibling of the receiver-side Audio Datagram Loss panel above — this signal survives a wedged client. Does NOT count datagrams quinn accepts (returns Ok) and then silently evicts when its bounded send buffer (datagram_send_buffer_size) overflows — quinn pops the oldest queued datagram and still returns Ok, so this call site can't see it (pacing/cwnd only set the drain rate). That class needs a quinn-level hook, out of scope for issue 2030.",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -5312,7 +5312,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Per-receiver relay outbound queue occupancy in BYTES, keyed by session and split by media kind (#2593). WebSocket only. Labeled by room (== meeting name), transport, session_id, kind (video|screen|other). The #2261 shed points are per kind: camera VIDEO at 80% of 384,000 B (307,200), SCREEN at 90% of 7,076,736 B (6,369,062); kind=other (audio, control) is counted here but never shed on bytes. The attributable form of relay_outbound_queue_bytes, which is room-level last-writer-wins and can read ~0 while one receiver sits at its shed point. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,kind} metric.",
+      "description": "Per-receiver relay outbound queue occupancy in BYTES, keyed by session and split by media kind (#2593, #2717). WebSocket reports its single outbound channel; WebTransport reports its unistream lane. Labeled by room (== meeting name), transport, session_id, kind (video|screen|other). The #2261 shed points are per kind: camera VIDEO at 80% of 384,000 B (307,200), SCREEN at 90% of 7,076,736 B (6,369,062); kind=other (audio, control) is counted here but never shed on bytes. The attributable form of relay_outbound_queue_bytes, which is room-level last-writer-wins and can read ~0 while one receiver sits at its shed point. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,kind} metric.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -5374,6 +5374,73 @@
       "datasource": {
         "type": "prometheus"
       },
+      "description": "Camera and screen DELTA frames the publisher's WebSocket freshness gate dropped per minute (camera #2809, screen #1921). increase(...[1m]) over counters that are cumulative since page load and never reset; joined to videocall_peer_info for display_name.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 270
+      },
+      "id": 127,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(videocall_camera_ws_stale_delta_drops_total{meeting_id=~\"$meeting\"}[1m]) * on(meeting_id,session_id,peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} camera",
+          "refId": "A"
+        },
+        {
+          "expr": "increase(videocall_screen_ws_stale_delta_drops_total{meeting_id=~\"$meeting\"}[1m]) * on(meeting_id,session_id,peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} screen",
+          "refId": "B"
+        }
+      ],
+      "title": "WS Delta Frames Dropped by the Freshness Gate /1m (#2809 / #1921)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
       "description": "Per-client max gap (ms) between successive incoming-datagram read resolutions on the main-thread reader, over the last health interval (issue 2031). The DIRECT causal signal for the audio-loss class: a long task starves the reader, the browser age-drops the OLDEST queued datagrams, and audio is silently lost. Sustained hundreds of ms => reader starvation. WebTransport-only (0 on WebSocket). Joined to videocall_peer_info for display_name; filtered to > 0 so only starved clients plot.",
       "fieldConfig": {
         "defaults": {
@@ -5404,7 +5471,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 270
+        "y": 278
       },
       "id": 105,
       "options": {
@@ -5467,7 +5534,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 270
+        "y": 278
       },
       "id": 106,
       "options": {
@@ -5529,7 +5596,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 278
+        "y": 286
       },
       "id": 107,
       "options": {
@@ -5590,7 +5657,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 278
+        "y": 286
       },
       "id": 108,
       "options": {
@@ -5654,7 +5721,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 287
+        "y": 295
       },
       "id": 109,
       "options": {
@@ -5742,7 +5809,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 287
+        "y": 295
       },
       "id": 110,
       "options": {
@@ -5808,7 +5875,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 296
+        "y": 304
       },
       "id": 111,
       "options": {
@@ -5875,7 +5942,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 296
+        "y": 304
       },
       "id": 112,
       "options": {
@@ -5942,7 +6009,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 305
+        "y": 313
       },
       "id": 113,
       "options": {
@@ -5969,6 +6036,742 @@
       ],
       "title": "Camera Measured Per-Layer Output FPS (#2170)",
       "description": "Measured output fps for each active camera rung over the latest roughly one-second window, not the nominal 7/15/30 ladder targets. Layer 0 should closely track the existing videocall_encoder_output_fps series; disagreement is itself a useful wiring or timing signal. Geometry can appear before this series while the first measurement window warms. Only ACTIVE rungs appear, so a rung vanishing means AQ shed it, not that the encoder broke.",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 321
+      },
+      "id": 115,
+      "panels": [],
+      "title": "WT Relay Runtime & QUIC Transport (#1637 / #2712 / #2713)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Distribution of videocall_relay_scheduler_lag_ms across the histogram's ms buckets (1/5/10/25/50/100/250/500/1000/2500). Each probe runs ON one of the WebTransport relay's runtimes (#2727: the main one plus every session arbiter), all feeding this one unlabelled histogram and observes how late each fixed-interval tick was polled versus its scheduled deadline, so a band lighting up at 100ms and above is the epic #1636 thread-starvation fingerprint (mechanism B): some future held one of those threads without yielding. Sub-10ms is ordinary timer jitter. Read this WITH the per-connection path_sent_packets panels: upper buckets here while sent_packets is flat is mechanism B; no upper-bucket movement while RTT and loss climb is mechanism C (shared downlink/NIC). Only webtransport_server spawns the probe, so the WebSocket relay contributes no series.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 322
+      },
+      "id": 116,
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "cellValues": {
+          "unit": "short"
+        },
+        "color": {
+          "exponent": 0.5,
+          "fill": "dark-orange",
+          "mode": "scheme",
+          "reverse": false,
+          "scheme": "Oranges",
+          "steps": 64
+        },
+        "filterValues": {
+          "le": 1e-09
+        },
+        "legend": {
+          "show": true
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "tooltip": {
+          "mode": "single",
+          "showColorScale": false,
+          "yHistogram": false
+        },
+        "yAxis": {
+          "axisPlacement": "left",
+          "reverse": false,
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (le) (increase(videocall_relay_scheduler_lag_ms_bucket{namespace=\"$namespace\"}[5m]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WT Relay Scheduler Lag Distribution (#1636/#1639)",
+      "type": "heatmap"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "p50 and p99 of the relay's scheduler lag, aggregated over every runtime (#2727), per relay pod. p99 crossing 100ms is the RelaySchedulerLagHigh alert condition. A healthy relay sits at single-digit ms. Because the histogram's top explicit bucket is 2500ms, a p99 reported at exactly 2500 means the true value is somewhere above it.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 322
+      },
+      "id": 117,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, pod) (rate(videocall_relay_scheduler_lag_ms_bucket{namespace=\"$namespace\"}[5m])))",
+          "legendFormat": "p99 {{pod}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, pod) (rate(videocall_relay_scheduler_lag_ms_bucket{namespace=\"$namespace\"}[5m])))",
+          "legendFormat": "p50 {{pod}}",
+          "refId": "B"
+        }
+      ],
+      "title": "WT Relay Scheduler Lag p50/p99 (#1636/#1639)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per room, the number of mirrored remote-origin room_members rows this relay binary holds -- sessions it learned about from the OTHER binary's PARTICIPANT_JOINED broadcasts. Any value above 0 means the room is SPLIT across the ws and wt relays, the exact condition behind the #1202 layer-hint base-pin. 0 means every member is local to the reporting binary. The series is removed on room drain, so an empty panel means no active rooms, not a healthy 0. topk bounds the rendered series because $meeting defaults to All.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 330
+      },
+      "id": 118,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, relay_room_membership_divergence{room=~\"$meeting\"})",
+          "legendFormat": "{{room}} @ {{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Relay Room Membership Divergence (#1202)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Absolute CPU cores consumed by the WebTransport relay container, against its own CPU limit. Since #2727 the relay shards sessions across arbiters and quinn drivers across a tokio pool, so it can reach that limit and a reading near 1.0 is normal, not saturation -- the pre-#2727 one-core ceiling and its absolute 0.85 threshold are gone. available_parallelism() FLOORS the cgroup quota, so the usable parallelism is the limit rounded DOWN to whole cores. The container total also covers the tokio blocking pool; corroborate with the scheduler-lag panels before calling a high reading a stall.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 330
+      },
+      "id": 119,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\",container=~\"videocall-webtransport|webtransport-us-east\"}[2m]))",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        },
+        {
+          "expr": "max(kube_pod_container_resource_limits{namespace=\"$namespace\",container=~\"videocall-webtransport|webtransport-us-east\",resource=\"cpu\"})",
+          "legendFormat": "cpu limit",
+          "refId": "B"
+        }
+      ],
+      "title": "WT Relay CPU vs Its Limit (#2727)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Rate of MAX_DATA and MAX_STREAM_DATA frames the relay RECEIVED on live WebTransport connections -- flow-control credit each peer granted. Read it as the INVERSE of a stall: a healthy receiver grants credit continuously as it drains, so a line that FLATTENS while the relay still has data queued identifies that receiver as the wedge, not relay CPU. MAX_STREAM_DATA is the per-stream window the persistent unistream writer parks on (#1638); MAX_DATA is the connection-level one. Both gauges are cumulative, so they are charted with rate(). Corroborate a flat line with videocall_relay_connection_path_cwnd_bytes and the outbound queue depth. This panel previously charted frame_tx_data_blocked / frame_tx_stream_data_blocked, which read zero forever: quinn-proto 0.11.13 decodes those frames but has no TX construction site for them (#2716).",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 338
+      },
+      "id": 120,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, rate(videocall_relay_connection_frame_rx_max_data{room=~\"$meeting\"}[5m]))",
+          "legendFormat": "conn credit {{session_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "topk(25, rate(videocall_relay_connection_frame_rx_max_stream_data{room=~\"$meeting\"}[5m]))",
+          "legendFormat": "stream credit {{session_id}}",
+          "refId": "B"
+        }
+      ],
+      "title": "WT Peer Credit Grants /sec (#2712)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "quinn's current congestion window per live WebTransport connection. This is an INSTANTANEOUS level -- read it directly, never rate() it. A cwnd collapsed to a few multiples of the path MTU means the congestion controller, not the relay, is metering that receiver's downlink.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 338
+      },
+      "id": 121,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, videocall_relay_connection_path_cwnd_bytes{room=~\"$meeting\"})",
+          "legendFormat": "{{session_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WT Congestion Window (#2712)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Current path MTU per live WebTransport connection, an instantaneous level. It bounds max_datagram_size and therefore the largest packet the relay can send as a datagram. A drop to the QUIC minimum is what quinn does after a black-hole detection; check the black-hole panel beside this one.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 346
+      },
+      "id": 122,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, videocall_relay_connection_path_current_mtu_bytes{room=~\"$meeting\"})",
+          "legendFormat": "{{session_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WT Path MTU (#2712)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Black-hole detections on a connection's path over 5 minutes. The gauge is cumulative, so this charts increase(). Any nonzero value is a path fault rather than ordinary congestion: quinn falls back to the minimum MTU on each detection, which shows up as a step down on the Path MTU panel.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 346
+      },
+      "id": 123,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, increase(videocall_relay_connection_path_black_holes_detected{room=~\"$meeting\"}[5m]))",
+          "legendFormat": "{{session_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WT Path Black-Hole Detections /5m (#2712)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Two cumulative gauges charted as rates. send_datagram calls counts datagrams quinn ACCEPTED into its bounded outgoing queue (returned Ok); frame_tx.datagram counts datagram frames that actually left the relay. The two tracking together is healthy. Calls running above frames is the silent-drop condition -- quinn evicts the OLDEST queued datagram on overflow and still returns Ok, so the send-failures counter never sees it. The gap itself is the next panel.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 354
+      },
+      "id": 124,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, rate(videocall_relay_connection_datagram_send_calls{room=~\"$meeting\"}[5m]))",
+          "legendFormat": "calls {{session_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "topk(25, rate(videocall_relay_connection_frame_tx_datagram{room=~\"$meeting\"}[5m]))",
+          "legendFormat": "sent {{session_id}}",
+          "refId": "B"
+        }
+      ],
+      "title": "WT Datagram Frames Sent vs send_datagram Calls /sec (#2712)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "How far the silent-drop level (send_datagram calls minus datagram frames transmitted, clamped at 0) CLIMBED over the last 5 minutes. That level is a backlog, not a monotonic counter -- it falls again when the queue drains -- so this uses delta() rather than increase(), which would apply counter-reset correction to every legitimate dip. Part of any standing value is simply queued-not-yet-sent, bounded by the relay's configured datagram_send_buffer_size -- 65,975 bytes since #2742, about 325 top-tier audio datagrams at 203 wire bytes each, overridable by QUIC_DATAGRAM_SEND_BUFFER_BYTES -- so a standing level near a thousand is mostly real eviction, not transient queue. Only a sustained positive delta is real silent loss. Pair it with the send-buffer-space panel: space pinned at 0 while this climbs identifies queue overflow as the mechanism.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 354
+      },
+      "id": 125,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, delta(videocall_relay_connection_datagram_silent_drops{room=~\"$meeting\"}[5m]))",
+          "legendFormat": "{{session_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WT Datagram Silent Drops: 5m climb (#2712)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Bytes still free in quinn's outgoing datagram queue for each live WebTransport connection, an instantaneous level. Zero means the queue has reached its budget: quinn evicts only while the queued total EXCEEDS datagram_send_buffer_size, so zero is the point at which the next send_datagram MAY start evicting, not proof that one already did. Sustained zero together with a climbing silent-drop delta is the overflow signature.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 362
+      },
+      "id": 126,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, videocall_relay_connection_datagram_send_buffer_space_bytes{room=~\"$meeting\"})",
+          "legendFormat": "{{session_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WT Datagram Send-Buffer Space Free (#2712)",
       "type": "timeseries"
     }
   ],

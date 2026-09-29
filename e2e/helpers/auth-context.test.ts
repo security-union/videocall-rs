@@ -4,7 +4,11 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { assertDevCertHashesPresent, readDevCertHashes } from "./auth-context";
+import {
+  assertDevCertHashesPresent,
+  createAuthenticatedContext,
+  readDevCertHashes,
+} from "./auth-context";
 
 /**
  * Regression lock for #2159's second half: a missing hash file was swallowed
@@ -47,5 +51,33 @@ describe("assertDevCertHashesPresent", () => {
 
   it("does not throw when a hash is present", () => {
     expect(() => assertDevCertHashesPresent(["AAAA="])).not.toThrow();
+  });
+});
+
+describe("createAuthenticatedContext", () => {
+  function stubBrowser() {
+    const scripts: string[] = [];
+    return {
+      scripts,
+      newContext: async () => ({
+        addInitScript: async (script: unknown) => {
+          scripts.push(typeof script === "string" ? script : String(script));
+        },
+        addCookies: async () => {},
+      }),
+    };
+  }
+
+  it("seeds no transport preference", async () => {
+    const browser = stubBrowser();
+    await createAuthenticatedContext(
+      browser as unknown as Parameters<typeof createAuthenticatedContext>[0],
+      "lock@videocall.rs",
+      "Lock",
+      "http://localhost:3001",
+    );
+    // Or a helper that injects nothing at all would pass vacuously.
+    expect(browser.scripts.length).toBeGreaterThan(0);
+    expect(browser.scripts.join("\n")).not.toContain("vc_transport_preference");
   });
 });

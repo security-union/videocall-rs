@@ -44,6 +44,7 @@ use crate::auth::RoomMember;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::state::AppState;
+use videocall_types::validation::is_valid_meeting_id;
 
 /// Query parameters accepted as a fallback for `navigator.sendBeacon()` which
 /// cannot set custom request headers. The primary upload path uses headers;
@@ -193,16 +194,16 @@ fn check_upload_quota(user_id: &str, body_len: u64) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Meeting IDs: alphanumeric, hyphens, and underscores only.
-static SAFE_MEETING_ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+$").expect("valid regex"));
-
 /// User IDs: also allow dots and `@` for OAuth email addresses.
 static SAFE_USER_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_.@-]+$").expect("valid regex"));
 
+fn is_safe_user_id(value: &str) -> bool {
+    SAFE_USER_ID_RE.is_match(value)
+}
+
 /// Validate that an identifier contains only safe characters.
-fn validate_id(value: &str, field_name: &str, re: &Regex) -> Result<(), AppError> {
+fn validate_id(value: &str, field_name: &str, is_safe: fn(&str) -> bool) -> Result<(), AppError> {
     if value.is_empty() {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
@@ -223,7 +224,7 @@ fn validate_id(value: &str, field_name: &str, re: &Regex) -> Result<(), AppError
             },
         ));
     }
-    if !re.is_match(value) {
+    if !is_safe(value) {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
             videocall_meeting_types::APIError {
@@ -248,8 +249,9 @@ fn validate_id(value: &str, field_name: &str, re: &Regex) -> Result<(), AppError
 ///   issued by the Meeting Backend (`generate_room_token`). Identity is derived
 ///   from the token's `sub` claim; any `X-User-Id` header is **ignored**. The
 ///   token's `room` claim MUST equal the `{meeting_id}` path segment, otherwise
-///   the request is rejected with 403. A missing, invalid, or observer-only
-///   token (which lacks room-join access) is rejected with 401.
+///   the request is rejected with 403 (400 if the segment is not a valid
+///   meeting ID). A missing, invalid, or observer-only token (which lacks
+///   room-join access) is rejected with 401.
 ///
 /// # Headers
 ///
@@ -286,6 +288,8 @@ pub async fn upload_console_logs(
         ));
     }
 
+    validate_id(&meeting_id, "meeting_id", is_valid_meeting_id)?;
+
     // --- Cross-meeting binding ---
     // The room token's `room` claim must match the meeting being uploaded to.
     // This stops an authenticated participant of meeting A from writing logs
@@ -296,7 +300,7 @@ pub async fn upload_console_logs(
     // bearer holds a valid room credential, so 403 is the correct shape.
     if token_meeting_id != meeting_id {
         tracing::warn!(
-            token_meeting_id = %token_meeting_id,
+            token_meeting_id = ?token_meeting_id,
             path_meeting_id = %meeting_id,
             user_id = %user_id,
             "Console log upload rejected: room token meeting does not match path"
@@ -345,9 +349,6 @@ pub async fn upload_console_logs(
             }
         });
 
-    // --- Validate meeting_id path-safety ---
-    validate_id(&meeting_id, "meeting_id", &SAFE_MEETING_ID_RE)?;
-
     // Session timestamp must be numeric (epoch ms).
     if !session_ts.chars().all(|c| c.is_ascii_digit()) || session_ts.is_empty() {
         return Err(AppError::new(
@@ -371,7 +372,7 @@ pub async fn upload_console_logs(
     // Guest console-log capture is out of scope; the rejection is a clean 400
     // (no crash, no security impact) and the guest collector simply drops the
     // chunk. Authenticated participants (email `sub`) are unaffected.
-    validate_id(&user_id, "user_id", &SAFE_USER_ID_RE)?;
+    validate_id(&user_id, "user_id", is_safe_user_id)?;
 
     // --- Meeting membership check ---
     // Verify that the caller is (or was) a participant of this meeting.
@@ -617,71 +618,76 @@ pub async fn upload_console_logs(
 mod tests {
     use super::*;
 
-    // --- Meeting ID validation (restrictive: [a-zA-Z0-9_-]) ---
+    // --- Meeting ID validation (the shared meeting ID rule) ---
 
     #[test]
     fn meeting_id_accepts_alphanumeric() {
-        assert!(validate_id("daily-standup", "meeting_id", &SAFE_MEETING_ID_RE).is_ok());
+        assert!(validate_id("daily-standup", "meeting_id", is_valid_meeting_id).is_ok());
+    }
+
+    #[test]
+    fn meeting_id_accepts_tilde() {
+        assert!(validate_id("a~b", "meeting_id", is_valid_meeting_id).is_ok());
     }
 
     #[test]
     fn meeting_id_rejects_dots_and_slashes() {
-        assert!(validate_id("../etc/passwd", "meeting_id", &SAFE_MEETING_ID_RE).is_err());
-        assert!(validate_id("room.name", "meeting_id", &SAFE_MEETING_ID_RE).is_err());
+        assert!(validate_id("../etc/passwd", "meeting_id", is_valid_meeting_id).is_err());
+        assert!(validate_id("room.name", "meeting_id", is_valid_meeting_id).is_err());
     }
 
     #[test]
     fn meeting_id_rejects_at_sign() {
-        assert!(validate_id("room@host", "meeting_id", &SAFE_MEETING_ID_RE).is_err());
+        assert!(validate_id("room@host", "meeting_id", is_valid_meeting_id).is_err());
     }
 
     // --- User ID validation (allows dots and @ for OAuth emails) ---
 
     #[test]
     fn user_id_accepts_alphanumeric() {
-        assert!(validate_id("user123", "user_id", &SAFE_USER_ID_RE).is_ok());
+        assert!(validate_id("user123", "user_id", is_safe_user_id).is_ok());
     }
 
     #[test]
     fn user_id_accepts_hyphens_and_underscores() {
-        assert!(validate_id("my-user_id-123", "user_id", &SAFE_USER_ID_RE).is_ok());
+        assert!(validate_id("my-user_id-123", "user_id", is_safe_user_id).is_ok());
     }
 
     #[test]
     fn user_id_accepts_email() {
-        assert!(validate_id("alice@example.com", "user_id", &SAFE_USER_ID_RE).is_ok());
-        assert!(validate_id("jay.boyd@test.io", "user_id", &SAFE_USER_ID_RE).is_ok());
+        assert!(validate_id("alice@example.com", "user_id", is_safe_user_id).is_ok());
+        assert!(validate_id("jay.boyd@test.io", "user_id", is_safe_user_id).is_ok());
     }
 
     #[test]
     fn user_id_rejects_slashes() {
-        assert!(validate_id("../etc/passwd", "user_id", &SAFE_USER_ID_RE).is_err());
-        assert!(validate_id("user/name", "user_id", &SAFE_USER_ID_RE).is_err());
+        assert!(validate_id("../etc/passwd", "user_id", is_safe_user_id).is_err());
+        assert!(validate_id("user/name", "user_id", is_safe_user_id).is_err());
     }
 
     #[test]
     fn user_id_rejects_spaces() {
-        assert!(validate_id("user name", "user_id", &SAFE_USER_ID_RE).is_err());
+        assert!(validate_id("user name", "user_id", is_safe_user_id).is_err());
     }
 
     // --- Shared validation behavior ---
 
     #[test]
     fn rejects_empty() {
-        assert!(validate_id("", "test", &SAFE_MEETING_ID_RE).is_err());
-        assert!(validate_id("", "test", &SAFE_USER_ID_RE).is_err());
+        assert!(validate_id("", "test", is_valid_meeting_id).is_err());
+        assert!(validate_id("", "test", is_safe_user_id).is_err());
     }
 
     #[test]
     fn rejects_too_long() {
         let long = "a".repeat(256);
-        assert!(validate_id(&long, "test", &SAFE_MEETING_ID_RE).is_err());
+        assert!(validate_id(&long, "test", is_valid_meeting_id).is_err());
     }
 
     #[test]
     fn accepts_max_length() {
         let max = "a".repeat(255);
-        assert!(validate_id(&max, "test", &SAFE_MEETING_ID_RE).is_ok());
+        assert!(validate_id(&max, "test", is_valid_meeting_id).is_ok());
     }
 
     // --- Rate-limited ENOSPC logging helper ---

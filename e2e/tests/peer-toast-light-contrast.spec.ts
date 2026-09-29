@@ -1,5 +1,5 @@
-import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
-import { generateSessionToken } from "../helpers/auth";
+import { test, expect, chromium, Page } from "@playwright/test";
+import { createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 
@@ -40,8 +40,6 @@ import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
  * luminance 255. The floor of 180 cleanly separates the two.
  */
 
-const COOKIE_NAME = process.env.COOKIE_NAME || "session";
-
 // A revert re-introduces near-black tokens (luminance ~0); the fix is white
 // (luminance 255). 180 sits comfortably between the two with no overlap.
 const LIGHT_LUMINANCE_FLOOR = 180;
@@ -54,32 +52,6 @@ const BROWSER_ARGS = [
   "--disable-dev-shm-usage",
   "--renderer-process-limit=1",
 ];
-
-async function createAuthenticatedContext(
-  browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
-  email: string,
-  name: string,
-  uiURL: string,
-): Promise<BrowserContext> {
-  const context = await browser.newContext({
-    baseURL: uiURL,
-    ignoreHTTPSErrors: true,
-  });
-  const token = generateSessionToken(email, name);
-  const url = new URL(uiURL);
-  await context.addCookies([
-    {
-      name: COOKIE_NAME,
-      value: token,
-      domain: url.hostname,
-      path: "/",
-      httpOnly: true,
-      secure: false,
-      sameSite: "Lax",
-    },
-  ]);
-  return context;
-}
 
 async function navigateToMeeting(page: Page, meetingId: string, username: string): Promise<void> {
   // Hydration-robust submit (helpers/join-meeting.ts): gates on the

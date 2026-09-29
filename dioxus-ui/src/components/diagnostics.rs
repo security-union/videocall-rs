@@ -29,7 +29,10 @@ use crate::components::performance_settings::{
     received_layer_led_on, unknown_reading_note, DiagnosticsReader, HelpPopover,
     PerfControlsHandle, PerformanceSettingsPanel,
 };
-use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
+use crate::context::{
+    confirm_transport_change, displayed_default_transport, effective_default_transport,
+    transport_option_label, TransportPreference, TransportPreferenceCtx,
+};
 use crate::local_storage::save_bool;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -627,6 +630,37 @@ impl ConnectionManagerState {
     }
 }
 
+fn server_url_href(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let is = |name: &str| scheme.eq_ignore_ascii_case(name);
+    let scheme = if is("wss") || is("https") {
+        "https"
+    } else if is("ws") || is("http") {
+        "http"
+    } else {
+        return None;
+    };
+    Some(format!("{scheme}://{rest}"))
+}
+
+fn server_url_view(url: &str, class: &str) -> Element {
+    match server_url_href(url) {
+        Some(href) => rsx! {
+            a {
+                class: "{class}",
+                href: "{href}",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                title: "Open {href} in a new tab",
+                "{url}"
+            }
+        },
+        None => rsx! {
+            span { class: "{class}", "{url}" }
+        },
+    }
+}
+
 #[component]
 pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Element {
     let parsed_state = connection_manager_state.as_ref().map(|json| {
@@ -704,9 +738,9 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                         h4 { "Active Connection" }
                         div { class: "connection-details",
                             if let Some(url) = &state.active_server_url {
-                                div { class: "detail-item",
+                                div { class: "detail-item detail-item-url",
                                     span { class: "detail-label", "Server:" }
-                                    span { class: "detail-value server-url", "{url}" }
+                                    {server_url_view(url, "detail-value server-url active-server-url")}
                                 }
                             }
                             if let Some(server_type) = &state.active_server_type {
@@ -765,7 +799,7 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                                                 }
                                             }
                                             div { class: "server-details",
-                                                div { class: "server-url", "{server.url}" }
+                                                {server_url_view(&server.url, "server-url server-card-url")}
                                                 div { class: "server-info",
                                                     span { class: "{type_class}", "{st_upper}" }
                                                     if let Some(rtt) = server.rtt {
@@ -851,6 +885,9 @@ pub fn Diagnostics(
     on_resize_end: EventHandler<()>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let transport_server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
+    let transport_default =
+        displayed_default_transport(effective_default_transport(), transport_server_wt_enabled);
     // Issue 1768: the shared "Show diagnostics on tiles" flag. The checkbox
     // below writes it (and persists to localStorage); every PeerTile reads the
     // same signal to show/hide its overlay.
@@ -1403,15 +1440,8 @@ pub fn Diagnostics(
                         select {
                             id: "diagnostics-transport-select",
                             class: "peer-selector",
+                            "aria-label": "Transport protocol",
                             onchange: move |evt: Event<FormData>| {
-                                // The diagnostics select has no "remember" checkbox, so it
-                                // expresses an explicit, NOT-remembered choice (#1291). Passing
-                                // `sticky = false` means: WebSocket (the default) clears all
-                                // storage (load resolves to the default); WebTransport (the
-                                // non-default) writes a session-scoped value AND clears any prior
-                                // sticky pin, so WT wins this session and is forgotten on tab
-                                // close. Reading the stored sticky flag here would re-pin against
-                                // the user's intent.
                                 confirm_transport_change(
                                     &evt.value(),
                                     (transport_pref_ctx.0)(),
@@ -1420,19 +1450,20 @@ pub fn Diagnostics(
                                 );
                             },
                             option {
-                                value: "websocket",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocket,
-                                "WebSocket (default)"
-                            }
-                            option {
                                 value: "webtransport",
                                 selected: (transport_pref_ctx.0)() == TransportPreference::WebTransport,
-                                "WebTransport (experimental)"
+                                disabled: !transport_server_wt_enabled,
+                                {transport_option_label(TransportPreference::WebTransport, transport_default, transport_server_wt_enabled)}
+                            }
+                            option {
+                                value: "websocket",
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocket,
+                                {transport_option_label(TransportPreference::WebSocket, transport_default, transport_server_wt_enabled)}
                             }
                         }
                     }
                     p { class: "transport-preference-note",
-                        "Changing protocol will reload the page."
+                        "Changing protocol will reload the page. WebTransport switches to WebSocket on its own when a network blocks it."
                     }
                 }
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-display-options",
@@ -2720,6 +2751,48 @@ mod tests {
         Metric { name, value }
     }
 
+    #[test]
+    fn server_url_href_maps_transport_schemes_to_navigable_ones() {
+        for (url, href) in [
+            (
+                "wss://websocket.example.com:443/lobby",
+                "https://websocket.example.com:443/lobby",
+            ),
+            ("ws://localhost:8080/lobby", "http://localhost:8080/lobby"),
+            (
+                "https://webtransport.example.com:443/lobby",
+                "https://webtransport.example.com:443/lobby",
+            ),
+            ("http://localhost:4433/lobby", "http://localhost:4433/lobby"),
+            (
+                "WSS://Host.example.com/lobby",
+                "https://Host.example.com/lobby",
+            ),
+            ("Ws://host/", "http://host/"),
+            ("HtTpS://host/", "https://host/"),
+        ] {
+            assert_eq!(server_url_href(url).as_deref(), Some(href), "{url}");
+        }
+    }
+
+    #[test]
+    fn server_url_href_rejects_every_other_scheme() {
+        for url in [
+            "javascript://%0aalert(1)",
+            "JavaScript://x%0aalert(1)",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "data://text/html,x",
+            "vbscript://x",
+            "file:///etc/passwd",
+            "",
+            "websocket.example.com/lobby",
+            "unknown",
+        ] {
+            assert_eq!(server_url_href(url), None, "{url:?}");
+        }
+    }
+
     /// FIX 1: a synthetic subsystem `"video"` event must format to a Reception
     /// dump that carries the fps, the bitrate, and the `to_peer` (NOT `from_peer`)
     /// label. Mutating the metric key `"fps_received"` back to `"fps"` (the old,
@@ -3325,5 +3398,249 @@ mod tests {
             peer_lag_class(PEER_LAG_POOR_MS - 0.1),
             ("is-warn", "falling behind")
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dom_tests {
+    use super::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    const WS_URL: &str =
+        "wss://websocket.videocall.some-long-cluster-hostname.example.com:443/lobby";
+    const WT_URL: &str =
+        "https://webtransport.videocall.some-long-cluster-hostname.example.com:443/lobby";
+    const SHORT_URL: &str = "ws://localhost:8080/lobby";
+    const SHORT_HREF: &str = "http://localhost:8080/lobby";
+    const HOSTILE_URL: &str = "javascript://%0aalert(1)";
+    const TAILWIND_CSS: &str = include_str!("../../static/tailwind.css");
+
+    fn cm_event(stream_id: Option<&str>, metrics: &[(&str, &str)]) -> SerializableDiagEvent {
+        SerializableDiagEvent {
+            subsystem: "connection_manager".to_string(),
+            stream_id: stream_id.map(str::to_string),
+            ts_ms: 0,
+            metrics: metrics
+                .iter()
+                .map(|(name, value)| SerializableMetric {
+                    name: name.to_string(),
+                    value: MetricValue::Text(value.to_string().into()),
+                })
+                .collect(),
+        }
+    }
+
+    fn cm_state(active_url: &str) -> String {
+        serde_json::to_string(&[
+            cm_event(
+                None,
+                &[
+                    ("election_state", "elected"),
+                    ("active_server_url", active_url),
+                    ("active_server_type", "websocket"),
+                ],
+            ),
+            cm_event(
+                Some("ws_0"),
+                &[("server_url", WS_URL), ("server_type", "websocket")],
+            ),
+            cm_event(
+                Some("ws_1"),
+                &[("server_url", SHORT_URL), ("server_type", "websocket")],
+            ),
+            cm_event(
+                Some("wt_0"),
+                &[("server_url", WT_URL), ("server_type", "webtransport")],
+            ),
+            cm_event(Some("zz_0"), &[("server_url", HOSTILE_URL)]),
+        ])
+        .unwrap()
+    }
+
+    #[allow(non_snake_case)]
+    fn UrlHarness() -> Element {
+        let state = cm_state(WS_URL);
+        rsx! {
+            div { id: "drawer-wide", style: "width: 520px",
+                ConnectionManagerDisplay { connection_manager_state: state.clone() }
+            }
+            div { id: "drawer-narrow", style: "width: 240px",
+                ConnectionManagerDisplay { connection_manager_state: state }
+            }
+            div { id: "drawer-short", style: "width: 520px",
+                ConnectionManagerDisplay { connection_manager_state: cm_state(SHORT_URL) }
+            }
+        }
+    }
+
+    async fn next_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let _ = gloo_utils::window().request_animation_frame(&resolve);
+        });
+        let _ = JsFuture::from(promise).await;
+    }
+
+    fn assert_whole_link(el: &web_sys::Element, drawer: &str, url: &str, href: &str) {
+        let at = format!("{drawer} .{}", el.class_name().replace(' ', "."));
+        assert_eq!(el.tag_name(), "A", "{at}: not a link");
+        assert_eq!(el.get_attribute("href").as_deref(), Some(href), "{at}");
+        assert_eq!(
+            el.get_attribute("target").as_deref(),
+            Some("_blank"),
+            "{at}"
+        );
+        assert_eq!(
+            el.get_attribute("rel").as_deref(),
+            Some("noopener noreferrer"),
+            "{at}"
+        );
+        assert_eq!(
+            el.get_attribute("title"),
+            Some(format!("Open {href} in a new tab")),
+            "{at}"
+        );
+        assert_eq!(el.text_content().as_deref(), Some(url), "{at}");
+
+        let win = gloo_utils::window();
+        let style = win.get_computed_style(el).unwrap().unwrap();
+        assert_eq!(
+            style.get_property_value("text-decoration-line").unwrap(),
+            "underline",
+            "{at}: not underlined at rest"
+        );
+        let after = win
+            .get_computed_style_with_pseudo_elt(el, "::after")
+            .unwrap()
+            .unwrap()
+            .get_property_value("content")
+            .unwrap();
+        assert!(
+            after.contains('\u{2197}'),
+            "{at}: no new-tab glyph (::after content {after})"
+        );
+
+        let outer = el
+            .closest(drawer)
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let rect = el.get_bounding_client_rect();
+        assert!(
+            rect.left() >= outer.left() - 0.5 && rect.right() <= outer.right() + 0.5,
+            "{at}: the URL overflows the drawer ({} .. {} outside {} .. {})",
+            rect.left(),
+            rect.right(),
+            outer.left(),
+            outer.right()
+        );
+        assert!(
+            el.client_width() > 0 && el.scroll_width() <= el.client_width(),
+            "{at}: the URL is clipped (scrollWidth {} > clientWidth {})",
+            el.scroll_width(),
+            el.client_width()
+        );
+    }
+
+    fn active_url(mount: &web_sys::Element, drawer: &str) -> web_sys::Element {
+        mount
+            .query_selector(&format!("{drawer} .active-connection .active-server-url"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("no {drawer} active URL"))
+    }
+
+    fn server_label_bottom_and_url_top(mount: &web_sys::Element, drawer: &str) -> (f64, f64) {
+        let url = active_url(mount, drawer);
+        let label = url.previous_element_sibling().unwrap();
+        assert_eq!(label.text_content().as_deref(), Some("Server:"), "{drawer}");
+        (
+            label.get_bounding_client_rect().bottom(),
+            url.get_bounding_client_rect().top(),
+        )
+    }
+
+    #[wasm_bindgen_test]
+    async fn server_urls_render_whole_as_links_at_drawer_widths() {
+        let doc = gloo_utils::document();
+        let tailwind = doc.create_element("style").unwrap();
+        tailwind.set_text_content(Some(TAILWIND_CSS));
+        doc.head().unwrap().append_child(&tailwind).unwrap();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(UrlHarness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        next_frame().await;
+        next_frame().await;
+
+        let ws_href =
+            "https://websocket.videocall.some-long-cluster-hostname.example.com:443/lobby";
+        for drawer in ["#drawer-wide", "#drawer-narrow"] {
+            assert_whole_link(&active_url(&mount, drawer), drawer, WS_URL, ws_href);
+
+            let cards = mount
+                .query_selector_all(&format!("{drawer} .server-card"))
+                .unwrap();
+            assert_eq!(cards.length(), 4, "{drawer}: ws_0, ws_1, wt_0, zz_0");
+            let card = |i: u32| cards.get(i).unwrap().unchecked_into::<web_sys::Element>();
+            let card_url = |i: u32| {
+                card(i)
+                    .query_selector(".server-card-url")
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{drawer}: card {i} has no URL"))
+            };
+            assert_whole_link(&card_url(0), drawer, WS_URL, ws_href);
+            assert_whole_link(&card_url(1), drawer, SHORT_URL, SHORT_HREF);
+            assert_whole_link(&card_url(2), drawer, WT_URL, WT_URL);
+
+            assert_eq!(
+                card_url(3).text_content().as_deref(),
+                Some(HOSTILE_URL),
+                "{drawer}"
+            );
+            assert!(
+                card(3).query_selector("a").unwrap().is_none(),
+                "{drawer}: the {HOSTILE_URL} card carries an anchor"
+            );
+        }
+
+        let short_card_url = mount
+            .query_selector(&format!("#drawer-wide .server-card a[href='{SHORT_HREF}']"))
+            .unwrap()
+            .unwrap();
+        let link = short_card_url.get_bounding_client_rect().width();
+        let row = short_card_url
+            .parent_element()
+            .unwrap()
+            .get_bounding_client_rect()
+            .width();
+        assert!(
+            link < row - 1.0,
+            "#drawer-wide: the {SHORT_URL} link spans the card ({link} of {row}px)"
+        );
+
+        let (label_bottom, url_top) = server_label_bottom_and_url_top(&mount, "#drawer-narrow");
+        assert!(
+            url_top >= label_bottom - 0.5,
+            "#drawer-narrow: the URL that does not fit beside \"Server:\" starts at {url_top}, \
+             above the label's bottom {label_bottom}, instead of wrapping under it"
+        );
+
+        assert_whole_link(
+            &active_url(&mount, "#drawer-short"),
+            "#drawer-short",
+            SHORT_URL,
+            SHORT_HREF,
+        );
+        let (label_bottom, url_top) = server_label_bottom_and_url_top(&mount, "#drawer-short");
+        assert!(
+            url_top < label_bottom,
+            "#drawer-short: {SHORT_URL} fits beside \"Server:\" but starts at {url_top}, \
+             under the label's bottom {label_bottom}"
+        );
+        mount.remove();
+        tailwind.remove();
     }
 }

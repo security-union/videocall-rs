@@ -3,6 +3,7 @@
 export const SCREEN_SHARE_COORDINATION_LOG = "CameraEncoder: screen sharing ACTIVE";
 export const TIER_CHANGE_LOG = "CameraEncoder: tier changed to";
 export const FORCED_KEYFRAME_LOG = "CameraEncoder: forcing keyframe at frame";
+export const PERIODIC_KEYFRAME_LOG = "CameraEncoder: periodic keyframe at frame";
 
 // Substring of both the `TierChange` and `Both` labels, so a concurrent PLI matches.
 export const TIER_CHANGE_CAUSE = "tier change";

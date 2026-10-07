@@ -192,25 +192,24 @@ test.describe("Density settings", () => {
     ).toHaveCount(1);
   });
 
-  test("Tiling section exists in Appearance settings", async ({ page }) => {
+  test("Tiling section exists in Preferences settings", async ({ page }) => {
     await joinMeeting(page, "tiling_appearance");
 
     await openSettingsModal(page);
 
-    // Navigate to Appearance tab
-    await page.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-    await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
+    await page.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+    await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
 
     // Verify "Tiling" section heading is visible
     await expect(
-      page.locator("#settings-panel-appearance .appearance-section-title").filter({
+      page.locator("#settings-panel-preferences .appearance-section-title").filter({
         hasText: "Tiling",
       }),
     ).toBeVisible();
 
     // Verify the segmented control group for density mode exists
     const densityGroup = page.locator(
-      '#settings-panel-appearance .transport-segmented[role="radiogroup"][aria-label="Tile density mode"]',
+      '#settings-panel-preferences .transport-segmented[role="radiogroup"][aria-label="Tile density mode"]',
     );
     await expect(densityGroup).toBeVisible();
 
@@ -219,18 +218,17 @@ test.describe("Density settings", () => {
     await expect(radioButtons).toHaveCount(4);
   });
 
-  test("density selection in Appearance syncs with popover", async ({ page }) => {
+  test("density selection in Preferences syncs with popover", async ({ page }) => {
     await joinMeeting(page, "appearance_sync");
 
     await openSettingsModal(page);
 
-    // Navigate to Appearance tab
-    await page.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-    await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
+    await page.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+    await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
 
-    // Select Standard in the Appearance settings
+    // Select Standard in the Preferences settings
     const densityGroup = page.locator(
-      '#settings-panel-appearance .transport-segmented[role="radiogroup"][aria-label="Tile density mode"]',
+      '#settings-panel-preferences .transport-segmented[role="radiogroup"][aria-label="Tile density mode"]',
     );
     await densityGroup.locator('button[role="radio"]').filter({ hasText: "Standard" }).click();
 

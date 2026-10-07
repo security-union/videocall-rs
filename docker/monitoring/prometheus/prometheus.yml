@@ -3,31 +3,33 @@ global:
   evaluation_interval: 15s
 
 rule_files:
-  - "alert_rules.yml"
+  - /etc/prometheus/alert_rules.yml
 
 scrape_configs:
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
-  
+
   # Client health metrics (sessions, NetEQ, video quality, etc.)
   - job_name: 'videocall-client-metrics'
     static_configs:
       - targets: ['metrics-api:9091']
     metrics_path: '/metrics'
-    scrape_interval: 5s
-    scrape_timeout: 4s
 
   # Server connection tracking (with session_id, stale cleanup, etc.)
   - job_name: 'videocall-server-stats'
     static_configs:
       - targets: ['server-stats-api:9092']
     metrics_path: '/metrics'
-    scrape_interval: 5s
-    scrape_timeout: 4s
 
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets:
-          # - alertmanager:9093
+  # WS relay serves /metrics on its app port. entrypoint.sh rewrites this exact
+  # target line to $WS_RELAY_PORT.
+  - job_name: 'relay-ws'
+    static_configs:
+      - targets: ['websocket-api:8080']
+    metrics_path: '/metrics'
+
+  - job_name: 'relay-wt'
+    static_configs:
+      - targets: ['webtransport-api:5321']
+    metrics_path: '/metrics'

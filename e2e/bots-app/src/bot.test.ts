@@ -1,7 +1,9 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   addInitScript: vi.fn(),
@@ -51,12 +53,20 @@ vi.mock("./meeting-join", async (importOriginal) => {
 import {
   BOT_RECEIVE_POSTURE,
   browserEnvWithoutFleetCreds,
+  type DiagPacketsObservation,
   ENCODER_FPS_POLL_MS,
   isBenignTeardownError,
   launchBot,
+  parseDiagPacketsLine,
 } from "./bot";
 import { openSsoCaptureBrowser } from "./auth/sso-capture";
 import { CAMERA_CYCLE_NEVER_FIRED_BANNER } from "./camera-cycle";
+import {
+  buildDecodeBudgetInitScript,
+  DECODE_BUDGET_STORAGE_KEY,
+  DecodeBudgetNotAppliedError,
+} from "./decode-budget";
+import { HANG_UP_SELECTOR, PRE_MARKER_UI_BANNER } from "./control-buttons";
 import { SD_SOURCE } from "./posture";
 
 const CLOCK_SOURCE_PATH = fileURLToPath(new URL("./clock-source.js", import.meta.url));
@@ -97,6 +107,7 @@ describe("isBenignTeardownError", () => {
 });
 
 describe("launchBot clock mode", () => {
+  let pageOn: ReturnType<typeof vi.fn>;
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.browserClose.mockResolvedValue(undefined);
@@ -111,6 +122,7 @@ describe("launchBot clock mode", () => {
       on: vi.fn(),
       url: vi.fn(() => "https://example.test/meeting/ClockTest"),
     };
+    pageOn = page.on;
     const context = {
       close: mocks.contextClose,
       newPage: vi.fn().mockResolvedValue(page),
@@ -131,6 +143,28 @@ describe("launchBot clock mode", () => {
       audioPath: "/tmp/audio.wav",
       videoPath: "/tmp/video.y4m",
     });
+  });
+
+  it("resolves crashDetected on an unasked browser disconnect or page crash (#2917)", async () => {
+    const opts = {
+      meetingURL: "https://example.test/meeting/ClockTest",
+      participant: "clock-bot",
+      displayName: "Clock Bot",
+      headless: true,
+      videoMode: "clock" as const,
+      authBackend: "none" as const,
+      sourceGeometry: SD_SOURCE,
+    };
+    const handlerOf = (target: { on: ReturnType<typeof vi.fn> }, event: string) =>
+      target.on.mock.calls.filter((c) => c[0] === event).at(-1)?.[1] as () => void;
+    for (const [pick, event, detail] of [
+      ["browser", "disconnected", "browser disconnected unexpectedly"],
+      ["page", "crash", "page crashed"],
+    ] as const) {
+      const bot = await launchBot(opts);
+      handlerOf((pick === "browser" ? bot.browser : bot.page) as never, event)();
+      await expect(bot.crashDetected).resolves.toBe(detail);
+    }
   });
 
   it("registers the participant and clock source without priming or fake-file capture", async () => {
@@ -170,6 +204,49 @@ describe("launchBot clock mode", () => {
         expect.stringMatching(/^--use-file-for-fake-(?:audio|video)-capture=/),
       ]),
     );
+  });
+
+  it("forwards the requested join media and exposes what the join observed (#2914)", async () => {
+    const base = {
+      meetingURL: "https://example.test/meeting/ClockTest",
+      participant: "clock-bot",
+      displayName: "Clock Bot",
+      headless: true,
+      videoMode: "clock" as const,
+      authBackend: "none" as const,
+      sourceGeometry: SD_SOURCE,
+    };
+    mocks.joinMeetingAndEnableMedia.mockResolvedValueOnce({ camera: false, mic: null });
+    const handle = await launchBot({ ...base, joinMedia: { camera: false, mic: true } });
+    expect(mocks.joinMeetingAndEnableMedia.mock.calls[0][0].media).toEqual({
+      camera: false,
+      mic: true,
+    });
+    expect(handle.joinMedia).toEqual({ camera: false, mic: null });
+
+    const onResponse = (pageOn.mock.calls as Array<[string, (r: unknown) => void]>).find(
+      ([ev]) => ev === "response",
+    )?.[1];
+    expect(onResponse).toBeDefined();
+    const respond = (url: string, body: unknown, ok = true): void =>
+      onResponse?.({ ok: () => ok, url: () => url, json: () => Promise.resolve(body) });
+    expect(handle.sessionUserId()).toBeNull();
+    respond("https://api.example.test/api/v1/meetings/ClockTest/join", {
+      success: true,
+      result: { user_id: "bot-7@labs.example", status: "waiting" },
+    });
+    respond("https://api.example.test/api/v1/meetings/Other/join", {
+      success: true,
+      result: { user_id: "wrong@labs.example" },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(handle.sessionUserId()).toBe("bot-7@labs.example");
+
+    await launchBot(base);
+    expect(mocks.joinMeetingAndEnableMedia.mock.calls[1][0].media).toEqual({
+      camera: true,
+      mic: true,
+    });
   });
 
   it("injects the task's source geometry in the label's own init script (#2236)", async () => {
@@ -1037,6 +1114,162 @@ describe("launchBot hardwareConcurrency spoof (#2035)", () => {
   });
 });
 
+describe("launchBot decode budget (#2914)", () => {
+  let goto: ReturnType<typeof vi.fn>;
+  let browserClose: ReturnType<typeof vi.fn>;
+  let hangUpClick: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    goto = vi.fn().mockResolvedValue(undefined);
+    browserClose = vi.fn().mockResolvedValue(undefined);
+    hangUpClick = vi.fn().mockResolvedValue(undefined);
+    const page = {
+      addInitScript: mocks.addInitScript,
+      evaluate: mocks.pageEvaluate,
+      goto,
+      locator: vi.fn((selector: string) => ({
+        isVisible: async () => selector === HANG_UP_SELECTOR,
+        click: hangUpClick,
+      })),
+      off: vi.fn(),
+      on: vi.fn(),
+      url: vi.fn(() => "https://example.test/meeting/DbTest"),
+      waitForURL: vi.fn().mockResolvedValue(undefined),
+    };
+    const context = {
+      close: vi.fn().mockResolvedValue(undefined),
+      newPage: vi.fn().mockResolvedValue(page),
+    };
+    mocks.launch.mockResolvedValue({
+      close: browserClose,
+      newContext: vi.fn().mockResolvedValue(context),
+      on: vi.fn(),
+    });
+    mocks.addInitScript.mockResolvedValue(undefined);
+    mocks.joinMeetingAndEnableMedia.mockResolvedValue(undefined);
+  });
+
+  const baseOpts = {
+    meetingURL: "https://example.test/meeting/DbTest",
+    participant: "db-bot",
+    displayName: "DB Bot",
+    headless: true,
+    videoMode: "clock" as const,
+    authBackend: "none" as const,
+    sourceGeometry: SD_SOURCE,
+  };
+  const SEED = buildDecodeBudgetInitScript("https://example.test");
+  const storage = (value: string | null | Error) =>
+    mocks.pageEvaluate.mockImplementation(async (_fn: unknown, arg: unknown) => {
+      if (arg !== DECODE_BUDGET_STORAGE_KEY) return undefined;
+      if (value instanceof Error) throw value;
+      return value;
+    });
+  const readbacks = () =>
+    mocks.pageEvaluate.mock.calls.filter((c) => c[1] === DECODE_BUDGET_STORAGE_KEY);
+
+  it("off seeds the override before the first navigation and reads it back after join", async () => {
+    storage("all");
+    const bot = await launchBot({ ...baseOpts, decodeBudget: "off" });
+    const idx = mocks.addInitScript.mock.calls.findIndex((c) => c[0] === SEED);
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(mocks.addInitScript.mock.invocationCallOrder[idx]).toBeLessThan(
+      goto.mock.invocationCallOrder[0],
+    );
+    expect(readbacks()).toHaveLength(1);
+    expect(readbacks()[0][0].toString()).toContain("localStorage.getItem");
+    expect(mocks.pageEvaluate.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mocks.joinMeetingAndEnableMedia.mock.invocationCallOrder[0],
+    );
+    expect(bot.decodeBudgetReadback).toBe("all");
+    expect(browserClose).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, "client"] as const)(
+    "decodeBudget %j installs nothing and reads nothing back",
+    async (decodeBudget) => {
+      storage("all");
+      const bot = await launchBot({ ...baseOpts, decodeBudget });
+      const touched = mocks.addInitScript.mock.calls.some(
+        (c) => typeof c[0] === "string" && c[0].includes(DECODE_BUDGET_STORAGE_KEY),
+      );
+      expect(touched).toBe(false);
+      expect(readbacks()).toHaveLength(0);
+      expect(bot.decodeBudgetReadback).toBeNull();
+    },
+  );
+
+  it.each([
+    ["absent", null],
+    ["a different value", "auto"],
+    ["an evaluate failure", new Error("Execution context was destroyed")],
+  ] as const)("hangs up, closes the browser and fails the launch on %s", async (_what, value) => {
+    storage(value);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const launched = launchBot({ ...baseOpts, decodeBudget: "off" });
+      await expect(launched).rejects.toBeInstanceOf(DecodeBudgetNotAppliedError);
+      await expect(launched).rejects.toMatchObject({
+        observed: value instanceof Error ? null : value,
+      });
+      expect(browserClose).toHaveBeenCalledTimes(1);
+      expect(hangUpClick).toHaveBeenCalledTimes(1);
+      expect(hangUpClick.mock.invocationCallOrder[0]).toBeLessThan(
+        browserClose.mock.invocationCallOrder[0],
+      );
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  describe("client with a replayed SSO state", () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "bots-db-"));
+      writeFileSync(join(dir, "sso.json"), '{"cookies":[],"origins":[]}');
+    });
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+    const ssoOpts = () => ({
+      ...baseOpts,
+      authBackend: "jwt" as const,
+      ssoStateFile: join(dir, "sso.json"),
+      decodeBudget: "client" as const,
+    });
+
+    it("reads a stray override back, warns, and keeps the bot running", async () => {
+      storage("4");
+      const errors: string[] = [];
+      const errSpy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+        errors.push(a.map(String).join(" "));
+      });
+      try {
+        const bot = await launchBot(ssoOpts());
+        expect(bot.decodeBudgetReadback).toBe("4");
+        expect(browserClose).not.toHaveBeenCalled();
+        expect(errors.join("\n")).toContain(
+          "decode budget client requested but vc_decode_budget_override=4 is in storage",
+        );
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
+
+    it("stays quiet when the replayed storage has no override", async () => {
+      storage(null);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const bot = await launchBot(ssoOpts());
+        expect(readbacks()).toHaveLength(1);
+        expect(bot.decodeBudgetReadback).toBeNull();
+        expect(errSpy).not.toHaveBeenCalled();
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
+  });
+});
+
 describe("launchBot receive posture (#2235)", () => {
   // Why the posture matters at all: see `BOT_RECEIVE_POSTURE`.
   let newContext: ReturnType<typeof vi.fn>;
@@ -1331,5 +1564,256 @@ describe("launchBot camera cycle wiring (#2362)", () => {
     // No timer advanced, so no toggle fired — and the receipt must say so
     // rather than being absent.
     expect(lines.some((l) => l.includes(CAMERA_CYCLE_NEVER_FIRED_BANNER))).toBe(true);
+  });
+});
+
+describe("launchBot leaveMeeting fallback banner (#2486)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const button = (selector: string): unknown => ({
+      isVisible: async () => selector !== HANG_UP_SELECTOR,
+      click: async () => {},
+    });
+    const page = {
+      addInitScript: mocks.addInitScript.mockResolvedValue(undefined),
+      evaluate: mocks.pageEvaluate,
+      goto: vi.fn().mockResolvedValue(undefined),
+      locator: vi.fn(button),
+      off: vi.fn(),
+      on: vi.fn(),
+      url: vi.fn(() => "https://example.test/meeting/ClockTest"),
+      waitForURL: vi.fn().mockResolvedValue(undefined),
+    };
+    mocks.launch.mockResolvedValue({
+      close: vi.fn().mockResolvedValue(undefined),
+      newContext: vi.fn().mockResolvedValue({
+        close: vi.fn().mockResolvedValue(undefined),
+        newPage: vi.fn().mockResolvedValue(page),
+      }),
+      on: vi.fn(),
+    });
+    mocks.joinMeetingAndEnableMedia.mockResolvedValue(undefined);
+  });
+
+  it("tags the tooltip-fallback banner with the bot label", async () => {
+    const bot = await launchBot({
+      meetingURL: "https://example.test/meeting/ClockTest",
+      participant: "clock-bot",
+      displayName: "Clock Bot",
+      headless: true,
+      videoMode: "clock",
+      authBackend: "none",
+      sourceGeometry: SD_SOURCE,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await bot.leaveMeeting();
+      const banners = warn.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.includes(PRE_MARKER_UI_BANNER));
+      expect(banners).toEqual([
+        expect.stringMatching(new RegExp(`^\\[clock-bot\\] ${PRE_MARKER_UI_BANNER} leaveMeeting:`)),
+      ]);
+    } finally {
+      warn.mockRestore();
+      await bot.shutdown();
+    }
+  });
+});
+
+describe("launchBot page-event writers compose before sanitising (#2484)", () => {
+  const FORGED = "[clock-bot] FORGED-BY-PAGE-EVENT";
+  const on = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    on.mockReset();
+    const page = {
+      addInitScript: mocks.addInitScript.mockResolvedValue(undefined),
+      evaluate: mocks.pageEvaluate,
+      goto: vi.fn().mockResolvedValue(undefined),
+      locator: vi.fn(),
+      off: vi.fn(),
+      on,
+      url: vi.fn(() => "https://example.test/meeting/ClockTest"),
+    };
+    mocks.launch.mockResolvedValue({
+      close: vi.fn().mockResolvedValue(undefined),
+      newContext: vi.fn().mockResolvedValue({
+        close: vi.fn().mockResolvedValue(undefined),
+        newPage: vi.fn().mockResolvedValue(page),
+      }),
+      on: vi.fn(),
+    });
+    mocks.joinMeetingAndEnableMedia.mockResolvedValue(undefined);
+  });
+
+  async function linesFrom(event: string, payload: unknown): Promise<string[]> {
+    const bot = await launchBot({
+      meetingURL: "https://example.test/meeting/ClockTest",
+      participant: "clock-bot",
+      displayName: "Clock Bot",
+      headless: true,
+      videoMode: "clock",
+      authBackend: "none",
+      sourceGeometry: SD_SOURCE,
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const handler = on.mock.calls.find(([e]) => e === event)?.[1] as (p: unknown) => void;
+      handler(payload);
+      return err.mock.calls.map((c) => c.map(String).join(" ")).flatMap((l) => l.split(/[\r\n]/));
+    } finally {
+      err.mockRestore();
+      await bot.shutdown();
+    }
+  }
+
+  function expectCollapsed(lines: string[], site: string): void {
+    expect(lines.filter((l) => l.startsWith(FORGED))).toEqual([]);
+    expect(lines.filter((l) => l.includes(site) && l.includes(FORGED))).toHaveLength(1);
+  }
+
+  it("pageerror", async () => {
+    const lines = await linesFrom("pageerror", new Error(`boom\n${FORGED}`));
+    expectCollapsed(lines, "[clock-bot] pageerror:");
+  });
+
+  it("console.error", async () => {
+    const msg = { type: () => "error", text: () => `boom\n${FORGED}` };
+    const lines = await linesFrom("console", msg);
+    expectCollapsed(lines, "[clock-bot] console.error:");
+  });
+});
+
+describe("diagnostics packets switch in launchBot (#2970)", () => {
+  const on = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    on.mockReset();
+    const page = {
+      addInitScript: mocks.addInitScript.mockResolvedValue(undefined),
+      evaluate: mocks.pageEvaluate,
+      goto: vi.fn().mockResolvedValue(undefined),
+      locator: vi.fn(),
+      off: vi.fn(),
+      on,
+      url: vi.fn(() => "https://app.example.test/meeting/DiagTest"),
+    };
+    mocks.launch.mockResolvedValue({
+      close: vi.fn().mockResolvedValue(undefined),
+      newContext: vi.fn().mockResolvedValue({
+        close: vi.fn().mockResolvedValue(undefined),
+        newPage: vi.fn().mockResolvedValue(page),
+      }),
+      on: vi.fn(),
+    });
+    mocks.joinMeetingAndEnableMedia.mockResolvedValue(undefined);
+  });
+
+  const baseOpts = {
+    meetingURL: "https://app.example.test/meeting/DiagTest?x=1",
+    participant: "diag-bot",
+    displayName: "Diag Bot",
+    headless: true,
+    videoMode: "clock" as const,
+    authBackend: "none" as const,
+    sourceGeometry: SD_SOURCE,
+  };
+
+  const appConfigScripts = (): string[] =>
+    mocks.addInitScript.mock.calls
+      .map((c) => c[0])
+      .filter((s): s is string => typeof s === "string" && s.includes("__APP_CONFIG"));
+
+  function emitConsole(type: string, text: string): void {
+    for (const [event, handler] of on.mock.calls) {
+      if (event === "console")
+        (handler as (m: unknown) => void)({ type: () => type, text: () => text });
+    }
+  }
+
+  it("adds the key to the ONE receiver-caps script, guarded to the meeting's origin", async () => {
+    const bot = await launchBot({ ...baseOpts, maxReceivedLayer: 0, diagPackets: "off" });
+    await bot.shutdown();
+    const scripts = appConfigScripts();
+    expect(scripts).toHaveLength(1);
+    expect(scripts[0]).toContain('"diagnosticsPacketsEnabled":"0"');
+    expect(scripts[0]).toContain('"maxReceivedLayer":0');
+    expect(scripts[0]).toContain('location.origin !== "https://app.example.test"');
+  });
+
+  it("injects no __APP_CONFIG script when unset", async () => {
+    const bot = await launchBot(baseOpts);
+    await bot.shutdown();
+    expect(appConfigScripts()).toEqual([]);
+  });
+
+  it("forwards the client's line from an info console message", async () => {
+    const seen: DiagPacketsObservation[] = [];
+    const bot = await launchBot({ ...baseOpts, onDiagPackets: (o) => seen.push(o) });
+    emitConsole(
+      "info",
+      "INFO src/components/attendants.rs:4418 diagnostics packets: DISABLED (source=config)",
+    );
+    await bot.shutdown();
+    expect(seen).toEqual([{ state: "DISABLED", source: "config" }]);
+  });
+
+  it("logs every observation with its state and source, not only ENABLED", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const bot = await launchBot({ ...baseOpts, diagPackets: "off" });
+    try {
+      log.mockClear();
+      emitConsole("info", "diagnostics packets: DISABLED (source=config)");
+      expect(log.mock.calls.map((c) => c.map(String).join(" "))).toEqual([
+        expect.stringMatching(/^\[diag-bot\] diagnostics packets: DISABLED \(source=config\)$/),
+      ]);
+    } finally {
+      log.mockRestore();
+      await bot.shutdown();
+    }
+  });
+
+  it("logs an error when off was requested and the client still sends", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bot = await launchBot({ ...baseOpts, diagPackets: "off", onDiagPackets: () => {} });
+    try {
+      emitConsole("log", "diagnostics packets: ENABLED (source=default)");
+      expect(err.mock.calls.map((c) => c.map(String).join(" ")).join("\n")).toContain(
+        "--diag-packets off requested but the client logged ENABLED (source=default)",
+      );
+    } finally {
+      err.mockRestore();
+      await bot.shutdown();
+    }
+  });
+
+  it("prints no off-requested error for a default bot that logs ENABLED", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bot = await launchBot(baseOpts);
+    try {
+      emitConsole("info", "diagnostics packets: ENABLED (source=default)");
+      expect(err.mock.calls.flat().map(String).join("\n")).not.toContain("--diag-packets off");
+    } finally {
+      err.mockRestore();
+      await bot.shutdown();
+    }
+  });
+
+  it("rejects near-miss lines", () => {
+    expect(parseDiagPacketsLine("diagnostics packets: ENABLED (source=url)")).toEqual({
+      state: "ENABLED",
+      source: "url",
+    });
+    for (const text of [
+      "diagnostics packets: disabled (source=config)",
+      "diagnostics packets: DISABLED (source=env)",
+      "diagnostics packets: DISABLED",
+      "diagnostic packets: DISABLED (source=config)",
+    ]) {
+      expect(parseDiagPacketsLine(text)).toBeNull();
+    }
   });
 });

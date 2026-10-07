@@ -1250,6 +1250,10 @@ mod tests {
             display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
+            kick_rate_limiter: std::sync::Arc::new(
+                crate::rate_limit::KeyedRateLimiter::for_host_kicks(),
+            ),
+            recording: Default::default(),
             search: None,
             display_name_rate_limit_disabled: false,
             dev_user: None,

@@ -398,6 +398,12 @@ impl BotAq {
         ctrl.observe_encoder_queue_depth(depth);
     }
 
+    /// Record the relay's camera `LAYER_HINT` (the highest video layer id any
+    /// receiver wants; `u32::MAX` = no cap). The next [`Self::tick`] applies it.
+    pub fn observe_layer_hint(&self, max_layer: u32) {
+        self.lock_ctrl().observe_union_requested_layer(max_layer);
+    }
+
     /// Aggressively cut quality on a self-targeted server CONGESTION signal
     /// (issue #1108 thin wrapper over the controller's kept `force_congestion_cut`).
     /// Republishes the tier snapshot if the tier changed.

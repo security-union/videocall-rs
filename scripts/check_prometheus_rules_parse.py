@@ -52,6 +52,7 @@ EXPERIMENTAL_FUNCTIONS = (
 )
 
 DEFAULT_FILES = tuple(REPO_ROOT / c.values for c in parity.CLUSTERS)
+RULE_TESTS_DIR = REPO_ROOT / "helm" / "global" / "prometheus-rule-tests"
 
 
 def rule_subtrees(text):
@@ -179,13 +180,45 @@ def stage_rules(workdir, files_by_label):
     return entries, problems
 
 
-def promtool_argv(exe, workdir, image, name):
+def promtool_argv(exe, workdir, image, name, command=("check", "rules")):
     """Run as the invoking user; promtool reads one file and needs no home."""
     argv = [exe, "run", "--rm", "--entrypoint", "promtool"]
     if hasattr(os, "getuid"):
         argv += ["--user", "%d:%d" % (os.getuid(), os.getgid())]
-    argv += ["-v", "%s:/rules" % workdir, image, "check", "rules", "/rules/%s" % name]
+    argv += ["-v", "%s:/rules" % workdir, image, *command, "/rules/%s" % name]
     return argv
+
+
+def rule_test_files():
+    return sorted(RULE_TESTS_DIR.glob("*.test.yaml"))
+
+
+def stage_rule_tests(workdir, files_by_label, tests):
+    by_cluster = {}
+    for label, rule_text in files_by_label.items():
+        cluster, key = label.split("::", 1)
+        by_cluster.setdefault(cluster, {})[key] = rule_text
+    runs = []
+    for cluster, rules in sorted(by_cluster.items()):
+        d = workdir / ("tests__" + cluster)
+        d.mkdir()
+        os.chmod(d, 0o755)
+        for key, rule_text in rules.items():
+            (d / key).write_text(rule_text)
+            os.chmod(d / key, 0o644)
+        header = "rule_files:\n" + "".join("  - %s\n" % k for k in sorted(rules))
+        for test in tests:
+            (d / test.name).write_text(header + test.read_text())
+            os.chmod(d / test.name, 0o644)
+            runs.append("%s/%s" % (d.name, test.name))
+    return runs
+
+
+def rule_test_verdict(image, name, returncode, output):
+    if returncode == 0 and "SUCCESS" in output:
+        return None
+    return "%s %s: promtool test rules FAILED (exit %d)\n%s" % (
+        image, name, returncode, output.strip() or "(no output)")
 
 
 def promtool_problems(exe, images, files_by_label):
@@ -204,6 +237,18 @@ def promtool_problems(exe, images, files_by_label):
                 bad = promtool_verdict(
                     image, name, expected, res.returncode, res.stdout + res.stderr
                 )
+                if bad:
+                    problems.append(bad)
+        runs = stage_rule_tests(workdir, files_by_label, rule_test_files())
+        for image in images:
+            print("  %s: promtool test rules on %d staged test(s)" % (image, len(runs)))
+            for name in runs:
+                res = subprocess.run(
+                    promtool_argv(exe, workdir, image, name, ("test", "rules")),
+                    capture_output=True,
+                    text=True,
+                )
+                bad = rule_test_verdict(image, name, res.returncode, res.stdout + res.stderr)
                 if bad:
                     problems.append(bad)
     finally:
@@ -235,6 +280,9 @@ def main(argv):
             label = "%s::%s" % (cluster.key if cluster else p.parent.parent.name, key)
             files_by_label[label] = rule_text
             failures.extend(static_problems(label, rule_text))
+
+    if not rule_test_files():
+        failures.append("%s: no *.test.yaml rule unit tests found." % RULE_TESTS_DIR)
 
     images = tuple(
         i.strip() for i in os.environ.get("PROMTOOL_IMAGES", "").split(",") if i.strip()

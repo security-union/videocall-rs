@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Renews the local participant's presence lease on an interval while
-//! lingering in the pre-join lobby, before `PRESENCE_CONNECT_WINDOW_SECS`
-//! expires the REST `/join` admission.
+//! Renews the local participant's presence lease on an interval while they sit
+//! in the waiting room, or linger in the pre-join lobby before
+//! `PRESENCE_CONNECT_WINDOW_SECS` expires the REST `/join` admission.
 
 use dioxus::prelude::*;
+use futures::future::{select, Either};
 use gloo_timers::callback::Interval;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -16,8 +17,8 @@ use crate::meeting_api::JoinError;
 pub enum KeepaliveOutcome {
     /// Keep the interval armed; try again next tick.
     Continue,
-    /// The server said there is nothing left to renew (not admitted, already
-    /// connected, or the meeting ended) — stop calling.
+    /// The server said there is nothing left to renew (neither waiting nor
+    /// admitted, already connected, or the meeting ended) — stop calling.
     Stop,
 }
 
@@ -29,20 +30,30 @@ pub fn classify_keepalive_result(result: &Result<(), JoinError>) -> KeepaliveOut
     }
 }
 
-/// Renders nothing. `interval_ms` is a test-only seam; production call sites
-/// leave it `None`.
+/// How long one keepalive may stay pending before it is abandoned, so the
+/// in-flight guard is clear again before the next tick.
+fn request_deadline_ms(interval_ms: u32) -> u32 {
+    interval_ms - interval_ms / 4
+}
+
+/// Renders nothing. Each tick sends the latest `observer_token` prop without
+/// restarting the interval. `interval_ms` is a test-only seam; production call
+/// sites leave it `None`.
 #[component]
 pub fn PresenceKeepalive(
     meeting_id: String,
     is_guest: bool,
     observer_token: String,
     meeting_joined: Signal<bool>,
+    #[props(default = true)] stop_on_not_found: bool,
     #[props(default)] interval_ms: Option<u32>,
 ) -> Element {
     type KeepaliveCell = Rc<RefCell<Option<Interval>>>;
     let cell: KeepaliveCell = use_hook(|| Rc::new(RefCell::new(None)));
     let cell_effect = cell.clone();
     let in_flight: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+    let latest_token: Rc<RefCell<String>> = use_hook(|| Rc::new(RefCell::new(String::new())));
+    *latest_token.borrow_mut() = observer_token;
     use_effect(move || {
         if meeting_joined() {
             *cell_effect.borrow_mut() = None;
@@ -51,11 +62,13 @@ pub fn PresenceKeepalive(
         if cell_effect.borrow().is_some() {
             return;
         }
-        let meeting_id = meeting_id.clone();
-        let observer_token = observer_token.clone();
+        let ms = interval_ms.unwrap_or(
+            (videocall_meeting_types::presence::PRESENCE_HEARTBEAT_INTERVAL_SECS * 1000) as u32,
+        );
+        let deadline_ms = request_deadline_ms(ms);
         let fire = {
             let meeting_id = meeting_id.clone();
-            let observer_token = observer_token.clone();
+            let latest_token = latest_token.clone();
             let stop = cell_effect.clone();
             let in_flight = in_flight.clone();
             move || {
@@ -67,21 +80,39 @@ pub fn PresenceKeepalive(
                 }
                 in_flight.set(true);
                 let meeting_id = meeting_id.clone();
-                let observer_token = observer_token.clone();
+                let observer_token = latest_token.borrow().clone();
                 let stop = stop.clone();
                 let in_flight = in_flight.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let result = if is_guest {
-                        crate::meeting_api::presence_keepalive_guest(&meeting_id, &observer_token)
+                    let request = async {
+                        if is_guest {
+                            crate::meeting_api::presence_keepalive_guest(
+                                &meeting_id,
+                                &observer_token,
+                            )
                             .await
-                    } else {
-                        crate::meeting_api::presence_keepalive(&meeting_id).await
+                        } else {
+                            crate::meeting_api::presence_keepalive(&meeting_id).await
+                        }
+                    };
+                    let deadline = gloo_timers::future::TimeoutFuture::new(deadline_ms);
+                    let result = match select(std::pin::pin!(request), deadline).await {
+                        Either::Left((result, _)) => result,
+                        Either::Right(((), _)) => {
+                            in_flight.set(false);
+                            log::warn!(
+                                "[presence-keepalive] {meeting_id}: abandoned after {deadline_ms}ms"
+                            );
+                            return;
+                        }
                     };
                     in_flight.set(false);
                     if let Err(e) = &result {
                         log::warn!("[presence-keepalive] {meeting_id}: {e:?}");
                     }
-                    if classify_keepalive_result(&result) == KeepaliveOutcome::Stop {
+                    if stop_on_not_found
+                        && classify_keepalive_result(&result) == KeepaliveOutcome::Stop
+                    {
                         log::debug!(
                             "[presence-keepalive] {meeting_id}: nothing left to renew, stopping"
                         );
@@ -91,9 +122,6 @@ pub fn PresenceKeepalive(
             }
         };
         fire();
-        let ms = interval_ms.unwrap_or(
-            (videocall_meeting_types::presence::PRESENCE_HEARTBEAT_INTERVAL_SECS * 1000) as u32,
-        );
         let interval = Interval::new(ms, fire);
         *cell_effect.borrow_mut() = Some(interval);
     });
@@ -121,6 +149,19 @@ mod tests {
             classify_keepalive_result(&Ok(())),
             KeepaliveOutcome::Continue
         );
+    }
+
+    #[test]
+    fn a_hung_request_is_abandoned_before_the_next_tick() {
+        let production_ms =
+            (videocall_meeting_types::presence::PRESENCE_HEARTBEAT_INTERVAL_SECS * 1000) as u32;
+        for interval_ms in [150, 400, production_ms] {
+            let deadline = request_deadline_ms(interval_ms);
+            assert!(
+                deadline > 0 && deadline < interval_ms,
+                "deadline {deadline}ms must fall inside the {interval_ms}ms interval"
+            );
+        }
     }
 
     #[test]

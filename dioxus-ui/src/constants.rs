@@ -253,6 +253,11 @@ pub struct RuntimeConfig {
     #[serde(rename = "defaultTransport")]
     #[serde(default)]
     pub default_transport: Option<String>,
+    /// Whether this client sends `DiagnosticsPacket`s. Absent means enabled;
+    /// a falsy value cannot be re-enabled by `?diag_packets=`.
+    #[serde(rename = "diagnosticsPacketsEnabled")]
+    #[serde(default)]
+    pub diagnostics_packets_enabled: Option<String>,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -419,6 +424,76 @@ pub fn skip_canvas_paint() -> bool {
     app_config()
         .map(|c| truthy(Some(c.skip_canvas_paint.as_str())))
         .unwrap_or(false)
+}
+
+pub fn diagnostics_packets_config_value() -> Option<String> {
+    app_config().ok()?.diagnostics_packets_enabled
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticsPacketsSource {
+    Url,
+    Config,
+    Default,
+}
+
+impl std::fmt::Display for DiagnosticsPacketsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Url => "url",
+            Self::Config => "config",
+            Self::Default => "default",
+        })
+    }
+}
+
+fn parse_diagnostics_packets_switch(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+/// Config is a ceiling: a falsy `diagnosticsPacketsEnabled` disables and the
+/// URL param is ignored; otherwise the URL param, then the config, then
+/// enabled. An empty or unrecognised value falls through to the next source.
+pub fn resolve_diagnostics_packets(
+    url_param: Option<&str>,
+    config: Option<&str>,
+) -> (bool, DiagnosticsPacketsSource) {
+    let config = config.and_then(parse_diagnostics_packets_switch);
+    if config == Some(false) {
+        return (false, DiagnosticsPacketsSource::Config);
+    }
+    if let Some(enabled) = url_param.and_then(parse_diagnostics_packets_switch) {
+        return (enabled, DiagnosticsPacketsSource::Url);
+    }
+    if config == Some(true) {
+        return (true, DiagnosticsPacketsSource::Config);
+    }
+    (true, DiagnosticsPacketsSource::Default)
+}
+
+thread_local! {
+    static DIAG_PACKETS_URL_PARAM: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Capture `?diag_packets=` from the page-load URL; `main` calls this once.
+pub fn snapshot_diagnostics_packets_url_param() {
+    let value = window()
+        .and_then(|w| w.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .and_then(|params| params.get("diag_packets"));
+    DIAG_PACKETS_URL_PARAM.with(|cell| *cell.borrow_mut() = value);
+}
+
+pub fn diagnostics_packets_resolution() -> (bool, DiagnosticsPacketsSource) {
+    let url_param = DIAG_PACKETS_URL_PARAM.with(|cell| cell.borrow().clone());
+    resolve_diagnostics_packets(
+        url_param.as_deref(),
+        diagnostics_packets_config_value().as_deref(),
+    )
 }
 
 /// Parse a `logLevel` string (case-insensitive `trace`/`debug`/`info`/`warn`/
@@ -712,6 +787,13 @@ pub(crate) fn build_datetime_local(ts: &str) -> Option<String> {
     })
 }
 
+/// [`build_datetime_local`] to the minute (e.g. `Jun 19, 2026, 6:48 AM PDT`), with
+/// one `Intl.DateTimeFormat` shared by every timestamp the returned closure formats.
+pub(crate) fn build_datetime_local_minutes_formatter() -> impl Fn(&str) -> Option<String> {
+    let format = crate::components::meeting_format::ZonedDateTimeFormat::new(false);
+    move |ts| build_datetime_local_with(ts, |ms| format.format(ms))
+}
+
 /// Issue #1789: render a build timestamp as a bare `YYYY-MM-DD` calendar date in
 /// the **viewer's local timezone**. Replaces the raw-UTC [`build_date`] at the
 /// home-page footer so a near-midnight-UTC build shows the day that matches the
@@ -975,6 +1057,134 @@ mod simulcast_default_tests {
 }
 
 #[cfg(test)]
+mod diagnostics_packets_tests {
+    use super::{resolve_diagnostics_packets, DiagnosticsPacketsSource as Src};
+
+    #[test]
+    fn defaults_to_enabled_when_no_source_is_set() {
+        assert_eq!(
+            resolve_diagnostics_packets(None, None),
+            (true, Src::Default)
+        );
+    }
+
+    #[test]
+    fn falsy_config_is_a_ceiling_the_url_cannot_lift() {
+        for url in [
+            None,
+            Some("1"),
+            Some("on"),
+            Some("yes"),
+            Some("true"),
+            Some("0"),
+        ] {
+            assert_eq!(
+                resolve_diagnostics_packets(url, Some("0")),
+                (false, Src::Config),
+                "url={url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_can_disable_when_config_allows() {
+        assert_eq!(
+            resolve_diagnostics_packets(Some("0"), None),
+            (false, Src::Url)
+        );
+        assert_eq!(
+            resolve_diagnostics_packets(Some("0"), Some("1")),
+            (false, Src::Url)
+        );
+    }
+
+    #[test]
+    fn enabled_source_labels() {
+        assert_eq!(
+            resolve_diagnostics_packets(Some("1"), Some("1")),
+            (true, Src::Url)
+        );
+        assert_eq!(
+            resolve_diagnostics_packets(Some("1"), None),
+            (true, Src::Url)
+        );
+        assert_eq!(
+            resolve_diagnostics_packets(None, Some("1")),
+            (true, Src::Config)
+        );
+        assert_eq!(
+            resolve_diagnostics_packets(Some("maybe"), Some("1")),
+            (true, Src::Config)
+        );
+    }
+
+    #[test]
+    fn config_applies_when_url_param_is_absent() {
+        assert_eq!(
+            resolve_diagnostics_packets(None, Some("false")),
+            (false, Src::Config)
+        );
+        assert_eq!(
+            resolve_diagnostics_packets(None, Some("true")),
+            (true, Src::Config)
+        );
+    }
+
+    #[test]
+    fn every_falsy_spelling_disables_case_insensitively() {
+        for raw in ["0", "false", "FALSE", "Off", "no", " NO "] {
+            assert_eq!(
+                resolve_diagnostics_packets(Some(raw), None),
+                (false, Src::Url),
+                "url={raw:?}"
+            );
+            assert_eq!(
+                resolve_diagnostics_packets(Some("1"), Some(raw)),
+                (false, Src::Config),
+                "config={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_truthy_url_spelling_lifts_a_disabling_config() {
+        for raw in ["1", "true", "TRUE", "on", "On", "yes", " YES "] {
+            assert_eq!(
+                resolve_diagnostics_packets(Some(raw), Some("0")),
+                (false, Src::Config),
+                "url={raw:?}"
+            );
+            assert_eq!(
+                resolve_diagnostics_packets(Some(raw), None),
+                (true, Src::Url),
+                "url={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_or_unrecognised_values_fall_through() {
+        for junk in ["", "  ", "maybe", "2", "disabled"] {
+            assert_eq!(
+                resolve_diagnostics_packets(Some(junk), Some("0")),
+                (false, Src::Config),
+                "url={junk:?} must fall through to config"
+            );
+            assert_eq!(
+                resolve_diagnostics_packets(Some("0"), Some(junk)),
+                (false, Src::Url),
+                "config={junk:?} must not block a url disable"
+            );
+            assert_eq!(
+                resolve_diagnostics_packets(Some(junk), Some(junk)),
+                (true, Src::Default),
+                "url/config={junk:?} must fall through to the default"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod runtime_config_tests {
     use super::RuntimeConfig;
 
@@ -1018,6 +1228,7 @@ mod runtime_config_tests {
         assert_eq!(config.server_election_period_ms, 2000);
         assert_eq!(config.max_received_layer, None);
         assert_eq!(config.skip_canvas_paint, "");
+        assert_eq!(config.diagnostics_packets_enabled, None);
     }
 }
 
@@ -1458,7 +1669,38 @@ mod build_info_tests {
 // -----------------------------------------------------------------------------
 #[cfg(test)]
 mod build_info_local_wasm_tests {
-    use super::{build_date_local, build_datetime, build_datetime_local};
+    use super::{
+        build_date_local, build_datetime, build_datetime_local,
+        build_datetime_local_minutes_formatter, build_datetime_local_with,
+    };
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn build_datetime_local_minutes_drops_the_seconds() {
+        let ts = "2024-04-28T17:00:37Z";
+        let seconds = build_datetime_local(ts).expect("parseable → Some");
+        let minutes = build_datetime_local_minutes_formatter()(ts).expect("parseable → Some");
+        assert!(seconds.contains("37"), "premise: '{seconds}' shows seconds");
+        assert!(
+            !minutes.contains("37"),
+            "'{minutes}' must stop at the minute"
+        );
+        assert!(minutes.contains("2024"), "'{minutes}' keeps the date");
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn the_shared_minutes_formatter_matches_formatting_each_timestamp_alone() {
+        let format = build_datetime_local_minutes_formatter();
+        for ts in ["2024-04-28T17:00:37Z", "2026-01-03T23:59:00Z", "unknown"] {
+            assert_eq!(
+                format(ts),
+                build_datetime_local_with(
+                    ts,
+                    crate::components::meeting_format::format_datetime_zoned
+                ),
+                "{ts}"
+            );
+        }
+    }
 
     #[wasm_bindgen_test::wasm_bindgen_test]
     fn build_datetime_local_converts_off_verbatim_utc() {

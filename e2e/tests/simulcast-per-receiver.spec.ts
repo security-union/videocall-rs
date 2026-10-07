@@ -361,21 +361,26 @@ async function pinReceiverToBaseLayer(page: Page, kind: "video" | "audio" | "scr
  *
  * Applies to BOTH publisher and receiver contexts.
  */
-async function joinMeeting(page: Page, meetingId: string, displayName: string): Promise<void> {
+async function joinMeeting(
+  page: Page,
+  meetingId: string,
+  displayName: string,
+  { micOn = true }: { micOn?: boolean } = {},
+): Promise<void> {
   // Pre-join camera AND mic default to OFF (see `load_preferred_camera_on` /
-  // `load_preferred_mic_on`, context.rs); force BOTH ON before the app boots so
-  // the publisher emits video AND audio. The audio readout specs read
+  // `load_preferred_mic_on`, context.rs); force the camera ON (and the mic to
+  // `micOn`) before the app boots. The audio readout specs read
   // the receiver's AUDIO readout, which stays "Not receiving" forever unless the
   // publisher's mic is actually sending. addInitScript runs on every navigation
   // in this page before the page's own scripts.
-  await page.addInitScript(() => {
+  await page.addInitScript((mic: boolean) => {
     try {
       window.localStorage.setItem("vc_prejoin_camera_on", "true");
-      window.localStorage.setItem("vc_prejoin_mic_on", "true");
+      window.localStorage.setItem("vc_prejoin_mic_on", mic ? "true" : "false");
     } catch {
       /* storage may be unavailable pre-navigation; the app origin sets it */
     }
-  });
+  }, micOn);
 
   // ── Home form: enter the meeting id + display name, then submit (Enter). ──
   await page.goto("/");
@@ -408,10 +413,7 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
   if (result === "join") {
     // Deterministically start the camera on the pre-join card BEFORE joining so
     // the publisher actually emits video (the receive-side needle assertions
-    // need a real decoded stream). The persisted camera-ON preference alone is
-    // NOT sufficient: `resolve_initial_enabled` (context.rs) only enables the
-    // camera at join when the pre-join device list is populated, which requires
-    // getUserMedia to have run. So grant media + ensure the camera toggle is ON
+    // need a real decoded stream): grant media + ensure the camera toggle is ON
     // + await a live preview track, then click the action button.
     const allow = page.locator('[data-testid="prejoin-permission-allow"]');
     if (await allow.isVisible().catch(() => false)) {
@@ -489,8 +491,7 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
           /* toggle may have unmounted on a fast auto-join */
         });
       }
-      // Best-effort wait for a live preview track so the device list is
-      // populated before join (this is what starts the in-meeting encoder).
+      // Best-effort wait for a live preview track before join.
       await expect
         .poll(
           async () =>
@@ -507,15 +508,13 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
         .toBeGreaterThan(0);
     }
 
-    // Enable the MIC on the pre-join card too, so the publisher actually sends
-    // audio (the receiver readout assertions need a real decoded audio stream).
-    // The persisted `vc_prejoin_mic_on=true` seed
-    // above is the primary lever; this click is belt-and-suspenders in case the
+    // Set the MIC on the pre-join card to `micOn` too. The persisted
+    // `vc_prejoin_mic_on` seed above is the primary lever; this click is belt-and-suspenders in case the
     // toggle rendered from a stale default before the seed was read. Same
     // `aria-pressed` contract as the camera toggle (pre_join_settings_card.rs).
     const micToggle = page.locator('[data-testid="prejoin-mic-toggle"]');
     if (await micToggle.isVisible().catch(() => false)) {
-      if ((await micToggle.getAttribute("aria-pressed")) !== "true") {
+      if (((await micToggle.getAttribute("aria-pressed")) === "true") !== micOn) {
         await micToggle.click().catch(() => {
           /* toggle may have unmounted on a fast auto-join */
         });
@@ -546,14 +545,14 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
  *   - Seed `vc_prejoin_camera_on=false` + `vc_prejoin_mic_on=true` BEFORE boot
  *     (the keys `context.rs::DEVICE_PREF_CAMERA_ON_KEY` / `_MIC_ON_KEY` that
  *     `load_preferred_camera_on` / `load_preferred_mic_on` read).
- *   - Grant media permission (so the device list enumerates and `want_mic` in
- *     `attendants.rs::resolve_initial_enabled(prejoin_mic_on, audio_ok, has_mic)`
- *     evaluates true). Camera permission is granted too, but the camera toggle is
- *     left OFF so `want_cam` is false and no video track is published.
+ *   - Grant media permission (so `want_mic` in `attendants.rs`, from
+ *     `context.rs::resolve_initial_enabled(prejoin_mic_on, audio_ok)`, evaluates
+ *     true). Camera permission is granted too, but the camera toggle is left OFF
+ *     so `want_cam` is false and no video track is published.
  *   - DO NOT click the camera toggle (the only thing that would turn it on).
  *   - Readiness signal is the populated MIC SELECT (`#prejoin-mic-select`,
  *     `pre_join_settings_card.rs::PREVIEW_MIC_SELECT_ID`) — it renders only once
- *     the mic device list is enumerated, which is what makes `want_mic` true.
+ *     the permission request has resolved.
  *
  * Single publisher page; no receiver is needed (the detector is publisher-side).
  */
@@ -597,9 +596,9 @@ async function joinMeetingAudioOnly(
   ]);
 
   if (result === "join") {
-    // Grant media permission so the device list enumerates (needed for the mic to
-    // actually start). Camera permission is granted too, but we never enable the
-    // camera toggle, so no video track is published.
+    // Grant media permission (needed for the mic to actually start). Camera
+    // permission is granted too, but we never enable the camera toggle, so no
+    // video track is published.
     const allow = page.locator('[data-testid="prejoin-permission-allow"]');
     if (await allow.isVisible().catch(() => false)) {
       await allow.click();
@@ -675,10 +674,7 @@ async function joinMeetingAudioOnly(
       }
     }
 
-    // Readiness: the mic SELECT renders only once the device list is enumerated,
-    // which is the same condition that makes `want_mic` true at join. Waiting on
-    // it (rather than the camera preview track, which never appears here) proves
-    // the mic will actually start.
+    // Readiness: the mic SELECT renders only once the permission request has resolved.
     await expect(page.locator("#prejoin-mic-select")).toBeVisible({ timeout: 15_000 });
 
     await page.waitForTimeout(500);
@@ -1277,9 +1273,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // 3a. LOCAL CPU pressure steps the RECEIVED simulcast layer DOWN (issue #1569).
   //
   // WHAT #1569 CHANGED (RECEIVER-ONLY): the dioxus decode-budget loop
-  // (attendants.rs) now, on the SAME Down edge that already pauses/hides peer
-  // tiles (Stage 2), ALSO calls `VideoCallClient::apply_local_cpu_pressure_
-  // congestion()` (Stage 1). That seeds synthetic downlink congestion into every
+  // (attendants.rs) now, on a Down edge, calls `VideoCallClient::apply_local_
+  // cpu_pressure_congestion()` (Stage 1); in 1:1 that is the only response (no
+  // tile is paused or hidden). That seeds synthetic downlink congestion into every
   // connected peer's receiver-side LayerChooser and publishes a lower
   // LAYER_PREFERENCE — i.e. under LOCAL CPU/render pressure this client now
   // requests a LOWER-RESOLUTION stream from its peers. Before #1569 the decode
@@ -1303,10 +1299,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //   3. The OBSERVABLE SIGNAL is the same one tests #1/#3 read — the receiver's
   //      `#perf-vu-recv-video-readout` layer index (`readVideoLayer().layerIndex`).
   //      With #1569 present it must DROP toward base (the new Stage-1 actuator
-  //      published a lower preference). With #1569 reverted, sustained low FPS
-  //      still sheds tiles but NEVER lowers the received layer, so the index
-  //      would stay at the top rung — this test FAILS on revert. That is the
-  //      mutation-sensitive proof that the new layer-down path actually fired.
+  //      published a lower preference). With #1569 reverted, or with the
+  //      one-tile Down gate (`down_step_possible`) refusing this 1:1 call, the
+  //      index stays at the top rung and this test FAILS.
   //
   // Why the layer-down is feasible here (and why the prerequisites are real):
   //   - `seed_downlink_congestion_for_connected_peers` only publishes a lower
@@ -1325,6 +1320,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   test("local CPU pressure steps the received simulcast layer DOWN (#1569)", async ({
     baseURL,
   }) => {
+    test.setTimeout(240_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_cpu_down_${Date.now()}`;
 
@@ -1342,11 +1338,13 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
     const injectFps = (page: Page, fps: number) =>
       page.evaluate(
-        (v) =>
-          (
+        ([v, n]) => {
+          const inject = (
             window as unknown as { __videocall_inject_render_fps?: (n: number) => void }
-          ).__videocall_inject_render_fps?.(v),
-        fps,
+          ).__videocall_inject_render_fps;
+          for (let i = 0; i < n; i++) inject?.(v);
+        },
+        [fps, SUSTAIN_SAMPLES] as const,
       );
     const hasInjectHook = (page: Page) =>
       page.evaluate(
@@ -1380,8 +1378,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
       // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
       const pubConsole = collectConsole(pubPage);
+      const rxConsole = collectConsole(rxPage);
 
-      await joinMeeting(pubPage, meetingId, "SimPublisherCpu");
+      await joinMeeting(pubPage, meetingId, "SimPublisherCpu", { micOn: false });
       await joinMeeting(rxPage, meetingId, "SimReceiverCpu");
 
       // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
@@ -1424,14 +1423,22 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           "See helpers/simulcast-config.ts",
       );
 
+      // Read the start index only once the climb has settled: two equal
+      // consecutive readings above base, one chooser tick (5 s) apart.
+      let startIndex = 0;
+      let prevIndex = -1;
       await expect
-        .poll(async () => (await readVideoLayer(rxPage))?.layerIndex ?? 0, {
-          timeout: 30_000,
-          intervals: [1000, 2000, 3000],
-        })
-        .toBeGreaterThan(0);
-
-      const startIndex = (await readVideoLayer(rxPage))!.layerIndex;
+        .poll(
+          async () => {
+            const idx = (await readVideoLayer(rxPage))?.layerIndex ?? 0;
+            const settled = idx > 0 && idx === prevIndex;
+            prevIndex = idx;
+            if (settled) startIndex = idx;
+            return settled;
+          },
+          { timeout: 60_000, intervals: [5000] },
+        )
+        .toBe(true);
       expect(
         startIndex,
         "receiver must be above the base layer before we apply CPU pressure",
@@ -1440,9 +1447,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // PHASE 2 — drive the decode-budget loop to a sustained Down edge purely
       // with synthetic LOW FPS (no network impairment). On the Down edge the
       // #1569 actuator publishes a LOWER received-layer preference, so the
-      // receiver's layer index must drop BELOW where it started — and, because
-      // LOW_FPS is held, eventually reach base (index 0). We feed samples until
+      // receiver's layer index must drop BELOW where it started. We feed samples until
       // the index drops or we exhaust the budget.
+      const phase2ConsoleStart = rxConsole.length;
       await expect
         .poll(
           async () => {
@@ -1459,14 +1466,6 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         )
         .toBeLessThan(startIndex);
 
-      // The #1569 actuator steps the received layer down AT LEAST ONE RUNG below
-      // the start index under local CPU pressure (matching the host test, which
-      // proves 2->1, not 2->0): on a lossless transport the synthetic seed steps
-      // the chooser down exactly one rung and then no-ops, and the real {0,0}
-      // telemetry never drives `choose` further down, so the layer settles at
-      // ~startIndex - 1 (NOT necessarily base index 0) and does not climb back
-      // while the pressure holds. Hold the assertion across a few more injected
-      // samples to prove the lower preference is sticky under continued pressure.
       for (let i = 0; i < SUSTAIN_SAMPLES + 2; i++) {
         await injectFps(rxPage, LOW_FPS);
         await rxPage.waitForTimeout(INJECT_INTERVAL_MS);
@@ -1477,6 +1476,174 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             `stepped-down rung (< start ${startIndex}); sample ${i}`,
         ).toBeLessThan(startIndex);
       }
+
+      // A 1:1 drop lowers the layer only: no pressured latch, no tile cascade.
+      const budgetLines = rxConsole.filter((l) => l.includes("DecodeBudget:"));
+      expect(
+        rxConsole.slice(phase2ConsoleStart).some((l) => l.includes("one_tile_layer_drop")),
+      ).toBe(true);
+      expect(
+        budgetLines.filter((l) => /pressured_latch=true|cascade=|dir=down/.test(l)),
+        budgetLines.join("\n"),
+      ).toEqual([]);
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // Issue 3014: a call that shrinks to one remote peer while the decode budget
+  // is already pressured must take the one-tile layer drop, not a cascade arm.
+  test("pressured decode budget that shrinks to one tile drops a layer without cascading (3014)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(300_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_cpu_shrink_${Date.now()}`;
+
+    const { FPS_STEP_DOWN, FPS_SEVERE, SUSTAIN_SAMPLES } = BUDGET;
+    const LOW_FPS = FPS_STEP_DOWN - 6;
+    expect(LOW_FPS).toBeGreaterThan(FPS_SEVERE);
+    const INJECT_INTERVAL_MS = 1200;
+    const LATCH_LOG = "pressured_latch=true";
+    const UNLATCH_LOG = "pressured_latch=false trigger=";
+    const ONE_TILE_LOG = "DecodeBudget: one_tile_layer_drop natural=1";
+    const ONE_TILE_CASCADE = /cascade=.*\bnatural=1 cap=/;
+    // The latch's layer drop leaves the chooser constrained; a one-tile drop logs
+    // only once it un-constrains (re-climb, or availability decaying to it).
+    const UNCONSTRAIN_BUDGET_MS = LAYER_AVAILABILITY_WINDOW_MS + 18 * PEER_MONITOR_TICK_MS;
+
+    const injectFps = (page: Page, fps: number) =>
+      page.evaluate(
+        ([v, n]) => {
+          const inject = (
+            window as unknown as { __videocall_inject_render_fps?: (n: number) => void }
+          ).__videocall_inject_render_fps;
+          for (let i = 0; i < n; i++) inject?.(v);
+        },
+        [fps, SUSTAIN_SAMPLES] as const,
+      );
+    const hasInjectHook = (page: Page) =>
+      page.evaluate(
+        () =>
+          typeof (window as unknown as { __videocall_inject_render_fps?: unknown })
+            .__videocall_inject_render_fps === "function",
+      );
+    const setMockPeers = async (page: Page, count: number) => {
+      await page.locator(".video-controls-container").hover();
+      await page.locator("#mock-peers-trigger").click({ timeout: 10_000 });
+      await expect(page.locator(".mock-peers-popover")).toBeVisible({ timeout: 5_000 });
+      const input = page.locator("#mock-count-input");
+      await input.fill(String(count));
+      await input.dispatchEvent("input");
+      await page.locator(".mock-peers-popover-close").click({ timeout: 5_000 });
+      await expect(page.locator(".mock-peers-popover")).not.toBeVisible({ timeout: 5_000 });
+    };
+    const gridItems = (page: Page) => page.locator("#grid-container .grid-item");
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub-shrink@videocall.rs",
+        "SimPublisherShrink",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx-shrink@videocall.rs",
+        "SimReceiverShrink",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+      const pubConsole = collectConsole(pubPage);
+      const rxConsole = collectConsole(rxPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisherShrink", { micOn: false });
+      await joinMeeting(rxPage, meetingId, "SimReceiverShrink");
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await openPerformancePanel(rxPage);
+
+      if (!(await hasInjectHook(rxPage))) {
+        test.skip(
+          true,
+          "window.__videocall_inject_render_fps not registered (MOCK_PEERS_ENABLED off)",
+        );
+      }
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage)) !== null, {
+          timeout: 45_000,
+          intervals: [500, 1000, 2000],
+        })
+        .toBe(true);
+      const layerCount = (await readVideoLayer(rxPage))!.layerCount;
+      test.skip(
+        layerCount <= 1,
+        `single-layer ladder (count=${layerCount}); no received layer to drop on this runner`,
+      );
+
+      let prevIndex = -1;
+      await expect
+        .poll(
+          async () => {
+            const idx = (await readVideoLayer(rxPage))?.layerIndex ?? 0;
+            const settled = idx > 0 && idx === prevIndex;
+            prevIndex = idx;
+            return settled;
+          },
+          { timeout: 60_000, intervals: [5000] },
+        )
+        .toBe(true);
+
+      // natural = 1 real peer + 1 mock, so the first Down edge latches pressure.
+      const baselineTiles = await gridItems(rxPage).count();
+      await setMockPeers(rxPage, 1);
+      await expect(gridItems(rxPage)).toHaveCount(baselineTiles + 1, { timeout: 10_000 });
+
+      await expect
+        .poll(
+          async () => {
+            await injectFps(rxPage, LOW_FPS);
+            await rxPage.waitForTimeout(INJECT_INTERVAL_MS);
+            return rxConsole.some((l) => l.includes(LATCH_LOG));
+          },
+          { timeout: 60_000, intervals: [0] },
+        )
+        .toBe(true);
+
+      await setMockPeers(rxPage, 0);
+      await expect(gridItems(rxPage)).toHaveCount(baselineTiles, { timeout: 10_000 });
+      const shrinkMark = rxConsole.length;
+
+      const afterShrink = () => rxConsole.slice(shrinkMark);
+      await expect
+        .poll(
+          async () => {
+            await injectFps(rxPage, LOW_FPS);
+            await rxPage.waitForTimeout(INJECT_INTERVAL_MS);
+            return afterShrink().some((l) => l.includes(ONE_TILE_LOG) || ONE_TILE_CASCADE.test(l));
+          },
+          { timeout: UNCONSTRAIN_BUDGET_MS, intervals: [0] },
+        )
+        .toBe(true);
+
+      const budgetLines = rxConsole.filter((l) => l.includes("DecodeBudget:"));
+      expect(budgetLines.filter((l) => l.includes(UNLATCH_LOG))).toEqual([]);
+      expect(
+        afterShrink().filter((l) => ONE_TILE_CASCADE.test(l)),
+        budgetLines.join("\n"),
+      ).toEqual([]);
+      expect(afterShrink().some((l) => l.includes(ONE_TILE_LOG))).toBe(true);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -4104,12 +4271,10 @@ test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
 // IMPORTANT: the runtime default of `experimentalSimulcastMaxLayers` was flipped
 // from 1 → 3 (multicast ON by default). So "set no flag" no longer means OFF —
 // it now means 3. To genuinely exercise the single-layer / feature-OFF path this
-// test PINS the flag to 1 explicitly via `pinSimulcastMaxLayers(ctx, 1)` on both
-// ends. The #1082 ladder machinery went N-generic but MUST NOT change the
-// single-layer path: with the flag at 1 the publisher emits a single layer for
-// every kind, byte-identical to the pre-simulcast encoders. The DOM-observable
-// proof is that every received readout reports `/1` (a single-layer ladder)
-// once decoding begins.
+// test PINS the flag to 1 explicitly on both ends. The #1082 ladder machinery
+// went N-generic but MUST NOT change the single-layer path: with the flag at 1
+// the publisher emits a single layer for every kind, byte-identical to the
+// pre-simulcast encoders.
 //
 // FIXME(#1093): multi-party (2-context) — this control also joins a publisher +
 // receiver and polls the receiver decoding the publisher's stream, so it hits
@@ -4154,7 +4319,8 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
       // Explicitly PIN the flag to 1 (= single layer / OFF) on BOTH ends. The
       // runtime default is now 3, so omitting the flag would NOT exercise the
       // OFF path — it would emit 3 layers. Must run before the first navigation.
-      await pinSimulcastMaxLayers(pubCtx, 1);
+      // The capability override makes a regressed pin publish 3 layers on any runner.
+      await enableSimulcastFlag(pubCtx, 1, { capabilityMaxLayersOverride: 3 });
       await pinSimulcastMaxLayers(rxCtx, 1);
 
       const pubPage = await pubCtx.newPage();
@@ -4169,23 +4335,30 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 
       await openPerformancePanel(rxPage);
 
-      // Wait until the receiver is decoding the publisher's VIDEO, then assert
-      // the ladder is a SINGLE layer (count == 1). With the flag off the encoder
-      // produces exactly one layer, so the readout reports position/count "1/1"
-      // (#1222: the single-layer quality letter is "1", so the readout reads
-      // "1 · 1/1 · …"; `readVideoLayer` parses the position/count tail).
-      let video: { layerIndex: number; layerCount: number } | null = null;
+      let readout = "";
       await expect
         .poll(
           async () => {
-            video = await readVideoLayer(rxPage);
-            return video !== null;
+            readout = await readVideoReadoutText(rxPage, 5_000);
+            return parseReadoutDims(readout) !== null;
           },
           { timeout: 45_000, intervals: [500, 1000, 2000] },
         )
         .toBe(true);
-      expect(video!.layerCount, "flag-off video must be single-layer").toBe(1);
-      expect(video!.layerIndex).toBe(0);
+      // The chip appears only once a higher layer has been seen, so watch for one, not one read.
+      const observeUntil = Date.now() + 10_000;
+      while (Date.now() < observeUntil) {
+        expect(
+          parseReadoutDims(readout),
+          `the readout stopped reporting video: "${readout}"`,
+        ).not.toBeNull();
+        expect(
+          parsePositionChip(readout),
+          `flag-off video must be single-layer, so the readout carries no layer chip: "${readout}"`,
+        ).toBeNull();
+        await rxPage.waitForTimeout(500);
+        readout = await readVideoReadoutText(rxPage, 5_000);
+      }
 
       await expect
         .poll(

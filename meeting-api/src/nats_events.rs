@@ -19,7 +19,7 @@
 use protobuf::Message;
 use serde::{Deserialize, Serialize};
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
-use videocall_types::protos::meeting_packet::MeetingPacket;
+use videocall_types::protos::meeting_packet::{MeetingPacket, RecordingEntry, RecordingState};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::validation::is_valid_meeting_id;
@@ -362,6 +362,45 @@ pub async fn publish_host_disable_video(
     Ok(())
 }
 
+/// `RECORDING_STATE` for `snapshot`; carries no user id or secret.
+pub fn recording_state_packet(
+    room_id: &str,
+    snapshot: &crate::db::recordings::Snapshot,
+) -> Vec<u8> {
+    let state = RecordingState {
+        version: snapshot.version.max(0) as u64,
+        entries: snapshot
+            .entries
+            .iter()
+            .map(|(recording_id, revoked)| RecordingEntry {
+                recording_id: recording_id.as_bytes().to_vec(),
+                revoked: *revoked,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    build_meeting_wrapper(&MeetingPacket {
+        event_type: MeetingEventType::RECORDING_STATE.into(),
+        room_id: room_id.to_string(),
+        recording_epoch: snapshot.epoch,
+        recording_state: protobuf::MessageField::some(state),
+        ..Default::default()
+    })
+}
+
+/// Publish `snapshot` on `room_id`'s system subject.
+pub async fn publish_recording_state(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    snapshot: &crate::db::recordings::Snapshot,
+) {
+    let (Some(nats), Some(subject)) = (nats, room_system_subject(room_id)) else {
+        return;
+    };
+    publish(nats, subject, recording_state_packet(room_id, snapshot)).await;
+}
+
 /// Publish `PARTICIPANT_KICKED` to tell one participant they have been removed.
 pub async fn publish_host_kick(
     nats: Option<&async_nats::Client>,
@@ -379,6 +418,30 @@ pub async fn publish_host_kick(
     let subject = room_system_subject(room_id).ok_or("room id is not a valid meeting ID")?;
     nats.publish(subject, bytes.into()).await?;
     tracing::debug!("Published PARTICIPANT_KICKED for room {room_id} target=\"{target_user_id}\"");
+    Ok(())
+}
+
+/// Publish a host-kick revocation on [`PARTICIPANT_KICKED_SUBJECT`] for every
+/// relay to enforce (#2934). Server-internal, unlike [`publish_host_kick`].
+///
+/// [`PARTICIPANT_KICKED_SUBJECT`]: videocall_meeting_types::kick::PARTICIPANT_KICKED_SUBJECT
+pub async fn publish_kick_revocation(
+    nats: Option<&async_nats::Client>,
+    payload: &videocall_meeting_types::kick::ParticipantKickedPayload,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let bytes = serde_json::to_vec(payload)?;
+    nats.publish(
+        videocall_meeting_types::kick::PARTICIPANT_KICKED_SUBJECT,
+        bytes.into(),
+    )
+    .await?;
+    tracing::debug!(
+        "Published kick revocation for room {} user=\"{}\" through={}",
+        payload.room_id,
+        payload.user_id,
+        payload.revoke_iat_through
+    );
     Ok(())
 }
 

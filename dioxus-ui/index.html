@@ -96,8 +96,9 @@
             data-bin="wt_session_worker"
             data-type="worker"
             data-cargo-no-default-features
-            data-loader-shim
         />
+        <!-- No data-loader-shim on wt_session_worker: trunk's shim would replace this loader. -->
+        <link data-trunk rel="copy-file" href="../videocall-transport/src/bin/wt_session_worker_loader.js" />
         <link id="wt-session-worker" href="/wt_session_worker_loader.js" />
 
         <!-- Load wasm worker scripts from the videocall-codecs crate -->

@@ -1,20 +1,56 @@
 #!/bin/sh
 set -eu
 
+APP_ROOT="${START_DIOXUS_APP_ROOT:-/app}"
+
+CONFIG_LOCAL="${APP_ROOT}/dioxus-ui/scripts/config.local.js"
+DIST="${APP_ROOT}/dioxus-ui/dist"
+RELEASE_BUILD=0
+case "${VIDEOCALL_RELEASE_BUILD:-}" in
+    1)
+        RELEASE_BUILD=1
+        RELEASE_ROOT="${CARGO_TARGET_DIR:-${APP_ROOT}/dioxus-ui/target}/videocall-release"
+        CONFIG_LOCAL="${RELEASE_ROOT}/config.local.js"
+        DIST="${RELEASE_ROOT}/dist"
+        DIOXUS_SERVE_MODE="static"
+        export CARGO_INCREMENTAL=0
+        ;;
+    ""|0) ;;
+    *)
+        echo "start-dioxus: VIDEOCALL_RELEASE_BUILD='${VIDEOCALL_RELEASE_BUILD}' is not 0 or 1" >&2
+        exit 64
+        ;;
+esac
+
 # Generate runtime config.local.js.
 #
 # The e2e stack bind-mounts the repo at /app. Writing the generated e2e
 # runtime config into the tracked `scripts/config.js` dirties the developer's
 # worktree, so keep the generated values in the gitignored local override file
 # that index.html loads after the committed defaults.
-mkdir -p /app/dioxus-ui/scripts
+mkdir -p "$(dirname "$CONFIG_LOCAL")"
 if [ -n "${SEARCH_API_BASE_URL:-}" ]; then
     SEARCH_API_BASE_URL_CONFIG="\"${SEARCH_API_BASE_URL}\""
 else
     SEARCH_API_BASE_URL_CONFIG="null"
 fi
 
-cat > /app/dioxus-ui/scripts/config.local.js <<EOF
+# Local dev only: WT cert hash for serverCertificateHashes (Playwright injects its own in e2e).
+WT_CERT_HASHES_JS=""
+if [ "${WT_DEV_CERT_HASH_INJECT:-false}" = "true" ] && [ "${WEBTRANSPORT_ENABLED:-false}" = "true" ]; then
+    wt_hash_file="${APP_ROOT}/actix-api/certs/localhost.cert-sha256.txt"
+    wt_hash="$(grep -v '^[[:space:]]*#' "$wt_hash_file" 2>/dev/null | grep -v '^[[:space:]]*$' | head -n 1 | tr -d '[:space:]' || true)"
+    case "$wt_hash" in
+        ''|*[!A-Za-z0-9+/=]*)
+            echo "start-dioxus: WT dev cert hash missing/malformed at $wt_hash_file; run 'make e2e-cert', then restart webtransport-api and dioxus-ui" >&2
+            ;;
+        *)
+            WT_CERT_HASHES_JS="if (location.hostname === \"localhost\" || location.hostname === \"127.0.0.1\" || location.hostname.endsWith(\".localhost\")) { window.__VC_WT_CERT_HASHES__ = [\"${wt_hash}\"]; }"
+            ;;
+    esac
+fi
+
+cat > "$CONFIG_LOCAL" <<EOF
 if (window.__APP_CONFIG) {
   Object.assign(window.__APP_CONFIG, {
   apiBaseUrl: "${API_BASE_URL:-http://localhost:${ACTIX_PORT:-8080}}",
@@ -42,12 +78,13 @@ if (window.__APP_CONFIG) {
   mockPeersEnabled: "${MOCK_PEERS_ENABLED:-false}"
   });
 }
+${WT_CERT_HASHES_JS}
 EOF
 
 # Stage the developer's optional config.local.js so it's available at serve
 # time regardless of whether trunk built before or after it appeared.
-mkdir -p /app/dioxus-ui/dist
-cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js
+mkdir -p "$DIST"
+cp -f "$CONFIG_LOCAL" "$DIST/config.local.js"
 
 # ---------------------------------------------------------------------------
 # DIOXUS_SERVE_MODE controls runtime behavior:
@@ -103,11 +140,15 @@ if [ "$DIOXUS_SERVE_MODE" = "static" ]; then
     tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify
 
     # Build wasm once. Uses cached artifacts from the Docker volume on warm runs.
-    trunk build
+    if [ "$RELEASE_BUILD" = 1 ]; then
+        trunk build --dist "$DIST" --release
+    else
+        trunk build
+    fi
 
     # Copy runtime overrides into the built dist/ (trunk's copy-file directive
     # only copies config.js, and config.local.js is intentionally optional).
-    cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js
+    cp -f "$CONFIG_LOCAL" "$DIST/config.local.js"
 
     # Serve statically. No file watcher, no recompilation, ~3MB RSS.
     # --spa enables SPA fallback: unknown routes serve index.html so the
@@ -118,18 +159,18 @@ if [ "$DIOXUS_SERVE_MODE" = "static" ]; then
         --index index.html \
         --spa \
         --header "Content-Security-Policy-Report-Only: ${CSP_REPORT_ONLY_HEADER}" \
-        /app/dioxus-ui/dist
+        "$DIST"
 else
     # Development mode: hot-reload with trunk serve.
     # Mirror overrides into dist/ in case trunk has already done its initial build.
-    if [ -d /app/dioxus-ui/dist ]; then
-        cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js
+    if [ -d "$DIST" ]; then
+        cp -f "$CONFIG_LOCAL" "$DIST/config.local.js"
     fi
 
     (
         while true; do
-            if [ -d /app/dioxus-ui/dist ]; then
-                cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js 2>/dev/null || true
+            if [ -d "$DIST" ]; then
+                cp -f "$CONFIG_LOCAL" "$DIST/config.local.js" 2>/dev/null || true
             fi
             sleep 1
         done

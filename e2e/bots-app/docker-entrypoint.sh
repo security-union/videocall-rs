@@ -160,6 +160,10 @@ if [ "${BOT_IDENTITY_MODE}" = "auto" ]; then
   fi
 fi
 
+# The participant record (src/run-record.ts) reads these; never trust an inherited value.
+BOT_POD_ORDINAL=""
+BOT_JOIN_STAGGER_MS=""
+BOT_JOIN_STAGGER_INCOMPLETE=""
 if [ "${BOT_IDENTITY_MODE}" = "ordinal" ]; then
   # StatefulSet sets hostname = pod name = "<statefulset>-<ordinal>", so the
   # trailing "-<N>" segment is this pod's ordinal. Prefer the HOSTNAME env var
@@ -190,6 +194,7 @@ if [ "${BOT_IDENTITY_MODE}" = "ordinal" ]; then
   BOT_PARTICIPANT="bot-${ORDINAL}"
   # Same reason for the fleet index: the ordinal wins over a template BOT_INDEX.
   BOT_INDEX="${ORDINAL}"
+  BOT_POD_ORDINAL="$((10#${ORDINAL}))"
   # `-`, not `:-`: an explicitly EMPTY value opts this pod out, not the fleet.
   hw_var="BOT_HW_CONCURRENCY_${ORDINAL}"
   BOT_HW_CONCURRENCY="${!hw_var-${BOT_HW_CONCURRENCY}}"
@@ -237,8 +242,7 @@ if [ -n "${inert_suffixed}" ]; then
 fi
 
 # Every operator string this script puts on the launch line or exports to the bot
-# process. Downstream TypeScript composes `[label] …` lines from these without
-# collapsing CR/LF, so the value is refused here rather than at each writer.
+# process.
 for raw_var in MEETING_URL BOT_PARTICIPANT TTL BOT_AUTH BOT_RUN_DIR \
   BOT_HW_CONCURRENCY BOT_INDEX BOT_CTL_PORT BOT_CTL_BIND BOT_CTL_STATE_DIR \
   BOT_EMAIL BOT_EXTRA_ARGS; do
@@ -485,6 +489,14 @@ netem_read() {
   esac
 }
 
+# resolveHardwareConcurrency's grammar on the trimmed token; `<= 0` passes through as its disable sentinel.
+hw_token="${BOT_HW_CONCURRENCY#"${BOT_HW_CONCURRENCY%%[![:space:]]*}"}"
+hw_token="${hw_token%"${hw_token##*[![:space:]]}"}"
+if [ -n "${hw_token}" ] && ! [[ "${hw_token}" =~ ^-?[0-9]+$ ]]; then
+  say "docker-entrypoint: FATAL — BOT_HW_CONCURRENCY (or this ordinal's BOT_HW_CONCURRENCY_<N>) must be an integer, got '${BOT_HW_CONCURRENCY}'." 2
+  exit 1
+fi
+
 # Validated before the first interface mutation: a reject must not leave it shaped.
 stagger_max=0
 if [ -n "${BOT_MAX_JOIN_STAGGER_SECS}" ]; then
@@ -559,7 +571,7 @@ fi
 
 netem_state="unknown"
 if [ -n "${BOT_NETEM_PROFILE}" ]; then
-  # Mirrors NETEM_PROFILES / ingressNetemParams; the two differ only in `rate`.
+  # Mirrors NETEM_PROFILES / ingressNetemParams; the two differ only in `rate` and `limit`.
   netem_params=()
   netem_ingress_params=()
   netem_op="shape"
@@ -571,11 +583,11 @@ if [ -n "${BOT_NETEM_PROFILE}" ]; then
       ;;
     good_wifi)
       netem_params=(delay 20ms 5ms loss 0.1% rate 20000kbit limit 100)
-      netem_ingress_params=(delay 20ms 5ms loss 0.1% rate 50000kbit limit 100)
+      netem_ingress_params=(delay 20ms 5ms loss 0.1% rate 50000kbit limit 150)
       ;;
     good_4g)
       netem_params=(delay 50ms 15ms loss 0.5% rate 10000kbit limit 100)
-      netem_ingress_params=(delay 50ms 15ms loss 0.5% rate 30000kbit limit 100)
+      netem_ingress_params=(delay 50ms 15ms loss 0.5% rate 30000kbit limit 250)
       ;;
     congested_wifi)
       netem_params=(delay 80ms 30ms loss 2% rate 2000kbit limit 55)
@@ -583,11 +595,11 @@ if [ -n "${BOT_NETEM_PROFILE}" ]; then
       ;;
     lossy_mobile)
       netem_params=(delay 150ms 50ms loss 5% rate 800kbit limit 40)
-      netem_ingress_params=(delay 150ms 50ms loss 5% rate 2000kbit limit 40)
+      netem_ingress_params=(delay 150ms 50ms loss 5% rate 2000kbit limit 50)
       ;;
     satellite)
       netem_params=(delay 600ms 50ms loss 1% rate 1500kbit limit 300)
-      netem_ingress_params=(delay 600ms 50ms loss 1% rate 10000kbit limit 300)
+      netem_ingress_params=(delay 600ms 50ms loss 1% rate 10000kbit limit 700)
       ;;
     dialup)
       netem_params=(delay 200ms 40ms loss 3% rate 56kbit limit 10)
@@ -616,6 +628,7 @@ if [ -n "${BOT_NETEM_PROFILE}" ]; then
     netem_state="clear profile=${BOT_NETEM_PROFILE} iface=${BOT_NETEM_IFACE} direction=both tc=[${netem_read_root}] ingress=none"
   fi
   say "docker-entrypoint: netem ${netem_verb} — ${netem_state}"
+  BOT_NETEM_APPLIED="${BOT_NETEM_PROFILE}"
 else
   netem_read
   netem_ingress_state="none"
@@ -633,7 +646,11 @@ else
     # "No netem" is not "no shaping", so report the evidence, never a bare claim.
     netem_state="no-netem iface=${BOT_NETEM_IFACE} tc=[${netem_read_root}] ingress=none"
   fi
+  BOT_NETEM_APPLIED="unknown"
+  case "${netem_state}" in no-netem*"tc=[qdisc noqueue "*) BOT_NETEM_APPLIED="none" ;; esac
 fi
+# The participant record (src/run-record.ts) reads what this pod verifiably applied.
+export BOT_NETEM_APPLIED
 
 # Non-sensitive startup line only — password is never logged; email is reported
 # as present/absent to minimize PII in logs.
@@ -652,6 +669,7 @@ stagger_note=""
 if [ "${stagger_max}" -gt 0 ]; then
   stagger_secs=$((RANDOM % (stagger_max + 1)))
   stagger_state="${stagger_secs}s"
+  BOT_JOIN_STAGGER_MS=$((stagger_secs * 1000))
   # TERM and INT both: an operator stop must not be swallowed by this sleep.
   trap 'exit 143' TERM
   trap 'exit 130' INT
@@ -659,9 +677,12 @@ if [ "${stagger_max}" -gt 0 ]; then
   sleep "${stagger_secs}" &
   if ! wait $!; then
     stagger_note="(INCOMPLETE)"
+    BOT_JOIN_STAGGER_INCOMPLETE=1
     say "docker-entrypoint: WARNING — stagger sleep failed; joining without the full ${stagger_secs}s" 2
   fi
 fi
+
+export BOT_POD_ORDINAL BOT_JOIN_STAGGER_MS BOT_JOIN_STAGGER_INCOMPLETE
 
 say "docker-entrypoint: launching bot — url=${MEETING_URL} participant=${BOT_PARTICIPANT} auth=${BOT_AUTH} ttl=${TTL} identity_mode=${BOT_IDENTITY_MODE} hw_concurrency=${BOT_HW_CONCURRENCY:-<omitted>} credentials=${cred_state} control=[${ctl_state}] netem=[${netem_state}] join_stagger=${stagger_state}${stagger_note} camera_cycle=[${camera_cycle_state}]"
 

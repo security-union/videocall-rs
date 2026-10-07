@@ -41,3 +41,10 @@ pub struct Message {
     pub session: SessionId,
     pub msg: Bytes,
 }
+
+/// Server-initiated close of a transport session whose participant was
+/// removed by the host (#2934). The transport closes after a short flush
+/// delay so a notice queued ahead of it can still reach the client.
+#[derive(ActixMessage, Debug, Clone, Copy)]
+#[rtype(result = "()")]
+pub struct ForceClose;

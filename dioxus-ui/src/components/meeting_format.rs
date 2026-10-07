@@ -126,7 +126,7 @@ pub fn format_datetime(timestamp_ms: i64) -> String {
 /// `Intl` result), this degrades gracefully to [`format_datetime`] — which
 /// still gives date + time, just without the zone — rather than panicking.
 pub fn format_datetime_zoned(timestamp_ms: i64) -> String {
-    intl_zoned(timestamp_ms, false).unwrap_or_else(|_| format_datetime(timestamp_ms))
+    ZonedDateTimeFormat::new(false).format(timestamp_ms)
 }
 
 /// Issue #1789: same as [`format_datetime_zoned`] but also renders **seconds**.
@@ -140,17 +140,41 @@ pub fn format_datetime_zoned(timestamp_ms: i64) -> String {
 /// failure — the seconds are lost in that last-resort path, but the common case
 /// (a real browser) always carries them.
 pub fn format_datetime_zoned_seconds(timestamp_ms: i64) -> String {
-    intl_zoned(timestamp_ms, true).unwrap_or_else(|_| format_datetime(timestamp_ms))
+    ZonedDateTimeFormat::new(true).format(timestamp_ms)
+}
+
+/// One `Intl.DateTimeFormat` in the shape of [`format_datetime_zoned`] (or, with
+/// `include_seconds`, [`format_datetime_zoned_seconds`]), reusable across many
+/// timestamps. Formats exactly as those functions do, fallback included.
+pub struct ZonedDateTimeFormat {
+    format_fn: Result<js_sys::Function, wasm_bindgen::JsValue>,
+}
+
+impl ZonedDateTimeFormat {
+    pub fn new(include_seconds: bool) -> Self {
+        Self {
+            format_fn: intl_zoned_format_fn(include_seconds),
+        }
+    }
+
+    pub fn format(&self, timestamp_ms: i64) -> String {
+        self.format_fn
+            .as_ref()
+            .ok()
+            .and_then(|format_fn| intl_format(format_fn, timestamp_ms).ok())
+            .unwrap_or_else(|| format_datetime(timestamp_ms))
+    }
 }
 
 /// Shared `Intl.DateTimeFormat` core for the zoned variants. Builds the options
-/// object (optionally including `second`) and formats `timestamp_ms` in the
-/// viewer's locale + local timezone, carrying the short `timeZoneName` label.
+/// object (optionally including `second`) for the viewer's locale + local
+/// timezone, carrying the short `timeZoneName` label, and returns the bound
+/// formatting function.
 ///
 /// Each `Reflect::set` returns a `Result`; on any interop failure the whole
 /// function returns the `JsValue` error so the caller can pick its own zone-less
 /// fallback.
-fn intl_zoned(timestamp_ms: i64, include_seconds: bool) -> Result<String, wasm_bindgen::JsValue> {
+fn intl_zoned_format_fn(include_seconds: bool) -> Result<js_sys::Function, wasm_bindgen::JsValue> {
     use wasm_bindgen::{JsCast, JsValue};
 
     let options = js_sys::Object::new();
@@ -174,11 +198,18 @@ fn intl_zoned(timestamp_ms: i64, include_seconds: bool) -> Result<String, wasm_b
     // js-sys `DateTimeFormat::default()` pattern.
     let locales: js_sys::Array = JsValue::UNDEFINED.unchecked_into();
     let formatter = js_sys::Intl::DateTimeFormat::new(&locales, &options);
+    // `format` is a getter that returns the bound formatting Function; call it
+    // with a Date to produce the localized string.
+    Ok(formatter.format())
+}
+
+fn intl_format(
+    format_fn: &js_sys::Function,
+    timestamp_ms: i64,
+) -> Result<String, wasm_bindgen::JsValue> {
+    use wasm_bindgen::JsValue;
 
     let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
-    // `format` is a getter that returns the bound formatting Function; call it
-    // with the Date to produce the localized string.
-    let format_fn = formatter.format();
     let formatted = format_fn.call1(&JsValue::UNDEFINED, date.as_ref())?;
     formatted
         .as_string()

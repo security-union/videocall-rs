@@ -14,6 +14,7 @@
 //! Host-only meeting controls: mute, disable video, kick.
 
 use axum::{extract::State, Json};
+use chrono::Utc;
 use videocall_meeting_types::{
     requests::{
         DisableVideoParticipantRequest, KickParticipantRequest, MuteParticipantRequest,
@@ -28,6 +29,7 @@ use crate::db::participants::KickOutcome;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
+use crate::kick_revocation;
 use crate::nats_events;
 use crate::routes::valid_meeting_id::ValidMeetingId;
 use crate::state::AppState;
@@ -220,7 +222,10 @@ pub async fn kick_participant(
     if body.user_id == user_id {
         return Err(AppError::bad_request("cannot kick yourself"));
     }
-    let was_host = match db_participants::kick(&state.db, meeting.id, &user_id, &body.user_id)
+    if !state.kick_rate_limiter.allow(&user_id) {
+        return Err(AppError::rate_limit_exceeded());
+    }
+    let outcome = db_participants::kick(&state.db, meeting.id, &user_id, &body.user_id)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -228,14 +233,36 @@ pub async fn kick_participant(
                 body.user_id
             );
             AppError::internal("failed to update participant status")
-        })? {
-        KickOutcome::Kicked { was_host } => was_host,
+        })?;
+    let (revocation, was_host) = match outcome {
+        KickOutcome::Kicked {
+            was_host,
+            kicked_at,
+            deny_until,
+        } => (
+            kick_revocation::payload(&meeting_id, &body.user_id, kicked_at, deny_until),
+            was_host,
+        ),
+        KickOutcome::AlreadyKicked {
+            kicked_at,
+            deny_until,
+        } => {
+            if deny_until <= Utc::now() {
+                return Ok(Json(APIResponse::ok(())));
+            }
+            (
+                kick_revocation::payload(&meeting_id, &body.user_id, kicked_at, deny_until),
+                false,
+            )
+        }
         KickOutcome::NotAdmitted => return Ok(Json(APIResponse::ok(()))),
         KickOutcome::NotFound => return Err(AppError::participant_not_in_meeting(&body.user_id)),
         KickOutcome::CallerNotHost => return Err(AppError::not_host()),
         KickOutcome::OwnerOnly => return Err(AppError::not_owner()),
         KickOutcome::CannotKickSelf => return Err(AppError::bad_request("cannot kick yourself")),
     };
+
+    let revoked = nats_events::publish_kick_revocation(state.nats.as_ref(), &revocation).await;
     if was_host {
         nats_events::announce_host_change(
             state.nats.as_ref(),
@@ -246,13 +273,8 @@ pub async fn kick_participant(
         )
         .await;
     }
-
-    nats_events::publish_host_kick(state.nats.as_ref(), &meeting_id, &body.user_id)
-        .await
-        .map_err(|e| {
-            tracing::error!("NATS publish failed for PARTICIPANT_KICKED in room {meeting_id}: {e}");
-            AppError::internal("failed to broadcast kick event")
-        })?;
+    let broadcast =
+        nats_events::publish_host_kick(state.nats.as_ref(), &meeting_id, &body.user_id).await;
 
     // Live homepage-feed nudge (issue #1081): a kick removes a present
     // participant (status='kicked'), dropping the count the feed shows.
@@ -263,6 +285,15 @@ pub async fn kick_participant(
     )
     .await;
 
+    if let Err(e) = &revoked {
+        tracing::error!("NATS publish failed for kick revocation in room {meeting_id}: {e}");
+    }
+    if let Err(e) = &broadcast {
+        tracing::error!("NATS publish failed for PARTICIPANT_KICKED in room {meeting_id}: {e}");
+    }
+    if revoked.is_err() || broadcast.is_err() {
+        return Err(AppError::internal("failed to broadcast kick event"));
+    }
     Ok(Json(APIResponse::ok(())))
 }
 

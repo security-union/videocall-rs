@@ -120,10 +120,19 @@ fn resolve_status_observer_token(
         .unwrap_or_default()
 }
 
+/// The guest credential `guest_session` keeps freshest for `meeting_id`, else `held`.
+fn freshest_guest_token(meeting_id: &str, held: String) -> String {
+    crate::guest_session::load(meeting_id)
+        .token
+        .filter(|t| !t.is_empty())
+        .unwrap_or(held)
+}
+
 /// Apply a [`JoinMeetingResponse`] that is already known to represent admission
 /// (e.g. from the waiting-room push). Sets host metadata signals and transitions
 /// to [`GuestStatus::Admitted`].
 fn handle_admitted(
+    meeting_id: &str,
     response: JoinMeetingResponse,
     fallback_status_observer_token: String,
     mut guest_status: Signal<GuestStatus>,
@@ -136,7 +145,10 @@ fn handle_admitted(
     let token = response.room_token.unwrap_or_default();
     let status_observer_token = resolve_status_observer_token(
         response.observer_token,
-        Some(fallback_status_observer_token),
+        Some(freshest_guest_token(
+            meeting_id,
+            fallback_status_observer_token,
+        )),
     );
     host_display_name.set(determined_host.clone());
     host_user_id.set(determined_host_uid.clone());
@@ -243,6 +255,7 @@ fn start_observer_connection(
         get_peer_video_canvas_id: VcCallback::from(|id| id),
         get_peer_screen_canvas_id: VcCallback::from(|id| id),
         enable_diagnostics: false,
+        send_diagnostics_packets: true,
         diagnostics_update_interval_ms: None,
         enable_health_reporting: false,
         health_reporting_interval_ms: None,
@@ -374,6 +387,7 @@ pub fn GuestJoinPage(id: String) -> Element {
 
 #[component]
 fn GuestJoinPageContent(id: String) -> Element {
+    crate::context::use_wt_session_worker_prewarm(true);
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut guest_status = use_signal(|| GuestStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
@@ -536,6 +550,7 @@ fn GuestJoinPageContent(id: String) -> Element {
 
     // Handle waiting room admission
     let on_admitted = {
+        let meeting_id = id.clone();
         move |status: JoinMeetingResponse| {
             let fallback_status_observer_token = match guest_status() {
                 GuestStatus::Waiting { observer_token }
@@ -547,6 +562,7 @@ fn GuestJoinPageContent(id: String) -> Element {
                 _ => String::new(),
             };
             handle_admitted(
+                &meeting_id,
                 status,
                 fallback_status_observer_token,
                 guest_status,
@@ -570,7 +586,11 @@ fn GuestJoinPageContent(id: String) -> Element {
         let meeting_id = id.clone();
         move |_| {
             let meeting_id = meeting_id.clone();
-            let token = observer_token_signal().unwrap_or_default();
+            let held = match &*guest_status.peek() {
+                GuestStatus::Waiting { observer_token } => observer_token.clone(),
+                _ => String::new(),
+            };
+            let token = freshest_guest_token(&meeting_id, held);
             wasm_bindgen_futures::spawn_local(async move {
                 crate::meeting_api::leave_within_deadline(
                     &meeting_id,
@@ -613,18 +633,22 @@ fn GuestJoinPageContent(id: String) -> Element {
             },
 
             // Waiting room
-            GuestStatus::Waiting { observer_token } => rsx! {
-                WaitingRoom {
-                    meeting_id: id.clone(),
-                    user_id: current_user_id().unwrap_or_default(),
-                    display_name: display_name_for_render.clone(),
-                    observer_token: observer_token.clone(),
-                    is_guest: true,
-                    on_admitted: on_admitted,
-                    on_rejected: on_rejected,
-                    on_cancel: on_cancel_waiting,
+            GuestStatus::Waiting { observer_token } => {
+                let mut on_join = on_join_guest.clone();
+                rsx! {
+                    WaitingRoom {
+                        meeting_id: id.clone(),
+                        user_id: current_user_id().unwrap_or_default(),
+                        display_name: display_name_for_render.clone(),
+                        observer_token: observer_token.clone(),
+                        is_guest: true,
+                        on_admitted: on_admitted,
+                        on_rejected: on_rejected,
+                        on_cancel: on_cancel_waiting,
+                        on_waiting_room_disabled: move |_| on_join(None),
+                    }
                 }
-            },
+            }
 
             // Issue 1613 — the meeting is password-protected and the server
             // refused this join. Replaces the guest form so nothing else on the
@@ -870,6 +894,7 @@ mod tests {
             status: status.to_string(),
             is_host: false,
             is_guest: true,
+            in_call: false,
             joined_at: 0,
             admitted_at: None,
             room_token: room_token.map(ToString::to_string),
@@ -934,5 +959,290 @@ mod tests {
             }
             other => panic!("expected Admitted, got {other:?}"),
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use std::cell::RefCell;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    const CANCEL_MEETING: &str = "guestcancel1";
+    const ADMIT_MEETING: &str = "guestadmit1";
+    const FRESH_TOKEN: &str = "fresh-guest-token";
+
+    type AdmitSignals = (
+        Signal<GuestStatus>,
+        Signal<Option<String>>,
+        Signal<Option<String>>,
+        Signal<Option<String>>,
+    );
+
+    thread_local! {
+        static SHOWN: RefCell<Option<Signal<bool>>> = const { RefCell::new(None) };
+        static ADMIT: RefCell<Option<AdmitSignals>> = const { RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn CancelHarness() -> Element {
+        let name = use_signal(|| None::<String>);
+        use_context_provider(|| DisplayNameCtx(name));
+        let transport = use_signal(TransportPreference::default);
+        use_context_provider(|| TransportPreferenceCtx(transport));
+        let shown = use_signal(|| true);
+        use_hook(move || SHOWN.with(|s| *s.borrow_mut() = Some(shown)));
+        rsx! {
+            if shown() {
+                GuestJoinPage { id: CANCEL_MEETING.to_string() }
+            }
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn AdmitHarness() -> Element {
+        let signals = (
+            use_signal(|| GuestStatus::Waiting {
+                observer_token: "stale-waiting-token".to_string(),
+            }),
+            use_signal(|| None::<String>),
+            use_signal(|| None::<String>),
+            use_signal(|| None::<String>),
+        );
+        use_hook(move || ADMIT.with(|a| *a.borrow_mut() = Some(signals)));
+        rsx! {}
+    }
+
+    fn install_mocks() {
+        js_sys::eval(&format!(
+            r#"
+            window.__APP_CONFIG = Object.freeze({{
+                apiBaseUrl: 'http://test:8080', wsUrl: 'ws://test:8080',
+                webTransportHost: 'https://test:4433', oauthEnabled: 'false',
+                e2eeEnabled: 'false', webTransportEnabled: 'false', firefoxEnabled: 'false',
+                usersAllowedToStream: '', serverElectionPeriodMs: 2000, vadThreshold: 0.02
+            }});
+            window.__leaveAuths = [];
+            window.__joins = 0;
+            window.__strandedPolls = 0;
+            window.__original_fetch = window.__original_fetch || window.fetch;
+            window.fetch = function (input, init) {{
+                var req = typeof input === 'string' ? null : input;
+                var url = req ? req.url : input;
+                var respond = function (body) {{
+                    var resp = new Response(JSON.stringify({{ success: true, result: body }}),
+                        {{ status: 200, headers: {{ 'Content-Type': 'application/json' }} }});
+                    Object.defineProperty(resp, 'url', {{ value: url }});
+                    return Promise.resolve(resp);
+                }};
+                var row = {{ user_id: 'guest:c1', display_name: 'Guest', status: 'waiting',
+                    is_host: false, is_guest: true, joined_at: 0 }};
+                if (url.endsWith('/join-guest')) {{
+                    window.__joins += 1;
+                    row.observer_token = '';
+                    return respond(row);
+                }}
+                if (url.endsWith('/guest-status')) {{
+                    row.observer_token = '{FRESH_TOKEN}';
+                    if (window.__strandedPolls > 0) {{
+                        window.__strandedPolls -= 1;
+                        row.waiting_room_enabled = false;
+                    }}
+                    return respond(row);
+                }}
+                if (url.indexOf('/presence/keepalive') !== -1) {{
+                    return respond(null);
+                }}
+                if (url.endsWith('/leave-guest')) {{
+                    window.__leaveAuths.push(req ? req.headers.get('Authorization') : null);
+                    return new Promise(function () {{}});
+                }}
+                return window.__original_fetch(input, init);
+            }};
+            "#
+        ))
+        .unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    fn remove_mocks() {
+        js_sys::eval(
+            r#"
+            if (window.__original_fetch) { window.fetch = window.__original_fetch; delete window.__original_fetch; }
+            delete window.__APP_CONFIG;
+            "#,
+        )
+        .unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    fn leave_auths() -> Vec<Option<String>> {
+        let value = js_sys::Reflect::get(&gloo_utils::window(), &"__leaveAuths".into()).unwrap();
+        js_sys::Array::from(&value)
+            .iter()
+            .map(|v| v.as_string())
+            .collect()
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            TimeoutFuture::new(10).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn bubbling(kind: &str) -> web_sys::Event {
+        let init = web_sys::EventInit::new();
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        web_sys::Event::new_with_event_init_dict(kind, &init).unwrap()
+    }
+
+    fn mount(root: fn() -> Element) -> web_sys::Element {
+        let el = gloo_utils::document().create_element("div").unwrap();
+        gloo_utils::document()
+            .body()
+            .unwrap()
+            .append_child(&el)
+            .unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(root),
+            dioxus::web::Config::new().rootelement(el.clone()),
+        );
+        el
+    }
+
+    /// Mounts the guest page with `setup` run against the mocks, and joins.
+    async fn join_as_guest(setup: &str) -> web_sys::Element {
+        crate::guest_session::clear(CANCEL_MEETING);
+        install_mocks();
+        js_sys::eval(setup).unwrap();
+        let root = mount(CancelHarness);
+        wait_until("the guest form", || {
+            root.query_selector("#guest-name").unwrap().is_some()
+        })
+        .await;
+        let input: web_sys::HtmlInputElement = root
+            .query_selector("#guest-name")
+            .unwrap()
+            .unwrap()
+            .unchecked_into();
+        input.set_value("Guest");
+        input.dispatch_event(&bubbling("input")).unwrap();
+        TimeoutFuture::new(50).await;
+        let form = root.query_selector("form").unwrap().unwrap();
+        form.dispatch_event(&bubbling("submit")).unwrap();
+        wait_until("the waiting room", || {
+            root.query_selector("[data-testid='meeting-waiting-room']")
+                .unwrap()
+                .is_some()
+        })
+        .await;
+        root
+    }
+
+    fn joins() -> u32 {
+        js_sys::Reflect::get(&gloo_utils::window(), &"__joins".into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u32
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_guest_stranded_by_the_waiting_room_turning_off_joins_again_once() {
+        let root = join_as_guest("window.__strandedPolls = 1;").await;
+        wait_until("the re-join", || joins() == 2).await;
+        wait_until("the second waiting room", || {
+            root.query_selector("[data-testid='meeting-waiting-room']")
+                .unwrap()
+                .is_some()
+        })
+        .await;
+        TimeoutFuture::new(500).await;
+        assert_eq!(joins(), 2, "one re-join per stranded poll, no loop");
+
+        SHOWN.with(|s| s.borrow().expect("shown signal").set(false));
+        TimeoutFuture::new(50).await;
+        remove_mocks();
+        crate::guest_session::clear(CANCEL_MEETING);
+        root.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_guest_leaving_the_waiting_room_sends_leave_guest_with_the_freshest_token() {
+        let root = join_as_guest("").await;
+        wait_until("a status poll to refresh the stored token", || {
+            crate::guest_session::load(CANCEL_MEETING).token.as_deref() == Some(FRESH_TOKEN)
+        })
+        .await;
+
+        // An opaque base URL makes the handler's `set_href("/")` fail to parse
+        // instead of navigating the test page away.
+        let base = gloo_utils::document().create_element("base").unwrap();
+        base.set_attribute("href", "about:blank").unwrap();
+        gloo_utils::document()
+            .head()
+            .unwrap()
+            .append_child(&base)
+            .unwrap();
+        root.query_selector("[data-testid='meeting-waiting-room'] button.btn-secondary")
+            .unwrap()
+            .expect("the leave button")
+            .unchecked_into::<web_sys::HtmlElement>()
+            .click();
+        wait_until("the leave-guest request", || !leave_auths().is_empty()).await;
+        assert_eq!(
+            leave_auths()[0].as_deref(),
+            Some(format!("Bearer {FRESH_TOKEN}").as_str()),
+            "Cancel must authenticate leave-guest with the freshest guest token"
+        );
+
+        TimeoutFuture::new(crate::meeting_api::LEAVE_DEADLINE_MS + 500).await;
+        base.remove();
+        SHOWN.with(|s| s.borrow().expect("shown signal").set(false));
+        TimeoutFuture::new(50).await;
+        remove_mocks();
+        crate::guest_session::clear(CANCEL_MEETING);
+        root.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn an_admitted_guest_keeps_the_freshest_token_for_its_lobby_keepalive() {
+        crate::guest_session::clear(ADMIT_MEETING);
+        let root = mount(AdmitHarness);
+        wait_until("the harness", || ADMIT.with(|a| a.borrow().is_some())).await;
+        let (guest_status, host_name, host_id, observer) =
+            ADMIT.with(|a| a.borrow().expect("admit signals"));
+        crate::guest_session::remember(ADMIT_MEETING, "guest:a1", Some(FRESH_TOKEN), None);
+        let response: JoinMeetingResponse = serde_json::from_str(
+            r#"{"user_id":"guest:a1","status":"admitted","is_host":false,"is_guest":true,
+                "joined_at":0,"room_token":"room-token"}"#,
+        )
+        .unwrap();
+
+        handle_admitted(
+            ADMIT_MEETING,
+            response,
+            "stale-waiting-token".to_string(),
+            guest_status,
+            host_name,
+            host_id,
+            observer,
+        );
+
+        match &*guest_status.peek() {
+            GuestStatus::Admitted {
+                status_observer_token,
+                ..
+            } => assert_eq!(status_observer_token, FRESH_TOKEN),
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+        crate::guest_session::clear(ADMIT_MEETING);
+        root.remove();
     }
 }

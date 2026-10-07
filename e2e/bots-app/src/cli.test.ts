@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { DECODE_BUDGET_WAIVER_NOTE } from "./decode-budget";
 import { type BotTask } from "./orchestrator";
 
 const mocks = vi.hoisted(() => ({ runBotsToCompletion: vi.fn() }));
@@ -38,7 +39,8 @@ vi.mock("./dashboard", async (importOriginal) => ({
   spawnViteDev: vi.fn(),
 }));
 
-vi.mock("./resource/session", () => ({
+vi.mock("./resource/session", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./resource/session")>()),
   ResourceCaptureSession: class {
     readonly label = "cli-test";
     startLocal(): void {}
@@ -65,9 +67,11 @@ async function runCli(
   exits: number[];
   errors: string[];
   runOpts: { onEncoderFps?: unknown };
+  logs: string[];
 }> {
   const exits: number[] = [];
   const errors: string[] = [];
+  const logs: string[] = [];
   let tasks: BotTask[] = [];
   let runOpts: { onEncoderFps?: unknown } = {};
   mocks.runBotsToCompletion.mockReset();
@@ -85,7 +89,9 @@ async function runCli(
     vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
       errors.push(a.map(String).join(" "));
     }),
-    vi.spyOn(console, "log").mockImplementation(() => {}),
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      logs.push(a.map(String).join(" "));
+    }),
     vi.spyOn(console, "warn").mockImplementation(() => {}),
   ];
   const argv = process.argv;
@@ -110,14 +116,17 @@ async function runCli(
     }
     for (const spy of spies) spy.mockRestore();
   }
-  return { tasks, exits, errors, runOpts };
+  return { tasks, exits, errors, runOpts, logs };
 }
 
 /**
  * Drive the real `conduct` subcommand. `globalThis.fetch` is the ONLY seam the
  * readiness probe can reach, so recording it observes the CLI's own wiring.
  */
-async function runConduct(args: string[]): Promise<{
+async function runConduct(
+  args: string[],
+  healthz: () => Response = () => ({ ok: false }) as Response,
+): Promise<{
   probed: string[];
   exits: number[];
   errors: string[];
@@ -136,7 +145,7 @@ async function runConduct(args: string[]): Promise<{
     vi.spyOn(console, "log").mockImplementation(() => {}),
     vi.spyOn(globalThis, "fetch").mockImplementation((async (url: unknown) => {
       probed.push(String(url));
-      return { ok: false } as Response;
+      return healthz();
     }) as typeof fetch),
   ];
   const argv = process.argv;
@@ -163,6 +172,131 @@ afterEach(() => {
 function baseArgs(): string[] {
   return ["--meeting-url", "http://127.0.0.1:3001/meeting/GeomTest", "--assets-dir", workdir()];
 }
+
+describe("bots-app run — join media and participant record (#2914)", () => {
+  const JOIN_ENV = {
+    BOT_JOIN_CAMERA_OFF: undefined,
+    BOT_JOIN_MIC_MUTED: undefined,
+    BOT_ROLE: undefined,
+    BOT_NETEM_APPLIED: undefined,
+    BOT_POD_ORDINAL: undefined,
+    BOT_NODE_NAME: undefined,
+    BOT_JOIN_STAGGER_MS: undefined,
+    BOTS_IMAGE_REVISION: undefined,
+  };
+
+  it("defaults to camera and mic on", async () => {
+    const { tasks } = await runCli([...baseArgs(), "--participant", "alice"], JOIN_ENV);
+    expect(tasks[0].joinMedia).toEqual({ camera: true, mic: true });
+  });
+
+  it("carries --join-camera-off / --join-mic-muted into the task", async () => {
+    const { tasks } = await runCli(
+      [...baseArgs(), "--participant", "alice", "--join-camera-off", "--join-mic-muted"],
+      JOIN_ENV,
+    );
+    expect(tasks[0].joinMedia).toEqual({ camera: false, mic: false });
+  });
+
+  it("reads the env when the flags are absent", async () => {
+    const { tasks } = await runCli([...baseArgs(), "--participant", "alice"], {
+      ...JOIN_ENV,
+      BOT_JOIN_MIC_MUTED: "true",
+    });
+    expect(tasks[0].joinMedia).toEqual({ camera: true, mic: false });
+  });
+
+  it("exits 2 when a camera-off join meets the camera duty cycle", async () => {
+    const { exits, errors } = await runCli(
+      [...baseArgs(), "--participant", "alice", "--join-camera-off"],
+      {
+        ...JOIN_ENV,
+        BOT_CAMERA_ON_SECS_MIN: "5",
+        BOT_CAMERA_ON_SECS_MAX: "10",
+        BOT_CAMERA_OFF_SECS_MIN: "5",
+        BOT_CAMERA_OFF_SECS_MAX: "10",
+      },
+    );
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain("cannot be combined with the camera duty cycle");
+  });
+
+  it("wires the participant recorder into the run", async () => {
+    const assetsDir = workdir();
+    const { tasks, runOpts } = await runCli(
+      [
+        "--meeting-url",
+        "http://127.0.0.1:3001/meeting/GeomTest",
+        "--assets-dir",
+        assetsDir,
+        "--participant",
+        "alice",
+        "--auth",
+        "jwt",
+        "--role",
+        "probe-mix",
+        "--join-camera-off",
+      ],
+      {
+        ...JOIN_ENV,
+        BOT_NETEM_APPLIED: "good_4g",
+        BOT_POD_ORDINAL: "2",
+        BOT_NODE_NAME: "node-b",
+        BOT_JOIN_STAGGER_MS: "17000",
+        BOTS_IMAGE_REVISION: "cafe",
+      },
+    );
+    const hooks = runOpts as {
+      onRegister: (t: BotTask) => void;
+      onJoin: (id: string, at: number, m: { camera: boolean | null; mic: boolean | null }) => void;
+      onFinish: (id: string, at: number, reason: string | undefined) => void;
+      onRejoin: (id: string, network: string | null) => void;
+      onNetem: (action: { op: "clear"; label: string }, at: number, error?: unknown) => void;
+    };
+    const id = tasks[0].botId;
+    hooks.onRegister(tasks[0]);
+    const atRegister = JSON.parse(
+      readFileSync(join(assetsDir, "participants", `${id}.json`), "utf8"),
+    );
+    expect(atRegister.participant.network).toMatchObject({ profile: "good_4g", shaped: true });
+    hooks.onJoin(id, 1_000_500, { camera: false, mic: true });
+    hooks.onRejoin(id, "dialup");
+    hooks.onNetem({ op: "clear", label: "clear" }, 1_030_000);
+    expect(
+      JSON.parse(readFileSync(join(assetsDir, "participants", `${id}.json`), "utf8")).participant
+        .network,
+    ).toMatchObject({ profile: "dialup", shaper: "netsim" });
+    hooks.onNetem({ op: "clear", label: "clear" }, 1_040_000, new Error("tc failed"));
+    hooks.onFinish(id, 1_060_000, "ttl-expired");
+    const rec = JSON.parse(readFileSync(join(assetsDir, "participants", `${id}.json`), "utf8"));
+    expect(rec).toMatchObject({
+      schema: "bots-app-participant-record/v0",
+      outcome: "ttl-expired",
+      participant: {
+        user_id: "alice@bots-app.local",
+        role: "probe-mix",
+        publishes: { camera: false, mic: true, screen: false },
+        network: { profile: "unknown", shaped: null, direction: null, shaper: null },
+        transport_intended: "auto",
+        join_ts: 1000.5,
+        leave_ts: 1060,
+        placement: { ordinal: 2, node: "node-b" },
+        stagger_ms: 17_000,
+      },
+      code: { images: { "bots-app": "cafe" } },
+    });
+    expect(rec.unverified.map((u: { field: string }) => u.field)).toContain("rejoin");
+  });
+
+  it("exits 2 on a malformed --role", async () => {
+    const { exits, errors } = await runCli(
+      [...baseArgs(), "--participant", "alice", "--role", "probe mix"],
+      JOIN_ENV,
+    );
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain("--role / BOT_ROLE must match");
+  });
+});
 
 describe("bots-app run — source geometry reaches the bot task (#2236)", () => {
   it.each([
@@ -326,6 +460,41 @@ describe("bots-app conduct — readiness seam wiring (#2356)", () => {
     );
     expect(errors.join("\n")).toContain("never answered /healthz");
     expect(exits[0]).toBe(1);
+  }, 15_000);
+
+  it("reads the /healthz body: a 200 with no bot in the meeting is not ready (#2917)", async () => {
+    const idle = { ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 1 };
+    const { exits, errors } = await runConduct(
+      ["--scenario", scenarioFile(), "--readiness-timeout", "1"],
+      () => Response.json(idle),
+    );
+    expect(errors.join("\n")).toContain("not in the meeting (inMeeting 0/1, still joining 0)");
+    expect(exits[0]).toBe(1);
+  }, 15_000);
+
+  it("--fleet-size probes pods the timeline never names", async () => {
+    const { probed } = await runConduct([
+      "--scenario",
+      scenarioFile(),
+      "--readiness-timeout",
+      "1",
+      "--fleet-size",
+      "2",
+    ]);
+    expect(probed).toContain(
+      "http://videocall-bots-1.videocall-bots.bot-load.svc.cluster.local:8080/healthz",
+    );
+  }, 15_000);
+
+  it("exits 2 on a malformed --fleet-size", async () => {
+    const { exits, errors } = await runConduct([
+      "--scenario",
+      scenarioFile(),
+      "--fleet-size",
+      "2x",
+    ]);
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain("--fleet-size must be a non-negative integer");
   }, 15_000);
 });
 
@@ -656,5 +825,112 @@ describe("bots-app non-run subcommands — log-line forgery (#2406)", () => {
       ({ output: o }) => o.some((l) => l.includes("BOT_CTL_PROXY_IDLE_TIMEOUT_MS")),
     );
     assertCollapsed(output);
+  });
+});
+
+describe("bots-app run — --diag-packets (#2970)", () => {
+  const ENV = { BOT_DIAG_PACKETS: undefined, BOTS_IMAGE_REVISION: undefined };
+
+  it("carries the flag, else the env, into the task; unset leaves it null", async () => {
+    const flag = await runCli([...baseArgs(), "--participant", "a", "--diag-packets", "off"], ENV);
+    expect(flag.tasks[0].diagPackets).toBe("off");
+    const env = await runCli([...baseArgs(), "--participant", "a"], {
+      ...ENV,
+      BOT_DIAG_PACKETS: "0",
+    });
+    expect(env.tasks[0].diagPackets).toBe("off");
+    const unset = await runCli([...baseArgs(), "--participant", "a"], ENV);
+    expect(unset.tasks[0].diagPackets).toBeNull();
+  });
+
+  it("exits 2 on on: an injected truthy value would lift the deployment's ceiling", async () => {
+    const { exits, errors } = await runCli(
+      [...baseArgs(), "--participant", "a", "--diag-packets", "on"],
+      ENV,
+    );
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain('--diag-packets (or BOT_DIAG_PACKETS) must be "off"');
+  });
+
+  it("routes each bot's observation into its participant record", async () => {
+    const assetsDir = workdir();
+    const { tasks, runOpts } = await runCli(
+      [
+        "--meeting-url",
+        "http://127.0.0.1:3001/meeting/GeomTest",
+        "--assets-dir",
+        assetsDir,
+        "--participant",
+        "a",
+        "--diag-packets",
+        "off",
+      ],
+      ENV,
+    );
+    const hooks = runOpts as {
+      onRegister: (t: BotTask) => void;
+      onDiagPackets: (id: string, obs: { state: string; source: string }) => void;
+    };
+    hooks.onRegister(tasks[0]);
+    hooks.onDiagPackets(tasks[0].botId, { state: "DISABLED", source: "config" });
+    const rec = JSON.parse(
+      readFileSync(join(assetsDir, "participants", `${tasks[0].botId}.json`), "utf8"),
+    );
+    expect(rec.diagnostics_packets).toEqual({
+      requested: "off",
+      observed: "DISABLED",
+      source: "config",
+    });
+  });
+});
+
+describe("bots-app run — --decode-budget (#2914)", () => {
+  const ENV = { BOTS_IMAGE_REVISION: undefined };
+
+  it("defaults every task to client and carries off when asked", async () => {
+    const unset = await runCli([...baseArgs(), "--participant", "a"], ENV);
+    expect(unset.tasks.map((t) => t.decodeBudget)).toEqual(["client"]);
+    expect(unset.logs.join("\n")).not.toContain(DECODE_BUDGET_WAIVER_NOTE);
+    const off = await runCli([...baseArgs(), "--participant", "a", "--decode-budget", "off"], ENV);
+    expect(off.exits).not.toContain(2);
+    expect(off.tasks.map((t) => t.decodeBudget)).toEqual(["off"]);
+    expect(off.logs.join("\n")).toContain(DECODE_BUDGET_WAIVER_NOTE);
+  });
+
+  it("exits 2 on a value that is not client or off", async () => {
+    const { exits, errors } = await runCli(
+      [...baseArgs(), "--participant", "a", "--decode-budget", "all"],
+      ENV,
+    );
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain('--decode-budget must be "client" or "off", got "all"');
+  });
+
+  it("routes the join readback into the participant record", async () => {
+    const assetsDir = workdir();
+    const { tasks, runOpts } = await runCli(
+      [
+        "--meeting-url",
+        "http://127.0.0.1:3001/meeting/GeomTest",
+        "--assets-dir",
+        assetsDir,
+        "--participant",
+        "a",
+        "--decode-budget",
+        "off",
+      ],
+      ENV,
+    );
+    const hooks = runOpts as {
+      onRegister: (t: BotTask) => void;
+      onJoin: (id: string, at: number, media: unknown, uid: null, readback: string) => void;
+    };
+    hooks.onRegister(tasks[0]);
+    hooks.onJoin(tasks[0].botId, 1_000, { camera: true, mic: true }, null, "all");
+    const rec = JSON.parse(
+      readFileSync(join(assetsDir, "participants", `${tasks[0].botId}.json`), "utf8"),
+    );
+    expect(rec.decode_budget).toEqual({ requested: "off", observed: "all" });
+    expect(rec.unverified.map((u: { field: string }) => u.field)).toContain("decode_budget");
   });
 });

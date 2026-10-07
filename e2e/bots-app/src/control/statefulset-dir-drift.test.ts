@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { describe, expect, it } from "vitest";
 
+import { taggedLine } from "../log-line";
 import { CTL_STATE_DIR_ENV, resolveCtlStateDir } from "./auth";
 import { isLoopbackBindAddress } from "./server";
 
@@ -338,7 +339,8 @@ describe("README's fleet-ramp recipe ↔ manifest + log line (#2294)", () => {
 
   it("greps a string the orchestrator still emits on join", () => {
     const src = readFileSync(resolve(import.meta.dirname, "..", "orchestrator.ts"), "utf8");
-    expect(src).toContain("] joined; ttl=");
+    expect(src).toContain("taggedLine(label, `joined; ttl=");
+    expect(taggedLine("bot-0@abc123", "joined; ttl=10s")).toContain("] joined; ttl=");
     expect(readme()).toContain('grep "] joined; ttl="');
   });
 

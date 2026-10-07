@@ -130,7 +130,10 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 | Alert | Condition | Severity |
 |---|---|---|
 | `RelayPacketDrops` | `rate(relay_packet_drops_total[1m]) > 0` for 1m | critical |
-| `RelayNATSLatencyHigh` | NATS publish p99 > 50ms for 2m | warning |
+| `RelayNATSLatencyHigh` | NATS client enqueue p99 > 50ms for 2m: the command channel is full or a relay runtime is busy, not a round-trip. Pools every relay pod; read with `videocall_relay_scheduler_lag_ms` by pod where the pod exports it | warning |
+| `RelayNATSDisconnectOrSlowConsumer` | `increase(relay_nats_events_total{event=~"disconnected\|slow_consumer"}[5m]) > 0`, per relay pod and event. Non-paging. Panel *NATS Client Events /5m by Relay Pod* (#2925) | warning |
+| `RelaySchedulerLagHigh` | `videocall_relay_scheduler_lag_ms` p99 > 100ms for 1m, per WT relay pod | critical |
+| `RelaySchedulerLagHighWS` | The same condition on a WS relay pod; warning until a WS baseline exists (#2924) | warning |
 | `RelayQueueNearFullWS` | One receiver's WS `channel="ws"` depth > 819/1024 across a 1m window | warning |
 | `RelayQueueNearFullWTUnistream` | One receiver's WT unistream depth > 819/1024 across a 1m window. Cannot fire on media with E2EE off: the byte shed caps camera+screen near 219 slots | warning |
 | `RelayQueueNearFullWTDatagram` | One receiver's WT datagram depth > 410/512 across a 1m window. Runtime starvation, not downlink | warning |
@@ -157,7 +160,12 @@ Time-to-page is therefore ~60s (window) + 15s (`for`) ≈ 75s, against ~30s befo
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `relay_packet_drops_total` | Counter | room, transport, drop_reason | Packets dropped due to full queue/mailbox |
-| `relay_nats_publish_latency_ms` | Histogram | — | Time to publish media packet to NATS |
+| `relay_nats_publish_latency_ms` | Histogram | — | Time for `Client::publish()` to enqueue a media packet into the async-nats client's local 2048-slot command channel. Not a NATS round-trip or a socket write. It rises when that channel is full (the pod's NATS connection task is behind) or when the publishing ChatServer task is descheduled on a busy relay runtime (tokio coop yield). On a pod that also exports `videocall_relay_scheduler_lag_ms`: if lag rose too, suspect the runtime first; if it is flat, the NATS writer. A pod without that series cannot be split this way |
+| `relay_nats_events_total` | Counter | event | async-nats connection events (#2925): `connected` (initial connect and each reconnect), `disconnected`, `client_error` (each failed reconnect attempt), `slow_consumer` (a 65,536-message subscription channel was full and the message was DROPPED; most likely a session's media subscription, though the relay also holds control subscriptions), `lame_duck_mode`, `server_error`. A lower bound: async-nats drops events past its 128-slot event queue |
+| `relay_nats_{in,out}_messages_total` | Counter | — | async-nats `Statistics` read at scrape time (#2925). `in` counts every message received, before per-subscription dispatch, so slow-consumer drops are included; `out` counts publishes taken off the command channel, before the socket write |
+| `relay_nats_in_bytes_total` | Counter | — | Socket bytes read, framing included. No `out` bytes counter: async-nats 0.42's `out_bytes` double-counts publishes |
+| `relay_nats_connects_total` | Counter | — | Successful NATS connections: the initial connect plus every reconnect. Exact, unlike `relay_nats_events_total{event="connected"}`, which async-nats can drop |
+| `videocall_relay_scheduler_lag_ms` | Histogram | — | How late a 500ms probe tick is polled on a relay runtime, in ms. WT: the main runtime plus every session arbiter (#2727). WS: the main runtime only, which hosts `ChatServer` and every session's NATS receive loop (#2924); the HTTP worker threads running the WS sessions are not probed. A 100ms+ band means that runtime's thread was held and fan-out stalled. Panels: *Relay Scheduler Lag Distribution* and *p50/p99* in the meeting-investigation dashboard |
 | `relay_outbound_queue_depth` | Gauge | room, transport | Outbound channel occupancy in SLOTS (WS 1024; WT unistream default 1024, env `WT_OUTBOUND_CHANNEL_CAPACITY`; WT datagram fixed 512). Room-level: every session in the room writes this same series, so each scrape reports one arbitrary session and it does not reliably detect a single backed-up receiver — use `videocall_relay_outbound_queue_depth_by_session` for that. On WT it is the uni+datagram SUM |
 | `videocall_relay_outbound_queue_depth_by_session` | Gauge | room, transport, session_id, channel | Per-receiver outbound occupancy in SLOTS, attributable (#1737). `channel` is `ws` on WebSocket, `unistream` or `datagram` on WebTransport — per primitive, not summed. The `RelayQueueNearFull*` alerts key off this and its byte sibling, never the room-level pair |
 | `relay_outbound_queue_bytes` | Gauge | room, transport, kind | Outbound channel occupancy in BYTES by kind (`video`\|`screen`\|`other`). WS reports its single channel; WT reports its unistream lane, the only lane video and screen ride (#2717). With E2EE ON the outer `media_kind` is what buckets a sealed frame, so an older publisher that leaves it unset reports its media under `kind="other"` and is not byte-shed (#2717). `video` and `screen` are the dimensions the #2261 policy sheds on (80% of 384,000 B; 90% of 7,076,736 B). Audio and control are COUNTED, under `kind="other"` — they are simply never *shed* on bytes, only on slots. Room-level: each scrape reports one arbitrary session, so it does not reliably detect a single backed-up receiver — use `relay_outbound_queue_bytes_by_session` for that |
@@ -180,6 +188,28 @@ Time-to-page is therefore ~60s (window) + 15s (`for`) ≈ 75s, against ~30s befo
 | `videocall_neteq_expand_ops_per_sec` | Audio concealment rate (key audio health signal) |
 | `videocall_neteq_target_delay_ms` | Jitter estimate |
 | `videocall_audio_concealment_pct` | Audio concealment percentage |
+
+### HEALTH ingest completeness (metrics_server)
+`videocall_health_reports_total` counts only packets that reached the per-session series. These counters account for the rest, so a quiet meeting can be told apart from a lossy pipeline (#2920). All exist at 0 from startup.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `videocall_health_packets_dropped_total` | Counter | reason | Dequeued packets discarded before ingest. `reason="stale"`: server time minus the client's send `timestamp_ms` exceeded 30 s. Either the sender's clock is behind or the packet waited 30 s in the NATS/ingest backlog; the guard cannot tell which. A clock running ahead always passes (#2096). `reason="decode_error"`: the payload is not a `HealthPacket`. |
+| `videocall_health_ingest_nats_received_total` | Counter | — | Messages the NATS connection received from the server (async-nats `in_messages`), counted before the client hands them to the 65,536-slot subscription channel, so it includes the ones dropped there. Synced at each scrape. |
+| `videocall_health_ingest_dequeued_total` | Counter | — | Messages the ingest loop took off that channel. |
+
+`received - dequeued` is the messages NATS dropped on a full subscription channel plus the current backlog (at most 65,536). It is the exact drop count once the loop has drained, and an upper bound during a burst.
+
+Over a window, `increase(received) - increase(dequeued)` is the drops plus the change in backlog across the window: it can read up to 65,536 low, or negative while a backlog drains. It is exact only when the backlog is empty at both ends of the window, so read it over a window that ends after the burst has drained, and clamp it at 0.
+
+```promql
+# Packets dropped on a full subscription channel over 5m (within ±65,536; exact if no backlog at either end)
+clamp_min(sum(increase(videocall_health_ingest_nats_received_total[5m])) - sum(increase(videocall_health_ingest_dequeued_total[5m])), 0)
+
+# Fraction of dequeued packets discarded as stale or undecodable
+sum(rate(videocall_health_packets_dropped_total[5m])) / sum(rate(videocall_health_ingest_dequeued_total[5m]))
+```
+`sum()` is required: `videocall_health_packets_dropped_total` carries `reason` and the other two do not, so a bare binary operator matches no series.
 
 ### Decode-budget metrics (client-side, via metrics_server)
 Receiver-side decode-budget state reported by each client in its health packet. All are `meeting_id`-keyed per-session gauges (not relay `room`-keyed), and surface in the **Decode-Budget (Client-Side)** dashboard row.

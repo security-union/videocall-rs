@@ -173,7 +173,7 @@ function luminance(value: string): number {
 
 // data-testid on the synthetic container so every assertion below is scoped to
 // OUR injected nodes and can never collide with a real toast the app happens to
-// render (e.g. a "Host muted your microphone" toast, which also carries
+// render (e.g. a real peer's "left the meeting" toast, which also carries
 // `.toast-left`).
 const SYNTHETIC_TESTID = "synthetic-peer-toasts";
 

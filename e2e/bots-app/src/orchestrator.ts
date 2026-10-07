@@ -1,6 +1,11 @@
 import { existsSync } from "node:fs";
 
-import { type BotExitReason, launchBot, type BotRunOptions } from "./bot";
+import {
+  type BotExitReason,
+  type BotRunOptions,
+  type DiagPacketsObservation,
+  launchBot,
+} from "./bot";
 import { type CameraCycleConfig } from "./camera-cycle";
 import {
   cameraControlSelector,
@@ -16,6 +21,8 @@ import {
   type BotRegistryEntry,
   generateBotId,
   newRegistryEntry,
+  BotNotJoinedError,
+  ExpectedBots,
   NotSupportedRemoteError,
   shortBotId,
 } from "./control/registry";
@@ -29,12 +36,20 @@ import {
   applyNetemAction,
   defaultNetemExec,
   NETEM_IFACE_DEFAULT,
+  type NetemAction,
+  type NetemApplyResult,
   type NetemExec,
 } from "./control/netem";
 import { getHost, type SshHost } from "./control/ssh-hosts";
 import { spawnRemoteBot, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
+import { taggedLine } from "./log-line";
 import { loadManifest, type Manifest } from "./manifest";
-import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
+import {
+  JoinRejectedError,
+  type JoinMediaState,
+  MeetingNavigatedAwayError,
+  WaitingRoomError,
+} from "./meeting-join";
 import { SD_SOURCE } from "./posture";
 import { type RemoteResourceManager } from "./resource/session";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
@@ -125,7 +140,25 @@ export interface RunOptions {
    */
   onEncoderFps?: (botId: string, fps: number | null) => void;
   /** Local bots only; a ctl rejoin re-fires it with the FIRST join instant (#2294). */
-  onJoin?: (botId: string, joinedAt: number) => void;
+  onJoin?: (
+    botId: string,
+    joinedAt: number,
+    media?: JoinMediaState,
+    sessionUserId?: string | null,
+    decodeBudgetReadback?: string | null,
+  ) => void;
+  /** Local bots only: each `diagnostics packets:` line a bot's client prints. */
+  onDiagPackets?: (botId: string, obs: DiagPacketsObservation) => void;
+  /** Overrides {@link DIAG_PACKETS_VERIFY_MS}. */
+  diagPacketsVerifyMs?: number;
+  /** Local bots only: fired when a task is registered, before it launches. */
+  onRegister?: (task: BotTask) => void;
+  /** Local bots only: fired when a ctl network change starts tearing the bot down to relaunch it on `network`. */
+  onRejoin?: (botId: string, network: string | null) => void;
+  /** Local bots only: fired once per task when its run ends, whatever the outcome. */
+  onFinish?: (botId: string, finishedAt: number, finishReason: string | undefined) => void;
+  /** Fired after a control-API netem action on this host's interface; `error` when it threw partway. */
+  onNetem?: (action: NetemAction, at: number, error?: unknown) => void;
   /**
    * Optional remote-resource manager (issue 2032). When set, each SSH-hosted
    * bot triggers `ensureForHost(host)` so the box that actually runs the bot is
@@ -178,6 +211,7 @@ export async function registerSshTask(
     // Unused on this path: an SSH bot launches via the remote CLI, not launchBot.
     sourceGeometry: SD_SOURCE,
     cameraCycle: null,
+    diagPackets: spec.diagPackets ?? null,
   };
   const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
   const entry = newRegistryEntry(task, hostKind);
@@ -198,6 +232,7 @@ export async function registerSshTask(
     displayName: task.displayName,
     headless: spec.headless,
     ssoStateFile,
+    diagPackets: task.diagPackets,
     botId,
   });
   entry.sshHandle = sshHandle;
@@ -207,7 +242,10 @@ export async function registerSshTask(
   // failure must never disturb the bot launch above.
   void deps.remoteResource?.ensureForHost(host).catch(() => {});
   console.log(
-    `[orchestrator] ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
+    taggedLine(
+      "orchestrator",
+      `ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
+    ),
   );
   const exitPromise: Promise<BotExitReason> = sshHandle.exit.then((code) => {
     entry.status = code === 0 ? "done" : "failed";
@@ -260,7 +298,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   const initialTasks = opts.tasks;
 
   if (initialTasks.length === 0 && opts.control === undefined) {
-    console.warn("[orchestrator] no tasks supplied; nothing to do");
+    console.warn(taggedLine("orchestrator", "no tasks supplied; nothing to do"));
     return;
   }
 
@@ -273,7 +311,9 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   const requestShutdown = (signal: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`[orchestrator] received ${signal}; signaling ${registry.size} bot(s) to leave`);
+    console.log(
+      taggedLine("orchestrator", `received ${signal}; signaling ${registry.size} bot(s) to leave`),
+    );
     resolveShutdown();
   };
   const sigintHandler = (): void => requestShutdown("SIGINT");
@@ -306,9 +346,11 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   const ctlSignals: Map<string, { trigger: (reason: CtlReason) => void }> = new Map();
 
   if (initialTasks.length > 0) {
-    console.log(`[orchestrator] launching ${initialTasks.length} bot(s)`);
+    console.log(taggedLine("orchestrator", `launching ${initialTasks.length} bot(s)`));
   } else {
-    console.log("[orchestrator] starting with 0 bots; waiting for dashboard / ctl to add some");
+    console.log(
+      taggedLine("orchestrator", "starting with 0 bots; waiting for dashboard / ctl to add some"),
+    );
   }
 
   // Pre-load the conversation manifest once at startup when the
@@ -335,16 +377,25 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         dashboardManifest = loaded.manifest;
         dashboardManifestDir = loaded.manifestDir;
         console.log(
-          `[orchestrator] dashboard manifest loaded from ${opts.control.manifestPath} (${dashboardManifest.participants.length} participant(s))`,
+          taggedLine(
+            "orchestrator",
+            `dashboard manifest loaded from ${opts.control.manifestPath} (${dashboardManifest.participants.length} participant(s))`,
+          ),
         );
       } catch (e) {
         console.warn(
-          `[orchestrator] dashboard manifest at ${opts.control.manifestPath} failed to parse: ${(e as Error).message} — dashboard-launched bots will fall back to default fake devices unless an operator explicitly picks costume/audio.`,
+          taggedLine(
+            "orchestrator",
+            `dashboard manifest at ${opts.control.manifestPath} failed to parse: ${(e as Error).message} — dashboard-launched bots will fall back to default fake devices unless an operator explicitly picks costume/audio.`,
+          ),
         );
       }
     } else {
       console.warn(
-        `[orchestrator] dashboard manifest not found at ${opts.control.manifestPath} — dashboard-launched bots will fall back to default fake devices unless an operator explicitly picks costume/audio.`,
+        taggedLine(
+          "orchestrator",
+          `dashboard manifest not found at ${opts.control.manifestPath} — dashboard-launched bots will fall back to default fake devices unless an operator explicitly picks costume/audio.`,
+        ),
       );
     }
   }
@@ -352,8 +403,13 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   // Build the control surface up front so we can hand it to the
   // server before any bot finishes — the server can be queried the
   // instant it's listening.
+  const expected = new ExpectedBots();
   const surface: OrchestratorControlSurface = {
     getRegistry: () => registry,
+    expectedBots: () => expected.value,
+    releaseExpected: (entry) => {
+      expected.dropped(entry);
+    },
     triggerLeave: async (botId) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in flight`);
@@ -368,7 +424,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         return;
       }
       const sig = ctlSignals.get(botId);
-      if (sig === undefined) throw new Error(`bot ${botId} not in flight`);
+      if (sig === undefined) throw new BotNotJoinedError(`bot ${botId} is not in the meeting`);
       sig.trigger("ctl-leave");
     },
     forceKill: async (botId) => {
@@ -381,7 +437,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         return;
       }
       const sig = ctlSignals.get(botId);
-      if (sig === undefined) throw new Error(`bot ${botId} not in flight`);
+      if (sig === undefined) throw new BotNotJoinedError(`bot ${botId} is not in the meeting`);
       sig.trigger("ctl-kill");
     },
     applyTtl: (botId, newTtl) => {
@@ -393,7 +449,10 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       const timer = ttlTimers.get(botId);
       if (timer !== undefined) timer.rearm(newTtl);
       console.log(
-        `[${entry.task.participant}@${shortBotId(botId)}] ttl rearmed → ${formatDuration(newTtl)}`,
+        taggedLine(
+          `${entry.task.participant}@${shortBotId(botId)}`,
+          `ttl rearmed → ${formatDuration(newTtl)}`,
+        ),
       );
     },
     changeNetwork: async (botId, network) => {
@@ -413,21 +472,21 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
       if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("mute");
-      if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
+      if (entry.handle === null) throw new BotNotJoinedError(`bot ${botId} is not yet in-meeting`);
       await toggleMicrophone(entry, micMuted);
     },
     setCameraOff: async (botId, cameraOff) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
       if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("camera");
-      if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
+      if (entry.handle === null) throw new BotNotJoinedError(`bot ${botId} is not yet in-meeting`);
       await toggleCamera(entry, cameraOff);
     },
     setScreenShare: async (botId, share) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
       if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("share");
-      if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
+      if (entry.handle === null) throw new BotNotJoinedError(`bot ${botId} is not yet in-meeting`);
       await toggleScreenShare(entry, share);
     },
     launchOne: async (spec: LaunchSpec) => {
@@ -459,7 +518,10 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       });
       registerTask(newTask);
       console.log(
-        `[orchestrator] dashboard-launch → ${newTask.participant}@${shortBotId(newTask.botId)}`,
+        taggedLine(
+          "orchestrator",
+          `dashboard-launch → ${newTask.participant}@${shortBotId(newTask.botId)}`,
+        ),
       );
       return newTask.botId;
     },
@@ -479,7 +541,10 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       };
       registerTask(newTask);
       console.log(
-        `[orchestrator] duplicate of ${shortBotId(sourceBotId)} → ${newTask.participant}@${shortBotId(newTask.botId)}`,
+        taggedLine(
+          "orchestrator",
+          `duplicate of ${shortBotId(sourceBotId)} → ${newTask.participant}@${shortBotId(newTask.botId)}`,
+        ),
       );
       return newTask.botId;
     },
@@ -494,11 +559,25 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   if (opts.control?.netem) {
     const iface = opts.control.netem.iface ?? NETEM_IFACE_DEFAULT;
     const exec = opts.control.netem.exec ?? defaultNetemExec();
+    // One action at a time: an interleaved shape and clear leave a state neither asked for.
+    let netemTail: Promise<unknown> = Promise.resolve();
     surface.setNetem = async (action) => {
-      const result = await applyNetemAction(action, { iface, exec });
+      const applied = netemTail.then(() => applyNetemAction(action, { iface, exec }));
+      netemTail = applied.catch(() => {});
+      let result: NetemApplyResult;
+      try {
+        result = await applied;
+      } catch (e) {
+        opts.onNetem?.(action, Date.now(), e);
+        throw e;
+      }
+      opts.onNetem?.(action, Date.now());
       const ran = result.commands.map((c) => c.join(" ")).join("; ");
       console.log(
-        `[orchestrator] netem ${result.op} (${result.label}) mirror_removed=${result.mirrorRemoved}: ${ran}`,
+        taggedLine(
+          "orchestrator",
+          `netem ${result.op} (${result.label}) ingress_shaped=${result.ingressShaped} mirror_removed=${result.mirrorRemoved}: ${ran}`,
+        ),
       );
       return result;
     };
@@ -516,7 +595,10 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       manifestPath: opts.control.manifestPath,
     });
     console.log(
-      `[orchestrator] control server listening on http://${bindAddress}:${controlHandle.port}`,
+      taggedLine(
+        "orchestrator",
+        `control server listening on http://${bindAddress}:${controlHandle.port}`,
+      ),
     );
     if (opts.control.onListen) {
       await opts.control.onListen({ port: controlHandle.port, token: opts.control.token });
@@ -526,6 +608,8 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   function registerTask(task: BotTask): void {
     const entry = newRegistryEntry(task);
     registry.set(task.botId, entry);
+    expected.launched(entry.host);
+    opts.onRegister?.(task);
     inFlight.set(
       task.botId,
       runSingleBotTask(task, entry, {
@@ -537,7 +621,13 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
           ctlSignals.delete(botId);
         },
         onEncoderFps: opts.onEncoderFps,
+        onDiagPackets: opts.onDiagPackets,
+        diagPacketsVerifyMs: opts.diagPacketsVerifyMs,
         onJoin: opts.onJoin,
+        onRejoin: opts.onRejoin,
+      }).then((reason) => {
+        expected.finished(entry);
+        return reason;
       }),
     );
     // Wake the wait loop if it was parked waiting for new work
@@ -592,34 +682,50 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       ),
     );
     inFlight.delete(winner.id);
+    const finished = registry.get(winner.id);
+    if (finished?.host.kind === "local") {
+      opts.onFinish?.(
+        winner.id,
+        finished.finishedAt ?? Date.now(),
+        finished.finishReason ?? (winner.kind === "err" ? "threw" : undefined),
+      );
+    }
     if (winner.kind === "err") {
       const entry = registry.get(winner.id);
       const label = entry ? `${entry.task.participant}@${shortBotId(winner.id)}` : winner.id;
       console.error(
-        `[orchestrator] bot ${label} threw:`,
-        (winner.err as Error)?.message ?? winner.err,
+        taggedLine(
+          "orchestrator",
+          `bot ${label} threw: ${String((winner.err as Error)?.message ?? winner.err)}`,
+        ),
       );
     }
   }
 
   const failed = countFailed(registry);
   if (failed > 0) {
-    console.warn(`[orchestrator] ${failed}/${registry.size} bot(s) ended with an error`);
+    console.warn(
+      taggedLine("orchestrator", `${failed}/${registry.size} bot(s) ended with an error`),
+    );
   }
-  console.log(`[orchestrator] all bot(s) finished`);
+  console.log(taggedLine("orchestrator", "all bot(s) finished"));
 
   // Issue 2032: retrieve + derive every remote box's resource CSV and print its
   // RESOURCE_STARVED verdict. Guarded so a remote-capture failure cannot mask a
   // clean run's completion.
   if (opts.remoteResource) {
     await opts.remoteResource.finalizeAll().catch((e: unknown) => {
-      console.warn(`[orchestrator] remote resource finalize failed:`, (e as Error).message);
+      console.warn(
+        taggedLine("orchestrator", `remote resource finalize failed: ${(e as Error).message}`),
+      );
     });
   }
 
   if (controlHandle) {
     await controlHandle.close().catch((e: unknown) => {
-      console.error(`[orchestrator] control server close failed:`, (e as Error).message);
+      console.error(
+        taggedLine("orchestrator", `control server close failed: ${(e as Error).message}`),
+      );
     });
   }
   process.off("SIGINT", sigintHandler);
@@ -628,6 +734,9 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
 
 type CtlReason = "ctl-leave" | "ctl-kill" | "ctl-rejoin";
 
+/** How long after a join an `off` bot may go without a `diagnostics packets:` line. */
+export const DIAG_PACKETS_VERIFY_MS = 15_000;
+
 interface SingleBotDeps {
   shutdownRequested: Promise<void>;
   registerTtlTimer: (botId: string, ctl: { cancel: () => void; rearm: (ttl: Ttl) => void }) => void;
@@ -635,8 +744,17 @@ interface SingleBotDeps {
   clearMaps: (botId: string) => void;
   /** Per-bot FPS sink threaded from {@link RunOptions.onEncoderFps} (issue 2032). */
   onEncoderFps?: (botId: string, fps: number | null) => void;
+  onDiagPackets?: (botId: string, obs: DiagPacketsObservation) => void;
+  diagPacketsVerifyMs?: number;
   /** Join sink threaded from {@link RunOptions.onJoin} (#2294). */
-  onJoin?: (botId: string, joinedAt: number) => void;
+  onJoin?: (
+    botId: string,
+    joinedAt: number,
+    media?: JoinMediaState,
+    sessionUserId?: string | null,
+    decodeBudgetReadback?: string | null,
+  ) => void;
+  onRejoin?: (botId: string, network: string | null) => void;
 }
 
 async function runSingleBotTask(
@@ -674,17 +792,26 @@ async function runSingleBotTask(
     // the bot's log prefix reads `[participant@<id>]`.
     const { ttl, botId, ...rest } = entry.task;
     void botId;
+    let diagSeen = false;
     const launchOpts = {
       ...rest,
       botIdShort: shortBotId(task.botId),
       onEncoderFps: deps.onEncoderFps
         ? (fps: number | null): void => deps.onEncoderFps?.(task.botId, fps)
         : null,
+      onDiagPackets: (obs: DiagPacketsObservation): void => {
+        diagSeen = true;
+        appendLocalLog(
+          entry,
+          taggedLine(label, `diagnostics packets: ${obs.state} (source=${obs.source})`),
+        );
+        deps.onDiagPackets?.(task.botId, obs);
+      },
       onPrimeProgress: willAutoPrime
         ? (p: PrimeProgress): void => {
             // Mirror the CLI's prefix format so the dashboard log
             // dialog reads consistently with stdout-tail debugging.
-            const line = `[${label}] auto-prime: ${p.step} — ${p.message}`;
+            const line = taggedLine(label, `auto-prime: ${p.step} — ${p.message}`);
             appendLocalLog(entry, line);
             console.log(line);
             // Transition out of `priming` the moment the helper
@@ -703,7 +830,7 @@ async function runSingleBotTask(
       bot = await launchBot(launchOpts);
     } catch (err) {
       if (err instanceof MeetingNavigatedAwayError) {
-        console.log(`[${label}] exited cleanly: user dismissed via browser hang-up`);
+        console.log(taggedLine(label, "exited cleanly: user dismissed via browser hang-up"));
         entry.status = "done";
         entry.finishReason = "user-hangup";
         entry.finishedAt = Date.now();
@@ -717,7 +844,7 @@ async function runSingleBotTask(
         // failure-tally doesn't paint a misleading picture for runs
         // where the operator intentionally joins a meeting they can't
         // self-admit into.
-        console.log(`[${label}] exited cleanly: ${err.message}`);
+        console.log(taggedLine(label, `exited cleanly: ${err.message}`));
         entry.status = "done";
         entry.finishReason = `waiting-room:${err.variant}`;
         entry.finishedAt = Date.now();
@@ -728,7 +855,7 @@ async function runSingleBotTask(
         // Real failure (host denied us or the server reported an
         // error) — but report it cleanly instead of the misleading
         // "join button reappeared after 3 attempts" diagnostic.
-        console.error(`[${label}] join rejected: ${err.message}`);
+        console.error(taggedLine(label, `join rejected: ${err.message}`));
         entry.status = "failed";
         entry.lastError = err.message;
         entry.finishReason = `meeting-rejected:${err.reason}`;
@@ -736,7 +863,7 @@ async function runSingleBotTask(
         deps.clearMaps(task.botId);
         return { kind: "meeting-rejected", reason: err.reason, detail: err.message };
       }
-      console.error(`[${label}] launch failed:`, (err as Error).message);
+      console.error(taggedLine(label, `launch failed: ${(err as Error).message}`));
       entry.status = "failed";
       entry.lastError = (err as Error).message;
       entry.finishReason = "launch-error";
@@ -749,8 +876,28 @@ async function runSingleBotTask(
     entry.joinedAt ??= Date.now();
     entry.ttl = ttl;
     entry.ttlDeadline = ttl === "infinite" ? null : Date.now() + ttl;
-    deps.onJoin?.(task.botId, entry.joinedAt);
-    console.log(`[${label}] joined; ttl=${formatDuration(ttl)}`);
+    deps.onJoin?.(
+      task.botId,
+      entry.joinedAt,
+      bot.joinMedia,
+      bot.sessionUserId(),
+      bot.decodeBudgetReadback,
+    );
+    console.log(taggedLine(label, `joined; ttl=${formatDuration(ttl)}`));
+    const verifyMs = deps.diagPacketsVerifyMs ?? DIAG_PACKETS_VERIFY_MS;
+    const diagCheck =
+      entry.task.diagPackets === "off"
+        ? setTimeout(() => {
+            if (diagSeen) return;
+            const line = taggedLine(
+              label,
+              `--diag-packets off requested but no 'diagnostics packets:' line within ${verifyMs}ms of joining: its DIAGNOSTICS sends are unverified`,
+            );
+            appendLocalLog(entry, line);
+            console.error(line);
+          }, verifyMs)
+        : undefined;
+    diagCheck?.unref?.();
 
     // Build the rearmable TTL timer. The control server's `applyTtl`
     // calls `rearm()` to swap the underlying timer; cancellation
@@ -780,7 +927,11 @@ async function runSingleBotTask(
     // "always true" at the type level.
     let exitReason: BotExitReason = { kind: "ttl-expired" } as BotExitReason;
     let ctlReason: CtlReason | null = null;
+    let crash: string | null = null;
     await Promise.race([
+      bot.crashDetected.then((detail) => {
+        crash = detail;
+      }),
       ttlCtl.done.then(() => {
         exitReason = { kind: "ttl-expired" };
       }),
@@ -795,6 +946,19 @@ async function runSingleBotTask(
       }),
     ]);
     ttlCtl.cancel();
+    clearTimeout(diagCheck);
+
+    if (crash !== null) {
+      console.error(taggedLine(label, `left the meeting unasked: ${crash}`));
+      entry.handle = null;
+      entry.status = "failed";
+      deps.clearMaps(task.botId);
+      await bot.shutdown().catch(() => {});
+      entry.lastError = crash;
+      entry.finishReason = "browser-crash";
+      entry.finishedAt = Date.now();
+      return { kind: "browser-crash", detail: crash };
+    }
 
     if (ctlReason === "ctl-rejoin") {
       // The control server stamped `entry.task.network` already; tear
@@ -802,11 +966,12 @@ async function runSingleBotTask(
       // operator sees this as a brief reconnect — the meeting drops
       // and re-establishes with the new netsim shim active.
       entry.status = "leaving";
-      console.log(`[${label}] rejoining with new netsim profile '${entry.task.network}'`);
+      console.log(taggedLine(label, `rejoining with new netsim profile '${entry.task.network}'`));
+      deps.onRejoin?.(task.botId, entry.task.network ?? null);
       try {
         await bot.leaveMeeting();
       } catch (e) {
-        console.error(`[${label}] leaveMeeting (rejoin) failed:`, (e as Error).message);
+        console.error(taggedLine(label, `leaveMeeting (rejoin) failed: ${(e as Error).message}`));
       }
       await bot.shutdown();
       entry.handle = null;
@@ -827,7 +992,7 @@ async function runSingleBotTask(
         : ctlReason === "ctl-kill"
           ? "ctl-kill"
           : exitReason.kind;
-    console.log(`[${label}] shutting down (${finishReason})`);
+    console.log(taggedLine(label, `shutting down (${finishReason})`));
 
     // Skip leaveMeeting on user-hangup (the page already navigated
     // away — clicking a non-existent button is a no-op) and on
@@ -836,7 +1001,7 @@ async function runSingleBotTask(
       try {
         await bot.leaveMeeting();
       } catch (e) {
-        console.error(`[${label}] leaveMeeting failed:`, (e as Error).message);
+        console.error(taggedLine(label, `leaveMeeting failed: ${(e as Error).message}`));
       }
     }
     await bot.shutdown();
@@ -953,19 +1118,22 @@ async function clickControlButton(
   const { page } = entry.handle;
   const label = `${entry.task.participant}@${shortBotId(entry.botId)}`;
   const selector = await resolveControlSelector(page, candidates, `ctl ${action}`, (m) =>
-    console.warn(`[${label}] ${m}`),
+    console.warn(taggedLine(label, m)),
   );
   if (selector === null) {
     console.warn(
-      `[${label}] ctl ${action}: no visible button matching ${candidates.join(" | ")} — action bar autohidden, control unavailable, or the bot is not in-meeting yet`,
+      taggedLine(
+        label,
+        `ctl ${action}: no visible button matching ${candidates.join(" | ")} — action bar autohidden, control unavailable, or the bot is not in-meeting yet`,
+      ),
     );
     return;
   }
   try {
     await page.locator(selector).click({ timeout: 2_000 });
-    console.log(`[${label}] ctl ${action} → clicked ${selector}`);
+    console.log(taggedLine(label, `ctl ${action} → clicked ${selector}`));
   } catch (e) {
-    console.warn(`[${label}] ctl ${action} click failed: ${(e as Error).message}`);
+    console.warn(taggedLine(label, `ctl ${action} click failed: ${(e as Error).message}`));
   }
 }
 
@@ -1049,6 +1217,7 @@ export function buildLaunchedBotTask(
     sourceGeometry: SD_SOURCE,
     // `LaunchSpec` carries no cycle, so a /launch bot keeps its camera on.
     cameraCycle: null,
+    diagPackets: spec.diagPackets ?? null,
   };
 }
 

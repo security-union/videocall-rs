@@ -211,13 +211,17 @@ pub fn decode_room_token(secret: &str, token: &str) -> Result<RoomAccessTokenCla
 /// `decode_room_token` can wrap every error path with a single
 /// `record_rejection` call without scattering counter increments through
 /// every `Err(...)` site.
-fn decode_room_token_inner(secret: &str, token: &str) -> Result<RoomAccessTokenClaims, TokenError> {
-    let decoding_key = DecodingKey::from_secret(secret.as_bytes());
-
+fn room_token_validation() -> Validation {
     let mut validation = Validation::default();
     validation.set_required_spec_claims(&["exp", "sub"]);
     validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
     validation.validate_exp = true;
+    validation
+}
+
+fn decode_room_token_inner(secret: &str, token: &str) -> Result<RoomAccessTokenClaims, TokenError> {
+    let decoding_key = DecodingKey::from_secret(secret.as_bytes());
+    let validation = room_token_validation();
 
     let token_data =
         jsonwebtoken::decode::<RoomAccessTokenClaims>(token, &decoding_key, &validation).map_err(
@@ -354,6 +358,7 @@ mod tests {
             exp: now + exp_offset_secs,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
+            iat: Some(now),
         };
         jsonwebtoken::encode(
             &Header::default(),
@@ -420,6 +425,7 @@ mod tests {
             exp: now + 600,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
+            iat: Some(now),
         };
         let token = jsonwebtoken::encode(
             &Header::default(),
@@ -889,6 +895,7 @@ mod tests {
             exp: now + 600,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: typ.map(str::to_string),
+            iat: Some(now),
         };
         jsonwebtoken::encode(
             &Header::default(),
@@ -966,5 +973,22 @@ mod tests {
             before_malformed,
             "a cross-type presentation must be distinguishable from a garbage token"
         );
+    }
+
+    /// meeting-api sizes a kick's `deny_until` from this leeway (#2934).
+    #[test]
+    fn exp_leeway_is_the_one_the_kick_deny_window_assumes() {
+        assert_eq!(
+            room_token_validation().leeway as i64,
+            videocall_meeting_types::kick::JWT_EXP_LEEWAY_SECS
+        );
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn the_iat_claim_reaches_the_relay() {
+        let claims = decode_room_token(TEST_SECRET, &make_token("a@b.c", "room-1", true, 600))
+            .expect("valid token");
+        assert!(claims.iat.is_some());
     }
 }

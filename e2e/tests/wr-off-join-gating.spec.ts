@@ -3,18 +3,14 @@
  * page reload. One test per lock the fix opens; each "un-fixed, this fails
  * because…" trace lives in the expect() message of the assertion it guards.
  *
- * #2193 cannot make these vacuous: neither asserts a decoded remote camera
- * canvas — (a) stops at `#grid-container`, the same node
- * `guest-waiting-room.spec.ts` asserts, and (b) never enters the grid.
- *
  * Citations below name SYMBOLS, not line numbers, on purpose: a symbol survives
  * an edit above it, a line number does not.
  *
- * UNTAGGED on purpose: (b) sits through a 15s production timer and (a) drives a
- * real observer socket plus a full grid entry, so neither belongs in the `bvt1`
- * project's grep (`playwright.config.ts`). They run only under
- * `--project=dioxus`, so NOT in per-PR CI — the green receipt must come from the
- * local docker stack or a scoped `dioxus` dispatch.
+ * UNTAGGED on purpose: the start-watch test sits through a 15s production timer
+ * and the waiting-room-OFF test drives a real observer socket plus a full grid
+ * entry, so neither belongs in the `bvt1` project's grep (`playwright.config.ts`).
+ * They run only under `--project=dioxus`, so NOT in per-PR CI — the green receipt
+ * must come from the local docker stack or a scoped `dioxus` dispatch.
  */
 
 import { test, expect, chromium, Page } from "@playwright/test";
@@ -65,9 +61,14 @@ async function waitForGrid(page: Page): Promise<void> {
   );
 
   if (result === "join-button") {
-    await page.waitForTimeout(1000);
-    await joinButton.click();
-    await page.waitForTimeout(3000);
+    // An admitted page can advance to the grid on its own; click only if it has not.
+    const advanced = await grid
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!advanced && (await joinButton.isVisible())) {
+      await joinButton.click({ timeout: 10_000 });
+    }
   }
 
   await expect(

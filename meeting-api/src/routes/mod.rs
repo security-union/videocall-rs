@@ -21,6 +21,7 @@ pub mod host;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
+pub mod recordings;
 pub mod valid_meeting_id;
 pub mod waiting_room;
 
@@ -257,6 +258,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/co-hosts/revoke",
             post(co_hosts::revoke_co_host),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/recordings",
+            post(recordings::register),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/recordings/{recording_id}/stop",
+            post(recordings::stop).layer(DefaultBodyLimit::max(recordings::MAX_STOP_BODY)),
         )
         // Console log uploads
         .route(

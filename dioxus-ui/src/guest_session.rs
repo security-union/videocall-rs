@@ -64,6 +64,14 @@ fn is_expired(token: &str, now: u64) -> bool {
     token_exp(token).is_some_and(|exp| exp <= now)
 }
 
+/// Whether `offered` should replace `held`: it outlives `held` by more than the
+/// refresh margin, or `held` is itself within that margin of expiring.
+pub(crate) fn should_replace(held: &str, offered: &str, now: u64) -> bool {
+    let held_exp = expires_at(held);
+    expires_at(offered) > held_exp.saturating_add(REFRESH_MARGIN_SECS)
+        || held_exp <= now.saturating_add(REFRESH_MARGIN_SECS)
+}
+
 /// Pick the token to keep for `user_id` out of `candidates` and what is stored.
 ///
 /// The stored token is a candidate only while the identity is unchanged: a
@@ -94,16 +102,11 @@ pub(crate) fn next_token<'a>(
     }
 
     match (best.map(|(_, token)| token), carried) {
-        (Some(offered), Some(held)) => {
-            let held_exp = expires_at(held);
-            let outlives_held = expires_at(offered) > held_exp.saturating_add(REFRESH_MARGIN_SECS);
-            let held_expiring = held_exp <= now.saturating_add(REFRESH_MARGIN_SECS);
-            Some(if outlives_held || held_expiring {
-                offered
-            } else {
-                held
-            })
-        }
+        (Some(offered), Some(held)) => Some(if should_replace(held, offered, now) {
+            offered
+        } else {
+            held
+        }),
         (offered, None) => offered,
         (None, held) => held,
     }

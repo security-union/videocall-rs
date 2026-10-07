@@ -49,6 +49,7 @@ import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 import { startScreenShare, stopScreenShare } from "../helpers/screen-share-meeting";
+import { enterMeetingAsHost, guestJoinsMeeting } from "../helpers/two-user-meeting";
 
 declare global {
   interface Window {
@@ -56,6 +57,7 @@ declare global {
     // recording state machine from E2E.
     __vcRecording: {
       getState(): string;
+      stop(): void;
       // Resolves the display name the compositor extracts for every peer tile
       // in `#grid-container`, via the SAME production getTileName() drawFrame()
       // feeds into the recording name chips. Used to guard the "remote peer
@@ -69,6 +71,17 @@ declare global {
       };
       _localShareVideo(): HTMLVideoElement | null;
     };
+    __e2eRecorders: MediaRecorder[];
+    __e2eRecorderNoStart?: boolean;
+    __e2eRecorderNoStop?: boolean;
+    __e2eNoMime?: boolean;
+    __e2eWrites?: number;
+    __e2eBarCleared?: boolean;
+    __e2eResolvePicker?: () => void;
+    __e2eRecorderMicTracks: MediaStreamTrack[];
+    __e2eConnectedStreams: MediaStream[];
+    __e2eRecorderGumDelayMs?: number;
+    __e2eRecorderGumFailOnce?: boolean;
     // `displaySurface` reported by SHARE_WITH_AUDIO_MOCK's next share.
     __e2eShareSurface?: string;
     // Test-only override for the in-memory fallback byte ceiling (see below).
@@ -103,7 +116,7 @@ const STUB_FILE_PICKER_SCRIPT = `
     return {
       createWritable: async function () {
         return {
-          write:  async function () {},
+          write:  async function () { window.__e2eWrites = (window.__e2eWrites || 0) + 1; },
           close:  async function () {},
           abort:  async function () {},
         };
@@ -178,6 +191,104 @@ const SHARE_WITH_AUDIO_MOCK = `
     });
   })();
 `;
+
+/** Wraps MediaRecorder so a test can count constructions, reach the instance, or suppress start()/stop()/every MIME type. */
+const RECORDER_PROBE_SCRIPT = `
+  (() => {
+    const Real = window.MediaRecorder;
+    if (!Real) return;
+    window.__e2eRecorders = [];
+    window.MediaRecorder = class extends Real {
+      static isTypeSupported(t) {
+        return !window.__e2eNoMime && Real.isTypeSupported(t);
+      }
+      constructor(...args) {
+        super(...args);
+        window.__e2eRecorders.push(this);
+      }
+      start(...args) {
+        if (window.__e2eRecorderNoStart) return;
+        return super.start(...args);
+      }
+      stop() {
+        if (window.__e2eRecorderNoStop) return;
+        return super.stop();
+      }
+    };
+  })();
+`;
+
+/** A save picker that stays open until the test calls `window.__e2eResolvePicker()`. */
+const DEFERRED_PICKER_SCRIPT = `
+  window.showSaveFilePicker = () =>
+    new Promise((resolve) => {
+      window.__e2eResolvePicker = () =>
+        resolve({
+          createWritable: async () => ({
+            write: async () => {},
+            close: async () => {},
+            abort: async () => {},
+          }),
+        });
+    });
+`;
+
+function recordingState(page: Page): Promise<string> {
+  return page.evaluate(() => window.__vcRecording.getState());
+}
+
+/** Records the recorder's own mic tracks (AEC/NS/AGC off) and which streams are connected to a MediaStreamAudioDestinationNode. */
+const RECORDER_MIC_PROBE_SCRIPT = `
+  (() => {
+    window.__e2eRecorderMicTracks = [];
+    window.__e2eConnectedStreams = [];
+    const md = navigator.mediaDevices;
+    if (!md) return;
+    const gum = md.getUserMedia.bind(md);
+    md.getUserMedia = async (c) => {
+      const a = c && c.audio;
+      const isRecorder =
+        a && a.echoCancellation === false && a.noiseSuppression === false && a.autoGainControl === false;
+      if (isRecorder && window.__e2eRecorderGumFailOnce) {
+        window.__e2eRecorderGumFailOnce = false;
+        throw new DOMException("e2e", "NotReadableError");
+      }
+      const s = await gum(c);
+      if (isRecorder) {
+        window.__e2eRecorderMicTracks.push(...s.getAudioTracks());
+        const delay = window.__e2eRecorderGumDelayMs;
+        if (delay) await new Promise((r) => setTimeout(r, delay));
+      }
+      return s;
+    };
+    const create = AudioContext.prototype.createMediaStreamSource;
+    AudioContext.prototype.createMediaStreamSource = function (stream) {
+      const node = create.call(this, stream);
+      const connect = node.connect.bind(node);
+      node.connect = (...args) => {
+        if (args[0] instanceof MediaStreamAudioDestinationNode) {
+          window.__e2eConnectedStreams.push(stream);
+        }
+        return connect(...args);
+      };
+      return node;
+    };
+  })();
+`;
+
+/** Recorder mic tracks so far: count, readyStates, and whether the newest one reached a MediaStreamAudioDestinationNode. */
+function recorderMic(page: Page) {
+  return page.evaluate(() => {
+    const tracks = window.__e2eRecorderMicTracks;
+    const last = tracks[tracks.length - 1];
+    return {
+      count: tracks.length,
+      states: tracks.map((t) => t.readyState),
+      lastMixed:
+        !!last && window.__e2eConnectedStreams.some((s) => s.getAudioTracks().includes(last)),
+    };
+  });
+}
 
 /** Id (or tag) of the element the recording would draw as the shared screen. */
 function resolvedScreenSource(page: Page): Promise<string | null> {
@@ -1457,6 +1568,412 @@ test.describe("Recording feature", () => {
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+  test("recorder failures (no supported type, no onstart, no onstop) end in idle and clear the peer's bar", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_rec_fail_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-fail@videocall.rs",
+        "RecHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(RECORDER_PROBE_SCRIPT);
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-rec-fail@videocall.rs",
+        "RecGuest",
+        uiURL,
+      );
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+      await enterMeetingAsHost(hostPage, meetingId, "RecHost");
+      await guestJoinsMeeting(hostPage, guestPage, meetingId, "RecGuest");
+      const recordBtn = hostPage.getByTestId("record-button");
+      const guestBar = guestPage.locator(".meeting-status-bar");
+      const errorToast = hostPage.locator(".recording-error-banner .toast-name");
+
+      // No supported MIME type.
+      await hostPage.evaluate(() => {
+        window.__e2eNoMime = true;
+      });
+      await recordBtn.click();
+      await expect(errorToast).toHaveText("Recording failed.", { timeout: 5_000 });
+      await guestPage.waitForTimeout(3000);
+      await expect(guestBar).toHaveCount(0);
+      await expect(errorToast).toHaveCount(0, { timeout: 10_000 });
+
+      // MediaRecorder never fires onstart.
+      await hostPage.evaluate(() => {
+        window.__e2eNoMime = false;
+        window.__e2eRecorderNoStart = true;
+      });
+      await recordBtn.click();
+      await expect.poll(() => recordingState(hostPage), { timeout: 15_000 }).toBe("activating");
+      await expect(guestBar).toBeVisible({ timeout: 20_000 });
+      await expect.poll(() => recordingState(hostPage), { timeout: 10_000 }).toBe("idle");
+      await expect(errorToast).toHaveText("Recording failed.");
+      await expect(guestBar).toHaveCount(0, { timeout: 20_000 });
+      expect(await hostPage.evaluate(() => window.__e2eRecorders.length)).toBe(1);
+
+      // MediaRecorder never fires onstop.
+      await expect(errorToast).toHaveCount(0, { timeout: 10_000 });
+      await hostPage.evaluate(() => {
+        window.__e2eRecorderNoStart = false;
+        window.__e2eRecorderNoStop = true;
+      });
+      await recordBtn.click();
+      await expect.poll(() => recordingState(hostPage), { timeout: 15_000 }).toBe("recording");
+      await expect(guestBar).toBeVisible({ timeout: 20_000 });
+      await recordBtn.click();
+      await expect.poll(() => recordingState(hostPage), { timeout: 5_000 }).toBe("stopping");
+      await expect.poll(() => recordingState(hostPage), { timeout: 20_000 }).toBe("saved");
+      await expect(errorToast).toHaveText("Recording failed.");
+      await expect(guestBar).toHaveCount(0, { timeout: 20_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("a MediaRecorder error mid-recording stops, saves and clears the peer's status bar", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_rec_onerror_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-onerror@videocall.rs",
+        "RecHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(RECORDER_PROBE_SCRIPT);
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-rec-onerror@videocall.rs",
+        "RecGuest",
+        uiURL,
+      );
+      const hostPage = await hostCtx.newPage();
+      const forceCloses: string[] = [];
+      hostPage.on("console", (msg) => {
+        if (/^\[recording\] (onstop did not fire|recorder\.stop\(\) failed)/.test(msg.text())) {
+          forceCloses.push(msg.text());
+        }
+      });
+      const guestPage = await guestCtx.newPage();
+      await enterMeetingAsHost(hostPage, meetingId, "RecHost");
+      await guestJoinsMeeting(hostPage, guestPage, meetingId, "RecGuest");
+      const recordBtn = hostPage.getByTestId("record-button");
+      const guestBar = guestPage.locator(".meeting-status-bar");
+
+      await recordBtn.click();
+      await expect.poll(() => recordingState(hostPage), { timeout: 15_000 }).toBe("recording");
+      await expect(guestBar).toBeVisible({ timeout: 20_000 });
+      await hostPage.waitForTimeout(1000);
+      const barAtInstall = await guestPage.evaluate(() => {
+        window.__e2eBarCleared = false;
+        new MutationObserver(() => {
+          if (!document.querySelector(".meeting-status-bar")) window.__e2eBarCleared = true;
+        }).observe(document.body, { childList: true, subtree: true });
+        return !!document.querySelector(".meeting-status-bar");
+      });
+      expect(barAtInstall).toBe(true);
+
+      // Adding a track to the recorded stream makes Chromium raise a real error.
+      const writesBefore = await hostPage.evaluate(() => {
+        const writes = window.__e2eWrites || 0;
+        const canvas = document.createElement("canvas");
+        window.__e2eRecorders[0].stream.addTrack(canvas.captureStream(1).getVideoTracks()[0]);
+        return writes;
+      });
+      await expect(hostPage.locator(".recording-error-banner .toast-name")).toHaveText(
+        "Recording failed.",
+        { timeout: 5_000 },
+      );
+      // Reads "saved" and clicks in one task, so no timer runs between the two.
+      const atSaved = await hostPage.waitForFunction(
+        () => {
+          const btn = document.querySelector<HTMLButtonElement>('[data-testid="record-button"]');
+          if (window.__vcRecording.getState() !== "saved" || !btn || btn.disabled) return null;
+          const writes = window.__e2eWrites || 0;
+          btn.click();
+          return { writes };
+        },
+        undefined,
+        { polling: 50, timeout: 15_000 },
+      );
+      expect(forceCloses).toEqual([]);
+      expect((await atSaved.jsonValue())!.writes).toBeGreaterThan(writesBefore);
+      await expect
+        .poll(() => guestPage.evaluate(() => window.__e2eBarCleared), { timeout: 20_000 })
+        .toBe(true);
+      await expect.poll(() => recordingState(hostPage), { timeout: 15_000 }).toBe("recording");
+      await expect(guestBar).toBeVisible({ timeout: 20_000 });
+      await recordBtn.click();
+      await expect(guestBar).toHaveCount(0, { timeout: 20_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("stop() while the save picker is open never constructs a MediaRecorder", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-picker-stop@videocall.rs",
+        "RecHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(RECORDER_PROBE_SCRIPT);
+      await hostCtx.addInitScript(DEFERRED_PICKER_SCRIPT);
+      const hostPage = await hostCtx.newPage();
+      await enterMeetingAsHost(hostPage, `e2e_rec_picker_stop_${Date.now()}`, "RecHost");
+
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => typeof window.__e2eResolvePicker), { timeout: 15_000 })
+        .toBe("function");
+      expect(await recordingState(hostPage)).toBe("activating");
+
+      await hostPage.evaluate(() => window.__vcRecording.stop());
+      expect(await recordingState(hostPage)).toBe("idle");
+      await hostPage.evaluate(() => window.__e2eResolvePicker!());
+      await hostPage.waitForTimeout(2000);
+      expect(await recordingState(hostPage)).toBe("idle");
+      expect(await hostPage.evaluate(() => window.__e2eRecorders.length)).toBe(0);
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("an abandoned attempt releases the recorder's microphone (no onstart, stop() during getUserMedia)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-mic-abandon@videocall.rs",
+        "RecMicAbandonHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_mic_on", "true");`);
+      await hostCtx.addInitScript(RECORDER_PROBE_SCRIPT);
+      await hostCtx.addInitScript(RECORDER_MIC_PROBE_SCRIPT);
+      const hostPage = await hostCtx.newPage();
+
+      await fillAndSubmitJoinForm(
+        hostPage,
+        `e2e_rec_mic_abandon_${Date.now()}`,
+        "RecMicAbandonHost",
+      );
+      await hostPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+      await expect(hostPage.getByTestId("mic-toggle-button")).toHaveAttribute(
+        "aria-label",
+        "Microphone — Mute",
+        { timeout: 15_000 },
+      );
+      const recordBtn = hostPage.getByTestId("record-button");
+
+      // MediaRecorder never fires onstart.
+      await hostPage.evaluate(() => {
+        window.__e2eRecorderNoStart = true;
+      });
+      await recordBtn.click();
+      await expect
+        .poll(() => recorderMic(hostPage), { timeout: 10_000 })
+        .toEqual({ count: 1, states: ["live"], lastMixed: true });
+      expect(await recordingState(hostPage)).toBe("activating");
+      await expect.poll(() => recordingState(hostPage), { timeout: 10_000 }).toBe("idle");
+      expect((await recorderMic(hostPage)).states).toEqual(["ended"]);
+
+      // stop() while start() waits on the recorder's getUserMedia.
+      await hostPage.evaluate(() => {
+        window.__e2eRecorderNoStart = false;
+        window.__e2eRecorderGumDelayMs = 4000;
+        window.__e2eRecorders = [];
+      });
+      await recordBtn.click();
+      await expect
+        .poll(async () => (await recorderMic(hostPage)).count, {
+          timeout: 10_000,
+          intervals: [50],
+        })
+        .toBe(2);
+      expect(await recordingState(hostPage)).toBe("activating");
+      await hostPage.evaluate(() => window.__vcRecording.stop());
+      expect(await recordingState(hostPage)).toBe("idle");
+      await expect
+        .poll(async () => (await recorderMic(hostPage)).states, { timeout: 10_000 })
+        .toEqual(["ended", "ended"]);
+      expect(await hostPage.evaluate(() => window.__e2eRecorders.length)).toBe(0);
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("muting stops the recorder's microphone track and unmuting mixes in a new one", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-mic@videocall.rs",
+        "RecMicHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_mic_on", "true");`);
+      await hostCtx.addInitScript(RECORDER_MIC_PROBE_SCRIPT);
+      const hostPage = await hostCtx.newPage();
+
+      await fillAndSubmitJoinForm(hostPage, `e2e_rec_mic_${Date.now()}`, "RecMicHost");
+      await hostPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+
+      const mic = hostPage.getByTestId("mic-toggle-button");
+      await expect(mic).toHaveAttribute("aria-label", "Microphone — Mute", { timeout: 15_000 });
+
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 15_000 })
+        .toBe("recording");
+      await expect
+        .poll(() => recorderMic(hostPage), { timeout: 10_000 })
+        .toEqual({ count: 1, states: ["live"], lastMixed: true });
+
+      await mic.click();
+      await expect(mic).toHaveAttribute("aria-label", "Microphone — Unmute", { timeout: 10_000 });
+      await expect
+        .poll(async () => (await recorderMic(hostPage)).states, { timeout: 5_000 })
+        .toEqual(["ended"]);
+
+      await mic.click();
+      await expect(mic).toHaveAttribute("aria-label", "Microphone — Mute", { timeout: 10_000 });
+      await expect
+        .poll(() => recorderMic(hostPage), { timeout: 10_000 })
+        .toEqual({ count: 2, states: ["ended", "live"], lastMixed: true });
+
+      // A getUserMedia that resolves after the user muted again must not stay live.
+      await hostPage.evaluate(() => {
+        window.__e2eRecorderGumDelayMs = 4000;
+      });
+      await mic.click();
+      await expect(mic).toHaveAttribute("aria-label", "Microphone — Unmute", { timeout: 10_000 });
+      await mic.click();
+      await expect(mic).toHaveAttribute("aria-label", "Microphone — Mute", { timeout: 10_000 });
+      await expect
+        .poll(async () => (await recorderMic(hostPage)).count, { timeout: 5_000 })
+        .toBe(3);
+      await mic.click();
+      await expect(mic).toHaveAttribute("aria-label", "Microphone — Unmute", { timeout: 10_000 });
+      await expect
+        .poll(() => recorderMic(hostPage), { timeout: 10_000 })
+        .toEqual({ count: 3, states: ["ended", "ended", "ended"], lastMixed: false });
+
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 10_000 })
+        .toBe("idle");
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 15_000 })
+        .toBe("recording");
+      expect((await recorderMic(hostPage)).count).toBe(3);
+
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 10_000 })
+        .toBe("idle");
+      await hostPage.evaluate(() => {
+        window.__e2eRecorderGumDelayMs = 0;
+        window.__e2eRecorderGumFailOnce = true;
+      });
+      await mic.click();
+      await expect(mic).toHaveAttribute("aria-label", "Microphone — Mute", { timeout: 10_000 });
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 15_000 })
+        .toBe("recording");
+      await expect
+        .poll(() => recorderMic(hostPage), { timeout: 10_000 })
+        .toEqual({ count: 4, states: ["ended", "ended", "ended", "live"], lastMixed: true });
+
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 10_000 })
+        .toBe("idle");
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 15_000 })
+        .toBe("recording");
+      expect(await recorderMic(hostPage)).toEqual({
+        count: 5,
+        states: ["ended", "ended", "ended", "ended", "live"],
+        lastMixed: true,
+      });
+    } finally {
+      await browser1.close();
+    }
+  });
+  test("the recorder follows the mic button when another slot is first in the action bar", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-mic-order@videocall.rs",
+        "RecMicOrderHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(
+        `localStorage.setItem("vc_prejoin_mic_on", "false");` +
+          `localStorage.setItem("vc_action_bar_layout", JSON.stringify({ v: 2, slots: ["camera", "mic"], hidden: [] }));`,
+      );
+      await hostCtx.addInitScript(RECORDER_MIC_PROBE_SCRIPT);
+      const hostPage = await hostCtx.newPage();
+
+      await fillAndSubmitJoinForm(hostPage, `e2e_rec_mic_order_${Date.now()}`, "RecMicOrderHost");
+      await hostPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+
+      await expect(
+        hostPage.locator(".video-controls-container .video-control-button").first(),
+      ).toHaveAttribute("data-testid", "camera-toggle-button", { timeout: 15_000 });
+      await expect(hostPage.getByTestId("camera-toggle-button")).toHaveClass(/\bactive\b/);
+      await expect(hostPage.getByTestId("mic-toggle-button")).toHaveAttribute(
+        "aria-label",
+        "Microphone — Unmute",
+      );
+
+      await hostPage.getByTestId("record-button").click();
+      await expect
+        .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 15_000 })
+        .toBe("recording");
+      expect((await recorderMic(hostPage)).count).toBe(0);
+    } finally {
+      await browser1.close();
     }
   });
 });

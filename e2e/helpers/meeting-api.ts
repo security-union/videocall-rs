@@ -50,6 +50,8 @@ interface CreateMeetingOpts {
    * every existing caller of this helper relies on.
    */
   password?: string;
+  /** User ids granted co-host at create time, saved for future meetings. */
+  coHosts?: string[];
 }
 
 /**
@@ -72,6 +74,7 @@ export async function createMeeting(
   if (opts.meetingId !== undefined) body.meeting_id = opts.meetingId;
   if (opts.endOnHostLeave !== undefined) body.end_on_host_leave = opts.endOnHostLeave;
   if (opts.password !== undefined) body.password = opts.password;
+  if (opts.coHosts !== undefined) body.co_hosts = opts.coHosts;
 
   const res = await fetch(`${API_URL}/api/v1/meetings`, {
     method: "POST",
@@ -227,6 +230,30 @@ export async function transferHost(
       `POST /api/v1/meetings/${meetingId}/transfer-host failed (${res.status}): ${txt}`,
     );
   }
+}
+
+export interface WaitingParticipant {
+  user_id: string;
+  display_name?: string | null;
+  is_guest?: boolean;
+}
+
+/** The waiting list a host sees, via `GET /api/v1/meetings/{id}/waiting`. */
+export async function fetchWaiting(
+  email: string,
+  name: string,
+  meetingId: string,
+): Promise<WaitingParticipant[]> {
+  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}/waiting`, {
+    method: "GET",
+    headers: { Cookie: authCookie(email, name) },
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`GET /api/v1/meetings/${meetingId}/waiting failed (${res.status}): ${txt}`);
+  }
+  const json = (await res.json()) as { result: { waiting: WaitingParticipant[] } };
+  return json.result.waiting;
 }
 
 /**

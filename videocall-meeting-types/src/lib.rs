@@ -18,6 +18,7 @@
 //! It is intentionally framework-agnostic — no actix-web, no database types.
 
 pub mod error;
+pub mod kick;
 #[cfg(feature = "mint")]
 pub mod mint;
 pub mod presence;

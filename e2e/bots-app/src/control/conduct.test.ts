@@ -1,8 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import dns from "node:dns";
+import { createServer as createHttpServer } from "node:http";
+import { type AddressInfo, createServer } from "node:net";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BotTask } from "../orchestrator";
 import { SD_SOURCE } from "../posture";
 import { generateToken } from "./auth";
+import { CtlHttpError, CtlUnreachableError } from "./client";
 import {
   type Clock,
   type ConductorClient,
@@ -12,6 +17,8 @@ import {
   type ScheduledCall,
   applyAction,
   buildSchedule,
+  classifyHealthz,
+  fetchHealthzHttp,
   conductScenario,
   httpConductorClientFactory,
   parseAtDuration,
@@ -20,7 +27,13 @@ import {
   resolveBotHost,
   ScenarioValidationError,
 } from "./conduct";
-import { generateBotId, newRegistryEntry, type BotRegistryEntry } from "./registry";
+import { NETEM_PARAM_KEYS } from "./netem";
+import {
+  BotNotJoinedError,
+  generateBotId,
+  newRegistryEntry,
+  type BotRegistryEntry,
+} from "./registry";
 import { type ControlServerHandle, startControlServer } from "./server";
 
 // The canonical scenario from the deploy task's scenario.example.yaml.
@@ -182,11 +195,16 @@ describe("parseScenario (validation errors)", () => {
     ).toThrow(/timeline\[0\]: "limitPkts" must be an integer >= 1/);
   });
 
-  it("rejects a scenario downlink rate rather than silently dropping it", () => {
-    // A dropped key would leave the operator believing the downlink was shaped.
+  it("rejects a scenario downlink rate without its ingress depth", () => {
     expect(
-      bad("timeline:\n  - { at: 0s, bot: 0, action: netem, downlinkRateKbit: 4000 }\n"),
-    ).toThrow(/"downlinkRateKbit" is not accepted at runtime/);
+      bad("timeline:\n  - { at: 0s, bot: 0, action: netem, lossPct: 1, downlinkRateKbit: 4000 }\n"),
+    ).toThrow(/timeline\[0\]: .*supply both or neither/);
+  });
+
+  it.each(NETEM_PARAM_KEYS)("carries %s to the validator instead of dropping it", (key) => {
+    expect(
+      bad(`timeline:\n  - { at: 0s, bot: 0, action: netem, profile: satellite, ${key}: 10 }\n`),
+    ).toThrow(/not both/);
   });
 
   it("rejects an unknown netem profile", () => {
@@ -314,11 +332,11 @@ function recordingClient(record: string[]): ConductorClient {
     leave: async () => void record.push("leave"),
     applyNetem: async (b) => {
       record.push(`netem:${JSON.stringify(b)}`);
-      return { mirrorRemoved: false };
+      return { ingressShaped: false, mirrorRemoved: false };
     },
     clearNetem: async () => {
       record.push("netem-clear");
-      return { mirrorRemoved: false };
+      return { ingressShaped: false, mirrorRemoved: false };
     },
   };
 }
@@ -383,11 +401,11 @@ describe("conductScenario (live run under injectable clock)", () => {
           host: config.host,
           label: `netem:${JSON.stringify(b)}`,
         });
-        return { mirrorRemoved: false };
+        return { ingressShaped: false, mirrorRemoved: false };
       },
       clearNetem: async () => {
         fired.push({ offset: fc.read() - 1000, host: config.host, label: "netem-clear" });
-        return { mirrorRemoved: false };
+        return { ingressShaped: false, mirrorRemoved: false };
       },
     });
 
@@ -400,7 +418,14 @@ describe("conductScenario (live run under injectable clock)", () => {
       deps: { clientFactory: factory, clock: fc.clock, sleep: fc.sleep, log: () => {} },
     });
 
-    expect(summary).toEqual({ planned: 7, fired: 7, failed: 0, dryRun: false });
+    expect(summary).toEqual({
+      planned: 7,
+      fired: 7,
+      failed: 0,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: false,
+    });
     expect(fired.map((f) => f.offset)).toEqual([0, 10_000, 20_000, 35_000, 40_000, 55_000, 60_000]);
     expect(fired.map((f) => f.label)).toEqual([
       "mute:false",
@@ -434,7 +459,123 @@ describe("conductScenario (live run under injectable clock)", () => {
       deps: { clientFactory: factory, clock: fc.clock, sleep: fc.sleep, log: () => {} },
     });
     // Two screenshare calls fail; the other five fire.
-    expect(summary).toEqual({ planned: 7, fired: 5, failed: 2, dryRun: false });
+    expect(summary).toEqual({
+      planned: 7,
+      fired: 5,
+      failed: 2,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: false,
+    });
+  });
+
+  it("counts a call rejected because no bot has joined as dropped, not failed (#2386)", async () => {
+    const fc = fakeClock();
+    const logs: string[] = [];
+    const factory: ConductorClientFactory = () => ({
+      ...recordingClient([]),
+      mute: async () => {
+        throw new BotNotJoinedError("no bot registered on h");
+      },
+      setScreenShare: async () => {
+        throw new CtlHttpError(409, { error: "bot x is not yet in-meeting" });
+      },
+      clearNetem: async () => {
+        throw new Error("pod unreachable");
+      },
+    });
+    const summary = await conductScenario({
+      scenarioText: EXAMPLE_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      deps: { clientFactory: factory, clock: fc.clock, sleep: fc.sleep, log: (l) => logs.push(l) },
+    });
+    expect(summary).toEqual({
+      planned: 7,
+      fired: 1,
+      failed: 1,
+      dropped: 5,
+      unreachable: 0,
+      dryRun: false,
+    });
+    expect(logs.filter((l) => l.includes("dropped (not joined):"))).toHaveLength(5);
+    expect(logs.at(-1)).toBe(
+      "conduct: done - 1 action(s) fired, 1 failed, 5 dropped (not joined), 0 unreachable",
+    );
+  });
+
+  it("counts a call whose connection never opened as unreachable, apart from failed (#2386)", async () => {
+    const fc = fakeClock();
+    const logs: string[] = [];
+    const factory: ConductorClientFactory = () => ({
+      ...recordingClient([]),
+      setScreenShare: async () => {
+        throw new CtlUnreachableError("ctl: connection to h:8080 failed: connect ECONNREFUSED");
+      },
+      clearNetem: async () => {
+        throw new Error("ctl: connection to h:8080 failed: socket hang up");
+      },
+    });
+    const summary = await conductScenario({
+      scenarioText: EXAMPLE_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      deps: { clientFactory: factory, clock: fc.clock, sleep: fc.sleep, log: (l) => logs.push(l) },
+    });
+    expect(summary).toEqual({
+      planned: 7,
+      fired: 4,
+      failed: 1,
+      dropped: 0,
+      unreachable: 2,
+      dryRun: false,
+    });
+    expect(logs.filter((l) => l.includes(" unreachable: "))).toHaveLength(2);
+  });
+
+  it("a failed name lookup rejects with CtlUnreachableError; an HTTP error after connect does not", async () => {
+    const surface = { getRegistry: () => new Map(), expectedBots: () => 0 } as never;
+    const lookup = vi
+      .spyOn(dns, "lookup")
+      .mockImplementation(((
+        _host: string,
+        _opts: unknown,
+        cb: (e: NodeJS.ErrnoException) => void,
+      ) => cb(Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }))) as never);
+    try {
+      const dead = httpConductorClientFactory()({
+        host: "pod.fleet.invalid",
+        port: 8080,
+        token: "t",
+      });
+      await expect(dead.clearNetem()).rejects.toBeInstanceOf(CtlUnreachableError);
+    } finally {
+      lookup.mockRestore();
+    }
+    const reset = createServer((s) => s.destroy());
+    await new Promise<void>((r) => reset.listen(0, "127.0.0.1", r));
+    try {
+      const resetPort = (reset.address() as AddressInfo).port;
+      const cut = httpConductorClientFactory()({ host: "127.0.0.1", port: resetPort, token: "t" });
+      const err = await cut.clearNetem().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(CtlUnreachableError);
+    } finally {
+      await new Promise((r) => reset.close(r));
+    }
+    const open = await startControlServer({ port: 0, token: "t", surface });
+    try {
+      const live = httpConductorClientFactory()({ host: "127.0.0.1", port: open.port, token: "x" });
+      const err = await live.clearNetem().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CtlHttpError);
+      expect(err).not.toBeInstanceOf(CtlUnreachableError);
+    } finally {
+      await open.close();
+    }
   });
 
   it("never writes the bearer token to a log line", async () => {
@@ -454,14 +595,63 @@ describe("conductScenario (live run under injectable clock)", () => {
     expect(logs.join("\n")).not.toContain(SECRET);
   });
 
-  /** A pod started with BOT_NETEM_PROFILE: the action downgrades it to egress-only. */
+  /** A pod carrying a mirror that an egress-only shape removes. */
   const mirrorRemovingClient = (): ConductorClient => ({
     ...recordingClient([]),
-    applyNetem: async () => ({ mirrorRemoved: true }),
-    clearNetem: async () => ({ mirrorRemoved: true }),
+    applyNetem: async () => ({ ingressShaped: false, mirrorRemoved: true }),
+    clearNetem: async () => ({ ingressShaped: false, mirrorRemoved: true }),
   });
 
-  it("records that a netem action tore down a startup ingress mirror", async () => {
+  const conductLogs = async (
+    client: () => ConductorClient,
+    scenarioText = EXAMPLE_SCENARIO,
+  ): Promise<string[]> => {
+    const logs: string[] = [];
+    const fc = fakeClock();
+    await conductScenario({
+      scenarioText,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "t",
+      deps: { clientFactory: client, clock: fc.clock, sleep: fc.sleep, log: (l) => logs.push(l) },
+    });
+    return logs;
+  };
+
+  it("logs a profile shape as both directions, and a clear's removal as no warning", async () => {
+    const logs = await conductLogs(() => ({
+      ...recordingClient([]),
+      applyNetem: async () => ({ ingressShaped: true, mirrorRemoved: false }),
+      clearNetem: async () => ({ ingressShaped: false, mirrorRemoved: true }),
+    }));
+    expect(logs.filter((l) => l.includes("shaped both directions"))).toHaveLength(1);
+    expect(logs.filter((l) => l.includes("UNSHAPED"))).toEqual([]);
+  });
+
+  it("logs an egress-only shape as such", async () => {
+    const logs = await conductLogs(() => recordingClient([]));
+    expect(logs.filter((l) => l.includes("shaped egress only"))).toHaveLength(1);
+  });
+
+  it("warns only for the shape that removed a mirror, never the clear", async () => {
+    const logs = await conductLogs(mirrorRemovingClient);
+    const warned = logs.filter((l) => l.includes("downlink is now UNSHAPED"));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain("netem");
+    expect(warned[0]).not.toContain("netem-clear");
+    expect(warned[0]).not.toContain("startup");
+  });
+
+  it.each(["none", "clean"])("logs a netem profile: %s as a clear, not a shape", async (p) => {
+    const logs = await conductLogs(
+      mirrorRemovingClient,
+      `timeline:\n  - { at: 0s, bot: 0, action: netem, profile: ${p} }\n`,
+    );
+    expect(logs.filter((l) => l.includes("shaped") || l.includes("UNSHAPED"))).toEqual([]);
+  });
+
+  it("records that a netem action tore down an ingress mirror", async () => {
     const logs: string[] = [];
     const fc = fakeClock();
     const summary = await conductScenario({
@@ -531,6 +721,249 @@ const BOT0 = "videocall-bots-0.videocall-bots.bot-load.svc.cluster.local";
 const BOT1 = "videocall-bots-1.videocall-bots.bot-load.svc.cluster.local";
 const TWO_BOT_SCENARIO =
   "timeline:\n  - { at: 0s, bot: 0, action: unmute }\n  - { at: 0s, bot: 1, action: unmute }\n";
+const JOINED = { ok: true, bots: 1, inMeeting: 1, pending: 0, expected: 1 };
+
+describe("classifyHealthz (#2917)", () => {
+  it.each([
+    [null, "unreachable"],
+    [{ ok: true, bots: 1 }, "legacy"],
+    [{ ok: true, bots: 1, inMeeting: "1", expected: 1 }, "legacy"],
+    [{ ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 1 }, "not-joined"],
+    [{ ok: true, bots: 1, inMeeting: 0, pending: 1, expected: 1 }, "not-joined"],
+    [{ ok: true, bots: 2, inMeeting: 1, pending: 1, expected: 2 }, "not-joined"],
+    [{ ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 0 }, "not-joined"],
+    [JOINED, "in-meeting"],
+    [{ inMeeting: 1 }, "legacy"],
+    [{ inMeeting: -1, expected: -1 }, "legacy"],
+    [{ inMeeting: 0, expected: 1, pending: 2.5 }, "not-joined", { pending: 0 }],
+  ] as Array<[unknown, string, object?]>)("%j -> %s", (body, state, fields) => {
+    expect(classifyHealthz(body)).toMatchObject({ state, ...fields });
+  });
+});
+
+describe("fetchHealthzHttp (#2917)", () => {
+  it.each([
+    [200, "<html>proxy</html>", "unreachable"],
+    [503, JSON.stringify(JOINED), "unreachable"],
+    [200, JSON.stringify(JOINED), "in-meeting"],
+  ])("a %i with body %s reads %s", async (status, body, state) => {
+    const pod = createHttpServer((_req, res) => {
+      res.statusCode = status;
+      res.end(body);
+    });
+    await new Promise<void>((r) => pod.listen(0, "127.0.0.1", r));
+    try {
+      const got = await fetchHealthzHttp("127.0.0.1", (pod.address() as AddressInfo).port);
+      expect(classifyHealthz(got).state).toBe(state);
+    } finally {
+      pod.closeAllConnections();
+      await new Promise((r) => pod.close(r));
+    }
+  });
+});
+
+describe("in-meeting readiness gate (#2917)", () => {
+  it("probes every pod once even when the deadline has passed before the first sweep", async () => {
+    let reads = 0;
+    const probed: string[] = [];
+    await expect(
+      conductScenario({
+        scenarioText: ONE_BOT_SCENARIO,
+        hostOpts: HOST_OPTS,
+        port: 8080,
+        dryRun: false,
+        token: "T",
+        readinessTimeoutMs: 1,
+        deps: {
+          clientFactory: () => recordingClient([]),
+          clock: { now: () => (reads++ === 0 ? 1000 : 5000) },
+          sleep: async () => {},
+          log: () => {},
+          fetchHealthz: async (host) => {
+            probed.push(host);
+            return JOINED;
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ fired: 1 });
+    expect(probed).toEqual([BOT0]);
+  });
+
+  function gateRun(
+    fetchHealthz: (host: string) => Promise<unknown>,
+    extra: {
+      scenarioText?: string;
+      fleetSize?: number;
+      allowLegacyHealthz?: boolean;
+      logs?: string[];
+      record?: string[];
+    } = {},
+  ): Promise<unknown> {
+    const fc = fakeClock();
+    return conductScenario({
+      scenarioText: extra.scenarioText ?? TWO_BOT_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      readinessTimeoutMs: 3 * READINESS_POLL_INTERVAL_MS,
+      fleetSize: extra.fleetSize,
+      allowLegacyHealthz: extra.allowLegacyHealthz,
+      deps: {
+        clientFactory: () => recordingClient(extra.record ?? []),
+        clock: fc.clock,
+        sleep: fc.sleep,
+        log: (l) => extra.logs?.push(l),
+        fetchHealthz: (host) => fetchHealthz(host),
+      },
+    });
+  }
+
+  it("rejects a pod that answers 200 with no bot in the meeting, and issues no call", async () => {
+    const record: string[] = [];
+    const idle = { ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 1 };
+    await expect(gateRun(async (h) => (h === BOT0 ? JOINED : idle), { record })).rejects.toThrow(
+      `1 of 2 pod(s) not ready within 6000ms: ${BOT1} not in the meeting (inMeeting 0/1, still joining 0)`,
+    );
+    expect(record).toEqual([]);
+  });
+
+  it("names a still-joining pod and a pod whose image predates the field", async () => {
+    const joining = { ok: true, bots: 1, inMeeting: 0, pending: 1, expected: 1 };
+    const legacy = { ok: true, bots: 1 };
+    await expect(gateRun(async (h) => (h === BOT0 ? joining : legacy))).rejects.toThrow(
+      `2 of 2 pod(s) not ready within 6000ms: ${BOT0} not in the meeting (inMeeting 0/1, still joining 1); ${BOT1} /healthz reports no in-meeting count (image predates #2917; re-pin the fleet)`,
+    );
+  });
+
+  it("anchors t0 once a joining pod joins, and logs the fleet in-meeting total", async () => {
+    const logs: string[] = [];
+    const record: string[] = [];
+    let polls = 0;
+    const joining = { ok: true, bots: 1, inMeeting: 0, pending: 1, expected: 1 };
+    await gateRun(
+      async (h) => {
+        if (h !== BOT1) return JOINED;
+        polls += 1;
+        return polls > 1 ? JOINED : joining;
+      },
+      { logs, record },
+    );
+    expect(polls).toBe(2);
+    expect(record).toEqual(["mute:false", "mute:false"]);
+    expect(logs).toContain("conduct: all pods ready - 2 bot(s) in the meeting at t0");
+  });
+
+  const RAISE_HINT = "raise --readiness-timeout above BOT_MAX_JOIN_STAGGER_SECS";
+  const joining = { ok: true, bots: 1, inMeeting: 0, pending: 1, expected: 1 };
+  const legacy = { ok: true, bots: 1 };
+
+  it("hints to raise --readiness-timeout only when every gated pod misses (#2387)", async () => {
+    await expect(gateRun(async () => joining)).rejects.toThrow(RAISE_HINT);
+    await expect(gateRun(async () => null)).rejects.toThrow(RAISE_HINT);
+    const crashed = { ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 1 };
+    await expect(gateRun(async () => crashed)).rejects.not.toThrow("--readiness-timeout");
+    const partial = gateRun(async (h) => (h === BOT0 ? JOINED : joining));
+    await expect(partial).rejects.toThrow("1 of 2 pod(s) not ready");
+    await expect(partial).rejects.not.toThrow("--readiness-timeout");
+  });
+
+  it("points a legacy-image pod at a re-pin or --allow-legacy-healthz", async () => {
+    await expect(gateRun(async (h) => (h === BOT0 ? JOINED : legacy))).rejects.toThrow(
+      "re-pin the fleet to the current image, or pass --allow-legacy-healthz",
+    );
+  });
+
+  it("--allow-legacy-healthz accepts a legacy pod but logs its bots UNVERIFIED", async () => {
+    const logs: string[] = [];
+    const record: string[] = [];
+    await gateRun(async (h) => (h === BOT0 ? JOINED : legacy), {
+      allowLegacyHealthz: true,
+      logs,
+      record,
+    });
+    expect(record).toEqual(["mute:false", "mute:false"]);
+    expect(logs).toContain(
+      `conduct: --allow-legacy-healthz: 1 pod(s) report no in-meeting count, so their bots are UNVERIFIED and not in the t0 total: ${BOT1}`,
+    );
+    expect(logs).toContain(
+      "conduct: all pods ready - 1 bot(s) in the meeting at t0, 1 pod(s) UNVERIFIED",
+    );
+  });
+
+  it("--allow-legacy-healthz still refuses a current pod that is not in the meeting", async () => {
+    await expect(
+      gateRun(async (h) => (h === BOT0 ? joining : legacy), { allowLegacyHealthz: true }),
+    ).rejects.toThrow(`1 of 2 pod(s) not ready within 6000ms: ${BOT0} not in the meeting`);
+  });
+
+  it("names a pod whose every bot left on purpose", async () => {
+    const left = { ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 0 };
+    await expect(gateRun(async (h) => (h === BOT0 ? JOINED : left))).rejects.toThrow(
+      `${BOT1} expects no bot (none launched, or every bot left on purpose)`,
+    );
+  });
+
+  it("fails a pod that read ready and then lost its bot while another pod was joining", async () => {
+    const record: string[] = [];
+    const polls = new Map<string, number>();
+    const gone = { ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 1 };
+    const run = gateRun(
+      async (h) => {
+        const n = (polls.get(h) ?? 0) + 1;
+        polls.set(h, n);
+        if (h === BOT0) return n === 1 ? JOINED : gone;
+        return n === 1 ? joining : JOINED;
+      },
+      { record },
+    );
+    await expect(run).rejects.toThrow(
+      `1 of 2 pod(s) not ready within 6000ms: ${BOT0} not in the meeting (inMeeting 0/1, still joining 0)`,
+    );
+    expect(record).toEqual([]);
+  });
+
+  it("--fleet-size gates pods the timeline never names", async () => {
+    const probed: string[] = [];
+    const logs: string[] = [];
+    await gateRun(
+      async (h) => {
+        probed.push(h);
+        return JOINED;
+      },
+      { scenarioText: ONE_BOT_SCENARIO, fleetSize: 2, logs },
+    );
+    expect(probed).toEqual([BOT0, BOT1]);
+    expect(logs.some((l) => l.includes("no --fleet-size"))).toBe(false);
+  });
+
+  it("warns that unnamed pods are unchecked when no fleet size is given", async () => {
+    const logs: string[] = [];
+    await gateRun(async () => JOINED, { scenarioText: ONE_BOT_SCENARIO, logs });
+    expect(logs.some((l) => l.includes("no --fleet-size"))).toBe(true);
+  });
+
+  it("marks the in-meeting count UNVERIFIED when the gate is skipped", async () => {
+    const logs: string[] = [];
+    const fc = fakeClock();
+    await conductScenario({
+      scenarioText: ONE_BOT_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      readinessTimeoutMs: 0,
+      deps: {
+        clientFactory: () => recordingClient([]),
+        clock: fc.clock,
+        sleep: fc.sleep,
+        log: (l) => logs.push(l),
+        fetchHealthz: async () => JOINED,
+      },
+    });
+    expect(logs.some((l) => l.includes("UNVERIFIED"))).toBe(true);
+  });
+});
 
 describe("awaitFleetReady via conductScenario", () => {
   it("runs the schedule once every pod answers /healthz on the first sweep", async () => {
@@ -550,11 +983,18 @@ describe("awaitFleetReady via conductScenario", () => {
         log: () => {},
         fetchHealthz: async (host, port) => {
           probes.push(`${host}:${port}`);
-          return true;
+          return JOINED;
         },
       },
     });
-    expect(summary).toEqual({ planned: 2, fired: 2, failed: 0, dryRun: false });
+    expect(summary).toEqual({
+      planned: 2,
+      fired: 2,
+      failed: 0,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: false,
+    });
     // Probed each unique pod exactly once, on the control port.
     expect(probes).toEqual([`${BOT0}:8080`, `${BOT1}:8080`]);
     expect(record).toEqual(["mute:false", "mute:false"]);
@@ -580,13 +1020,20 @@ describe("awaitFleetReady via conductScenario", () => {
         sleep: fc.sleep,
         log: () => {},
         fetchHealthz: async (host) => {
-          if (host !== BOT1) return true;
+          if (host !== BOT1) return JOINED;
           bot1Attempts += 1;
-          return bot1Attempts > 1;
+          return bot1Attempts > 1 ? JOINED : null;
         },
       },
     });
-    expect(summary).toEqual({ planned: 2, fired: 2, failed: 0, dryRun: false });
+    expect(summary).toEqual({
+      planned: 2,
+      fired: 2,
+      failed: 0,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: false,
+    });
     expect(bot1Attempts).toBe(2);
     // One poll interval elapsed before t0, so the t+0 actions fire late in
     // wall-clock terms — that is the point of the gate.
@@ -609,10 +1056,12 @@ describe("awaitFleetReady via conductScenario", () => {
           clock: fc.clock,
           sleep: fc.sleep,
           log: () => {},
-          fetchHealthz: async (host) => host === BOT0,
+          fetchHealthz: async (host) => (host === BOT0 ? JOINED : null),
         },
       }),
-    ).rejects.toThrow(new RegExp(`1 pod\\(s\\) never answered /healthz within 10000ms: ${BOT1}`));
+    ).rejects.toThrow(
+      new RegExp(`1 of 2 pod\\(s\\) not ready within 10000ms: ${BOT1} never answered /healthz`),
+    );
     // A partially-bound set of scheduled pods must not produce a run at all.
     expect(record).toEqual([]);
   });
@@ -636,7 +1085,14 @@ describe("awaitFleetReady via conductScenario", () => {
         log: () => {},
       },
     });
-    expect(summary).toEqual({ planned: 1, fired: 1, failed: 0, dryRun: false });
+    expect(summary).toEqual({
+      planned: 1,
+      fired: 1,
+      failed: 0,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: false,
+    });
     expect(sleeps).toBe(0);
   });
 
@@ -658,11 +1114,18 @@ describe("awaitFleetReady via conductScenario", () => {
         // Never ready — the run must still proceed because the gate is off.
         fetchHealthz: async () => {
           probes += 1;
-          return false;
+          return null;
         },
       },
     });
-    expect(summary).toEqual({ planned: 1, fired: 1, failed: 0, dryRun: false });
+    expect(summary).toEqual({
+      planned: 1,
+      fired: 1,
+      failed: 0,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: false,
+    });
     expect(probes).toBe(0);
   });
 
@@ -684,7 +1147,7 @@ describe("awaitFleetReady via conductScenario", () => {
         log: () => {},
         fetchHealthz: async () => {
           probes += 1;
-          return true;
+          return JOINED;
         },
       },
     });
@@ -710,7 +1173,7 @@ describe("awaitFleetReady via conductScenario", () => {
           log: () => {},
           fetchHealthz: async () => {
             probes += 1;
-            return false;
+            return null;
           },
         },
       }),
@@ -744,7 +1207,14 @@ describe("conductScenario (--dry-run)", () => {
         log: (l) => logs.push(l),
       },
     });
-    expect(summary).toEqual({ planned: 7, fired: 0, failed: 0, dryRun: true });
+    expect(summary).toEqual({
+      planned: 7,
+      fired: 0,
+      failed: 0,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: true,
+    });
     expect(sleeps).toBe(0);
     // The resolved schedule lines name the pod host + action + offset.
     expect(
@@ -786,11 +1256,12 @@ describe("httpConductorClientFactory (against a live control server)", () => {
   let token: string;
   let calls: string[];
   let liveBotId: string;
+  let registry: Map<string, BotRegistryEntry>;
 
   beforeEach(async () => {
     token = generateToken();
     calls = [];
-    const registry = new Map<string, BotRegistryEntry>();
+    registry = new Map<string, BotRegistryEntry>();
     // A terminated bot lingers in the registry's retention window; the
     // client must skip it and target the live one.
     const dead = newRegistryEntry(fakeTask({ participant: "zombie" }));
@@ -806,6 +1277,7 @@ describe("httpConductorClientFactory (against a live control server)", () => {
       token,
       surface: {
         getRegistry: () => registry,
+        expectedBots: () => 0,
         triggerLeave: async (id) => void calls.push(`leave:${id}`),
         forceKill: async () => {},
         applyTtl: () => {},
@@ -819,7 +1291,9 @@ describe("httpConductorClientFactory (against a live control server)", () => {
             commands: [["tc", "qdisc"]],
             label: action.label,
             op: action.op,
+            ingressShaped: false,
             mirrorRemoved: false,
+            readback: {},
           };
         },
         duplicateBot: async () => "x",
@@ -850,6 +1324,96 @@ describe("httpConductorClientFactory (against a live control server)", () => {
     ]);
   });
 
+  /** A pod whose `GET /bots` lists `bots`; a control on `old` answers `oldStatus` with `oldBody`. */
+  async function withPod(
+    oldStatus: number,
+    oldBody: unknown,
+    run: (pod: {
+      client: ConductorClient;
+      posts: string[];
+      lookups: () => number;
+      list: (b: Array<{ botId: string; status: string }>) => void;
+    }) => Promise<void>,
+  ): Promise<void> {
+    let bots = [{ botId: "old", status: "in-meeting" }];
+    let lookups = 0;
+    const posts: string[] = [];
+    const pod = createHttpServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.method === "GET" && req.url === "/bots") {
+        lookups += 1;
+        res.end(JSON.stringify({ bots }));
+        return;
+      }
+      posts.push(req.url ?? "");
+      const old = req.url?.startsWith("/bots/old/") === true;
+      res.statusCode = old ? oldStatus : 200;
+      res.end(JSON.stringify(old ? oldBody : {}));
+    });
+    await new Promise<void>((r) => pod.listen(0, "127.0.0.1", r));
+    try {
+      const client = httpConductorClientFactory()({
+        host: "127.0.0.1",
+        port: (pod.address() as AddressInfo).port,
+        token,
+      });
+      await run({ client, posts, lookups: () => lookups, list: (b) => (bots = b) });
+    } finally {
+      pod.closeAllConnections();
+      await new Promise((r) => pod.close(r));
+    }
+  }
+
+  const REPLACED = [
+    { botId: "old", status: "failed" },
+    { botId: "new", status: "in-meeting" },
+  ];
+
+  it("re-resolves the bot after a 409, so a replacement bot gets the next control", async () => {
+    await withPod(409, { error: "bot old is not yet in-meeting" }, async (pod) => {
+      await expect(pod.client.mute(true)).rejects.toMatchObject({ status: 409 });
+      pod.list(REPLACED);
+      await pod.client.mute(false);
+      expect(pod.posts).toEqual(["/bots/old/mute", "/bots/new/mute"]);
+    });
+  });
+
+  it("reads the control server's 404 for a dropped bot as not joined, then reaches its replacement", async () => {
+    const client = httpConductorClientFactory()({ host: "127.0.0.1", port: handle.port, token });
+    await client.mute(true);
+    registry.delete(liveBotId);
+    const next = newRegistryEntry(fakeTask({ participant: "bob" }));
+    next.status = "in-meeting";
+    registry.set(next.botId, next);
+    await expect(client.mute(false)).rejects.toBeInstanceOf(BotNotJoinedError);
+    await client.mute(true);
+    expect(calls).toEqual([`mic:${liveBotId}:true`, `mic:${next.botId}:true`]);
+  });
+
+  it("treats a 404 for a dropped bot id as not joined and re-resolves the replacement", async () => {
+    await withPod(404, { error: "bot old not found" }, async (pod) => {
+      await expect(pod.client.mute(true)).rejects.toBeInstanceOf(BotNotJoinedError);
+      pod.list([{ botId: "new", status: "in-meeting" }]);
+      await pod.client.mute(false);
+      expect(pod.posts).toEqual(["/bots/old/mute", "/bots/new/mute"]);
+    });
+  });
+
+  it.each([
+    [500, { error: "boom" }],
+    [404, { error: "no route for POST /bots/old/mute" }],
+  ])("keeps the cached bot id after a %i that is not a dropped bot", async (status, body) => {
+    await withPod(status, body, async (pod) => {
+      const err = await pod.client.mute(true).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CtlHttpError);
+      expect(err).not.toBeInstanceOf(BotNotJoinedError);
+      pod.list(REPLACED);
+      await pod.client.mute(false).catch(() => {});
+      expect(pod.lookups()).toBe(1);
+      expect(pod.posts).toEqual(["/bots/old/mute", "/bots/old/mute"]);
+    });
+  });
+
   it("resolves the bot id exactly once across multiple meeting-control calls", async () => {
     const client = httpConductorClientFactory()({ host: "127.0.0.1", port: handle.port, token });
     await Promise.all([client.mute(true), client.setCameraOff(false), client.setScreenShare(true)]);
@@ -865,6 +1429,7 @@ describe("httpConductorClientFactory (against a live control server)", () => {
       token: emptyToken,
       surface: {
         getRegistry: () => emptyRegistry,
+        expectedBots: () => 0,
         triggerLeave: async () => {},
         forceKill: async () => {},
         applyTtl: () => {},
@@ -876,7 +1441,9 @@ describe("httpConductorClientFactory (against a live control server)", () => {
           commands: [["tc"]],
           label: action.label,
           op: action.op,
-          mirrorRemoved: true,
+          ingressShaped: action.op === "shape",
+          mirrorRemoved: action.op === "clear",
+          readback: {},
         }),
         duplicateBot: async () => "x",
         launchOne: async () => "x",
@@ -890,9 +1457,17 @@ describe("httpConductorClientFactory (against a live control server)", () => {
       });
       // netem needs no bot id — succeeds against an empty registry. The outcome
       // is asserted end to end: the server's mirrorRemoved must reach the caller.
-      await expect(client.clearNetem()).resolves.toEqual({ mirrorRemoved: true });
+      await expect(client.clearNetem()).resolves.toEqual({
+        ingressShaped: false,
+        mirrorRemoved: true,
+      });
+      await expect(client.applyNetem({ profile: "lossy_mobile" })).resolves.toEqual({
+        ingressShaped: true,
+        mirrorRemoved: false,
+      });
       // mute needs a bot id — surfaces a clear error.
       await expect(client.mute(true)).rejects.toThrow(/no bot registered/);
+      await expect(client.mute(true)).rejects.toBeInstanceOf(BotNotJoinedError);
     } finally {
       await emptyHandle.close();
     }
@@ -911,6 +1486,7 @@ describe("httpConductorClientFactory (against a live control server)", () => {
       token: retryToken,
       surface: {
         getRegistry: () => retryRegistry,
+        expectedBots: () => 0,
         triggerLeave: async () => {},
         forceKill: async () => {},
         applyTtl: () => {},
@@ -922,7 +1498,9 @@ describe("httpConductorClientFactory (against a live control server)", () => {
           commands: [["tc"]],
           label: action.label,
           op: action.op,
+          ingressShaped: false,
           mirrorRemoved: false,
+          readback: {},
         }),
         duplicateBot: async () => "x",
         launchOne: async () => "x",

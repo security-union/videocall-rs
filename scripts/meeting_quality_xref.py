@@ -1477,9 +1477,10 @@ def render_relay_section(meeting, prom, out):
         "videocall_websocket_drops (client-side WS drops, by reporter)":
             f'sum by (meeting_id, session_id, peer_id)(videocall_websocket_drops{{meeting_id="{room}"}} @ {ep})'
             f' * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info',
-        "videocall_relay_scheduler_lag_ms (avg, histogram)":
-            f'sum(rate(videocall_relay_scheduler_lag_ms_sum[{lb}] @ {ep}))'
-            f'/sum(rate(videocall_relay_scheduler_lag_ms_count[{lb}] @ {ep}))',
+        # Per pod: WS and WT relays both export this family since #2924.
+        "videocall_relay_scheduler_lag_ms (avg per relay pod, histogram)":
+            f'sum by (pod)(rate(videocall_relay_scheduler_lag_ms_sum[{lb}] @ {ep}))'
+            f'/sum by (pod)(rate(videocall_relay_scheduler_lag_ms_count[{lb}] @ {ep}))',
     }
     out.append("**Relay Prometheus (anchored @ meeting epoch):**")
     out.append("")

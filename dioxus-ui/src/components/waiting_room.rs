@@ -12,11 +12,12 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use crate::components::presence_keepalive::PresenceKeepalive;
 use crate::constants::{actix_websocket_base, webtransport_enabled, webtransport_host_base};
 use crate::context::{
     load_transport_preference_with_source, resolve_transport_config, TransportPreferenceCtx,
 };
-use crate::meeting_api::{fetch_participant_status, JoinMeetingResponse};
+use crate::meeting_api::{fetch_participant_status, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -45,6 +46,43 @@ pub fn meeting_has_started(state: &str) -> bool {
     state == "active"
 }
 
+/// Still `waiting` although the meeting's waiting room is off, where a fresh
+/// join admits directly.
+pub(crate) fn stranded_by_waiting_room_off(status: &ParticipantStatus) -> bool {
+    status.status == "waiting" && !status.waiting_room_enabled
+}
+
+/// The token to hold instead of `held` once a status poll `offered` one.
+pub(crate) fn refreshed_observer_token(
+    held: &str,
+    offered: Option<&str>,
+    now_secs: u64,
+) -> Option<String> {
+    let offered = offered.filter(|t| !t.is_empty() && *t != held)?;
+    (held.is_empty() || crate::guest_session::should_replace(held, offered, now_secs))
+        .then(|| offered.to_string())
+}
+
+/// A status poll that sends, and then keeps, the freshest observer token.
+async fn poll_status(
+    meeting_id: &str,
+    is_guest: bool,
+    mut token: Signal<String>,
+) -> Result<ParticipantStatus, JoinError> {
+    let held = token.try_peek().map(|t| t.clone()).unwrap_or_default();
+    let status = fetch_participant_status(meeting_id, &held, is_guest).await?;
+    let Ok(current) = token.try_peek().map(|t| t.clone()) else {
+        return Ok(status);
+    };
+    let offered = status.observer_token.as_deref();
+    if let Some(next) = refreshed_observer_token(&current, offered, crate::id_token::now_secs()) {
+        if let Ok(mut slot) = token.try_write() {
+            *slot = next;
+        }
+    }
+    Ok(status)
+}
+
 #[component]
 pub fn WaitingRoom(
     meeting_id: String,
@@ -55,9 +93,13 @@ pub fn WaitingRoom(
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
     on_cancel: EventHandler<()>,
+    on_waiting_room_disabled: EventHandler<()>,
+    #[props(default)] keepalive_interval_ms: Option<u32>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut error = use_signal(|| None::<String>);
+    let latest_token = use_signal(|| observer_token.clone());
+    let keepalive_stopped = use_signal(|| false);
 
     // Guard against duplicate on_admitted / on_rejected calls.
     // Multiple concurrent code paths (mount poll, post-connect poll,
@@ -130,8 +172,6 @@ pub fn WaitingRoom(
             let meeting_id_for_post_connect = meeting_id.clone();
             let obs_conn_on_connect = observer_connected.clone();
             let obs_conn_on_lost = observer_connected.clone();
-            let observer_token_for_post_connect = observer_token.clone();
-            let observer_token_for_fetch = observer_token.clone();
             let resolved_on_connect = resolved.clone();
             let resolved_on_push = resolved.clone();
             let resolved_on_push_reject = resolved.clone();
@@ -165,13 +205,12 @@ pub fn WaitingRoom(
                     // handshake window (NATS event already published but observer
                     // wasn't subscribed yet).
                     let mid = meeting_id_for_post_connect.clone();
-                    let token = observer_token_for_post_connect.clone();
                     let resolved = resolved_on_connect.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         if resolved.get() {
                             return;
                         }
-                        let status_result = fetch_participant_status(&mid, &token, is_guest).await;
+                        let status_result = poll_status(&mid, is_guest, latest_token).await;
                         match status_result {
                             Ok(status) => match status.status.as_str() {
                                 "admitted" if status.room_token.is_some() => {
@@ -215,6 +254,7 @@ pub fn WaitingRoom(
                 get_peer_video_canvas_id: VcCallback::from(|id| id),
                 get_peer_screen_canvas_id: VcCallback::from(|id| id),
                 enable_diagnostics: false,
+                send_diagnostics_packets: true,
                 diagnostics_update_interval_ms: None,
                 enable_health_reporting: false,
                 health_reporting_interval_ms: None,
@@ -227,7 +267,6 @@ pub fn WaitingRoom(
                 on_participant_admitted: Some(VcCallback::from(move |_: ()| {
                     log::info!("Participant admitted push received, fetching room token via HTTP");
                     let mid = meeting_id_for_fetch.clone();
-                    let token = observer_token_for_fetch.clone();
                     let resolved = resolved_on_push.clone();
                     // Use spawn_local instead of dioxus::spawn because
                     // this callback fires from a WebSocket message
@@ -237,7 +276,7 @@ pub fn WaitingRoom(
                         if resolved.get() {
                             return;
                         }
-                        let status_result = fetch_participant_status(&mid, &token, is_guest).await;
+                        let status_result = poll_status(&mid, is_guest, latest_token).await;
                         match status_result {
                             Ok(status) => {
                                 if status.room_token.is_some() {
@@ -321,7 +360,6 @@ pub fn WaitingRoom(
     let poll_tick: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(0)));
     {
         let meeting_id = meeting_id.clone();
-        let observer_token = observer_token.clone();
         let poll_interval_id = poll_interval_id.clone();
         let poll_tick = poll_tick.clone();
         let resolved_mount = resolved.clone();
@@ -342,14 +380,12 @@ pub fn WaitingRoom(
             // during the join -> connect gap).
             {
                 let meeting_id = meeting_id.clone();
-                let token = observer_token.clone();
                 let resolved_mount = resolved_mount.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     if resolved_mount.get() {
                         return;
                     }
-                    let status_result =
-                        fetch_participant_status(&meeting_id, &token, is_guest).await;
+                    let status_result = poll_status(&meeting_id, is_guest, latest_token).await;
                     match status_result {
                         Ok(status) => match status.status.as_str() {
                             "admitted" if status.room_token.is_some() => {
@@ -368,6 +404,14 @@ pub fn WaitingRoom(
                                     on_rejected.call(());
                                 }
                             }
+                            _ if stranded_by_waiting_room_off(&status) => {
+                                if !resolved_mount.replace(true) {
+                                    log::info!(
+                                        "Immediate mount poll: waiting room is off, re-joining"
+                                    );
+                                    on_waiting_room_disabled.call(());
+                                }
+                            }
                             other => {
                                 log::debug!(
                                     "Immediate mount poll: status={other}, will continue polling"
@@ -382,7 +426,6 @@ pub fn WaitingRoom(
             }
 
             let meeting_id = meeting_id.clone();
-            let observer_token = observer_token.clone();
             let resolved_interval = resolved_interval.clone();
             let observer_connected = observer_connected.clone();
             let poll_tick = poll_tick.clone();
@@ -396,11 +439,9 @@ pub fn WaitingRoom(
                     return;
                 }
                 let meeting_id = meeting_id.clone();
-                let token = observer_token.clone();
                 let resolved_interval = resolved_interval.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let status_result =
-                        fetch_participant_status(&meeting_id, &token, is_guest).await;
+                    let status_result = poll_status(&meeting_id, is_guest, latest_token).await;
                     match status_result {
                         Ok(status) => match status.status.as_str() {
                             "admitted" => {
@@ -420,6 +461,12 @@ pub fn WaitingRoom(
                             "rejected" => {
                                 log::info!("Polling fallback: participant rejected");
                                 on_rejected.call(());
+                            }
+                            _ if stranded_by_waiting_room_off(&status) => {
+                                if !resolved_interval.replace(true) {
+                                    log::info!("Polling fallback: waiting room is off, re-joining");
+                                    on_waiting_room_disabled.call(());
+                                }
                             }
                             // "waiting" | "waiting_for_meeting" | _ => continue polling
                             other => {
@@ -468,6 +515,14 @@ pub fn WaitingRoom(
         // to distinguish "parked waiting for host admission" from the
         // post-admit grid. Behaviourally inert.
         div { class: "waiting-room-container", "data-testid": "meeting-waiting-room",
+            PresenceKeepalive {
+                meeting_id: meeting_id.clone(),
+                is_guest,
+                observer_token: latest_token(),
+                meeting_joined: keepalive_stopped,
+                stop_on_not_found: false,
+                interval_ms: keepalive_interval_ms,
+            }
             div { class: "waiting-room-card card-apple",
                 div { class: "waiting-room-icon",
                     svg {
@@ -508,7 +563,10 @@ pub fn WaitingRoom(
 
 #[cfg(test)]
 mod tests {
-    use super::{meeting_has_started, should_poll, POLL_INTERVAL_MS, PUSHED_POLL_EVERY_N_TICKS};
+    use super::{
+        meeting_has_started, refreshed_observer_token, should_poll, stranded_by_waiting_room_off,
+        POLL_INTERVAL_MS, PUSHED_POLL_EVERY_N_TICKS,
+    };
 
     #[test]
     fn only_an_active_meeting_is_worth_re_joining() {
@@ -553,5 +611,61 @@ mod tests {
         let wrapped = u32::MAX.wrapping_add(1);
         assert!(should_poll(true, wrapped));
         assert!(wrapped.is_multiple_of(PUSHED_POLL_EVERY_N_TICKS));
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    fn token_expiring_at(exp: u64) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"guest:w","exp":{exp}}}"#));
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn a_waiter_swaps_in_the_polled_token_before_its_own_expires() {
+        let held = token_expiring_at(NOW + 60);
+        let offered = token_expiring_at(NOW + 1_800);
+        assert_eq!(
+            refreshed_observer_token(&held, Some(&offered), NOW),
+            Some(offered.clone())
+        );
+        assert_eq!(
+            refreshed_observer_token("opaque-initial-token", Some(&offered), NOW),
+            Some(offered.clone())
+        );
+        assert_eq!(
+            refreshed_observer_token("", Some(&offered), NOW),
+            Some(offered)
+        );
+    }
+
+    #[test]
+    fn a_near_identical_token_does_not_churn_the_held_one() {
+        let held = token_expiring_at(NOW + 1_800);
+        let offered = token_expiring_at(NOW + 1_805);
+        assert_eq!(refreshed_observer_token(&held, Some(&offered), NOW), None);
+        assert_eq!(refreshed_observer_token(&held, Some(&held), NOW), None);
+    }
+
+    #[test]
+    fn only_a_waiter_in_a_meeting_without_a_waiting_room_is_stranded() {
+        let status = |status: &str, waiting_room_enabled: bool| -> super::ParticipantStatus {
+            serde_json::from_value(serde_json::json!({
+                "user_id": "w", "status": status, "is_host": false, "joined_at": 0,
+                "waiting_room_enabled": waiting_room_enabled,
+            }))
+            .unwrap()
+        };
+        assert!(stranded_by_waiting_room_off(&status("waiting", false)));
+        assert!(!stranded_by_waiting_room_off(&status("waiting", true)));
+        assert!(!stranded_by_waiting_room_off(&status("admitted", false)));
+        assert!(!stranded_by_waiting_room_off(&status("rejected", false)));
+    }
+
+    #[test]
+    fn a_poll_without_a_token_keeps_the_held_one() {
+        let held = token_expiring_at(NOW + 60);
+        assert_eq!(refreshed_observer_token(&held, None, NOW), None);
+        assert_eq!(refreshed_observer_token(&held, Some(""), NOW), None);
     }
 }

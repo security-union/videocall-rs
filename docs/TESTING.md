@@ -152,6 +152,10 @@ stack does write a tracked file: `tailwindcss` runs in both serve modes and
 writes `dioxus-ui/static/tailwind.css`, so that path can show up modified in
 `git status` while the stack is up.
 
+With `VIDEOCALL_RELEASE_BUILD=1`, `start-dioxus.sh` writes `config.local.js` and
+`dist/` under `$CARGO_TARGET_DIR/videocall-release/` (the `e2e-dioxus-ui-target`
+volume) instead of the checkout. `tailwind.css` is still written in the checkout.
+
 The two files reach `dist/` by different mechanisms, and `index.html` loads them
 in this order:
 
@@ -176,6 +180,12 @@ re-copies `config.local.js` into `dist/` on a one-second loop. Both e2e workflow
 (`.github/workflows/e2e-hcl.yaml`, `pr-check-e2e-smoke-hcl.yaml`) set `static`,
 which runs `trunk build`, copies `config.local.js` into `dist/`, then serves
 `dist/` with `miniserve`.
+
+`VIDEOCALL_RELEASE_BUILD=1` forces `static` whatever `DIOXUS_SERVE_MODE` says,
+and builds with `trunk build --release` into
+`$CARGO_TARGET_DIR/videocall-release/dist`. The same no-watcher rule applies.
+`docker/docker-compose.scale-ports.yaml` moves the stack's host ports off the
+dev stack's; its header says when a separate worktree is still needed.
 
 After that initial build `static` mode neither recompiles nor re-copies. A source
 edit — Rust or JS — reaches the browser only after `start-dioxus.sh` runs again,
@@ -401,6 +411,7 @@ cargo test --target wasm32-unknown-unknown --test popup_transport_pill_colors
 cargo test --target wasm32-unknown-unknown --test speaker_highlight_panel
 cargo test --target wasm32-unknown-unknown --test self_tile_inline_rename
 cargo test --target wasm32-unknown-unknown --test portrait_camera_fit
+cargo test --target wasm32-unknown-unknown --test diagnostics_packets_config
 ```
 
 If you want to match the CI workflow even more closely, kill leftover browser

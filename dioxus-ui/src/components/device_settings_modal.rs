@@ -2,6 +2,7 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
+use crate::components::transport_fallback::{transport_fallback_active, FALLBACK_NOTE};
 use crate::context::{
     apply_transport_decision, displayed_default_transport, effective_default_transport,
     load_transport_sticky, pinned_protocol_advice, transport_option_label, TransportPreference,
@@ -314,6 +315,7 @@ pub fn DeviceSettingsModal(
     visible: bool,
     on_close: EventHandler<()>,
     #[props(default)] transport_preference: TransportPreference,
+    #[props(default)] active_transport: Option<TransportPreference>,
     #[props(default)] initial_section: Option<String>,
 ) -> Element {
     let is_ios_safari = is_ios();
@@ -566,6 +568,11 @@ pub fn DeviceSettingsModal(
                                     default_transport,
                                     server_wt_enabled,
                                 );
+                                let in_fallback = transport_fallback_active(
+                                    transport_preference,
+                                    server_wt_enabled,
+                                    active_transport,
+                                ) == Some(true);
                                 rsx! {
                                 div {
                                     id: SettingsSection::Network.panel_id(),
@@ -579,6 +586,46 @@ pub fn DeviceSettingsModal(
                                     }
 
                                     p { class: "settings-section-description", "Choose the transport protocol for media connections." }
+
+                                    if in_fallback {
+                                        div {
+                                            class: "settings-info-panel",
+                                            role: "note",
+                                            "data-testid": "transport-in-use-mismatch",
+                                            div { class: "settings-info-panel-icon",
+                                                svg {
+                                                    view_box: "0 0 24 24",
+                                                    width: "16",
+                                                    height: "16",
+                                                    "aria-hidden": "true",
+                                                    circle {
+                                                        cx: "12",
+                                                        cy: "12",
+                                                        r: "10",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "1.5",
+                                                    }
+                                                    path {
+                                                        d: "M12 8v5",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "1.5",
+                                                        stroke_linecap: "round",
+                                                    }
+                                                    circle {
+                                                        cx: "12",
+                                                        cy: "16",
+                                                        r: "0.9",
+                                                        fill: "currentColor",
+                                                    }
+                                                }
+                                            }
+                                            div { class: "settings-info-panel-body",
+                                                p { class: "settings-info-panel-title", "Not using your preferred protocol" }
+                                                p { class: "settings-info-panel-text", "{FALLBACK_NOTE}" }
+                                            }
+                                        }
+                                    }
 
                                     // Selection is staged in `pending_protocol`; "Apply" commits and reloads.
                                     div { class: "device-setting-group",
@@ -1024,5 +1071,145 @@ mod tests {
             assert_eq!(s.next().prev(), s, "prev(next({s:?})) must round-trip");
             assert_eq!(s.prev().next(), s, "next(prev({s:?})) must round-trip");
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[allow(non_snake_case)]
+    fn NetworkHarness() -> Element {
+        let mut active = use_signal(|| Some(TransportPreference::WebSocket));
+        rsx! {
+            button {
+                id: "active-wt",
+                onclick: move |_| active.set(Some(TransportPreference::WebTransport)),
+            }
+            button { id: "active-none", onclick: move |_| active.set(None) }
+            button {
+                id: "active-ws",
+                onclick: move |_| active.set(Some(TransportPreference::WebSocket)),
+            }
+            DeviceSettingsModal {
+                microphones: Vec::new(),
+                cameras: Vec::new(),
+                speakers: Vec::new(),
+                selected_microphone_id: None,
+                selected_camera_id: None,
+                selected_speaker_id: None,
+                on_microphone_select: move |_| {},
+                on_camera_select: move |_| {},
+                on_speaker_select: move |_| {},
+                visible: true,
+                on_close: move |_| {},
+                transport_preference: TransportPreference::WebTransport,
+                active_transport: active(),
+                initial_section: Some("network".to_string()),
+            }
+        }
+    }
+
+    fn inject_app_config(webtransport_enabled: bool) {
+        let config = js_sys::Object::new();
+        let set = |key: &str, value: wasm_bindgen::JsValue| {
+            js_sys::Reflect::set(&config, &key.into(), &value).unwrap();
+        };
+        set("apiBaseUrl", "http://test:8080".into());
+        set("wsUrl", "ws://test:8080".into());
+        set("webTransportHost", "https://test:4433".into());
+        set("oauthEnabled", "false".into());
+        set("e2eeEnabled", "false".into());
+        set(
+            "webTransportEnabled",
+            (if webtransport_enabled {
+                "true"
+            } else {
+                "false"
+            })
+            .into(),
+        );
+        set("usersAllowedToStream", "".into());
+        set("serverElectionPeriodMs", 2000.into());
+        js_sys::Reflect::set(&gloo_utils::window(), &"__APP_CONFIG".into(), &config).unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    fn remove_app_config() {
+        let _ =
+            js_sys::Reflect::delete_property(&gloo_utils::window().into(), &"__APP_CONFIG".into());
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_network_panel_notes_a_webtransport_fallback_only_while_one_is_active() {
+        inject_app_config(true);
+        let doc = gloo_utils::document();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(NetworkHarness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        let click = |id: &str| {
+            mount
+                .query_selector(&format!("#{id}"))
+                .unwrap()
+                .unwrap()
+                .unchecked_into::<web_sys::HtmlElement>()
+                .click();
+        };
+        let note = || {
+            mount
+                .query_selector("[data-testid='transport-in-use-mismatch']")
+                .unwrap()
+                .map(|el| el.text_content().unwrap_or_default())
+        };
+        TimeoutFuture::new(30).await;
+        assert!(
+            mount
+                .query_selector("[data-testid='transport-radio-webtransport']")
+                .unwrap()
+                .is_some(),
+            "the Network section must be the one rendered"
+        );
+        let shown = note().expect("preferred WebTransport, using WebSocket");
+        assert!(shown.contains(FALLBACK_NOTE), "{shown}");
+
+        click("active-wt");
+        TimeoutFuture::new(30).await;
+        assert_eq!(note(), None, "the preferred protocol is in use");
+
+        click("active-none");
+        TimeoutFuture::new(30).await;
+        assert_eq!(note(), None, "no connection, nothing to compare");
+
+        click("active-ws");
+        TimeoutFuture::new(30).await;
+        assert!(note().is_some(), "the note follows a live transport change");
+
+        inject_app_config(false);
+        click("active-none");
+        TimeoutFuture::new(30).await;
+        click("active-ws");
+        TimeoutFuture::new(30).await;
+        let wt_label = mount
+            .query_selector("[data-testid='transport-radio-webtransport']")
+            .unwrap()
+            .and_then(|el| el.text_content())
+            .unwrap_or_default();
+        let disabled_note = note();
+        remove_app_config();
+        mount.remove();
+        assert_eq!(
+            wt_label, "WebTransport (unavailable)",
+            "the WebTransport-disabled config must be the one rendered"
+        );
+        assert_eq!(
+            disabled_note, None,
+            "WebSocket on a deployment without WebTransport is not a fallback"
+        );
     }
 }

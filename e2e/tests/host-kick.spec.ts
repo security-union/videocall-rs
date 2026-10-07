@@ -1,10 +1,15 @@
 import { test, expect, chromium, Page } from "@playwright/test";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  createAuthenticatedContext,
+  pinWebSocketTransport,
+} from "../helpers/auth-context";
 import {
   getEncoderAudioGumCount,
   getEncoderAudioTracks,
   installGetUserMediaMock,
 } from "../helpers/media-mock";
+import { createMeeting } from "../helpers/meeting-api";
 import { waitForServices } from "../helpers/wait-for-services";
 import { openPeerList } from "../helpers/controls";
 
@@ -248,6 +253,88 @@ async function hostKickPeerViaTile(page: Page): Promise<void> {
   await kickItem.click();
 }
 
+const GUEST_TILE_ON_HOST = ".grid-item:has(.tile-mute-btn)";
+/** `ws_chat_session.rs` `Handler<ForceClose>`. */
+const RELAY_KICK_CLOSE = { code: 1008, reason: "removed by host" };
+const RELAY_CLOSE_DEADLINE_MS = 10_000;
+const REJOIN_HOLD_MS = 5_000;
+
+type RawRelaySocket = {
+  opened: boolean;
+  messages: number;
+  close: { code: number; reason: string } | null;
+};
+
+type RawRelayWindow = {
+  __rawRelay?: Record<string, { state: RawRelaySocket; socket: WebSocket }>;
+};
+
+/** A relay socket that ignores every packet, PARTICIPANT_KICKED included. */
+async function openRawRelaySocket(page: Page, name: string, url: string): Promise<void> {
+  await page.evaluate(
+    ({ name, url }) => {
+      const state: RawRelaySocket = { opened: false, messages: 0, close: null };
+      const socket = new WebSocket(url);
+      socket.onopen = () => {
+        state.opened = true;
+      };
+      socket.onmessage = () => {
+        state.messages += 1;
+      };
+      socket.onclose = (event) => {
+        state.close = { code: event.code, reason: event.reason };
+      };
+      const w = window as unknown as RawRelayWindow;
+      w.__rawRelay = { ...w.__rawRelay, [name]: { state, socket } };
+    },
+    { name, url },
+  );
+}
+
+async function readRawRelaySocket(page: Page, name: string): Promise<RawRelaySocket> {
+  return page.evaluate((name) => {
+    const entry = (window as unknown as RawRelayWindow).__rawRelay?.[name];
+    if (!entry) {
+      throw new Error(`no raw relay socket named ${name}`);
+    }
+    return entry.state;
+  }, name);
+}
+
+function recordRelayLobbyUrls(page: Page): string[] {
+  const urls: string[] = [];
+  page.on("websocket", (socket) => {
+    if (new URL(socket.url()).pathname.endsWith("/lobby")) {
+      urls.push(socket.url());
+    }
+  });
+  return urls;
+}
+
+// Token only: the guest's `instance_id` would make the relay evict the guest's own session.
+function lobbyUrlWithHeldToken(lobbyUrl: string): string {
+  const url = new URL(lobbyUrl);
+  const token = url.searchParams.get("token");
+  expect(token, "the guest's relay URL must carry its room token").toBeTruthy();
+  url.search = "";
+  url.searchParams.set("token", token as string);
+  return url.toString();
+}
+
+async function expectRejoinHolds(hostPage: Page, guestPage: Page): Promise<void> {
+  const guestTile = hostPage.locator(GUEST_TILE_ON_HOST).first();
+  await expect(guestTile, "the host must see the re-joined guest").toBeVisible({
+    timeout: 30_000,
+  });
+  await guestPage.waitForTimeout(REJOIN_HOLD_MS);
+  await expect(
+    guestPage.locator(MEETING_ENDED_OVERLAY),
+    "#2934: the relay must accept a room token minted after the kick",
+  ).toHaveCount(0);
+  await expect(guestPage.locator("#grid-container")).toBeVisible();
+  await expect(guestTile, "the re-joined guest must stay in the meeting").toBeVisible();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -436,6 +523,7 @@ test.describe("Host kick controls", () => {
           hasText: "You have been removed from the meeting by the host.",
         }),
       ).toBeVisible({ timeout: 5_000 });
+      await expect(hostPage.locator(GUEST_TILE_ON_HOST)).toHaveCount(0, { timeout: 20_000 });
 
       // ---- Guest clicks "Return to Home" on the overlay ----
       // The button navigates the browser to `/`, which is the same flow a
@@ -456,8 +544,7 @@ test.describe("Host kick controls", () => {
       // ---- Guest is back in the meeting (grid container visible again) ----
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 20_000 });
 
-      // ---- The kicked overlay must not be present after a successful rejoin ----
-      await expect(guestPage.locator(".meeting-ended-overlay")).toHaveCount(0);
+      await expectRejoinHolds(hostPage, guestPage);
     } finally {
       await browser1.close();
       await browser2.close();
@@ -629,6 +716,97 @@ test.describe("Host kick controls", () => {
 
       // The Home button is left focused but NEVER activated: its onclick sets
       // `location.href = "/"`, which would navigate the page mid-test.
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("the relay closes a kicked participant's session that ignores the kick and refuses its pre-kick token", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hostkick_relay_${Date.now()}`;
+    const hostEmail = "host-kickrelay@videocall.rs";
+    const hostName = "KickRelayHost";
+    await createMeeting(hostEmail, hostName, { meetingId, waitingRoomEnabled: false });
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(browser1, hostEmail, hostName, uiURL);
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-kickrelay@videocall.rs",
+        "KickRelayGuest",
+        uiURL,
+      );
+      await pinWebSocketTransport(guestCtx);
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+      const guestLobbyUrls = recordRelayLobbyUrls(guestPage);
+
+      await navigateToMeeting(hostPage, meetingId, hostName);
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+      await navigateToMeeting(guestPage, meetingId, "KickRelayGuest");
+      expect(await joinMeetingFromPage(guestPage), "no waiting room: the guest is admitted").toBe(
+        "in-meeting",
+      );
+      await expect(hostPage.locator(GUEST_TILE_ON_HOST).first()).toBeVisible({ timeout: 30_000 });
+
+      await expect
+        .poll(() => guestLobbyUrls.length, { message: "the guest must dial the WebSocket relay" })
+        .toBeGreaterThan(0);
+      const heldTokenUrl = lobbyUrlWithHeldToken(guestLobbyUrls[guestLobbyUrls.length - 1]);
+
+      const probePage = await (await browser1.newContext()).newPage();
+      await probePage.goto(`${uiURL}/config.js`);
+      await openRawRelaySocket(probePage, "held", heldTokenUrl);
+      await expect
+        .poll(
+          async () => {
+            const { opened, messages, close } = await readRawRelaySocket(probePage, "held");
+            return { served: opened && messages > 0, close };
+          },
+          {
+            timeout: 15_000,
+            message: "the raw socket must be connected and served before the kick",
+          },
+        )
+        .toEqual({ served: true, close: null });
+
+      await hostKickPeerViaTile(hostPage);
+
+      await expect
+        .poll(async () => (await readRawRelaySocket(probePage, "held")).close, {
+          timeout: RELAY_CLOSE_DEADLINE_MS,
+          message: "#2934: the relay must close a kicked session that ignores PARTICIPANT_KICKED",
+        })
+        .toEqual(RELAY_KICK_CLOSE);
+
+      await expect(
+        guestPage.locator(".meeting-ended-message", { hasText: KICK_MESSAGE }),
+      ).toBeVisible({ timeout: 20_000 });
+      await expect(hostPage.locator(GUEST_TILE_ON_HOST)).toHaveCount(0, { timeout: 20_000 });
+
+      await openRawRelaySocket(probePage, "replayed", heldTokenUrl);
+      await expect
+        .poll(async () => (await readRawRelaySocket(probePage, "replayed")).close, {
+          timeout: RELAY_CLOSE_DEADLINE_MS,
+          message: "#2934: the relay must refuse a room token issued before the kick",
+        })
+        .toEqual(RELAY_KICK_CLOSE);
+
+      await guestPage.locator(MEETING_ENDED_HOME_BTN).click();
+      await expect(guestPage).toHaveURL(new RegExp(`^${uiURL}/?$`), { timeout: 10_000 });
+      await navigateToMeeting(guestPage, meetingId, "KickRelayGuest");
+      expect(await joinMeetingFromPage(guestPage), "no waiting room: the re-join is admitted").toBe(
+        "in-meeting",
+      );
+      await expectRejoinHolds(hostPage, guestPage);
     } finally {
       await browser1.close();
       await browser2.close();

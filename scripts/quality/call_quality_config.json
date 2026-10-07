@@ -1,0 +1,46 @@
+{
+  "config_version": "bands-v0",
+  "limits": "Built-in, not configurable: peer_stats cap 128 and CANVAS_LIMIT 30 (G-V12). A step with more than 30 camera publishers besides the probe is INVALID by construction, so an N=200 cameras-on step cannot be valid until probes report which tiles they render.",
+  "note": "Every value is a proposal (doc sections 3.2, 3.3); bands come from calibration. Override per scenario with --config; fail-closed minimums are enforced at load time.",
+  "sampling": {
+    "scrape_step_s": {"value": 15, "status": "proposal"}
+  },
+  "bands": {
+    "A": {"green": 0.01, "red": 0.05, "unit": "concealed share of continuous talker audio", "status": "proposal"},
+    "V": {"green": 0.005, "red": 0.03, "unit": "freeze share of decoded tile-time", "status": "proposal"},
+    "L": {"green": 100, "red": 300, "unit": "p95 audio-timestamp delay, ms (absolute on synced clocks, else excess over the pair's window minimum)", "status": "proposal"},
+    "Q": {"green": 0.01, "red": 0.1, "unit": "share of tile-time with 0 < decoded video fps < 5", "status": "proposal"},
+    "S": {"green": 0, "red": 1, "unit": "unplanned reconnects per participant-hour", "status": "proposal"}
+  },
+  "dimensions": {
+    "nominal_talker_pps": {"value": 50, "status": "proposal"},
+    "talker_min_pps": {"value": 45, "status": "proposal"},
+    "expand_ops_full_scale": {"value": 100, "status": "proposal"},
+    "near_frozen_fps": {"value": 5, "status": "proposal"}
+  },
+  "quality_gates": {
+    "k_red_fail": {"value": 2, "status": "proposal"},
+    "join_deadline_s": {"value": 30, "status": "proposal"},
+    "drop_gap_s": {"value": 30, "status": "proposal"},
+    "split_rate_red": {"value": 0.02, "status": "proposal", "note": "placeholder until calibration"},
+    "per_talker_A_red": {"value": 0.05, "status": "proposal", "note": "G-Q3 also fails when one unshaped talker's A, over all UxU observers, exceeds this (#2998); default 0.05; overrides may only lower it (bound [0, 0.05])"},
+    "rejoin_grace_s": {"value": 20, "status": "proposal", "note": "after a declared rejoin, startup time before the new session is sampled (one browser HEALTH interval + one scrape); built-in max 20"},
+    "reconnect_gate_enabled": {"value": true, "status": "proposal", "note": "G-Q9 on S (red band) by p95 and k-of-n; team decision pending (#2913)"}
+  },
+  "latency_gate": {
+    "audio_delay_metric": {"value": null, "status": "proposal", "note": "per-pair audio-timestamp delay series; the client metric does not exist yet (#2948). null = gate not yet measurable"},
+    "allowed_unmeasured": {"value": true, "status": "proposal", "note": "lets G-Q5 stay unmeasured only while audio_delay_metric is null; set false when #2948 lands"}
+  },
+  "validity_gates": {
+    "health_reports_min_ratio": {"value": 0.95, "status": "proposal", "note": "calibration pending: measure the ratio and its spread on one clean run on a dedicated metrics-api"},
+    "health_reports_max_ratio": {"value": 1.2, "status": "proposal", "note": "calibration pending: measure the ratio and its spread on one clean run on a dedicated metrics-api"},
+    "browser_health_interval_s": {"value": 5, "status": "proposal"},
+    "rust_health_interval_s": {"value": 5, "status": "proposal", "note": "#2919: session-level HEALTH every 5 s; holds once the Rust bot change (#2958) is deployed, the PR-staging bot drains every 1 s"},
+    "n_min_observers": {"value": 10, "status": "proposal"},
+    "required_dimensions": {"value": ["A", "V", "Q", "S"], "status": "proposal"},
+    "allowed_not_measured": {"value": ["G-V2", "G-V3", "G-V4", "G-V5"], "status": "proposal"},
+    "relay_path_exemptions": {"value": {}, "status": "proposal", "note": "{counter: reason}; each exemption is printed as a step notice"},
+    "scrape_up_selector": {"value": null, "status": "proposal"},
+    "restarts_selector": {"value": null, "status": "proposal"}
+  }
+}

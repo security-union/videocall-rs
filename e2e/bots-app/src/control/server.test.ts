@@ -8,12 +8,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { BotTask } from "../orchestrator";
 import { SD_SOURCE } from "../posture";
 import { generateToken } from "./auth";
+import { buildNetemRequest } from "./ctl";
 import {
   applyNetemAction,
-  buildNetemMirrorClearArgs,
-  buildNetemProbeArgs,
+  buildNetemMirrorInstallArgs,
   buildNetemShapeArgs,
   NETEM_PROFILES,
+  NETEM_SETPRIV_DEFAULT,
   type NetemExec,
   NetemExecError,
 } from "./netem";
@@ -49,6 +50,7 @@ function fakeTask(overrides: Partial<BotTask> = {}): BotTask {
 interface MockSurface extends OrchestratorControlSurface {
   registry: Map<string, BotRegistryEntry>;
   callLog: string[];
+  expected: number;
 }
 
 function mockSurface(initial: BotRegistryEntry[] = []): MockSurface {
@@ -58,7 +60,9 @@ function mockSurface(initial: BotRegistryEntry[] = []): MockSurface {
   const surface: MockSurface = {
     registry,
     callLog,
+    expected: 0,
     getRegistry: () => registry,
+    expectedBots: () => surface.expected,
     triggerLeave: async (id) => void callLog.push(`leave:${id}`),
     forceKill: async (id) => void callLog.push(`kill:${id}`),
     applyTtl: (id, ttl) => void callLog.push(`ttl:${id}:${ttl}`),
@@ -125,7 +129,44 @@ describe("control server", () => {
   it("GET /healthz is unauthenticated and returns the live bot count", async () => {
     const res = await fetchJson(handle.port, "/healthz");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, bots: 0 });
+    expect(res.body).toEqual({ ok: true, bots: 0, inMeeting: 0, pending: 0, expected: 0 });
+  });
+
+  it("GET /healthz separates in-meeting from still-joining and ended bots (#2917)", async () => {
+    const at = (status: BotRegistryEntry["status"], extra: Partial<BotRegistryEntry> = {}) => ({
+      ...newRegistryEntry(fakeTask()),
+      status,
+      ...extra,
+    });
+    for (const e of [
+      at("in-meeting", { joinedAt: 1 }),
+      at("launching"),
+      at("priming"),
+      at("failed", { finishedAt: Date.now(), finishReason: "meeting-rejected:rejected" }),
+      at("done", { finishedAt: Date.now(), finishReason: "waiting-room:waiting-room" }),
+      // An SSH bot is marked in-meeting at spawn; its remote join is never observed.
+      at("in-meeting", { host: { kind: "ssh", hostLabel: "h" } }),
+    ]) {
+      surface.registry.set(e.botId, e);
+    }
+    surface.expected = 6;
+    const res = await fetchJson(handle.port, "/healthz");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, bots: 4, inMeeting: 1, pending: 2, expected: 6 });
+  });
+
+  it("GET /healthz reports inMeeting 0 against expected 1 for a failed or parked join (#2917)", async () => {
+    for (const [status, finishReason] of [
+      ["failed", "launch-error"],
+      ["done", "waiting-room:waiting-for-host"],
+    ] as const) {
+      surface.registry.clear();
+      const e = { ...newRegistryEntry(fakeTask()), status, finishReason, finishedAt: Date.now() };
+      surface.registry.set(e.botId, e);
+      surface.expected = 1;
+      const res = await fetchJson(handle.port, "/healthz");
+      expect(res.body).toMatchObject({ ok: true, bots: 0, inMeeting: 0, expected: 1 });
+    }
   });
 
   it("answers the path k8s/statefulset.yaml probes, with no bearer token (#2349)", async () => {
@@ -603,6 +644,32 @@ describe("control server", () => {
     expect(launch).toContain(`"videoMode":"clock"`);
   });
 
+  it("POST /launch carries diagPackets off and refuses on (#2970)", async () => {
+    const body = {
+      meetingURL: "https://example.com/meeting/X",
+      participant: "probe",
+      ttl: "5m",
+      headless: true,
+      network: "none",
+      authBackend: "none",
+    };
+    const auth = { authorization: `Bearer ${token}` };
+    const on = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: auth,
+      body: { ...body, diagPackets: "on" },
+    });
+    expect(on.status).toBe(400);
+    expect(surface.callLog.filter((l) => l.startsWith("launch:"))).toHaveLength(0);
+    const off = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: auth,
+      body: { ...body, diagPackets: "off" },
+    });
+    expect(off.status).toBe(201);
+    expect(surface.callLog.find((l) => l.startsWith("launch:"))).toContain(`"diagPackets":"off"`);
+  });
+
   it("POST /launch rejects an unknown video mode", async () => {
     const res = await fetchJson(handle.port, `/launch`, {
       method: "POST",
@@ -978,6 +1045,55 @@ describe("control server: run profiles", () => {
       { participant: "costume-bot", videoMode: "costume" },
       { participant: "legacy-bot", videoMode: null },
     ]);
+  });
+
+  it("a profile keeps diagPackets from a snapshot and a save, and its launch carries it (#2970)", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "probe", diagPackets: "off" }));
+    surface.registry.set(entry.botId, entry);
+    const auth = { authorization: `Bearer ${token}` };
+    const snap = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: auth,
+      body: { name: "diag-snap", source: "current" },
+    });
+    expect((snap.body as { bots: { diagPackets?: string }[] }).bots[0].diagPackets).toBe("off");
+
+    const bot = {
+      meetingURL: "https://example.com/meeting/X",
+      ttl: "5m",
+      headless: false,
+      network: "none",
+      authBackend: "jwt",
+    };
+    const bad = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: auth,
+      body: {
+        name: "diag-bad",
+        source: { bots: [{ ...bot, participant: "a", diagPackets: "on" }] },
+      },
+    });
+    expect(bad.status).toBe(400);
+    await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: auth,
+      body: {
+        name: "diag-save",
+        source: {
+          bots: [
+            { ...bot, participant: "a", diagPackets: "off" },
+            { ...bot, participant: "b" },
+          ],
+        },
+      },
+    });
+    await fetchJson(handle.port, `/profiles/diag-save/launch`, { method: "POST", headers: auth });
+    const launched = surface.callLog
+      .filter((l) => l.startsWith("launch:"))
+      .map(
+        (l) => (JSON.parse(l.slice(l.indexOf("{"))) as { diagPackets?: string | null }).diagPackets,
+      );
+    expect(launched).toEqual(["off", null]);
   });
 
   it("POST /profiles rejects an invalid videoMode in source.bots", async () => {
@@ -1489,35 +1605,145 @@ describe("POST/DELETE /netem", () => {
     }
   });
 
-  it("applies a named profile and echoes every command it ran", async () => {
+  const SETPRIV_IP = [NETEM_SETPRIV_DEFAULT, "--inh-caps", "+net_admin", "--ambient-caps"];
+  const ETH_SHAPED =
+    "qdisc netem 8001: root refcnt 2 limit 55\nqdisc ingress ffff: parent ffff:fff1";
+  const IFB_SHAPED = "qdisc netem 8002: root refcnt 2 limit 55";
+  const qdiscShow =
+    (show: Record<string, string>): NetemExec =>
+    async (_file, args) => ({
+      stdout: args[1] === "show" ? (show[args[3]] ?? "") : "",
+      stderr: "",
+    });
+
+  it("applies a named profile to both directions and echoes every command it ran", async () => {
     const tok = generateToken();
-    const { surface, calls } = netemSurface("eth0");
+    const { surface, calls } = netemSurface(
+      "eth0",
+      qdiscShow({ eth0: ETH_SHAPED, ifb0: IFB_SHAPED }),
+    );
     const h = await startControlServer({ port: 0, token: tok, surface });
     try {
       const res = await fetchJson(h.port, "/netem", {
         method: "POST",
         headers: { authorization: `Bearer ${tok}` },
-        body: { profile: "lossy_mobile" },
+        body: { profile: "congested_wifi" },
       });
       expect(res.status).toBe(200);
-      const expectedArgs = buildNetemShapeArgs("eth0", NETEM_PROFILES.lossy_mobile!);
-      // Runtime shaping is egress-only, so the response must disclose that it
-      // removed the startup mirror instead of reporting a bidirectional link.
+      const profile = NETEM_PROFILES.congested_wifi!;
+      const [, , ...install] = buildNetemMirrorInstallArgs("eth0", profile);
       // toEqual, not toMatchObject: the body must carry no other field either.
       expect(res.body).toEqual({
         op: "shape",
-        label: "lossy_mobile",
-        commands: [
-          ["tc", ...expectedArgs],
-          ...buildNetemMirrorClearArgs("eth0").map((c) => [c.file, ...c.args]),
-          ["tc", ...buildNetemProbeArgs("eth0")],
-        ],
-        mirrorRemoved: true,
+        label: "congested_wifi",
+        commands: calls.map((c) => [c.file, ...c.args]),
+        ingressShaped: true,
+        mirrorRemoved: false,
+        readback: { eth0: ETH_SHAPED, ifb0: IFB_SHAPED },
       });
-      expect(calls[0].args).toEqual(expectedArgs);
-      expect(calls.map((c) => c.file)).toContain("ip");
-      // Count pinned, so an added or dropped step cannot pass unnoticed.
-      expect(calls).toHaveLength(buildNetemMirrorClearArgs("eth0").length + 2);
+      expect(calls[0]).toEqual({ file: "tc", args: buildNetemShapeArgs("eth0", profile) });
+      const ip = calls.filter((c) => c.args.includes("ip"));
+      expect(ip.map((c) => c.args.slice(c.args.indexOf("ip") + 1))).toEqual([
+        ["link", "show", "ifb0"],
+        ...install.filter((c) => c.file === "ip").map((c) => c.args),
+      ]);
+      for (const c of ip) expect([c.file, ...c.args].slice(0, 4)).toEqual(SETPRIV_IP);
+      expect(calls.filter((c) => c.file === "ip")).toEqual([]);
+      expect(calls.at(-1)).toEqual({ file: "tc", args: ["qdisc", "show", "dev", "ifb0"] });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("replies 500 with the read-back when a profile lands on eth0 but not ifb0", async () => {
+    const tok = generateToken();
+    const { surface } = netemSurface("eth0", qdiscShow({ eth0: ETH_SHAPED }));
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}` },
+        body: { profile: "congested_wifi" },
+      });
+      expect(res.status).toBe(500);
+      expect(res.body).toMatchObject({
+        error: expect.stringContaining("no netem on ifb0"),
+        ingressShaped: false,
+        readback: { eth0: ETH_SHAPED, ifb0: "" },
+      });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("replies 500 with both read-backs when a mirror install step fails", async () => {
+    const tok = generateToken();
+    const show = qdiscShow({ eth0: "qdisc netem 8001: root refcnt 2 limit 55", ifb0: IFB_SHAPED });
+    const { surface } = netemSurface("eth0", async (file, args) => {
+      if (args.join(" ").includes("handle ffff: ingress")) {
+        throw new NetemExecError("tc qdisc add failed: Exclusivity flag on", 2);
+      }
+      return show(file, args);
+    });
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}` },
+        body: { profile: "congested_wifi" },
+      });
+      expect(res.status).toBe(500);
+      expect(res.body).toMatchObject({
+        error: expect.stringContaining("shaped egress on eth0"),
+        ingressShaped: false,
+        readback: { eth0: "qdisc netem 8001: root refcnt 2 limit 55", ifb0: IFB_SHAPED },
+      });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("replies 200 with mirrorRemoved true when DELETE finds ifb0 already gone", async () => {
+    const tok = generateToken();
+    const { surface } = netemSurface("eth0", async (_file, args) => {
+      if (args.includes("link") && args.includes("del")) {
+        throw new NetemExecError('ip link del ifb0 failed: Cannot find device "ifb0"', 1);
+      }
+      return { stdout: "", stderr: "" };
+    });
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${tok}` },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ op: "clear", mirrorRemoved: true });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("replies 500 with mirrorRemoved false when DELETE cannot remove ifb0", async () => {
+    const tok = generateToken();
+    const { surface } = netemSurface("eth0", async (_file, args) => {
+      if (args.includes("link") && args.includes("del")) {
+        throw new NetemExecError("ip link del ifb0 failed: Operation not permitted", 1);
+      }
+      return { stdout: "", stderr: "" };
+    });
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${tok}` },
+      });
+      expect(res.status).toBe(500);
+      expect(res.body).toMatchObject({
+        error: expect.stringContaining("ifb0 was NOT removed"),
+        op: "clear",
+        mirrorRemoved: false,
+      });
     } finally {
       await h.close();
     }
@@ -1556,6 +1782,29 @@ describe("POST/DELETE /netem", () => {
       });
       expect(res.status).toBe(500);
       expect(calls).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it.each([
+    { profile: "satellite", limit: "10" },
+    { profile: "satellite", delay: "10", loss: "1" },
+    { clear: true, profile: "dialup" },
+    { clear: true, rate: "56" },
+  ])("replies 400 to the ctl netem flag combination %j (and never calls tc)", async (opts) => {
+    const plan = buildNetemRequest(opts);
+    const tok = generateToken();
+    const { surface, calls } = netemSurface("eth0");
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: plan.method,
+        headers: { authorization: `Bearer ${tok}` },
+        body: plan.body,
+      });
+      expect(res.status).toBe(400);
+      expect(calls).toHaveLength(0);
     } finally {
       await h.close();
     }

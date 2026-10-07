@@ -38,6 +38,8 @@ message MeetingPacket {
     HOST_REVOKED = 16;
     // Transport reconnect: `session_id` supersedes `previous_session_id` (#2269)
     PARTICIPANT_SESSION_RESUMED = 17;
+    // Server-authored recording registry snapshot
+    RECORDING_STATE = 19;
   }
 
   MeetingEventType event_type = 1;
@@ -79,5 +81,18 @@ message MeetingPacket {
   string requester_instance_id = 12;
   // PARTICIPANT_SESSION_RESUMED: the superseded session_id receivers evict.
   uint64 previous_session_id = 13;
+  // RECORDING_STATE: meetings.created_at in microseconds.
+  uint64 recording_epoch = 14;
+  RecordingState recording_state = 15;
+}
+
+message RecordingState {
+  uint64 version = 1;
+  repeated RecordingEntry entries = 2;
+}
+
+message RecordingEntry {
+  bytes recording_id = 1;
+  bool revoked = 2;
 }
 

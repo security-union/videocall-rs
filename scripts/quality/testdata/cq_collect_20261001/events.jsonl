@@ -1,0 +1,9 @@
+{"type": "preflight", "wall": 1790867500.0, "mono": 1000.0, "commit": "64f649e21e6916489b0f34c062615363a12bd2e1", "dirty": false, "clock": {"sync": "none", "max_abs_skew_ms": null, "measured_at": null, "per_node": [{"node": "local", "skew_ms": 0.0}]}}
+{"type": "stack_ready", "wall": 1790867510.0, "mono": 1010.0}
+{"type": "join_start", "wall": 1790867520.0, "mono": 1020.0, "step_id": "n7"}
+{"type": "event", "wall": 1790867563.0612528, "mono": 1063.061253, "action": "mute", "participants": ["probe0@bots-app.local"], "params": {}, "t_issued": 1790867561.964955, "t_confirmed": 1790867563.0612528, "result": "ok"}
+{"type": "hold_start", "wall": 1790867665.0, "mono": 1165.0, "step_id": "n7"}
+{"type": "hold_end", "wall": 1790868085.0, "mono": 1585.0, "step_id": "n7"}
+{"type": "teardown_start", "wall": 1790868115.0, "mono": 1615.0}
+{"type": "stopped", "wall": 1790868145.0, "mono": 1645.0, "participants": ["probe0@bots-app.local"], "exit_code": 0}
+{"type": "stopped", "wall": 1790868174.3350308, "mono": 1674.335031, "participants": ["alice", "bot-002", "bot-003", "bot-004", "bot-005", "bot-006"], "exit_code": 0}

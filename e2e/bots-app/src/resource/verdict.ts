@@ -209,9 +209,8 @@ export interface ResourceVerdict {
  *
  * When NEITHER fires, the healthy reading still has to be earned: with no
  * derived samples, or with join tracking reporting zero joined bots, the
- * verdict is `noEvidence` rather than clean. `joinedBots === null` means joins
- * were not tracked for this receipt, which cannot support that conclusion
- * either way.
+ * verdict is `noEvidence` rather than clean. `joinedBots === null` means the join
+ * rule does not apply to this receipt (joins unobserved, or no bot launched).
  */
 export function evaluateVerdict(
   samples: readonly DerivedSample[],

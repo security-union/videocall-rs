@@ -6,9 +6,13 @@ import {
   buildReceiverConfigInitScript,
   buildReceiverConfigOverrides,
   MAX_RECEIVED_LAYER_CEILING,
+  parseDiagPacketsField,
+  resolveDiagPackets,
   resolveMaxReceivedLayer,
   resolveSkipCanvasPaint,
 } from "./receiver-caps";
+
+const APP_ORIGIN = "https://app.example.test";
 
 describe("resolveMaxReceivedLayer (#2068)", () => {
   it("returns undefined (no cap) when unset, empty, or whitespace", () => {
@@ -107,9 +111,10 @@ describe("buildReceiverConfigOverrides", () => {
 function afterConfigJs(
   overrides: Record<string, unknown>,
   configJsAssignExpr: string | null,
+  pageOrigin = APP_ORIGIN,
 ): { cfg: Record<string, unknown> | undefined; isFrozen: boolean } {
-  const script = buildReceiverConfigInitScript(overrides);
-  const sandbox: Record<string, unknown> = { console };
+  const script = buildReceiverConfigInitScript(overrides, APP_ORIGIN);
+  const sandbox: Record<string, unknown> = { console, location: { origin: pageOrigin } };
   sandbox.window = sandbox; // window === global, as in a browser document
   vm.createContext(sandbox);
   vm.runInContext(script, sandbox);
@@ -151,8 +156,8 @@ describe("buildReceiverConfigInitScript (setter-merge injection seam)", () => {
   });
 
   it("re-merges on a SECOND assignment (cannot be clobbered)", () => {
-    const script = buildReceiverConfigInitScript({ skipCanvasPaint: "true" });
-    const sandbox: Record<string, unknown> = { console };
+    const script = buildReceiverConfigInitScript({ skipCanvasPaint: "true" }, APP_ORIGIN);
+    const sandbox: Record<string, unknown> = { console, location: { origin: APP_ORIGIN } };
     sandbox.window = sandbox;
     vm.createContext(sandbox);
     vm.runInContext(script, sandbox);
@@ -164,5 +169,53 @@ describe("buildReceiverConfigInitScript (setter-merge injection seam)", () => {
     expect(cfg.skipCanvasPaint).toBe("true"); // override still wins after re-assign
     expect(cfg.b).toBe(2); // last assignment's base is used
     expect(cfg.a).toBeUndefined();
+  });
+});
+
+describe("diagnostics packets switch (#2970)", () => {
+  it("resolves off-tokens to off, unset/default to inherit, and refuses anything else", () => {
+    for (const t of ["off", "OFF", " 0 ", "false", "no"]) {
+      expect(resolveDiagPackets(t)).toEqual({ kind: "ok", value: "off" });
+    }
+    for (const t of [undefined, "", "  ", "default", "Default"]) {
+      expect(resolveDiagPackets(t)).toEqual({ kind: "ok", value: undefined });
+    }
+    for (const t of ["on", "1", "true", "yes", "maybe"]) {
+      expect(resolveDiagPackets(t).kind).toBe("invalid");
+    }
+  });
+
+  it("parses a JSON field: absent/null inherit, a non-string is refused", () => {
+    expect(parseDiagPacketsField(undefined)).toEqual({ kind: "ok", value: undefined });
+    expect(parseDiagPacketsField(null)).toEqual({ kind: "ok", value: undefined });
+    expect(parseDiagPacketsField("off")).toEqual({ kind: "ok", value: "off" });
+    expect(parseDiagPacketsField(0).kind).toBe("invalid");
+    expect(parseDiagPacketsField("on").kind).toBe("invalid");
+  });
+
+  it('injects the STRING "0" (the client field is Option<String>) and nothing when unset', () => {
+    expect(buildReceiverConfigOverrides({ diagPackets: "off" })).toEqual({
+      diagnosticsPacketsEnabled: "0",
+    });
+    expect(buildReceiverConfigOverrides({ diagPackets: undefined })).toBeNull();
+  });
+
+  it("lands next to a receive cap and over a deployment's truthy value through ONE merge", () => {
+    const overrides = buildReceiverConfigOverrides({ maxReceivedLayer: 0, diagPackets: "off" });
+    const { cfg } = afterConfigJs(
+      overrides!,
+      'Object.freeze({ apiBaseUrl: "x", diagnosticsPacketsEnabled: "1" })',
+    );
+    expect(cfg).toEqual({ apiBaseUrl: "x", diagnosticsPacketsEnabled: "0", maxReceivedLayer: 0 });
+  });
+
+  it("installs nothing on another origin (an IdP or SSO page)", () => {
+    const { cfg, isFrozen } = afterConfigJs(
+      { diagnosticsPacketsEnabled: "0" },
+      'Object.freeze({ idp: "y" })',
+      "https://id.example.test",
+    );
+    expect(cfg).toEqual({ idp: "y" });
+    expect(isFrozen).toBe(true);
   });
 });

@@ -253,8 +253,17 @@ prometheus:
               labels:
                 severity: warning
               annotations:
-                summary: "NATS publish latency p99 > 50ms"
-                description: "NATS publish p99 latency is {{ $value | printf \"%.1f\" }}ms"
+                summary: "NATS client enqueue latency p99 > 50ms"
+                description: "relay_nats_publish_latency_ms p99 is {{ $value | printf \"%.1f\" }}ms. It times the enqueue into the async-nats client's local command channel, not a NATS round-trip. It rises when that channel is full (a relay pod's NATS connection task is behind) or when a relay runtime is too busy to re-poll ChatServer. This pools every relay pod; read videocall_relay_scheduler_lag_ms by pod on the pods that export it: if lag rose too, suspect the runtime first; if it is flat, the NATS writer. A pod without that series cannot be split this way (#2925)"
+
+            - alert: RelayNATSDisconnectOrSlowConsumer
+              expr: increase(relay_nats_events_total{event=~"disconnected|slow_consumer"}[5m]) > 0
+              labels:
+                severity: warning
+                component: relay-nats
+              annotations:
+                summary: "NATS {{ $labels.event }} on relay pod {{ $labels.pod }}"
+                description: "Relay pod {{ $labels.pod }} booked {{ $value | printf \"%.1f\" }} async-nats {{ $labels.event }} events in 5m (#2925). slow_consumer: a NATS subscription channel on this pod was full and async-nats DROPPED the message, most likely from a session's media subscription (the relay also holds control subscriptions). disconnected: the pod lost its NATS connection, which interrupts NATS fan-out for its sessions until it reconnects (relay_nats_connects_total rises). A lower bound: async-nats drops events past its 128-slot event queue. Warning, not paging."
 
             # These MUST read the *_by_session series: the room-level
             # relay_outbound_queue_{depth,bytes} are last-writer-wins across a
@@ -362,14 +371,24 @@ prometheus:
                 description: "A non-VIDEO packet reached the viewport drop branch in room {{ $labels.room }} — the #988 is_video guard regressed (#1437). This counter must ALWAYS be 0; observed increase {{ $value }}."
 
             - alert: RelaySchedulerLagHigh
-              expr: histogram_quantile(0.99, sum by (le, pod) (rate(videocall_relay_scheduler_lag_ms_bucket[5m]))) > 100
+              expr: histogram_quantile(0.99, sum by (le, pod) (rate(videocall_relay_scheduler_lag_ms_bucket[5m]))) > 100 unless on(pod) last_over_time(relay_ws_fragmented_inbound_total[10m])
               for: 1m
               labels:
                 severity: critical
                 component: relay-runtime
               annotations:
                 summary: "WT relay scheduler lag p99 > 100ms on {{ $labels.pod }}"
-                description: "Pod {{ $labels.pod }}: a fixed-interval probe running ON one of the WebTransport relay's runtimes (#2727: the main one plus each session arbiter, all feeding this one unlabelled histogram, so a spike names the relay and not which arbiter) was polled {{ $value | printf \"%.0f\" }}ms past its scheduled deadline at p99. Some future is holding one of those threads without yielding — epic #1636 mechanism B. Confirm against the per-connection path_sent_packets gauges: flat there too means the relay stalled rather than the network. Only webtransport_server spawns this probe, so a WebSocket pod never contributes."
+                description: "Pod {{ $labels.pod }}: a fixed-interval probe running ON one of the WebTransport relay's runtimes (#2727: the main one plus each session arbiter, all feeding this one unlabelled histogram, so a spike names the relay and not which arbiter) was polled {{ $value | printf \"%.0f\" }}ms past its scheduled deadline at p99. Some future is holding one of those threads without yielding — epic #1636 mechanism B. Confirm against the per-connection path_sent_packets gauges: flat there too means the relay stalled rather than the network. WebSocket pods are excluded here and warn via RelaySchedulerLagHighWS."
+
+            - alert: RelaySchedulerLagHighWS
+              expr: histogram_quantile(0.99, sum by (le, pod) (rate(videocall_relay_scheduler_lag_ms_bucket[5m]))) > 100 and on(pod) last_over_time(relay_ws_fragmented_inbound_total[10m])
+              for: 1m
+              labels:
+                severity: warning
+                component: relay-runtime
+              annotations:
+                summary: "WS relay scheduler lag p99 > 100ms on {{ $labels.pod }}"
+                description: "Pod {{ $labels.pod }}: the WebSocket relay's main runtime, which hosts ChatServer, the NATS connection and every session's NATS receive loop, was polled {{ $value | printf \"%.0f\" }}ms past a 500ms probe deadline at p99 (#2924). Fan-out for every room on that pod stalls for the duration. Warning until a WS baseline exists."
 
             # RelayRoomMembershipDivergent: retired, true for every mixed room. Panel 118.
 

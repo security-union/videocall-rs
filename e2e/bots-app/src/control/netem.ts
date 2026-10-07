@@ -8,10 +8,6 @@ import { execFile } from "node:child_process";
  * the QUIC/WebTransport and TCP/WebSocket handshakes, TLS, DNS — the
  * whole stack — the way a real degraded link does.
  *
- * Requirements at runtime: the container must have `NET_ADMIN` and the
- * `iproute2` package (provides `tc`). Both are supplied by the pod /
- * image in the deploy task; this module only builds + runs the command.
- *
  * SECURITY: every `tc` invocation goes through {@link execFile} with an
  * argv ARRAY and no shell, so no request-supplied value is ever parsed
  * by a shell. Numeric parameters are validated + re-formatted by us
@@ -19,9 +15,8 @@ import { execFile } from "node:child_process";
  * against {@link IFACE_PATTERN}. There is no code path that interpolates
  * untrusted text into a shell string.
  *
- * NOTE — direction: root netem shapes EGRESS only. Ingress needs the `ifb`
- * mirror that ONLY `docker-entrypoint.sh` installs; a runtime action cannot,
- * so it REMOVES any mirror rather than mislabel a downlink it did not shape.
+ * Direction: root netem shapes egress; ingress is shaped on an `ifb` mirror,
+ * installed only when the params carry both downlink fields.
  */
 
 /** Default interface shaped when the deploy config does not override it. */
@@ -58,7 +53,23 @@ export interface NetemParams {
   downlinkRateKbit?: number;
   /** Netem queue depth, packets. Unset ⇒ netem's own default backlog. */
   limitPkts?: number;
+  /** Ingress queue depth, packets — for the `ifb` mirror, never the root qdisc. */
+  ingressLimitPkts?: number;
 }
+
+const NETEM_PARAM_KEY_SET = {
+  delayMs: true,
+  jitterMs: true,
+  lossPct: true,
+  rateKbit: true,
+  downlinkRateKbit: true,
+  limitPkts: true,
+  ingressLimitPkts: true,
+} as const satisfies Record<keyof NetemParams, true>;
+
+export const NETEM_PARAM_KEYS = Object.keys(NETEM_PARAM_KEY_SET) as ReadonlyArray<
+  keyof NetemParams
+>;
 
 /**
  * A fully-resolved netem operation. `shape` carries validated params;
@@ -89,6 +100,7 @@ export const NETEM_PROFILES: Readonly<Record<string, NetemParams | null>> = {
     rateKbit: 20_000,
     downlinkRateKbit: 50_000,
     limitPkts: 100,
+    ingressLimitPkts: 150,
   },
   good_4g: {
     delayMs: 50,
@@ -97,6 +109,7 @@ export const NETEM_PROFILES: Readonly<Record<string, NetemParams | null>> = {
     rateKbit: 10_000,
     downlinkRateKbit: 30_000,
     limitPkts: 100,
+    ingressLimitPkts: 250,
   },
   congested_wifi: {
     delayMs: 80,
@@ -105,6 +118,7 @@ export const NETEM_PROFILES: Readonly<Record<string, NetemParams | null>> = {
     rateKbit: 2_000,
     downlinkRateKbit: 4_000,
     limitPkts: 55,
+    ingressLimitPkts: 55,
   },
   lossy_mobile: {
     delayMs: 150,
@@ -113,6 +127,7 @@ export const NETEM_PROFILES: Readonly<Record<string, NetemParams | null>> = {
     rateKbit: 800,
     downlinkRateKbit: 2_000,
     limitPkts: 40,
+    ingressLimitPkts: 50,
   },
   satellite: {
     delayMs: 600,
@@ -121,6 +136,7 @@ export const NETEM_PROFILES: Readonly<Record<string, NetemParams | null>> = {
     rateKbit: 1_500,
     downlinkRateKbit: 10_000,
     limitPkts: 300,
+    ingressLimitPkts: 700,
   },
   dialup: {
     delayMs: 200,
@@ -129,6 +145,7 @@ export const NETEM_PROFILES: Readonly<Record<string, NetemParams | null>> = {
     rateKbit: 56,
     downlinkRateKbit: 56,
     limitPkts: 10,
+    ingressLimitPkts: 10,
   },
 };
 
@@ -151,11 +168,14 @@ export class NetemValidationError extends Error {
   }
 }
 
+/** `mirrorRemoved`: a mirror existed and this action left none. `readback`: `tc qdisc show` per device. */
 export interface NetemApplyResult {
   commands: string[][];
   label: string;
   op: "shape" | "clear";
+  ingressShaped: boolean;
   mirrorRemoved: boolean;
+  readback: Record<string, string>;
 }
 
 /** `exitStatus` is the status the child exited with, or null when none is available. */
@@ -205,7 +225,7 @@ export function defaultNetemExec(): NetemExec {
         if (err) {
           const detail = stderr.trim().length > 0 ? stderr.trim() : err.message;
           const exitStatus = typeof err.code === "number" ? err.code : null;
-          reject(new NetemExecError(`tc ${args.join(" ")} failed: ${detail}`, exitStatus));
+          reject(new NetemExecError(`${file} ${args.join(" ")} failed: ${detail}`, exitStatus));
           return;
         }
         resolve({ stdout, stderr });
@@ -226,6 +246,24 @@ function assertFiniteNonNegative(value: number, field: string, max: number): num
   return value;
 }
 
+function assertRateKbit(value: unknown, field: string): number {
+  const rate = assertFiniteNonNegative(value as number, field, 10_000_000);
+  if (rate < 8) {
+    throw new NetemValidationError(
+      `"${field}" must be >= 8 when provided (lower can strand the control API)`,
+    );
+  }
+  return rate;
+}
+
+function assertLimitPkts(value: unknown, field: string): number {
+  const limit = assertFiniteNonNegative(value as number, field, 100_000);
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new NetemValidationError(`"${field}" must be an integer >= 1`);
+  }
+  return limit;
+}
+
 /**
  * Validate a raw params object (from a request body's numeric fields).
  * Enforces sane bounds, the delay-before-jitter grammar rule, and that
@@ -241,34 +279,24 @@ export function validateNetemParams(raw: Record<string, unknown>): NetemParams {
     params.jitterMs = assertFiniteNonNegative(raw.jitterMs as number, "jitterMs", 600_000);
   }
   if (raw.lossPct !== undefined && raw.lossPct !== null) {
-    // Cap BELOW 100: netem shapes the pod's own eth0 EGRESS, which also carries
-    // the control server's responses. 100% loss would strand the control API
-    // (the DELETE /netem that clears it can't get through) — recoverable only
-    // by out-of-band `kubectl exec … tc qdisc del`. 95 keeps the channel usable.
     params.lossPct = assertFiniteNonNegative(raw.lossPct as number, "lossPct", 95);
   }
   if (raw.rateKbit !== undefined && raw.rateKbit !== null) {
-    const rate = assertFiniteNonNegative(raw.rateKbit as number, "rateKbit", 10_000_000);
-    if (rate < 8) {
-      // Same self-strand concern: a near-zero rate chokes the control API's own
-      // responses. Floor at 8 kbit so the pod stays reachable to be cleared.
-      throw new NetemValidationError(
-        '"rateKbit" must be >= 8 when provided (lower can strand the control API)',
-      );
-    }
-    params.rateKbit = rate;
+    params.rateKbit = assertRateKbit(raw.rateKbit, "rateKbit");
   }
   if (raw.downlinkRateKbit !== undefined && raw.downlinkRateKbit !== null) {
-    throw new NetemValidationError(
-      '"downlinkRateKbit" is not accepted at runtime — ingress is shaped only at pod start, via BOT_NETEM_PROFILE',
-    );
+    params.downlinkRateKbit = assertRateKbit(raw.downlinkRateKbit, "downlinkRateKbit");
   }
   if (raw.limitPkts !== undefined && raw.limitPkts !== null) {
-    const limit = assertFiniteNonNegative(raw.limitPkts as number, "limitPkts", 100_000);
-    if (!Number.isInteger(limit) || limit < 1) {
-      throw new NetemValidationError('"limitPkts" must be an integer >= 1');
-    }
-    params.limitPkts = limit;
+    params.limitPkts = assertLimitPkts(raw.limitPkts, "limitPkts");
+  }
+  if (raw.ingressLimitPkts !== undefined && raw.ingressLimitPkts !== null) {
+    params.ingressLimitPkts = assertLimitPkts(raw.ingressLimitPkts, "ingressLimitPkts");
+  }
+  if ((params.downlinkRateKbit === undefined) !== (params.ingressLimitPkts === undefined)) {
+    throw new NetemValidationError(
+      '"downlinkRateKbit" and "ingressLimitPkts" shape ingress together — supply both or neither',
+    );
   }
   if (params.jitterMs !== undefined && params.delayMs === undefined) {
     throw new NetemValidationError('"jitterMs" requires "delayMs" (netem puts jitter after delay)');
@@ -290,7 +318,7 @@ export function validateNetemParams(raw: Record<string, unknown>): NetemParams {
  *
  * Accepts EITHER:
  *   - `{ profile: "<name>" }` — a named profile ("clean"/"none" ⇒ clear)
- *   - `{ delayMs?, jitterMs?, lossPct?, rateKbit?, limitPkts? }` — raw params
+ *   - raw {@link NetemParams} — ingress is shaped only when both downlink fields are set
  *
  * Supplying both a profile AND raw params is rejected as ambiguous. An
  * explicit `{ clear: true }` (or the DELETE verb, handled by the caller)
@@ -303,13 +331,7 @@ export function resolveNetemRequest(body: unknown): NetemAction {
   const o = body as Record<string, unknown>;
 
   const hasProfile = o.profile !== undefined && o.profile !== null;
-  const hasRawParam =
-    o.delayMs !== undefined ||
-    o.jitterMs !== undefined ||
-    o.lossPct !== undefined ||
-    o.rateKbit !== undefined ||
-    o.downlinkRateKbit !== undefined ||
-    o.limitPkts !== undefined;
+  const hasRawParam = NETEM_PARAM_KEYS.some((k) => o[k] !== undefined);
 
   if (o.clear === true) {
     if (hasProfile || hasRawParam) {
@@ -409,21 +431,43 @@ export const NETEM_IFB_TXQUEUELEN = 1000;
 export interface NetemCommand {
   file: "tc" | "ip";
   args: string[];
+  tolerateFailure?: true;
+}
+
+export const NETEM_SETPRIV_DEFAULT = "/usr/local/bin/netem-setpriv";
+export const NETEM_SETPRIV_ARGS = [
+  "--inh-caps",
+  "+net_admin",
+  "--ambient-caps",
+  "+net_admin",
+  "--",
+] as const;
+
+/** Same resolution as the entrypoint's `${NETEM_SETPRIV:-…}`: empty means default. */
+export function netemSetprivPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.NETEM_SETPRIV || NETEM_SETPRIV_DEFAULT;
+}
+
+/** `ip` cannot hold CAP_NET_ADMIN from its file capability alone, so it runs under setpriv. */
+export function netemExecArgv(cmd: NetemCommand, setpriv: string): [string, string[]] {
+  return cmd.file === "ip"
+    ? [setpriv, [...NETEM_SETPRIV_ARGS, "ip", ...cmd.args]]
+    : [cmd.file, cmd.args];
 }
 
 /**
- * The ingress half of a profile: downlink rate in place of uplink, the rest
- * symmetric. `rateKbit` here would tighten the downlink 2–6.7x. Throws without
- * a downlink rate: a mirror at the wrong rate mislabels the receipt.
+ * The ingress half of a profile: downlink rate and depth in place of uplink, the rest
+ * symmetric. `rateKbit` here would tighten the downlink 2–6.7x. Throws if either
+ * is missing: a mirror at the wrong rate or depth mislabels the receipt.
  */
 export function ingressNetemParams(params: NetemParams): NetemParams {
-  if (params.downlinkRateKbit === undefined) {
+  const { downlinkRateKbit, ingressLimitPkts, ...rest } = params;
+  if (downlinkRateKbit === undefined || ingressLimitPkts === undefined) {
     throw new NetemValidationError(
-      "cannot shape ingress without a downlinkRateKbit (see NETEM_PROFILES)",
+      "cannot shape ingress without a downlinkRateKbit and an ingressLimitPkts (see NETEM_PROFILES)",
     );
   }
-  const { downlinkRateKbit, ...rest } = params;
-  return { ...rest, rateKbit: downlinkRateKbit };
+  return { ...rest, rateKbit: downlinkRateKbit, limitPkts: ingressLimitPkts };
 }
 
 /**
@@ -441,7 +485,7 @@ export function buildNetemMirrorInstallArgs(iface: string, params: NetemParams):
       file: "ip",
       args: ["link", "set", NETEM_IFB_DEV, "txqueuelen", `${NETEM_IFB_TXQUEUELEN}`],
     },
-    { file: "tc", args: ["qdisc", "del", "dev", iface, "ingress"] },
+    { file: "tc", args: ["qdisc", "del", "dev", iface, "ingress"], tolerateFailure: true },
     { file: "tc", args: ["qdisc", "add", "dev", iface, "handle", "ffff:", "ingress"] },
     {
       file: "tc",
@@ -482,33 +526,53 @@ export function isBenignClearError(message: string): boolean {
   return NETEM_BENIGN_CLEAR_ERRORS.some((needle) => msg.includes(needle));
 }
 
+/** Lowercased `ip link del` stderr meaning the device is already gone. Wording only. */
+export const NETEM_BENIGN_LINK_DEL_ERRORS = ["cannot find device", "does not exist"] as const;
+
+export function isBenignLinkDelError(message: string): boolean {
+  const msg = message.toLowerCase();
+  return NETEM_BENIGN_LINK_DEL_ERRORS.some((needle) => msg.includes(needle));
+}
+
 export class NetemStateError extends Error {
-  constructor(message: string) {
+  readonly result: NetemApplyResult;
+
+  constructor(message: string, result: NetemApplyResult) {
     super(message);
     this.name = "NetemStateError";
+    this.result = result;
   }
 }
 
-/**
- * Run a resolved {@link NetemAction} against `iface` using the injected
- * `exec`. A `clear` on an interface that has no qdisc makes `tc` exit
- * non-zero; that idempotency case is swallowed so repeated clears
- * succeed.
- *
- * BOTH ops then remove any startup ingress mirror and re-read the qdisc.
- * Teardown is best-effort per step; the post-read is the gate.
- */
+const NETEM_QDISC_MARKER = "qdisc netem";
+
+export function netemActionShapesIngress(
+  action: NetemAction,
+): action is Extract<NetemAction, { op: "shape" }> {
+  return (
+    action.op === "shape" &&
+    action.params.downlinkRateKbit !== undefined &&
+    action.params.ingressLimitPkts !== undefined
+  );
+}
+
+/** Shapes with both downlink fields install or replace the mirror; every other action removes it. */
 export async function applyNetemAction(
   action: NetemAction,
-  deps: { iface: string; exec: NetemExec },
+  deps: { iface: string; exec: NetemExec; setpriv?: string },
 ): Promise<NetemApplyResult> {
   const { iface, exec } = deps;
+  const setpriv = deps.setpriv ?? netemSetprivPath();
   const commands: string[][] = [];
 
+  const run = async (cmd: NetemCommand): Promise<{ stdout: string; stderr: string }> => {
+    const [file, args] = netemExecArgv(cmd, setpriv);
+    commands.push([file, ...args]);
+    return exec(file, args);
+  };
   const attempt = async (cmd: NetemCommand): Promise<boolean> => {
-    commands.push([cmd.file, ...cmd.args]);
     try {
-      await exec(cmd.file, cmd.args);
+      await run(cmd);
       return true;
     } catch (e) {
       if (!netemExecExitedNonZero(e)) throw e;
@@ -516,37 +580,101 @@ export async function applyNetemAction(
     }
   };
 
-  if (action.op === "shape") {
-    const args = buildNetemShapeArgs(iface, action.params);
-    commands.push(["tc", ...args]);
-    await exec("tc", args);
-  } else {
-    const args = buildNetemClearArgs(iface);
-    commands.push(["tc", ...args]);
+  const probe = async (dev: string, strict: boolean): Promise<string> => {
     try {
-      await exec("tc", args);
+      return (await run({ file: "tc", args: buildNetemProbeArgs(dev) })).stdout.trim();
+    } catch (e) {
+      if (strict && !netemExecExitedNonZero(e)) throw e;
+      return `unread: ${(e as Error).message}`;
+    }
+  };
+  const bestEffortReadback = async (): Promise<Record<string, string>> => ({
+    [iface]: await probe(iface, false),
+    [NETEM_IFB_DEV]: await probe(NETEM_IFB_DEV, false),
+  });
+
+  const wantIngress = netemActionShapesIngress(action);
+  let mirrorRemoved = false;
+  const result = (readback: Record<string, string>): NetemApplyResult => ({
+    commands,
+    label: action.label,
+    op: action.op,
+    ingressShaped: wantIngress,
+    mirrorRemoved,
+    readback,
+  });
+
+  if (action.op === "shape") {
+    await run({ file: "tc", args: buildNetemShapeArgs(iface, action.params) });
+  } else {
+    try {
+      await run({ file: "tc", args: buildNetemClearArgs(iface) });
     } catch (e) {
       if (!netemExecExitedNonZero(e) || !isBenignClearError(e.message)) throw e;
     }
   }
 
-  const [hook, ...ifbSteps] = buildNetemMirrorClearArgs(iface);
-  const mirrorRemoved = await attempt(hook);
-  if (mirrorRemoved) {
-    for (const step of ifbSteps) await attempt(step);
+  if (netemActionShapesIngress(action)) {
+    const [show, add, ...rest] = buildNetemMirrorInstallArgs(iface, action.params);
+    try {
+      if (!(await attempt(show))) await run(add);
+      for (const step of rest) {
+        if (step.tolerateFailure) mirrorRemoved = await attempt(step);
+        else await run(step);
+        if (step.args.includes("mirred")) mirrorRemoved = false;
+      }
+    } catch (e) {
+      throw new NetemStateError(
+        `netem shape (${action.label}) shaped egress on ${iface} but the ${NETEM_IFB_DEV} ingress mirror failed to install: ${(e as Error).message}`,
+        { ...result(await bestEffortReadback()), ingressShaped: false },
+      );
+    }
+  } else {
+    const [hook, ifbQdisc, ifbLink] = buildNetemMirrorClearArgs(iface);
+    if (await attempt(hook)) {
+      await attempt(ifbQdisc);
+      try {
+        await run(ifbLink);
+      } catch (e) {
+        if (!netemExecExitedNonZero(e) || !isBenignLinkDelError(e.message)) {
+          throw new NetemStateError(
+            `netem ${action.op} (${action.label}) removed the ingress hook on ${iface} but ip ${ifbLink.args.join(" ")} failed, so ${NETEM_IFB_DEV} was NOT removed: ${(e as Error).message}`,
+            result(await bestEffortReadback()),
+          );
+        }
+      }
+      mirrorRemoved = true;
+    }
   }
 
-  const probe = buildNetemProbeArgs(iface);
-  commands.push(["tc", ...probe]);
-  const { stdout } = await exec("tc", probe);
-  const left = [
-    stdout.includes(NETEM_INGRESS_QDISC_MARKER) ? "an ingress mirror" : "",
-    action.op === "clear" && stdout.includes("qdisc netem") ? "a netem qdisc" : "",
-  ].filter(Boolean);
-  if (left.length > 0) {
+  const readback: Record<string, string> = {};
+  readback[iface] = (await run({ file: "tc", args: buildNetemProbeArgs(iface) })).stdout.trim();
+  if (wantIngress) readback[NETEM_IFB_DEV] = await probe(NETEM_IFB_DEV, true);
+
+  const eth = readback[iface];
+  const wrong: string[] = [];
+  if (action.op === "shape" && !eth.includes(NETEM_QDISC_MARKER)) {
+    wrong.push(`no netem on ${iface}`);
+  }
+  if (action.op === "clear" && eth.includes(NETEM_QDISC_MARKER)) {
+    wrong.push(`a netem qdisc left on ${iface}`);
+  }
+  if (wantIngress) {
+    if (!eth.includes(NETEM_INGRESS_QDISC_MARKER)) wrong.push(`no ingress hook on ${iface}`);
+    if (!readback[NETEM_IFB_DEV].includes(NETEM_QDISC_MARKER)) {
+      wrong.push(`no netem on ${NETEM_IFB_DEV}`);
+    }
+  } else if (eth.includes(NETEM_INGRESS_QDISC_MARKER)) {
+    wrong.push(`an ingress mirror left on ${iface}`);
+  }
+  if (wrong.length > 0) {
+    const read = Object.entries(readback)
+      .map(([dev, out]) => `${dev}=[${out}]`)
+      .join(" ");
     throw new NetemStateError(
-      `netem ${action.op} (${action.label}) left ${left.join(" and ")} on ${iface}: ${stdout.trim()}`,
+      `netem ${action.op} (${action.label}) post-read found ${wrong.join(" and ")}; read back ${read}`,
+      { ...result(readback), ingressShaped: false },
     );
   }
-  return { commands, label: action.label, op: action.op, mirrorRemoved };
+  return result(readback);
 }

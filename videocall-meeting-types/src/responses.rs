@@ -356,6 +356,11 @@ pub struct ParticipantStatusResponse {
     /// Whether this participant joined as an unauthenticated guest.
     #[serde(default)]
     pub is_guest: bool,
+    /// `true` only while the participant is admitted, a relay-reported session
+    /// has been recorded live since their last REST join or admit, and their
+    /// presence lease is fresh. `false` means not confirmed live.
+    #[serde(default)]
+    pub in_call: bool,
     /// Unix timestamp in seconds when the participant joined/entered the waiting room.
     pub joined_at: i64,
     /// Unix timestamp in seconds when the participant was admitted, or `null`.
@@ -617,5 +622,21 @@ mod tests {
         assert!(json_non_default.contains("\"waiting_room_enabled\""));
         assert!(json_non_default.contains("\"is_co_host\""));
         assert!(json_non_default.contains("\"is_owner\""));
+    }
+
+    #[test]
+    fn participant_status_without_in_call_deserializes_as_not_in_call() {
+        let legacy =
+            r#"{"user_id":"u@example.com","status":"admitted","is_host":false,"joined_at":1}"#;
+        let parsed: ParticipantStatusResponse =
+            serde_json::from_str(legacy).expect("a response without in_call must deserialize");
+        assert!(!parsed.in_call);
+
+        let live = ParticipantStatusResponse {
+            in_call: true,
+            ..parsed
+        };
+        let wire = serde_json::to_value(&live).expect("serialize");
+        assert_eq!(wire["in_call"], serde_json::Value::Bool(true));
     }
 }

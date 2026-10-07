@@ -1088,7 +1088,9 @@ dependencies = [
  "prometheus",
  "protobuf 3.7.2",
  "rand 0.8.5",
+ "rcgen",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tokio-tungstenite",
@@ -4737,6 +4739,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",
@@ -7174,6 +7177,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid 1.21.0",
 ]
 
 [[package]]
@@ -7254,6 +7258,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.17",
  "tracing",
+ "uuid 1.21.0",
  "whoami",
 ]
 
@@ -7292,6 +7297,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.17",
  "tracing",
+ "uuid 1.21.0",
  "whoami",
 ]
 
@@ -7318,6 +7324,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "url",
+ "uuid 1.21.0",
 ]
 
 [[package]]
@@ -8372,6 +8379,7 @@ checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

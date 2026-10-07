@@ -672,6 +672,44 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     expect(await keyframeRequestCount(page)).toBe(afterFirst);
   });
 
+  // Issue 3032: the second burst reuses seqs 1..2 and adds seq 3 at an arrival EARLIER than the
+  // first burst's, so the clock steps backward between video frames 2 and 3.
+  test("a backward video arrival step leaves the decoder worker alive (#3032)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "backward_arrival");
+
+    await assertInjectHook(page);
+
+    await injectStaleBacklog(page, 2, FRESH_AGE_MS);
+    const before = (await skipsFor(page, INJECT_TO_PEER)).length;
+    await injectStaleBacklog(page, 3, STALE_AGE_MS);
+
+    await expect
+      .poll(() => skipsFor(page, INJECT_TO_PEER).then((s) => s.length), {
+        timeout: 30_000,
+        message:
+          "no freshness_skip after a backward arrival step: the decoder worker did not survive the insert",
+      })
+      .toBeGreaterThan(before);
+
+    const skip = (await skipsFor(page, INJECT_TO_PEER))[before];
+    expect(skip.head_age_ms).toBeGreaterThanOrEqual(MAX_PLAYOUT_AGE_MS);
+    expect(skip.keyframe_seq).toBe(KEYFRAME_LESS_SENTINEL);
+
+    // A worker tick can land between batch 2's per-frame messages and post the skip above before
+    // seq 3 arrives, so only a skip from a LATER batch proves the worker outlived seq 3's insert.
+    await page.waitForTimeout(1500);
+    const beforeThird = (await skipsFor(page, INJECT_TO_PEER)).length;
+    await injectStaleBacklog(page, 2, STALE_AGE_MS);
+    await expect
+      .poll(() => skipsFor(page, INJECT_TO_PEER).then((s) => s.length), {
+        timeout: 30_000,
+        message: "no freshness_skip from a later batch: the decoder worker died on seq 3's insert",
+      })
+      .toBeGreaterThan(beforeThird);
+  });
+
   // Test 5 — issue 1741: a NEVER-PRE-WARMED worker still gets its attribution.
   test("@bvt1 a cold decoder worker is attributed despite the boot race (#1741)", async ({
     page,

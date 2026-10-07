@@ -101,6 +101,8 @@ pub struct Connection {
     /// passive label of the locally-chosen transport; it does not affect
     /// connection selection.
     transport_type: TransportType,
+    /// Set in `Drop`, so a loss reported after the owner dropped us reads as owner-initiated.
+    dropped_mark: Option<Rc<Cell<bool>>>,
 }
 
 impl Connection {
@@ -123,7 +125,7 @@ impl Connection {
         // this wasm instance), so re-parsing on reconnect would yield
         // the same profile — skipping it is an optimization, not a
         // behavior change. See `connection/netsim_url.rs`.
-        #[cfg(feature = "netsim")]
+        #[cfg(all(feature = "netsim", any(not(test), target_arch = "wasm32")))]
         {
             static NETSIM_URL_INSTALL: std::sync::Once = std::sync::Once::new();
             NETSIM_URL_INSTALL.call_once(|| {
@@ -216,9 +218,19 @@ impl Connection {
             state_resend: RefCell::new(None),
             url,
             transport_type,
+            dropped_mark: None,
         };
 
         Ok(connection)
+    }
+
+    pub(crate) fn set_dropped_mark(&mut self, mark: Rc<Cell<bool>>) {
+        self.dropped_mark = Some(mark);
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn dropped_mark_holders(&self) -> usize {
+        self.dropped_mark.as_ref().map_or(0, Rc::strong_count)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -479,6 +491,9 @@ impl Drop for Connection {
     fn drop(&mut self) {
         log::debug!("Dropping Connection to {}", strip_query_for_log(&self.url));
         self.stop_heartbeat();
+        if let Some(mark) = &self.dropped_mark {
+            mark.set(true);
+        }
     }
 }
 
@@ -502,6 +517,7 @@ impl Connection {
             state_resend: RefCell::new(None),
             url: "test://stub".to_string(),
             transport_type: TransportType::TRANSPORT_WEBSOCKET,
+            dropped_mark: None,
         }
     }
 

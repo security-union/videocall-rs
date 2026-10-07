@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::actors::session_logic::{RoomId, SessionId};
 
-use super::session::Message;
+use super::session::{ForceClose, Message};
 use actix::{Message as ActixMessage, Recipient};
 
 #[derive(ActixMessage)]
@@ -89,6 +89,10 @@ pub struct JoinRoom {
     ///
     /// [`DOWNLINK_EPOCH_NEVER`]: crate::actors::session_logic::DOWNLINK_EPOCH_NEVER
     pub downlink_congested_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The room token's `iat` claim; `None` for a token without one (#2934).
+    pub token_iat: Option<i64>,
+    /// Closes this session's transport when its participant is kicked (#2934).
+    pub closer: Option<Recipient<ForceClose>>,
 }
 
 #[derive(ActixMessage)]

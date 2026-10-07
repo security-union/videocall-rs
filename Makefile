@@ -1,7 +1,8 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
+COMPOSE_E2E_MONITORING := $(COMPOSE_E2E) -f docker/docker-compose.monitoring.yaml --profile monitoring
 
-.PHONY: tests_up test test-scripts build-videocall-postgres test-videocall-postgres test-webtransport-chart test-api-chart up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
+.PHONY: tests_up test test-scripts changelog changelog-pending build-videocall-postgres test-videocall-postgres test-webtransport-chart test-api-chart up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-up-monitoring e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -13,6 +14,7 @@ tests_run:
 		cargo fmt --all --check && \
 		cargo test -p videocall-meeting-types --all-features && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
+		cargo test -p videocall-api --bin metrics_server -- --ignored --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
 tests_build:
@@ -57,13 +59,24 @@ clippy-fix:
 # Script test suites (bash/python tooling under scripts/). Not covered by cargo
 # test, and nothing else in CI runs them, so a regression here would rot silently.
 test-scripts:
+		python3 -c 'import sys; sys.version_info >= (3, 9) or sys.exit("scripts require Python >= 3.9, runner has " + sys.version.split()[0])'
 		python3 scripts/test_parse_meeting_console_logs_census.py
+		python3 scripts/test_reconcile_skills.py
+		python3 scripts/test_comment_ratio.py
+		python3 scripts/test_guards.py
 		python3 scripts/test_check_clippy_ci_sync.py
 		python3 scripts/test_check_protos_regen.py
 		python3 scripts/test_e2e_doctor_freshness.py
 		python3 scripts/test_e2e_up_stamp_clear.py
+		python3 scripts/test_e2e_backend_stop.py
+		python3 scripts/test_compose_scale_overlay.py
+		python3 scripts/test_trim_cargo_targets.py
 		python3 scripts/test_check_native_test_coverage.py
 		python3 scripts/test_mutation_check.py
+		python3 scripts/test_check_dashboard_metric_refs.py
+		python3 scripts/test_check_call_quality_dashboard.py
+		python3 scripts/test_call_quality_dashboard_semantics.py
+		python3 scripts/test_check_dashboard_configmap_keys.py
 		@if [ -f helm/global/hcl/prometheus/values.yaml ] && [ -f helm/global/hcl-daily-deployment/prometheus/values.yaml ]; then \
 			python3 scripts/test_check_prometheus_alert_parity.py; \
 			PROMTOOL_SKIP_RUNTIME=1 python3 scripts/test_check_prometheus_rules_parse.py; \
@@ -78,10 +91,46 @@ test-scripts:
 		fi
 		python3 scripts/test_meeting_quality_xref.py
 		python3 scripts/test_meeting_quality_xref_load.py
+		python3 scripts/quality/test_call_quality_score.py
+		python3 scripts/quality/test_cq_collect.py
+		python3 scripts/quality/test_cq_collect_integration.py
+		python3 scripts/quality/test_cq_scenario.py
+		python3 scripts/quality/test_scenario_run.py
+		python3 scripts/quality/test_scenario_run_integration.py
+		@if command -v docker >/dev/null || [ -n "$$CI" ]; then \
+			python3 scripts/test_nginx_cache_headers.py; \
+		else \
+			echo "SKIP: scripts/test_nginx_cache_headers.py (needs docker; never skipped under CI)"; \
+		fi
 		@if [ -f scripts/test_sync_strip_blocked_paths.py ]; then \
 			python3 scripts/test_sync_strip_blocked_paths.py; \
 		else \
 			echo "SKIP: scripts/test_sync_strip_blocked_paths.py absent (stripped for public sync)"; \
+		fi
+		@if [ -f scripts/test_update_changelog.py ]; then \
+			python3 scripts/test_update_changelog.py; \
+		else \
+			echo "SKIP: scripts/test_update_changelog.py absent (stripped for public sync)"; \
+		fi
+
+# Stamp built pending sections of dioxus-ui/assets/changelog.json (GH_TOKEN for the Actions API).
+changelog:
+		@if [ -f scripts/changelog/update-changelog.sh ]; then \
+			bash scripts/changelog/update-changelog.sh --stamp; \
+		else \
+			echo "SKIP: scripts/changelog/update-changelog.sh absent (stripped for public sync)"; \
+		fi
+
+# Propose pending sections, one per PR, for PRs no section lists yet (see --help).
+# CHANGELOG_REMOTE: the git remote hcl-main and PR-staging are fetched from (pass your HTTPS remote).
+CHANGELOG_REMOTE ?= origin
+changelog-pending:
+		@if [ -f scripts/changelog/update-changelog.sh ]; then \
+			git fetch $(CHANGELOG_REMOTE) hcl-main PR-staging && \
+			bash scripts/changelog/update-changelog.sh --pending \
+				--base $(CHANGELOG_REMOTE)/hcl-main --head $(CHANGELOG_REMOTE)/PR-staging; \
+		else \
+			echo "SKIP: scripts/changelog/update-changelog.sh absent (stripped for public sync)"; \
 		fi
 
 build-videocall-postgres:
@@ -206,11 +255,16 @@ e2e-up-impair: e2e-cert
 	-rm -rf e2e/.stack-stamps
 	COMPOSE_PROFILES=impair $(COMPOSE_E2E) up -d
 
-# Tear down the E2E stack and remove volumes. `--profile impair` ensures the
-# toxiproxy container is also removed when it was started by `e2e-up-impair`
-# (compose only stops profile services if the profile is named on `down`).
+# E2E stack plus docker/docker-compose.monitoring.yaml (#2923); the first run builds two extra backends.
+e2e-up-monitoring: e2e-cert
+	-rm -rf e2e/.stack-stamps
+	$(COMPOSE_E2E_MONITORING) up -d
+
+# Tear down the E2E stack and remove volumes. `--profile impair` and the
+# monitoring overlay ensure toxiproxy and the monitoring services are also
+# removed (compose only stops profile services if the profile is named on `down`).
 e2e-down:
-	$(COMPOSE_E2E) --profile impair down -v
+	$(COMPOSE_E2E_MONITORING) --profile impair down -v
 
 # Run e2e tests headless. Assumes the stack is already up — bring it up
 # with `make e2e-up`, which is also the only target that rotates the cert.

@@ -389,6 +389,30 @@ lazy_static! {
     )
     .expect("Failed to create health_reports_total metric");
 
+    /// HEALTH packets metrics-api discarded before they reached any per-session series.
+    /// `reason` is one of [`HEALTH_PACKET_DROP_REASONS`].
+    pub static ref HEALTH_PACKETS_DROPPED_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_health_packets_dropped_total",
+        "HEALTH packets discarded by metrics-api before ingest, by reason (issue 2920)",
+        &["reason"]
+    )
+    .expect("Failed to create health_packets_dropped_total metric");
+
+    /// Messages the metrics-api NATS connection received from the server, including
+    /// those the client dropped because the ingest subscription's channel was full.
+    pub static ref HEALTH_INGEST_NATS_RECEIVED_TOTAL: Counter = register_counter!(
+        "videocall_health_ingest_nats_received_total",
+        "Messages the metrics-api NATS connection received, including those it dropped on a full subscription channel (issue 2920)"
+    )
+    .expect("Failed to create health_ingest_nats_received_total metric");
+
+    /// Messages the metrics-api ingest loop took off its NATS subscription.
+    pub static ref HEALTH_INGEST_DEQUEUED_TOTAL: Counter = register_counter!(
+        "videocall_health_ingest_dequeued_total",
+        "Messages the metrics-api ingest loop dequeued from its NATS subscription (issue 2920)"
+    )
+    .expect("Failed to create health_ingest_dequeued_total metric");
+
     /// Client-reported floating-point samples REJECTED for being non-finite
     /// (NaN / +Inf / -Inf) before they could reach a gauge or histogram
     /// (issue 2047).
@@ -418,6 +442,22 @@ lazy_static! {
         "TierTransition entries discarded for exceeding the per-packet ingest cap (issue 2047)"
     )
     .expect("Failed to create tier_transitions_dropped_total metric");
+
+    /// `peer_stats` entries discarded from a single health packet for exceeding
+    /// the per-packet ingest cap (issue 2582). Unlabeled, like its sibling above.
+    pub static ref PEER_STATS_DROPPED_TOTAL: Counter = register_counter!(
+        "videocall_peer_stats_dropped_total",
+        "PeerStats entries discarded for exceeding the per-packet ingest cap (issue 2582)"
+    )
+    .expect("Failed to create peer_stats_dropped_total metric");
+
+    /// `peer_stats` entries whose id was not tracked because the session had reached
+    /// the per-session cap (issue 2582). Counts entries per packet, not distinct ids.
+    pub static ref PEER_IDS_CAPPED_TOTAL: Counter = register_counter!(
+        "videocall_peer_ids_capped_total",
+        "PeerStats entries whose id was not tracked because the session reached the per-session cap (issue 2582)"
+    )
+    .expect("Failed to create peer_ids_capped_total metric");
 
     /// Rejected client-authored camera layer reports (#2170). Unlabeled for the
     /// same reason as [`TIER_TRANSITIONS_DROPPED_TOTAL`]: rejected input must not
@@ -672,14 +712,6 @@ lazy_static! {
         "Total connection lifecycle events on servers"
     )
     .expect("Failed to create server_connection_events_total metric");
-
-    /// Reconnection tracking per customer and meeting
-    pub static ref SERVER_RECONNECTIONS_TOTAL: GaugeVec = register_gauge_vec!(
-        "videocall_server_reconnections_total",
-        "Total reconnections per customer and meeting",
-        &["protocol", "customer_email", "meeting_id", "server_instance", "region"]
-    )
-    .expect("Failed to create server_reconnections_total metric");
 
     // ===== PHASE 1 METRICS: Browser State and Quality Indicators =====
 
@@ -2405,13 +2437,19 @@ lazy_static! {
     )
     .expect("Failed to create relay_outbound_queue_bytes_by_session metric");
 
-    /// NATS publish latency histogram (milliseconds)
     pub static ref RELAY_NATS_PUBLISH_LATENCY_MS: Histogram = register_histogram!(
         "relay_nats_publish_latency_ms",
-        "Time to publish a media packet to NATS (ms)",
+        "Time for Client::publish() to enqueue a media packet into the async-nats client's local 2048-slot command channel, in ms. NOT a NATS round-trip or a socket write. It rises when that channel is full (this pod's NATS connection task is behind) OR when the publishing ChatServer task is descheduled (a tokio coop-budget yield on a busy relay runtime). On a pod that also exports videocall_relay_scheduler_lag_ms, read the two together: if lag rose too, suspect the runtime first; if lag is flat, the NATS writer. On a pod without that series the two causes cannot be told apart (#2925)",
         vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0]
     )
     .expect("Failed to create relay_nats_publish_latency_ms metric");
+
+    pub static ref RELAY_NATS_EVENTS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_nats_events_total",
+        "async-nats connection events on this relay's NATS client, by event (#2925). slow_consumer: a subscription's 65,536-message channel was full and async-nats DROPPED the message, most likely from a session's media subscription (the relay also holds control subscriptions). connected: the initial connect and every reconnect. disconnected: each lost connection. client_error: each failed reconnect attempt. A lower bound: async-nats queues events in a 128-slot channel and drops the overflow",
+        &["event"]
+    )
+    .expect("Failed to create relay_nats_events_total metric");
 
     /// Publisher-to-relay inbound MEDIA frame inter-arrival gap (milliseconds).
     ///
@@ -2471,6 +2509,22 @@ lazy_static! {
         &["reason"]
     )
     .expect("Failed to create videocall_auth_rejections_total metric");
+
+    /// Host-kick denylist entries evicted to stay within a cap (#2934).
+    pub static ref RELAY_KICK_DENYLIST_EVICTIONS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_relay_kick_denylist_evictions_total",
+        "Host-kick denylist entries evicted by cap (room_quota|global_cap) (#2934)",
+        &["reason"]
+    )
+    .expect("Failed to create videocall_relay_kick_denylist_evictions_total metric");
+
+    /// Sessions the relay closed or refused because of a host kick (#2934).
+    pub static ref RELAY_KICK_ENFORCEMENTS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_relay_kick_enforcements_total",
+        "Sessions closed (closed) or joins refused (refused) after a host kick (#2934)",
+        &["action"]
+    )
+    .expect("Failed to create videocall_relay_kick_enforcements_total metric");
 
     /// Room tokens accepted despite carrying no `typ` claim (#2411).
     pub static ref LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL: Counter = register_counter!(
@@ -3282,8 +3336,8 @@ lazy_static! {
 
     // ===== TOKIO SCHEDULER-LAG PROBE (#1637, epic #1636 — INSURANCE SIGNAL) =====
 
-    /// Tokio scheduler lag of the WebTransport relay's runtime, in ms — a
-    /// HISTOGRAM (#1637).
+    /// Tokio scheduler lag of a relay runtime, in ms — a HISTOGRAM (#1637; the
+    /// WebSocket relay's main runtime since #2924).
     ///
     /// This is the ONLY signal that resolves sub-second correlated scheduling
     /// jitter on a relay runtime (the latent Gun #2 / #1639; since #2727 that is
@@ -3338,7 +3392,7 @@ lazy_static! {
     /// No cleanup needed (it is never per-session).
     pub static ref RELAY_SCHEDULER_LAG_MS: Histogram = register_histogram!(
         "videocall_relay_scheduler_lag_ms",
-        "Tokio scheduler lag of a WebTransport relay runtime, in ms (actual minus expected wake of a fixed-interval probe running ON that runtime). Since #2727 the main runtime and every session arbiter each run one probe and all feed this one UNLABELLED histogram, so a spike names the relay, not which arbiter; /healthz reads the oldest per-runtime heartbeat and is what identifies a wedged one. A histogram so sub-second spikes survive the ~15s scrape. Upper-bucket increase() with sent_packets flat => relay thread-starvation (mechanism B, #1639); no upper-bucket movement while RTT/loss spike or sent_packets climbs => shared downlink/NIC (mechanism C) (#1637)",
+        "Tokio scheduler lag of a relay runtime, in ms (actual minus expected wake of a fixed-interval probe running ON that runtime). WebTransport: since #2727 the main runtime and every session arbiter each run one probe and all feed this one UNLABELLED histogram, so a spike names the relay, not which arbiter; /healthz reads the oldest per-runtime heartbeat and is what identifies a wedged one. WebSocket (#2924): one probe on the main runtime, which hosts ChatServer and every session's NATS receive loop; the HTTP worker threads running the WS sessions are not probed. A histogram so sub-second spikes survive the ~15s scrape. Upper-bucket increase() with sent_packets flat => relay thread-starvation (mechanism B, #1639); no upper-bucket movement while RTT/loss spike or sent_packets climbs => shared downlink/NIC (mechanism C) (#1637)",
         vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]
     )
     .expect("Failed to create videocall_relay_scheduler_lag_ms metric");
@@ -3532,6 +3586,15 @@ pub fn spawn_scheduler_lag_probe_on_slot(
     actix_rt::spawn(run_scheduler_lag_probe_on_slot(period, slot))
 }
 
+/// `websocket_server`'s one probe (#2924), at the WT relay's period. Call it from the
+/// `#[actix_web::main]` runtime, not from an `HttpServer` worker factory.
+pub fn spawn_websocket_relay_scheduler_lag_probe() -> actix_rt::task::JoinHandle<()> {
+    spawn_scheduler_lag_probe_on_slot(
+        crate::relay_health::HEARTBEAT_PERIOD,
+        crate::relay_health::MAIN_HEARTBEAT_SLOT,
+    )
+}
+
 /// Remove the per-connection QUIC path-health gauges for a single WebTransport
 /// `session_id` (#1637; issue #996 cardinality-GC pattern).
 ///
@@ -3587,14 +3650,153 @@ pub fn init_ws_fragment_discard_series() {
     });
 }
 
+const NATS_EVENT_LABELS: [&str; 8] = [
+    "connected",
+    "disconnected",
+    "lame_duck_mode",
+    "draining",
+    "closed",
+    "slow_consumer",
+    "server_error",
+    "client_error",
+];
+
+fn nats_event_index(event: &async_nats::Event) -> usize {
+    use async_nats::Event;
+    match event {
+        Event::Connected => 0,
+        Event::Disconnected => 1,
+        Event::LameDuckMode => 2,
+        Event::Draining => 3,
+        Event::Closed => 4,
+        Event::SlowConsumer(_) => 5,
+        Event::ServerError(_) => 6,
+        Event::ClientError(_) => 7,
+    }
+}
+
+/// One per label, resolved on first use: a slow-consumer storm emits an event per
+/// dropped message.
+static NATS_EVENT_COUNTERS: [std::sync::OnceLock<prometheus::Counter>; 8] =
+    [const { std::sync::OnceLock::new() }; 8];
+
+/// Books `event` in [`RELAY_NATS_EVENTS_TOTAL`].
+pub fn record_nats_event(event: &async_nats::Event) {
+    let i = nats_event_index(event);
+    NATS_EVENT_COUNTERS[i]
+        .get_or_init(|| RELAY_NATS_EVENTS_TOTAL.with_label_values(&[NATS_EVENT_LABELS[i]]))
+        .inc();
+}
+
+/// Both relay binaries connect through this, so both count the same events.
+pub fn with_nats_event_metrics(options: async_nats::ConnectOptions) -> async_nats::ConnectOptions {
+    options.event_callback(|event| async move { record_nats_event(&event) })
+}
+
+/// No `draining` or `closed`: the relay never drains its client and holds it for its
+/// whole life, so those series would be a permanent 0.
+const NATS_EVENTS_PUBLISHED_AT_ZERO: [&str; 6] = [
+    "connected",
+    "disconnected",
+    "lame_duck_mode",
+    "slow_consumer",
+    "server_error",
+    "client_error",
+];
+
+fn init_nats_event_series() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for event in NATS_EVENTS_PUBLISHED_AT_ZERO {
+            RELAY_NATS_EVENTS_TOTAL
+                .with_label_values(&[event])
+                .inc_by(0.0);
+        }
+    });
+}
+
+type NatsStatisticReader = fn(&async_nats::Statistics) -> u64;
+
+const NATS_STATISTICS_COUNTERS: [(&str, &str, NatsStatisticReader); 4] = [
+    (
+        "relay_nats_in_messages_total",
+        "Messages this relay's NATS client received (async-nats Statistics::in_messages), counted before per-subscription dispatch, so messages then dropped as slow_consumer are included. Since relay start; survives NATS reconnects (#2925)",
+        |s| s.in_messages.load(std::sync::atomic::Ordering::Relaxed),
+    ),
+    (
+        "relay_nats_out_messages_total",
+        "Messages this relay's NATS client took off its command channel to write (async-nats Statistics::out_messages), counted before the socket write. Since relay start; survives NATS reconnects (#2925)",
+        |s| s.out_messages.load(std::sync::atomic::Ordering::Relaxed),
+    ),
+    (
+        "relay_nats_in_bytes_total",
+        "Bytes this relay's NATS client read from its socket, protocol framing included (async-nats Statistics::in_bytes) (#2925)",
+        |s| s.in_bytes.load(std::sync::atomic::Ordering::Relaxed),
+    ),
+    (
+        "relay_nats_connects_total",
+        "Successful connections by this relay's NATS client: the initial connect plus every reconnect (async-nats Statistics::connects). Exact, unlike relay_nats_events_total{event=\"connected\"}, which async-nats can drop (#2925)",
+        |s| s.connects.load(std::sync::atomic::Ordering::Relaxed),
+    ),
+];
+
+/// Reads the client's cumulative statistics at scrape time; nothing polls them.
+pub struct NatsStatisticsCollector {
+    stats: std::sync::Arc<async_nats::Statistics>,
+    descs: Vec<prometheus::core::Desc>,
+}
+
+impl NatsStatisticsCollector {
+    /// Fails only if a family name or help string is invalid.
+    pub fn new(stats: std::sync::Arc<async_nats::Statistics>) -> prometheus::Result<Self> {
+        let descs = NATS_STATISTICS_COUNTERS
+            .iter()
+            .map(|(name, help, _)| {
+                prometheus::core::Desc::new(
+                    name.to_string(),
+                    help.to_string(),
+                    Vec::new(),
+                    std::collections::HashMap::new(),
+                )
+            })
+            .collect::<prometheus::Result<_>>()?;
+        Ok(Self { stats, descs })
+    }
+}
+
+impl prometheus::core::Collector for NatsStatisticsCollector {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        self.descs.iter().collect()
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        NATS_STATISTICS_COUNTERS
+            .iter()
+            .filter_map(|(name, help, read)| {
+                let counter = prometheus::IntCounter::new(*name, *help).ok()?;
+                counter.inc_by(read(&self.stats));
+                prometheus::core::Collector::collect(&counter).pop()
+            })
+            .collect()
+    }
+}
+
+/// Exports `client.statistics()` as the `relay_nats_*_total` counters (#2925).
+pub fn register_nats_statistics(client: &async_nats::Client) -> prometheus::Result<()> {
+    prometheus::register(Box::new(NatsStatisticsCollector::new(client.statistics())?))
+}
+
 // `lazy_static` registers on first dereference, so an unlabelled metric is absent from
 // `/metrics` until incremented. Each binary is its own process and registry, so a metric
 // belongs only in the init of the process that increments it (issue 2645).
 
-/// `token_validator` (via `lobby`/`webtransport`) and `ChatServer` — both relays.
+/// `token_validator` (via `lobby`/`webtransport`), `ChatServer` and the scheduler-lag
+/// probe — both relays.
 fn init_relay_common_series() {
     lazy_static::initialize(&LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL);
     lazy_static::initialize(&RELAY_NATS_PUBLISH_LATENCY_MS);
+    init_nats_event_series();
+    lazy_static::initialize(&RELAY_SCHEDULER_LAG_MS);
 }
 
 /// `websocket_server`. `relay_ws_*` comes from `WsChatSession`, which only it builds.
@@ -3604,17 +3806,32 @@ pub fn init_websocket_relay_series() {
     init_ws_fragment_discard_series();
 }
 
-/// `webtransport_server`. Only it runs a scheduler-lag probe.
+/// `webtransport_server`.
 pub fn init_webtransport_relay_series() {
     init_relay_common_series();
-    lazy_static::initialize(&RELAY_SCHEDULER_LAG_MS);
 }
+
+/// `reason` label for a HEALTH packet older than the freshness window.
+pub const HEALTH_DROP_STALE: &str = "stale";
+/// `reason` label for a HEALTH payload that does not decode as a `HealthPacket`.
+pub const HEALTH_DROP_DECODE_ERROR: &str = "decode_error";
+/// Every `reason` value of `videocall_health_packets_dropped_total`.
+pub const HEALTH_PACKET_DROP_REASONS: [&str; 2] = [HEALTH_DROP_STALE, HEALTH_DROP_DECODE_ERROR];
 
 /// `metrics_server` — the client health-packet ingest process.
 pub fn init_health_ingest_series() {
     lazy_static::initialize(&HEALTH_REPORTS_TOTAL);
+    lazy_static::initialize(&HEALTH_INGEST_NATS_RECEIVED_TOTAL);
+    lazy_static::initialize(&HEALTH_INGEST_DEQUEUED_TOTAL);
+    for reason in HEALTH_PACKET_DROP_REASONS {
+        HEALTH_PACKETS_DROPPED_TOTAL
+            .with_label_values(&[reason])
+            .inc_by(0.0);
+    }
     lazy_static::initialize(&NON_FINITE_SAMPLES_DROPPED_TOTAL);
     lazy_static::initialize(&TIER_TRANSITIONS_DROPPED_TOTAL);
+    lazy_static::initialize(&PEER_STATS_DROPPED_TOTAL);
+    lazy_static::initialize(&PEER_IDS_CAPPED_TOTAL);
     lazy_static::initialize(&ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL);
 }
 
@@ -3824,14 +4041,51 @@ mod tests {
         }
         assert!(common.contains("&LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL)"));
         assert!(common.contains("&RELAY_NATS_PUBLISH_LATENCY_MS)"));
+        assert!(common.contains("init_nats_event_series()"));
+        assert!(common.contains("&RELAY_SCHEDULER_LAG_MS)"));
 
-        // WsChatSession exists only in the WS binary; spawn_scheduler_lag_probe only in WT.
+        // WsChatSession exists only in the WS binary.
         assert!(ws.contains("&WS_FRAGMENTED_INBOUND_TOTAL)"));
         assert!(ws.contains("init_ws_fragment_discard_series()"));
         assert!(!wt.contains("WS_FRAGMENTED_INBOUND_TOTAL"));
         assert!(!wt.contains("init_ws_fragment_discard_series"));
-        assert!(wt.contains("&RELAY_SCHEDULER_LAG_MS)"));
-        assert!(!ws.contains("RELAY_SCHEDULER_LAG_MS"));
+    }
+
+    #[test]
+    fn websocket_main_spawns_its_probe_before_building_the_http_server() {
+        let src: String = include_str!("bin/websocket_server.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let main = src
+            .split_once("async fn main()")
+            .expect("websocket_server must have an async main")
+            .1;
+        let probe = main
+            .find("spawn_websocket_relay_scheduler_lag_probe()")
+            .expect("websocket_server main must spawn its scheduler-lag probe");
+        let http = main
+            .find("HttpServer::new(")
+            .expect("websocket_server main must build its HttpServer");
+        assert!(probe < http);
+    }
+
+    #[test]
+    fn both_relay_binaries_instrument_their_nats_client() {
+        for (bin, bin_src, _) in &METRICS_BINS[..2] {
+            let uncommented: String = bin_src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for call in [
+                "with_nats_event_metrics(",
+                "register_nats_statistics(&nats_client)",
+            ] {
+                assert!(uncommented.contains(call), "{bin} never calls {call}");
+            }
+        }
     }
 
     /// Presence, not placement: relocating a call after the server starts still passes.
@@ -5064,6 +5318,168 @@ mod tests {
             "spawn_scheduler_lag_probe must spawn the probe and observe at least \
              one sample (before={before}, after={after}); if not, the \
              actix_rt::spawn wiring inside the helper is gone"
+        );
+    }
+
+    #[test]
+    #[serial(relay_nats_events)]
+    fn every_async_nats_event_books_under_its_label() {
+        use async_nats::{ClientError, Event, ServerError};
+        let cases = [
+            (Event::Connected, "connected"),
+            (Event::Disconnected, "disconnected"),
+            (Event::LameDuckMode, "lame_duck_mode"),
+            (Event::Draining, "draining"),
+            (Event::Closed, "closed"),
+            (Event::SlowConsumer(7), "slow_consumer"),
+            (
+                Event::ServerError(ServerError::AuthorizationViolation),
+                "server_error",
+            ),
+            (
+                Event::ClientError(ClientError::MaxReconnects),
+                "client_error",
+            ),
+        ];
+        for (event, label) in cases {
+            let before = RELAY_NATS_EVENTS_TOTAL.with_label_values(&[label]).get();
+            record_nats_event(&event);
+            assert_eq!(
+                RELAY_NATS_EVENTS_TOTAL.with_label_values(&[label]).get(),
+                before + 1.0,
+                "{event:?} must book under event=\"{label}\""
+            );
+        }
+    }
+
+    /// Through the real async-nats event task, with no server: every failed connect
+    /// attempt emits `ClientError`, which the production callback must count.
+    #[tokio::test]
+    #[serial(relay_nats_events)]
+    async fn with_nats_event_metrics_counts_events_async_nats_emits() {
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("an ephemeral port must be bindable")
+            .port();
+        let client_errors = || {
+            RELAY_NATS_EVENTS_TOTAL
+                .with_label_values(&["client_error"])
+                .get()
+        };
+        let before = client_errors();
+        let _client =
+            with_nats_event_metrics(async_nats::ConnectOptions::new().retry_on_initial_connect())
+                .connect(format!("nats://127.0.0.1:{closed_port}"))
+                .await
+                .expect("retry_on_initial_connect returns before connecting");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while client_errors() <= before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no client_error booked for a refused connect"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn the_statistics_collector_exports_each_counter_under_its_own_name() {
+        let stats = std::sync::Arc::new(async_nats::Statistics::default());
+        let fields = [
+            &stats.in_messages,
+            &stats.out_messages,
+            &stats.in_bytes,
+            &stats.connects,
+        ];
+        for (value, field) in (1..).zip(fields) {
+            field.store(value, std::sync::atomic::Ordering::Relaxed);
+        }
+        let collector = NatsStatisticsCollector::new(stats.clone()).expect("valid descs");
+        let read = |c: &NatsStatisticsCollector| -> Vec<(String, f64)> {
+            prometheus::core::Collector::collect(c)
+                .iter()
+                .map(|mf| {
+                    (
+                        mf.get_name().to_string(),
+                        mf.get_metric()[0].get_counter().get_value(),
+                    )
+                })
+                .collect()
+        };
+        let expected = |offset: f64| {
+            [
+                "relay_nats_in_messages_total",
+                "relay_nats_out_messages_total",
+                "relay_nats_in_bytes_total",
+                "relay_nats_connects_total",
+            ]
+            .iter()
+            .zip(1..)
+            .map(|(n, v)| (n.to_string(), f64::from(v) + offset))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(read(&collector), expected(0.0));
+
+        for field in fields {
+            field.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(
+            read(&collector),
+            expected(10.0),
+            "a scrape must read the live statistics, not a snapshot"
+        );
+    }
+
+    fn scheduler_lag_samples_above_ms(bound_ms: f64) -> u64 {
+        let metric = prometheus::core::Metric::metric(&*RELAY_SCHEDULER_LAG_MS);
+        let histogram = metric.get_histogram();
+        let at_or_below = histogram
+            .get_bucket()
+            .iter()
+            .find(|b| b.get_upper_bound() == bound_ms)
+            .expect("the bound must be one of the histogram's buckets")
+            .get_cumulative_count();
+        histogram.get_sample_count() - at_or_below
+    }
+
+    #[test]
+    #[serial(relay_scheduler_lag_probe)]
+    fn a_stall_in_a_task_spawned_from_an_actor_lands_in_the_websocket_probe() {
+        use actix::{Actor, Context, Handler, Message};
+
+        const STALL: std::time::Duration = std::time::Duration::from_millis(1_200);
+
+        struct NatsLoopSpawner;
+        impl Actor for NatsLoopSpawner {
+            type Context = Context<Self>;
+        }
+        #[derive(Message)]
+        #[rtype(result = "()")]
+        struct SpawnStalledLoop;
+        impl Handler<SpawnStalledLoop> for NatsLoopSpawner {
+            type Result = ();
+            fn handle(&mut self, _: SpawnStalledLoop, _: &mut Context<Self>) {
+                tokio::spawn(async { std::thread::sleep(STALL) });
+            }
+        }
+
+        let before = scheduler_lag_samples_above_ms(100.0);
+        actix_rt::System::new().block_on(async {
+            let probe = spawn_websocket_relay_scheduler_lag_probe();
+            NatsLoopSpawner
+                .start()
+                .send(SpawnStalledLoop)
+                .await
+                .expect("the spawner actor must be alive");
+            actix_rt::time::sleep(STALL + 2 * crate::relay_health::HEARTBEAT_PERIOD).await;
+            probe.abort();
+        });
+        let after = scheduler_lag_samples_above_ms(100.0);
+        assert!(
+            after > before,
+            "a {STALL:?} stall on the System runtime must land above 100ms \
+             (before={before}, after={after})"
         );
     }
 }

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
+use videocall_types::url_log::strip_url_query_from_message;
 use videocall_types::Callback;
 use wasm_bindgen_futures::JsFuture;
 
@@ -1481,6 +1482,16 @@ fn wt_receive_worker_enabled() -> bool {
     resolve_worker_flag(from_override.as_deref(), from_config.as_deref())
 }
 
+/// Boot the session Worker the next adopting `connect` will take; a no-op without a held
+/// [`SpareLease`](crate::worker_session::SpareLease) or where it could not be used.
+pub fn prewarm_session_worker() {
+    let has_webtransport =
+        Reflect::has(&js_sys::global(), &JsValue::from_str("WebTransport")).unwrap_or(false);
+    if has_webtransport && wt_receive_worker_enabled() {
+        crate::worker_session::prewarm();
+    }
+}
+
 fn read_wt_cert_hash_strings() -> Vec<String> {
     let Some(raw) = global_property(WT_CERT_HASHES_GLOBAL) else {
         return Vec::new();
@@ -1586,16 +1597,11 @@ pub struct WebTransportTask {
     pub host: SessionHost,
     #[allow(dead_code)]
     notification: Callback<WebTransportStatus>,
-    #[allow(dead_code)]
     listeners: [Promise; 2],
-    /// Stored so the closures live as long as the task and are properly dropped
-    /// instead of being leaked via `forget()`. The closed closure is wrapped in
-    /// `Rc` because it is shared across multiple promise chains (`ready.catch`,
-    /// `closed.then`, `closed.catch`).
-    #[allow(dead_code)]
-    opened_closure: Closure<dyn FnMut(JsValue)>,
-    #[allow(dead_code)]
-    closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
+    // Freed by `Drop` once `listeners` settle; `None` for `new_worker`.
+    opened_closure: Option<Closure<dyn FnMut(JsValue)>>,
+    closed_closure: Option<Closure<dyn FnMut(JsValue)>>,
+    fired: Rc<Cell<bool>>,
     /// Per-media-type persistent unidirectional send streams.  Lazily
     /// populated by `send_on_persistent_stream` on first send for each key.
     /// On stream-write error the entry is removed; the next send for that
@@ -1609,14 +1615,16 @@ impl WebTransportTask {
         notification: Callback<WebTransportStatus>,
         listeners: [Promise; 2],
         opened_closure: Closure<dyn FnMut(JsValue)>,
-        closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
+        closed_closure: Closure<dyn FnMut(JsValue)>,
+        fired: Rc<Cell<bool>>,
     ) -> WebTransportTask {
         WebTransportTask {
             host,
             notification,
             listeners,
-            opened_closure,
-            closed_closure,
+            opened_closure: Some(opened_closure),
+            closed_closure: Some(closed_closure),
+            fired,
             persistent_streams: new_persistent_stream_map(),
         }
     }
@@ -1632,10 +1640,9 @@ impl WebTransportTask {
                 Promise::resolve(&JsValue::UNDEFINED),
                 Promise::resolve(&JsValue::UNDEFINED),
             ],
-            opened_closure: Closure::wrap(Box::new(|_: JsValue| {}) as Box<dyn FnMut(JsValue)>),
-            closed_closure: Rc::new(Closure::wrap(
-                Box::new(|_: JsValue| {}) as Box<dyn FnMut(JsValue)>
-            )),
+            opened_closure: None,
+            closed_closure: None,
+            fired: Rc::default(),
             persistent_streams: new_persistent_stream_map(),
         }
     }
@@ -1643,7 +1650,18 @@ impl WebTransportTask {
 
 impl Drop for WebTransportTask {
     fn drop(&mut self) {
+        self.fired.set(true);
         self.host.close();
+        let closures = (self.opened_closure.take(), self.closed_closure.take());
+        let tails = self.listeners.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            for tail in tails {
+                if let Err(e) = JsFuture::from(tail).await {
+                    log::error!("[WT_TASK_DROP] promise reaction failed after drop: {e:?}");
+                }
+            }
+            drop(closures);
+        });
     }
 }
 
@@ -1660,13 +1678,15 @@ pub struct WebTransportService {}
 impl WebTransportService {
     /// Connects to a server through a WebTransport connection. Needs callbacks for
     /// datagrams, unidirectional streams, bidirectional streams, and status notifications.
+    /// `adopt_spare_worker` lets the session Worker path take the prewarmed spare.
     pub fn connect(
         url: &str,
+        adopt_spare_worker: bool,
         on_frame: Callback<InboundFrame>,
         notification: Callback<WebTransportStatus>,
     ) -> Result<WebTransportTask, WebTransportError> {
         if wt_receive_worker_enabled() {
-            return Self::connect_via_worker(url, on_frame, notification);
+            return Self::connect_via_worker(url, adopt_spare_worker, on_frame, notification);
         }
         Self::connect_in_page(url, on_frame, notification)
     }
@@ -1690,7 +1710,7 @@ impl WebTransportService {
         on_frame: Callback<(Option<StreamKey>, InboundFrame)>,
         notification: Callback<WebTransportStatus>,
     ) -> Result<WebTransportTask, WebTransportError> {
-        let ConnectCommon(transport, listeners, opened_closure, closed_closure) =
+        let ConnectCommon(transport, listeners, opened_closure, closed_closure, fired) =
             Self::connect_common(url, &notification)?;
         let transport = Rc::new(transport);
         crate::inbound::reset_audio_lane_anchor();
@@ -1759,11 +1779,13 @@ impl WebTransportService {
             listeners,
             opened_closure,
             closed_closure,
+            fired,
         ))
     }
 
     fn connect_via_worker(
         url: &str,
+        adopt_spare_worker: bool,
         on_frame: Callback<InboundFrame>,
         notification: Callback<WebTransportStatus>,
     ) -> Result<WebTransportTask, WebTransportError> {
@@ -1780,6 +1802,7 @@ impl WebTransportService {
                 }),
                 notification: notification.clone(),
             },
+            adopt_spare_worker,
         )
         .map_err(WebTransportError::CreationError)?;
         Ok(WebTransportTask::new_worker(session, notification))
@@ -1952,24 +1975,24 @@ impl WebTransportService {
             None => WebTransport::new(url),
         };
         let transport = transport.map_err(|e| {
-            WebTransportError::CreationError(format!("Failed to create WebTransport: {e:?}"))
+            WebTransportError::CreationError(strip_url_query_from_message(
+                &format!("Failed to create WebTransport: {e:?}"),
+                url,
+            ))
         })?;
 
         // Track whether the handshake (`ready()`) has completed, so that
         // subsequent close/error events can be classified correctly.
         let handshake_complete = Rc::new(Cell::new(false));
-        // Guard against emitting connection-lost more than once per connection
-        // (browser may fire both `closed` and `ready.catch` for the same failure).
         let fired = Rc::new(Cell::new(false));
 
         let notify = notification.clone();
         let hs_flag = handshake_complete.clone();
-
-        // Both closures are stored in the WebTransportTask struct so they are
-        // dropped when the task is dropped, instead of being leaked via
-        // `forget()`. Previously, every reconnection/re-election cycle would
-        // permanently leak two closures into WASM linear memory.
+        let fired_opened = fired.clone();
         let opened_closure = Closure::wrap(Box::new(move |_: JsValue| {
+            if fired_opened.get() {
+                return;
+            }
             hs_flag.set(true);
             notify.emit(WebTransportStatus::Opened);
         }) as Box<dyn FnMut(JsValue)>);
@@ -1977,19 +2000,21 @@ impl WebTransportService {
         let notify = notification.clone();
         let hs_flag_closed = handshake_complete.clone();
         let fired_closed = fired.clone();
-        // `closed_closure` is shared via `Rc` because it is referenced by
-        // multiple promise chains (`ready.catch`, `closed.then`, `closed.catch`).
-        let closed_closure = Rc::new(Closure::wrap(Box::new(move |e: JsValue| {
+        let url_for_close = url.to_string();
+        let closed_closure = Closure::wrap(Box::new(move |e: JsValue| {
             if fired_closed.replace(true) {
-                return; // already emitted
+                return;
             }
-            let described = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+            let described = strip_url_query_from_message(
+                &e.as_string().unwrap_or_else(|| format!("{e:?}")),
+                &url_for_close,
+            );
             notify.emit(close_status(
                 hs_flag_closed.get(),
                 read_close_info(&e),
                 described,
             ));
-        }) as Box<dyn FnMut(JsValue)>));
+        }) as Box<dyn FnMut(JsValue)>);
         let ready = transport
             .ready()
             .then(&opened_closure)
@@ -2006,6 +2031,7 @@ impl WebTransportService {
                 listeners,
                 opened_closure,
                 closed_closure,
+                fired,
             ))
         }
     }
@@ -2014,7 +2040,8 @@ struct ConnectCommon(
     WebTransport,
     [Promise; 2],
     Closure<dyn FnMut(JsValue)>,
-    Rc<Closure<dyn FnMut(JsValue)>>,
+    Closure<dyn FnMut(JsValue)>,
+    Rc<Cell<bool>>,
 );
 
 pub fn process_binary(bytes: &Uint8Array, callback: &Callback<Vec<u8>>) {
@@ -4390,5 +4417,24 @@ mod uplink_propagation_tests {
             1,
             "and the cert hashes must arrive as an array, not flattened"
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod creation_error_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn constructor_error_does_not_carry_the_token() {
+        let Err(WebTransportError::CreationError(message)) = WebTransportService::connect_here(
+            "https://relay:99999/lobby?token=SECRETJWT",
+            Callback::from(|_: (Option<StreamKey>, InboundFrame)| {}),
+            Callback::from(|_: WebTransportStatus| {}),
+        ) else {
+            panic!("an out-of-range port must fail construction");
+        };
+        assert!(!message.contains("SECRETJWT"), "{message}");
+        assert!(message.contains("https://relay:99999/lobby"), "{message}");
     }
 }

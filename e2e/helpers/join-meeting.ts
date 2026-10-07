@@ -41,12 +41,12 @@ export async function fillAndSubmitJoinForm(
   page: Page,
   meetingId: string,
   username: string,
-  opts: { navTimeoutMs?: number } = {},
+  opts: { navTimeoutMs?: number; entryPath?: string } = {},
 ): Promise<void> {
   const navTimeoutMs = opts.navTimeoutMs ?? 20_000;
   const meetingUrlRe = new RegExp(`/meeting/${meetingId}`);
 
-  await page.goto("/");
+  await page.goto(opts.entryPath ?? "/");
 
   // The form fields are rendered by the WASM app; wait for the meeting-id
   // input to be visible before interacting (replaces the blind waitForTimeout).

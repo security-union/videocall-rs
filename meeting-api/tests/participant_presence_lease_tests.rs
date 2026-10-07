@@ -244,9 +244,11 @@ async fn heartbeat(pool: &PgPool, room: &str, sessions: &[(&str, u64)]) -> u64 {
                     session_id: *session_id,
                 })
                 .collect(),
+            unreported_user_ids: Vec::new(),
         },
     )
     .await
+    .renewed
 }
 
 /// Move every timestamp of `room` `secs` seconds into the past, as if that
@@ -922,6 +924,7 @@ async fn heartbeats_over_nats_renew_leases() {
             user_id: OWNER.to_string(),
             session_id: S1,
         }],
+        unreported_user_ids: Vec::new(),
     };
     nats.publish(
         PRESENCE_HEARTBEAT_SUBJECT,
@@ -1204,9 +1207,11 @@ async fn kicking_a_swept_left_co_host_prevents_their_own_restore() {
     let outcome = db_participants::kick(&pool, pk, OWNER, CO)
         .await
         .expect("kick");
-    assert_eq!(
-        outcome,
-        db_participants::KickOutcome::Kicked { was_host: true },
+    assert!(
+        matches!(
+            outcome,
+            db_participants::KickOutcome::Kicked { was_host: true, .. }
+        ),
         "a swept-left co-host of the current instance must still be kickable"
     );
     let kicked = row(&pool, room, CO).await;
@@ -1479,6 +1484,254 @@ async fn keepalive_after_the_meeting_ended_is_a_no_op() {
     cleanup_test_data(&pool, room).await;
 }
 
+async fn get_json(pool: &PgPool, uri: &str, caller: &str) -> serde_json::Value {
+    let req = request_with_cookie("GET", uri, caller)
+        .body(Body::empty())
+        .unwrap();
+    let resp = build_app(pool.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {uri} as {caller}");
+    response_json(resp).await
+}
+
+async fn in_call(pool: &PgPool, room: &str, user: &str) -> bool {
+    let info = get_json(pool, &format!("/api/v1/meetings/{room}"), user).await;
+    info["result"]["your_status"]["in_call"]
+        .as_bool()
+        .expect("your_status.in_call on the wire")
+}
+
+async fn listed_in_call(pool: &PgPool, room: &str, viewer: &str, target: &str) -> bool {
+    let list = get_json(
+        pool,
+        &format!("/api/v1/meetings/{room}/participants"),
+        viewer,
+    )
+    .await;
+    list["result"]
+        .as_array()
+        .expect("participant list")
+        .iter()
+        .find(|p| p["user_id"] == target)
+        .expect("target is listed")["in_call"]
+        .as_bool()
+        .expect("in_call on the wire")
+}
+
+#[tokio::test]
+#[serial]
+async fn in_call_is_false_in_the_lobby_and_follows_the_reported_session() {
+    let pool = get_test_pool().await;
+    let room = "in-call-lobby-then-live";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    assert_eq!(row(&pool, room, ATTENDEE).await.status, "waiting");
+    assert!(!in_call(&pool, room, ATTENDEE).await);
+
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/admit"),
+        OWNER,
+        serde_json::json!({ "user_id": ATTENDEE }),
+    )
+    .await;
+    assert_eq!(
+        keepalive_status(&pool, room, ATTENDEE).await,
+        StatusCode::OK
+    );
+    assert!(
+        !listed_in_call(&pool, room, OWNER, ATTENDEE).await,
+        "admitted but still in the pre-join lobby"
+    );
+
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    assert!(listed_in_call(&pool, room, OWNER, ATTENDEE).await);
+    assert!(in_call(&pool, room, ATTENDEE).await);
+
+    travel(&pool, room, 2 * PRESENCE_HEARTBEAT_INTERVAL_SECS).await;
+    assert_eq!(heartbeat(&pool, room, &[(ATTENDEE, S2)]).await, 1);
+    travel(&pool, room, 2 * PRESENCE_HEARTBEAT_INTERVAL_SECS).await;
+    assert!(
+        in_call(&pool, room, ATTENDEE).await,
+        "the heartbeat renewed the lease"
+    );
+
+    transport(&pool, room, ATTENDEE, S2, false).await;
+    assert!(!in_call(&pool, room, ATTENDEE).await);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn in_call_lapses_with_the_lease_when_no_left_ever_arrives() {
+    let pool = get_test_pool().await;
+    let room = "in-call-lease-lapse";
+    create(
+        &pool,
+        room,
+        serde_json::json!({ "end_on_host_leave": false }),
+    )
+    .await;
+    join(&pool, room, OWNER).await;
+    transport(&pool, room, OWNER, S1, true).await;
+    assert!(in_call(&pool, room, OWNER).await);
+
+    travel(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    assert_eq!(row(&pool, room, OWNER).await.status, "admitted");
+    assert!(
+        !in_call(&pool, room, OWNER).await,
+        "a lapsed lease is out of the call before any sweep"
+    );
+    sweep(&pool).await;
+    assert_eq!(row(&pool, room, OWNER).await.status, "left");
+    assert!(!in_call(&pool, room, OWNER).await);
+
+    assert_eq!(heartbeat(&pool, room, &[(OWNER, S1)]).await, 1);
+    assert!(
+        in_call(&pool, room, OWNER).await,
+        "its own session's heartbeat restores the swept row"
+    );
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_left_for_a_replaced_session_keeps_the_participant_in_the_call() {
+    let pool = get_test_pool().await;
+    let room = "in-call-stale-left";
+    create(
+        &pool,
+        room,
+        serde_json::json!({ "waiting_room_enabled": false, "end_on_host_leave": false }),
+    )
+    .await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    transport(&pool, room, ATTENDEE, S3, true).await;
+    transport(&pool, room, ATTENDEE, S2, false).await;
+    assert!(in_call(&pool, room, ATTENDEE).await);
+
+    transport(&pool, room, ATTENDEE, S3, false).await;
+    assert!(!in_call(&pool, room, ATTENDEE).await);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_rest_rejoin_or_a_kick_takes_the_participant_out_of_the_call() {
+    let pool = get_test_pool().await;
+    let room = "in-call-rejoin-kick";
+    create(
+        &pool,
+        room,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    assert!(in_call(&pool, room, ATTENDEE).await);
+
+    join(&pool, room, ATTENDEE).await;
+    assert!(
+        !in_call(&pool, room, ATTENDEE).await,
+        "a REST rejoin is back in the lobby"
+    );
+    transport(&pool, room, ATTENDEE, S3, true).await;
+    assert!(in_call(&pool, room, ATTENDEE).await);
+
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/kick"),
+        OWNER,
+        serde_json::json!({ "user_id": ATTENDEE }),
+    )
+    .await;
+    assert!(!in_call(&pool, room, ATTENDEE).await);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn in_call_requires_an_admitted_row_even_with_a_fresh_live_session() {
+    let pool = get_test_pool().await;
+    let room = "in-call-requires-admitted";
+    create(
+        &pool,
+        room,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    assert!(in_call(&pool, room, ATTENDEE).await);
+
+    let pk = meeting(&pool, room).await.id;
+    for (status, left_at) in [("left", None), ("admitted", Some(chrono::Utc::now()))] {
+        sqlx::query(
+            "UPDATE meeting_participants SET status = $3, left_at = $4 \
+             WHERE meeting_id = $1 AND user_id = $2",
+        )
+        .bind(pk)
+        .bind(ATTENDEE)
+        .bind(status)
+        .bind(left_at)
+        .execute(&pool)
+        .await
+        .expect("change the row without touching its session");
+        assert!(
+            !in_call(&pool, room, ATTENDEE).await,
+            "status {status}, left_at {left_at:?}"
+        );
+    }
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_kicked_participant_who_requeues_and_leaves_is_not_restored_by_present() {
+    let pool = get_test_pool().await;
+    let room = "in-call-kicked-requeue-present";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/admit"),
+        OWNER,
+        serde_json::json!({ "user_id": ATTENDEE }),
+    )
+    .await;
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/kick"),
+        OWNER,
+        serde_json::json!({ "user_id": ATTENDEE }),
+    )
+    .await;
+    join(&pool, room, ATTENDEE).await;
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/leave"),
+        ATTENDEE,
+        serde_json::json!({}),
+    )
+    .await;
+
+    transport(&pool, room, ATTENDEE, S3, true).await;
+    assert_eq!(row(&pool, room, ATTENDEE).await.status, "left");
+    assert!(!in_call(&pool, room, ATTENDEE).await);
+    cleanup_test_data(&pool, room).await;
+}
+
 /// A guest with a valid room token can keep their own lobby row alive; a
 /// forged/garbage token is rejected outright by the `GuestObserver` extractor.
 #[tokio::test]
@@ -1512,5 +1765,493 @@ async fn a_guest_keepalive_works_and_a_wrong_token_is_rejected() {
         StatusCode::UNAUTHORIZED,
         "a garbage bearer token must be rejected"
     );
+    cleanup_test_data(&pool, room).await;
+}
+
+const WAITER_B: &str = "lease-waiter-b@example.com";
+const WAITER_C: &str = "lease-waiter-c@example.com";
+const WAITER_D: &str = "lease-waiter-d@example.com";
+
+async fn post_status(
+    pool: &PgPool,
+    uri: &str,
+    caller: &str,
+    body: serde_json::Value,
+) -> StatusCode {
+    let req = request_with_cookie("POST", uri, caller)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    build_app(pool.clone()).oneshot(req).await.unwrap().status()
+}
+
+async fn admit_status(pool: &PgPool, room: &str, user: &str) -> StatusCode {
+    post_status(
+        pool,
+        &format!("/api/v1/meetings/{room}/admit"),
+        OWNER,
+        serde_json::json!({ "user_id": user }),
+    )
+    .await
+}
+
+async fn admit_all_ids(pool: &PgPool, room: &str) -> Vec<String> {
+    let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room}/admit-all"), OWNER)
+        .body(Body::empty())
+        .unwrap();
+    let resp = build_app(pool.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "admit-all");
+    let body: serde_json::Value = response_json(resp).await;
+    user_ids(&body["result"]["admitted"])
+}
+
+fn user_ids(list: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = list
+        .as_array()
+        .expect("participant array")
+        .iter()
+        .map(|p| p["user_id"].as_str().expect("user_id").to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+async fn waiting_list(pool: &PgPool, room: &str) -> Vec<String> {
+    let body = get_json(pool, &format!("/api/v1/meetings/{room}/waiting"), OWNER).await;
+    user_ids(&body["result"]["waiting"])
+}
+
+async fn waiting_order(pool: &PgPool, room: &str) -> Vec<String> {
+    let body = get_json(pool, &format!("/api/v1/meetings/{room}/waiting"), OWNER).await;
+    body["result"]["waiting"]
+        .as_array()
+        .expect("waiting array")
+        .iter()
+        .map(|p| p["user_id"].as_str().expect("user_id").to_string())
+        .collect()
+}
+
+/// `waiting_count` as `GET /meetings/{id}`, the feed and the joined list report it.
+async fn waiting_counts(pool: &PgPool, room: &str) -> [i64; 3] {
+    let info = get_json(pool, &format!("/api/v1/meetings/{room}"), OWNER).await;
+    let listed = |body: serde_json::Value| {
+        body["result"]["meetings"]
+            .as_array()
+            .expect("meetings")
+            .iter()
+            .find(|m| m["meeting_id"] == room)
+            .expect("meeting listed")
+            .get("waiting_count")
+            .map_or(0, |n| n.as_i64().expect("waiting_count"))
+    };
+    [
+        info["result"]["waiting_count"]
+            .as_i64()
+            .expect("waiting_count"),
+        listed(get_json(pool, "/api/v1/meetings/feed", OWNER).await),
+        listed(get_json(pool, "/api/v1/meetings/joined?limit=50", OWNER).await),
+    ]
+}
+
+async fn keepalive_ok(pool: &PgPool, room: &str, user: &str) {
+    assert_eq!(
+        keepalive_status(pool, room, user).await,
+        StatusCode::OK,
+        "keepalive as {user}"
+    );
+}
+
+/// `travel`, then renew the lobby owner so an admit does not start a new instance.
+async fn travel_keeping_owner(pool: &PgPool, room: &str, secs: u64) {
+    travel(pool, room, secs).await;
+    keepalive_ok(pool, room, OWNER).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_waiter_drops_out_when_their_keepalive_lapses_and_returns_on_renewal() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-lapse";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    keepalive_ok(&pool, room, ATTENDEE).await;
+    assert_eq!(row(&pool, room, ATTENDEE).await.status, "waiting");
+
+    travel(&pool, room, PRESENCE_LEASE_SECS - 10).await;
+    assert_eq!(waiting_list(&pool, room).await, [ATTENDEE]);
+    assert_eq!(waiting_counts(&pool, room).await, [1, 1, 1]);
+
+    travel(&pool, room, 11).await;
+    assert!(waiting_list(&pool, room).await.is_empty());
+    assert_eq!(waiting_counts(&pool, room).await, [0, 0, 0]);
+
+    keepalive_ok(&pool, room, ATTENDEE).await;
+    assert_eq!(waiting_list(&pool, room).await, [ATTENDEE]);
+    assert_eq!(waiting_counts(&pool, room).await, [1, 1, 1]);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_waiter_who_never_renews_stays_listed_beside_one_whose_lease_lapsed() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-never-renews";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    join(&pool, room, WAITER_B).await;
+    keepalive_ok(&pool, room, WAITER_B).await;
+
+    travel_keeping_owner(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    assert_eq!(waiting_list(&pool, room).await, [ATTENDEE]);
+    assert_eq!(waiting_counts(&pool, room).await, [1, 1, 1]);
+    assert_eq!(admit_status(&pool, room, ATTENDEE).await, StatusCode::OK);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_requeue_clears_the_presence_seen_at_of_an_earlier_admission() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-requeue";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    assert_eq!(admit_status(&pool, room, ATTENDEE).await, StatusCode::OK);
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/leave"),
+        ATTENDEE,
+        serde_json::json!({}),
+    )
+    .await;
+
+    travel_keeping_owner(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    join(&pool, room, ATTENDEE).await;
+    assert_eq!(row(&pool, room, ATTENDEE).await.status, "waiting");
+    assert_eq!(presence_seen_at_of(&pool, room, ATTENDEE).await, None);
+    assert_eq!(waiting_list(&pool, room).await, [ATTENDEE]);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn admitting_a_lapsed_waiter_is_refused_and_admit_all_skips_them() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-admit-lapsed";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    for user in [ATTENDEE, WAITER_B, WAITER_C] {
+        join(&pool, room, user).await;
+        keepalive_ok(&pool, room, user).await;
+    }
+
+    travel_keeping_owner(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    keepalive_ok(&pool, room, WAITER_B).await;
+    keepalive_ok(&pool, room, WAITER_C).await;
+
+    assert_eq!(
+        admit_status(&pool, room, ATTENDEE).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(row(&pool, room, ATTENDEE).await.status, "waiting");
+    assert_eq!(admit_status(&pool, room, WAITER_B).await, StatusCode::OK);
+    assert_eq!(row(&pool, room, WAITER_B).await.status, "admitted");
+    assert!(!in_call(&pool, room, WAITER_B).await);
+    assert_eq!(admit_all_ids(&pool, room).await, [WAITER_C]);
+    assert_eq!(row(&pool, room, ATTENDEE).await.status, "waiting");
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn admitting_only_lapsed_waiters_does_not_start_a_new_instance() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-admit-lapsed-no-instance";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    keepalive_ok(&pool, room, ATTENDEE).await;
+
+    travel(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    let started_at = meeting(&pool, room).await.started_at;
+    assert_eq!(
+        admit_status(&pool, room, ATTENDEE).await,
+        StatusCode::NOT_FOUND
+    );
+    assert!(admit_all_ids(&pool, room).await.is_empty());
+    assert_eq!(meeting(&pool, room).await.started_at, started_at);
+    assert_eq!(row(&pool, room, OWNER).await.status, "admitted");
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn turning_the_waiting_room_off_admits_only_live_waiters() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-room-off";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    for user in [ATTENDEE, WAITER_B] {
+        join(&pool, room, user).await;
+        keepalive_ok(&pool, room, user).await;
+    }
+
+    travel_keeping_owner(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    keepalive_ok(&pool, room, WAITER_B).await;
+    send(
+        &pool,
+        "PATCH",
+        &format!("/api/v1/meetings/{room}"),
+        OWNER,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    assert_eq!(row(&pool, room, WAITER_B).await.status, "admitted");
+    assert_eq!(presence_seen_at_of(&pool, room, WAITER_B).await, None);
+    assert_eq!(row(&pool, room, ATTENDEE).await.status, "waiting");
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn keepalive_renews_a_waiting_row_but_not_a_rejected_kicked_left_or_ended_one() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-keepalive-scope";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    for user in [ATTENDEE, WAITER_B, WAITER_C, WAITER_D] {
+        join(&pool, room, user).await;
+        keepalive_ok(&pool, room, user).await;
+    }
+    assert!(presence_seen_at_of(&pool, room, ATTENDEE).await.is_some());
+
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/reject"),
+        OWNER,
+        serde_json::json!({ "user_id": WAITER_B }),
+    )
+    .await;
+    assert_eq!(admit_status(&pool, room, WAITER_C).await, StatusCode::OK);
+    transport(&pool, room, WAITER_C, S2, true).await;
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/kick"),
+        OWNER,
+        serde_json::json!({ "user_id": WAITER_C }),
+    )
+    .await;
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/leave"),
+        WAITER_D,
+        serde_json::json!({}),
+    )
+    .await;
+
+    travel(&pool, room, 1).await;
+    for (user, status) in [
+        (WAITER_B, "rejected"),
+        (WAITER_C, "kicked"),
+        (WAITER_D, "left"),
+    ] {
+        assert_eq!(row(&pool, room, user).await.status, status);
+        let before = presence_seen_at_of(&pool, room, user).await;
+        assert!(before.is_some(), "{user} renewed before leaving the queue");
+        assert_eq!(
+            keepalive_status(&pool, room, user).await,
+            StatusCode::NOT_FOUND,
+            "{user} is {status}"
+        );
+        assert_eq!(presence_seen_at_of(&pool, room, user).await, before);
+    }
+
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/end"),
+        OWNER,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        keepalive_status(&pool, room, ATTENDEE).await,
+        StatusCode::NOT_FOUND
+    );
+    join(&pool, room, OWNER).await;
+    keepalive_ok(&pool, room, ATTENDEE).await;
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_waiting_guest_renews_with_their_observer_token_only() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-guest";
+    create(&pool, room, serde_json::json!({ "allow_guests": true })).await;
+    join(&pool, room, OWNER).await;
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/meetings/{room}/join-guest"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "display_name": "Waiting Guest" }).to_string(),
+        ))
+        .unwrap();
+    let resp = build_app(pool.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let joined: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert_eq!(joined.result.status, "waiting");
+    let guest = joined.result.user_id;
+    let observer = joined.result.observer_token.expect("observer token");
+
+    assert_eq!(
+        keepalive_guest_status(&pool, room, &observer).await,
+        StatusCode::OK
+    );
+    travel(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    assert!(waiting_list(&pool, room).await.is_empty());
+    assert_eq!(
+        keepalive_guest_status(&pool, room, &observer).await,
+        StatusCode::OK
+    );
+    assert_eq!(waiting_list(&pool, room).await, [guest.as_str()]);
+
+    let other_meeting = meeting_api::token::generate_observer_token(
+        TEST_JWT_SECRET,
+        &guest,
+        "some-other-room",
+        "Waiting Guest",
+        true,
+    )
+    .unwrap();
+    join(&pool, room, ATTENDEE).await;
+    let not_a_guest =
+        meeting_api::token::generate_observer_token(TEST_JWT_SECRET, ATTENDEE, room, "A", false)
+            .unwrap();
+    for bearer in [other_meeting, not_a_guest] {
+        assert_eq!(
+            keepalive_guest_status(&pool, room, &bearer).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(presence_seen_at_of(&pool, room, ATTENDEE).await, None);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn the_waiting_list_keeps_arrival_order_across_keepalives_and_requeues() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-order";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, WAITER_D).await;
+    assert_eq!(admit_status(&pool, room, WAITER_D).await, StatusCode::OK);
+    for user in [WAITER_C, ATTENDEE, WAITER_B] {
+        join(&pool, room, user).await;
+    }
+    let arrival = [WAITER_C, ATTENDEE, WAITER_B];
+    assert_eq!(waiting_order(&pool, room).await, arrival);
+    for user in [WAITER_C, ATTENDEE, WAITER_B, WAITER_C] {
+        keepalive_ok(&pool, room, user).await;
+        assert_eq!(
+            waiting_order(&pool, room).await,
+            arrival,
+            "after {user}'s keepalive"
+        );
+    }
+
+    send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room}/leave"),
+        WAITER_D,
+        serde_json::json!({}),
+    )
+    .await;
+    join(&pool, room, WAITER_D).await;
+    join(&pool, room, WAITER_C).await;
+    assert_eq!(
+        waiting_order(&pool, room).await,
+        [WAITER_C, ATTENDEE, WAITER_B, WAITER_D]
+    );
+
+    travel(&pool, room, PRESENCE_LEASE_SECS + 1).await;
+    assert_eq!(waiting_order(&pool, room).await, [WAITER_C, WAITER_D]);
+    join(&pool, room, ATTENDEE).await;
+    assert_eq!(
+        waiting_order(&pool, room).await,
+        [WAITER_C, WAITER_D, ATTENDEE]
+    );
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn an_admitted_waiter_is_present_through_the_connect_window_until_they_renew() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-admitted-presence";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    keepalive_ok(&pool, room, ATTENDEE).await;
+    assert_eq!(admit_status(&pool, room, ATTENDEE).await, StatusCode::OK);
+    assert_eq!(present_count(&pool, room).await, 2);
+
+    travel(&pool, room, PRESENCE_CONNECT_WINDOW_SECS + 1).await;
+    assert_eq!(present_count(&pool, room).await, 0);
+    keepalive_ok(&pool, room, ATTENDEE).await;
+    assert_eq!(present_count(&pool, room).await, 1);
+    assert!(!in_call(&pool, room, ATTENDEE).await);
+    cleanup_test_data(&pool, room).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn the_migration_relists_a_waiting_row_the_old_upsert_left_a_stale_presence_on() {
+    let pool = get_test_pool().await;
+    let room = "lease-waiting-migration";
+    create(&pool, room, serde_json::json!({})).await;
+    join(&pool, room, OWNER).await;
+    transport(&pool, room, OWNER, S1, true).await;
+    join(&pool, room, ATTENDEE).await;
+    sqlx::query(
+        "UPDATE meeting_participants SET presence_seen_at = NOW() - INTERVAL '1 hour' \
+         WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(meeting(&pool, room).await.id)
+    .bind(ATTENDEE)
+    .execute(&pool)
+    .await
+    .expect("a stale presence_seen_at the pre-#2912 upsert kept");
+    assert!(waiting_list(&pool, room).await.is_empty());
+    let owner_seen = presence_seen_at_of(&pool, room, OWNER).await;
+    assert!(owner_seen.is_some());
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dbmate/db/migrations/20260930000000_clear_waiting_presence_seen_at.sql"
+    );
+    let migration = std::fs::read_to_string(path).expect("migration file");
+    let up = migration
+        .split("-- migrate:down")
+        .next()
+        .expect("up section");
+    sqlx::raw_sql(up)
+        .execute(&pool)
+        .await
+        .expect("migration up");
+
+    assert_eq!(waiting_list(&pool, room).await, [ATTENDEE]);
+    assert_eq!(presence_seen_at_of(&pool, room, OWNER).await, owner_seen);
     cleanup_test_data(&pool, room).await;
 }

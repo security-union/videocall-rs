@@ -1,0 +1,362 @@
+{
+  "_comment": [
+    "Fail-closed rules of the run-manifest collector (#2914 PR-3) against the integration and property suite:",
+    "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-collect-integration.json"
+  ],
+  "runner": "unittest",
+  "cwd": ".",
+  "command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "scripts/quality",
+    "-p",
+    "test_cq_collect_integration.py"
+  ],
+  "baseline_tests": 22,
+  "mutations": [
+    {
+      "name": "missing record dropped silently",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            missing.append(f\"{uid}: no participant record\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_missing_record_is_partial_and_named"
+      ]
+    },
+    {
+      "name": "null join_ts dropped silently",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            missing.append(f\"{uid}: join_ts is null in {rec.source}\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_null_join_ts_is_partial_and_named"
+      ]
+    },
+    {
+      "name": "extra record accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"{uid}: record {rec.source} is not in the plan\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_an_extra_unknown_record_is_an_error"
+      ]
+    },
+    {
+      "name": "null user_id accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"{rec.source}: user_id is null; the session cannot be identified (G-V8)\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_duplicate_clashing_or_null_user_id_is_an_error"
+      ]
+    },
+    {
+      "name": "user_id clash accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"{uid}: two records, {by_uid[uid].source} and {rec.source} (G-V8)\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_duplicate_clashing_or_null_user_id_is_an_error"
+      ]
+    },
+    {
+      "name": "dead participant gets leave_ts null, not absent",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if p.get(\"leave_ts\") is not None or not died:",
+      "replace": "    if True:",
+      "expect_kills": [
+        "test_a_process_stopped_after_its_confirmed_final_leave"
+      ]
+    },
+    {
+      "name": "a stop after teardown counts as a death",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "(stop is not None and stop < (math.inf if teardown is None else teardown))",
+      "replace": "(stop is not None)",
+      "expect_kills": [
+        "test_a_missing_record_is_partial_and_named"
+      ]
+    },
+    {
+      "name": "D34 check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    _talkers_unmuted(parts, steps, manifest_events, errors)\n",
+      "replace": "",
+      "expect_kills": [
+        "test_a_talker_unmuted_at_or_after_hold_start_is_an_error",
+        "test_a_failed_unmute_of_a_talker_muted_at_join_is_an_error"
+      ]
+    },
+    {
+      "name": "D34 not strict",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "if e[\"at\"] < s[\"hold_start\"]:",
+      "replace": "if e[\"at\"] <= s[\"hold_start\"]:",
+      "expect_kills": [
+        "test_a_talker_unmuted_at_or_after_hold_start_is_an_error"
+      ]
+    },
+    {
+      "name": "unmute dated at t_issued",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "AT_CONFIRMED = (\"unmute\",)",
+      "replace": "AT_CONFIRMED = ()",
+      "expect_kills": [
+        "test_a_talker_unmuted_at_or_after_hold_start_is_an_error"
+      ]
+    },
+    {
+      "name": "D35 unconfirmed events written",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if e.get(\"result\") != \"ok\" or not _num(e.get(\"t_confirmed\")):\n            errors.append(f\"events: {action} for {', '.join(parts)} was not confirmed (result {e.get('result')!r})\")\n            continue\n",
+      "replace": "",
+      "expect_kills": [
+        "test_an_unconfirmed_planned_leave_is_an_error",
+        "test_a_failed_event_with_no_effect"
+      ]
+    },
+    {
+      "name": "leave dated at t_confirmed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "AT_CONFIRMED = (\"unmute\",)",
+      "replace": "AT_CONFIRMED = (\"unmute\", \"leave\")",
+      "expect_kills": [
+        "test_a_planned_leave_confirmed_late_is_credited_at_t_issued"
+      ]
+    },
+    {
+      "name": "partial manifest keeps the scorable schema",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "PARTIAL_SCHEMA = cq_manifest.SCHEMA + \"-partial\"",
+      "replace": "PARTIAL_SCHEMA = cq_manifest.SCHEMA",
+      "expect_kills": [
+        "test_a_missing_record_is_partial_and_named",
+        "test_a_null_join_ts_is_partial_and_named",
+        "test_a_missing_step_mark_or_teardown_is_partial"
+      ]
+    },
+    {
+      "name": "missing step mark not partial",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                missing.append(f\"step {s['step_id']}: no {kind} in {EVENTS_FILE}\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_missing_step_mark_or_teardown_is_partial"
+      ]
+    },
+    {
+      "name": "missing teardown_start not partial",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        missing.append(f\"no teardown_start in {EVENTS_FILE}\")",
+      "replace": "        pass",
+      "expect_kills": [
+        "test_a_missing_step_mark_or_teardown_is_partial"
+      ]
+    },
+    {
+      "name": "stale outputs kept",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    clear_outputs(out_dir)\n",
+      "replace": "",
+      "expect_kills": [
+        "test_a_missing_record_is_partial_and_named",
+        "test_an_extra_unknown_record_is_an_error"
+      ]
+    },
+    {
+      "name": "publishes cross-check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if p.get(\"publishes\") != planned[\"publishes\"]:",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "unverified publishes ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "str(u.get(\"field\", \"\")).startswith(\"publishes\")",
+      "replace": "False",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "unknown network accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if not isinstance(net, dict) or net.get(\"profile\") == \"unknown\" or not isinstance(net.get(\"shaped\"), bool):",
+      "replace": "    if not isinstance(net, dict):",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "node without alias accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                errors.append(f\"{uid}: placement.node has no alias in the plan's node_aliases\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "event outside every step accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                errors.append(f\"events: {action} at {at} for {', '.join(parts)} is outside every step window\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "scorer validator not run",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    invalid = cq_manifest.validate_manifest(manifest)",
+      "replace": "    invalid = []",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "fleet/observer/talker cross-check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    for k in (\"fleet\", \"observer\", \"talker\"):",
+      "replace": "    for k in ():",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "browser role cross-check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if p.get(\"fleet\") == \"browser\" and p.get(\"role\") not in (None, planned[\"role\"]):",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "missing image id accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if absent:\n",
+      "replace": "    if False:\n",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "Rust file from another meeting accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if f.get(\"meeting_id\") != meeting_id:",
+      "replace": "        if False:",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "event naming an unplanned participant accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if unknown:\n            errors.append(f\"events: {action} names",
+      "replace": "        if False:\n            errors.append(f\"events: {action} names",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "preflight count not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if len(pre) != 1:",
+      "replace": "    if not pre:",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "preflight commit not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        errors.append(\"events: preflight needs a commit string and a boolean dirty\")",
+      "replace": "        pass",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "step mark recorded twice accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                errors.append(f\"events: {e['type']} for step {key[0]!r} recorded twice\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "mark naming an unknown step accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        errors.append(f\"events: {kind} names unknown step {sid!r}\")",
+      "replace": "        pass",
+      "expect_kills": [
+        "test_a_record_contradicting_the_plan_or_run_is_an_error"
+      ]
+    },
+    {
+      "name": "partial written as manifest.json",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if result.missing:\n        _write(",
+      "replace": "    if False:\n        _write(",
+      "expect_kills": [
+        "test_a_missing_record_is_partial_and_named",
+        "test_a_missing_step_mark_or_teardown_is_partial"
+      ]
+    },
+    {
+      "name": "clock window not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        _check_clocks(by_uid.values(), (min(joins) - tol, max(ends) + tol), errors)",
+      "replace": "        pass",
+      "expect_kills": [
+        "test_a_record_clock_minutes_behind_is_an_error"
+      ]
+    },
+    {
+      "name": "departure check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                _departure(uid, rec, stop, teardown, _final_leave(manifest_events, uid), cover_s, errors)",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_process_that_died_in_the_last_scrape_of_the_hold",
+        "test_a_process_that_died_mid_hold_without_a_final_leave",
+        "test_a_mid_hold_leave_with_no_event"
+      ]
+    },
+    {
+      "name": "unconfirmed event dropped silently",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"events: {action} for {', '.join(parts)} was not confirmed (result {e.get('result')!r})\")\n",
+      "replace": "",
+      "expect_kills": [
+        "test_a_failed_event_with_no_effect_is_an_error"
+      ]
+    },
+    {
+      "name": "teardown_start before hold_end accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "st.get(\"hold_end\", -math.inf) > teardown)",
+      "replace": "False)",
+      "expect_kills": [
+        "test_a_teardown_start_before_hold_end_is_an_error"
+      ]
+    },
+    {
+      "name": "Rust talker media check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    _rust_talkers_media(parts, by_uid, steps, errors)\n",
+      "replace": "",
+      "expect_kills": [
+        "test_a_rust_talker_whose_media_starts_after_hold_start_is_an_error"
+      ]
+    }
+  ]
+}

@@ -29,6 +29,8 @@ use sqlx::PgPool;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
+/// The allowed origin of [`build_state`]'s `AppState`.
+pub const TEST_ORIGIN: &str = "https://app.test";
 const TEST_TOKEN_TTL: i64 = 600;
 const TEST_SESSION_TTL: i64 = 3600;
 
@@ -119,6 +121,13 @@ pub fn build_state(
             std::collections::HashMap::new(),
         )),
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        kick_rate_limiter: std::sync::Arc::new(
+            meeting_api::rate_limit::KeyedRateLimiter::for_host_kicks(),
+        ),
+        recording: std::sync::Arc::new(meeting_api::recording::RecordingGuard::new(
+            vec![TEST_ORIGIN.to_string()],
+            false,
+        )),
         search: None,
         display_name_rate_limit_disabled: false,
         dev_user,

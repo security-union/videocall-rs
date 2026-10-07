@@ -203,7 +203,7 @@ const MAX_SESSION_COOKIE_CANDIDATES: usize = 8;
 /// more than once when it is set at more than one scope (host-only plus
 /// `Domain=`-scoped), and RFC 6265 sorts by path length and creation time, not
 /// by domain scope — the user's own session is not necessarily first.
-fn session_cookie_candidates<'a>(
+pub(crate) fn session_cookie_candidates<'a>(
     cookie_header: &'a str,
     cookie_name: &'a str,
 ) -> impl Iterator<Item = &'a str> + 'a {
@@ -425,6 +425,10 @@ mod tests {
             display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
+            kick_rate_limiter: std::sync::Arc::new(
+                crate::rate_limit::KeyedRateLimiter::for_host_kicks(),
+            ),
+            recording: Default::default(),
             search: None,
             display_name_rate_limit_disabled: false,
             dev_user: None,
@@ -946,6 +950,10 @@ mod tests {
             display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
+            kick_rate_limiter: std::sync::Arc::new(
+                crate::rate_limit::KeyedRateLimiter::for_host_kicks(),
+            ),
+            recording: Default::default(),
             search: None,
             display_name_rate_limit_disabled: false,
             dev_user: None,
@@ -1368,6 +1376,7 @@ mod tests {
             exp: now + 600,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: typ.map(str::to_string),
+            iat: Some(now),
         };
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),

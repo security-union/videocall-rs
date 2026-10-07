@@ -61,6 +61,8 @@ fn main() {
     let level_filter = constants::log_level();
     log::set_max_level(level_filter);
 
+    constants::snapshot_diagnostics_packets_url_param();
+
     // Issue #1080: install the `window.__vcNetsim` runtime control surface
     // BEFORE the component tree mounts and before any meeting is joined, so
     // the Playwright harness can arm downlink impairment pre-join and toggle

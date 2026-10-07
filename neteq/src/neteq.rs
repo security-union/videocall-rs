@@ -1750,6 +1750,49 @@ mod tests {
     }
 
     #[test]
+    fn audio_packets_after_an_89_5s_sequence_gap_insert_and_decode_without_panicking() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        for seq in [0u16, 4_475, 4_476] {
+            neteq
+                .insert_packet(create_48k_20ms_packet(seq, u32::from(seq) * 960))
+                .unwrap();
+        }
+        assert!(!neteq.is_empty());
+        for _ in 0..20 {
+            neteq.get_audio().unwrap();
+        }
+        neteq.get_statistics();
+    }
+
+    #[test]
+    fn audio_sequence_reset_after_an_89_5s_session_inserts_without_panicking() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        for seq in 5_000u32..5_300 {
+            neteq
+                .insert_packet(create_48k_20ms_packet(seq as u16, seq * 960))
+                .unwrap();
+            neteq.get_audio().unwrap();
+            neteq.get_audio().unwrap();
+        }
+        for seq in 0u16..2 {
+            neteq
+                .insert_packet(create_48k_20ms_packet(seq, u32::from(seq) * 960))
+                .unwrap();
+        }
+        assert!(!neteq.is_empty());
+    }
+
+    #[test]
     fn test_packet_insertion() {
         let config = NetEqConfig::default();
         let mut neteq = NetEq::new(config).unwrap();

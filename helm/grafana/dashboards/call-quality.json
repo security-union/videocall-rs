@@ -1,0 +1,1917 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Call quality diagnostic view: per-observer A, V and Q and per-participant S for one meeting over a hold window, using the scorer's definitions and red bands. Not the verdict.",
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Meeting Investigation",
+      "tooltip": "Server health and relay drops",
+      "type": "link",
+      "url": "/d/videocall-investigation"
+    }
+  ],
+  "panels": [
+    {
+      "type": "text",
+      "title": "Read this first",
+      "options": {
+        "mode": "markdown",
+        "content": "**Diagnostic view, not the verdict.** Validity gates, observer/talker roles and cells (U\u00d7U, U\u00d7S) come from the run manifest. Run the scorer (`scripts/quality/call_quality_score.py`) for PASS/FAIL/INVALID.\n\n- **Time range = the hold.** Set the time range to the hold: `from=<hold_start ms>&to=<hold_end ms>`. Hold values are evaluated at the end of the range over the whole range.\n- **observers (regex)**: receiver user ids for A, V and Q. **talkers (regex)**: publisher user ids for A; set it to the declared continuous talkers, because a participant who is not talking counts as concealed audio here. **S participants (regex)**: whose S is shown; the scorer's G-Q9 uses every unshaped participant.\n- Values follow the scorer's definitions and red bands but are not exact: for A and V, PromQL drops missing samples and pairs that the scorer counts as loss, and the 15 s grid of A and Q is aligned to the epoch, not to the hold.\n- **Reconnects.** For A, V and Q, only each observer's most recently started session that is still reporting counts, as in the scorer, except when: two sessions of one observer are first seen in the same scrape (one is kept here; the scorer drops the samples where they disagree and fails G-Q8); a publisher reconnects (both of its sessions count here; the scorer fails G-Q8); an observer session has no `videocall_client_packets_sent_per_sec` (its pairs are missing here; the scorer still scores them); or a newer session reports `videocall_client_packets_sent_per_sec` before, or without, its per-pair series (the old session's values are dropped here from the newer session's first report, so the observer has no A, V or Q samples until the newer pairs appear, or for the rest of the hold if they never do; the scorer keeps the old session's values and fails G-Q8 when the newer pairs never appear).\n- Server health: see the Meeting Investigation dashboard (link above)."
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "id": 2,
+      "panels": [],
+      "title": "Run header",
+      "type": "row"
+    },
+    {
+      "type": "stat",
+      "title": "Participants seen",
+      "description": "Distinct peer_id with a videocall_peer_info series during the range.",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "count(count by (peer_id) (last_over_time(videocall_peer_info{meeting_id=\"$meeting\"}[$__range])))",
+          "legendFormat": "participants",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 0,
+        "y": 7
+      },
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Transport mix (observers)",
+      "description": "Observer sessions by server_type of videocall_client_active_server_rtt_ms during the range.",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "count by (server_type) (max by (server_type, session_id) (last_over_time(videocall_client_active_server_rtt_ms{meeting_id=\"$meeting\",peer_id=~\"$obs\"}[$__range])))",
+          "legendFormat": "{{server_type}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 4,
+        "y": 7
+      },
+      "id": 4
+    },
+    {
+      "type": "timeseries",
+      "title": "Reporters over time",
+      "description": "Sessions reporting HEALTH (videocall_client_packets_sent_per_sec) and observers reporting per-pair series (videocall_peer_can_listen). A drop is a reporting gap, not a quality signal.",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "interval": "15s",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "count(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\"})",
+          "legendFormat": "sessions reporting",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "count(count by (from_peer) (videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"}))",
+          "legendFormat": "observers with per-pair series",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 14,
+        "x": 10,
+        "y": 7
+      },
+      "id": 5
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "id": 6,
+      "panels": [],
+      "title": "Audio (A): concealed share of talker audio",
+      "type": "row"
+    },
+    {
+      "type": "timeseries",
+      "title": "A per observer over time",
+      "description": "Per observer, the share of talker audio that was concealed or not delivered. Per pair and 15 s sample: max(min(expand_ops / 100, 1), max(0, 1 - videocall_neteq_packets_per_sec / 50)), or 1 when videocall_peer_can_listen is not 1. Only publishers matching talkers count, and a silent gap of a declared talker counts as loss. videocall_audio_concealment_pct is deliberately not used (it overstates about 2x and its denominator moves). A missing pair shows as no data, never as 0, where the scorer counts it as loss.\n\ncq:A:series",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "interval": "15s",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (from_peer) (sum_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__interval:15s]))\n/\nsum by (from_peer) (count_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__interval:15s]))",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "id": 7
+    },
+    {
+      "type": "bargauge",
+      "title": "A per observer over the hold",
+      "description": "Per observer, the share of talker audio that was concealed or not delivered. Per pair and 15 s sample: max(min(expand_ops / 100, 1), max(0, 1 - videocall_neteq_packets_per_sec / 50)), or 1 when videocall_peer_can_listen is not 1. Only publishers matching talkers count, and a silent gap of a declared talker counts as loss. videocall_audio_concealment_pct is deliberately not used (it overstates about 2x and its denominator moves). A missing pair shows as no data, never as 0, where the scorer counts it as loss. Set the time range to the hold: `from=<hold_start ms>&to=<hold_end ms>`. Hold values are evaluated at the end of the range over the whole range.\n\ncq:A:hold",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "percentunit",
+          "decimals": 4,
+          "max": 0.1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sort_desc(\nsum by (from_peer) (sum_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\nsum by (from_peer) (count_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n)",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 14
+      },
+      "id": 8
+    },
+    {
+      "type": "stat",
+      "title": "p95 A",
+      "description": "Linear-interpolation p95 of the per-observer concealed share, the same method as the scorer's percentile(). Red only above the red band: the scorer's G-Q3 fails when p95 > red.\n\ncq:A:p95",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05000000000000001
+              }
+            ]
+          },
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "quantile(0.95,\nsum by (from_peer) (sum_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\nsum by (from_peer) (count_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n)",
+          "legendFormat": "p95",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 18,
+        "y": 14
+      },
+      "id": 9
+    },
+    {
+      "type": "stat",
+      "title": "k in red (A)",
+      "description": "Observers whose concealed share is at or above the red band (the scorer's k_red). The scorer's G-Q3 fails at 2 or more, or when p95 > red. No data when nothing reports.\n\ncq:A:k",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(\nsum by (from_peer) (sum_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\nsum by (from_peer) (count_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n>= bool 0.05\n)",
+          "legendFormat": "k",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 21,
+        "y": 14
+      },
+      "id": 10
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "id": 11,
+      "panels": [],
+      "title": "Video (V, Q): freezes and near-frozen decoded video",
+      "type": "row"
+    },
+    {
+      "type": "timeseries",
+      "title": "V per observer over time",
+      "description": "Per observer, freeze seconds (videocall_video_freeze_seconds_total, decoder-output gaps over 1 s) divided by decoded tile-time: per 15 s step, one step when decoded video fps > 0, else that step's freeze increase. A counter that drops restarts from its new value, and a series' first sample counts from 0, as in the scorer. After an observer reconnects, the new session's first sample counts in full here only when it is at or above the old session's last; the scorer then counts only the rise. A missing pair shows as no data, never as 0, where the scorer counts it as loss.\n\ncq:V:series",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "interval": "15s",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.03
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (from_peer) (sum_over_time((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__interval:15s]))\n/\n(sum by (from_peer) (sum_over_time(max by (from_peer, to_peer) (label_replace((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))), \"term\", \"freeze\", \"\", \"\") or ((15 * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))))[$__interval:15s])) > 0)",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "id": 12
+    },
+    {
+      "type": "bargauge",
+      "title": "V per observer over the hold",
+      "description": "Per observer, freeze seconds (videocall_video_freeze_seconds_total, decoder-output gaps over 1 s) divided by decoded tile-time: per 15 s step, one step when decoded video fps > 0, else that step's freeze increase. A counter that drops restarts from its new value, and a series' first sample counts from 0, as in the scorer. After an observer reconnects, the new session's first sample counts in full here only when it is at or above the old session's last; the scorer then counts only the rise. A missing pair shows as no data, never as 0, where the scorer counts it as loss. Set the time range to the hold: `from=<hold_start ms>&to=<hold_end ms>`. Hold values are evaluated at the end of the range over the whole range.\n\ncq:V:hold",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "percentunit",
+          "decimals": 4,
+          "max": 0.06,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.03
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sort_desc(\nsum by (from_peer) (sum_over_time((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(max by (from_peer, to_peer) (label_replace((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))), \"term\", \"freeze\", \"\", \"\") or ((15 * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))))[$__range:15s])) > 0)\n)",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 23
+      },
+      "id": 13
+    },
+    {
+      "type": "stat",
+      "title": "p95 V",
+      "description": "Linear-interpolation p95 of the per-observer freeze share, the same method as the scorer's percentile(). Red only above the red band: the scorer's G-Q4 fails when p95 > red.\n\ncq:V:p95",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.030000000000000002
+              }
+            ]
+          },
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "quantile(0.95,\nsum by (from_peer) (sum_over_time((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(max by (from_peer, to_peer) (label_replace((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))), \"term\", \"freeze\", \"\", \"\") or ((15 * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))))[$__range:15s])) > 0)\n)",
+          "legendFormat": "p95",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 18,
+        "y": 23
+      },
+      "id": 14
+    },
+    {
+      "type": "stat",
+      "title": "k in red (V)",
+      "description": "Observers whose freeze share is at or above the red band (the scorer's k_red). The scorer's G-Q4 fails at 2 or more, or when p95 > red. No data when nothing reports.\n\ncq:V:k",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(\nsum by (from_peer) (sum_over_time((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(max by (from_peer, to_peer) (label_replace((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))), \"term\", \"freeze\", \"\", \"\") or ((15 * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))))[$__range:15s])) > 0)\n>= bool 0.03\n)",
+          "legendFormat": "k",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 21,
+        "y": 23
+      },
+      "id": 15
+    },
+    {
+      "type": "timeseries",
+      "title": "Q per observer over time",
+      "description": "Per observer, the share of decoded tile samples with 0 < decoded video fps < 5. Samples at 0 fps are left to V. Q is reported, not gated.\n\ncq:Q:series",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "interval": "15s",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (from_peer) (sum_over_time((((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} < bool 5)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__interval:15s]))\n/\n(sum by (from_peer) (sum_over_time(((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__interval:15s])) > 0)",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
+      "id": 16
+    },
+    {
+      "type": "bargauge",
+      "title": "Q per observer over the hold",
+      "description": "Per observer, the share of decoded tile samples with 0 < decoded video fps < 5. Samples at 0 fps are left to V. Q is reported, not gated. Set the time range to the hold: `from=<hold_start ms>&to=<hold_end ms>`. Hold values are evaluated at the end of the range over the whole range.\n\ncq:Q:hold",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "percentunit",
+          "decimals": 4,
+          "max": 0.2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sort_desc(\nsum by (from_peer) (sum_over_time((((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} < bool 5)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s])) > 0)\n)",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 31
+      },
+      "id": 17
+    },
+    {
+      "type": "stat",
+      "title": "p95 Q",
+      "description": "Linear-interpolation p95 of the per-observer near-frozen share, the same method as the scorer's percentile(). Q is reported, not gated.\n\ncq:Q:p95",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.10000000000000002
+              }
+            ]
+          },
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "quantile(0.95,\nsum by (from_peer) (sum_over_time((((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} < bool 5)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s])) > 0)\n)",
+          "legendFormat": "p95",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 18,
+        "y": 31
+      },
+      "id": 18
+    },
+    {
+      "type": "stat",
+      "title": "k in red (Q)",
+      "description": "Observers whose near-frozen share is at or above the red band (the scorer's k_red). Q is reported, not gated. No data when nothing reports.\n\ncq:Q:k",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(\nsum by (from_peer) (sum_over_time((((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} < bool 5)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s])) > 0)\n>= bool 0.1\n)",
+          "legendFormat": "k",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 21,
+        "y": 31
+      },
+      "id": 19
+    },
+    {
+      "type": "timeseries",
+      "title": "Publisher active video layers",
+      "description": "videocall_encoder_active_layers for camera publishers: the number of video layers each publisher encodes (1 = video layer 0 only, 3 = video layers 0 to 2). A drop is video layer shedding on the publish side.",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "interval": "15s",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (peer_id) (videocall_encoder_active_layers{meeting_id=\"$meeting\",media_kind=~\"camera|video\"})",
+          "legendFormat": "{{peer_id}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "id": 20
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      },
+      "id": 21,
+      "panels": [],
+      "title": "Stability (S): unplanned reconnects",
+      "type": "row"
+    },
+    {
+      "type": "bargauge",
+      "title": "S per participant over the hold",
+      "description": "Per participant matching S participants: sessions (videocall_client_packets_sent_per_sec) first seen inside the range, minus 1 if the participant had no session before it (joined inside the range), minus proceeded re-elections (videocall_client_reelection_total{result=\"proceeded\"}, absent counts as 0), floored at 0, per hour of the range. Declared rejoins are not subtracted (manifest facts). Set the time range to the hold: `from=<hold_start ms>&to=<hold_end ms>`. Hold values are evaluated at the end of the range over the whole range.\n\ncq:S:hold",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "none",
+          "decimals": 2,
+          "max": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sort_desc(\nclamp_min((count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range])) unless on (session_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0 + 1 unless on (peer_id) count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (sum by (peer_id) ((last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) - (videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"} offset $__range or last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) * 0)) * on (session_id) group_left (peer_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0), 0)\n/ ($__range_s / 3600)\n)",
+          "legendFormat": "{{peer_id}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 0,
+        "y": 46
+      },
+      "id": 22
+    },
+    {
+      "type": "stat",
+      "title": "p95 S",
+      "description": "Linear-interpolation p95 of the per-participant S, the same method as the scorer's percentile(). Red only above the red band: the scorer's G-Q9 fails when p95 > red.\n\ncq:S:p95",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1.0000000000000002
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "quantile(0.95,\nclamp_min((count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range])) unless on (session_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0 + 1 unless on (peer_id) count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (sum by (peer_id) ((last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) - (videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"} offset $__range or last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) * 0)) * on (session_id) group_left (peer_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0), 0)\n/ ($__range_s / 3600)\n)",
+          "legendFormat": "p95",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 9,
+        "y": 46
+      },
+      "id": 23
+    },
+    {
+      "type": "stat",
+      "title": "k in red (S)",
+      "description": "Participants whose S is at or above the red band (the scorer's k_red). The scorer's G-Q9 fails at 2 or more, or when p95 > red. No data when nothing reports.\n\ncq:S:k",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(\nclamp_min((count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range])) unless on (session_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0 + 1 unless on (peer_id) count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (sum by (peer_id) ((last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) - (videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"} offset $__range or last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) * 0)) * on (session_id) group_left (peer_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0), 0)\n/ ($__range_s / 3600)\n>= bool 1\n)",
+          "legendFormat": "k",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 3,
+        "x": 12,
+        "y": 46
+      },
+      "id": 24
+    },
+    {
+      "type": "bargauge",
+      "title": "Sessions per participant",
+      "description": "Distinct session_id per peer_id with a videocall_client_packets_sent_per_sec sample in the range.",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "none",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sort_desc(count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))))",
+          "legendFormat": "{{peer_id}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 15,
+        "y": 46
+      },
+      "id": 25
+    },
+    {
+      "type": "bargauge",
+      "title": "Re-election outcomes",
+      "description": "Increase of videocall_client_reelection_total by result over the range. The series appears only after the first re-election, so none reads 0 while the meeting reports.",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "none",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (result) (last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\"}[$__range]) - (videocall_client_reelection_total{meeting_id=\"$meeting\"} offset $__range or last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\"}[$__range]) * 0))\nor label_replace(count(last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\"}[$__range])) * 0, \"result\", \"none\", \"\", \"\")",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 5,
+        "x": 19,
+        "y": 46
+      },
+      "id": 26
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 54
+      },
+      "id": 27,
+      "panels": [],
+      "title": "Latency (L)",
+      "type": "row"
+    },
+    {
+      "type": "text",
+      "title": "Latency is not gated",
+      "options": {
+        "mode": "markdown",
+        "content": "**latency not gated: #2948 pending.** The audio-timestamp delay metric does not exist yet. The panels to the right are diagnostics and never gate."
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 55
+      },
+      "id": 28
+    },
+    {
+      "type": "timeseries",
+      "title": "Worst decoded tile staleness per observer (diagnostic)",
+      "description": "Max videocall_video_content_staleness_ms over an observer's tiles, only while the tile decodes (decoded video fps > 0).",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "interval": "15s",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (from_peer) (videocall_video_content_staleness_ms{meeting_id=\"$meeting\",from_peer=~\"$obs\"} and on (session_id, from_peer, to_peer) (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > 0))",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 9,
+        "x": 6,
+        "y": 55
+      },
+      "id": 29
+    },
+    {
+      "type": "timeseries",
+      "title": "Client to relay RTT (diagnostic)",
+      "description": "videocall_client_active_server_rtt_ms per observer and transport.",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "interval": "15s",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (peer_id, server_type) (videocall_client_active_server_rtt_ms{meeting_id=\"$meeting\",peer_id=~\"$obs\"})",
+          "legendFormat": "{{peer_id}} {{server_type}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 9,
+        "x": 15,
+        "y": 55
+      },
+      "id": 30
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 62
+      },
+      "id": 31,
+      "panels": [],
+      "title": "Participants",
+      "type": "row"
+    },
+    {
+      "type": "table",
+      "title": "Participants, worst A first",
+      "description": "One row per participant: A, V and Q for observers, S for S participants, over the hold. A missing pair shows as no data, never as 0, where the scorer counts it as loss. Set the time range to the hold: `from=<hold_start ms>&to=<hold_end ms>`. Hold values are evaluated at the end of the range over the whole range.\n\ncq:table",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.05
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "V"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.03
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Q"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "S"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "A"
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "participant": 0,
+              "Value #A": 1,
+              "Value #V": 2,
+              "Value #Q": 3,
+              "Value #S": 4
+            },
+            "renameByName": {
+              "Value #A": "A",
+              "Value #V": "V",
+              "Value #Q": "Q",
+              "Value #S": "S"
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (participant) (label_replace(\nsum by (from_peer) (sum_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\nsum by (from_peer) (count_over_time(((((((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) and on (session_id, from_peer, to_peer) videocall_peer_can_listen{meeting_id=\"$meeting\",from_peer=~\"$obs\"} == 1) or on (session_id, from_peer, to_peer) (((clamp_max(videocall_neteq_expand_ops_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"}, 100) / 100 > clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) or clamp_min(1 - videocall_neteq_packets_per_sec{meeting_id=\"$meeting\",from_peer=~\"$obs\"} / 50, 0)) * 0 + 1)) * on (to_peer) group_left () max by (to_peer) (label_replace(videocall_peer_info{meeting_id=\"$meeting\",peer_id=~\"$talkers\"}, \"to_peer\", \"$1\", \"session_id\", \"(.*)\"))) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n, \"participant\", \"$1\", \"from_peer\", \"(.*)\"))",
+          "legendFormat": "{{from_peer}}",
+          "refId": "A",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (participant) (label_replace(\nsum by (from_peer) (sum_over_time((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(max by (from_peer, to_peer) (label_replace((((videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} - last_over_time(videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"}[5m] offset 15s)) >= 0 or videocall_video_freeze_seconds_total{meeting_id=\"$meeting\",from_peer=~\"$obs\"} * 1) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))), \"term\", \"freeze\", \"\", \"\") or ((15 * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end())))))[$__range:15s])) > 0)\n, \"participant\", \"$1\", \"from_peer\", \"(.*)\"))",
+          "legendFormat": "{{from_peer}}",
+          "refId": "V",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (participant) (label_replace(\nsum by (from_peer) (sum_over_time((((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) * (videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} < bool 5)) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s]))\n/\n(sum by (from_peer) (sum_over_time(((videocall_video_fps{meeting_id=\"$meeting\",from_peer=~\"$obs\"} > bool 0) and on (session_id) topk by (peer_id) (1, max by (peer_id, session_id) (videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"}) * 0 + on (session_id) group_left () min by (session_id) (min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[5m:15s] @ end() offset $__range) or min_over_time(timestamp(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$obs\"})[$__range:15s] @ end()))))[$__range:15s])) > 0)\n, \"participant\", \"$1\", \"from_peer\", \"(.*)\"))",
+          "legendFormat": "{{from_peer}}",
+          "refId": "Q",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (participant) (label_replace(\nclamp_min((count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range])) unless on (session_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0 + 1 unless on (peer_id) count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range] offset $__range))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0) - (sum by (peer_id) ((last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) - (videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"} offset $__range or last_over_time(videocall_client_reelection_total{meeting_id=\"$meeting\",result=\"proceeded\"}[$__range]) * 0)) * on (session_id) group_left (peer_id) max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) or count by (peer_id) (max by (peer_id, session_id) (last_over_time(videocall_client_packets_sent_per_sec{meeting_id=\"$meeting\",peer_id=~\"$participants\"}[$__range]))) * 0), 0)\n/ ($__range_s / 3600)\n, \"participant\", \"$1\", \"peer_id\", \"(.*)\"))",
+          "legendFormat": "{{from_peer}}",
+          "refId": "S",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 63
+      },
+      "id": 32
+    }
+  ],
+  "refresh": "",
+  "schemaVersion": 39,
+  "tags": [
+    "videocall",
+    "call-quality"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus"
+        },
+        "definition": "label_values(videocall_peer_info, meeting_id)",
+        "includeAll": false,
+        "multi": false,
+        "name": "meeting",
+        "label": "meeting",
+        "query": {
+          "query": "label_values(videocall_peer_info, meeting_id)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        },
+        "name": "obs",
+        "label": "observers (regex)",
+        "query": ".*",
+        "type": "textbox",
+        "options": [
+          {
+            "selected": true,
+            "text": ".*",
+            "value": ".*"
+          }
+        ]
+      },
+      {
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        },
+        "name": "talkers",
+        "label": "talkers (regex)",
+        "query": ".*",
+        "type": "textbox",
+        "options": [
+          {
+            "selected": true,
+            "text": ".*",
+            "value": ".*"
+          }
+        ]
+      },
+      {
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        },
+        "name": "participants",
+        "label": "S participants (regex)",
+        "query": ".*",
+        "type": "textbox",
+        "options": [
+          {
+            "selected": true,
+            "text": ".*",
+            "value": ".*"
+          }
+        ]
+      }
+    ]
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Call Quality",
+  "uid": "videocall-call-quality",
+  "version": 1
+}

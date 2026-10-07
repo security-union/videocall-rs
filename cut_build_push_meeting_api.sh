@@ -7,7 +7,7 @@ TAG="${1:-$(git rev-parse HEAD)}"
 
 GIT_SHA=$(git rev-parse --short HEAD)
 GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BUILD_TIMESTAMP="${BUILD_TIMESTAMP:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
 IMAGE_URL="${REGISTRY}/videocall-meeting-api:${TAG}"
 echo "Building image ${IMAGE_URL}"

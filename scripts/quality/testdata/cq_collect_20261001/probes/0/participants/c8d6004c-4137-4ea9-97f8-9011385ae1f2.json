@@ -1,0 +1,53 @@
+{
+  "schema": "bots-app-participant-record/v0",
+  "bot_id": "c8d6004c-4137-4ea9-97f8-9011385ae1f2",
+  "join_media_requested": {
+    "camera": true,
+    "mic": true
+  },
+  "code": {
+    "images": {
+      "bots-app": null
+    }
+  },
+  "outcome": null,
+  "unverified": [
+    {
+      "field": "code.images.bots-app",
+      "reason": "BOTS_IMAGE_REVISION unset: not a build.sh-stamped fleet image"
+    },
+    {
+      "field": "user_id",
+      "reason": "read from the meeting-api join response the client connects with; not checked against a relay label"
+    }
+  ],
+  "diagnostics_packets": {
+    "requested": "default",
+    "observed": null,
+    "source": null
+  },
+  "participant": {
+    "user_id": "probe0@bots-app.local",
+    "fleet": "browser",
+    "role": "probe-ref",
+    "observer": true,
+    "talker": false,
+    "publishes": {
+      "camera": true,
+      "mic": true,
+      "screen": false
+    },
+    "network": {
+      "profile": "none",
+      "shaped": false,
+      "direction": "none",
+      "shaper": "none",
+      "params": {}
+    },
+    "transport_intended": "auto",
+    "join_ts": 1790867530.291027,
+    "leave_ts": null,
+    "placement": null,
+    "stagger_ms": null
+  }
+}

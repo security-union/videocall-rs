@@ -968,9 +968,8 @@ pub fn RecordButton(
 /// can be unit-tested independently of the Dioxus runtime.
 ///
 /// The string values must match what `recording.js` passes to `setState()`:
-/// `"activating"`, `"recording"`, `"stopping"`, `"saving"`, `"saved"`,
-/// `"idle"`.  Unknown strings fall back to `Idle` (log-level warn in the
-/// call-site closure).
+/// `"activating"`, `"recording"`, `"failed"`, `"stopping"`, `"saving"`,
+/// `"saved"`, `"idle"`.  `"failed"` and unknown strings fall back to `Idle`.
 pub fn js_state_to_record_button_state(s: &str) -> RecordButtonState {
     match s {
         "activating" => RecordButtonState::Activating,

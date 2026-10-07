@@ -32,6 +32,45 @@ export class NotSupportedRemoteError extends Error {
   }
 }
 
+/** A meeting control has no joined bot to act on: server-side it maps to 409; `conduct` throws it when `GET /bots` lists none or a cached bot id gets 404 (#2386). */
+export class BotNotJoinedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BotNotJoinedError";
+  }
+}
+
+/** Exits the orchestrator asked for after a join; they release the bot from `/healthz` `expected`. */
+export const LEFT_ON_PURPOSE: ReadonlySet<string> = new Set([
+  "ctl-leave",
+  "ctl-kill",
+  "ttl-expired",
+]);
+
+/**
+ * `/healthz` `expected` (#2917): local bots launched, minus those that left on purpose
+ * or whose terminated entry an operator dropped. SSH bots never count: their join is not observable here.
+ */
+export class ExpectedBots {
+  private n = 0;
+
+  get value(): number {
+    return this.n;
+  }
+
+  launched(host: BotHostKind): void {
+    if (host.kind === "local") this.n += 1;
+  }
+
+  finished(entry: BotRegistryEntry): void {
+    if (entry.host.kind === "local" && LEFT_ON_PURPOSE.has(entry.finishReason ?? "")) this.n -= 1;
+  }
+
+  dropped(entry: BotRegistryEntry): void {
+    if (entry.host.kind === "local" && !LEFT_ON_PURPOSE.has(entry.finishReason ?? "")) this.n -= 1;
+  }
+}
+
 /**
  * Lifecycle states a bot transitions through in the orchestrator's
  * in-process registry. Used by the control API to render `GET /bots`
@@ -149,6 +188,7 @@ export interface BotRegistryEntry {
    *   - `"meeting-rejected:rejected"`(failed — host denied)
    *   - `"meeting-rejected:error"`   (failed — server-reported error)
    *   - `"launch-error"`             (failed)
+   *   - `"browser-crash"`            (failed — browser or page died after joining)
    */
   finishReason?: string;
   /**
@@ -338,6 +378,29 @@ export function snapshotEntry(entry: BotRegistryEntry, now: number = Date.now())
   if (entry.finishReason !== undefined) snap.finishReason = entry.finishReason;
   if (entry.lastError !== undefined) snap.lastError = entry.lastError;
   return snap;
+}
+
+/** Counts on the unauthenticated `/healthz` (#2917); never per-bot detail. */
+export interface ReadinessCounts {
+  /** Every entry not `done` / `failed`. */
+  bots: number;
+  /** Observed joins only; an SSH bot's remote join is never observed, so it is not counted. */
+  inMeeting: number;
+  /** Still logging in or joining. */
+  pending: number;
+}
+
+export function countReadiness(registry: Map<string, BotRegistryEntry>): ReadinessCounts {
+  const counts: ReadinessCounts = { bots: 0, inMeeting: 0, pending: 0 };
+  for (const entry of registry.values()) {
+    if (entry.status === "done" || entry.status === "failed") continue;
+    counts.bots += 1;
+    if (entry.status === "in-meeting" && entry.joinedAt !== undefined) counts.inMeeting += 1;
+    if (entry.status === "priming" || entry.status === "launching" || entry.status === "joining") {
+      counts.pending += 1;
+    }
+  }
+  return counts;
 }
 
 /**

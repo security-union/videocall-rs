@@ -115,7 +115,9 @@ impl RelativeArrivalDelayTracker {
     pub fn update(&mut self, timestamp: u32, sample_rate: u32, arrival_time: Instant) -> i32 {
         // Calculate expected time since last packet
         let expected_iat_ms = if let Some(last_timestamp) = self.last_timestamp {
-            timestamp.saturating_sub(last_timestamp) * 1000 / sample_rate
+            let gap_ms =
+                u64::from(timestamp.saturating_sub(last_timestamp)) * 1000 / u64::from(sample_rate);
+            i32::try_from(gap_ms).unwrap_or(i32::MAX)
         } else {
             0
         };
@@ -128,7 +130,7 @@ impl RelativeArrivalDelayTracker {
         };
 
         // Calculate jitter: positive means packet is late, negative means packet is early
-        let iat_delay_ms = actual_iat_ms - expected_iat_ms as i32;
+        let iat_delay_ms = actual_iat_ms - expected_iat_ms;
 
         self.last_packet_time = Some(arrival_time);
 
@@ -489,5 +491,27 @@ mod tests {
         // Reset and check state
         delay_manager.reset();
         assert_eq!(delay_manager.target_delay_ms(), 80); // Reset to kStartDelayMs
+    }
+
+    #[test]
+    fn audio_gap_beyond_u32_ms_product_matches_its_arrival_gap() {
+        const PACKETS: u32 = 4_475;
+        const SAMPLES_PER_PACKET: u32 = 960;
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        let t0 = Instant::now();
+        tracker.update(0, 48_000, t0);
+
+        let d = tracker.update(
+            PACKETS * SAMPLES_PER_PACKET,
+            48_000,
+            t0 + Duration::from_millis(u64::from(PACKETS) * 20),
+        );
+
+        assert_eq!(d, 0, "arrival matched the timestamp gap, so no extra delay");
+        assert_eq!(
+            tracker.delay_history.back().map(|p| p.iat_delay_ms),
+            Some(0),
+            "inter-arrival delay of the audio packet after the gap"
+        );
     }
 }

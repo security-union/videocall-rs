@@ -25,6 +25,7 @@ pub mod auth;
 pub mod client_diagnostics;
 pub mod constants;
 pub mod db;
+pub mod kick_denylist;
 pub mod lobby;
 pub mod messages;
 pub mod metrics;

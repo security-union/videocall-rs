@@ -84,6 +84,7 @@ use wasm_bindgen::JsValue;
 /// Generate a cryptographically random instance ID for correlating reconnections.
 /// Uses `crypto.getRandomValues()` for unpredictability since the instance_id
 /// is used for session eviction (a predictable ID could allow targeted eviction).
+#[cfg(any(not(test), target_arch = "wasm32"))]
 fn generate_instance_id() -> String {
     let mut buf = [0u8; 16];
     if let Some(crypto) = web_sys::window().and_then(|w| w.crypto().ok()) {
@@ -103,6 +104,11 @@ fn generate_instance_id() -> String {
         u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
         u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
     )
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn generate_instance_id() -> String {
+    "host-test-instance-id".to_string()
 }
 
 /// How long (ms) the early-seed sampler stays armed after a peer first joins
@@ -278,6 +284,9 @@ pub struct VideoCallClientOptions {
     pub on_connected: Callback<()>,
     pub on_connection_lost: Callback<ConnectionLostReason>,
     pub enable_diagnostics: bool,
+    /// When false, the local `DiagnosticsPacket` send handler is not installed;
+    /// receive-side diagnostics still run when `enable_diagnostics` is true.
+    pub send_diagnostics_packets: bool,
     pub diagnostics_update_interval_ms: Option<u64>,
     pub enable_health_reporting: bool,
     pub health_reporting_interval_ms: Option<u64>,
@@ -1969,7 +1978,10 @@ impl VideoCallClient {
             }
         }
 
-        if let Some(diagnostics) = &diagnostics {
+        if let Some(diagnostics) = diagnostics
+            .as_ref()
+            .filter(|_| options.send_diagnostics_packets)
+        {
             let client_clone = client.clone();
             diagnostics.set_packet_handler(Callback::from(move |packet| {
                 client_clone.send_diagnostic_packet(packet);
@@ -2302,6 +2314,7 @@ impl VideoCallClient {
             // and sharing by handle is what carries the ids we held before that
             // reconnect into the new manager's self-filter.
             own_session_ids: self.inner.borrow().own_session_ids.clone(),
+            adopt_wt_spare_worker: self.options.decode_media,
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -3114,7 +3127,7 @@ impl VideoCallClient {
     pub fn apply_local_cpu_pressure_congestion(&self) -> Option<bool> {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             let now_ms = js_sys::Date::now() as u64;
-            // LOCAL CPU pressure: speaker stays sharp, so `exempt_speakers = true`.
+            // LOCAL CPU pressure: speakers stay sharp unless one is the only remote peer.
             Some(inner.seed_local_congestion_and_publish(now_ms, true))
         } else {
             warn!("apply_local_cpu_pressure_congestion: inner busy, layer step skipped this call");
@@ -4346,7 +4359,8 @@ impl Inner {
     /// `seed_downlink_congestion_for_connected_peers`; this helper does not choose
     /// the policy — the CALLERS do. The LOCAL CPU-pressure caller
     /// (`apply_local_cpu_pressure_congestion`) passes `true` so the active speaker
-    /// stays sharp while the local decoder is the bottleneck, whereas the relay
+    /// stays sharp while the local decoder is the bottleneck (the manager ignores it
+    /// when only one peer is connected), whereas the relay
     /// DOWNLINK_CONGESTION caller passes `false` so the speaker's video is shed
     /// under real downlink saturation (in the degenerate 1-on-1 the speaker IS the
     /// only stream worth shedding).
@@ -5348,6 +5362,7 @@ impl Inner {
                             // client is unexpected — ignore it.
                             debug!("Ignoring server-internal PARTICIPANT_LIST_REQUEST");
                         }
+                        Ok(MeetingEventType::RECORDING_STATE) => {}
                         Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                             error!(
                                 "Received meeting packet with unknown event type: room={}",
@@ -5914,6 +5929,7 @@ impl VideoCallClient {
             on_connected: Callback::noop(),
             on_connection_lost: Callback::noop(),
             enable_diagnostics: false,
+            send_diagnostics_packets: true,
             diagnostics_update_interval_ms: None,
             enable_health_reporting: false,
             health_reporting_interval_ms: None,
@@ -6023,6 +6039,7 @@ pub(crate) mod disconnect_tests {
             // Diagnostics + health reporting ON so the cycle paths under test
             // actually exist for this run.
             enable_diagnostics: true,
+            send_diagnostics_packets: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
@@ -6120,6 +6137,26 @@ pub(crate) mod disconnect_tests {
         let _ = inner_weak; // silence unused — this is a pin against
                             // future code accidentally reintroducing a
                             // strong ref the test forgot about.
+    }
+
+    #[wasm_bindgen_test]
+    fn diagnostics_packet_handler_is_installed_only_when_sending_is_enabled() {
+        for (send_diagnostics_packets, expected_installs) in [(true, 1), (false, 0)] {
+            let client = VideoCallClient::new(VideoCallClientOptions {
+                send_diagnostics_packets,
+                ..build_test_options()
+            });
+            let diagnostics = client
+                ._diagnostics
+                .as_ref()
+                .expect("enable_diagnostics=true must still build the DiagnosticManager");
+            assert_eq!(
+                diagnostics.set_packet_handler_calls_for_test(),
+                expected_installs,
+                "send_diagnostics_packets={send_diagnostics_packets}"
+            );
+            client.disconnect().expect("disconnect must succeed");
+        }
     }
 
     #[wasm_bindgen_test]
@@ -6230,6 +6267,7 @@ mod dedup_tests {
             on_connected: VcCallback::noop(),
             on_connection_lost: VcCallback::noop(),
             enable_diagnostics: false,
+            send_diagnostics_packets: true,
             diagnostics_update_interval_ms: None,
             enable_health_reporting: false,
             health_reporting_interval_ms: None,
@@ -6726,6 +6764,22 @@ mod cooldown_reset_hardening_tests {
         build_test_client_with(None, false)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn only_a_decoding_client_lets_its_manager_adopt_the_wt_spare_worker() {
+        for decode_media in [false, true] {
+            let mut client = build_test_client();
+            client.options.decode_media = decode_media;
+            client.options.websocket_urls = vec!["ws://relay.test/lobby".to_string()];
+            let _ = crate::connection::take_adopt_wt_spare_worker();
+            assert!(client.connect_with_rtt_testing().is_err());
+            assert_eq!(
+                crate::connection::take_adopt_wt_spare_worker(),
+                Some(decode_media)
+            );
+        }
+    }
+
     fn build_test_client_with(
         max_received_layer: Option<u32>,
         skip_canvas_paint: bool,
@@ -6750,6 +6804,7 @@ mod cooldown_reset_hardening_tests {
             on_connected: Callback::noop(),
             on_connection_lost: Callback::noop(),
             enable_diagnostics: false,
+            send_diagnostics_packets: true,
             diagnostics_update_interval_ms: None,
             enable_health_reporting: false,
             health_reporting_interval_ms: None,

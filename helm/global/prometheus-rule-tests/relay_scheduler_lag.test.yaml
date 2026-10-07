@@ -1,0 +1,31 @@
+# check_prometheus_rules_parse.py prepends rule_files: each cluster's extracted rules.
+evaluation_interval: 1m
+tests:
+  # ws-0 (WebSocket) leaves service discovery at 10m; rate(...[5m]) still sees it until 15m.
+  - interval: 1m
+    input_series:
+      - series: 'relay_ws_fragmented_inbound_total{pod="ws-0"}'
+        values: '0x10 stale'
+      - series: 'videocall_relay_scheduler_lag_ms_bucket{pod="ws-0",le="100"}'
+        values: '0x10 stale'
+      - series: 'videocall_relay_scheduler_lag_ms_bucket{pod="ws-0",le="250"}'
+        values: '0+60x10 stale'
+      - series: 'videocall_relay_scheduler_lag_ms_bucket{pod="ws-0",le="+Inf"}'
+        values: '0+60x10 stale'
+      - series: 'videocall_relay_scheduler_lag_ms_bucket{pod="wt-0",le="100"}'
+        values: '0x20'
+      - series: 'videocall_relay_scheduler_lag_ms_bucket{pod="wt-0",le="250"}'
+        values: '0+60x20'
+      - series: 'videocall_relay_scheduler_lag_ms_bucket{pod="wt-0",le="+Inf"}'
+        values: '0+60x20'
+    promql_expr_test:
+      - expr: count by (alertname, pod, severity) (ALERTS{alertname=~"RelaySchedulerLagHigh.*", alertstate="firing"})
+        eval_time: 8m
+        exp_samples: &ws_warns_wt_pages
+          - labels: '{alertname="RelaySchedulerLagHigh", pod="wt-0", severity="critical"}'
+            value: 1
+          - labels: '{alertname="RelaySchedulerLagHighWS", pod="ws-0", severity="warning"}'
+            value: 1
+      - expr: count by (alertname, pod, severity) (ALERTS{alertname=~"RelaySchedulerLagHigh.*", alertstate="firing"})
+        eval_time: 13m
+        exp_samples: *ws_warns_wt_pages

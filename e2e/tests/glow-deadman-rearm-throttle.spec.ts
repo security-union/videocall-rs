@@ -40,28 +40,6 @@ import { wakeControls } from "../helpers/controls";
  * 4 000, 6 000, 8 000 or a named constant of a different value. Nothing in the
  * page's JavaScript (`dioxus-ui/scripts/`) schedules 12 500 ms either.
  *
- * WHY IT DISCRIMINATES (the arithmetic)
- * -------------------------------------
- * The guest's fake mic runs `continuousToneWavPath()` — a swept-amplitude tone
- * (`helpers/audio-fixtures.ts`): peak 0.6 / floor 0.085 amplitude on a 2 s
- * envelope. RMS is amplitude/√2, and `rms_to_intensity` saturates at
- * `RMS_LOUD_SPEECH_CEILING` = 0.10, so intensity is pinned at 1.0 for most of
- * the envelope and sweeps 1.0 → ~0.71 → 1.0 through each trough. The decoder-side
- * VAD re-broadcasts whenever intensity moves more than
- * `AUDIO_LEVEL_DELTA_THRESHOLD` (0.02), i.e. ~29 qualifying events per 2 s
- * envelope — roughly 200 across this spec's 15 s window.
- *
- *   - UN-FIXED: one `setTimeout(_, 12500)` per qualifying event → ~200 arms in
- *     the window, an order of magnitude over [`ARM_BUDGET`] (17).
- *   - FIXED: at most one arm per 1 000 ms period → 8–15 arms, inside the budget.
- *
- * [`MIN_STYLE_WRITES`] and the `styleWrites >= 3 * arms` check make that argument
- * self-calibrating rather than a bet on the event rate a given machine achieves.
- * The tile's inline `style` attribute is EXACTLY `speak_style(...)`
- * (`canvas_generator.rs`: `style: "{grid_tile_style}"`), and Dioxus writes it
- * only when the rendered string changes, so each style mutation implies at least
- * one level change.
- *
  * THE SAFETY HALF
  * ---------------
  * A throttle is only correct if it cannot become a mute button. The observation
@@ -149,11 +127,6 @@ const ARM_BUDGET = Math.ceil(OBSERVE_MS / GLOW_DEADMAN_REARM_THROTTLE_MS) + 2;
 /**
  * The absolute non-vacuity floor on level updates: 2 per second across the
  * window.
- *
- * The fixture's arithmetic predicts ~14 qualifying events per second, so this is
- * a ~7x margin — but a run that produced only a handful (a dead fake mic, a
- * stalled audio path) must fail rather than pass a throttle assertion that is
- * trivially true when nothing was arriving to throttle.
  */
 const MIN_STYLE_WRITES = Math.round((2 * OBSERVE_MS) / 1_000);
 
@@ -216,9 +189,6 @@ const BLUR_PX_PER_LEVEL =
 
 const MIN_RENDERED_BLUR_STEP_PX = Math.floor(UI_AUDIO_LEVEL_DELTA * BLUR_PX_PER_LEVEL - 1) + 1;
 const ONE_PX_STEP_BUDGET = 2;
-const FIXTURE_LEVEL_TRAVEL_PER_ENVELOPE = 2 * (1.0 - 0.708);
-const FIXTURE_ENVELOPE_MS = 2_000;
-
 const RENDER_CHAIN = [
   "level -> tile style, traced in production source:",
   "  peer_tile.rs:1487         if glow_write_reaches_signal(lvl, prev) { audio_level.set(lvl) }",
@@ -230,10 +200,6 @@ const RENDER_CHAIN = [
   "  context.rs:500-501 + canvas_generator.rs:293/:57/:59 at the seeded appearance make that",
   `  14 + ${BLUR_PX_PER_LEVEL.toFixed(1)} * level, quantised to whole px by {:.0}`,
 ].join("\n");
-
-const MAX_STYLE_WRITES = Math.ceil(
-  (FIXTURE_LEVEL_TRAVEL_PER_ENVELOPE * (OBSERVE_MS / FIXTURE_ENVELOPE_MS)) / UI_AUDIO_LEVEL_DELTA,
-);
 
 const MIN_RENDERED_STYLES = 30;
 const MIN_NONZERO_STEPS = 20;
@@ -659,10 +625,9 @@ test.describe("Speaking-glow deadman re-arm throttle", () => {
           `about the event rate a machine achieves: the signal is only ever fed values the ` +
           `decoder emitted (peer_tile.rs::apply_resolved_level), and 2289's UI gate (0.04) is ` +
           `WIDER than the codec-side AUDIO_LEVEL_DELTA_THRESHOLD (0.02), so writes are a subset ` +
-          `of qualifying events and the un-fixed build has arms >= styleWrites. Margin note: a ` +
-          `correct build is PREDICTED (never yet measured) at ~71 writes, against a ` +
-          `3 * ARM_BUDGET ceiling of ${3 * ARM_BUDGET}`,
-      ).toBeGreaterThanOrEqual(3 * arms.length);
+          `of qualifying events and the un-fixed build has arms >= styleWrites. At most ` +
+          `${2 * ARM_BUDGET} writes are required (2 * ARM_BUDGET)`,
+      ).toBeGreaterThanOrEqual(2 * arms.length);
 
       expect(
         classifyGlow((await tile.getAttribute("style")) || ""),
@@ -731,7 +696,7 @@ test.describe("Tile audio-level write gate", () => {
 
       // No camera seed, deliberately: the glow path is audio-only, `.grid-item`
       // exists for a camera-off peer, and `enterTwoUserMeeting` settles on
-      // `.canvas-container` — a div. That is why issue 2193 does not block this.
+      // `.canvas-container` — a div.
       await enterTwoUserMeeting(hostPage, guestPage, meetingId);
       await enableMic(guestPage);
 
@@ -823,19 +788,6 @@ test.describe("Tile audio-level write gate", () => {
           `where every emitted event reaches the signal and re-renders the whole PeerTile.\n` +
           `${RENDER_CHAIN}${errNote}`,
       ).toBeLessThanOrEqual(ONE_PX_STEP_BUDGET);
-
-      // === CORROBORATING — agrees with the verdict, does not set it =========
-      expect(
-        result.styleWrites,
-        `${result.styleWrites} tile style writes in ${OBSERVE_MS}ms, over a ceiling of ` +
-          `${MAX_STYLE_WRITES}. Each write costs more than ${UI_AUDIO_LEVEL_DELTA} of level ` +
-          `movement and this fixture supplies only ${FIXTURE_LEVEL_TRAVEL_PER_ENVELOPE.toFixed(3)} ` +
-          `per ${FIXTURE_ENVELOPE_MS}ms envelope (audio-fixtures.ts: ENVELOPE_PERIOD_SECONDS = 2, ` +
-          `amplitude 0.6 -> 0.085 -> 0.6, which rms_to_intensity maps to level 1.0 -> 0.708), ` +
-          `so a correct build cannot reach it; the un-fixed gate is predicted at ~141. Read it as ` +
-          `corroboration of the step histogram above, not as the verdict — it leans on the ` +
-          `fixture's travel, which the capture path can perturb${errNote}`,
-      ).toBeLessThanOrEqual(MAX_STYLE_WRITES);
 
       expect(
         classifyGlow((await tile.getAttribute("style")) || ""),

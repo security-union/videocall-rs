@@ -323,8 +323,7 @@ test.describe("Crop toggle", () => {
   // ────────────────────────────────────────────────────────────────────────
   // Test 3: Second click restores cropped
   //
-  // Regression guard for #765 and #885 — object-position must return to
-  // `center top` (50% 0%) after toggling back to cropped.
+  // object-position must return to `center center` after toggling back to cropped.
   // ────────────────────────────────────────────────────────────────────────
   test("second click restores cropped", async ({ baseURL }) => {
     test.setTimeout(90_000);
@@ -364,12 +363,10 @@ test.describe("Crop toggle", () => {
       const objectFit = await canvasFinal.evaluate((el) => window.getComputedStyle(el).objectFit);
       expect(objectFit).toBe("cover");
 
-      // Regression lock (#765, #885): object-position must be `center top`
-      // (i.e. 50% 0%), NOT `center center` (50% 50%).
       const objectPosition = await canvasFinal.evaluate(
         (el) => window.getComputedStyle(el).objectPosition,
       );
-      expect(["50% 0%", "center top"]).toContain(objectPosition);
+      expect(["50% 50%", "center center"]).toContain(objectPosition);
     } finally {
       await browser1.close();
       await browser2.close();

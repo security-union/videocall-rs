@@ -562,13 +562,10 @@ test.describe("Screen share right panel layout", () => {
       expect(canvasCount).toBeGreaterThan(0);
       expect(canvasCount).toBeLessThanOrEqual(FORCED_BUDGET);
 
-      // Verify the paused placeholder has the expected accessibility
-      // attributes (role="img" + non-empty aria-label).
+      // The paused reason rides on the PLAY button, not on the placeholder (#1466).
       const firstPaused = pausedTiles.first();
       await expect(firstPaused).toBeVisible({ timeout: 5_000 });
-      await expect(firstPaused).toHaveAttribute("role", "img");
-      const ariaLabel = await firstPaused.getAttribute("aria-label");
-      expect(ariaLabel).toBeTruthy();
+      await expect(firstPaused.locator(".decode-play-overlay")).toHaveAttribute("title", /\S/);
     } finally {
       await browser1.close();
       await browser2.close();

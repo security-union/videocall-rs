@@ -1,0 +1,49 @@
+# Rust synthetic-client bot (bot/). Build from the repo root:
+#   docker build -f Dockerfile.bot -t videocall-bot .
+# No config, conversation or secret is baked in; see bot/README.md.
+
+ARG RUST_VERSION=1.95.0
+ARG DEBIAN_RELEASE=trixie
+
+FROM rust:${RUST_VERSION}-slim-${DEBIAN_RELEASE} AS build
+ARG RUST_VERSION
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+       pkg-config clang libclang-dev libvpx-dev libopus-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Fail instead of letting rustup fetch a toolchain other than the image's.
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
+RUN pinned="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+    && if [ "${pinned}" != "${RUST_VERSION}" ]; then \
+         echo "rust-toolchain.toml pins '${pinned}' but Dockerfile.bot builds with '${RUST_VERSION}'" >&2; \
+         exit 1; \
+       fi
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo build --release --locked -p bot --features metrics \
+    && install -D -m 0755 target/release/bot /out/bot
+
+FROM debian:${DEBIAN_RELEASE}-slim
+
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=${GIT_SHA}
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+       ca-certificates libvpx9 libopus0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 10001 bot \
+    && useradd --system --uid 10001 --gid bot --home-dir /bot --create-home bot
+COPY --from=build /out/bot /usr/local/bin/bot
+
+USER 10001:10001
+WORKDIR /bot
+ENV RUST_LOG=info
+
+ENTRYPOINT ["bot"]

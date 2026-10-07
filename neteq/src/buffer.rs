@@ -302,7 +302,7 @@ impl PacketBuffer {
 
         // Convert samples to milliseconds (assuming first packet sample rate)
         let sample_rate = self.buffer.front().unwrap().sample_rate;
-        (span_samples * 1000) / sample_rate
+        u32::try_from(u64::from(span_samples) * 1000 / u64::from(sample_rate)).unwrap_or(u32::MAX)
     }
 
     /// Get the total content duration of packets in the buffer (sum of packet durations)
@@ -505,5 +505,26 @@ mod tests {
 
         // Span should be 40ms (640 samples at 16kHz = 40ms)
         assert_eq!(buffer.get_span_duration_ms(), 40);
+    }
+
+    #[test]
+    fn span_beyond_u32_ms_product_is_exact() {
+        let mut buffer = PacketBuffer::new(10);
+        let mut stats = StatisticsCalculator::new();
+        let packet = |seq: u16, ts: u32| {
+            AudioPacket::new(
+                RtpHeader::new(seq, ts, 12345, 96, false),
+                vec![0; 160],
+                48_000,
+                1,
+                20,
+            )
+        };
+        buffer.insert_packet(packet(0, 0), &mut stats, 100).unwrap();
+        buffer
+            .insert_packet(packet(4_475, 4_475 * 960), &mut stats, 100)
+            .unwrap();
+
+        assert_eq!(buffer.get_span_duration_ms(), 89_500);
     }
 }

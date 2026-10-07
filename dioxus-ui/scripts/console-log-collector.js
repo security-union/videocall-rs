@@ -218,7 +218,7 @@
   // Cookie header values
   var COOKIE_RE = /Cookie:\s*[^\r\n]*/gi;
   // Crypto key material (hex or base64 blobs after key-related labels)
-  var CRYPTO_KEY_RE = /\b(aes_key|rsa_pub_key|private_key|iv|encryption_key|secret_key)\s*[:=]\s*["']?[A-Za-z0-9+/=_-]{8,}["']?/gi;
+  var CRYPTO_KEY_RE = /\b(aes_key|rsa_pub_key|private_key|iv|encryption_key|secret_key|lease_?secret)\\?["']?\s*[:=]\s*\\?["']?[A-Za-z0-9+/=_-]{8,}\\?["']?/gi;
 
   // ---------------------------------------------------------------------------
   // Helpers

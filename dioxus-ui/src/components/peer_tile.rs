@@ -1939,7 +1939,7 @@ fn handle_diagnostics_event(
                 }
             } else {
                 if let Some(f) = fps {
-                    // ARRIVAL rate: still feeds the drawer chart, signal popup, and
+                    // DECODE rate: still feeds the drawer chart, signal popup, and
                     // health reporter. Issue #1784 moved the OVERLAY's "↓ fps" off
                     // this bucket and onto the painted rate (the `video_painted` arm
                     // below), so this no longer touches the overlay signal.

@@ -1,0 +1,41 @@
+## Alternate host ports for the e2e + monitoring stack. Beside a dev stack on the same checkout set
+## VIDEOCALL_RELEASE_BUILD=1; beside another e2e stack (shared e2e/.stack-stamps) use a separate worktree.
+
+services:
+  dioxus-ui:
+    ports: !override
+      - "3011:3001"
+    environment:
+      - UI_URL=http://localhost:3011
+      - ACTIX_UI_BACKEND_URL=ws://localhost:8180
+      - API_BASE_URL=http://localhost:8181
+      - LOGIN_URL=http://localhost:8181/login
+      - WEBTRANSPORT_HOST=https://127.0.0.1:4434
+      - WT_DEV_CERT_HASH_INJECT=true
+
+  meeting-api:
+    ports: !override
+      - "8181:8081"
+    environment:
+      - CORS_ALLOWED_ORIGIN=http://localhost:3011
+      - AFTER_LOGIN_URL=http://localhost:3011
+      - ALLOWED_REDIRECT_URLS=http://localhost:3011
+
+  websocket-api:
+    ports: !override
+      - "8180:8080"
+    environment:
+      - UI_ENDPOINT=http://localhost:3011
+
+  webtransport-api:
+    ports: !override
+      - "4434:4433/udp"
+      - "5331:5321"
+
+  prometheus:
+    ports: !override
+      - "${PROMETHEUS_HOST_PORT:-9190}:9090"
+
+  grafana:
+    ports: !override
+      - "${GRAFANA_HOST_PORT:-3100}:3000"

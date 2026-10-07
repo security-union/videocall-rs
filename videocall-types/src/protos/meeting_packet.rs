@@ -81,6 +81,11 @@ pub struct MeetingPacket {
     ///  PARTICIPANT_SESSION_RESUMED: the superseded session_id receivers evict.
     // @@protoc_insertion_point(field:MeetingPacket.previous_session_id)
     pub previous_session_id: u64,
+    ///  RECORDING_STATE: meetings.created_at in microseconds.
+    // @@protoc_insertion_point(field:MeetingPacket.recording_epoch)
+    pub recording_epoch: u64,
+    // @@protoc_insertion_point(field:MeetingPacket.recording_state)
+    pub recording_state: ::protobuf::MessageField<RecordingState>,
     // special fields
     // @@protoc_insertion_point(special_field:MeetingPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -98,7 +103,7 @@ impl MeetingPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(13);
+        let mut fields = ::std::vec::Vec::with_capacity(15);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "event_type",
@@ -165,6 +170,16 @@ impl MeetingPacket {
             |m: &MeetingPacket| { &m.previous_session_id },
             |m: &mut MeetingPacket| { &mut m.previous_session_id },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "recording_epoch",
+            |m: &MeetingPacket| { &m.recording_epoch },
+            |m: &mut MeetingPacket| { &mut m.recording_epoch },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, RecordingState>(
+            "recording_state",
+            |m: &MeetingPacket| { &m.recording_state },
+            |m: &mut MeetingPacket| { &mut m.recording_state },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MeetingPacket>(
             "MeetingPacket",
             fields,
@@ -222,6 +237,12 @@ impl ::protobuf::Message for MeetingPacket {
                 104 => {
                     self.previous_session_id = is.read_uint64()?;
                 },
+                112 => {
+                    self.recording_epoch = is.read_uint64()?;
+                },
+                122 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.recording_state)?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -273,6 +294,13 @@ impl ::protobuf::Message for MeetingPacket {
         if self.previous_session_id != 0 {
             my_size += ::protobuf::rt::uint64_size(13, self.previous_session_id);
         }
+        if self.recording_epoch != 0 {
+            my_size += ::protobuf::rt::uint64_size(14, self.recording_epoch);
+        }
+        if let Some(v) = self.recording_state.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -318,6 +346,12 @@ impl ::protobuf::Message for MeetingPacket {
         if self.previous_session_id != 0 {
             os.write_uint64(13, self.previous_session_id)?;
         }
+        if self.recording_epoch != 0 {
+            os.write_uint64(14, self.recording_epoch)?;
+        }
+        if let Some(v) = self.recording_state.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(15, v, os)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -348,6 +382,8 @@ impl ::protobuf::Message for MeetingPacket {
         self.is_guest = false;
         self.requester_instance_id.clear();
         self.previous_session_id = 0;
+        self.recording_epoch = 0;
+        self.recording_state.clear();
         self.special_fields.clear();
     }
 
@@ -366,6 +402,8 @@ impl ::protobuf::Message for MeetingPacket {
             is_guest: false,
             requester_instance_id: ::std::string::String::new(),
             previous_session_id: 0,
+            recording_epoch: 0,
+            recording_state: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -430,6 +468,8 @@ pub mod meeting_packet {
         HOST_REVOKED = 16,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_SESSION_RESUMED)
         PARTICIPANT_SESSION_RESUMED = 17,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.RECORDING_STATE)
+        RECORDING_STATE = 19,
     }
 
     impl ::protobuf::Enum for MeetingEventType {
@@ -459,6 +499,7 @@ pub mod meeting_packet {
                 15 => ::std::option::Option::Some(MeetingEventType::HOST_GRANTED),
                 16 => ::std::option::Option::Some(MeetingEventType::HOST_REVOKED),
                 17 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_SESSION_RESUMED),
+                19 => ::std::option::Option::Some(MeetingEventType::RECORDING_STATE),
                 _ => ::std::option::Option::None
             }
         }
@@ -483,6 +524,7 @@ pub mod meeting_packet {
                 "HOST_GRANTED" => ::std::option::Option::Some(MeetingEventType::HOST_GRANTED),
                 "HOST_REVOKED" => ::std::option::Option::Some(MeetingEventType::HOST_REVOKED),
                 "PARTICIPANT_SESSION_RESUMED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_SESSION_RESUMED),
+                "RECORDING_STATE" => ::std::option::Option::Some(MeetingEventType::RECORDING_STATE),
                 _ => ::std::option::Option::None
             }
         }
@@ -506,6 +548,7 @@ pub mod meeting_packet {
             MeetingEventType::HOST_GRANTED,
             MeetingEventType::HOST_REVOKED,
             MeetingEventType::PARTICIPANT_SESSION_RESUMED,
+            MeetingEventType::RECORDING_STATE,
         ];
     }
 
@@ -516,7 +559,27 @@ pub mod meeting_packet {
         }
 
         fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
-            let index = *self as usize;
+            let index = match self {
+                MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN => 0,
+                MeetingEventType::MEETING_STARTED => 1,
+                MeetingEventType::MEETING_ENDED => 2,
+                MeetingEventType::PARTICIPANT_JOINED => 3,
+                MeetingEventType::PARTICIPANT_LEFT => 4,
+                MeetingEventType::MEETING_ACTIVATED => 5,
+                MeetingEventType::PARTICIPANT_ADMITTED => 6,
+                MeetingEventType::PARTICIPANT_REJECTED => 7,
+                MeetingEventType::WAITING_ROOM_UPDATED => 8,
+                MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED => 9,
+                MeetingEventType::MEETING_SETTINGS_UPDATED => 10,
+                MeetingEventType::HOST_MUTE_PARTICIPANT => 11,
+                MeetingEventType::HOST_DISABLE_VIDEO => 12,
+                MeetingEventType::PARTICIPANT_KICKED => 13,
+                MeetingEventType::PARTICIPANT_LIST_REQUEST => 14,
+                MeetingEventType::HOST_GRANTED => 15,
+                MeetingEventType::HOST_REVOKED => 16,
+                MeetingEventType::PARTICIPANT_SESSION_RESUMED => 17,
+                MeetingEventType::RECORDING_STATE => 18,
+            };
             Self::enum_descriptor().value_by_index(index)
         }
     }
@@ -534,8 +597,289 @@ pub mod meeting_packet {
     }
 }
 
+// @@protoc_insertion_point(message:RecordingState)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct RecordingState {
+    // message fields
+    // @@protoc_insertion_point(field:RecordingState.version)
+    pub version: u64,
+    // @@protoc_insertion_point(field:RecordingState.entries)
+    pub entries: ::std::vec::Vec<RecordingEntry>,
+    // special fields
+    // @@protoc_insertion_point(special_field:RecordingState.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a RecordingState {
+    fn default() -> &'a RecordingState {
+        <RecordingState as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl RecordingState {
+    pub fn new() -> RecordingState {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "version",
+            |m: &RecordingState| { &m.version },
+            |m: &mut RecordingState| { &mut m.version },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "entries",
+            |m: &RecordingState| { &m.entries },
+            |m: &mut RecordingState| { &mut m.entries },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<RecordingState>(
+            "RecordingState",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for RecordingState {
+    const NAME: &'static str = "RecordingState";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.version = is.read_uint64()?;
+                },
+                18 => {
+                    self.entries.push(is.read_message()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.version != 0 {
+            my_size += ::protobuf::rt::uint64_size(1, self.version);
+        }
+        for value in &self.entries {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.version != 0 {
+            os.write_uint64(1, self.version)?;
+        }
+        for v in &self.entries {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+        };
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> RecordingState {
+        RecordingState::new()
+    }
+
+    fn clear(&mut self) {
+        self.version = 0;
+        self.entries.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static RecordingState {
+        static instance: RecordingState = RecordingState {
+            version: 0,
+            entries: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for RecordingState {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("RecordingState").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for RecordingState {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for RecordingState {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:RecordingEntry)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct RecordingEntry {
+    // message fields
+    // @@protoc_insertion_point(field:RecordingEntry.recording_id)
+    pub recording_id: ::std::vec::Vec<u8>,
+    // @@protoc_insertion_point(field:RecordingEntry.revoked)
+    pub revoked: bool,
+    // special fields
+    // @@protoc_insertion_point(special_field:RecordingEntry.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a RecordingEntry {
+    fn default() -> &'a RecordingEntry {
+        <RecordingEntry as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl RecordingEntry {
+    pub fn new() -> RecordingEntry {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "recording_id",
+            |m: &RecordingEntry| { &m.recording_id },
+            |m: &mut RecordingEntry| { &mut m.recording_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "revoked",
+            |m: &RecordingEntry| { &m.revoked },
+            |m: &mut RecordingEntry| { &mut m.revoked },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<RecordingEntry>(
+            "RecordingEntry",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for RecordingEntry {
+    const NAME: &'static str = "RecordingEntry";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.recording_id = is.read_bytes()?;
+                },
+                16 => {
+                    self.revoked = is.read_bool()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.recording_id.is_empty() {
+            my_size += ::protobuf::rt::bytes_size(1, &self.recording_id);
+        }
+        if self.revoked != false {
+            my_size += 1 + 1;
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.recording_id.is_empty() {
+            os.write_bytes(1, &self.recording_id)?;
+        }
+        if self.revoked != false {
+            os.write_bool(2, self.revoked)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> RecordingEntry {
+        RecordingEntry::new()
+    }
+
+    fn clear(&mut self) {
+        self.recording_id.clear();
+        self.revoked = false;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static RecordingEntry {
+        static instance: RecordingEntry = RecordingEntry {
+            recording_id: ::std::vec::Vec::new(),
+            revoked: false,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for RecordingEntry {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("RecordingEntry").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for RecordingEntry {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for RecordingEntry {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/meeting_packet.proto\"\xda\x07\n\rMeetingPacket\x12>\n\neven\
+    \n\x1atypes/meeting_packet.proto\"\xd2\x08\n\rMeetingPacket\x12>\n\neven\
     t_type\x18\x01\x20\x01(\x0e2\x1f.MeetingPacket.MeetingEventTypeR\teventT\
     ype\x12\x17\n\x07room_id\x18\x02\x20\x01(\tR\x06roomId\x12\"\n\rstart_ti\
     me_ms\x18\x03\x20\x01(\x04R\x0bstartTimeMs\x12\x18\n\x07message\x18\x04\
@@ -547,142 +891,171 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x0cR\x0bdisplayName\x12\x19\n\x08is_guest\x18\x0b\x20\x01(\x08R\x07isGu\
     est\x122\n\x15requester_instance_id\x18\x0c\x20\x01(\tR\x13requesterInst\
     anceId\x12.\n\x13previous_session_id\x18\r\x20\x01(\x04R\x11previousSess\
-    ionId\"\xdf\x03\n\x10MeetingEventType\x12\x1e\n\x1aMEETING_EVENT_TYPE_UN\
-    KNOWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\n\rMEETING_ENDE\
-    D\x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\x14\n\x10PARTICIPA\
-    NT_LEFT\x10\x04\x12\x15\n\x11MEETING_ACTIVATED\x10\x05\x12\x18\n\x14PART\
-    ICIPANT_ADMITTED\x10\x06\x12\x18\n\x14PARTICIPANT_REJECTED\x10\x07\x12\
-    \x18\n\x14WAITING_ROOM_UPDATED\x10\x08\x12$\n\x20PARTICIPANT_DISPLAY_NAM\
-    E_CHANGED\x10\t\x12\x1c\n\x18MEETING_SETTINGS_UPDATED\x10\n\x12\x19\n\
-    \x15HOST_MUTE_PARTICIPANT\x10\x0b\x12\x16\n\x12HOST_DISABLE_VIDEO\x10\
-    \x0c\x12\x16\n\x12PARTICIPANT_KICKED\x10\r\x12\x1c\n\x18PARTICIPANT_LIST\
-    _REQUEST\x10\x0e\x12\x10\n\x0cHOST_GRANTED\x10\x0f\x12\x10\n\x0cHOST_REV\
-    OKED\x10\x10\x12\x1f\n\x1bPARTICIPANT_SESSION_RESUMED\x10\x11J\xa4\x1f\n\
-    \x06\x12\x04\0\0Q\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\nH\n\x02\x04\0\x12\
-    \x04\x03\0Q\x01\x1a<\x20Meeting\x20lifecycle\x20messages\x20sent\x20betw\
-    een\x20server\x20and\x20clients\n\n\n\n\x03\x04\0\x01\x12\x03\x03\x08\
-    \x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x04\x02(\x03\n\x0c\n\x05\x04\0\x04\
-    \0\x01\x12\x03\x04\x07\x17\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\x05\x04#\
-    \n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x05\x04\x1e\n\x0e\n\x07\x04\0\
-    \x04\0\x02\0\x02\x12\x03\x05!\"\nF\n\x06\x04\0\x04\0\x02\x01\x12\x03\x07\
-    \x04\x18\x1a7\x20Meeting\x20started\x20-\x20sent\x20to\x20participants\
-    \x20when\x20they\x20join\n\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x03\
-    \x07\x04\x13\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x07\x16\x17\nQ\
-    \n\x06\x04\0\x04\0\x02\x02\x12\x03\t\x04\x16\x1aB\x20Meeting\x20ended\
-    \x20-\x20sent\x20when\x20host\x20leaves\x20or\x20last\x20participant\x20\
-    leaves\n\n\x0e\n\x07\x04\0\x04\0\x02\x02\x01\x12\x03\t\x04\x11\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x02\x02\x12\x03\t\x14\x15\n/\n\x06\x04\0\x04\0\x02\
-    \x03\x12\x03\x0b\x04\x1b\x1a\x20\x20Participant\x20joined\x20the\x20meet\
-    ing\n\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x0b\x04\x16\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x03\x02\x12\x03\x0b\x19\x1a\n-\n\x06\x04\0\x04\0\
-    \x02\x04\x12\x03\r\x04\x19\x1a\x1e\x20Participant\x20left\x20the\x20meet\
-    ing\n\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\x12\x03\r\x04\x14\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x04\x02\x12\x03\r\x17\x18\n0\n\x06\x04\0\x04\0\x02\x05\
-    \x12\x03\x0f\x04\x1a\x1a!\x20Host\x20joined,\x20meeting\x20now\x20active\
-    \n\n\x0e\n\x07\x04\0\x04\0\x02\x05\x01\x12\x03\x0f\x04\x15\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x05\x02\x12\x03\x0f\x18\x19\n+\n\x06\x04\0\x04\0\x02\
-    \x06\x12\x03\x11\x04\x1d\x1a\x1c\x20Admitted\x20from\x20waiting\x20room\
-    \n\n\x0e\n\x07\x04\0\x04\0\x02\x06\x01\x12\x03\x11\x04\x18\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x06\x02\x12\x03\x11\x1b\x1c\n+\n\x06\x04\0\x04\0\x02\
-    \x07\x12\x03\x13\x04\x1d\x1a\x1c\x20Rejected\x20from\x20waiting\x20room\
-    \n\n\x0e\n\x07\x04\0\x04\0\x02\x07\x01\x12\x03\x13\x04\x18\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x07\x02\x12\x03\x13\x1b\x1c\n*\n\x06\x04\0\x04\0\x02\
-    \x08\x12\x03\x15\x04\x1d\x1a\x1b\x20Waiting\x20room\x20list\x20changed\n\
-    \n\x0e\n\x07\x04\0\x04\0\x02\x08\x01\x12\x03\x15\x04\x18\n\x0e\n\x07\x04\
-    \0\x04\0\x02\x08\x02\x12\x03\x15\x1b\x1c\n7\n\x06\x04\0\x04\0\x02\t\x12\
-    \x03\x17\x04)\x1a(\x20Participant\x20updated\x20their\x20display\x20name\
-    \n\n\x0e\n\x07\x04\0\x04\0\x02\t\x01\x12\x03\x17\x04$\n\x0e\n\x07\x04\0\
-    \x04\0\x02\t\x02\x12\x03\x17'(\n5\n\x06\x04\0\x04\0\x02\n\x12\x03\x19\
-    \x04\"\x1a&\x20Meeting\x20settings\x20updated\x20mid-meeting\n\n\x0e\n\
-    \x07\x04\0\x04\0\x02\n\x01\x12\x03\x19\x04\x1c\n\x0e\n\x07\x04\0\x04\0\
-    \x02\n\x02\x12\x03\x19\x1f!\n:\n\x06\x04\0\x04\0\x02\x0b\x12\x03\x1b\x04\
-    \x1f\x1a+\x20Host\x20requests\x20participants\x20mute\x20their\x20mic\n\
-    \n\x0e\n\x07\x04\0\x04\0\x02\x0b\x01\x12\x03\x1b\x04\x19\n\x0e\n\x07\x04\
-    \0\x04\0\x02\x0b\x02\x12\x03\x1b\x1c\x1e\n?\n\x06\x04\0\x04\0\x02\x0c\
-    \x12\x03\x1d\x04\x1c\x1a0\x20Host\x20requests\x20participants\x20disable\
-    \x20their\x20video\n\n\x0e\n\x07\x04\0\x04\0\x02\x0c\x01\x12\x03\x1d\x04\
-    \x16\n\x0e\n\x07\x04\0\x04\0\x02\x0c\x02\x12\x03\x1d\x19\x1b\n<\n\x06\
-    \x04\0\x04\0\x02\r\x12\x03\x1f\x04\x1c\x1a-\x20Host\x20removes\x20a\x20p\
-    articipant\x20from\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\r\x01\
-    \x12\x03\x1f\x04\x16\n\x0e\n\x07\x04\0\x04\0\x02\r\x02\x12\x03\x1f\x19\
-    \x1b\nZ\n\x06\x04\0\x04\0\x02\x0e\x12\x03!\x04\"\x1aK\x20Server-internal\
-    :\x20triggers\x20Active\x20peers\x20to\x20re-broadcast\x20PARTICIPANT_JO\
-    INED\n\n\x0e\n\x07\x04\0\x04\0\x02\x0e\x01\x12\x03!\x04\x1c\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x0e\x02\x12\x03!\x1f!\n.\n\x06\x04\0\x04\0\x02\x0f\x12\
-    \x03#\x04\x16\x1a\x1f\x20Host\x20granted\x20to\x20a\x20participant\n\n\
-    \x0e\n\x07\x04\0\x04\0\x02\x0f\x01\x12\x03#\x04\x10\n\x0e\n\x07\x04\0\
-    \x04\0\x02\x0f\x02\x12\x03#\x13\x15\n0\n\x06\x04\0\x04\0\x02\x10\x12\x03\
-    %\x04\x16\x1a!\x20Host\x20revoked\x20from\x20a\x20participant\n\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x10\x01\x12\x03%\x04\x10\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x10\x02\x12\x03%\x13\x15\n[\n\x06\x04\0\x04\0\x02\x11\x12\x03'\x04%\
-    \x1aL\x20Transport\x20reconnect:\x20`session_id`\x20supersedes\x20`previ\
-    ous_session_id`\x20(#2269)\n\n\x0e\n\x07\x04\0\x04\0\x02\x11\x01\x12\x03\
-    '\x04\x1f\n\x0e\n\x07\x04\0\x04\0\x02\x11\x02\x12\x03'\"$\n\x0b\n\x04\
-    \x04\0\x02\0\x12\x03*\x02\"\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03*\x02\x12\
-    \n\x0c\n\x05\x04\0\x02\0\x01\x12\x03*\x13\x1d\n\x0c\n\x05\x04\0\x02\0\
-    \x03\x12\x03*\x20!\n\x0b\n\x04\x04\0\x02\x01\x12\x03+\x02\x15\n\x0c\n\
-    \x05\x04\0\x02\x01\x05\x12\x03+\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\
-    \x12\x03+\t\x10\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03+\x13\x14\n\x0b\n\
-    \x04\x04\0\x02\x02\x12\x03,\x02\x1b\n\x0c\n\x05\x04\0\x02\x02\x05\x12\
-    \x03,\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03,\t\x16\n\x0c\n\x05\
-    \x04\0\x02\x02\x03\x12\x03,\x19\x1a\n\x0b\n\x04\x04\0\x02\x03\x12\x03-\
-    \x02\x15\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03-\x02\x08\n\x0c\n\x05\x04\
-    \0\x02\x03\x01\x12\x03-\t\x10\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03-\x13\
-    \x14\n\x0b\n\x04\x04\0\x02\x04\x12\x03.\x02\x17\n\x0c\n\x05\x04\0\x02\
-    \x04\x05\x12\x03.\x02\x07\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03.\x08\x12\
-    \n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03.\x15\x16\n\x0b\n\x04\x04\0\x02\
-    \x05\x12\x03/\x02\x1e\n\x0c\n\x05\x04\0\x02\x05\x05\x12\x03/\x02\x07\n\
-    \x0c\n\x05\x04\0\x02\x05\x01\x12\x03/\x08\x19\n\x0c\n\x05\x04\0\x02\x05\
-    \x03\x12\x03/\x1c\x1d\n8\n\x04\x04\0\x02\x06\x12\x031\x02\x1b\x1a+\x20Fo\
-    r\x20ADMITTED/REJECTED:\x20affected\x20user's\x20ID\n\n\x0c\n\x05\x04\0\
-    \x02\x06\x05\x12\x031\x02\x07\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x031\x08\
-    \x16\n\x0c\n\x05\x04\0\x02\x06\x03\x12\x031\x19\x1a\n6\n\x04\x04\0\x02\
-    \x07\x12\x033\x02\x18\x1a)\x20For\x20ADMITTED:\x20JWT\x20to\x20upgrade\
-    \x20connection\n\n\x0c\n\x05\x04\0\x02\x07\x05\x12\x033\x02\x08\n\x0c\n\
-    \x05\x04\0\x02\x07\x01\x12\x033\t\x13\n\x0c\n\x05\x04\0\x02\x07\x03\x12\
-    \x033\x16\x17\n\x0b\n\x04\x04\0\x02\x08\x12\x034\x02\x18\n\x0c\n\x05\x04\
-    \0\x02\x08\x05\x12\x034\x02\x08\n\x0c\n\x05\x04\0\x02\x08\x01\x12\x034\t\
-    \x13\n\x0c\n\x05\x04\0\x02\x08\x03\x12\x034\x16\x17\nS\n\x04\x04\0\x02\t\
-    \x12\x036\x02\x1a\x1aF\x20Display\x20name\x20of\x20the\x20participant\
-    \x20(for\x20PARTICIPANT_JOINED/LEFT\x20events)\n\n\x0c\n\x05\x04\0\x02\t\
-    \x05\x12\x036\x02\x07\n\x0c\n\x05\x04\0\x02\t\x01\x12\x036\x08\x14\n\x0c\
-    \n\x05\x04\0\x02\t\x03\x12\x036\x17\x19\n\xfe\x01\n\x04\x04\0\x02\n\x12\
-    \x03;\x02\x15\x1a\xf0\x01\x20Whether\x20the\x20participant\x20joined\x20\
-    as\x20an\x20unauthenticated\x20guest\n\x20(for\x20PARTICIPANT_JOINED/LEF\
-    T\x20events).\x20Sourced\x20from\x20the\n\x20authenticated\x20JWT\x20is_\
-    guest\x20claim\x20on\x20the\x20server.\x20Default\x20false\n\x20keeps\
-    \x20the\x20wire\x20format\x20backward-compatible\x20with\x20older\x20pee\
-    rs.\n\n\x0c\n\x05\x04\0\x02\n\x05\x12\x03;\x02\x06\n\x0c\n\x05\x04\0\x02\
-    \n\x01\x12\x03;\x07\x0f\n\x0c\n\x05\x04\0\x02\n\x03\x12\x03;\x12\x14\n\
-    \xb8\x08\n\x04\x04\0\x02\x0b\x12\x03N\x02$\x1a\xaa\x08\x20For\x20PARTICI\
-    PANT_LIST_REQUEST:\x20the\x20requesting\x20joiner's\x20CLAIMED\x20per-ta\
-    b\n\x20instance_id.\x20Relay-internal\x20\xe2\x80\x94\x20PARTICIPANT_LIS\
-    T_REQUEST\x20is\x20consumed\x20by\n\x20the\x20receiving\x20relay\x20and\
-    \x20never\x20forwarded\x20to\x20clients.\n\n\x20NOT\x20server-authoritat\
-    ive.\x20The\x20value\x20originates\x20as\x20the\x20client's\x20own\n\x20\
-    ?instance_id=\x20connect\x20parameter;\x20the\x20joiner's\x20relay\x20co\
-    pies\x20it\x20onto\x20the\n\x20wire\x20after\x20a\x20length/emptiness\
-    \x20check\x20only,\x20and\x20never\x20checks\x20it\x20against\n\x20the\
-    \x20authenticated\x20JWT\x20sub.\x20Treat\x20it\x20as\x20a\x20hint\x20a\
-    \x20client\x20could\x20forge.\n\n\x20It\x20lets\x20a\x20responding\x20re\
-    lay\x20count\x20one\x20client's\x20dual\x20election\x20candidate\n\x20se\
-    ssions\x20(WS\x20+\x20WT,\x20distinct\x20session_id,\x20same\x20instance\
-    _id)\x20as\x20ONE\n\x20distinct\x20requester,\x20which\x20selects\x20a\
-    \x20unicast\x20re-announce\x20instead\x20of\x20a\n\x20broadcast.\x20That\
-    \x20is\x20the\x20only\x20decision\x20keyed\x20on\x20it,\x20and\x20a\x20f\
-    alse\x20claim\n\x20resolves\x20toward\x20broadcast\x20\xe2\x80\x94\x20re\
-    aching\x20more\x20sessions,\x20never\x20fewer\x20\xe2\x80\x94\x20so\x20a\
-    \n\x20forged\x20value\x20cannot\x20withhold\x20a\x20presence\x20answer\
-    \x20from\x20anyone.\x20Empty\x20when\n\x20the\x20joiner\x20supplied\x20n\
-    o\x20instance_id\x20or\x20the\x20request\x20came\x20from\x20an\x20older\
-    \n\x20relay;\x20receivers\x20then\x20fall\x20back\x20to\x20keying\x20on\
-    \x20session_id,\x20which\x20is\x20the\n\x20pre-#1600\x20behaviour.\n\n\
-    \x0c\n\x05\x04\0\x02\x0b\x05\x12\x03N\x02\x08\n\x0c\n\x05\x04\0\x02\x0b\
-    \x01\x12\x03N\t\x1e\n\x0c\n\x05\x04\0\x02\x0b\x03\x12\x03N!#\nV\n\x04\
-    \x04\0\x02\x0c\x12\x03P\x02\"\x1aI\x20PARTICIPANT_SESSION_RESUMED:\x20th\
-    e\x20superseded\x20session_id\x20receivers\x20evict.\n\n\x0c\n\x05\x04\0\
-    \x02\x0c\x05\x12\x03P\x02\x08\n\x0c\n\x05\x04\0\x02\x0c\x01\x12\x03P\t\
-    \x1c\n\x0c\n\x05\x04\0\x02\x0c\x03\x12\x03P\x1f!b\x06proto3\
+    ionId\x12'\n\x0frecording_epoch\x18\x0e\x20\x01(\x04R\x0erecordingEpoch\
+    \x128\n\x0frecording_state\x18\x0f\x20\x01(\x0b2\x0f.RecordingStateR\x0e\
+    recordingState\"\xf4\x03\n\x10MeetingEventType\x12\x1e\n\x1aMEETING_EVEN\
+    T_TYPE_UNKNOWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\n\rMEE\
+    TING_ENDED\x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\x14\n\x10\
+    PARTICIPANT_LEFT\x10\x04\x12\x15\n\x11MEETING_ACTIVATED\x10\x05\x12\x18\
+    \n\x14PARTICIPANT_ADMITTED\x10\x06\x12\x18\n\x14PARTICIPANT_REJECTED\x10\
+    \x07\x12\x18\n\x14WAITING_ROOM_UPDATED\x10\x08\x12$\n\x20PARTICIPANT_DIS\
+    PLAY_NAME_CHANGED\x10\t\x12\x1c\n\x18MEETING_SETTINGS_UPDATED\x10\n\x12\
+    \x19\n\x15HOST_MUTE_PARTICIPANT\x10\x0b\x12\x16\n\x12HOST_DISABLE_VIDEO\
+    \x10\x0c\x12\x16\n\x12PARTICIPANT_KICKED\x10\r\x12\x1c\n\x18PARTICIPANT_\
+    LIST_REQUEST\x10\x0e\x12\x10\n\x0cHOST_GRANTED\x10\x0f\x12\x10\n\x0cHOST\
+    _REVOKED\x10\x10\x12\x1f\n\x1bPARTICIPANT_SESSION_RESUMED\x10\x11\x12\
+    \x13\n\x0fRECORDING_STATE\x10\x13\"U\n\x0eRecordingState\x12\x18\n\x07ve\
+    rsion\x18\x01\x20\x01(\x04R\x07version\x12)\n\x07entries\x18\x02\x20\x03\
+    (\x0b2\x0f.RecordingEntryR\x07entries\"M\n\x0eRecordingEntry\x12!\n\x0cr\
+    ecording_id\x18\x01\x20\x01(\x0cR\x0brecordingId\x12\x18\n\x07revoked\
+    \x18\x02\x20\x01(\x08R\x07revokedJ\xc3#\n\x06\x12\x04\0\0`\x01\n\x08\n\
+    \x01\x0c\x12\x03\0\0\x12\nH\n\x02\x04\0\x12\x04\x03\0V\x01\x1a<\x20Meeti\
+    ng\x20lifecycle\x20messages\x20sent\x20between\x20server\x20and\x20clien\
+    ts\n\n\n\n\x03\x04\0\x01\x12\x03\x03\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\
+    \x04\x04\x02*\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x04\x07\x17\n\r\n\
+    \x06\x04\0\x04\0\x02\0\x12\x03\x05\x04#\n\x0e\n\x07\x04\0\x04\0\x02\0\
+    \x01\x12\x03\x05\x04\x1e\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x05!\
+    \"\nF\n\x06\x04\0\x04\0\x02\x01\x12\x03\x07\x04\x18\x1a7\x20Meeting\x20s\
+    tarted\x20-\x20sent\x20to\x20participants\x20when\x20they\x20join\n\n\
+    \x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x03\x07\x04\x13\n\x0e\n\x07\x04\0\
+    \x04\0\x02\x01\x02\x12\x03\x07\x16\x17\nQ\n\x06\x04\0\x04\0\x02\x02\x12\
+    \x03\t\x04\x16\x1aB\x20Meeting\x20ended\x20-\x20sent\x20when\x20host\x20\
+    leaves\x20or\x20last\x20participant\x20leaves\n\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x02\x01\x12\x03\t\x04\x11\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\
+    \x03\t\x14\x15\n/\n\x06\x04\0\x04\0\x02\x03\x12\x03\x0b\x04\x1b\x1a\x20\
+    \x20Participant\x20joined\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x03\x01\x12\x03\x0b\x04\x16\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\
+    \x03\x0b\x19\x1a\n-\n\x06\x04\0\x04\0\x02\x04\x12\x03\r\x04\x19\x1a\x1e\
+    \x20Participant\x20left\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\
+    \x04\x01\x12\x03\r\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\r\
+    \x17\x18\n0\n\x06\x04\0\x04\0\x02\x05\x12\x03\x0f\x04\x1a\x1a!\x20Host\
+    \x20joined,\x20meeting\x20now\x20active\n\n\x0e\n\x07\x04\0\x04\0\x02\
+    \x05\x01\x12\x03\x0f\x04\x15\n\x0e\n\x07\x04\0\x04\0\x02\x05\x02\x12\x03\
+    \x0f\x18\x19\n+\n\x06\x04\0\x04\0\x02\x06\x12\x03\x11\x04\x1d\x1a\x1c\
+    \x20Admitted\x20from\x20waiting\x20room\n\n\x0e\n\x07\x04\0\x04\0\x02\
+    \x06\x01\x12\x03\x11\x04\x18\n\x0e\n\x07\x04\0\x04\0\x02\x06\x02\x12\x03\
+    \x11\x1b\x1c\n+\n\x06\x04\0\x04\0\x02\x07\x12\x03\x13\x04\x1d\x1a\x1c\
+    \x20Rejected\x20from\x20waiting\x20room\n\n\x0e\n\x07\x04\0\x04\0\x02\
+    \x07\x01\x12\x03\x13\x04\x18\n\x0e\n\x07\x04\0\x04\0\x02\x07\x02\x12\x03\
+    \x13\x1b\x1c\n*\n\x06\x04\0\x04\0\x02\x08\x12\x03\x15\x04\x1d\x1a\x1b\
+    \x20Waiting\x20room\x20list\x20changed\n\n\x0e\n\x07\x04\0\x04\0\x02\x08\
+    \x01\x12\x03\x15\x04\x18\n\x0e\n\x07\x04\0\x04\0\x02\x08\x02\x12\x03\x15\
+    \x1b\x1c\n7\n\x06\x04\0\x04\0\x02\t\x12\x03\x17\x04)\x1a(\x20Participant\
+    \x20updated\x20their\x20display\x20name\n\n\x0e\n\x07\x04\0\x04\0\x02\t\
+    \x01\x12\x03\x17\x04$\n\x0e\n\x07\x04\0\x04\0\x02\t\x02\x12\x03\x17'(\n5\
+    \n\x06\x04\0\x04\0\x02\n\x12\x03\x19\x04\"\x1a&\x20Meeting\x20settings\
+    \x20updated\x20mid-meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\n\x01\x12\x03\
+    \x19\x04\x1c\n\x0e\n\x07\x04\0\x04\0\x02\n\x02\x12\x03\x19\x1f!\n:\n\x06\
+    \x04\0\x04\0\x02\x0b\x12\x03\x1b\x04\x1f\x1a+\x20Host\x20requests\x20par\
+    ticipants\x20mute\x20their\x20mic\n\n\x0e\n\x07\x04\0\x04\0\x02\x0b\x01\
+    \x12\x03\x1b\x04\x19\n\x0e\n\x07\x04\0\x04\0\x02\x0b\x02\x12\x03\x1b\x1c\
+    \x1e\n?\n\x06\x04\0\x04\0\x02\x0c\x12\x03\x1d\x04\x1c\x1a0\x20Host\x20re\
+    quests\x20participants\x20disable\x20their\x20video\n\n\x0e\n\x07\x04\0\
+    \x04\0\x02\x0c\x01\x12\x03\x1d\x04\x16\n\x0e\n\x07\x04\0\x04\0\x02\x0c\
+    \x02\x12\x03\x1d\x19\x1b\n<\n\x06\x04\0\x04\0\x02\r\x12\x03\x1f\x04\x1c\
+    \x1a-\x20Host\x20removes\x20a\x20participant\x20from\x20the\x20meeting\n\
+    \n\x0e\n\x07\x04\0\x04\0\x02\r\x01\x12\x03\x1f\x04\x16\n\x0e\n\x07\x04\0\
+    \x04\0\x02\r\x02\x12\x03\x1f\x19\x1b\nZ\n\x06\x04\0\x04\0\x02\x0e\x12\
+    \x03!\x04\"\x1aK\x20Server-internal:\x20triggers\x20Active\x20peers\x20t\
+    o\x20re-broadcast\x20PARTICIPANT_JOINED\n\n\x0e\n\x07\x04\0\x04\0\x02\
+    \x0e\x01\x12\x03!\x04\x1c\n\x0e\n\x07\x04\0\x04\0\x02\x0e\x02\x12\x03!\
+    \x1f!\n.\n\x06\x04\0\x04\0\x02\x0f\x12\x03#\x04\x16\x1a\x1f\x20Host\x20g\
+    ranted\x20to\x20a\x20participant\n\n\x0e\n\x07\x04\0\x04\0\x02\x0f\x01\
+    \x12\x03#\x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\x0f\x02\x12\x03#\x13\x15\n\
+    0\n\x06\x04\0\x04\0\x02\x10\x12\x03%\x04\x16\x1a!\x20Host\x20revoked\x20\
+    from\x20a\x20participant\n\n\x0e\n\x07\x04\0\x04\0\x02\x10\x01\x12\x03%\
+    \x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\x10\x02\x12\x03%\x13\x15\n[\n\x06\
+    \x04\0\x04\0\x02\x11\x12\x03'\x04%\x1aL\x20Transport\x20reconnect:\x20`s\
+    ession_id`\x20supersedes\x20`previous_session_id`\x20(#2269)\n\n\x0e\n\
+    \x07\x04\0\x04\0\x02\x11\x01\x12\x03'\x04\x1f\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x11\x02\x12\x03'\"$\n<\n\x06\x04\0\x04\0\x02\x12\x12\x03)\x04\x19\
+    \x1a-\x20Server-authored\x20recording\x20registry\x20snapshot\n\n\x0e\n\
+    \x07\x04\0\x04\0\x02\x12\x01\x12\x03)\x04\x13\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x12\x02\x12\x03)\x16\x18\n\x0b\n\x04\x04\0\x02\0\x12\x03,\x02\"\n\
+    \x0c\n\x05\x04\0\x02\0\x06\x12\x03,\x02\x12\n\x0c\n\x05\x04\0\x02\0\x01\
+    \x12\x03,\x13\x1d\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03,\x20!\n\x0b\n\x04\
+    \x04\0\x02\x01\x12\x03-\x02\x15\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03-\
+    \x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03-\t\x10\n\x0c\n\x05\x04\0\
+    \x02\x01\x03\x12\x03-\x13\x14\n\x0b\n\x04\x04\0\x02\x02\x12\x03.\x02\x1b\
+    \n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03.\x02\x08\n\x0c\n\x05\x04\0\x02\
+    \x02\x01\x12\x03.\t\x16\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03.\x19\x1a\n\
+    \x0b\n\x04\x04\0\x02\x03\x12\x03/\x02\x15\n\x0c\n\x05\x04\0\x02\x03\x05\
+    \x12\x03/\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03/\t\x10\n\x0c\n\
+    \x05\x04\0\x02\x03\x03\x12\x03/\x13\x14\n\x0b\n\x04\x04\0\x02\x04\x12\
+    \x030\x02\x17\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x030\x02\x07\n\x0c\n\x05\
+    \x04\0\x02\x04\x01\x12\x030\x08\x12\n\x0c\n\x05\x04\0\x02\x04\x03\x12\
+    \x030\x15\x16\n\x0b\n\x04\x04\0\x02\x05\x12\x031\x02\x1e\n\x0c\n\x05\x04\
+    \0\x02\x05\x05\x12\x031\x02\x07\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x031\
+    \x08\x19\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x031\x1c\x1d\n8\n\x04\x04\0\
+    \x02\x06\x12\x033\x02\x1b\x1a+\x20For\x20ADMITTED/REJECTED:\x20affected\
+    \x20user's\x20ID\n\n\x0c\n\x05\x04\0\x02\x06\x05\x12\x033\x02\x07\n\x0c\
+    \n\x05\x04\0\x02\x06\x01\x12\x033\x08\x16\n\x0c\n\x05\x04\0\x02\x06\x03\
+    \x12\x033\x19\x1a\n6\n\x04\x04\0\x02\x07\x12\x035\x02\x18\x1a)\x20For\
+    \x20ADMITTED:\x20JWT\x20to\x20upgrade\x20connection\n\n\x0c\n\x05\x04\0\
+    \x02\x07\x05\x12\x035\x02\x08\n\x0c\n\x05\x04\0\x02\x07\x01\x12\x035\t\
+    \x13\n\x0c\n\x05\x04\0\x02\x07\x03\x12\x035\x16\x17\n\x0b\n\x04\x04\0\
+    \x02\x08\x12\x036\x02\x18\n\x0c\n\x05\x04\0\x02\x08\x05\x12\x036\x02\x08\
+    \n\x0c\n\x05\x04\0\x02\x08\x01\x12\x036\t\x13\n\x0c\n\x05\x04\0\x02\x08\
+    \x03\x12\x036\x16\x17\nS\n\x04\x04\0\x02\t\x12\x038\x02\x1a\x1aF\x20Disp\
+    lay\x20name\x20of\x20the\x20participant\x20(for\x20PARTICIPANT_JOINED/LE\
+    FT\x20events)\n\n\x0c\n\x05\x04\0\x02\t\x05\x12\x038\x02\x07\n\x0c\n\x05\
+    \x04\0\x02\t\x01\x12\x038\x08\x14\n\x0c\n\x05\x04\0\x02\t\x03\x12\x038\
+    \x17\x19\n\xfe\x01\n\x04\x04\0\x02\n\x12\x03=\x02\x15\x1a\xf0\x01\x20Whe\
+    ther\x20the\x20participant\x20joined\x20as\x20an\x20unauthenticated\x20g\
+    uest\n\x20(for\x20PARTICIPANT_JOINED/LEFT\x20events).\x20Sourced\x20from\
+    \x20the\n\x20authenticated\x20JWT\x20is_guest\x20claim\x20on\x20the\x20s\
+    erver.\x20Default\x20false\n\x20keeps\x20the\x20wire\x20format\x20backwa\
+    rd-compatible\x20with\x20older\x20peers.\n\n\x0c\n\x05\x04\0\x02\n\x05\
+    \x12\x03=\x02\x06\n\x0c\n\x05\x04\0\x02\n\x01\x12\x03=\x07\x0f\n\x0c\n\
+    \x05\x04\0\x02\n\x03\x12\x03=\x12\x14\n\xb8\x08\n\x04\x04\0\x02\x0b\x12\
+    \x03P\x02$\x1a\xaa\x08\x20For\x20PARTICIPANT_LIST_REQUEST:\x20the\x20req\
+    uesting\x20joiner's\x20CLAIMED\x20per-tab\n\x20instance_id.\x20Relay-int\
+    ernal\x20\xe2\x80\x94\x20PARTICIPANT_LIST_REQUEST\x20is\x20consumed\x20b\
+    y\n\x20the\x20receiving\x20relay\x20and\x20never\x20forwarded\x20to\x20c\
+    lients.\n\n\x20NOT\x20server-authoritative.\x20The\x20value\x20originate\
+    s\x20as\x20the\x20client's\x20own\n\x20?instance_id=\x20connect\x20param\
+    eter;\x20the\x20joiner's\x20relay\x20copies\x20it\x20onto\x20the\n\x20wi\
+    re\x20after\x20a\x20length/emptiness\x20check\x20only,\x20and\x20never\
+    \x20checks\x20it\x20against\n\x20the\x20authenticated\x20JWT\x20sub.\x20\
+    Treat\x20it\x20as\x20a\x20hint\x20a\x20client\x20could\x20forge.\n\n\x20\
+    It\x20lets\x20a\x20responding\x20relay\x20count\x20one\x20client's\x20du\
+    al\x20election\x20candidate\n\x20sessions\x20(WS\x20+\x20WT,\x20distinct\
+    \x20session_id,\x20same\x20instance_id)\x20as\x20ONE\n\x20distinct\x20re\
+    quester,\x20which\x20selects\x20a\x20unicast\x20re-announce\x20instead\
+    \x20of\x20a\n\x20broadcast.\x20That\x20is\x20the\x20only\x20decision\x20\
+    keyed\x20on\x20it,\x20and\x20a\x20false\x20claim\n\x20resolves\x20toward\
+    \x20broadcast\x20\xe2\x80\x94\x20reaching\x20more\x20sessions,\x20never\
+    \x20fewer\x20\xe2\x80\x94\x20so\x20a\n\x20forged\x20value\x20cannot\x20w\
+    ithhold\x20a\x20presence\x20answer\x20from\x20anyone.\x20Empty\x20when\n\
+    \x20the\x20joiner\x20supplied\x20no\x20instance_id\x20or\x20the\x20reque\
+    st\x20came\x20from\x20an\x20older\n\x20relay;\x20receivers\x20then\x20fa\
+    ll\x20back\x20to\x20keying\x20on\x20session_id,\x20which\x20is\x20the\n\
+    \x20pre-#1600\x20behaviour.\n\n\x0c\n\x05\x04\0\x02\x0b\x05\x12\x03P\x02\
+    \x08\n\x0c\n\x05\x04\0\x02\x0b\x01\x12\x03P\t\x1e\n\x0c\n\x05\x04\0\x02\
+    \x0b\x03\x12\x03P!#\nV\n\x04\x04\0\x02\x0c\x12\x03R\x02\"\x1aI\x20PARTIC\
+    IPANT_SESSION_RESUMED:\x20the\x20superseded\x20session_id\x20receivers\
+    \x20evict.\n\n\x0c\n\x05\x04\0\x02\x0c\x05\x12\x03R\x02\x08\n\x0c\n\x05\
+    \x04\0\x02\x0c\x01\x12\x03R\t\x1c\n\x0c\n\x05\x04\0\x02\x0c\x03\x12\x03R\
+    \x1f!\nD\n\x04\x04\0\x02\r\x12\x03T\x02\x1e\x1a7\x20RECORDING_STATE:\x20\
+    meetings.created_at\x20in\x20microseconds.\n\n\x0c\n\x05\x04\0\x02\r\x05\
+    \x12\x03T\x02\x08\n\x0c\n\x05\x04\0\x02\r\x01\x12\x03T\t\x18\n\x0c\n\x05\
+    \x04\0\x02\r\x03\x12\x03T\x1b\x1d\n\x0b\n\x04\x04\0\x02\x0e\x12\x03U\x02\
+    &\n\x0c\n\x05\x04\0\x02\x0e\x06\x12\x03U\x02\x10\n\x0c\n\x05\x04\0\x02\
+    \x0e\x01\x12\x03U\x11\x20\n\x0c\n\x05\x04\0\x02\x0e\x03\x12\x03U#%\n\n\n\
+    \x02\x04\x01\x12\x04X\0[\x01\n\n\n\x03\x04\x01\x01\x12\x03X\x08\x16\n\
+    \x0b\n\x04\x04\x01\x02\0\x12\x03Y\x02\x15\n\x0c\n\x05\x04\x01\x02\0\x05\
+    \x12\x03Y\x02\x08\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03Y\t\x10\n\x0c\n\
+    \x05\x04\x01\x02\0\x03\x12\x03Y\x13\x14\n\x0b\n\x04\x04\x01\x02\x01\x12\
+    \x03Z\x02&\n\x0c\n\x05\x04\x01\x02\x01\x04\x12\x03Z\x02\n\n\x0c\n\x05\
+    \x04\x01\x02\x01\x06\x12\x03Z\x0b\x19\n\x0c\n\x05\x04\x01\x02\x01\x01\
+    \x12\x03Z\x1a!\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03Z$%\n\n\n\x02\x04\
+    \x02\x12\x04]\0`\x01\n\n\n\x03\x04\x02\x01\x12\x03]\x08\x16\n\x0b\n\x04\
+    \x04\x02\x02\0\x12\x03^\x02\x19\n\x0c\n\x05\x04\x02\x02\0\x05\x12\x03^\
+    \x02\x07\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x03^\x08\x14\n\x0c\n\x05\x04\
+    \x02\x02\0\x03\x12\x03^\x17\x18\n\x0b\n\x04\x04\x02\x02\x01\x12\x03_\x02\
+    \x13\n\x0c\n\x05\x04\x02\x02\x01\x05\x12\x03_\x02\x06\n\x0c\n\x05\x04\
+    \x02\x02\x01\x01\x12\x03_\x07\x0e\n\x0c\n\x05\x04\x02\x02\x01\x03\x12\
+    \x03_\x11\x12b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -700,8 +1073,10 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(1);
+            let mut messages = ::std::vec::Vec::with_capacity(3);
             messages.push(MeetingPacket::generated_message_descriptor_data());
+            messages.push(RecordingState::generated_message_descriptor_data());
+            messages.push(RecordingEntry::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(1);
             enums.push(meeting_packet::MeetingEventType::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(

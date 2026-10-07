@@ -47,6 +47,7 @@ function mockSurface(initial: BotRegistryEntry[] = []): MockSurface {
     registry,
     callLog,
     getRegistry: () => registry,
+    expectedBots: () => 0,
     triggerLeave: async (id) => void callLog.push(`leave:${id}`),
     forceKill: async (id) => void callLog.push(`kill:${id}`),
     applyTtl: (id, ttl) => void callLog.push(`ttl:${id}:${ttl}`),
@@ -415,6 +416,24 @@ describe("control server: SSH host registry endpoints", () => {
       expect(body.remoteCommand).toContain("--participant 'alice'");
       expect(body.remoteCommand).toContain("--ttl '5m'");
       expect(body.remoteCommand).toContain("--video-mode 'clock'");
+    });
+
+    it("previews the --diag-packets off the launch would pass (#2970)", async () => {
+      await seed("preview-diag");
+      const res = await fetchJson(handle.port, "/hosts/preview-diag/preview-launch", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          meetingURL: "https://example.com/meeting/X",
+          participant: "alice",
+          ttl: "5m",
+          headless: true,
+          network: "none",
+          authBackend: "jwt",
+          diagPackets: "off",
+        },
+      });
+      expect((res.body as { remoteCommand: string }).remoteCommand).toContain("--diag-packets off");
     });
 
     it("returns 404 when the host is not registered", async () => {

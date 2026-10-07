@@ -60,6 +60,7 @@
 //!     on_connected: Callback::noop(),
 //!     on_connection_lost: Callback::noop(),
 //!     enable_diagnostics: false,
+//!     send_diagnostics_packets: true,
 //!     diagnostics_update_interval_ms: None,
 //!     enable_health_reporting: false,
 //!     on_encoder_settings_update: None,
@@ -113,7 +114,7 @@
 //! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
 //! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), user_id: "user".to_string(),
 //! #     display_name: "User".to_string(), meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
-//! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), enable_diagnostics: false, diagnostics_update_interval_ms: None,
+//! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), enable_diagnostics: false, send_diagnostics_packets: true, diagnostics_update_interval_ms: None,
 //! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
 //! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
 //! #     on_peer_removed: None,
@@ -296,6 +297,8 @@ pub use client::{
     RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
 };
 pub use connection::{ConnectionLostReason, ConnectionState};
+pub use videocall_transport::webtransport::prewarm_session_worker as prewarm_wt_session_worker;
+pub use videocall_transport::worker_session::SpareLease as WtSessionWorkerLease;
 // Issue #1080: runtime netsim control-surface installer. Feature-gated so
 // default builds neither export nor link it.
 #[cfg(feature = "netsim")]

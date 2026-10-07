@@ -519,8 +519,7 @@ impl PeerSignalHistory {
         // is `fps_received`, which until #2190 counted every arriving simulcast rung — so a
         // 3-rung publisher fed the LADDER SUM (~52 for an 8fps sender), `52/30` clamped to
         // 1.0, and the score sat PERMANENTLY AT FULL no matter the peer's real cadence,
-        // so the indicator could not fall. It now reads the DECODED rung, so a truthful
-        // 8fps peer reads ~0.27 and the indicator moves again.
+        // so the indicator could not fall. It now reads the DECODED rung.
         //
         // KNOWN LIMITATION (pre-existing, deliberately NOT changed here): the `30.0`
         // denominator is the CAMERA ladder's TOP rung (`target_fps` 7/15/30). A receiver
@@ -2401,7 +2400,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                 if decode_paused_locally {
                     p {
                         class: "signal-quality-unmeasured",
-                        "Video paused to save CPU. Signal is not measured for this peer."
+                        {SIGNAL_UNMEASURED_TEXT}
                     }
                 } else {
                     p { style: "color: {theme_color::TEXT_SUBTLE}; font-size: var(--fs-3);", "No data yet." }
@@ -2612,7 +2611,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
             if decode_paused_locally {
                 p {
                     class: "signal-quality-unmeasured",
-                    "Video paused to save CPU. Signal is not measured for this peer."
+                    {SIGNAL_UNMEASURED_TEXT}
                 }
             }
             div { class: "signal-chart-wrapper",
@@ -3079,7 +3078,7 @@ pub struct SparkPaint {
 }
 
 pub const SIGNAL_UNMEASURED_TEXT: &str =
-    "Video paused to save CPU. Signal is not measured for this peer.";
+    "Video paused to save CPU. Video and screen-share quality are not measured for this peer.";
 
 fn capitalized(word: &str) -> String {
     let mut chars = word.chars();
@@ -3463,8 +3462,7 @@ mod tests {
     /// Before #2190 the receive-side fps counted every arriving simulcast rung, so a 3-rung
     /// publisher reported the LADDER SUM (~52 for an 8fps sender). 52/30 clamps to 1.0, so
     /// the score sat PERMANENTLY AT FULL regardless of the peer's real cadence — the
-    /// indicator could not fall, the worst failure mode for a health display. With the
-    /// counter fixed, the same publisher reports its true 8fps and the score reads ~0.27.
+    /// indicator could not fall, the worst failure mode for a health display.
     ///
     /// This pins both ends: the honest rung scores partial, and the pre-fix ladder-sum
     /// value is what saturation looks like. It is a host test because the arithmetic and
@@ -3474,7 +3472,6 @@ mod tests {
     fn video_quality_bar_tracks_decoded_rung_and_is_saturated_by_the_ladder_sum() {
         let mut history = PeerSignalHistory::new();
 
-        // The TRUE cadence of one 8fps rung (post-#2190).
         let decoded = SampleData {
             video_fps: 8.0,
             video_enabled: true,
@@ -5152,6 +5149,13 @@ mod tests {
             peer_signal_title(SignalLevel::Unmeasured, 0, 0.0, false),
             SIGNAL_UNMEASURED_TEXT
         );
+        let parked = peer_signal_aria("Ada", SignalLevel::Unmeasured, 0, false);
+        assert!(
+            !parked.contains("Signal is not measured")
+                && parked.contains("Video and screen-share quality"),
+            "the popup still charts audio for a parked peer, so the text must scope to video \
+             and screen share: {parked}"
+        );
 
         assert_eq!(
             peer_signal_aria("Ada", SignalLevel::Lost, 4, false),
@@ -5330,5 +5334,72 @@ mod tests {
             SignalLevel::Unmeasured.level_color(),
             "both are 'no reading', and the slash is what separates them"
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod unmeasured_popup_dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn parked_history() -> Vec<SignalSample> {
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(
+            &SampleData {
+                audio_enabled: true,
+                decode_paused_locally: true,
+                ..Default::default()
+            },
+            1_000.0,
+        );
+        history.samples_vec()
+    }
+
+    #[allow(non_snake_case)]
+    fn Harness() -> Element {
+        rsx! {
+            div { id: "empty",
+                SignalQualityPopup {
+                    peer_id: "empty".to_string(),
+                    peer_name: "Ada".to_string(),
+                    history: Vec::new(),
+                    decode_paused_locally: true,
+                    meeting_start_ms: 0.0,
+                    anchor_id: "absent".to_string(),
+                    on_close: move |_| {},
+                }
+            }
+            div { id: "charted",
+                SignalQualityPopup {
+                    peer_id: "charted".to_string(),
+                    peer_name: "Ada".to_string(),
+                    history: parked_history(),
+                    meeting_start_ms: 0.0,
+                    anchor_id: "absent".to_string(),
+                    on_close: move |_| {},
+                }
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn both_popup_branches_render_the_shared_unmeasured_text() {
+        let doc = gloo_utils::document();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(Harness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        TimeoutFuture::new(30).await;
+        for id in ["empty", "charted"] {
+            let text = mount
+                .query_selector(&format!("#{id} .signal-quality-unmeasured"))
+                .unwrap()
+                .and_then(|el| el.text_content());
+            assert_eq!(text.as_deref(), Some(SIGNAL_UNMEASURED_TEXT), "#{id}");
+        }
+        mount.remove();
     }
 }

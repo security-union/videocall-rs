@@ -31,11 +31,6 @@ const DURATION_SECONDS = 10;
  * PEAK 0.6 → RMS 0.42. Four times over the saturation ceiling, so the reported
  * intensity is a clean 1.0 even if the capture path attenuates the signal.
  *
- * FLOOR 0.085 → RMS 0.060. Chosen to sit INSIDE the 0.02–0.10 band where
- * intensity actually varies (it maps to ~0.71), while still standing three
- * times clear of the VAD threshold — so the peer never stops counting as
- * speaking, and a dropped glow is never a legitimate silence.
- *
  * WHY MODULATE AT ALL: the decoder-side VAD is edge-triggered — `handle_pcm_data`
  * re-broadcasts only when the speaking boolean flips or the intensity moves by
  * more than `AUDIO_LEVEL_DELTA_THRESHOLD` (0.02) from the value it last sent. A
@@ -43,11 +38,10 @@ const DURATION_SECONDS = 10;
  * event the fast path goes permanently silent. That is indistinguishable from a
  * dead peer, and the resolver zeroes a glow that has had no events for 12.5s —
  * which would put out the glow on CORRECT code and fail this spec for a reason
- * that has nothing to do with the bug. Sweeping the amplitude through the
- * sub-saturation band keeps real level updates flowing the whole time.
+ * that has nothing to do with the bug.
  */
 const PEAK_AMPLITUDE = 0.6;
-const FLOOR_AMPLITUDE = 0.085;
+const FLOOR_AMPLITUDE = 0.15;
 
 /**
  * Seconds per amplitude sweep. Comfortably under the 12.5s no-events deadline
@@ -119,9 +113,6 @@ function renderSweptTone(totalSeconds: number, toneSeconds: number): Buffer {
 }
 
 /**
- * Absolute path to a looping, constant-amplitude tone WAV suitable for
- * `--use-file-for-fake-audio-capture`.
- *
  * Written to the OS temp dir (not the repo) and regenerated only when absent,
  * so a spec run leaves no tracked artifact behind and repeat runs pay the
  * render cost once. `DURATION_SECONDS` is a whole number of sweep periods, so

@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 
+import { type DiagPackets } from "../receiver-caps";
 import { reapChild, type ReapHandle } from "./reap-child";
 
 /**
@@ -738,6 +739,7 @@ export interface RemoteLaunchCmd {
    * pre-escaped value.
    */
   ssoStateFileRaw?: string | null;
+  diagPackets?: DiagPackets | null;
 }
 
 export function buildRemoteLaunchCommand(spec: RemoteLaunchCmd): string {
@@ -762,6 +764,9 @@ export function buildRemoteLaunchCommand(spec: RemoteLaunchCmd): string {
   }
   if (spec.ssoStateFileRaw !== undefined && spec.ssoStateFileRaw !== null) {
     cmd.push("--sso-state-file", spec.ssoStateFileRaw);
+  }
+  if (spec.diagPackets === "off") {
+    cmd.push("--diag-packets", "off");
   }
   parts.push(cmd.join(" "));
   return parts.join(" && ");

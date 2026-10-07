@@ -53,7 +53,7 @@ docker volume create docker_rustlemania-bot-cargo-git-cache
 docker volume create docker_rustlemania-bot-cargo-target-cache
 docker volume create docker_rustlemania-bot-cache
 docker volume create docker_prometheus_data
-docker volume create docker_grafana_data
+docker volume create docker_grafana_data_v10
 ```
 
 ### 4. Start the Services

@@ -9,6 +9,7 @@ use log::warn;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error as ThisError;
+use videocall_types::url_log::strip_url_query_from_message;
 use videocall_types::Callback;
 
 /// Maximum allowed buffered bytes before dropping outbound packets.
@@ -440,13 +441,14 @@ impl WebSocketService {
         let ws = WebSocket::new(url);
 
         let ws = ws.map_err(|ws_error| {
-            WebSocketError::CreationError(
-                ws_error
+            WebSocketError::CreationError(strip_url_query_from_message(
+                &ws_error
                     .unchecked_into::<js_sys::Error>()
                     .to_string()
                     .as_string()
                     .unwrap(),
-            )
+                url,
+            ))
         })?;
 
         ws.set_binary_type(BinaryType::Arraybuffer);
@@ -949,5 +951,24 @@ mod tests {
             websocket_inactive_dropped_frames_closed() - closed_before,
             1
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod creation_error_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn constructor_error_does_not_carry_the_token() {
+        let Err(WebSocketError::CreationError(message)) = WebSocketService::connect_binary(
+            "ws://relay:99999/lobby?token=SECRETJWT",
+            Callback::from(|_: Binary| {}),
+            Callback::from(|_: WebSocketStatus| {}),
+        ) else {
+            panic!("an out-of-range port must fail construction");
+        };
+        assert!(!message.contains("SECRETJWT"), "{message}");
+        assert!(message.contains("ws://relay:99999/lobby"), "{message}");
     }
 }

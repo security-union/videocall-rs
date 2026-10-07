@@ -179,10 +179,7 @@ interface JoinOpts {
    * When true, deterministically drive the #1061 pre-join card to turn the
    * camera ON before joining (grant media → toggle camera → await a live video
    * track → join). Use this for tests that assert the live SEND video VU
-   * readout — the LS preference seed alone is NOT enough because
-   * `resolve_initial_enabled` (context.rs) only enables the camera at join when
-   * the pre-join device list is populated, which requires getUserMedia to have
-   * run first. Defaults to false (camera left at its persisted state).
+   * readout. Defaults to false (camera left at its persisted state).
    */
   ensureCameraOn?: boolean;
 
@@ -204,10 +201,9 @@ async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): 
   const meetingId = `e2e_perf_${testLabel}_${Date.now()}`;
 
   // Seed the persisted camera preference before the app boots. By default this
-  // makes the pre-join camera toggle default ON; combined with `ensureCameraOn`
-  // (which drives the UI so the device list is populated) it guarantees the SEND
-  // encoder runs. When `cameraOff` is set the seed is FALSE so the camera is
-  // genuinely off in the meeting (the OFF-state caption tests depend on this).
+  // makes the pre-join camera toggle default ON. When `cameraOff` is set the
+  // seed is FALSE so the camera is genuinely off in the meeting (the OFF-state
+  // caption tests depend on this).
   // addInitScript runs on every navigation (incl. post-reload).
   const seedCameraOn = opts.cameraOff ? "false" : "true";
   await page.addInitScript((value) => {
@@ -238,10 +234,10 @@ async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): 
   if (opts.ensureCameraOn) {
     // Deterministic camera-on path (mirrors prejoin-device-preview.spec.ts
     // "camera ON in pre-join carries into the meeting"). The pre-join card must
-    // be present (it coexists with the action button); grant media so the device
-    // list populates, ensure the camera toggle is ON and a live track is
-    // acquired, THEN click the action button. This guarantees the in-meeting
-    // SEND encoder actually starts (so the VU readout shows {w}x{h}…kbps).
+    // be present (it coexists with the action button); grant media, ensure the
+    // camera toggle is ON and a live track is acquired, THEN click the action
+    // button. This guarantees the in-meeting SEND encoder actually starts (so
+    // the VU readout shows {w}x{h}…kbps).
     await joinButton.waitFor({ timeout: 30_000 });
 
     // Grant media if the permission prompt is still showing. NOTE (#1134): the
@@ -273,8 +269,6 @@ async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): 
     }
     await expect(cameraToggle).toHaveAttribute("aria-pressed", "true", { timeout: 5_000 });
 
-    // Wait for a live preview video track so the device list is populated before
-    // join (this is what makes the in-meeting encoder start).
     await expect
       .poll(
         async () =>
@@ -881,10 +875,6 @@ test.describe("Performance settings panel (#961)", () => {
   test("bar-meters are live: video readout shows a real value, screen shows 'Screen — not sharing'", async ({
     page,
   }) => {
-    // ensureCameraOn drives the pre-join card to actually start the camera (grant
-    // + toggle + live track) so the in-meeting SEND encoder runs — otherwise the
-    // video meter readout stays "Camera — off" (the LS preference alone doesn't
-    // populate the pre-join device list that resolve_initial_enabled requires).
     await joinMeeting(page, "vu_live", { ensureCameraOn: true });
     await openPerformanceDrawer(page);
     // Both directions render together now; the send meters are always present.
@@ -2404,24 +2394,13 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
    * box, and it is gated on `video_width > 0 && video_height > 0` — a gate that
    * could NEVER fire before #2170, because a tier box is never zero.
    *
-   * WHY THIS LIVES HERE AND NOT IN `media-metrics-overlay.spec.ts`: the SELF overlay
-   * needs no remote peer. It renders from `Host`'s own snapshot reader, gated only on
-   * the diagnostics checkbox. The 2-peer spec is currently unable to reach any
-   * assertion at all (issue #2193 — the peer canvas tile never appears), so putting
-   * the only guard for this consumer there would leave it permanently unverified.
-   * A solo meeting traverses the entire production chain this PR changed — live
-   * encoder → `publish_layer_dims` → `top_published_layer_dims` →
-   * `live_quality_snapshot` → `host.rs` → rendered DOM — which is exactly what the
-   * host and wasm tests CANNOT do (they inject a snapshot).
-   *
    * What a solo meeting deliberately does NOT exercise: the `[..active]` bound and
    * the `.rev()` scan non-degenerately, since with no receiver the relay's
    * layer-union hint pins `active = 1` and both reduce to "read slot 0". Those are
    * covered by the client-side host tests
    * (`quality_snapshot_tracks_the_shed_and_does_not_report_shed_rungs`,
-   * `top_published_layer_dims_picks_the_highest_published_active_rung`), and the
-   * 2-peer assertion in `media-metrics-overlay.spec.ts` will cover them end-to-end
-   * once #2193 is fixed.
+   * `top_published_layer_dims_picks_the_highest_published_active_rung`) and, end to
+   * end, by the 2-peer assertion in `media-metrics-overlay.spec.ts`.
    *
    * The overlay formats dims with `×` (U+00D7), unlike the readout's ASCII `x` —
    * different formatters, deliberately not unified.

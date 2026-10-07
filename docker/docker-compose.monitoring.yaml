@@ -1,0 +1,130 @@
+## Monitoring overlay for docker-compose.e2e.yaml only (`make e2e-up-monitoring`).
+## docker-compose.yaml already runs these services; do not combine the two.
+
+services:
+  metrics-api:
+    profiles: ["monitoring"]
+    build:
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
+    working_dir: /app/actix-api
+    command: >
+      nix develop path:/flake#backend-dev --no-write-lock-file --command bash -c
+      "case $${VIDEOCALL_RELEASE_BUILD:-0} in 1) export CARGO_INCREMENTAL=0 ;; 0) ;; *) echo VIDEOCALL_RELEASE_BUILD=$${VIDEOCALL_RELEASE_BUILD} is not 0 or 1 >&2; exit 64 ;; esac; cargo watch -x 'run -r --bin metrics_server'"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - METRICS_PORT=9091
+      - NATS_URL=nats:4222
+      - REGION=us-east
+      - SERVER_ID=server-1
+      - SERVICE_TYPE=client-metrics
+      - RUST_LOG=info
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - VIDEOCALL_RELEASE_BUILD=${VIDEOCALL_RELEASE_BUILD:-0}
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - type: bind
+        source: ../flake.nix
+        target: /flake/flake.nix
+        read_only: true
+      - type: bind
+        source: ../flake.lock
+        target: /flake/flake.lock
+        read_only: true
+      - nix-store-e2e-metrics-api:/nix
+      # Shares the release (`-r`) target with webtransport-api, as the dev
+      # stack shares one actix-api target across its backends.
+      - e2e-webtransport-api-registry:/root/.cargo/registry
+      - e2e-webtransport-api-git:/root/.cargo/git
+      - e2e-webtransport-api-target:/app/actix-api/target
+    depends_on:
+      - nats
+
+  server-stats-api:
+    profiles: ["monitoring"]
+    build:
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
+    working_dir: /app/actix-api
+    command: >
+      nix develop path:/flake#backend-dev --no-write-lock-file --command bash -c
+      "case $${VIDEOCALL_RELEASE_BUILD:-0} in 1) export CARGO_INCREMENTAL=0 ;; 0) ;; *) echo VIDEOCALL_RELEASE_BUILD=$${VIDEOCALL_RELEASE_BUILD} is not 0 or 1 >&2; exit 64 ;; esac; cargo watch -x 'run -r --bin metrics_server_snapshot'"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - METRICS_PORT=9092
+      - NATS_URL=nats:4222
+      - REGION=us-east
+      - SERVER_ID=server-1
+      - SERVICE_TYPE=server-stats
+      - RUST_LOG=info
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - VIDEOCALL_RELEASE_BUILD=${VIDEOCALL_RELEASE_BUILD:-0}
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - type: bind
+        source: ../flake.nix
+        target: /flake/flake.nix
+        read_only: true
+      - type: bind
+        source: ../flake.lock
+        target: /flake/flake.lock
+        read_only: true
+      - nix-store-e2e-server-stats-api:/nix
+      - e2e-webtransport-api-registry:/root/.cargo/registry
+      - e2e-webtransport-api-git:/root/.cargo/git
+      - e2e-webtransport-api-target:/app/actix-api/target
+    depends_on:
+      - nats
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v3.11.2
+    entrypoint: ["/bin/sh", "/etc/prometheus/entrypoint.sh"]
+    command:
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    environment:
+      # The e2e websocket-api hard-codes ACTIX_PORT=8080; a host ACTIX_PORT
+      # meant for the dev stack must not leak in here.
+      - WS_RELAY_PORT=8080
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - e2e-prometheus-data:/prometheus
+    depends_on:
+      - metrics-api
+      - server-stats-api
+      - websocket-api
+      - webtransport-api
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:10.0.0
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=grafana
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - e2e-grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../helm/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  nix-store-e2e-metrics-api:
+  nix-store-e2e-server-stats-api:
+  e2e-webtransport-api-registry:
+  e2e-webtransport-api-git:
+  e2e-webtransport-api-target:
+  e2e-prometheus-data:
+  e2e-grafana-data:

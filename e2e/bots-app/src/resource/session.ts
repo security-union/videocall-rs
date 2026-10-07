@@ -241,8 +241,8 @@ export class ResourceCaptureSession {
 }
 
 /** The revision build.sh stamped into this process's image; `null` outside it. */
-export function localImageRevision(): string | null {
-  return process.env.BOTS_IMAGE_REVISION ?? null;
+export function localImageRevision(env: NodeJS.ProcessEnv = process.env): string | null {
+  return env.BOTS_IMAGE_REVISION ?? null;
 }
 
 /**
@@ -259,7 +259,7 @@ export async function deriveReport(args: {
   reportPath: string;
   fpsByBot: ReadonlyMap<string, FpsStats>;
   arrival: ArrivalSpread | null;
-  /** Bots seen to join; `null` when this process does not observe joins. */
+  /** Bots seen to join; `null` when the join rule does not apply to this receipt. */
   joinedBots: number | null;
   /** Revision of the image the SAMPLED host ran; a remote host's is unknown here. */
   imageRevision: string | null;

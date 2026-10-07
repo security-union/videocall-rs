@@ -822,6 +822,23 @@ fn take_reconnection_loops_spawned() -> u32 {
     RECONNECTION_LOOPS_SPAWNED.with(|count| count.replace(0))
 }
 
+#[cfg(test)]
+thread_local! {
+    static WT_SPARE_REFILLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_wt_spare_refills() -> u32 {
+    WT_SPARE_REFILLS.with(|count| count.replace(0))
+}
+
+fn refill_wt_session_worker_spare() {
+    #[cfg(test)]
+    WT_SPARE_REFILLS.with(|count| count.set(count.get() + 1));
+    #[cfg(not(test))]
+    videocall_transport::webtransport::prewarm_session_worker();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_reconnection_loop(
     reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
@@ -1324,6 +1341,28 @@ pub(super) fn monotonic_now_ms() -> f64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_secs_f64() * 1000.0
+}
+
+fn non_active_loss_level(closed_by_manager: bool) -> log::Level {
+    if closed_by_manager {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    }
+}
+
+fn non_active_loss_log_line(
+    connection_id: &str,
+    reason: &ConnectionLostReason,
+    age_ms: f64,
+    active: Option<&str>,
+) -> String {
+    format!(
+        "Non-active connection lost: {connection_id} [{}] {:.0}ms after creation: {}, current active: {active:?}",
+        reason.label(),
+        age_ms.max(0.0),
+        reason.message(),
+    )
 }
 
 /// Age (ms) of the oldest in-flight probe relative to `now`, or None if empty.
@@ -1850,6 +1889,10 @@ pub struct ConnectionManagerOptions {
     /// Written only by `VideoCallClient`'s `SESSION_ASSIGNED` arm; read here by
     /// [`should_filter_self_packet`].
     pub own_session_ids: Rc<RefCell<SessionIdHistory>>,
+
+    /// Observer clients pass `false`: their WT sessions neither take the prewarmed
+    /// session Worker nor refill it.
+    pub adopt_wt_spare_worker: bool,
 }
 
 /// Maximum number of relay `session_id`s retained by [`SessionIdHistory`].
@@ -2548,6 +2591,7 @@ impl ConnectionManager {
             };
             let conn_id = self.make_connection_id(prefix, candidate.index);
             let url = self.connect_url(&candidate.base_url, is_wt);
+            let closed_by_manager = Rc::new(Cell::new(false));
             let connect_options = ConnectOptions {
                 websocket_url: if is_wt { String::new() } else { url.clone() },
                 webtransport_url: if is_wt { url.clone() } else { String::new() },
@@ -2558,12 +2602,15 @@ impl ConnectionManager {
                     url.clone(),
                     candidate.base_url.clone(),
                     is_wt,
+                    closed_by_manager.clone(),
                 ),
                 peer_monitor: self.options.peer_monitor.clone(),
+                adopt_wt_spare_worker: self.options.adopt_wt_spare_worker,
             };
 
             match Connection::connect(is_wt, connect_options, self.aes.clone()) {
-                Ok(connection) => {
+                Ok(mut connection) => {
+                    connection.set_dropped_mark(closed_by_manager);
                     self.connections.insert(conn_id.clone(), connection);
                     self.rtt_measurements.insert(
                         conn_id.clone(),
@@ -2761,6 +2808,7 @@ impl ConnectionManager {
         server_url: String,
         base_url: String,
         is_webtransport: bool,
+        closed_by_manager: Rc<Cell<bool>>,
     ) -> Callback<ConnectionLostReason> {
         let on_state_changed = self.options.on_state_changed.clone();
         let active_connection_id = self.active_connection_id.clone();
@@ -2769,6 +2817,7 @@ impl ConnectionManager {
         let election_period_ms = self.options.election_period_ms;
         let intentionally_disconnected = self.intentionally_disconnected.clone();
         let downlink_close_pending = self.downlink_close_pending.clone();
+        let created_at_ms = monotonic_now_ms();
 
         Callback::from(move |reason: ConnectionLostReason| {
             // If the user explicitly called disconnect(), do not attempt reconnection.
@@ -2779,10 +2828,15 @@ impl ConnectionManager {
 
             // Only react if this was the active connection.
             if Some(connection_id.as_str()) != active_connection_id.borrow().as_deref() {
-                info!(
-                    "Non-active connection lost: {connection_id} [{}], current active: {:?}",
-                    reason.label(),
-                    active_connection_id.borrow()
+                log::log!(
+                    non_active_loss_level(closed_by_manager.get()),
+                    "{}",
+                    non_active_loss_log_line(
+                        &connection_id,
+                        &reason,
+                        monotonic_now_ms() - created_at_ms,
+                        active_connection_id.borrow().as_deref(),
+                    )
                 );
                 return;
             }
@@ -3196,6 +3250,13 @@ impl ConnectionManager {
                 self.election_prior_close,
             )
         );
+        // Every terminal election outcome passes through here.
+        if self.options.adopt_wt_spare_worker
+            && !self.wt_audio_fallback_latched
+            && !self.options.webtransport_urls.is_empty()
+        {
+            refill_wt_session_worker_spare();
+        }
     }
 
     /// Complete the election and select the best connection
@@ -6517,6 +6578,7 @@ mod tests {
             // `mgr.options.refresh_room_token_callback = Some(...)`.
             refresh_room_token_callback: None,
             own_session_ids: Rc::new(RefCell::new(SessionIdHistory::default())),
+            adopt_wt_spare_worker: true,
         };
 
         ConnectionManager {
@@ -7141,7 +7203,10 @@ mod tests {
         insert_measurement(&mut mgr, "ws_0", false, Some(200.0), vec![200.0, 200.0]);
 
         let _ = take_last_election_decision(); // clear any prior capture
+        offer_a_wt_candidate(&mut mgr);
+        let _ = take_wt_spare_refills();
         mgr.complete_election();
+        assert_eq!(take_wt_spare_refills(), 1);
 
         // The re-election must have aborted, keeping the old connection.
         assert!(
@@ -7233,7 +7298,10 @@ mod tests {
 
         let _ = take_last_election_decision();
         let _ = take_retry_scheduled();
+        offer_a_wt_candidate(&mut mgr);
+        let _ = take_wt_spare_refills();
         mgr.complete_election();
+        assert_eq!(take_wt_spare_refills(), 1);
 
         // Preservation must have fired (not fallen through to Failed).
         assert!(
@@ -10562,6 +10630,7 @@ mod tests {
             format!("{base_url}?instance_id=test-instance-id&ds=1"),
             base_url.to_string(),
             true,
+            Rc::new(Cell::new(false)),
         );
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
         callback.emit(reason);
@@ -12265,6 +12334,104 @@ mod tests {
         );
     }
 
+    fn offer_a_wt_candidate(mgr: &mut ConnectionManager) {
+        mgr.options.webtransport_urls = vec!["https://wt.test:4433".to_string()];
+    }
+
+    fn refills_after_a_failed_election(block: impl FnOnce(&mut ConnectionManager)) -> u32 {
+        let mut mgr = make_test_manager();
+        seed_live_candidate_without_samples(&mut mgr, "ws_0");
+        offer_a_wt_candidate(&mut mgr);
+        block(&mut mgr);
+        mgr.election_no_measurement_retries = ELECTION_NO_MEASUREMENT_MAX_RETRIES;
+        seed_testing_state(&mut mgr);
+        let _ = take_wt_spare_refills();
+        mgr.complete_election();
+        assert!(matches!(mgr.election_state, ElectionState::Failed { .. }));
+        take_wt_spare_refills()
+    }
+
+    #[test]
+    fn an_election_refills_the_wt_spare_only_when_a_later_one_could_adopt_it() {
+        let _guard = REELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(refills_after_a_failed_election(|_| {}), 1);
+        assert_eq!(
+            refills_after_a_failed_election(|m| m.options.adopt_wt_spare_worker = false),
+            0,
+            "an observer"
+        );
+        assert_eq!(
+            refills_after_a_failed_election(|m| m.wt_audio_fallback_latched = true),
+            0,
+            "WS-only latch"
+        );
+        assert_eq!(
+            refills_after_a_failed_election(|m| m.options.webtransport_urls.clear()),
+            0,
+            "no WT URL"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_wt_candidate_dials_with_the_managers_spare_worker_choice() {
+        for adopt in [false, true] {
+            let mut mgr = make_test_manager();
+            mgr.options.adopt_wt_spare_worker = adopt;
+            offer_a_wt_candidate(&mut mgr);
+            let _ = super::super::webtransport::host_seam::take_adopt_spare_worker();
+            mgr.create_all_connections().unwrap();
+            assert_eq!(
+                super::super::webtransport::host_seam::take_adopt_spare_worker(),
+                Some(adopt)
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_election_refills_the_wt_spare_and_a_retry_round_does_not() {
+        let _guard = REELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut mgr = make_test_manager();
+        seed_live_candidate_without_samples(&mut mgr, "ws_0");
+        offer_a_wt_candidate(&mut mgr);
+        let _ = take_wt_spare_refills();
+
+        for _ in 1..=ELECTION_NO_MEASUREMENT_MAX_RETRIES {
+            seed_testing_state(&mut mgr);
+            mgr.complete_election();
+            assert_eq!(take_wt_spare_refills(), 0, "a retry round is not an end");
+        }
+        seed_testing_state(&mut mgr);
+        mgr.complete_election();
+        assert!(matches!(mgr.election_state, ElectionState::Failed { .. }));
+        assert_eq!(take_wt_spare_refills(), 1);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn an_elected_outcome_refills_the_wt_spare() {
+        let mut mgr = make_test_manager();
+        mgr.connections
+            .insert("ws_0".to_string(), Connection::new_for_test());
+        insert_measurement(
+            &mut mgr,
+            "ws_0",
+            false,
+            Some(40.0),
+            vec![40.0; ELECTION_MIN_RTT_SAMPLES],
+        );
+        seed_testing_state(&mut mgr);
+        offer_a_wt_candidate(&mut mgr);
+        let _ = take_wt_spare_refills();
+        mgr.complete_election();
+        assert!(matches!(mgr.election_state, ElectionState::Elected { .. }));
+        assert_eq!(take_wt_spare_refills(), 1);
+    }
+
     #[test]
     fn election_without_a_live_candidate_fails_without_retrying() {
         let _guard = REELECTION_TEST_LOCK
@@ -12959,6 +13126,79 @@ mod tests {
                 "WS candidate {cand_ws} must not collide with active {active_id}"
             );
         }
+    }
+
+    #[test]
+    fn non_active_loss_log_line_carries_reason_detail() {
+        let reason = ConnectionLostReason::SessionDropped(
+            "server closed the session: code 7 reason \"x\"".into(),
+        );
+        let line = non_active_loss_log_line("wt_0_g1", &reason, 412.6, Some("ws_0"));
+        assert_eq!(
+            line,
+            "Non-active connection lost: wt_0_g1 [session_dropped] 413ms after creation: \
+             server closed the session: code 7 reason \"x\", current active: Some(\"ws_0\")"
+        );
+    }
+
+    #[test]
+    fn close_unused_connections_sets_dropped_mark() {
+        let mut mgr = make_test_manager();
+        mgr.insert_active_connection_for_test("ws_0", Connection::new_for_test());
+        let closed_by_manager = Rc::new(Cell::new(false));
+        let mut loser = Connection::new_for_test_with_transport(true);
+        loser.set_dropped_mark(closed_by_manager.clone());
+        mgr.connections.insert("wt_0".to_string(), loser);
+
+        assert!(!closed_by_manager.get());
+        mgr.close_unused_connections();
+        assert!(closed_by_manager.get());
+    }
+
+    fn capture_logs(body: impl FnOnce()) -> Vec<(log::Level, String)> {
+        super::super::log_capture::capture_logs(
+            "videocall_client::connection::connection_manager",
+            body,
+        )
+    }
+
+    fn log_non_active_loss(closed_by_manager: bool) -> Vec<(log::Level, String)> {
+        let mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        let callback = mgr.create_connection_lost_callback(
+            "wt_0".to_string(),
+            "https://wt-a?instance_id=test-instance-id".to_string(),
+            "https://wt-a".to_string(),
+            true,
+            Rc::new(Cell::new(closed_by_manager)),
+        );
+        capture_logs(|| {
+            callback.emit(ConnectionLostReason::SessionDropped(
+                "server closed the session: code 7 reason \"x\"".into(),
+            ))
+        })
+    }
+
+    #[test]
+    fn non_active_loss_warns_with_detail_unless_manager_closed_it() {
+        let detail = "wt_0 [session_dropped]";
+        let reason = "server closed the session: code 7 reason \"x\"";
+
+        let unexpected = log_non_active_loss(false);
+        assert_eq!(unexpected.len(), 1, "{unexpected:?}");
+        assert_eq!(unexpected[0].0, log::Level::Warn, "{unexpected:?}");
+        assert!(
+            unexpected[0].1.contains(detail) && unexpected[0].1.contains(reason),
+            "{unexpected:?}"
+        );
+
+        let closed = log_non_active_loss(true);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0].0, log::Level::Info, "{closed:?}");
+        assert!(
+            closed[0].1.contains(detail) && closed[0].1.contains(reason),
+            "{closed:?}"
+        );
     }
 
     #[test]
@@ -14432,6 +14672,25 @@ mod tests {
             mgr.is_reelection_in_progress(),
             "refresh failure must NOT block re-election (cached URLs are tried)"
         );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn create_all_connections_shares_each_dropped_mark_with_its_loss_callback() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://relay/lobby?token=T".into()];
+        mgr.options.webtransport_urls = vec!["https://relay/lobby?token=T".into()];
+
+        mgr.create_all_connections().unwrap();
+
+        assert_eq!(mgr.connections.len(), 2, "{:?}", mgr.connections.keys());
+        for (id, connection) in &mgr.connections {
+            assert_eq!(
+                connection.dropped_mark_holders(),
+                2,
+                "{id}: mark must be held by its connection and its loss callback only"
+            );
+        }
     }
 
     #[test]

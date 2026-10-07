@@ -5856,6 +5856,7 @@ mod tests {
             on_connected: Callback::noop(),
             on_connection_lost: Callback::noop(),
             enable_diagnostics: false,
+            send_diagnostics_packets: true,
             diagnostics_update_interval_ms: None,
             enable_health_reporting: false,
             health_reporting_interval_ms: None,

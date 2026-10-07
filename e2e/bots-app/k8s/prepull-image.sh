@@ -11,7 +11,6 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # this reads, and the dashboard's dist/ is dockerignored with no build step here.
 DRIFT_PATHS=(
   e2e
-  .dockerignore
   ':(exclude)e2e/bots-app/k8s'
   ':(exclude)e2e/bots-app/dashboard'
   ':(exclude)e2e/tests'

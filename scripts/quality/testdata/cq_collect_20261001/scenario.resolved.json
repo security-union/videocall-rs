@@ -1,0 +1,124 @@
+{
+ "run_id": "cqlocal1-20261001",
+ "meeting_id": "cqlocal1",
+ "environment": "local",
+ "scenario": {
+  "file": "adhoc: cqrun/bot_cmd.sh + cqrun/probe_cmd.sh (no scenario file)",
+  "sha256": "3f18c570012064cb862f117e9070ddcd66635a7ae31848f6ad5db0ab8a5ac9b0"
+ },
+ "node_aliases": {},
+ "steps": [
+  {
+   "step_id": "n7",
+   "n_target": 7,
+   "headline": true
+  }
+ ],
+ "participants": [
+  {
+   "user_id": "probe0@bots-app.local",
+   "fleet": "browser",
+   "role": "probe-ref",
+   "observer": true,
+   "talker": false,
+   "publishes": {
+    "camera": true,
+    "mic": true,
+    "screen": false
+   },
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "alice",
+   "fleet": "rust",
+   "role": "talker",
+   "observer": false,
+   "talker": true,
+   "publishes": {
+    "camera": true,
+    "mic": true,
+    "screen": false
+   },
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-002",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-003",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-004",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-005",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-006",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": true,
+    "mic": false,
+    "screen": false
+   },
+   "steps": [
+    "n7"
+   ]
+  }
+ ]
+}

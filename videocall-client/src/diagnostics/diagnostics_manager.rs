@@ -437,6 +437,8 @@ pub struct DiagnosticManager {
     peer_media_state_calls: std::cell::RefCell<Vec<(String, bool, bool)>>,
     #[cfg(test)]
     peer_decode_eligibility_calls: std::cell::RefCell<Vec<(String, bool)>>,
+    #[cfg(test)]
+    set_packet_handler_calls: std::cell::Cell<u32>,
     /// Drives the periodic `HeartbeatTick` event.
     ///
     /// Backed by a Worker (when available) so that background-tab throttling
@@ -529,6 +531,8 @@ impl DiagnosticManager {
             peer_media_state_calls: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             peer_decode_eligibility_calls: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            set_packet_handler_calls: std::cell::Cell::new(0),
         };
 
         manager.setup_heartbeat(sender);
@@ -547,6 +551,7 @@ impl DiagnosticManager {
             track_frame_calls: std::cell::RefCell::new(Vec::new()),
             peer_media_state_calls: std::cell::RefCell::new(Vec::new()),
             peer_decode_eligibility_calls: std::cell::RefCell::new(Vec::new()),
+            set_packet_handler_calls: std::cell::Cell::new(0),
             timer: None,
         }
     }
@@ -577,6 +582,9 @@ impl DiagnosticManager {
 
     // Set the callback for when a diagnostic packet is received
     pub fn set_packet_handler(&self, callback: Callback<DiagnosticsPacket>) {
+        #[cfg(test)]
+        self.set_packet_handler_calls
+            .set(self.set_packet_handler_calls.get() + 1);
         if let Err(e) = self
             .sender
             .clone()
@@ -773,6 +781,11 @@ impl DiagnosticManager {
     #[cfg(test)]
     pub(crate) fn take_peer_media_state_calls_for_test(&self) -> Vec<(String, bool, bool)> {
         std::mem::take(&mut *self.peer_media_state_calls.borrow_mut())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_packet_handler_calls_for_test(&self) -> u32 {
+        self.set_packet_handler_calls.get()
     }
 
     #[cfg(test)]

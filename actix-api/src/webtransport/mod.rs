@@ -497,6 +497,7 @@ struct WtConnectIdentity {
     display_name: String,
     is_guest: bool,
     is_host: bool,
+    token_iat: Option<i64>,
 }
 
 /// Resolve who is connecting, from the JWT when one is presented and otherwise
@@ -529,6 +530,7 @@ fn resolve_wt_connect_identity(
             display_name: claims.display_name,
             is_guest: claims.is_guest,
             is_host: claims.is_host,
+            token_iat: claims.iat,
         });
     }
 
@@ -558,6 +560,7 @@ fn resolve_wt_connect_identity(
         display_name,
         is_guest: false,
         is_host: false,
+        token_iat: None,
     })
 }
 
@@ -677,6 +680,7 @@ async fn run_webtransport_connection_from_request(
         display_name,
         is_guest,
         is_host,
+        token_iat,
     } = identity;
 
     // `instance_id` binds reconnect adoption to identity; this path has no verified one.
@@ -700,6 +704,7 @@ async fn run_webtransport_connection_from_request(
         observer,
         instance_id,
         is_host,
+        token_iat,
         downlink_mode,
     )
     .await
@@ -891,8 +896,10 @@ async fn handle_webtransport_session(
     observer: bool,
     instance_id: Option<String>,
     is_host: bool,
+    token_iat: Option<i64>,
     downlink_mode: DownlinkStreamMode,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     // Create two channels for actor → WebTransport I/O — one per QUIC
     // primitive. Phase 2 split (discussion #756): a stalled persistent
     // uni-stream cannot back up the datagram path because the two
@@ -934,7 +941,8 @@ async fn handle_webtransport_session(
         is_host,
         audio_lane,
         escalation.clone(),
-    );
+    )
+    .with_token_iat(token_iat);
     // Capture the canonical per-session id BEFORE `start()` consumes the actor.
     // It is the SAME id `relay_session_drops_total` uses, so the #1637 relay RTT
     // gauge joins with the per-session drop series for this connection.
@@ -942,6 +950,7 @@ async fn handle_webtransport_session(
     let metrics_room = lobby_id.to_string();
     // #2718: same capture-before-`start()` rule as the session id above.
     let downlink_drops = actor.downlink_drop_sink();
+    let removed_by_host = actor.removed_by_host();
 
     let actor_addr = actor.start();
 
@@ -973,6 +982,7 @@ async fn handle_webtransport_session(
     #[cfg(not(test))]
     let on_packet_sent: Option<bridge::PacketSentCallback> = None;
 
+    let session_for_close = session.clone();
     let mut bridge = WebTransportBridge::new_with_callback(
         session,
         actor_addr.clone(),
@@ -986,8 +996,16 @@ async fn handle_webtransport_session(
         downlink_mode,
         escalation,
     );
-    bridge.wait_for_disconnect().await;
+    let close_cause = bridge.wait_for_disconnect().await;
     bridge.shutdown().await;
+    if removed_by_host.load(std::sync::atomic::Ordering::Acquire) {
+        session_for_close.close(
+            videocall_types::wt_close::WT_CLOSE_CODE_REMOVED_BY_HOST,
+            videocall_types::wt_close::WT_CLOSE_REASON_REMOVED_BY_HOST,
+        );
+    } else {
+        session_for_close.close(0, b"");
+    }
 
     // #1637: stop the path-health sampler and remove its per-session gauges.
     stop_connection_path_sampler(sampler_handle, &metrics_room, &metrics_session_id);
@@ -995,7 +1013,12 @@ async fn handle_webtransport_session(
     // Signal actor to stop
     actor_addr.do_send(crate::actors::transports::wt_chat_session::StopSession);
 
-    warn!("Finished handling WebTransport session for {username} in {lobby_id}");
+    warn!(
+        "Finished handling WebTransport session for {username} in {lobby_id}: \
+         session={metrics_session_id} {close_cause} \
+         duration_ms={} is_guest={is_guest} observer={observer} ds={downlink_mode:?}",
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -3740,5 +3763,156 @@ mod tests {
             wt_request_log_line("https://relay.example.com/lobby/alice/room-1"),
             "received WebTransport request: https://relay.example.com/lobby/alice/room-1"
         );
+    }
+
+    fn kick_room_token(user: &str, room: &str, authorized_at: i64) -> String {
+        meeting_api::token::generate_room_token_at(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            authorized_at,
+            user,
+            room,
+            false,
+            user,
+            false,
+            false,
+        )
+        .expect("room token")
+    }
+
+    async fn closed_within(session: &web_transport_quinn::Session, wait: Duration) -> bool {
+        tokio::time::timeout(wait, session.closed()).await.is_ok()
+    }
+
+    fn is_kick_notice(frame: &[u8]) -> bool {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        VcPacketWrapper::parse_from_bytes(frame).is_ok_and(|w| {
+            w.packet_type.enum_value() == Ok(VcPacketType::MEETING)
+                && MeetingPacket::parse_from_bytes(&w.data).is_ok_and(|m| {
+                    m.event_type.enum_value() == Ok(MeetingEventType::PARTICIPANT_KICKED)
+                })
+        })
+    }
+
+    /// Whether the relay's downlink carried PARTICIPANT_KICKED within `wait`.
+    async fn kick_notice_within(
+        downlink: &mut web_transport_quinn::RecvStream,
+        wait: Duration,
+    ) -> bool {
+        tokio::time::timeout(wait, async {
+            while let Some(frame) = read_length_prefixed_frame(downlink).await {
+                if is_kick_notice(&frame) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Whether `session` was closed with the kick close code within `wait`.
+    async fn closed_as_removed_within(
+        session: &web_transport_quinn::Session,
+        wait: Duration,
+    ) -> bool {
+        match tokio::time::timeout(wait, session.closed()).await {
+            Ok(web_transport_quinn::SessionError::WebTransportError(
+                web_transport_quinn::WebTransportError::Closed(code, _),
+            )) => code == videocall_types::wt_close::WT_CLOSE_CODE_REMOVED_BY_HOST,
+            _ => false,
+        }
+    }
+
+    /// A WebTransport client that ignores the kick, and keeps its uplink stream
+    /// open, gets the kick notice and is then closed by the relay with the kick
+    /// close code; its held token is refused on replay, and a token minted
+    /// after the kick connects and stays up (#2934).
+    ///
+    /// MUTATION: drop the `session_for_close.close(..)` after
+    /// `bridge.shutdown()`, or the `ctx.stop()` in `WtChatSession`'s
+    /// `ForceClose` handler, and this fails.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn test_wt_kicked_session_is_closed_and_its_held_token_refused() {
+        use videocall_meeting_types::kick::{ParticipantKickedPayload, PARTICIPANT_KICKED_SUBJECT};
+
+        setup_jwt_wt().await;
+        let now = chrono::Utc::now().timestamp();
+        let room = format!("wt-kick-2934-{now}");
+        let held = kick_room_token("kicked@test.com", &room, now - 10);
+
+        let kicked = connect_client_with_token(&held).await.expect("connect");
+        let mut downlink = wait_for_session_ready(&kicked, "kicked")
+            .await
+            .expect("kicked client joins")
+            .expect("MEETING_STARTED arrives on the reliable downlink");
+        let mut uplink = kicked.open_uni().await.expect("open uplink");
+        let hold = create_test_packet("kicked@test.com", VcMediaType::HEARTBEAT, String::new());
+        uplink
+            .write_all(&(hold.len() as u32).to_be_bytes())
+            .await
+            .expect("write uplink header");
+        uplink.write_all(&hold).await.expect("write uplink frame");
+        let bystander =
+            connect_client_with_token(&kick_room_token("stays@test.com", &room, now - 10))
+                .await
+                .expect("connect bystander");
+        wait_for_session_ready(&bystander, "bystander")
+            .await
+            .expect("bystander joins");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nc = async_nats::connect(&nats_url).await.expect("NATS");
+        let payload = serde_json::to_vec(&ParticipantKickedPayload::new(
+            &room,
+            "kicked@test.com",
+            now - 6,
+            now + 3600,
+        ))
+        .unwrap();
+        let publisher = tokio::spawn(async move {
+            loop {
+                let _ = nc
+                    .publish(PARTICIPANT_KICKED_SUBJECT, payload.clone().into())
+                    .await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        });
+
+        assert!(
+            kick_notice_within(&mut downlink, Duration::from_secs(10)).await,
+            "the relay must send PARTICIPANT_KICKED before closing"
+        );
+        assert!(
+            closed_as_removed_within(&kicked, Duration::from_secs(5)).await,
+            "the relay must close a kicked WebTransport session, uplink open or not"
+        );
+        drop(uplink);
+        assert!(
+            !closed_within(&bystander, Duration::from_millis(1500)).await,
+            "the bystander must stay connected"
+        );
+
+        let replay = connect_client_with_token(&held)
+            .await
+            .expect("the session is accepted before JoinRoom refuses it");
+        assert!(
+            closed_as_removed_within(&replay, Duration::from_secs(5)).await,
+            "a replayed pre-kick token must be closed"
+        );
+
+        let rejoined = connect_client_with_token(&kick_room_token("kicked@test.com", &room, now))
+            .await
+            .expect("connect with a post-kick token");
+        wait_for_session_ready(&rejoined, "rejoined")
+            .await
+            .expect("a post-kick token joins");
+        assert!(
+            !closed_within(&rejoined, Duration::from_secs(3)).await,
+            "a post-kick token must not be closed"
+        );
+        publisher.abort();
     }
 }

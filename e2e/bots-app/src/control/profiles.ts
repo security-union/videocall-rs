@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promi
 import { basename, join, resolve } from "node:path";
 
 import type { AuthBackend } from "../auth/storage-state";
+import { type DiagPackets, parseDiagPacketsField } from "../receiver-caps";
 import type { LaunchSpec } from "./server";
 
 /**
@@ -58,6 +59,7 @@ export interface ProfileBotSpec {
    * fall back to `{ kind: "local" }` at launch time.
    */
   runLocation?: { kind: "local" } | { kind: "ssh"; hostLabel: string };
+  diagPackets?: DiagPackets;
 }
 
 export interface RunProfile {
@@ -264,6 +266,10 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
   // and is filled in with `{ kind: "local" }` by the launch route.
   const runLocation = parseRunLocationField(o.runLocation, `${where}.runLocation`);
   const videoMode = parseVideoModeField(o.videoMode, `${where}.videoMode`);
+  const diag = parseDiagPacketsField(o.diagPackets);
+  if (diag.kind === "invalid") {
+    throw new ProfileValidationError(`${where}.diagPackets: ${diag.message}`);
+  }
   return {
     meetingURL,
     participant,
@@ -275,6 +281,7 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
     storageStateFile,
     runLocation,
     videoMode,
+    diagPackets: diag.value,
   };
 }
 
@@ -436,5 +443,6 @@ export function launchSpecToProfileBot(spec: LaunchSpec): ProfileBotSpec {
     storageStateFile: spec.storageStateFile,
     runLocation: spec.runLocation,
     videoMode: spec.videoMode,
+    diagPackets: spec.diagPackets ?? undefined,
   };
 }

@@ -87,6 +87,7 @@ fn MeetingPageContent(id: String) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
+    crate::context::use_wt_session_worker_prewarm(auth_checked());
     let mut user_profile = use_signal(|| None::<UserProfile>);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
@@ -288,6 +289,7 @@ fn MeetingPageContent(id: String) -> Element {
                 get_peer_video_canvas_id: VcCallback::from(|id| id),
                 get_peer_screen_canvas_id: VcCallback::from(|id| id),
                 enable_diagnostics: false,
+                send_diagnostics_packets: true,
                 diagnostics_update_interval_ms: None,
                 enable_health_reporting: false,
                 health_reporting_interval_ms: None,
@@ -850,17 +852,21 @@ fn MeetingPageContent(id: String) -> Element {
                     chat_allowed_for_all: *chat_allowed_for_all,
                 }
             },
-            (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {
-                WaitingRoom {
-                    meeting_id: id.clone(),
-                    user_id: current_user_id().unwrap_or_default(),
-                    display_name: input_value_state(),
-                    observer_token: observer_token.clone(),
-                    on_admitted,
-                    on_rejected,
-                    on_cancel: on_cancel_waiting,
+            (Some(_), MeetingStatus::Waiting { observer_token }) => {
+                let mut on_join = on_join_meeting.clone();
+                rsx! {
+                    WaitingRoom {
+                        meeting_id: id.clone(),
+                        user_id: current_user_id().unwrap_or_default(),
+                        display_name: input_value_state(),
+                        observer_token: observer_token.clone(),
+                        on_admitted,
+                        on_rejected,
+                        on_cancel: on_cancel_waiting,
+                        on_waiting_room_disabled: move |_| on_join(None),
+                    }
                 }
-            },
+            }
             // Issue 1613 — the meeting is password-protected and the server
             // refused this join. Replaces the joining view so nothing else on
             // the page competes for focus (which is what makes `aria-modal` on

@@ -49,6 +49,7 @@ function mockSurface(): MockSurface {
     launchSpecs,
     failNextNLaunches: 0,
     getRegistry: () => registry,
+    expectedBots: () => 0,
     triggerLeave: async () => {},
     forceKill: async () => {},
     applyTtl: () => {},
@@ -242,6 +243,29 @@ describe("POST /launch/multi", () => {
     expect(body.errors).toEqual([]);
     expect(surface.launchSpecs.map((s) => s.participant)).toEqual(["alice", "bob"]);
     expect(surface.launchSpecs[0].ttl).toBe(300_000);
+  });
+
+  it("carries diagPackets to every spawned bot and refuses on (#2970)", async () => {
+    const body = {
+      mode: "first-n",
+      count: 2,
+      meetingURL: "https://example.com/meeting/X",
+      ttl: "5m",
+    };
+    const auth = { authorization: `Bearer ${token}` };
+    const on = await fetchJson(handle.port, "/launch/multi", {
+      method: "POST",
+      headers: auth,
+      body: { ...body, diagPackets: "on" },
+    });
+    expect(on.status).toBe(400);
+    expect(surface.launchSpecs).toHaveLength(0);
+    await fetchJson(handle.port, "/launch/multi", {
+      method: "POST",
+      headers: auth,
+      body: { ...body, diagPackets: "off" },
+    });
+    expect(surface.launchSpecs.map((s) => s.diagPackets)).toEqual(["off", "off"]);
   });
 
   it("random mode is reproducible given a seed", async () => {
@@ -488,6 +512,20 @@ describe("POST /launch/from-config", () => {
     expect(surface.launchSpecs[1].participant).toBe("bob");
     expect(surface.launchSpecs[1].ttl).toBe(30_000);
     expect(surface.launchSpecs[1].videoMode).toBe("file");
+  });
+
+  it("carries a body-level diagPackets to every config bot (#2970)", async () => {
+    const yaml =
+      "meeting_url: https://example.com/meeting/X\n" +
+      "bots:\n" +
+      "  - participant: alice\n" +
+      "  - participant: bob\n";
+    await fetchJson(handle.port, "/launch/from-config", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { configYaml: yaml, diagPackets: "off" },
+    });
+    expect(surface.launchSpecs.map((s) => s.diagPackets)).toEqual(["off", "off"]);
   });
 
   it("rejects malformed YAML with 400 and the parser error message", async () => {

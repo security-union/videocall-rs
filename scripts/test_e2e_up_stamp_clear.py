@@ -66,6 +66,11 @@ class E2eUpStampClearTest(unittest.TestCase):
     def test_a_failing_clear_does_not_abort_the_impair_recipe(self) -> None:
         self._assert_brought_the_stack_up(self._make("e2e-up-impair", stub_rm=True))
 
+    def test_a_failing_clear_does_not_abort_the_monitoring_recipe(self) -> None:
+        proc = self._make("e2e-up-monitoring", stub_rm=True)
+        self._assert_brought_the_stack_up(proc)
+        self.assertIn("-f docker/docker-compose.monitoring.yaml --profile monitoring up -d", proc.stdout)
+
     @unittest.skipIf(os.geteuid() == 0, "root ignores the permission bits this relies on")
     def test_an_unwritable_stamp_dir_does_not_abort_the_recipe(self) -> None:
         self.stamps.chmod(0o555)

@@ -45,6 +45,9 @@ const FIELDS: Array<[string, keyof NetemParams]> = [
   ["downlink_kbps", "downlinkRateKbit"],
 ];
 
+/** The smallest maximum datagram size RFC 9000 (section 14) lets a QUIC path use. */
+const QUIC_MIN_PACKET_BYTES = 1200;
+
 const SHAPING = Object.entries(NETEM_PROFILES).filter(
   (e): e is [string, NetemParams] => e[1] !== null,
 );
@@ -73,22 +76,45 @@ describe("NETEM_PROFILES vs videocall-netsim's presets (#2353)", () => {
   });
 
   it("keeps the README's queue-depth claims true in code", () => {
-    expect(readme()).toContain("The ingress queue depth is the SAME `limitPkts` as egress");
+    expect(readme()).toContain("The ingress queue depth is each profile's own `ingressLimitPkts`");
+    expect(readme()).toContain(`over delay + jitter at ${QUIC_MIN_PACKET_BYTES}-byte packets`);
     expect(readme()).toContain(
       `\`${NETEM_IFB_DEV}\` device queue is raised from its default 32 to ${NETEM_IFB_TXQUEUELEN}`,
     );
     for (const [name, params] of SHAPING) {
-      expect(ingressNetemParams(params).limitPkts, name).toBe(params.limitPkts);
+      expect(ingressNetemParams(params).limitPkts, name).toBe(params.ingressLimitPkts);
     }
   });
 
   // A fresh ifb comes up at 32 and that queue sits AHEAD of the netem qdisc, so
   // a depth below any profile's limit makes the device, not the profile, decide.
-  it("keeps the ifb device queue above every profile's netem limit", () => {
+  it("keeps the ifb device queue above every profile's ingress netem limit", () => {
     for (const [name, params] of SHAPING) {
-      expect(NETEM_IFB_TXQUEUELEN, name).toBeGreaterThanOrEqual(params.limitPkts!);
+      expect(NETEM_IFB_TXQUEUELEN, name).toBeGreaterThanOrEqual(
+        ingressNetemParams(params).limitPkts!,
+      );
     }
   });
+
+  const bdpPkts = (p: NetemParams, packetBytes: number): number =>
+    Math.ceil((p.rateKbit! * (p.delayMs! + (p.jitterMs ?? 0))) / 8 / packetBytes);
+
+  it.each([1500, QUIC_MIN_PACKET_BYTES])(
+    "holds every profile's limit, both directions, at or above its BDP at %i B/packet",
+    (packetBytes) => {
+      for (const [name, params] of SHAPING) {
+        const directions: Array<[string, NetemParams]> = [
+          ["egress", params],
+          ["ingress", ingressNetemParams(params)],
+        ];
+        for (const [dir, p] of directions) {
+          expect(p.limitPkts, `${name} ${dir} limit`).toBeGreaterThanOrEqual(
+            bdpPkts(p, packetBytes),
+          );
+        }
+      }
+    },
+  );
 
   it("pins the downlink/uplink spread the README and netem.ts both quote", () => {
     const ratios = SHAPING.map(([, p]) => p.downlinkRateKbit! / p.rateKbit!).filter((r) => r > 1);

@@ -153,7 +153,7 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
-    /// Renew your own presence lease from the manual pre-join lobby (call every ~30s).
+    /// Renew your own presence lease from the waiting room or the manual pre-join lobby (call every ~30s).
     pub async fn presence_keepalive(&self, meeting_id: &str) -> Result<(), ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/presence/keepalive");
         let response = self.post(&path).send().await?;

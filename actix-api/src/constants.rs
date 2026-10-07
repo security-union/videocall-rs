@@ -31,6 +31,10 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// broadcast, avoiding false join/leave notification spam.
 pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
+/// Delay between a host kick and the relay closing the kicked transport, so
+/// the PARTICIPANT_KICKED notice queued ahead of the close is written (#2934).
+pub const KICK_CLOSE_FLUSH_DELAY: Duration = Duration::from_secs(1);
+
 /// Regex pattern for validating user IDs on the deprecated `/lobby/{user_id}/{room}`
 /// path. Room IDs use `videocall_types::validation::is_valid_meeting_id` instead.
 pub const VALID_USER_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";

@@ -40,6 +40,8 @@ pub struct ConnectionController {
 impl ConnectionController {
     /// Create a new ConnectionController with timer management
     pub fn new(options: ConnectionManagerOptions, aes: Rc<Aes128State>) -> Result<Self> {
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        host_seam::refuse(&options)?;
         info!("Creating ConnectionController with timer management");
 
         let manager = Rc::new(RefCell::new(ConnectionManager::new(
@@ -615,6 +617,7 @@ mod tests {
             allow_post_rebase_retry: true,
             refresh_room_token_callback: None,
             own_session_ids: Rc::new(RefCell::new(SessionIdHistory::default())),
+            adopt_wt_spare_worker: true,
         }
     }
 
@@ -693,5 +696,24 @@ mod uplink_depth_tests {
     fn health_send_queue_bytes_is_empty_with_no_elected_connection() {
         let cc = ConnectionController::from_manager_for_test(ConnectionManager::new_for_test());
         assert_eq!(cc.health_send_queue_bytes(), None);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod host_seam {
+    use super::ConnectionManagerOptions;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ADOPT_WT_SPARE_WORKER: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn refuse(options: &ConnectionManagerOptions) -> anyhow::Result<()> {
+        ADOPT_WT_SPARE_WORKER.with(|slot| slot.set(Some(options.adopt_wt_spare_worker)));
+        Err(anyhow::anyhow!("ConnectionController needs a browser"))
+    }
+
+    pub(crate) fn take_adopt_wt_spare_worker() -> Option<bool> {
+        ADOPT_WT_SPARE_WORKER.with(Cell::take)
     }
 }

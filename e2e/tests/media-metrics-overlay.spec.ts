@@ -21,9 +21,9 @@ import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
  *
  * Issue #1784: the REMOTE peer's fps is the PAINTED rate (frames drawn to the
  * canvas), sourced from the decoder's per-peer `video_painted` diagnostics event —
- * not the arrival-rate `fps_received` bucket, which still feeds the diagnostics
+ * not the decode-rate `fps_received` bucket, which still feeds the diagnostics
  * drawer / signal popup unchanged. The visible three-segment format is unchanged;
- * the painted-vs-arrival source is guarded at the unit level (`overlay_painted_fps_
+ * the painted-vs-decoded source is guarded at the unit level (`overlay_painted_fps_
  * sample`, `PaintRateMeter` in videocall-client), while this spec asserts the
  * painted route reaches the overlay as a real number.
  *
@@ -39,41 +39,6 @@ import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
  * metrics, and mic-on makes the peer's audio field visible for the #2279
  * assertion that it renders the em-dash ("· —k").
  * Untagged (no @bvt): runs in the dioxus full suite, not per-PR CI.
- *
- * ⚠ THIS SPEC CANNOT CURRENTLY RUN GREEN LOCALLY — issue #2193, and it is NOT the
- * #2170 assertion below that fails. `setupTwoUserMeeting` times out waiting for the
- * remote peer's decoding canvas tile (`.grid-item:has(canvas)`, 30s), so the test
- * dies in the harness before reaching any assertion. Verified independent of #2170:
- * reverting this file to its PR-staging baseline fails identically, and the
- * untouched `crop-toggle.spec.ts` fails on the SAME locator (4 of 5 tests). A
- * from-scratch stack rebuild (`make e2e-down` with volumes + `make e2e-up`) did not
- * fix it, and single-peer specs on the same stack are green.
- *
- * So the #2170 self-overlay assertion added here is WRITTEN AND LINTED BUT NOT YET
- * DEMONSTRATED GREEN. It is NOT the only guard on that consumer, and the others ARE
- * proven green:
- *   - `performance-settings.spec.ts::"self-tile overlay reports the FITTED encode
- *     size, never the AQ tier box"` — the SAME `host.rs::self_metrics_overlay`
- *     consumer on the real production path (live encoder → publish → snapshot →
- *     rendered DOM), in a SOLO meeting, because the self overlay needs no remote
- *     peer. Runs green, and mutation-verified: restoring the tier-box readout fails
- *     it with "reported 1920×1080".
- *   - `dioxus-ui/tests/send_video_readout_unknown_dims.rs` (wasm, rendered DOM, per-PR CI)
- *
- * NOT a guard, deliberately not listed above:
- * `media_metrics_overlay.rs::self_line_renders_an_em_dash_for_unpublished_encode_geometry`
- * calls `format_media_metrics_line(true, None, …)` — a pure formatter #2170 does not
- * change — with a hand-passed `None`. Reverting `live_quality_snapshot` to the tier
- * box leaves it GREEN (verified by running that mutation). It usefully DOCUMENTS a
- * state #2170 newly made reachable on the self tile, which is why it exists, but it
- * cannot detect a regression in this change and must not be cited as if it could.
- *
- * What ONLY this spec can add once #2193 is fixed is the 2-peer part: with a real
- * receiver the AQ can earn rungs above the base, so `top_published_layer_dims`'
- * `[..active]` bound and `.rev()` scan are exercised non-degenerately end-to-end.
- * In a solo meeting the relay's layer-union hint pins `active = 1` and both reduce
- * to "read slot 0" (host tests cover them at the unit level meanwhile). Re-run this
- * spec once #2193 lands.
  */
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -235,7 +200,7 @@ async function setupTwoUserMeeting(
   // which would silently restore the degenerate single-slot case.
   // OPT-IN (`threeRungLadder`), not unconditional: a 3-rung ladder triples this
   // peer's encode load, and only the #2170 test needs it. Forcing it on every test in
-  // the file would tax an already-fragile 2-peer harness (see #2193) for tests that
+  // the file would tax an already-fragile 2-peer harness for tests that
   // never asked for simulcast.
   if (opts.threeRungLadder) {
     await enableSimulcastFlag(hostCtx, 3, { capabilityMaxLayersOverride: 3 });

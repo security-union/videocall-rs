@@ -68,7 +68,7 @@
 | `videocall_server_protocol_connections` | Connections per protocol |
 | `videocall_server_data_bytes_total` | Bytes per session/direction |
 | `videocall_server_connection_events_total` | Total connection events |
-| `videocall_server_reconnections_total` | Reconnection count |
+| ~~`videocall_server_reconnections_total`~~ | Removed in #2922: nothing in the tree wrote it. Use `videocall_client_reelection_total` |
 
 ---
 
@@ -83,7 +83,7 @@
 | `videocall_client_active_server_rtt_ms` | Jay 48ms, Tony 76ms, anhelina 160ms | Established transport context |
 | `videocall_client_active_server` | Jay=WT, Tony/others=WS | Identified transport per participant |
 | `videocall_adaptive_video_tier` | Everyone degraded to 7 (minimal) | Confirmed widespread degradation |
-| `videocall_server_reconnections_total` | Yury_Ch had reconnections | Explained metric gaps |
+| `videocall_server_reconnections_total` (removed in #2922; no writer remained) | Yury_Ch had reconnections | Explained metric gaps |
 
 ### Misleading (pointed investigation in wrong direction)
 

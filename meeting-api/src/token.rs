@@ -241,13 +241,42 @@ pub fn decode_guest_token(secret: &str, token: &str) -> Result<RoomAccessTokenCl
 // Room access token
 // ---------------------------------------------------------------------------
 
-/// Sign a room access token for the given participant.
+/// Sign a room access token for the given participant, stamping `iat` with the
+/// signing time. Request handlers use [`generate_room_token_at`].
 // Keep this signature stable across multiple call sites; grouping into a struct
 // would be a broader refactor with no behavioral benefit.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_room_token(
     secret: &str,
     ttl_secs: i64,
+    user_id: &str,
+    room: &str,
+    is_host: bool,
+    display_name: &str,
+    end_on_host_leave: bool,
+    is_guest: bool,
+) -> Result<String, AppError> {
+    generate_room_token_at(
+        secret,
+        ttl_secs,
+        Utc::now().timestamp(),
+        user_id,
+        room,
+        is_host,
+        display_name,
+        end_on_host_leave,
+        is_guest,
+    )
+}
+
+/// Sign a room access token whose `iat` is `authorized_at`: the Unix second,
+/// taken before the database read that authorized the mint, that the relay
+/// compares against a host kick (#2934).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_room_token_at(
+    secret: &str,
+    ttl_secs: i64,
+    authorized_at: i64,
     user_id: &str,
     room: &str,
     is_host: bool,
@@ -268,6 +297,7 @@ pub fn generate_room_token(
         exp: now + ttl_secs,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
         typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
+        iat: Some(authorized_at),
     };
 
     encode(
@@ -296,6 +326,26 @@ pub fn generate_observer_token(
     display_name: &str,
     is_guest: bool,
 ) -> Result<String, AppError> {
+    generate_observer_token_at(
+        secret,
+        Utc::now().timestamp(),
+        user_id,
+        room,
+        display_name,
+        is_guest,
+    )
+}
+
+/// [`generate_observer_token`] with `iat` set to `authorized_at`; see
+/// [`generate_room_token_at`].
+pub fn generate_observer_token_at(
+    secret: &str,
+    authorized_at: i64,
+    user_id: &str,
+    room: &str,
+    display_name: &str,
+    is_guest: bool,
+) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
         sub: user_id.to_string(),
@@ -309,6 +359,7 @@ pub fn generate_observer_token(
         exp: now + OBSERVER_TOKEN_TTL_SECS,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
         typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
+        iat: Some(authorized_at),
     };
 
     encode(
@@ -735,5 +786,50 @@ mod tests {
         .expect("should decode");
 
         assert!(data.claims.room_join);
+    }
+
+    fn unverified_claims(token: &str) -> RoomAccessTokenClaims {
+        let mut validation = Validation::default();
+        validation.insecure_disable_signature_validation();
+        validation.validate_exp = false;
+        decode::<RoomAccessTokenClaims>(token, &DecodingKey::from_secret(b"x"), &validation)
+            .expect("should decode")
+            .claims
+    }
+
+    #[test]
+    fn iat_is_the_authorization_second_not_the_signing_second() {
+        let authorized_at = Utc::now().timestamp() - 7;
+        let room = generate_room_token_at(
+            TEST_SECRET,
+            600,
+            authorized_at,
+            "a@b.com",
+            "r",
+            false,
+            "X",
+            false,
+            false,
+        )
+        .expect("room");
+        let observer =
+            generate_observer_token_at(TEST_SECRET, authorized_at, "a@b.com", "r", "X", false)
+                .expect("observer");
+        assert_eq!(unverified_claims(&room).iat, Some(authorized_at));
+        assert_eq!(unverified_claims(&observer).iat, Some(authorized_at));
+    }
+
+    #[test]
+    fn the_signing_time_variants_stamp_iat() {
+        let before = Utc::now().timestamp();
+        let room = generate_room_token(TEST_SECRET, 60, "a@b.com", "r", false, "X", false, false)
+            .expect("room");
+        let observer =
+            generate_observer_token(TEST_SECRET, "a@b.com", "r", "X", false).expect("observer");
+        let after = Utc::now().timestamp();
+        for token in [room, observer] {
+            let iat = unverified_claims(&token).iat.expect("iat");
+            assert!((before..=after).contains(&iat));
+        }
     }
 }

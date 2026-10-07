@@ -84,5 +84,11 @@ if (window.__APP_CONFIG) {
     // Absent or unrecognised means "webtransport". Per-cluster route: see
     // `docs/DEPLOYMENT_CONFIG_MAP.md`.
     // defaultTransport: "websocket",
+
+    // Stop sending DiagnosticsPackets ("0"/"false"/"off"/"no"). Absent means
+    // ON. A falsy value is authoritative: a `?diag_packets=` URL param cannot
+    // re-enable it. When this key allows sending, `?diag_packets=0` on the
+    // page-load URL can still turn it off for that tab.
+    // diagnosticsPacketsEnabled: "0",
   });
 }

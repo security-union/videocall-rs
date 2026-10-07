@@ -36,12 +36,56 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 const RMS_SPEAKING_ENTER: f32 = 0.012;
 const RMS_SPEAKING_EXIT: f32 = 0.008;
 
+/// Frames below this RMS are skipped (not encoded or sent) unless the talker is continuous.
+const SILENCE_RMS: f32 = 0.005;
+
+/// Whether to skip a frame: near-silence is skipped, except for continuous talkers,
+/// which send every 20 ms frame so receivers see ~50 audio packets/s.
+pub fn skip_silent_frame(rms: f32, continuous: bool) -> bool {
+    !continuous && rms < SILENCE_RMS
+}
+
 fn next_speaking_state(is_speaking: bool, rms: f32) -> bool {
     if is_speaking {
         rms > RMS_SPEAKING_EXIT
     } else {
         rms > RMS_SPEAKING_ENTER
     }
+}
+
+/// Stitch one looping 48 kHz timeline per broadcaster from the conversation lines.
+///
+/// `speakers[i]` spoke `line_audio[i]`. Each broadcaster gets its own lines in
+/// place and silence elsewhere, with `pause_samples` of silence after every line.
+/// Participants not in `broadcasters` get no entry. Returns the timelines and the
+/// shared loop length in samples.
+pub fn stitch_participant_audio(
+    speakers: &[&str],
+    line_audio: &[Vec<f32>],
+    broadcasters: &[&str],
+    pause_samples: usize,
+) -> (std::collections::HashMap<String, Vec<f32>>, usize) {
+    let lines_total: usize = line_audio.iter().map(|l| l.len() + pause_samples).sum();
+    // With no lines a presenter still needs a silent timeline to send from.
+    let total_samples = match lines_total {
+        0 => crate::config::SILENT_LOOP.as_millis() as usize * 48,
+        n => n,
+    };
+    let mut out = std::collections::HashMap::new();
+    for name in broadcasters {
+        let mut audio = Vec::with_capacity(total_samples);
+        for (speaker, samples) in speakers.iter().zip(line_audio) {
+            if speaker == name {
+                audio.extend_from_slice(samples);
+            } else {
+                audio.resize(audio.len() + samples.len(), 0.0f32);
+            }
+            audio.resize(audio.len() + pause_samples, 0.0f32);
+        }
+        audio.resize(total_samples, 0.0f32);
+        out.insert((*name).to_string(), audio);
+    }
+    (out, total_samples)
 }
 
 pub struct AudioProducer {
@@ -72,6 +116,7 @@ impl AudioProducer {
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
         transport_drops_counter: Arc<AtomicU64>,
+        continuous: bool,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -88,6 +133,7 @@ impl AudioProducer {
                 is_speaking,
                 aq,
                 transport_drops_counter,
+                continuous,
             ) {
                 error!("Audio producer error: {}", e);
             }
@@ -164,6 +210,7 @@ impl AudioProducer {
             is_speaking,
             aq,
             transport_drops_counter,
+            false,
         )
     }
 
@@ -178,6 +225,7 @@ impl AudioProducer {
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
         transport_drops_counter: Arc<AtomicU64>,
+        continuous: bool,
     ) -> anyhow::Result<()> {
         if audio_data.is_empty() {
             warn!("Audio producer for {} has no audio data, exiting", user_id);
@@ -300,8 +348,8 @@ impl AudioProducer {
             let speaking_now = next_speaking_state(is_speaking.load(Ordering::Relaxed), rms);
             is_speaking.store(speaking_now, Ordering::Relaxed);
 
-            // Skip encode/send for near-silence packets
-            if rms < 0.005 {
+            // Skip encode/send for near-silence packets (continuous talkers never skip)
+            if skip_silent_frame(rms, continuous) {
                 global_sequence += 1;
 
                 // Still need to sleep to maintain timing
@@ -421,7 +469,76 @@ fn get_timestamp_ms() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_speaking_state, RMS_SPEAKING_ENTER, RMS_SPEAKING_EXIT};
+    use super::{
+        next_speaking_state, skip_silent_frame, stitch_participant_audio, RMS_SPEAKING_ENTER,
+        RMS_SPEAKING_EXIT,
+    };
+
+    #[test]
+    fn continuous_talkers_never_skip_silence() {
+        assert!(skip_silent_frame(0.0, false), "speech mode skips silence");
+        assert!(!skip_silent_frame(0.1, false));
+        assert!(
+            !skip_silent_frame(0.0, true),
+            "continuous mode sends every frame"
+        );
+    }
+
+    #[test]
+    fn stitching_gives_timelines_only_to_broadcasters() {
+        let lines = vec![vec![1.0f32; 3], vec![2.0f32; 2]];
+        let (audio, total) = stitch_participant_audio(&["alice", "bob"], &lines, &["alice"], 1);
+        assert_eq!(total, 3 + 1 + 2 + 1);
+        assert_eq!(audio.len(), 1, "receive-only participants hold no timeline");
+        assert_eq!(audio["alice"], vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_presenter_on_a_host_without_lines_still_sends_audio() {
+        use crate::transport::MediaTypeLabel;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let (audio, total) = stitch_participant_audio(&[], &[], &["presenter"], 960);
+        assert!(total > 0);
+        let loop_duration = crate::config::media_loop_duration(total);
+        assert_eq!(loop_duration, crate::config::SILENT_LOOP);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let producer = super::AudioProducer::new(
+            "presenter".into(),
+            audio["presenter"].clone(),
+            tx.into(),
+            Instant::now(),
+            loop_duration,
+            Arc::new(AtomicBool::new(false)),
+            crate::aq_controller::BotAq::with_default_clock(),
+            Arc::new(AtomicU64::new(0)),
+            true,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut frames = 0;
+        while frames < 5 && Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(frame) => frames += usize::from(frame.kind == MediaTypeLabel::Audio),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        drop(producer);
+        assert!(
+            frames >= 5,
+            "a continuous presenter sends audio; got {} in 5 s",
+            frames
+        );
+    }
+
+    #[test]
+    fn a_broadcaster_without_lines_gets_full_length_silence() {
+        let lines = vec![vec![1.0f32; 4]];
+        let (audio, total) = stitch_participant_audio(&["alice"], &lines, &["alice", "bot-003"], 2);
+        assert_eq!(audio["bot-003"], vec![0.0; total]);
+        assert_eq!(audio["alice"].len(), total);
+    }
 
     #[test]
     fn entering_speaking_requires_upper_threshold() {

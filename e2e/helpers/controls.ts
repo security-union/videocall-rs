@@ -95,8 +95,8 @@ export async function openPeerList(page: Page): Promise<void> {
   });
 }
 
-// The camera is OFF on join; the tooltip flips to "Stop Video" once capture is
-// live, so this locator only matches while it is still off.
+// The tooltip flips to "Stop Video" once capture is live, so this locator only
+// matches while the camera is off.
 export async function enableCamera(page: Page): Promise<void> {
   await wakeControls(page);
   await page.waitForTimeout(300);

@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::kick_denylist::{issued_through, KickDenylist, KickRevocation};
 use crate::{
     constants::{
         LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
@@ -31,11 +32,12 @@ use crate::{
             ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave,
             RebroadcastPresence,
         },
-        session::Message,
+        session::{ForceClose, Message},
     },
     models::build_subject_and_queue,
     session_manager::SessionManager,
 };
+use videocall_meeting_types::kick::{ParticipantKickedPayload, PARTICIPANT_KICKED_SUBJECT};
 
 use actix::{
     Actor, Addr, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
@@ -58,7 +60,8 @@ use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_CONGESTION_FILTERED_TOTAL, RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
     RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_INNER_SESSION_SELF_FILTERED_TOTAL,
-    RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_KICK_DENYLIST_EVICTIONS_TOTAL, RELAY_KICK_ENFORCEMENTS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
     RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL,
@@ -79,7 +82,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::validation::validate_display_name;
 use videocall_types::SYSTEM_USER_ID;
 
-use super::session_logic::{ConnectionState, SessionId};
+use super::session_logic::{ConnectionState, SessionId, JOIN_REFUSED_KICKED};
 
 /// Internal message sent via `notify_later` after the reconnection grace period
 /// expires. If the user has not reconnected by the time this message is handled,
@@ -219,6 +222,31 @@ struct EvictInstance(EvictInstancePayload);
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct UpdateMemberHostFlag(MeetingHostChangePayload);
+
+/// A [`PARTICIPANT_KICKED_SUBJECT`] revocation from meeting-api (#2934).
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct ParticipantKicked(ParticipantKickedPayload);
+
+/// What a joined session authenticated as, kept from `JoinRoom` until its
+/// `Disconnect` so a host kick can find and close it (#2934).
+struct SessionCredential {
+    room: String,
+    user_id: String,
+    observer: bool,
+    token_iat: Option<i64>,
+    closer: Option<Recipient<ForceClose>>,
+}
+
+/// How often expired host-kick revocations are dropped.
+const KICK_DENYLIST_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Internal actix message to update a room member's display name.
 /// Sent from the per-session NATS subscription loop when a
@@ -391,27 +419,72 @@ fn user_has_remaining_session(remaining_members: &[RoomMemberInfo], user_id: &st
 }
 
 /// The heartbeats renewing every reported session, one or more per room: a
-/// room larger than [`PRESENCE_HEARTBEAT_MAX_SESSIONS`] is split.
+/// room larger than [`PRESENCE_HEARTBEAT_MAX_SESSIONS`] is split. `unreported`
+/// names, per room, users holding only sessions that renew nothing; they ride
+/// along for meeting-api's kick check (#2934).
 fn presence_heartbeats(
     reported: &HashMap<String, HashMap<String, SessionId>>,
+    unreported: &HashMap<String, Vec<String>>,
 ) -> Vec<PresenceHeartbeat> {
     let mut heartbeats = Vec::new();
-    for (room, users) in reported {
-        let sessions: Vec<HeartbeatSession> = users
-            .iter()
+    let rooms = reported.keys().chain(
+        unreported
+            .keys()
+            .filter(|room| !reported.contains_key(*room)),
+    );
+    for room in rooms {
+        let sessions: Vec<HeartbeatSession> = reported
+            .get(room)
+            .into_iter()
+            .flatten()
             .map(|(user_id, session)| HeartbeatSession {
                 user_id: user_id.clone(),
                 session_id: *session,
             })
             .collect();
-        for chunk in sessions.chunks(PRESENCE_HEARTBEAT_MAX_SESSIONS) {
+        let mut session_chunks = sessions.chunks(PRESENCE_HEARTBEAT_MAX_SESSIONS);
+        let mut unreported_chunks = unreported
+            .get(room)
+            .map(|users| users.chunks(PRESENCE_HEARTBEAT_MAX_SESSIONS))
+            .into_iter()
+            .flatten();
+        loop {
+            let (sessions, unreported) = (session_chunks.next(), unreported_chunks.next());
+            if sessions.is_none() && unreported.is_none() {
+                break;
+            }
             heartbeats.push(PresenceHeartbeat {
                 room_id: room.clone(),
-                sessions: chunk.to_vec(),
+                sessions: sessions.unwrap_or_default().to_vec(),
+                unreported_user_ids: unreported.unwrap_or_default().to_vec(),
             });
         }
     }
     heartbeats
+}
+
+/// Per room, the users with a joined local session but none reported present.
+fn unreported_users(
+    credentials: &HashMap<SessionId, SessionCredential>,
+    reported: &HashMap<String, HashMap<String, SessionId>>,
+) -> HashMap<String, Vec<String>> {
+    let mut unreported: HashMap<String, Vec<String>> = HashMap::new();
+    for credential in credentials.values() {
+        let is_reported = reported
+            .get(&credential.room)
+            .is_some_and(|users| users.contains_key(&credential.user_id));
+        if !is_reported {
+            unreported
+                .entry(credential.room.clone())
+                .or_default()
+                .push(credential.user_id.clone());
+        }
+    }
+    for users in unreported.values_mut() {
+        users.sort_unstable();
+        users.dedup();
+    }
+    unreported
 }
 
 /// Whether a room's member slice holds NO LOCAL-origin row (issue #1705 / #1202).
@@ -1443,6 +1516,12 @@ pub struct ChatServer {
     /// publisher whose receivers are all on the other relay binary fail-opens to
     /// the full ladder instead of being base-pinned.
     membership_mirror_enabled: bool,
+    /// Host kicks received on [`PARTICIPANT_KICKED_SUBJECT`] (#2934). Unlike the
+    /// per-room caches it survives the room draining, so a later reconnect with
+    /// a pre-kick token is still refused.
+    kick_denylist: KickDenylist,
+    /// Every session between its `JoinRoom` and its `Disconnect` (#2934).
+    session_credentials: HashMap<SessionId, SessionCredential>,
 }
 
 impl ChatServer {
@@ -1500,6 +1579,8 @@ impl ChatServer {
             membership_mirror_enabled: std::env::var("MEMBERSHIP_MIRROR_ENABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            kick_denylist: KickDenylist::default(),
+            session_credentials: HashMap::new(),
         }
     }
 
@@ -2082,6 +2163,82 @@ impl ChatServer {
         }
     }
 
+    /// Tell `session` it was kicked, cut it off from the room, and have its
+    /// transport close (#2934). Its later `Disconnect` finds it already gone.
+    fn revoke_session(&mut self, session: SessionId, ctx: &mut Context<Self>) {
+        let Some(credential) = self.session_credentials.remove(&session) else {
+            return;
+        };
+        if let Some(recipient) = self.sessions.remove(&session) {
+            let notice = SessionManager::build_participant_kicked_packet(
+                &credential.room,
+                &credential.user_id,
+            );
+            recipient.do_send(Message {
+                session,
+                msg: bytes::Bytes::from(notice),
+            });
+            let display_name = self
+                .room_members
+                .get(&credential.room)
+                .and_then(|members| members.iter().find(|m| m.session == session))
+                .map(|m| m.display_name.clone());
+            self.leave_rooms(
+                LeaveContext {
+                    session_id: &session,
+                    room: Some(&credential.room),
+                    user_id: Some(&credential.user_id),
+                    display_name: display_name.as_deref(),
+                    observer: credential.observer,
+                },
+                ctx,
+            );
+            self.connection_states
+                .insert(session, ConnectionState::Revoked);
+            self.suppress_join_broadcast.remove(&session);
+        }
+        if let Some(closer) = credential.closer {
+            closer.do_send(ForceClose);
+        }
+        RELAY_KICK_ENFORCEMENTS_TOTAL
+            .with_label_values(&["closed"])
+            .inc();
+        info!(
+            "Closed session {} of kicked user {} in room {}",
+            session, credential.user_id, credential.room
+        );
+    }
+
+    /// Refuse a `JoinRoom` presenting a room token a kick revoked: deliver
+    /// the kick notice, then close the transport (#2934).
+    fn refuse_kicked_join(
+        &mut self,
+        session: SessionId,
+        room: &str,
+        user_id: &str,
+        closer: Option<Recipient<ForceClose>>,
+    ) {
+        if let Some(recipient) = self.sessions.remove(&session) {
+            let notice = SessionManager::build_participant_kicked_packet(room, user_id);
+            recipient.do_send(Message {
+                session,
+                msg: bytes::Bytes::from(notice),
+            });
+            self.connection_states
+                .insert(session, ConnectionState::Revoked);
+        }
+        if let Some(closer) = closer {
+            closer.do_send(ForceClose);
+        }
+        RELAY_KICK_ENFORCEMENTS_TOTAL
+            .with_label_values(&["refused"])
+            .inc();
+        info!(
+            "Refused session {} of kicked user {} in room {}: token revoked by the kick",
+            session, user_id, room
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Publish-side layer suppression (#1108, Stage 3 — LAYER_HINT)
     // -----------------------------------------------------------------------
@@ -2613,6 +2770,40 @@ impl Actor for ChatServer {
             }
         });
 
+        // #2934: every instance subscribes, since a kicked user may hold a
+        // session on any of them.
+        let nc_kick = self.nats_connection.clone();
+        let addr_kick = ctx.address();
+        tokio::spawn(async move {
+            loop {
+                match nc_kick.subscribe(PARTICIPANT_KICKED_SUBJECT).await {
+                    Ok(mut sub) => {
+                        while let Some(msg) = sub.next().await {
+                            match serde_json::from_slice::<ParticipantKickedPayload>(&msg.payload) {
+                                Ok(payload) => addr_kick.do_send(ParticipantKicked(payload)),
+                                Err(e) => warn!(
+                                    "Failed to deserialize {} payload: {}",
+                                    PARTICIPANT_KICKED_SUBJECT, e
+                                ),
+                            }
+                        }
+                        warn!(
+                            "{} subscription stream ended, re-subscribing in 1s",
+                            PARTICIPANT_KICKED_SUBJECT
+                        );
+                    }
+                    Err(e) => error!(
+                        "Failed to subscribe to {}: {}, retrying in 1s",
+                        PARTICIPANT_KICKED_SUBJECT, e
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        ctx.run_interval(KICK_DENYLIST_SWEEP_INTERVAL, |act, _ctx| {
+            act.kick_denylist.sweep(unix_now_secs());
+        });
+
         // Arm the periodic DEMAND-side gauge cycle (#1170 item 2, #1284). The
         // start command captures the O(1) queue length; the handler processes a
         // bounded room chunk and appends continuation commands behind existing
@@ -2632,7 +2823,8 @@ impl Actor for ChatServer {
                 warn!("Skipping presence heartbeat tick: {pending} publish(es) still queued");
                 return;
             }
-            for heartbeat in presence_heartbeats(&act.reported_present) {
+            let unreported = unreported_users(&act.session_credentials, &act.reported_present);
+            for heartbeat in presence_heartbeats(&act.reported_present, &unreported) {
                 act.publish_json_ordered(PRESENCE_HEARTBEAT_SUBJECT, &heartbeat);
             }
         });
@@ -2691,6 +2883,13 @@ impl Handler<Disconnect> for ChatServer {
         }: Disconnect,
         ctx: &mut Self::Context,
     ) -> Self::Result {
+        self.session_credentials.remove(&session);
+        // A session closed for a host kick already left the room (#2934).
+        if self.connection_states.get(&session) == Some(&ConnectionState::Revoked) {
+            self.connection_states.remove(&session);
+            self.session_is_guest.remove(&session);
+            return;
+        }
         // Persist the authoritative guest flag so leave_rooms can populate
         // PARTICIPANT_LEFT consistently even if the original JoinRoom entry
         // was evicted. `is_guest` for a session never changes mid-lifetime.
@@ -3895,6 +4094,54 @@ impl Handler<UpdateMemberHostFlag> for ChatServer {
     }
 }
 
+/// Record a host kick and close every local session of the kicked user in that
+/// room whose room token's `iat` is at or before `revoke_iat_through` (#2934).
+impl Handler<ParticipantKicked> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: ParticipantKicked, ctx: &mut Self::Context) -> Self::Result {
+        let now = unix_now_secs();
+        let Some(revocation) = KickRevocation::from_payload(msg.0, now) else {
+            warn!(
+                "Ignoring malformed or expired {}",
+                PARTICIPANT_KICKED_SUBJECT
+            );
+            return;
+        };
+        if let Some(eviction) = self.kick_denylist.record(&revocation) {
+            RELAY_KICK_DENYLIST_EVICTIONS_TOTAL
+                .with_label_values(&[eviction.label()])
+                .inc();
+        }
+        let Some(through) =
+            self.kick_denylist
+                .revoked_through(&revocation.room_id, &revocation.user_id, now)
+        else {
+            return;
+        };
+        let mut targets: Vec<SessionId> = self
+            .session_credentials
+            .iter()
+            .filter(|(_, c)| {
+                c.room == revocation.room_id
+                    && c.user_id == revocation.user_id
+                    && issued_through(c.token_iat, through)
+            })
+            .map(|(session, _)| *session)
+            .collect();
+        // Active sessions last, so their departure finds no same-user session left.
+        targets.sort_by_key(|s| {
+            (
+                self.connection_states.get(s) == Some(&ConnectionState::Active),
+                *s,
+            )
+        });
+        for session in targets {
+            self.revoke_session(session, ctx);
+        }
+    }
+}
+
 /// Whether a superseded session was ever announced, so receivers hold a tile to
 /// evict. `Handler<Disconnect>` drops `connection_states`, not `pending_departures`.
 fn predecessor_was_announced(
@@ -4225,6 +4472,8 @@ impl Handler<JoinRoom> for ChatServer {
             is_host,
             transport,
             downlink_congested_epoch,
+            token_iat,
+            closer,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -4248,6 +4497,14 @@ impl Handler<JoinRoom> for ChatServer {
         // rather than admit a session with no identity to stamp.
         if user_id.is_empty() {
             return MessageResult(Err("Cannot join with an empty user ID".into()));
+        }
+
+        if self
+            .kick_denylist
+            .refuses(&room, &user_id, token_iat, unix_now_secs())
+        {
+            self.refuse_kicked_join(session, &room, &user_id, closer);
+            return MessageResult(Err(JOIN_REFUSED_KICKED.into()));
         }
 
         // Persist the server-authoritative guest flag so downstream
@@ -4407,6 +4664,16 @@ impl Handler<JoinRoom> for ChatServer {
                 return MessageResult(Err("Session not found".into()));
             }
         };
+        self.session_credentials.insert(
+            session,
+            SessionCredential {
+                room: room.clone(),
+                user_id: user_id.clone(),
+                observer,
+                token_iat,
+                closer,
+            },
+        );
 
         // Allocate this session's viewport / "desired streams" set (HCL issue
         // #988). It starts empty = fail-open (forward all video) and is shared
@@ -6949,6 +7216,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7026,6 +7295,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7088,6 +7359,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7124,6 +7397,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7188,6 +7463,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7208,6 +7485,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7862,6 +8141,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7975,6 +8256,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -8074,6 +8357,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -8179,6 +8464,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -8248,6 +8535,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -8360,6 +8649,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -8473,6 +8764,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -8597,6 +8890,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -8619,6 +8914,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -10982,6 +11279,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -11572,6 +11871,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -11673,6 +11974,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should succeed")
@@ -11767,6 +12070,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should succeed")
@@ -11861,6 +12166,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should succeed")
@@ -12098,6 +12405,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -12207,6 +12516,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should deliver")
@@ -12290,7 +12601,7 @@ mod tests {
             HashMap::from([("a@example.com".to_string(), 7)]),
         );
 
-        let heartbeats = presence_heartbeats(&reported);
+        let heartbeats = presence_heartbeats(&reported, &HashMap::new());
         let mut per_room: HashMap<String, Vec<usize>> = HashMap::new();
         let mut seen: HashMap<(String, String), SessionId> = HashMap::new();
         for heartbeat in &heartbeats {
@@ -12475,6 +12786,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom C should deliver")
@@ -12507,6 +12820,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom P should deliver")
@@ -12569,6 +12884,8 @@ mod tests {
                 is_host: true,                          // STALE pre-demotion claim
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Reconnect JoinRoom C should deliver")
@@ -12650,6 +12967,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -12737,6 +13056,8 @@ mod tests {
                     is_host: false,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
+                    token_iat: None,
+                    closer: None,
                 })
                 .await
                 .expect("Message delivery should succeed")
@@ -13058,6 +13379,8 @@ mod tests {
             is_host: false,
             transport: "websocket".to_string(),
             downlink_congested_epoch: never_epoch(),
+            token_iat: None,
+            closer: None,
         })
         .await
         .expect("JoinRoom L delivery")
@@ -13553,6 +13876,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -13629,6 +13954,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14036,6 +14363,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14084,6 +14413,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14163,6 +14494,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14224,6 +14557,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14276,6 +14611,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14392,6 +14729,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14424,6 +14763,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14551,6 +14892,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14576,6 +14919,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14620,6 +14965,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14688,6 +15035,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14714,6 +15063,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14792,6 +15143,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14825,6 +15178,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14932,6 +15287,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -14979,6 +15336,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Message delivery should succeed")
@@ -15097,6 +15456,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Delivery A")
@@ -15125,6 +15486,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Delivery B")
@@ -15223,6 +15586,8 @@ mod tests {
                     is_host: false,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
+                    token_iat: None,
+                    closer: None,
                 })
                 .await
                 .expect("Delivery")
@@ -15309,6 +15674,8 @@ mod tests {
                     is_host: false,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
+                    token_iat: None,
+                    closer: None,
                 })
                 .await
                 .expect("Delivery")
@@ -15416,6 +15783,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Delivery A")
@@ -15458,6 +15827,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Delivery B")
@@ -15538,6 +15909,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Delivery victim")
@@ -15583,6 +15956,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("Delivery attacker")
@@ -15687,6 +16062,8 @@ mod tests {
                     is_host: false,
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
+                    token_iat: None,
+                    closer: None,
                 })
                 .await
                 .expect("Delivery")
@@ -19754,6 +20131,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom delivery should succeed")
@@ -19953,6 +20332,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom delivery should succeed")
@@ -20089,6 +20470,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom delivery should succeed")
@@ -20498,6 +20881,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should be delivered");
@@ -20539,6 +20924,8 @@ mod tests {
                 is_host: true, // <-- the stale claim
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should be delivered");
@@ -20667,6 +21054,8 @@ mod tests {
                 is_host: false,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should be delivered");
@@ -20785,6 +21174,8 @@ mod tests {
                 is_host: true,
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                closer: None,
             })
             .await
             .expect("JoinRoom should be delivered");
@@ -20827,3 +21218,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "chat_server_kick_tests.rs"]
+mod kick_tests;

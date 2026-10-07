@@ -1,0 +1,446 @@
+{
+ "_comment": [
+  "Mutations of the scenario compiler (#2914 PR-4), each naming the test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-scenario.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_scenario.py"
+ ],
+ "baseline_tests": 30,
+ "mutations": [
+  {
+   "name": "YAML 1.1 booleans resolved",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "re.compile(r\"^(?:true|false)$\"), list(\"tf\"))",
+   "replace": "re.compile(r\"^(?:true|false|on|off|yes|no)$\"), list(\"tfoyn\"))",
+   "expect_kills": [
+    "test_on_off_yes_no_and_sexagesimal_stay_strings"
+   ]
+  },
+  {
+   "name": "YAML floats resolved",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "keep = {\"tag:yaml.org,2002:null\"}",
+   "replace": "keep = {\"tag:yaml.org,2002:null\", \"tag:yaml.org,2002:float\"}",
+   "expect_kills": [
+    "test_on_off_yes_no_and_sexagesimal_stay_strings"
+   ]
+  },
+  {
+   "name": "duplicate keys accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "                if key in seen:",
+   "replace": "                if False:",
+   "expect_kills": [
+    "test_a_duplicate_key_is_refused"
+   ]
+  },
+  {
+   "name": "non-string keys accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "                if not isinstance(key, str):",
+   "replace": "                if False:",
+   "expect_kills": [
+    "test_a_non_string_key_is_refused"
+   ]
+  },
+  {
+   "name": "unknown keys accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        for k in sorted(set(obj) - allowed):",
+   "replace": "        for k in []:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "more than 30 cameras accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if cameras > cq_score.CANVAS_LIMIT:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "30 cameras refused",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if cameras > cq_score.CANVAS_LIMIT:",
+   "replace": "    if cameras >= cq_score.CANVAS_LIMIT:",
+   "expect_kills": [
+    "test_exactly_30_camera_publishers_is_accepted"
+   ]
+  },
+  {
+   "name": "talker mute accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "            elif p[\"talker\"]:",
+   "replace": "            elif False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "Rust mute accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "            elif p[\"fleet\"] == \"rust\":",
+   "replace": "            elif False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "unpaired mute accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "            elif mic[uid] == (action == \"unmute\"):",
+   "replace": "            elif False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "event offset bounds dropped",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "not step_s <= offset <= hold_s - last",
+   "replace": "not 0 <= offset <= hold_s",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "event offset bounds exclusive",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "not step_s <= offset <= hold_s - last",
+   "replace": "not step_s < offset < hold_s - last",
+   "expect_kills": [
+    "test_event_offsets_at_the_bounds_are_accepted"
+   ]
+  },
+  {
+   "name": "n_target ignores planned leaves",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "\"n_target\": len(parts) - len(leavers)",
+   "replace": "\"n_target\": len(parts)",
+   "expect_kills": [
+    "test_n_target_excludes_the_planned_final_leave"
+   ]
+  },
+  {
+   "name": "camera process without a talker accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "and not any(p[\"talker\"] for p in members):",
+   "replace": "and False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "mixed video layers accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "if r[\"camera\"]}) > 1:",
+   "replace": "if r[\"camera\"]}) > 2:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "Rust webtransport accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if transport != \"websocket\":",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "netem network accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if network != \"none\":",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "screen share accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if \"screen\" in (media if isinstance(media, dict) else {}):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "a leaver can be selected again",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        present = [p for p in by_role[sel[\"role\"]] if p[\"user_id\"] not in left]",
+   "replace": "        present = list(by_role[sel[\"role\"]])",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "selection takes the first members",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        chosen = present[-sel[\"count\"]:]",
+   "replace": "        chosen = present[:sel[\"count\"]]",
+   "expect_kills": [
+    "test_the_planned_leave_picks_the_last_viewer_at_its_offset"
+   ]
+  },
+  {
+   "name": "report mode accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if scoring[\"mode\"] != \"gate\":",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "an expected PASS accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "if expect[\"verdict\"] not in (\"INVALID\", \"FAIL\"):",
+   "replace": "if expect[\"verdict\"] not in (\"INVALID\", \"FAIL\", \"PASS\"):",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "cluster target accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "TARGETS = {\"local\": \"local\", \"ci\": \"ci-smoke\"}",
+   "replace": "TARGETS = {\"local\": \"local\", \"ci\": \"ci-smoke\", \"cluster\": \"cluster\"}",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "long id prefix accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "ID_PREFIX_RE = re.compile(r\"^[a-z0-9]{1,12}$\")",
+   "replace": "ID_PREFIX_RE = re.compile(r\"^[a-z0-9]{1,40}$\")",
+   "expect_kills": [
+    "test_bad_prefixes_and_commits_are_refused"
+   ]
+  },
+  {
+   "name": "receive on a publisher accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "            if out[\"camera\"] or out[\"mic\"] != \"off\":",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "two steps accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if not isinstance(steps, list) or len(steps) != 1:",
+   "replace": "    if not isinstance(steps, list) or not steps:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "browser observers not observers",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "\"observer\": r[\"fleet\"] == \"browser\"",
+   "replace": "\"observer\": True",
+   "expect_kills": [
+    "test_participants_carry_the_planned_roles_and_media"
+   ]
+  },
+  {
+   "name": "event slack not reserved",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        last = 2 * step_s + EVENT_SLACK_S",
+   "replace": "        last = 2 * step_s",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "role process named like the publisher process",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "PROC_ROLE = \"rust-role-{}\"",
+   "replace": "PROC_ROLE = \"rust-{}\"",
+   "expect_kills": [
+    "test_role_names_that_spell_another_process_id_still_get_their_own_process",
+    "test_rust_processes_share_one_roster_and_isolate_the_leaver"
+   ]
+  },
+  {
+   "name": "leave process named like a role process",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "PROC_LEAVE = \"rust-leave-{:02d}\"",
+   "replace": "PROC_LEAVE = \"rust-role-leave-{:02d}\"",
+   "expect_kills": [
+    "test_role_names_that_spell_another_process_id_still_get_their_own_process",
+    "test_rust_processes_share_one_roster_and_isolate_the_leaver"
+   ]
+  },
+  {
+   "name": "duplicate proc ids accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    for dup in sorted(i for i, n in ids.items() if n > 1):",
+   "replace": "    for dup in []:",
+   "expect_kills": [
+    "test_two_processes_with_one_name_are_refused"
+   ]
+  },
+  {
+   "name": "a zero event count selects the whole role",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "or not _int(sel[\"count\"]) or sel[\"count\"] < 1:",
+   "replace": "or not _int(sel[\"count\"]):",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "a negative viewport_visible_count accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "if vis is not None and (not _int(vis) or vis < 0):",
+   "replace": "if vis is not None and not _int(vis):",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "four video layers accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "not 1 <= layers <= 3",
+   "replace": "not 1 <= layers <= 4",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "a staggered Rust role accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if \"join_stagger\" in r:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "video_layers on a camera-off Rust role accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if not out[\"camera\"] and \"video_layers\" in media:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "an unknown browser transport accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if transport not in cq_manifest.TRANSPORTS:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "a truthy headline accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if step[\"headline\"] is not True:",
+   "replace": "    if not step[\"headline\"]:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "a non-integer seed accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if not _int(run[\"seed\"]):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "repeated expected gates accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "or len(set(gates)) != len(gates) or (",
+   "replace": "or (",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "the relay exemption cap excludes its bound",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "len(ex) > cq_score.MAX_RELAY_EXEMPTIONS",
+   "replace": "len(ex) >= cq_score.MAX_RELAY_EXEMPTIONS",
+   "expect_kills": [
+    "test_exactly_two_relay_exemptions_are_accepted"
+   ]
+  },
+  {
+   "name": "the minimum hold excludes its bound",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "hold_s < MIN_HOLD_S",
+   "replace": "hold_s <= MIN_HOLD_S",
+   "expect_kills": [
+    "test_a_hold_of_exactly_60_s_is_accepted"
+   ]
+  },
+  {
+   "name": "a bad join_window compiles",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if join_window is None:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_each_refusal_names_its_reason"
+   ]
+  },
+  {
+   "name": "signed and underscored integers resolved",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "re.compile(r\"^-?(?:0|[1-9][0-9]*)$\"),\n                                 list(\"-0123456789\"))",
+   "replace": "re.compile(r\"^[-+]?(?:0|[1-9][0-9_]*)$\"),\n                                 list(\"-+0123456789\"))",
+   "expect_kills": [
+    "test_signed_and_underscored_integers_stay_strings"
+   ]
+  },
+  {
+   "name": "explicit tags accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "            if tag not in (None, \"!\") and tag not in EXPLICIT_TAGS:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_explicit_tags_other_than_str_seq_map_and_null_are_refused"
+   ]
+  },
+  {
+   "name": "a deep document escapes as RecursionError",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    except RecursionError as exc:\n        raise ScenarioError([\"YAML: nested too deeply\"]) from exc\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_deeply_nested_document_is_a_scenario_error"
+   ]
+  },
+  {
+   "name": "participant process found by a scan",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        p[\"process\"] = owner[p[\"user_id\"]]",
+   "replace": "        p[\"process\"] = next(q[\"proc_id\"] for q in processes if p[\"user_id\"] in q[\"participants\"])",
+   "expect_kills": [
+    "test_compiling_is_linear_in_the_participant_count"
+   ]
+  }
+ ]
+}

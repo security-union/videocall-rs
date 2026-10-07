@@ -125,6 +125,10 @@ pub struct BotMetrics {
     // other}`. The label space is bounded so cardinality is predictable
     // even with many bots/meetings on one scrape target.
     // ---------------------------------------------------------------------
+    pub media_owd_ms: HistogramVec,
+    pub media_excess_delay_ms: HistogramVec,
+    pub media_delay_implausible_total: IntCounterVec,
+
     pub packets_sent_total: IntCounterVec,
     pub packets_received_total: IntCounterVec,
     pub packets_parsed_error_total: IntCounterVec,
@@ -184,6 +188,33 @@ impl BotMetrics {
             registry
         )?;
 
+        // Per-process aggregates (no per-bot or per-pair label) so N bots do not
+        // create N² series.
+        let delay_buckets = vec![
+            5.0, 10.0, 20.0, 50.0, 100.0, 150.0, 200.0, 300.0, 500.0, 750.0, 1_000.0, 1_500.0,
+            2_000.0, 3_000.0, 5_000.0, 10_000.0,
+        ];
+        let media_owd_ms = register_histogram_vec_with_registry!(
+            "bot_media_owd_ms",
+            "Receiver-side one-way media delay: arrival minus the sender's wall-clock timestamp (ms; absolute only with synchronized clocks)",
+            &["kind", "tx_profile", "rx_profile", "transport"],
+            delay_buckets.clone(),
+            registry
+        )?;
+        let media_excess_delay_ms = register_histogram_vec_with_registry!(
+            "bot_media_excess_delay_ms",
+            "One-way media delay above the stream's lowest delay in a 30 s window (ms; immune to constant clock offset)",
+            &["kind", "tx_profile", "rx_profile", "transport"],
+            delay_buckets,
+            registry
+        )?;
+        let media_delay_implausible_total = register_int_counter_vec_with_registry!(
+            "bot_media_delay_implausible_total",
+            "Decoded media packets whose sender timestamp is not wall-clock ms (e.g. browser video), so no delay was recorded",
+            &["kind"],
+            registry
+        )?;
+
         let packets_sent_total = register_int_counter_vec_with_registry!(
             "bot_packets_sent_total",
             "Total packets sent by the bot's outbound pipeline",
@@ -220,6 +251,9 @@ impl BotMetrics {
             aq_p75_peer_fps,
             netsim_dropped_total,
             netsim_delay_ms,
+            media_owd_ms,
+            media_excess_delay_ms,
+            media_delay_implausible_total,
             packets_sent_total,
             packets_received_total,
             packets_parsed_error_total,
@@ -367,6 +401,14 @@ mod tests {
             .with_label_values(&["b", "m", "audio"])
             .inc();
         metrics
+            .media_owd_ms
+            .with_label_values(&["audio", "none", "none", "websocket"])
+            .observe(120.0);
+        metrics
+            .media_excess_delay_ms
+            .with_label_values(&["audio", "none", "none", "websocket"])
+            .observe(10.0);
+        metrics
             .packets_received_total
             .with_label_values(&["b", "m", "video"])
             .inc();
@@ -388,5 +430,7 @@ mod tests {
             body
         );
         assert!(body.contains("bot_netsim_dropped_total"));
+        assert!(body.contains("bot_media_owd_ms_bucket"));
+        assert!(body.contains("bot_media_excess_delay_ms_bucket"));
     }
 }

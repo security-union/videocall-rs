@@ -6,7 +6,9 @@ sit at the real relative paths so the guard's cluster lookup resolves them.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 import shutil
 import subprocess
@@ -271,6 +273,55 @@ class RulesParseGuardTest(unittest.TestCase):
         self.assertIn("alerting_rules.yml", found["helm/global/hcl/prometheus/values.yaml"])
         self.assertIn("alert_rules.yml", found["helm/global/us-east/prometheus/values.yaml"])
 
+    @unittest.skipUnless(HAVE_RUNTIME and not SKIP_RUNTIME_REQUESTED, "no container runtime")
+    def test_rule_unit_test_fails_when_a_vanished_ws_pod_pages_critical(self):
+        with Sandbox() as s:
+            s.mutate(
+                0,
+                "unless on(pod) last_over_time(relay_ws_fragmented_inbound_total[10m])",
+                "unless on(pod) relay_ws_fragmented_inbound_total",
+            )
+            rc, out, err = run(s.paths)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("promtool test rules FAILED", out)
+        self.assertIn('alertname="RelaySchedulerLagHigh", pod="ws-0", severity="critical"', out)
+
+    def test_rule_test_verdict_needs_exit_zero_and_success(self):
+        self.assertIsNone(guard.rule_test_verdict("i", "t", 0, "Unit Testing: t\n  SUCCESS\n"))
+        self.assertIsNotNone(guard.rule_test_verdict("i", "t", 0, ""))
+        self.assertIsNotNone(guard.rule_test_verdict("i", "t", 1, "SUCCESS"))
+
+    def test_each_staged_test_names_its_own_clusters_rule_files(self):
+        tmp = Path(tempfile.mkdtemp(prefix="rule-tests-"))
+        try:
+            src = tmp / "src.test.yaml"
+            src.write_text("tests: []\n")
+            runs = guard.stage_rule_tests(
+                tmp, {"a::alerting_rules.yml": "groups: []\n", "b::alert_rules.yml": "groups: []\n"}, [src]
+            )
+            self.assertEqual(runs, ["tests__a/src.test.yaml", "tests__b/src.test.yaml"])
+            self.assertTrue((tmp / runs[1]).read_text().startswith("rule_files:\n  - alert_rules.yml\ntests"))
+            self.assertTrue((tmp / "tests__b" / "alert_rules.yml").is_file())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_no_rule_unit_tests_is_a_failure(self):
+        empty = Path(tempfile.mkdtemp(prefix="no-rule-tests-"))
+        real, env = guard.RULE_TESTS_DIR, dict(os.environ)
+        out = io.StringIO()
+        try:
+            guard.RULE_TESTS_DIR = empty
+            os.environ["PROMTOOL_SKIP_RUNTIME"] = "1"
+            os.environ.pop("REQUIRE_PROMTOOL", None)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                rc = guard.main(["x"] + [str(ROOT / rel) for rel in REL])
+        finally:
+            guard.RULE_TESTS_DIR = real
+            os.environ.clear()
+            os.environ.update(env)
+            shutil.rmtree(empty, ignore_errors=True)
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("no *.test.yaml rule unit tests found", out.getvalue())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

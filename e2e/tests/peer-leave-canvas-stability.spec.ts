@@ -271,10 +271,7 @@ test.describe("Peer-leave canvas-node stability (issue 508)", () => {
     await waitForServices();
   });
 
-  // Issue #1530: headless Chrome with SwiftShader (software GPU) cannot reliably
-  // produce <canvas> elements from multi-peer WebCodecs decode within test timeouts.
-  // The CI runner lacks a hardware GPU; re-enable once a GPU runner is available.
-  test.fixme("surviving camera-on tile reuses the SAME <canvas> node across 2->1 collapse", async ({
+  test("surviving camera-on tile reuses the SAME <canvas> node across 2->1 collapse", async ({
     baseURL,
   }) => {
     test.setTimeout(300_000);

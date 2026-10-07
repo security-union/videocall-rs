@@ -30,6 +30,7 @@ function mockSurface(): MockSurface {
   return {
     registry,
     getRegistry: () => registry,
+    expectedBots: () => 0,
     triggerLeave: async () => {},
     forceKill: async () => {},
     applyTtl: () => {},

@@ -1,0 +1,7 @@
+.dockerignore
+**/target
+**/dist
+**/node_modules
+bots-app/run
+**/auth.json
+**/tmp.*

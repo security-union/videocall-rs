@@ -17,8 +17,10 @@
 //! numbers, measures inter-arrival variability, and computes A/V sync drift.
 //! Reports a summary line at `INFO` level every 10 seconds.
 
+use crate::aq_controller::BotAq;
 use crate::keyframe_requester::KeyframeRequester;
 use crate::layer_preference_sender::{LayerPreferenceSender, PinMediaKind};
+use crate::media_delay::{DelayKind, DelayWindowStats, MediaDelayTracker};
 use crate::rtt_probe::RttProbeState;
 use crate::viewport_sender::ViewportSender;
 use protobuf::Message;
@@ -30,27 +32,24 @@ use videocall_aq::constants::{
     AUDIO_SIMULCAST_MAX_LAYERS, LAYER_AVAILABILITY_WINDOW_MS, SEQ_RESET_REANCHOR_GAP,
     SIMULCAST_MAX_LAYERS,
 };
+use videocall_types::protos::layer_hint_packet::{
+    layer_hint_packet::MediaKind as HintMediaKind, LayerHintPacket,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
 
-/// Per-sender counters accumulated between health report drains.
+/// Per-sender bytes accumulated between DIAGNOSTICS drains.
 #[derive(Default, Clone)]
 pub struct SenderHealthCounters {
-    pub audio_packets: u64,
-    pub video_packets: u64,
     pub audio_bytes: u64,
     pub video_bytes: u64,
-    /// Sequence positions the DECODED rung skipped, per drain window — the browser
-    /// gates its tracker the same way, so an unfiltered count would make one proto
-    /// field mean two things by producer. Bounded by `RUNG_WINDOW`: a rung silent
-    /// longer than that re-baselines and books nothing.
-    pub audio_seq_gaps: u64,
-    pub video_seq_gaps: u64,
 }
 
 /// How long a rung stays "arriving" after its last packet.
@@ -59,6 +58,12 @@ pub struct SenderHealthCounters {
 /// `LayerAvailability::DEFAULT_WINDOW_MS` so bot and browser cannot drift on which
 /// rungs a source is offering (#2206).
 const RUNG_WINDOW: Duration = Duration::from_millis(LAYER_AVAILABILITY_WINDOW_MS);
+
+/// A peer silent this long has left. The browser drops a peer after three
+/// consecutive 5 s monitor ticks with no packet from it, 10–15 s
+/// (`videocall-client` `Peer::check_heartbeat`); checked on the 500 ms
+/// DIAGNOSTICS tick, the bot drops it after 15–15.5 s.
+pub const PEER_SILENCE_EVICT: Duration = Duration::from_secs(15);
 
 /// A media kind with its own simulcast ladder, layer-id space and sequence space.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -78,7 +83,6 @@ struct RungState {
 #[derive(Default)]
 struct RungAdmission {
     would_decode: bool,
-    gap: u64,
 }
 
 /// Welford accumulator for the population standard deviation of consecutive
@@ -161,25 +165,26 @@ pub struct InboundStats {
     audio_ia: InterArrival,
     // A/V sync dropped: browser audio uses Date.now() ms, video uses EncodedVideoChunk µs — cross-unit delta is meaningless. Re-add when browser wire format is unified.
     parse_errors: u64,
+    /// One-way delay per sender stream, from the embedded wall-clock timestamp.
+    delay: MediaDelayTracker,
+    audio_delay: DelayWindowStats,
+    video_delay: DelayWindowStats,
     /// Arrival and sequence state per (session_id, kind, rung).
     ///
     /// Keyed by SESSION, not user: one user on two devices is two independent sources
     /// with independent per-rung sequence counters, so a user-keyed mark makes every
     /// alternation between them look like loss.
     rung_state: HashMap<(u64, RungKind, u32), RungState>,
-    /// Per-sender counters for health reporting (accumulated between drains).
-    health_counters: HashMap<Arc<str>, SenderHealthCounters>,
+    /// Per-sender counters drained by the DIAGNOSTICS reporter on its own cadence.
+    diag_counters: HashMap<Arc<str>, SenderHealthCounters>,
     /// Total inbound packets since last health drain (all types).
     health_total_packets: u64,
-    /// Snapshot of the most recently drained health-counter window, kept so
-    /// secondary consumers (e.g. the diagnostics reporter) can read the same
-    /// window the health reporter emitted without double-draining and zeroing
-    /// the live counters between producers.
-    last_drain_snapshot: HashMap<String, SenderHealthCounters>,
     /// Last time each sender was seen — used to evict stale entries.
     last_seen: HashMap<Arc<str>, Instant>,
     /// Intern map: raw user_id bytes → the one shared name every per-sender map keys on.
     sender_names: HashMap<Vec<u8>, Arc<str>>,
+    /// Relay session of each sender's latest media packet.
+    sender_session: HashMap<Arc<str>, u64>,
     // NOTE(#1108): the `aq` controller handle and `diagnostics_parse_errors`
     // counter were removed — inbound DIAGNOSTICS are no longer parsed or routed
     // into the AQ (receiver FPS no longer feeds the sender AQ). The bot AQ ticks
@@ -199,6 +204,11 @@ pub struct InboundStats {
     /// LAYER_PREFERENCE control packets pinning each source to a fixed simulcast
     /// layer, like a real client that selected a quality tier (#1083-A2).
     layer_preference_sender: Option<LayerPreferenceSender>,
+    /// This client's relay session (from `SESSION_ASSIGNED`); a `LAYER_HINT`
+    /// for another session is ignored.
+    own_session_id: Option<u64>,
+    /// Receives this publisher's camera `LAYER_HINT` caps.
+    layer_hint_aq: Option<Arc<BotAq>>,
     /// Optional Prometheus metrics handle. When set, every inbound packet
     /// increments `bot_packets_received_total` (labeled by media_type) and
     /// parse failures increment `bot_packets_parsed_error_total`.
@@ -212,6 +222,16 @@ struct InboundMetrics {
     metrics: Arc<BotMetrics>,
     bot: String,
     meeting: String,
+    delay_labels: Option<DelayLabels>,
+}
+
+/// Labels for the delay histograms: this receiver's transport and network
+/// profile, plus the profile of each sender run by the same process.
+#[cfg(feature = "metrics")]
+pub struct DelayLabels {
+    pub transport: &'static str,
+    pub rx_profile: String,
+    pub sender_profiles: Arc<HashMap<String, String>>,
 }
 
 impl InboundStats {
@@ -223,6 +243,17 @@ impl InboundStats {
     /// generic media.
     pub fn set_rtt_probe(&mut self, state: Arc<RttProbeState>) {
         self.rtt_probe = Some(state);
+    }
+
+    /// This client's relay session, once `SESSION_ASSIGNED` has arrived.
+    pub fn own_session_id(&self) -> Option<u64> {
+        self.own_session_id
+    }
+
+    /// Apply self-targeted `LAYER_HINT` VIDEO caps to `aq`, as the browser
+    /// feeds them to its camera encoder's controller.
+    pub fn set_layer_hint_aq(&mut self, aq: Arc<BotAq>) {
+        self.layer_hint_aq = Some(aq);
     }
 
     /// Attach a keyframe requester. When set, newly discovered peers trigger
@@ -255,6 +286,7 @@ impl InboundStats {
             metrics,
             bot,
             meeting,
+            delay_labels: None,
         });
     }
 
@@ -389,7 +421,6 @@ impl InboundStats {
 
         RungAdmission {
             would_decode: rung == self.decoded_rung_for(kind, session_id, now),
-            gap,
         }
     }
 
@@ -411,6 +442,19 @@ impl InboundStats {
             return;
         };
         let session_id = wrapper.session_id;
+
+        match wrapper.packet_type.enum_value() {
+            Ok(PacketType::MEETING) => {
+                if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                    if meeting.event_type.enum_value() == Ok(MeetingEventType::PARTICIPANT_LEFT) {
+                        self.remove_sender(&meeting.target_user_id, meeting.session_id);
+                    }
+                }
+            }
+            Ok(PacketType::SESSION_ASSIGNED) => self.own_session_id = Some(session_id),
+            Ok(PacketType::LAYER_HINT) => self.on_layer_hint(&wrapper),
+            _ => {}
+        }
 
         // DIAGNOSTICS packets: counted for inbound-stats accounting only.
         //
@@ -466,6 +510,7 @@ impl InboundStats {
 
         // Update last-seen time for stale entry eviction.
         self.last_seen.insert(Arc::clone(&sender), now);
+        self.sender_session.insert(Arc::clone(&sender), session_id);
 
         // Notify keyframe requester about newly seen peers.
         if let Some(ref mut kr) = self.keyframe_requester {
@@ -526,15 +571,21 @@ impl InboundStats {
                 self.audio_ia.record(now_ms);
                 if admission.would_decode {
                     self.audio_packets += 1;
+                    self.observe_delay(
+                        &sender,
+                        session_id,
+                        DelayKind::Audio,
+                        now_ms,
+                        media.timestamp,
+                        now,
+                    );
                 }
 
                 // Accumulate health counters for this sender
-                let hc = self.health_counters.entry(Arc::clone(&sender)).or_default();
-                hc.audio_bytes += media.data.len() as u64;
-                if admission.would_decode {
-                    hc.audio_packets += 1;
-                    hc.audio_seq_gaps += admission.gap;
-                }
+                self.diag_counters
+                    .entry(Arc::clone(&sender))
+                    .or_default()
+                    .audio_bytes += media.data.len() as u64;
             }
             Ok(MediaType::VIDEO) => {
                 #[cfg(feature = "metrics")]
@@ -556,15 +607,21 @@ impl InboundStats {
                 self.video_ia.record(now_ms);
                 if admission.would_decode {
                     self.video_packets += 1;
+                    self.observe_delay(
+                        &sender,
+                        session_id,
+                        DelayKind::Video,
+                        now_ms,
+                        media.timestamp,
+                        now,
+                    );
                 }
 
                 // Accumulate health counters for this sender
-                let hc = self.health_counters.entry(Arc::clone(&sender)).or_default();
-                hc.video_bytes += media.data.len() as u64;
-                if admission.would_decode {
-                    hc.video_packets += 1;
-                    hc.video_seq_gaps += admission.gap;
-                }
+                self.diag_counters
+                    .entry(Arc::clone(&sender))
+                    .or_default()
+                    .video_bytes += media.data.len() as u64;
 
                 if admission.would_decode && media.frame_type == "key" {
                     self.video_keyframes += 1;
@@ -583,6 +640,66 @@ impl InboundStats {
         }
     }
 
+    /// Record one decoded-layer packet's one-way delay (skipped, and counted,
+    /// when the sender timestamp is not wall-clock ms).
+    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+    fn observe_delay(
+        &mut self,
+        sender: &str,
+        stream: u64,
+        kind: DelayKind,
+        now_ms: f64,
+        sender_ts_ms: f64,
+        now: Instant,
+    ) {
+        let Some(sample) = self.delay.observe(stream, kind, now_ms, sender_ts_ms, now) else {
+            #[cfg(feature = "metrics")]
+            if let Some(m) = &self.metrics {
+                m.metrics
+                    .media_delay_implausible_total
+                    .with_label_values(&[kind.as_str()])
+                    .inc();
+            }
+            return;
+        };
+        match kind {
+            DelayKind::Audio => self.audio_delay.record(sample),
+            DelayKind::Video => self.video_delay.record(sample),
+        }
+        #[cfg(feature = "metrics")]
+        if let Some(m) = &self.metrics {
+            if let Some(l) = &m.delay_labels {
+                let tx = l
+                    .sender_profiles
+                    .get(sender)
+                    .map(String::as_str)
+                    .unwrap_or("external");
+                let labels = [kind.as_str(), tx, l.rx_profile.as_str(), l.transport];
+                m.metrics
+                    .media_owd_ms
+                    .with_label_values(&labels)
+                    .observe(sample.owd_ms);
+                m.metrics
+                    .media_excess_delay_ms
+                    .with_label_values(&labels)
+                    .observe(sample.excess_ms);
+            }
+        }
+    }
+
+    /// Delay statistics for the current reporting window: (audio, video).
+    pub fn delay_window(&self) -> (DelayWindowStats, DelayWindowStats) {
+        (self.audio_delay, self.video_delay)
+    }
+
+    /// Label the delay histograms (no-op until `set_metrics` has run).
+    #[cfg(feature = "metrics")]
+    pub fn set_delay_labels(&mut self, labels: DelayLabels) {
+        if let Some(m) = &mut self.metrics {
+            m.delay_labels = Some(labels);
+        }
+    }
+
     pub fn report(&self, user_id: &str) {
         let audio_iastddev = self.audio_ia.stddev_ms();
         let video_iastddev = self.video_ia.stddev_ms();
@@ -591,7 +708,8 @@ impl InboundStats {
             "[{}] RX STATS (10s): audio={} decoded-rung pkts (all rungs: {:.0} KB, \
              ia_stddev={:.1}ms, gaps={}, rung_expiries={}), video={} decoded-rung pkts \
              ({} key, all rungs: {:.0} KB, ia_stddev={:.1}ms, gaps={}, rung_expiries={}), \
-             heartbeat={}, errors={}",
+             heartbeat={}, errors={}, delay audio mean/max={:.0}/{:.0}ms excess_max={:.0}ms, \
+             video mean/max={:.0}/{:.0}ms excess_max={:.0}ms",
             user_id,
             self.audio_packets,
             self.audio_bytes as f64 / 1024.0,
@@ -606,30 +724,29 @@ impl InboundStats {
             self.video_rung_expiries,
             self.heartbeat_packets,
             self.parse_errors,
+            self.audio_delay.owd_mean_ms(),
+            self.audio_delay.owd_max_ms,
+            self.audio_delay.excess_max_ms,
+            self.video_delay.owd_mean_ms(),
+            self.video_delay.owd_max_ms,
+            self.video_delay.excess_max_ms,
         );
     }
 
     pub fn reset(&mut self) {
-        // Preserve health counters across diagnostic resets — they are
-        // drained independently by the health reporter on a 1s cadence.
-        // Also preserve last_seen and sender_names since they track cross-window
-        // state. They are evicted by evict_stale(); `rung_state` is swept below.
-        let health_counters = std::mem::take(&mut self.health_counters);
-        let health_total = self.health_total_packets;
-        let last_drain_snapshot = std::mem::take(&mut self.last_drain_snapshot);
-        let last_seen = std::mem::take(&mut self.last_seen);
-        let sender_names = std::mem::take(&mut self.sender_names);
+        // Only the window's counters are cleared; attached senders, session
+        // identity and per-sender maps persist.
+        //
         // Rolling 4s availability window — dropping it on the 10s diagnostic reset
         // would repeat the ramp and inflate the next health sample (#2206). Stale
         // entries are evicted HERE rather than on the packet path: `reset` runs every
         // 10s in both pin and observation modes, so this is the one sweep that bounds
         // the map against per-reconnect `session_id` churn.
-        let mut rung_state = std::mem::take(&mut self.rung_state);
         let sweep_now = Instant::now();
         // A rung silent past the window loses its mark: what the relay shed was never sent
         // here. Counted, like the packet-path expiry, so the abandoned stretch is visible.
         let mut swept = (0u64, 0u64);
-        rung_state.retain(|&(_, kind, _), st| {
+        self.rung_state.retain(|&(_, kind, _), st| {
             let keep = sweep_now.duration_since(st.last_seen) <= RUNG_WINDOW;
             if !keep {
                 match kind {
@@ -639,32 +756,26 @@ impl InboundStats {
             }
             keep
         });
-        shrink_if_sparse(&mut rung_state);
-        let rtt_probe = self.rtt_probe.take();
-        let keyframe_requester = self.keyframe_requester.take();
-        let viewport_sender = self.viewport_sender.take();
-        let layer_preference_sender = self.layer_preference_sender.take();
-        #[cfg(feature = "metrics")]
-        let metrics = self.metrics.take();
-        *self = Self::default();
-        self.health_counters = health_counters;
-        self.health_total_packets = health_total;
-        self.last_drain_snapshot = last_drain_snapshot;
-        self.last_seen = last_seen;
-        self.sender_names = sender_names;
-        self.rung_state = rung_state;
-        self.rtt_probe = rtt_probe;
-        self.keyframe_requester = keyframe_requester;
-        self.viewport_sender = viewport_sender;
-        self.layer_preference_sender = layer_preference_sender;
+        shrink_if_sparse(&mut self.rung_state);
+        self.delay.evict_idle(sweep_now);
+        self.audio_packets = 0;
+        self.video_packets = 0;
+        self.video_keyframes = 0;
+        self.heartbeat_packets = 0;
+        self.other_packets = 0;
+        self.audio_bytes = 0;
+        self.video_bytes = 0;
+        self.audio_seq_gaps = 0;
+        self.video_seq_gaps = 0;
+        self.parse_errors = 0;
+        self.video_ia = InterArrival::default();
+        self.audio_ia = InterArrival::default();
+        self.audio_delay = DelayWindowStats::default();
+        self.video_delay = DelayWindowStats::default();
         // Seeded, not zeroed: `report` runs before `reset`, so a sweep's marks land in the
         // window that opens here rather than the one that just closed.
         self.audio_rung_expiries = swept.0;
         self.video_rung_expiries = swept.1;
-        #[cfg(feature = "metrics")]
-        {
-            self.metrics = metrics;
-        }
 
         // Re-assert the VIEWPORT (#988 load-test fidelity). The relay drops a
         // bot's viewport subscription on disconnect, and a reconnect / re-election
@@ -712,6 +823,51 @@ impl InboundStats {
         }
     }
 
+    /// The browser's `LAYER_HINT` arm (`video_call_client.rs`): only a hint
+    /// stamped with our own session counts, and only its VIDEO entry is used.
+    fn on_layer_hint(&mut self, wrapper: &PacketWrapper) {
+        let (Some(aq), Some(own)) = (&self.layer_hint_aq, self.own_session_id) else {
+            return;
+        };
+        if wrapper.session_id != own {
+            return;
+        }
+        let Ok(hint) = LayerHintPacket::parse_from_bytes(&wrapper.data) else {
+            return;
+        };
+        for entry in &hint.entries {
+            if entry.media_kind.enum_value() == Ok(HintMediaKind::VIDEO) {
+                aq.observe_layer_hint(entry.max_requested_layer);
+            }
+        }
+    }
+
+    /// Forget a peer that left (relay `PARTICIPANT_LEFT`), as the browser's
+    /// `remove_peer` does, so its DIAGNOSTICS trackers stop at once.
+    /// The browser removes by session, so a leave for a session other than the
+    /// sender's latest (a reconnect's old one) is ignored.
+    pub fn remove_sender(&mut self, raw_user_id: &[u8], session_id: u64) {
+        let name = String::from_utf8_lossy(raw_user_id);
+        if self
+            .sender_session
+            .get(name.as_ref())
+            .is_some_and(|&live| live != session_id)
+        {
+            return;
+        }
+        self.sender_session.remove(name.as_ref());
+        self.last_seen.remove(name.as_ref());
+        self.diag_counters.remove(name.as_ref());
+        self.sender_names.remove(raw_user_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_sender(&mut self, name: &str, age: Duration) {
+        if let Some(seen) = self.last_seen.get_mut(name) {
+            *seen = Instant::now() - age;
+        }
+    }
+
     /// Remove entries from ALL per-sender maps for senders not seen within `max_age`.
     /// Call this periodically (e.g. from the 10s reporting tick) to bound memory.
     pub fn evict_stale(&mut self, max_age: Duration) {
@@ -725,8 +881,8 @@ impl InboundStats {
 
         for sender in &stale_senders {
             self.last_seen.remove(&**sender);
-            self.health_counters.remove(&**sender);
-            self.last_drain_snapshot.remove(&**sender);
+            self.sender_session.remove(&**sender);
+            self.diag_counters.remove(&**sender);
         }
 
         // Also evict from the intern map — find Vec<u8> keys whose name value
@@ -739,32 +895,22 @@ impl InboundStats {
         }
     }
 
-    /// Drain per-sender health counters accumulated since the last drain.
-    /// Returns `(per_sender_counters, total_packets)` and resets both to zero.
-    ///
-    /// Before clearing, the drained per-sender map is cloned into
-    /// `last_drain_snapshot` so secondary consumers (e.g. the diagnostics
-    /// reporter) can read the *same* one-second window the health reporter
-    /// emitted — a single source of truth for per-sender rate counters.
-    pub fn drain_health_counters(&mut self) -> (HashMap<String, SenderHealthCounters>, u64) {
-        let counters: HashMap<String, SenderHealthCounters> =
-            std::mem::take(&mut self.health_counters)
-                .into_iter()
-                .map(|(name, c)| (name.to_string(), c))
-                .collect();
-        let total = self.health_total_packets;
-        self.health_total_packets = 0;
-        self.last_drain_snapshot = counters.clone();
-        (counters, total)
+    /// Inbound packets of every type since the last call, for HEALTH.
+    pub fn take_health_total(&mut self) -> u64 {
+        std::mem::take(&mut self.health_total_packets)
     }
 
-    /// Non-destructive snapshot of the last drained health-counter window.
-    ///
-    /// The diagnostics reporter calls this each tick to emit
-    /// `DiagnosticsPacket`s over the same ~1-second window the health reporter
-    /// already observed. Returns an empty map before the first drain.
-    pub fn snapshot_diagnostics_counters(&self) -> HashMap<String, SenderHealthCounters> {
-        self.last_drain_snapshot.clone()
+    /// Drain the per-sender bytes since the last call (DIAGNOSTICS).
+    pub fn drain_diagnostics_counters(&mut self) -> HashMap<String, SenderHealthCounters> {
+        std::mem::take(&mut self.diag_counters)
+            .into_iter()
+            .map(|(name, c)| (name.to_string(), c))
+            .collect()
+    }
+
+    /// Senders currently known (not yet evicted as stale).
+    pub fn known_senders(&self) -> std::collections::HashSet<String> {
+        self.last_seen.keys().map(|k| k.to_string()).collect()
     }
 
     /// An `Arc` and not a borrow so callers can key the per-sender maps while
@@ -776,6 +922,74 @@ impl InboundStats {
         let name: Arc<str> = Arc::from(String::from_utf8_lossy(raw).as_ref());
         self.sender_names.insert(raw.to_vec(), Arc::clone(&name));
         name
+    }
+}
+
+/// Wire packets for tests in this and sibling modules.
+#[cfg(test)]
+pub(crate) mod test_packets {
+    use protobuf::Message;
+    use videocall_types::protos::media_packet::media_packet::MediaType;
+    use videocall_types::protos::media_packet::MediaPacket;
+    use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+    use videocall_types::protos::meeting_packet::MeetingPacket;
+    use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+    use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    /// A 100-byte media packet from `sender`.
+    pub(crate) fn media(sender: &str, media_type: MediaType) -> Vec<u8> {
+        media_from(sender, media_type, 7)
+    }
+
+    /// A 100-byte media packet from `sender`'s relay session `session_id`.
+    pub(crate) fn media_from(sender: &str, media_type: MediaType, session_id: u64) -> Vec<u8> {
+        let mut media = MediaPacket::new();
+        media.media_type = media_type.into();
+        media.data = vec![0u8; 100];
+        PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: sender.as_bytes().to_vec(),
+            data: media.write_to_bytes().unwrap(),
+            session_id,
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    /// A relay packet of `packet_type` stamped with `session_id`.
+    pub(crate) fn control(packet_type: PacketType, session_id: u64, data: Vec<u8>) -> Vec<u8> {
+        PacketWrapper {
+            packet_type: packet_type.into(),
+            session_id,
+            data,
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    /// The relay's `PARTICIPANT_LEFT` for `user_id` (`session_manager.rs` `build_peer_left_packet`).
+    pub(crate) fn participant_left(user_id: &str) -> Vec<u8> {
+        participant_left_session(user_id, 7)
+    }
+
+    /// The relay's `PARTICIPANT_LEFT` for one session of `user_id`.
+    pub(crate) fn participant_left_session(user_id: &str, session_id: u64) -> Vec<u8> {
+        let meeting = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_LEFT.into(),
+            target_user_id: user_id.as_bytes().to_vec(),
+            session_id,
+            ..Default::default()
+        };
+        PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: b"system".to_vec(),
+            data: meeting.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
     }
 }
 
@@ -857,6 +1071,167 @@ mod tests {
 
     const ALICE: u64 = 11;
     const BOB: u64 = 22;
+
+    fn wall_now_ms() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64
+    }
+
+    #[test]
+    fn decoded_audio_and_video_record_one_way_delay_from_the_sender_timestamp() {
+        let mut stats = InboundStats::default();
+        let sent = wall_now_ms() - 150.0;
+        stats.record_packet("me", &make_media_packet("alice", MediaType::AUDIO, 1, sent));
+        stats.record_packet("me", &make_media_packet("alice", MediaType::VIDEO, 1, sent));
+        let (audio, video) = stats.delay_window();
+        assert_eq!(audio.count, 1);
+        assert_eq!(video.count, 1);
+        assert!(
+            (150.0..1_000.0).contains(&audio.owd_max_ms),
+            "audio owd {}",
+            audio.owd_max_ms
+        );
+    }
+
+    #[test]
+    fn a_media_time_timestamp_records_no_delay() {
+        let mut stats = InboundStats::default();
+        // Browser video carries EncodedVideoChunk.timestamp(), not wall-clock ms.
+        stats.record_packet(
+            "me",
+            &make_media_packet("alice", MediaType::VIDEO, 1, 33_366.0),
+        );
+        assert_eq!(stats.delay_window().1.count, 0);
+        assert_eq!(stats.delay.implausible(), 1);
+    }
+
+    #[test]
+    fn the_delay_floor_survives_the_report_reset() {
+        let mut stats = InboundStats::default();
+        stats.record_packet(
+            "me",
+            &make_media_packet("alice", MediaType::AUDIO, 1, wall_now_ms() - 50.0),
+        );
+        stats.reset();
+        assert_eq!(stats.delay_window().0.count, 0, "window stats reset");
+        stats.record_packet(
+            "me",
+            &make_media_packet("alice", MediaType::AUDIO, 2, wall_now_ms() - 450.0),
+        );
+        let (audio, _) = stats.delay_window();
+        assert!(
+            audio.excess_max_ms >= 350.0,
+            "floor from before the reset must still apply, excess {}",
+            audio.excess_max_ms
+        );
+    }
+
+    #[test]
+    fn participant_left_forgets_the_peer_at_once() {
+        let mut stats = InboundStats::default();
+        stats.record_packet("me", &test_packets::media("alice", MediaType::AUDIO));
+        stats.record_packet("me", &test_packets::media("bob", MediaType::AUDIO));
+        stats.record_packet("me", &test_packets::participant_left("alice"));
+        assert!(!stats.known_senders().contains("alice"));
+        assert!(stats.known_senders().contains("bob"));
+        assert!(!stats.drain_diagnostics_counters().contains_key("alice"));
+    }
+
+    #[test]
+    fn only_a_self_targeted_video_layer_hint_caps_the_published_ladder() {
+        use videocall_aq::TestClock;
+        use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry;
+        let clock = Arc::new(TestClock::new(0));
+        let aq = BotAq::new(clock.clone());
+        aq.set_simulcast_layers(3);
+        let mut stats = InboundStats::default();
+        stats.set_layer_hint_aq(Arc::clone(&aq));
+        let hint = |kind: HintMediaKind, max: u32| {
+            let mut entry = Entry::new();
+            entry.media_kind = kind.into();
+            entry.max_requested_layer = max;
+            let mut packet = LayerHintPacket::new();
+            packet.entries.push(entry);
+            packet.write_to_bytes().unwrap()
+        };
+        let mut t = 0;
+        let mut tick = |aq: &BotAq| {
+            t += 1_000;
+            clock.set_ms(t);
+            aq.tick();
+            aq.simulcast_snapshot().active
+        };
+        stats.record_packet(
+            "me",
+            &test_packets::control(PacketType::SESSION_ASSIGNED, 42, vec![]),
+        );
+        let to = |session| {
+            test_packets::control(
+                PacketType::LAYER_HINT,
+                session,
+                hint(HintMediaKind::VIDEO, 0),
+            )
+        };
+        stats.record_packet("me", &to(43));
+        stats.record_packet(
+            "me",
+            &test_packets::control(PacketType::LAYER_HINT, 42, hint(HintMediaKind::AUDIO, 0)),
+        );
+        assert_eq!(
+            tick(&aq),
+            3,
+            "another session's hint and AUDIO entries are ignored"
+        );
+        stats.reset();
+        stats.record_packet("me", &to(42));
+        assert_eq!(
+            tick(&aq),
+            1,
+            "our own VIDEO hint sheds to the base layer, also after the 10 s reset"
+        );
+    }
+
+    #[test]
+    fn a_leave_for_an_old_session_keeps_the_reconnected_peer() {
+        let mut stats = InboundStats::default();
+        stats.record_packet(
+            "me",
+            &test_packets::media_from("alice", MediaType::AUDIO, 8),
+        );
+        stats.record_packet("me", &test_packets::participant_left_session("alice", 7));
+        assert!(stats.known_senders().contains("alice"));
+        stats.record_packet("me", &test_packets::participant_left_session("alice", 8));
+        assert!(!stats.known_senders().contains("alice"));
+    }
+
+    #[test]
+    fn a_peer_silent_for_three_browser_monitor_ticks_is_gone() {
+        let mut stats = InboundStats::default();
+        stats.record_packet("me", &test_packets::media("alice", MediaType::AUDIO));
+        stats.record_packet("me", &test_packets::media("bob", MediaType::AUDIO));
+        *stats.last_seen.get_mut("alice").unwrap() = Instant::now() - Duration::from_secs(16);
+        *stats.last_seen.get_mut("bob").unwrap() = Instant::now() - Duration::from_secs(9);
+        stats.evict_stale(PEER_SILENCE_EVICT);
+        assert!(!stats.known_senders().contains("alice"));
+        assert!(stats.known_senders().contains("bob"));
+    }
+
+    #[test]
+    fn diagnostics_counters_drain_independently_and_survive_the_report_reset() {
+        let mut stats = InboundStats::default();
+        stats.record_packet("me", &make_media_packet("alice", MediaType::AUDIO, 1, 0.0));
+        stats.record_packet("me", &make_media_packet("alice", MediaType::VIDEO, 1, 0.0));
+        // The HEALTH drain must not consume the DIAGNOSTICS window.
+        let _ = stats.take_health_total();
+        stats.reset();
+        let window = stats.drain_diagnostics_counters();
+        assert_eq!(window["alice"].audio_bytes, 100);
+        assert_eq!(window["alice"].video_bytes, 100);
+        assert!(stats.drain_diagnostics_counters().is_empty());
+        assert!(stats.known_senders().contains("alice"));
+    }
 
     #[test]
     fn video_packets_counts_one_rung_not_the_ladder_sum() {
@@ -1132,47 +1507,6 @@ mod tests {
             RUNG_WINDOW,
             Duration::from_millis(LAYER_AVAILABILITY_WINDOW_MS),
             "the window must be derived from the shared constant, not redefined"
-        );
-    }
-
-    #[test]
-    fn the_drained_health_counter_is_rung_filtered_too() {
-        // `fps_received` is built from the PER-SENDER health counters, not the
-        // diagnostic total — so filtering only `self.video_packets` would leave the
-        // actually-reported telemetry reading the ladder sum.
-        let mut stats = InboundStats::default();
-        for rung in 0..3u32 {
-            stats.record_packet(
-                "bot",
-                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
-            );
-        }
-        let (warm, _) = stats.drain_health_counters();
-        let warm_count = warm.get("alice").map(|c| c.video_packets).unwrap_or(0);
-
-        let frames = 6u64;
-        for seq in 1..=frames {
-            for rung in 0..3u32 {
-                stats.record_packet(
-                    "bot",
-                    &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
-                );
-            }
-        }
-        let (drained, _) = stats.drain_health_counters();
-        let c = drained.get("alice").expect("alice must be present");
-        assert_eq!(
-            c.video_packets, frames,
-            "the REPORTED counter must count one rung, not the ladder sum"
-        );
-        // Bytes stay unfiltered here too, which is what liveness reads.
-        assert_eq!(c.video_bytes, frames * 3 * 100);
-        // The first frame's three rungs all count: each is the top rung SEEN SO FAR at
-        // the moment it lands. That ramp is inherent to observing arrivals and is why
-        // `reset` preserves the window rather than restarting it.
-        assert_eq!(
-            warm_count, 3,
-            "the warm-up frame over-counts by the ladder depth"
         );
     }
 
@@ -1486,7 +1820,7 @@ mod tests {
             !stats.last_seen.contains_key("alice"),
             "alice should be evicted"
         );
-        assert!(!stats.health_counters.contains_key("alice"));
+        assert!(!stats.diag_counters.contains_key("alice"));
 
         assert!(stats.last_seen.contains_key("bob"), "bob should remain");
     }
@@ -1508,18 +1842,23 @@ mod tests {
         assert_eq!(stats.health_total_packets, 8);
 
         // Drain
-        let (counters, total) = stats.drain_health_counters();
+        let (counters, total) = (
+            stats.drain_diagnostics_counters(),
+            stats.take_health_total(),
+        );
         assert_eq!(total, 8);
         let alice = counters.get("alice").expect("alice should have counters");
-        assert_eq!(alice.audio_packets, 5);
-        assert_eq!(alice.video_packets, 3);
+        assert_eq!((alice.audio_bytes, alice.video_bytes), (500, 300));
 
         // After drain, counters should be reset
         assert_eq!(stats.health_total_packets, 0);
-        assert!(stats.health_counters.is_empty());
+        assert!(stats.diag_counters.is_empty());
 
         // A second drain should return empty
-        let (counters2, total2) = stats.drain_health_counters();
+        let (counters2, total2) = (
+            stats.drain_diagnostics_counters(),
+            stats.take_health_total(),
+        );
         assert_eq!(total2, 0);
         assert!(counters2.is_empty());
     }
@@ -1572,8 +1911,6 @@ mod tests {
             );
         }
         let after_warmup = stats.audio_packets;
-        let (warm, _) = stats.drain_health_counters();
-        assert_eq!(warm.get("alice").map(|c| c.audio_packets), Some(3));
 
         let frames = 50u64;
         for seq in 1..=frames {
@@ -1590,15 +1927,8 @@ mod tests {
             frames,
             "steady state must count ONE rung's packets, not all three"
         );
-        let (drained, _) = stats.drain_health_counters();
-        let c = drained.get("alice").expect("alice must be present");
-        assert_eq!(
-            c.audio_packets, frames,
-            "the REPORTED counter must count one rung, not the ladder sum"
-        );
-        // Bytes and arrivals stay unfiltered; bytes are what `can_listen` reads.
+        // Bytes and arrivals stay unfiltered.
         let total = (frames + 1) * 3;
-        assert_eq!(c.audio_bytes, frames * 3 * 100);
         assert_eq!(stats.audio_ia.arrivals(), total);
         assert_eq!(stats.audio_bytes, total * 100);
     }
@@ -2024,13 +2354,12 @@ mod tests {
         stats.admit_rung(RungKind::Video, ALICE, 0, Some(10), t0);
 
         let returned = t0 + RUNG_WINDOW + Duration::from_millis(1);
-        let admission = stats.admit_rung(RungKind::Video, ALICE, 0, Some(5_010), returned);
+        stats.admit_rung(RungKind::Video, ALICE, 0, Some(5_010), returned);
 
         assert_eq!(
-            admission.gap, 0,
+            stats.video_seq_gaps, 0,
             "a rung returning past the window must re-baseline, not book 5000 lost packets"
         );
-        assert_eq!(stats.video_seq_gaps, 0);
         assert_eq!(
             stats.video_rung_expiries, 1,
             "the un-measurable stretch must be counted, or the 0 above is silent"
@@ -2054,7 +2383,7 @@ mod tests {
 
         let returned = t0 + RUNG_WINDOW + Duration::from_millis(1);
         stats.admit_rung(RungKind::Video, ALICE, 0, None, returned);
-        let admission = stats.admit_rung(
+        stats.admit_rung(
             RungKind::Video,
             ALICE,
             0,
@@ -2062,7 +2391,6 @@ mod tests {
             returned + Duration::from_millis(30),
         );
 
-        assert_eq!(admission.gap, 0);
         assert_eq!(stats.video_seq_gaps, 0);
         assert_eq!(stats.video_rung_expiries, 1);
     }
@@ -2074,9 +2402,8 @@ mod tests {
         stats.admit_rung(RungKind::Audio, ALICE, 0, Some(10), t0);
 
         let still_inside = t0 + RUNG_WINDOW - Duration::from_millis(1);
-        let admission = stats.admit_rung(RungKind::Audio, ALICE, 0, Some(60), still_inside);
+        stats.admit_rung(RungKind::Audio, ALICE, 0, Some(60), still_inside);
 
-        assert_eq!(admission.gap, 49);
         assert_eq!(stats.audio_seq_gaps, 49);
         assert_eq!(stats.audio_rung_expiries, 0);
     }
@@ -2111,71 +2438,5 @@ mod tests {
             stats.video_seq_gaps, lost,
             "the diagnostic counter stays unfiltered: it measures what the link lost"
         );
-
-        let (drained, _) = stats.drain_health_counters();
-        assert_eq!(
-            drained["alice"].video_seq_gaps, 0,
-            "rung 2 is the decoded rung and lost nothing; rung 1's loss must not be reported"
-        );
-    }
-
-    #[test]
-    fn reported_gaps_do_count_loss_on_the_decoded_rung() {
-        let mut stats = InboundStats::default();
-        for rung in 0..3u32 {
-            stats.record_packet(
-                "bot",
-                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
-            );
-        }
-
-        let mut lost = 0u64;
-        for seq in 1..=60u64 {
-            for rung in 0..3u32 {
-                if rung == 2 && seq % 5 == 2 {
-                    lost += 1;
-                    continue;
-                }
-                stats.record_packet(
-                    "bot",
-                    &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
-                );
-            }
-        }
-        assert_eq!(lost, 12);
-        let (drained, _) = stats.drain_health_counters();
-        assert_eq!(
-            drained["alice"].video_seq_gaps, lost,
-            "the guard must not swallow loss on the rung this bot decodes"
-        );
-    }
-
-    #[test]
-    fn health_counters_attribute_each_rung_gap_to_its_own_sender() {
-        let mut stats = InboundStats::default();
-        for seq in [0u64, 1, 2] {
-            stats.record_packet(
-                "bot",
-                &make_audio_packet_on_rung("alice", ALICE, seq, 1000.0, 0),
-            );
-            stats.record_packet(
-                "bot",
-                &make_video_packet_on_rung("bob", BOB, seq, 1000.0, 0),
-            );
-        }
-        stats.record_packet(
-            "bot",
-            &make_audio_packet_on_rung("alice", ALICE, 5, 1005.0, 0),
-        );
-        stats.record_packet("bot", &make_video_packet_on_rung("bob", BOB, 8, 1008.0, 0));
-
-        let (per_sender, _) = stats.drain_health_counters();
-        assert_eq!(per_sender["alice"].audio_seq_gaps, 2);
-        assert_eq!(
-            per_sender["alice"].video_seq_gaps, 0,
-            "alice sent no video; bob's loss must not land on her"
-        );
-        assert_eq!(per_sender["bob"].video_seq_gaps, 5);
-        assert_eq!(per_sender["bob"].audio_seq_gaps, 0);
     }
 }

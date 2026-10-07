@@ -11,9 +11,8 @@
 //!
 //! 1. [`DecodeBudgetBanner`] — a slim, dismissible glass bar pinned top-centre of
 //!    the grid area. It announces how many visible tiles are paused and offers a
-//!    one-click "Show all videos" escape hatch that flips the decode-budget
-//!    override to `Fixed(natural)` (reusing the exact machinery the appearance
-//!    settings panel uses).
+//!    one-click "Show all videos" escape hatch that sets the decode-budget
+//!    override to `All`.
 //!
 //! 2. [`BannerDamper`] — a **pure, host-testable** state machine that decides
 //!    *whether* the banner should be visible right now, given the live pressure
@@ -454,7 +453,7 @@ pub fn DecodeBudgetBanner(
                     // (issue #1466) so EVERY present peer decodes — and stays
                     // decoded as peers join, since `All` tracks the live natural
                     // count rather than a frozen `Fixed(n)`. This is the exact
-                    // path the appearance settings panel uses — set the shared
+                    // path the preferences settings panel uses — set the shared
                     // context signal AND persist to localStorage — so the render
                     // scope's `effective_cap(All, …)` re-reveals all tiles on the
                     // next frame and the choice survives reloads.

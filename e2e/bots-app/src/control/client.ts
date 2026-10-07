@@ -61,6 +61,14 @@ export class CtlHttpError extends Error {
   }
 }
 
+/** The TCP connection never opened, so the request cannot have reached the control API (#2386). */
+export class CtlUnreachableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CtlUnreachableError";
+  }
+}
+
 function formatBody(body: unknown): string {
   if (body == null) return "";
   if (
@@ -133,6 +141,11 @@ export async function ctlRequest<T = unknown>(
         });
       },
     );
+    let connected = false;
+    req.on("socket", (s) => {
+      if (req.reusedSocket) connected = true;
+      else s.once("connect", () => (connected = true));
+    });
     req.on("error", (e) => {
       // AbortSignal.timeout rejects with an AbortError whose message ("The
       // operation was aborted") names neither the host nor the timeout. Translate
@@ -140,7 +153,8 @@ export async function ctlRequest<T = unknown>(
       // truthful and callers/tests can key off it; the wrapper always names the
       // host either way.
       const msg = e.name === "AbortError" ? `timed out after ${timeoutMs}ms` : e.message;
-      reject(new Error(`ctl: connection to ${host}:${config.port} failed: ${msg}`));
+      const text = `ctl: connection to ${host}:${config.port} failed: ${msg}`;
+      reject(connected ? new Error(text) : new CtlUnreachableError(text));
     });
     if (payload !== null) req.write(payload);
     req.end();

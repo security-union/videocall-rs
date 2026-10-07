@@ -45,6 +45,7 @@ pub struct ConnectOptions {
     pub on_connected: Callback<()>,
     pub on_connection_lost: Callback<ConnectionLostReason>,
     pub peer_monitor: Callback<()>,
+    pub adopt_wt_spare_worker: bool,
 }
 
 /// Logical media-type identifier used by the WebTransport transport to pick

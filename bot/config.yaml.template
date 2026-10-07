@@ -12,7 +12,8 @@
 #   RUST_LOG=info ./target/release/bot --config config-myenv.yaml --users 20
 
 # Transport — set one or both URLs.
-# Use wt_ratio: 0 for load testing (WT inbound is broken in web-transport-quinn 0.8.1).
+# wt_ratio is the WebTransport share. WT results are not browser-shaped yet: the
+# bot opens a stream per packet where the browser keeps 4 persistent streams.
 ws_url: "wss://websocket.example.com"
 # wt_url: "https://webtransport.example.com:443"
 # wt_ratio: 0.0
@@ -30,8 +31,8 @@ conversation_dir: "conversation"
 # Video mode: "costume" (pre-recorded clips) or "ekg" (animated waveform)
 video_mode: costume
 
-# Broadcaster/observer split: first N participants send A/V, rest are
-# receive-only observers. 0 = all participants broadcast.
+# First N manifest participants send A/V. 0 = every manifest participant.
+# Generated bot-NNN participants never send audio (see `cameras`).
 # broadcasters: 5
 
 # Seconds of silence before conversation starts (one-time warmup)

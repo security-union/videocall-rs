@@ -60,6 +60,152 @@ static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 /// How many `WorkerSession`s are alive right now.
 static LIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 
+struct Spare {
+    worker: web_sys::Worker,
+    booted: Rc<Cell<bool>>,
+    failed: Rc<Cell<bool>>,
+    _on_message: Closure<dyn FnMut(MessageEvent)>,
+    _on_error: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+thread_local! {
+    static SPARE: RefCell<Option<Spare>> = const { RefCell::new(None) };
+    static WANTED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// One holder's claim on the spare; the spare is discarded when the last held lease drops.
+#[derive(Default)]
+pub struct SpareLease {
+    held: Cell<bool>,
+}
+
+impl SpareLease {
+    pub fn acquire(&self) {
+        if !self.held.replace(true) {
+            WANTED.with(|wanted| wanted.set(wanted.get() + 1));
+        }
+    }
+
+    pub fn held(&self) -> bool {
+        self.held.get()
+    }
+
+    #[doc(hidden)]
+    pub fn held_count() -> u32 {
+        WANTED.with(Cell::get)
+    }
+}
+
+impl Drop for SpareLease {
+    fn drop(&mut self) {
+        if !self.held.get() {
+            return;
+        }
+        let remaining = WANTED.with(|wanted| {
+            wanted.set(wanted.get().saturating_sub(1));
+            wanted.get()
+        });
+        if remaining == 0 {
+            if let Some((worker, _)) = take_spare() {
+                worker.terminate();
+            }
+        }
+    }
+}
+
+/// While a lease is held and no spare without a load error is waiting, boot one for the
+/// next adopting `start`. Not counted in `LIVE_SESSIONS`.
+pub fn prewarm() {
+    if WANTED.with(Cell::get) == 0 {
+        return;
+    }
+    let healthy = SPARE.with(|slot| slot.borrow().as_ref().map(|spare| !spare.failed.get()));
+    match healthy {
+        Some(true) => return,
+        Some(false) => {
+            let _ = take_spare();
+        }
+        None => {}
+    }
+    let worker = match web_sys::Worker::new(&resolve_worker_url()) {
+        Ok(worker) => worker,
+        Err(e) => {
+            log::warn!("WT session worker prewarm failed: {e:?}");
+            return;
+        }
+    };
+    let booted = Rc::new(Cell::new(false));
+    let failed = Rc::new(Cell::new(false));
+    let on_message = {
+        let booted = booted.clone();
+        Closure::wrap(
+            Box::new(move |event: MessageEvent| match tag_of(&event.data()) {
+                Some((_, to_main::BOOTED)) => booted.set(true),
+                Some((array, to_main::LOG)) => forward_worker_log(&array),
+                _ => {}
+            }) as Box<dyn FnMut(MessageEvent)>,
+        )
+    };
+    let on_error = {
+        let failed = failed.clone();
+        Closure::wrap(Box::new(move |event: web_sys::Event| {
+            log::warn!(
+                "prewarmed WT session worker failed: {}",
+                worker_error_detail(&event)
+            );
+            failed.set(true);
+        }) as Box<dyn FnMut(web_sys::Event)>)
+    };
+    worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    SPARE.with(|slot| {
+        *slot.borrow_mut() = Some(Spare {
+            worker,
+            booted,
+            failed,
+            _on_message: on_message,
+            _on_error: on_error,
+        })
+    });
+}
+
+/// `Some((worker, booted))` when a healthy spare was waiting.
+fn take_spare() -> Option<(web_sys::Worker, bool)> {
+    let spare = SPARE.with(|slot| slot.borrow_mut().take())?;
+    spare.worker.set_onmessage(None);
+    spare.worker.set_onerror(None);
+    if spare.failed.get() {
+        spare.worker.terminate();
+        return None;
+    }
+    Some((spare.worker, spare.booted.get()))
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+struct SpareView {
+    worker: web_sys::Worker,
+    booted: bool,
+    failed: bool,
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+fn spare_for_test() -> Option<SpareView> {
+    SPARE.with(|slot| {
+        slot.borrow().as_ref().map(|spare| SpareView {
+            worker: spare.worker.clone(),
+            booted: spare.booted.get(),
+            failed: spare.failed.get(),
+        })
+    })
+}
+
+fn worker_error_detail(event: &web_sys::Event) -> String {
+    Reflect::get(event, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "worker error".to_string())
+}
+
 /// True when this `start` is the one that should clear the session window.
 pub fn is_cold_start(live_before: u64) -> bool {
     live_before == 0
@@ -281,14 +427,31 @@ impl WorkerSession {
         url: &str,
         cert_hashes: Vec<String>,
         callbacks: WorkerSessionCallbacks,
+        adopt_spare: bool,
     ) -> Result<Rc<Self>, String> {
         if is_cold_start(LIVE_SESSIONS.load(Ordering::Relaxed)) {
             reset_session_telemetry();
             crate::inbound::reset_audio_lane_anchor();
         }
-        let worker_url = resolve_worker_url();
-        let worker = web_sys::Worker::new(&worker_url)
-            .map_err(|e| format!("failed to start the WebTransport session worker: {e:?}"))?;
+        let spare = if adopt_spare { take_spare() } else { None };
+        log::info!(
+            "WT session worker start: spare={}",
+            match spare {
+                Some((_, true)) => "booted",
+                Some((_, false)) => "booting",
+                None if adopt_spare => "none",
+                None => "skipped",
+            }
+        );
+        let (worker, prebooted) = match spare {
+            Some(spare) => spare,
+            None => (
+                web_sys::Worker::new(&resolve_worker_url()).map_err(|e| {
+                    format!("failed to start the WebTransport session worker: {e:?}")
+                })?,
+                false,
+            ),
+        };
 
         LIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
 
@@ -303,6 +466,9 @@ impl WorkerSession {
             boot_queue: BootQueue::new(),
             source_id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
         });
+        if prebooted {
+            let _ = shared.boot_queue.release();
+        }
 
         let on_message = {
             let shared = shared.clone();
@@ -324,12 +490,9 @@ impl WorkerSession {
         let on_error = {
             let notification = callbacks.notification.clone();
             Closure::wrap(Box::new(move |event: web_sys::Event| {
-                let detail = Reflect::get(&event, &JsValue::from_str("message"))
-                    .ok()
-                    .and_then(|v| v.as_string())
-                    .unwrap_or_else(|| "worker error".to_string());
                 notification.emit(WebTransportStatus::ClosedBeforeReady(format!(
-                    "session worker error: {detail}"
+                    "session worker error: {}",
+                    worker_error_detail(&event)
                 )));
             }) as Box<dyn FnMut(web_sys::Event)>)
         };
@@ -496,6 +659,16 @@ fn tag_of(data: &JsValue) -> Option<(Array, u8)> {
     Some((array, tag))
 }
 
+fn forward_worker_log(array: &Array) {
+    let message = array.get(2).as_string().unwrap_or_default();
+    match array.get(1).as_f64().unwrap_or(0.0) as u8 {
+        1 => log::error!("[wt-worker] {message}"),
+        2 => log::warn!("[wt-worker] {message}"),
+        3 => log::info!("[wt-worker] {message}"),
+        _ => log::debug!("[wt-worker] {message}"),
+    }
+}
+
 fn handle_worker_message(
     shared: &Rc<Shared>,
     worker: &web_sys::Worker,
@@ -602,15 +775,7 @@ fn handle_worker_message(
             with_telemetry(|t| t.fold.apply(shared.source_id, push), ());
             let _ = post_to_worker(shared, worker, drained_ack(shared), None);
         }
-        to_main::LOG => {
-            let message = array.get(2).as_string().unwrap_or_default();
-            match array.get(1).as_f64().unwrap_or(0.0) as u8 {
-                1 => log::error!("[wt-worker] {message}"),
-                2 => log::warn!("[wt-worker] {message}"),
-                3 => log::info!("[wt-worker] {message}"),
-                _ => log::debug!("[wt-worker] {message}"),
-            }
-        }
+        to_main::LOG => forward_worker_log(&array),
         to_main::BOOTED => flush_outbox(shared, worker),
         to_main::CLOSED => shared.closed_ack.set(true),
         other => log::warn!("session worker sent an unknown tag {other}"),
@@ -873,5 +1038,316 @@ mod tests {
              not the fresh one that followed it"
         );
         assert_eq!(frames_received(), 2);
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod prewarm_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    // Stands in for the real Worker: it ignores everything until it posts
+    // BOOTED, answers INIT with STATUS(OPENED), and "ping" with "pong".
+    #[wasm_bindgen(inline_js = r#"
+function install(src) {
+  let link = document.getElementById("wt-session-worker");
+  if (!link) {
+    link = document.createElement("link");
+    link.id = "wt-session-worker";
+    document.head.appendChild(link);
+  }
+  link.href = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+}
+export function install_fake_session_worker(boot_delay_ms) {
+  install(`setTimeout(() => {
+    onmessage = (e) => {
+      if (e.data === "ping") postMessage("pong");
+      else if (e.data[0] === 0) postMessage([1, 0, "", 0]);
+    };
+    postMessage([8]);
+  }, ${boot_delay_ms});`);
+}
+export function install_failing_session_worker() {
+  install(`throw new Error("fake worker failed to load");`);
+}
+export function install_shipped_loader_with_missing_wasm(loader) {
+  const base = JSON.stringify(new URL("/missing-2988/", location.href).href);
+  install(`self.importScripts = () => {
+    self.wasm_bindgen = (p) => fetch(new URL(p, ${base})).then(WebAssembly.instantiateStreaming);
+  };
+${loader}`);
+}
+export function answers_ping(worker, timeout_ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeout_ms);
+    worker.addEventListener("message", (e) => {
+      if (e.data === "pong") { clearTimeout(timer); resolve(true); }
+    });
+    worker.postMessage("ping");
+  });
+}
+"#)]
+    extern "C" {
+        fn install_fake_session_worker(boot_delay_ms: u32);
+        fn install_failing_session_worker();
+        fn install_shipped_loader_with_missing_wasm(loader: &str);
+        fn answers_ping(worker: &web_sys::Worker, timeout_ms: u32) -> js_sys::Promise;
+    }
+
+    async fn pings(worker: &web_sys::Worker) -> bool {
+        wasm_bindgen_futures::JsFuture::from(answers_ping(worker, 500))
+            .await
+            .map(|v| v.as_bool() == Some(true))
+            .unwrap_or(false)
+    }
+
+    fn held_lease() -> SpareLease {
+        let lease = SpareLease::default();
+        lease.acquire();
+        lease
+    }
+
+    type Seen = Rc<RefCell<Vec<WebTransportStatus>>>;
+
+    fn start_recording() -> (Rc<WorkerSession>, Seen) {
+        start_recording_adopting(true)
+    }
+
+    fn start_recording_adopting(adopt_spare: bool) -> (Rc<WorkerSession>, Seen) {
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let session = WorkerSession::start(
+            "https://relay.invalid/lobby",
+            Vec::new(),
+            WorkerSessionCallbacks {
+                on_frame: Callback::from(|_: WorkerFrame| {}),
+                notification: Callback::from(move |s| sink.borrow_mut().push(s)),
+            },
+            adopt_spare,
+        )
+        .expect("start");
+        (session, seen)
+    }
+
+    async fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if done() {
+                return true;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        done()
+    }
+
+    fn opened(seen: &Seen) -> impl FnMut() -> bool + '_ {
+        move || seen.borrow().contains(&WebTransportStatus::Opened)
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_spare_that_booted_before_start_is_adopted_and_receives_init() {
+        install_fake_session_worker(0);
+        let lease = held_lease();
+        let live_before = LIVE_SESSIONS.load(Ordering::Relaxed);
+        prewarm();
+        assert_eq!(
+            LIVE_SESSIONS.load(Ordering::Relaxed),
+            live_before,
+            "the spare is not a session"
+        );
+        assert!(wait_until(|| spare_for_test().is_some_and(|s| s.booted)).await);
+        let spare_worker = spare_for_test().expect("spare").worker;
+
+        let (session, seen) = start_recording();
+        assert!(spare_for_test().is_none(), "start consumes the spare");
+        assert!(js_sys::Object::is(&session.worker, &spare_worker));
+        assert_eq!(LIVE_SESSIONS.load(Ordering::Relaxed), live_before + 1);
+        assert!(
+            wait_until(opened(&seen)).await,
+            "BOOTED already went to the spare, so INIT must not wait for another"
+        );
+        session.terminate();
+        drop(lease);
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_spare_still_booting_at_start_gets_init_after_it_boots() {
+        install_fake_session_worker(300);
+        let lease = held_lease();
+        prewarm();
+        let spare = spare_for_test().expect("spare");
+        assert!(!spare.booted);
+        let (session, seen) = start_recording();
+        assert!(js_sys::Object::is(&session.worker, &spare.worker));
+        assert!(
+            wait_until(opened(&seen)).await,
+            "BOOTED must reach the session's handler and release INIT"
+        );
+        session.terminate();
+        drop(lease);
+    }
+
+    #[wasm_bindgen_test]
+    async fn one_spare_per_prewarm_and_a_second_start_spawns_fresh() {
+        install_fake_session_worker(0);
+        let lease = held_lease();
+        prewarm();
+        let first = spare_for_test().expect("spare").worker;
+        prewarm();
+        let again = spare_for_test().expect("spare").worker;
+        assert!(js_sys::Object::is(&first, &again), "no second spare");
+
+        let (adopted, _) = start_recording();
+        let (fresh, seen) = start_recording();
+        assert!(!js_sys::Object::is(&fresh.worker, &first));
+        assert!(wait_until(opened(&seen)).await);
+        adopted.terminate();
+        fresh.terminate();
+        drop(lease);
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_spare_that_failed_to_load_is_not_adopted() {
+        install_failing_session_worker();
+        let lease = held_lease();
+        prewarm();
+        assert!(wait_until(|| spare_for_test().is_some_and(|s| s.failed)).await);
+        let failed = spare_for_test().expect("spare").worker;
+
+        install_fake_session_worker(0);
+        let (session, seen) = start_recording();
+        assert!(!js_sys::Object::is(&session.worker, &failed));
+        assert!(wait_until(opened(&seen)).await);
+        session.terminate();
+        drop(lease);
+    }
+
+    const SHIPPED_LOADER: &str = include_str!("bin/wt_session_worker_loader.js");
+
+    #[wasm_bindgen_test]
+    async fn a_spare_whose_wasm_fails_to_load_is_marked_failed_and_not_adopted() {
+        install_shipped_loader_with_missing_wasm(SHIPPED_LOADER);
+        let lease = held_lease();
+        prewarm();
+        let marked = wait_until(|| spare_for_test().is_some_and(|s| s.failed)).await;
+        let adopted = take_spare();
+        if let Some((worker, _)) = &adopted {
+            worker.terminate();
+        }
+        drop(lease);
+        assert!(
+            marked,
+            "a rejected wasm_bindgen() must reach Worker.onerror"
+        );
+        assert!(adopted.is_none());
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_fresh_worker_whose_wasm_fails_to_load_closes_before_ready() {
+        install_shipped_loader_with_missing_wasm(SHIPPED_LOADER);
+        let (session, seen) = start_recording_adopting(false);
+        let closed = wait_until(|| {
+            seen.borrow()
+                .iter()
+                .any(|s| matches!(s, WebTransportStatus::ClosedBeforeReady(_)))
+        })
+        .await;
+        session.terminate();
+        assert!(closed);
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_start_that_does_not_adopt_leaves_the_spare_for_the_next_start() {
+        install_fake_session_worker(0);
+        let lease = held_lease();
+        prewarm();
+        let spare = spare_for_test().expect("spare").worker;
+
+        let (observer, seen) = start_recording_adopting(false);
+        assert!(!js_sys::Object::is(&observer.worker, &spare));
+        assert!(wait_until(opened(&seen)).await);
+        let (joiner, _) = start_recording();
+        assert!(js_sys::Object::is(&joiner.worker, &spare));
+        observer.terminate();
+        joiner.terminate();
+        drop(lease);
+    }
+
+    #[wasm_bindgen_test]
+    async fn prewarm_replaces_a_spare_that_failed_to_load() {
+        install_failing_session_worker();
+        let lease = held_lease();
+        prewarm();
+        assert!(wait_until(|| spare_for_test().is_some_and(|s| s.failed)).await);
+        let failed = spare_for_test().expect("spare").worker;
+
+        install_fake_session_worker(0);
+        prewarm();
+        let replacement = spare_for_test().expect("a replacement spare");
+        assert!(!js_sys::Object::is(&replacement.worker, &failed));
+        assert!(!replacement.failed);
+        drop(lease);
+    }
+
+    #[wasm_bindgen_test]
+    fn dropping_a_lease_that_was_never_acquired_does_not_release_a_held_one() {
+        install_fake_session_worker(0);
+        let held = held_lease();
+        prewarm();
+        drop(SpareLease::default());
+        assert!(spare_for_test().is_some());
+        drop(held);
+    }
+
+    #[wasm_bindgen_test]
+    fn acquiring_one_lease_twice_takes_one_claim() {
+        install_fake_session_worker(0);
+        let lease = held_lease();
+        lease.acquire();
+        prewarm();
+        drop(lease);
+        assert!(spare_for_test().is_none());
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_last_release_terminates_the_spare() {
+        install_fake_session_worker(0);
+        let lease = held_lease();
+        prewarm();
+        assert!(wait_until(|| spare_for_test().is_some_and(|s| s.booted)).await);
+        let worker = spare_for_test().expect("spare").worker;
+        assert!(pings(&worker).await, "the fake answers while it lives");
+
+        drop(lease);
+        assert!(spare_for_test().is_none());
+        assert!(
+            !pings(&worker).await,
+            "a discarded spare must be terminated"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_spare_survives_until_every_lease_is_released() {
+        install_fake_session_worker(0);
+        let outgoing = held_lease();
+        let incoming = held_lease();
+        prewarm();
+        drop(outgoing);
+        assert!(spare_for_test().is_some(), "one lease is still held");
+        drop(incoming);
+        assert!(spare_for_test().is_none());
+    }
+
+    #[wasm_bindgen_test]
+    fn the_election_end_refill_boots_a_spare_only_while_a_lease_is_held() {
+        install_fake_session_worker(0);
+        crate::webtransport::prewarm_session_worker();
+        assert!(spare_for_test().is_none(), "no lease, no spare");
+
+        let lease = held_lease();
+        crate::webtransport::prewarm_session_worker();
+        assert!(spare_for_test().is_some());
+        drop(lease);
     }
 }

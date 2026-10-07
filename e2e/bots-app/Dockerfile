@@ -9,10 +9,6 @@
 # $PLAYWRIGHT_BROWSERS_PATH (/ms-playwright), so we skip the browser download at
 # npm-install time and the runtime launch resolves the bundled browser.
 #
-# BUILD CONTEXT: the REPO ROOT (not e2e/). The repo-root .dockerignore already
-# excludes **/target, **/node_modules, **/dist and .git, keeping the context
-# lean for the remote podman builder. See build.sh.
-#
 # The e2e/ tree is copied to /app/e2e so the bots-app's repoRoot() derivation
 # (cli.ts: three dirs up from bots-app/src) resolves to /app — preserving the
 # code's default path assumptions.
@@ -60,12 +56,12 @@ WORKDIR /app/e2e
 # @playwright/test, …) live in devDependencies, so we MUST include dev deps —
 # a plain production install (NODE_ENV=production / --omit=dev) would install
 # nothing and the bot could not run.
-COPY --chown=pwuser:pwuser e2e/package.json e2e/package-lock.json ./
+COPY --chown=pwuser:pwuser package.json package-lock.json ./
 RUN npm ci --include=dev
 
 # Application source (node_modules is excluded by .dockerignore, so this COPY
 # does not clobber the freshly-installed dependencies).
-COPY --chown=pwuser:pwuser e2e/ ./
+COPY --chown=pwuser:pwuser . ./
 
 RUN chmod +x bots-app/docker-entrypoint.sh
 

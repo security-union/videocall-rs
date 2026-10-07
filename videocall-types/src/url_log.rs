@@ -38,3 +38,42 @@ pub fn strip_query_for_log(url: &str) -> String {
         None => url.to_string(),
     }
 }
+
+/// `message` with every echo of `url`'s query string removed.
+pub fn strip_url_query_from_message(message: &str, url: &str) -> String {
+    match url.find('?') {
+        Some(i) if i + 1 < url.len() => message.replace(&url[i..], ""),
+        _ => message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_url_query_from_message;
+
+    #[test]
+    fn strips_the_echoed_query_from_a_constructor_error() {
+        let url = "https://relay:99999/lobby?token=SECRETJWT";
+        let message = "SyntaxError: Failed to construct 'WebTransport': \
+                       The URL 'https://relay:99999/lobby?token=SECRETJWT' is invalid.";
+        assert_eq!(
+            strip_url_query_from_message(message, url),
+            "SyntaxError: Failed to construct 'WebTransport': \
+             The URL 'https://relay:99999/lobby' is invalid."
+        );
+    }
+
+    #[test]
+    fn leaves_the_message_alone_when_the_url_has_no_query() {
+        let message = "The URL's scheme must be 'https'. 'http' is not allowed.";
+        assert_eq!(
+            strip_url_query_from_message(message, "http://relay/lobby"),
+            message
+        );
+        let with_mark = "Is 'http://relay/lobby?' valid?";
+        assert_eq!(
+            strip_url_query_from_message(with_mark, "http://relay/lobby?"),
+            with_mark
+        );
+    }
+}

@@ -2,8 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { BotTask } from "./orchestrator";
 import type { ArrivalSpread } from "./resource/arrival";
 import type { FpsStats } from "./resource/fps";
 
@@ -49,19 +50,27 @@ afterEach(() => {
   process.removeAllListeners("SIGINT");
 });
 
-it("hands the self-hosted daemon's receipt no arrival spread (#2294)", async () => {
+const registered = (botId: string): BotTask => ({ botId }) as BotTask;
+
+interface DaemonSinks {
+  onRegister?: (task: BotTask) => void;
+  onJoin?: (botId: string, joinedAt: number) => void;
+}
+
+async function runDaemon(
+  drive: (sinks: DaemonSinks) => void,
+): Promise<[FpsStats, ArrivalSpread | null, number | null]> {
   const runDir = mkdtempSync(join(tmpdir(), "bots-dash-"));
   dirs.push(runDir);
   mocks.finalizeCalls.length = 0;
   mocks.runBotsToCompletion.mockReset();
   mocks.runBotsToCompletion.mockImplementation(
-    async (opts: {
-      control?: { onListen?: (a: { port: number; token: string }) => unknown };
-      onJoin?: (botId: string, joinedAt: number) => void;
-    }) => {
-      // Joins must be observed here: an ArrivalTracker that recorded none snapshots null.
-      opts.onJoin?.("bot-a", 1_000_000);
-      opts.onJoin?.("bot-b", 1_030_000);
+    async (
+      opts: DaemonSinks & {
+        control?: { onListen?: (a: { port: number; token: string }) => unknown };
+      },
+    ) => {
+      drive(opts);
       await opts.control?.onListen?.({ port: 45_678, token: "t" });
     },
   );
@@ -93,19 +102,41 @@ it("hands the self-hosted daemon's receipt no arrival spread (#2294)", async () 
   try {
     vi.resetModules();
     await import("./cli");
-    await vi.waitFor(() => expect(mocks.startDashboardServer.mock.calls.length).toBe(1));
+    await vi.waitFor(() => expect(mocks.startDashboardServer.mock.calls.length).toBe(1), {
+      timeout: 10_000,
+    });
     process.emit("SIGTERM");
-    await vi.waitFor(() => expect(mocks.finalizeCalls.length).toBe(1));
+    await vi.waitFor(() => expect(mocks.finalizeCalls.length).toBe(1), { timeout: 10_000 });
   } finally {
     process.argv = argv;
     for (const s of spies) s.mockRestore();
   }
-  // The seam itself: the daemon wires no join callback, so nothing downstream can
-  // mistake its ad-hoc launches for a ramp.
-  expect(mocks.runBotsToCompletion.mock.calls[0][0].onJoin).toBeUndefined();
-  const [fps, arrival, joinedBots] = mocks.finalizeCalls[0];
-  expect(arrival).toBeNull();
-  // Untracked, not zero: a daemon must not banner a no-evidence verdict (#2358).
-  expect(joinedBots).toBeNull();
-  expect(fps).toBeDefined();
+  return mocks.finalizeCalls[0];
+}
+
+describe("bots-app dashboard — self-hosted daemon receipt", () => {
+  it("hands finalize joins but no arrival spread (#2294)", async () => {
+    const [fps, arrival, joinedBots] = await runDaemon(({ onRegister, onJoin }) => {
+      onRegister?.(registered("bot-a"));
+      onRegister?.(registered("bot-b"));
+      onJoin?.("bot-a", 1_000_000);
+      onJoin?.("bot-b", 1_030_000);
+    });
+    expect(fps).toBeDefined();
+    expect(arrival).toBeNull();
+    expect(joinedBots).toBe(2);
+  });
+
+  it("hands finalize a zero join count once a single launched bot never joined (#2407)", async () => {
+    const [, arrival, joinedBots] = await runDaemon(({ onRegister }) =>
+      onRegister?.(registered("bot-a")),
+    );
+    expect(arrival).toBeNull();
+    expect(joinedBots).toBe(0);
+  });
+
+  it("leaves joins untracked for an idle daemon that launched nothing (#2407)", async () => {
+    const [, , joinedBots] = await runDaemon(() => {});
+    expect(joinedBots).toBeNull();
+  });
 });

@@ -179,6 +179,8 @@ services:
       - REGION=us-east
       - SERVER_ID=server-1
       - SERVICE_TYPE=websocket
+      - E2E_CARGO_RELEASE=${VIDEOCALL_RELEASE_BUILD:-0}
+      - VIDEOCALL_RELEASE_BUILD=${VIDEOCALL_RELEASE_BUILD:-0}
       - FEATURE_MEETING_MANAGEMENT=true
       - JWT_SECRET=dev-jwt-secret-change-me
       - CARGO_TARGET_DIR=/app/actix-api/target
@@ -225,13 +227,13 @@ services:
       "/app/docker/e2e-backend.sh supervise webtransport_server"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
-      # The one backend built in release mode; e2e-backend.sh maps this to -r.
       - E2E_CARGO_RELEASE=1
       - RUST_LOG=info
       - NATS_URL=nats:4222
       - REGION=us-east
       - SERVER_ID=server-1
       - SERVICE_TYPE=webtransport
+      - VIDEOCALL_RELEASE_BUILD=${VIDEOCALL_RELEASE_BUILD:-0}
       - LISTEN_URL=0.0.0.0:4433
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
@@ -352,6 +354,8 @@ services:
       - TRUNK_BUILD_FEATURES=netsim
       - USERS_ALLOWED_TO_STREAM=
       - DIOXUS_SERVE_MODE=${DIOXUS_SERVE_MODE:-dev}
+      - VIDEOCALL_RELEASE_BUILD=${VIDEOCALL_RELEASE_BUILD:-0}
+      - WT_DEV_CERT_HASH_INJECT=${WT_DEV_CERT_HASH_INJECT:-false}
       - CARGO_TARGET_DIR=/app/dioxus-ui/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false

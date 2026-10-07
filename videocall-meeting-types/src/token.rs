@@ -82,6 +82,11 @@ pub struct RoomAccessTokenClaims {
     /// Token-type discriminator (#2411); `None` predates the claim. See [`check_token_type`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typ: Option<String>,
+
+    /// Unix seconds at which the mint was authorized; the relay refuses a kicked
+    /// participant's token whose `iat` does not postdate the kick (#2934).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iat: Option<i64>,
 }
 
 impl RoomAccessTokenClaims {
@@ -182,8 +187,27 @@ mod tests {
             exp: 1707004800,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: None,
+            iat: None,
         };
 
-        assert!(!serde_json::to_string(&claims).unwrap().contains("typ"));
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(!json.contains("typ"));
+        assert!(!json.contains("iat"));
+    }
+
+    #[test]
+    fn iat_round_trips_and_absent_iat_is_none() {
+        let legacy = r#"{"sub":"a","room":"r","room_join":true,"is_host":false,
+            "display_name":"A","exp":1707004800,"iss":"videocall-meeting-backend"}"#;
+        let claims: RoomAccessTokenClaims = serde_json::from_str(legacy).expect("legacy");
+        assert_eq!(claims.iat, None);
+
+        let with_iat = RoomAccessTokenClaims {
+            iat: Some(1_707_000_000),
+            ..claims
+        };
+        let back: RoomAccessTokenClaims =
+            serde_json::from_str(&serde_json::to_string(&with_iat).unwrap()).unwrap();
+        assert_eq!(back.iat, Some(1_707_000_000));
     }
 }

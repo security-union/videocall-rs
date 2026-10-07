@@ -131,85 +131,6 @@
             }
           },
           "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 0
-      },
-      "id": 1,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "single"
-        }
-      },
-      "targets": [
-        {
-          "expr": "videocall_video_packets_buffered{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
-          "legendFormat": "{{from_peer}} sees {{to_peer}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Video Packets Buffered",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "vis": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
           "max": 1,
           "min": 0,
           "thresholds": {
@@ -263,6 +184,7 @@
     },
     {
       "datasource": "Prometheus",
+      "description": "Camera frames per second handed to the decoder (videocall_video_fps); not an arrival or paint rate. Excludes packets the simulcast layer guard or a hidden tile skipped, or that failed to decrypt. FPS ~0 with live Video Bitrate = receiving but not decoding.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -767,24 +689,6 @@
           "interval": "",
           "legendFormat": "{{from_peer}}\u2192{{to_peer}} Accelerate",
           "refId": "C"
-        },
-        {
-          "expr": "videocall_neteq_fast_accelerate_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
-          "interval": "",
-          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Fast Accel",
-          "refId": "D"
-        },
-        {
-          "expr": "videocall_neteq_preemptive_expand_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
-          "interval": "",
-          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Expand",
-          "refId": "E"
-        },
-        {
-          "expr": "videocall_neteq_merge_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
-          "interval": "",
-          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Merge",
-          "refId": "F"
         }
       ],
       "title": "Decode Operations Per Second",
@@ -1603,7 +1507,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "Video bitrate observed by the receiver. Low bitrate + normal FPS = low-complexity scene. Low bitrate + low FPS = possible bandwidth constraint.",
+      "description": "Video bitrate observed by the receiver; counts every packet that arrived, decoded or not. Low bitrate + normal FPS = low-complexity scene. Low bitrate + low FPS = possible bandwidth constraint. Live bitrate + FPS ~0 = receiving but not decoding.",
       "fieldConfig": {
         "defaults": {
           "color": {

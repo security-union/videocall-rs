@@ -54,6 +54,7 @@ memmap2 = "0.9"
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 
 # Logging
 tracing = "0.1.37"
@@ -74,3 +75,7 @@ rand = "0.8"
 prometheus = { version = "0.13", optional = true }
 # Minimal hyper server for the `/metrics` endpoint. Feature-gated.
 hyper = { version = "0.14", features = ["server", "http1", "tcp"], optional = true }
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio = { version = "1.28.1", features = ["full", "test-util"] }

@@ -76,6 +76,37 @@ export interface ReceiverCaps {
   maxReceivedLayer?: number;
   /** `window.__APP_CONFIG.skipCanvasPaint` — `undefined` = inherit deployment. */
   skipCanvasPaint?: boolean;
+  diagPackets?: DiagPackets;
+}
+
+export const DIAG_PACKETS_ENV = "BOT_DIAG_PACKETS";
+
+/** dioxus-ui `RuntimeConfig.diagnostics_packets_enabled` (#2970), an `Option<String>`. */
+export const DIAG_PACKETS_CONFIG_KEY = "diagnosticsPacketsEnabled";
+
+export type DiagPackets = "off";
+
+export type DiagPacketsResult =
+  | { kind: "ok"; value: DiagPackets | undefined }
+  | { kind: "invalid"; message: string };
+
+export function parseDiagPacketsField(raw: unknown): DiagPacketsResult {
+  if (raw === undefined || raw === null) return { kind: "ok", value: undefined };
+  if (typeof raw !== "string") {
+    return { kind: "invalid", message: '"diagPackets" must be "off" or "default"' };
+  }
+  return resolveDiagPackets(raw);
+}
+
+/** `--diag-packets` / `BOT_DIAG_PACKETS`: unset, empty or `default` inherit; `off`/`0`/`false`/`no` disable. */
+export function resolveDiagPackets(raw: string | undefined): DiagPacketsResult {
+  const token = raw?.trim().toLowerCase() ?? "";
+  if (token === "" || token === "default") return { kind: "ok", value: undefined };
+  if (FALSE_TOKENS.has(token)) return { kind: "ok", value: "off" };
+  return {
+    kind: "invalid",
+    message: `--diag-packets (or BOT_DIAG_PACKETS) must be "off" or "default", got "${raw}"`,
+  };
 }
 
 /**
@@ -166,24 +197,23 @@ export function buildReceiverConfigOverrides(caps: ReceiverCaps): Record<string,
     // String, not boolean — the client's RuntimeConfig field is `String`.
     overrides.skipCanvasPaint = caps.skipCanvasPaint ? "true" : "false";
   }
+  if (caps.diagPackets === "off") {
+    overrides[DIAG_PACKETS_CONFIG_KEY] = "0";
+  }
   return Object.keys(overrides).length > 0 ? overrides : null;
 }
 
 /**
- * Build the Playwright `addInitScript` source that installs the
- * `window.__APP_CONFIG` setter-merge for the given overrides. Pure string
- * builder (the mutation-testable core): the returned IIFE defines an accessor
- * on `window.__APP_CONFIG` whose setter merges `overrides` over whatever
- * `config.js` assigns (including a frozen literal), so the wasm client's
- * one-time read observes the merged config.
- *
- * `current` is seeded with the overrides so a read BEFORE `config.js` runs (or
- * a deployment that mutates in place instead of reassigning) still returns a
- * valid object rather than `undefined`.
+ * `addInitScript` source: on `appOrigin` only, an `__APP_CONFIG` accessor whose
+ * setter merges `overrides` over whatever `config.js` assigns, seeded with them.
  */
-export function buildReceiverConfigInitScript(overrides: Record<string, unknown>): string {
+export function buildReceiverConfigInitScript(
+  overrides: Record<string, unknown>,
+  appOrigin: string,
+): string {
   const json = JSON.stringify(overrides);
   return `(() => {
+  if (location.origin !== ${JSON.stringify(appOrigin)}) return;
   const __botReceiverOverrides = ${json};
   let __botAppConfig = Object.assign({}, __botReceiverOverrides);
   try {

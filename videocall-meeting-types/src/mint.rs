@@ -107,6 +107,7 @@ pub fn mint_room_token(
         exp: (now + ttl_secs) as i64,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
         typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
+        iat: Some(now as i64),
     };
 
     // The relay treats the secret as raw UTF-8 bytes (not base64-decoded).

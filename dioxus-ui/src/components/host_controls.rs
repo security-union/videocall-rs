@@ -11,7 +11,8 @@
 //! `VideoCallClient`. The `use_effect` reacts to changes in this counter
 //! and fetches the waiting room list once per notification.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::meeting_api::JoinError;
@@ -29,6 +30,42 @@ const POLL_AUTH_ERROR_EVERY: u32 = 6;
 
 pub type WaitingParticipant = ParticipantStatusResponse;
 
+/// Adds each waiting user id to `announced`; true if any was not already
+/// there. An id leaves the set only via [`AnnouncedIds::forget`].
+fn announce_arrivals<'a>(
+    announced: &mut HashSet<String>,
+    waiting: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let mut arrived = false;
+    for user_id in waiting {
+        arrived |= announced.insert(user_id.to_owned());
+    }
+    arrived
+}
+
+/// Waiting user ids already knocked for in this mount.
+#[derive(Clone, Default)]
+struct AnnouncedIds(Rc<RefCell<HashSet<String>>>);
+
+impl AnnouncedIds {
+    fn knock_for_arrivals(&self, waiting: &[WaitingParticipant]) {
+        let arrived = announce_arrivals(
+            &mut self.0.borrow_mut(),
+            waiting.iter().map(|p| p.user_id.as_str()),
+        );
+        if arrived {
+            play_knock_sound();
+        }
+    }
+
+    fn forget<'a>(&self, user_ids: impl IntoIterator<Item = &'a str>) {
+        let mut announced = self.0.borrow_mut();
+        for user_id in user_ids {
+            announced.remove(user_id);
+        }
+    }
+}
+
 #[component]
 pub fn HostControls(
     meeting_id: String,
@@ -41,7 +78,7 @@ pub fn HostControls(
     let mut waiting = use_signal(Vec::<WaitingParticipant>::new);
     let mut error = use_signal(|| None::<String>);
     let mut expanded = use_signal(|| true);
-    let mut prev_waiting_count = use_signal(|| 0usize);
+    let announced: AnnouncedIds = use_hook(AnnouncedIds::default);
 
     let fetch_waiting_list = {
         let meeting_id = meeting_id.clone();
@@ -68,6 +105,7 @@ pub fn HostControls(
     // Fetch on mount and whenever waiting_room_version changes (push notification).
     {
         let meeting_id = meeting_id.clone();
+        let announced = announced.clone();
         use_effect(move || {
             // Read the version so Dioxus tracks it as a reactive dependency.
             let _version = waiting_room_version();
@@ -76,15 +114,11 @@ pub fn HostControls(
             }
 
             let meeting_id = meeting_id.clone();
+            let announced = announced.clone();
             spawn(async move {
                 match fetch_waiting(&meeting_id).await {
                     Ok(w) => {
-                        let new_count = w.len();
-                        let old_count = *prev_waiting_count.peek();
-                        if new_count > old_count {
-                            play_knock_sound();
-                        }
-                        prev_waiting_count.set(new_count);
+                        announced.knock_for_arrivals(&w);
                         waiting.set(w);
                         error.set(None);
                     }
@@ -107,6 +141,7 @@ pub fn HostControls(
         let meeting_id = meeting_id.clone();
         let poll_interval_id = poll_interval_id.clone();
         let poll_auth_failures = poll_auth_failures.clone();
+        let announced = announced.clone();
         use_effect(move || {
             if !is_admitted {
                 return;
@@ -120,18 +155,15 @@ pub fn HostControls(
 
             let meeting_id = meeting_id.clone();
             let poll_auth_failures = poll_auth_failures.clone();
+            let announced = announced.clone();
             let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
                 let meeting_id = meeting_id.clone();
                 let poll_auth_failures = poll_auth_failures.clone();
+                let announced = announced.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     match fetch_waiting(&meeting_id).await {
                         Ok(w) => {
-                            let new_count = w.len();
-                            let old_count = *prev_waiting_count.peek();
-                            if new_count > old_count {
-                                play_knock_sound();
-                            }
-                            prev_waiting_count.set(new_count);
+                            announced.knock_for_arrivals(&w);
                             waiting.set(w);
                             error.set(None);
                             poll_auth_failures.set(0);
@@ -178,19 +210,51 @@ pub fn HostControls(
     let on_admit_all = {
         let meeting_id = meeting_id.clone();
         let fetch_waiting_list = fetch_waiting_list.clone();
+        let announced = announced.clone();
         move |_| {
+            let admitted: Vec<String> = waiting.peek().iter().map(|p| p.user_id.clone()).collect();
             waiting.write().clear();
             let meeting_id = meeting_id.clone();
             let fetch_waiting_list = fetch_waiting_list.clone();
+            let announced = announced.clone();
             spawn(async move {
-                match admit_all_participants(&meeting_id).await {
-                    Ok(_) => fetch_waiting_list(),
-                    Err(e) => {
-                        error.set(Some(e));
-                        fetch_waiting_list();
-                    }
+                let result = admit_all_participants(&meeting_id).await;
+                announced.forget(admitted.iter().map(String::as_str));
+                if let Err(e) = result {
+                    error.set(Some(e));
                 }
+                fetch_waiting_list();
             });
+        }
+    };
+
+    let decide = {
+        let meeting_id = meeting_id.clone();
+        let fetch_waiting_list = fetch_waiting_list.clone();
+        let announced = announced.clone();
+        move |user_id: String, admit: bool| {
+            let meeting_id = meeting_id.clone();
+            let fetch = fetch_waiting_list.clone();
+            let announced = announced.clone();
+            move |_: MouseEvent| {
+                waiting.write().retain(|p| p.user_id != user_id);
+                let user_id = user_id.clone();
+                let meeting_id = meeting_id.clone();
+                let fetch = fetch.clone();
+                let announced = announced.clone();
+                spawn(async move {
+                    let result = if admit {
+                        admit_participant(&meeting_id, &user_id).await
+                    } else {
+                        reject_participant(&meeting_id, &user_id).await
+                    };
+                    announced.forget([user_id.as_str()]);
+                    if let Err(e) = result {
+                        error.set(Some(e));
+                    }
+                    fetch();
+                });
+            }
         }
     };
 
@@ -225,103 +289,40 @@ pub fn HostControls(
                             }
                         }
                     }
-                    for participant in waiting().iter() {
-                        {
-                            let peer_user_id = participant.user_id.clone();
-                            let display_name = participant.display_name.clone();
-                            let is_guest = participant.is_guest;
-
-                            let uid_for_key = peer_user_id.clone();
-                            let uid_for_view = peer_user_id.clone();
-                            let uid_admit = peer_user_id.clone();
-                            let uid_reject = peer_user_id.clone();
-
-                            let meeting_id_admit = meeting_id.clone();
-                            let meeting_id_reject = meeting_id.clone();
-
-                            let fetch_admit = fetch_waiting_list.clone();
-                            let fetch_reject = fetch_waiting_list.clone();
-
-                            let mut waiting_admit = waiting;
-                            let mut waiting_reject = waiting;
-
-                            let error_admit = error;
-                            let error_reject = error;
-
-                            rsx! {
-                                div { key: "{uid_for_key}", class: "waiting-participant",
-                                    div { class: "participant-info",
-                                        if let Some(name) = display_name.clone() {
-                                            if !name.trim().is_empty() {
-                                                div { class: "participant-name",
-                                                    "{name}"
-                                                    if is_guest {
-                                                        span { class: "guest-badge", "Guest" }
-                                                    }
-                                                }
-                                            } else {
-                                                div { class: "participant-name", "{uid_for_view}" }
-                                            }
-                                        } else {
-                                            div { class: "participant-name", "{uid_for_view}" }
-                                        }
+                    for (user_id, label, guest_badge) in waiting().iter().map(waiting_row) {
+                        div { key: "{user_id}", class: "waiting-participant",
+                            div { class: "participant-info",
+                                div { class: "participant-name",
+                                    "{label}"
+                                    if guest_badge {
+                                        span { class: "guest-badge", "Guest" }
                                     }
-                                    div { class: "participant-actions",
-                                        button {
-                                            class: "btn-admit",
-                                            title: "Admit",
-                                            onclick: move |_| {
-                                                waiting_admit.write().retain(|p| p.user_id != uid_admit);
-                                                let uid = uid_admit.clone();
-                                                let meeting_id = meeting_id_admit.clone();
-                                                let fetch = fetch_admit.clone();
-                                                let mut error = error_admit;
-
-                                                spawn(async move {
-                                                    match admit_participant(&meeting_id, &uid).await {
-                                                        Ok(_) => fetch(),
-                                                        Err(e) => {
-                                                            error.set(Some(e));
-                                                            fetch();
-                                                        }
-                                                    }
-                                                });
-                                            },
-                                            svg {
-                                                xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                                polyline { points: "20 6 9 17 4 12" }
-                                            }
-                                        }
-                                        button {
-                                            class: "btn-reject",
-                                            title: "Reject",
-                                            onclick: move |_| {
-                                                waiting_reject.write().retain(|p| p.user_id != uid_reject);
-                                                let uid = uid_reject.clone();
-                                                let meeting_id = meeting_id_reject.clone();
-                                                let fetch = fetch_reject.clone();
-                                                let mut error = error_reject;
-
-                                                spawn(async move {
-                                                    match reject_participant(&meeting_id, &uid).await {
-                                                        Ok(_) => fetch(),
-                                                        Err(e) => {
-                                                            error.set(Some(e));
-                                                            fetch();
-                                                        }
-                                                    }
-                                                });
-                                            },
-                                            svg {
-                                                xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                                line { x1: "18", y1: "6", x2: "6", y2: "18" }
-                                                line { x1: "6", y1: "6", x2: "18", y2: "18" }
-                                            }
-                                        }
+                                }
+                            }
+                            div { class: "participant-actions",
+                                button {
+                                    class: "btn-admit",
+                                    title: "Admit",
+                                    aria_label: "Admit {label}",
+                                    onclick: decide(user_id.clone(), true),
+                                    svg {
+                                        xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                                        polyline { points: "20 6 9 17 4 12" }
+                                    }
+                                }
+                                button {
+                                    class: "btn-reject",
+                                    title: "Reject",
+                                    aria_label: "Reject {label}",
+                                    onclick: decide(user_id.clone(), false),
+                                    svg {
+                                        xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                                        line { x1: "18", y1: "6", x2: "6", y2: "18" }
+                                        line { x1: "6", y1: "6", x2: "18", y2: "18" }
                                     }
                                 }
                             }
@@ -330,6 +331,22 @@ pub fn HostControls(
                 }
             }
         }
+    }
+}
+
+/// `(user_id, label, guest badge)`: a blank display name shows the user id.
+fn waiting_row(participant: &WaitingParticipant) -> (String, String, bool) {
+    match participant.display_name.as_deref() {
+        Some(name) if !name.trim().is_empty() => (
+            participant.user_id.clone(),
+            name.to_string(),
+            participant.is_guest,
+        ),
+        _ => (
+            participant.user_id.clone(),
+            participant.user_id.clone(),
+            false,
+        ),
     }
 }
 
@@ -414,5 +431,338 @@ mod poll_failure_tests {
         report_poll_failure(&counter, &JoinError::NotAuthenticated);
         report_poll_failure(&counter, &JoinError::NotAuthenticated);
         assert_eq!(counter.get(), 2);
+    }
+}
+
+#[cfg(test)]
+mod knock_tests {
+    use super::*;
+
+    fn arrivals(ids: &AnnouncedIds, waiting: &[&str]) -> bool {
+        announce_arrivals(&mut ids.0.borrow_mut(), waiting.iter().copied())
+    }
+
+    #[test]
+    fn a_waiter_who_drops_off_the_list_and_returns_does_not_knock_again() {
+        let ids = AnnouncedIds::default();
+        assert!(arrivals(&ids, &["alice"]));
+        assert!(!arrivals(&ids, &[]));
+        assert!(!arrivals(&ids, &["alice"]));
+    }
+
+    #[test]
+    fn a_new_arrival_knocks_even_when_the_list_length_is_unchanged() {
+        let ids = AnnouncedIds::default();
+        assert!(arrivals(&ids, &["alice"]));
+        assert!(arrivals(&ids, &["bob"]));
+        assert!(!arrivals(&ids, &["alice", "bob"]));
+    }
+
+    #[test]
+    fn a_waiter_the_host_admitted_or_rejected_knocks_again_on_return() {
+        let ids = AnnouncedIds::default();
+        assert!(arrivals(&ids, &["alice", "bob"]));
+        ids.forget(["alice"]);
+        assert!(arrivals(&ids, &["alice", "bob"]));
+        assert!(!arrivals(&ids, &["bob"]));
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    thread_local! {
+        static VERSION: RefCell<Option<Signal<u64>>> = const { RefCell::new(None) };
+        static MOUNTED: RefCell<Option<Signal<bool>>> = const { RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn Harness() -> Element {
+        let version = use_signal(|| 0u64);
+        let mounted = use_signal(|| true);
+        use_hook(move || {
+            VERSION.with(|v| *v.borrow_mut() = Some(version));
+            MOUNTED.with(|m| *m.borrow_mut() = Some(mounted));
+        });
+        rsx! {
+            if mounted() {
+                HostControls {
+                    meeting_id: "m-knock".to_string(),
+                    is_admitted: true,
+                    waiting_room_version: version,
+                }
+            }
+        }
+    }
+
+    fn install_mocks() {
+        js_sys::eval(
+            r#"
+            window.__APP_CONFIG = Object.freeze({
+                apiBaseUrl: 'http://test:8080', wsUrl: 'ws://test:8080',
+                webTransportHost: 'https://test:4433', oauthEnabled: 'false',
+                e2eeEnabled: 'false', webTransportEnabled: 'false', firefoxEnabled: 'false',
+                usersAllowedToStream: '', serverElectionPeriodMs: 2000, vadThreshold: 0.02
+            });
+            window.__knocks = 0;
+            window.__waitingFetches = 0;
+            window.__waitingIds = [];
+            window.__original_play = window.__original_play || HTMLMediaElement.prototype.play;
+            HTMLMediaElement.prototype.play = function () {
+                window.__knocks += 1;
+                return Promise.resolve();
+            };
+            window.__decisions = [];
+            window.__admitFails = false;
+            window.__original_fetch = window.__original_fetch || window.fetch;
+            window.fetch = function (input, init) {
+                var url = typeof input === 'string' ? input : input.url;
+                var respond = function (status, body) {
+                    var resp = new Response(JSON.stringify({ success: status === 200, result: body }),
+                        { status: status, headers: { 'Content-Type': 'application/json' } });
+                    Object.defineProperty(resp, 'url', { value: url });
+                    return resp;
+                };
+                var row = function (id, status) {
+                    return { user_id: id, display_name: id, status: status, is_host: false, joined_at: 0 };
+                };
+                if (url.endsWith('/waiting')) {
+                    window.__waitingFetches += 1;
+                    return Promise.resolve(respond(200, { meeting_id: 'm-knock',
+                        waiting: window.__waitingIds.map(function (id) { return row(id, 'waiting'); }) }));
+                }
+                if (url.endsWith('/admit-all')) {
+                    window.__decisions.push('admit-all');
+                    return Promise.resolve(respond(200, { admitted_count: 0, admitted: [] }));
+                }
+                if (url.endsWith('/admit') || url.endsWith('/reject')) {
+                    var verb = url.endsWith('/admit') ? 'admit' : 'reject';
+                    return input.text().then(function (text) {
+                        var id = JSON.parse(text).user_id;
+                        window.__decisions.push(verb + ':' + id);
+                        if (verb === 'admit' && window.__admitFails) {
+                            return respond(404, { code: 'PARTICIPANT_NOT_FOUND', message: 'gone' });
+                        }
+                        return respond(200, row(id, verb === 'admit' ? 'admitted' : 'rejected'));
+                    });
+                }
+                return window.__original_fetch(input, init);
+            };
+            "#,
+        )
+        .unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    fn decisions() -> Vec<String> {
+        let value = js_sys::Reflect::get(&gloo_utils::window(), &"__decisions".into()).unwrap();
+        js_sys::Array::from(&value)
+            .iter()
+            .filter_map(|v| v.as_string())
+            .collect()
+    }
+
+    fn button(root: &web_sys::Element, label: &str) -> web_sys::HtmlElement {
+        root.query_selector(&format!("button[aria-label='{label}']"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("no button labelled {label:?}"))
+            .unchecked_into()
+    }
+
+    /// Clicks `target`, with the server then listing `after`, and waits for
+    /// the refetch that follows the decision.
+    async fn decide_on(target: &web_sys::HtmlElement, after: &[&str]) {
+        set_waiting(after);
+        let fetches = js_number("__waitingFetches");
+        target.click();
+        wait_until("the refetch after the decision", || {
+            js_number("__waitingFetches") > fetches
+        })
+        .await;
+    }
+
+    async fn mount_with_waiting(ids: &[&str]) -> web_sys::Element {
+        let stale = MOUNTED.with(|m| m.borrow_mut().take());
+        if let Some(mut mounted) = stale {
+            if mounted.try_peek().map(|v| *v).unwrap_or(false) {
+                mounted.set(false);
+                TimeoutFuture::new(50).await;
+            }
+        }
+        install_mocks();
+        set_waiting(ids);
+        let root = gloo_utils::document().create_element("div").unwrap();
+        gloo_utils::document()
+            .body()
+            .unwrap()
+            .append_child(&root)
+            .unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(Harness),
+            dioxus::web::Config::new().rootelement(root.clone()),
+        );
+        let expected: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        wait_until("the first list", || listed(&root) == expected).await;
+        root
+    }
+
+    async fn unmount(root: web_sys::Element) {
+        MOUNTED.with(|m| m.borrow().expect("mounted signal").set(false));
+        TimeoutFuture::new(50).await;
+        remove_mocks();
+        root.remove();
+    }
+
+    fn remove_mocks() {
+        js_sys::eval(
+            r#"
+            if (window.__original_fetch) { window.fetch = window.__original_fetch; delete window.__original_fetch; }
+            if (window.__original_play) { HTMLMediaElement.prototype.play = window.__original_play; delete window.__original_play; }
+            delete window.__APP_CONFIG;
+            "#,
+        )
+        .unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    fn js_number(name: &str) -> u32 {
+        js_sys::Reflect::get(&gloo_utils::window(), &name.into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u32
+    }
+
+    fn set_waiting(ids: &[&str]) {
+        let list = js_sys::Array::new();
+        for id in ids {
+            list.push(&(*id).into());
+        }
+        js_sys::Reflect::set(&gloo_utils::window(), &"__waitingIds".into(), &list).unwrap();
+    }
+
+    fn listed(root: &web_sys::Element) -> Vec<String> {
+        let names = root
+            .query_selector_all(".waiting-participant .participant-name")
+            .unwrap();
+        (0..names.length())
+            .filter_map(|i| names.item(i).and_then(|n| n.text_content()))
+            .collect()
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..300 {
+            if done() {
+                return;
+            }
+            TimeoutFuture::new(10).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    async fn host_sees(root: &web_sys::Element, ids: &[&str]) {
+        set_waiting(ids);
+        VERSION.with(|v| {
+            let mut version = v.borrow().expect("version signal");
+            version += 1;
+        });
+        let expected: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        wait_until(&format!("the host list to show {ids:?}"), || {
+            listed(root) == expected
+        })
+        .await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_knock_sounds_once_per_waiter_not_once_per_reappearance() {
+        let root = mount_with_waiting(&["alice"]).await;
+        assert_eq!(js_number("__knocks"), 1, "alice's first arrival knocks");
+
+        host_sees(&root, &[]).await;
+        host_sees(&root, &["alice"]).await;
+        assert_eq!(
+            js_number("__knocks"),
+            1,
+            "alice lapsing off the list and coming back is not a new arrival"
+        );
+
+        host_sees(&root, &["bob"]).await;
+        assert_eq!(js_number("__knocks"), 2, "bob is a new arrival");
+
+        host_sees(&root, &["alice", "bob"]).await;
+        decide_on(&button(&root, "Reject alice"), &["bob"]).await;
+        host_sees(&root, &["alice", "bob"]).await;
+        assert_eq!(
+            js_number("__knocks"),
+            3,
+            "alice re-queueing after the host rejected her knocks again"
+        );
+
+        unmount(root).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn admit_a_failed_admit_and_admit_all_each_let_the_waiter_knock_again() {
+        let root = mount_with_waiting(&["alice"]).await;
+        assert_eq!(js_number("__knocks"), 1);
+
+        decide_on(&button(&root, "Admit alice"), &[]).await;
+        host_sees(&root, &["alice"]).await;
+        assert_eq!(js_number("__knocks"), 2, "alice back after an admit");
+
+        js_sys::eval("window.__admitFails = true;").unwrap();
+        decide_on(&button(&root, "Admit alice"), &[]).await;
+        host_sees(&root, &["alice"]).await;
+        assert_eq!(
+            js_number("__knocks"),
+            3,
+            "alice back after an admit that failed because her row had lapsed"
+        );
+
+        host_sees(&root, &["alice", "bob"]).await;
+        assert_eq!(js_number("__knocks"), 4, "bob arrives");
+        let admit_all = root
+            .query_selector(".btn-admit-all")
+            .unwrap()
+            .expect("admit all")
+            .unchecked_into::<web_sys::HtmlElement>();
+        decide_on(&admit_all, &[]).await;
+        host_sees(&root, &["alice", "bob"]).await;
+        assert_eq!(js_number("__knocks"), 5, "both back after admit-all");
+        assert_eq!(
+            decisions(),
+            ["admit:alice", "admit:alice", "admit-all"],
+            "each click reached the server"
+        );
+
+        unmount(root).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_row_keeps_its_waiter_when_an_earlier_waiter_leaves() {
+        let root = mount_with_waiting(&["alice", "bob"]).await;
+        let bobs_admit = root
+            .query_selector_all(".waiting-participant .btn-admit")
+            .unwrap()
+            .item(1)
+            .expect("bob's admit button")
+            .unchecked_into::<web_sys::HtmlElement>();
+        bobs_admit.focus().unwrap();
+
+        host_sees(&root, &["bob"]).await;
+        assert!(
+            bobs_admit.is_connected(),
+            "bob's row must survive alice leaving above it"
+        );
+        assert_eq!(
+            bobs_admit.get_attribute("aria-label").as_deref(),
+            Some("Admit bob")
+        );
+        decide_on(&bobs_admit, &[]).await;
+        assert_eq!(decisions(), ["admit:bob"], "the held button admits bob");
+
+        unmount(root).await;
     }
 }

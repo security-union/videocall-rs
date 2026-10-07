@@ -11,18 +11,26 @@ import {
   closePeerList,
   detectJoinMode,
   ensureDisplayNameInMeeting,
+  enableJoinMedia,
   ensureWaitingRoomOff,
   installClickDiagnostics,
+  isSessionUserIdResponse,
+  JOIN_MEDIA_ON,
+  type JoinMediaPage,
   joinMeetingAndEnableMedia,
   logPostClickDiagnostics,
+  sessionUserIdFromBody,
   waitForJoinButton,
 } from "./meeting-join";
 import {
   CAMERA_TOOLTIP,
   MIC_UNMUTE_SELECTOR,
   cameraButtonSelector,
+  cameraControlSelector,
+  micControlSelector,
   peerListControlSelector,
 } from "./control-buttons";
+import { ParticipantRecorder } from "./run-record";
 
 // #865 regression lock (the deterministic one). The end-to-end Playwright
 // spec (bot-join-flow.spec.ts) is smoke coverage of the real join flow but is
@@ -90,6 +98,27 @@ describe("meeting-join module surface", () => {
       rejected: '[data-testid="meeting-rejected"]',
       error: '[data-testid="meeting-error"]',
     });
+  });
+});
+
+describe("session user_id from the meeting-api participant-status responses", () => {
+  it("matches only this meeting's join/status paths", () => {
+    const base = "https://api.example.test/api/v1/meetings";
+    for (const tail of ["join", "join-guest", "status", "guest-status"]) {
+      expect(isSessionUserIdResponse(`${base}/m1/${tail}`, "m1")).toBe(true);
+    }
+    expect(isSessionUserIdResponse(`${base}/m2/join`, "m1")).toBe(false);
+    expect(isSessionUserIdResponse(`${base}/m1/leave`, "m1")).toBe(false);
+    expect(isSessionUserIdResponse(`${base}/m1/participants`, "m1")).toBe(false);
+    expect(isSessionUserIdResponse("not a url", "m1")).toBe(false);
+  });
+
+  it("reads a non-empty result.user_id from a successful body only", () => {
+    expect(sessionUserIdFromBody({ success: true, result: { user_id: "a@b.c" } })).toBe("a@b.c");
+    expect(sessionUserIdFromBody({ success: true, result: { user_id: "" } })).toBeNull();
+    expect(sessionUserIdFromBody({ success: false, result: { user_id: "a@b.c" } })).toBeNull();
+    expect(sessionUserIdFromBody({ success: true, result: null })).toBeNull();
+    expect(sessionUserIdFromBody(null)).toBeNull();
   });
 });
 
@@ -351,6 +380,162 @@ function makeJoinHarness(initialState: JoinHarnessState): {
   };
 }
 
+/** The harness renders no mic/camera control, so the join cannot observe either. */
+const UNSEEN_MEDIA = { camera: null, mic: null };
+
+const MIC_ON = micControlSelector("on");
+const CAM_ON = cameraControlSelector("on");
+const TOGGLES = new Map([
+  [MIC_UNMUTE_SELECTOR, MIC_ON],
+  [MIC_ON, MIC_UNMUTE_SELECTOR],
+  [cameraControlSelector("off"), CAM_ON],
+  [CAM_ON, cameraControlSelector("off")],
+]);
+
+/** A click swaps the medium's control as the product does, unless `stuck`. */
+function mediaPage(
+  visible: Set<string>,
+  stuck = false,
+  flipAfterMs = 0,
+): {
+  page: JoinMediaPage;
+  clicked: string[];
+} {
+  const clicked: string[] = [];
+  const page = {
+    locator: vi.fn((sel: string) => ({
+      first: vi.fn().mockReturnThis(),
+      hover: vi.fn(async () => undefined),
+      isVisible: vi.fn(async () => visible.has(sel)),
+      click: vi.fn(async () => {
+        clicked.push(sel);
+        const next = TOGGLES.get(sel);
+        if (stuck || next === undefined) return;
+        const flip = (): void => {
+          visible.delete(sel);
+          visible.add(next);
+        };
+        if (flipAfterMs > 0) setTimeout(flip, flipAfterMs);
+        else flip();
+      }),
+      waitFor: vi.fn(async ({ timeout = 0 }: { timeout?: number } = {}) => {
+        if (stuck && !visible.has(sel)) throw new Error(`timeout waiting for ${sel}`);
+        const until = Date.now() + timeout;
+        while (!visible.has(sel)) {
+          if (Date.now() > until) throw new Error(`timeout waiting for ${sel}`);
+          await new Promise((r) => setTimeout(r, 5));
+        }
+      }),
+    })),
+    waitForTimeout: vi.fn(async () => undefined),
+  };
+  return { page: page as unknown as JoinMediaPage, clicked };
+}
+
+describe("enableJoinMedia (#2914)", () => {
+  const MIC = MIC_UNMUTE_SELECTOR;
+  const CAM = cameraButtonSelector(CAMERA_TOOLTIP.off);
+
+  it("turns both on by default and reports them on", async () => {
+    const { page, clicked } = mediaPage(new Set([MIC, CAM]));
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([MIC, CAM]);
+  });
+
+  it("leaves an opted-off medium untouched and reports it off only when its enable control shows", async () => {
+    const { page, clicked } = mediaPage(new Set([MIC, CAM]));
+    await expect(enableJoinMedia(page, "alice", { camera: false, mic: true })).resolves.toEqual({
+      camera: false,
+      mic: true,
+    });
+    expect(clicked).toEqual([MIC]);
+  });
+
+  it("turns off a medium the product joined on when it was requested off (storage-state prefs)", async () => {
+    const { page, clicked } = mediaPage(new Set([MIC_ON, CAM_ON]));
+    await expect(enableJoinMedia(page, "alice", { camera: false, mic: false })).resolves.toEqual({
+      camera: false,
+      mic: false,
+    });
+    expect(clicked).toEqual([MIC_ON, CAM_ON]);
+  });
+
+  it("waits for an async enable to flip the control before reading it back", async () => {
+    const { page, clicked } = mediaPage(new Set([MIC, CAM]), false, 50);
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([MIC, CAM]);
+  });
+
+  it("reports what the control reads after the click, and the record flags a mismatch", async () => {
+    const { page } = mediaPage(new Set([MIC_ON, CAM]), true);
+    const media = await enableJoinMedia(page, "alice", { camera: true, mic: false });
+    expect(media).toEqual({ camera: false, mic: true });
+    const rec = new ParticipantRecorder({
+      runDir: "/nonexistent",
+      role: null,
+      kernelNetem: undefined,
+      pod: {
+        ordinal: null,
+        node: null,
+        staggerMs: null,
+        staggerIncomplete: false,
+        imageRevision: "x",
+      },
+      write: () => {},
+    });
+    const t = {
+      botId: "b",
+      meetingURL: "https://example.test/meeting/R",
+      participant: "alice",
+      displayName: "alice",
+      headless: true,
+      authBackend: "storage-state" as const,
+      joinMedia: { camera: true, mic: false },
+    } as Parameters<ParticipantRecorder["register"]>[0];
+    rec.register(t);
+    rec.joined("b", 1_000, media, null);
+    expect(rec.snapshot("b")?.unverified).toEqual(
+      expect.arrayContaining([
+        { field: "publishes.camera", reason: "requested on at join but observed off" },
+        { field: "publishes.mic", reason: "requested off at join but observed on" },
+      ]),
+    );
+  });
+
+  it("reports unknown, not off, when the control is not visible", async () => {
+    const { page, clicked } = mediaPage(new Set());
+    await expect(enableJoinMedia(page, "alice", { camera: false, mic: true })).resolves.toEqual({
+      camera: null,
+      mic: null,
+    });
+    expect(clicked).toEqual([]);
+  });
+
+  it("is what joinMeetingAndEnableMedia runs with its media argument", async () => {
+    const { page } = makeJoinHarness("button");
+    const { page: controls, clicked } = mediaPage(new Set([MIC, CAM]));
+    const base = page.locator.bind(page);
+    (page as unknown as { locator: (s: string) => unknown }).locator = (s: string) =>
+      s === MIC || s === CAM ? controls.locator(s) : base(s);
+    await expect(
+      joinMeetingAndEnableMedia({
+        page,
+        participant: "alice",
+        displayName: "",
+        meetingId: "TestRoom",
+        media: { camera: false, mic: false },
+      }),
+    ).resolves.toEqual({ camera: false, mic: false });
+    expect(clicked).toEqual([]);
+  });
+});
+
 describe("joinMeetingAndEnableMedia state machine", () => {
   const args = {
     participant: "alice",
@@ -372,7 +557,7 @@ describe("joinMeetingAndEnableMedia state machine", () => {
       }),
     ]);
 
-    await expect(boundedJoin).resolves.toBeUndefined();
+    await expect(boundedJoin).resolves.toEqual(UNSEEN_MEDIA);
     expect(promptFill).toHaveBeenCalledWith("Alice", {
       delay: 30,
       timeout: 5_000,
@@ -390,7 +575,7 @@ describe("joinMeetingAndEnableMedia state machine", () => {
         setTimeout(() => reject(new Error("auto-join did not resolve")), 500);
       }),
     ]);
-    await expect(boundedJoin).resolves.toBeUndefined();
+    await expect(boundedJoin).resolves.toEqual(UNSEEN_MEDIA);
 
     const requested = (page.locator as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
       (c) => c[0],
@@ -437,7 +622,7 @@ describe("joinMeetingAndEnableMedia state machine", () => {
 
   it("clicks the normal Join button and succeeds when the grid follows", async () => {
     const { page, joinClick } = makeJoinHarness("button");
-    await expect(joinMeetingAndEnableMedia({ page, ...args })).resolves.toBeUndefined();
+    await expect(joinMeetingAndEnableMedia({ page, ...args })).resolves.toEqual(UNSEEN_MEDIA);
     expect(joinClick).toHaveBeenCalledTimes(1);
     expect(joinClick).toHaveBeenCalledWith({ timeout: 5_000 });
   });

@@ -29,6 +29,7 @@ use crate::components::performance_settings::{
     PerfControlsHandle, PerformancePreference, ReceivedReader, ScreenSnapshotReader,
     SimulcastSummary, SnapshotReader,
 };
+use crate::components::transport_fallback::ActiveTransportCtx;
 use crate::constants::*;
 use crate::context::{
     load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
@@ -166,6 +167,7 @@ pub fn Host(
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let active_transport_ctx = try_use_context::<ActiveTransportCtx>();
     let pre_acquired_stream = use_context::<PreAcquiredScreenStream>();
 
     use_hook(videocall_client::capability_probe::spawn_capability_probe);
@@ -1286,6 +1288,11 @@ pub fn Host(
                     visible: device_settings_open,
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
+                    active_transport: if device_settings_open {
+                        active_transport_ctx.and_then(|ctx| (ctx.0)())
+                    } else {
+                        None
+                    },
                     initial_section: device_settings_initial_section.clone(),
                 }
             }

@@ -52,6 +52,44 @@ fn assert_present(names: &[&str], init: &str) {
     }
 }
 
+fn nats_event_children() -> Vec<(String, f64)> {
+    let mut children: Vec<(String, f64)> = prometheus::gather()
+        .iter()
+        .filter(|f| f.get_name() == "relay_nats_events_total")
+        .flat_map(|f| f.get_metric().iter())
+        .map(|m| {
+            let event = m
+                .get_label()
+                .iter()
+                .find(|l| l.get_name() == "event")
+                .map_or_else(String::new, |l| l.get_value().to_string());
+            (event, m.get_counter().get_value())
+        })
+        .collect();
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    children
+}
+
+fn assert_nats_events_published_at_zero(init: &str) {
+    let expected: Vec<(String, f64)> = [
+        "client_error",
+        "connected",
+        "disconnected",
+        "lame_duck_mode",
+        "server_error",
+        "slow_consumer",
+    ]
+    .iter()
+    .map(|e| (e.to_string(), 0.0))
+    .collect();
+    assert_eq!(
+        nats_event_children(),
+        expected,
+        "after {init}, relay_nats_events_total must hold exactly these children at 0, \
+         with no draining or closed child"
+    );
+}
+
 /// Both relay inits in ONE test on purpose: they share `init_relay_common_series`, so a
 /// separate test asserting the shared families absent would race this one's registration.
 #[test]
@@ -63,20 +101,20 @@ fn each_relay_init_moves_its_families_from_absent_to_zero() {
     let shared = [
         "videocall_legacy_token_type_accepted_total",
         "relay_nats_publish_latency_ms",
+        "relay_nats_events_total",
+        "videocall_relay_scheduler_lag_ms",
     ];
-    let wt = ["videocall_relay_scheduler_lag_ms"];
 
     assert_absent(&ws, "init_websocket_relay_series");
     assert_absent(&shared, "init_websocket_relay_series");
     init_websocket_relay_series();
     assert_present(&ws, "init_websocket_relay_series");
     assert_present(&shared, "init_websocket_relay_series");
+    assert_nats_events_published_at_zero("init_websocket_relay_series");
 
-    // The WT init must still publish its own transport-specific family. `shared` is already
-    // registered by now, so only `wt` can be asserted absent here.
-    assert_absent(&wt, "init_webtransport_relay_series");
+    // `shared` is already registered by now, so the WT init has no absent family left.
     init_webtransport_relay_series();
-    assert_present(&wt, "init_webtransport_relay_series");
+    assert_present(&shared, "init_webtransport_relay_series");
 }
 
 #[test]
@@ -85,7 +123,12 @@ fn the_health_ingest_init_moves_its_families_from_absent_to_zero() {
         "videocall_health_reports_total",
         "videocall_client_non_finite_samples_dropped_total",
         "videocall_tier_transitions_dropped_total",
+        "videocall_peer_stats_dropped_total",
+        "videocall_peer_ids_capped_total",
         "videocall_encoder_layer_geometry_dropped_total",
+        "videocall_health_packets_dropped_total",
+        "videocall_health_ingest_nats_received_total",
+        "videocall_health_ingest_dequeued_total",
     ];
     assert_absent(&names, "init_health_ingest_series");
     init_health_ingest_series();

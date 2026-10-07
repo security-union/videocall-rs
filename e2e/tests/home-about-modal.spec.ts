@@ -4,6 +4,18 @@ import { test, expect } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { setShowBuildGitInfoFlag } from "../helpers/show-build-git-info-config";
+import {
+  CHANGELOG_EMPTY_VERSIONS,
+  CHANGELOG_HTML_SHELL_REPLY,
+  CHANGELOG_JSON_REPLY,
+  CHANGELOG_NEWEST_CHANGES,
+  CHANGELOG_NEWEST_FIRST,
+  CHANGELOG_PENDING_CHANGES,
+  CHANGELOG_WITH_PENDING_REPLY,
+  aboutWhatsNewToggle,
+  openAboutModal,
+  routeChangelog,
+} from "../helpers/whats-new";
 
 /**
  * E2E tests for the "About" modal on the homepage (issue 785).
@@ -273,5 +285,221 @@ test.describe("Homepage About modal", () => {
     await expect(modal).toContainText(`v${CLIENT_VERSION}`);
     // Server-side area shows an error.
     await expect(modal).toContainText(/Couldn't reach the server/i);
+  });
+
+  test("What's new fetches on first expand, lists builds newest first and reveals older ones in steps (issue 2882)", async ({
+    page,
+  }) => {
+    const changelogRequests = await routeChangelog(page, [CHANGELOG_JSON_REPLY]);
+    const modal = await openAboutModal(page);
+    // The modal's own versions fetch has landed, so an eager log fetch would have too.
+    await expect(modal).toContainText("meeting-api");
+
+    const toggle = aboutWhatsNewToggle(modal);
+    await expect(toggle).toHaveText("What's new");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toHaveAttribute("aria-controls", "about-changelog-panel");
+    await expect(modal.locator('[data-testid="changelog-panel"]')).toHaveCount(0);
+    expect(changelogRequests(), "nothing is fetched until the log is expanded").toBe(0);
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const panel = modal.locator("#about-changelog-panel");
+    await expect(panel).toHaveAttribute("data-testid", "changelog-panel");
+    await expect(panel).toHaveAttribute("role", "region");
+    const builds = panel.locator(':scope > [data-testid="changelog-build"]');
+    const versions = builds.locator("h5 > .changelog-build-version");
+    await expect(builds).toHaveCount(3);
+    await expect(
+      versions,
+      "the three newest builds that list changes; newer change-less ones are skipped",
+    ).toHaveText(CHANGELOG_NEWEST_FIRST.slice(0, 3));
+    const newestDate = builds.first().locator("h5 > .changelog-build-date:first-child");
+    await expect(newestDate, "the heading leads with the build date").toContainText("2026");
+    await expect(newestDate, "the date stops at the minute").not.toHaveText(/\d:\d{2}:\d{2}/);
+    await expect(
+      builds.first().locator('ul > [data-testid="changelog-change"]'),
+      "the newest build lists its one-liners, blank lines dropped",
+    ).toHaveText(CHANGELOG_NEWEST_CHANGES);
+    await expect(
+      panel.locator(':scope > [data-testid="changelog-status"]'),
+      "the status line stays mounted, empty, while builds are listed",
+    ).toHaveText("");
+    expect(changelogRequests()).toBe(1);
+
+    const showOlder = panel.locator(':scope > [data-testid="changelog-show-older"]');
+    await expect(showOlder).toHaveText("Show 10 older builds");
+    await showOlder.click();
+    await expect(builds).toHaveCount(13);
+    await expect(versions).toHaveText(CHANGELOG_NEWEST_FIRST.slice(0, 13));
+    const fourth = panel.locator("#about-changelog-build-3");
+    await expect(fourth).toContainText(CHANGELOG_NEWEST_FIRST[3]);
+    await expect(fourth, "focus moves to the first newly shown build").toBeFocused();
+
+    await expect(showOlder, "the label counts only builds that list changes").toHaveText(
+      "Show 2 older builds",
+    );
+    await showOlder.click();
+    await expect(builds).toHaveCount(15);
+    await expect(versions).toHaveText(CHANGELOG_NEWEST_FIRST);
+    await expect(panel.locator("#about-changelog-build-13")).toBeFocused();
+    await expect(showOlder, "the button goes once every build is shown").toHaveCount(0);
+    for (const version of CHANGELOG_EMPTY_VERSIONS) {
+      await expect(panel, `${version} lists no changes, so it is not rendered`).not.toContainText(
+        version,
+      );
+    }
+
+    // A dispatched click leaves focus on the heading, as a click that does not
+    // focus the button (Safari) would.
+    await toggle.dispatchEvent("click");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(panel).toHaveCount(0);
+    await expect(toggle, "collapsing hands focus from the removed log to the toggle").toBeFocused();
+    await toggle.click();
+    await expect(builds).toHaveCount(3);
+    await expect(versions).toHaveText(CHANGELOG_NEWEST_FIRST.slice(0, 3));
+    // A round trip through the list, so a refetch from the re-expand would be counted.
+    await showOlder.click();
+    await expect(builds).toHaveCount(13);
+    expect(changelogRequests(), "a loaded log is not fetched again").toBe(1);
+  });
+
+  test("What's new reports an HTML app-shell answer as unavailable, and a re-expand or Try again refetches (issue 2882)", async ({
+    page,
+  }) => {
+    const changelogRequests = await routeChangelog(page, [
+      CHANGELOG_HTML_SHELL_REPLY,
+      CHANGELOG_HTML_SHELL_REPLY,
+      CHANGELOG_JSON_REPLY,
+    ]);
+    const modal = await openAboutModal(page);
+    const toggle = aboutWhatsNewToggle(modal);
+    await expect(toggle).toBeVisible();
+    await toggle.click();
+
+    const panel = modal.locator("#about-changelog-panel");
+    const status = panel.locator(':scope > [data-testid="changelog-status"]');
+    const retry = panel.locator(':scope > [data-testid="changelog-retry"]');
+    await expect(status).toHaveText("Change log unavailable");
+    await expect(status).toHaveAttribute("role", "status");
+    await expect(retry).toHaveText("Try again");
+    await expect(panel.locator('[data-testid="changelog-build"]')).toHaveCount(0);
+    expect(changelogRequests()).toBe(1);
+
+    await toggle.click();
+    await expect(panel).toHaveCount(0);
+    await toggle.click();
+    await expect
+      .poll(changelogRequests, {
+        message: "a failed load is not cached, so re-expanding refetches",
+      })
+      .toBe(2);
+    await expect(status).toHaveText("Change log unavailable");
+    // Marks this node; a replaced status line would not carry the mark.
+    await status.evaluate((el) => el.setAttribute("data-e2e-mark", "kept"));
+
+    await retry.click();
+    const builds = panel.locator(':scope > [data-testid="changelog-build"]');
+    await expect(builds).toHaveCount(3);
+    await expect(builds.locator("h5 > .changelog-build-version")).toHaveText(
+      CHANGELOG_NEWEST_FIRST.slice(0, 3),
+    );
+    await expect(status, "the same status line is emptied, not removed").toHaveAttribute(
+      "data-e2e-mark",
+      "kept",
+    );
+    await expect(status).toHaveText("");
+    await expect(retry).toHaveCount(0);
+    await expect(toggle, "focus leaves the removed Try again button for the toggle").toBeFocused();
+    expect(changelogRequests()).toBe(3);
+  });
+
+  test("What's new merges pending sections into one Unreleased section above the three newest dated builds (issue 2882)", async ({
+    page,
+  }) => {
+    await routeChangelog(page, [CHANGELOG_WITH_PENDING_REPLY]);
+    const modal = await openAboutModal(page);
+    const toggle = aboutWhatsNewToggle(modal);
+    await expect(toggle).toBeVisible();
+    await toggle.click();
+
+    const panel = modal.locator("#about-changelog-panel");
+    const builds = panel.locator(':scope > [data-testid="changelog-build"]');
+    const versions = builds.locator("h5 > .changelog-build-version");
+    await expect(builds).toHaveCount(4);
+    const unreleased = builds.first();
+    await expect(unreleased, "pending sections, mid-file and last, sort first").toHaveAttribute(
+      "data-pending",
+      "true",
+    );
+    await expect(unreleased.locator("h5")).toHaveAttribute("id", "about-changelog-unreleased");
+    await expect(unreleased.locator("h5 > .changelog-build-date")).toHaveText("Unreleased");
+    await expect(unreleased.locator("h5 > .changelog-build-version")).toHaveCount(0);
+    await expect(unreleased.locator('[data-testid="changelog-this-build"]')).toHaveCount(0);
+    await expect(
+      unreleased.locator('ul > [data-testid="changelog-change"]'),
+      "one section lists both pending sections' lines, each once",
+    ).toHaveText(CHANGELOG_PENDING_CHANGES);
+    await expect(panel.locator('[data-testid="changelog-build"][data-pending="true"]')).toHaveCount(
+      1,
+    );
+    await expect(versions, "Unreleased does not count toward the three newest builds").toHaveText(
+      CHANGELOG_NEWEST_FIRST.slice(0, 3),
+    );
+    await expect(panel.locator("#about-changelog-build-0")).toContainText(
+      CHANGELOG_NEWEST_FIRST[0],
+    );
+
+    const showOlder = panel.locator(':scope > [data-testid="changelog-show-older"]');
+    await expect(showOlder).toHaveText("Show 10 older builds");
+    await showOlder.click();
+    await expect(builds).toHaveCount(14);
+    await expect(versions).toHaveText(CHANGELOG_NEWEST_FIRST.slice(0, 13));
+    const fourthDated = panel.locator("#about-changelog-build-3");
+    await expect(fourthDated).toContainText(CHANGELOG_NEWEST_FIRST[3]);
+    await expect(fourthDated, "focus moves to the first newly shown build").toBeFocused();
+    await expect(showOlder).toHaveText("Show 2 older builds");
+    await showOlder.click();
+    await expect(builds).toHaveCount(16);
+    await expect(versions).toHaveText(CHANGELOG_NEWEST_FIRST);
+    await expect(panel.locator('[data-testid="changelog-build"][data-pending="true"]')).toHaveCount(
+      1,
+    );
+    await expect(showOlder).toHaveCount(0);
+  });
+
+  test("the About dialog keeps Tab inside it and hands focus back to the footer link on close (issue 2882)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const link = page.locator('[data-testid="about-footer-link"]');
+    const modal = page.locator('[data-testid="about-modal"]');
+    const dialog = page.locator('[data-testid="about-modal-dialog"]');
+    const focusInDialog = () => dialog.evaluate((el) => el.contains(document.activeElement));
+
+    await link.click();
+    await expect(dialog).toBeFocused({ timeout: 3_000 });
+    for (const key of ["Tab", "Shift+Tab"]) {
+      for (let press = 1; press <= 6; press++) {
+        await page.keyboard.press(key);
+        expect(await focusInDialog(), `${key} #${press} must stay in the dialog`).toBe(true);
+      }
+    }
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden({ timeout: 3_000 });
+    await expect(link, "Escape returns focus to the footer link").toBeFocused();
+
+    await link.click();
+    await expect(dialog).toBeFocused({ timeout: 3_000 });
+    await modal.locator('[data-testid="about-modal-close"]').click();
+    await expect(modal).toBeHidden({ timeout: 3_000 });
+    await expect(link, "Close returns focus to the footer link").toBeFocused();
+
+    await link.click();
+    await expect(dialog).toBeFocused({ timeout: 3_000 });
+    await modal.click({ position: { x: 5, y: 5 } });
+    await expect(modal).toBeHidden({ timeout: 3_000 });
+    await expect(link, "a backdrop click returns focus to the footer link").toBeFocused();
   });
 });

@@ -178,6 +178,10 @@ spec:
             # parses that once + prod config.js freezes it, so they are NOT
             # runtime-toggleable); effect requires the DEPLOYED client to carry
             # videocall-client PR #2078 (bot logs a post-join assertion either way).
+            # DIAGNOSTICS sends (#2970) stay ON. Opt out only for a run where
+            # every participant has them off (Phase 0 arm 3):
+            #   - name: BOT_DIAG_PACKETS
+            #     value: "off"
             # Camera duty cycle (#2362) UNSET — cycling LOWERS published load. Opt in
             # with all four, in seconds (a partial set is rejected at startup):
             #   BOT_CAMERA_ON_SECS_MIN "20" · BOT_CAMERA_ON_SECS_MAX "90"
@@ -197,6 +201,11 @@ spec:
                 secretKeyRef:
                   name: bot-ctl-token
                   key: token
+            # Participant record placement (#2358); the downward API is per-pod.
+            - name: BOT_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           # Control-API port. Named `ctl` so the Service can target it by name.
           # Reachable ONLY in-cluster (headless Service DNS) — no Ingress/LB fronts
           # it — and every request requires the bot-ctl-token bearer token.

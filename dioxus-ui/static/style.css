@@ -652,11 +652,6 @@ h3 {
   }
 }
 
-/* Issue #1466: the persistent "show all paused videos" / "back to automatic"
-   escape hatch in the Appearance panel's Video-tiles area. Styled to match the
-   panel's warning-accent action buttons (same token family as the banner's
-   `.decode-budget-banner-action`), set apart from the segmented tile-count
-   picker above it. */
 .decode-budget-show-all-btn {
   margin-top: 10px;
   min-height: 36px;
@@ -4718,9 +4713,86 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: var(--success);
 }
 
-.co-hosts-details > summary {
+.co-hosts-section--collapsible {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.co-hosts-details {
+  border-bottom: 1px solid var(--glass-bg);
+}
+
+.co-hosts-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 44px;
+  margin: 0 calc(-1 * var(--space-2));
+  padding: 0.625rem var(--space-2);
+  border-radius: var(--radius-sm);
+  list-style: none;
   cursor: pointer;
-  list-style-position: inside;
+  transition: background-color 0.2s ease;
+}
+
+.co-hosts-summary::-webkit-details-marker {
+  display: none;
+}
+
+.co-hosts-summary::marker {
+  content: "";
+}
+
+.co-hosts-summary:hover {
+  background: var(--field-bg);
+}
+
+.co-hosts-summary:focus-visible {
+  outline: 2px solid transparent;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.co-hosts-summary .co-hosts-heading {
+  flex: 1 1 auto;
+  font-weight: 500;
+}
+
+.co-hosts-count {
+  font-size: var(--fs-4);
+  color: var(--text-secondary);
+}
+
+.co-hosts-chevron {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  transition: transform 0.2s ease;
+}
+
+.co-hosts-details[open] > .co-hosts-summary .co-hosts-chevron {
+  transform: rotate(180deg);
+}
+
+.co-hosts-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-1) 0 var(--space-3);
+}
+
+.co-hosts-body > .co-hosts-add {
+  margin-bottom: 0;
+}
+
+.co-hosts-section--collapsible + .settings-action-row {
+  margin-top: var(--space-5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .co-hosts-summary,
+  .co-hosts-chevron {
+    transition: none;
+  }
 }
 
 .co-hosts-busy {
@@ -6134,6 +6206,11 @@ html[data-theme="light"] .decode-paused-pill-action {
   width: calc(100% - 32px);
 }
 
+/* Clears the recording bar (global.css `.meeting-status-bar`, 40px). */
+.meeting-status-bar ~ .peer-toasts {
+  top: 48px;
+}
+
 .peer-toast {
   display: flex;
   align-items: center;
@@ -6229,6 +6306,44 @@ html[data-theme="light"] .decode-paused-pill-action {
    ------------------------------------------------------------------ */
 .peer-toast.recording-status-banner {
   animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Host mute / camera-off notice (issue 2899): it stays until dismissed, so it
+   takes clicks inside `.peer-toasts` and, per issue 1197, drops the backdrop
+   blur for a near-opaque fill. */
+.peer-toast.host-action-notice {
+  pointer-events: auto;
+  animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  background: var(--fixed-dark-heavy);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.peer-toast.host-action-notice .toast-icon {
+  background: var(--btn-warning-bg);
+}
+
+.peer-toast.host-action-notice .toast-icon svg {
+  color: var(--warning);
+}
+
+.peer-toast.host-action-notice .toast-action {
+  color: var(--on-dark-text-secondary);
+  font-weight: 400;
+}
+
+.peer-toast.host-action-notice--resolved .toast-icon {
+  background: var(--toast-icon-neutral-bg);
+}
+
+.peer-toast.host-action-notice--resolved .toast-icon svg {
+  color: var(--on-dark-text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .peer-toast.host-action-notice {
+    animation: toast-enter-reduced 0.15s ease-out;
+  }
 }
 
 .peer-toast.toast-loading .toast-icon {
@@ -6346,6 +6461,13 @@ html[data-theme="light"] .decode-paused-pill-action {
   .peer-toast .toast-icon svg {
     width: 14px;
     height: 14px;
+  }
+}
+
+/* The recording bar is 32px here (global.css, 567px breakpoint). */
+@media (max-width: 567px) {
+  .meeting-status-bar ~ .peer-toasts {
+    top: 40px;
   }
 }
 

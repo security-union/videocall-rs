@@ -909,6 +909,114 @@ async fn the_owner_gets_options_and_co_hosts_on_pre_join() {
     restore_fetch();
 }
 
+fn computed(el: &web_sys::Element, property: &str) -> String {
+    gloo_utils::window()
+        .get_computed_style(el)
+        .unwrap()
+        .unwrap()
+        .get_property_value(property)
+        .unwrap()
+}
+
+#[allow(non_snake_case)]
+fn HeroPreJoinParent() -> Element {
+    rsx! {
+        div { class: "hero-content", PreJoinParent {} }
+    }
+}
+
+#[wasm_bindgen_test]
+async fn the_pre_join_co_hosts_disclosure_reads_like_an_option_row_clear_of_start_meeting() {
+    let doc = gloo_utils::document();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(&format!(
+        "{}{}.co-hosts-chevron{{transition:none}}",
+        include_str!("../static/style.css"),
+        include_str!("../static/global.css"),
+    )));
+    doc.head().unwrap().append_child(&style).unwrap();
+    let mount = render_as(OWNER, HeroPreJoinParent).await;
+    let loaded = wait_for_selector(&mount, "[data-testid='co-host-row']", 3_000).await;
+    let rect = |selector: &str| query(&mount, selector).map(|e| e.get_bounding_client_rect());
+    let css =
+        |selector: &str, property: &str| query(&mount, selector).map(|e| computed(&e, property));
+    let gap = rect(".settings-action-btn")
+        .zip(rect(".co-hosts-summary"))
+        .map(|(btn, summary)| btn.top() - summary.bottom());
+    let summary_display = css(".co-hosts-summary", "display");
+    let section_border_top = css("[data-testid='co-hosts-section']", "border-top-style");
+    let font = |selector: &str| css(selector, "font-weight").zip(css(selector, "font-size"));
+    let heading_font = font(".co-hosts-summary .co-hosts-heading");
+    let label_font = font(".settings-option-label");
+    let closed_transform = css(".co-hosts-chevron", "transform");
+    if let Some(summary) = query(&mount, ".co-hosts-summary") {
+        html(&summary).click();
+    }
+    settle().await;
+    let opened = query(&mount, ".co-hosts-details").map(|d| d.has_attribute("open"));
+    let open_transform = css(".co-hosts-chevron", "transform");
+    let body_display = css(".co-hosts-body", "display");
+    let details = rect(".co-hosts-details");
+    let above = details
+        .clone()
+        .zip(rect(".co-hosts-add"))
+        .map(|(d, add)| d.bottom() - add.bottom());
+    let below = rect(".settings-action-btn")
+        .zip(details)
+        .map(|(btn, d)| btn.top() - d.bottom());
+    style.remove();
+    cleanup(&mount);
+    restore_fetch();
+
+    assert!(loaded, "positive control: the co-host list loaded");
+    assert!(
+        gap.is_some_and(|g| g >= 16.0),
+        "Start Meeting must sit clear of the collapsed Co-hosts row; gap was {gap:?}px"
+    );
+    assert!(
+        summary_display.as_deref().is_some_and(|d| d != "list-item"),
+        "the summary must not render the UA disclosure marker, got {summary_display:?}"
+    );
+    assert_eq!(
+        section_border_top.as_deref(),
+        Some("none"),
+        "the collapsible section drops the section divider"
+    );
+    assert!(
+        heading_font.is_some() && heading_font == label_font,
+        "the Co-hosts label must match the sibling option-row labels: \
+         {heading_font:?} vs {label_font:?}"
+    );
+    assert_eq!(
+        closed_transform.as_deref(),
+        Some("none"),
+        "chevron rendered"
+    );
+    assert_eq!(
+        opened,
+        Some(true),
+        "clicking the summary opens the disclosure"
+    );
+    assert!(
+        open_transform
+            .as_deref()
+            .is_some_and(|t| t.starts_with("matrix(-1,")),
+        "the chevron flips when open, got {open_transform:?}"
+    );
+    assert_eq!(
+        body_display.as_deref(),
+        Some("flex"),
+        "the expanded body spaces its children"
+    );
+    assert!(
+        above
+            .zip(below)
+            .is_some_and(|(above, below)| above <= below + 8.0),
+        "the expanded divider must not sit nearer Start Meeting than the add form: \
+         above {above:?}px, below {below:?}px"
+    );
+}
+
 #[wasm_bindgen_test]
 async fn a_plain_participant_does_not_get_the_in_call_meeting_options_panel() {
     let mount = render_as(COHOST, PanelParent).await;

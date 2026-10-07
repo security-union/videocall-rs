@@ -498,13 +498,6 @@ test.describe("Speaker highlight glow on video tiles", () => {
   // `is_speaking = true` the sender had just put in the packet. The fix makes
   // the boolean authoritative and the float a refinement.
   //
-  // WHY THE TONE FIXTURE: the speech clip the tests above use is intermittent,
-  // so a dropped glow cannot be distinguished from a natural pause between
-  // words. `continuousToneWavPath()` renders audio that never falls silent —
-  // its RMS stays between 0.060 and 0.42, three times clear of the 0.02 VAD
-  // threshold at its quietest — so the peer counts as speaking for the whole
-  // run and any moment the tile is NOT glowing is unambiguously the bug.
-  //
   // WHY THE AMPLITUDE MOVES: a constant loud tone would pin the decoder's
   // reported intensity at a saturated 1.0, and its VAD is edge-triggered
   // (`handle_pcm_data` re-broadcasts only when the speaking boolean flips or
@@ -512,8 +505,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
   // would emit once and then go quiet for the rest of the run — which the
   // resolver cannot distinguish from a dead peer, and its no-events deadline
   // (12.5s) would put the glow out on CORRECT code, failing this spec for a
-  // reason unrelated to the bug. The fixture sweeps its amplitude through the
-  // sub-saturation band every 2s so genuine level updates keep arriving.
+  // reason unrelated to the bug.
   //
   // WHAT THE FAILURE LOOKS LIKE: on the un-fixed code each heartbeat writes the
   // silent style, and the glow stays out until the next fast-path update

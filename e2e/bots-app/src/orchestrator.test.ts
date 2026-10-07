@@ -254,6 +254,12 @@ lines:
     expect(task.manifestDir).toBe("/repo/bot/conversation");
   });
 
+  it("carries diagPackets onto the task, null when the spec has none (#2970)", () => {
+    const deps = { manifest: null, runDir: null };
+    expect(buildLaunchedBotTask(baseSpec({ diagPackets: "off" }), deps).diagPackets).toBe("off");
+    expect(buildLaunchedBotTask(baseSpec(), deps).diagPackets).toBeNull();
+  });
+
   it("defaults manifestDir to null when omitted by the caller (back-compat)", () => {
     const task = buildLaunchedBotTask(baseSpec(), {
       manifest: null,
@@ -317,6 +323,19 @@ describe("orchestrator.registerSshTask", () => {
     expect(captured!.videoMode).toBe("clock");
     expect(buildSshCommand(captured!.host, captured!).remoteCommand).toContain(
       "--video-mode 'clock'",
+    );
+    expect(buildSshCommand(captured!.host, captured!).remoteCommand).not.toContain(
+      "--diag-packets",
+    );
+
+    await registerSshTask({ ...spec, diagPackets: "off" }, host, {
+      registry,
+      inFlight,
+      inFlightWaiters: [],
+      spawnRemoteBot: fakeSpawnRemoteBot,
+    });
+    expect(buildSshCommand(captured!.host, captured!).remoteCommand).toContain(
+      "--diag-packets off",
     );
   });
 });

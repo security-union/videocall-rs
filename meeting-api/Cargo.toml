@@ -28,7 +28,7 @@ axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -37,9 +37,10 @@ jsonwebtoken = "9"
 argon2 = "0.5"
 regex = "1"
 rand = "0.8"
-uuid = { version = "1.6", features = ["v4", "v7"] }
+uuid = { version = "1.6", features = ["v4", "v7", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 base64 = "0.22"
+sha2 = "0.10"
 oauth2 = "4"
 url = "2"
 

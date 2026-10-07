@@ -319,6 +319,14 @@ pub async fn apply_participant_presence(
             FeedChangeReason::Joined,
         ));
     }
+    if let Some((kicked_at, kick_deny_until)) = presence.active_kick {
+        let kick = db_participants::ActiveKick {
+            user_id: report.user_id.clone(),
+            kicked_at,
+            kick_deny_until,
+        };
+        crate::kick_revocation::reassert(nats, &meeting.room_id, &[kick]).await;
+    }
 }
 
 /// After a participant departed `room_id`: broadcast MEETING_ENDED when the
@@ -383,6 +391,7 @@ pub fn spawn_presence_heartbeat_consumer_inner(
                     // UPDATE, so one slow write can't backlog the rest.
                     sub.for_each_concurrent(8, |msg| {
                         let pool = pool.clone();
+                        let nats = nats.clone();
                         async move {
                             let heartbeat =
                                 match serde_json::from_slice::<PresenceHeartbeat>(&msg.payload) {
@@ -398,6 +407,8 @@ pub fn spawn_presence_heartbeat_consumer_inner(
                             if heartbeat.room_id.is_empty()
                                 || heartbeat.room_id.len() > 256
                                 || heartbeat.sessions.len() > PRESENCE_HEARTBEAT_MAX_SESSIONS
+                                || heartbeat.unreported_user_ids.len()
+                                    > PRESENCE_HEARTBEAT_MAX_SESSIONS
                             {
                                 tracing::warn!(
                                     "Ignoring {} with invalid room_id length {} or {} sessions",
@@ -407,7 +418,13 @@ pub fn spawn_presence_heartbeat_consumer_inner(
                                 );
                                 return;
                             }
-                            apply_presence_heartbeat(&pool, &heartbeat).await;
+                            let outcome = apply_presence_heartbeat(&pool, &heartbeat).await;
+                            crate::kick_revocation::reassert(
+                                Some(&nats),
+                                &heartbeat.room_id,
+                                &outcome.active_kicks,
+                            )
+                            .await;
                         }
                     })
                     .await;
@@ -426,10 +443,24 @@ pub fn spawn_presence_heartbeat_consumer_inner(
     Some(handle)
 }
 
+/// What [`apply_presence_heartbeat`] found.
+#[derive(Debug, Default)]
+pub struct HeartbeatOutcome {
+    /// Presence leases renewed.
+    pub renewed: u64,
+    /// Users the heartbeat names, reported present or not, under a kick still
+    /// in force (#2934).
+    pub active_kicks: Vec<db_participants::ActiveKick>,
+}
+
 /// Renew the presence lease of every well-formed session in `heartbeat` via
 /// [`db_participants::record_heartbeat`] (which resolves the room itself, no
-/// separate lookup). Returns the rows renewed.
-pub async fn apply_presence_heartbeat(pool: &PgPool, heartbeat: &PresenceHeartbeat) -> u64 {
+/// separate lookup), and look up active kicks of every user it names. A
+/// heartbeat naming only unreported users renews nothing.
+pub async fn apply_presence_heartbeat(
+    pool: &PgPool,
+    heartbeat: &PresenceHeartbeat,
+) -> HeartbeatOutcome {
     // Relay session ids are u64; the column stores the same 64 bits.
     let sessions: Vec<(String, i64)> = heartbeat
         .sessions
@@ -437,14 +468,43 @@ pub async fn apply_presence_heartbeat(pool: &PgPool, heartbeat: &PresenceHeartbe
         .filter(|s| !s.user_id.is_empty() && s.user_id.len() <= 256 && s.session_id != 0)
         .map(|s| (s.user_id.clone(), s.session_id as i64))
         .collect();
-    match db_participants::record_heartbeat(pool, &heartbeat.room_id, &sessions).await {
-        Ok(renewed) => renewed,
+    let mut kick_user_ids: Vec<String> = heartbeat
+        .sessions
+        .iter()
+        .map(|s| &s.user_id)
+        .chain(&heartbeat.unreported_user_ids)
+        .filter(|u| !u.is_empty() && u.len() <= 256)
+        .cloned()
+        .collect();
+    kick_user_ids.sort_unstable();
+    kick_user_ids.dedup();
+    if heartbeat.sessions.is_empty() {
+        let active_kicks =
+            db_participants::active_kicks(pool, &heartbeat.room_id, &kick_user_ids).await;
+        return HeartbeatOutcome {
+            renewed: 0,
+            active_kicks: active_kicks.unwrap_or_else(|e| {
+                tracing::error!(
+                    "Failed to look up kicks in meeting {}: {e}",
+                    heartbeat.room_id
+                );
+                Vec::new()
+            }),
+        };
+    }
+    match db_participants::record_heartbeat(pool, &heartbeat.room_id, &sessions, &kick_user_ids)
+        .await
+    {
+        Ok((renewed, active_kicks)) => HeartbeatOutcome {
+            renewed,
+            active_kicks,
+        },
         Err(e) => {
             tracing::error!(
                 "Failed to renew presence in meeting {}: {e}",
                 heartbeat.room_id
             );
-            0
+            HeartbeatOutcome::default()
         }
     }
 }

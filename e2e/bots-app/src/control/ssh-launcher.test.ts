@@ -759,3 +759,63 @@ describe("buildSshCommand", () => {
     );
   });
 });
+
+describe("spawnRemoteBot log-line routing (#2484)", () => {
+  const FORGED = "[bot-XYZ] FORGED-BY-OPERATOR-VALUE";
+  const spec = (ssoStateFile: string) => ({
+    host: host({ forwardSsoState: true }),
+    ttl: "5m",
+    meetingURL: "u",
+    participant: "alice",
+    authBackend: "jwt" as const,
+    ssoStateFile,
+    botId: "bot-XYZ",
+  });
+  const lines = (w: { mock: { calls: unknown[][] } }): string[] =>
+    w.mock.calls.map((c) => c.map(String).join(" ")).flatMap((l) => l.split(/[\r\n]/));
+
+  it("collapses a CR/LF in the missing SSO state path, on console and in recentLog", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { fn } = stubSpawnFactory();
+      const handle = spawnRemoteBot(spec(`/nope/hcl-sso.json\n${FORGED}`), {
+        spawn: fn as unknown as typeof import("node:child_process").spawn,
+      });
+      expect(lines(warn).filter((l) => l.startsWith(FORGED))).toEqual([]);
+      expect(lines(warn).filter((l) => l.includes(FORGED))).toHaveLength(1);
+      expect(handle.recentLog.filter((l) => /[\r\n]/.test(l))).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("collapses a CR/LF in the SSO pipe failure message", () => {
+    const tmp = makeTempSsoState(Buffer.from("payload"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const noop = (): void => {};
+      const child = {
+        stdin: {
+          write: () => {
+            throw new Error(`EPIPE\n${FORGED}`);
+          },
+          end: noop,
+        },
+        stdout: { on: noop },
+        stderr: { on: noop },
+        on: noop,
+        kill: noop,
+      };
+      spawnRemoteBot(spec(tmp.path), {
+        spawn: (() => child) as unknown as typeof import("node:child_process").spawn,
+      });
+      expect(lines(warn).filter((l) => l.startsWith(FORGED))).toEqual([]);
+      expect(
+        lines(warn).filter((l) => l.includes("failed to pipe SSO state") && l.includes(FORGED)),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+      tmp.cleanup();
+    }
+  });
+});

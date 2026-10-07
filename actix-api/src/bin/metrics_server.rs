@@ -1,10 +1,11 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Result};
-use async_nats::{Client, Message};
+use async_nats::{Client, Message, Statistics};
 use futures::StreamExt;
 use protobuf::Message as PbMessage;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use tracing::{debug, error, info};
@@ -90,13 +91,16 @@ use sec_api::metrics::{
     DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS,
     ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL, ENCODER_LAYER_HEIGHT, ENCODER_LAYER_OUTPUT_FPS,
     ENCODER_LAYER_PIXELS, ENCODER_LAYER_PIXEL_RATE, ENCODER_LAYER_WIDTH, ENCODER_OUTPUT_FPS,
-    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS,
+    HEALTH_DROP_DECODE_ERROR, HEALTH_DROP_STALE, HEALTH_INGEST_DEQUEUED_TOTAL,
+    HEALTH_INGEST_NATS_RECEIVED_TOTAL, HEALTH_PACKETS_DROPPED_TOTAL, HEALTH_REPORTS_TOTAL,
     INBOUND_UNISTREAM_RESETS_TOTAL, KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL,
     MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
     NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
     NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, NON_FINITE_SAMPLES_DROPPED_TOTAL,
-    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    RECEIVED_LAYER, RELIABLE_LANE_STALL_EPISODES_TOTAL, RTT_PROBE_DROPPED_TOTAL,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL,
+    PEER_IDS_CAPPED_TOTAL, PEER_STATS_DROPPED_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER,
+    RELIABLE_LANE_STALL_EPISODES_TOTAL, RTT_PROBE_DROPPED_TOTAL,
     RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS, SCREEN_ENCODER_OUTPUT_FPS,
     SCREEN_ENCODER_STALL_EPISODES, SCREEN_KEYFRAME_REQUESTS_PER_SEC, SCREEN_SHARING_ACTIVE,
     SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS,
@@ -130,6 +134,9 @@ async fn metrics_handler(
 
     // Clean up stale sessions before processing metrics
     cleanup_stale_sessions(&session_tracker);
+    if let Some(installed) = NATS_RECEIVED_SYNC.get() {
+        sync_nats_received(&installed.stats, &installed.exported);
+    }
 
     // Do not mutate metrics here. Metrics are updated only on fresh NATS messages.
 
@@ -745,6 +752,29 @@ const UNKNOWN_LABEL: &str = "unknown";
 /// stream, ~6-8 total per packet. The headroom absorbs a reconfigured interval up
 /// to ~48s without dropping real events.
 const MAX_TIER_TRANSITIONS_PER_PACKET: usize = 64;
+
+/// Maximum `peer_stats` entries ingested from ONE health packet: ~5x
+/// `RELAY_SIZING_TARGET_PARTICIPANTS`; there is no join cap.
+const MAX_PEER_STATS_PER_PACKET: usize = 128;
+
+/// Over-cap ordering for one reporter's `peer_stats`: peers whose sender flags show
+/// media first, then a hash of (reporter, peer) so each reporter keeps a different,
+/// membership-stable subset. Never ranks by received rates.
+fn peer_selection_rank<'a>(
+    reporter_key: &str,
+    peer_id: &'a str,
+    ps: &videocall_types::protos::health_packet::PeerStats,
+) -> (bool, u64, &'a str) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (reporter_key, peer_id).hash(&mut hasher);
+    let media_less = !(ps.audio_enabled || ps.video_enabled);
+    (media_less, hasher.finish(), peer_id)
+}
+
+/// Maximum `peer_ids` (and so `PEER_CONNECTIONS_TOTAL` series) one session tracks. Only a
+/// session reap shrinks it, so a long-lived session in a room with turnover keeps every peer seen.
+const MAX_TRACKED_PEER_IDS_PER_SESSION: usize = 1024;
 
 /// Collapse a client-supplied `TierTransition` label onto its fixed taxonomy,
 /// returning [`UNKNOWN_LABEL`] for anything outside it.
@@ -1875,6 +1905,24 @@ fn process_health_packet_to_metrics_pb(
                 .set_finite(fps);
         }
 
+        // The prune, the tracking sets and the per-pair loop below must all see this
+        // same truncated set, or `to_peers` would name peers whose series were never written.
+        let peer_stats = &health_packet.peer_stats;
+        let mut ingested_peers: Vec<_> = peer_stats.iter().collect();
+        if ingested_peers.len() > MAX_PEER_STATS_PER_PACKET {
+            debug!(
+                "Truncating {} peer_stats to {} for meeting={} session={}",
+                peer_stats.len(),
+                MAX_PEER_STATS_PER_PACKET,
+                meeting_id,
+                session_id
+            );
+            PEER_STATS_DROPPED_TOTAL.inc_by((peer_stats.len() - MAX_PEER_STATS_PER_PACKET) as f64);
+            ingested_peers
+                .sort_by_cached_key(|&(id, ps)| peer_selection_rank(&session_key, id, ps));
+            ingested_peers.truncate(MAX_PEER_STATS_PER_PACKET);
+        }
+
         // Per-packet prune of departed peers (issue #1092).
         //
         // A peer that LEAVES a still-live reporter's view drops out of this
@@ -1882,7 +1930,7 @@ fn process_health_packet_to_metrics_pb(
         // earlier packets and are never re-written — so without this prune they
         // freeze at their last value in Prometheus until the WHOLE reporter
         // session is reaped (30s+). Here we diff the session's stored `to_peers`
-        // against the peers present in THIS packet and, for each peer now absent,
+        // against the peers ingested from this packet and, for each peer now absent,
         // delete its per-pair series and drop it from the session's tracking sets.
         //
         // This runs UNCONDITIONALLY (not gated on a non-empty `peer_stats`) so the
@@ -1891,11 +1939,8 @@ fn process_health_packet_to_metrics_pb(
         // never in `to_peers` (only observed peers are inserted), and the 4-label
         // reporter-level metrics are keyed without `to_peer`, so neither is touched.
         {
-            let current_peer_ids: HashSet<&str> = health_packet
-                .peer_stats
-                .keys()
-                .map(|s| s.as_str())
-                .collect();
+            let current_peer_ids: HashSet<&str> =
+                ingested_peers.iter().map(|(id, _)| id.as_str()).collect();
             let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = tracker.get_mut(&session_key) {
                 let departed = peers_to_prune(&info.to_peers, &current_peer_ids);
@@ -1936,24 +1981,29 @@ fn process_health_packet_to_metrics_pb(
             // lifetime-of-session `peer_ids` set (which drives the meeting-scoped
             // PEER_CONNECTIONS_TOTAL reap in remove_session_metrics). Per-pair series
             // are keyed only by stable ids after #1954, so there is no display-name
-            // rename to detect here anymore — just maintain the sets under one lock.
+            // rename to detect here anymore.
             {
                 let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
-                    for peer_id in health_packet.peer_stats.keys() {
-                        info.to_peers.insert(peer_id.clone());
-                        info.peer_ids.insert(peer_id.clone());
+                    for (peer_id, _) in &ingested_peers {
+                        info.to_peers.insert((*peer_id).clone());
+                        if info.peer_ids.contains(*peer_id)
+                            || info.peer_ids.len() < MAX_TRACKED_PEER_IDS_PER_SESSION
+                        {
+                            info.peer_ids.insert((*peer_id).clone());
+                            PEER_CONNECTIONS_TOTAL
+                                .with_label_values(&[meeting_id, peer_id])
+                                .set(1.0);
+                        } else {
+                            PEER_IDS_CAPPED_TOTAL.inc();
+                        }
                     }
                 }
             }
 
-            for (peer_id, peer_data) in &health_packet.peer_stats {
+            for &(peer_id, peer_data) in &ingested_peers {
                 let peer_labels: [&str; 4] = [meeting_id, session_id, reporting_user_id, peer_id];
-
-                PEER_CONNECTIONS_TOTAL
-                    .with_label_values(&[meeting_id, peer_id])
-                    .set(1.0);
 
                 PEER_CAN_LISTEN
                     .with_label_values(&peer_labels)
@@ -2434,14 +2484,49 @@ async fn nats_health_consumer(
 
     info!("Subscribed to NATS topic: health.diagnostics.>");
 
-    while let Some(message) = subscription.next().await {
+    consume_health_messages(&mut subscription, &health_store, &session_tracker).await;
+    Ok(())
+}
+
+async fn consume_health_messages<S>(
+    messages: &mut S,
+    health_store: &HealthDataStore,
+    session_tracker: &SessionTracker,
+) where
+    S: futures::Stream<Item = Message> + Unpin,
+{
+    while let Some(message) = messages.next().await {
+        HEALTH_INGEST_DEQUEUED_TOTAL.inc();
         debug!("Received health message from NATS: {}", message.subject);
-        if let Err(e) = handle_health_message(message, &health_store, &session_tracker).await {
+        if let Err(e) = handle_health_message(message, health_store, session_tracker).await {
             error!("Failed to handle health message: {}", e);
         }
     }
+}
 
-    Ok(())
+struct NatsReceivedSync {
+    stats: Arc<Statistics>,
+    exported: AtomicU64,
+}
+
+static NATS_RECEIVED_SYNC: OnceLock<NatsReceivedSync> = OnceLock::new();
+
+fn install_nats_statistics(client: &Client) {
+    let _ = NATS_RECEIVED_SYNC.set(NatsReceivedSync {
+        stats: client.statistics(),
+        exported: AtomicU64::new(0),
+    });
+}
+
+/// Adds the connection's `in_messages` growth since `exported` to
+/// `videocall_health_ingest_nats_received_total`. async-nats counts `in_messages`
+/// before its subscription-channel `try_send`.
+fn sync_nats_received(stats: &Statistics, exported: &AtomicU64) {
+    let seen = stats.in_messages.load(Ordering::Relaxed);
+    let prev = exported.fetch_max(seen, Ordering::Relaxed);
+    if seen > prev {
+        HEALTH_INGEST_NATS_RECEIVED_TOTAL.inc_by((seen - prev) as f64);
+    }
 }
 
 async fn handle_health_message(
@@ -2453,7 +2538,15 @@ async fn handle_health_message(
     debug!("Received health data from topic: {}", topic);
 
     // Parse protobuf health packet
-    let health_packet: PbHealthPacket = PbHealthPacket::parse_from_bytes(&message.payload)?;
+    let health_packet: PbHealthPacket = match PbHealthPacket::parse_from_bytes(&message.payload) {
+        Ok(packet) => packet,
+        Err(e) => {
+            HEALTH_PACKETS_DROPPED_TOTAL
+                .with_label_values(&[HEALTH_DROP_DECODE_ERROR])
+                .inc();
+            return Err(e.into());
+        }
+    };
 
     // Freshness guard: discard stale packets
     let now_ms: u128 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
@@ -2471,6 +2564,9 @@ async fn handle_health_message(
             error!("Failed to process health packet for metrics: {}", e);
         }
     } else {
+        HEALTH_PACKETS_DROPPED_TOTAL
+            .with_label_values(&[HEALTH_DROP_STALE])
+            .inc();
         debug!("Discarded stale health packet on topic {}", topic);
     }
 
@@ -2515,6 +2611,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Connect to NATS
     let nats_client = async_nats::connect(&nats_url).await?;
+    install_nats_statistics(&nats_client);
     info!("Connected to NATS successfully");
 
     // Create shared health data store
@@ -3741,6 +3838,7 @@ mod tests {
     /// all 400 entries ingest, so the distinct-series count exceeds the cap and
     /// the drop-counter assert fails.
     #[test]
+    #[serial]
     fn over_cap_tier_transitions_are_truncated_and_counted() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
         let mut hp = create_test_health_packet(
@@ -3794,6 +3892,276 @@ mod tests {
             TIER_TRANSITIONS_DROPPED_TOTAL.get() - dropped_before,
             (total - MAX_TIER_TRANSITIONS_PER_PACKET) as f64,
             "every entry past the cap must be counted as dropped"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn over_cap_peer_stats_are_truncated_and_counted() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let total = MAX_PEER_STATS_PER_PACKET + 1;
+        let peer_stats: HashMap<String, PbPeerStats> = (0..total)
+            .map(|i| create_test_peer_stats(&format!("peer_cap_2582_{i}"), true, true, 50.0, 1.0))
+            .collect();
+        let hp =
+            create_test_health_packet("s_cap_2582", "m_cap_2582", "reporter_cap_2582", peer_stats);
+        let pair_labels = [
+            ("meeting_id", "m_cap_2582"),
+            ("session_id", "s_cap_2582"),
+            ("from_peer", "reporter_cap_2582"),
+        ];
+
+        let dropped_before = PEER_STATS_DROPPED_TOTAL.get();
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        assert_eq!(
+            matching_series_count("videocall_peer_can_listen", &pair_labels),
+            MAX_PEER_STATS_PER_PACKET,
+            "exactly `cap` peers may write per-pair series from one packet, not {total}"
+        );
+        assert_eq!(
+            PEER_STATS_DROPPED_TOTAL.get() - dropped_before,
+            (total - MAX_PEER_STATS_PER_PACKET) as f64,
+            "every peer past the cap must be counted as dropped"
+        );
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.values().next().expect("session tracked").clone()
+        };
+        assert_eq!(
+            info.to_peers.len(),
+            MAX_PEER_STATS_PER_PACKET,
+            "the #1092 tracking set must hold only the ingested peers"
+        );
+
+        remove_session_metrics(&info);
+        assert_eq!(
+            matching_series_count("videocall_peer_can_listen", &pair_labels),
+            0
+        );
+    }
+
+    fn media_peer(audio: bool, video: bool) -> PbPeerStats {
+        let mut ps = PbPeerStats::new();
+        ps.audio_enabled = audio;
+        ps.video_enabled = video;
+        ps
+    }
+
+    fn ingest_and_take(
+        tracker: &SessionTracker,
+        session: &str,
+        meeting: &str,
+        peers: HashMap<String, PbPeerStats>,
+    ) -> SessionInfo {
+        let hp = create_test_health_packet(session, meeting, session, peers);
+        assert!(process_health_packet_to_metrics_pb(&hp, tracker).is_ok());
+        let key = format!("{meeting}_{session}_{session}");
+        let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&key).expect("session tracked")
+    }
+
+    #[test]
+    #[serial]
+    fn over_cap_selection_covers_every_publisher_at_200() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let m = "m_cov_2916";
+        let n = 200;
+        let ids: Vec<String> = (0..n).map(|i| format!("s_cov_2916_{i:03}")).collect();
+        let mut covered: HashSet<String> = HashSet::new();
+        for reporter in &ids {
+            let peers: HashMap<String, PbPeerStats> = ids
+                .iter()
+                .filter(|p| *p != reporter)
+                .map(|p| (p.clone(), media_peer(true, false)))
+                .collect();
+            let info = ingest_and_take(&tracker, reporter, m, peers);
+            assert_eq!(info.to_peers.len(), MAX_PEER_STATS_PER_PACKET);
+            covered.extend(info.to_peers.iter().cloned());
+            remove_session_metrics(&info);
+        }
+        let missing: Vec<&String> = ids.iter().filter(|p| !covered.contains(*p)).collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {n} publishers are never a to_peer: {missing:?}",
+            missing.len()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn over_cap_selection_keeps_every_media_peer() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let total = MAX_PEER_STATS_PER_PACKET * 2;
+        let k = 20;
+        let mut peers: HashMap<String, PbPeerStats> = (0..total)
+            .map(|i| (format!("peer_a_2916_{i:03}"), PbPeerStats::new()))
+            .collect();
+        peers.insert("peer_z_2916_audio".to_string(), media_peer(true, false));
+        peers.insert("peer_z_2916_video".to_string(), media_peer(false, true));
+        for i in 2..k {
+            peers.insert(format!("peer_z_2916_{i:03}"), media_peer(true, true));
+        }
+        let info = ingest_and_take(&tracker, "s_media_2916", "m_media_2916", peers);
+        let kept = info
+            .to_peers
+            .iter()
+            .filter(|p| p.starts_with("peer_z_"))
+            .count();
+        assert_eq!(kept, k, "every peer with sender media must be ingested");
+        assert_eq!(info.to_peers.len(), MAX_PEER_STATS_PER_PACKET);
+        remove_session_metrics(&info);
+    }
+
+    #[test]
+    #[serial]
+    fn over_cap_selection_is_stable_and_per_reporter() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let m = "m_stable_2916";
+        let peers = || -> HashMap<String, PbPeerStats> {
+            (0..MAX_PEER_STATS_PER_PACKET * 2)
+                .map(|i| (format!("peer_2916_{i:03}"), media_peer(true, true)))
+                .collect()
+        };
+        let first = ingest_and_take(&tracker, "s_stable_2916_a", m, peers());
+        remove_session_metrics(&first);
+        let again = ingest_and_take(&tracker, "s_stable_2916_a", m, peers());
+        remove_session_metrics(&again);
+        assert_eq!(first.to_peers, again.to_peers, "same input, same selection");
+
+        let other = ingest_and_take(&tracker, "s_stable_2916_b", m, peers());
+        remove_session_metrics(&other);
+        assert_ne!(
+            first.to_peers, other.to_peers,
+            "different reporters must keep different subsets"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn over_cap_media_flip_swaps_at_most_one_peer() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let (s, m) = ("s_flip_2916", "m_flip_2916");
+        let mut peers: HashMap<String, PbPeerStats> = (0..MAX_PEER_STATS_PER_PACKET * 2)
+            .map(|i| (format!("peer_flip_2916_{i:03}"), media_peer(i < 10, false)))
+            .collect();
+        let before = ingest_and_take(&tracker, s, m, peers.clone());
+        remove_session_metrics(&before);
+        let flipped = before
+            .to_peers
+            .iter()
+            .find(|p| !peers[*p].audio_enabled)
+            .expect("a selected media-less peer")
+            .clone();
+        peers.insert(flipped.clone(), media_peer(true, false));
+        let unchanged = ingest_and_take(&tracker, s, m, peers.clone());
+        remove_session_metrics(&unchanged);
+        assert_eq!(before.to_peers, unchanged.to_peers);
+
+        let victim = before
+            .to_peers
+            .iter()
+            .find(|p| peers[*p].audio_enabled && **p != flipped)
+            .expect("a selected media peer")
+            .clone();
+        peers.insert(victim, media_peer(false, false));
+        let after = ingest_and_take(&tracker, s, m, peers);
+        remove_session_metrics(&after);
+        assert!(
+            before
+                .to_peers
+                .symmetric_difference(&after.to_peers)
+                .count()
+                <= 2,
+            "one class flip may swap at most one peer"
+        );
+    }
+
+    fn tracked_session(tracker: &SessionTracker) -> SessionInfo {
+        let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().next().expect("session tracked").clone()
+    }
+
+    #[test]
+    #[serial]
+    fn over_cap_prune_follows_the_ingested_subset() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let (m, s, r) = ("m_prune_2582", "s_prune_2582", "r_prune_2582");
+        let mut peers: HashMap<String, PbPeerStats> = (0..MAX_PEER_STATS_PER_PACKET)
+            .map(|i| (format!("peer_b_2582_{i:03}"), PbPeerStats::new()))
+            .collect();
+        let hp1 = create_test_health_packet(s, m, r, peers.clone());
+        assert!(process_health_packet_to_metrics_pb(&hp1, &tracker).is_ok());
+        assert_eq!(
+            tracked_session(&tracker).to_peers.len(),
+            MAX_PEER_STATS_PER_PACKET
+        );
+
+        let before = tracked_session(&tracker).to_peers;
+        peers.insert("peer_a_2582_x".to_string(), media_peer(true, false));
+        let hp2 = create_test_health_packet(s, m, r, peers);
+        assert!(process_health_packet_to_metrics_pb(&hp2, &tracker).is_ok());
+
+        let info = tracked_session(&tracker);
+        assert_eq!(info.to_peers.len(), MAX_PEER_STATS_PER_PACKET);
+        assert!(
+            info.to_peers.contains("peer_a_2582_x"),
+            "a peer with media must displace a media-less one"
+        );
+        let cut: Vec<&String> = before.difference(&info.to_peers).collect();
+        assert_eq!(cut.len(), 1, "exactly one media-less peer must be cut");
+        let last = cut[0].clone();
+        let pair = |to: &str| {
+            matching_series_count(
+                "videocall_peer_can_listen",
+                &[
+                    ("meeting_id", m),
+                    ("session_id", s),
+                    ("from_peer", r),
+                    ("to_peer", to),
+                ],
+            )
+        };
+        assert_eq!(
+            pair(&last),
+            0,
+            "a cut peer's series must be pruned, not left frozen"
+        );
+        assert_eq!(pair("peer_a_2582_x"), 1);
+
+        remove_session_metrics(&info);
+    }
+
+    #[test]
+    #[serial]
+    fn peer_ids_are_bounded_per_session() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let (m, s, r) = ("m_ids_2582", "s_ids_2582", "r_ids_2582");
+        let packets = MAX_TRACKED_PEER_IDS_PER_SESSION.div_ceil(MAX_PEER_STATS_PER_PACKET) + 1;
+        let capped_before = PEER_IDS_CAPPED_TOTAL.get();
+        for p in 0..packets {
+            let peers: HashMap<String, PbPeerStats> = (0..MAX_PEER_STATS_PER_PACKET)
+                .map(|i| (format!("peer_ids_2582_{p}_{i}"), PbPeerStats::new()))
+                .collect();
+            let hp = create_test_health_packet(s, m, r, peers);
+            assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        }
+
+        let info = tracked_session(&tracker);
+        assert_eq!(info.peer_ids.len(), MAX_TRACKED_PEER_IDS_PER_SESSION);
+        assert_eq!(
+            PEER_IDS_CAPPED_TOTAL.get() - capped_before,
+            (packets * MAX_PEER_STATS_PER_PACKET - MAX_TRACKED_PEER_IDS_PER_SESSION) as f64
+        );
+        assert_eq!(
+            matching_series_count("videocall_peer_connections_total", &[("meeting_id", m)]),
+            MAX_TRACKED_PEER_IDS_PER_SESSION
+        );
+
+        remove_session_metrics(&info);
+        assert_eq!(
+            matching_series_count("videocall_peer_connections_total", &[("meeting_id", m)]),
+            0
         );
     }
 
@@ -7332,5 +7700,187 @@ mod tests {
             Some("text/plain; version=0.0.4"),
             "Prometheus rejects a scrape that is not text/plain"
         );
+    }
+
+    fn health_drops(reason: &str) -> f64 {
+        HEALTH_PACKETS_DROPPED_TOTAL
+            .with_label_values(&[reason])
+            .get()
+    }
+
+    async fn ingest_packet_aged(age: Duration) {
+        let mut hp = create_test_health_packet("s2920", "m2920", "alice", HashMap::new());
+        hp.timestamp_ms = (SystemTime::now() - age)
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after the epoch")
+            .as_millis() as u64;
+        let payload = hp.write_to_bytes().expect("encode health packet");
+        let message = Message {
+            subject: "health.diagnostics.test.m2920.s2920".into(),
+            reply: None,
+            length: payload.len(),
+            payload: payload.into(),
+            headers: None,
+            status: None,
+            description: None,
+        };
+        let store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        handle_health_message(message, &store, &tracker)
+            .await
+            .expect("a well-formed packet is handled");
+    }
+
+    #[tokio::test]
+    #[serial(health_drops)]
+    async fn a_packet_older_than_the_freshness_window_is_counted_as_a_stale_drop() {
+        let before = health_drops(HEALTH_DROP_STALE);
+        ingest_packet_aged(Duration::from_secs(31)).await;
+        assert_eq!(health_drops(HEALTH_DROP_STALE) - before, 1.0);
+    }
+
+    #[tokio::test]
+    #[serial(health_drops)]
+    async fn a_fresh_packet_is_not_counted_as_a_drop() {
+        let before = health_drops(HEALTH_DROP_STALE);
+        ingest_packet_aged(Duration::from_secs(1)).await;
+        assert_eq!(health_drops(HEALTH_DROP_STALE), before);
+    }
+
+    #[tokio::test]
+    #[serial(health_drops)]
+    async fn every_message_taken_off_the_subscription_is_counted_as_dequeued() {
+        let messages: Vec<Message> = (0..3)
+            .map(|_| Message {
+                subject: "health.diagnostics.test".into(),
+                reply: None,
+                length: 1,
+                payload: b"x".to_vec().into(),
+                headers: None,
+                status: None,
+                description: None,
+            })
+            .collect();
+        let mut stream = futures::stream::iter(messages);
+        let store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let before = HEALTH_INGEST_DEQUEUED_TOTAL.get();
+        consume_health_messages(&mut stream, &store, &tracker).await;
+        assert_eq!(HEALTH_INGEST_DEQUEUED_TOTAL.get() - before, 3.0);
+    }
+
+    #[test]
+    #[serial(health_drops)]
+    fn a_sync_exports_only_the_in_messages_growth_since_the_last_one() {
+        let stats = Statistics::default();
+        let exported = AtomicU64::new(0);
+        let before = HEALTH_INGEST_NATS_RECEIVED_TOTAL.get();
+        stats.in_messages.store(5, Ordering::Relaxed);
+        sync_nats_received(&stats, &exported);
+        sync_nats_received(&stats, &exported);
+        stats.in_messages.store(8, Ordering::Relaxed);
+        sync_nats_received(&stats, &exported);
+        assert_eq!(HEALTH_INGEST_NATS_RECEIVED_TOTAL.get() - before, 8.0);
+    }
+
+    #[tokio::test]
+    #[serial(health_drops)]
+    async fn an_undecodable_payload_is_counted_as_a_decode_error_drop() {
+        let before = health_drops(HEALTH_DROP_DECODE_ERROR);
+        let store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let message = Message {
+            subject: "health.diagnostics.test".into(),
+            reply: None,
+            length: 1,
+            payload: b"x".to_vec().into(),
+            headers: None,
+            status: None,
+            description: None,
+        };
+        assert!(handle_health_message(message, &store, &tracker)
+            .await
+            .is_err());
+        assert_eq!(health_drops(HEALTH_DROP_DECODE_ERROR) - before, 1.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(health_drops)]
+    #[ignore = "needs a NATS server at NATS_URL; run by `make tests_run`"]
+    async fn received_minus_dequeued_equals_the_messages_nats_dropped_on_a_full_channel() {
+        const PUBLISHED: u64 = 100_000;
+        const DEFAULT_SUBSCRIPTION_CAPACITY: u64 = 65_536;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let subject = format!("test2920.{}", uuid::Uuid::new_v4());
+        let mut sub = client
+            .queue_subscribe(format!("{subject}.>"), "test2920".to_string())
+            .await
+            .expect("subscribe");
+        for _ in 0..PUBLISHED {
+            client
+                .publish(format!("{subject}.p"), "x".into())
+                .await
+                .expect("publish");
+        }
+        client.flush().await.expect("flush");
+        let stats = client.statistics();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while stats.in_messages.load(Ordering::Relaxed) < PUBLISHED {
+            assert!(
+                Instant::now() < deadline,
+                "server did not deliver every message"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        sub.unsubscribe().await.expect("unsubscribe");
+
+        let received_before = HEALTH_INGEST_NATS_RECEIVED_TOTAL.get();
+        let dequeued_before = HEALTH_INGEST_DEQUEUED_TOTAL.get();
+        let store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        consume_health_messages(&mut sub, &store, &tracker).await;
+        sync_nats_received(&stats, &AtomicU64::new(0));
+
+        let received = HEALTH_INGEST_NATS_RECEIVED_TOTAL.get() - received_before;
+        let dequeued = HEALTH_INGEST_DEQUEUED_TOTAL.get() - dequeued_before;
+        assert_eq!(received, PUBLISHED as f64);
+        assert_eq!(dequeued, DEFAULT_SUBSCRIPTION_CAPACITY as f64);
+        assert_eq!(
+            received - dequeued,
+            (PUBLISHED - DEFAULT_SUBSCRIPTION_CAPACITY) as f64
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(health_drops)]
+    #[ignore = "needs a NATS server at NATS_URL; run by `make tests_run`"]
+    async fn a_scrape_exports_what_the_installed_connection_received() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        install_nats_statistics(&client);
+        let subject = format!("test2920.{}", uuid::Uuid::new_v4());
+        let mut sub = client.subscribe(subject.clone()).await.expect("subscribe");
+        client.publish(subject, "x".into()).await.expect("publish");
+        client.flush().await.expect("flush");
+        tokio::time::timeout(Duration::from_secs(10), sub.next())
+            .await
+            .expect("message delivered")
+            .expect("subscription open");
+
+        let store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        metrics_handler(web::Data::new(store), web::Data::new(tracker))
+            .await
+            .expect("scrape");
+
+        let installed = NATS_RECEIVED_SYNC.get().expect("statistics installed");
+        let seen = client.statistics().in_messages.load(Ordering::Relaxed);
+        assert!(seen >= 1);
+        assert_eq!(installed.exported.load(Ordering::Relaxed), seen);
     }
 }

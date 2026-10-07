@@ -335,11 +335,7 @@ test.describe("Screen-share panel decode-budget wiring (#1471)", () => {
   //
   // Fixed(2) with 3 camera-ON peers guarantees ≥1 shed (paused) SS tile.
   // ──────────────────────────────────────────────────────────────────────
-  // Issue #1530: headless Chrome with SwiftShader (software GPU) cannot reliably
-  // trigger decode-budget shedding with 3+ simultaneous camera-on peers — the
-  // software decode path is too slow to produce enough load. Re-enable once a
-  // GPU-equipped CI runner is available.
-  test.fixme("PLAY on a paused screen-share tile force-decodes that peer", async ({ baseURL }) => {
+  test("PLAY on a paused screen-share tile force-decodes that peer", async ({ baseURL }) => {
     test.setTimeout(200_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `ss_decode_budget_play_${Date.now()}`;

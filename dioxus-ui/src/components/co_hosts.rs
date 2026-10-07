@@ -1132,7 +1132,7 @@ pub fn CoHostsSection(
 
     rsx! {
         section {
-            class: "co-hosts-section",
+            class: if collapsible { "co-hosts-section co-hosts-section--collapsible" } else { "co-hosts-section" },
             "data-testid": "co-hosts-section",
             "aria-labelledby": "{heading_id}",
             // Reflects `retrying` regardless of which list-state branch is
@@ -1143,10 +1143,29 @@ pub fn CoHostsSection(
             if collapsible {
                 details { class: "co-hosts-details",
                     summary { class: "co-hosts-summary",
-                        span { id: "{heading_id}", class: "co-hosts-heading", "Co-hosts{summary_count}" }
+                        span { id: "{heading_id}", class: "co-hosts-heading", "Co-hosts" }
+                        if !summary_count.is_empty() {
+                            span { class: "co-hosts-count", "{summary_count}" }
+                        }
+                        svg {
+                            class: "co-hosts-chevron",
+                            "aria-hidden": "true",
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "16",
+                            height: "16",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            polyline { points: "6 9 12 15 18 9" }
+                        }
                     }
-                    p { class: "co-hosts-hint", "{hint_text}" }
-                    {content}
+                    div { class: "co-hosts-body",
+                        p { class: "co-hosts-hint", "{hint_text}" }
+                        {content}
+                    }
                 }
             } else {
                 if card_title {

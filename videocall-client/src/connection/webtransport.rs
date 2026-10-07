@@ -33,16 +33,28 @@ const _: () = assert!(
 // on_inbound_media
 //
 use super::connection_lost_reason::ConnectionLostReason;
+use super::connection_manager::monotonic_now_ms;
 use super::url_log::strip_query_for_log;
 use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use host_seam::WebTransportService;
 use log::debug;
 use log::info;
 use videocall_transport::inbound::{emit_packet, InboundFrame, InboundLane, MessageType};
+#[cfg(any(not(test), target_arch = "wasm32"))]
+use videocall_transport::webtransport::WebTransportService;
 use videocall_transport::webtransport::{
-    FrameDropMeta, WebTransportCloseInfo, WebTransportService, WebTransportStatus, WebTransportTask,
+    FrameDropMeta, WebTransportCloseInfo, WebTransportStatus, WebTransportTask,
 };
 use videocall_types::wt_close::WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE;
 use videocall_types::Callback;
+
+fn handshake_complete_message(redacted_url: &str, started_at_ms: f64, now_ms: f64) -> String {
+    format!(
+        "WebTransport handshake complete to {redacted_url} {:.0}ms after connect",
+        now_ms - started_at_ms
+    )
+}
 
 /// Map a server close code on an established session to a loss reason. Every
 /// other code, `0` included, keeps today's generic session-dropped path.
@@ -86,11 +98,24 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             })
         };
 
+        let redacted_url = strip_query_for_log(&options.webtransport_url);
+        let started_at_ms = monotonic_now_ms();
         let notification = {
             let connected_callback = options.on_connected.clone();
             let connection_lost_callback = options.on_connection_lost.clone();
+            let redacted_url = redacted_url.clone();
             Callback::from(move |status| match status {
-                WebTransportStatus::Opened => connected_callback.emit(()),
+                WebTransportStatus::Opened => {
+                    info!(
+                        "{}",
+                        handshake_complete_message(
+                            &redacted_url,
+                            started_at_ms,
+                            monotonic_now_ms()
+                        )
+                    );
+                    connected_callback.emit(());
+                }
                 WebTransportStatus::ClosedBeforeReady(msg) => {
                     connection_lost_callback.emit(ConnectionLostReason::HandshakeFailed(msg));
                 }
@@ -112,12 +137,14 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 }
             })
         };
-        info!(
-            "WebTransport connecting to {}",
-            strip_query_for_log(&options.webtransport_url)
-        );
-        let task = WebTransportService::connect(&options.webtransport_url, on_frame, notification)?;
-        info!("WebTransport connection success");
+        info!("WebTransport connecting to {redacted_url}");
+        let task = WebTransportService::connect(
+            &options.webtransport_url,
+            options.adopt_wt_spare_worker,
+            on_frame,
+            notification,
+        )?;
+        info!("WebTransport connect initiated; awaiting handshake");
         Ok(task)
     }
 
@@ -199,6 +226,45 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod host_seam {
+    use std::cell::{Cell, RefCell};
+    use videocall_transport::inbound::InboundFrame;
+    use videocall_transport::webtransport::{
+        WebTransportError, WebTransportStatus, WebTransportTask,
+    };
+    use videocall_types::Callback;
+
+    thread_local! {
+        static ADOPT_SPARE_WORKER: Cell<Option<bool>> = const { Cell::new(None) };
+        static NOTIFICATION: RefCell<Option<Callback<WebTransportStatus>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) struct WebTransportService;
+
+    impl WebTransportService {
+        pub(crate) fn connect(
+            _url: &str,
+            adopt_spare_worker: bool,
+            _on_frame: Callback<InboundFrame>,
+            notification: Callback<WebTransportStatus>,
+        ) -> Result<WebTransportTask, WebTransportError> {
+            ADOPT_SPARE_WORKER.with(|slot| slot.set(Some(adopt_spare_worker)));
+            NOTIFICATION.with(|slot| *slot.borrow_mut() = Some(notification));
+            Err(WebTransportError::CreationError("host test".to_string()))
+        }
+    }
+
+    pub(crate) fn take_adopt_spare_worker() -> Option<bool> {
+        ADOPT_SPARE_WORKER.with(Cell::take)
+    }
+
+    pub(crate) fn take_notification() -> Option<Callback<WebTransportStatus>> {
+        NOTIFICATION.with(|slot| slot.borrow_mut().take())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +276,69 @@ mod tests {
             code,
             reason: reason.to_string(),
         }
+    }
+
+    #[test]
+    fn handshake_complete_message_reports_whole_ms_elapsed_since_start() {
+        assert_eq!(
+            handshake_complete_message("https://relay.example/lobby", 1000.0, 1250.6),
+            "WebTransport handshake complete to https://relay.example/lobby 251ms after connect"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_opened_session_logs_the_handshake_once_without_the_token() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let connected = Rc::new(Cell::new(0));
+        let options = ConnectOptions {
+            websocket_url: String::new(),
+            webtransport_url: "https://relay.example/lobby?token=eyJSECRET&instance_id=x&ds=1"
+                .to_string(),
+            on_inbound_media: Callback::from(|_| ()),
+            on_connected: {
+                let connected = connected.clone();
+                Callback::from(move |()| connected.set(connected.get() + 1))
+            },
+            on_connection_lost: Callback::from(|_| ()),
+            peer_monitor: Callback::from(|()| ()),
+            adopt_wt_spare_worker: false,
+        };
+        let _ = host_seam::take_notification();
+
+        let lines = super::super::log_capture::capture_logs(
+            "videocall_client::connection::webtransport",
+            || {
+                assert!(WebTransportTask::connect(options).is_err());
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                host_seam::take_notification()
+                    .expect("connect hands the notification callback to the service")
+                    .emit(WebTransportStatus::Opened);
+            },
+        );
+
+        assert_eq!(connected.get(), 1, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|(_, l)| !l.contains("token=") && !l.contains("eyJSECRET")),
+            "{lines:?}"
+        );
+        let prefix = "WebTransport handshake complete to https://relay.example/lobby ";
+        let handshakes: Vec<_> = lines
+            .iter()
+            .filter(|(_, l)| l.starts_with("WebTransport handshake complete"))
+            .collect();
+        assert_eq!(handshakes.len(), 1, "{lines:?}");
+        assert_eq!(handshakes[0].0, log::Level::Info);
+        let elapsed = handshakes[0]
+            .1
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix("ms after connect"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(elapsed.parse::<u64>().is_ok_and(|ms| ms >= 20), "{lines:?}");
     }
 
     #[test]

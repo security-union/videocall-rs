@@ -15,6 +15,8 @@ metadata:
     # so it is safe to carry in the shared template.
     grafana_dashboard: "1"
 data:
+  call-quality.json: |-
+    {{ .Files.Get "dashboards/call-quality.json" | nindent 4 }}
   client-stability.json: |-
     {{ .Files.Get "dashboards/client-stability.json" | nindent 4 }}
   meeting-investigation.json: |-

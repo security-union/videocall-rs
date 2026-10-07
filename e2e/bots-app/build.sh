@@ -3,9 +3,8 @@
 # build.sh — build + tag the bots-app image for the Harbor registry (#2035/#2072).
 #
 # Authoring note: this script is provided for the orchestrator to run. It does
-# NOT push by default (set PUSH=1 to enable). The build CONTEXT is the repo
-# root (the repo-root .dockerignore keeps it lean); the Dockerfile lives at
-# e2e/bots-app/Dockerfile.
+# NOT push by default (set PUSH=1 to enable). The build CONTEXT is e2e/,
+# filtered by e2e/.dockerignore; the Dockerfile lives at e2e/bots-app/Dockerfile.
 #
 # ── Registry: Harbor `hclcr.io/hcllabs` (same as all videocall images) ───────
 # Pushes go to hclcr.io/hcllabs/videocall-bots-app. Auth = the same Harbor
@@ -28,6 +27,7 @@ trap 'exit 130' INT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
+CONTEXT="${REPO_ROOT}/e2e"
 
 # ── Configurable inputs (override via env) ──────────────────────────────────
 REGISTRY="${REGISTRY:-hclcr.io}"
@@ -40,7 +40,6 @@ TAG="${TAG:-${VERSION}-${DATE}-${GIT_SHA}}"
 # Locked to prepull-image.sh's DRIFT_PATHS by image-pin-drift.test.ts.
 REVISION_PATHS=(
   e2e
-  .dockerignore
   ':(exclude)e2e/bots-app/k8s'
   ':(exclude)e2e/bots-app/dashboard'
   ':(exclude)e2e/tests'
@@ -87,7 +86,7 @@ else
 fi
 
 echo "==> Building ${IMAGE_TAGGED}"
-echo "    context:    ${REPO_ROOT}"
+echo "    context:    ${CONTEXT}"
 echo "    dockerfile: ${DOCKERFILE}"
 echo "    builder:    ${BUILD[*]}"
 echo "    revision:   ${GIT_REVISION}"
@@ -107,7 +106,7 @@ fi
   --build-arg "GIT_SHA=${GIT_REVISION}" \
   "${TAGS[@]}" \
   -f "${DOCKERFILE}" \
-  "${REPO_ROOT}"
+  "${CONTEXT}"
 
 echo "==> Built and tagged:"
 echo "    ${IMAGE_TAGGED}"

@@ -1547,7 +1547,9 @@ impl<T> JitterBuffer<T> {
 
             if let Some(key) = next_decodable_key {
                 if let Some(frame) = self.buffered_frames.get(&key) {
-                    let time_in_buffer_ms = (current_time_ms - frame.arrival_time_ms) as f64;
+                    let time_in_buffer_ms = current_time_ms
+                        .checked_sub(frame.arrival_time_ms)
+                        .map_or(f64::INFINITY, |d| d as f64);
 
                     let is_ready = time_in_buffer_ms >= self.target_playout_delay_ms;
                     log::trace!(
@@ -2757,6 +2759,82 @@ mod tests {
     }
 
     #[test]
+    fn backward_clock_step_between_inserts_keeps_playout_delay_low() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 990);
+        let mut arrival = 990u128;
+        for seq in 3..=22 {
+            arrival += 33;
+            jb.insert_frame(create_test_frame(seq, FrameType::DeltaFrame), arrival);
+        }
+        jb.find_and_move_continuous_frames(arrival + 100);
+
+        let seqs: Vec<u64> = decoded_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.sequence_number)
+            .collect();
+        assert!(
+            jb.get_target_playout_delay_ms() < 50.0,
+            "target playout delay {}",
+            jb.get_target_playout_delay_ms()
+        );
+        assert!(
+            jb.get_jitter_estimate_ms() < 100.0,
+            "jitter {}",
+            jb.get_jitter_estimate_ms()
+        );
+        assert_eq!(seqs, (1..=22).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn tick_clock_earlier_than_buffered_arrival_releases_promptly() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        assert!(
+            decoded_frames.lock().unwrap().is_empty(),
+            "setup: 0ms in buffer is below the minimum playout delay"
+        );
+
+        jb.find_and_move_continuous_frames(995);
+        let seqs: Vec<u64> = decoded_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.sequence_number)
+            .collect();
+        assert_eq!(seqs, vec![1]);
+    }
+
+    #[test]
+    fn one_second_backward_clock_step_releases_at_the_stepped_clock() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let decoded = || -> Vec<u64> {
+            decoded_frames
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|f| f.sequence_number)
+                .collect()
+        };
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 10_000);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 10_060);
+        assert_eq!(decoded(), vec![1], "setup: video frame 2 is buffered");
+
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), 9_070);
+        assert_eq!(
+            decoded(),
+            vec![1, 2],
+            "video frame 2 must not wait for the clock to catch up"
+        );
+
+        jb.find_and_move_continuous_frames(9_090);
+        assert_eq!(decoded(), vec![1, 2, 3]);
+    }
+
+    #[test]
     fn insert_out_of_order() {
         let (mut jb, decoded_frames) = create_test_jitter_buffer();
         let mut time = 1000;
@@ -3606,10 +3684,9 @@ mod tests {
         // evicts exactly one head delta (keyframe-less branch drops only the head); the next delta
         // then becomes the head with the same old arrival, so it too is instantly stale on the next
         // poll. last_decoded stays at 1 the whole stall (nothing is released), so every poll is
-        // *eligible* to fire — gated only by the backoff interval. Inserting all at one arrival
-        // keeps the jitter estimator's inter-arrival delta non-negative (it underflows on
-        // backwards-moving arrival times). Each poll below evicts one head delta, so the backlog
-        // must be at least as large as the total number of polls (12 here); 2..=24 is generous.
+        // *eligible* to fire — gated only by the backoff interval. Each poll below evicts one head
+        // delta, so the backlog must be at least as large as the total number of polls (12 here);
+        // 2..=24 is generous.
         for s in 2u64..=24 {
             jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
         }
@@ -4730,9 +4807,7 @@ mod tests {
         assert_eq!(jb.governor_skip_count(), 0, "no skips before the window");
 
         // Poll the head age band [1350, 1740) — always >= GOVERNOR_ENGAGE_MS (1300) via the span,
-        // always < MAX_PLAYOUT_AGE_MS (1800) so the deadline never fires. The keyframe arrived at
-        // head_arrival + 1300 = 1400 <= the first poll time (1450), so the release gate's
-        // arrival-subtraction can never underflow.
+        // always < MAX_PLAYOUT_AGE_MS (1800) so the deadline never fires.
         let mut now = head_arrival + 1350; // 1450
         for _ in 0..GOVERNOR_SUSTAIN_TICKS {
             // Latency total must sit at the engage threshold throughout the sustain window.

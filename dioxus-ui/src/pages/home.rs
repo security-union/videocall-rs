@@ -20,7 +20,7 @@ use crate::auth::{
     check_session, clear_access_token, clear_id_token, clear_refresh_token, clear_user_profile,
     get_stored_id_token, get_user_profile, UserProfile,
 };
-use crate::components::about_modal::AboutModal;
+use crate::components::about_modal::{AboutModal, ABOUT_TRIGGER_ID};
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::hero_orbs::HeroOrbs;
 use crate::components::login::{do_login, ProviderButton};
@@ -832,6 +832,7 @@ pub fn Home() -> Element {
                 div { class: "about-footer",
                     button {
                         r#type: "button",
+                        id: ABOUT_TRIGGER_ID,
                         class: "about-footer-link",
                         "data-testid": "about-footer-link",
                         "aria-label": "Show app version and About details",

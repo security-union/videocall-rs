@@ -5,10 +5,12 @@ Dockerfile*
 result
 result-*
 .git
-# bots-app image (#2035): never bake captured auth storage-state / run
-# artifacts into the anonymous-pull shared-registry image. `run/auth/*.json`
-# holds real OAuth session cookies from `bots-app login`/`sso-login`.
 e2e/bots-app/run
-# build.sh mktemps a registry authfile; keep it out even if TMPDIR is in-tree.
 **/auth.json
 **/tmp.*
+# Rust bot (#2918): configs can carry jwt_secret; conversation/voices/assets are
+# generated media that is mounted at run time, never baked.
+bot/config*.yaml
+bot/conversation/
+bot/voices/
+bot/assets/

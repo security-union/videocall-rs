@@ -1749,25 +1749,36 @@ async fn host_role_changes_are_reported_only_when_they_happen() {
         "re-granting a present host is not a host change"
     );
 
-    assert_eq!(
-        db_participants::kick(&pool, pk, OWNER, ATTENDEE)
-            .await
-            .expect("kick"),
-        db_participants::KickOutcome::Kicked { was_host: false },
+    assert!(
+        matches!(
+            db_participants::kick(&pool, pk, OWNER, ATTENDEE)
+                .await
+                .expect("kick"),
+            db_participants::KickOutcome::Kicked {
+                was_host: false,
+                ..
+            }
+        ),
         "kicking a non-host is not a host change"
     );
+    let db_participants::KickOutcome::Kicked {
+        was_host: true,
+        kicked_at,
+        deny_until,
+    } = db_participants::kick(&pool, pk, OWNER, CO)
+        .await
+        .expect("kick")
+    else {
+        panic!("kicking a host is a host change");
+    };
     assert_eq!(
         db_participants::kick(&pool, pk, OWNER, CO)
             .await
             .expect("kick"),
-        db_participants::KickOutcome::Kicked { was_host: true },
-        "kicking a host is a host change"
-    );
-    assert_eq!(
-        db_participants::kick(&pool, pk, OWNER, CO)
-            .await
-            .expect("kick"),
-        db_participants::KickOutcome::NotAdmitted,
+        db_participants::KickOutcome::AlreadyKicked {
+            kicked_at,
+            deny_until,
+        },
         "a second kick changes nothing"
     );
 

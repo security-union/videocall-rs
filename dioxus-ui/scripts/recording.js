@@ -30,6 +30,14 @@
   /** Timeslice in milliseconds — MediaRecorder flushes a chunk this often. */
   var CHUNK_MS = 3000;
 
+  /** Fail if MediaRecorder has not fired onstart this long after recorder.start(). */
+  var ACTIVATE_TIMEOUT_MS = 5000;
+  /** Run the save path ourselves if onstop has not fired this long after stop(). */
+  var STOP_TIMEOUT_MS = 10000;
+
+  /** Delay before re-trying a recorder getUserMedia that failed with NotReadableError (device busy). */
+  var MIC_RETRY_MS = 2000;
+
   /**
    * Hard ceiling (bytes) on the in-memory fallback path (`_chunks`), used when
    * `_writer` (streaming-to-disk via the File System Access API) is
@@ -131,7 +139,14 @@
   }
   var _offCanvas = null;
   var _offCtx = null;
-  var _state = "idle"; // idle | activating | recording | stopping
+  var _state = "idle"; // idle | activating | recording | failed | stopping | saving | saved
+  var _attempt = 0;
+  /** Releases the current attempt's capture resources, without saving. */
+  var _discard = null;
+  /** The current attempt's onstop handler. */
+  var _finish = null;
+  var _activateTimer = null;
+  var _stopTimer = null;
   var _onStateChange = null;
   var _visibHandler = null;
   var _recorderPaused = false;
@@ -189,7 +204,7 @@
   /**
    * Cache of measured text widths keyed by "font\ntext", shared by the per-tile
    * text draws (see measureTextWidthCached). Lazy-initialised on first use and
-   * reset in stop() so a new recording (with a possibly different participant
+   * reset by resetRenderState() so a new recording (with a possibly different participant
    * set) starts clean.
    */
   var _textWidthCache = null;
@@ -246,6 +261,10 @@
   var _masterGainRef = null;
   /** MediaStreamSourceNode for the local microphone (null when not acquired). */
   var _micSource = null;
+  /** The recorder's own getUserMedia stream; held only while the local mic is unmuted. */
+  var _micStream = null;
+  var _micGen = 0;
+  var _micPending = null;
   /** MediaStreamAudioDestinationNode mixer destination (kept for dynamic mic connect). */
   var _mixDest = null;
   /** Tracks the previous mic-active state to avoid redundant connect/disconnect calls. */
@@ -271,6 +290,78 @@
       } catch (e) {
         console.error("[recording] onStateChange threw:", e);
       }
+    }
+  }
+
+  function resetRenderState() {
+    _peerIds = [];
+    _localUserName = "";
+    _localIsHost = false;
+    _bgImageAttempted = false;
+    _bgImage = null;
+    _textWidthCache = null;
+    _peerAudioActivatedAt = {};
+    _peerVideoActivatedAt = {};
+    _prevPeerMicMuted = {};
+    _prevSceneKey = null;
+    _lastFrameMs = 0;
+  }
+
+  function endAttempt() {
+    _attempt++;
+    clearTimeout(_activateTimer);
+    clearTimeout(_stopTimer);
+    _activateTimer = null;
+    _stopTimer = null;
+    var discard = _discard;
+    _discard = null;
+    _finish = null;
+    return discard;
+  }
+
+  /** Abandon the current attempt before anything was recorded. */
+  function abandon(failed) {
+    var discard = endAttempt();
+    if (discard) discard();
+    if (failed) setState("failed");
+    setState("idle");
+  }
+
+  function forceClose(reason) {
+    console.error("[recording] " + reason);
+    var finish = _finish;
+    if (_recorder) {
+      _recorder.ondataavailable = null;
+      _recorder.onerror = null;
+      _recorder.onstop = null;
+      try {
+        if (_recorder.state !== "inactive") _recorder.stop();
+      } catch (_) {}
+      _recorder.stream.getTracks().forEach(function (t) {
+        t.stop();
+      });
+    }
+    setState("failed");
+    finish();
+  }
+
+  function stopRecorder() {
+    setState("stopping");
+    stopRafLoop();
+    _stopTimer = setTimeout(function () {
+      forceClose("onstop did not fire within " + STOP_TIMEOUT_MS + " ms");
+    }, STOP_TIMEOUT_MS);
+    // After a fatal error the recorder is already inactive with its stop event queued.
+    if (!_recorder || _recorder.state === "inactive") return;
+    try {
+      // Explicitly request any data buffered since the last timeslice so
+      // the final partial chunk is delivered to ondataavailable before stop()
+      // fires onstop.  Some browsers do not reliably fire a final
+      // ondataavailable on stop() alone when a timeslice is used.
+      _recorder.requestData();
+      _recorder.stop();
+    } catch (e) {
+      forceClose("recorder.stop() failed: " + e);
     }
   }
 
@@ -1640,27 +1731,86 @@
    * The controls bar and REC indicator are drawn last (always on top).
    */
   /**
-   * Dynamically connect or disconnect the local microphone source from the
-   * audio mixer based on the current state of the mic button in the DOM.
-   * Called on every animation frame so mic mute/unmute during recording is
-   * reflected in the audio output with ≤1 frame latency (~33 ms at 30 fps).
+   * Acquire or release the recorder's microphone to follow the DOM mic button.
+   * Called on every frame tick.
    */
   function updateMicConnection() {
-    if (!_micSource || !_mixDest) return;
-    var firstBtn = document.querySelector(
-      ".video-controls-container .video-control-button",
+    if (!_mixDest) return;
+    var micBtn = document.querySelector(
+      '.video-controls-container .action-bar-slot-wrapper[data-slot="mic"] > button.video-control-button',
     );
-    var micOn = !!(firstBtn && firstBtn.classList.contains("active"));
+    var micOn = !!(micBtn && micBtn.classList.contains("active"));
     if (micOn === _prevMicOn) return;
     _prevMicOn = micOn;
-    try {
-      if (micOn) {
-        _micSource.connect(_mixDest);
-      } else {
-        _micSource.disconnect(_mixDest);
-      }
-    } catch (_e) {
-      // Ignore: already connected / already disconnected.
+    if (micOn) {
+      acquireMic();
+    } else {
+      releaseMic();
+    }
+  }
+
+  function stopTracks(stream) {
+    stream.getTracks().forEach(function (t) {
+      t.stop();
+    });
+  }
+
+  // AEC/NS/AGC are off so the WebAudio mixer is the sole authority on what
+  // reaches the recording. Connected to mixDest directly, not via master_gain,
+  // to avoid speaker bleed.
+  function acquireMic() {
+    var md = navigator.mediaDevices;
+    if (!md || !md.getUserMedia) return;
+    var gen = ++_micGen;
+    _micPending = md
+      .getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+        video: false,
+      })
+      .then(function (stream) {
+        if (gen !== _micGen || !_mixDest) {
+          stopTracks(stream);
+          return;
+        }
+        try {
+          _micSource = _audioMixerCtx.createMediaStreamSource(stream);
+          _micSource.connect(_mixDest);
+          _micStream = stream;
+        } catch (e) {
+          _micSource = null;
+          stopTracks(stream);
+          console.warn("[recording] Could not mix microphone:", e.message || e);
+        }
+      })
+      .catch(function (e) {
+        console.warn("[recording] Could not get microphone:", e.message || e);
+        if (e && e.name === "NotReadableError") {
+          setTimeout(function () {
+            if (gen === _micGen) _prevMicOn = null;
+          }, MIC_RETRY_MS);
+        }
+      })
+      .then(function () {
+        if (gen === _micGen) _micPending = null;
+      });
+  }
+
+  function releaseMic() {
+    _micGen++;
+    _micPending = null;
+    if (_micSource) {
+      try {
+        _micSource.disconnect();
+      } catch (_) {}
+      _micSource = null;
+    }
+    if (_micStream) {
+      stopTracks(_micStream);
+      _micStream = null;
     }
   }
 
@@ -2611,9 +2761,7 @@
    * video timeline stays aligned with real time regardless of tab visibility.
    */
   function frameTick() {
-    // Run during both activating (captureStream started, recorder not yet
-    // started) and recording states.
-    if (_state !== "recording" && _state !== "activating") return;
+    if (_state !== "recording") return;
 
     var now = performance.now();
     var elapsed = now - _lastFrameMs;
@@ -2634,7 +2782,7 @@
     // get a frame into the video track.  This guarantees one frame per tick
     // regardless of whether drawFrame() drew anything new, preventing gaps in
     // the recording during static meeting moments.
-    if (_state === "recording" && _videoTrack) {
+    if (_videoTrack) {
       try {
         _videoTrack.requestFrame();
       } catch (_) {}
@@ -2726,9 +2874,15 @@
       localUserName,
       isLocalUserHost,
     ) {
+      // "saved" is post-capture and shows as Idle, so a Record click can land in it.
+      if (_state === "saved") _state = "idle";
       if (_state !== "idle") {
         console.warn("[recording] start() called while state=" + _state);
         return;
+      }
+      var attempt = ++_attempt;
+      function abandoned() {
+        return attempt !== _attempt;
       }
 
       _peerIds = Array.isArray(peerSessionIds) ? peerSessionIds : [];
@@ -2757,6 +2911,9 @@
         console.error(
           "[recording] No supported MIME type found for MediaRecorder",
         );
+        // Let the caller's STARTED go out before this STOPPED.
+        await null;
+        setState("failed");
         setState("idle");
         return;
       }
@@ -2770,7 +2927,7 @@
       //
       // Audio graph:
       //   peer_gain (per remote peer) → master_gain ─┐
-      //   local mic (getUserMedia, below) ────────────┼→ mixDest → audio track
+      //   local mic (acquireMic) ─────────────────────┼→ mixDest → audio track
       //   screen-share audio (updateScreenShareAudio) ┘
       var sharedAudioCtx =
         typeof window.__vcSharedAudioCtx !== "undefined"
@@ -2795,7 +2952,51 @@
           (AudioCtx ? new AudioCtx({ sampleRate: 48000 }) : null);
       }
       var mixedTrack = null;
-      var micStream = null;
+      _discard = function () {
+        stopRafLoop();
+        if (_recorder) {
+          _recorder.ondataavailable = null;
+          _recorder.onstart = null;
+          _recorder.onerror = null;
+          _recorder.onstop = null;
+          try {
+            if (_recorder.state !== "inactive") _recorder.stop();
+          } catch (_) {}
+          _recorder = null;
+        }
+        _videoTrack = null;
+        _offCanvas = null;
+        _offCtx = null;
+        resetRenderState();
+        if (_writer) {
+          _writer.abort().catch(function () {});
+          _writer = null;
+        }
+        _writeChain = Promise.resolve();
+        _chunks = [];
+        _fileHandle = null;
+        releaseMic();
+        if (_masterGainRef && _mixDest) {
+          try {
+            _masterGainRef.disconnect(_mixDest);
+          } catch (_) {}
+        }
+        _masterGainRef = null;
+        if (_audioMixerCtx && _audioMixerCtx !== sharedAudioCtx) {
+          _audioMixerCtx.close().catch(function () {});
+        }
+        _audioMixerCtx = null;
+        _mixDest = null;
+        _prevMicOn = null;
+        if (_ssAudioSource) {
+          try {
+            _ssAudioSource.disconnect();
+          } catch (_) {}
+          _ssAudioSource = null;
+        }
+        _prevSsObject = null;
+        _e2eeKey = null;
+      };
 
       if (_audioMixerCtx) {
         var mixDest = _audioMixerCtx.createMediaStreamDestination();
@@ -2834,8 +3035,9 @@
       // into a standard playable file on save. No separate key file is produced.
       _e2eeKey = null;
       if (window.crypto && window.crypto.subtle) {
+        var key = null;
         try {
-          _e2eeKey = await window.crypto.subtle.generateKey(
+          key = await window.crypto.subtle.generateKey(
             { name: "AES-GCM", length: 256 },
             false /* non-extractable — key stays in browser KeyStore */,
             ["encrypt", "decrypt"],
@@ -2845,8 +3047,9 @@
             "[recording] E2EE key generation failed, recording unencrypted:",
             e,
           );
-          _e2eeKey = null;
         }
+        if (abandoned()) return;
+        _e2eeKey = key;
       }
 
       // ── File picker (second await) ────────────────────────────────────────
@@ -2861,7 +3064,7 @@
         var ext = fileExtension(_mimeType);
         var ts = new Date().toISOString().replace(/[:.]/g, "-");
         try {
-          _fileHandle = await window.showSaveFilePicker({
+          var handle = await window.showSaveFilePicker({
             suggestedName: "meeting-recording-" + ts + "." + ext,
             types: [
               {
@@ -2870,11 +3073,19 @@
               },
             ],
           });
+          if (abandoned()) return;
+          _fileHandle = handle;
           // Open the writable stream now, inside the user-gesture frame, so
           // ondataavailable can call _writer.write() without any further prompts.
           try {
-            _writer = await _fileHandle.createWritable();
+            var writer = await handle.createWritable();
+            if (abandoned()) {
+              writer.abort().catch(function () {});
+              return;
+            }
+            _writer = writer;
           } catch (we) {
+            if (abandoned()) return;
             console.warn(
               "[recording] createWritable() failed, falling back to in-memory:",
               we,
@@ -2883,21 +3094,10 @@
             _writer = null;
           }
         } catch (e) {
+          if (abandoned()) return;
           if (e.name === "AbortError") {
-            // User cancelled the picker — abort recording and clean up audio.
-            if (_masterGainRef && _mixDest) {
-              try {
-                _masterGainRef.disconnect(_mixDest);
-              } catch (_) {}
-            }
-            _masterGainRef = null;
-            if (_audioMixerCtx && _audioMixerCtx !== sharedAudioCtx) {
-              _audioMixerCtx.close().catch(function () {});
-            }
-            _audioMixerCtx = null;
-            _mixDest = null;
-            _e2eeKey = null;
-            setState("idle");
+            // User cancelled the picker.
+            abandon(false);
             return;
           }
           // Other errors (e.g. security restrictions): fall back to auto-download.
@@ -2925,82 +3125,21 @@
       // Chrome's automatic capture silently skips frames when canvas pixels
       // have not changed since the previous capture, causing the recorded video
       // to be shorter than the actual meeting duration during static periods.
-      //
-      // The draw loop is started IMMEDIATELY after captureStream so that
-      // every new peer join, camera-on event, or screen-share change is
-      // composited into the next captured frame without waiting for the
-      // MediaRecorder to fire its onstart callback.  We use setInterval (not
-      // rAF) so the tick keeps firing at real time while the tab is in the
-      // background — see the comment on frameTick() for the full rationale.
       var videoStream;
       try {
         videoStream = _offCanvas.captureStream(0);
         _videoTrack = videoStream.getVideoTracks()[0] || null;
-        // Start continuous draw loop immediately — runs in "activating" state
-        // so the canvas is refreshed every frame even before the recorder fires.
-        // setInterval fires slightly faster than FRAME_INTERVAL_MS so the
-        // drift-corrected `elapsed >= FRAME_INTERVAL_MS - 1` gate in frameTick
-        // reliably catches every intended frame boundary.
-        if (_animFrameId === null) {
-          _lastFrameMs = performance.now();
-          _animFrameId = setInterval(
-            frameTick,
-            Math.max(1, FRAME_INTERVAL_MS - 4),
-          );
-        }
       } catch (e) {
         console.error("[recording] captureStream() failed:", e);
-        if (_writer) {
-          _writer.abort().catch(function () {});
-          _writer = null;
-        }
-        _writeChain = Promise.resolve();
-        if (_masterGainRef && _mixDest) {
-          try {
-            _masterGainRef.disconnect(_mixDest);
-          } catch (_) {}
-        }
-        _masterGainRef = null;
-        if (_audioMixerCtx && _audioMixerCtx !== sharedAudioCtx) {
-          _audioMixerCtx.close().catch(function () {});
-        }
-        _audioMixerCtx = null;
-        _mixDest = null;
-        _e2eeKey = null;
-        setState("idle");
+        abandon(false);
         return;
       }
 
       // ── Local mic (third await) ───────────────────────────────────────────
-      // Acquired here and connected directly to mixDest (NOT through
-      // master_gain) to avoid speaker bleed.  AEC/NS/AGC are disabled so the
-      // WebAudio mixer is the sole authority on what reaches the recording.
+      // The initial drawFrame() above already ran updateMicConnection().
       if (_audioMixerCtx) {
-        try {
-          if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-            micStream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false,
-              },
-              video: false,
-            });
-            _micSource = _audioMixerCtx.createMediaStreamSource(micStream);
-            var firstBtn = document.querySelector(
-              ".video-controls-container .video-control-button",
-            );
-            var localMicActive = !!(
-              firstBtn && firstBtn.classList.contains("active")
-            );
-            if (localMicActive) {
-              _micSource.connect(mixDest);
-            }
-            _prevMicOn = localMicActive;
-          }
-        } catch (e) {
-          console.warn("[recording] Could not get microphone:", e.message || e);
-        }
+        if (_micPending) await _micPending;
+        if (abandoned()) return;
 
         var mixedTracks = mixDest.stream.getAudioTracks();
         if (mixedTracks.length) mixedTrack = mixedTracks[0];
@@ -3031,45 +3170,7 @@
         _recorder = new MediaRecorder(compositeStream, options);
       } catch (e) {
         console.error("[recording] MediaRecorder constructor failed:", e);
-        stopRafLoop();
-        _videoTrack = null;
-        if (_writer) {
-          _writer.abort().catch(function () {});
-          _writer = null;
-        }
-        _writeChain = Promise.resolve();
-        if (_micSource) {
-          try {
-            _micSource.disconnect();
-          } catch (_) {}
-          _micSource = null;
-        }
-        if (_masterGainRef && _mixDest) {
-          try {
-            _masterGainRef.disconnect(_mixDest);
-          } catch (_) {}
-        }
-        _masterGainRef = null;
-        if (_audioMixerCtx && _audioMixerCtx !== sharedAudioCtx) {
-          _audioMixerCtx.close().catch(function () {});
-        }
-        _audioMixerCtx = null;
-        _mixDest = null;
-        _prevMicOn = null;
-        if (_ssAudioSource) {
-          try {
-            _ssAudioSource.disconnect();
-          } catch (_) {}
-          _ssAudioSource = null;
-        }
-        _prevSsObject = null;
-        if (micStream) {
-          micStream.getTracks().forEach(function (t) {
-            t.stop();
-          });
-        }
-        _e2eeKey = null;
-        setState("idle");
+        abandon(false);
         return;
       }
 
@@ -3080,9 +3181,10 @@
           // accumulates in RAM.  Writes are serialised through _writeChain
           // because the FileSystemWritableFileStream is not concurrency-safe.
           var chunk = e.data;
+          var writer = _writer;
           _writeChain = _writeChain
             .then(function () {
-              return _writer.write(chunk);
+              return writer.write(chunk);
             })
             .catch(function (err) {
               console.error("[recording] Incremental write failed:", err);
@@ -3131,16 +3233,34 @@
       };
 
       _recorder.onstart = function () {
+        clearTimeout(_activateTimer);
+        _activateTimer = null;
         setState("recording");
         _recorderPaused = false;
-        // rAF loop is already running (started right after captureStream).
+        // setInterval fires slightly faster than FRAME_INTERVAL_MS so the
+        // drift-corrected `elapsed >= FRAME_INTERVAL_MS - 1` gate in frameTick
+        // reliably catches every intended frame boundary.
+        if (_animFrameId === null) {
+          _lastFrameMs = performance.now();
+          _animFrameId = setInterval(
+            frameTick,
+            Math.max(1, FRAME_INTERVAL_MS - 4),
+          );
+        }
       };
 
       _recorder.onerror = function (e) {
         console.error("[recording] MediaRecorder error:", e);
+        if (_state === "activating") {
+          abandon(true);
+        } else if (_state === "recording") {
+          setState("failed");
+          stopRecorder();
+        }
       };
 
-      _recorder.onstop = function () {
+      _finish = _recorder.onstop = function () {
+        endAttempt();
         stopRafLoop();
         setState("saving");
 
@@ -3161,21 +3281,7 @@
         _offCanvas = null;
         _offCtx = null;
         _videoTrack = null;
-        _peerIds = [];
-        _localUserName = "";
-        _localIsHost = false;
-        // Allow bg-image to be re-read next recording (theme may have changed).
-        _bgImageAttempted = false;
-        _bgImage = null;
-        // Drop cached text widths so the next recording (possibly a different
-        // participant set) starts with a clean, bounded cache.
-        _textWidthCache = null;
-        // Reset A/V sync and scene-change tracking so the next recording starts clean.
-        _peerAudioActivatedAt = {};
-        _peerVideoActivatedAt = {};
-        _prevPeerMicMuted = {};
-        _prevSceneKey = null;
-        _lastFrameMs = 0;
+        resetRenderState();
         // Disconnect master_gain from mixDest to avoid a dangling connection
         // inside the SharedAudioContext.
         if (_masterGainRef && _mixDest) {
@@ -3190,13 +3296,7 @@
           _audioMixerCtx.close().catch(function () {});
         }
         _audioMixerCtx = null;
-        // Release the mic source node reference.
-        if (_micSource) {
-          try {
-            _micSource.disconnect();
-          } catch (_) {}
-          _micSource = null;
-        }
+        releaseMic();
         _mixDest = null;
         _prevMicOn = null;
         // Release the screen-share audio source.
@@ -3207,14 +3307,6 @@
           _ssAudioSource = null;
         }
         _prevSsObject = null;
-        // Stop the local mic stream acquired for recording so the browser
-        // removes the "microphone in use" indicator.
-        if (micStream) {
-          micStream.getTracks().forEach(function (t) {
-            t.stop();
-          });
-          micStream = null;
-        }
 
         // Remove visibility listener.
         if (_visibHandler) {
@@ -3323,35 +3415,27 @@
         _recorder.start(CHUNK_MS);
       } catch (e) {
         console.error("[recording] recorder.start() failed:", e);
-        if (_writer) {
-          _writer.abort().catch(function () {});
-          _writer = null;
-        }
-        _writeChain = Promise.resolve();
-        setState("idle");
-      }
-    },
-
-    /** Stop an in-progress recording and trigger the file download. */
-    stop: function () {
-      if (_state !== "recording") {
-        console.warn("[recording] stop() called while state=" + _state);
+        abandon(true);
         return;
       }
-      setState("stopping");
-      stopRafLoop();
-      if (_recorder && _recorder.state !== "inactive") {
-        try {
-          // Explicitly request any data buffered since the last timeslice so
-          // the final partial chunk is delivered to ondataavailable before stop()
-          // fires onstop.  Some browsers do not reliably fire a final
-          // ondataavailable on stop() alone when a timeslice is used.
-          _recorder.requestData();
-          _recorder.stop();
-        } catch (e) {
-          console.error("[recording] recorder.stop() failed:", e);
-          setState("idle");
-        }
+      _activateTimer = setTimeout(function () {
+        console.error(
+          "[recording] MediaRecorder did not start within " +
+            ACTIVATE_TIMEOUT_MS +
+            " ms",
+        );
+        abandon(true);
+      }, ACTIVATE_TIMEOUT_MS);
+    },
+
+    /** Stop a recording, or cancel one that is still activating. */
+    stop: function () {
+      if (_state === "recording") {
+        stopRecorder();
+      } else if (_state === "activating") {
+        abandon(false);
+      } else {
+        console.warn("[recording] stop() called while state=" + _state);
       }
     },
 
@@ -3407,5 +3491,13 @@
     _stopFrameLoop: stopRafLoop,
     _buildFrameParticipants: buildFrameParticipants,
     _composeTileOrder: composeTileOrder,
+  };
+
+  var startAttempt = window.__vcRecording.start;
+  window.__vcRecording.start = function () {
+    return startAttempt.apply(this, arguments).catch(function (e) {
+      console.error("[recording] start() threw:", e);
+      if (_state === "activating") abandon(true);
+    });
   };
 })();

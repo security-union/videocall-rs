@@ -4,6 +4,7 @@
 
 use crate::components::attendants::focus_trigger_or_grid;
 use crate::components::call_timer::CallTimer;
+use crate::components::changelog::WhatsNew;
 use crate::components::meeting_format::format_datetime_zoned;
 use crate::constants::{build_date_local, build_datetime_local, short_sha};
 use crate::context::MeetingTimeCtx;
@@ -70,9 +71,15 @@ fn node_contains(parent: &web_sys::Node, child: &web_sys::Node) -> bool {
     parent.contains(Some(child))
 }
 
+fn at_or_after(node: &web_sys::Node, anchor: &web_sys::Node) -> bool {
+    same_node(node, anchor)
+        || anchor.compare_document_position(node) & web_sys::Node::DOCUMENT_POSITION_FOLLOWING != 0
+}
+
 /// Wraps Tab / Shift+Tab between the first and last enabled button inside the
-/// element with id `dialog_id`. Returns `true` when it moved focus, so the
-/// caller prevents the default.
+/// element with id `dialog_id`; Tab from focused content after the last button
+/// wraps too. Returns `true` when it moved focus, so the caller prevents the
+/// default.
 pub(crate) fn trap_tab_in_dialog(dialog_id: &str, shift: bool) -> bool {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return false;
@@ -100,7 +107,7 @@ pub(crate) fn trap_tab_in_dialog(dialog_id: &str, shift: bool) -> bool {
     let inside = !same_node(&active, &dialog) && node_contains(&dialog, &active);
     let target = if shift && (same_node(&active, &first) || !inside) {
         last
-    } else if !shift && (same_node(&active, &last) || !inside) {
+    } else if !shift && (at_or_after(&active, &last) || !inside) {
         first
     } else {
         return false;
@@ -438,6 +445,7 @@ fn MeetingInfoCard(
                             }
                         }
                     }
+                    WhatsNew { id_prefix: "meeting-info" }
                 }
 
                 span { class: "visually-hidden", role: "status", "aria-live": "polite",

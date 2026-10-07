@@ -29,11 +29,11 @@ use crate::actors::priority_drop::{
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{
     ws_mailbox_capacity, CLIENT_TIMEOUT, FRAGMENT_ASSEMBLY_IDLE_TIMEOUT,
-    FRAGMENT_ASSEMBLY_MAX_LIFETIME, HEARTBEAT_INTERVAL, MAX_FRAME_SIZE,
+    FRAGMENT_ASSEMBLY_MAX_LIFETIME, HEARTBEAT_INTERVAL, KICK_CLOSE_FLUSH_DELAY, MAX_FRAME_SIZE,
     OUTBOUND_SCREEN_BYTE_BUDGET, OUTBOUND_VIDEO_BYTE_BUDGET, WS_OUTBOUND_CHANNEL_CAPACITY,
 };
 use crate::messages::server::{ActivateConnection, Packet};
-use crate::messages::session::Message;
+use crate::messages::session::{ForceClose, Message};
 use crate::metrics::{
     OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_PACKET_DROPS_TOTAL, WS_FRAGMENTED_INBOUND_TOTAL,
     WS_FRAGMENT_DISCARDED_TOTAL,
@@ -274,6 +274,12 @@ impl WsChatSession {
             outbound_bytes: QueueByteMeter::default(),
             fragment: FragmentBuffer::default(),
         }
+    }
+
+    /// Carry the room token's `iat` claim into `JoinRoom` (#2934).
+    pub fn with_token_iat(mut self, token_iat: Option<i64>) -> Self {
+        self.logic.token_iat = token_iat;
+        self
     }
 
     /// Start heartbeat check (WebSocket-specific: uses ping frames)
@@ -620,6 +626,24 @@ impl Handler<Packet> for WsChatSession {
     }
 }
 
+impl Handler<ForceClose> for WsChatSession {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ForceClose, ctx: &mut Self::Context) -> Self::Result {
+        info!(
+            "Closing WebSocket session {} in room {}: removed by host",
+            self.logic.id, self.logic.room
+        );
+        ctx.run_later(KICK_CLOSE_FLUSH_DELAY, |_act, ctx| {
+            ctx.close(Some(ws::CloseReason {
+                code: ws::CloseCode::Policy,
+                description: Some("removed by host".to_string()),
+            }));
+            ctx.stop();
+        });
+    }
+}
+
 // =============================================================================
 // Outbound Drain Stream Handler
 // =============================================================================
@@ -797,7 +821,10 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
 impl WsChatSession {
     fn join_room(&self, ctx: &mut WebsocketContext<Self>) {
-        let join_room = self.logic.addr.send(self.logic.create_join_room_message());
+        let join_room = self.logic.addr.send(
+            self.logic
+                .create_join_room_message(ctx.address().recipient()),
+        );
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
@@ -1763,5 +1790,197 @@ mod tests {
 
         println!("\n=== SESSION LIFECYCLE TEST PASSED (WebSocket) ===");
         Ok(())
+    }
+
+    const KICK_JWT_SECRET: &str = "test-secret-for-integration-tests";
+
+    /// The production token endpoint (`GET /lobby?token=`) on `port`.
+    async fn start_token_websocket_server(port: u16) {
+        std::env::set_var("JWT_SECRET", KICK_JWT_SECRET);
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat = ChatServer::new(nats_client.clone()).await.start();
+        let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
+        let state = crate::models::AppState {
+            chat,
+            nats_client,
+            tracker_sender,
+            session_manager: SessionManager::new(),
+        };
+        actix_rt::spawn(async move {
+            let _ = HttpServer::new(move || {
+                App::new()
+                    .app_data(web::Data::new(state.clone()))
+                    .service(crate::lobby::ws_connect_authenticated)
+            })
+            .bind(format!("127.0.0.1:{port}"))
+            .expect("Failed to bind server")
+            .run()
+            .await;
+        });
+    }
+
+    type WsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect_with_token(port: u16, token: &str) -> WsClient {
+        let url = format!(
+            "ws://127.0.0.1:{port}/lobby?token={}",
+            urlencoding::encode(token)
+        );
+        for _ in 0..50 {
+            if let Ok((ws, _)) = tokio_tungstenite::connect_async(&url).await {
+                return ws;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("token WebSocket server not ready");
+    }
+
+    fn room_token(user: &str, room: &str, authorized_at: i64) -> String {
+        meeting_api::token::generate_room_token_at(
+            KICK_JWT_SECRET,
+            600,
+            authorized_at,
+            user,
+            room,
+            false,
+            user,
+            false,
+            false,
+        )
+        .expect("room token")
+    }
+
+    /// Read until the connection ends, noting any PARTICIPANT_KICKED in
+    /// `saw_kick`. `Some(policy_close)` once closed, `None` if still open at
+    /// `timeout`.
+    async fn read_until_closed(
+        ws: &mut WsClient,
+        timeout: Duration,
+        saw_kick: &mut bool,
+    ) -> Option<bool> {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, ws.next()).await {
+                Err(_) => return None,
+                Ok(None) | Ok(Some(Err(_))) => return Some(false),
+                Ok(Some(Ok(Message::Close(frame)))) => {
+                    return Some(frame.is_some_and(|f| {
+                        f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+                    }));
+                }
+                Ok(Some(Ok(Message::Binary(data)))) => {
+                    let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) else {
+                        continue;
+                    };
+                    if wrapper.packet_type.enum_value() != Ok(PacketType::MEETING) {
+                        continue;
+                    }
+                    if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if meeting.event_type.enum_value()
+                            == Ok(MeetingEventType::PARTICIPANT_KICKED)
+                        {
+                            *saw_kick = true;
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+    }
+
+    /// A client that ignores the kick is still closed by the relay, its held
+    /// token is refused on replay, and a token minted after the kick (a
+    /// re-join with no waiting room) connects and stays up (#2934).
+    #[actix_rt::test]
+    #[serial]
+    async fn a_kicked_websocket_client_is_closed_and_its_held_token_refused() {
+        use videocall_meeting_types::kick::{ParticipantKickedPayload, PARTICIPANT_KICKED_SUBJECT};
+
+        let port = 18934;
+        start_token_websocket_server(port).await;
+        let now = chrono::Utc::now().timestamp();
+        let room = format!("ws-kick-2934-{now}");
+        let held = room_token("kicked@test.com", &room, now - 10);
+
+        let mut kicked = connect_with_token(port, &held).await;
+        wait_for_meeting_started(&mut kicked, Duration::from_secs(5))
+            .await
+            .expect("kicked client joins");
+        let mut bystander =
+            connect_with_token(port, &room_token("stays@test.com", &room, now - 10)).await;
+        wait_for_meeting_started(&mut bystander, Duration::from_secs(5))
+            .await
+            .expect("bystander joins");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nc = async_nats::connect(&nats_url).await.expect("NATS");
+        let payload = serde_json::to_vec(&ParticipantKickedPayload {
+            room_id: room.clone(),
+            user_id: "kicked@test.com".to_string(),
+            kicked_at: now - 5,
+            revoke_iat_through: now - 5,
+            deny_until: now + 3600,
+        })
+        .unwrap();
+        let mut saw_kick = false;
+        let mut closed = None;
+        for _ in 0..20 {
+            nc.publish(PARTICIPANT_KICKED_SUBJECT, payload.clone().into())
+                .await
+                .expect("publish");
+            closed =
+                read_until_closed(&mut kicked, Duration::from_millis(500), &mut saw_kick).await;
+            if closed.is_some() {
+                break;
+            }
+        }
+        if closed.is_none() {
+            closed = read_until_closed(&mut kicked, Duration::from_secs(3), &mut saw_kick).await;
+        }
+        assert_eq!(closed, Some(true), "the relay must close with Policy");
+        assert!(saw_kick, "PARTICIPANT_KICKED must precede the close");
+        let mut bystander_kicked = false;
+        assert_eq!(
+            read_until_closed(
+                &mut bystander,
+                Duration::from_millis(1500),
+                &mut bystander_kicked
+            )
+            .await,
+            None,
+            "the bystander must stay connected"
+        );
+
+        let mut replay = connect_with_token(port, &held).await;
+        let mut replay_kicked = false;
+        assert_eq!(
+            read_until_closed(&mut replay, Duration::from_secs(5), &mut replay_kicked).await,
+            Some(true),
+            "a replayed pre-kick token must be refused"
+        );
+        assert!(replay_kicked);
+
+        let mut rejoined =
+            connect_with_token(port, &room_token("kicked@test.com", &room, now)).await;
+        wait_for_meeting_started(&mut rejoined, Duration::from_secs(5))
+            .await
+            .expect("a post-kick token joins");
+        let mut rejoined_kicked = false;
+        assert_eq!(
+            read_until_closed(&mut rejoined, Duration::from_secs(3), &mut rejoined_kicked).await,
+            None,
+            "a post-kick token must not be closed"
+        );
+        assert!(!rejoined_kicked);
     }
 }

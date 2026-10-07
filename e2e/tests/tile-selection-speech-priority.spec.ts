@@ -213,7 +213,7 @@ test.describe("Tile selection ranks speech above join order (#2273)", () => {
 
       await expect(
         tileByName(hostPage, SILENT_NAME),
-        "SANITY FLOOR 1 (not a discriminator): both camera-off guests must be on screen at the roomy baseline. The viewport is set explicitly above because a manually-created context does NOT inherit the config's Desktop Chrome viewport. Note this spec asserts NO decoded remote canvas anywhere — every tile here is a camera-OFF avatar that needs none, and issue #2193 makes a canvas precondition unpassable in this environment",
+        "SANITY FLOOR 1 (not a discriminator): both camera-off guests must be on screen at the roomy baseline. The viewport is set explicitly above because a manually-created context does NOT inherit the config's Desktop Chrome viewport",
       ).toBeVisible({ timeout: 60_000 });
       await expect(
         tileByName(hostPage, SPEAKER_NAME),

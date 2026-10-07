@@ -63,17 +63,17 @@ impl JitterEstimator {
             // D(i, j) = (R_j - R_i) - (S_j - S_i)
             // D(i, j) is the difference in transit times.
 
-            // Difference in arrival times (R_j - R_i)
-            let arrival_diff = arrival_time_ms - self.last_arrival_time_ms;
+            if let Some(arrival_diff) = arrival_time_ms.checked_sub(self.last_arrival_time_ms) {
+                // Difference in "sending" times, using sequence number as a proxy for the RTP
+                // timestamp.
+                let seq_diff = sequence_number - self.last_sequence_number;
+                let timestamp_diff = seq_diff as f64 * FRAME_PERIOD_MS;
 
-            // Difference in "sending" times, using sequence number as a proxy for the RTP timestamp.
-            let seq_diff = sequence_number - self.last_sequence_number;
-            let timestamp_diff = seq_diff as f64 * FRAME_PERIOD_MS;
+                let transit_diff = arrival_diff as f64 - timestamp_diff;
 
-            let transit_diff = arrival_diff as f64 - timestamp_diff;
-
-            // J(i) = J(i-1) + (|D(i-1, i)| - J(i-1))/16
-            self.jitter += (transit_diff.abs() - self.jitter) / 16.0;
+                // J(i) = J(i-1) + (|D(i-1, i)| - J(i-1))/16
+                self.jitter += (transit_diff.abs() - self.jitter) / 16.0;
+            }
 
             self.last_arrival_time_ms = arrival_time_ms;
             self.last_sequence_number = sequence_number;
@@ -158,5 +158,24 @@ mod tests {
         // Arrival diff = 33ms. Timestamp diff = 33.33ms. D is small.
         // J_2 = 3.125 + (|D_2| - 3.125) / 16 = 3.125 + (0 - 3.125) / 16 = 2.929
         assert!((estimator.get_jitter_estimate_ms() - 2.93).abs() < 0.1);
+    }
+
+    #[test]
+    fn backward_arrival_step_rebaselines_without_a_jitter_sample() {
+        let mut estimator = JitterEstimator::new();
+        estimator.update_estimate(1, 1000);
+        estimator.update_estimate(2, 990);
+        assert!(
+            estimator.get_jitter_estimate_ms() < FRAME_PERIOD_MS,
+            "jitter {} after a 10ms backward clock step",
+            estimator.get_jitter_estimate_ms()
+        );
+
+        estimator.update_estimate(3, 990 + FRAME_PERIOD_MS.round() as u128);
+        assert!(
+            estimator.get_jitter_estimate_ms() < 1.0,
+            "the backward step must not feed a transit sample, jitter {}",
+            estimator.get_jitter_estimate_ms()
+        );
     }
 }

@@ -47,7 +47,7 @@ use videocall_types::Callback;
 let on_message = Callback::from(|data| { /* handle binary message */ });
 let on_status  = Callback::from(|status: WebTransportStatus| { /* connection status */ });
 
-let task = WebTransportService::connect("https://example.com:4433", on_message, on_status)
+let task = WebTransportService::connect("https://example.com:4433", false, on_message, on_status)
     .expect("failed to connect");
 ```
 

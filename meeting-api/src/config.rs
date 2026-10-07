@@ -291,6 +291,13 @@ impl Config {
             .unwrap_or_else(|_| "86400".to_string())
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
+        if token_ttl_secs > videocall_meeting_types::kick::MAX_ROOM_TOKEN_TTL_SECS {
+            return Err(format!(
+                "TOKEN_TTL_SECS must not exceed {} (7 days): a host kick must outlive every \
+                 room token minted before it",
+                videocall_meeting_types::kick::MAX_ROOM_TOKEN_TTL_SECS
+            ));
+        }
         let session_ttl_secs = env::var("SESSION_TTL_SECS")
             .unwrap_or_else(|_| "604800".to_string()) // 7 days (#1750: was ~10y)
             .parse::<i64>()
@@ -848,6 +855,37 @@ mod tests {
         match prior_cors {
             Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
             None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn token_ttl_secs_above_seven_days_is_refused() {
+        let prior: Vec<(&str, Option<String>)> = [
+            "DATABASE_URL",
+            "JWT_SECRET",
+            "CORS_ALLOWED_ORIGIN",
+            "TOKEN_TTL_SECS",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+
+        std::env::set_var("TOKEN_TTL_SECS", "604800");
+        assert_eq!(Config::from_env().map(|c| c.token_ttl_secs), Ok(604800));
+        std::env::set_var("TOKEN_TTL_SECS", "604801");
+        assert!(Config::from_env()
+            .err()
+            .is_some_and(|e| e.contains("TOKEN_TTL_SECS")));
+
+        for (k, v) in prior {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
     }
 

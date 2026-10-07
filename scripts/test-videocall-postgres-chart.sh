@@ -212,6 +212,35 @@ if grep -Fq 'volumeClaimTemplates:' "$tmp_dir/existing-claim.out" ||
   exit 1
 fi
 
+expect_rejected() {
+  local name="$1"
+  local pattern="$2"
+  shift 2
+  printf '%s\n' 'postgresql:' '  primary:' '    persistence:' "$@" \
+    >"$tmp_dir/$name.yaml"
+  if "$HELM_BIN" template postgres "$chart_dir" \
+    -f "$complete_values" \
+    -f "$tmp_dir/$name.yaml" \
+    >"$tmp_dir/$name.out" 2>"$tmp_dir/$name.err"; then
+    echo "ERROR: $name rendered despite $pattern" >&2
+    exit 1
+  fi
+  if ! tr "/'" ".." <"$tmp_dir/$name.err" | grep -Eq "$pattern"; then
+    echo "ERROR: $name failed for an unexpected reason:" >&2
+    cat "$tmp_dir/$name.err" >&2
+    exit 1
+  fi
+}
+
+expect_rejected existing-claim-null 'missing property .existingClaim.' \
+  '      enabled: true' '      existingClaim: null' '      size: ""'
+expect_rejected enabled-null 'missing property .enabled.' \
+  '      enabled: null' '      existingClaim: ""' '      size: ""'
+expect_rejected enabled-null-existing-claim 'missing property .enabled.' \
+  '      enabled: null' '      existingClaim: existing-pvc' '      size: 10Gi'
+expect_rejected enabled-null-size 'missing property .enabled.' \
+  '      enabled: null' '      existingClaim: ""' '      size: 10Gi'
+
 package_dir="$tmp_dir/package"
 mkdir -p "$package_dir"
 "$HELM_BIN" package "$chart_dir" --destination "$package_dir" >/dev/null

@@ -3,7 +3,7 @@
 //! Adaptive decode-budget decision logic (issue #987, task 1a.1).
 //!
 //! This module is the pure, DOM-free, JS-free *foundation* for the adaptive
-//! decode budget. It contains a single decision function, [`decide_step`],
+//! decode budget. It contains a single decision function, [`decide_step_with_median`],
 //! that — given a short window of recent local quality samples plus the
 //! current budget state — decides whether the number of simultaneously
 //! decoded video tiles (the "cap") should be lowered, raised, or held.
@@ -247,8 +247,8 @@ pub struct BudgetState {
     /// this field UNCHANGED so the cascade does not advance. `stepped == false`
     /// means no peer chooser moved — every
     /// droppable/non-exempt received layer is already at base (this includes the
-    /// degenerate case where the only connected peers are active speakers, who are
-    /// exempt from layer-drop, so nothing was eligible to move). When
+    /// degenerate case where two or more connected peers are all active speakers,
+    /// who are exempt from layer-drop, so nothing was eligible to move). When
     /// `layers_at_floor == true`, further layer drops are a no-op and
     /// [`cascade_action`] may escalate to pausing tiles.
     pub layers_at_floor: bool,
@@ -504,18 +504,13 @@ pub fn suppress_growth_step(step: BudgetStep, emergency_now: bool) -> BudgetStep
 /// Returns [`BudgetStep::Hold`] when there is insufficient data, during
 /// cooldown, or when no threshold is crossed. This function is pure: it reads
 /// no clock and touches no DOM, so it is fully unit-testable.
+#[cfg(test)]
 pub fn decide_step(
     samples: &[BudgetSample],
     state: &BudgetState,
     natural_count: usize,
     now_ms: f64,
 ) -> BudgetStep {
-    // Thin wrapper: compute the sustain-window median once and delegate. The
-    // control loop, which ALSO needs the median for its protective distress
-    // predicate, calls `decide_step_with_median` directly to compute it exactly
-    // once per tick (issue #1558 perf hoist — restores the #1001 single-median
-    // contract); every other caller (tests, the un-pressured latch probe) uses
-    // this convenience wrapper.
     let median = median_render_fps(samples, SUSTAIN_SAMPLES);
     decide_step_with_median(samples, state, natural_count, now_ms, median)
 }
@@ -556,9 +551,9 @@ pub fn decide_step_with_median(
         longtask_sustained_above(samples, SUSTAIN_SAMPLES, LONGTASK_BUSY_MS_PER_SEC);
 
     if fps_low || longtask_busy {
-        // Only step down if we are not already at the floor and not cooling
+        // Only step down if there is something to shed and we are not cooling
         // down from a prior down-step.
-        if state.cap > MIN_CAP && down_cooldown_elapsed {
+        if down_step_possible(state.cap, natural_count) && down_cooldown_elapsed {
             // Severity: catastrophic pressure (collapsed FPS or extreme
             // sustained jank) drops a quarter of the cap at once for fast
             // relief; mild pressure steps a single tile to avoid overshoot.
@@ -594,6 +589,52 @@ pub fn decide_step_with_median(
     }
 
     BudgetStep::Hold
+}
+
+/// Whether a Down step can shed anything: a tile above [`MIN_CAP`], or, in a
+/// one-tile call, the remote peer's received layer (the cap stays at 1).
+fn down_step_possible(cap: usize, natural_count: usize) -> bool {
+    cap > MIN_CAP || natural_count == MIN_CAP
+}
+
+/// Routes a tick with at most one remote participant (`natural_count <= MIN_CAP`, any cap).
+/// Returns `(step for the cascade, seed the layer drop)`: on a Down, or on the
+/// presenter band once the down cooldown has elapsed, it returns `(Hold, true)`
+/// and touches only `last_step_ms`. Otherwise `(step, false)`, state untouched.
+pub fn route_one_tile_down(
+    step: BudgetStep,
+    presenter_band: bool,
+    state: &mut BudgetState,
+    natural_count: usize,
+    now_ms: f64,
+) -> (BudgetStep, bool) {
+    let down_cooldown_elapsed = (now_ms - state.last_step_ms) >= STEP_DOWN_COOLDOWN_MS;
+    let pressure = matches!(step, BudgetStep::Down(_)) || (presenter_band && down_cooldown_elapsed);
+    if natural_count <= MIN_CAP && pressure {
+        state.last_step_ms = now_ms;
+        (BudgetStep::Hold, true)
+    } else {
+        (step, false)
+    }
+}
+
+/// One control-loop tick's step, routed through [`route_one_tile_down`].
+pub fn routed_budget_step(
+    samples: &[BudgetSample],
+    state: &mut BudgetState,
+    natural_count: usize,
+    now_ms: f64,
+    median: Option<f64>,
+    emergency_now: bool,
+    sharing: bool,
+) -> (BudgetStep, bool) {
+    let step = suppress_growth_step(
+        decide_step_with_median(samples, state, natural_count, now_ms, median),
+        emergency_now,
+    );
+    let presenter_band =
+        natural_count == MIN_CAP && presenter_extra_shed_pressure(samples, sharing);
+    route_one_tile_down(step, presenter_band, state, natural_count, now_ms)
 }
 
 /// The cascade decision produced by [`cascade_action`] — whether a Down edge
@@ -2661,6 +2702,172 @@ mod tests {
     }
 
     #[test]
+    fn one_tile_call_steps_down_under_sustained_low_fps() {
+        let mild = (FPS_SEVERE + FPS_STEP_DOWN) / 2.0;
+        let samples = [fps_sample(mild); SUSTAIN_SAMPLES];
+        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+        let state = state_with_cap(MIN_CAP);
+        assert_eq!(
+            decide_step_with_median(&samples, &state, MIN_CAP, PAST_COOLDOWN, median),
+            BudgetStep::Down(1),
+            "1:1 call: the Down edge must fire so the cascade can lower the received layer"
+        );
+        assert_eq!(
+            decide_step_with_median(
+                &samples,
+                &state,
+                MIN_CAP,
+                STEP_DOWN_COOLDOWN_MS - 1.0,
+                median
+            ),
+            BudgetStep::Hold,
+            "the down cooldown still applies at one tile"
+        );
+        assert_eq!(
+            decide_step_with_median(&samples, &state, 0, PAST_COOLDOWN, median),
+            BudgetStep::Hold,
+            "no remote tile: nothing to lower"
+        );
+    }
+
+    fn mild_low() -> [BudgetSample; SUSTAIN_SAMPLES] {
+        [fps_sample((FPS_SEVERE + FPS_STEP_DOWN) / 2.0); SUSTAIN_SAMPLES]
+    }
+
+    #[test]
+    fn one_tile_down_touches_only_the_down_cooldown() {
+        let samples = mild_low();
+        // Stale cap 2 from a call that just shrank to one remote participant.
+        for cap in [MIN_CAP, 2] {
+            let mut state = state_with_cap(cap);
+            let before = state;
+            let step = decide_step(&samples, &state, MIN_CAP, PAST_COOLDOWN);
+            assert_eq!(
+                route_one_tile_down(step, false, &mut state, MIN_CAP, PAST_COOLDOWN),
+                (BudgetStep::Hold, true),
+                "cap {cap}: the cascade sees Hold and the layer drop is seeded"
+            );
+            assert_eq!(
+                state,
+                BudgetState {
+                    last_step_ms: PAST_COOLDOWN,
+                    ..before
+                },
+                "cap {cap}: cap, layers_at_floor and the settle clock are untouched"
+            );
+            assert_eq!(
+                decide_step(&samples, &state, MIN_CAP, PAST_COOLDOWN + 1.0),
+                BudgetStep::Hold,
+                "cap {cap}: the next seed waits out the down cooldown"
+            );
+        }
+    }
+
+    #[test]
+    fn shrinking_to_one_tile_clears_the_floor_and_a_down_keeps_it_clear() {
+        let mut state = BudgetState {
+            cap: 2,
+            last_step_ms: 0.0,
+            direction_hold: 0,
+            last_layer_drop_ms: 0.0,
+            layers_at_floor: true,
+        };
+        let resets = budget_reset_actions(MIN_CAP, 3, Some(1), Some(1));
+        assert!(resets.rearm_cascade);
+        re_arm_cascade_after_recovery(&mut state, PAST_COOLDOWN);
+        let step = decide_step(&mild_low(), &state, MIN_CAP, 2.0 * PAST_COOLDOWN);
+        assert_eq!(
+            route_one_tile_down(step, false, &mut state, MIN_CAP, 2.0 * PAST_COOLDOWN),
+            (BudgetStep::Hold, true)
+        );
+        assert!(!state.layers_at_floor);
+    }
+
+    #[test]
+    fn zero_tile_down_with_a_stale_cap_is_held_not_cascaded() {
+        let mut state = state_with_cap(2);
+        let step = decide_step(&mild_low(), &state, 0, PAST_COOLDOWN);
+        assert_eq!(step, BudgetStep::Down(1));
+        assert_eq!(
+            route_one_tile_down(step, false, &mut state, 0, PAST_COOLDOWN),
+            (BudgetStep::Hold, true)
+        );
+        assert!(!state.layers_at_floor);
+        assert_eq!(state.cap, 2);
+    }
+
+    #[test]
+    fn multi_tile_down_still_takes_the_cascade() {
+        let samples = mild_low();
+        let mut state = state_with_cap(3);
+        let step = decide_step(&samples, &state, 3, PAST_COOLDOWN);
+        assert_eq!(step, BudgetStep::Down(1));
+        assert_eq!(
+            route_one_tile_down(step, true, &mut state, 3, PAST_COOLDOWN),
+            (BudgetStep::Down(1), false)
+        );
+        assert_eq!(state, state_with_cap(3));
+        let mut one = state_with_cap(MIN_CAP);
+        assert_eq!(
+            route_one_tile_down(BudgetStep::Hold, false, &mut one, MIN_CAP, PAST_COOLDOWN),
+            (BudgetStep::Hold, false)
+        );
+    }
+
+    #[test]
+    fn one_tile_presenter_band_seeds_the_layer_drop() {
+        let band = (FPS_STEP_DOWN + FPS_STEP_UP) / 2.0;
+        let samples = [fps_sample(band); SUSTAIN_SAMPLES];
+        assert!(presenter_extra_shed_pressure(&samples, true));
+        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+        let mut state = state_with_cap(MIN_CAP);
+        let step = decide_step(&samples, &state, MIN_CAP, PAST_COOLDOWN);
+        assert_eq!(step, BudgetStep::Hold, "the band is above FPS_STEP_DOWN");
+        let mut tick = |now, sharing| {
+            routed_budget_step(&samples, &mut state, MIN_CAP, now, median, false, sharing)
+        };
+        assert_eq!(tick(PAST_COOLDOWN, false), (BudgetStep::Hold, false));
+        assert_eq!(tick(PAST_COOLDOWN, true), (BudgetStep::Hold, true));
+        assert_eq!(
+            tick(PAST_COOLDOWN + 1.0, true),
+            (BudgetStep::Hold, false),
+            "the presenter band respects the down cooldown"
+        );
+    }
+
+    #[test]
+    fn pressured_call_shrunk_to_one_tile_seeds_instead_of_cascading() {
+        let samples = mild_low();
+        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+        let mut multi = state_with_cap(3);
+        assert_eq!(
+            routed_budget_step(&samples, &mut multi, 3, PAST_COOLDOWN, median, false, false),
+            (BudgetStep::Down(1), false),
+            "the same pressure at 3 tiles cascades"
+        );
+
+        let mut state = state_with_cap(3);
+        let before = state;
+        let mut seeds = Vec::new();
+        for tick in 0..5 {
+            let now = PAST_COOLDOWN + f64::from(tick) * 1000.0;
+            let (step, seed) =
+                routed_budget_step(&samples, &mut state, MIN_CAP, now, median, false, false);
+            assert_eq!(step, BudgetStep::Hold, "tick {tick}");
+            seeds.push(seed);
+        }
+        assert_eq!(seeds, [true, false, true, false, true]);
+        assert_eq!(
+            state,
+            BudgetState {
+                last_step_ms: PAST_COOLDOWN + 4000.0,
+                ..before
+            },
+            "cap and layers_at_floor untouched"
+        );
+    }
+
+    #[test]
     fn result_never_below_min_cap() {
         // Sustained pressure, but already at the floor: no further down step.
         let samples = [fps_sample(5.0), fps_sample(5.0), fps_sample(5.0)];
@@ -2887,7 +3094,8 @@ mod tests {
     // and the non-distress growth gate in the Hold arm) so the key invariants
     // can be asserted deterministically. Keep this in lockstep with the loop.
     fn sim_tick(samples: &[BudgetSample], state: &mut BudgetState, natural: usize, now: f64) {
-        let step = decide_step(samples, state, natural, now);
+        let median = median_render_fps(samples, SUSTAIN_SAMPLES);
+        let (step, _) = routed_budget_step(samples, state, natural, now, median, false, false);
         if recovery_qualifying(samples, SUSTAIN_SAMPLES) {
             state.direction_hold = state.direction_hold.saturating_add(1);
         } else {
@@ -3099,9 +3307,14 @@ mod tests {
         // SHARED Up-arm gate: coerce Up->Hold under the emergency exactly as the
         // loop does. Removing the veto from `suppress_growth_step` lets the Up arm
         // below clear `layers_at_floor` and flips the ceiling — failing this test.
-        let step = suppress_growth_step(
-            decide_step_with_median(samples, &state, natural, now, median),
+        let (step, _) = routed_budget_step(
+            samples,
+            &mut state,
+            natural,
+            now,
+            median,
             emergency_now,
+            false,
         );
         match step {
             BudgetStep::Down(magnitude) => {
@@ -4279,7 +4492,8 @@ mod tests {
             layers_at_floor: false,
         };
         // Pressured path: apply decide_step's step.
-        match decide_step(samples, &state, natural, now) {
+        let median = median_render_fps(samples, SUSTAIN_SAMPLES);
+        match routed_budget_step(samples, &mut state, natural, now, median, false, sharing).0 {
             BudgetStep::Down(m) => state.cap = state.cap.saturating_sub(m).max(MIN_CAP),
             BudgetStep::Up => state.cap = (state.cap + 1).min(natural.max(MIN_CAP)),
             BudgetStep::Hold => {}

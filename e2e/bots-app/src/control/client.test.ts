@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { NETSIM_PRESETS } from "../meeting-config";
 import { generateToken } from "./auth";
-import { CtlHttpError, ctlRequest } from "./client";
+import { CtlHttpError, CtlUnreachableError, ctlRequest } from "./client";
 import { type ControlServerHandle, startControlServer } from "./server";
 import { type BotRegistryEntry } from "./registry";
 
@@ -34,6 +34,7 @@ describe("ctlRequest", () => {
       token,
       surface: {
         getRegistry: () => registry,
+        expectedBots: () => 0,
         triggerLeave: async () => {},
         forceKill: async () => {},
         applyTtl: () => {},
@@ -111,6 +112,35 @@ describe("ctlRequest", () => {
       ).rejects.toThrow(/timed out/);
     } finally {
       await new Promise<void>((r) => hung.close(() => r()));
+    }
+  });
+
+  it("classifies a reset on a reused keep-alive socket as failed, not unreachable (#2386)", async () => {
+    let requests = 0;
+    const sockets = new Set<unknown>();
+    const flaky: Server = createServer((req, res) => {
+      requests += 1;
+      sockets.add(req.socket);
+      if (requests === 2) {
+        req.socket.destroy();
+        return;
+      }
+      res.setHeader("content-type", "application/json");
+      res.end("{}");
+    });
+    await new Promise<void>((r) => flaky.listen(0, "127.0.0.1", r));
+    const port = (flaky.address() as { port: number }).port;
+    try {
+      await ctlRequest({ host: "127.0.0.1", port, token }, "GET", "/bots");
+      const err = await ctlRequest({ host: "127.0.0.1", port, token }, "GET", "/bots").catch(
+        (e: unknown) => e,
+      );
+      expect(sockets.size).toBe(1);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(CtlUnreachableError);
+    } finally {
+      flaky.closeAllConnections();
+      await new Promise<void>((r) => flaky.close(() => r()));
     }
   });
 

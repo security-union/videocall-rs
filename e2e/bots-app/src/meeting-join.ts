@@ -8,9 +8,9 @@ import {
 
 import {
   ACTION_BAR_SELECTOR,
-  CAMERA_TOOLTIP,
   MIC_UNMUTE_SELECTOR,
-  cameraButtonSelector,
+  cameraControlSelector,
+  micControlSelector,
   peerListCandidates,
   resolveControlSelector,
 } from "./control-buttons";
@@ -161,7 +161,8 @@ export async function joinMeetingAndEnableMedia(args: {
   participant: string;
   displayName: string;
   meetingId: string;
-}): Promise<void> {
+  media?: JoinMedia;
+}): Promise<JoinMediaState> {
   const { page, participant, displayName, meetingId } = args;
 
   // ── Step 1: detect where the navigation landed ──────────────────────
@@ -247,20 +248,117 @@ export async function joinMeetingAndEnableMedia(args: {
     await ensureDisplayNameInMeeting({ page, participant, displayName });
 
     // ── Step 3: enable mic + camera so the prep'd fake devices flow ───
-
-    // The action bar auto-hides by default; hover it so the buttons are
-    // visible to Playwright's isVisible check.
-    const controlsContainer = page.locator(ACTION_BAR_SELECTOR).first();
-    await controlsContainer.hover({ timeout: 5_000 }).catch(() => {
-      // Fine — some layouts may not need the hover.
-    });
-    await page.waitForTimeout(200);
-
-    await clickWhenVisible(page, participant, "microphone", [MIC_UNMUTE_SELECTOR]);
-    await clickWhenVisible(page, participant, "camera", [cameraButtonSelector(CAMERA_TOOLTIP.off)]);
+    return await enableJoinMedia(page, participant, args.media ?? JOIN_MEDIA_ON);
   } finally {
     page.off("framenavigated", onFrameNavigated);
   }
+}
+
+/** Media to turn on after joining; `false` keeps the product's join default (camera off, mic muted). */
+export interface JoinMedia {
+  camera: boolean;
+  mic: boolean;
+}
+
+/** The meeting-api participant-status paths whose `result.user_id` the client connects as. */
+export function isSessionUserIdResponse(url: string, meetingId: string): boolean {
+  let path: string;
+  try {
+    path = decodeURIComponent(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+  const prefix = `/api/v1/meetings/${meetingId}/`;
+  if (!path.startsWith(prefix)) return false;
+  return ["join", "join-guest", "status", "guest-status"].includes(path.slice(prefix.length));
+}
+
+/** `result.user_id` of a successful participant-status body, or null (empty: the client invents a local id). */
+export function sessionUserIdFromBody(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return null;
+  const { success, result } = body as { success?: unknown; result?: unknown };
+  if (success !== true || typeof result !== "object" || result === null) return null;
+  const id = (result as { user_id?: unknown }).user_id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+export const JOIN_MEDIA_ON: Readonly<JoinMedia> = { camera: true, mic: true };
+
+/** Read back from the action bar after join: `true` on, `false` off, `null` no control found. */
+export interface JoinMediaState {
+  camera: boolean | null;
+  mic: boolean | null;
+}
+
+export type JoinMediaPage = Pick<Page, "locator" | "waitForTimeout">;
+
+export const MEDIA_SETTLE_TIMEOUT_MS = 10_000;
+
+export async function enableJoinMedia(
+  page: JoinMediaPage,
+  participant: string,
+  request: JoinMedia,
+): Promise<JoinMediaState> {
+  // The action bar auto-hides by default; hover it so the buttons are
+  // visible to Playwright's isVisible check.
+  const controlsContainer = page.locator(ACTION_BAR_SELECTOR).first();
+  await controlsContainer.hover({ timeout: 5_000 }).catch(() => {
+    // Fine — some layouts may not need the hover.
+  });
+  await page.waitForTimeout(200);
+
+  const visible = (sel: string): Promise<boolean> =>
+    page
+      .locator(sel)
+      .isVisible({ timeout: 2_000 })
+      .catch(() => false);
+  // The control a medium shows names its current state: "Mute" / "Stop Video" means on.
+  const read = async (onSel: string, offSel: string): Promise<boolean | null> => {
+    if (await visible(onSel)) return true;
+    return (await visible(offSel)) ? false : null;
+  };
+  const settle = async (
+    label: string,
+    onSel: string,
+    offSel: string,
+    want: boolean,
+  ): Promise<boolean | null> => {
+    const before = await read(onSel, offSel);
+    if (before === null || before === want) {
+      if (before === null)
+        console.warn(`[${participant}] ${label} control not visible — state unknown`);
+      else console.log(`[${participant}] ${label} already ${want ? "on" : "off"} at join`);
+      return before;
+    }
+    await clickWhenVisible(page, participant, `${label} ${want ? "on" : "off"}`, [
+      before ? onSel : offSel,
+    ]);
+    // An ON click resolves through an async device probe, so wait for the label to flip.
+    await page
+      .locator(want ? onSel : offSel)
+      .waitFor({ state: "visible", timeout: MEDIA_SETTLE_TIMEOUT_MS })
+      .catch(() => {});
+    const after = await read(onSel, offSel);
+    if (after !== want) {
+      console.warn(
+        `[${participant}] ${label} requested ${want ? "on" : "off"} but reads ${after === null ? "unknown" : after ? "on" : "off"} after the click`,
+      );
+    }
+    return after;
+  };
+  const mic = await settle(
+    "microphone",
+    micControlSelector("on"),
+    MIC_UNMUTE_SELECTOR,
+    request.mic,
+  );
+  const camera = await settle(
+    "camera",
+    cameraControlSelector("on"),
+    cameraControlSelector("off"),
+    request.camera,
+  );
+  return { camera, mic };
 }
 
 function throwIfNavigatedAway(navigatedAway: boolean, participant: string): void {
@@ -1141,19 +1239,19 @@ export async function closePeerList(page: Page, participant: string): Promise<vo
 }
 
 async function clickWhenVisible(
-  page: Page,
+  page: JoinMediaPage,
   participant: string,
   label: string,
   selectors: readonly string[],
-): Promise<void> {
+): Promise<boolean> {
   for (const sel of selectors) {
     const candidate: Locator = page.locator(sel);
     try {
       if (await candidate.isVisible({ timeout: 2_000 }).catch(() => false)) {
         await candidate.click({ timeout: 2_000 });
-        console.log(`[${participant}] ${label} enabled`);
+        console.log(`[${participant}] ${label}: clicked`);
         await page.waitForTimeout(300);
-        return;
+        return true;
       }
     } catch (e) {
       console.warn(
@@ -1163,6 +1261,7 @@ async function clickWhenVisible(
     }
   }
   console.warn(
-    `[${participant}] could not find a visible ${label} enable button — selectors tried: ${selectors.join(" | ")}. The action bar may have autohidden, the device may be unavailable, or the aria-label changed.`,
+    `[${participant}] could not find a visible ${label} button — selectors tried: ${selectors.join(" | ")}. The action bar may have autohidden, the device may be unavailable, or the aria-label changed.`,
   );
+  return false;
 }

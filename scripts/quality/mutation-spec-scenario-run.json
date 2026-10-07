@@ -1,0 +1,1398 @@
+{
+ "_comment": [
+  "Mutations of the scenario runner core (#2914 PR-4), each naming the unit test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-scenario-run.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_scenario_run.py"
+ ],
+ "baseline_tests": 140,
+ "mutations": [
+  {
+   "name": "stopped stamped at reap time",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.log.write(\"stopped\", wall=ex.exited_at,",
+   "replace": "        self.log.write(\"stopped\", wall=reaped.wall,",
+   "expect_kills": [
+    "test_a_crash_seen_only_at_reap_is_stamped_at_its_exit_time",
+    "test_a_crash_seen_by_a_poll_is_stamped_at_its_exit_time_not_the_poll"
+   ]
+  },
+  {
+   "name": "exit time not checked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if not _num(ex.exited_at) or not proc[\"launched_at\"] - EXIT_SLACK_S <= ex.exited_at \\\n                <= reaped.wall + EXIT_SLACK_S:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_an_unknown_or_impossible_exit_time_writes_no_stopped_line"
+   ]
+  },
+  {
+   "name": "exit slack widened",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                <= reaped.wall + EXIT_SLACK_S:",
+   "replace": "                <= reaped.wall + 10 * EXIT_SLACK_S:",
+   "expect_kills": [
+    "test_an_exit_time_up_to_the_slack_after_the_reap_is_kept"
+   ]
+  },
+  {
+   "name": "max skew taken from the adapter",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    skew = max(abs(n[\"skew_ms\"]) for n in out)",
+   "replace": "    skew = facts.get(\"max_abs_skew_ms\", 0)",
+   "expect_kills": [
+    "test_max_abs_skew_ms_is_always_set_from_per_node",
+    "test_the_preflight_line_carries_max_abs_skew_ms"
+   ]
+  },
+  {
+   "name": "max skew sign ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    skew = max(abs(n[\"skew_ms\"]) for n in out)",
+   "replace": "    skew = max(n[\"skew_ms\"] for n in out)",
+   "expect_kills": [
+    "test_max_abs_skew_ms_is_always_set_from_per_node"
+   ]
+  },
+  {
+   "name": "host names accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if not isinstance(n, dict) or n.get(\"node\") not in allowed:",
+   "replace": "        if not isinstance(n, dict) or not isinstance(n.get(\"node\"), str):",
+   "expect_kills": [
+    "test_a_host_name_is_refused_before_anything_starts_and_never_written"
+   ]
+  },
+  {
+   "name": "environment name refused",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    allowed = set(RESERVED_NODES) | {environment}",
+   "replace": "    allowed = set(RESERVED_NODES)",
+   "expect_kills": [
+    "test_reserved_and_environment_names_are_accepted"
+   ]
+  },
+  {
+   "name": "skew cap dropped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if skew > cq_collect.MAX_ABS_SKEW_MS:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_bad_clock_facts_are_refused"
+   ]
+  },
+  {
+   "name": "skew cap inclusive",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if skew > cq_collect.MAX_ABS_SKEW_MS:",
+   "replace": "    if skew >= cq_collect.MAX_ABS_SKEW_MS:",
+   "expect_kills": [
+    "test_skew_exactly_at_the_cap_is_accepted"
+   ]
+  },
+  {
+   "name": "non-finite skew accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if not _num(n.get(\"skew_ms\")):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_bad_clock_facts_are_refused"
+   ]
+  },
+  {
+   "name": "generator ok truthy",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if v.get(\"ok\") is not True:",
+   "replace": "        if not v.get(\"ok\"):",
+   "expect_kills": [
+    "test_anything_missing_extra_or_off_window_is_not_ok"
+   ]
+  },
+  {
+   "name": "generator window unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if not isinstance(w, dict) or w.get(\"from\") != window[0] or w.get(\"to\") != window[1]:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_anything_missing_extra_or_off_window_is_not_ok",
+    "test_the_runner_asks_for_exactly_the_reached_hold"
+   ]
+  },
+  {
+   "name": "generator missing host ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            problems.append(f\"{host}: no verdict for the hold\")",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_anything_missing_extra_or_off_window_is_not_ok",
+    "test_a_scorer_pass_with_any_runner_fault_is_never_pass"
+   ]
+  },
+  {
+   "name": "generator duplicate accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        elif host in seen:",
+   "replace": "        elif False:",
+   "expect_kills": [
+    "test_anything_missing_extra_or_off_window_is_not_ok"
+   ]
+  },
+  {
+   "name": "generator undeclared host accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        elif host not in hosts:",
+   "replace": "        elif False:",
+   "expect_kills": [
+    "test_anything_missing_extra_or_off_window_is_not_ok"
+   ]
+  },
+  {
+   "name": "generator no hosts accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if not hosts:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_anything_missing_extra_or_off_window_is_not_ok"
+   ]
+  },
+  {
+   "name": "runner gates ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    capped = \"INVALID\" if not gates or any(not g[\"ok\"] for g in gates) else \"PASS\"",
+   "replace": "    capped = \"PASS\"",
+   "expect_kills": [
+    "test_the_runner_only_downgrades",
+    "test_a_scorer_pass_with_any_runner_fault_is_never_pass"
+   ]
+  },
+  {
+   "name": "verdict upgraded",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    return max(base, capped, key=RANK.get)",
+   "replace": "    return min(base, capped, key=RANK.get)",
+   "expect_kills": [
+    "test_the_runner_only_downgrades"
+   ]
+  },
+  {
+   "name": "error not an ERROR",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if error is not None:\n        return \"ERROR\"",
+   "replace": "    if False:\n        return \"ERROR\"",
+   "expect_kills": [
+    "test_the_runner_only_downgrades"
+   ]
+  },
+  {
+   "name": "unscored is PASS",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    base = scorer_verdict if scorer_verdict in SCORER_EXIT else \"INVALID\"",
+   "replace": "    base = scorer_verdict if scorer_verdict in SCORER_EXIT else \"PASS\"",
+   "expect_kills": [
+    "test_the_runner_only_downgrades"
+   ]
+  },
+  {
+   "name": "R1 ignores the on-disk order",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        complete = order == [\"hold_start\", \"hold_end\", \"teardown_start\"] and walls == sorted(walls)",
+   "replace": "        complete = True",
+   "expect_kills": [
+    "test_r1_reads_the_timeline_on_disk"
+   ]
+  },
+  {
+   "name": "R1 ignores interrupts",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        gate(\"R1\", complete and on_time and not s.interrupted and s.aborted is None,",
+   "replace": "        gate(\"R1\", complete and on_time and s.aborted is None,",
+   "expect_kills": [
+    "test_r1_an_interrupt_after_hold_end_is_not_scored",
+    "test_a_signal_in_finish_still_writes_run_json_and_caps_the_verdict"
+   ]
+  },
+  {
+   "name": "R2 allows extras",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        gate(\"R2\", joined == planned,",
+   "replace": "        gate(\"R2\", planned <= joined,",
+   "expect_kills": [
+    "test_r2_an_extra_participant_fails"
+   ]
+  },
+  {
+   "name": "R4 unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        gate(\"R4\", s.manifest_sha is not None and s.manifest_sha == s.manifest_sha_after,",
+   "replace": "        gate(\"R4\", s.manifest_sha is not None,",
+   "expect_kills": [
+    "test_r4_a_manifest_changed_before_scoring_fails"
+   ]
+  },
+  {
+   "name": "R5 every exit planned",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                               s.final_leave.get(u, math.inf) <= ex.exited_at",
+   "replace": "                               s.final_leave.get(u, -math.inf) <= ex.exited_at",
+   "expect_kills": [
+    "test_a_clean_exit_without_a_leave_is_unplanned"
+   ]
+  },
+  {
+   "name": "R5 a leave after the exit covers it",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                               s.final_leave.get(u, math.inf) <= ex.exited_at",
+   "replace": "                               s.final_leave.get(u, math.inf) <= ex.exited_at + 60",
+   "expect_kills": [
+    "test_an_exit_before_its_confirmed_leave_is_unplanned"
+   ]
+  },
+  {
+   "name": "R5 exit problems ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        r5 = unplanned + [f\"{p}: never stopped\" for p in never] + s.exit_problems",
+   "replace": "        r5 = unplanned + [f\"{p}: never stopped\" for p in never]",
+   "expect_kills": [
+    "test_an_unknown_or_impossible_exit_time_writes_no_stopped_line",
+    "test_a_failed_stop_writes_no_line_and_still_stops_the_rest"
+   ]
+  },
+  {
+   "name": "R6 unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        gate(\"R6\", set(planned_events) == ok_events and len(s.event_lines) == len(planned_events) and not late,",
+   "replace": "        gate(\"R6\", True,",
+   "expect_kills": [
+    "test_r6_a_failed_event_is_written_once_and_fails"
+   ]
+  },
+  {
+   "name": "R7 unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        gate(\"R7\", bool(s.stack_ready) and s.stack_ready == s.stack_teardown,",
+   "replace": "        gate(\"R7\", bool(s.stack_ready),",
+   "expect_kills": [
+    "test_r7_a_restarted_stack_container_fails"
+   ]
+  },
+  {
+   "name": "R8 limit widened",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        gate(\"R8\", s.drift_base is not None and s.max_drift <= MAX_CLOCK_DRIFT_S,",
+   "replace": "        gate(\"R8\", s.drift_base is not None and s.max_drift <= 10 * MAX_CLOCK_DRIFT_S,",
+   "expect_kills": [
+    "test_r8_a_clock_jump_fails_and_small_drift_passes"
+   ]
+  },
+  {
+   "name": "R8 drift sign ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.s.max_drift = max(self.s.max_drift, abs(offset - self.s.drift_base))",
+   "replace": "        self.s.max_drift = max(self.s.max_drift, offset - self.s.drift_base)",
+   "expect_kills": [
+    "test_r8_a_clock_jump_fails_and_small_drift_passes"
+   ]
+  },
+  {
+   "name": "R9 dirty preflight allowed",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        clean = s.dirty_at_preflight is False and s.dirty_at_teardown is False and s.commit == s.commit_at_teardown",
+   "replace": "        clean = s.dirty_at_teardown is False and s.commit == s.commit_at_teardown",
+   "expect_kills": [
+    "test_r9_a_tree_dirty_at_preflight_and_clean_later_still_fails"
+   ]
+  },
+  {
+   "name": "R9 teardown tree ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        clean = s.dirty_at_preflight is False and s.dirty_at_teardown is False and s.commit == s.commit_at_teardown",
+   "replace": "        clean = s.dirty_at_preflight is False",
+   "expect_kills": [
+    "test_r9_a_tree_that_changes_or_moves_during_the_run_fails",
+    "test_a_failing_tree_at_teardown_still_collects_and_scores"
+   ]
+  },
+  {
+   "name": "R10 config echo unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if r.get(\"config_overrides\") != cq_score.config_overrides(cfg) or r.get(\"run\", {}).get(\"config_sha256\") != sha:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_r10_a_scorer_that_ignored_the_forced_config_fails"
+   ]
+  },
+  {
+   "name": "R10 G-V5 only measured",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "if g.get(\"gate\") == \"G-V5\"), None) != want]",
+   "replace": "if g.get(\"gate\") == \"G-V5\"), None) not in (\"pass\", \"fail\")]",
+   "expect_kills": [
+    "test_r10_a_g_v5_that_contradicts_the_generator_verdict_fails"
+   ]
+  },
+  {
+   "name": "scorer exit and result not compared",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if SCORER_EXIT.get(result.get(\"verdict\")) != self.s.scorer_rc:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_scorer_exit_that_disagrees_with_its_result_is_an_error"
+   ]
+  },
+  {
+   "name": "validate-only failure ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.s.validate_rc != 0:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_validate_only_failing_on_a_collected_manifest_is_an_error"
+   ]
+  },
+  {
+   "name": "dirty tree runs without allow-dirty",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.s.dirty_at_preflight and not self.allow_dirty:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_r9_a_dirty_tree_is_refused_without_allow_dirty"
+   ]
+  },
+  {
+   "name": "missing selector accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if not isinstance(selector, str) or not selector.strip():",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_missing_scrape_up_selector_is_refused"
+   ]
+  },
+  {
+   "name": "stack preflight problems ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        problems = self.stack.preflight(self.plan)\n        if problems:",
+   "replace": "        problems = self.stack.preflight(self.plan)\n        if False:",
+   "expect_kills": [
+    "test_stack_preflight_problems_are_refused_before_up"
+   ]
+  },
+  {
+   "name": "Rust join without media",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                        planned.get(uid, {}).get(\"fleet\") == \"rust\" and not _num(j.media_started_at)):",
+   "replace": "                        False):",
+   "expect_kills": [
+    "test_r2_a_rust_participant_without_media_has_not_joined"
+   ]
+  },
+  {
+   "name": "exit during join ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if self.s.exits:\n                raise Abort",
+   "replace": "            if False:\n                raise Abort",
+   "expect_kills": [
+    "test_a_process_exit_during_the_join_aborts"
+   ]
+  },
+  {
+   "name": "join budget without the extra",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        deadline = start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S",
+   "replace": "        deadline = start[\"mono\"] + self.step[\"join_window_s\"]",
+   "expect_kills": [
+    "test_r2_a_participant_that_never_joins_aborts_at_the_join_budget"
+   ]
+  },
+  {
+   "name": "hold start without the scrape",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "max(joins) + deadline + JOIN_SETTLE_S]",
+   "replace": "max(joins) + deadline]",
+   "expect_kills": [
+    "test_hold_and_teardown_respect_the_settle_rules_over_random_timings",
+    "test_a_healthy_run_follows_the_phase_order_and_every_gate_passes"
+   ]
+  },
+  {
+   "name": "hold start ignores media",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "[m + MEDIA_SETTLE_S for m in media])",
+   "replace": "[m for m in media])",
+   "expect_kills": [
+    "test_hold_and_teardown_respect_the_settle_rules_over_random_timings"
+   ]
+  },
+  {
+   "name": "hold start stamped as planned",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        hs = self.log.write(\"hold_start\", step_id=sid)\n",
+   "replace": "        hs = dict(self.log.write(\"hold_start\", step_id=sid), wall=self.hold_start_target())\n",
+   "expect_kills": [
+    "test_hold_marks_are_the_reached_times_not_the_planned_ones"
+   ]
+  },
+  {
+   "name": "no settle before teardown",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self._sleep_until_mono(he[\"mono\"] + TEARDOWN_DELAY_S)",
+   "replace": "        self._sleep_until_mono(he[\"mono\"])",
+   "expect_kills": [
+    "test_hold_and_teardown_respect_the_settle_rules_over_random_timings",
+    "test_a_healthy_run_follows_the_phase_order_and_every_gate_passes"
+   ]
+  },
+  {
+   "name": "probes stopped first",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        order = [p for p in self.plan[\"processes\"] if p[\"fleet\"] == \"rust\"]\n        order += [p for p in self.plan[\"processes\"] if p[\"fleet\"] == \"browser\"]",
+   "replace": "        order = [p for p in self.plan[\"processes\"] if p[\"fleet\"] == \"browser\"]\n        order += [p for p in self.plan[\"processes\"] if p[\"fleet\"] == \"rust\"]",
+   "expect_kills": [
+    "test_teardown_stops_every_rust_process_before_any_probe"
+   ]
+  },
+  {
+   "name": "confirmation after the reply accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "t_issued - back <= confirmed <= reply.wall + back)",
+   "replace": "t_issued - back <= confirmed)",
+   "expect_kills": [
+    "test_r6_a_confirmation_outside_issue_and_reply_is_unconfirmed"
+   ]
+  },
+  {
+   "name": "confirmation before the issue accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "t_issued - back <= confirmed <= reply.wall + back)",
+   "replace": "confirmed <= reply.wall + back)",
+   "expect_kills": [
+    "test_r6_a_confirmation_outside_issue_and_reply_is_unconfirmed"
+   ]
+  },
+  {
+   "name": "confirmed leave not recorded",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                self.s.final_leave[uid] = t_issued",
+   "replace": "                pass",
+   "expect_kills": [
+    "test_a_planned_leave_exit_is_not_an_unplanned_exit"
+   ]
+  },
+  {
+   "name": "run folder inside the repo",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if os.path.commonpath([out, root]) == root:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_an_out_dir_inside_the_repo_is_refused"
+   ]
+  },
+  {
+   "name": "run folder reused",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        os.makedirs(run_dir)\n",
+   "replace": "        os.makedirs(run_dir, exist_ok=True)\n",
+   "expect_kills": [
+    "test_an_existing_run_folder_is_never_reused"
+   ]
+  },
+  {
+   "name": "teardown not best effort",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        except BaseException as exc:  # noqa: B036 - teardown never stops early",
+   "replace": "        except AdapterError as exc:",
+   "expect_kills": [
+    "test_any_exception_from_a_teardown_adapter_call_still_stops_every_process",
+    "test_an_events_write_that_fails_in_teardown_still_stops_every_process"
+   ]
+  },
+  {
+   "name": "strict not-measured dropped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    return {\"validity_gates\": {\"allowed_not_measured\": {\"value\": list(FORCED_NOT_MEASURED)},",
+   "replace": "    return {\"validity_gates\": {\"allowed_not_measured\": {\"value\": [\"G-V2\", \"G-V3\", \"G-V4\", \"G-V5\"]},",
+   "expect_kills": [
+    "test_the_forced_config_is_strict_and_loads"
+   ]
+  },
+  {
+   "name": "one failing stop ends teardown",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            except BaseException as exc:  # noqa: B036 - every process must get its stop",
+   "replace": "            except AdapterError as exc:",
+   "expect_kills": [
+    "test_any_exception_from_one_stop_still_stops_every_other_process"
+   ]
+  },
+  {
+   "name": "an interrupt during teardown forgotten",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.s.interrupted = self.s.interrupted or isinstance(exc, KeyboardInterrupt)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_any_exception_from_one_stop_still_stops_every_other_process",
+    "test_an_events_write_that_fails_in_teardown_still_stops_every_process"
+   ]
+  },
+  {
+   "name": "a failing down loses run.json",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            except BaseException as exc:  # noqa: B036 - run.json is still written",
+   "replace": "            except AdapterError as exc:",
+   "expect_kills": [
+    "test_a_failing_down_still_writes_run_json"
+   ]
+  },
+  {
+   "name": "launch recorded after it returns",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.s.launched[proc[\"proc_id\"]] = dict(proc, launched_at=self._now().wall)\n        self.fleet.launch(proc)\n",
+   "replace": "        self.fleet.launch(proc)\n        self.s.launched[proc[\"proc_id\"]] = dict(proc, launched_at=self._now().wall)\n",
+   "expect_kills": [
+    "test_a_launch_that_fails_after_starting_is_still_stopped"
+   ]
+  },
+  {
+   "name": "generator host names unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if any(h not in allowed for h in hosts):",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_host_name_is_never_written_to_the_verdict",
+    "test_anything_missing_extra_or_off_window_is_not_ok"
+   ]
+  },
+  {
+   "name": "per_node entries copied whole",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        out.append({\"node\": n[\"node\"], \"skew_ms\": n[\"skew_ms\"]})",
+   "replace": "        out.append(dict(n))",
+   "expect_kills": [
+    "test_only_node_and_skew_are_copied"
+   ]
+  },
+  {
+   "name": "SIGTERM not handled",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "                previous[name] = signal.signal(getattr(signal, name), runner.on_signal)",
+   "replace": "                previous[name] = signal.getsignal(getattr(signal, name))",
+   "expect_kills": [
+    "test_sigterm_mid_hold_tears_down_and_exits_invalid",
+    "test_a_run_with_injected_adapters_returns_the_verdict_exit_code"
+   ]
+  },
+  {
+   "name": "a wrong-shaped scenario value crashes",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    except (TypeError, AttributeError, KeyError) as exc:",
+   "replace": "    except ZeroDivisionError as exc:",
+   "expect_kills": [
+    "test_a_malformed_scenario_value_exits_3_not_a_traceback"
+   ]
+  },
+  {
+   "name": "reused stack torn down",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.s.stack_started and self.stack_mode == \"up\" and not self.keep_stack:",
+   "replace": "        if self.s.stack_started and not self.keep_stack:",
+   "expect_kills": [
+    "test_a_reused_or_kept_stack_is_left_running"
+   ]
+  },
+  {
+   "name": "kept stack torn down",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.s.stack_started and self.stack_mode == \"up\" and not self.keep_stack:",
+   "replace": "        if self.s.stack_started and self.stack_mode == \"up\":",
+   "expect_kills": [
+    "test_a_reused_or_kept_stack_is_left_running"
+   ]
+  },
+  {
+   "name": "not-measured widened",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "FORCED_NOT_MEASURED = [\"G-V2\", \"G-V4\"]",
+   "replace": "FORCED_NOT_MEASURED = [\"G-V2\", \"G-V3\", \"G-V4\", \"G-V5\"]",
+   "expect_kills": [
+    "test_the_forced_config_is_strict_and_loads"
+   ]
+  },
+  {
+   "name": "partial manifest scored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if self.s.manifest_sha is not None and self.s.error is None:",
+   "replace": "            if self.s.error is None:",
+   "expect_kills": [
+    "test_r2_a_participant_that_never_joins_aborts_at_the_join_budget"
+   ]
+  },
+  {
+   "name": "hold events re-anchored on the wall clock",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._sleep_until_mono(hs[\"mono\"] + ev[\"at_offset_s\"])",
+   "replace": "            self._sleep_until(hs[\"wall\"] + ev[\"at_offset_s\"])",
+   "expect_kills": [
+    "test_a_wall_step_between_two_events_does_not_delay_the_second"
+   ]
+  },
+  {
+   "name": "hold end re-anchored on the wall clock",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self._sleep_until_mono(hs[\"mono\"] + self.step[\"hold_s\"])",
+   "replace": "        self._sleep_until(hs[\"wall\"] + self.step[\"hold_s\"])",
+   "expect_kills": [
+    "test_a_backward_wall_step_does_not_stretch_the_hold"
+   ]
+  },
+  {
+   "name": "R1 hold length unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        on_time = held is not None and held <= self.step[\"hold_s\"] + EVENT_SLACK_S",
+   "replace": "        on_time = True",
+   "expect_kills": [
+    "test_r1_a_hold_stretched_by_a_slow_event_fails"
+   ]
+  },
+  {
+   "name": "R1 hold slack dropped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "held <= self.step[\"hold_s\"] + EVENT_SLACK_S",
+   "replace": "held <= self.step[\"hold_s\"]",
+   "expect_kills": [
+    "test_r1_a_hold_within_the_slack_passes"
+   ]
+  },
+  {
+   "name": "R6 lateness unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": " and len(s.event_lines) == len(planned_events) and not late,",
+   "replace": " and len(s.event_lines) == len(planned_events),",
+   "expect_kills": [
+    "test_r6_an_event_issued_late_fails",
+    "test_r6_an_event_after_the_last_two_scrapes_fails_whatever_the_plan_says"
+   ]
+  },
+  {
+   "name": "R6 slack dropped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "> min(e[\"at_offset_s\"] + EVENT_SLACK_S, last)]",
+   "replace": "> min(e[\"at_offset_s\"], last)]",
+   "expect_kills": [
+    "test_r6_an_event_issued_late_fails"
+   ]
+  },
+  {
+   "name": "R6 last-two-scrapes bound dropped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "> min(e[\"at_offset_s\"] + EVENT_SLACK_S, last)]",
+   "replace": "> e[\"at_offset_s\"] + EVENT_SLACK_S]",
+   "expect_kills": [
+    "test_r6_an_event_after_the_last_two_scrapes_fails_whatever_the_plan_says"
+   ]
+  },
+  {
+   "name": "backward step not tolerated",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        back = max(0.0, (issued.wall - issued.mono) - (reply.wall - reply.mono))",
+   "replace": "        back = 0.0",
+   "expect_kills": [
+    "test_a_small_backward_step_inside_an_event_call_is_confirmed_no_earlier_than_issued"
+   ]
+  },
+  {
+   "name": "upper bound not widened by the step",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "<= confirmed <= reply.wall + back)",
+   "replace": "<= confirmed <= reply.wall)",
+   "expect_kills": [
+    "test_a_small_backward_step_inside_an_event_call_is_confirmed_no_earlier_than_issued"
+   ]
+  },
+  {
+   "name": "early confirmation written as is",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        elif confirmed < t_issued:\n            confirmed = t_issued\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_small_backward_step_inside_an_event_call_is_confirmed_no_earlier_than_issued"
+   ]
+  },
+  {
+   "name": "a failing stopped line ends teardown",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            except BaseException as exc:  # noqa: B036 - the next process still gets its stop",
+   "replace": "            except AdapterError as exc:",
+   "expect_kills": [
+    "test_an_events_write_that_fails_in_teardown_still_stops_every_process"
+   ]
+  },
+  {
+   "name": "a failing teardown_start line ends teardown",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        line = self._try(\"teardown_start line\", lambda: self.log.write(\"teardown_start\"))",
+   "replace": "        line = self.log.write(\"teardown_start\")",
+   "expect_kills": [
+    "test_an_events_write_that_fails_in_teardown_still_stops_every_process"
+   ]
+  },
+  {
+   "name": "a crossed exit accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if getattr(ex, \"proc_id\", None) != pid:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_a_stop_that_returns_another_process_exit_still_stops_that_process"
+   ]
+  },
+  {
+   "name": "a finish write failure escapes",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            except BaseException as exc:  # noqa: B036 - run.json is written next",
+   "replace": "            except ZeroDivisionError as exc:",
+   "expect_kills": [
+    "test_a_done_line_or_commands_file_that_cannot_be_written_is_an_error"
+   ]
+  },
+  {
+   "name": "a run.json failure escapes",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        except BaseException as exc:  # noqa: B036 - the exit code still says ERROR",
+   "replace": "        except ZeroDivisionError as exc:",
+   "expect_kills": [
+    "test_a_run_json_that_cannot_be_written_is_an_error",
+    "test_a_run_json_that_cannot_be_written_exits_3"
+   ]
+  },
+  {
+   "name": "a run.json failure is not an error",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self.s.error = self.s.error or f\"finish: run.json not written ({_describe(exc)})\"\n            run = self._record(gates)\n",
+   "replace": "            pass\n",
+   "expect_kills": [
+    "test_a_run_json_that_cannot_be_written_is_an_error",
+    "test_a_run_json_that_cannot_be_written_exits_3"
+   ]
+  },
+  {
+   "name": "OSError text keeps its path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if isinstance(exc, OSError) and exc.strerror:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_run_json_that_cannot_be_written_is_an_error",
+    "test_an_events_write_that_fails_in_teardown_still_stops_every_process"
+   ]
+  },
+  {
+   "name": "duplicate proc ids launched",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if len(set(ids)) != len(ids):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_plan_with_two_processes_of_one_id_is_refused_before_anything_starts"
+   ]
+  },
+  {
+   "name": "an interrupted run is scored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    def _score(self):\n        if self.s.interrupted:",
+   "replace": "    def _score(self):\n        if False:",
+   "expect_kills": [
+    "test_r1_an_interrupt_after_hold_end_is_not_scored",
+    "test_a_signal_in_the_settle_out_after_hold_end_is_not_scored",
+    "test_a_signal_during_collect_is_recorded_and_collect_finishes",
+    "test_a_signal_after_collect_and_before_scoring_starts_is_never_scored"
+   ]
+  },
+  {
+   "name": "a signal never raises",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self._signal_mode == \"raise\":",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_signal_mid_hold_raises_and_the_run_is_torn_down_unscored",
+    "test_a_signal_while_scoring_raises_and_the_scorer_never_runs"
+   ]
+  },
+  {
+   "name": "a signal always raises",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self._signal_mode == \"raise\":",
+   "replace": "        if True:",
+   "expect_kills": [
+    "test_a_signal_anywhere_in_teardown_is_recorded_and_every_process_is_stopped",
+    "test_a_signal_during_collect_is_recorded_and_collect_finishes"
+   ]
+  },
+  {
+   "name": "phases leave signals raising",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                self.s.error = self.s.error or f\"{self.s.phase}: internal error {_describe(exc)}\"\n            self._signal_mode = \"record\"\n",
+   "replace": "                self.s.error = self.s.error or f\"{self.s.phase}: internal error {_describe(exc)}\"\n",
+   "expect_kills": [
+    "test_a_signal_anywhere_in_teardown_is_recorded_and_every_process_is_stopped"
+   ]
+  },
+  {
+   "name": "an adapter interrupt leaves signals raising",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        except BaseException as exc:  # noqa: B036 - teardown still runs\n            self._signal_mode = \"record\"\n",
+   "replace": "        except BaseException as exc:  # noqa: B036 - teardown still runs\n",
+   "expect_kills": [
+    "test_a_signal_anywhere_in_teardown_is_recorded_and_every_process_is_stopped"
+   ]
+  },
+  {
+   "name": "scoring shielded from signals",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                self._guarded(self._score, \"raise\")",
+   "replace": "                self._guarded(self._score, \"record\")",
+   "expect_kills": [
+    "test_a_signal_while_scoring_raises_and_the_scorer_never_runs"
+   ]
+  },
+  {
+   "name": "collect not shielded from signals",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._guarded(self._collect, \"record\")",
+   "replace": "            self._guarded(self._collect, \"raise\")",
+   "expect_kills": [
+    "test_a_signal_during_collect_is_recorded_and_collect_finishes"
+   ]
+  },
+  {
+   "name": "finish gates not recomputed after a signal",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.s.interrupted != seen:\n            gates = self._gates_or_error()",
+   "replace": "        if False:\n            gates = self._gates_or_error()",
+   "expect_kills": [
+    "test_a_signal_in_finish_still_writes_run_json_and_caps_the_verdict"
+   ]
+  },
+  {
+   "name": "SIGHUP not handled",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "SIGNALS = (\"SIGINT\", \"SIGTERM\", \"SIGHUP\")",
+   "replace": "SIGNALS = (\"SIGINT\", \"SIGTERM\")",
+   "expect_kills": [
+    "test_a_run_with_injected_adapters_returns_the_verdict_exit_code"
+   ]
+  },
+  {
+   "name": "handlers not restored",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "            signal.signal(getattr(signal, name), handler)",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_a_run_with_injected_adapters_returns_the_verdict_exit_code"
+   ]
+  },
+  {
+   "name": "PASS completeness unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if incomplete:\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_a_scorer_pass_without_every_validity_gate_passing_is_an_error"
+   ]
+  },
+  {
+   "name": "not_measured allowed for any gate",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "[waived[key].get(gate, \"pass\")]",
+   "replace": "[\"not_measured\"]",
+   "expect_kills": [
+    "test_a_scorer_pass_without_every_validity_gate_passing_is_an_error",
+    "test_a_self_contradicting_scorer_pass_is_an_error"
+   ]
+  },
+  {
+   "name": "a gate listed twice accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            status.setdefault(g.get(\"gate\"), []).append(g.get(\"status\"))",
+   "replace": "            status[g.get(\"gate\")] = [g.get(\"status\")]",
+   "expect_kills": [
+    "test_a_scorer_pass_without_every_validity_gate_passing_is_an_error"
+   ]
+  },
+  {
+   "name": "a missing gate accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                if sorted(status, key=str) != sorted(want):",
+   "replace": "                if False:",
+   "expect_kills": [
+    "test_a_scorer_pass_without_every_validity_gate_passing_is_an_error",
+    "test_a_self_contradicting_scorer_pass_is_an_error"
+   ]
+  },
+  {
+   "name": "PASS step ids unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": " or [st.get(\"step_id\") for st in steps] != [self.step[\"step_id\"]]:",
+   "replace": ":",
+   "expect_kills": [
+    "test_a_scorer_pass_without_every_validity_gate_passing_is_an_error"
+   ]
+  },
+  {
+   "name": "forced not-measured gates must pass",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "[waived[key].get(gate, \"pass\")]",
+   "replace": "[\"pass\"]",
+   "expect_kills": [
+    "test_a_healthy_run_follows_the_phase_order_and_every_gate_passes"
+   ]
+  },
+  {
+   "name": "generator window start unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "w.get(\"from\") != window[0] or ",
+   "replace": "",
+   "expect_kills": [
+    "test_anything_missing_extra_or_off_window_is_not_ok"
+   ]
+  },
+  {
+   "name": "R10 config_sha256 unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": " or r.get(\"run\", {}).get(\"config_sha256\") != sha",
+   "replace": "",
+   "expect_kills": [
+    "test_r10_each_echo_alone_is_checked"
+   ]
+  },
+  {
+   "name": "R10 config_overrides unchecked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "r.get(\"config_overrides\") != cq_score.config_overrides(cfg) or ",
+   "replace": "",
+   "expect_kills": [
+    "test_r10_each_echo_alone_is_checked"
+   ]
+  },
+  {
+   "name": "R10 empty steps accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "if wrong or not r.get(\"steps\"):",
+   "replace": "if wrong:",
+   "expect_kills": [
+    "test_r10_a_result_without_steps_fails"
+   ]
+  },
+  {
+   "name": "R7 empty state accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "gate(\"R7\", bool(s.stack_ready) and",
+   "replace": "gate(\"R7\", True and",
+   "expect_kills": [
+    "test_r7_an_empty_stack_state_at_both_ends_fails"
+   ]
+  },
+  {
+   "name": "R5 never-stopped ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "r5 = unplanned + [f\"{p}: never stopped\" for p in never] + s.exit_problems",
+   "replace": "r5 = unplanned + s.exit_problems",
+   "expect_kills": [
+    "test_r5_a_launched_process_with_no_exit_fails"
+   ]
+  },
+  {
+   "name": "tool child shares the runner's process group",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "check=False,\n                               start_new_session=True)",
+   "replace": "check=False,\n                               start_new_session=False)",
+   "expect_kills": [
+    "test_a_terminal_signal_to_the_process_group_never_reaches_a_tool",
+    "test_every_child_the_runner_starts_gets_its_own_session_and_a_timeout"
+   ]
+  },
+  {
+   "name": "git child shares the runner's process group",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "timeout=TOOL_TIMEOUT_S, start_new_session=True)",
+   "replace": "timeout=TOOL_TIMEOUT_S, start_new_session=False)",
+   "expect_kills": [
+    "test_every_child_the_runner_starts_gets_its_own_session_and_a_timeout"
+   ]
+  },
+  {
+   "name": "a hung git is not an adapter error",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        except subprocess.TimeoutExpired as exc:\n            raise AdapterError",
+   "replace": "        except ZeroDivisionError as exc:\n            raise AdapterError",
+   "expect_kills": [
+    "test_a_git_call_that_hangs_is_an_adapter_error"
+   ]
+  },
+  {
+   "name": "stop failure text keeps the path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "self._unrecorded(pid, f\"stop failed ({_describe(exc)})\")",
+   "replace": "self._unrecorded(pid, f\"stop failed ({type(exc).__name__}: {exc})\")",
+   "expect_kills": [
+    "test_no_os_error_path_reaches_run_json"
+   ]
+  },
+  {
+   "name": "phase internal error keeps the path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "f\"{self.s.phase}: internal error {_describe(exc)}\"",
+   "replace": "f\"{self.s.phase}: internal error {type(exc).__name__}: {exc}\"",
+   "expect_kills": [
+    "test_no_os_error_path_reaches_run_json"
+   ]
+  },
+  {
+   "name": "down error keeps the path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "f\"down: {_describe(exc)}\"",
+   "replace": "f\"down: {type(exc).__name__}: {exc}\"",
+   "expect_kills": [
+    "test_no_os_error_path_reaches_run_json"
+   ]
+  },
+  {
+   "name": "gates error keeps the path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "f\"gates: internal error {_describe(exc)}\"",
+   "replace": "f\"gates: internal error {type(exc).__name__}: {exc}\"",
+   "expect_kills": [
+    "test_no_os_error_path_reaches_run_json"
+   ]
+  },
+  {
+   "name": "R10 read error keeps the path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "generator verdict: {_describe(exc)}\"",
+   "replace": "generator verdict: {exc}\"",
+   "expect_kills": [
+    "test_r10_names_no_path_when_the_verdict_file_is_gone"
+   ]
+  },
+  {
+   "name": "refusal text gets a type prefix",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if isinstance(exc, (AdapterError, Refused)):",
+   "replace": "    if isinstance(exc, AdapterError):",
+   "expect_kills": [
+    "test_r9_a_dirty_tree_is_refused_without_allow_dirty"
+   ]
+  },
+  {
+   "name": "git timeout dropped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "timeout=TOOL_TIMEOUT_S, start_new_session=True)",
+   "replace": "start_new_session=True)",
+   "expect_kills": [
+    "test_every_child_the_runner_starts_gets_its_own_session_and_a_timeout"
+   ]
+  },
+  {
+   "name": "result kept before the scored line",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.log.write(\"scored\", scorer_exit=self.s.scorer_rc, verdict=result[\"verdict\"])\n        self.s.result = result\n",
+   "replace": "        self.s.result = result\n        self.log.write(\"scored\", scorer_exit=self.s.scorer_rc, verdict=result[\"verdict\"])\n",
+   "expect_kills": [
+    "test_a_signal_while_the_scored_line_is_written_leaves_the_run_unscored"
+   ]
+  },
+  {
+   "name": "a step verdict other than PASS accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if st.get(\"verdict\") != \"PASS\" or st.get(\"invalid_reasons\") != []:",
+   "replace": "            if st.get(\"invalid_reasons\") != []:",
+   "expect_kills": [
+    "test_a_self_contradicting_scorer_pass_is_an_error"
+   ]
+  },
+  {
+   "name": "invalid_reasons on a PASS accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if st.get(\"verdict\") != \"PASS\" or st.get(\"invalid_reasons\") != []:",
+   "replace": "            if st.get(\"verdict\") != \"PASS\":",
+   "expect_kills": [
+    "test_a_self_contradicting_scorer_pass_is_an_error"
+   ]
+  },
+  {
+   "name": "quality gates not checked on a PASS",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "for key, want in ((\"validity\", VALIDITY_GATES), (\"quality_gates\", QUALITY_GATES)):",
+   "replace": "for key, want in ((\"validity\", VALIDITY_GATES),):",
+   "expect_kills": [
+    "test_a_self_contradicting_scorer_pass_is_an_error"
+   ]
+  },
+  {
+   "name": "G-Q5 waived whatever the config",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "\"quality_gates\": {\"G-Q5\": \"not_measured\"} if latency_waived else {}}",
+   "replace": "\"quality_gates\": {\"G-Q5\": \"not_measured\"}}",
+   "expect_kills": [
+    "test_g_q5_may_be_unmeasured_only_while_latency_is_waived"
+   ]
+  },
+  {
+   "name": "G-Q5 never waived",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "\"quality_gates\": {\"G-Q5\": \"not_measured\"} if latency_waived else {}}",
+   "replace": "\"quality_gates\": {}}",
+   "expect_kills": [
+    "test_a_healthy_run_follows_the_phase_order_and_every_gate_passes"
+   ]
+  },
+  {
+   "name": "a future join time accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                if future:",
+   "replace": "                if False:",
+   "expect_kills": [
+    "test_a_join_or_media_time_in_milliseconds_aborts_the_join",
+    "test_a_join_time_up_to_the_slack_ahead_is_kept"
+   ]
+  },
+  {
+   "name": "a future media start accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "for k in (\"join_ts\", \"media_started_at\")",
+   "replace": "for k in (\"join_ts\",)",
+   "expect_kills": [
+    "test_a_join_or_media_time_in_milliseconds_aborts_the_join"
+   ]
+  },
+  {
+   "name": "the join-time slack excludes its bound",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "getattr(j, k) > horizon]",
+   "replace": "getattr(j, k) >= horizon]",
+   "expect_kills": [
+    "test_a_join_time_up_to_the_slack_ahead_is_kept"
+   ]
+  },
+  {
+   "name": "a join without a time recorded",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                if uid in self.s.joined or not _num(j.join_ts) or (",
+   "replace": "                if uid in self.s.joined or (",
+   "expect_kills": [
+    "test_a_join_without_a_time_is_ignored_until_it_has_one"
+   ]
+  },
+  {
+   "name": "an exit at teardown_start is unplanned",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "ex.exited_at < teardown and",
+   "replace": "ex.exited_at <= teardown and",
+   "expect_kills": [
+    "test_an_exit_at_teardown_start_is_not_an_unplanned_exit"
+   ]
+  },
+  {
+   "name": "a leave exit with any code is planned",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "not (ex.exit_code == 0 and all(",
+   "replace": "not (True and all(",
+   "expect_kills": [
+    "test_a_leaver_that_exits_with_an_error_after_its_leave_is_unplanned"
+   ]
+  },
+  {
+   "name": "a missing git escapes as OSError",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        except OSError as exc:\n            raise AdapterError(f\"git {' '.join(args)}: {_describe(exc)}\") from exc\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_missing_git_is_an_adapter_error"
+   ]
+  },
+  {
+   "name": "git stderr paths kept",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "_no_paths(p.stderr.strip())",
+   "replace": "p.stderr.strip()",
+   "expect_kills": [
+    "test_git_stderr_reaches_the_error_without_its_paths"
+   ]
+  },
+  {
+   "name": "main lets an exception escape",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "    except Exception as exc:  # noqa: BLE001 - exit 1 would read as FAIL",
+   "replace": "    except ZeroDivisionError as exc:  # noqa: BLE001 - exit 1 would read as FAIL",
+   "expect_kills": [
+    "test_an_unexpected_exception_exits_3"
+   ]
+  },
+  {
+   "name": "a tool timeout logs its argv",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            return 3, \"\", f\"TimeoutExpired: no exit after {TOOL_TIMEOUT_S} s\"",
+   "replace": "            return 3, \"\", f\"TimeoutExpired: {argv}\"",
+   "expect_kills": [
+    "test_a_tool_that_times_out_or_cannot_start_logs_no_argv_url_or_path"
+   ]
+  },
+  {
+   "name": "a failed tool start logs its path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            return 3, \"\", _describe(exc)",
+   "replace": "            return 3, \"\", f\"{type(exc).__name__}: {exc}\"",
+   "expect_kills": [
+    "test_a_tool_that_times_out_or_cannot_start_logs_no_argv_url_or_path"
+   ]
+  },
+  {
+   "name": "the events.jsonl path reaches run.json",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "raise AdapterError(str(exc).replace(events, cq_collect.EVENTS_FILE)) from exc",
+   "replace": "raise AdapterError(str(exc)) from exc",
+   "expect_kills": [
+    "test_no_os_error_path_reaches_run_json"
+   ]
+  },
+  {
+   "name": "tool logs keep the run folder path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "--- stderr\\n{err}\\n\".replace(self.dir, \"$RUN\")\n",
+   "replace": "--- stderr\\n{err}\\n\"\n",
+   "expect_kills": [
+    "test_a_collector_error_names_the_run_folder_as_run_in_its_log"
+   ]
+  },
+  {
+   "name": "commands.txt keeps the raw argv",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "recorded_argv(\n                                  sys.argv[1:] if argv is None else argv, label))",
+   "replace": "list(\n                                  sys.argv[1:] if argv is None else argv))",
+   "expect_kills": [
+    "test_no_run_folder_file_names_a_user_path"
+   ]
+  },
+  {
+   "name": "an external scenario recorded by its label",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "\"$RUN/scenario.yaml\" if label.startswith(\"external:\") else label",
+   "replace": "label",
+   "expect_kills": [
+    "test_no_run_folder_file_names_a_user_path"
+   ]
+  },
+  {
+   "name": "--flag=value forms not rewritten",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "        elif eq and flag in subs:",
+   "replace": "        elif False:",
+   "expect_kills": [
+    "test_no_run_folder_file_names_a_user_path"
+   ]
+  },
+  {
+   "name": "an errored run can meet its expectation",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    if error is not None:\n        problems.append(f\"run error: {error}\")",
+   "replace": "    if False:\n        problems.append(f\"run error: {error}\")",
+   "expect_kills": [
+    "test_not_met_when_the_run_ends_in_error"
+   ]
+  },
+  {
+   "name": "a signal before the run raises",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self._signal_mode = \"record\"\n\n    def on_signal",
+   "replace": "        self._signal_mode = \"raise\"\n\n    def on_signal",
+   "expect_kills": [
+    "test_a_signal_before_the_run_starts_is_recorded_and_nothing_starts"
+   ]
+  },
+  {
+   "name": "a signal before the run is ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    def _phases(self):\n        if self.s.interrupted:",
+   "replace": "    def _phases(self):\n        if False:",
+   "expect_kills": [
+    "test_a_signal_before_the_run_starts_is_recorded_and_nothing_starts"
+   ]
+  },
+  {
+   "name": "G-Q9 disabled waived whatever the config",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if not cq_score.cv(cfg, \"quality_gates\", \"reconnect_gate_enabled\"):",
+   "replace": "        if True:",
+   "expect_kills": [
+    "test_g_q9_may_be_disabled_only_while_the_config_disables_it"
+   ]
+  },
+  {
+   "name": "tool logs keep the checkout path",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "\n                     .replace(HERE, \"scripts/quality\"))",
+   "replace": ")",
+   "expect_kills": [
+    "test_a_tool_traceback_names_the_checkout_as_scripts_quality_in_its_log"
+   ]
+  },
+  {
+   "name": "quoted git paths kept",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "r\"'/[^']*'|\\\"/[^\\\"]*\\\"|(?<![\\w.])/\\S+\"",
+   "replace": "r\"(?<![\\w.'])/\\S+\"",
+   "expect_kills": [
+    "test_git_stderr_reaches_the_error_without_its_paths"
+   ]
+  },
+  {
+   "name": "unquoted git paths kept",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "r\"'/[^']*'|\\\"/[^\\\"]*\\\"|(?<![\\w.])/\\S+\"",
+   "replace": "r\"'/[^']*'|\\\"/[^\\\"]*\\\"\"",
+   "expect_kills": [
+    "test_git_stderr_reaches_the_error_without_its_paths"
+   ]
+  },
+  {
+   "name": "the join-time slack widened tenfold",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "JOIN_TIME_SLACK_S = cq_collect.MAX_ABS_SKEW_MS / 1000 + EXIT_SLACK_S",
+   "replace": "JOIN_TIME_SLACK_S = cq_collect.MAX_ABS_SKEW_MS / 1000 + EXIT_SLACK_S * 10",
+   "expect_kills": [
+    "test_a_join_time_up_to_the_slack_ahead_is_kept"
+   ]
+  },
+  {
+   "name": "the join-time slack without EXIT_SLACK_S",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "JOIN_TIME_SLACK_S = cq_collect.MAX_ABS_SKEW_MS / 1000 + EXIT_SLACK_S",
+   "replace": "JOIN_TIME_SLACK_S = cq_collect.MAX_ABS_SKEW_MS / 1000",
+   "expect_kills": [
+    "test_a_join_time_up_to_the_slack_ahead_is_kept"
+   ]
+  },
+  {
+   "name": "a leave exit with no code is planned",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "not (ex.exit_code == 0 and all(",
+   "replace": "not (not ex.exit_code and all(",
+   "expect_kills": [
+    "test_a_leaver_that_exits_with_an_error_after_its_leave_is_unplanned"
+   ]
+  },
+  {
+   "name": "the latency waiver ignores allowed_unmeasured",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "latency_waived = cq_score.latency_metric(cfg) is None and cq_score.cv(cfg, \"latency_gate\",\n                                                                            \"allowed_unmeasured\")",
+   "replace": "latency_waived = cq_score.latency_metric(cfg) is None",
+   "expect_kills": [
+    "test_g_q5_may_be_unmeasured_only_while_latency_is_waived"
+   ]
+  }
+ ]
+}

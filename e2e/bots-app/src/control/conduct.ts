@@ -4,9 +4,9 @@ import { Command } from "commander";
 import { parse as parseYaml } from "yaml";
 
 import { conductLine, sanitizeLogLine } from "../log-line";
-import { type CtlClientConfig, ctlRequest } from "./client";
-import { NetemValidationError, resolveNetemRequest } from "./netem";
-import { type BotSnapshot } from "./registry";
+import { type CtlClientConfig, CtlHttpError, ctlRequest, CtlUnreachableError } from "./client";
+import { NETEM_PARAM_KEYS, NetemValidationError, resolveNetemRequest } from "./netem";
+import { BotNotJoinedError, type BotSnapshot } from "./registry";
 
 /**
  * Increment 4 (#2072): the CONDUCTOR.
@@ -126,16 +126,7 @@ export interface ParsedScenario {
   entries: ParsedEntry[];
 }
 
-/** Must cover every raw key {@link resolveNetemRequest} accepts, or YAML silently drops it. */
-const NETEM_PARAM_KEYS = [
-  "profile",
-  "delayMs",
-  "jitterMs",
-  "lossPct",
-  "rateKbit",
-  "downlinkRateKbit",
-  "limitPkts",
-] as const;
+const NETEM_BODY_KEYS = ["profile", ...NETEM_PARAM_KEYS] as const;
 
 /**
  * Collect the netem-relevant keys present on a raw entry into a request
@@ -146,7 +137,7 @@ const NETEM_PARAM_KEYS = [
  */
 function collectNetemBody(o: Record<string, unknown>): Record<string, unknown> {
   const body: Record<string, unknown> = {};
-  for (const k of NETEM_PARAM_KEYS) {
+  for (const k of NETEM_BODY_KEYS) {
     if (o[k] !== undefined) body[k] = o[k];
   }
   return body;
@@ -308,6 +299,7 @@ export interface ConductorClient {
 
 /** What a netem action reports back; every other action reports nothing. */
 export interface NetemOutcome {
+  ingressShaped: boolean;
   mirrorRemoved: boolean;
 }
 
@@ -486,7 +478,7 @@ export function buildSchedule(
 
 // ── The runner ───────────────────────────────────────────────────────────
 
-/** Budget for the control API to answer /healthz (one per scheduled host). */
+/** Budget for every gated pod to report its expected bots in the meeting. */
 export const READINESS_TIMEOUT_MS = 120_000;
 
 export const READINESS_POLL_INTERVAL_MS = 2_000;
@@ -504,8 +496,57 @@ export interface ConductDeps {
   clock: Clock;
   sleep: SleepFn;
   log: (line: string) => void;
-  /** `GET /healthz` probe: true on 2xx, false otherwise. Absent ⇒ gate skipped. */
-  fetchHealthz?: (host: string, port: number) => Promise<boolean>;
+  /** `GET /healthz` probe: the parsed 2xx body, or `null` when unreachable / non-2xx. Absent ⇒ gate skipped. */
+  fetchHealthz?: (host: string, port: number) => Promise<unknown>;
+}
+
+export type PodReadiness =
+  | { state: "unreachable" }
+  | { state: "legacy" }
+  | { state: "not-joined"; inMeeting: number; pending: number; expected: number }
+  | { state: "in-meeting"; inMeeting: number; expected: number };
+
+const isCount = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
+
+/** A pod is ready only when it expects a bot and every expected bot has joined (#2917). */
+export function classifyHealthz(body: unknown): PodReadiness {
+  if (body === null || typeof body !== "object") return { state: "unreachable" };
+  const b = body as { inMeeting?: unknown; pending?: unknown; expected?: unknown };
+  if (!isCount(b.inMeeting) || !isCount(b.expected)) return { state: "legacy" };
+  if (b.expected > 0 && b.inMeeting >= b.expected) {
+    return { state: "in-meeting", inMeeting: b.inMeeting, expected: b.expected };
+  }
+  const pending = isCount(b.pending) ? b.pending : 0;
+  return { state: "not-joined", inMeeting: b.inMeeting, pending, expected: b.expected };
+}
+
+function describeNotReady(host: string, r: PodReadiness): string {
+  switch (r.state) {
+    case "unreachable":
+      return `${host} never answered /healthz`;
+    case "legacy":
+      return `${host} /healthz reports no in-meeting count (image predates #2917; re-pin the fleet)`;
+    case "not-joined":
+      if (r.expected === 0)
+        return `${host} expects no bot (none launched, or every bot left on purpose)`;
+      return `${host} not in the meeting (inMeeting ${r.inMeeting}/${r.expected}, still joining ${r.pending})`;
+    case "in-meeting":
+      return host;
+  }
+}
+
+/** The operator-side fix when the misses point at configuration rather than at the pods. */
+function readinessHint(missed: PodReadiness[], gated: number): string {
+  if (missed.some((r) => r.state === "legacy")) {
+    return " - a pod on an image older than #2917 cannot report in-meeting bots: re-pin the fleet to the current image, or pass --allow-legacy-healthz to accept those pods on a serving /healthz (their in-meeting count is then UNVERIFIED)";
+  }
+  const slow = missed.some(
+    (r) => r.state === "unreachable" || (r.state === "not-joined" && r.pending > 0),
+  );
+  if (missed.length === gated && slow) {
+    return " - every gated pod missed the budget, which usually means it is too low: raise --readiness-timeout above BOT_MAX_JOIN_STAGGER_SECS plus pod startup, login and join";
+  }
+  return "";
 }
 
 export interface ConductSummary {
@@ -513,39 +554,70 @@ export interface ConductSummary {
   planned: number;
   /** Calls that returned successfully. */
   fired: number;
-  /** Calls that threw (logged, non-fatal — the run continues). */
+  /** Calls the pod received, plus connection errors after connect, where delivery is unknown (logged, non-fatal). */
   failed: number;
+  /** Calls never applied: the pod had no joined bot, or the cached bot id was stale (409/404) even if a replacement joined (#2386). */
+  dropped: number;
+  /** Calls whose TCP connection never opened, so the pod never saw them (#2386). */
+  unreachable: number;
   dryRun: boolean;
 }
 
 /**
- * Hold t0 until each scheduled pod's control API answers /healthz, else throw
- * naming the silent pods. Skipped: no `fetchHealthz`, no hosts, `timeoutMs <= 0`.
+ * Hold t0 until every gated pod reports all its expected bots in the meeting,
+ * else throw naming each short pod. Skipped: no `fetchHealthz`, no hosts, `timeoutMs <= 0`.
  */
 async function awaitFleetReady(
   hosts: string[],
   port: number,
   deps: ConductDeps,
   timeoutMs: number,
+  allowLegacy: boolean,
 ): Promise<void> {
-  if (!deps.fetchHealthz || hosts.length === 0 || timeoutMs <= 0) return;
+  if (!deps.fetchHealthz || hosts.length === 0 || timeoutMs <= 0) {
+    deps.log(conductLine("readiness gate skipped - in-meeting bot count is UNVERIFIED"));
+    return;
+  }
   const deadline = deps.clock.now() + timeoutMs;
+  const last = new Map<string, PodReadiness>(hosts.map((h) => [h, { state: "unreachable" }]));
   const remaining = new Set(hosts);
-  deps.log(conductLine(`awaiting readiness of ${remaining.size} pod(s) (timeout ${timeoutMs}ms)`));
-  while (remaining.size > 0 && deps.clock.now() < deadline) {
-    for (const host of [...remaining]) {
-      if (await deps.fetchHealthz(host, port)) remaining.delete(host);
+  deps.log(
+    conductLine(`awaiting in-meeting bots on ${remaining.size} pod(s) (timeout ${timeoutMs}ms)`),
+  );
+  // Every sweep re-polls every pod, so t0 needs one sweep in which all of them read ready.
+  do {
+    remaining.clear();
+    for (const host of hosts) {
+      const r = classifyHealthz(await deps.fetchHealthz(host, port));
+      last.set(host, r);
+      if (r.state !== "in-meeting" && !(allowLegacy && r.state === "legacy")) remaining.add(host);
     }
     if (remaining.size > 0 && deps.clock.now() < deadline) {
       await deps.sleep(READINESS_POLL_INTERVAL_MS);
     }
-  }
+  } while (remaining.size > 0 && deps.clock.now() < deadline);
   if (remaining.size > 0) {
+    const missed = [...remaining].map((h) => [h, last.get(h) ?? { state: "unreachable" }] as const);
+    const detail = missed.map(([h, r]) => describeNotReady(h, r)).join("; ");
     throw new Error(
-      `${remaining.size} pod(s) never answered /healthz within ${timeoutMs}ms: ${[...remaining].join(", ")}`,
+      `${remaining.size} of ${hosts.length} pod(s) not ready within ${timeoutMs}ms: ${detail}${readinessHint(
+        missed.map(([, r]) => r),
+        hosts.length,
+      )}`,
     );
   }
-  deps.log(conductLine("all pods ready"));
+  let inMeeting = 0;
+  for (const r of last.values()) if (r.state === "in-meeting") inMeeting += r.inMeeting;
+  const legacy = hosts.filter((h) => last.get(h)?.state === "legacy");
+  if (legacy.length > 0) {
+    deps.log(
+      conductLine(
+        `--allow-legacy-healthz: ${legacy.length} pod(s) report no in-meeting count, so their bots are UNVERIFIED and not in the t0 total: ${legacy.join(", ")}`,
+      ),
+    );
+  }
+  const unverified = legacy.length > 0 ? `, ${legacy.length} pod(s) UNVERIFIED` : "";
+  deps.log(conductLine(`all pods ready - ${inMeeting} bot(s) in the meeting at t0${unverified}`));
 }
 
 /**
@@ -565,6 +637,8 @@ async function runSchedule(
   const clients = new Map<string, ConductorClient>();
   let fired = 0;
   let failed = 0;
+  let dropped = 0;
+  let unreachable = 0;
 
   for (const sc of schedule) {
     const due = t0 + sc.atMs;
@@ -584,25 +658,52 @@ async function runSchedule(
     try {
       const outcome = await applyAction(client, sc.call);
       fired += 1;
-      if (outcome?.mirrorRemoved === true) {
-        deps.log(
-          sanitizeLogLine(
-            `  ! bot ${sc.bot} (${sc.host}) ${describeCall(sc.call)} removed this pod's startup ingress mirror — its downlink is now UNSHAPED`,
-          ),
-        );
+      if (
+        sc.call.kind === "netem" &&
+        outcome !== undefined &&
+        resolveNetemRequest(sc.call.body).op === "shape"
+      ) {
+        const what = `bot ${sc.bot} (${sc.host}) ${describeCall(sc.call)}`;
+        const dirs = outcome.ingressShaped ? "both directions" : "egress only";
+        deps.log(sanitizeLogLine(`  ${what} shaped ${dirs}`));
+        if (outcome.mirrorRemoved) {
+          deps.log(
+            sanitizeLogLine(
+              `  ! ${what} removed this pod's ingress mirror — its downlink is now UNSHAPED`,
+            ),
+          );
+        }
       }
     } catch (e) {
-      failed += 1;
+      let outcome = "failed";
+      if (e instanceof CtlUnreachableError) {
+        unreachable += 1;
+        outcome = "unreachable";
+      } else if (isNotJoined(e)) {
+        dropped += 1;
+        outcome = "dropped (not joined)";
+      } else {
+        failed += 1;
+      }
       deps.log(
         sanitizeLogLine(
-          `  ! bot ${sc.bot} (${sc.host}) ${describeCall(sc.call)} failed: ${(e as Error).message}`,
+          `  ! bot ${sc.bot} (${sc.host}) ${describeCall(sc.call)} ${outcome}: ${(e as Error).message}`,
         ),
       );
     }
   }
 
-  deps.log(conductLine(`done - ${fired} action(s) fired, ${failed} failed`));
-  return { planned: schedule.length, fired, failed, dryRun: false };
+  deps.log(
+    conductLine(
+      `done - ${fired} action(s) fired, ${failed} failed, ${dropped} dropped (not joined), ${unreachable} unreachable`,
+    ),
+  );
+  return { planned: schedule.length, fired, failed, dropped, unreachable, dryRun: false };
+}
+
+/** The pod was reached but had no joined bot to apply the call to (#2386). */
+function isNotJoined(e: unknown): boolean {
+  return e instanceof BotNotJoinedError || (e instanceof CtlHttpError && e.status === 409);
 }
 
 /** Print the resolved schedule (host + action + offset). No calls issued. */
@@ -630,6 +731,10 @@ export async function conductScenario(params: {
   dryRun: boolean;
   token?: string;
   readinessTimeoutMs?: number;
+  /** Also gate ordinals 0..fleetSize-1 that the timeline never names. */
+  fleetSize?: number;
+  /** Accept a pod whose `/healthz` predates #2917 on a serving answer alone. */
+  allowLegacyHealthz?: boolean;
   deps: ConductDeps;
 }): Promise<ConductSummary> {
   const { deps } = params;
@@ -645,7 +750,14 @@ export async function conductScenario(params: {
   if (params.dryRun) {
     printSchedule(schedule, deps.log);
     deps.log(conductLine("dry-run - no control calls issued"));
-    return { planned: schedule.length, fired: 0, failed: 0, dryRun: true };
+    return {
+      planned: schedule.length,
+      fired: 0,
+      failed: 0,
+      dropped: 0,
+      unreachable: 0,
+      dryRun: true,
+    };
   }
 
   if (params.token === undefined || params.token.length === 0) {
@@ -654,12 +766,24 @@ export async function conductScenario(params: {
     );
   }
 
-  const uniqueHosts = [...new Set(schedule.map((s) => s.host))];
+  const fleetSize = params.fleetSize ?? 0;
+  const fleetHosts = Array.from({ length: fleetSize }, (_, n) =>
+    resolveBotHost(n, params.hostOpts),
+  );
+  const uniqueHosts = [...new Set([...schedule.map((s) => s.host), ...fleetHosts])];
+  if (fleetSize === 0) {
+    deps.log(
+      conductLine(
+        "no --fleet-size: pods the timeline does not name are not checked for in-meeting bots",
+      ),
+    );
+  }
   await awaitFleetReady(
     uniqueHosts,
     params.port,
     deps,
     params.readinessTimeoutMs ?? READINESS_TIMEOUT_MS,
+    params.allowLegacyHealthz ?? false,
   );
 
   return runSchedule(schedule, { ...deps, port: params.port, token: params.token });
@@ -670,7 +794,8 @@ export async function conductScenario(params: {
 /**
  * The live {@link ConductorClient}. mute/camera/share/leave target the
  * pod's SINGLE bot, whose (random UUID) id is not known ahead of time, so
- * it is resolved once via `GET /bots` and cached. netem is a top-level
+ * it is resolved via `GET /bots` and cached until a control on it answers 409
+ * or the pod no longer lists it (404). netem is a top-level
  * route and needs no bot id — a netem-only scenario never triggers a
  * bot-id lookup.
  */
@@ -703,31 +828,47 @@ class HttpConductorClient implements ConductorClient {
     // registry's retention window and must not be targeted.
     const pick = bots.find((b) => b.status !== "done" && b.status !== "failed") ?? bots[0];
     if (pick === undefined) {
-      throw new Error(
+      throw new BotNotJoinedError(
         `no bot registered on ${this.config.host ?? "127.0.0.1"} - cannot target its meeting controls (netem actions do not need a bot)`,
       );
     }
     return pick.botId;
   }
 
+  /** A 409, or a 404 for a bot the pod dropped, clears the cached id so the next control re-resolves. */
+  private async botControl(route: string, body?: Record<string, unknown>): Promise<void> {
+    const cached = this.botId();
+    const id = await cached;
+    try {
+      await ctlRequest(this.config, "POST", `/bots/${encodeURIComponent(id)}/${route}`, body);
+    } catch (e) {
+      const gone = isDroppedBot(e, id);
+      if (e instanceof CtlHttpError && (e.status === 409 || gone)) {
+        if (this.botIdPromise === cached) this.botIdPromise = null;
+      }
+      if (gone) {
+        throw new BotNotJoinedError(
+          `bot ${id} is no longer registered on ${this.config.host ?? "127.0.0.1"}`,
+        );
+      }
+      throw e;
+    }
+  }
+
   async mute(muted: boolean): Promise<void> {
-    const id = await this.botId();
-    await ctlRequest(this.config, "POST", `/bots/${encodeURIComponent(id)}/mute`, { mic: muted });
+    await this.botControl("mute", { mic: muted });
   }
 
   async setCameraOff(off: boolean): Promise<void> {
-    const id = await this.botId();
-    await ctlRequest(this.config, "POST", `/bots/${encodeURIComponent(id)}/video`, { camera: off });
+    await this.botControl("video", { camera: off });
   }
 
   async setScreenShare(on: boolean): Promise<void> {
-    const id = await this.botId();
-    await ctlRequest(this.config, "POST", `/bots/${encodeURIComponent(id)}/share`, { share: on });
+    await this.botControl("share", { share: on });
   }
 
   async leave(): Promise<void> {
-    const id = await this.botId();
-    await ctlRequest(this.config, "POST", `/bots/${encodeURIComponent(id)}/leave`);
+    await this.botControl("leave");
   }
 
   async applyNetem(body: Record<string, unknown>): Promise<NetemOutcome> {
@@ -739,10 +880,29 @@ class HttpConductorClient implements ConductorClient {
   }
 }
 
-/** An older pod omits the field; absent is reported as no mirror, never as one. */
+/** The control server's `requireBot` 404 for an id no longer in its registry, not a missing route. */
+function isDroppedBot(e: unknown, id: string): boolean {
+  if (!(e instanceof CtlHttpError) || e.status !== 404) return false;
+  return (e.body as { error?: unknown } | null)?.error === `bot ${id} not found`;
+}
+
+/** An older pod omits the fields; absent is reported as false, never as true. */
 function netemOutcome(res: unknown): NetemOutcome {
-  const o = (res ?? {}) as { mirrorRemoved?: unknown };
-  return { mirrorRemoved: o.mirrorRemoved === true };
+  const o = (res ?? {}) as { ingressShaped?: unknown; mirrorRemoved?: unknown };
+  return { ingressShaped: o.ingressShaped === true, mirrorRemoved: o.mirrorRemoved === true };
+}
+
+/** Production `/healthz` probe: a 2xx body that is not JSON is unreachable, not legacy. */
+export async function fetchHealthzHttp(host: string, port: number): Promise<unknown> {
+  try {
+    const res = await fetch(`http://${host}:${port}/healthz`, {
+      signal: AbortSignal.timeout(READINESS_POLL_INTERVAL_MS),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
 
 /** Production factory: real HTTP calls via {@link ctlRequest}. */
@@ -761,6 +921,8 @@ interface ConductCommandOptions {
   dnsSuffix: string;
   dryRun: boolean;
   readinessTimeout: string;
+  fleetSize: string;
+  allowLegacyHealthz: boolean;
 }
 
 /**
@@ -799,8 +961,18 @@ export function registerConductCommand(program: Command): void {
     )
     .option(
       "--readiness-timeout <ms>",
-      "How long to wait (ms) for each scheduled pod's control API to answer /healthz before anchoring t0. Set 0 to skip the gate.",
+      "How long to wait (ms) for every gated pod to report all its expected bots in the meeting (GET /healthz) before anchoring t0. Must exceed the fleet's BOT_MAX_JOIN_STAGGER_SECS plus pod startup, login and join. Set 0 to skip the gate (the in-meeting count is then unverified).",
       String(READINESS_TIMEOUT_MS),
+    )
+    .option(
+      "--fleet-size <n>",
+      "StatefulSet replica count. Also gates pods 0..n-1 the timeline never names, so the t0 in-meeting total covers the whole fleet. 0 gates only the pods the timeline names.",
+      "0",
+    )
+    .option(
+      "--allow-legacy-healthz",
+      "Accept pods on an image older than #2917 (no in-meeting count on /healthz) once they answer. Their bots are logged as UNVERIFIED and left out of the t0 total.",
+      false,
     )
     .action(async (opts: ConductCommandOptions) => {
       const port = Number.parseInt(opts.port, 10);
@@ -815,6 +987,14 @@ export function registerConductCommand(program: Command): void {
           conductLine(
             `--readiness-timeout must be a non-negative integer in ms (got "${opts.readinessTimeout}")`,
           ),
+        );
+        process.exit(2);
+      }
+
+      const fleetSize = Number.parseInt(opts.fleetSize, 10);
+      if (!/^\d+$/.test(opts.fleetSize.trim()) || fleetSize < 0) {
+        console.error(
+          conductLine(`--fleet-size must be a non-negative integer (got "${opts.fleetSize}")`),
         );
         process.exit(2);
       }
@@ -848,16 +1028,7 @@ export function registerConductCommand(program: Command): void {
         clock: { now: () => Date.now() },
         sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
         log: (line) => console.log(line),
-        fetchHealthz: async (host, healthPort) => {
-          try {
-            const res = await fetch(`http://${host}:${healthPort}/healthz`, {
-              signal: AbortSignal.timeout(READINESS_POLL_INTERVAL_MS),
-            });
-            return res.ok;
-          } catch {
-            return false;
-          }
-        },
+        fetchHealthz: fetchHealthzHttp,
       };
 
       try {
@@ -872,11 +1043,13 @@ export function registerConductCommand(program: Command): void {
           dryRun: opts.dryRun,
           token,
           readinessTimeoutMs,
+          fleetSize,
+          allowLegacyHealthz: opts.allowLegacyHealthz,
           deps,
         });
-        // A live run with any failed call exits non-zero so CI / a wrapper
+        // A live run with any failed, dropped or unreachable call exits non-zero so CI / a wrapper
         // script sees the scenario did not fully apply.
-        if (!summary.dryRun && summary.failed > 0) {
+        if (!summary.dryRun && summary.failed + summary.dropped + summary.unreachable > 0) {
           process.exit(1);
         }
       } catch (e) {

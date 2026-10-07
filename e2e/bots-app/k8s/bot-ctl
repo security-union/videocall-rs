@@ -8,6 +8,8 @@ usage() {
 bot-ctl — control K8s-deployed bot fleet pods; handles the port-forward and token for you.
 
 Usage:
+  bot-ctl preflight <replicas>     before a scale: live quota headroom, manifest drift,
+                                   every pod on the StatefulSet's update revision
   bot-ctl list [N|all]             bots on pod N, or on every running pod (default: all)
   bot-ctl netem <profile> [N|all]  apply a netem profile
   bot-ctl clear [N|all]            remove netem shaping
@@ -24,16 +26,18 @@ Env:
   KUBECONFIG          fallback kubeconfig (default: ~/qsk8s-config)
   BOT_NAMESPACE       K8s namespace       (default: bot-load)
   BOT_STS             StatefulSet name    (default: videocall-bots)
+  BOT_QUOTA           ResourceQuota preflight checks (default: bot-load-quota)
   BOT_CTL_PORT_BASE   local port base for port-forwards (default: 18080); give
                       concurrent invocations different bases
-  BOT_CTL_PF_WAIT     seconds to wait for each port-forward (default: 1)
+  BOT_CTL_PF_WAIT     max seconds to wait for each port-forward (default: 10)
   E2E_DIR             path to e2e/ (default: derived from this script's location)
 
-Requires kubectl, GNU coreutils, and a node that can run `npm run bot` from e2e/.
+Requires kubectl and GNU coreutils; every command but preflight also needs a node
+that can run `npm run bot` from e2e/.
 
-Every command targets one pod (N) or all running pods. Mutating commands act on
-the pod's in-meeting bot, print one ✓ or ✗ per pod, and exit non-zero if any pod
-failed.
+Every command but preflight targets one pod (N) or all running pods. Mutating
+commands act on the pod's in-meeting bot, print one ✓ or ✗ per pod, and exit
+non-zero if any pod failed.
 
 Examples:
   bot-ctl list                     # every pod's registry
@@ -61,7 +65,7 @@ export KUBECONFIG
 NS="${BOT_NAMESPACE:-bot-load}"
 STS="${BOT_STS:-videocall-bots}"
 PORT_BASE="${BOT_CTL_PORT_BASE:-18080}"
-PF_WAIT="${BOT_CTL_PF_WAIT:-1}"
+PF_WAIT="${BOT_CTL_PF_WAIT:-10}"
 
 # Above this a TTL overflows setTimeout's 32-bit millisecond argument and fires
 # immediately instead of later.
@@ -84,6 +88,220 @@ fail() {
   FAILED_PODS="$FAILED_PODS $1"
   return 0
 }
+
+# Echo a quantity in milli-units; fail on a form it does not parse.
+to_milli() {
+  local num suf mult
+  [[ "$1" =~ ^([0-9]{1,15})(m|k|M|G|T|Ki|Mi|Gi|Ti)?$ ]] || return 1
+  num=$((10#${BASH_REMATCH[1]}))
+  suf="${BASH_REMATCH[2]}"
+  case "$suf" in
+  m) mult=1 ;;
+  "") mult=1000 ;;
+  k) mult=1000000 ;;
+  M) mult=1000000000 ;;
+  G) mult=1000000000000 ;;
+  T) mult=1000000000000000 ;;
+  Ki) mult=1024000 ;;
+  Mi) mult=1048576000 ;;
+  Gi) mult=1073741824000 ;;
+  Ti) mult=1099511627776000 ;;
+  esac
+  ((num <= 9223372036854775807 / mult)) || return 1
+  echo $((num * mult))
+}
+
+fmt_qty() {
+  local v="$2" b
+  case "$1" in
+  *cpu) if ((v % 1000 == 0)); then echo "$((v / 1000))"; else echo "${v}m"; fi ;;
+  *memory)
+    b=$((v / 1000))
+    if ((b % 1073741824 == 0)); then
+      echo "$((b / 1073741824))Gi"
+    elif ((b % 1048576 == 0)); then
+      echo "$((b / 1048576))Mi"
+    else
+      echo "$b"
+    fi
+    ;;
+  *) echo "$((v / 1000))" ;;
+  esac
+}
+
+PRE_FAILS=0
+pre_ok() { echo "✓ $*"; }
+pre_bad() {
+  echo "✗ $*" >&2
+  PRE_FAILS=$((PRE_FAILS + 1))
+}
+
+# Usage: pre_diff <label> <manifest-name> <manifest-on-stdin
+pre_diff() {
+  local label="$1" file="$2" out rc=0
+  out="$(kubectl diff -n "$NS" -f - 2>&1)" || rc=$?
+  if ((rc == 0)); then
+    pre_ok "$label matches k8s/$file"
+  elif ((rc == 1)); then
+    pre_bad "$label has drifted from k8s/$file:"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+  else
+    pre_bad "kubectl diff of k8s/$file failed (exit $rc), drift unknown:"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+  fi
+}
+
+pre_env() {
+  local label="statefulset/$STS pod template" live committed rc=0 entry fails_before="$PRE_FAILS"
+  # shellcheck disable=SC2016
+  local tmpl='{{range .spec.template.spec.containers}}{{$c := .name}}{{range .env}}container {{$c}} env {{.name}}{{"\n"}}{{end}}{{range .envFrom}}container {{$c}} envFrom {{with .configMapRef}}configMap {{.name}}{{end}}{{with .secretRef}}secret {{.name}}{{end}} prefix={{with .prefix}}{{.}}{{end}}{{"\n"}}{{end}}{{end}}'
+  live="$(kubectl get statefulset "$STS" -n "$NS" -o go-template="$tmpl")" || rc=$?
+  ((rc == 0)) || {
+    pre_bad "could not read the env of $label (exit $rc), env drift unknown"
+    return 0
+  }
+  committed="$(kubectl create --dry-run=client --validate=false -f - -o go-template="$tmpl" <"$SCRIPT_DIR/statefulset.yaml")" || rc=$?
+  if ((rc != 0)) || [[ -z "$committed" ]]; then
+    pre_bad "could not render the env of k8s/statefulset.yaml (exit $rc), env drift unknown"
+    return 0
+  fi
+  while read -r entry; do
+    pre_bad "$label has $entry, which k8s/statefulset.yaml does not"
+  done < <(LC_ALL=C comm -23 <(sed '/^$/d' <<<"$live" | LC_ALL=C sort) <(sed '/^$/d' <<<"$committed" | LC_ALL=C sort))
+  while read -r entry; do
+    pre_bad "k8s/statefulset.yaml has $entry, which $label does not"
+  done < <(LC_ALL=C comm -13 <(sed '/^$/d' <<<"$live" | LC_ALL=C sort) <(sed '/^$/d' <<<"$committed" | LC_ALL=C sort))
+  ((PRE_FAILS > fails_before)) || pre_ok "$label env and envFrom names match k8s/statefulset.yaml"
+}
+
+preflight() {
+  local n="${1:-}" quota="${BOT_QUOTA:-bot-load-quota}" out rc line
+  local spec_replicas status_replicas update_rev gen obs k v dim need head cap fails_before
+  local listed=0 active=0 add bind="" bind_cap=-1 bind_need=0 bind_head=0 stale_pods=""
+  local committed name phase rev tmpl=""
+  if [[ ! "$n" =~ ^[0-9]{1,4}$ ]]; then
+    echo "bot-ctl: preflight requires a replica count of 0-9999 (got \"$n\")" >&2
+    return 1
+  fi
+  n=$((10#$n))
+
+  rc=0
+  # shellcheck disable=SC2016
+  out="$(kubectl get statefulset "$STS" -n "$NS" -o go-template='{{.spec.replicas}} {{.status.replicas}} {{.status.updateRevision}} {{.metadata.generation}} {{.status.observedGeneration}}{{"\n"}}{{if .spec.template.spec.initContainers}}initContainers{{"\n"}}{{end}}{{range .spec.template.spec.containers}}{{range $k, $v := .resources.limits}}limits.{{$k}} {{$v}}{{"\n"}}{{end}}{{range $k, $v := .resources.requests}}requests.{{$k}} {{$v}}{{"\n"}}{{end}}{{end}}')" || rc=$?
+  read -r spec_replicas status_replicas update_rev gen obs <<<"$out" || true
+  if ((rc != 0)) || [[ ! "$spec_replicas" =~ ^[0-9]+$ || ! "$status_replicas" =~ ^[0-9]+$ ]]; then
+    echo "✗ could not read statefulset/$STS in namespace $NS (exit $rc); nothing checked" >&2
+    return 1
+  fi
+  tmpl="$(printf '%s\n' "$out" | tail -n +2)"
+  echo "preflight: statefulset/$STS in $NS, live replicas $spec_replicas, target $n"
+
+  rc=0
+  out="$(kubectl get pods -n "$NS" -l "app.kubernetes.io/instance=$STS" -o go-template='{{range .items}}{{.metadata.name}} {{.status.phase}} {{index .metadata.labels "controller-revision-hash"}}{{"\n"}}{{end}}')" || rc=$?
+  if ((rc != 0)); then
+    echo "✗ could not list pods of statefulset/$STS (exit $rc); nothing checked" >&2
+    return 1
+  fi
+  while read -r name phase rev; do
+    [[ -n "$name" ]] || continue
+    listed=$((listed + 1))
+    [[ "$phase" == Succeeded || "$phase" == Failed ]] || active=$((active + 1))
+    [[ "$rev" == "$update_rev" ]] || stale_pods="$stale_pods $name:$rev"
+  done <<<"$out"
+  if [[ "$gen" != "$obs" ]]; then
+    pre_bad "statefulset/$STS generation $gen not yet observed by the controller (observed $obs); re-run preflight"
+  elif ((listed != status_replicas)); then
+    pre_bad "found $listed pod(s) labelled app.kubernetes.io/instance=$STS but the StatefulSet reports $status_replicas"
+  elif ((listed == 0)); then
+    echo "- no fleet pods exist; run preflight again after the scale to verify each pod"
+  elif [[ -z "$stale_pods" ]]; then
+    pre_ok "all $listed fleet pod(s) are on update revision $update_rev"
+  else
+    for name in $stale_pods; do
+      pre_bad "pod ${name%%:*} is on revision ${name#*:}, not the StatefulSet's update revision $update_rev"
+    done
+  fi
+
+  rc=0
+  # shellcheck disable=SC2016
+  out="$(kubectl get resourcequota "$quota" -n "$NS" -o go-template='{{range $k, $v := .status.hard}}hard {{$k}} {{$v}}{{"\n"}}{{end}}{{range $k, $v := .status.used}}used {{$k}} {{$v}}{{"\n"}}{{end}}')" || rc=$?
+  if ((rc != 0)) || ! grep -q '^hard ' <<<"$out"; then
+    pre_bad "could not read status.hard of resourcequota/$quota (exit $rc); admission unchecked"
+  elif grep -qx initContainers <<<"$tmpl"; then
+    pre_bad "the pod template has initContainers, which preflight does not model; admission unchecked"
+  else
+    add=$((n > active ? n - active : 0))
+    fails_before="$PRE_FAILS"
+    while read -r k dim v; do
+      [[ "$k" == hard ]] || continue
+      case "$dim" in
+      pods) need=1000 ;;
+      limits.cpu | limits.memory | requests.cpu | requests.memory | cpu | memory)
+        need=0
+        while read -r name line; do
+          if [[ "$name" == "$dim" || "requests.$dim" == "$name" ]]; then
+            line="$(to_milli "$line")" || {
+              pre_bad "unparseable quantity for $name in the pod template"
+              continue 2
+            }
+            need=$((need + line))
+          fi
+        done <<<"$tmpl"
+        if ((need == 0)); then
+          pre_bad "the pod template sets no $dim, which resourcequota/$quota constrains"
+          continue
+        fi
+        ;;
+      *)
+        pre_bad "resourcequota/$quota constrains $dim, which preflight does not check"
+        continue
+        ;;
+      esac
+      line="$(grep -m1 "^used $dim " <<<"$out" | cut -d' ' -f3)"
+      if ! head="$(to_milli "$v")" || ! line="$(to_milli "$line")"; then
+        pre_bad "unparseable hard or used quantity for $dim in resourcequota/$quota"
+        continue
+      fi
+      head=$((head - line))
+      cap=$((head < 0 ? 0 : head / need))
+      if ((bind_cap < 0 || cap < bind_cap)); then
+        bind="$dim" bind_cap="$cap" bind_need=$((add * need)) bind_head="$head"
+      fi
+    done <<<"$out"
+    if [[ -z "$bind" ]]; then
+      pre_bad "resourcequota/$quota constrains nothing preflight checks; admission unchecked"
+    elif ((add > bind_cap)); then
+      pre_bad "$add new pod(s) do not fit resourcequota/$quota; $bind binds: need $(fmt_qty "$bind" "$bind_need"), headroom $(fmt_qty "$bind" "$bind_head") (at most $bind_cap new)"
+    elif ((PRE_FAILS > fails_before)); then
+      pre_bad "$add new pod(s) fit only the quota dimensions preflight could read; admission incomplete"
+    else
+      pre_ok "$add new pod(s) fit resourcequota/$quota; tightest is $bind: need $(fmt_qty "$bind" "$bind_need"), headroom $(fmt_qty "$bind" "$bind_head") (at most $bind_cap new)"
+    fi
+  fi
+
+  pre_diff "namespace/$NS and its quota" namespace.yaml <"$SCRIPT_DIR/namespace.yaml"
+  committed="$(grep -E '^  replicas: [0-9]+$' "$SCRIPT_DIR/statefulset.yaml" || true)"
+  if [[ "$(grep -c . <<<"$committed")" != 1 ]]; then
+    pre_bad "could not find exactly one spec.replicas line in k8s/statefulset.yaml; drift unknown"
+  else
+    pre_diff "statefulset/$STS (replicas ignored: live $spec_replicas, committed ${committed##* })" statefulset.yaml \
+      < <(sed -E "s/^  replicas: [0-9]+\$/  replicas: $spec_replicas/" "$SCRIPT_DIR/statefulset.yaml")
+  fi
+  pre_env
+
+  if ((PRE_FAILS > 0)); then
+    echo "preflight: $PRE_FAILS check(s) failed; do not scale to $n" >&2
+    return 1
+  fi
+  echo "preflight: all checks passed; scale with: kubectl -n $NS scale statefulset/$STS --replicas=$n"
+}
+
+if [[ "$1" == preflight ]]; then
+  shift
+  rc=0
+  preflight "$@" || rc=$?
+  exit "$rc"
+fi
 
 TOKEN="$(kubectl get secret bot-ctl-token -n "$NS" -o jsonpath='{.data.token}' | base64 -d)" || {
   echo "bot-ctl: could not read the bot-ctl-token secret from namespace $NS" >&2
@@ -142,6 +360,17 @@ resolve_targets() {
   printf '%s\n' "$pods"
 }
 
+pf_listening() {
+  local tries
+  tries="$(awk -v w="$PF_WAIT" 'BEGIN { n = int(w / 0.05 + 0.999); print (n < 1 ? 1 : n) }')"
+  while :; do
+    grep -q "^Forwarding from 127\.0\.0\.1:$1 -> " "$PF_LOG" && return 0
+    kill -0 "$PF_PID" 2>/dev/null || return 1
+    ((tries-- > 0)) || return 1
+    sleep 0.05
+  done
+}
+
 # Usage: run_ctl <pod_name> <local_port> <ctl_args...>
 # Returns ctl's exit code; ctl's stderr is not redirected.
 run_ctl() {
@@ -149,11 +378,8 @@ run_ctl() {
   shift 2
   kubectl port-forward -n "$NS" "pod/$pod" "${port}:8080" >"$PF_LOG" 2>&1 &
   PF_PID=$!
-  sleep "$PF_WAIT"
-  # A dead forwarder means this port is not ours, so the request — bearer token
-  # included — would reach whatever else is listening on it.
-  if ! kill -0 "$PF_PID" 2>/dev/null; then
-    echo "bot-ctl: port-forward to $pod on local port $port died:" >&2
+  if ! pf_listening "$port" || ! kill -0 "$PF_PID" 2>/dev/null; then
+    echo "bot-ctl: port-forward to $pod on local port $port is not listening on 127.0.0.1:" >&2
     sed 's/^/  /' "$PF_LOG" >&2
     kill_pf
     return 1

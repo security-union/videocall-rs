@@ -19,6 +19,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender};
+use tokio::sync::watch;
 use tracing::info;
 use url::Url;
 use videocall_meeting_types::mint::{self, LobbyAuth};
@@ -211,7 +212,82 @@ pub enum TransportClient {
     WebTransport(WebTransportClient),
 }
 
+/// Set by a transport when the relay connection ends without a local stop;
+/// carries the reason. `None` while the connection is up.
+#[derive(Clone)]
+pub struct ClosedSignal(Arc<watch::Sender<Option<String>>>);
+
+impl Default for ClosedSignal {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(None).0))
+    }
+}
+
+impl ClosedSignal {
+    /// Record that the connection ended, unless `quit` says we stopped it.
+    pub fn report(&self, quit: &AtomicBool, reason: impl Into<String>) {
+        if quit.load(Ordering::Relaxed) {
+            return;
+        }
+        let reason = reason.into();
+        self.0.send_if_modified(|current| {
+            current.is_none() && {
+                *current = Some(reason);
+                true
+            }
+        });
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<Option<String>> {
+        self.0.subscribe()
+    }
+}
+
+/// Wait until the connection closes and return the reason.
+pub async fn wait_closed(rx: &mut watch::Receiver<Option<String>>) -> String {
+    let reason = match rx.wait_for(Option::is_some).await {
+        Ok(reason) => reason.clone(),
+        Err(_) => None,
+    };
+    match reason {
+        Some(reason) => reason,
+        None => std::future::pending().await,
+    }
+}
+
+/// Something with an async stop, such as a connected client.
+pub trait Stop {
+    fn stop(&mut self) -> impl std::future::Future<Output = ()>;
+}
+
+impl Stop for TransportClient {
+    async fn stop(&mut self) {
+        TransportClient::stop(self).await
+    }
+}
+
+/// Run a connected client's `body`; however it ends (return, error, early
+/// `?`), set `quit` for the client's tasks and stop the client afterwards.
+pub async fn stop_after<T>(
+    client: &mut impl Stop,
+    quit: &AtomicBool,
+    body: impl std::future::Future<Output = T>,
+) -> T {
+    let out = body.await;
+    quit.store(true, Ordering::Relaxed);
+    client.stop().await;
+    out
+}
+
 impl TransportClient {
+    /// Fires when the relay connection ends without a local stop.
+    pub fn closed(&self) -> watch::Receiver<Option<String>> {
+        match self {
+            TransportClient::WebSocket(c) => c.closed().subscribe(),
+            TransportClient::WebTransport(c) => c.closed().subscribe(),
+        }
+    }
+
     pub fn new(
         transport: &Transport,
         config: ClientConfig,
@@ -285,6 +361,49 @@ impl TransportClient {
             TransportClient::WebSocket(c) => c.stop().await,
             TransportClient::WebTransport(c) => c.stop(),
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{stop_after, ClosedSignal, Stop};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct FakeClient {
+        stopped: bool,
+    }
+
+    impl Stop for FakeClient {
+        async fn stop(&mut self) {
+            self.stopped = true;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_after_join_still_quits_and_stops_the_client() {
+        let mut client = FakeClient::default();
+        let quit = AtomicBool::new(false);
+        let out: anyhow::Result<()> = stop_after(&mut client, &quit, async {
+            Err(anyhow::anyhow!("producer failed"))
+        })
+        .await;
+        assert!(out.is_err());
+        assert!(quit.load(Ordering::Relaxed), "tasks must see quit");
+        assert!(client.stopped, "the socket must be closed");
+    }
+
+    #[test]
+    fn a_close_is_reported_once_and_never_after_a_local_stop() {
+        let signal = ClosedSignal::default();
+        let rx = signal.subscribe();
+        let quit = AtomicBool::new(true);
+        signal.report(&quit, "stopped by us");
+        assert_eq!(*rx.borrow(), None);
+        quit.store(false, Ordering::Relaxed);
+        signal.report(&quit, "first");
+        signal.report(&quit, "second");
+        assert_eq!(rx.borrow().as_deref(), Some("first"));
     }
 }
 

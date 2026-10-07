@@ -239,6 +239,21 @@ pub fn PreferencesSettingsPanel() -> Element {
                         p { class: "appearance-section-helper",
                             "Auto reduces video tiles on slower devices to keep playback smooth — off-budget participants stay audible and appear as avatars. A fixed number always shows that many video tiles."
                         }
+                        {
+                            let (target, label) = show_all_toggle_action(decode_budget_ctx.0());
+                            rsx! {
+                                button {
+                                    r#type: "button",
+                                    class: "decode-budget-show-all-btn",
+                                    "data-testid": "decode-budget-show-all-persistent",
+                                    onclick: move |_| {
+                                        decode_budget_ctx.0.set(target);
+                                        save_decode_budget_override(target);
+                                    },
+                                    "{label}"
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -574,6 +589,15 @@ const DECODE_BUDGET_OPTIONS: [DecodeBudgetOverride; 5] = [
     DecodeBudgetOverride::Fixed(9),
     DecodeBudgetOverride::Fixed(16),
 ];
+
+fn show_all_toggle_action(current: DecodeBudgetOverride) -> (DecodeBudgetOverride, &'static str) {
+    match current {
+        DecodeBudgetOverride::Auto => (DecodeBudgetOverride::All, "Show all videos"),
+        DecodeBudgetOverride::All | DecodeBudgetOverride::Fixed(_) => {
+            (DecodeBudgetOverride::Auto, "Back to automatic")
+        }
+    }
+}
 
 /// Short button label for a decode-budget option.
 fn decode_budget_label(option: DecodeBudgetOverride) -> String {

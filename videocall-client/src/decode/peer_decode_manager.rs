@@ -5473,6 +5473,8 @@ impl PeerDecodeManager {
         exempt_speakers: bool,
     ) -> bool {
         let mut seeded = false;
+        // A sole remote peer is never exempt: skipping it would shed nothing.
+        let exempt_speakers = exempt_speakers && self.connected_peers.ordered_keys().len() > 1;
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
                 // Issue #1557: the active speaker(s) are EXEMPT from receiver-side
@@ -5897,8 +5899,8 @@ impl PeerDecodeManager {
                         // no `LAYER_PREFERENCE` at all (`tick_layer_choosers` omits the
                         // entry when it already tracks the top), so the relay fails OPEN
                         // and forwards every rung — each non-selected one arrived here and
-                        // was counted, making an 8fps 3-rung camera read ~52 fps (7+15+30,
-                        // the ladder sum) instead of 8. Field-confirmed across three
+                        // was counted, making a 3-rung camera read ~52 fps (7+15+30,
+                        // the ladder sum). Field-confirmed across three
                         // meetings on two clusters. NOTE the inflation is therefore a
                         // HEALTHY-receiver phenomenon: once this receiver constrains below
                         // the top, the relay filters server-side and there is little left
@@ -14450,6 +14452,42 @@ mod tests {
                 .selected_video_layer(),
             1,
             "non-speaking peer is stepped down by the seed (2 -> 1)"
+        );
+    }
+
+    #[test]
+    fn sole_speaking_peer_not_exempt_from_local_cpu_seed() {
+        use crate::decode::layer_chooser::ReceiveLayerBounds;
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(714, make_zero_loss_top_peer(714));
+        manager.connected_peers.get_mut(&714).unwrap().is_speaking = true;
+        let open = ReceiveLayerBounds::default();
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&714)
+                .unwrap()
+                .selected_video_layer(),
+            2
+        );
+
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open, true);
+
+        assert!(
+            seeded,
+            "1:1: the only remote peer is stepped even while speaking"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&714)
+                .unwrap()
+                .selected_video_layer(),
+            1
         );
     }
 

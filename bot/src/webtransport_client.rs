@@ -63,15 +63,39 @@ fn frame_packet(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
-use crate::transport::InboundHook;
-use crate::websocket_client::build_heartbeat_packet;
+use crate::transport::{ClosedSignal, InboundHook};
+use crate::websocket_client::{build_heartbeat_packet, HeartbeatClock, HEARTBEAT_POLL};
+
+/// Accept inbound streams until the session ends; an end we did not cause
+/// (no `quit`) is reported on `closed`.
+pub(crate) async fn accept_until_closed<S, E, F, Fut>(
+    mut accept: F,
+    mut on_stream: impl FnMut(S),
+    quit: &AtomicBool,
+    closed: &ClosedSignal,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<S, E>>,
+    E: std::fmt::Display,
+{
+    while !quit.load(Ordering::Relaxed) {
+        match accept().await {
+            Ok(stream) => on_stream(stream),
+            Err(e) => {
+                closed.report(quit, format!("WebTransport session ended: {e}"));
+                break;
+            }
+        }
+    }
+}
 
 pub struct WebTransportClient {
     config: ClientConfig,
     session: Option<Session>,
     quit: Arc<AtomicBool>,
+    closed: ClosedSignal,
 }
 
 impl WebTransportClient {
@@ -80,7 +104,12 @@ impl WebTransportClient {
             config,
             session: None,
             quit: Arc::new(AtomicBool::new(false)),
+            closed: ClosedSignal::default(),
         }
+    }
+
+    pub fn closed(&self) -> &ClosedSignal {
+        &self.closed
     }
 
     pub async fn connect(
@@ -149,23 +178,28 @@ impl WebTransportClient {
     async fn start_heartbeat(&self, is_speaking: Arc<AtomicBool>) {
         if let Some(session) = &self.session {
             let session = session.clone();
+            let config = self.config.clone();
             let user_id = self.config.user_id.clone();
-            let video_enabled = self.config.enable_video;
-            let audio_enabled = self.config.enable_audio;
             let quit = self.quit.clone();
+            let heartbeat_interval = self.config.heartbeat_interval;
 
             tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(1));
+                let mut poll = time::interval(HEARTBEAT_POLL.min(heartbeat_interval));
+                let mut clock = HeartbeatClock::default();
 
                 loop {
                     if quit.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    interval.tick().await;
+                    poll.tick().await;
 
-                    let speaking = is_speaking.load(Ordering::Relaxed);
-                    match build_heartbeat_packet(&user_id, audio_enabled, video_enabled, speaking) {
+                    let Some(speaking) =
+                        clock.poll(heartbeat_interval, is_speaking.load(Ordering::Relaxed))
+                    else {
+                        continue;
+                    };
+                    match build_heartbeat_packet(&config, &Transport::WebTransport, speaking) {
                         Ok(data) => {
                             if let Err(e) = Self::send_via_session(&session, data).await {
                                 warn!("Failed to send heartbeat for {}: {}", user_id, e);
@@ -219,7 +253,7 @@ impl WebTransportClient {
                     }
                     let mut s = stats_clone.lock().unwrap();
                     s.report(&user_id_report);
-                    s.evict_stale(Duration::from_secs(60));
+                    s.evict_stale(crate::inbound_stats::PEER_SILENCE_EVICT);
                     s.reset();
                 }
             });
@@ -265,31 +299,32 @@ impl WebTransportClient {
 
             // --- Unistream acceptor ------------------------------------------
             let hook_uni = inbound_hook;
+            let closed = self.closed.clone();
             tokio::spawn(async move {
-                loop {
-                    if quit.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    match session.accept_uni().await {
-                        Ok(stream) => {
-                            let user_id = user_id.clone();
-                            let stats = stats.clone();
-                            let quit = quit.clone();
-                            let hook = hook_uni.clone();
-                            tokio::spawn(async move {
-                                Self::read_length_prefixed_stream(
-                                    stream, &user_id, stats, quit, hook,
-                                )
+                let accept_session = session.clone();
+                let on_stream = {
+                    let (user_id, stats, quit) = (user_id.clone(), stats.clone(), quit.clone());
+                    move |stream| {
+                        let user_id = user_id.clone();
+                        let stats = stats.clone();
+                        let quit = quit.clone();
+                        let hook = hook_uni.clone();
+                        tokio::spawn(async move {
+                            Self::read_length_prefixed_stream(stream, &user_id, stats, quit, hook)
                                 .await;
-                            });
-                        }
-                        Err(e) => {
-                            debug!("Inbound consumer ended for {}: {}", user_id, e);
-                            break;
-                        }
+                        });
                     }
-                }
+                };
+                accept_until_closed(
+                    || {
+                        let s = accept_session.clone();
+                        async move { s.accept_uni().await }
+                    },
+                    on_stream,
+                    &quit,
+                    &closed,
+                )
+                .await;
                 let s = stats.lock().unwrap();
                 s.report(&user_id);
                 info!("Inbound consumer stopped for {}", user_id);
@@ -386,6 +421,113 @@ impl WebTransportClient {
     pub fn stop(&self) {
         self.quit.store(true, Ordering::Relaxed);
         info!("Stopping WebTransport client for {}", self.config.user_id);
+        if let Some(session) = &self.session {
+            session.close(0, b"bot stopped");
+        }
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::{accept_until_closed, WebTransportClient};
+    use crate::config::{ClientConfig, Role};
+    use crate::inbound_stats::InboundStats;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use web_transport_quinn::quinn::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    fn local_relay() -> (u16, web_transport_quinn::Server) {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+        let server = web_transport_quinn::ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().unwrap())
+            .with_certificate(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        (server.local_addr().unwrap().port(), server)
+    }
+
+    async fn connected_client(port: u16) -> WebTransportClient {
+        let mut client = WebTransportClient::new(ClientConfig::for_role(
+            "u".into(),
+            "m".into(),
+            Role::Viewer,
+            Duration::from_secs(5),
+        ));
+        // An IP, not `localhost`: hosts that list `::1 localhost` resolve it to
+        // IPv6 first, which this IPv4-bound server never answers.
+        let url = url::Url::parse(&format!("https://127.0.0.1:{port}/lobby")).unwrap();
+        let stats = Arc::new(Mutex::new(InboundStats::default()));
+        client
+            .connect(&url, true, stats, Arc::new(Default::default()), None)
+            .await
+            .unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn stop_closes_the_session_so_the_relay_sees_the_bot_leave() {
+        let (port, mut server) = local_relay();
+        let relay = tokio::spawn(async move {
+            let session = server.accept().await.unwrap().ok().await.unwrap();
+            session.closed().await
+        });
+        let client = connected_client(port).await;
+        client.stop();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the relay must see the session close after stop()")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_relay_closing_the_session_is_reported_to_the_client() {
+        let (port, mut server) = local_relay();
+        tokio::spawn(async move {
+            let session = server.accept().await.unwrap().ok().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            session.close(0, b"kicked");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let client = connected_client(port).await;
+        let mut closed = client.closed().subscribe();
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::transport::wait_closed(&mut closed),
+        )
+        .await
+        .expect("the relay's close must be signalled");
+        assert!(reason.contains("WebTransport session ended"), "{}", reason);
+        client.stop();
+    }
+    use crate::transport::ClosedSignal;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn a_session_that_ends_on_its_own_reports_closed() {
+        let closed = ClosedSignal::default();
+        let rx = closed.subscribe();
+        let quit = AtomicBool::new(false);
+        let mut calls = 0;
+        accept_until_closed(
+            || {
+                calls += 1;
+                let n = calls;
+                async move {
+                    if n < 3 {
+                        Ok(n)
+                    } else {
+                        Err("connection lost")
+                    }
+                }
+            },
+            |_stream: i32| {},
+            &quit,
+            &closed,
+        )
+        .await;
+        assert_eq!(calls, 3);
+        assert!(rx.borrow().as_deref().unwrap().contains("connection lost"));
+        quit.store(true, Ordering::Relaxed);
     }
 }
 

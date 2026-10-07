@@ -22,6 +22,9 @@
 //     NOT sample (README has the query and the counter to avoid), plus this
 //     tool's own fps-based RESOURCE_STARVED verdict (resource/verdict.ts).
 
+/** docker-entrypoint.sh enforces a copy of this before `tc`; docker-entrypoint.test.ts locks the two. */
+export const HW_CONCURRENCY_PATTERN = /^-?[0-9]+$/;
+
 /**
  * Result of resolving a raw hardware-concurrency input.
  * - `ok` + `value: number`    → a strict positive integer; spoof at that count.
@@ -55,7 +58,7 @@ export function resolveHardwareConcurrency(raw: string | undefined): HwConcurren
     return { kind: "ok", value: undefined };
   }
   const token = raw.trim();
-  if (!/^-?\d+$/.test(token)) {
+  if (!HW_CONCURRENCY_PATTERN.test(token)) {
     return {
       kind: "invalid",
       message: `--hardware-concurrency (or BOT_HW_CONCURRENCY) must be an integer, got "${raw}"`,

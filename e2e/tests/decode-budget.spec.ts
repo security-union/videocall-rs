@@ -9,7 +9,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  *
  * The feature caps how many peer tiles decode video at once. Two paths:
  *
- *   1. Manual HARD override (Appearance settings → "Video tiles"): selecting a
+ *   1. Manual HARD override (Preferences settings → "Video tiles"): selecting a
  *      fixed value forces exactly that many DECODED tiles. Peers beyond the cap
  *      become "off-budget" avatar tiles — class `.grid-item.off-budget-tile`,
  *      attribute `[data-off-budget="true"]` — still present, NOT decoded.
@@ -172,14 +172,14 @@ test.describe("Adaptive decode budget (#987)", () => {
     return true;
   }
 
-  /** Open Device Settings → Appearance tab so the decode-budget control shows. */
-  async function openAppearancePanel(page: Page): Promise<void> {
+  /** Open Device Settings → Preferences tab so the decode-budget control shows. */
+  async function openPreferencesPanel(page: Page): Promise<void> {
     await page.locator(".video-controls-container").hover();
     await page.locator('[data-testid="open-settings"]').click();
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
 
-    await page.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-    await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
+    await page.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+    await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
     await expect(page.locator("#decode-budget-override")).toBeVisible({ timeout: 5_000 });
   }
 
@@ -274,7 +274,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 45_000 });
 
     // Force a fixed cap of 6.
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-6"]').click();
     await expect(page.locator('[data-testid="decode-budget-6"]')).toHaveAttribute(
       "aria-checked",
@@ -293,7 +293,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     // Reopen settings and confirm the persisted localStorage value is reflected
     // back into the UI. Avoid reloading an active sole-host meeting: the host
     // disconnect can legitimately end the meeting before the reload rejoins.
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await expect(page.locator('[data-testid="decode-budget-6"]')).toHaveAttribute(
       "aria-checked",
       "true",
@@ -349,7 +349,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     }
 
     // Ensure override is Auto (default, but make it explicit & resilient).
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",
@@ -457,7 +457,7 @@ test.describe("Adaptive decode budget (#987)", () => {
       return;
     }
 
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",
@@ -558,7 +558,7 @@ test.describe("Adaptive decode budget (#987)", () => {
       return;
     }
 
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await closeSettingsModal(page);
 
@@ -604,7 +604,7 @@ test.describe("Adaptive decode budget (#987)", () => {
       return;
     }
 
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await closeSettingsModal(page);
 
@@ -667,7 +667,7 @@ test.describe("Adaptive decode budget (#987)", () => {
       return;
     }
 
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await closeSettingsModal(page);
 
@@ -715,7 +715,7 @@ test.describe("Adaptive decode budget (#987)", () => {
   //
   // The pill's action button (`decode-paused-pill-show-all`, visible text
   // "Show all") takes the SAME escape-hatch path as the banner's Show-all and
-  // the appearance panel: it sets the decode-budget override to `All` (issue
+  // the Preferences panel: it sets the decode-budget override to `All` (issue
   // #1466) and persists the literal "all" to localStorage
   // (`vc_decode_budget_override`). `All` tracks the live natural count, so every
   // present peer decodes and stays decoded as peers join. Once avatar_count hits
@@ -744,7 +744,7 @@ test.describe("Adaptive decode budget (#987)", () => {
       return;
     }
 
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await closeSettingsModal(page);
 
@@ -813,7 +813,7 @@ test.describe("Adaptive decode budget (#987)", () => {
 
     // Start in Auto, un-pressured: all tiles decode immediately (render-derived
     // cap == natural). We do NOT inject any FPS sample at any point in this test.
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",
@@ -855,7 +855,7 @@ test.describe("Adaptive decode budget (#987)", () => {
 
     // Ensure Auto (default, but explicit & resilient). No FPS pressure is ever
     // injected in this test, so the machine stays un-pressured throughout.
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",
@@ -920,7 +920,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     }
 
     // Ensure Auto (default, but explicit & resilient).
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",
@@ -948,7 +948,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     expect(decoded).toBeGreaterThanOrEqual(1); // MIN_CAP floor
 
     // --- Step 2: switch to a hard Fixed(6) override. ---
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-6"]').click();
     await expect(page.locator('[data-testid="decode-budget-6"]')).toHaveAttribute(
       "aria-checked",
@@ -964,7 +964,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     // effective cap snaps back to `total_tiles` and every natural tile decodes
     // again on the next render. A loop-gated reset (the old bug) would leave the
     // reduced cap in place — avatars would persist — because no FPS tick follows.
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",
@@ -991,10 +991,6 @@ test.describe("Adaptive decode budget (#987)", () => {
   // full Auto → All → Auto cycle. Mock peers (no FPS pressure needed) make the
   // tile-count side deterministic too: All decodes everything, Auto un-pressured
   // also decodes everything, so we additionally confirm all tiles stay decoded.
-  //
-  // Note (#1466 S1): the segmented picker no longer has an "All" option — the
-  // toggle is now the sole control that sets the `All` override — so this test
-  // proves the variant via the persisted "all" literal, not a picker selection.
   // ──────────────────────────────────────────────────────────────────────
   test("persistent show-all toggle flips between All and Auto and persists", async ({ page }) => {
     test.setTimeout(120_000);
@@ -1009,7 +1005,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     }
 
     // Start from a known Auto baseline.
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-auto"]').click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",
@@ -1069,7 +1065,7 @@ test.describe("Adaptive decode budget (#987)", () => {
       return;
     }
 
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await page.locator('[data-testid="decode-budget-6"]').click();
     await expect(page.locator('[data-testid="decode-budget-6"]')).toHaveAttribute(
       "aria-checked",
@@ -1086,7 +1082,7 @@ test.describe("Adaptive decode budget (#987)", () => {
 
     // Click the recovery toggle: override → Auto, persisted "auto", all tiles
     // decode again (un-pressured Auto cap == natural).
-    await openAppearancePanel(page);
+    await openPreferencesPanel(page);
     await toggle.click();
     await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
       "aria-checked",

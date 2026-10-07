@@ -183,7 +183,7 @@ pub fn smooth_fps(prev: f64, sample: f64) -> f64 {
 ///   * SMOOTH — otherwise [`smooth_fps`] damps the residual bucket-boundary jitter.
 ///
 /// Pure / host-tested; the production feed in `peer_tile.rs`'s `video_painted` arm
-/// calls exactly this on the painted sample, and the raw `fps_received` arrival
+/// calls exactly this on the painted sample, and the raw `fps_received` decode
 /// signal every other consumer reads (drawer chart, signal popup, health reporter)
 /// is left untouched.
 pub fn next_overlay_fps(prev: f64, sample: f64) -> f64 {

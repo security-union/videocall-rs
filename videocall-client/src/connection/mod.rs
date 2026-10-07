@@ -21,6 +21,58 @@ mod connection;
 mod connection_controller;
 mod connection_lost_reason;
 mod connection_manager;
+#[cfg(test)]
+mod log_capture {
+    use std::cell::RefCell;
+
+    struct CaptureLogger;
+
+    type Captured = (&'static str, Vec<(log::Level, String)>);
+
+    thread_local! {
+        static CAPTURED_LOGS: RefCell<Option<Captured>> = const { RefCell::new(None) };
+    }
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            CAPTURED_LOGS.with(|c| {
+                if let Some((target, lines)) = c.borrow_mut().as_mut() {
+                    if record.target() == *target {
+                        lines.push((record.level(), record.args().to_string()));
+                    }
+                }
+            });
+        }
+
+        fn flush(&self) {}
+    }
+
+    pub(crate) fn capture_logs(
+        target: &'static str,
+        body: impl FnOnce(),
+    ) -> Vec<(log::Level, String)> {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CaptureLogger).expect("no other logger in this test binary")
+        });
+        let _guard = crate::test_serial::lock_log_max_level();
+        let previous = log::max_level();
+        log::set_max_level(log::LevelFilter::Info);
+        CAPTURED_LOGS.with(|c| *c.borrow_mut() = Some((target, Vec::new())));
+        body();
+        log::set_max_level(previous);
+        CAPTURED_LOGS.with(|c| {
+            c.borrow_mut()
+                .take()
+                .map(|(_, lines)| lines)
+                .unwrap_or_default()
+        })
+    }
+}
 mod task;
 mod url_log;
 mod webmedia;
@@ -69,6 +121,9 @@ pub use webmedia::{ConnectOptions, MediaStreamKey};
 // #2746: test-only, to pin this whitelist against the peer-creation gate.
 #[cfg(test)]
 pub(crate) use connection_manager::should_filter_self_packet;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) use connection_controller::host_seam::take_adopt_wt_spare_worker;
 
 // Issue #1080: the runtime netsim control-surface installer, re-exported
 // so the UI crate (e.g. `dioxus-ui`) can register `window.__vcNetsim` at

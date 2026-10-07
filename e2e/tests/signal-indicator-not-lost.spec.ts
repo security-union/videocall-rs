@@ -29,12 +29,8 @@ import {
  * the config — most likely total browser/fake-media pressure within one 180 s test timeout.
  * Keeping the split because it is empirically green, not because of a parallelism theory.
  *
- * WHAT IT GUARDS. The tagged test pins the normal measured state on a real 2-peer call.
- * The off-budget reproduction below is intentionally untagged and marked `fixme` because
- * #2193 prevents the docker/CI stack from materialising the remote canvases that drive budget
- * shedding. The exact neutral `Unmeasured` render state is therefore guarded today by the
- * production-path component test in `peer_tile.rs`; the E2E remains ready to enable when #2193
- * restores its precondition.
+ * WHAT IT GUARDS. The tagged tests pin the normal measured state on a real 2-peer call; the
+ * untagged off-budget test pins the neutral `Unmeasured` state on a budget-shed tile.
  */
 
 async function navigateToMeeting(page: Page, meetingId: string, username: string): Promise<void> {
@@ -155,7 +151,10 @@ test.describe("Per-tile signal indicator", () => {
       "SignalGuest",
       uiURL,
     );
-    await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await guestCtx.addInitScript(
+      `localStorage.setItem("vc_prejoin_camera_on", "true");` +
+        `localStorage.setItem("vc_prejoin_mic_on", "true");`,
+    );
     await enableDiagnosticsTileIndicators(guestCtx);
 
     const hostPage = await hostCtx.newPage();
@@ -168,12 +167,24 @@ test.describe("Per-tile signal indicator", () => {
       await navigateToMeeting(guestPage, meetingId, "SignalGuest");
       const guestResult = await joinMeetingFromPage(guestPage);
       await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+      await expect(
+        guestPage.locator('[data-testid="camera-toggle-button"]'),
+        "an admitted guest with a saved camera-on choice joins camera-on (issue 2992)",
+      ).toHaveAttribute("aria-label", "Camera — Stop Video", { timeout: 30_000 });
+      await expect(
+        guestPage.locator('[data-testid="mic-toggle-button"]'),
+        "an admitted guest with a saved mic-on choice joins unmuted (issue 2992)",
+      ).toHaveAttribute("aria-label", "Microphone — Mute", { timeout: 30_000 });
 
       // The guest's tile must exist on the host grid before its indicator means anything.
       const guestTile = hostPage.locator("#grid-container .grid-item", {
         has: hostPage.locator(`text="SignalGuest"`),
       });
       await expect(guestTile).toBeVisible({ timeout: 45_000 });
+      await expect(
+        guestTile.locator("canvas"),
+        "the guest must be decoding camera video; a camera-off, mic-on peer also reads >= 4 bars",
+      ).toBeVisible({ timeout: 30_000 });
 
       // Since #2673 the disc is diagnostics-gated; the context seed above is what mounts it.
       const signalIcon = guestTile.locator("[data-signal-level]").first();
@@ -184,14 +195,6 @@ test.describe("Per-tile signal indicator", () => {
       // startup transient rather than steady state.
       await hostPage.waitForTimeout(6000);
 
-      // PRECONDITION on the sampler, not on a canvas. Tony asked for a camera-published
-      // guard; a `canvas` assertion is the wrong one HERE because remote decoding canvases do
-      // not materialise on this docker stack (#2193 — verified: the pre-existing
-      // `decode-budget-play-button.spec.ts` fails on its own locator for the same reason), so
-      // it would make this spec red for an environment problem rather than a regression.
-      //
-      // Assert the rendered indicator contract. This does not prove a decoded canvas exists;
-      // that stronger precondition is blocked by #2193 and belongs with its fix.
       await expect
         .poll(async () => await signalIcon.getAttribute("data-signal-level"), {
           timeout: 30_000,
@@ -212,16 +215,15 @@ test.describe("Per-tile signal indicator", () => {
         })
         .toBe("false");
 
-      // Bar count, with a DISCRIMINATING threshold. `bars() > 0` was entailed by the poll
-      // above (`bars() == 0` <=> `Lost` <=> `is_lost()`), so it proved nothing extra. `>= 4`
-      // separates a healthy read from the pre-fix off-budget arithmetic `(1.0 + 0)/2 = 0.5`
-      // => `Fair` => 3 bars.
-      const bars = Number(await signalIcon.getAttribute("data-signal-level"));
-      expect(
-        bars,
-        `a healthy decoding peer must read >= 4 bars; 3 is the pre-fix averaged-in-zero value ` +
-          `(got ${bars})`,
-      ).toBeGreaterThanOrEqual(4);
+      // The mic is seeded on so a dead video term reads 3 bars and a healthy one >= 4.
+      await expect
+        .poll(async () => Number(await signalIcon.getAttribute("data-signal-level")), {
+          timeout: 15_000,
+          message:
+            "a healthy mic-on, camera-on peer must read >= 4 bars; 3 is a zero video term " +
+            "averaged with healthy audio",
+        })
+        .toBeGreaterThanOrEqual(4);
 
       // FAILS ON 0d48bec5^: the disc wore an opaque `#101114` of its own.
       const iconCluster = guestTile.locator(".tile-top-icons");
@@ -394,13 +396,8 @@ test.describe("Per-tile signal indicator", () => {
    * The expected state is neutral and explicit: zero filled bars, no red lost slash, and
    * `data-signal-state="unmeasured"`.
    */
-  test("off-budget peers render signal as unmeasured (pending #2193)", async ({ baseURL }) => {
+  test("off-budget peers render signal as unmeasured", async ({ baseURL }) => {
     test.setTimeout(180_000);
-    test.fixme(
-      true,
-      "blocked by #2193: docker/CI does not materialise remote canvases, so decode-budget " +
-        "shedding never reaches the off-budget render path",
-    );
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `signal_offbudget_${Date.now()}`;
     // Cap of 1 decoded tile: with 2 camera-on guests, exactly one is shed.
@@ -454,8 +451,6 @@ test.describe("Per-tile signal indicator", () => {
 
       // PRECONDITION: the budget actually shed a tile. Without this the test would silently
       // assert nothing about the off-budget path.
-      //
-      // Once #2193 is fixed, this precondition must fail loudly if the budget does not shed.
       const offBudget = hostPage.locator("#grid-container .grid-item.off-budget-tile");
       await expect(offBudget).toHaveCount(1, { timeout: 30_000 });
 
@@ -470,7 +465,7 @@ test.describe("Per-tile signal indicator", () => {
       await expect(icon).toHaveAttribute("data-signal-level", "0");
       await expect(icon).toHaveAttribute(
         "aria-label",
-        "Video paused to save CPU. Signal is not measured for this peer.",
+        "Video paused to save CPU. Video and screen-share quality are not measured for this peer.",
       );
     } finally {
       await browserHost.close();

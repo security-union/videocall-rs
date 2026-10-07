@@ -33,14 +33,27 @@ import {
 import { runBotsToCompletion, type BotTask, type RunOptions } from "./orchestrator";
 import { type VideoMode } from "./bot";
 import { CAMERA_CYCLE_ENV, resolveCameraCycle } from "./camera-cycle";
+import {
+  DECODE_BUDGET_DEFAULT,
+  DECODE_BUDGET_WAIVER_NOTE,
+  resolveDecodeBudget,
+} from "./decode-budget";
 import { resolveHardwareConcurrency } from "./hw-concurrency";
 import { botsAppLine, taggedLine } from "./log-line";
 import { resolveBaseBotIndex, sourceGeometryForIndex } from "./posture";
-import { resolveMaxReceivedLayer, resolveSkipCanvasPaint } from "./receiver-caps";
+import { JOIN_MEDIA_ON, type JoinMediaState } from "./meeting-join";
+import {
+  DIAG_PACKETS_ENV,
+  resolveDiagPackets,
+  resolveMaxReceivedLayer,
+  resolveSkipCanvasPaint,
+} from "./receiver-caps";
+import { ParticipantRecorder, readPodContext, resolveJoinMedia, resolveRole } from "./run-record";
 import { ArrivalTracker } from "./resource/arrival";
 import { FpsTracker } from "./resource/fps";
 import { RemoteResourceManager, ResourceCaptureSession } from "./resource/session";
 import { RESOURCE_FPS_BASE_RUNG } from "./resource/verdict";
+import { registerResourceVerdictCommand } from "./resource/window-verdict";
 
 /**
  * Orphan-safety hard cap (s) for every remote resource sampler (issue 2032).
@@ -164,8 +177,29 @@ program
     "Skip per-tile canvas paint via window.__APP_CONFIG.skipCanvasPaint (env: BOT_SKIP_CANVAS_PAINT; CLI flag wins). true = decode-and-drop (saves paint/GPU only — decode still runs; use --max-received-layer to cut decode CPU) (issue #2069). Same launch-time injection + PR #2078 dependency as --max-received-layer. When unset the deployment's value is inherited.",
   )
   .option(
+    "--diag-packets <off|default>",
+    "off stops each bot's own DIAGNOSTICS sends by injecting window.__APP_CONFIG.diagnosticsPacketsEnabled=\"0\" (env: BOT_DIAG_PACKETS; CLI flag wins). A real client sends DIAGNOSTICS, so off is a fidelity trade: use it only where every participant in the scenario has them off (Phase 0 arm 3). It still receives other clients' DIAGNOSTICS. Requires a deployed client with #2970; each bot records the client's own report in <assets-dir>/participants/<bot-id>.json (diagnostics_packets). Applies to the bots this command starts and their /duplicate copies; a control-API launch carries its own diagPackets field. When unset (or default) the deployment's setting applies.",
+  )
+  .option(
+    "--decode-budget <client|off>",
+    'off seeds localStorage vc_decode_budget_override="all" before any page script runs, so the client\'s adaptive decode budget (tile cap, layer cascade, ProtectiveMode) never acts, then reads it back after join and fails the bot if it did not stick. A FIDELITY WAIVER: a real client runs the budget, so an off run measures delivery (server and network path, plus the receive-side video layer chooser, which still runs), not the decode budget behaviour. Each bot records it in <assets-dir>/participants/<bot-id>.json (decode_budget, plus an unverified entry). Applies to the bots this command starts and their /duplicate copies, not to /launch, profile or SSH launches. client injects nothing, and reads the key back only when a storage state is replayed.',
+    DECODE_BUDGET_DEFAULT,
+  )
+  .option(
     "--bot-index <N>",
     "Fleet index of this process's FIRST bot (env: BOT_INDEX; CLI flag wins). Clock-mode capture geometry is a pure function of the index: every 6th index (1, 7, 13, 19, …) captures 1280x720, the rest 640x480, seeding the observed publisher mix (issue #2236, following #2171). Further bots in this process take the following indices. A K8s pod passes its StatefulSet ordinal (the entrypoint does this in ordinal identity mode). Unset ⇒ 0 ⇒ 640x480.",
+  )
+  .option(
+    "--join-camera-off",
+    "Leave the camera off after joining instead of turning it on (env: BOT_JOIN_CAMERA_OFF). If the product joins with the camera on, the bot clicks it off and reads the control back. A camera-off bot publishes no camera, which is less load than a camera-on participant; use it only where the scenario's participant really has the camera off (#2914). Recorded in <assets-dir>/participants/<bot-id>.json. Refused together with the camera duty cycle. Applies to the bots this command starts and to their control-API `/duplicate` copies, not to bots launched with `/launch`.",
+  )
+  .option(
+    "--join-mic-muted",
+    "Leave the mic muted after joining instead of unmuting it (env: BOT_JOIN_MIC_MUTED). If the product joins with the mic on, the bot clicks it off and reads the control back; the record carries the observed state and flags a mismatch. Recorded like --join-camera-off.",
+  )
+  .option(
+    "--role <name>",
+    "Scenario role written into each bot's participant record (env: BOT_ROLE), e.g. probe-mix. Free-form, [A-Za-z0-9._-]{1,64}.",
   )
   .action(async (opts: RunCommandOptions) => {
     // Mutual exclusion / required-arg checks ──────────────────────────
@@ -376,6 +410,19 @@ program
       process.exit(2);
     }
     const skipCanvasPaint = scpResult.value;
+    const diagResult = resolveDiagPackets(opts.diagPackets ?? process.env[DIAG_PACKETS_ENV]);
+    if (diagResult.kind === "invalid") {
+      console.error(botsAppLine(diagResult.message));
+      process.exit(2);
+    }
+    const diagPackets = diagResult.value ?? null;
+    const decodeBudgetResult = resolveDecodeBudget(opts.decodeBudget);
+    if (decodeBudgetResult.kind === "invalid") {
+      console.error(botsAppLine(decodeBudgetResult.message));
+      process.exit(2);
+    }
+    const decodeBudget = decodeBudgetResult.kind === "ok" ? decodeBudgetResult.value : "client";
+    if (decodeBudget === "off") console.log(botsAppLine(DECODE_BUDGET_WAIVER_NOTE));
 
     // #2362: env-only (the fleet sets it via the StatefulSet).
     const cameraCycleResult = resolveCameraCycle({
@@ -389,6 +436,29 @@ program
       process.exit(2);
     }
     const cameraCycle = cameraCycleResult.value ?? null;
+
+    const joinMediaResult = resolveJoinMedia({
+      cameraOffFlag: opts.joinCameraOff,
+      micMutedFlag: opts.joinMicMuted,
+      env: process.env,
+      cameraCycle: cameraCycle !== null,
+    });
+    const roleResult = resolveRole(opts.role ?? process.env.BOT_ROLE);
+    for (const r of [joinMediaResult, roleResult]) {
+      if (r.kind === "invalid") {
+        console.error(botsAppLine(r.message));
+        process.exit(2);
+      }
+    }
+    const joinMedia = joinMediaResult.kind === "ok" ? joinMediaResult.value : JOIN_MEDIA_ON;
+    const role = roleResult.kind === "ok" ? roleResult.value : null;
+    if (!joinMedia.camera || !joinMedia.mic) {
+      console.log(
+        botsAppLine(
+          `join media: camera ${joinMedia.camera ? "on" : "OFF"}, mic ${joinMedia.mic ? "on" : "MUTED"} (opt-in; less publish load than a camera-on, unmuted participant)`,
+        ),
+      );
+    }
 
     const formLoginTimeoutMs = resolvePositiveMs(
       "--login-timeout",
@@ -464,10 +534,13 @@ program
         hardwareConcurrency,
         maxReceivedLayer,
         skipCanvasPaint,
+        diagPackets,
+        decodeBudget,
         formLoginTimeoutMs,
         formLoginActionTimeoutMs,
         sourceGeometry: sourceGeometryForIndex(baseIndex + offset),
         cameraCycle,
+        joinMedia,
       };
     });
 
@@ -501,7 +574,32 @@ program
     const capture = new ResourceCaptureSession({ runDir: opts.assetsDir });
     capture.startLocal();
     const onEncoderFps = (botId: string, fps: number | null): void => fpsTracker.record(botId, fps);
-    const onJoin = (botId: string, joinedAt: number): void => arrivals.record(botId, joinedAt);
+    const recorder = new ParticipantRecorder({
+      runDir: opts.assetsDir,
+      role,
+      kernelNetem: process.env.BOT_NETEM_APPLIED,
+      pod: readPodContext(process.env),
+      warn: (m) => console.warn(botsAppLine(m)),
+    });
+    const onJoin = (
+      botId: string,
+      joinedAt: number,
+      media?: JoinMediaState,
+      sessionUserId?: string | null,
+      decodeBudgetReadback?: string | null,
+    ): void => {
+      arrivals.record(botId, joinedAt);
+      recorder.joined(
+        botId,
+        joinedAt,
+        media ?? null,
+        sessionUserId ?? null,
+        decodeBudgetReadback ?? null,
+      );
+    };
+    const onRegister = (task: BotTask): void => recorder.register(task);
+    const onFinish = (botId: string, finishedAt: number, reason: string | undefined): void =>
+      recorder.finished(botId, finishedAt, reason);
     // A ctl-enabled run can launch SSH bots on remote boxes; give those a
     // per-host remote sampler too. Plain local runs never call ensureForHost,
     // so this is inert unless SSH bots appear.
@@ -575,7 +673,18 @@ program
     }
 
     try {
-      await runBotsToCompletion({ tasks, control, onEncoderFps, onJoin, remoteResource });
+      await runBotsToCompletion({
+        tasks,
+        control,
+        onEncoderFps,
+        onDiagPackets: (botId, obs) => recorder.diagPacketsObserved(botId, obs),
+        onJoin,
+        onRegister,
+        onRejoin: (botId, network) => recorder.rejoining(botId, network),
+        onFinish,
+        onNetem: (action, at, error) => recorder.netemApplied(action, at, error !== undefined),
+        remoteResource,
+      });
     } finally {
       const result = await capture.finalize(
         fpsTracker.snapshot(),
@@ -611,9 +720,14 @@ interface RunCommandOptions {
   hardwareConcurrency?: string;
   maxReceivedLayer?: string;
   skipCanvasPaint?: string;
+  diagPackets?: string;
+  decodeBudget?: string;
   botIndex?: string;
   loginTimeout?: string;
   loginActionTimeout?: string;
+  joinCameraOff?: boolean;
+  joinMicMuted?: boolean;
+  role?: string;
 }
 
 /** Unset/blank ⇒ `null` (callee default); malformed or non-positive ⇒ exit 2. */
@@ -1016,6 +1130,8 @@ registerCtlCommands(program, join(repoRoot(), "e2e/bots-app/run"));
 // scenario timeline against the fleet's per-pod control servers.
 registerConductCommand(program);
 
+registerResourceVerdictCommand(program);
+
 // Phase 5: the dashboard subcommand. Spins up a small Node HTTP
 // sidecar that proxies the browser-facing UI to a phase-4
 // orchestrator's ctl API, attaching the bearer token server-side so
@@ -1097,6 +1213,8 @@ program
     // orchestrator is out of our process). Finalized in `cleanup` below.
     let dashCapture: ResourceCaptureSession | null = null;
     const dashFps = new FpsTracker(RESOURCE_FPS_BASE_RUNG);
+    const dashJoins = new ArrivalTracker();
+    let dashLaunches = 0;
 
     if (attachRequested) {
       try {
@@ -1137,6 +1255,10 @@ program
         orchestratorTask = runBotsToCompletion({
           tasks: [],
           onEncoderFps: (botId, fps) => dashFps.record(botId, fps),
+          onJoin: (botId, joinedAt) => dashJoins.record(botId, joinedAt),
+          onRegister: () => {
+            dashLaunches += 1;
+          },
           remoteResource: dashRemote,
           control: {
             port: 0,
@@ -1242,9 +1364,9 @@ program
       // orchestrator (and its remote finalize) has wound down.
       if (dashCapture) {
         const result = await dashCapture
-          // No arrival spread: a daemon has no run boundary, so its launches are not a ramp,
-          // and joins are not tracked at all.
-          .finalize(dashFps.snapshot(), null, null)
+          // No arrival spread: a daemon has no run boundary, so its launches are not a ramp.
+          // An idle daemon (no local launch) leaves the join rule out of the verdict.
+          .finalize(dashFps.snapshot(), null, dashLaunches > 0 ? dashJoins.joinedBots : null)
           .catch(() => null);
         if (result) console.log(result.reportText);
       }

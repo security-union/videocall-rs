@@ -1,0 +1,230 @@
+{
+ "schema": "call-quality-run-manifest/v1",
+ "run_id": "cqlocal1-20261001",
+ "meeting_id": "cqlocal1",
+ "environment": "local",
+ "code": {
+  "commit": "64f649e21e6916489b0f34c062615363a12bd2e1",
+  "images": {
+   "ui": "sha256:b39dc7d87ac969ec353115a3cfb5e3d6aa63ec0d1520f0d26673a7ae74527721",
+   "relay_ws": "sha256:dc324b923fac236b28adacf9a0a6371af2cfc63312359d082488129b2f462435",
+   "relay_wt": "sha256:8dce42545e30ae1574c29676cee33d0034c75e50e192d94d6c4494dc20676252",
+   "bots_app": "sha256:6446946a1d9fd62d9ae501312a2d76a43ee688542b21622056a372959b65d63d",
+   "rust_bot": "sha256:38a75309ed8b025bd3f43e2aa0535494a04977aa073bf2113dc1273e2fc051bc"
+  }
+ },
+ "scenario": {
+  "file": "adhoc: cqrun/bot_cmd.sh + cqrun/probe_cmd.sh (no scenario file)",
+  "sha256": "3f18c570012064cb862f117e9070ddcd66635a7ae31848f6ad5db0ab8a5ac9b0"
+ },
+ "clock": {
+  "sync": "none",
+  "max_abs_skew_ms": null,
+  "measured_at": null,
+  "per_node": [
+   {
+    "node": "local-wsl2",
+    "skew_ms": 0.0
+   }
+  ]
+ },
+ "steps": [
+  {
+   "step_id": "n7",
+   "n_target": 7,
+   "join_start": 1790867520.0,
+   "hold_start": 1790867665.0,
+   "hold_end": 1790868085.0,
+   "headline": true
+  }
+ ],
+ "events": [
+  {
+   "at": 1790867561.964955,
+   "step_id": "n7",
+   "action": "mute",
+   "participants": [
+    "probe0@bots-app.local"
+   ],
+   "params": {}
+  }
+ ],
+ "participants": [
+  {
+   "user_id": "probe0@bots-app.local",
+   "fleet": "browser",
+   "role": "probe-ref",
+   "observer": true,
+   "talker": false,
+   "publishes": {
+    "camera": true,
+    "mic": true,
+    "screen": false
+   },
+   "network": {
+    "profile": "none",
+    "shaped": false,
+    "direction": "none",
+    "shaper": "none"
+   },
+   "transport_intended": "auto",
+   "placement": null,
+   "stagger_ms": null,
+   "join_ts": 1790867530.291027,
+   "leave_ts": null,
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "alice",
+   "fleet": "rust",
+   "role": "talker",
+   "observer": false,
+   "talker": true,
+   "publishes": {
+    "camera": true,
+    "mic": true,
+    "screen": false
+   },
+   "network": {
+    "profile": "none",
+    "shaped": false,
+    "direction": "none",
+    "shaper": "none",
+    "params": {}
+   },
+   "transport_intended": "websocket",
+   "join_ts": 1790867571.739495,
+   "leave_ts": 1790868171.8104837,
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-002",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "network": {
+    "profile": "none",
+    "shaped": false,
+    "direction": "none",
+    "shaper": "none",
+    "params": {}
+   },
+   "transport_intended": "websocket",
+   "join_ts": 1790867572.2369432,
+   "leave_ts": 1790868172.2783778,
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-003",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "network": {
+    "profile": "none",
+    "shaped": false,
+    "direction": "none",
+    "shaper": "none",
+    "params": {}
+   },
+   "transport_intended": "websocket",
+   "join_ts": 1790867572.7388103,
+   "leave_ts": 1790868172.7806664,
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-004",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "network": {
+    "profile": "none",
+    "shaped": false,
+    "direction": "none",
+    "shaper": "none",
+    "params": {}
+   },
+   "transport_intended": "websocket",
+   "join_ts": 1790867573.2387247,
+   "leave_ts": 1790868173.2799895,
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-005",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": false,
+    "mic": false,
+    "screen": false
+   },
+   "network": {
+    "profile": "none",
+    "shaped": false,
+    "direction": "none",
+    "shaper": "none",
+    "params": {}
+   },
+   "transport_intended": "websocket",
+   "join_ts": 1790867573.7413108,
+   "leave_ts": 1790868173.7831826,
+   "steps": [
+    "n7"
+   ]
+  },
+  {
+   "user_id": "bot-006",
+   "fleet": "rust",
+   "role": "viewer",
+   "observer": false,
+   "talker": false,
+   "publishes": {
+    "camera": true,
+    "mic": false,
+    "screen": false
+   },
+   "network": {
+    "profile": "none",
+    "shaped": false,
+    "direction": "none",
+    "shaper": "none",
+    "params": {}
+   },
+   "transport_intended": "websocket",
+   "join_ts": 1790867574.2435405,
+   "leave_ts": 1790868174.310331,
+   "steps": [
+    "n7"
+   ]
+  }
+ ]
+}

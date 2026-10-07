@@ -67,12 +67,17 @@ async fn run(arbiters: usize, workers: usize) {
 
     // Connect to NATS
     let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
-    let nats_client = async_nats::ConnectOptions::new()
-        .require_tls(false)
-        .ping_interval(std::time::Duration::from_secs(10))
-        .connect(&nats_url)
-        .await
-        .expect("Failed to connect to NATS");
+    let nats_client = sec_api::metrics::with_nats_event_metrics(
+        async_nats::ConnectOptions::new()
+            .require_tls(false)
+            .ping_interval(std::time::Duration::from_secs(10)),
+    )
+    .connect(&nats_url)
+    .await
+    .expect("Failed to connect to NATS");
+    if let Err(e) = sec_api::metrics::register_nats_statistics(&nats_client) {
+        error!("NATS client statistics will not be exported: {e}");
+    }
     info!("Connected to NATS at {}", nats_url);
 
     // Start ChatServer actor

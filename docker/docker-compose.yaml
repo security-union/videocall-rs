@@ -29,6 +29,7 @@ services:
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
+      - WT_DEV_CERT_HASH_INJECT=${WT_DEV_CERT_HASH_INJECT:-true}
       - TRANSPORT_BADGE_ENABLED=${TRANSPORT_BADGE_ENABLED:-false}
       - E2EE_ENABLED=${E2EE_ENABLED:-false}
       - FIREFOX_ENABLED=${FIREFOX_ENABLED:-false}
@@ -385,26 +386,26 @@ services:
       - 5432
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.11.2
     container_name: videocall-prometheus
+    entrypoint: ["/bin/sh", "/etc/prometheus/entrypoint.sh"]
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
       - '--storage.tsdb.retention.time=200h'
       - '--web.enable-lifecycle'
+    environment:
+      - WS_RELAY_PORT=${ACTIX_PORT:-8080}
     restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
-      - ./monitoring/prometheus:/etc/prometheus
+      - ./monitoring/prometheus:/etc/prometheus:ro
       - prometheus_data:/prometheus
     depends_on:
       - metrics-api
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:10.0.0
     container_name: videocall-grafana
     ports:
       - "3000:3000"
@@ -414,9 +415,9 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=grafana
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana_data_v10:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../helm/grafana/dashboards:/var/lib/grafana/dashboards:ro
 
 
 volumes:
@@ -444,4 +445,4 @@ volumes:
   rustlemania-bot-cargo-git-cache:
   rustlemania-bot-cache:
   prometheus_data:
-  grafana_data:
+  grafana_data_v10:

@@ -125,6 +125,7 @@ pub async fn ws_connect_authenticated(
     let display_name = claims.display_name;
     let is_host = claims.is_host;
     let is_guest = claims.is_guest;
+    let token_iat = claims.iat;
 
     debug!(
         "socket connected (token-based) for user_id={user_id}, room={room}, display_name={display_name}, is_guest={is_guest}, observer={observer}, is_host={is_host}"
@@ -146,7 +147,8 @@ pub async fn ws_connect_authenticated(
         observer,
         instance_id,
         is_host,
-    );
+    )
+    .with_token_iat(token_iat);
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
 }

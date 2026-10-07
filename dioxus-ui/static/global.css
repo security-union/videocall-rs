@@ -4453,6 +4453,7 @@ html[data-theme="light"] #invite-overlay p {
   width: min(640px, 94vw);
   max-height: min(85vh, 720px);
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 1.5rem;
 }
 
@@ -4597,6 +4598,9 @@ html[data-theme="light"] #invite-overlay p {
   .about-modal-card {
     padding: var(--space-5);
   }
+  .about-modal-card .btn-sm {
+    height: 44px;
+  }
   .about-modal-row {
     grid-template-columns: 1fr;
     gap: 0.125rem;
@@ -4610,6 +4614,80 @@ html[data-theme="light"] #invite-overlay p {
   }
   .about-modal-row--header {
     display: none;
+  }
+}
+
+/* "What's new" change log inside the About and Meeting info dialogs */
+.changelog {
+  margin-top: var(--space-3);
+  scroll-margin-top: var(--space-4);
+}
+.changelog-toggle {
+  gap: var(--space-1);
+}
+.changelog-chevron {
+  width: 14px;
+  height: 14px;
+  transition: transform var(--motion-fast) ease;
+}
+.changelog-toggle[aria-expanded="true"] .changelog-chevron {
+  transform: rotate(180deg);
+}
+.changelog-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.changelog-build {
+  padding: var(--space-2) var(--space-3);
+  background: var(--glass-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-input);
+}
+.changelog-build[data-pending="true"] {
+  border-style: dashed;
+}
+.changelog-build-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  margin: 0 0 var(--space-1) 0;
+  font-size: var(--fs-5);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.changelog-build-version {
+  font-size: var(--fs-4);
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+.changelog-this-build {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-3);
+  color: var(--text-primary);
+}
+.changelog-changes {
+  margin: 0;
+  padding-left: 1.1rem;
+  list-style: disc;
+  font-size: var(--fs-5);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+.changelog-changes li + li {
+  margin-top: 2px;
+}
+.changelog-show-older,
+.changelog-retry {
+  align-self: flex-start;
+}
+@media (prefers-reduced-motion: reduce) {
+  .changelog-chevron {
+    transition: none;
   }
 }
 
@@ -4801,6 +4879,7 @@ html[data-theme="light"] #invite-overlay p {
   width: min(480px, 94vw);
   max-height: min(85vh, 640px);
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 1.5rem;
   background: var(--surface-overlay);
   -webkit-backdrop-filter: none;

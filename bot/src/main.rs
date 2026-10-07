@@ -19,7 +19,7 @@
 // All modules live in `src/lib.rs` so integration tests under `tests/`
 // can share code with the binary. The binary only pulls in what it needs.
 use bot::aq_controller::BotAq;
-use bot::audio_producer::AudioProducer;
+use bot::audio_producer::{stitch_participant_audio, AudioProducer};
 use bot::config::{
     self, evaluate_costume_memory, BotConfig, ClientConfig, CostumeMemoryDecision, Manifest,
     Transport, VideoMode,
@@ -35,6 +35,8 @@ use bot::layer_preference_sender::LayerPreferenceSender;
 use bot::metrics_server::{self, BotMetrics};
 use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
 use bot::rtt_probe::spawn_rtt_probe;
+use bot::run_manifest;
+use bot::shutdown;
 use bot::transport::{
     self, OutboundFrame, OutboundFrameSender, TransportClient, WebSocketStreamByteCounters,
 };
@@ -47,8 +49,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time;
 use tracing::{debug, error, info, warn};
+use videocall_meeting_types::mint::LobbyAuth;
 use videocall_types::url_log::strip_query_for_log;
 
 #[tokio::main]
@@ -67,6 +69,15 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting videocall synthetic client bot");
 
     let (config, num_users) = BotConfig::from_args()?;
+    let run_started_at = run_manifest::epoch_secs();
+
+    // One shutdown flag for the whole run: Ctrl-C, SIGTERM or --duration.
+    let (shutdown_tx, mut shutdown_rx) = shutdown::shutdown_channel();
+    let run_duration = config.run_duration()?;
+    let _shutdown_trigger = shutdown::spawn_shutdown_trigger(shutdown_tx, run_duration);
+    if let Some(d) = run_duration {
+        info!("Run duration: {:?} (from process start)", d);
+    }
 
     // Fail before any bot is spawned rather than once per client (#2298).
     config.resolve_lobby_auth()?;
@@ -136,43 +147,41 @@ async fn main() -> anyhow::Result<()> {
         manifest.pause_ms
     );
 
-    // Take first N participants (0 = all)
-    let n = if num_users == 0 {
-        manifest.participants.len()
-    } else {
-        num_users.min(manifest.participants.len())
-    };
-    let active_participants = &manifest.participants[..n];
-    let active_names: HashSet<&str> = active_participants
+    // Roles follow the run-wide roster position (config::build_roster): generated
+    // bot-NNN participants are cameras or viewers, never audio publishers.
+    let roster_offset = config.roster_offset.unwrap_or(0);
+    let speaker_set: HashSet<&str> = manifest.lines.iter().map(|l| l.speaker.as_str()).collect();
+    let roster = config::build_roster(
+        &manifest.participants,
+        &speaker_set,
+        roster_offset,
+        num_users,
+        &config.population(),
+    );
+    let n = roster.len();
+    if n == 0 {
+        return Err(anyhow::anyhow!(
+            "no participants to run (empty manifest and --users 0, or --roster-offset past it)"
+        ));
+    }
+    let active_participants: Vec<&config::Participant> =
+        roster.iter().map(|e| &e.participant).collect();
+    let role_of: HashMap<&str, config::Role> = roster
         .iter()
-        .map(|p| p.name.as_str())
+        .map(|e| (e.participant.name.as_str(), e.role))
+        .collect();
+    let broadcaster_names: HashSet<&str> = roster
+        .iter()
+        .filter(|e| e.role.sends_audio())
+        .map(|e| e.participant.name.as_str())
         .collect();
 
-    // Determine broadcaster/observer split
-    let broadcaster_count = config.broadcasters();
-    let broadcaster_names: HashSet<&str> = if broadcaster_count == 0 {
-        // 0 means all broadcast
-        active_names.clone()
-    } else {
-        active_participants
-            .iter()
-            .take(broadcaster_count)
-            .map(|p| p.name.as_str())
-            .collect()
-    };
-
     info!(
-        "Active participants ({}): {} | Broadcasters ({}): {}",
+        "Active participants ({}): {}",
         n,
-        active_participants
+        roster
             .iter()
-            .map(|p| p.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        broadcaster_names.len(),
-        broadcaster_names
-            .iter()
-            .copied()
+            .map(|e| format!("{} ({:?})", e.participant.name, e.role))
             .collect::<Vec<_>>()
             .join(", "),
     );
@@ -196,31 +205,84 @@ async fn main() -> anyhow::Result<()> {
         .map(|line| load_wav_samples(&format!("{conv_dir}/{}", line.audio_file)))
         .collect::<Result<_, _>>()?;
 
-    // Stitch per-participant audio (plain conversation audio, no warmup padding)
+    // Stitch per-broadcaster audio (plain conversation audio, no warmup padding).
+    // Receive-only participants get no timeline: they never produce audio.
     let pause_samples = (manifest.pause_ms as usize * 48000) / 1000;
-    let mut participant_audio: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut total_samples: usize = 0;
+    let speakers: Vec<&str> = active_lines.iter().map(|l| l.speaker.as_str()).collect();
+    let broadcaster_list: Vec<&str> = active_participants
+        .iter()
+        .map(|p| p.name.as_str())
+        .filter(|name| broadcaster_names.contains(name))
+        .collect();
+    let (mut participant_audio, total_samples) =
+        stitch_participant_audio(&speakers, &line_audio, &broadcaster_list, pause_samples);
 
-    for p in active_participants {
-        participant_audio.insert(p.name.clone(), Vec::new());
+    // Network profile of every participant this process runs, keyed by wire
+    // user id, so receivers can label delay by sender profile.
+    let sender_profiles: Arc<HashMap<String, String>> = Arc::new(
+        active_participants
+            .iter()
+            .map(|p| (config.wire_user_id(&p.name), config.network_label(p)))
+            .collect(),
+    );
+    // The bot's share of the run manifest (Discussion #2913 §5.2): one record
+    // per participant, completed with actual join/leave times as the run goes.
+    let mut records = Vec::with_capacity(n);
+    for (index, entry) in roster.iter().enumerate() {
+        let p = &entry.participant;
+        let (transport, _) = config.resolve_transport(roster_offset + index)?;
+        records.push(run_manifest::ParticipantRecord {
+            user_id: config.wire_user_id(&p.name),
+            fleet: "rust",
+            role: run_manifest::role_for(entry.role),
+            observer: false,
+            talker: entry.role.is_talker(),
+            publishes: run_manifest::Publishes {
+                camera: entry.role.sends_video(),
+                mic: entry.role.sends_audio(),
+                screen: false,
+            },
+            network: run_manifest::network_record(
+                &config.network_label(p),
+                &config.resolve_network(p)?,
+            ),
+            transport_intended: match transport {
+                Transport::WebSocket => "websocket",
+                Transport::WebTransport => "webtransport",
+            },
+            placement: config
+                .placement_node
+                .clone()
+                .map(|node| run_manifest::Placement { node }),
+            join_ts: None,
+            leave_ts: None,
+            instance_id: None,
+            outcome: None,
+        });
     }
-
-    for (i, line) in active_lines.iter().enumerate() {
-        let line_samples = line_audio[i].len();
-        for p in active_participants {
-            let audio = participant_audio.get_mut(&p.name).unwrap();
-            if p.name == line.speaker {
-                audio.extend_from_slice(&line_audio[i]);
-            } else {
-                audio.resize(audio.len() + line_samples, 0.0f32);
-            }
-            // Pause between lines
-            audio.resize(audio.len() + pause_samples, 0.0f32);
-        }
-        total_samples = participant_audio.values().next().map_or(0, |a| a.len());
+    let registry = Arc::new(run_manifest::ParticipantRegistry::new(
+        config.meeting_id.clone(),
+        config.id_prefix.clone(),
+        run_started_at,
+        records,
+    ));
+    let participants_out = config
+        .participants_out
+        .as_ref()
+        .map(std::path::PathBuf::from);
+    if let Some(path) = &participants_out {
+        registry.write(path)?;
+        info!("Participant list written to {}", path.display());
     }
+    let participants_writer = participants_out.clone().map(|path| {
+        run_manifest::ParticipantsWriter::spawn(
+            Arc::clone(&registry),
+            path,
+            run_manifest::WRITE_INTERVAL,
+        )
+    });
 
-    let loop_duration = Duration::from_millis((total_samples as u64 * 1000) / 48000);
+    let loop_duration = config::media_loop_duration(total_samples);
     info!(
         "Stitched timeline: {:.1}s ({} samples), {} active lines for {} participants",
         loop_duration.as_secs_f64(),
@@ -235,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
         let mut costume_count = 0usize;
         for p in active_participants
             .iter()
-            .filter(|p| broadcaster_names.contains(p.name.as_str()))
+            .filter(|p| role_of[p.name.as_str()].sends_video())
         {
             if let Some(ref dir) = p.costume_dir {
                 let idle_path = format!("{dir}/idle.i420");
@@ -310,8 +372,18 @@ async fn main() -> anyhow::Result<()> {
     let mut client_handles = Vec::new();
 
     for (index, p) in active_participants.iter().enumerate() {
-        let audio_data = participant_audio.remove(&p.name).unwrap();
-        let is_broadcaster = broadcaster_names.contains(p.name.as_str());
+        if *shutdown_rx.borrow() {
+            warn!(
+                "Shutdown requested during ramp-up; {} of {} clients started",
+                index, n
+            );
+            break;
+        }
+        let audio_data = participant_audio.remove(&p.name).unwrap_or_default();
+        let role = role_of[p.name.as_str()];
+        let rx_profile = config.network_label(p);
+        let profiles = Arc::clone(&sender_profiles);
+        let client_registry = Arc::clone(&registry);
 
         // Resolve network profile for this participant once, upfront, so
         // invalid configs fail the whole run before we spawn transports.
@@ -329,27 +401,28 @@ async fn main() -> anyhow::Result<()> {
         }
 
         info!(
-            "Starting client {} ({}) - audio: {} samples, broadcaster: {}",
+            "Starting client {} ({}) - audio: {} samples, role: {:?}",
             index,
             p.name,
             audio_data.len(),
-            is_broadcaster,
+            role,
         );
 
         let bot_config = config.clone();
-        let user_id = p.name.clone();
+        let user_id = config.wire_user_id(&p.name);
         let meeting_id = config.meeting_id.clone();
         let ekg_color = p.ekg_color;
         let costume_dir = p.costume_dir.clone();
         let cell = media_start_cell.clone();
         let ld = loop_duration;
-        let total_bots = n;
+        let position = roster_offset + index;
         let netprof = network_profile;
         #[cfg(feature = "metrics")]
         let metrics_for_bot = metrics_handle.clone();
 
+        let client_shutdown = shutdown_rx.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_client(
+            match run_client(
                 bot_config,
                 user_id,
                 meeting_id,
@@ -359,16 +432,23 @@ async fn main() -> anyhow::Result<()> {
                 insecure,
                 cell,
                 ld,
-                index,
-                total_bots,
-                is_broadcaster,
+                position,
+                role,
                 netprof,
+                rx_profile,
+                profiles,
+                client_registry,
+                client_shutdown,
                 #[cfg(feature = "metrics")]
                 metrics_for_bot,
             )
             .await
             {
-                error!("Client failed: {}", e);
+                Ok(()) => true,
+                Err(e) => {
+                    error!("Client failed: {}", e);
+                    false
+                }
             }
         });
 
@@ -379,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
                 "Waiting {}ms before starting next client",
                 ramp_up_delay.as_millis()
             );
-            time::sleep(ramp_up_delay).await;
+            shutdown::sleep_or_shutdown(ramp_up_delay, &mut shutdown_rx).await;
         }
     }
 
@@ -389,21 +469,63 @@ async fn main() -> anyhow::Result<()> {
         "All {} clients spawned, waiting {}s warmup before starting media",
         n, warmup
     );
-    time::sleep(Duration::from_secs(warmup)).await;
+    shutdown::sleep_or_shutdown(Duration::from_secs(warmup), &mut shutdown_rx).await;
 
-    let now = Instant::now();
-    let _ = media_start_cell.set(now);
+    let now = shutdown::release_media(&media_start_cell, &registry);
     info!("Media start signal sent at {:?}", now);
 
-    info!("All {} clients running, waiting for Ctrl+C", n);
+    info!(
+        "All {} clients running until {}",
+        n,
+        if run_duration.is_some() {
+            "the run duration elapses, Ctrl-C or SIGTERM"
+        } else {
+            "Ctrl-C or SIGTERM"
+        }
+    );
 
+    let started = client_handles.len();
+    let mut failed = 0usize;
+    let mut stop_deadline = None;
     for handle in client_handles {
-        let _ = handle.await;
+        let joined = shutdown::join_or_abort(
+            handle,
+            &mut shutdown_rx,
+            CLIENT_STOP_GRACE,
+            &mut stop_deadline,
+        )
+        .await;
+        if joined != Some(true) {
+            failed += 1;
+        }
     }
 
-    info!("All clients finished");
+    info!(
+        "All clients finished: {} started, {} failed",
+        started, failed
+    );
+    let interim_writes = registry
+        .close(
+            participants_writer,
+            participants_out.as_deref(),
+            run_manifest::epoch_secs(),
+        )
+        .await?;
+    if let Some(path) = &participants_out {
+        info!(
+            "Participant list finalized in {} after {} interim writes",
+            path.display(),
+            interim_writes
+        );
+    }
+    if failed > 0 {
+        return Err(anyhow::anyhow!("{failed} of {started} clients failed"));
+    }
     Ok(())
 }
+
+/// How long clients get to stop after shutdown before they are aborted.
+const CLIENT_STOP_GRACE: Duration = Duration::from_secs(30);
 
 #[allow(clippy::too_many_arguments)]
 async fn run_client(
@@ -416,26 +538,23 @@ async fn run_client(
     insecure: bool,
     media_start_cell: Arc<tokio::sync::OnceCell<Instant>>,
     loop_duration: Duration,
-    bot_index: usize,
-    total_bots: usize,
-    is_broadcaster: bool,
+    position: usize,
+    role: config::Role,
     network_profile: NetworkProfile,
+    rx_profile: String,
+    sender_profiles: Arc<HashMap<String, String>>,
+    registry: Arc<run_manifest::ParticipantRegistry>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
 ) -> anyhow::Result<()> {
-    info!(
-        "Initializing client: {} (broadcaster={})",
-        user_id, is_broadcaster
-    );
+    info!("Initializing client: {} (role={:?})", user_id, role);
 
     // Resolve transport for this bot
-    let (resolved_transport, server_url) = bot_config.resolve_transport(bot_index, total_bots)?;
+    let (resolved_transport, server_url) = bot_config.resolve_transport(position)?;
 
-    let client_config = ClientConfig {
-        user_id: user_id.clone(),
-        meeting_id,
-        enable_audio: is_broadcaster,
-        enable_video: is_broadcaster,
-    };
+    let timings = bot_config.control_timings()?;
+    let client_config =
+        ClientConfig::for_role(user_id.clone(), meeting_id, role, timings.heartbeat);
 
     let lobby_auth = bot_config.resolve_lobby_auth()?;
     let lobby_url = TransportClient::build_lobby_url(
@@ -445,6 +564,16 @@ async fn run_client(
         &client_config.user_id,
         &client_config.meeting_id,
     )?;
+    // Like the browser, identify this client instance so the relay's
+    // reconnect-grace and stale-session paths key on it. The relay ignores it on
+    // the deprecated path-based join, so it is only sent with a token.
+    let instance_id = config::generate_instance_id(&mut rand::thread_rng());
+    let lobby_url = if matches!(lobby_auth, LobbyAuth::DeprecatedPath) {
+        lobby_url
+    } else {
+        registry.set_instance_id(&user_id, &instance_id);
+        config::append_instance_id(lobby_url, &instance_id)
+    };
     info!(
         "[{}] Transport: {:?}, Lobby URL: {}{}",
         user_id,
@@ -488,6 +617,9 @@ async fn run_client(
     // receiver-reported DIAGNOSTICS no longer feed the sender AQ. The AQ now
     // advances on a self-timer (see the `aq.tick()` task spawned below).
     let stats = Arc::new(Mutex::new(InboundStats::default()));
+    if client_config.enable_video {
+        stats.lock().unwrap().set_layer_hint_aq(Arc::clone(&aq));
+    }
     #[cfg(feature = "metrics")]
     {
         let mut s = stats.lock().unwrap();
@@ -497,8 +629,18 @@ async fn run_client(
                 user_id.clone(),
                 client_config.meeting_id.clone(),
             );
+            s.set_delay_labels(bot::inbound_stats::DelayLabels {
+                transport: match resolved_transport {
+                    Transport::WebSocket => "websocket",
+                    Transport::WebTransport => "webtransport",
+                },
+                rx_profile: rx_profile.clone(),
+                sender_profiles: Arc::clone(&sender_profiles),
+            });
         }
     }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (&rx_profile, &sender_profiles);
 
     // Shared is_speaking flag -- audio producer sets, heartbeat/video reads
     let is_speaking = Arc::new(AtomicBool::new(false));
@@ -568,6 +710,7 @@ async fn run_client(
             inbound_hook,
         )
         .await?;
+    let presence = registry.join(&user_id, run_manifest::epoch_secs());
 
     // The transport-facing packet channel. This carries raw wire bytes ready
     // to hand to the WebSocket/WebTransport sender. Producers upstream send
@@ -577,396 +720,363 @@ async fn run_client(
 
     // Start packet sender task.
     client.start_packet_sender(transport_rx).await;
-
-    // Outbound shim/counter task. We always splice in one task between
-    // producers (which emit `OutboundFrame`) and the transport sender
-    // (which consumes raw bytes), so the channel types don't need to be
-    // conditional on feature / passthrough state.
-    //
-    // In passthrough + no-metrics the task body is a tiny forward loop;
-    // with netsim enabled it applies the uplink impairment; with metrics
-    // enabled it also labels Prometheus counters using the pre-tagged
-    // `frame.kind` — no protobuf re-parse on the hot path.
-    let (packet_tx_raw, packet_rx) = mpsc::channel::<OutboundFrame>(500);
-    // `Some` only on a WebSocket run: one Option both wires the byte accounting
-    // and reaches the health reporter, so the two cannot disagree on transport.
-    let websocket_stream_bytes = matches!(resolved_transport, Transport::WebSocket)
-        .then(|| Arc::new(WebSocketStreamByteCounters::default()));
-    let packet_tx = match websocket_stream_bytes.clone() {
-        Some(counters) => OutboundFrameSender::with_websocket_accounting(packet_tx_raw, counters),
-        None => OutboundFrameSender::new(packet_tx_raw),
-    };
-
-    // Shared counters for HealthPacket telemetry:
-    // - packets_sent_counter: incremented by the outbound shim/passthrough on
-    //   every successful transport send; read+reset by health reporter each tick.
-    // - transport_drops_counter: cumulative try_send failures from any producer;
-    //   read (not reset) by health reporter for websocket/datagram_drops_total.
-    // - encoder_output_fps: written by the video producer with the current target
-    //   FPS the encoder is configured at.
-    let packets_sent_counter = Arc::new(AtomicU64::new(0));
-    let transport_drops_counter = Arc::new(AtomicU64::new(0));
-    let encoder_output_fps = Arc::new(AtomicU32::new(0));
-    let encoder_errors_generic = Arc::new(AtomicU64::new(0));
-    let encoder_frames_ok = Arc::new(AtomicU64::new(0));
-
-    // Handle to the uplink netsim shim, shared with the AQ tick so it can read
-    // the shim's `bandwidth_wait_us` saturation counter (issue #1083 V21).
-    // `None` in passthrough (no shim runs), so the AQ sees zero uplink
-    // saturation and the legacy zero-backpressure behavior is preserved.
-    let mut uplink_shim: Option<Arc<NetSimShim>> = None;
-
-    let outbound_shim_task = if network_profile.is_passthrough() {
-        let user_id_out = user_id.clone();
-        let transport_tx_inner = transport_tx.clone();
-        let psc = packets_sent_counter.clone();
-        #[cfg(feature = "metrics")]
-        let metrics_out = metrics.clone();
-        #[cfg(feature = "metrics")]
-        let meeting_out = client_config.meeting_id.clone();
-        let handle = tokio::spawn(run_outbound_passthrough(
-            packet_rx,
-            transport_tx_inner,
-            user_id_out,
-            psc,
-            #[cfg(feature = "metrics")]
-            metrics_out,
-            #[cfg(feature = "metrics")]
-            meeting_out,
-        ));
-        Some(handle)
-    } else {
-        let shim = NetSimShim::new(network_profile.clone(), Direction::Up);
-        #[cfg(feature = "metrics")]
-        let shim = match metrics.as_ref() {
-            Some(m) => shim.with_metrics(Arc::clone(m), user_id.clone()),
-            None => shim,
-        };
-        let shim = Arc::new(shim);
-        // Share the uplink shim with the AQ tick (issue #1083 V21): the tick
-        // reads `bandwidth_wait_us` to detect the bot's own uplink saturation.
-        uplink_shim = Some(shim.clone());
-        let user_id_up = user_id.clone();
-        let psc = packets_sent_counter.clone();
-        #[cfg(feature = "metrics")]
-        let metrics_up = metrics.clone();
-        #[cfg(feature = "metrics")]
-        let meeting_up = client_config.meeting_id.clone();
-        let handle = tokio::spawn(run_outbound_shim(
-            packet_rx,
-            transport_tx,
-            shim,
-            user_id_up,
-            psc,
-            #[cfg(feature = "metrics")]
-            metrics_up,
-            #[cfg(feature = "metrics")]
-            meeting_up,
-        ));
-        Some(handle)
-    };
-
-    // For WebSocket transport, heartbeats go through the shared mpsc channel
+    let mut closed = client.closed();
+    let (shutdown_peek, closed_peek) = (shutdown_rx.clone(), closed.clone());
     let quit = Arc::new(AtomicBool::new(false));
-
-    // Adaptive-quality self-timer (issue #1108). The sender AQ no longer reacts
-    // to receiver-reported DIAGNOSTICS; it advances on its own tick, reading the
-    // bot's (always-zero) encoder backpressure plus any explicit force_* signals.
-    // The bot has no WebCodecs encoder, so with zero backpressure it never
-    // degrades on the gradual axis — matching the browser's behavior on a
-    // healthy sender. Ticks until `quit`.
-    {
-        let aq_tick = aq.clone();
-        let quit_tick = quit.clone();
-        // Feed the bot's OWN uplink saturation into the AQ each tick (issue
-        // #1083 V21). The netsim uplink shim records, per packet, the
-        // microseconds of delay it imposed *solely* because its token bucket was
-        // in deficit (the offered byte rate exceeded `uplink_kbps`) — see
-        // `NetSimShim::bandwidth_wait_us`. A positive per-tick delta means the
-        // uplink was bandwidth-saturated this interval, the bot's honest analog
-        // of an encoder queue backing up (the bot has no WebCodecs encoder to
-        // sample); it arms the controller's sustained-backpressure shed. A flat
-        // counter (no saturation, including ALL pure latency/jitter/loss
-        // profiles, which never put the bucket in deficit) lets it recover. In
-        // passthrough `uplink_shim` is `None` and the AQ sees a constant 0.
-        // NOTE: this deliberately does NOT use `transport_drops_counter` — the
-        // outbound shim spawns a detached delay task per `Admission::Delay`, so
-        // `packet_tx` never backs up under bandwidth shaping and the drop counter
-        // stays flat on a real run; the shed would never arm off it.
-        let uplink_shim_tick = uplink_shim.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(
-                videocall_aq::constants::AQ_TICK_INTERVAL_MS,
-            ));
-            loop {
-                interval.tick().await;
-                if quit_tick.load(Ordering::Relaxed) {
-                    break;
+    let (started, result) = shutdown::hold_then_stop(
+        &mut client,
+        &quit,
+        async {
+            // Outbound shim/counter task. We always splice in one task between
+            // producers (which emit `OutboundFrame`) and the transport sender
+            // (which consumes raw bytes), so the channel types don't need to be
+            // conditional on feature / passthrough state.
+            //
+            // In passthrough + no-metrics the task body is a tiny forward loop;
+            // with netsim enabled it applies the uplink impairment; with metrics
+            // enabled it also labels Prometheus counters using the pre-tagged
+            // `frame.kind` — no protobuf re-parse on the hot path.
+            let (packet_tx_raw, packet_rx) = mpsc::channel::<OutboundFrame>(500);
+            // `Some` only on a WebSocket run: one Option both wires the byte accounting
+            // and reaches the health reporter, so the two cannot disagree on transport.
+            let websocket_stream_bytes = matches!(resolved_transport, Transport::WebSocket)
+                .then(|| Arc::new(WebSocketStreamByteCounters::default()));
+            let packet_tx = match websocket_stream_bytes.clone() {
+                Some(counters) => {
+                    OutboundFrameSender::with_websocket_accounting(packet_tx_raw, counters)
                 }
-                let uplink_wait_us = uplink_shim_tick
-                    .as_ref()
-                    .map(|s| s.bandwidth_wait_us())
-                    .unwrap_or(0);
-                aq_tick.observe_uplink_saturation(uplink_wait_us);
-                aq_tick.tick();
-            }
-        });
-    }
+                None => OutboundFrameSender::new(packet_tx_raw),
+            };
 
-    if matches!(resolved_transport, Transport::WebSocket) {
-        spawn_heartbeat_producer(
-            client_config.user_id.clone(),
-            client_config.enable_audio,
-            client_config.enable_video,
-            packet_tx.clone(),
-            quit.clone(),
-            is_speaking.clone(),
-        );
-    }
+            // Shared counters for HealthPacket telemetry:
+            // - packets_sent_counter: incremented by the outbound shim/passthrough on
+            //   every successful transport send; read+reset by health reporter each tick.
+            // - transport_drops_counter: cumulative try_send failures from any producer;
+            //   read (not reset) by health reporter for websocket/datagram_drops_total.
+            // - encoder_output_fps: written by the video producer with the current target
+            //   FPS the encoder is configured at.
+            let packets_sent_counter = Arc::new(AtomicU64::new(0));
+            let transport_drops_counter = Arc::new(AtomicU64::new(0));
+            let encoder_output_fps = Arc::new(AtomicU32::new(0));
+            let encoder_errors_generic = Arc::new(AtomicU64::new(0));
+            let encoder_frames_ok = Arc::new(AtomicU64::new(0));
 
-    // --- RTT probe (passthrough bots only) ---
-    // Impaired bots use simulated RTT (2× netsim latency); passthrough bots
-    // send actual RTT probe packets to the relay and measure real round-trip.
-    let (simulated_rtt_ms, measured_rtt_ms) = if network_profile.is_passthrough() {
-        let rtt_state = spawn_rtt_probe(user_id.clone(), packet_tx.clone(), quit.clone());
-        // Install the RTT probe state in InboundStats so echoed packets
-        // are routed to record_echo instead of counted as media.
-        {
-            let mut s = stats.lock().unwrap();
-            s.set_rtt_probe(Arc::clone(&rtt_state));
-        }
-        (None, Some(rtt_state.rtt_atomic()))
-    } else {
-        (Some((network_profile.latency_ms as f64) * 2.0), None)
-    };
+            // Handle to the uplink netsim shim, shared with the AQ tick so it can read
+            // the shim's `bandwidth_wait_us` saturation counter (issue #1083 V21).
+            // `None` in passthrough (no shim runs), so the AQ sees zero uplink
+            // saturation and the legacy zero-backpressure behavior is preserved.
+            let mut uplink_shim: Option<Arc<NetSimShim>> = None;
 
-    // --- Keyframe requester ---
-    // Send KEYFRAME_REQUEST to each newly discovered peer, mimicking browser
-    // behavior on join.
-    let keyframe_requests_sent = {
-        let kr = KeyframeRequester::new(user_id.clone(), packet_tx.clone());
-        let counter = kr.requests_sent_counter();
-        {
-            let mut s = stats.lock().unwrap();
-            s.set_keyframe_requester(kr);
-        }
-        counter
-    };
-
-    // --- Viewport sender (HCL issue #988) ---
-    // Mimic a real browser that only renders its on-screen tiles: emit a
-    // VIEWPORT control packet listing the first N discovered peers (sorted for
-    // reproducibility). A #988-enabled relay then stops forwarding VIDEO from
-    // off-screen peers, so the load test measures realistic relay fan-out.
-    // `None` keeps legacy behaviour (no VIEWPORT — relay forwards everything).
-    {
-        let vs = ViewportSender::new(
-            user_id.clone(),
-            bot_config.viewport_visible_count,
-            packet_tx.clone(),
-        );
-        if vs.is_enabled() {
-            info!(
-                "[{}] VIEWPORT fidelity enabled: rendering up to {:?} peer(s)",
-                user_id, bot_config.viewport_visible_count
-            );
-        }
-        let mut s = stats.lock().unwrap();
-        s.set_viewport_sender(vs);
-    }
-
-    // --- Layer-preference sender (HCL follow-up #1083-A2) ---
-    // Per-receiver simulcast: a browser receiver tells the relay which simulcast
-    // layer it wants per source via a LAYER_PREFERENCE control packet. The bot
-    // has no receiver chooser, so this "pin to layer N" mode is the only way it
-    // expresses a preference: when `pin_layer` is set it emits a LAYER_PREFERENCE
-    // pinning every discovered source to that fixed layer (0 = base only). This
-    // validates the relay's per-receiver layer filter from the bot side. `None`
-    // keeps legacy behaviour (no LAYER_PREFERENCE — relay forwards every layer).
-    {
-        let lps = LayerPreferenceSender::new(
-            user_id.clone(),
-            bot_config.pin_layer,
-            bot_config.pin_media_kind(),
-            packet_tx.clone(),
-        );
-        if lps.is_enabled() {
-            info!(
-                "[{}] LAYER_PREFERENCE pin enabled: pinning every source to layer {:?} ({:?})",
-                user_id,
-                bot_config.pin_layer,
-                bot_config.pin_media_kind()
-            );
-        }
-        let mut s = stats.lock().unwrap();
-        s.set_layer_preference_sender(lps);
-    }
-
-    // Spawn health reporter -- sends HealthPacket every 1s so senders can
-    // observe this bot's received FPS and adjust their encoding tiers.
-    spawn_health_reporter(
-        HealthReporterConfig {
-            client_config: client_config.clone(),
-            transport: resolved_transport.clone(),
-            simulated_rtt_ms,
-            measured_rtt_ms,
-            packets_sent_counter: packets_sent_counter.clone(),
-            transport_drops_counter: transport_drops_counter.clone(),
-            websocket_stream_bytes: websocket_stream_bytes.clone(),
-            encoder_output_fps: encoder_output_fps.clone(),
-            encoder_errors_generic: encoder_errors_generic.clone(),
-            encoder_frames_ok: encoder_frames_ok.clone(),
-            keyframe_requests_sent: Some(keyframe_requests_sent),
-        },
-        stats.clone(),
-        packet_tx.clone(),
-        quit.clone(),
-        aq.clone(),
-    );
-
-    // Spawn the per-peer diagnostics reporter. Real browsers emit one
-    // DiagnosticsPacket per observed remote peer per (audio, video) media
-    // type every heartbeat; bots must do the same or sender-side AQ
-    // controllers go blind in bot-heavy meetings. The reporter reads the
-    // same 1s window as the health reporter via a non-destructive snapshot,
-    // so counters are never double-drained.
-    spawn_diagnostics_reporter(
-        DiagnosticsReporterConfig {
-            client_config: client_config.clone(),
-            transport_drops_counter: transport_drops_counter.clone(),
-        },
-        stats,
-        packet_tx.clone(),
-        quit.clone(),
-    );
-
-    // Wait for media start signal from main
-    let media_start = loop {
-        if let Some(t) = media_start_cell.get() {
-            break *t;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    info!("[{}] Media start received, beginning producers", user_id);
-
-    // Only spawn media producers for broadcasters
-    let _audio_producer;
-    let _video_producer;
-
-    if is_broadcaster {
-        // Start audio producer
-        _audio_producer = Some(AudioProducer::new(
-            user_id.clone(),
-            audio_data.clone(),
-            packet_tx.clone(),
-            media_start,
-            loop_duration,
-            is_speaking.clone(),
-            aq.clone(),
-            transport_drops_counter.clone(),
-        )?);
-        info!("Audio producer started for {}", user_id);
-
-        // Start video producer. The initial snapshot from `aq` already
-        // reflects the default tier; producers poll `aq.tier_epoch()` each
-        // iteration and re-snapshot on change.
-        let v0 = aq.snapshot_video();
-        let ekg_width = v0.max_width;
-        let ekg_height = v0.max_height;
-        let ekg_fps = v0.target_fps.max(1);
-        let video_mode = &bot_config.video_mode;
-        // Resolved simulcast layer count (#989): default 3, clamped to
-        // 1..=SIMULCAST_MAX_LAYERS. N==1 = legacy single-stream path.
-        let simulcast_layers = bot_config.simulcast_layer_count();
-        if *video_mode == VideoMode::Costume {
-            if let Some(ref dir) = costume_dir {
-                let renderer = CostumeRenderer::load(Path::new(dir))?;
-                _video_producer = Some(VideoProducer::from_costume(
-                    user_id.clone(),
-                    renderer,
-                    packet_tx.clone(),
-                    media_start,
-                    loop_duration,
-                    is_speaking.clone(),
-                    aq.clone(),
-                    encoder_output_fps.clone(),
-                    encoder_errors_generic.clone(),
-                    encoder_frames_ok.clone(),
-                    transport_drops_counter.clone(),
-                    simulcast_layers,
-                )?);
-                info!("Costume video producer started for {} ({})", user_id, dir);
+            let outbound_shim_task = if network_profile.is_passthrough() {
+                let user_id_out = user_id.clone();
+                let transport_tx_inner = transport_tx.clone();
+                let psc = packets_sent_counter.clone();
+                #[cfg(feature = "metrics")]
+                let metrics_out = metrics.clone();
+                #[cfg(feature = "metrics")]
+                let meeting_out = client_config.meeting_id.clone();
+                let handle = tokio::spawn(run_outbound_passthrough(
+                    packet_rx,
+                    transport_tx_inner,
+                    user_id_out,
+                    psc,
+                    #[cfg(feature = "metrics")]
+                    metrics_out,
+                    #[cfg(feature = "metrics")]
+                    meeting_out,
+                ));
+                Some(handle)
             } else {
-                // Costume mode but no costume_dir -- fall back to EKG.
-                warn!(
-                    "[{}] video_mode=costume but no costume_dir set, falling back to EKG",
-                    user_id
-                );
-                let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
-                let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
-                let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
-                _video_producer = Some(VideoProducer::from_ekg(
-                    user_id.clone(),
-                    renderer,
-                    rms,
-                    max_rms,
-                    // rms was sampled at ekg_fps; the simulcast loop remaps the
-                    // index to its (possibly higher) render fps (#1123 item 2).
-                    ekg_fps,
-                    packet_tx.clone(),
-                    media_start,
-                    loop_duration,
-                    aq.clone(),
-                    encoder_output_fps.clone(),
-                    encoder_errors_generic.clone(),
-                    encoder_frames_ok.clone(),
-                    transport_drops_counter.clone(),
-                    simulcast_layers,
-                )?);
-                info!("EKG video producer started for {} (fallback)", user_id);
+                let shim = NetSimShim::new(network_profile.clone(), Direction::Up);
+                #[cfg(feature = "metrics")]
+                let shim = match metrics.as_ref() {
+                    Some(m) => shim.with_metrics(Arc::clone(m), user_id.clone()),
+                    None => shim,
+                };
+                let shim = Arc::new(shim);
+                // Share the uplink shim with the AQ tick (issue #1083 V21): the tick
+                // reads `bandwidth_wait_us` to detect the bot's own uplink saturation.
+                uplink_shim = Some(shim.clone());
+                let user_id_up = user_id.clone();
+                let psc = packets_sent_counter.clone();
+                #[cfg(feature = "metrics")]
+                let metrics_up = metrics.clone();
+                #[cfg(feature = "metrics")]
+                let meeting_up = client_config.meeting_id.clone();
+                let handle = tokio::spawn(run_outbound_shim(
+                    packet_rx,
+                    transport_tx,
+                    shim,
+                    user_id_up,
+                    psc,
+                    #[cfg(feature = "metrics")]
+                    metrics_up,
+                    #[cfg(feature = "metrics")]
+                    meeting_up,
+                ));
+                Some(handle)
+            };
+
+            {
+                let aq_tick = aq.clone();
+                let quit_tick = quit.clone();
+                let uplink_shim_tick = uplink_shim.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_millis(
+                        videocall_aq::constants::AQ_TICK_INTERVAL_MS,
+                    ));
+                    loop {
+                        interval.tick().await;
+                        if quit_tick.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let uplink_wait_us = uplink_shim_tick
+                            .as_ref()
+                            .map(|s| s.bandwidth_wait_us())
+                            .unwrap_or(0);
+                        aq_tick.observe_uplink_saturation(uplink_wait_us);
+                        aq_tick.tick();
+                    }
+                });
             }
-        } else {
-            // EKG mode
-            let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
-            let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
-            let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
-            _video_producer = Some(VideoProducer::from_ekg(
-                user_id.clone(),
-                renderer,
-                rms,
-                max_rms,
-                // rms was sampled at ekg_fps; the simulcast loop remaps the
-                // index to its (possibly higher) render fps (#1123 item 2).
-                ekg_fps,
+
+            // For WebSocket transport, heartbeats go through the shared mpsc channel
+            if matches!(resolved_transport, Transport::WebSocket) {
+                spawn_heartbeat_producer(
+                    client_config.clone(),
+                    packet_tx.clone(),
+                    quit.clone(),
+                    is_speaking.clone(),
+                );
+            }
+
+            // --- RTT probe (passthrough bots only) ---
+            // Passthrough bots probe the relay for a real RTT; impaired bots report none.
+            let measured_rtt_ms = if network_profile.is_passthrough() {
+                let rtt_state = spawn_rtt_probe(user_id.clone(), packet_tx.clone(), quit.clone());
+                // Install the RTT probe state in InboundStats so echoed packets
+                // are routed to record_echo instead of counted as media.
+                {
+                    let mut s = stats.lock().unwrap();
+                    s.set_rtt_probe(Arc::clone(&rtt_state));
+                }
+                Some(rtt_state.rtt_atomic())
+            } else {
+                None
+            };
+
+            // --- Keyframe requester ---
+            // Send KEYFRAME_REQUEST to each newly discovered peer, mimicking browser
+            // behavior on join.
+            let keyframe_requests_sent = {
+                let kr = KeyframeRequester::new(user_id.clone(), packet_tx.clone());
+                let counter = kr.requests_sent_counter();
+                {
+                    let mut s = stats.lock().unwrap();
+                    s.set_keyframe_requester(kr);
+                }
+                counter
+            };
+
+            // --- Viewport sender (HCL issue #988) ---
+            {
+                let vs = ViewportSender::new(
+                    user_id.clone(),
+                    bot_config.viewport_visible_count,
+                    packet_tx.clone(),
+                );
+                if vs.is_enabled() {
+                    info!(
+                        "[{}] VIEWPORT fidelity enabled: rendering up to {:?} peer(s)",
+                        user_id, bot_config.viewport_visible_count
+                    );
+                }
+                let mut s = stats.lock().unwrap();
+                s.set_viewport_sender(vs);
+            }
+
+            // --- Layer-preference sender (HCL follow-up #1083-A2) ---
+            {
+                let lps = LayerPreferenceSender::new(
+                    user_id.clone(),
+                    bot_config.pin_layer,
+                    bot_config.pin_media_kind(),
+                    packet_tx.clone(),
+                );
+                if lps.is_enabled() {
+                    info!(
+                    "[{}] LAYER_PREFERENCE pin enabled: pinning every source to layer {:?} ({:?})",
+                    user_id,
+                    bot_config.pin_layer,
+                    bot_config.pin_media_kind()
+                );
+                }
+                let mut s = stats.lock().unwrap();
+                s.set_layer_preference_sender(lps);
+            }
+
+            spawn_health_reporter(
+                HealthReporterConfig {
+                    client_config: client_config.clone(),
+                    interval: timings.health,
+                    transport: resolved_transport.clone(),
+                    measured_rtt_ms,
+                    packets_sent_counter: packets_sent_counter.clone(),
+                    transport_drops_counter: transport_drops_counter.clone(),
+                    websocket_stream_bytes: websocket_stream_bytes.clone(),
+                    encoder_output_fps: encoder_output_fps.clone(),
+                    encoder_errors_generic: encoder_errors_generic.clone(),
+                    encoder_frames_ok: encoder_frames_ok.clone(),
+                    keyframe_requests_sent: Some(keyframe_requests_sent),
+                },
+                stats.clone(),
                 packet_tx.clone(),
-                media_start,
-                loop_duration,
+                quit.clone(),
                 aq.clone(),
-                encoder_output_fps.clone(),
-                encoder_errors_generic.clone(),
-                encoder_frames_ok.clone(),
-                transport_drops_counter.clone(),
-                simulcast_layers,
-            )?);
-            info!("EKG video producer started for {}", user_id);
-        }
-    } else {
-        _audio_producer = None::<AudioProducer>;
-        _video_producer = None::<VideoProducer>;
-        info!("[{}] Observer mode -- no media producers", user_id);
-    }
+            );
 
-    info!("Client {} running", user_id);
+            // Spawn the per-peer diagnostics reporter on its own cadence.
+            spawn_diagnostics_reporter(
+                DiagnosticsReporterConfig {
+                    client_config: client_config.clone(),
+                    interval: timings.diagnostics,
+                    persistent_trackers: timings.persistent_diagnostics,
+                    max_video_trackers: bot_config.diag_video_tracker_cap(),
+                    enabled: bot_config.diagnostics_enabled(),
+                    transport_drops_counter: transport_drops_counter.clone(),
+                },
+                stats,
+                packet_tx.clone(),
+                quit.clone(),
+            );
 
-    // Keep the client running
-    tokio::signal::ctrl_c().await?;
+            let media_start =
+                shutdown::wait_for_media_start(&media_start_cell, &shutdown_peek, &closed_peek)
+                    .await;
 
-    info!("Shutting down client: {}", user_id);
+            let mut audio_producer: Option<AudioProducer> = None;
+            let mut video_producer: Option<VideoProducer> = None;
+            if let Some(media_start) = media_start {
+                if role.sends_video() {
+                    audio_producer = role
+                        .sends_audio()
+                        .then(|| {
+                            AudioProducer::new(
+                                user_id.clone(),
+                                audio_data.clone(),
+                                packet_tx.clone(),
+                                media_start,
+                                loop_duration,
+                                is_speaking.clone(),
+                                aq.clone(),
+                                transport_drops_counter.clone(),
+                                role.is_talker(),
+                            )
+                        })
+                        .transpose()?;
+                    info!("Media producers starting for {} ({:?})", user_id, role);
 
-    quit.store(true, Ordering::Relaxed);
-    client.stop().await;
-    drop(_audio_producer);
-    drop(_video_producer);
+                    // Start video producer. The initial snapshot from `aq` already
+                    // reflects the default tier; producers poll `aq.tier_epoch()` each
+                    // iteration and re-snapshot on change.
+                    let v0 = aq.snapshot_video();
+                    let ekg_width = v0.max_width;
+                    let ekg_height = v0.max_height;
+                    let ekg_fps = v0.target_fps.max(1);
+                    let video_mode = &bot_config.video_mode;
+                    // Resolved simulcast layer count (#989): default 3, clamped to
+                    // 1..=SIMULCAST_MAX_LAYERS. N==1 = legacy single-stream path.
+                    let simulcast_layers = bot_config.simulcast_layer_count();
+                    if *video_mode == VideoMode::Costume {
+                        if let Some(ref dir) = costume_dir {
+                            let renderer = CostumeRenderer::load(Path::new(dir))?;
+                            video_producer = Some(VideoProducer::from_costume(
+                                user_id.clone(),
+                                renderer,
+                                packet_tx.clone(),
+                                media_start,
+                                loop_duration,
+                                is_speaking.clone(),
+                                aq.clone(),
+                                encoder_output_fps.clone(),
+                                encoder_errors_generic.clone(),
+                                encoder_frames_ok.clone(),
+                                transport_drops_counter.clone(),
+                                simulcast_layers,
+                            )?);
+                            info!("Costume video producer started for {} ({})", user_id, dir);
+                        } else {
+                            // Costume mode but no costume_dir -- fall back to EKG.
+                            warn!(
+                            "[{}] video_mode=costume but no costume_dir set, falling back to EKG",
+                            user_id
+                        );
+                            let rms =
+                                ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
+                            let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
+                            let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
+                            video_producer = Some(VideoProducer::from_ekg(
+                                user_id.clone(),
+                                renderer,
+                                rms,
+                                max_rms,
+                                // rms was sampled at ekg_fps; the simulcast loop remaps the
+                                // index to its (possibly higher) render fps (#1123 item 2).
+                                ekg_fps,
+                                packet_tx.clone(),
+                                media_start,
+                                loop_duration,
+                                aq.clone(),
+                                encoder_output_fps.clone(),
+                                encoder_errors_generic.clone(),
+                                encoder_frames_ok.clone(),
+                                transport_drops_counter.clone(),
+                                simulcast_layers,
+                            )?);
+                            info!("EKG video producer started for {} (fallback)", user_id);
+                        }
+                    } else {
+                        let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
+                        let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
+                        let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
+                        video_producer = Some(VideoProducer::from_ekg(
+                            user_id.clone(),
+                            renderer,
+                            rms,
+                            max_rms,
+                            // rms was sampled at ekg_fps; the simulcast loop remaps the
+                            // index to its (possibly higher) render fps (#1123 item 2).
+                            ekg_fps,
+                            packet_tx.clone(),
+                            media_start,
+                            loop_duration,
+                            aq.clone(),
+                            encoder_output_fps.clone(),
+                            encoder_errors_generic.clone(),
+                            encoder_frames_ok.clone(),
+                            transport_drops_counter.clone(),
+                            simulcast_layers,
+                        )?);
+                        info!("EKG video producer started for {}", user_id);
+                    }
+                }
+            }
+
+            info!("Client {} running", user_id);
+            // The producers must outlive the hold: dropping one stops it.
+            Ok::<_, anyhow::Error>((outbound_shim_task, audio_producer, video_producer))
+        },
+        &mut shutdown_rx,
+        &mut closed,
+        presence,
+        &user_id,
+    )
+    .await;
+    info!("Client {} stopped", user_id);
+    let outbound_shim_task = started.and_then(|(task, audio_producer, video_producer)| {
+        drop((audio_producer, video_producer));
+        task
+    });
 
     // Let shim tasks drain. They terminate when their input channel closes,
     // which happens when the producer side is dropped (outbound) or the
@@ -979,8 +1089,10 @@ async fn run_client(
         let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
     }
 
-    info!("Client {} shut down cleanly", user_id);
-    Ok(())
+    if result.is_ok() {
+        info!("Client {} shut down cleanly", user_id);
+    }
+    result
 }
 
 /// Outbound network-impairment task. Reads tagged [`OutboundFrame`]s from

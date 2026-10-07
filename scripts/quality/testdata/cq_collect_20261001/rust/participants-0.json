@@ -1,0 +1,150 @@
+{
+  "kind": "rust-bot-participants",
+  "manifest_schema": "call-quality-run-manifest/v1",
+  "meeting_id": "cqlocal1",
+  "id_prefix": null,
+  "started_at": 1790867571.6937923,
+  "media_started_at": 1790867589.243758,
+  "ended_at": 1790868174.310531,
+  "planned": 6,
+  "participants": [
+    {
+      "user_id": "alice",
+      "fleet": "rust",
+      "role": "talker",
+      "observer": false,
+      "talker": true,
+      "publishes": {
+        "camera": true,
+        "mic": true,
+        "screen": false
+      },
+      "network": {
+        "profile": "none",
+        "shaped": false,
+        "direction": "none",
+        "shaper": "none",
+        "params": {}
+      },
+      "transport_intended": "websocket",
+      "join_ts": 1790867571.739495,
+      "leave_ts": 1790868171.8104837,
+      "instance_id": "e349f28f-79ec-4cfd-90fb-5c6ef01abecb"
+    },
+    {
+      "user_id": "bot-002",
+      "fleet": "rust",
+      "role": "viewer",
+      "observer": false,
+      "talker": false,
+      "publishes": {
+        "camera": false,
+        "mic": false,
+        "screen": false
+      },
+      "network": {
+        "profile": "none",
+        "shaped": false,
+        "direction": "none",
+        "shaper": "none",
+        "params": {}
+      },
+      "transport_intended": "websocket",
+      "join_ts": 1790867572.2369432,
+      "leave_ts": 1790868172.2783778,
+      "instance_id": "25a1e0bc-a040-4dd8-b7bc-84af27ffa48f"
+    },
+    {
+      "user_id": "bot-003",
+      "fleet": "rust",
+      "role": "viewer",
+      "observer": false,
+      "talker": false,
+      "publishes": {
+        "camera": false,
+        "mic": false,
+        "screen": false
+      },
+      "network": {
+        "profile": "none",
+        "shaped": false,
+        "direction": "none",
+        "shaper": "none",
+        "params": {}
+      },
+      "transport_intended": "websocket",
+      "join_ts": 1790867572.7388103,
+      "leave_ts": 1790868172.7806664,
+      "instance_id": "ee423e94-8e03-4add-8f3b-da61cbaa2706"
+    },
+    {
+      "user_id": "bot-004",
+      "fleet": "rust",
+      "role": "viewer",
+      "observer": false,
+      "talker": false,
+      "publishes": {
+        "camera": false,
+        "mic": false,
+        "screen": false
+      },
+      "network": {
+        "profile": "none",
+        "shaped": false,
+        "direction": "none",
+        "shaper": "none",
+        "params": {}
+      },
+      "transport_intended": "websocket",
+      "join_ts": 1790867573.2387247,
+      "leave_ts": 1790868173.2799895,
+      "instance_id": "67fd306c-7892-487a-a392-10a86c20fef9"
+    },
+    {
+      "user_id": "bot-005",
+      "fleet": "rust",
+      "role": "viewer",
+      "observer": false,
+      "talker": false,
+      "publishes": {
+        "camera": false,
+        "mic": false,
+        "screen": false
+      },
+      "network": {
+        "profile": "none",
+        "shaped": false,
+        "direction": "none",
+        "shaper": "none",
+        "params": {}
+      },
+      "transport_intended": "websocket",
+      "join_ts": 1790867573.7413108,
+      "leave_ts": 1790868173.7831826,
+      "instance_id": "844c8c4b-ae47-4091-aad0-f5f10ad89437"
+    },
+    {
+      "user_id": "bot-006",
+      "fleet": "rust",
+      "role": "viewer",
+      "observer": false,
+      "talker": false,
+      "publishes": {
+        "camera": true,
+        "mic": false,
+        "screen": false
+      },
+      "network": {
+        "profile": "none",
+        "shaped": false,
+        "direction": "none",
+        "shaper": "none",
+        "params": {}
+      },
+      "transport_intended": "websocket",
+      "join_ts": 1790867574.2435405,
+      "leave_ts": 1790868174.310331,
+      "instance_id": "476bafc9-c79a-45c3-801b-2047306f8d2b"
+    }
+  ]
+}

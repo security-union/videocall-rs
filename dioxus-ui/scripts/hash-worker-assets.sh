@@ -70,6 +70,10 @@ assert_hashed_worker() {
     ! grep -Fq "./${bin}_bg.wasm" "$loader_path" || die "$loader_name references unhashed ${bin}_bg.wasm"
     grep -Fq "./$js_name" "$loader_path" || die "$loader_name does not reference $js_name"
     grep -Fq "./$wasm_name" "$loader_path" || die "$loader_name does not reference $wasm_name"
+    if [ "$bin" = wt_session_worker ]; then
+        grep -Fq '.catch(' "$loader_path" && grep -Fq 'throw e' "$loader_path" \
+            || die "$loader_name does not re-throw a wasm load failure"
+    fi
 
     ! grep -Fq "href=\"/${bin}_loader.js\"" "$dist/index.html" || die "index.html references unhashed ${bin}_loader.js"
     grep -Fq "href=\"/$loader_name\"" "$dist/index.html" || die "index.html does not reference $loader_name"

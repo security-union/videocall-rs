@@ -3,7 +3,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { type BotSnapshot } from "./registry";
 import { ctlRequest } from "./client";
-import { buildNetemRequest, printBotsTable, registerCtlCommands } from "./ctl";
+import {
+  buildNetemRequest,
+  type NetemCmdOptions,
+  printBotsTable,
+  registerCtlCommands,
+} from "./ctl";
 
 vi.mock("./client", () => ({
   ctlRequest: vi.fn(async () => ({
@@ -52,9 +57,33 @@ describe("buildNetemRequest", () => {
     expect(() => buildNetemRequest(opts)).toThrow(`ctl netem: ${flag}: expected a number`);
   });
 
-  it("prefers --clear over any other flag", () => {
-    // Defensive: if both are somehow set, clear wins and produces no body.
-    expect(buildNetemRequest({ clear: true, profile: "dialup" })).toEqual({ method: "DELETE" });
+  const RAW_FLAGS: Array<[keyof NetemCmdOptions, string]> = [
+    ["delay", "delayMs"],
+    ["jitter", "jitterMs"],
+    ["loss", "lossPct"],
+    ["rate", "rateKbit"],
+    ["limit", "limitPkts"],
+  ];
+
+  it.each(RAW_FLAGS)("forwards --%s alongside --profile for the server to reject", (flag, key) => {
+    expect(buildNetemRequest({ profile: "satellite", [flag]: "10" })).toEqual({
+      method: "POST",
+      body: { profile: "satellite", [key]: 10 },
+    });
+  });
+
+  it.each(RAW_FLAGS)("forwards --%s alongside --clear for the server to reject", (flag, key) => {
+    expect(buildNetemRequest({ clear: true, [flag]: "10" })).toEqual({
+      method: "POST",
+      body: { clear: true, [key]: 10 },
+    });
+  });
+
+  it("forwards --profile alongside --clear for the server to reject", () => {
+    expect(buildNetemRequest({ clear: true, profile: "dialup" })).toEqual({
+      method: "POST",
+      body: { clear: true, profile: "dialup" },
+    });
   });
 });
 
@@ -226,6 +255,15 @@ describe("ctl netem flag surface", () => {
       rateKbit: 56,
       limitPkts: 10,
     });
+  });
+
+  it("sends --downlink-rate and --ingress-limit as the ingress pair", async () => {
+    expect(
+      await netemBodyOf([
+        ...["ctl", "netem", "--rate", "2000", "--limit", "55"],
+        ...["--downlink-rate", "4000", "--ingress-limit", "55"],
+      ]),
+    ).toEqual({ rateKbit: 2000, limitPkts: 55, downlinkRateKbit: 4000, ingressLimitPkts: 55 });
   });
 
   it("omits limitPkts when --limit is absent", async () => {

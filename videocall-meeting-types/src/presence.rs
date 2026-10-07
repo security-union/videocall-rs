@@ -33,6 +33,11 @@ pub struct HeartbeatSession {
 pub struct PresenceHeartbeat {
     pub room_id: String,
     pub sessions: Vec<HeartbeatSession>,
+    /// Users holding a joined session the relay has not reported present (never
+    /// activated, or an observer). Checked against host kicks only (#2934); it
+    /// renews nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreported_user_ids: Vec<String>,
 }
 
 #[cfg(test)]
@@ -44,6 +49,15 @@ mod tests {
         let wire = r#"{"room_id":"r","sessions":[{"user_id":"a@example.com","session_id":18446744073709551615}]}"#;
         let heartbeat: PresenceHeartbeat = serde_json::from_str(wire).expect("heartbeat");
         assert_eq!(heartbeat.sessions[0].session_id, u64::MAX);
+        assert!(heartbeat.unreported_user_ids.is_empty());
+        assert_eq!(serde_json::to_string(&heartbeat).expect("serialize"), wire);
+    }
+
+    #[test]
+    fn unreported_users_ride_the_heartbeat_when_present() {
+        let wire = r#"{"room_id":"r","sessions":[],"unreported_user_ids":["k@example.com"]}"#;
+        let heartbeat: PresenceHeartbeat = serde_json::from_str(wire).expect("heartbeat");
+        assert_eq!(heartbeat.unreported_user_ids, vec!["k@example.com"]);
         assert_eq!(serde_json::to_string(&heartbeat).expect("serialize"), wire);
     }
 }

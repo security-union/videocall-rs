@@ -27,11 +27,14 @@ import {
   shuffleSeeded,
   type MeetingConfig,
 } from "../meeting-config";
+import { taggedLine } from "../log-line";
+import { type DiagPackets, parseDiagPacketsField } from "../receiver-caps";
 import { formatDuration, parseDuration, type Ttl } from "../ttl";
 import { extractBearerToken, tokensMatch } from "./auth";
 import {
   type NetemAction,
   type NetemApplyResult,
+  NetemStateError,
   NetemValidationError,
   resolveNetemRequest,
 } from "./netem";
@@ -57,6 +60,8 @@ import {
 import {
   type BotRegistryEntry,
   type BotSnapshot,
+  BotNotJoinedError,
+  countReadiness,
   NotSupportedRemoteError,
   readLocalLogWindow,
   snapshotEntry,
@@ -93,6 +98,10 @@ import { buildSshCommand, readLogWindow } from "./ssh-launcher";
  */
 export interface OrchestratorControlSurface {
   getRegistry(): Map<string, BotRegistryEntry>;
+  /** `/healthz` `expected`; see `ExpectedBots` in `./registry`. */
+  expectedBots(): number;
+  /** An operator dropped this terminated entry: stop expecting it, unless it already left on purpose. */
+  releaseExpected?(entry: BotRegistryEntry): void;
   /** Trigger graceful `leaveMeeting` + `shutdown` on a bot. */
   triggerLeave(botId: string): Promise<void>;
   /** Force-kill (skip leaveMeeting). Used by DELETE /bots/:id. */
@@ -186,6 +195,15 @@ export interface LaunchSpec {
    * separately and rejected by the validator today.
    */
   runLocation?: { kind: "local" } | { kind: "ssh"; hostLabel: string };
+  /** Carried to a local task and to the SSH command line; absent = deployment default. */
+  diagPackets?: DiagPackets | null;
+}
+
+/** Parses `body.diagPackets` for every launch route. */
+function diagPacketsFromBody(raw: unknown, where = "diagPackets"): DiagPackets | undefined {
+  const r = parseDiagPacketsField(raw);
+  if (r.kind === "invalid") throw new ControlServerError(400, `${where}: ${r.message}`);
+  return r.value;
 }
 
 /**
@@ -477,7 +495,10 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
         await entry.session.close();
       } catch (e) {
         console.warn(
-          `[control] failed to close stranded sso recapture ${entry.id}: ${(e as Error).message}`,
+          taggedLine(
+            "control",
+            `failed to close stranded sso recapture ${entry.id}: ${(e as Error).message}`,
+          ),
         );
       }
     }
@@ -493,7 +514,10 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
         await entry.session.close();
       } catch (e) {
         console.warn(
-          `[control] failed to close stranded oauth capture ${entry.id}: ${(e as Error).message}`,
+          taggedLine(
+            "control",
+            `failed to close stranded oauth capture ${entry.id}: ${(e as Error).message}`,
+          ),
         );
       }
     }
@@ -560,13 +584,13 @@ async function handleRequest(
 
   // `/healthz` is the only path that does NOT require auth — used
   // by readiness probes and `ctl status --help`-style introspection
-  // that doesn't yet know the token. Returns the in-flight bot count
-  // as a sanity signal but no individual bot detail.
+  // that doesn't yet know the token. Returns aggregate counts only
+  // (`ReadinessCounts` + `expected`), never individual bot detail.
   if (method === "GET" && pathname === "/healthz") {
     const registry = opts.surface.getRegistry();
     sweepStaleEntries(registry);
-    const live = countLiveBots(registry);
-    sendJson(res, 200, { ok: true, bots: live });
+    const counts = countReadiness(registry);
+    sendJson(res, 200, { ok: true, ...counts, expected: opts.surface.expectedBots() });
     return;
   }
 
@@ -618,6 +642,10 @@ async function handleRequest(
       sendJson(res, 400, { error: err.message });
       return;
     }
+    if (err instanceof NetemStateError) {
+      sendJson(res, 500, { error: err.message, ...netemBody(err.result) });
+      return;
+    }
     if (err instanceof ProfileNotFoundError) {
       sendJson(res, 404, { error: err.message });
       return;
@@ -640,6 +668,10 @@ async function handleRequest(
     }
     if (err instanceof NotSupportedRemoteError) {
       sendJson(res, 501, { error: err.message });
+      return;
+    }
+    if (err instanceof BotNotJoinedError) {
+      sendJson(res, 409, { error: err.message });
       return;
     }
     throw err;
@@ -984,6 +1016,7 @@ async function launchProfileRoute(opts: ControlServerOptions, name: string): Pro
       // SSH-hosted bot resumes on the same registered host.
       runLocation: bot.runLocation ?? { kind: "local" },
       videoMode: bot.videoMode ?? null,
+      diagPackets: bot.diagPackets ?? null,
     };
     const id = await opts.surface.launchOne(spec);
     botIds.push(id);
@@ -1017,6 +1050,7 @@ function snapshotCurrentBotsForProfile(surface: OrchestratorControlSurface): Pro
       // running locally serialize as `{ kind: "local" }`; SSH bots
       // serialize with the registered `hostLabel`.
       runLocation: entry.host,
+      diagPackets: t.diagPackets ?? undefined,
     });
   }
   return out;
@@ -1080,6 +1114,7 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
   // predates the field — the launch route fills in a local default.
   const runLocation = parseRunLocationFromSaveBody(o.runLocation, `${where}.runLocation`);
   const videoMode = parseVideoModeFromSaveBody(o.videoMode, `${where}.videoMode`);
+  const diagPackets = diagPacketsFromBody(o.diagPackets, `${where}.diagPackets`);
   return {
     meetingURL: o.meetingURL,
     participant: o.participant,
@@ -1091,6 +1126,7 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
     storageStateFile,
     runLocation,
     videoMode,
+    diagPackets,
   };
 }
 
@@ -1151,6 +1187,7 @@ async function killBot(surface: OrchestratorControlSurface, botId: string): Prom
   // treat it as idempotent: remove the entry and return 200. The
   // running path still 202s through `forceKill` below.
   if (entry.status === "done" || entry.status === "failed") {
+    surface.releaseExpected?.(entry);
     surface.getRegistry().delete(botId);
     return { status: 200, body: { botId, action: "drop", removed: true } };
   }
@@ -1170,6 +1207,7 @@ function clearTerminatedBots(surface: OrchestratorControlSurface): RouteResult {
   let removedCount = 0;
   for (const [id, entry] of registry) {
     if (entry.status === "done" || entry.status === "failed") {
+      surface.releaseExpected?.(entry);
       registry.delete(id);
       removedCount += 1;
     }
@@ -1289,22 +1327,20 @@ async function share(
   return { status: 200, body: { botId, share: body.share } };
 }
 
-/**
- * Render a netem apply result as the JSON the client sees. Every command
- * is echoed so a conductor (and `ctl`) can log exactly what ran, and
- * `mirrorRemoved` discloses that this action tore down a startup ingress
- * mirror it cannot reinstall.
- */
-function netemResult(result: NetemApplyResult): RouteResult {
+/** Every command is echoed so a conductor (and `ctl`) can log exactly what ran. */
+function netemBody(result: NetemApplyResult): Record<string, unknown> {
   return {
-    status: 200,
-    body: {
-      op: result.op,
-      label: result.label,
-      commands: result.commands,
-      mirrorRemoved: result.mirrorRemoved,
-    },
+    op: result.op,
+    label: result.label,
+    commands: result.commands,
+    ingressShaped: result.ingressShaped,
+    mirrorRemoved: result.mirrorRemoved,
+    readback: result.readback,
   };
+}
+
+function netemResult(result: NetemApplyResult): RouteResult {
+  return { status: 200, body: netemBody(result) };
 }
 
 async function netemApplyRoute(
@@ -1484,6 +1520,7 @@ async function launchOne(
     costume: costume as string | undefined,
     audio: audio as string | undefined,
     runLocation,
+    diagPackets: diagPacketsFromBody(body.diagPackets),
   };
   const newId = await surface.launchOne(spec);
   return { status: 201, body: { botId: newId } };
@@ -1762,13 +1799,17 @@ async function ssoRecaptureStartRoute(
     ssoState.ssoRecaptureSessions.delete(sessionId);
     void entry.session.close().catch((err: unknown) => {
       console.warn(
-        `[control] idle-timeout teardown of sso recapture ${sessionId} failed: ${
-          (err as Error).message
-        }`,
+        taggedLine(
+          "control",
+          `idle-timeout teardown of sso recapture ${sessionId} failed: ${(err as Error).message}`,
+        ),
       );
     });
     console.log(
-      `[control] sso recapture ${sessionId} auto-cancelled after idle timeout (${ssoState.idleTimeout}ms)`,
+      taggedLine(
+        "control",
+        `sso recapture ${sessionId} auto-cancelled after idle timeout (${ssoState.idleTimeout}ms)`,
+      ),
     );
   }, ssoState.idleTimeout);
   // Detach the timer from keeping the event loop alive — the parent
@@ -2026,6 +2067,7 @@ async function launchMultiRoute(
   const displayNameTemplate =
     typeof body.displayNameTemplate === "string" ? body.displayNameTemplate : undefined;
   const runLocation = parseRunLocationField(body.runLocation);
+  const diagPackets = diagPacketsFromBody(body.diagPackets);
 
   let seed: number | undefined;
   if (body.seed !== undefined) {
@@ -2107,6 +2149,7 @@ async function launchMultiRoute(
       storageStateFile,
       ssoStateFile,
       runLocation,
+      diagPackets,
     };
     try {
       const id = await surface.launchOne(spec);
@@ -2192,6 +2235,7 @@ async function launchFromConfigRoute(
     typeof body.storageStateFile === "string" ? body.storageStateFile : undefined;
   const overrideSsoStateFile =
     typeof body.ssoStateFile === "string" ? body.ssoStateFile : undefined;
+  const diagPackets = diagPacketsFromBody(body.diagPackets);
 
   // Default TTL: per-bot ttl wins, then meeting-level, then 5m.
   const defaultTtl = config.ttl ?? "5m";
@@ -2235,6 +2279,7 @@ async function launchFromConfigRoute(
       authBackend,
       storageStateFile: overrideStorageStateFile,
       ssoStateFile: overrideSsoStateFile,
+      diagPackets,
     };
     try {
       const id = await surface.launchOne(spec);
@@ -2427,11 +2472,17 @@ async function oauthCaptureStartRoute(
     ssoState.oauthCaptureSessions.delete(sessionId);
     void entry.session.close().catch((err: unknown) => {
       console.warn(
-        `[control] idle-timeout teardown of oauth capture ${sessionId} failed: ${(err as Error).message}`,
+        taggedLine(
+          "control",
+          `idle-timeout teardown of oauth capture ${sessionId} failed: ${(err as Error).message}`,
+        ),
       );
     });
     console.log(
-      `[control] oauth capture ${sessionId} auto-cancelled after idle timeout (${ssoState.idleTimeout}ms)`,
+      taggedLine(
+        "control",
+        `oauth capture ${sessionId} auto-cancelled after idle timeout (${ssoState.idleTimeout}ms)`,
+      ),
     );
   }, ssoState.idleTimeout);
   if (typeof idleTimer.unref === "function") idleTimer.unref();
@@ -2844,6 +2895,7 @@ async function previewLaunchRoute(
       authBackend: spec.authBackend,
       displayName: spec.displayName ?? null,
       headless: spec.headless,
+      diagPackets: spec.diagPackets ?? null,
     },
     { ssoWrap },
   );
@@ -2977,6 +3029,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
   videoMode: "costume" | "file" | "clock" | null;
+  diagPackets: DiagPackets | undefined;
 } {
   const meetingURL = body.meetingURL;
   if (typeof meetingURL !== "string" || meetingURL === "") {
@@ -3039,6 +3092,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
     network,
     authBackend,
     videoMode,
+    diagPackets: diagPacketsFromBody(body.diagPackets),
   };
 }
 
@@ -3155,8 +3209,8 @@ function parseHostPatch(body: Record<string, unknown>): SshHostPatch {
 /**
  * `GET /bots/:id/log?since=<n>` — paginates the rolling log buffer
  * stored on the registry entry. For SSH-hosted bots this is the SSH
- * ChildProcess's stdout/stderr; for local bots it's currently always
- * empty (Playwright bots log to stdout directly, not to the registry).
+ * ChildProcess's stdout/stderr; for local bots, the orchestrator's
+ * auto-prime and `diagnostics packets` lines.
  * The wire shape is stable across both kinds so the dashboard can use
  * a single fetch path.
  */
@@ -3177,19 +3231,7 @@ function botLogRoute(surface: OrchestratorControlSurface, botId: string, url: UR
   if (entry.sshHandle !== null) {
     return { status: 200, body: readLogWindow(entry.sshHandle, since) };
   }
-  // Local bot — read the orchestrator-side rolling buffer. Currently
-  // populated by the auto-prime helper (priming progress events) and
-  // empty otherwise. Returns the same wire shape as the SSH path so
-  // the dashboard's polling loop is transport-agnostic.
   return { status: 200, body: readLocalLogWindow(entry, since) };
-}
-
-function countLiveBots(registry: Map<string, BotRegistryEntry>): number {
-  let n = 0;
-  for (const entry of registry.values()) {
-    if (entry.status !== "done" && entry.status !== "failed") n++;
-  }
-  return n;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

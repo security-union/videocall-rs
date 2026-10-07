@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 
+import { taggedLine } from "../log-line";
+import { type DiagPackets } from "../receiver-caps";
 import {
   buildRemoteLaunchCommand,
   buildSshArgsForLaunch,
@@ -94,6 +96,7 @@ export interface SshLaunchSpec {
    * (byte-for-byte identical to today's behaviour).
    */
   ssoStateFile?: string | null;
+  diagPackets?: DiagPackets | null;
   /**
    * Optional `botId` used when emitting the warning log line that
    * fires when SSO forwarding is requested but the local state file
@@ -177,6 +180,7 @@ export function buildSshCommand(
     // flag is omitted entirely — preserving byte-for-byte the un-
     // wrapped launch command shape operators see today.
     ssoStateFileRaw: ssoWrap ? SSO_FORWARD_TEMP_TOKEN : null,
+    diagPackets: spec.diagPackets ?? null,
   });
   const argv = ["ssh", ...buildSshArgsForLaunch(host, remoteCommand, { ssoWrap })];
   return {
@@ -255,7 +259,10 @@ export function spawnRemoteBot(spec: SshLaunchSpec, deps: SshLaunchDeps = {}): S
   // state, and the warning surfaces in the bot's recentLog for context.
   const ssoMissingWarning =
     forwardEnabled && isJwt && !haveLocalFile && typeof spec.ssoStateFile === "string"
-      ? `[${spec.botId ?? "ssh"}] ssh: no local SSO state file at ${spec.ssoStateFile} — bot will hit HCL SSO portal if the target sits behind one`
+      ? taggedLine(
+          spec.botId ?? "ssh",
+          `ssh: no local SSO state file at ${spec.ssoStateFile} — bot will hit HCL SSO portal if the target sits behind one`,
+        )
       : null;
 
   const render = buildSshCommand(spec.host, spec, { ssoWrap });
@@ -287,7 +294,10 @@ export function spawnRemoteBot(spec: SshLaunchSpec, deps: SshLaunchDeps = {}): S
       // failure and let the bot continue — the remote will still spin
       // up but will hit the SSO portal at runtime.
       console.warn(
-        `[${spec.botId ?? "ssh"}] ssh: failed to pipe SSO state to remote: ${(e as Error).message}`,
+        taggedLine(
+          spec.botId ?? "ssh",
+          `ssh: failed to pipe SSO state to remote: ${(e as Error).message}`,
+        ),
       );
     } finally {
       child.stdin?.end();

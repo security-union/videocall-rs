@@ -1,0 +1,938 @@
+{
+  "_comment": [
+    "Mutations of the run-manifest collector (#2914 PR-3), each naming the test that must catch it:",
+    "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-collect.json"
+  ],
+  "runner": "unittest",
+  "cwd": ".",
+  "command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "scripts/quality",
+    "-p",
+    "test_cq_collect.py"
+  ],
+  "baseline_tests": 88,
+  "mutations": [
+    {
+      "name": "missing record dropped silently",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            missing.append(f\"{uid}: no participant record\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_missing_record_is_partial_and_named",
+        "test_cli_writes_only_the_partial"
+      ]
+    },
+    {
+      "name": "null join_ts dropped silently",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            missing.append(f\"{uid}: join_ts is null in {rec.source}\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_null_join_ts_is_partial_and_named"
+      ]
+    },
+    {
+      "name": "extra record accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"{uid}: record {rec.source} is not in the plan\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_record_outside_the_plan_is_an_error"
+      ]
+    },
+    {
+      "name": "null user_id accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"{rec.source}: user_id is null; the session cannot be identified (G-V8)\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_null_user_id_is_an_error",
+        "test_cli_error_removes_a_stale_manifest"
+      ]
+    },
+    {
+      "name": "user_id clash accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"{uid}: two records, {by_uid[uid].source} and {rec.source} (G-V8)\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_user_id_clash_is_an_error"
+      ]
+    },
+    {
+      "name": "dead participant gets leave_ts null, not absent",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if p.get(\"leave_ts\") is not None or not died:",
+      "replace": "    if True:",
+      "expect_kills": [
+        "test_a_probe_dead_after_its_final_leave_has_no_leave_ts_key",
+        "test_an_unclean_rust_exit_drops_only_the_unrecorded_leave_ts"
+      ]
+    },
+    {
+      "name": "a stop after teardown counts as a death",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "(stop is not None and stop < (math.inf if teardown is None else teardown))",
+      "replace": "(stop is not None)",
+      "expect_kills": [
+        "test_a_probe_stopped_after_teardown_keeps_null"
+      ]
+    },
+    {
+      "name": "unclean Rust exit ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "recs += [_Record(path, p, f.get(\"ended_at\") is None, [],",
+      "replace": "recs += [_Record(path, p, False, [],",
+      "expect_kills": [
+        "test_an_unclean_rust_exit_drops_only_the_unrecorded_leave_ts"
+      ]
+    },
+    {
+      "name": "D34 check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    _talkers_unmuted(parts, steps, manifest_events, errors)\n",
+      "replace": "",
+      "expect_kills": [
+        "test_a_talker_muted_at_hold_start_is_an_error",
+        "test_an_unmute_confirmed_exactly_at_hold_start_is_an_error"
+      ]
+    },
+    {
+      "name": "D34 not strict",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "if e[\"at\"] < s[\"hold_start\"]:",
+      "replace": "if e[\"at\"] <= s[\"hold_start\"]:",
+      "expect_kills": [
+        "test_an_unmute_confirmed_exactly_at_hold_start_is_an_error"
+      ]
+    },
+    {
+      "name": "unmute dated at t_issued",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "AT_CONFIRMED = (\"unmute\",)",
+      "replace": "AT_CONFIRMED = ()",
+      "expect_kills": [
+        "test_an_unmute_confirmed_exactly_at_hold_start_is_an_error",
+        "test_an_unmute_confirmed_before_hold_start_is_accepted"
+      ]
+    },
+    {
+      "name": "D35 unconfirmed events written",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if e.get(\"result\") != \"ok\" or not _num(e.get(\"t_confirmed\")):\n            errors.append(f\"events: {action} for {', '.join(parts)} was not confirmed (result {e.get('result')!r})\")\n            continue\n",
+      "replace": "",
+      "expect_kills": [
+        "test_an_unconfirmed_event_is_an_error",
+        "test_an_unconfirmed_leave_never_covers"
+      ]
+    },
+    {
+      "name": "leave dated at t_confirmed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "AT_CONFIRMED = (\"unmute\",)",
+      "replace": "AT_CONFIRMED = (\"unmute\", \"leave\")",
+      "expect_kills": [
+        "test_a_confirmed_final_leave_is_written_at_t_issued"
+      ]
+    },
+    {
+      "name": "partial manifest keeps the scorable schema",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "PARTIAL_SCHEMA = cq_manifest.SCHEMA + \"-partial\"",
+      "replace": "PARTIAL_SCHEMA = cq_manifest.SCHEMA",
+      "expect_kills": [
+        "test_a_missing_record_is_partial_and_named",
+        "test_a_null_join_ts_is_partial_and_named",
+        "test_a_missing_hold_end_is_partial",
+        "test_a_missing_teardown_start_is_partial"
+      ]
+    },
+    {
+      "name": "missing step mark not partial",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                missing.append(f\"step {s['step_id']}: no {kind} in {EVENTS_FILE}\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_missing_hold_end_is_partial"
+      ]
+    },
+    {
+      "name": "missing teardown_start not partial",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        missing.append(f\"no teardown_start in {EVENTS_FILE}\")",
+      "replace": "        pass",
+      "expect_kills": [
+        "test_a_missing_teardown_start_is_partial"
+      ]
+    },
+    {
+      "name": "stale outputs kept",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    clear_outputs(out_dir)\n",
+      "replace": "",
+      "expect_kills": [
+        "test_cli_writes_only_the_partial_and_removes_a_stale_manifest",
+        "test_cli_error_removes_a_stale_manifest"
+      ]
+    },
+    {
+      "name": "publishes cross-check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if p.get(\"publishes\") != planned[\"publishes\"]:",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_observed_publishes_must_match_the_plan"
+      ]
+    },
+    {
+      "name": "unverified publishes ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "str(u.get(\"field\", \"\")).startswith(\"publishes\")",
+      "replace": "False",
+      "expect_kills": [
+        "test_an_unverified_publishes_field_is_an_error"
+      ]
+    },
+    {
+      "name": "unknown network accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if not isinstance(net, dict) or net.get(\"profile\") == \"unknown\" or not isinstance(net.get(\"shaped\"), bool):",
+      "replace": "    if not isinstance(net, dict):",
+      "expect_kills": [
+        "test_an_unknown_network_is_an_error"
+      ]
+    },
+    {
+      "name": "node without alias accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                errors.append(f\"{uid}: placement.node has no alias in the plan's node_aliases\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_node_without_an_alias_is_an_error"
+      ]
+    },
+    {
+      "name": "event outside every step accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                errors.append(f\"events: {action} at {at} for {', '.join(parts)} is outside every step window\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_an_event_outside_every_step_is_an_error"
+      ]
+    },
+    {
+      "name": "scorer validator not run",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    invalid = cq_manifest.validate_manifest(manifest)",
+      "replace": "    invalid = []",
+      "expect_kills": [
+        "test_the_result_goes_through_the_scorer_validator"
+      ]
+    },
+    {
+      "name": "clock window not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        _check_clocks(by_uid.values(), (min(joins) - tol, max(ends) + tol), errors)",
+      "replace": "        pass",
+      "expect_kills": [
+        "test_a_join_ts_before_join_start_is_an_error",
+        "test_a_leave_ts_after_the_last_event",
+        "test_a_rust_file_started_before_join_start",
+        "test_a_media_started_at_outside_the_window",
+        "test_the_tolerance_is_two_seconds"
+      ]
+    },
+    {
+      "name": "clock tolerance two minutes",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "CLOCK_TOLERANCE_S = 2.0",
+      "replace": "CLOCK_TOLERANCE_S = 120.0",
+      "expect_kills": [
+        "test_the_tolerance_is_two_seconds"
+      ]
+    },
+    {
+      "name": "declared skew ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    tol = CLOCK_TOLERANCE_S + (abs(skew) / 1000 if _num(skew) else 0)",
+      "replace": "    tol = CLOCK_TOLERANCE_S",
+      "expect_kills": [
+        "test_a_declared_skew_widens_the_tolerance"
+      ]
+    },
+    {
+      "name": "Rust file times not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        times = {k: f[k] for k in FILE_TIMES if f.get(k) is not None}",
+      "replace": "        times = {}",
+      "expect_kills": [
+        "test_a_rust_file_started_before_join_start",
+        "test_a_media_started_at_outside_the_window"
+      ]
+    },
+    {
+      "name": "no upper clock bound",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            if _num(v) and not lo <= v <= hi:",
+      "replace": "            if _num(v) and not lo <= v:",
+      "expect_kills": [
+        "test_a_leave_ts_after_the_last_event"
+      ]
+    },
+    {
+      "name": "departure check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                _departure(uid, rec, stop, teardown, _final_leave(manifest_events, uid), cover_s, errors)",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_a_probe_dead_before_teardown_without_a_final_leave",
+        "test_a_leave_more_than_one_scrape_after_the_death",
+        "test_a_leave_followed_by_a_rejoin",
+        "test_a_rust_leave_ts_before_teardown",
+        "test_an_unconfirmed_leave_never_covers",
+        "test_a_participant_no_stopped_line_names_is_an_error"
+      ]
+    },
+    {
+      "name": "any later leave covers a death",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "final_leave > gone + cover_s",
+      "replace": "final_leave > gone + 10 * cover_s",
+      "expect_kills": [
+        "test_a_leave_more_than_one_scrape_after_the_death"
+      ]
+    },
+    {
+      "name": "a rejoin does not cancel the final leave",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "final = e[\"at\"] if e[\"action\"] == \"leave\" else None",
+      "replace": "final = e[\"at\"] if e[\"action\"] == \"leave\" else final",
+      "expect_kills": [
+        "test_a_leave_followed_by_a_rejoin"
+      ]
+    },
+    {
+      "name": "missing stopped line accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        errors.append(f\"{uid}: no stopped line names it, so when its process exited is unknown\")\n        return\n",
+      "replace": "        return\n",
+      "expect_kills": [
+        "test_a_participant_no_stopped_line_names_is_an_error"
+      ]
+    },
+    {
+      "name": "unconfirmed event dropped silently",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"events: {action} for {', '.join(parts)} was not confirmed (result {e.get('result')!r})\")\n",
+      "replace": "",
+      "expect_kills": [
+        "test_an_unconfirmed_event_is_an_error",
+        "test_a_failed_event_is_an_error_even_with",
+        "test_an_unconfirmed_leave_never_covers"
+      ]
+    },
+    {
+      "name": "result ignored when t_confirmed is set",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if e.get(\"result\") != \"ok\" or not _num(e.get(\"t_confirmed\")):",
+      "replace": "        if not _num(e.get(\"t_confirmed\")):",
+      "expect_kills": [
+        "test_a_failed_event_is_an_error_even_with"
+      ]
+    },
+    {
+      "name": "departures just before teardown accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if gone < teardown and",
+      "replace": "    if gone < teardown - 30 and",
+      "expect_kills": [
+        "test_a_rust_leave_ts_before_teardown_without_a_final_leave"
+      ]
+    },
+    {
+      "name": "teardown_start before hold_end accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "st.get(\"hold_end\", -math.inf) > teardown)",
+      "replace": "False)",
+      "expect_kills": [
+        "test_a_teardown_start_before_hold_end_is_an_error"
+      ]
+    },
+    {
+      "name": "teardown_start at hold_end refused",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "st.get(\"hold_end\", -math.inf) > teardown)",
+      "replace": "st.get(\"hold_end\", -math.inf) >= teardown)",
+      "expect_kills": [
+        "test_a_teardown_start_at_hold_end_is_accepted"
+      ]
+    },
+    {
+      "name": "two teardown_start lines accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    elif len(teardowns) > 1:\n",
+      "replace": "    elif False:\n",
+      "expect_kills": [
+        "test_two_teardown_starts_are_an_error"
+      ]
+    },
+    {
+      "name": "planned not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if not isinstance(planned, int) or isinstance(planned, bool) or planned != n:",
+      "replace": "        if False:",
+      "expect_kills": [
+        "test_a_rust_file_with_fewer_records_than_planned",
+        "test_a_rust_file_without_planned"
+      ]
+    },
+    {
+      "name": "absent planned accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if not isinstance(planned, int) or isinstance(planned, bool) or planned != n:",
+      "replace": "        if planned is not None and planned != n:",
+      "expect_kills": [
+        "test_a_rust_file_without_planned"
+      ]
+    },
+    {
+      "name": "Rust talker media check removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    _rust_talkers_media(parts, by_uid, steps, errors)\n",
+      "replace": "",
+      "expect_kills": [
+        "test_a_rust_talker_needs_media_strictly_before_hold_start"
+      ]
+    },
+    {
+      "name": "Rust talker media not strict",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "media >= s[\"hold_start\"]",
+      "replace": "media > s[\"hold_start\"]",
+      "expect_kills": [
+        "test_a_rust_talker_needs_media_strictly_before_hold_start"
+      ]
+    },
+    {
+      "name": "null media_started_at accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "if not _num(media) or media >= s[\"hold_start\"]:",
+      "replace": "if _num(media) and media >= s[\"hold_start\"]:",
+      "expect_kills": [
+        "test_a_rust_talker_needs_media_strictly_before_hold_start"
+      ]
+    },
+    {
+      "name": "unverified network accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    elif unexcused:\n",
+      "replace": "    elif False:\n",
+      "expect_kills": [
+        "test_an_unverified_network_is_an_error"
+      ]
+    },
+    {
+      "name": "undeclared rejoin accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if \"rejoin\" not in declared and any(",
+      "replace": "    if False and any(",
+      "expect_kills": [
+        "test_an_undeclared_rejoin_is_an_error"
+      ]
+    },
+    {
+      "name": "rejoin events ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "declared = {e[\"action\"] for e in manifest_events if uid in e[\"participants\"]}",
+      "replace": "declared = set()",
+      "expect_kills": [
+        "test_an_undeclared_rejoin_is_an_error"
+      ]
+    },
+    {
+      "name": "outcome without leave_ts accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if rec.outcome is not None and p.get(\"leave_ts\") is None:",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_an_outcome_without_a_leave_ts_is_an_error"
+      ]
+    },
+    {
+      "name": "wall type not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": " or not _num(e.get(\"wall\")):",
+      "replace": " or not isinstance(e.get(\"wall\"), (int, float)):",
+      "expect_kills": [
+        "test_a_non_numeric_wall_is_an_error"
+      ]
+    },
+    {
+      "name": "skew sign kept",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "(abs(skew) / 1000",
+      "replace": "(skew / 1000",
+      "expect_kills": [
+        "test_a_negative_declared_skew_widens_the_tolerance_too"
+      ]
+    },
+    {
+      "name": "netem excuse removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    unexcused = [w for w in why if not _netem_excused(w, *netem)]",
+      "replace": "    unexcused = why",
+      "expect_kills": [
+        "test_a_confirmed_netem_excuses_its_unverified_network"
+      ]
+    },
+    {
+      "name": "netem reason excused without an event",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    return any(lo - tol <= t <= hi + tol for lo, hi in windows)",
+      "replace": "    return True",
+      "expect_kills": [
+        "test_a_netem_reason_needs_a_netem_event_naming_the_participant"
+      ]
+    },
+    {
+      "name": "netem excuse matches a prefix",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "NETEM_UNVERIFIED.fullmatch(",
+      "replace": "NETEM_UNVERIFIED.match(",
+      "expect_kills": [
+        "test_a_netem_event_excuses_only_the_netem_reason"
+      ]
+    },
+    {
+      "name": "another participant's event excuses",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "declared = {e[\"action\"] for e in manifest_events if uid in e[\"participants\"]}",
+      "replace": "declared = {e[\"action\"] for e in manifest_events}",
+      "expect_kills": [
+        "test_another_participants_rejoin_does_not_excuse_a_rejoin"
+      ]
+    },
+    {
+      "name": "t_issued not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if not _num(t_issued) or t_issued > t_confirmed:",
+      "replace": "        if False:",
+      "expect_kills": [
+        "test_every_confirmed_action_needs_t_issued",
+        "test_a_confirmed_event_with_a_non_numeric_t_issued"
+      ]
+    },
+    {
+      "name": "t_issued may follow t_confirmed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if not _num(t_issued) or t_issued > t_confirmed:",
+      "replace": "        if not _num(t_issued):",
+      "expect_kills": [
+        "test_every_confirmed_action_needs_t_issued"
+      ]
+    },
+    {
+      "name": "t_issued equal to t_confirmed refused",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "t_issued > t_confirmed:",
+      "replace": "t_issued >= t_confirmed:",
+      "expect_kills": [
+        "test_t_issued_equal_to_t_confirmed_is_accepted"
+      ]
+    },
+    {
+      "name": "any line widens the clock window",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "ends = [e[\"wall\"] for e in events if e[\"type\"] in (\"teardown_start\", \"stopped\")]",
+      "replace": "ends = [e[\"wall\"] for e in events]",
+      "expect_kills": [
+        "test_an_unknown_line_type_does_not_widen_the_clock_window"
+      ]
+    },
+    {
+      "name": "clock window opens at the last join_start",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "(min(joins) - tol",
+      "replace": "(max(joins) - tol",
+      "expect_kills": [
+        "test_the_clock_window_opens_at_the_first_step_join_start"
+      ]
+    },
+    {
+      "name": "a stop is ignored when leave_ts is set",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "gone = stop if leave is None else min(leave, stop)",
+      "replace": "gone = stop if leave is None else leave",
+      "expect_kills": [
+        "test_a_stop_mid_hold_counts_even_when_leave_ts_is_after_teardown"
+      ]
+    },
+    {
+      "name": "an event with no participants accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "if not isinstance(parts, list) or not parts or not all(isinstance(u, str) for u in parts):\n            errors.append(f\"events: {action}",
+      "replace": "if not isinstance(parts, list) or not all(isinstance(u, str) for u in parts):\n            errors.append(f\"events: {action}",
+      "expect_kills": [
+        "test_an_event_with_no_participants_is_an_error"
+      ]
+    },
+    {
+      "name": "a user_id planned twice accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        elif p[\"user_id\"] in seen:",
+      "replace": "        elif False:",
+      "expect_kills": [
+        "test_a_user_id_planned_twice_is_an_error"
+      ]
+    },
+    {
+      "name": "Rust file kind not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "f.get(\"kind\") != RUST_KIND or ",
+      "replace": "",
+      "expect_kills": [
+        "test_a_rust_file_with_a_wrong_or_absent_kind_is_an_error"
+      ]
+    },
+    {
+      "name": "stopped ids not type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if not isinstance(parts, list) or not all(isinstance(u, str) for u in parts):\n            errors.append(\"events: stopped",
+      "replace": "        if not isinstance(parts, list):\n            errors.append(\"events: stopped",
+      "expect_kills": [
+        "test_a_stopped_line_must_name_planned_user_ids"
+      ]
+    },
+    {
+      "name": "stopped may name unplanned ids",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            errors.append(f\"events: stopped names {', '.join(unknown)}, not in the plan\")",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_a_stopped_line_must_name_planned_user_ids"
+      ]
+    },
+    {
+      "name": "record time types not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        elif bad:\n",
+      "replace": "        elif False:\n",
+      "expect_kills": [
+        "test_a_non_numeric_leave_ts_is_an_error"
+      ]
+    },
+    {
+      "name": "non-finite partial manifest accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    errors += [f\"{path}: NaN and infinity are not numbers here\" for path in cq_manifest.non_finite_paths(manifest)]\n",
+      "replace": "",
+      "expect_kills": [
+        "test_a_nan_in_a_partial_manifest_is_an_error"
+      ]
+    },
+    {
+      "name": "non-object publishes crashes D34",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "on = isinstance(p[\"publishes\"], dict) and p[\"publishes\"].get(\"mic\") is True",
+      "replace": "on = bool((p[\"publishes\"] or {}).get(\"mic\"))",
+      "expect_kills": [
+        "test_a_non_object_publishes_is_an_error"
+      ]
+    },
+    {
+      "name": "fleet not checked against the source",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if p.get(\"fleet\") != rec.fleet:",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_the_fleet_must_match_the_records_source"
+      ]
+    },
+    {
+      "name": "Rust records not tagged rust",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "times, \"rust\") for p in",
+      "replace": "times) for p in",
+      "expect_kills": [
+        "test_matches_the_hand_built_manifest"
+      ]
+    },
+    {
+      "name": "plan lists not type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if not isinstance(plan.get(k), list):",
+      "replace": "        if False:",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "plan user_id and steps not type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        elif not isinstance(p[\"user_id\"], str) or not _str_list(p[\"steps\"]):",
+      "replace": "        elif False:",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "plan step_id not type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "or any(k not in s for k in (\"step_id\", \"n_target\", \"headline\")) \\\n                or not isinstance(s[\"step_id\"], str):",
+      "replace": "or any(k not in s for k in (\"step_id\", \"n_target\", \"headline\")):",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "record unverified not type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        if not isinstance(unverified, list):",
+      "replace": "        if False:",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "mark step_id not type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            if not isinstance(e.get(\"step_id\"), str):",
+      "replace": "            if False:",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "t_issued may follow t_confirmed by 0.5 s",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "t_issued > t_confirmed:",
+      "replace": "t_issued > t_confirmed + 0.5:",
+      "expect_kills": [
+        "test_every_confirmed_action_needs_t_issued_no_later_than_t_confirmed"
+      ]
+    },
+    {
+      "name": "only leave_ts type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "bad = [k for k in RECORD_TIMES if",
+      "replace": "bad = [k for k in (\"leave_ts\",) if",
+      "expect_kills": [
+        "test_a_non_numeric_join_ts_is_an_error_not_a_partial"
+      ]
+    },
+    {
+      "name": "skew cap removed",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if _num(skew) and abs(skew) > MAX_ABS_SKEW_MS:",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_a_declared_skew_above_30_s_is_an_error"
+      ]
+    },
+    {
+      "name": "skew cap excludes 30 s",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "abs(skew) > MAX_ABS_SKEW_MS",
+      "replace": "abs(skew) >= MAX_ABS_SKEW_MS",
+      "expect_kills": [
+        "test_a_declared_skew_above_30_s_is_an_error"
+      ]
+    },
+    {
+      "name": "skew cap ignores the sign",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "abs(skew) > MAX_ABS_SKEW_MS",
+      "replace": "skew > MAX_ABS_SKEW_MS",
+      "expect_kills": [
+        "test_a_declared_skew_above_30_s_is_an_error"
+      ]
+    },
+    {
+      "name": "usage error exits 2",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "self.exit(EXIT_ERROR,",
+      "replace": "self.exit(2,",
+      "expect_kills": [
+        "test_a_usage_error_exits_3_not_the_partial_code"
+      ]
+    },
+    {
+      "name": "per_node not aliased",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    clock = _aliased_clock(clock, aliases, RESERVED_NODES + (plan[\"environment\"],), errors)\n",
+      "replace": "",
+      "expect_kills": [
+        "test_clock_per_node_is_aliased",
+        "test_an_unaliased_or_malformed_per_node"
+      ]
+    },
+    {
+      "name": "raw node kept",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "            n = dict(n, node=aliases[n[\"node\"]])",
+      "replace": "            pass",
+      "expect_kills": [
+        "test_clock_per_node_is_aliased"
+      ]
+    },
+    {
+      "name": "an alias value refused",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        elif n[\"node\"] not in aliases.values() and n[\"node\"] not in reserved:",
+      "replace": "        elif n[\"node\"] not in reserved:",
+      "expect_kills": [
+        "test_clock_per_node_is_aliased"
+      ]
+    },
+    {
+      "name": "per_node shape not checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if not isinstance(per_node, list) or not all(",
+      "replace": "    if False and all(",
+      "expect_kills": [
+        "test_an_unaliased_or_malformed_per_node"
+      ]
+    },
+    {
+      "name": "netem time ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    return any(lo - tol <= t <= hi + tol for lo, hi in windows)",
+      "replace": "    return bool(windows)",
+      "expect_kills": [
+        "test_a_netem_reason_stamped_outside_the_event_window_is_an_error"
+      ]
+    },
+    {
+      "name": "netem time without tolerance",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "lo - tol <= t <= hi + tol",
+      "replace": "lo <= t <= hi",
+      "expect_kills": [
+        "test_a_netem_reason_within_the_clock_tolerance_is_excused"
+      ]
+    },
+    {
+      "name": "netem window for any participant",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "and isinstance(e.get(\"participants\"), list) and uid in e[\"participants\"]",
+      "replace": "and isinstance(e.get(\"participants\"), list)",
+      "expect_kills": [
+        "test_a_netem_reason_needs_a_netem_event_naming_the_participant"
+      ]
+    },
+    {
+      "name": "node_aliases not type-checked",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if not isinstance(aliases, dict) or not all(isinstance(v, str) for v in aliases.values()):",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "reserved node names refused",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        elif n[\"node\"] not in aliases.values() and n[\"node\"] not in reserved:",
+      "replace": "        elif n[\"node\"] not in aliases.values():",
+      "expect_kills": [
+        "test_reserved_node_names_need_no_alias"
+      ]
+    },
+    {
+      "name": "environment not reserved",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "RESERVED_NODES + (plan[\"environment\"],)",
+      "replace": "RESERVED_NODES",
+      "expect_kills": [
+        "test_reserved_node_names_need_no_alias"
+      ]
+    },
+    {
+      "name": "ci not reserved",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "RESERVED_NODES = (\"local\", \"ci\")",
+      "replace": "RESERVED_NODES = (\"local\",)",
+      "expect_kills": [
+        "test_reserved_node_names_need_no_alias"
+      ]
+    },
+    {
+      "name": "any name reserved",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "        elif n[\"node\"] not in aliases.values() and n[\"node\"] not in reserved:",
+      "replace": "        elif False:",
+      "expect_kills": [
+        "test_any_other_unmapped_node_name_is_an_error",
+        "test_an_unaliased_or_malformed_per_node"
+      ]
+    },
+    {
+      "name": "bad netem date crashes",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    except ValueError:\n        return False\n",
+      "replace": "    except KeyError:\n        return False\n",
+      "expect_kills": [
+        "test_a_netem_reason_with_an_impossible_date_is_an_error"
+      ]
+    },
+    {
+      "name": "netem window from any action",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "if e[\"type\"] == \"event\" and e.get(\"action\") == \"netem\" and e.get(\"result\") == \"ok\"",
+      "replace": "if e[\"type\"] == \"event\" and e.get(\"result\") == \"ok\"",
+      "expect_kills": [
+        "test_only_a_netem_event_excuses_the_netem_reason"
+      ]
+    },
+    {
+      "name": "huge integer overflows the number check",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "abs(v) <= sys.float_info.max",
+      "replace": "math.isfinite(v)",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "invalid UTF-8 in events uncaught",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    except (OSError, UnicodeDecodeError) as exc:",
+      "replace": "    except OSError as exc:",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "unhashable placement.node looked up",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "aliases.get(node) if isinstance(node, str) else None",
+      "replace": "aliases.get(node)",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "non-string placement.node accepted",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "                errors.append(f\"{uid}: placement.node must be a string or null\")",
+      "replace": "                pass",
+      "expect_kills": [
+        "test_malformed_shapes_exit_3_not_a_traceback"
+      ]
+    },
+    {
+      "name": "missing out-dir not refused",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "if args.out_dir is not None and not os.path.isdir(args.out_dir):",
+      "replace": "if False:",
+      "expect_kills": [
+        "test_a_missing_out_dir_exits_3_and_is_not_created"
+      ]
+    }
+  ]
+}

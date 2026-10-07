@@ -450,3 +450,214 @@ async fn test_get_participants_success() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+async fn post_as(
+    pool: &sqlx::PgPool,
+    uri: &str,
+    caller: &str,
+    body: serde_json::Value,
+) -> StatusCode {
+    let req = request_with_cookie("POST", uri, caller)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    build_app(pool.clone()).oneshot(req).await.unwrap().status()
+}
+
+async fn list_participants_as(
+    pool: &sqlx::PgPool,
+    room_id: &str,
+    caller: &str,
+) -> Result<(), (u16, String)> {
+    let req = request_with_cookie(
+        "GET",
+        &format!("/api/v1/meetings/{room_id}/participants"),
+        caller,
+    )
+    .body(Body::empty())
+    .unwrap();
+    let resp = build_app(pool.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    if status == StatusCode::OK {
+        return Ok(());
+    }
+    let body: APIResponse<APIError> = response_json(resp).await;
+    Err((status.as_u16(), body.result.code))
+}
+
+#[tokio::test]
+#[serial]
+async fn get_participants_rejects_waiting_rejected_and_kicked_callers() {
+    let pool = get_test_pool().await;
+    let room_id = "test-get-participants-non-members";
+    setup_active_meeting(&pool, room_id).await;
+    let host = "host@example.com";
+    let not_in_meeting = Err((404, "NOT_IN_MEETING".to_string()));
+
+    for user in [
+        "waiter@example.com",
+        "rejected@example.com",
+        "kicked@example.com",
+    ] {
+        let join = format!("/api/v1/meetings/{room_id}/join");
+        assert_eq!(
+            post_as(&pool, &join, user, serde_json::json!({})).await,
+            StatusCode::OK
+        );
+    }
+    let reject = format!("/api/v1/meetings/{room_id}/reject");
+    let rejected = serde_json::json!({ "user_id": "rejected@example.com" });
+    assert_eq!(
+        post_as(&pool, &reject, host, rejected).await,
+        StatusCode::OK
+    );
+    let admit = format!("/api/v1/meetings/{room_id}/admit");
+    let kicked = serde_json::json!({ "user_id": "kicked@example.com" });
+    assert_eq!(
+        post_as(&pool, &admit, host, kicked.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_participants_as(&pool, room_id, "kicked@example.com").await,
+        Ok(())
+    );
+    let kick = format!("/api/v1/meetings/{room_id}/kick");
+    assert_eq!(post_as(&pool, &kick, host, kicked).await, StatusCode::OK);
+
+    assert_eq!(
+        list_participants_as(&pool, room_id, "waiter@example.com").await,
+        not_in_meeting
+    );
+    assert_eq!(
+        list_participants_as(&pool, room_id, "rejected@example.com").await,
+        not_in_meeting
+    );
+    assert_eq!(
+        list_participants_as(&pool, room_id, "kicked@example.com").await,
+        not_in_meeting
+    );
+    assert_eq!(list_participants_as(&pool, room_id, host).await, Ok(()));
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn get_participants_admits_current_instance_leavers_and_the_owner_only() {
+    let pool = get_test_pool().await;
+    let room_id = "test-get-participants-instance";
+    cleanup_test_data(&pool, room_id).await;
+    let host = "host@example.com";
+    let create = serde_json::json!({
+        "meeting_id": room_id,
+        "attendees": [],
+        "waiting_room_enabled": false,
+        "end_on_host_leave": false,
+    });
+    assert_eq!(
+        post_as(&pool, "/api/v1/meetings", host, create).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        list_participants_as(&pool, room_id, host).await,
+        Ok(()),
+        "the owner may list before having a participant row"
+    );
+    let join = format!("/api/v1/meetings/{room_id}/join");
+    for user in [host, "previous@example.com", "leaver@example.com"] {
+        assert_eq!(
+            post_as(&pool, &join, user, serde_json::json!({})).await,
+            StatusCode::OK
+        );
+    }
+    let leave = format!("/api/v1/meetings/{room_id}/leave");
+    assert_eq!(
+        post_as(&pool, &leave, "leaver@example.com", serde_json::json!({})).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_participants_as(&pool, room_id, "leaver@example.com").await,
+        Ok(()),
+        "a leaver of the current instance keeps access"
+    );
+
+    let end = format!("/api/v1/meetings/{room_id}/end");
+    assert_eq!(
+        post_as(&pool, &end, host, serde_json::json!({})).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_as(&pool, &join, "newcomer@example.com", serde_json::json!({})).await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        list_participants_as(&pool, room_id, "previous@example.com").await,
+        Err((404, "NOT_IN_MEETING".to_string())),
+        "a participant of a previous instance is not a member"
+    );
+    assert_eq!(
+        list_participants_as(&pool, room_id, host).await,
+        Ok(()),
+        "the owner keeps access after the new instance retired their row"
+    );
+    assert_eq!(
+        list_participants_as(&pool, room_id, "newcomer@example.com").await,
+        Ok(())
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn get_participants_rejects_a_kicked_or_rejected_caller_who_requeues_and_leaves() {
+    let pool = get_test_pool().await;
+    let room_id = "test-get-participants-requeue";
+    setup_active_meeting(&pool, room_id).await;
+    let host = "host@example.com";
+    let kicked = "kicked@example.com";
+    let rejected = "rejected@example.com";
+    let join = format!("/api/v1/meetings/{room_id}/join");
+    let admit = format!("/api/v1/meetings/{room_id}/admit");
+    let leave = format!("/api/v1/meetings/{room_id}/leave");
+    let no_body = serde_json::json!({});
+
+    for user in [kicked, rejected] {
+        assert_eq!(
+            post_as(&pool, &join, user, no_body.clone()).await,
+            StatusCode::OK
+        );
+        let target = serde_json::json!({ "user_id": user });
+        assert_eq!(post_as(&pool, &admit, host, target).await, StatusCode::OK);
+        assert_eq!(list_participants_as(&pool, room_id, user).await, Ok(()));
+    }
+    let kick = format!("/api/v1/meetings/{room_id}/kick");
+    let target = serde_json::json!({ "user_id": kicked });
+    assert_eq!(post_as(&pool, &kick, host, target).await, StatusCode::OK);
+    assert_eq!(
+        post_as(&pool, &join, rejected, no_body.clone()).await,
+        StatusCode::OK
+    );
+    let reject = format!("/api/v1/meetings/{room_id}/reject");
+    let target = serde_json::json!({ "user_id": rejected });
+    assert_eq!(post_as(&pool, &reject, host, target).await, StatusCode::OK);
+
+    for user in [kicked, rejected] {
+        assert_eq!(
+            post_as(&pool, &join, user, no_body.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_as(&pool, &leave, user, no_body.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_participants_as(&pool, room_id, user).await,
+            Err((404, "NOT_IN_MEETING".to_string())),
+            "{user}"
+        );
+    }
+
+    cleanup_test_data(&pool, room_id).await;
+}

@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { relative, resolve } from "node:path";
+import { posix, relative, resolve } from "node:path";
 
 import { parseAllDocuments, parse as parseYaml } from "yaml";
 import { describe, expect, it, vi } from "vitest";
@@ -567,8 +567,18 @@ const PR_CHECK = resolve(REPO_ROOT, ".github", "workflows", "pr-check-e2e-lint-h
 const BUILD_SH = resolve(K8S, "..", "build.sh");
 const DOCKERFILE = resolve(K8S, "..", "Dockerfile");
 const FIXTURE_SRC = "e2e/bots-app/src/fixture-source.ts";
-/** Not in the image, but it decides what of e2e/ reaches it. */
-const CONTEXT_FILTER = ".dockerignore";
+
+function buildContext(): string {
+  const src = readFileSync(BUILD_SH, "utf8");
+  const m = /^CONTEXT="\$\{REPO_ROOT\}(?:\/(.*))?"$/m.exec(src);
+  expect(m, "build.sh has no CONTEXT under REPO_ROOT").not.toBeNull();
+  const call = src.indexOf('"${BUILD[@]}"');
+  expect(call, "build.sh has no BUILD invocation").toBeGreaterThan(-1);
+  const args = src.slice(call).split("\n\n")[0].trimEnd().split("\n");
+  expect(args.at(-1)?.trim(), "the builder is not handed CONTEXT").toBe('"${CONTEXT}"');
+  return m![1] ?? "";
+}
+const CONTEXT_FILTER = posix.join(buildContext(), ".dockerignore");
 const IN_IMAGE_BUT_INERT = [
   "e2e/tests/fixture.spec.ts",
   "e2e/bots-app/fixture.test.ts",
@@ -719,7 +729,7 @@ function dockerfileCopySources(): string[] {
     const m = /^\s*COPY\s+(.*)$/i.exec(line);
     if (!m || /--from=/.test(m[1])) continue;
     const words = m[1].split(/\s+/).filter((w) => !w.startsWith("--"));
-    for (const w of words.slice(0, -1)) srcs.add(w);
+    for (const w of words.slice(0, -1)) srcs.add(posix.join(buildContext(), w));
   }
   return [...srcs].sort();
 }
@@ -1085,6 +1095,7 @@ describe("pinned image ↔ the source it ships (#2293)", () => {
     expect(sources.length).toBeGreaterThan(0);
     for (const raw of sources) {
       const src = trimSlash(raw);
+      expect(existsSync(resolve(REPO_ROOT, src)), `${raw} is not in the build context`).toBe(true);
       const under = (p: string) => src === p || src.startsWith(`${p}/`);
       expect(positives.some(under), `${src} reaches the image but no drift path covers it`).toBe(
         true,
@@ -1118,6 +1129,11 @@ describe("pinned image ↔ the source it ships (#2293)", () => {
     expect(driftPathsFromScript()).toContain(":(exclude)e2e/bots-app/dashboard");
   });
 
+  it("keeps captured auth state out of the image, relative to the context it filters", () => {
+    const lines = readFileSync(resolve(REPO_ROOT, CONTEXT_FILTER), "utf8").split("\n");
+    expect(lines).toContain(posix.relative(buildContext(), "e2e/bots-app/run"));
+  });
+
   it("rebuilds on a change to the build workflow itself, or it can never be exercised", () => {
     const wf = parseYaml(readFileSync(WORKFLOW, "utf8")) as Record<string, unknown>;
     const on = (wf.on ?? wf[String(true)]) as { push?: { paths?: string[] } };
@@ -1129,7 +1145,9 @@ describe("pinned image ↔ the source it ships (#2293)", () => {
     const on = (wf.on ?? wf[String(true)]) as { pull_request?: { paths?: string[] } };
     const paths = on?.pull_request?.paths ?? [];
     expect(paths).toContain(".github/workflows/build-bots-image-hcl.yaml");
-    expect(paths).toContain(CONTEXT_FILTER);
+    const covers = (p: string) =>
+      p === CONTEXT_FILTER || (p.endsWith("/**") && CONTEXT_FILTER.startsWith(p.slice(0, -2)));
+    expect(paths.some(covers), `no pull_request path covers ${CONTEXT_FILTER}`).toBe(true);
   });
 
   it("serializes on the one condition that moves :latest, and cancels nothing", () => {
@@ -1146,7 +1164,10 @@ describe("pinned image ↔ the source it ships (#2293)", () => {
 
   it("refuses when .dockerignore moved, which silently changes what the image holds", () => {
     const { root, run } = gitFixture();
-    writeFileSync(resolve(root, CONTEXT_FILTER), "**/node_modules\ne2e/bots-app/src\n");
+    writeFileSync(
+      resolve(root, CONTEXT_FILTER),
+      `**/node_modules\n${posix.relative(buildContext(), "e2e/bots-app/src")}\n`,
+    );
     expect(() => run("--check-source-drift")).toThrow(/\.dockerignore/);
   });
 

@@ -636,4 +636,79 @@ test.describe("Meeting co-hosts", () => {
       await closeAll([owner, peer]);
     }
   });
+
+  test("owner's pre-join Co-hosts disclosure starts collapsed, sits clear of Start Meeting, and expands and collapses @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_cohost_prejoin_${Date.now()}`;
+    const OWNER = { email: "cohost-prejoin-owner@videocall.rs", name: "PrejoinOwner" };
+    await createMeeting(OWNER.email, OWNER.name, {
+      meetingId,
+      waitingRoomEnabled: false,
+      coHosts: ["cohost-prejoin-a@videocall.rs", "cohost-prejoin-b@videocall.rs"],
+    });
+
+    const owner = await launch(uiURL, OWNER);
+    try {
+      const page = owner.page;
+      await fillAndSubmitJoinForm(page, meetingId, OWNER.name);
+      const start = page.getByRole("button", { name: "Start Meeting" });
+      await expect(start).toBeVisible({ timeout: 20_000 });
+
+      const section = page.getByTestId("co-hosts-section");
+      const details = section.locator("details.co-hosts-details");
+      const summary = details.locator("summary.co-hosts-summary");
+      const hint = section.getByText(
+        "Co-hosts share your host controls and can change meeting options. Only you can manage co-hosts.",
+        { exact: true },
+      );
+      const input = section.getByTestId("co-host-input");
+      const chevron = section.locator(".co-hosts-chevron");
+      const chevronTransform = () => chevron.evaluate((el) => getComputedStyle(el).transform);
+
+      await expect(summary).toHaveText("Co-hosts (2)", { timeout: 15_000 });
+      await expect(details).toHaveJSProperty("open", false);
+      await expect(hint).toBeHidden();
+      await expect(input).toBeHidden();
+
+      await expect
+        .poll(
+          async () => {
+            const [s, b] = await Promise.all([summary.boundingBox(), start.boundingBox()]);
+            return s && b ? b.y - (s.y + s.height) : -1;
+          },
+          { message: "gap between the collapsed Co-hosts row and Start Meeting (px)" },
+        )
+        .toBeGreaterThanOrEqual(16);
+
+      const optionLabelWeight = await page
+        .locator(".settings-card .settings-option-label")
+        .first()
+        .evaluate((el) => getComputedStyle(el).fontWeight);
+      await expect
+        .poll(() =>
+          summary.locator(".co-hosts-heading").evaluate((el) => getComputedStyle(el).fontWeight),
+        )
+        .toBe(optionLabelWeight);
+      await expect.poll(chevronTransform).toBe("none");
+
+      await summary.click();
+      await expect(details).toHaveJSProperty("open", true);
+      await expect(hint).toBeVisible();
+      await expect(input).toBeVisible();
+      await expect(section.getByTestId("co-host-row")).toHaveCount(2);
+      // rotate(180deg) computes to matrix(-1, ~0, ~0, -1, 0, 0).
+      await expect.poll(chevronTransform).toMatch(/^matrix\(-1, /);
+
+      await summary.click();
+      await expect(details).toHaveJSProperty("open", false);
+      await expect(hint).toBeHidden();
+      await expect(input).toBeHidden();
+      await expect.poll(chevronTransform).toBe("none");
+    } finally {
+      await closeAll([owner]);
+    }
+  });
 });

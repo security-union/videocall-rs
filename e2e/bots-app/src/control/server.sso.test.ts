@@ -18,6 +18,7 @@ function mockSurface(): OrchestratorControlSurface {
   const registry = new Map<string, BotRegistryEntry>();
   return {
     getRegistry: () => registry,
+    expectedBots: () => 0,
     triggerLeave: async () => {},
     forceKill: async () => {},
     applyTtl: () => {},

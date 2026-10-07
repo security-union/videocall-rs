@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyNetemAction,
@@ -14,13 +14,16 @@ import {
   NETEM_IFB_TXQUEUELEN,
   NETEM_INGRESS_QDISC_MARKER,
   NETEM_MIRROR_ADD_STEP,
+  NETEM_PARAM_KEYS,
   NETEM_PROFILES,
+  NETEM_SETPRIV_DEFAULT,
   type NetemCommand,
   type NetemExec,
   NetemExecError,
   netemExecExitedNonZero,
   NetemStateError,
   NetemValidationError,
+  netemSetprivPath,
   resolveNetemRequest,
   validateNetemParams,
 } from "./netem";
@@ -61,6 +64,45 @@ function failingOnlyExec(
 }
 
 const flat = (cmds: NetemCommand[]): string[][] => cmds.map((c) => [c.file, ...c.args]);
+
+const SETPRIV_IP = [
+  NETEM_SETPRIV_DEFAULT,
+  "--inh-caps",
+  "+net_admin",
+  "--ambient-caps",
+  "+net_admin",
+  "--",
+  "ip",
+];
+const ran = (cmds: NetemCommand[]): string[][] =>
+  cmds.map((c) => (c.file === "ip" ? [...SETPRIV_IP, ...c.args] : ["tc", ...c.args]));
+
+const ETH_NETEM = "qdisc netem 8001: root refcnt 2 limit 55 delay 80ms 30ms loss 2% rate 2Mbit";
+const ETH_HOOK = `${NETEM_INGRESS_QDISC_MARKER} ffff: parent ffff:fff1 ----------------`;
+const IFB_NETEM = "qdisc netem 8002: root refcnt 2 limit 55 delay 80ms 30ms loss 2% rate 4Mbit";
+
+/** Answers `tc qdisc show dev <dev>` from `show`; fails any argv containing `fail.needle`. */
+type PodFail = { needle: string; msg: string; status?: number | null };
+function podExec(
+  show: Record<string, string>,
+  fail?: PodFail | PodFail[],
+): { exec: NetemExec; calls: string[][] } {
+  const calls: string[][] = [];
+  const fails = fail === undefined ? [] : Array.isArray(fail) ? fail : [fail];
+  const exec: NetemExec = async (file, args) => {
+    const argv = [file, ...args];
+    calls.push(argv);
+    const f = fails.find((x) => argv.join(" ").includes(x.needle));
+    if (f) throw new NetemExecError(f.msg, f.status === undefined ? 1 : f.status);
+    if (file === "tc" && args[0] === "qdisc" && args[1] === "show") {
+      return { stdout: show[args[3]] ?? "", stderr: "" };
+    }
+    return { stdout: "", stderr: "" };
+  };
+  return { exec, calls };
+}
+
+const BOTH_SHAPED = { eth0: `${ETH_NETEM}\n${ETH_HOOK}`, [NETEM_IFB_DEV]: IFB_NETEM };
 
 describe("buildNetemShapeArgs", () => {
   it("builds a full delay+jitter+loss+rate command in netem grammar order", () => {
@@ -237,16 +279,10 @@ describe("validateNetemParams", () => {
     expect(() => validateNetemParams({ rateKbit: 0 })).toThrow(/>= 8/);
   });
 
-  it("caps impairment BELOW total so the control channel stays reachable (self-DoS guard)", () => {
-    // netem shapes the pod's OWN eth0 egress, which also carries the control
-    // server's responses (incl. the DELETE /netem that clears it). Total
-    // impairment would strand the API — recoverable only by out-of-band
-    // `kubectl exec … tc qdisc del`. These bounds keep the channel usable.
-    // lossPct is capped at 95, not 100:
+  it("caps lossPct below 100 and floors rateKbit at 8 (self-DoS guard)", () => {
     expect(validateNetemParams({ lossPct: 95 }).lossPct).toBe(95);
     expect(() => validateNetemParams({ lossPct: 96 })).toThrow(/<= 95/);
     expect(() => validateNetemParams({ lossPct: 100 })).toThrow(/<= 95/);
-    // rateKbit is floored at 8:
     expect(validateNetemParams({ rateKbit: 8 }).rateKbit).toBe(8);
     expect(() => validateNetemParams({ rateKbit: 7 })).toThrow(/>= 8/);
   });
@@ -272,14 +308,12 @@ describe("validateNetemParams", () => {
     expect(() => validateNetemParams({ limitPkts: 10 })).toThrow(/at least one/);
   });
 
-  it("accepts every shipped profile's runtime-applicable params unchanged", () => {
+  it("accepts every shipped profile's params unchanged, both directions", () => {
     for (const [name, params] of Object.entries(NETEM_PROFILES)) {
       if (params === null) continue;
-      const { downlinkRateKbit, ...runtime } = params;
-      expect(downlinkRateKbit, `${name} must carry a downlink rate`).toBeGreaterThan(0);
-      expect(validateNetemParams({ ...runtime }), name).toEqual(runtime);
-      // The ingress half is startup-only, so posting it verbatim is refused.
-      expect(() => validateNetemParams({ ...params }), name).toThrow(NetemValidationError);
+      expect(params.downlinkRateKbit, `${name} must carry a downlink rate`).toBeGreaterThan(0);
+      expect(params.ingressLimitPkts, `${name} must carry an ingress depth`).toBeGreaterThan(0);
+      expect(validateNetemParams({ ...params }), name).toEqual(params);
     }
   });
 });
@@ -323,6 +357,11 @@ describe("resolveNetemRequest", () => {
     expect(() => resolveNetemRequest({ profile: "satellite", delayMs: 10 })).toThrow(/not both/);
   });
 
+  it.each(NETEM_PARAM_KEYS)("rejects %s alongside a profile or a clear", (key) => {
+    expect(() => resolveNetemRequest({ profile: "satellite", [key]: 10 })).toThrow(/not both/);
+    expect(() => resolveNetemRequest({ clear: true, [key]: 10 })).toThrow(/cannot be combined/);
+  });
+
   it("rejects a non-object body", () => {
     expect(() => resolveNetemRequest(null)).toThrow(NetemValidationError);
     expect(() => resolveNetemRequest([])).toThrow(NetemValidationError);
@@ -348,50 +387,242 @@ describe("resolveNetemRequest", () => {
 });
 
 describe("applyNetemAction", () => {
-  /** Every command a runtime action runs, first the op then the teardown. */
-  const expected = (first: string[]): string[][] => [
-    first,
-    ...flat(buildNetemMirrorClearArgs("eth0")),
-    ["tc", ...buildNetemProbeArgs("eth0")],
-  ];
+  const congested = NETEM_PROFILES.congested_wifi!;
+  const egressOnly = { delayMs: 80, lossPct: 2, rateKbit: 2_000 };
 
-  it("runs the exact `tc` shape command via the injected exec", async () => {
-    const { exec, calls } = recordingExec();
+  it("installs a profile's ingress mirror, every ip through netem-setpriv and tc bare", async () => {
+    // A fresh pod: no ifb0 and no ingress hook to delete.
+    const { exec, calls } = podExec(BOTH_SHAPED, [
+      { needle: "link show", msg: 'Device "ifb0" does not exist.' },
+      {
+        needle: "qdisc del dev eth0 ingress",
+        msg: "RTNETLINK answers: No such file or directory",
+        status: 2,
+      },
+    ]);
     const result = await applyNetemAction(
-      { op: "shape", label: "lossy_mobile", params: NETEM_PROFILES.lossy_mobile! },
+      { op: "shape", label: "congested_wifi", params: congested },
       { iface: "eth0", exec },
     );
-    expect(calls[0].file).toBe("tc");
-    expect(calls[0].args).toEqual(buildNetemShapeArgs("eth0", NETEM_PROFILES.lossy_mobile!));
-    expect(result.commands).toEqual(
-      expected(["tc", ...buildNetemShapeArgs("eth0", NETEM_PROFILES.lossy_mobile!)]),
-    );
-    expect(result.op).toBe("shape");
-    expect(result.label).toBe("lossy_mobile");
+    const ifbArgs = buildNetemShapeArgs(NETEM_IFB_DEV, ingressNetemParams(congested));
+    expect(calls).toEqual([
+      ["tc", ...buildNetemShapeArgs("eth0", congested)],
+      [...SETPRIV_IP, "link", "show", "ifb0"],
+      [...SETPRIV_IP, "link", "add", "ifb0", "type", "ifb"],
+      [...SETPRIV_IP, "link", "set", "ifb0", "up"],
+      [...SETPRIV_IP, "link", "set", "ifb0", "txqueuelen", "1000"],
+      ["tc", "qdisc", "del", "dev", "eth0", "ingress"],
+      ["tc", "qdisc", "add", "dev", "eth0", "handle", "ffff:", "ingress"],
+      [
+        ...["tc", "filter", "add", "dev", "eth0", "parent", "ffff:", "protocol", "all"],
+        ...["u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect"],
+        ...["dev", "ifb0"],
+      ],
+      ["tc", ...ifbArgs],
+      ["tc", "qdisc", "show", "dev", "eth0"],
+      ["tc", "qdisc", "show", "dev", "ifb0"],
+    ]);
+    expect(ifbArgs).toContain(`${congested.downlinkRateKbit}kbit`);
+    expect(result).toEqual({
+      commands: calls,
+      label: "congested_wifi",
+      op: "shape",
+      ingressShaped: true,
+      mirrorRemoved: false,
+      readback: { eth0: BOTH_SHAPED.eth0, ifb0: IFB_NETEM },
+    });
   });
 
-  it("runs the exact `tc` clear command via the injected exec", async () => {
-    const { exec, calls } = recordingExec();
+  it("execs ip through the injected setpriv path", async () => {
+    const { exec, calls } = podExec(BOTH_SHAPED);
+    await applyNetemAction(
+      { op: "shape", label: "congested_wifi", params: congested },
+      { iface: "eth0", exec, setpriv: "/opt/caps/setpriv" },
+    );
+    const ip = calls.filter((c) => c.includes("ip"));
+    expect(ip.length).toBeGreaterThan(0);
+    for (const c of ip)
+      expect(c.slice(0, 7)).toEqual(["/opt/caps/setpriv", ...SETPRIV_IP.slice(1)]);
+    expect(calls.filter((c) => c[0] === "ip")).toEqual([]);
+  });
+
+  it("installs past a stale-hook delete that finds no hook", async () => {
+    const { exec } = podExec(BOTH_SHAPED, {
+      needle: "qdisc del dev eth0 ingress",
+      msg: "Error: Invalid handle.",
+    });
+    await expect(
+      applyNetemAction(
+        { op: "shape", label: "congested_wifi", params: congested },
+        { iface: "eth0", exec },
+      ),
+    ).resolves.toMatchObject({ ingressShaped: true });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("defaults the setpriv path to NETEM_SETPRIV from the environment", async () => {
+    vi.stubEnv("NETEM_SETPRIV", "/opt/env/setpriv");
+    const { exec, calls } = podExec({});
+    await applyNetemAction({ op: "clear", label: "clear" }, { iface: "eth0", exec });
+    expect(calls).toContainEqual([
+      "/opt/env/setpriv",
+      ...SETPRIV_IP.slice(1),
+      "link",
+      "del",
+      "ifb0",
+    ]);
+  });
+
+  it("reuses an ifb0 that already exists instead of adding a second", async () => {
+    const { exec, calls } = podExec(BOTH_SHAPED);
+    await applyNetemAction(
+      { op: "shape", label: "congested_wifi", params: congested },
+      { iface: "eth0", exec },
+    );
+    expect(calls.some((c) => c.includes("add") && c.includes("ifb"))).toBe(false);
+  });
+
+  it("fails a mirror install step that exits non-zero, saying egress is already shaped", async () => {
+    const { exec } = podExec(BOTH_SHAPED, { needle: "ffff: ingress", msg: "Exclusivity flag on" });
+    const err = await applyNetemAction(
+      { op: "shape", label: "congested_wifi", params: congested },
+      { iface: "eth0", exec },
+    ).then(
+      () => null,
+      (e: unknown) => e as NetemStateError,
+    );
+    expect(err).toBeInstanceOf(NetemStateError);
+    expect(err!.message).toMatch(/shaped egress on eth0 but .* failed to install: Exclusivity/);
+    expect(err!.result).toMatchObject({
+      ingressShaped: false,
+      mirrorRemoved: true,
+      readback: { eth0: BOTH_SHAPED.eth0, ifb0: IFB_NETEM },
+    });
+  });
+
+  it("reports no mirror removed when the redirect is back and only ifb0's netem fails", async () => {
+    const { exec } = podExec(BOTH_SHAPED, { needle: "replace dev ifb0", msg: "RTNETLINK answers" });
+    await expect(
+      applyNetemAction(
+        { op: "shape", label: "congested_wifi", params: congested },
+        { iface: "eth0", exec },
+      ),
+    ).rejects.toMatchObject({ name: "NetemStateError", result: { mirrorRemoved: false } });
+  });
+
+  it("reports no mirror removed when an install fails on a pod that had none", async () => {
+    const { exec } = podExec({ eth0: ETH_NETEM }, [
+      { needle: "del dev eth0 ingress", msg: "Cannot find specified qdisc" },
+      { needle: "ffff: ingress", msg: "Exclusivity flag on" },
+    ]);
+    await expect(
+      applyNetemAction(
+        { op: "shape", label: "congested_wifi", params: congested },
+        { iface: "eth0", exec },
+      ),
+    ).rejects.toMatchObject({ name: "NetemStateError", result: { mirrorRemoved: false } });
+  });
+
+  it("shapes raw params with the downlink pair in both directions", async () => {
+    const { exec, calls } = podExec(BOTH_SHAPED);
+    const params = { ...egressOnly, downlinkRateKbit: 4_000, ingressLimitPkts: 55 };
+    const result = await applyNetemAction(
+      { op: "shape", label: "custom", params },
+      { iface: "eth0", exec },
+    );
+    expect(result.ingressShaped).toBe(true);
+    expect(calls).toContainEqual([
+      "tc",
+      ...buildNetemShapeArgs(NETEM_IFB_DEV, ingressNetemParams(params)),
+    ]);
+  });
+
+  it("shapes raw params without the downlink pair on egress only, and says so", async () => {
+    const { exec, calls } = podExec({ eth0: ETH_NETEM });
+    const result = await applyNetemAction(
+      { op: "shape", label: "custom", params: egressOnly },
+      { iface: "eth0", exec },
+    );
+    expect(result.ingressShaped).toBe(false);
+    expect(calls.some((c) => c.includes("add"))).toBe(false);
+    expect(calls.some((c) => c.join(" ").includes(`show dev ${NETEM_IFB_DEV}`))).toBe(false);
+    expect(result.readback).toEqual({ eth0: ETH_NETEM });
+  });
+
+  it("runs the exact clear sequence, ip link del through netem-setpriv", async () => {
+    const { exec, calls } = podExec({});
     const result = await applyNetemAction({ op: "clear", label: "clear" }, { iface: "eth0", exec });
-    expect(calls[0].args).toEqual(["qdisc", "del", "dev", "eth0", "root"]);
-    expect(result.commands).toEqual(expected(["tc", "qdisc", "del", "dev", "eth0", "root"]));
-    expect(result.op).toBe("clear");
+    expect(calls).toEqual([
+      ["tc", "qdisc", "del", "dev", "eth0", "root"],
+      ["tc", "qdisc", "del", "dev", "eth0", "ingress"],
+      ["tc", "qdisc", "del", "dev", "ifb0", "root"],
+      [...SETPRIV_IP, "link", "del", "ifb0"],
+      ["tc", "qdisc", "show", "dev", "eth0"],
+    ]);
+    expect(result).toMatchObject({ op: "clear", ingressShaped: false, mirrorRemoved: true });
   });
 
-  // Startup shapes ingress; a runtime action cannot, so it must not report its
-  // own label over a downlink still shaped by the profile startup applied.
-  it.each(["shape", "clear"] as const)("tears the ingress mirror down on a %s", async (op) => {
-    const { exec, calls } = recordingExec();
-    const action =
-      op === "shape"
-        ? ({ op, label: "good_4g", params: NETEM_PROFILES.good_4g! } as const)
-        : ({ op, label: "clear" } as const);
-    const result = await applyNetemAction(action, { iface: "eth0", exec });
-    expect(result.mirrorRemoved).toBe(true);
-    expect(calls.map((c) => [c.file, ...c.args])).toEqual(
-      result.commands.slice(0, result.commands.length),
+  it.each(["shape", "clear"] as const)(
+    "tears the ingress mirror down on an egress-only %s",
+    async (op) => {
+      const { exec } = podExec({ eth0: op === "shape" ? ETH_NETEM : "" });
+      const action =
+        op === "shape"
+          ? ({ op, label: "custom", params: egressOnly } as const)
+          : ({ op, label: "clear" } as const);
+      const result = await applyNetemAction(action, { iface: "eth0", exec });
+      expect(result.mirrorRemoved).toBe(true);
+      expect(result.commands.slice(1, -1)).toEqual(ran(buildNetemMirrorClearArgs("eth0")));
+    },
+  );
+
+  it("fails a clear whose ip link del exits non-zero, reporting ifb0 NOT removed", async () => {
+    const { exec } = podExec({}, { needle: "link del", msg: "Operation not permitted" });
+    const err = await applyNetemAction(
+      { op: "clear", label: "clear" },
+      { iface: "eth0", exec },
+    ).then(
+      () => null,
+      (e: unknown) => e as NetemStateError,
     );
-    expect(result.commands.slice(1, -1)).toEqual(flat(buildNetemMirrorClearArgs("eth0")));
+    expect(err).toBeInstanceOf(NetemStateError);
+    expect(err!.message).toMatch(/ifb0 was NOT removed: Operation not permitted/);
+    expect(err!.result.mirrorRemoved).toBe(false);
+    expect(err!.result.commands).toContainEqual([...SETPRIV_IP, "link", "del", "ifb0"]);
+    expect(err!.result.readback).toEqual({ eth0: "", ifb0: "" });
+  });
+
+  it.each(['Cannot find device "ifb0"', 'Device "ifb0" does not exist.'])(
+    "treats an ip link del of an already-absent ifb0 (%s) as removed",
+    async (msg) => {
+      const { exec } = podExec({}, { needle: "link del", msg });
+      await expect(
+        applyNetemAction({ op: "clear", label: "clear" }, { iface: "eth0", exec }),
+      ).resolves.toMatchObject({ op: "clear", mirrorRemoved: true });
+    },
+  );
+
+  it.each(["RTNETLINK answers: Operation not permitted", "Device or resource busy"])(
+    "still fails an ip link del that exits non-zero with %s",
+    async (msg) => {
+      const { exec } = podExec({}, { needle: "link del", msg });
+      await expect(
+        applyNetemAction({ op: "clear", label: "clear" }, { iface: "eth0", exec }),
+      ).rejects.toMatchObject({ name: "NetemStateError", result: { mirrorRemoved: false } });
+    },
+  );
+
+  it("fails an absent-device wording from an ip link del that never ran", async () => {
+    const { exec } = podExec(
+      {},
+      { needle: "link del", msg: 'Cannot find device "ifb0"', status: 127 },
+    );
+    await expect(
+      applyNetemAction({ op: "clear", label: "clear" }, { iface: "eth0", exec }),
+    ).rejects.toThrow(NetemStateError);
   });
 
   it("leaves an ifb device alone when this interface carries no mirror hook", async () => {
@@ -414,51 +645,83 @@ describe("applyNetemAction", () => {
       { iface: "eth0", exec },
     );
     const hook = commands.findIndex((c) => c.includes("ingress"));
-    const del = commands.findIndex((c) => c[0] === "ip" && c.includes("del"));
+    const del = commands.findIndex((c) => c.includes("ip") && c.includes("del"));
     expect(hook).toBeGreaterThanOrEqual(0);
     expect(hook).toBeLessThan(del);
   });
 
+  it.each([
+    ["ifb0", { eth0: `${ETH_NETEM}\n${ETH_HOOK}`, ifb0: "qdisc noqueue 0: root refcnt 2" }],
+    ["eth0", { eth0: `qdisc noqueue 0: root refcnt 2\n${ETH_HOOK}`, ifb0: IFB_NETEM }],
+  ])("fails a profile shape whose post-read finds no netem on %s", async (missing, show) => {
+    const { exec } = podExec(show);
+    const err = await applyNetemAction(
+      { op: "shape", label: "congested_wifi", params: congested },
+      { iface: "eth0", exec },
+    ).then(
+      () => null,
+      (e: unknown) => e as NetemStateError,
+    );
+    expect(err).toBeInstanceOf(NetemStateError);
+    expect(err!.message).toContain(`no netem on ${missing}`);
+    expect(err!.result.readback).toEqual({ eth0: show.eth0, ifb0: show.ifb0 });
+    expect(err!.result.ingressShaped).toBe(false);
+  });
+
+  it("fails a profile shape whose post-read cannot read ifb0", async () => {
+    const { exec } = podExec(BOTH_SHAPED, {
+      needle: "show dev ifb0",
+      msg: 'Cannot find device "ifb0"',
+    });
+    await expect(
+      applyNetemAction(
+        { op: "shape", label: "congested_wifi", params: congested },
+        { iface: "eth0", exec },
+      ),
+    ).rejects.toThrow(/no netem on ifb0; read back eth0=\[.*\] ifb0=\[unread: Cannot find device/s);
+  });
+
+  it("fails a profile shape whose post-read finds no ingress hook on the interface", async () => {
+    const { exec } = podExec({ eth0: ETH_NETEM, ifb0: IFB_NETEM });
+    await expect(
+      applyNetemAction(
+        { op: "shape", label: "congested_wifi", params: congested },
+        { iface: "eth0", exec },
+      ),
+    ).rejects.toThrow(/no ingress hook on eth0/);
+  });
+
   it.each(["shape", "clear"] as const)(
-    "refuses to report a %s that left the mirror hook installed",
+    "refuses to report an egress-only %s that left the mirror hook installed",
     async (op) => {
       // Every command "succeeds" yet the post-read still shows the hook: the
       // exact shape of a step that reported success and did nothing.
-      const exec: NetemExec = async () => ({
-        stdout: `qdisc noqueue 0: root refcnt 2\n${NETEM_INGRESS_QDISC_MARKER} ffff: parent ffff:fff1`,
-        stderr: "",
-      });
+      const { exec } = podExec({ eth0: `${op === "shape" ? ETH_NETEM : ""}\n${ETH_HOOK}` });
       const action =
         op === "shape"
-          ? ({ op, label: "good_4g", params: NETEM_PROFILES.good_4g! } as const)
+          ? ({ op, label: "custom", params: egressOnly } as const)
           : ({ op, label: "clear" } as const);
       await expect(applyNetemAction(action, { iface: "eth0", exec })).rejects.toThrow(
-        NetemStateError,
+        /an ingress mirror left on eth0/,
       );
     },
   );
 
   it("refuses to report a clear that left a netem qdisc installed", async () => {
-    const exec: NetemExec = async () => ({
-      stdout: "qdisc netem 8001: root refcnt 2 limit 55 delay 80ms 30ms loss 2% rate 2Mbit",
-      stderr: "",
-    });
+    const { exec } = podExec({ eth0: ETH_NETEM });
     await expect(
       applyNetemAction({ op: "clear", label: "clean" }, { iface: "eth0", exec }),
-    ).rejects.toThrow(/left a netem qdisc/);
+    ).rejects.toThrow(/a netem qdisc left on eth0/);
   });
 
-  it("still reports a shape whose own netem the post-read finds", async () => {
-    const exec: NetemExec = async () => ({
-      stdout: "qdisc netem 8001: root refcnt 2 limit 100 delay 50ms 15ms loss 0.5% rate 10Mbit",
-      stderr: "",
-    });
+  it("fails an egress shape whose post-read finds no netem", async () => {
+    const { exec } = podExec({ eth0: "qdisc noqueue 0: root refcnt 2" });
     await expect(
       applyNetemAction(
-        { op: "shape", label: "good_4g", params: NETEM_PROFILES.good_4g! },
+        { op: "shape", label: "custom", params: egressOnly },
         { iface: "eth0", exec },
       ),
-    ).resolves.toMatchObject({ op: "shape" });
+    ).rejects.toThrow(/no netem on eth0/);
   });
 
   it("fails when the post-read itself cannot run, rather than reporting the action", async () => {
@@ -533,6 +796,14 @@ describe("applyNetemAction", () => {
   });
 });
 
+describe("netemSetprivPath", () => {
+  it("resolves like the entrypoint's ${NETEM_SETPRIV:-default}", () => {
+    expect(netemSetprivPath({})).toBe(NETEM_SETPRIV_DEFAULT);
+    expect(netemSetprivPath({ NETEM_SETPRIV: "" })).toBe(NETEM_SETPRIV_DEFAULT);
+    expect(netemSetprivPath({ NETEM_SETPRIV: "/opt/caps/setpriv" })).toBe("/opt/caps/setpriv");
+  });
+});
+
 describe("defaultNetemExec", () => {
   it("reports the child's own exit status when it ran and exited non-zero", async () => {
     const exec = defaultNetemExec();
@@ -565,21 +836,27 @@ describe("the ingress mirror's argv (#2353)", () => {
       params.downlinkRateKbit,
     );
     // Everything else symmetric: the profiles model delay/jitter/loss one way.
-    expect({ ...ingress, rateKbit: params.rateKbit }).toEqual({
+    expect({ ...ingress, rateKbit: params.rateKbit, limitPkts: params.limitPkts }).toEqual({
       ...params,
       downlinkRateKbit: undefined,
-      rateKbit: params.rateKbit,
+      ingressLimitPkts: undefined,
     });
   });
 
-  it("keeps the ingress queue depth equal to the egress depth, deliberately", () => {
+  it("shapes ingress at its own queue depth, not the egress one", () => {
     for (const [name, params] of SHAPING) {
-      expect(ingressNetemParams(params).limitPkts, name).toBe(params.limitPkts);
+      expect(ingressNetemParams(params).limitPkts, name).toBe(params.ingressLimitPkts);
     }
+    expect(ingressNetemParams(NETEM_PROFILES.satellite!).limitPkts).not.toBe(
+      NETEM_PROFILES.satellite!.limitPkts,
+    );
   });
 
-  it("refuses to build a mirror for params carrying no downlink rate", () => {
+  it("refuses to build a mirror for params carrying no downlink rate or depth", () => {
     expect(() => ingressNetemParams({ lossPct: 1, rateKbit: 800 })).toThrow(NetemValidationError);
+    expect(() =>
+      ingressNetemParams({ ...NETEM_PROFILES.satellite!, ingressLimitPkts: undefined }),
+    ).toThrow(/ingressLimitPkts/);
     expect(() => buildNetemMirrorInstallArgs("eth0", { lossPct: 1 })).toThrow(/downlinkRateKbit/);
   });
 
@@ -596,6 +873,9 @@ describe("the ingress mirror's argv (#2353)", () => {
 
   it("installs the mirror in the order real iproute2 requires", () => {
     const cmds = buildNetemMirrorInstallArgs("eth0", NETEM_PROFILES.congested_wifi!);
+    expect(flat(cmds.filter((c) => c.tolerateFailure))).toEqual([
+      ["tc", "qdisc", "del", "dev", "eth0", "ingress"],
+    ]);
     expect(flat(cmds)).toEqual([
       ["ip", "link", "show", NETEM_IFB_DEV],
       ["ip", "link", "add", NETEM_IFB_DEV, "type", "ifb"],
@@ -644,10 +924,24 @@ describe("the ingress mirror's argv (#2353)", () => {
     },
   );
 
-  it("rejects a request-supplied downlink rate, which nothing would apply", () => {
+  it("accepts a request-supplied downlink pair, validated like its egress twin", () => {
+    expect(
+      validateNetemParams({ lossPct: 1, downlinkRateKbit: 4000, ingressLimitPkts: 55 }),
+    ).toEqual({ lossPct: 1, downlinkRateKbit: 4000, ingressLimitPkts: 55 });
     expect(() => validateNetemParams({ lossPct: 1, downlinkRateKbit: 4000 })).toThrow(
-      /not accepted at runtime/,
+      /supply both or neither/,
     );
-    expect(() => resolveNetemRequest({ downlinkRateKbit: 4000 })).toThrow(NetemValidationError);
+    expect(() => validateNetemParams({ lossPct: 1, ingressLimitPkts: 55 })).toThrow(
+      /supply both or neither/,
+    );
+    expect(() =>
+      validateNetemParams({ lossPct: 1, downlinkRateKbit: 4, ingressLimitPkts: 55 }),
+    ).toThrow(/"downlinkRateKbit" must be >= 8/);
+    expect(() =>
+      validateNetemParams({ lossPct: 1, downlinkRateKbit: 4000, ingressLimitPkts: 1.5 }),
+    ).toThrow(/"ingressLimitPkts" must be an integer >= 1/);
+    expect(() => resolveNetemRequest({ downlinkRateKbit: 4000, ingressLimitPkts: 55 })).toThrow(
+      /at least one of/,
+    );
   });
 });

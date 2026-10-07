@@ -36,7 +36,7 @@ use crate::constants::{
     REACTION_DISPLAY_NAME_MAX_BYTES,
 };
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
-use crate::messages::session::Message;
+use crate::messages::session::{ForceClose, Message};
 use crate::metrics::{
     RELAY_ACTIVE_SESSIONS_PER_ROOM, RELAY_KEYFRAME_REQUESTS_TOTAL,
     RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS, RELAY_ROOM_BYTES_TOTAL,
@@ -297,7 +297,13 @@ pub enum ConnectionState {
     Testing,
     /// Connection is active and should broadcast to NATS
     Active,
+    /// The participant was kicked (#2934); the transport is closing and the
+    /// session may neither publish nor be re-activated.
+    Revoked,
 }
+
+/// `JoinRoom` error for a room token revoked by a host kick.
+pub const JOIN_REFUSED_KICKED: &str = "removed from the meeting by the host";
 
 /// Result of handling an inbound packet
 #[derive(Debug)]
@@ -608,6 +614,8 @@ pub struct SessionLogic {
     pub transport: String,
     /// Whether this participant is the meeting host.
     pub is_host: bool,
+    /// The room token's `iat` claim, compared against host kicks (#2934).
+    pub token_iat: Option<i64>,
     /// Tracks this receiver's outbound packet drops per sender; feeds the
     /// #979 keyframe-relax path (no longer a CONGESTION emit, see #1219).
     pub congestion_tracker: Arc<Mutex<CongestionTracker>>,
@@ -690,6 +698,7 @@ impl SessionLogic {
             instance_id,
             transport: transport.to_string(),
             is_host,
+            token_iat: None,
             congestion_tracker: Arc::new(Mutex::new(CongestionTracker::new())),
             keyframe_limiter: KeyframeRequestLimiter::new(),
             reaction_limiter: ReactionRateLimiter::new(),
@@ -815,7 +824,7 @@ impl SessionLogic {
     }
 
     /// Create JoinRoom message for ChatServer
-    pub fn create_join_room_message(&self) -> JoinRoom {
+    pub fn create_join_room_message(&self, closer: actix::Recipient<ForceClose>) -> JoinRoom {
         JoinRoom {
             room: self.room.clone(),
             session: self.id,
@@ -830,6 +839,8 @@ impl SessionLogic {
             // the fan-out closure. The closure reads it to drive emergency
             // shedding; this actor writes it from `on_outbound_drop`.
             downlink_congested_epoch: Arc::clone(&self.downlink_congested_epoch),
+            token_iat: self.token_iat,
+            closer: Some(closer),
         }
     }
 
@@ -894,6 +905,13 @@ impl SessionLogic {
                 info!(
                     "Successfully joined room {} for session {}",
                     self.room, self.id
+                );
+                false
+            }
+            Ok(Err(e)) if e == JOIN_REFUSED_KICKED => {
+                info!(
+                    "Join refused for session {} in room {}: {}",
+                    self.id, self.room, e
                 );
                 false
             }

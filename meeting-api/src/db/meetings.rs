@@ -58,17 +58,15 @@ pub struct MeetingRow {
     pub allow_guests: bool,
     /// Whether the record button is shown to all admitted participants (not
     /// just the host).  Defaults to `false`: only the host sees the record
-    /// button unless explicitly opened up.  This is a UI-visibility gate,
-    /// not an access-control enforcement — recording is entirely
-    /// client-side, so this flag does not prevent a non-host from recording
-    /// by other means.
+    /// button unless explicitly opened up.  `POST .../recordings` refuses a
+    /// non-host lease while it is off; capture itself stays client-side.
     pub recording_allowed_for_all: bool,
     /// Whether every admitted participant may SEND chat messages (not just the
     /// host/co-hosts).  Defaults to `true`, so normal meetings keep chat open
     /// for everyone; a host turns it off for an all-hands-style meeting so only
-    /// hosts can post, and can flip it back on live.  Like
-    /// `recording_allowed_for_all` this is a client UI-visibility gate on the
-    /// send affordance, not a server-side access-control enforcement.
+    /// hosts can post, and can flip it back on live.  This is a client
+    /// UI-visibility gate on the send affordance, not a server-side
+    /// access-control enforcement.
     pub chat_allowed_for_all: bool,
 }
 
@@ -334,17 +332,17 @@ pub async fn list_joined_by_user(
         ) pc ON TRUE
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS waiting_count
-            FROM meeting_participants
-            WHERE meeting_id = m.id
-              AND status = 'waiting'
-              AND left_at IS NULL
+            FROM meeting_participants wp
+            WHERE wp.meeting_id = m.id
+              AND {waiting}
         ) wc ON TRUE
         WHERE m.deleted_at IS NULL
           AND p.admitted_at IS NOT NULL
         ORDER BY p.admitted_at DESC, m.id DESC
         LIMIT $2
         "#,
-        present = crate::db::participants::present_sql("mp", healthy)
+        present = crate::db::participants::present_sql("mp", healthy),
+        waiting = crate::db::participants::waiting_sql("wp")
     ))
     .bind(user_id)
     .bind(limit)
@@ -438,10 +436,9 @@ pub async fn list_feed_for_user(
         ) pc ON TRUE
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS waiting_count
-            FROM meeting_participants
-            WHERE meeting_id = m.id
-              AND status = 'waiting'
-              AND left_at IS NULL
+            FROM meeting_participants wp
+            WHERE wp.meeting_id = m.id
+              AND {waiting}
         ) wc ON TRUE
         LEFT JOIN LATERAL (
             SELECT TRUE AS is_co_host
@@ -454,7 +451,8 @@ pub async fn list_feed_for_user(
         ORDER BY last_active_at DESC, m.id DESC
         LIMIT $2
         "#,
-        present = crate::db::participants::present_sql("mp", healthy)
+        present = crate::db::participants::present_sql("mp", healthy),
+        waiting = crate::db::participants::waiting_sql("wp")
     ))
     .bind(user_id)
     .bind(limit)
@@ -772,15 +770,17 @@ pub async fn update_meeting_settings(
     .fetch_optional(&mut *tx)
     .await?;
 
-    // When disabling the waiting room, admit everyone currently waiting.
+    // When disabling the waiting room, admit everyone `waiting_sql` counts as waiting.
     let mut auto_admitted_user_ids = Vec::new();
     if let Some(ref row) = updated {
         if waiting_room_enabled == Some(false) {
-            auto_admitted_user_ids = sqlx::query_scalar::<_, String>(
-                "UPDATE meeting_participants \
-                 SET status = 'admitted', admitted_at = NOW(), live_session_id = 0 \
-                 WHERE meeting_id = $1 AND status = 'waiting' RETURNING user_id",
-            )
+            auto_admitted_user_ids = sqlx::query_scalar::<_, String>(&format!(
+                "UPDATE meeting_participants p \
+                 SET status = 'admitted', admitted_at = NOW(), live_session_id = 0, \
+                     presence_seen_at = NULL \
+                 WHERE p.meeting_id = $1 AND {} RETURNING p.user_id",
+                crate::db::participants::waiting_sql("p")
+            ))
             .bind(row.id)
             .fetch_all(&mut *tx)
             .await?;

@@ -217,7 +217,7 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
 
   sharedConnOptions(ctl.command("netem"))
     .description(
-      "Apply OS-level tc/netem impairment to the target pod's interface (--profile OR raw --delay/--jitter/--loss/--rate/--limit), or remove it with --clear. Requires the pod's control server to have been started with --ctl-netem. Combine with --host to target a specific bot pod.",
+      "Apply OS-level tc/netem impairment to the target pod's interface (--profile OR raw --delay/--jitter/--loss/--rate/--limit[/--downlink-rate/--ingress-limit]), or remove it with --clear. A profile shapes both directions; raw params shape ingress only with --downlink-rate and --ingress-limit. Requires the pod's control server to have been started with --ctl-netem. Combine with --host to target a specific bot pod.",
     )
     .option("--profile <name>", `Named profile (${NETEM_PROFILE_NAMES.join(", ")})`)
     .option("--delay <ms>", "Raw one-way delay in ms")
@@ -228,6 +228,8 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
       "--limit <pkts>",
       "Raw netem queue depth in packets (requires --delay, --loss or --rate)",
     )
+    .option("--downlink-rate <kbit>", "Raw ingress rate cap in kbit/s (requires --ingress-limit)")
+    .option("--ingress-limit <pkts>", "Raw ingress netem queue depth in packets")
     .option("--clear", "Remove all shaping (restore line rate)", false)
     .action(async (opts: ConnOptions & NetemCmdOptions) => {
       const plan = buildNetemRequest(opts);
@@ -236,10 +238,13 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
         op: string;
         label: string;
         commands: string[][];
+        ingressShaped: boolean;
         mirrorRemoved: boolean;
       }>(cfg, plan.method, "/netem", plan.body);
       const ran = res.commands.map((c) => c.join(" ")).join("\n  ");
-      console.log(`netem: ${res.op} (${res.label}) mirror_removed=${res.mirrorRemoved}\n  ${ran}`);
+      console.log(
+        `netem: ${res.op} (${res.label}) ingress_shaped=${res.ingressShaped} mirror_removed=${res.mirrorRemoved}\n  ${ran}`,
+      );
     });
 }
 
@@ -250,6 +255,8 @@ export interface NetemCmdOptions {
   loss?: string;
   rate?: string;
   limit?: string;
+  downlinkRate?: string;
+  ingressLimit?: string;
   clear?: boolean;
 }
 
@@ -264,18 +271,24 @@ export function buildNetemRequest(opts: NetemCmdOptions): {
   method: "POST" | "DELETE";
   body?: Record<string, unknown>;
 } {
-  if (opts.clear === true) {
-    return { method: "DELETE" };
-  }
-  if (opts.profile !== undefined) {
-    return { method: "POST", body: { profile: opts.profile } };
-  }
   const body: Record<string, unknown> = {};
+  if (opts.profile !== undefined) body.profile = opts.profile;
   if (opts.delay !== undefined) body.delayMs = numericFlag("--delay", opts.delay);
   if (opts.jitter !== undefined) body.jitterMs = numericFlag("--jitter", opts.jitter);
   if (opts.loss !== undefined) body.lossPct = numericFlag("--loss", opts.loss);
   if (opts.rate !== undefined) body.rateKbit = numericFlag("--rate", opts.rate);
   if (opts.limit !== undefined) body.limitPkts = numericFlag("--limit", opts.limit);
+  if (opts.downlinkRate !== undefined) {
+    body.downlinkRateKbit = numericFlag("--downlink-rate", opts.downlinkRate);
+  }
+  if (opts.ingressLimit !== undefined) {
+    body.ingressLimitPkts = numericFlag("--ingress-limit", opts.ingressLimit);
+  }
+  if (opts.clear === true) {
+    return Object.keys(body).length === 0
+      ? { method: "DELETE" }
+      : { method: "POST", body: { clear: true, ...body } };
+  }
   return { method: "POST", body };
 }
 

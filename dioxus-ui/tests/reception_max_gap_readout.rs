@@ -3,7 +3,7 @@
 //
 // Issue #2524. Host tests cover `update_reception` and `render_reception`; neither can
 // see that `Diagnostics` WIRES them to the DOM, and the Playwright spec that would is
-// untagged and #2193-blocked. Browser-only: the bus has no native receiver.
+// untagged. Browser-only: the bus has no native receiver.
 
 use dioxus::prelude::*;
 use dioxus_ui::components::diagnostics::Diagnostics;

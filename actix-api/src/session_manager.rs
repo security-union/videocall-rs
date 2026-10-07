@@ -335,6 +335,24 @@ impl SessionManager {
         Some((subject, bytes))
     }
 
+    /// Build PARTICIPANT_KICKED for `target_user_id`, the same packet meeting-api
+    /// broadcasts on a host kick (#2934).
+    pub fn build_participant_kicked_packet(room_id: &str, target_user_id: &str) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_KICKED.into(),
+            room_id: room_id.to_string(),
+            target_user_id: to_user_id_bytes(target_user_id),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {

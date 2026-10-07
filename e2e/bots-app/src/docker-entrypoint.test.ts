@@ -31,6 +31,8 @@ import {
   NETEM_MIRROR_ADD_STEP,
   NETEM_PROFILES,
   NETEM_PROFILE_NAMES,
+  NETEM_SETPRIV_ARGS,
+  NETEM_SETPRIV_DEFAULT,
   buildNetemClearArgs,
   buildNetemMirrorClearArgs,
   buildNetemMirrorInstallArgs,
@@ -39,11 +41,13 @@ import {
   ingressNetemParams,
   type NetemCommand,
 } from "./control/netem";
+import { HW_CONCURRENCY_PATTERN, resolveHardwareConcurrency } from "./hw-concurrency";
 import { ResourceCaptureSession } from "./resource/session";
 
 // The PRODUCTION entrypoint — not a reimplementation. Reverting the ordinal
 // resolution in this script makes the assertions below fail.
 const ENTRYPOINT = fileURLToPath(new URL("../docker-entrypoint.sh", import.meta.url));
+const HW_CONCURRENCY_REJECTS = ["6junk", "1.5", "1e2", "abc", "0x10", "+ 5", "+5", "1 0", "--3"];
 /** What real iproute2 prints for an interface nothing has shaped. */
 const UNSHAPED_QDISC = "qdisc noqueue 0: root refcnt 2";
 
@@ -253,6 +257,8 @@ function runEntrypoint(
     [
       "#!/usr/bin/env bash",
       'echo "STUB_EMAIL=${BOT_EMAIL-<unset>}"',
+      'echo "STUB_NETEM_APPLIED=${BOT_NETEM_APPLIED-<unset>}"',
+      'echo "STUB_RECORD_CTX=${BOT_POD_ORDINAL-<unset>}|${BOT_JOIN_STAGGER_MS-<unset>}|${BOT_JOIN_STAGGER_INCOMPLETE-<unset>}"',
       'echo "STUB_PASSWORD=${BOT_PASSWORD-<unset>}"',
       // The camera cycle is consumed from the INHERITED env by cli.ts, not from
       // argv, so what the bot process sees is the contract (#2362).
@@ -911,6 +917,31 @@ describe("docker-entrypoint.sh — startup netem + join stagger (#2354)", () => 
     expect(stderr, "the operator must see WHY the posture is unknown").toContain(err);
   });
 
+  // The participant record (#2914) takes `network` from this export.
+  it.each([
+    ["a verified shape", { BOT_NETEM_PROFILE: "good_4g" }, {}, "good_4g"],
+    ["a verified clear", { BOT_NETEM_PROFILE: "clean" }, {}, "clean"],
+    ["an unshaped noqueue root", {}, {}, "none"],
+    [
+      "an inherited netem",
+      {},
+      { qdiscShow: "qdisc netem 8001: root refcnt 2 limit 1000 delay 80ms" },
+      "unknown",
+    ],
+    [
+      "a non-netem rate limiter",
+      {},
+      { qdiscShow: "qdisc tbf 8002: root refcnt 2 rate 1Mbit burst 5Kb lat 10ms" },
+      "unknown",
+    ],
+    ["a failed probe", {}, { failWhen: "qdisc show", failStatus: 127 }, "unknown"],
+    ["an operator-set value", { BOT_NETEM_APPLIED: "good_4g" }, {}, "none"],
+  ] as const)("exports BOT_NETEM_APPLIED for %s", (_label, vars, opts, applied) => {
+    const { status, stdout } = runEntrypoint({ ...ORDINAL_ENV, ...vars }, opts);
+    expect(status).toBe(0);
+    expect(stdout).toContain(`STUB_NETEM_APPLIED=${applied}\n`);
+  });
+
   it("lets one ordinal carry a different link than the fleet", () => {
     const fleet = { ...ORDINAL_ENV, BOT_NETEM_PROFILE: "good_4g", BOT_NETEM_PROFILE_1: "dialup" };
     const overridden = runEntrypoint({ ...fleet, HOSTNAME: "videocall-bots-1" });
@@ -1280,6 +1311,39 @@ describe("docker-entrypoint.sh — startup netem + join stagger (#2354)", () => 
     expect(stdout).toMatch(/join_stagger=off /m);
   });
 
+  it("exports the ordinal and the drawn stagger for the participant record (#2358)", () => {
+    const off = runEntrypoint({ ...ORDINAL_ENV, BOT_JOIN_STAGGER_MS: "999", BOT_POD_ORDINAL: "9" });
+    expect(off.stdout).toMatch(/^STUB_RECORD_CTX=0\|\|$/m);
+    const { stdout, commands } = runEntrypoint({
+      ...ORDINAL_ENV,
+      BOT_MAX_JOIN_STAGGER_SECS: "300",
+    });
+    expect(stdout).toContain(`STUB_RECORD_CTX=0|${slept(commands)[0] * 1000}|`);
+    const failed = runEntrypoint(
+      { ...ORDINAL_ENV, BOT_MAX_JOIN_STAGGER_SECS: "3" },
+      { failWhen: "sleep", failStderr: "sleep: cannot read realtime clock" },
+    );
+    expect(failed.stdout).toMatch(/^STUB_RECORD_CTX=0\|\d+\|1$/m);
+    const pod3 = runEntrypoint({
+      ...ORDINAL_ENV,
+      HOSTNAME: "videocall-bots-3",
+      BOT_EMAIL_3: "dan@example.test",
+      BOT_PASSWORD_3: "pw-dan",
+    });
+    expect(pod3.stdout).toMatch(/^STUB_RECORD_CTX=3\|\|$/m);
+    const single = runEntrypoint({
+      BOT_IDENTITY_MODE: "single",
+      BOT_AUTH: "form-login",
+      BOT_EMAIL: "alice@example.test",
+      BOT_PASSWORD: "pw-alice",
+      BOT_POD_ORDINAL: "9",
+      BOT_JOIN_STAGGER_MS: "999",
+      BOT_JOIN_STAGGER_INCOMPLETE: "1",
+    });
+    expect(single.status).toBe(0);
+    expect(single.stdout).toMatch(/^STUB_RECORD_CTX=\|\|$/m);
+  });
+
   it("staggers the join by 0..N seconds, after every preflight", () => {
     const max = 300;
     const { status, stdout, commands } = runEntrypoint({
@@ -1519,6 +1583,60 @@ describe("docker-entrypoint.sh — startup netem + join stagger (#2354)", () => 
     expect(status).toBe(0);
     expect(stdout).not.toContain("--hardware-concurrency");
   });
+
+  it.each([
+    ["the fleet value", { BOT_HW_CONCURRENCY: "6junk" }],
+    ["ordinal 0's override", { BOT_HW_CONCURRENCY: "10", BOT_HW_CONCURRENCY_0: "6junk" }],
+  ])("rejects a malformed cap in %s BEFORE tc runs or the stagger sleeps", (_case, cap) => {
+    const { status, stderr, commands } = runEntrypoint({
+      ...ORDINAL_ENV,
+      ...cap,
+      BOT_NETEM_PROFILE: "congested_wifi",
+      BOT_MAX_JOIN_STAGGER_SECS: "300",
+    });
+    expect(status).toBe(1);
+    expect(stderr).toContain("FATAL");
+    expect(stderr).toContain("6junk");
+    expect(commands, "a rejected cap must not shape, probe or sleep").toEqual([]);
+  });
+
+  it("validates the cap this pod resolved, so a valid override starts over a bad fleet value", () => {
+    const { status, stdout } = runEntrypoint({
+      ...ORDINAL_ENV,
+      HOSTNAME: "videocall-bots-1",
+      BOT_HW_CONCURRENCY: "6junk",
+      BOT_HW_CONCURRENCY_1: "6",
+    });
+    expect(status).toBe(0);
+    expect(flagValue(stdout, "--hardware-concurrency")).toBe("6");
+  });
+
+  it("keeps the shell's cap grammar equal to resolveHardwareConcurrency's", () => {
+    const shell = /hw_token\}" =~ \^(\S+)\$ \]\]/.exec(readFileSync(ENTRYPOINT, "utf8"));
+    expect(shell, "the cap grammar must be findable in the entrypoint").not.toBeNull();
+    expect(`^${shell![1]}$`).toBe(HW_CONCURRENCY_PATTERN.source);
+  });
+
+  it.each(["", "   ", "6", " 10 ", "\t6\t", "0", "-3", "007", ...HW_CONCURRENCY_REJECTS])(
+    "starts on BOT_HW_CONCURRENCY=%j exactly when resolveHardwareConcurrency accepts it",
+    (raw) => {
+      const expected = resolveHardwareConcurrency(raw);
+      const { status, stdout, argv, commands } = runEntrypoint({
+        BOT_IDENTITY_MODE: "single",
+        BOT_EMAIL: "s@e.test",
+        BOT_PASSWORD: "pw",
+        BOT_HW_CONCURRENCY: raw,
+      });
+      if (expected.kind === "invalid") {
+        expect(status).toBe(1);
+        expect(commands).toEqual([]);
+        return;
+      }
+      expect(status, stdout).toBe(0);
+      const i = argv.indexOf("--hardware-concurrency");
+      expect(resolveHardwareConcurrency(i < 0 ? undefined : argv[i + 1])).toEqual(expected);
+    },
+  );
 
   it("says so when per-ordinal overrides land on a pod that cannot read them", () => {
     const { status, stderr, commands } = runEntrypoint({
@@ -1893,6 +2011,7 @@ describe("docker-entrypoint.sh → orchestrator.ts [label] writers (#2375)", () 
       ...(await orig()),
       launchBot: vi.fn(async () => ({
         userHangupDetected: new Promise<void>(() => {}),
+        crashDetected: new Promise<string>(() => {}),
         leaveMeeting: vi.fn(async () => {}),
         shutdown: vi.fn(async () => {}),
       })),
@@ -1938,9 +2057,10 @@ describe("docker-entrypoint.sh → orchestrator.ts [label] writers (#2375)", () 
     expect(lines.filter((l) => l.startsWith("[bot-7@")).length).toBeGreaterThan(0);
   });
 
-  it("the probe DOES see a forged line when the value is handed over ungated", async () => {
+  it("orchestrator.ts collapses a forged value even when handed over ungated (#2484)", async () => {
     const lines = await orchestratorLines(`bot-7\r${FORGED}`);
-    expect(lines.filter((l) => l.startsWith(FORGED)).length).toBeGreaterThan(0);
+    expect(lines.filter((l) => l.startsWith(FORGED))).toEqual([]);
+    expect(lines.filter((l) => l.includes(FORGED)).length).toBeGreaterThan(0);
   });
 
   it.each([
@@ -1948,9 +2068,8 @@ describe("docker-entrypoint.sh → orchestrator.ts [label] writers (#2375)", () 
     ["CR", "\r"],
   ])("a %s in BOT_PARTICIPANT never reaches those writers", async (_name, ctrl) => {
     const run = runEntrypoint({ ...BASE, BOT_PARTICIPANT: `bot-7${ctrl}${FORGED}` });
-    const lines = await orchestratorLines(flagValue(run.argv, "--participant"));
-    expect(lines.filter((l) => l.startsWith(FORGED))).toEqual([]);
     expect(run.status).toBe(1);
+    expect(run.argv).toEqual([]);
   });
 });
 
@@ -2130,6 +2249,13 @@ describe("docker-entrypoint.sh ↔ the image's capability grants (#2353, #2428)"
       basenames(caps.filter((p) => p !== dest)),
       "a cap on a binary nothing calls is privilege for nothing",
     ).toEqual(["ip", "tc"]);
+  });
+
+  it("runs ip at runtime through the same setpriv path and flags as the entrypoint", () => {
+    expect(NETEM_SETPRIV_DEFAULT).toBe(entrypointSetpriv());
+    expect(readFileSync(ENTRYPOINT, "utf8")).toContain(
+      `"\${NETEM_SETPRIV}" ${NETEM_SETPRIV_ARGS.join(" ")} ip "$@"`,
+    );
   });
 
   it("resolves each target through readlink and re-reads the cap it just set", () => {

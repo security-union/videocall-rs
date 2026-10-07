@@ -18,16 +18,33 @@ import {
   startCameraCycle,
 } from "./camera-cycle";
 import { HANG_UP_CANDIDATES, resolveControlSelector } from "./control-buttons";
+import {
+  buildDecodeBudgetInitScript,
+  type DecodeBudget,
+  DECODE_BUDGET_OFF_VALUE,
+  DECODE_BUDGET_STORAGE_KEY,
+  DecodeBudgetNotAppliedError,
+  isClientDecodeBudget,
+} from "./decode-budget";
 import { isDevServerNoise } from "./dev-noise";
 import { taggedLine } from "./log-line";
 import { type Manifest } from "./manifest";
 import { captureGeometryToken, type SourceGeometry } from "./posture";
-import { buildReceiverConfigInitScript, buildReceiverConfigOverrides } from "./receiver-caps";
+import {
+  buildReceiverConfigInitScript,
+  buildReceiverConfigOverrides,
+  type DiagPackets,
+} from "./receiver-caps";
 import { coerceEncoderFps } from "./resource/fps";
 import {
+  isSessionUserIdResponse,
+  JOIN_MEDIA_ON,
+  type JoinMedia,
+  type JoinMediaState,
   joinMeetingAndEnableMedia,
   JoinRejectedError,
   MeetingNavigatedAwayError,
+  sessionUserIdFromBody,
   WaitingRoomError,
 } from "./meeting-join";
 
@@ -146,6 +163,21 @@ export function isBenignTeardownError(e: unknown, browserDiedUnexpectedly: boole
   if (browserDiedUnexpectedly) return false;
   if (!(e instanceof Error)) return false;
   return ALREADY_CLOSED_MESSAGES.some((message) => e.message.includes(message));
+}
+
+export interface DiagPacketsObservation {
+  state: "ENABLED" | "DISABLED";
+  source: "url" | "config" | "default";
+}
+
+/** dioxus-ui `attendants.rs` logs this once per meeting mount (#2970). */
+export const DIAG_PACKETS_LINE =
+  /diagnostics packets: (ENABLED|DISABLED) \(source=(url|config|default)\)/;
+
+export function parseDiagPacketsLine(text: string): DiagPacketsObservation | null {
+  const m = DIAG_PACKETS_LINE.exec(text);
+  if (m === null) return null;
+  return { state: m[1], source: m[2] } as DiagPacketsObservation;
 }
 
 export type VideoMode = "costume" | "file" | "clock";
@@ -306,6 +338,12 @@ export interface BotRunOptions {
    * {@link maxReceivedLayer}.
    */
   skipCanvasPaint?: boolean | null;
+  /** `"off"` stops this bot's own DIAGNOSTICS sends (#2970); a fidelity trade. */
+  diagPackets?: DiagPackets | null;
+  /** Receives each `diagnostics packets:` console line the client prints. */
+  onDiagPackets?: ((obs: DiagPacketsObservation) => void) | null;
+  /** `"off"` seeds `vc_decode_budget_override=all` and fails the launch unless it reads back; a fidelity waiver. */
+  decodeBudget?: DecodeBudget | null;
   /** Override `FORM_LOGIN_TIMEOUT_MS`; the login runs over startup shaping (#2354). */
   formLoginTimeoutMs?: number | null;
   /** Override `FORM_LOGIN_ACTION_TIMEOUT_MS` for the per-step fill/click actions. */
@@ -314,6 +352,8 @@ export interface BotRunOptions {
   sourceGeometry: SourceGeometry;
   /** Opt-in duty cycle (#2362); unset = camera on the whole run. Set = less publish. */
   cameraCycle?: CameraCycleConfig | null;
+  /** Opt-in camera-off / mic-muted join (#2914); unset = both turned on after joining. */
+  joinMedia?: JoinMedia | null;
 }
 
 /**
@@ -348,7 +388,8 @@ export type BotExitReason =
   | { kind: "user-hangup" }
   | { kind: "waiting-room"; variant: "waiting-room" | "waiting-for-host"; detail: string }
   | { kind: "meeting-rejected"; reason: "rejected" | "error"; detail: string }
-  | { kind: "launch-error"; cause: unknown };
+  | { kind: "launch-error"; cause: unknown }
+  | { kind: "browser-crash"; detail: string };
 
 export interface BotHandle {
   browser: Browser;
@@ -371,6 +412,14 @@ export interface BotHandle {
    * Resolves at most once per bot; rejection is not possible.
    */
   userHangupDetected: Promise<void>;
+  /** Resolves with a description when the browser or page dies without our asking. */
+  crashDetected: Promise<string>;
+  /** Media state the join step left behind. */
+  joinMedia: JoinMediaState;
+  /** The `user_id` the meeting-api handed this session, once a participant-status response named it. */
+  sessionUserId: () => string | null;
+  /** `vc_decode_budget_override` read back after join (only for `off` or a replayed storage state); `null` otherwise. */
+  decodeBudgetReadback: string | null;
 }
 
 /**
@@ -583,9 +632,14 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // to remove.
   let intentionalCloseStarted = false;
   let browserDiedUnexpectedly = false;
+  let resolveCrash!: (detail: string) => void;
+  const crashDetected = new Promise<string>((resolve) => {
+    resolveCrash = resolve;
+  });
   browser.on("disconnected", () => {
     if (!intentionalCloseStarted) {
       browserDiedUnexpectedly = true;
+      resolveCrash("browser disconnected unexpectedly");
       console.error(at(`browser disconnected unexpectedly (crash or external kill)`));
     }
   });
@@ -664,6 +718,10 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   }
 
   const page = await context.newPage();
+  page.on("crash", () => {
+    console.error(at("page crashed"));
+    resolveCrash("page crashed");
+  });
 
   // Issue #2035 (increment 2): optionally spoof `navigator.hardwareConcurrency`
   // BEFORE the first navigation. Playwright's addInitScript is evaluated after
@@ -693,16 +751,24 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // paint CPU. These are `window.__APP_CONFIG` overrides injected BEFORE the
   // first navigation via a setter-merge (the client parses __APP_CONFIG once
   // and prod config.js freezes it, so they are launch-time-only — see
-  // receiver-caps.ts). When neither is set, nothing is injected and the
+  // receiver-caps.ts). When none is set, nothing is injected and the
   // deployment config is used verbatim (default behavior unchanged).
   const receiverOverrides = buildReceiverConfigOverrides({
     maxReceivedLayer: opts.maxReceivedLayer ?? undefined,
     skipCanvasPaint: opts.skipCanvasPaint ?? undefined,
+    diagPackets: opts.diagPackets ?? undefined,
   });
   if (receiverOverrides !== null) {
-    await page.addInitScript(buildReceiverConfigInitScript(receiverOverrides));
+    await page.addInitScript(buildReceiverConfigInitScript(receiverOverrides, originalUrl.origin));
     console.log(
-      at(`receiver caps → __APP_CONFIG ${JSON.stringify(receiverOverrides)} (issues #2068/#2069)`),
+      at(`__APP_CONFIG overrides → ${JSON.stringify(receiverOverrides)} (#2068/#2069/#2970)`),
+    );
+  }
+
+  if (opts.decodeBudget === "off") {
+    await page.addInitScript(buildDecodeBudgetInitScript(originalUrl.origin));
+    console.log(
+      at(`decode budget off: seeding ${DECODE_BUDGET_STORAGE_KEY}=${DECODE_BUDGET_OFF_VALUE}`),
     );
   }
 
@@ -729,7 +795,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       suppressedNoise++;
       return;
     }
-    console.error(at(`pageerror:`), err.message);
+    console.error(at(`pageerror: ${err.message}`));
   });
   page.on("console", (msg) => {
     const text = msg.text();
@@ -738,7 +804,30 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       suppressedNoise++;
       return;
     }
-    console.error(at(`console.error:`), text);
+    console.error(at(`console.error: ${text}`));
+  });
+  page.on("console", (msg) => {
+    const obs = parseDiagPacketsLine(msg.text());
+    if (obs === null) return;
+    console.log(at(`diagnostics packets: ${obs.state} (source=${obs.source})`));
+    if (opts.diagPackets === "off" && obs.state === "ENABLED") {
+      console.error(
+        at(`--diag-packets off requested but the client logged ENABLED (source=${obs.source})`),
+      );
+    }
+    opts.onDiagPackets?.(obs);
+  });
+
+  let sessionUserId: string | null = null;
+  const statusMeetingId = meetingIdFromUrl(opts.meetingURL);
+  page.on("response", (res) => {
+    if (!res.ok() || !isSessionUserIdResponse(res.url(), statusMeetingId)) return;
+    void res
+      .json()
+      .then((body: unknown) => {
+        sessionUserId = sessionUserIdFromBody(body) ?? sessionUserId;
+      })
+      .catch(() => {});
   });
 
   const navigateUrl = target.toString();
@@ -815,15 +904,17 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
   });
 
+  let joinMedia: JoinMediaState;
   try {
     // Pass the composite label (participant or participant@idshort)
     // through to the join helper so its log lines match the rest of
     // the bot's prefix.
-    await joinMeetingAndEnableMedia({
+    joinMedia = await joinMeetingAndEnableMedia({
       page,
       participant: label,
       displayName: opts.displayName,
       meetingId,
+      media: opts.joinMedia ?? JOIN_MEDIA_ON,
     });
   } catch (e) {
     if (e instanceof MeetingNavigatedAwayError) {
@@ -888,6 +979,41 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     } catch (e) {
       console.error(at(`receiver-caps __APP_CONFIG assertion check failed:`), e);
     }
+  }
+
+  // A fresh context's storage is empty unless a storage state was replayed.
+  let decodeBudgetReadback: string | null = null;
+  if (opts.decodeBudget === "off" || initialStorageState !== undefined) {
+    try {
+      decodeBudgetReadback = await page.evaluate(
+        (key) => localStorage.getItem(key),
+        DECODE_BUDGET_STORAGE_KEY,
+      );
+    } catch (e) {
+      console.error(at(`decode-budget readback failed:`), e);
+    }
+  }
+  if (opts.decodeBudget === "off") {
+    if (decodeBudgetReadback !== DECODE_BUDGET_OFF_VALUE) {
+      const err = new DecodeBudgetNotAppliedError(decodeBudgetReadback);
+      console.error(at(err.message));
+      await clickHangUp(
+        page,
+        (m, e) => console.error(at(m), e),
+        (m) => console.warn(at(m)),
+      );
+      await closeBrowserIntentionally();
+      throw err;
+    }
+    console.log(
+      at(`decode budget off verified: ${DECODE_BUDGET_STORAGE_KEY}=${decodeBudgetReadback}`),
+    );
+  } else if (!isClientDecodeBudget(decodeBudgetReadback)) {
+    console.error(
+      at(
+        `WARNING: decode budget client requested but ${DECODE_BUDGET_STORAGE_KEY}=${decodeBudgetReadback} is in storage (a captured storage state?): this bot runs under that override`,
+      ),
+    );
   }
 
   // Best-effort: log the suppression summary once, after a successful
@@ -972,7 +1098,11 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   }
 
   const leaveMeeting = async (): Promise<void> => {
-    await clickHangUp(page, (m, e) => console.error(at(m), e));
+    await clickHangUp(
+      page,
+      (m, e) => console.error(at(m), e),
+      (m) => console.warn(at(m)),
+    );
   };
 
   const shutdown = async (): Promise<void> => {
@@ -1014,7 +1144,18 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
   };
 
-  return { browser, context, page, leaveMeeting, shutdown, userHangupDetected };
+  return {
+    browser,
+    context,
+    page,
+    leaveMeeting,
+    shutdown,
+    userHangupDetected,
+    crashDetected,
+    joinMedia,
+    sessionUserId: () => sessionUserId,
+    decodeBudgetReadback,
+  };
 }
 
 /**
@@ -1073,7 +1214,7 @@ function resolveOverrideOrAuto(args: {
  * Override with a literal email if the participant string already contains
  * an "@".
  */
-function participantEmail(participant: string): string {
+export function participantEmail(participant: string): string {
   if (participant.includes("@")) {
     return participant;
   }

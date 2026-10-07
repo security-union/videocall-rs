@@ -695,6 +695,7 @@
         },
         "overrides": []
       },
+      "description": "relay_nats_publish_latency_ms: time for Client::publish() to enqueue a media packet into the async-nats client's local 2048-slot command channel. Not a NATS round-trip or a socket write. It rises when that channel is full (a relay pod's NATS connection task is behind) or when a relay runtime is too busy to re-poll ChatServer (tokio coop yield). This panel pools every relay pod. Read it with the Relay Scheduler Lag p50/p99 panel, by pod, for the pods that export that series: lag rising too points at the runtime, flat lag at the NATS writer. A pod without that series cannot be split this way (#2925).",
       "gridPos": {
         "h": 8,
         "w": 6,
@@ -729,7 +730,7 @@
           "refId": ""
         }
       ],
-      "title": "NATS Publish Latency",
+      "title": "NATS Client Enqueue Latency",
       "type": "timeseries"
     },
     {
@@ -860,6 +861,67 @@
       "datasource": {
         "type": "prometheus"
       },
+      "description": "increase() over 5m of relay_nats_events_total, by relay pod and async-nats event (#2925). FLEET-WIDE: the counter has no room label, so this is NOT filtered by $meeting. slow_consumer: a NATS subscription channel on that pod was full and async-nats DROPPED the message, most likely from a session's media subscription (the relay also holds control subscriptions). disconnected: the pod lost its NATS connection. client_error: each failed reconnect attempt. connected: each reconnect (a new pod's initial connect usually lands before its first scrape). Any disconnected or slow_consumer rise fires the RelayNATSDisconnectOrSlowConsumer warning. A lower bound: async-nats drops events past its 128-slot event queue.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "id": 128,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod, event)(increase(relay_nats_events_total[5m]))",
+          "legendFormat": "{{pod}} {{event}}",
+          "refId": "A"
+        }
+      ],
+      "title": "NATS Client Events /5m by Relay Pod — FLEET-WIDE (#2925)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -888,7 +950,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 43
+        "y": 51
       },
       "id": 6,
       "options": {
@@ -950,7 +1012,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 43
+        "y": 51
       },
       "id": 43,
       "options": {
@@ -1010,7 +1072,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 43
+        "y": 51
       },
       "id": 45,
       "options": {
@@ -1071,7 +1133,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 51
+        "y": 59
       },
       "id": 44,
       "options": {
@@ -1136,7 +1198,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 51
+        "y": 59
       },
       "id": 40,
       "options": {
@@ -1207,7 +1269,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 51
+        "y": 59
       },
       "id": 39,
       "options": {
@@ -1299,7 +1361,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 59
+        "y": 67
       }
     },
     {
@@ -1365,7 +1427,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 59
+        "y": 67
       }
     },
     {
@@ -1374,7 +1436,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 67
+        "y": 75
       },
       "id": 11,
       "title": "Audio Deep Dive",
@@ -1414,7 +1476,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 68
+        "y": 76
       },
       "id": 12,
       "options": {
@@ -1496,7 +1558,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 68
+        "y": 76
       },
       "id": 13,
       "options": {
@@ -1563,7 +1625,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 68
+        "y": 76
       },
       "id": 14,
       "options": {
@@ -1597,7 +1659,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 84
       },
       "id": 16,
       "title": "Video & Network",
@@ -1637,7 +1699,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 77
+        "y": 85
       },
       "id": 17,
       "options": {
@@ -1698,7 +1760,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 77
+        "y": 85
       },
       "id": 19,
       "options": {
@@ -1759,7 +1821,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 77
+        "y": 85
       },
       "id": 20,
       "options": {
@@ -1846,7 +1908,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 85
+        "y": 93
       }
     },
     {
@@ -1973,7 +2035,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 85
+        "y": 93
       }
     },
     {
@@ -1982,7 +2044,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 93
+        "y": 101
       },
       "id": 21,
       "title": "Client Health",
@@ -2021,7 +2083,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 94
+        "y": 102
       },
       "id": 22,
       "options": {
@@ -2082,7 +2144,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 94
+        "y": 102
       },
       "id": 23,
       "options": {
@@ -2143,7 +2205,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 94
+        "y": 102
       },
       "id": 24,
       "options": {
@@ -2205,7 +2267,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 94
+        "y": 102
       },
       "id": 25,
       "options": {
@@ -2244,7 +2306,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 102
+        "y": 110
       },
       "id": 37,
       "title": "Receiver-Side Quality",
@@ -2291,7 +2353,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 103
+        "y": 111
       },
       "id": 38,
       "options": {
@@ -2391,7 +2453,7 @@
         "h": 8,
         "w": 16,
         "x": 8,
-        "y": 103
+        "y": 111
       },
       "id": 41,
       "options": {
@@ -2472,7 +2534,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 111
+        "y": 119
       },
       "id": 51,
       "options": {
@@ -2507,7 +2569,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 119
+        "y": 127
       },
       "id": 57,
       "title": "Decode-Budget (Client-Side)",
@@ -2610,7 +2672,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 120
+        "y": 128
       }
     },
     {
@@ -2646,7 +2708,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 128
+        "y": 136
       },
       "id": 47,
       "options": {
@@ -2713,7 +2775,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 128
+        "y": 136
       },
       "id": 48,
       "options": {
@@ -2794,7 +2856,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 128
+        "y": 136
       },
       "id": 49,
       "options": {
@@ -2834,7 +2896,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 136
+        "y": 144
       },
       "id": 30,
       "title": "Server Resources (CPU & Memory vs Limits)",
@@ -2888,7 +2950,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 137
+        "y": 145
       },
       "id": 31,
       "options": {
@@ -2967,7 +3029,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 137
+        "y": 145
       },
       "id": 32,
       "options": {
@@ -3017,7 +3079,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 137
+        "y": 145
       },
       "id": 35,
       "options": {
@@ -3086,7 +3148,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 145
+        "y": 153
       },
       "id": 33,
       "options": {
@@ -3153,7 +3215,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 145
+        "y": 153
       },
       "id": 34,
       "options": {
@@ -3245,7 +3307,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 145
+        "y": 153
       }
     },
     {
@@ -3254,7 +3316,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 153
+        "y": 161
       },
       "id": 42,
       "title": "Adaptive Quality Debugging",
@@ -3302,7 +3364,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 154
+            "y": 162
           },
           "id": 53,
           "options": {
@@ -3374,7 +3436,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 162
+            "y": 170
           },
           "id": 55,
           "options": {
@@ -3445,7 +3507,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 162
+            "y": 170
           },
           "id": 56,
           "options": {
@@ -3492,7 +3554,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 170
+        "y": 178
       },
       "id": 70,
       "title": "Simulcast / Per-Layer",
@@ -3532,7 +3594,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 171
+            "y": 179
           },
           "id": 71,
           "options": {
@@ -3595,7 +3657,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 171
+            "y": 179
           },
           "id": 72,
           "options": {
@@ -3657,7 +3719,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 179
+            "y": 187
           },
           "id": 73,
           "options": {
@@ -3724,7 +3786,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 221
+            "y": 229
           },
           "id": 86,
           "options": {
@@ -3790,7 +3852,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 229
+            "y": 237
           },
           "id": 88,
           "options": {
@@ -3855,7 +3917,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 229
+            "y": 237
           },
           "id": 89,
           "options": {
@@ -3920,7 +3982,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 237
+            "y": 245
           },
           "id": 90,
           "options": {
@@ -3980,7 +4042,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 237
+            "y": 245
           },
           "id": 91,
           "options": {
@@ -4040,7 +4102,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 179
+            "y": 187
           },
           "id": 74,
           "options": {
@@ -4102,7 +4164,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 187
+            "y": 195
           },
           "id": 75,
           "options": {
@@ -4164,7 +4226,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 187
+            "y": 195
           },
           "id": 76,
           "options": {
@@ -4230,7 +4292,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 195
+            "y": 203
           },
           "id": 77,
           "options": {
@@ -4296,7 +4358,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 195
+            "y": 203
           },
           "id": 78,
           "options": {
@@ -4336,7 +4398,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 204
+        "y": 212
       },
       "id": 80,
       "panels": [
@@ -4382,7 +4444,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 205
+            "y": 213
           },
           "id": 81,
           "options": {
@@ -4457,7 +4519,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 205
+            "y": 213
           },
           "id": 82,
           "options": {
@@ -4527,7 +4589,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 213
+            "y": 221
           },
           "id": 83,
           "options": {
@@ -4568,7 +4630,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 213
+        "y": 221
       },
       "id": 92,
       "panels": [
@@ -4614,7 +4676,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 214
+            "y": 222
           },
           "id": 93,
           "options": {
@@ -4689,7 +4751,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 214
+            "y": 222
           },
           "id": 94,
           "options": {
@@ -4759,7 +4821,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 222
+            "y": 230
           },
           "id": 95,
           "options": {
@@ -4821,7 +4883,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 222
+            "y": 230
           },
           "id": 96,
           "options": {
@@ -4883,7 +4945,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 230
+            "y": 238
           },
           "id": 97,
           "options": {
@@ -4945,7 +5007,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 230
+            "y": 238
           },
           "id": 98,
           "options": {
@@ -4983,7 +5045,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 245
+        "y": 253
       },
       "id": 103,
       "title": "Backpressure & Datagram Loss (#1737/#1878)",
@@ -5023,7 +5085,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 246
+        "y": 254
       },
       "id": 99,
       "options": {
@@ -5085,7 +5147,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 246
+        "y": 254
       },
       "id": 100,
       "options": {
@@ -5147,7 +5209,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 254
+        "y": 262
       },
       "id": 101,
       "options": {
@@ -5214,7 +5276,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 254
+        "y": 262
       },
       "id": 102,
       "options": {
@@ -5305,7 +5367,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 262
+        "y": 270
       }
     },
     {
@@ -5342,7 +5404,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 262
+        "y": 270
       },
       "id": 114,
       "options": {
@@ -5404,7 +5466,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 270
+        "y": 278
       },
       "id": 127,
       "options": {
@@ -5471,7 +5533,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 278
+        "y": 286
       },
       "id": 105,
       "options": {
@@ -5534,7 +5596,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 278
+        "y": 286
       },
       "id": 106,
       "options": {
@@ -5596,7 +5658,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 286
+        "y": 294
       },
       "id": 107,
       "options": {
@@ -5657,7 +5719,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 286
+        "y": 294
       },
       "id": 108,
       "options": {
@@ -5721,7 +5783,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 295
+        "y": 303
       },
       "id": 109,
       "options": {
@@ -5809,7 +5871,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 295
+        "y": 303
       },
       "id": 110,
       "options": {
@@ -5875,7 +5937,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 304
+        "y": 312
       },
       "id": 111,
       "options": {
@@ -5942,7 +6004,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 304
+        "y": 312
       },
       "id": 112,
       "options": {
@@ -6009,7 +6071,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 313
+        "y": 321
       },
       "id": 113,
       "options": {
@@ -6047,7 +6109,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 321
+        "y": 329
       },
       "id": 115,
       "panels": [],
@@ -6058,12 +6120,12 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Distribution of videocall_relay_scheduler_lag_ms across the histogram's ms buckets (1/5/10/25/50/100/250/500/1000/2500). Each probe runs ON one of the WebTransport relay's runtimes (#2727: the main one plus every session arbiter), all feeding this one unlabelled histogram and observes how late each fixed-interval tick was polled versus its scheduled deadline, so a band lighting up at 100ms and above is the epic #1636 thread-starvation fingerprint (mechanism B): some future held one of those threads without yielding. Sub-10ms is ordinary timer jitter. Read this WITH the per-connection path_sent_packets panels: upper buckets here while sent_packets is flat is mechanism B; no upper-bucket movement while RTT and loss climb is mechanism C (shared downlink/NIC). Only webtransport_server spawns the probe, so the WebSocket relay contributes no series.",
+      "description": "Distribution of videocall_relay_scheduler_lag_ms across the histogram's ms buckets (1/5/10/25/50/100/250/500/1000/2500). Each probe runs ON one relay runtime (WebTransport, #2727: the main one plus every session arbiter; WebSocket, #2924: the main runtime, which hosts ChatServer and every session's NATS receive loop), all feeding this one unlabelled histogram, and observes how late each fixed-interval tick was polled versus its scheduled deadline, so a band lighting up at 100ms and above is the epic #1636 thread-starvation fingerprint (mechanism B): some future held one of those threads without yielding. Sub-10ms is ordinary timer jitter. This sums every relay pod in the namespace, WebSocket and WebTransport alike; the p50/p99 panel names the pod. For a WebTransport pod, read this WITH the per-connection path_sent_packets panels: upper buckets here while sent_packets is flat is mechanism B; no upper-bucket movement while RTT and loss climb is mechanism C (shared downlink/NIC).",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 322
+        "y": 330
       },
       "id": 116,
       "options": {
@@ -6108,14 +6170,14 @@
           "refId": "A"
         }
       ],
-      "title": "WT Relay Scheduler Lag Distribution (#1636/#1639)",
+      "title": "Relay Scheduler Lag Distribution, WS + WT (#1636/#2924)",
       "type": "heatmap"
     },
     {
       "datasource": {
         "type": "prometheus"
       },
-      "description": "p50 and p99 of the relay's scheduler lag, aggregated over every runtime (#2727), per relay pod. p99 crossing 100ms is the RelaySchedulerLagHigh alert condition. A healthy relay sits at single-digit ms. Because the histogram's top explicit bucket is 2500ms, a p99 reported at exactly 2500 means the true value is somewhere above it.",
+      "description": "p50 and p99 of the relay's scheduler lag per relay pod, WebSocket and WebTransport alike (#2924); on a WebTransport pod aggregated over every runtime (#2727). p99 crossing 100ms is the RelaySchedulerLagHigh alert condition. A healthy relay sits at single-digit ms. Because the histogram's top explicit bucket is 2500ms, a p99 reported at exactly 2500 means the true value is somewhere above it.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -6152,7 +6214,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 322
+        "y": 330
       },
       "id": 117,
       "options": {
@@ -6182,7 +6244,7 @@
           "refId": "B"
         }
       ],
-      "title": "WT Relay Scheduler Lag p50/p99 (#1636/#1639)",
+      "title": "Relay Scheduler Lag p50/p99, WS + WT (#1636/#2924)",
       "type": "timeseries"
     },
     {
@@ -6226,7 +6288,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 330
+        "y": 338
       },
       "id": 118,
       "options": {
@@ -6291,7 +6353,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 330
+        "y": 338
       },
       "id": 119,
       "options": {
@@ -6358,7 +6420,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 338
+        "y": 346
       },
       "id": 120,
       "options": {
@@ -6425,7 +6487,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 338
+        "y": 346
       },
       "id": 121,
       "options": {
@@ -6487,7 +6549,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 346
+        "y": 354
       },
       "id": 122,
       "options": {
@@ -6556,7 +6618,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 346
+        "y": 354
       },
       "id": 123,
       "options": {
@@ -6618,7 +6680,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 354
+        "y": 362
       },
       "id": 124,
       "options": {
@@ -6684,7 +6746,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 354
+        "y": 362
       },
       "id": 125,
       "options": {
@@ -6746,7 +6808,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 362
+        "y": 370
       },
       "id": 126,
       "options": {

@@ -531,6 +531,8 @@ PATCH /api/v1/meetings/{meeting_id}
 
 **Authorization**: allowed for the owner, a live (unsuspended) co-host entry, or anyone currently a present host of the active meeting (e.g. a `transfer-host` target) — see `viewer_can_edit_options` above. `password` / `remove_password` are the exception: they stay **owner-only**. A non-owner sending either is rejected with `403 NOT_OWNER` before any hashing or DB write — nothing in the request is applied, even other, otherwise-valid fields in the same body. Granting/revoking co-hosts, ending the meeting for everyone (`/end`), and deleting it (`DELETE`) stay owner-only; listing co-hosts uses this same broader rule (see [Co-Hosts](#co-hosts)).
 
+Turning `waiting_room_enabled` off admits the participants `/admit-all` would; `waiting` rows whose lease expired stay `waiting` (see [Get Waiting Room](#get-waiting-room)).
+
 **Response (200 OK):** `APIResponse<MeetingInfoResponse>` — same shape as [Get Meeting Info](#get-meeting-info).
 
 **Errors:**
@@ -723,6 +725,8 @@ GET /api/v1/meetings/{meeting_id}/waiting
 
 > **Rust type**: `APIResponse<WaitingRoomResponse>` (each entry is a `ParticipantStatusResponse`)
 
+A `waiting` row is listed only while its waiting-room lease is live: `presence_seen_at` is `NULL` (no [Presence Keepalive](#presence-keepalive) since the `/join` or `/join-guest` that queued it, which clears it) or within `PRESENCE_LEASE_SECS` (90 s). A client that renews and then stops drops out within 90 s of its last renewal; its row stays `waiting` and is listed again on its next renewal. `waiting_count` (meeting info, meeting list, feed, joined list), `/admit`, `/admit-all` and turning the waiting room off use the same rule; the three admit paths clear `presence_seen_at`, so an admitted participant who never connects counts as present only through the 60 s connect window. `/leave` still removes a waiting row at once. The list is ordered by arrival (`joined_at`, then row id): re-joining while listed keeps `joined_at`, any other entry into the waiting room (from another status, or after the lease lapsed) resets it, and a keepalive never changes it.
+
 **Errors:**
 
 | Status | Code | Description |
@@ -774,14 +778,14 @@ The admitted participant receives a `PARTICIPANT_ADMITTED` push notification via
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
-| 404 | `PARTICIPANT_NOT_FOUND` | Participant not in waiting room |
+| 404 | `PARTICIPANT_NOT_FOUND` | Participant not in the [waiting list](#get-waiting-room), including a `waiting` row whose lease expired |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
 ---
 
 ### Admit All Participants
 
-Admits all participants currently in the waiting room at once. Room access tokens are generated for each admitted participant.
+Admits all participants currently in the [waiting list](#get-waiting-room) at once; `waiting` rows whose lease expired are skipped and stay `waiting`. Room access tokens are generated for each admitted participant.
 
 ```
 POST /api/v1/meetings/{meeting_id}/admit-all
@@ -975,6 +979,8 @@ otherwise have their lease lapse and get swept: the meeting ends (host,
 the host-presence guard, even though the user is right there. Call this on
 an interval under the lease window — every ~30 s — for as long as the lobby
 is shown, and stop once the transport connects and heartbeats take over.
+It also keeps a `waiting` row in the [waiting list](#get-waiting-room); call
+it on the same cadence while the waiting page is shown.
 
 ```
 POST /api/v1/meetings/{meeting_id}/presence/keepalive
@@ -986,11 +992,12 @@ cookie or room-token Bearer via `AuthUser`); `keepalive-guest` authenticates
 exactly like `leave-guest` / `guest-status` (observer-token Bearer via
 `GuestObserver`, rejecting a token issued for a different meeting).
 
-Both touch only the caller's own row, and only when it is `admitted`, not
-left, has no live session (`live_session_id` is `0` or `NULL`), and the
-meeting has not ended — a session a relay has already reported present is
-renewed by its heartbeat, never by this endpoint. A single `UPDATE`; no
-meeting row lock, no NATS publish, nothing broadcast to other participants.
+Both touch only the caller's own row, and only when it is not left, the
+meeting has not ended, and it is either `waiting` or `admitted` with no live
+session (`live_session_id` is `0` or `NULL`) — a session a relay has already
+reported present is renewed by its heartbeat, never by this endpoint. A
+single `UPDATE`; no meeting row lock, no NATS publish, nothing broadcast to
+other participants.
 
 No per-user rate limit: unlike a display-name change (which broadcasts to
 every participant and is rate-limited to bound that fan-out), a keepalive
@@ -1013,7 +1020,7 @@ client calling it faster than its intended cadence to amplify.
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session / guest token |
 | 404 | `MEETING_NOT_FOUND` | No such meeting |
-| 404 | `PARTICIPANT_NOT_FOUND` | Caller has no row eligible for renewal — not admitted, already has a live session, or the meeting ended. Stop calling. |
+| 404 | `PARTICIPANT_NOT_FOUND` | Caller has no row eligible for renewal — neither waiting nor admitted, already has a live session, or the meeting ended. A waiting row survives an end, so its 404 clears if the meeting restarts. |
 
 ---
 
@@ -1035,6 +1042,7 @@ GET /api/v1/meetings/{meeting_id}/participants
       "display_name": "Alice",
       "status": "admitted",
       "is_host": true,
+      "in_call": true,
       "joined_at": 1706918400,
       "admitted_at": 1706918400,
       "room_token": null
@@ -1044,6 +1052,7 @@ GET /api/v1/meetings/{meeting_id}/participants
       "display_name": "Bob",
       "status": "admitted",
       "is_host": false,
+      "in_call": false,
       "joined_at": 1706918500,
       "admitted_at": 1706918600,
       "room_token": null
@@ -1055,6 +1064,8 @@ GET /api/v1/meetings/{meeting_id}/participants
 > **Rust type**: `APIResponse<Vec<ParticipantStatusResponse>>`
 >
 > **Note**: The `room_token` field is `null` in participant listings. Tokens are only delivered to the participant themselves via `POST /join` or `GET /status`.
+>
+> **`in_call`** (every `ParticipantStatusResponse`): `true` only while the participant is `admitted`, a relay has reported their transport session present since their last REST join or admit, and their presence lease was renewed within `PRESENCE_LEASE_SECS` (90 s); an admitted participant still in the pre-join lobby reads `false`. `false` means "not confirmed live", not "absent": a repeat REST `/join` (e.g. a second tab) or a lost relay `PRESENT` reads `false` until they are re-admitted (a repeat `/join` puts a waiting-room meeting's attendee back in `waiting`, which a relay report never restores) and a relay next reports a session of theirs present, which heartbeats alone do not do. It does not use the presence-pipeline health fallback, so once heartbeats stop reaching the database each participant reads `false` when their lease lapses, even while presence counts fall back to latch semantics. After a meeting ends it can still read `true` until the relay's `LEFT` arrives or the lease lapses (at most 90 s, since ended meetings get no renewals).
 
 **Errors:**
 
@@ -1062,6 +1073,7 @@ GET /api/v1/meetings/{meeting_id}/participants
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
+| 404 | `NOT_IN_MEETING` | Caller is neither the owner nor a participant admitted into, or left from, the current instance |
 
 ---
 
@@ -1140,6 +1152,33 @@ When unhealthy, `present_sql` falls back to latch semantics (`admitted AND left_
 Rolling relays back to a pre-heartbeat version is **safe** against a meeting-api build that has the watermark: heartbeats simply stop, the watermark goes stale within 60 s, and every presence decision degrades to latch (`admitted AND left_at IS NULL`) instead of sweeping everyone — the same outcome as a genuine NATS outage. It is not safe against a meeting-api build that predates the watermark, which sweeps unconditionally on a lapsed lease with no watermark to consult; roll meeting-api back first, or accept that participants on old-relay rooms will be swept once their lease runs out.
 
 **Known limitation: the watermark is global, not per-relay.** One row answers "has *a* heartbeat reached *some* meeting-api", not "is *this specific* relay's heartbeat path healthy". If one relay's own heartbeat publish path breaks (a bug, a stuck queue, a misconfigured subject) while every other relay in the fleet keeps heartbeating normally, the watermark stays fresh — because it truthfully reflects that *the pipeline as a whole* is fine — and every presence decision keeps using strict lease semantics. That one broken relay's participants still lose their lease after `PRESENCE_LEASE_SECS` and get swept, exactly as if their relay had crashed, because nothing in this design distinguishes "the whole pipeline is down" from "one relay's path is down". Detecting the latter would need a per-relay (or per-room) freshness signal instead of a single global row; nothing here provides one.
+
+### Recordings
+
+```
+POST /api/v1/meetings/{meeting_id}/recordings                       Body: {"attempt_id": "<uuid>"}
+POST /api/v1/meetings/{meeting_id}/recordings/{recording_id}/stop   Body: the lease secret, text/plain
+```
+
+Register grants a recording lease (issue 2856). The caller must be an admitted participant who has not left, not a guest, and a host or co-host unless `recording_allowed_for_all` is on; the meeting must not be ended. A request that carries a session cookie also needs an `Origin` from `CORS_ALLOWED_ORIGIN`. The `200` result is `{recording_id, lease_secret, epoch, version}` with `Cache-Control: no-store`. Repeating the same `attempt_id` while the lease is active returns the same `recording_id` with a new secret; the old secret stops working.
+
+Stop takes no session or Bearer credential: the secret is the only one. It answers `204` whether or not a lease matched, including when rate-limited (30 per known client address and 600 in total per minute per replica) or on a database error, so `204` does not mean the lease ended. A body over 256 bytes gets `413`.
+
+After every change meeting-api publishes `RECORDING_STATE` on `room.{meeting_id}.system`: `recording_epoch` and `recording_state` `{version, entries: [{recording_id, revoked}]}`, with no user ids or secrets. On the wire `recording_id` is the UUID's 16 raw bytes; the register response carries it as a hyphenated string. A permitted register deletes the meeting's leases granted more than 90 s ago.
+
+**Errors (register):**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 401 | `UNAUTHORIZED` | No valid user credential; guest tokens are refused here |
+| 403 | `BAD_ORIGIN` | Session cookie without an allowed `Origin` |
+| 403 | `NOT_ADMITTED` | Caller is not an admitted participant, or has left |
+| 403 | `NOT_PERMITTED` | Non-host while `recording_allowed_for_all` is off |
+| 403 | `MEETING_ENDED` | Meeting has ended |
+| 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
+| 409 | `USER_CAP` | Caller already holds an active lease from another attempt |
+| 409 | `MEETING_CAP` | Five active non-host leases already; hosts are exempt |
+| 429 | `RATE_LIMITED` | 6 registers per user per fixed minute per replica, or (non-hosts only) more than 20 permitted attempts per meeting in a two-bucket sliding minute, hosts' attempts included |
 
 ---
 

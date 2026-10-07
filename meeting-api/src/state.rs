@@ -73,6 +73,10 @@ pub struct AppState {
     pub display_name_rate_limiter: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
     /// Shared operation counter used to run periodic rate-limiter sweeps.
     pub display_name_rate_limiter_ops: Arc<AtomicU64>,
+    /// Per-host limit on `POST .../kick`, per replica (#2934).
+    pub kick_rate_limiter: Arc<crate::rate_limit::KeyedRateLimiter>,
+    /// Recording-registry origins and per-replica limits (#2856).
+    pub recording: Arc<crate::recording::RecordingGuard>,
     /// SearchV2 integration config. `None` disables the push path entirely;
     /// every [`crate::search`] call becomes a no-op. See [`SearchConfig`].
     pub search: Option<SearchConfig>,
@@ -144,6 +148,11 @@ impl AppState {
                 .expect("failed to build reqwest client"),
             display_name_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
+            kick_rate_limiter: Arc::new(crate::rate_limit::KeyedRateLimiter::for_host_kicks()),
+            recording: Arc::new(crate::recording::RecordingGuard::new(
+                config.cors_allowed_origin.clone(),
+                config.dev_user.is_some(),
+            )),
             search: config.search.clone(),
             display_name_rate_limit_disabled: config.display_name_rate_limit_disabled,
             dev_user: config.dev_user.clone(),

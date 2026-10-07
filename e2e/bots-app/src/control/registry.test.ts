@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { BotTask } from "../orchestrator";
 import { SD_SOURCE } from "../posture";
 import {
+  type BotRegistryEntry,
+  ExpectedBots,
   generateBotId,
   newRegistryEntry,
   REGISTRY_RETENTION_MS,
@@ -240,5 +242,36 @@ describe("sweepStaleEntries", () => {
     }
     sweepStaleEntries(reg, now);
     expect(reg.size).toBe(TERMINATED_REGISTRY_CAP - 1);
+  });
+});
+
+describe("ExpectedBots (#2917)", () => {
+  const at = (host: BotRegistryEntry["host"], finishReason: string) => ({
+    ...newRegistryEntry(fakeTask()),
+    host,
+    status: "done" as const,
+    finishReason,
+  });
+
+  it("never counts an SSH bot, launched, finished or dropped", () => {
+    const e = new ExpectedBots();
+    const ssh = { kind: "ssh" as const, hostLabel: "h" };
+    e.launched(ssh);
+    e.finished(at(ssh, "ctl-leave"));
+    e.dropped(at(ssh, "ssh-exit-1"));
+    expect(e.value).toBe(0);
+  });
+
+  it("releases a local bot once: on a deliberate exit, or when an operator drops any other end", () => {
+    const e = new ExpectedBots();
+    const local = { kind: "local" as const };
+    e.launched(local);
+    e.launched(local);
+    e.finished(at(local, "ctl-leave"));
+    e.dropped(at(local, "ctl-leave"));
+    e.finished(at(local, "launch-error"));
+    expect(e.value).toBe(1);
+    e.dropped(at(local, "launch-error"));
+    expect(e.value).toBe(0);
   });
 });

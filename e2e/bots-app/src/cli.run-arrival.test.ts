@@ -18,7 +18,8 @@ vi.mock("./orchestrator", async (importOriginal) => ({
   runBotsToCompletion: mocks.runBotsToCompletion,
 }));
 
-vi.mock("./resource/session", () => ({
+vi.mock("./resource/session", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./resource/session")>()),
   ResourceCaptureSession: class {
     readonly label = "cli-run-test";
     startLocal(): void {

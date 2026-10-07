@@ -1,4 +1,7 @@
+import dns from "node:dns";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,21 +43,30 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-/** Drive the real `conduct` subcommand, capturing every written line. */
-async function runConduct(args: string[]): Promise<string[]> {
+let lastExit: number | null = null;
+
+/** Drive the real `conduct` subcommand, capturing every written line; `lastExit` gets its exit code. */
+async function runConduct(args: string[], healthz?: unknown): Promise<string[]> {
+  lastExit = null;
   const written: string[] = [];
   const record = (...a: unknown[]): void => {
     written.push(a.map(String).join(" "));
   };
   const spies = [
     vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      lastExit = code ?? 0;
       throw new ExitSignal(code ?? 0);
     }) as never),
     vi.spyOn(console, "error").mockImplementation(record),
     vi.spyOn(console, "log").mockImplementation(record),
     vi
       .spyOn(globalThis, "fetch")
-      .mockImplementation((async () => ({ ok: false }) as Response) as typeof fetch),
+      .mockImplementation(
+        (async () =>
+          (healthz === undefined
+            ? { ok: false }
+            : { ok: true, json: async () => healthz }) as Response) as typeof fetch,
+      ),
   ];
   const savedToken = process.env.BOT_CTL_TOKEN;
   process.env.BOT_CTL_TOKEN = "conduct-logline-token";
@@ -239,5 +251,82 @@ describe("conduct.ts marker routing (#2480)", () => {
       .map(([n, l]) => `${n}: ${l.trim()}`);
     expect(offending).toEqual([]);
     expect(code()).toContain("conductLine(");
+  });
+});
+
+describe("conduct CLI exit code (#2386)", () => {
+  const IN_MEETING = { ok: true, bots: 1, inMeeting: 1, pending: 0, expected: 1 };
+
+  async function runAgainst(
+    muteStatus: number | "unresolvable",
+    healthz: unknown = IN_MEETING,
+    extraArgs: string[] = [],
+  ): Promise<{ exit: number | null; mutes: number; done: string | undefined }> {
+    let mutes = 0;
+    const server = createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.method === "GET" && req.url === "/bots") {
+        res.end(JSON.stringify({ bots: [{ botId: "b0", status: "joining" }] }));
+        return;
+      }
+      mutes += 1;
+      res.statusCode = muteStatus === "unresolvable" ? 500 : muteStatus;
+      res.end(JSON.stringify(muteStatus === 409 ? { error: "bot b0 is not yet in-meeting" } : {}));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const realLookup = dns.lookup;
+    const lookup = vi.spyOn(dns, "lookup").mockImplementation(((
+      host: string,
+      opts: { all?: boolean },
+      cb: (e: Error | null, a?: unknown, f?: number) => void,
+    ) => {
+      if (!host.endsWith(".fleet.invalid")) {
+        return (realLookup as (...a: unknown[]) => void)(host, opts, cb);
+      }
+      if (muteStatus === "unresolvable") cb(Object.assign(new Error(host), { code: "ENOTFOUND" }));
+      else if (opts?.all) cb(null, [{ address: "127.0.0.1", family: 4 }]);
+      else cb(null, "127.0.0.1", 4);
+    }) as never);
+    try {
+      const written = await runConduct(
+        [
+          "--scenario",
+          scenarioFile(),
+          "--port",
+          String((server.address() as AddressInfo).port),
+          "--dns-suffix",
+          "fleet.invalid",
+          ...extraArgs,
+        ],
+        healthz,
+      );
+      return { exit: lastExit, mutes, done: written.find((l) => l.includes("done - ")) };
+    } finally {
+      lookup.mockRestore();
+      await new Promise((r) => server.close(r));
+    }
+  }
+
+  it("exits 1 when the only problem is a call dropped as not joined (409)", async () => {
+    await expect(runAgainst(409)).resolves.toMatchObject({ exit: 1, mutes: 1 });
+  });
+
+  it("exits 1 when the only problem is an unreachable pod", async () => {
+    const r = await runAgainst("unresolvable");
+    expect(r.done).toContain("0 failed, 0 dropped (not joined), 1 unreachable");
+    expect(r.exit).toBe(1);
+  });
+
+  it("--allow-legacy-healthz lets a pod with a pre-#2917 /healthz through the gate", async () => {
+    const r = await runAgainst(200, { ok: true, bots: 1 }, [
+      "--allow-legacy-healthz",
+      "--readiness-timeout",
+      "100",
+    ]);
+    expect(r).toMatchObject({ exit: null, mutes: 1 });
+  });
+
+  it("does not exit 1 when every call fires", async () => {
+    await expect(runAgainst(200)).resolves.toMatchObject({ exit: null, mutes: 1 });
   });
 });

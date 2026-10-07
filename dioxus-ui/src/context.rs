@@ -302,7 +302,7 @@ pub fn save_density_mode(mode: DensityMode) {
 /// the layout would show". Like `Fixed(n)` it bypasses the adaptive loop, but
 /// instead of a literal count it tracks the live natural tile count, so it
 /// stays correct as peers join/leave. It is the persistent "show all paused
-/// videos" escape hatch reachable from the Appearance/Settings panel,
+/// videos" escape hatch reachable from the Settings Preferences panel,
 /// independent of the banner's `pressured && avatar_count > 0` gate. The #1286
 /// iOS device ceiling STILL binds on `All` (see `effective_cap`): "All" means
 /// "everything the layout shows, still subject to the hardware ceiling", never
@@ -963,8 +963,8 @@ impl HostSetCtx {
 /// icon. A `HashSet` of `session_id`s models this — insert on that session's
 /// `RECORDING_STARTED`, remove on its `RECORDING_STOPPED` (or on its departure),
 /// with no cross-entry coupling. The wire carries the recorder's own session id
-/// in `PeerEvent.stream_id` (see `VideoCallClient::send_peer_event`). There is
-/// no persisted server-side "who is recording" state, so this set is purely
+/// in `PeerEvent.stream_id` (see `VideoCallClient::send_peer_event`). The
+/// server registry (`RECORDING_STATE`) does not feed it yet, so this set is purely
 /// live: driven by peer events plus the local recorder's own JS state-machine
 /// transitions, and never seeded from a roster.
 #[derive(Clone, Copy)]
@@ -1232,17 +1232,10 @@ pub fn restore_device_id(stored: Option<&str>, available: &[String]) -> Option<S
 
 /// Resolve the initial on/off state to apply for a track when joining.
 ///
-/// Pure decision function (host-testable). The user's stored preference only
-/// takes effect when the corresponding permission was granted AND a device of
-/// that kind actually exists. If permission was denied or no device is present,
-/// the track must start OFF regardless of the stored preference — we never try
-/// to enable capture we cannot perform.
-pub fn resolve_initial_enabled(
-    stored_on: bool,
-    permission_granted: bool,
-    has_device: bool,
-) -> bool {
-    stored_on && permission_granted && has_device
+/// The stored preference takes effect only when the join-time probe for that
+/// track was granted.
+pub fn resolve_initial_enabled(stored_on: bool, permission_granted: bool) -> bool {
+    stored_on && permission_granted
 }
 
 /// Feature-detect `HTMLMediaElement.prototype.setSinkId` support, given a
@@ -1813,6 +1806,38 @@ pub fn resolve_transport_config(
     }
 }
 
+pub fn wt_would_be_attempted(
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+    wt_host_base: &str,
+) -> bool {
+    let hosts = wt_host_base
+        .split(',')
+        .filter(|h| !h.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let (enabled, _, wt_urls) = resolve_transport_config(pref, server_wt_enabled, vec![], hosts);
+    enabled && !wt_urls.is_empty()
+}
+
+/// From `ready` until unmount, when a join would try WT, hold a spare-worker lease and
+/// boot the spare WT session Worker.
+pub fn use_wt_session_worker_prewarm(ready: bool) {
+    let pref = use_context::<TransportPreferenceCtx>().0;
+    let lease = use_hook(|| Rc::new(videocall_client::WtSessionWorkerLease::default()));
+    if ready
+        && !lease.held()
+        && wt_would_be_attempted(
+            *pref.peek(),
+            crate::constants::webtransport_enabled().unwrap_or(false),
+            &crate::constants::webtransport_host_base().unwrap_or_default(),
+        )
+    {
+        lease.acquire();
+        videocall_client::prewarm_wt_session_worker();
+    }
+}
+
 /// Persist a transport-preference decision to storage, with no UI side effects.
 ///
 /// This is the single source of truth for "given a chosen protocol and whether
@@ -2305,25 +2330,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_initial_enabled_requires_all_conditions() {
-        // The happy path: stored on + permission + device present → on.
-        assert!(resolve_initial_enabled(true, true, true));
+    fn resolve_initial_enabled_on_when_stored_on_and_permitted() {
+        assert!(resolve_initial_enabled(true, true));
     }
 
     #[test]
     fn resolve_initial_enabled_off_when_stored_off() {
-        assert!(!resolve_initial_enabled(false, true, true));
+        assert!(!resolve_initial_enabled(false, true));
     }
 
     #[test]
     fn resolve_initial_enabled_off_when_permission_denied() {
-        // Never enable capture we are not allowed to perform.
-        assert!(!resolve_initial_enabled(true, false, true));
-    }
-
-    #[test]
-    fn resolve_initial_enabled_off_when_no_device() {
-        assert!(!resolve_initial_enabled(true, true, false));
+        assert!(!resolve_initial_enabled(true, false));
     }
 
     #[test]
@@ -2339,6 +2357,20 @@ mod tests {
             TransportPreference::WebTransport,
             "WebTransport is the compiled default; WebSocket is the explicit opt-out"
         );
+    }
+
+    #[test]
+    fn the_session_worker_is_prewarmed_only_when_a_join_would_open_a_wt_candidate() {
+        let wt = TransportPreference::WebTransport;
+        assert!(wt_would_be_attempted(wt, true, "https://a:4433"));
+        assert!(!wt_would_be_attempted(wt, false, "https://a:4433"));
+        assert!(!wt_would_be_attempted(wt, true, ""));
+        assert!(!wt_would_be_attempted(wt, true, " , "));
+        assert!(!wt_would_be_attempted(
+            TransportPreference::WebSocket,
+            true,
+            "https://a:4433"
+        ));
     }
 
     #[test]

@@ -34,10 +34,11 @@ use crate::actors::session_logic::{
 use crate::actors::shed_escalation::DownlinkShedEscalation;
 use crate::constants::{
     wt_mailbox_capacity, wt_outbound_channel_capacity, AudioDownlinkLane, CLIENT_TIMEOUT,
-    OUTBOUND_SCREEN_BYTE_BUDGET, OUTBOUND_VIDEO_BYTE_BUDGET, WT_DATAGRAM_CHANNEL_CAPACITY,
+    KICK_CLOSE_FLUSH_DELAY, OUTBOUND_SCREEN_BYTE_BUDGET, OUTBOUND_VIDEO_BYTE_BUDGET,
+    WT_DATAGRAM_CHANNEL_CAPACITY,
 };
 use crate::messages::server::{ActivateConnection, Packet};
-use crate::messages::session::Message;
+use crate::messages::session::{ForceClose, Message};
 use crate::metrics::{
     OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_DOWNLINK_SHED_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH,
     RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION, RELAY_PACKET_DROPS_TOTAL,
@@ -51,6 +52,7 @@ use actix::{
 use bytes::Bytes;
 use protobuf::Enum as ProtobufEnum;
 use protobuf::Message as ProtobufMessage;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -583,6 +585,10 @@ pub struct WtChatSession {
 
     /// Track if ActivateConnection has been sent
     activated: bool,
+
+    /// Set when a host kick closes this session (#2934), so the connection
+    /// closes with [`videocall_types::wt_close::WT_CLOSE_CODE_REMOVED_BY_HOST`].
+    removed_by_host: Arc<AtomicBool>,
 }
 
 /// Pure outbound-routing decision used by [`WtChatSession::send_auto`].
@@ -721,7 +727,20 @@ impl WtChatSession {
             audio_lane,
             escalation,
             activated: false,
+            removed_by_host: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether a host kick closed this session. Read BEFORE `start()`, like
+    /// [`Self::session_id`].
+    pub fn removed_by_host(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.removed_by_host)
+    }
+
+    /// Carry the room token's `iat` claim into `JoinRoom` (#2934).
+    pub fn with_token_iat(mut self, token_iat: Option<i64>) -> Self {
+        self.logic.token_iat = token_iat;
+        self
     }
 
     /// The canonical per-session id for this connection (`SessionLogic::id`).
@@ -1355,6 +1374,19 @@ impl Handler<StopSession> for WtChatSession {
     }
 }
 
+impl Handler<ForceClose> for WtChatSession {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ForceClose, ctx: &mut Self::Context) -> Self::Result {
+        info!(
+            "Closing WebTransport session {} in room {}: removed by host",
+            self.logic.id, self.logic.room
+        );
+        self.removed_by_host.store(true, Ordering::Release);
+        ctx.run_later(KICK_CLOSE_FLUSH_DELAY, |_act, ctx| ctx.stop());
+    }
+}
+
 /// Handle outbound packets (forwarding to ChatServer)
 impl Handler<Packet> for WtChatSession {
     type Result = ();
@@ -1379,7 +1411,10 @@ impl Handler<Packet> for WtChatSession {
 
 impl WtChatSession {
     fn join_room(&self, ctx: &mut Context<Self>) {
-        let join_room = self.logic.addr.send(self.logic.create_join_room_message());
+        let join_room = self.logic.addr.send(
+            self.logic
+                .create_join_room_message(ctx.address().recipient()),
+        );
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {

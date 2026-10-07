@@ -1,0 +1,50 @@
+{
+  "schema": "call-quality-run-manifest/v1",
+  "run_id": "r42",
+  "meeting_id": "scale-r42",
+  "environment": "local",
+  "code": {
+    "commit": "0000000000000000000000000000000000000000",
+    "images": {"ui": "sha256:example-ui", "relay_ws": "sha256:example-ws", "relay_wt": "sha256:example-wt",
+               "bots_app": "sha256:example-bots", "rust_bot": "sha256:example-rust"}
+  },
+  "scenario": {"file": "e2e/scenarios/example.yaml", "sha256": "example"},
+  "clock": {"sync": "chrony", "max_abs_skew_ms": 3.2, "measured_at": 1759200000.0,
+            "per_node": [{"node": "node-a", "skew_ms": 1.1}]},
+  "steps": [
+    {"step_id": "n3", "n_target": 3, "join_start": 1759200000.0, "hold_start": 1759200060.0,
+     "hold_end": 1759200360.0, "headline": false},
+    {"step_id": "n5", "n_target": 5, "join_start": 1759200360.0, "hold_start": 1759200420.0,
+     "hold_end": 1759201020.0, "headline": true}
+  ],
+  "events": [
+    {"at": 1759200900.0, "step_id": "n5", "action": "netem", "participants": ["probe-002@bots-app.local"],
+     "params": {"profile": "lossy_mobile"}}
+  ],
+  "participants": [
+    {"user_id": "probe-000@bots-app.local", "fleet": "browser", "role": "probe-ref", "observer": true, "talker": false,
+     "publishes": {"camera": true, "mic": false, "screen": false},
+     "network": {"profile": "none", "shaped": false, "direction": "none", "shaper": "none"},
+     "transport_intended": "auto", "placement": {"ordinal": 0, "node": "node-a"}, "stagger_ms": 1200,
+     "join_ts": 1759200005.0, "leave_ts": null, "steps": ["n3", "n5"]},
+    {"user_id": "probe-001@bots-app.local", "fleet": "browser", "role": "probe-ref", "observer": true, "talker": false,
+     "publishes": {"camera": true, "mic": false, "screen": false},
+     "network": {"profile": "none", "shaped": false, "direction": "none", "shaper": "none"},
+     "transport_intended": "auto", "placement": {"ordinal": 1, "node": "node-a"}, "stagger_ms": 1500,
+     "join_ts": 1759200006.0, "leave_ts": null, "steps": ["n3", "n5"]},
+    {"user_id": "probe-002@bots-app.local", "fleet": "browser", "role": "slow-receivers", "observer": true, "talker": false,
+     "publishes": {"camera": true, "mic": false, "screen": false},
+     "network": {"profile": "lossy_mobile", "shaped": true, "direction": "both", "shaper": "netem",
+                 "params": {"delay_ms": 80, "jitter_ms": 20, "loss_pct": 3}},
+     "transport_intended": "websocket", "placement": {"ordinal": 2, "node": "node-b"}, "stagger_ms": 1800,
+     "join_ts": 1759200365.0, "leave_ts": null, "steps": ["n5"]},
+    {"user_id": "speaker-000", "fleet": "rust", "role": "speakers", "observer": false, "talker": true,
+     "publishes": {"camera": true, "mic": true, "screen": false},
+     "network": {"profile": "none", "shaped": false, "direction": "none", "shaper": "none"},
+     "transport_intended": "webtransport", "join_ts": 1759200010.0, "leave_ts": null, "steps": ["n3", "n5"]},
+    {"user_id": "viewer-000", "fleet": "rust", "role": "viewers", "observer": false, "talker": false,
+     "publishes": {"camera": false, "mic": false, "screen": false},
+     "network": {"profile": "none", "shaped": false, "direction": "none", "shaper": "none"},
+     "transport_intended": "websocket", "join_ts": 1759200370.0, "leave_ts": null, "steps": ["n5"]}
+  ]
+}

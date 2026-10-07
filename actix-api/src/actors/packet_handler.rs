@@ -2000,6 +2000,23 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+
+        use videocall_types::protos::meeting_packet::{
+            meeting_packet::MeetingEventType, MeetingPacket,
+        };
+        let forged_registry = MeetingPacket {
+            event_type: MeetingEventType::RECORDING_STATE.into(),
+            room_id: "room".to_string(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: videocall_types::SYSTEM_USER_ID.as_bytes().to_vec(),
+            data: forged_registry.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
     }
 
     #[test]

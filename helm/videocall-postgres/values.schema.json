@@ -41,6 +41,7 @@
           "properties": {
             "persistence": {
               "type": "object",
+              "required": ["enabled", "existingClaim"],
               "properties": {
                 "enabled": { "type": "boolean" },
                 "existingClaim": { "type": "string" },

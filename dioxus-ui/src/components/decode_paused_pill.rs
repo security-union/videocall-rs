@@ -480,7 +480,7 @@ pub fn DecodePausedPill(
                     // (issue #1466) so EVERY present peer decodes — and stays
                     // decoded as peers join, since `All` tracks the live natural
                     // count rather than a frozen `Fixed(n)`. This is the exact
-                    // path the banner and the appearance settings panel use —
+                    // path the banner and the preferences settings panel use —
                     // set the shared context signal AND persist to localStorage
                     // — so the render scope's `effective_cap(All, …)` re-reveals
                     // all tiles on the next frame and the choice survives

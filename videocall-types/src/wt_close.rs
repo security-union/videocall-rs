@@ -26,6 +26,15 @@ pub const WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE: u32 = 1001;
 /// Trace and log text for [`WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE`]; the client matches on the CODE.
 pub const WT_CLOSE_REASON_DOWNLINK_UNRECOVERABLE: &[u8] = b"downlink-shed-escalation";
 
+/// Sent by the relay when it closes a session whose participant the host kicked
+/// (#2934). The PARTICIPANT_KICKED notice precedes it.
+pub const WT_CLOSE_CODE_REMOVED_BY_HOST: u32 = 1002;
+
+/// Trace and log text for [`WT_CLOSE_CODE_REMOVED_BY_HOST`].
+pub const WT_CLOSE_REASON_REMOVED_BY_HOST: &[u8] = b"removed-by-host";
+
+const _: () = assert!(WT_CLOSE_CODE_REMOVED_BY_HOST >= 1000);
+
 const _: () = assert!(
     WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE >= 1000,
     "code 0 is the clean close every pre-existing relay path uses, so a \

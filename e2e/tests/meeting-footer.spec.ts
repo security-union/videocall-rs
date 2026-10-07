@@ -8,6 +8,12 @@ import { joinMeetingFromPage } from "../helpers/two-user-meeting";
 import { setShowBuildGitInfoFlag } from "../helpers/show-build-git-info-config";
 import { openPeerList } from "../helpers/controls";
 import { MEETING_FOOTER } from "../helpers/rust-mirrored-constants";
+import {
+  CHANGELOG_JSON_REPLY,
+  CHANGELOG_NEWEST_CHANGES,
+  CHANGELOG_NEWEST_FIRST,
+  routeChangelog,
+} from "../helpers/whats-new";
 
 /**
  * The in-call meeting footer and its "Meeting info" dialog (issue 2791).
@@ -21,6 +27,7 @@ import { MEETING_FOOTER } from "../helpers/rust-mirrored-constants";
 
 const DEFAULT_UI_URL = "http://localhost:3001";
 const DESKTOP = { width: 1280, height: 720 };
+const SHORT_LAPTOP = { width: 1366, height: 650 };
 const EPS = 1;
 const FOOTER_H = MEETING_FOOTER.MEETING_FOOTER_RESERVE;
 
@@ -41,6 +48,9 @@ const GRID = "#grid-container";
 const GRID_TILES = "#grid-container > .ss-peer-panel > .tile-slot > .grid-item";
 const PEER_LIST = "#peer-list-container";
 const TIMER_RE = /^\d{2}:\d{2}(:\d{2})?$/;
+const WHATS_NEW_TOGGLE =
+  'section[aria-labelledby="meeting-info-section-app"] > .changelog > [data-testid="changelog-toggle"]';
+const WHATS_NEW_PANEL_ID = "meeting-info-changelog-panel";
 
 function readClientVersionFromCargoToml(): string {
   const cargoTomlPath = path.resolve(__dirname, "../../dioxus-ui/Cargo.toml");
@@ -344,6 +354,97 @@ test.describe("In-call meeting footer and Meeting info dialog (issue 2791)", () 
 
       await page.keyboard.press("Escape");
       await expectDialogClosedWithFocusOnTrigger(page, "Escape");
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("Meeting info lists the newest builds under What's new, and Escape from the log still closes it (issue 2882)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterLog");
+      const changelogRequests = await routeChangelog(page, [CHANGELOG_JSON_REPLY]);
+      await joinSoloMeeting(page, `e2e_footer_log_${Date.now()}`, "FooterLog");
+      await expectFooter(page);
+
+      const dialog = await openDialog(page);
+      const toggle = dialog.locator(WHATS_NEW_TOGGLE);
+      await expect(toggle).toHaveAttribute("aria-expanded", "false");
+      await expect(toggle).toHaveAttribute("aria-controls", WHATS_NEW_PANEL_ID);
+      expect(changelogRequests(), "nothing is fetched until the log is expanded").toBe(0);
+
+      await toggle.click();
+      await expect(toggle).toHaveAttribute("aria-expanded", "true");
+      const panel = dialog.locator(`#${WHATS_NEW_PANEL_ID}`);
+      await expect(panel).toHaveAttribute("data-testid", "changelog-panel");
+      const builds = panel.locator(':scope > [data-testid="changelog-build"]');
+      await expect(builds).toHaveCount(3);
+      await expect(builds.locator("h5 > .changelog-build-version")).toHaveText(
+        CHANGELOG_NEWEST_FIRST.slice(0, 3),
+      );
+      await expect(panel.locator("#meeting-info-changelog-build-0")).toContainText(
+        CHANGELOG_NEWEST_FIRST[0],
+      );
+      await expect(builds.first().locator('ul > [data-testid="changelog-change"]')).toHaveText(
+        CHANGELOG_NEWEST_CHANGES,
+      );
+      expect(changelogRequests()).toBe(1);
+
+      await expect(toggle, "Escape starts from inside the expanded log").toBeFocused();
+      await page.keyboard.press("Escape");
+      await expectDialogClosedWithFocusOnTrigger(page, "Escape from the expanded log");
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("on a short laptop screen, expanding What's new brings the log into the Meeting info card (issue 2882)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterLogFold");
+      await page.setViewportSize(SHORT_LAPTOP);
+      await routeChangelog(page, [CHANGELOG_JSON_REPLY]);
+      await joinSoloMeeting(page, `e2e_footer_log_fold_${Date.now()}`, "FooterLogFold");
+      await expectFooter(page);
+
+      const dialog = await openDialog(page);
+      const toggle = dialog.locator(WHATS_NEW_TOGGLE);
+      await expect(toggle).toBeVisible();
+      // Scroll the card only as far as a user must to reach the toggle: its bottom edge.
+      await toggle.evaluate((el) => el.scrollIntoView({ block: "end" }));
+      await toggle.click({ timeout: 5_000 });
+      const panel = dialog.locator(`#${WHATS_NEW_PANEL_ID}`);
+      await expect(panel.locator(':scope > [data-testid="changelog-build"]')).toHaveCount(3);
+      expect(
+        await dialog.evaluate((card) => card.scrollHeight > card.clientHeight + 1),
+        "premise: the expanded log overflows the card at this viewport",
+      ).toBe(true);
+
+      const cardBottom = async () => (await rectOf(dialog, "the Meeting info card")).bottom;
+      // The card scrolls smoothly unless reduced motion is set, so poll the settled layout.
+      await expect
+        .poll(async () => (await rectOf(panel, "the change log")).top < (await cardBottom()), {
+          timeout: 5_000,
+          message: "the change log's top edge must be above the card's bottom edge",
+        })
+        .toBe(true);
+      const newestHeading = panel.locator("#meeting-info-changelog-build-0");
+      await expect
+        .poll(
+          async () =>
+            (await rectOf(newestHeading, "the newest build heading")).bottom <=
+            (await cardBottom()) + EPS,
+          { timeout: 5_000, message: "the newest build's heading must be fully inside the card" },
+        )
+        .toBe(true);
     } finally {
       await browser.close();
     }

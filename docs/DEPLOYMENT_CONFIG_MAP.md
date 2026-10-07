@@ -57,11 +57,12 @@ Local dev and CI stacks.
 | `docker/docker-compose.yaml` | Main local dev stack |
 | `docker/docker-compose.e2e.yaml` | Playwright E2E stack (Dioxus UI on port 3001 + shared backend) |
 | `docker/docker-compose.integration.yaml` | Integration test stack |
+| `docker/docker-compose.monitoring.yaml` | Monitoring overlay for the E2E stack (`make e2e-up-monitoring`) |
 | `docker/.env-sample` | Env var template (copy to `.env` at repo root) |
 | `docker/bot-config.yaml` | Synthetic-bot configuration |
-| `docker/monitoring/prometheus/prometheus.yml` | Local Prometheus config |
+| `docker/monitoring/prometheus/prometheus.yml` | Local Prometheus config (dev stack and E2E overlay); restart the prometheus container after editing it, `/-/reload` re-reads the rendered copy |
+| `docker/monitoring/prometheus/entrypoint.sh` | Renders the WS relay port into the Prometheus config |
 | `docker/monitoring/prometheus/alert_rules.yml` | Local Prometheus alert rules |
-| `docker/monitoring/grafana/dashboards/*.json` | Local Grafana dashboards |
 | `docker/monitoring/grafana/provisioning/` | Local Grafana datasource + dashboard provisioning |
 | `docker/Dockerfile.actix.dev` | Backend (actix-api) dev image |
 | `docker/Dockerfile.dioxus.dev` | Frontend (Dioxus UI) dev image |
@@ -97,6 +98,7 @@ behaves as the default says.
 |---|---|---|
 | `wtReceiveWorker` | ON | `"0"`, `"false"`, `"off"` or `"no"` runs the WebTransport session on the main thread instead of in its dedicated Worker (issue #2728). The Worker exists so a main-thread stall cannot starve the receive path; turning it off restores the pre-#2728 behaviour, including the audio-lane read starvation that stall caused. Applies to WebTransport only; WebSocket is unaffected. |
 | `defaultTransport` | `"webtransport"` | `"websocket"` hands every user who has NOT chosen a protocol in Settings a WebSocket-only connection, which is the pre-#2711 behaviour. Trimmed and case-insensitive; absent, empty or unrecognised leaves the compiled default in place, and an unrecognised value logs a `warn!` so a rollback that did not take is visible. This is the cluster-wide rollback for the epic #2711 default flip. It does NOT override a user who picked a protocol: precedence is stored user preference, then this key, then the compiled default. Users already carrying a sticky or session pin keep it until they clear it in Settings. **Set this to `"websocket"` whenever you set `webTransportEnabled: "false"`** — the two are independent keys, and leaving the default on WebTransport there means every unseeded user's RESOLVED preference is WebTransport (nothing is stored) while the client runs WebSocket. The Settings panel marks WebSocket as the default and shows the WebTransport option as unavailable on a `webTransportEnabled: "false"` deployment whatever this key says, so the UI never names a protocol the cluster cannot use. |
+| `diagnosticsPacketsEnabled` | ON | `"0"`, `"false"`, `"off"` or `"no"` (case-insensitive) stops the meeting client sending `DiagnosticsPacket`s; this client's own receive-side diagnostics and health reporting are unchanged, but peers lose its reception reports, so their sender-side stats about it (`SenderDiagnosticManager`, the diagnostics panel's "Sender" entries, vcprobe's DIAGNOSTICS view) stay empty while it is off. Absent, empty or unrecognised leaves it on. Set it as a string in Helm values (`--set-string`), like the other string keys. A falsy value is a ceiling: the `?diag_packets=` query param is then ignored, so a URL cannot re-enable sending. When this key is absent, empty, unrecognised or truthy, `?diag_packets=0` (any falsy spelling) disables sending for that page load, and `?diag_packets=1` changes nothing but the logged source. The param is read once at page load, so it must be on the URL the browser loads: in-app navigation does not add it, a page reload re-reads the address bar, and the guest redirect to `/meeting/<id>/guest` does not carry the query string. These packets are the only periodic outbound ones driven by a Worker timer; the other periodic packets use main-thread timers, and the relay refreshes a WebTransport session only on inbound data (30 s `CLIENT_TIMEOUT`). The client logs at `info` level `diagnostics packets: ENABLED\|DISABLED (source=url\|config\|default)` when it builds the meeting client. |
 
 `window.__VC_WT_RECEIVE_WORKER` is the same switch as a devtools/e2e override and
 takes precedence over the config key. It is not an operator interface.
@@ -177,7 +179,7 @@ restart plus a client reload, not a live flip.
 | Local dev stack composition | `docker/docker-compose.yaml` + `docker/.env-sample` → `.env` |
 | Frontend runtime URL injection | `dioxus-ui/scripts/config.js` (committed default) or `config.local.js` (local override) |
 | Add a new per-service default | `helm/{chart}/values.yaml` |
-| Local Grafana dashboard for dev | `docker/monitoring/grafana/dashboards/*.json` |
+| Local Grafana dashboard for dev | Mounted read-only from `helm/grafana/dashboards/` |
 | Bot configuration | `docker/bot-config.yaml` (local) / helm equivalent for production |
 | TLS / cert issuer | `helm/cert-manager-issuer/values.yaml` |
 | Ingress rules (per cluster) | `helm/global/{cluster}/ingress-nginx/values.yaml` |

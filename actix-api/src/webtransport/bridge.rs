@@ -107,7 +107,7 @@ use tracing::{debug, error, info, warn};
 use videocall_types::wt_close::{
     WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE, WT_CLOSE_REASON_DOWNLINK_UNRECOVERABLE,
 };
-use web_transport_quinn::{Session, SessionError};
+use web_transport_quinn::{quinn, Session, SessionError, WebTransportError};
 
 /// WebTransport/HTTP/3 application error code used when the relay RESETS a
 /// wedged persistent server→client uni stream (#1638).
@@ -135,7 +135,9 @@ pub type PacketSentCallback = Box<dyn Fn() + Send + Sync>;
 /// - Drain the actor's datagram outbound channel onto
 ///   `session.send_datagram` (unframed)
 pub struct WebTransportBridge {
-    join_set: JoinSet<()>,
+    join_set: JoinSet<&'static str>,
+    session: Session,
+    escalation: DownlinkShedEscalation,
 }
 
 impl WebTransportBridge {
@@ -203,6 +205,7 @@ impl WebTransportBridge {
         // closure type. `Option<Arc<...>>` lets us cheaply share a single
         // counter across both writers; in production both are `None`.
         let on_packet_sent = on_packet_sent.map(Arc::new);
+        let bridge_escalation = escalation.clone();
 
         Self::spawn_unistream_reader(&mut join_set, session.clone(), actor_addr.clone());
         Self::spawn_datagram_reader(&mut join_set, session.clone(), actor_addr);
@@ -228,7 +231,7 @@ impl WebTransportBridge {
         }
         Self::spawn_datagram_writer(
             &mut join_set,
-            session,
+            session.clone(),
             datagram_rx,
             unistream_fallback_tx,
             unistream_bytes,
@@ -236,12 +239,49 @@ impl WebTransportBridge {
             datagram_send_calls,
         );
 
-        Self { join_set }
+        Self {
+            join_set,
+            session,
+            escalation: bridge_escalation,
+        }
     }
 
-    /// Wait for any I/O task to complete (indicates session end).
-    pub async fn wait_for_disconnect(&mut self) {
-        self.join_set.join_next().await;
+    /// Wait for the first bridge task to end; return who closed the session, the
+    /// peer's WT close code and reason if it sent one, and that task's label (or
+    /// `task_failed` if it panicked).
+    #[must_use]
+    pub async fn wait_for_disconnect(&mut self) -> String {
+        let ended = match self.join_set.join_next().await {
+            Some(Ok(label)) => label,
+            Some(Err(_)) => "task_failed",
+            None => "none",
+        };
+        match self.closed_by() {
+            (closed_by, Some(wt_close)) => {
+                format!("closed_by={closed_by} wt_close={wt_close} ended={ended}")
+            }
+            (closed_by, None) => format!("closed_by={closed_by} ended={ended}"),
+        }
+    }
+
+    /// `no_close_frame`: no WT close capsule and no CONNECTION_CLOSE arrived — an idle
+    /// timeout, stateless reset, CONNECT stream FIN/reset without a capsule, or a
+    /// transport error the relay itself detected.
+    fn closed_by(&self) -> (&'static str, Option<String>) {
+        let shed_close = self.escalation.session_closed();
+        let close_reason = self.session.close_reason();
+        let conn: &quinn::Connection = &self.session;
+        let peer_close_frames = conn.stats().frame_rx.connection_close;
+        match close_reason {
+            _ if shed_close => ("relay_shed", None),
+            Some(SessionError::WebTransportError(WebTransportError::Closed(code, reason))) => (
+                "peer_wt",
+                Some(quote_capped(&format!("code={code} reason={reason}"))),
+            ),
+            None => ("relay_task", None),
+            Some(_) if peer_close_frames > 0 => ("peer_quic", None),
+            Some(_) => ("no_close_frame", None),
+        }
     }
 
     /// Shutdown all I/O tasks.
@@ -267,8 +307,11 @@ impl WebTransportBridge {
     /// reader matches that shape. Multiple frames per stream are read
     /// in order; the per-stream task exits cleanly when the client
     /// closes the stream.
-    fn spawn_unistream_reader<A>(join_set: &mut JoinSet<()>, session: Session, actor_addr: Addr<A>)
-    where
+    fn spawn_unistream_reader<A>(
+        join_set: &mut JoinSet<&'static str>,
+        session: Session,
+        actor_addr: Addr<A>,
+    ) where
         A: actix::Actor<Context = actix::Context<A>> + actix::Handler<WtInbound>,
     {
         join_set.spawn(async move {
@@ -279,12 +322,16 @@ impl WebTransportBridge {
                 });
             }
             info!("WebTransport UniStream reader ended");
+            "uni_reader"
         });
     }
 
     /// Spawn Datagram reader task.
-    fn spawn_datagram_reader<A>(join_set: &mut JoinSet<()>, session: Session, actor_addr: Addr<A>)
-    where
+    fn spawn_datagram_reader<A>(
+        join_set: &mut JoinSet<&'static str>,
+        session: Session,
+        actor_addr: Addr<A>,
+    ) where
         A: actix::Actor<Context = actix::Context<A>> + actix::Handler<WtInbound>,
     {
         join_set.spawn(async move {
@@ -306,6 +353,7 @@ impl WebTransportBridge {
                 }
             }
             info!("WebTransport Datagram reader ended");
+            "datagram_reader"
         });
     }
 
@@ -327,7 +375,7 @@ impl WebTransportBridge {
     /// writer.
     #[allow(clippy::too_many_arguments)]
     fn spawn_unistream_writer(
-        join_set: &mut JoinSet<()>,
+        join_set: &mut JoinSet<&'static str>,
         session: Session,
         mut unistream_rx: mpsc::Receiver<WtOutboundFrame>,
         unistream_bytes: Arc<SharedQueueByteMeter>,
@@ -371,6 +419,7 @@ impl WebTransportBridge {
                 }
             }
             info!("WebTransport UniStream writer ended");
+            "uni_writer"
         });
     }
 
@@ -381,7 +430,7 @@ impl WebTransportBridge {
     /// meter on dequeue, so this hand-off does not.
     #[allow(clippy::too_many_arguments)]
     fn spawn_downlink_dispatcher(
-        join_set: &mut JoinSet<()>,
+        join_set: &mut JoinSet<&'static str>,
         session: Session,
         mut unistream_rx: mpsc::Receiver<WtOutboundFrame>,
         unistream_bytes: Arc<SharedQueueByteMeter>,
@@ -416,6 +465,7 @@ impl WebTransportBridge {
 
             map.close_and_join().await;
             info!("WebTransport downlink dispatcher ended");
+            "downlink_dispatcher"
         });
     }
 
@@ -433,7 +483,7 @@ impl WebTransportBridge {
     /// `UnsupportedByPeer` is counted AND diverted rather than dropped.
     #[allow(clippy::too_many_arguments)]
     fn spawn_datagram_writer(
-        join_set: &mut JoinSet<()>,
+        join_set: &mut JoinSet<&'static str>,
         session: Session,
         mut datagram_rx: mpsc::Receiver<WtOutboundFrame>,
         unistream_fallback_tx: mpsc::Sender<WtOutboundFrame>,
@@ -467,8 +517,20 @@ impl WebTransportBridge {
                 }
             }
             info!("WebTransport Datagram writer ended");
+            "datagram_writer"
         });
     }
+}
+
+/// Caps the whole `wt_close` value (code and peer-supplied reason), then quotes it onto one line.
+const CLOSE_CAUSE_FIELD_MAX_CHARS: usize = 200;
+
+fn quote_capped(peer_text: &str) -> String {
+    let capped: String = peer_text
+        .chars()
+        .take(CLOSE_CAUSE_FIELD_MAX_CHARS)
+        .collect();
+    format!("{capped:?}")
 }
 
 /// Which downlink topology the relay serves one receiver (#2723).
@@ -1711,6 +1773,9 @@ async fn read_framed_packets_loop<A>(
                     data: Bytes::from(payload),
                     source: WtInboundSource::UniStream,
                 }) {
+                    if matches!(e, actix::prelude::SendError::Closed(_)) {
+                        return;
+                    }
                     // #1146: count the drop so a sustained inbound-media drop is
                     // visible on dashboards/alerts, not just in the warn log
                     // (which at volume is itself noise/cost).
@@ -2093,7 +2158,7 @@ mod writer_shed_tests {
         build_test_server_with_transport(None)
     }
 
-    fn build_test_server_with_transport(
+    pub(super) fn build_test_server_with_transport(
         transport: Option<Arc<quinn::TransportConfig>>,
     ) -> (std::net::SocketAddr, web_transport_quinn::Server) {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -2172,7 +2237,7 @@ mod writer_shed_tests {
     }
 
     /// Drive a frame onto the bridge's outbound unistream channel.
-    fn push(
+    pub(super) fn push(
         tx: &mpsc::Sender<WtOutboundFrame>,
         n: usize,
     ) -> Result<(), mpsc::error::TrySendError<WtOutboundFrame>> {
@@ -3631,8 +3696,8 @@ mod datagram_send_failure_tests {
 #[cfg(test)]
 mod downlink_stream_tests {
     use super::writer_shed_tests::{
-        build_test_server, connect_test_client, relief_stamp_total, test_drop_sink,
-        test_drop_sink_with, test_relief_signal, StubActor,
+        build_test_server, build_test_server_with_transport, connect_test_client, push,
+        relief_stamp_total, test_drop_sink, test_drop_sink_with, test_relief_signal, StubActor,
     };
     use super::*;
     use crate::actors::session_logic::RELIEF_SOURCE_OUTBOUND_DROP;
@@ -5685,6 +5750,273 @@ mod downlink_stream_tests {
             session_closes_total("shed_rounds") - closes_before,
             1.0,
             "one close, whatever the lane count",
+        );
+    }
+
+    struct CloseCauseRig {
+        client: web_transport_quinn::Session,
+        bridge: WebTransportBridge,
+        uni_tx: mpsc::Sender<WtOutboundFrame>,
+        dgram_tx: mpsc::Sender<WtOutboundFrame>,
+        escalation: DownlinkShedEscalation,
+    }
+
+    async fn close_cause_rig(transport: Option<Arc<quinn::TransportConfig>>) -> CloseCauseRig {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (addr, mut server) = build_test_server_with_transport(transport);
+        let server_session_fut = tokio::spawn(async move {
+            let request = server.accept().await.expect("accept request");
+            request.ok().await.expect("respond ok")
+        });
+        let client = connect_test_client(addr).await;
+        let server_session = server_session_fut.await.expect("join server session");
+
+        let (uni_tx, uni_rx) = mpsc::channel::<WtOutboundFrame>(16);
+        let (dgram_tx, dgram_rx) = mpsc::channel::<WtOutboundFrame>(16);
+        let escalation = DownlinkShedEscalation::new();
+        let bridge = WebTransportBridge::new_with_callback(
+            server_session,
+            StubActor.start(),
+            uni_rx,
+            dgram_rx,
+            uni_tx.clone(),
+            Arc::new(SharedQueueByteMeter::default()),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            test_drop_sink().0,
+            DownlinkStreamMode::Single,
+            escalation.clone(),
+        );
+        CloseCauseRig {
+            client,
+            bridge,
+            uni_tx,
+            dgram_tx,
+            escalation,
+        }
+    }
+
+    async fn close_cause_after(bridge: &mut WebTransportBridge) -> String {
+        tokio::time::timeout(Duration::from_secs(10), bridge.wait_for_disconnect())
+            .await
+            .expect("the bridge must end")
+    }
+
+    /// Splits a close cause into `(key, value)` pairs, decoding quoted values.
+    fn close_cause_tokens(cause: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut rest = cause;
+        while !rest.is_empty() {
+            let (key, after) = rest.split_once('=').expect("key=value");
+            let (value, next) = match after.strip_prefix('"') {
+                Some(quoted) => {
+                    let (mut value, mut escaped, mut end) = (String::new(), false, None);
+                    for (i, c) in quoted.char_indices() {
+                        if escaped {
+                            value.push(if c == 'n' { '\n' } else { c });
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            end = Some(i);
+                            break;
+                        } else {
+                            value.push(c);
+                        }
+                    }
+                    (value, &quoted[end.expect("closing quote") + 1..])
+                }
+                None => {
+                    let (v, n) = after.split_once(' ').unwrap_or((after, ""));
+                    (v.to_string(), n)
+                }
+            };
+            out.push((key.to_string(), value));
+            rest = next.strip_prefix(' ').unwrap_or(next);
+        }
+        out
+    }
+
+    fn close_cause_field_of(cause: &str, key: &str) -> String {
+        close_cause_tokens(cause)
+            .into_iter()
+            .find_map(|(k, v)| (k == key).then_some(v))
+            .unwrap_or_else(|| panic!("no {key}= in {cause:?}"))
+    }
+
+    fn assert_close_cause_keys(cause: &str, expected: &[&str]) {
+        let keys: Vec<String> = close_cause_tokens(cause)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, expected, "{cause:?}");
+    }
+
+    fn assert_a_reader_ended(cause: &str) {
+        let ended = close_cause_field_of(cause, "ended");
+        assert!(
+            ended == "uni_reader" || ended == "datagram_reader",
+            "a closed connection ends a reader first, got {cause:?}",
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn wait_for_disconnect_returns_the_peers_close_code_and_reason() {
+        let mut rig = close_cause_rig(None).await;
+
+        rig.client.close(4242, b"client-left");
+        let cause = close_cause_after(&mut rig.bridge).await;
+        rig.bridge.shutdown().await;
+
+        assert!(
+            cause
+                .starts_with(r#"closed_by=peer_wt wt_close="code=4242 reason=client-left" ended="#),
+            "the close cause must carry the peer's code and reason, got {cause:?}",
+        );
+        assert_a_reader_ended(&cause);
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn a_peer_quic_close_without_a_capsule_is_named_as_a_peer_close() {
+        let mut rig = close_cause_rig(None).await;
+
+        let conn: &quinn::Connection = &rig.client;
+        conn.close(0x100u32.into(), b"tab-gone");
+        let cause = close_cause_after(&mut rig.bridge).await;
+        rig.bridge.shutdown().await;
+
+        assert_close_cause_keys(&cause, &["closed_by", "ended"]);
+        assert_eq!(
+            close_cause_field_of(&cause, "closed_by"),
+            "peer_quic",
+            "{cause:?}"
+        );
+        assert_a_reader_ended(&cause);
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn an_idle_timeout_is_not_named_as_a_peer_or_relay_close() {
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            Duration::from_millis(300)
+                .try_into()
+                .expect("idle timeout fits"),
+        ));
+        let mut rig = close_cause_rig(Some(Arc::new(transport))).await;
+
+        let cause = close_cause_after(&mut rig.bridge).await;
+        rig.bridge.shutdown().await;
+
+        assert_close_cause_keys(&cause, &["closed_by", "ended"]);
+        assert_eq!(
+            close_cause_field_of(&cause, "closed_by"),
+            "no_close_frame",
+            "{cause:?}"
+        );
+        assert_a_reader_ended(&cause);
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn a_relay_side_end_names_the_bridge_task_that_ended() {
+        let mut rig = close_cause_rig(None).await;
+
+        drop(rig.dgram_tx);
+        let cause = close_cause_after(&mut rig.bridge).await;
+        rig.bridge.shutdown().await;
+
+        assert_eq!(cause, "closed_by=relay_task ended=datagram_writer");
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn a_peer_close_reason_is_logged_on_one_bounded_line() {
+        let mut rig = close_cause_rig(None).await;
+
+        let reason = format!("line1\nline2{}", "x".repeat(500));
+        rig.client.close(7, reason.as_bytes());
+        let cause = close_cause_after(&mut rig.bridge).await;
+        rig.bridge.shutdown().await;
+
+        assert!(
+            !cause.contains('\n'),
+            "a raw newline must not reach the log: {cause:?}"
+        );
+        assert_close_cause_keys(&cause, &["closed_by", "wt_close", "ended"]);
+        let wt_close = close_cause_field_of(&cause, "wt_close");
+        assert_eq!(
+            wt_close.chars().count(),
+            200,
+            "the peer's reason must be capped: {cause:?}"
+        );
+        assert!(wt_close.contains("line1\nline2"), "{cause:?}");
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn a_peer_close_reason_cannot_forge_log_fields() {
+        let mut rig = close_cause_rig(None).await;
+
+        rig.client.close(
+            7,
+            br#"x" closed_by=relay_task ended=datagram_writer is_guest=false"#,
+        );
+        let cause = close_cause_after(&mut rig.bridge).await;
+        rig.bridge.shutdown().await;
+
+        assert_close_cause_keys(&cause, &["closed_by", "wt_close", "ended"]);
+        assert_eq!(close_cause_field_of(&cause, "closed_by"), "peer_wt");
+        assert_eq!(
+            close_cause_field_of(&cause, "wt_close"),
+            r#"code=7 reason=x" closed_by=relay_task ended=datagram_writer is_guest=false"#,
+        );
+        assert_a_reader_ended(&cause);
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn a_stage_two_shed_close_ends_the_writer_and_is_named_in_the_close_cause() {
+        wait_until_process_epoch_reaches(
+            (WT_SHED_ESCALATION_STAGE2_ROUNDS as u64 + 1)
+                * WT_SHED_ESCALATION_ROUND.as_millis() as u64,
+        )
+        .await;
+        // The client never reads its uni stream, so the relay's writer wedges.
+        let mut rig = close_cause_rig(None).await;
+        let base = crate::actors::session_logic::downlink_congested_epoch_now();
+        let step = WT_SHED_ESCALATION_ROUND.as_millis() as u64;
+        let seeds = WT_SHED_ESCALATION_STAGE2_ROUNDS as u64 - 1;
+        for i in 0..seeds {
+            rig.escalation
+                .record_shed_at(base - (seeds - 1 - i) * step, i);
+        }
+
+        let uni_tx = rig.uni_tx.clone();
+        let feeder = tokio::spawn(async move {
+            while !matches!(
+                push(&uni_tx, 64 * 1024),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let cause = close_cause_after(&mut rig.bridge).await;
+        feeder.abort();
+        rig.bridge.shutdown().await;
+
+        assert_close_cause_keys(&cause, &["closed_by", "ended"]);
+        assert_eq!(
+            close_cause_field_of(&cause, "closed_by"),
+            "relay_shed",
+            "{cause:?}"
+        );
+        assert_eq!(
+            close_cause_field_of(&cause, "ended"),
+            "uni_writer",
+            "{cause:?}"
         );
     }
 

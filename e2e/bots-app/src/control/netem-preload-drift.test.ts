@@ -43,15 +43,23 @@ const moduleList = (): string[] => {
 function runScript(
   script: string,
   opts: { moduleFile?: string; builtinRc?: number; modprobeRc?: number; timeoutSecs?: number } = {},
-): { status: number | null; stdout: string; stderr: string; moduleFile: string } {
+): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  moduleFile: string;
+  nsenterCalls: string[][];
+} {
   const workdir = mkdtempSync(join(tmpdir(), "netem-preload-"));
   const stubBin = join(workdir, "bin");
   const nsenter = join(stubBin, "nsenter");
+  const nsenterLog = join(workdir, "nsenter.log");
   mkdirSync(stubBin, { recursive: true });
   writeFileSync(
     nsenter,
     [
       "#!/usr/bin/env bash",
+      `printf '%s\\0' "$@" '' >>'${nsenterLog}'`,
       `[[ "$*" == *" modprobe "* ]] && exit ${opts.modprobeRc ?? 0}`,
       `[[ "$*" == *" grep "* ]] && exit ${opts.builtinRc ?? 0}`,
       "exit 0",
@@ -68,18 +76,25 @@ function runScript(
       NODE_NAME: "test-node",
     },
   });
-  let written: string;
-  try {
-    written = readFileSync(moduleFile, "utf8");
-  } catch {
-    written = "";
-  }
+  const read = (path: string): string => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {
+      return "";
+    }
+  };
+  const written = read(moduleFile);
+  const nsenterCalls = read(nsenterLog)
+    .split("\0\0")
+    .filter(Boolean)
+    .map((call) => call.split("\0"));
   rmSync(workdir, { recursive: true, force: true });
   return {
     status: res.status,
     stdout: res.stdout ?? "",
     stderr: res.stderr ?? "",
     moduleFile: written,
+    nsenterCalls,
   };
 }
 
@@ -133,6 +148,29 @@ describe("netem-preload DaemonSet (#2072/#2353)", () => {
     writeFileSync(empty, "");
     expect(runScript(probeScript(), { moduleFile: empty }).status).not.toBe(0);
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reads modules.builtin at the same path through the host mount namespace in startup and probe", () => {
+    const fake = "bots_app_absent_mod";
+    const dir = mkdtempSync(join(tmpdir(), "netem-builtin-path-"));
+    const file = join(dir, "modules");
+    writeFileSync(file, `${fake}\n`);
+    const startup = runScript(startupScript().replace(/MODULES="[^"]*"/, `MODULES="${fake}"`));
+    const probe = runScript(probeScript(), { moduleFile: file });
+    rmSync(dir, { recursive: true, force: true });
+    const builtinRead = (calls: string[][]): { ns: string[]; path: string }[] =>
+      calls
+        .filter((c) => c.includes("grep"))
+        .map((c) => ({ ns: c.slice(0, c.indexOf("--")), path: c[c.length - 1] }));
+    const reads = [...builtinRead(startup.nsenterCalls), ...builtinRead(probe.nsenterCalls)];
+    expect(builtinRead(startup.nsenterCalls).length, "startup must read modules.builtin").toBe(1);
+    expect(builtinRead(probe.nsenterCalls).length, "the probe must read modules.builtin").toBe(1);
+    const uname = spawnSync("uname", ["-r"], { encoding: "utf8" }).stdout.trim();
+    for (const { ns, path } of reads) {
+      expect(ns.slice(0, 2)).toEqual(["--target", "1"]);
+      expect(ns).toContain("--mount");
+      expect(path).toBe(`/lib/modules/${uname}/modules.builtin`);
+    }
   });
 
   it("accepts a module compiled into the kernel, which never appears in /proc/modules", () => {

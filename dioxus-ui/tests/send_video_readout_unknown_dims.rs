@@ -39,9 +39,6 @@
 //     `e2e/tests/performance-settings.spec.ts::"self-tile overlay reports the FITTED
 //     encode size, never the AQ tier box"` — a SOLO test, because that overlay needs
 //     no remote peer — which runs green and is mutation-verified end-to-end.
-//     NOT by `media-metrics-overlay.spec.ts`: an earlier version of this note said so,
-//     but that spec cannot currently run green (issue #2193, its 2-peer harness times
-//     out before any assertion). It adds the 2-peer case once #2193 lands.
 //   * the ~4 Hz rAF driver's LIVE update path. This asserts FIRST PAINT, which runs
 //     the same `gauge_state_from_snapshot` mapper — deliberately, because the rAF
 //     loop's 250 ms throttle makes a live-update assertion timing-dependent for no

@@ -22,12 +22,11 @@ use crate::components::action_bar_layout::{
     DEFAULT_SLOTS,
 };
 use crate::components::decode_budget::{
-    build_peer_tile_hints, build_unified_render_list, decide_step, effective_cap,
-    ios_decode_tile_ceiling, is_sole_real_tile, merge_user_requested_decode,
-    partition_camera_tiles, plan_decode_publish, presenter_cap_ceiling,
-    presenter_extra_shed_pressure, should_clear_force_decode_on_override_change,
-    tile_hint_exemptions, viewport_roster, BudgetSample, BudgetState, BudgetStep, TileRenderMode,
-    MIN_CAP,
+    build_peer_tile_hints, build_unified_render_list, effective_cap, ios_decode_tile_ceiling,
+    is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles, plan_decode_publish,
+    presenter_cap_ceiling, presenter_extra_shed_pressure,
+    should_clear_force_decode_on_override_change, tile_hint_exemptions, viewport_roster,
+    BudgetSample, BudgetState, BudgetStep, TileRenderMode, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::decode_paused_pill::DecodePausedPill;
@@ -39,6 +38,9 @@ use crate::components::share_view::{
     ShareTileView, ShareTracker, ShareViewCtx, ShareViewMode, OWN_SHARE_KEY,
 };
 use crate::components::signal_quality::SignalMeterMode;
+use crate::components::transport_fallback::{
+    use_transport_fallback, ActiveTransportCtx, TransportFallbackNotice, FALLBACK_TOAST_MS,
+};
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{
@@ -56,6 +58,10 @@ use crate::components::{
     grid_overflow_badge::GridOverflowBadge,
     hero_orbs::HeroOrbs,
     host::Host,
+    host_action_notice::{
+        apply_host_media_off, dismiss_host_action_notice, escape_owned_elsewhere, focused_notice,
+        notice_for_escape, HostActionKind, HostActionNotice,
+    },
     host_controls::HostControls,
     icons::raised_hand::RaisedHandIcon,
     media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY},
@@ -1520,8 +1526,8 @@ enum RecordingWriteOp {
 /// dependent (the roster `PeerList`, and via `any_recording_active` the meeting
 /// status bar) — REGARDLESS of whether the underlying `HashSet` changed. So a
 /// redundant `insert` of a key already present, or a `remove` of a key already
-/// absent, fans out a wasted re-render. `recording.js` fires `STOPPED` twice per
-/// recording (a clean save, then an idle transition ~3s later) and a reconnect
+/// absent, fans out a wasted re-render. `STOPPED` can go out more than once per
+/// recording (e.g. saved, then idle ~3s later) and a reconnect
 /// re-announces `STARTED`, so these redundant writes are real, not theoretical.
 /// Callers gate `.write()` behind this predicate — reading membership via
 /// `.peek()` (which does NOT subscribe/dirty). An `insert` changes the set only
@@ -2069,9 +2075,11 @@ fn element_within_persistent_chrome(el: &web_sys::Element) -> bool {
 enum EscCloseTarget {
     Diagnostics,
     PeerList,
-    /// Issue 2693. Ranked last: a toast overlays nothing, so an open drawer is
-    /// always the layer the user meant to peel.
+    /// Issue 2693. Ranked below both drawers: a toast overlays nothing, so an
+    /// open drawer is always the layer the user meant to peel.
     SelfViewToast,
+    /// Issue 2899: below the hide toast, one notice per press.
+    HostNotice(HostActionKind),
 }
 
 impl EscCloseTarget {
@@ -2087,7 +2095,7 @@ impl EscCloseTarget {
             EscCloseTarget::PeerList => Some("peer-list-trigger"),
             // No action-bar trigger owns the toast, and its focus move is
             // conditional — the dismiss handler decides.
-            EscCloseTarget::SelfViewToast => None,
+            EscCloseTarget::SelfViewToast | EscCloseTarget::HostNotice(_) => None,
         }
     }
 }
@@ -2101,6 +2109,7 @@ fn esc_panel_close_target(
     diagnostics_open: bool,
     peer_list_open: bool,
     self_view_toast_open: bool,
+    host_notice: Option<HostActionKind>,
 ) -> Option<EscCloseTarget> {
     if diagnostics_open {
         Some(EscCloseTarget::Diagnostics)
@@ -2109,7 +2118,7 @@ fn esc_panel_close_target(
     } else if self_view_toast_open {
         Some(EscCloseTarget::SelfViewToast)
     } else {
-        None
+        host_notice.map(EscCloseTarget::HostNotice)
     }
 }
 
@@ -3572,7 +3581,7 @@ pub fn AttendantsComponent(
     // so several peers can record at once and one stopping never clears another's
     // icon. Keyed by session_id, not user_id, so two sessions of the SAME
     // account stay independent (see `RecordingSetCtx`'s doc comment).
-    // Purely live — NOT seeded from any roster (no persisted "who is recording").
+    // Purely live — NOT seeded from any roster or from the server registry (`RECORDING_STATE`).
     let recording_peer_ids: Signal<HashSet<String>> = use_signal(HashSet::new);
     // Derived meeting-wide "is anyone recording" boolean, memoized so a no-op
     // set mutation (a 2nd/3rd concurrent recorder starting or stopping while at
@@ -3581,11 +3590,7 @@ pub fn AttendantsComponent(
     let any_recording_active = use_memo(move || any_session_recording(&recording_peer_ids.read()));
     // Brief "Recording saved" toast shown to the recorder when recording completes.
     let recording_saved_toast: Signal<bool> = use_signal(|| false);
-    // Brief error toast shown to the local user when a Record click could not
-    // hand off to the JS recorder (recording.js missing / stale / 404). Without
-    // it the click would fail silently — no state change, and no way for the
-    // user to learn recording never started. See `recording_start_outcome`.
-    let recording_error_toast: Signal<bool> = use_signal(|| false);
+    let recording_error_toast: Signal<Option<&'static str>> = use_signal(|| None);
     // Stable JS closure passed to `window.__vcRecording.start()` so the JS
     // callback updates `record_state` when the recorder transitions.
     #[allow(clippy::type_complexity)]
@@ -4227,10 +4232,8 @@ pub fn AttendantsComponent(
     // Pending deferred leave sounds as `(unique_id, user_id)` pairs; the unique id
     // is drawn from `toast_counter`. See the debounce helpers near play_user_left.
     let pending_leave_sounds: Signal<Vec<(u64, String)>> = use_signal(Vec::new);
-    let show_muted_toast: Signal<bool> = use_signal(|| false);
-    let toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
-    let show_video_off_toast: Signal<bool> = use_signal(|| false);
-    let video_off_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
+    let host_mute_notice: Signal<Option<u32>> = use_signal(|| None);
+    let host_video_off_notice: Signal<Option<u32>> = use_signal(|| None);
     let peer_display_name_version = use_signal(|| 0u32);
 
     // Bumped when a HOST_GRANTED/HOST_REVOKED changes the host set; the open
@@ -4390,6 +4393,18 @@ pub fn AttendantsComponent(
         // Tracks the first `on_connected` so the reconcile below skips
         // the initial connect (already seeded by the mount effect).
         let host_reconcile_first_connect = Rc::new(Cell::new(true));
+
+        let (send_diagnostics_packets, diagnostics_packets_source) =
+            crate::constants::diagnostics_packets_resolution();
+        log::info!(
+            "diagnostics packets: {} (source={})",
+            if send_diagnostics_packets {
+                "ENABLED"
+            } else {
+                "DISABLED"
+            },
+            diagnostics_packets_source
+        );
 
         let opts = VideoCallClientOptions {
             user_id: user_id
@@ -4923,6 +4938,7 @@ pub fn AttendantsComponent(
                 crate::components::screen_share_zoom::screen_canvas_id(&id)
             }),
             enable_diagnostics: true,
+            send_diagnostics_packets,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
@@ -5023,19 +5039,7 @@ pub fn AttendantsComponent(
                         return;
                     }
                     log::info!("HOST_MUTE: muting local microphone on host request");
-                    let mut mic_enabled = mic_enabled;
-                    let mut show_muted_toast = show_muted_toast;
-                    let mut toast_timer = toast_timer;
-                    mic_enabled.set(false);
-                    show_muted_toast.set(true);
-                    // Cancel any pending dismiss timer before scheduling a new one.
-                    toast_timer.set(None);
-                    toast_timer.set(Some(Timeout::new(6_000, move || {
-                        let mut show_muted_toast = show_muted_toast;
-                        let mut toast_timer = toast_timer;
-                        show_muted_toast.set(false);
-                        toast_timer.set(None);
-                    })));
+                    apply_host_media_off(mic_enabled, pending_mic_enable, host_mute_notice);
                 }
             })),
             // Host's own client must NOT disable its own camera on
@@ -5052,18 +5056,11 @@ pub fn AttendantsComponent(
                         return;
                     }
                     log::info!("HOST_DISABLE_VIDEO: disabling local camera on host request");
-                    let mut video_enabled = video_enabled;
-                    let mut show_video_off_toast = show_video_off_toast;
-                    let mut video_off_toast_timer = video_off_toast_timer;
-                    video_enabled.set(false);
-                    show_video_off_toast.set(true);
-                    video_off_toast_timer.set(None);
-                    video_off_toast_timer.set(Some(Timeout::new(6_000, move || {
-                        let mut show_video_off_toast = show_video_off_toast;
-                        let mut video_off_toast_timer = video_off_toast_timer;
-                        show_video_off_toast.set(false);
-                        video_off_toast_timer.set(None);
-                    })));
+                    apply_host_media_off(
+                        video_enabled,
+                        pending_video_enable,
+                        host_video_off_notice,
+                    );
                 }
             })),
             on_participant_kicked: Some(VcCallback::from({
@@ -5193,9 +5190,9 @@ pub fn AttendantsComponent(
                         // concurrent recorders — it only affects THIS session's icon.
                         // Guard the write behind a `peek` membership check — an
                         // unconditional `write()` marks the signal dirty even when
-                        // the key is already absent. `recording.js` fires STOPPED
-                        // TWICE per recording (a clean save, then an idle transition
-                        // ~3s later), so the second one would otherwise re-render the
+                        // the key is already absent. STOPPED can arrive more than
+                        // once per recording (e.g. saved, then idle ~3s later), so a
+                        // repeat would otherwise re-render the
                         // roster + `any_recording_active` for no reason. Mirrors the
                         // `on_peer_left` and STARTED sites via `recording_set_write_needed`.
                         if let Some(key) = recording_event_key(&source_user_id, &source_session_id)
@@ -5798,6 +5795,19 @@ pub fn AttendantsComponent(
         });
     }
 
+    let transport_fallback = use_transport_fallback(
+        call_start_time,
+        connection_error,
+        transport_pref_ctx.0,
+        || crate::constants::webtransport_enabled().unwrap_or(false),
+        FALLBACK_TOAST_MS,
+        || {
+            let client = client.clone();
+            move || client.active_transport()
+        },
+    );
+    use_context_provider(|| ActiveTransportCtx(transport_fallback.active));
+
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
         let client_cell = RefCell::new(client.clone());
@@ -6099,10 +6109,6 @@ pub fn AttendantsComponent(
             } else {
                 // Real join. Apply the pre-join camera/mic on-off choices.
                 //
-                // Each track is honored only if permission for it was granted
-                // AND a device exists, so we never try to enable capture we
-                // can't perform (`resolve_initial_enabled`).
-                //
                 // We set `mic_enabled`/`video_enabled` DIRECTLY rather than via
                 // `pending_*_enable`: the pending flags are consumed earlier in
                 // THIS same `on_result` invocation (the granted-pending check
@@ -6113,16 +6119,8 @@ pub fn AttendantsComponent(
                 // `client.set_audio_enabled` / `set_video_enabled`. (issue #959)
                 let audio_ok = matches!(permit.audio, PermissionState::Granted);
                 let video_ok = matches!(permit.video, PermissionState::Granted);
-                let want_mic = resolve_initial_enabled(
-                    prejoin_mic_on(),
-                    audio_ok,
-                    !prejoin_microphones.read().is_empty(),
-                );
-                let want_cam = resolve_initial_enabled(
-                    prejoin_camera_on(),
-                    video_ok,
-                    !prejoin_cameras.read().is_empty(),
-                );
+                let want_mic = resolve_initial_enabled(prejoin_mic_on(), audio_ok);
+                let want_cam = resolve_initial_enabled(prejoin_camera_on(), video_ok);
 
                 // Release the preview hardware BEFORE the real encoders start so
                 // there is no double-capture of the camera/mic. (issue #959)
@@ -6734,7 +6732,7 @@ pub fn AttendantsComponent(
     use_context_provider(|| MediaMetricsOverlayCtx(media_metrics_overlay_enabled));
 
     // Action bar dock position and autohide — exposed via context so that
-    // the AppearanceSettingsPanel can read/write them.
+    // the PreferencesSettingsPanel can read/write them.
     use_context_provider(|| DockPositionCtx(dock_position));
     use_context_provider(|| AutohideCtx(autohide_enabled));
     use_context_provider(|| DensityModeCtx(density_mode));
@@ -6968,12 +6966,12 @@ pub fn AttendantsComponent(
         let task = spawn(async move {
             let client_for_budget = client_for_budget.clone();
             use crate::components::decode_budget::{
-                advance_observed_session, budget_reset_actions, cascade_action,
-                decide_step_with_median, in_distress, lower_layer_cap, median_render_fps,
-                next_layer_drop_ms, non_distress_growth_allowed, non_distress_growth_qualifying,
+                advance_observed_session, budget_reset_actions, cascade_action, in_distress,
+                lower_layer_cap, median_render_fps, next_layer_drop_ms,
+                non_distress_growth_allowed, non_distress_growth_qualifying,
                 protective_emergency_cap, protective_encoder_layer_ceiling,
-                re_arm_cascade_after_recovery, recovery_qualifying, settle_window_elapsed,
-                severe_label, suppress_growth_step, tick_protective_mode, CascadeAction,
+                re_arm_cascade_after_recovery, recovery_qualifying, routed_budget_step,
+                settle_window_elapsed, severe_label, tick_protective_mode, CascadeAction,
                 DistressSignals, ProtectiveModeState, ProtectiveTransition, STEP_UP_COOLDOWN_MS,
                 SUSTAIN_SAMPLES,
             };
@@ -7502,12 +7500,22 @@ pub fn AttendantsComponent(
                     // `presenter_extra_shed_pressure` returns false and the normal
                     // trigger is the sole latch path again. Pressure-gated: a
                     // presenter at a healthy >= 30 fps satisfies neither trigger.
-                    // One-time pressured-latch EDGE (not per tick): use the plain
-                    // `decide_step` wrapper here — its internal median recompute is
-                    // irrelevant on this rare edge (contrast the per-tick pressured
-                    // path below, which threads the hoisted `median_for_distress`
-                    // into `decide_step_with_median`, issue #1558 / #1001).
-                    let latch_step = match decide_step(&samples, &state, natural, now) {
+                    let (step, seed_layer_drop) = routed_budget_step(
+                        &samples,
+                        &mut state,
+                        natural,
+                        now,
+                        median_for_distress,
+                        emergency_now,
+                        sharing,
+                    );
+                    if seed_layer_drop {
+                        if client_for_budget.apply_local_cpu_pressure_congestion() == Some(true) {
+                            log::info!("DecodeBudget: one_tile_layer_drop natural={natural}");
+                        }
+                        continue;
+                    }
+                    let latch_step = match step {
                         BudgetStep::Down(magnitude) => Some(magnitude),
                         _ if presenter_extra_shed_pressure(&samples, sharing)
                             && state.cap > MIN_CAP =>
@@ -7702,12 +7710,6 @@ pub fn AttendantsComponent(
                 }
 
                 // ---- Pressured Auto path: the loop is the sole cap owner ----
-                // Reuse the single per-tick `median_for_distress` (issue #1558
-                // perf hoist): the protective distress predicate already computed
-                // `median_render_fps(&samples, SUSTAIN_SAMPLES)` at the top of this
-                // tick, so threading it in here avoids `decide_step` re-running the
-                // same `Vec`-alloc+sort a second time on the hot steady-state path
-                // (restores the #1001 "one median per tick" contract).
                 // Issue #1558 emergency-growth gate (Up arm): coerce a recovery
                 // `Up` to `Hold` while the protective EMERGENCY is active this tick
                 // (`emergency_now`). `decide_step`'s Up gate is blind to audio, so a
@@ -7721,10 +7723,20 @@ pub fn AttendantsComponent(
                 // path fights the emergency. `suppress_growth_step` is the single
                 // source of truth for this Up suppression (shared with the
                 // `sim_tick_protective` test model).
-                let step = suppress_growth_step(
-                    decide_step_with_median(&samples, &state, natural, now, median_for_distress),
+                let (step, seed_layer_drop) = routed_budget_step(
+                    &samples,
+                    &mut state,
+                    natural,
+                    now,
+                    median_for_distress,
                     emergency_now,
+                    sharing,
                 );
+                if seed_layer_drop
+                    && client_for_budget.apply_local_cpu_pressure_congestion() == Some(true)
+                {
+                    log::info!("DecodeBudget: one_tile_layer_drop natural={natural}");
+                }
 
                 // Controller owns direction_hold: increment per consecutive
                 // recovery-qualifying sample, reset to 0 when recovery breaks.
@@ -7856,8 +7868,8 @@ pub fn AttendantsComponent(
                                 // under catastrophic pressure. Floor at MIN_CAP.
                                 // #1558 perf hoist: reuse the single per-tick
                                 // `median_for_distress` (same value) instead of a
-                                // second alloc+sort. A Down only fires when
-                                // `cap > MIN_CAP` (decide_step guard), so it always
+                                // second alloc+sort. A Down only reaches here when
+                                // `cap > MIN_CAP` (one-tile Downs are taken above), so it always
                                 // strictly lowers the cap and the cap log below always
                                 // fires — these are never unused.
                                 let median = median_for_distress;
@@ -10243,6 +10255,12 @@ pub fn AttendantsComponent(
                             diagnostics_open(),
                             peer_list_open(),
                             self_view_hidden_toast(),
+                            notice_for_escape(
+                                host_mute_notice.peek().is_some(),
+                                host_video_off_notice.peek().is_some(),
+                                focused_notice(),
+                                escape_owned_elsewhere(),
+                            ),
                         ) {
                             evt.prevent_default();
                             match target {
@@ -10250,6 +10268,12 @@ pub fn AttendantsComponent(
                                 EscCloseTarget::PeerList => peer_list_open.set(false),
                                 EscCloseTarget::SelfViewToast => {
                                     dismiss_self_view_toast.call(())
+                                }
+                                EscCloseTarget::HostNotice(HostActionKind::Mic) => {
+                                    dismiss_host_action_notice(HostActionKind::Mic, host_mute_notice)
+                                }
+                                EscCloseTarget::HostNotice(HostActionKind::Camera) => {
+                                    dismiss_host_action_notice(HostActionKind::Camera, host_video_off_notice)
                                 }
                             }
                             if let Some(id) = target.trigger_id() {
@@ -10315,6 +10339,16 @@ pub fn AttendantsComponent(
 
                 // "participant joined/left" toast notifications
                 div { class: "peer-toasts",
+                    HostActionNotice {
+                        kind: HostActionKind::Mic,
+                        notice: host_mute_notice,
+                        device_on: mic_enabled(),
+                    }
+                    HostActionNotice {
+                        kind: HostActionKind::Camera,
+                        notice: host_video_off_notice,
+                        device_on: video_enabled(),
+                    }
                     if let Some((seq, msg)) = drawer_resize_notice() {
                         div {
                             key: "{seq}",
@@ -10366,17 +10400,14 @@ pub fn AttendantsComponent(
                             }
                         }
                     }
-                    // Recording-failed notification — shown briefly to the local user when a
-                    // Record click could not hand off to the JS recorder (recording.js
-                    // missing / stale / 404). `role="alert"` so it is announced assertively.
-                    if recording_error_toast() {
+                    if let Some(message) = recording_error_toast() {
                         div {
                             class: "peer-toast recording-error-banner",
                             role: "alert",
                             aria_live: "assertive",
-                            aria_label: "Couldn't start recording",
+                            aria_label: message,
                             span { class: "toast-text",
-                                span { class: "toast-name", "Couldn't start recording. Please refresh and try again." }
+                                span { class: "toast-name", "{message}" }
                             }
                         }
                     }
@@ -10477,71 +10508,8 @@ pub fn AttendantsComponent(
                             None => rsx! {},
                         }
                     }
-                    if show_muted_toast() {
-                        div { class: "peer-toast toast-left",
-                            span { class: "toast-icon",
-                                svg {
-                                    width: "16",
-                                    height: "16",
-                                    view_box: "0 0 24 24",
-                                    fill: "none",
-                                    stroke: "currentColor",
-                                    stroke_width: "2",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                    line {
-                                        x1: "1",
-                                        y1: "1",
-                                        x2: "23",
-                                        y2: "23",
-                                    }
-                                    path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
-                                    path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
-                                    line {
-                                        x1: "12",
-                                        y1: "19",
-                                        x2: "12",
-                                        y2: "23",
-                                    }
-                                    line {
-                                        x1: "8",
-                                        y1: "23",
-                                        x2: "16",
-                                        y2: "23",
-                                    }
-                                }
-                            }
-                            span { class: "toast-text",
-                                span { class: "toast-name", "Host muted your microphone" }
-                                br {}
-                                span { class: "toast-action", "Click the mic button to unmute." }
-                            }
-                        }
-                    }
-                    if show_video_off_toast() {
-                        div { class: "peer-toast toast-left",
-                            span { class: "toast-icon",
-                                svg {
-                                    width: "16",
-                                    height: "16",
-                                    view_box: "0 0 24 24",
-                                    fill: "none",
-                                    stroke: "currentColor",
-                                    stroke_width: "2",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                    path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
-                                    line { x1: "1", y1: "1", x2: "23", y2: "23" }
-                                }
-                            }
-                            span { class: "toast-text",
-                                span { class: "toast-name", "Host turned off your camera" }
-                                br {}
-                                span { class: "toast-action", "Click the camera button to turn it back on." }
-                            }
-                        }
-                    }
                     HostChangeNotice { toast: host_change_toast }
+                    TransportFallbackNotice { toast: transport_fallback.toast }
                     CoHostNoticeLayer { notice: co_host_notice }
                     for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                         {
@@ -10742,9 +10710,9 @@ pub fn AttendantsComponent(
                     // its own anti-flap damper, so it is mounted UNCONDITIONALLY —
                     // it self-gates on `pressured`/`avatar_count` and the sustain /
                     // dwell / back-off policy. `natural` is the uncapped layout
-                    // tile count (`total_tiles`); "Show all videos" pins the
-                    // override to `Fixed(natural)`, which `effective_cap` clamps to
-                    // `min(natural, CANVAS_LIMIT)` on the next render. Reading
+                    // tile count (`total_tiles`); "Show all videos" sets the
+                    // override to `All`, which `effective_cap` resolves against
+                    // the live natural count on the next render. Reading
                     // `decode_budget_pressured()` reactively keeps the props live.
                     DecodeBudgetBanner {
                         pressured: decode_budget_pressured(),
@@ -11962,7 +11930,16 @@ pub fn AttendantsComponent(
                                                                                                         );
                                                                                                     }
                                                                                                 }
-                                                                                                // Toast only on clean save, not on abort ("idle").
+                                                                                                if js_state == "failed" {
+                                                                                                    let mut err_toast = recording_error_toast;
+                                                                                                    err_toast.set(Some("Recording failed."));
+                                                                                                    Timeout::new(6_000, move || {
+                                                                                                        if let Ok(mut t) = err_toast.try_write() {
+                                                                                                            t.take();
+                                                                                                        }
+                                                                                                    })
+                                                                                                    .forget();
+                                                                                                }
                                                                                                 if js_state == "saved" {
                                                                                                     let mut saved = recording_saved_toast;
                                                                                                     saved.set(true);
@@ -11987,10 +11964,6 @@ pub fn AttendantsComponent(
                                                                                             // Peek-guard both writes via the shared
                                                                                             // `recording_set_write_needed` predicate, exactly like the
                                                                                             // remote STARTED/STOPPED and `on_peer_left` sites.
-                                                                                            // `recording.js` fires `saved` then `idle` ~3s apart, so the
-                                                                                            // local Remove would otherwise fire twice and the second
-                                                                                            // (key already absent) would dirty the signal and re-render
-                                                                                            // the roster + `any_recording_active` for no change.
                                                                                             match local_recording_set_op(&new_state) {
                                                                                                 LocalRecordingSetOp::Insert => {
                                                                                                     if !self_session.is_empty()
@@ -12054,14 +12027,14 @@ pub fn AttendantsComponent(
                                                                                                 "[recording] start hand-off failed — recording.js unavailable; not announcing to peers"
                                                                                             );
                                                                                             let mut err_toast = recording_error_toast;
-                                                                                            err_toast.set(true);
+                                                                                            err_toast.set(Some("Couldn't start recording. Please refresh and try again."));
                                                                                             // `.forget()`-ed: can fire up to 6s after the component
                                                                                             // unmounts (user leaves the meeting within 6s of a failed
                                                                                             // hand-off). `set()` == `try_write().unwrap()` PANICS on a
                                                                                             // dropped scope, so use `try_write()` and no-op if gone.
                                                                                             Timeout::new(6_000, move || {
                                                                                                 if let Ok(mut t) = err_toast.try_write() {
-                                                                                                    *t = false;
+                                                                                                    t.take();
                                                                                                 }
                                                                                             })
                                                                                             .forget();
@@ -17086,30 +17059,94 @@ mod tests {
     #[test]
     fn esc_both_open_closes_diagnostics_first() {
         assert_eq!(
-            esc_panel_close_target(true, true, false),
+            esc_panel_close_target(true, true, false, None),
             Some(EscCloseTarget::Diagnostics)
         );
     }
 
-    /// Issue 2693: the hide toast is the LAST rung. It overlays nothing, so an
-    /// open drawer is always the layer the user meant Escape to peel.
+    /// Issue 2693: the hide toast ranks below both drawers. It overlays nothing,
+    /// so an open drawer is always the layer the user meant Escape to peel.
     #[test]
     fn esc_ranks_the_hide_toast_below_both_drawers() {
         assert_eq!(
-            esc_panel_close_target(true, false, true),
+            esc_panel_close_target(true, false, true, None),
             Some(EscCloseTarget::Diagnostics),
             "diagnostics outranks the toast"
         );
         assert_eq!(
-            esc_panel_close_target(false, true, true),
+            esc_panel_close_target(false, true, true, None),
             Some(EscCloseTarget::PeerList),
             "the peer list outranks the toast"
         );
         assert_eq!(
-            esc_panel_close_target(false, false, true),
+            esc_panel_close_target(false, false, true, None),
             Some(EscCloseTarget::SelfViewToast),
             "with nothing else open, Escape dismisses the toast"
         );
+    }
+
+    #[test]
+    fn esc_ranks_a_host_notice_below_the_drawers_and_the_hide_toast() {
+        let mic = Some(HostActionKind::Mic);
+        assert_eq!(
+            esc_panel_close_target(true, false, false, mic),
+            Some(EscCloseTarget::Diagnostics)
+        );
+        assert_eq!(
+            esc_panel_close_target(false, true, false, mic),
+            Some(EscCloseTarget::PeerList)
+        );
+        assert_eq!(
+            esc_panel_close_target(false, false, true, mic),
+            Some(EscCloseTarget::SelfViewToast)
+        );
+        assert_eq!(
+            esc_panel_close_target(false, false, false, mic),
+            Some(EscCloseTarget::HostNotice(HostActionKind::Mic))
+        );
+        assert_eq!(
+            EscCloseTarget::HostNotice(HostActionKind::Mic).trigger_id(),
+            None
+        );
+    }
+
+    /// The callbacks, the Escape arms and the render sites are not mountable
+    /// here, so their wiring to the notice is read from source.
+    #[test]
+    fn host_media_off_and_escape_reach_the_host_action_notice_fns() {
+        let flat = include_str!("attendants.rs")
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")")
+            .replace(",}", "}");
+        for needle in [
+            concat!(
+                "HostActionNotice{kind:HostActionKind::Mic,notice:host_mute_",
+                "notice,device_on:mic_enabled()}"
+            ),
+            concat!(
+                "HostActionNotice{kind:HostActionKind::Camera,notice:host_video_off_",
+                "notice,device_on:video_enabled()}"
+            ),
+            concat!(
+                "apply_host_media_off(mic_enabled,pending_mic_",
+                "enable,host_mute_notice);"
+            ),
+            concat!(
+                "apply_host_media_off(video_enabled,pending_video_",
+                "enable,host_video_off_notice);"
+            ),
+            concat!(
+                "EscCloseTarget::HostNotice(HostActionKind::Mic)=>{dismiss_host_action_",
+                "notice(HostActionKind::Mic,host_mute_notice)"
+            ),
+            concat!(
+                "EscCloseTarget::HostNotice(HostActionKind::Camera)=>{dismiss_host_action_",
+                "notice(HostActionKind::Camera,host_video_off_notice)"
+            ),
+        ] {
+            assert!(flat.contains(needle), "missing `{needle}`");
+        }
     }
 
     /// The toast has no action-bar trigger, so the shared focus restore must sit
@@ -17123,7 +17160,7 @@ mod tests {
     #[test]
     fn esc_only_peer_list_closes_peer_list() {
         assert_eq!(
-            esc_panel_close_target(false, true, false),
+            esc_panel_close_target(false, true, false, None),
             Some(EscCloseTarget::PeerList)
         );
     }
@@ -17132,7 +17169,7 @@ mod tests {
     #[test]
     fn esc_only_diagnostics_closes_diagnostics() {
         assert_eq!(
-            esc_panel_close_target(true, false, false),
+            esc_panel_close_target(true, false, false, None),
             Some(EscCloseTarget::Diagnostics)
         );
     }
@@ -17142,7 +17179,7 @@ mod tests {
     /// behavior.
     #[test]
     fn esc_none_open_returns_none() {
-        assert_eq!(esc_panel_close_target(false, false, false), None);
+        assert_eq!(esc_panel_close_target(false, false, false, None), None);
     }
 
     /// Lockstep pin on the trigger-button ids this handler restores focus to.
@@ -17961,6 +17998,7 @@ mod tests {
             status: "admitted".to_string(),
             is_host,
             is_guest: false,
+            in_call: false,
             joined_at: 0,
             admitted_at: None,
             room_token: None,
@@ -18535,5 +18573,112 @@ mod tests {
             ),
             format!("{STATUS_BAR_RESERVE_MOBILE}px")
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod auto_join_dom_tests {
+    use super::*;
+    use crate::context::{DisplayNameCtx, TransportPreference, TransportPreferenceCtx};
+    use gloo_timers::future::TimeoutFuture;
+    use std::cell::RefCell;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    thread_local! {
+        static SHOWN: RefCell<Option<Signal<bool>>> = const { RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn AutoJoinHarness() -> Element {
+        let name = use_signal(|| Some("Guest".to_string()));
+        use_context_provider(|| DisplayNameCtx(name));
+        let transport = use_signal(TransportPreference::default);
+        use_context_provider(|| TransportPreferenceCtx(transport));
+        let shown = use_signal(|| true);
+        use_hook(move || SHOWN.with(|s| *s.borrow_mut() = Some(shown)));
+        rsx! {
+            if shown() {
+                AttendantsComponent {
+                    id: "autojoin2992".to_string(),
+                    display_name: "Guest".to_string(),
+                    e2ee_enabled: false,
+                    auto_join: true,
+                    is_guest: true,
+                    room_token: "room-token".to_string(),
+                }
+            }
+        }
+    }
+
+    fn set_prefs(camera_on: &str, mic_on: &str) {
+        let storage = gloo_utils::window().local_storage().unwrap().unwrap();
+        storage.set_item("vc_prejoin_camera_on", camera_on).unwrap();
+        storage.set_item("vc_prejoin_mic_on", mic_on).unwrap();
+    }
+
+    fn install_config() {
+        js_sys::eval(
+            r#"
+            window.__APP_CONFIG = Object.freeze({
+                apiBaseUrl: 'http://test:8080', wsUrl: 'ws://test:8080',
+                webTransportHost: 'https://test:4433', oauthEnabled: 'false',
+                e2eeEnabled: 'false', webTransportEnabled: 'false', firefoxEnabled: 'false',
+                usersAllowedToStream: '', serverElectionPeriodMs: 2000, vadThreshold: 0.02
+            });
+            "#,
+        )
+        .unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    async fn control_label(root: &web_sys::Element, testid: &str) -> String {
+        let selector = format!("[data-testid='{testid}']");
+        for _ in 0..1000 {
+            if let Some(el) = root.query_selector(&selector).unwrap() {
+                return el.get_attribute("aria-label").unwrap_or_default();
+            }
+            TimeoutFuture::new(10).await;
+        }
+        panic!("timed out waiting for {selector}");
+    }
+
+    async fn auto_join_labels(camera_on: &str, mic_on: &str) -> (String, String) {
+        install_config();
+        set_prefs(camera_on, mic_on);
+        let root = gloo_utils::document().create_element("div").unwrap();
+        gloo_utils::document()
+            .body()
+            .unwrap()
+            .append_child(&root)
+            .unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(AutoJoinHarness),
+            dioxus::web::Config::new().rootelement(root.clone()),
+        );
+        let camera = control_label(&root, "camera-toggle-button").await;
+        let mic = control_label(&root, "mic-toggle-button").await;
+        SHOWN.with(|s| s.borrow().expect("shown signal").set(false));
+        TimeoutFuture::new(100).await;
+        root.remove();
+        js_sys::eval("delete window.__APP_CONFIG;").unwrap();
+        crate::constants::reset_config_cache_for_test();
+        let storage = gloo_utils::window().local_storage().unwrap().unwrap();
+        storage.remove_item("vc_prejoin_camera_on").unwrap();
+        storage.remove_item("vc_prejoin_mic_on").unwrap();
+        (camera, mic)
+    }
+
+    #[wasm_bindgen_test]
+    async fn auto_join_honors_saved_camera_and_mic_on() {
+        let (camera, mic) = auto_join_labels("true", "true").await;
+        assert_eq!(camera, "Camera — Stop Video");
+        assert_eq!(mic, "Microphone — Mute");
+    }
+
+    #[wasm_bindgen_test]
+    async fn auto_join_keeps_saved_camera_and_mic_off() {
+        let (camera, mic) = auto_join_labels("false", "false").await;
+        assert_eq!(camera, "Camera — Start Video");
+        assert_eq!(mic, "Microphone — Unmute");
     }
 }

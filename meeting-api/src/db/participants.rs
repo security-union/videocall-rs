@@ -38,12 +38,26 @@ pub struct ParticipantRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub display_name: Option<String>,
+    pub in_call: bool,
 }
 
-const PARTICIPANT_COLUMNS: &str = r#"
-    id, meeting_id, user_id, status, is_host, is_guest, is_required,
-    joined_at, admitted_at, left_at, created_at, updated_at, display_name
-"#;
+struct ParticipantColumns;
+
+impl std::fmt::Display for ParticipantColumns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "id, meeting_id, user_id, status, is_host, is_guest, is_required, \
+             joined_at, admitted_at, left_at, created_at, updated_at, display_name, \
+             COALESCE(status = 'admitted' AND left_at IS NULL \
+                      AND COALESCE(live_session_id, 0) <> 0 \
+                      AND presence_seen_at > NOW() - INTERVAL '{PRESENCE_LEASE_SECS} seconds', \
+                      FALSE) AS in_call"
+        )
+    }
+}
+
+const PARTICIPANT_COLUMNS: ParticipantColumns = ParticipantColumns;
 
 /// Insert or update a participant as host (admitted immediately). A rejoin never overwrites an existing non-empty `display_name`.
 pub async fn upsert_host<'e>(
@@ -146,9 +160,15 @@ pub async fn join_attendee(
             VALUES ($1, $2, 'waiting', FALSE, $4, $3, 0)
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'waiting', left_at = NULL, live_session_id = 0,
+                          presence_seen_at = NULL,
+                          joined_at = CASE WHEN {live_waiter}
+                                           THEN meeting_participants.joined_at ELSE NOW() END,
+                          admitted_at = CASE WHEN meeting_participants.status IN ('kicked', 'rejected')
+                                             THEN NULL ELSE meeting_participants.admitted_at END,
                           display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
             RETURNING {PARTICIPANT_COLUMNS}
-            "#
+            "#,
+            live_waiter = waiting_sql("meeting_participants")
         );
         sqlx::query_as::<_, ParticipantRow>(&query)
             .bind(meeting_id)
@@ -182,13 +202,15 @@ pub async fn join_attendee(
     Ok(Some((!waiting_room_enabled, row, waiting_room_enabled)))
 }
 
-/// Get all participants in 'waiting' status for a meeting.
+/// Waiting participants (see [`waiting_sql`]) of a meeting, in order of arrival.
 pub async fn get_waiting(
     pool: &PgPool,
     meeting_id: i32,
 ) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
-        "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants WHERE meeting_id = $1 AND status = 'waiting'"
+        "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants p WHERE p.meeting_id = $1 AND {} \
+         ORDER BY p.joined_at, p.id",
+        waiting_sql("p")
     );
     sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
@@ -260,10 +282,11 @@ async fn admit_waiting(
         .bind(meeting_id)
         .execute(&mut *tx)
         .await?;
-    let anyone_waiting: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM meeting_participants \
-         WHERE meeting_id = $1 AND status = 'waiting' AND ($2::text IS NULL OR user_id = $2))",
-    )
+    let anyone_waiting: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM meeting_participants p \
+         WHERE p.meeting_id = $1 AND {} AND ($2::text IS NULL OR p.user_id = $2))",
+        waiting_sql("p")
+    ))
     .bind(meeting_id)
     .bind(user_id)
     .fetch_one(&mut *tx)
@@ -276,11 +299,12 @@ async fn admit_waiting(
     let activation = crate::db::meetings::start_instance_in(&mut tx, meeting_id, healthy).await?;
     let query = format!(
         r#"
-        UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = NOW(), live_session_id = 0
-        WHERE meeting_id = $1 AND status = 'waiting' AND ($2::text IS NULL OR user_id = $2)
+        UPDATE meeting_participants p
+        SET status = 'admitted', admitted_at = NOW(), live_session_id = 0, presence_seen_at = NULL
+        WHERE p.meeting_id = $1 AND {} AND ($2::text IS NULL OR p.user_id = $2)
         RETURNING {PARTICIPANT_COLUMNS}
-        "#
+        "#,
+        waiting_sql("p")
     );
     let rows = sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
@@ -315,8 +339,19 @@ pub async fn reject(
 /// Outcome of [`kick`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum KickOutcome {
-    /// The target was removed; `was_host` when they held the host role.
-    Kicked { was_host: bool },
+    /// The target was removed; `was_host` when they held the host role. The
+    /// relay revocation (#2934) was recorded in the same transaction.
+    Kicked {
+        was_host: bool,
+        kicked_at: DateTime<Utc>,
+        deny_until: DateTime<Utc>,
+    },
+    /// The target is still `kicked` from an earlier kick, whose revocation this
+    /// carries; only a revocation missing from a pre-#2934 kick is written.
+    AlreadyKicked {
+        kicked_at: DateTime<Utc>,
+        deny_until: DateTime<Utc>,
+    },
     /// The target has a row but it is not part of the current instance;
     /// nothing changed.
     NotAdmitted,
@@ -354,9 +389,16 @@ pub async fn kick(
     .bind(caller)
     .fetch_one(&mut *tx)
     .await?;
-    let target_row: Option<(String, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT status, is_host, admitted_at FROM meeting_participants \
-         WHERE meeting_id = $1 AND user_id = $2 FOR UPDATE",
+    type TargetRow = (
+        String,
+        bool,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    );
+    let target_row: Option<TargetRow> = sqlx::query_as(
+        "SELECT status, is_host, admitted_at, kicked_at, kick_deny_until \
+         FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2 FOR UPDATE",
     )
     .bind(meeting_id)
     .bind(target)
@@ -366,7 +408,7 @@ pub async fn kick(
     let outcome = match target_row {
         _ if !caller_is_host => KickOutcome::CallerNotHost,
         None => KickOutcome::NotFound,
-        Some((_, is_host, _))
+        Some((_, is_host, _, _, _))
             if creator_id.as_deref() != Some(caller)
                 && (creator_id.as_deref() == Some(target)
                     || is_host
@@ -375,32 +417,108 @@ pub async fn kick(
         {
             KickOutcome::OwnerOnly
         }
-        Some((ref status, _, admitted_at))
+        Some((ref status, _, _, Some(kicked_at), Some(deny_until))) if status == "kicked" => {
+            KickOutcome::AlreadyKicked {
+                kicked_at,
+                deny_until,
+            }
+        }
+        Some((ref status, _, _, _, _)) if status == "kicked" => {
+            let (kicked_at, deny_until) =
+                stamp_kick(&mut tx, meeting_id, target, "status = status").await?;
+            KickOutcome::AlreadyKicked {
+                kicked_at,
+                deny_until,
+            }
+        }
+        Some((ref status, _, admitted_at, _, _))
             if status != "admitted"
                 && !(status == "left" && admitted_at.is_some_and(|a| a >= started_at)) =>
         {
             KickOutcome::NotAdmitted
         }
-        Some((_, was_host, _)) => {
-            sqlx::query(
-                "UPDATE meeting_participants \
-                 SET status = 'kicked', left_at = NOW(), is_host = FALSE, live_session_id = 0 \
-                 WHERE meeting_id = $1 AND user_id = $2",
+        Some((_, was_host, _, _, _)) => {
+            let (kicked_at, deny_until) = stamp_kick(
+                &mut tx,
+                meeting_id,
+                target,
+                "status = 'kicked', left_at = NOW(), is_host = FALSE, live_session_id = 0",
             )
-            .bind(meeting_id)
-            .bind(target)
-            .execute(&mut *tx)
             .await?;
             crate::db::co_hosts::suspend(&mut *tx, meeting_id, target).await?;
-            KickOutcome::Kicked { was_host }
+            KickOutcome::Kicked {
+                was_host,
+                kicked_at,
+                deny_until,
+            }
         }
     };
-    if matches!(outcome, KickOutcome::Kicked { .. }) {
+    if matches!(
+        outcome,
+        KickOutcome::Kicked { .. } | KickOutcome::AlreadyKicked { .. }
+    ) {
         tx.commit().await?;
     } else {
         tx.rollback().await?;
     }
     Ok(outcome)
+}
+
+/// Apply `set` to `target`'s row and stamp its kick revocation (#2934) on the
+/// database clock at the moment of the write.
+async fn stamp_kick(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    meeting_id: i32,
+    target: &str,
+    set: &str,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), sqlx::Error> {
+    sqlx::query_as(&format!(
+        "UPDATE meeting_participants p \
+         SET {set}, kicked_at = t.now, \
+             kick_deny_until = t.now + make_interval(secs => $3::double precision) \
+         FROM (SELECT clock_timestamp() AS now) t \
+         WHERE p.meeting_id = $1 AND p.user_id = $2 \
+         RETURNING p.kicked_at, p.kick_deny_until"
+    ))
+    .bind(meeting_id)
+    .bind(target)
+    .bind(videocall_meeting_types::kick::KICK_DENY_WINDOW_SECS)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// A kick whose relay revocation is still in force.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ActiveKick {
+    pub user_id: String,
+    pub kicked_at: DateTime<Utc>,
+    pub kick_deny_until: DateTime<Utc>,
+}
+
+/// Row `p` holds a kick whose revocation is in force: not admitted again since
+/// (`kicked_at` and `admitted_at` are both database-clock stamps), and unexpired.
+const ACTIVE_KICK: &str = "p.kicked_at IS NOT NULL AND p.kick_deny_until > NOW() \
+     AND (p.status = 'kicked' OR p.admitted_at IS NULL OR p.admitted_at <= p.kicked_at)";
+
+/// Of `user_ids` in `room_id`, those under an active kick (#2934).
+pub async fn active_kicks(
+    pool: &PgPool,
+    room_id: &str,
+    user_ids: &[String],
+) -> Result<Vec<ActiveKick>, sqlx::Error> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, ActiveKick>(&format!(
+        "SELECT p.user_id, p.kicked_at, p.kick_deny_until \
+         FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
+         WHERE m.room_id = $1 AND m.deleted_at IS NULL AND p.user_id = ANY($2) \
+           AND {ACTIVE_KICK}"
+    ))
+    .bind(room_id)
+    .bind(user_ids)
+    .fetch_all(pool)
+    .await
 }
 
 /// Admit the creator on rejoin into an already-active meeting without changing `is_host` (a transfer target keeps it).
@@ -667,6 +785,8 @@ pub struct Presence {
     pub resumed: bool,
     /// A designated, unsuspended co-host got the host role.
     pub promoted: bool,
+    /// `(kicked_at, kick_deny_until)` of a kick of this user still in force (#2934).
+    pub active_kick: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
 /// Apply a relay's report that `session_id` of `user_id` is present: restore/resume/promote as applicable.
@@ -678,21 +798,35 @@ pub async fn record_present(
     healthy: bool,
 ) -> Result<Presence, sqlx::Error> {
     // Cheap unlocked pre-check; re-checked for real under the lock.
-    let maybe_relevant: bool = sqlx::query_scalar(
+    let (maybe_relevant, kicked_at, kick_deny_until): (
+        bool,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(&format!(
         "SELECT EXISTS (SELECT 1 FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
          WHERE p.meeting_id = $1 AND p.user_id = $2 AND p.admitted_at IS NOT NULL \
            AND m.state IS DISTINCT FROM 'ended' \
            AND NOT ($3 = ANY (p.left_session_ids)) \
            AND ((p.status = 'admitted' AND p.live_session_id IS DISTINCT FROM $3) \
-                OR (p.status = 'left' AND p.admitted_at >= m.started_at)))",
-    )
+                OR (p.status = 'left' AND p.admitted_at >= m.started_at \
+                    AND (p.kicked_at IS NULL OR p.admitted_at > p.kicked_at)))), \
+         k.kicked_at, k.kick_deny_until \
+         FROM (SELECT 1) one LEFT JOIN LATERAL ( \
+             SELECT p.kicked_at, p.kick_deny_until FROM meeting_participants p \
+             WHERE p.meeting_id = $1 AND p.user_id = $2 AND {ACTIVE_KICK}) k ON TRUE"
+    ))
     .bind(meeting_id)
     .bind(user_id)
     .bind(session_id)
     .fetch_one(pool)
     .await?;
+    let active_kick = kicked_at.zip(kick_deny_until);
+    let unchanged = Presence {
+        active_kick,
+        ..Presence::default()
+    };
     if !maybe_relevant {
-        return Ok(Presence::default());
+        return Ok(unchanged);
     }
     let mut tx = pool.begin().await?;
     let state: Option<String> =
@@ -702,14 +836,15 @@ pub async fn record_present(
             .await?;
     if state.as_deref() == Some(crate::db::meetings::STATE_ENDED) {
         tx.rollback().await?;
-        return Ok(Presence::default());
+        return Ok(unchanged);
     }
     let prior_status: Option<String> = sqlx::query_scalar(
         "SELECT p.status FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
          WHERE p.meeting_id = $1 AND p.user_id = $2 AND p.admitted_at IS NOT NULL \
            AND NOT ($3 = ANY (p.left_session_ids)) \
            AND ((p.status = 'admitted' AND p.live_session_id IS DISTINCT FROM $3) \
-                OR (p.status = 'left' AND p.admitted_at >= m.started_at)) \
+                OR (p.status = 'left' AND p.admitted_at >= m.started_at \
+                    AND (p.kicked_at IS NULL OR p.admitted_at > p.kicked_at))) \
          FOR UPDATE OF p",
     )
     .bind(meeting_id)
@@ -719,7 +854,7 @@ pub async fn record_present(
     .await?;
     let Some(prior_status) = prior_status else {
         tx.rollback().await?;
-        return Ok(Presence::default());
+        return Ok(unchanged);
     };
     sqlx::query(
         "UPDATE meeting_participants \
@@ -754,22 +889,28 @@ pub async fn record_present(
         restored: prior_status == "left",
         resumed,
         promoted,
+        active_kick,
     })
 }
 
 /// Renew the presence lease of each `(user_id, session_id)` a relay still holds: any non-tombstoned session renews an admitted row without changing `live_session_id`, so a `LEFT` for that exact session can still only match the session `record_present` actually recorded live. Also restores a matching `left` row. A `user_id` with two different session ids in one batch is dropped as ambiguous.
+///
+/// Also returns which of `kick_user_ids` are under an active kick (#2934),
+/// read in the same statement.
 pub async fn record_heartbeat(
     pool: &PgPool,
     room_id: &str,
     sessions: &[(String, i64)],
-) -> Result<u64, sqlx::Error> {
+    kick_user_ids: &[String],
+) -> Result<(u64, Vec<ActiveKick>), sqlx::Error> {
     let (user_ids, session_ids): (Vec<String>, Vec<i64>) = sessions.iter().cloned().unzip();
     // Ascending-`id` lock order matches `start_instance_in`'s retire UPDATE,
     // so the two can't deadlock; `SKIP LOCKED` is safe since a heartbeat is
     // best-effort and retried next tick. The watermark upsert is folded into
     // the same statement (one round trip); a data-modifying CTE always runs,
     // but both are still referenced by the final SELECT to keep that explicit.
-    let (renewed,): (i64,) = sqlx::query_as(&format!(
+    type Row = (i64, Vec<String>, Vec<DateTime<Utc>>, Vec<DateTime<Utc>>);
+    let (renewed, kicked_users, kicked_at, deny_until): Row = sqlx::query_as(&format!(
         "WITH hb AS ( \
             SELECT user_id, MAX(session_id) AS session_id \
             FROM UNNEST($2::TEXT[], $3::BIGINT[]) AS t(user_id, session_id) \
@@ -810,16 +951,35 @@ pub async fn record_heartbeat(
             WHERE presence_heartbeat_watermark.updated_at \
                   < NOW() - INTERVAL '{WATERMARK_STAMP_MIN_INTERVAL_SECS} seconds' \
             RETURNING 1 \
+         ), \
+         kicks AS ( \
+            SELECT p.user_id, p.kicked_at, p.kick_deny_until \
+            FROM meetings m JOIN meeting_participants p ON p.meeting_id = m.id \
+            WHERE m.room_id = $1 AND m.deleted_at IS NULL AND p.user_id = ANY($4) \
+              AND {ACTIVE_KICK} \
          ) \
-         SELECT (SELECT COUNT(*) FROM renewed)::BIGINT \
+         SELECT (SELECT COUNT(*) FROM renewed)::BIGINT, \
+                ARRAY(SELECT user_id FROM kicks ORDER BY user_id), \
+                ARRAY(SELECT kicked_at FROM kicks ORDER BY user_id), \
+                ARRAY(SELECT kick_deny_until FROM kicks ORDER BY user_id) \
          WHERE (SELECT COUNT(*) FROM watermark) IS NOT NULL"
     ))
     .bind(room_id)
     .bind(&user_ids)
     .bind(&session_ids)
+    .bind(kick_user_ids)
     .fetch_one(pool)
     .await?;
-    Ok(renewed as u64)
+    let kicks = kicked_users
+        .into_iter()
+        .zip(kicked_at.into_iter().zip(deny_until))
+        .map(|(user_id, (kicked_at, kick_deny_until))| ActiveKick {
+            user_id,
+            kicked_at,
+            kick_deny_until,
+        })
+        .collect();
+    Ok((renewed as u64, kicks))
 }
 
 /// Watermark staleness threshold for [`presence_healthy`]: two heartbeat
@@ -895,6 +1055,15 @@ pub fn present_sql(p: &str, healthy: bool) -> String {
                 AND {p}.presence_seen_at > NOW() - INTERVAL '{PRESENCE_LEASE_SECS} seconds') \
                OR (COALESCE({p}.live_session_id, 0) = 0 \
                    AND {p}.admitted_at > NOW() - INTERVAL '{PRESENCE_CONNECT_WINDOW_SECS} seconds')))"
+    )
+}
+
+/// SQL condition that row alias `p` is in the waiting room: its keepalive lease is fresh, or it never renewed (`NULL`).
+pub fn waiting_sql(p: &str) -> String {
+    format!(
+        "({p}.status = 'waiting' AND {p}.left_at IS NULL \
+          AND ({p}.presence_seen_at IS NULL \
+               OR {p}.presence_seen_at > NOW() - INTERVAL '{PRESENCE_LEASE_SECS} seconds'))"
     )
 }
 
@@ -984,15 +1153,16 @@ pub async fn leave(
         .await
 }
 
-/// Renew the caller's own presence lease directly (pre-join lobby, no live transport session). Returns whether a row matched.
+/// Renew the caller's own presence lease directly (waiting room, or pre-join lobby with no live transport session). Returns whether a row matched.
 pub async fn keepalive(pool: &PgPool, meeting_id: i32, user_id: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE meeting_participants mp \
          SET presence_seen_at = NOW() \
          FROM meetings m \
          WHERE m.id = mp.meeting_id AND mp.meeting_id = $1 AND mp.user_id = $2 \
-           AND mp.status = 'admitted' AND mp.left_at IS NULL \
-           AND COALESCE(mp.live_session_id, 0) = 0 \
+           AND ((mp.status = 'admitted' AND COALESCE(mp.live_session_id, 0) = 0) \
+                OR mp.status = 'waiting') \
+           AND mp.left_at IS NULL \
            AND m.state IS DISTINCT FROM 'ended'",
     )
     .bind(meeting_id)
@@ -1127,12 +1297,12 @@ pub async fn count_present_hosts<'e>(
     .await
 }
 
-/// Count participants still in the waiting room (explicit-leave-only; a transport disconnect does not un-count them).
+/// Count waiting participants (see [`waiting_sql`]).
 pub async fn count_waiting(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM meeting_participants \
-         WHERE meeting_id = $1 AND status = 'waiting' AND left_at IS NULL",
-    )
+    let row: (i64,) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FROM meeting_participants p WHERE p.meeting_id = $1 AND {}",
+        waiting_sql("p")
+    ))
     .bind(meeting_id)
     .fetch_one(pool)
     .await?;
@@ -1150,6 +1320,7 @@ impl ParticipantRow {
     ) -> videocall_meeting_types::responses::ParticipantStatusResponse {
         videocall_meeting_types::responses::ParticipantStatusResponse {
             is_guest: self.is_guest,
+            in_call: self.in_call,
             user_id: self.user_id,
             display_name: self.display_name,
             status: self.status,

@@ -36,7 +36,7 @@ use crate::password::ClientAddr;
 use crate::routes::valid_meeting_id::ValidMeetingId;
 use crate::search;
 use crate::state::AppState;
-use crate::token::{generate_observer_token, generate_room_token};
+use crate::token::{generate_observer_token_at, generate_room_token_at};
 use videocall_types::validation::validate_display_name;
 
 /// Maximum display-name changes allowed per window.
@@ -148,6 +148,7 @@ pub async fn join_meeting(
     ClientAddr(client_ip): ClientAddr,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let authorized_at = Utc::now().timestamp();
     let display_name = body
         .as_ref()
         .and_then(|b| b.display_name.as_deref())
@@ -209,9 +210,10 @@ pub async fn join_meeting(
         // is `false` when a transfer is in effect, so the creator rejoins as a
         // regular participant.
         let persisted_dn = row.display_name.clone();
-        let token = generate_room_token(
+        let token = generate_room_token_at(
             &state.jwt_secret,
             state.token_ttl_secs,
+            authorized_at,
             &user_id,
             &meeting_id,
             row.is_host,
@@ -252,6 +254,7 @@ pub async fn join_meeting(
             false,
             client_ip,
             supplied_password,
+            authorized_at,
         )
         .await
     }
@@ -289,6 +292,7 @@ async fn join_as_attendee(
     is_guest: bool,
     client_ip: Option<std::net::IpAddr>,
     supplied_password: Option<&str>,
+    authorized_at: i64,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     // Meeting-password gate. Before any DB write, token mint, or NATS publish —
     // a rejected join must leave no trace.
@@ -350,8 +354,15 @@ async fn join_as_attendee(
                 )
                 .await;
             }
-            if let Some(resp) =
-                try_join_as_co_host(state, &meeting, user_id, meeting_id, display_name).await?
+            if let Some(resp) = try_join_as_co_host(
+                state,
+                &meeting,
+                user_id,
+                meeting_id,
+                display_name,
+                authorized_at,
+            )
+            .await?
             {
                 return Ok(Json(APIResponse::ok(resp)));
             }
@@ -374,9 +385,10 @@ async fn join_as_attendee(
             // both of which are indexed by `list_for_search`. Re-push.
             search::spawn_repush(state, meeting.id, meeting_id.to_string());
             let token = if auto_admitted {
-                Some(generate_room_token(
+                Some(generate_room_token_at(
                     &state.jwt_secret,
                     state.token_ttl_secs,
+                    authorized_at,
                     user_id,
                     meeting_id,
                     is_host,
@@ -390,8 +402,9 @@ async fn join_as_attendee(
             let mut resp = row.into_participant_status(token);
             if is_guest || !auto_admitted {
                 let dn = display_name.unwrap_or(fallback_display_name);
-                resp.observer_token = Some(generate_observer_token(
+                resp.observer_token = Some(generate_observer_token_at(
                     &state.jwt_secret,
+                    authorized_at,
                     user_id,
                     meeting_id,
                     dn,
@@ -458,10 +471,17 @@ async fn join_as_attendee(
             waiting_room_enabled = meeting.waiting_room_enabled,
             "join gated: waiting_for_meeting (meeting is idle)"
         );
-        let observer =
-            generate_observer_token(&state.jwt_secret, user_id, meeting_id, dn, is_guest)?;
+        let observer = generate_observer_token_at(
+            &state.jwt_secret,
+            authorized_at,
+            user_id,
+            meeting_id,
+            dn,
+            is_guest,
+        )?;
         let resp = ParticipantStatusResponse {
             is_guest,
+            in_call: false,
             user_id: user_id.to_string(),
             display_name: display_name.map(String::from),
             status: "waiting_for_meeting".to_string(),
@@ -482,8 +502,15 @@ async fn join_as_attendee(
         return Ok(Json(APIResponse::ok(resp)));
     }
     if !is_guest {
-        if let Some(resp) =
-            try_join_as_co_host(state, &meeting, user_id, meeting_id, display_name).await?
+        if let Some(resp) = try_join_as_co_host(
+            state,
+            &meeting,
+            user_id,
+            meeting_id,
+            display_name,
+            authorized_at,
+        )
+        .await?
         {
             return Ok(Json(APIResponse::ok(resp)));
         }
@@ -536,9 +563,10 @@ async fn join_as_attendee(
     search::spawn_repush(state, meeting.id, meeting_id.to_string());
 
     let token = if auto_admitted {
-        Some(generate_room_token(
+        Some(generate_room_token_at(
             &state.jwt_secret,
             state.token_ttl_secs,
+            authorized_at,
             user_id,
             meeting_id,
             is_host,
@@ -554,8 +582,9 @@ async fn join_as_attendee(
     // Waiting attendees and all guests receive observer tokens for guest-status polling.
     if is_guest || !auto_admitted {
         let dn = display_name.unwrap_or(fallback_display_name);
-        resp.observer_token = Some(generate_observer_token(
+        resp.observer_token = Some(generate_observer_token_at(
             &state.jwt_secret,
+            authorized_at,
             user_id,
             meeting_id,
             dn,
@@ -594,6 +623,7 @@ async fn try_join_as_co_host(
     user_id: &str,
     meeting_id: &str,
     display_name: Option<&str>,
+    authorized_at: i64,
 ) -> Result<Option<ParticipantStatusResponse>, AppError> {
     if !db_co_hosts::has_live_entry(&state.db, meeting.id, user_id).await? {
         return Ok(None);
@@ -622,9 +652,10 @@ async fn try_join_as_co_host(
     )
     .await;
 
-    let token = generate_room_token(
+    let token = generate_room_token_at(
         &state.jwt_secret,
         state.token_ttl_secs,
+        authorized_at,
         user_id,
         meeting_id,
         row.is_host,
@@ -702,6 +733,7 @@ pub async fn join_meeting_as_guest(
     OptionalGuestObserver(observer): OptionalGuestObserver,
     body: Json<GuestJoinRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let authorized_at = Utc::now().timestamp();
     let display_name = validate_display_name(&body.display_name)
         .map_err(|_| AppError::invalid_input("Invalid display name."))?;
     let display_name = display_name.as_str();
@@ -727,6 +759,7 @@ pub async fn join_meeting_as_guest(
         true,
         client_ip,
         body.password.as_deref(),
+        authorized_at,
     )
     .await
 }
@@ -739,6 +772,7 @@ pub async fn get_my_status(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let authorized_at = Utc::now().timestamp();
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
@@ -753,9 +787,10 @@ pub async fn get_my_status(
         .ok_or_else(AppError::not_in_meeting)?;
 
     let token = if row.status == "admitted" {
-        Some(generate_room_token(
+        Some(generate_room_token_at(
             &state.jwt_secret,
             state.token_ttl_secs,
+            authorized_at,
             &user_id,
             &meeting_id,
             row.is_host,
@@ -793,6 +828,7 @@ pub async fn get_guest_status(
     }: GuestObserver,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let authorized_at = Utc::now().timestamp();
     // Reject cross-meeting token reuse: the observer token must have been
     // issued for exactly this meeting, not a different one.
     if token_meeting_id != meeting_id {
@@ -816,9 +852,10 @@ pub async fn get_guest_status(
     let display_name = row.display_name.as_deref().unwrap_or(&user_id);
 
     let token = if row.status == "admitted" {
-        Some(generate_room_token(
+        Some(generate_room_token_at(
             &state.jwt_secret,
             state.token_ttl_secs,
+            authorized_at,
             &user_id,
             &meeting_id,
             false,
@@ -834,8 +871,9 @@ pub async fn get_guest_status(
     // `kicked` and `left` are host-side revocations, and re-minting for those
     // would renew observation the host took away.
     let observer = if row.status == "waiting" {
-        Some(generate_observer_token(
+        Some(generate_observer_token_at(
             &state.jwt_secret,
+            authorized_at,
             &user_id,
             &meeting_id,
             display_name,
@@ -967,12 +1005,12 @@ pub async fn leave_meeting_as_guest(
 
 /// POST /api/v1/meetings/{meeting_id}/presence/keepalive
 ///
-/// Renews the caller's own presence lease while they sit in the manual
-/// pre-join lobby: admitted, but with no live transport session yet (the
-/// REST connect window alone only covers the first 60s). `404
-/// PARTICIPANT_NOT_FOUND` when the caller has no row eligible for this —
-/// not admitted, already has a live session (a heartbeat's job, not this
-/// one's), or the meeting has ended — so the client can stop calling.
+/// Renews the caller's own presence lease while they sit in the waiting room
+/// or the manual pre-join lobby (admitted, no live transport session yet).
+/// `404 PARTICIPANT_NOT_FOUND` when the caller has no row eligible for this —
+/// neither waiting nor admitted, already has a live session (a heartbeat's
+/// job, not this one's), or the meeting has ended. A waiting row survives an
+/// end, so its 404 clears if the meeting restarts.
 ///
 /// No rate limit: unlike a display-name change this is a single indexed
 /// `UPDATE` with no NATS publish and nothing broadcast to other
@@ -1101,7 +1139,8 @@ pub async fn update_display_name(
 
 /// GET /api/v1/meetings/{meeting_id}/participants
 ///
-/// Only participants who are themselves in the meeting can list other participants.
+/// Only the owner, or a participant admitted into (or left from) the current
+/// instance, can list other participants.
 pub async fn get_participants(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
@@ -1111,10 +1150,17 @@ pub async fn get_participants(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    // Verify the requester is actually a participant in this meeting.
-    db_participants::get_status(&state.db, meeting.id, &user_id)
-        .await?
-        .ok_or_else(AppError::not_in_meeting)?;
+    if meeting.creator_id.as_deref() != Some(user_id.as_str()) {
+        let caller = db_participants::get_status(&state.db, meeting.id, &user_id)
+            .await?
+            .ok_or_else(AppError::not_in_meeting)?;
+        let in_current_instance = caller.status == "admitted"
+            || (caller.status == "left"
+                && caller.admitted_at.is_some_and(|a| a >= meeting.started_at));
+        if !in_current_instance {
+            return Err(AppError::not_in_meeting());
+        }
+    }
 
     let rows = db_participants::get_admitted(&state.db, meeting.id).await?;
     let participants: Vec<ParticipantStatusResponse> = rows
@@ -1351,6 +1397,10 @@ mod tests {
             display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
+            kick_rate_limiter: std::sync::Arc::new(
+                crate::rate_limit::KeyedRateLimiter::for_host_kicks(),
+            ),
+            recording: Default::default(),
             search: None,
             display_name_rate_limit_disabled: disabled,
             dev_user: None,

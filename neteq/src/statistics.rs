@@ -267,6 +267,10 @@ pub struct LifetimeStatistics {
     pub buffer_flushes: u64,
     /// Late packets discarded
     pub late_packets_discarded: u64,
+    /// Samples played as comfort noise during DTX. Silence on purpose is not
+    /// concealment, so these are not in `concealed_samples` (WebRTC
+    /// `generated_noise_samples`).
+    pub generated_noise_samples: u64,
 }
 
 /// Operations and internal state metrics
@@ -374,6 +378,11 @@ impl StatisticsCalculator {
         if is_silent {
             self.lifetime_stats.silent_concealed_samples += concealed_samples;
         }
+    }
+
+    /// Record samples played as comfort noise (DTX).
+    pub fn generated_noise_samples(&mut self, samples: u64) {
+        self.lifetime_stats.generated_noise_samples += samples;
     }
 
     /// Record time-stretching operation

@@ -30,6 +30,14 @@ pub trait AudioDecoder {
 
     /// Decodes a single audio packet.
     fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>>;
+
+    /// Whether the decoder turns an Opus DTX frame (a payload of at most 2
+    /// bytes) or an empty payload into comfort noise at the stream's noise
+    /// floor, as libopus does. NetEq never passes such payloads to a decoder
+    /// that does not declare it, and generates comfort noise itself instead.
+    fn supports_dtx(&self) -> bool {
+        false
+    }
 }
 
 // Platform-specific codec implementations

@@ -116,18 +116,19 @@ pub async fn until_shutdown_or_closed(
     }
 }
 
-/// Await a client task; once the run is shutting down, give it `grace` from
-/// the first such wait (`deadline`, shared across tasks) and then abort it.
+/// Await a client task, or abort it during shutdown and return `None`.
 pub async fn join_or_abort<T>(
     mut handle: JoinHandle<T>,
     shutdown: &mut watch::Receiver<bool>,
     grace: Duration,
+    hard_stop: Option<tokio::time::Instant>,
     deadline: &mut Option<tokio::time::Instant>,
 ) -> Option<T> {
     let give_up = async {
         if deadline.is_none() {
             wait_for_shutdown(shutdown).await;
-            *deadline = Some(tokio::time::Instant::now() + grace);
+            let end = tokio::time::Instant::now() + grace;
+            *deadline = Some(hard_stop.map_or(end, |stop| stop.min(end)));
         }
         if let Some(at) = *deadline {
             tokio::time::sleep_until(at).await;
@@ -498,6 +499,7 @@ mod tests {
                 stuck,
                 &mut shutdown,
                 Duration::from_millis(50),
+                None,
                 &mut deadline,
             ),
         )
@@ -511,11 +513,33 @@ mod tests {
                 done,
                 &mut shutdown,
                 Duration::from_millis(50),
+                None,
                 &mut deadline
             )
             .await,
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn a_hard_stop_cuts_the_grace_short() {
+        let (tx, mut shutdown) = shutdown_channel();
+        let _ = tx.send(true);
+        let stuck = tokio::spawn(std::future::pending::<bool>());
+        let stop = tokio::time::Instant::now() + Duration::from_millis(50);
+        let joined = tokio::time::timeout(
+            Duration::from_secs(5),
+            join_or_abort(
+                stuck,
+                &mut shutdown,
+                Duration::from_secs(30),
+                Some(stop),
+                &mut None,
+            ),
+        )
+        .await
+        .expect("a hard stop must cut the 30 s grace short");
+        assert_eq!(joined, None);
     }
 
     #[test]

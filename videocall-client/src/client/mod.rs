@@ -16,6 +16,7 @@
  * conditions.
  */
 
+pub mod captions;
 mod layer_preference_sender;
 pub mod meeting_timer;
 pub mod raise_hand;

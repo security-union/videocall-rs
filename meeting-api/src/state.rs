@@ -75,8 +75,12 @@ pub struct AppState {
     pub display_name_rate_limiter_ops: Arc<AtomicU64>,
     /// Per-host limit on `POST .../kick`, per replica (#2934).
     pub kick_rate_limiter: Arc<crate::rate_limit::KeyedRateLimiter>,
+    /// Captions enable and renew requests per user per meeting.
+    pub captions_rate_limiter: Arc<crate::rate_limit::KeyedRateLimiter>,
     /// Recording-registry origins and per-replica limits (#2856).
     pub recording: Arc<crate::recording::RecordingGuard>,
+    /// Avatar rate limits, re-encode permits and the Gravatar client (#3125).
+    pub avatars: Arc<crate::avatar::AvatarService>,
     /// SearchV2 integration config. `None` disables the push path entirely;
     /// every [`crate::search`] call becomes a no-op. See [`SearchConfig`].
     pub search: Option<SearchConfig>,
@@ -86,6 +90,8 @@ pub struct AppState {
     /// update-display-name handlers short-circuits to allow.  Only intended
     /// for the E2E test harness — production must leave this `false`.
     pub display_name_rate_limit_disabled: bool,
+    /// Mirrors [`crate::config::Config::captions_enabled`].
+    pub captions_enabled: bool,
     /// Dev-only auto-login user. When `Some`, `GET /api/v1/dev/auto-login`
     /// issues a session cookie for this identity without any authentication.
     pub dev_user: Option<DevUser>,
@@ -149,12 +155,19 @@ impl AppState {
             display_name_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
             kick_rate_limiter: Arc::new(crate::rate_limit::KeyedRateLimiter::for_host_kicks()),
+            captions_rate_limiter: Arc::new(crate::rate_limit::KeyedRateLimiter::for_captions()),
             recording: Arc::new(crate::recording::RecordingGuard::new(
                 config.cors_allowed_origin.clone(),
                 config.dev_user.is_some(),
             )),
+            avatars: Arc::new(crate::avatar::AvatarService::new(
+                config
+                    .gravatar_enabled
+                    .then(crate::avatar::gravatar::default_base),
+            )),
             search: config.search.clone(),
             display_name_rate_limit_disabled: config.display_name_rate_limit_disabled,
+            captions_enabled: config.captions_enabled,
             dev_user: config.dev_user.clone(),
             password_gate: Arc::new(crate::password::MeetingPasswordGate::new()),
             presence_watermark_cache: Arc::new(Mutex::new(None)),

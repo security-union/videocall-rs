@@ -496,8 +496,8 @@ pub fn suppress_growth_step(step: BudgetStep, emergency_now: bool) -> BudgetStep
 
 /// Decide the next budget step from recent samples and current state.
 ///
-/// `samples` is most-recent-last (~the last 3–5 @ 1 Hz). `natural_count` is the
-/// uncapped layout tile count (the cap will never be raised above it).
+/// `samples` is most-recent-last (~the last 3–5 @ 1 Hz). `natural_count` is
+/// `total_tiles` (the cap will never be raised above it).
 /// `now_ms` is a monotonic-ish timestamp supplied by the caller for cooldown
 /// arithmetic.
 ///
@@ -826,7 +826,7 @@ pub(crate) fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'s
 /// - **`Auto`, pressured** — the adaptive control loop owns the cap; return it
 ///   verbatim (`cap`).
 ///
-/// `natural` is the uncapped layout tile count and `cap` is the loop-owned
+/// `natural` is `total_tiles` and `cap` is the loop-owned
 /// adaptive cap (only consulted on the pressured-Auto path).
 ///
 /// ## `device_ceiling` (issue #1286 / #1289)
@@ -1102,13 +1102,12 @@ pub const AVATAR_TILE_HINT_PX: u32 = 1;
 /// which emits no advertise entry, so the relay stays
 /// fail-open and forwards the whole ladder — the downlink flood the decode-budget clamp is
 /// supposed to be relieving. Such peers are floored at [`AVATAR_TILE_HINT_PX`].
-///
-/// `uncapped` names peers exempt from any lid (the active screen sharer in the split).
-pub fn build_peer_tile_hints(
+fn build_peer_tile_hints(
     viewport_sessions: &[u64],
     decoded_sessions: &std::collections::HashSet<u64>,
-    uncapped: &[u64],
-    tile_device_px_h: Option<u32>,
+    tile_device_px_h: u32,
+    enlarged_sessions: &std::collections::HashSet<u64>,
+    enlarged_device_px_h: u32,
 ) -> std::collections::HashMap<u64, TileHint> {
     viewport_sessions
         .iter()
@@ -1117,21 +1116,57 @@ pub fn build_peer_tile_hints(
         .collect::<std::collections::BTreeSet<u64>>()
         .into_iter()
         .map(|sid| {
-            let hint = if uncapped.contains(&sid) {
-                TileHint::Uncapped
-            } else if !decoded_sessions.contains(&sid) {
+            let hint = if !decoded_sessions.contains(&sid) {
                 TileHint::Capped {
                     device_px_h: AVATAR_TILE_HINT_PX,
                 }
+            } else if enlarged_sessions.contains(&sid) {
+                TileHint::Capped {
+                    device_px_h: enlarged_device_px_h,
+                }
             } else {
-                match tile_device_px_h {
-                    Some(h) => TileHint::Capped { device_px_h: h },
-                    None => TileHint::Uncapped,
+                TileHint::Capped {
+                    device_px_h: tile_device_px_h,
                 }
             };
             (sid, hint)
         })
         .collect()
+}
+
+/// The decoded sessions whose camera tile hint follows the tile size.
+pub struct HintedSessions(std::collections::HashSet<u64>);
+
+impl HintedSessions {
+    pub fn tile_hints(
+        &self,
+        viewport_sessions: &[u64],
+        tile_device_px_h: u32,
+        enlarged_sessions: &std::collections::HashSet<u64>,
+        enlarged_device_px_h: u32,
+    ) -> std::collections::HashMap<u64, TileHint> {
+        build_peer_tile_hints(
+            viewport_sessions,
+            &self.0,
+            tile_device_px_h,
+            enlarged_sessions,
+            enlarged_device_px_h,
+        )
+    }
+}
+
+/// The sessions to decode, and the decoded tiles plus the received share on
+/// show as the ones whose camera tile hint follows the tile size.
+pub fn screen_decode_sets(
+    decoded: &std::collections::HashSet<u64>,
+    primary: Option<&str>,
+    demoted: &[String],
+) -> (std::collections::HashSet<u64>, HintedSessions) {
+    let mut hinted = decoded.clone();
+    hinted.extend(primary.and_then(|s| s.parse::<u64>().ok()));
+    let mut active = hinted.clone();
+    active.extend(demoted.iter().filter_map(|s| s.parse::<u64>().ok()));
+    (active, HintedSessions(hinted))
 }
 
 /// Session_ids to publish as the relay's `VIEWPORT` filter.
@@ -1175,11 +1210,6 @@ pub fn viewport_roster(
         }
     }
     roster
-}
-
-/// Sessions exempt from the tile-size lid: the sharer in the split layout.
-pub fn tile_hint_exemptions(sharer: Option<u64>, split_layout: bool) -> Vec<u64> {
-    sharer.filter(|_| split_layout).into_iter().collect()
 }
 
 /// Promote user-requested ("PLAY") peers that are still ranked beyond the
@@ -1346,8 +1376,8 @@ pub enum TileRenderMode {
 /// - `avatar_tiles`: camera-on peers beyond the decode budget (Avatar)
 /// - `camera_off_tiles`: camera-off peers to render (CameraOff)
 ///
-/// This function merges them into a single list: the pinned sessions first, by
-/// `pin_rank`, then everyone by `peer_join_time`. Toggling a camera changes
+/// This function merges them into a single list: the sessions in `pin_rank`
+/// first, by rank, then everyone by `peer_join_time`. Toggling a camera changes
 /// WHAT renders in a grid cell (live video vs placeholder) but NOT WHERE in the
 /// grid the peer appears.
 ///
@@ -1993,6 +2023,48 @@ pub fn compose_encoder_ceiling(user_pref: Option<u32>, protective: Option<u32>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_demoted_sharer_decodes_its_screen_but_its_paused_camera_keeps_the_avatar_floor() {
+        let decoded: std::collections::HashSet<u64> = [1].into_iter().collect();
+        let demoted = ["8".to_string()];
+        let (active, hinted) = screen_decode_sets(&decoded, Some("7"), &demoted);
+        assert_eq!(active, [1, 7, 8].into_iter().collect());
+        let hints = hinted.tile_hints(&[1, 7, 8], 720, &HashSet::new(), 0);
+        let avatar = TileHint::Capped {
+            device_px_h: AVATAR_TILE_HINT_PX,
+        };
+        assert_eq!(hints[&8], avatar, "the demoted sharer's paused camera");
+        assert_eq!(hints[&7], TileHint::Capped { device_px_h: 720 });
+    }
+
+    #[test]
+    fn only_a_decoded_enlarged_tile_is_lidded_to_its_enlarged_size() {
+        use videocall_client::{size_cap_layer, PrefMediaKind};
+        let decoded: HashSet<u64> = [1, 2].into_iter().collect();
+        let (_, hinted) = screen_decode_sets(&decoded, None, &[]);
+        let enlarged: HashSet<u64> = [2, 3].into_iter().collect();
+        let hints = hinted.tile_hints(&[1, 2, 3], 199, &enlarged, 414);
+        assert_eq!(hints[&1], TileHint::Capped { device_px_h: 199 });
+        assert_eq!(hints[&2], TileHint::Capped { device_px_h: 414 });
+        assert_eq!(
+            hints[&3],
+            TileHint::Capped {
+                device_px_h: AVATAR_TILE_HINT_PX
+            },
+            "an enlarged tile the budget paused is still only an avatar"
+        );
+        let layer = |sid| {
+            let TileHint::Capped { device_px_h } = hints[&sid] else {
+                panic!("peer {sid} is Uncapped");
+            };
+            size_cap_layer(device_px_h, 2, 3, PrefMediaKind::Video)
+        };
+        assert!(
+            layer(2) > layer(1),
+            "the enlarged tile must be able to select a higher video layer"
+        );
+    }
 
     /// A sample with explicit FPS and a comfortably-idle main thread (a
     /// *present* `Some(0.0)` long-task reading — i.e. a Chromium browser where
@@ -5260,7 +5332,7 @@ mod tests {
         use videocall_client::{size_cap_layer, PrefMediaKind};
         let viewport: Vec<u64> = vec![11, 22, 33];
         let decoded: std::collections::HashSet<u64> = [11].into_iter().collect();
-        let hints = build_peer_tile_hints(&viewport, &decoded, &[], Some(720));
+        let hints = build_peer_tile_hints(&viewport, &decoded, 720, &HashSet::new(), 0);
 
         // Every FORWARDED peer is covered — an absent entry is Uncapped, which is the
         // whole-ladder fail-open this guards.
@@ -5283,14 +5355,6 @@ mod tests {
     }
 
     #[test]
-    fn uncapped_members_are_not_lidded_even_when_undecoded() {
-        let viewport: Vec<u64> = vec![11, 22];
-        let decoded: std::collections::HashSet<u64> = [11].into_iter().collect();
-        let hints = build_peer_tile_hints(&viewport, &decoded, &[22], Some(720));
-        assert_eq!(hints[&22], TileHint::Uncapped);
-    }
-
-    #[test]
     fn viewport_roster_keeps_an_overflowed_sharer_out_of_the_tile_layout() {
         let grid = vec![("7".to_string(), TileRenderMode::Decoded)];
         assert_eq!(
@@ -5306,13 +5370,6 @@ mod tests {
             viewport_roster(true, &[], &roster(&["7"]), Some("mock-1")),
             roster(&["7"])
         );
-    }
-
-    #[test]
-    fn only_the_split_exempts_the_sharer_from_the_tile_lid() {
-        assert_eq!(tile_hint_exemptions(Some(42), false), Vec::<u64>::new());
-        assert_eq!(tile_hint_exemptions(Some(42), true), vec![42]);
-        assert_eq!(tile_hint_exemptions(None, true), Vec::<u64>::new());
     }
 
     #[test]
@@ -5349,7 +5406,7 @@ mod tests {
         // fail-open this fix exists to close.
         let viewport: Vec<u64> = vec![11];
         let decoded: std::collections::HashSet<u64> = [11, 99].into_iter().collect();
-        let hints = build_peer_tile_hints(&viewport, &decoded, &[], Some(720));
+        let hints = build_peer_tile_hints(&viewport, &decoded, 720, &HashSet::new(), 0);
         assert_eq!(hints[&99], TileHint::Capped { device_px_h: 720 });
     }
 

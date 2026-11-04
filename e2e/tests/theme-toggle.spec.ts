@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
+import { wakeActionBar } from "../helpers/controls";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
@@ -56,8 +57,18 @@ async function openAppearanceTab(
 
   await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-  // Open the settings modal.
-  await page.locator('[data-testid="open-settings"]').click();
+  await wakeActionBar(page);
+  const settingsButton = page.locator('[data-testid="open-settings"]');
+  if (await settingsButton.isVisible()) {
+    await settingsButton.click();
+  } else {
+    await page.locator("#overflow-menu-trigger").click();
+    await page
+      .locator(".action-bar-overflow-popover button.overflow-item", {
+        has: page.locator('span:text-is("Settings")'),
+      })
+      .click();
+  }
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
 
   // Navigate to the Appearance tab.

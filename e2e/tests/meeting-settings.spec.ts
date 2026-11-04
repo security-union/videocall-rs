@@ -2,6 +2,11 @@ import { test, expect, Page, chromium, Locator } from "@playwright/test";
 import { injectSessionCookie, generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
+import { openMeetingOptions } from "../helpers/controls";
+
+function optionsCardHeading(page: Page): Locator {
+  return page.getByRole("heading", { name: "Options", exact: true });
+}
 
 test.describe("Meeting settings – Options toggles", () => {
   test.beforeAll(async () => {
@@ -49,7 +54,7 @@ test.describe("Meeting settings – Options toggles", () => {
     await expect(page.getByText("Meeting Settings")).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.getByText("Options")).toBeVisible({ timeout: 5_000 });
+    await expect(optionsCardHeading(page)).toBeVisible({ timeout: 5_000 });
   }
 
   /** Locate the toggle button inside a settings-option-row by its label text. */
@@ -314,7 +319,7 @@ test.describe("Meeting settings – Options toggles", () => {
 
     // Reload the page
     await page.reload();
-    await expect(page.getByText("Options")).toBeVisible({ timeout: 10_000 });
+    await expect(optionsCardHeading(page)).toBeVisible({ timeout: 10_000 });
 
     // Both toggles should reflect the persisted state
     await expect(optionToggle(page, "Waiting Room")).toHaveAttribute("aria-checked", "true");
@@ -336,7 +341,7 @@ test.describe("Meeting settings – Options toggles", () => {
 
     // Reload and verify state persists
     await page.reload();
-    await expect(page.getByText("Options")).toBeVisible({ timeout: 10_000 });
+    await expect(optionsCardHeading(page)).toBeVisible({ timeout: 10_000 });
     await expect(optionToggle(page, "End meeting when host leaves")).toHaveAttribute(
       "aria-checked",
       afterToggle,
@@ -442,7 +447,7 @@ async function hostJoinAndConfigureEohl(
   // Go to settings and configure the toggle
   await hostPage.goto(`/meeting/${meetingId}/settings`);
   await hostPage.waitForTimeout(1500);
-  await expect(hostPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
+  await expect(optionsCardHeading(hostPage)).toBeVisible({ timeout: 10_000 });
 
   const eohToggle = hostPage
     .locator(".settings-option-row")
@@ -680,8 +685,8 @@ async function joinMeetingWhenReady(page: Page): Promise<"in-meeting" | "waiting
   return "in-meeting";
 }
 
-function settingsToggle(page: Page, label: string) {
-  return page
+function settingsToggle(scope: Page | Locator, label: string) {
+  return scope
     .locator(".settings-option-row")
     .filter({ hasText: label })
     .locator('button[role="switch"]');
@@ -783,7 +788,7 @@ test.describe("Meeting settings – admitted_can_admit live propagation", () => 
 
       // Host toggles admitted_can_admit ON mid-meeting.
       await hostPage.goto(`/meeting/${meetingId}/settings`);
-      await expect(hostPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
+      await expect(optionsCardHeading(hostPage)).toBeVisible({ timeout: 10_000 });
       const admittedCanAdmitToggle = settingsToggle(hostPage, "Admitted can admit");
       await expect(admittedCanAdmitToggle).toHaveAttribute("aria-checked", "false", {
         timeout: 5_000,
@@ -883,7 +888,7 @@ test.describe("Meeting settings – live participant count refresh (issue 1551)"
       // with the host present.
       const settingsPage = await hostCtx.newPage();
       await settingsPage.goto(`/meeting/${meetingId}/settings`);
-      await expect(settingsPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
+      await expect(optionsCardHeading(settingsPage)).toBeVisible({ timeout: 10_000 });
 
       const countValue = participantsStatValue(settingsPage);
       await expect(countValue).toBeVisible({ timeout: 5_000 });
@@ -939,20 +944,20 @@ test.describe("Meeting settings – in-call Meeting Options panel", () => {
    *  toggle to `on`, then close the panel. Asserts the toggle reached the
    *  requested state before closing. */
   async function setWaitingRoomFromInCallPanel(hostPage: Page, on: boolean): Promise<void> {
-    const optionsButton = hostPage.locator('[data-testid="open-meeting-options"]');
-    await expect(optionsButton).toBeVisible({ timeout: 10_000 });
-    await optionsButton.click();
+    const panel = await openMeetingOptions(hostPage);
 
-    const wrToggle = settingsToggle(hostPage, "Waiting Room");
+    const wrToggle = settingsToggle(panel, "Waiting Room");
     await expect(wrToggle).toBeVisible({ timeout: 5_000 });
     const want = on ? "true" : "false";
     if ((await wrToggle.getAttribute("aria-checked")) !== want) {
-      await wrToggle.click();
+      await wrToggle.click({ timeout: 10_000 });
       await expect(wrToggle).toHaveAttribute("aria-checked", want, { timeout: 5_000 });
     }
 
-    await hostPage.getByRole("button", { name: "Done" }).click();
-    await expect(wrToggle).not.toBeVisible({ timeout: 5_000 });
+    await panel
+      .getByRole("button", { name: "Close meeting options", exact: true })
+      .click({ timeout: 10_000 });
+    await expect(panel).toHaveCount(0, { timeout: 5_000 });
   }
 
   // The host changes meeting options live from INSIDE the call (without going

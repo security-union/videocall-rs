@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """Run a declared set of mutations against a test suite and report which die.
 
-    scripts/mutation-check.py run    <spec>.json [--only NAME] [-v]
+    scripts/mutation-check.py run    <spec>.json [--only NAME]... [--changed-since REV] [--list] [-v]
     scripts/mutation-check.py verify <spec>.json [--sha REV]
 
 `run` applies each mutation, runs the suite, and asserts the NAMED tests die — so a
 mutation that kills some other test is an error, not a pass. `verify` asserts claims
 against COMMITTED blobs, which is the check to use after a fix round; `--sha` audits
 an older commit.
+
+`--only` repeats (union; a filter matching nothing is an error). `--changed-since REV`
+selects the targeted set for a fix round: entries new or edited in the spec since REV,
+anchors in or near lines changed since REV (whole enclosing def for Python) or whose
+count no longer matches, and entries whose `expect_kills` tests were edited or
+deleted. A changed run command, a fall in `baseline_tests` or an unparseable Python
+file selects everything. REV must be a pinned SHA (the last-reviewed commit), never a
+branch. Not seen: imported production code, same-file code outside the changed def
+or ±3 window, test helpers and fixtures, untracked files. `--list` prints the
+selection and why. No filter runs every mutation.
 
 WHY A TOOL AND NOT A SHELL LOOP. Each guard below exists because the hand-written
 equivalent returned a WRONG answer that a reviewer then had to catch. Do not remove
@@ -37,19 +47,54 @@ Runners: `vitest`, `cargo`, `unittest`.
 from __future__ import annotations
 
 import argparse
+import ast
+import contextlib
+import functools
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 KILLED, SURVIVED, ERROR = "KILLED", "SURVIVED", "ERROR"
+POLL_S = 0.05
+_DEFER = 0
+_PENDING: list[int] = []
 
 
-SPEC_TOP = {"runner", "cwd", "command", "node", "baseline_tests", "mutations",
+def _exit_on_signal(signum: int, _frame) -> None:
+    """Exit at once when nothing needs cleaning up; otherwise record the signal for
+    check_signal(), so a group kill or restore in progress is never cut short."""
+    if _DEFER:
+        _PENDING.append(signum)
+    else:
+        raise SystemExit(128 + signum)
+
+
+def check_signal() -> None:
+    if _PENDING:
+        raise SystemExit(128 + _PENDING[0])
+
+
+@contextlib.contextmanager
+def deferred_signals():
+    global _DEFER
+    _DEFER += 1
+    try:
+        yield
+    finally:
+        _DEFER -= 1
+    if not _DEFER:
+        check_signal()
+
+
+SPEC_TOP = {"runner", "cwd", "command", "node", "timeout_s", "baseline_tests", "mutations",
             "committed_claims", "_comment"}
 SPEC_MUT = {"name", "file", "find", "replace", "occurrences", "expect_kills"}
 SPEC_CLAIM = {"file", "present", "absent"}
@@ -163,16 +208,36 @@ class Runner:
         # below this closes a non-deterministic wrong-verdict path — the worst
         # outcome for a verifier, since it does not reproduce.
         env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-        try:
-            # Bounded: a hung suite (vitest awaiting a socket, a cargo deadlock) would
-            # otherwise stall the tool indefinitely behind a blank screen.
-            proc = subprocess.run(
-                self._shell(), cwd=self.cwd, capture_output=True, text=True, env=env,
-                timeout=self.timeout_s,
-            )
-        except subprocess.TimeoutExpired:
-            return None, [], f"suite exceeded timeout_s={self.timeout_s}"
-        out = proc.stdout + proc.stderr
+        # Own session, so the suite's whole group can be killed however it ends. That
+        # also takes it out of the terminal's and `timeout`'s signals, hence the
+        # deferred handlers and the `finally`. Files, not pipes: a grandchild
+        # holding a pipe open would hold the run until timeout_s.
+        with deferred_signals(), tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
+            proc = subprocess.Popen(self._shell(), cwd=self.cwd, stdout=fout, stderr=ferr,
+                                    env=env, start_new_session=True)
+            timed_out = False
+            try:
+                deadline = time.monotonic() + self.timeout_s
+                while True:
+                    check_signal()
+                    try:
+                        proc.wait(timeout=min(POLL_S, max(0.0, deadline - time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() >= deadline:
+                            timed_out = True
+                            break
+            finally:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    proc.kill()
+                proc.wait()
+            if timed_out:
+                return None, [], f"suite exceeded timeout_s={self.timeout_s}"
+            fout.seek(0)
+            ferr.seek(0)
+            out = (fout.read() + ferr.read()).decode(errors="replace")
         if self.verbose:
             print(out)
         if self.node:
@@ -304,12 +369,302 @@ def apply_mutation(path: Path, find: str, replace: str, want: int) -> None:
     path.write_text(mutated)
 
 
-def cmd_run(spec: dict, root: Path, only: str | None, verbose: bool) -> int:
+CONTEXT_MARGIN = 3
+TEST_EXTS = {
+    "unittest": (".py",),
+    "cargo": (".rs",),
+    "vitest": (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"),
+}
+
+
+def select_only(muts: list[dict], only: list[str]) -> dict[int, list[str]]:
+    picked: dict[int, list[str]] = {}
+    unmatched = []
+    for f in only:
+        hits = [i for i, m in enumerate(muts) if f.lower() in m["name"].lower()]
+        if not hits:
+            unmatched.append(f)
+        for i in hits:
+            picked.setdefault(i, []).append(f"--only {f!r}")
+    if unmatched:
+        sys.exit("ERROR: --only matched no mutation: " + ", ".join(map(repr, unmatched)))
+    return picked
+
+
+def resolve_rev(root: Path, rev: str) -> str:
+    out = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+                         cwd=root, capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"ERROR: --changed-since {rev!r} does not resolve to a commit")
+    return out.stdout.strip()
+
+
+def spec_at(root: Path, sha: str, spec_rel: str) -> dict:
+    blob = subprocess.run(["git", "show", f"{sha}:{spec_rel}"], cwd=root,
+                          capture_output=True, text=True)
+    if blob.returncode != 0:
+        sys.exit(f"ERROR: cannot read the spec at {sha[:8]} ({spec_rel}): {blob.stderr.strip()}\n"
+                 "A spec that did not exist then has no baseline to diff — run without "
+                 "--changed-since.")
+    try:
+        return json.loads(blob.stdout)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"ERROR: the spec at {sha[:8]} ({spec_rel}) is not valid JSON: {exc}")
+
+
+@dataclass
+class Change:
+    old: set[int]
+    new: set[int]
+    near: set[int]
+
+
+def changed_files(root: Path, sha: str, keep) -> dict[str, Change]:
+    """Changed line numbers per file, working tree against `sha`: removed or edited
+    lines at `sha`, added or edited lines now, and `near` = `new` plus the lines
+    either side of a pure deletion. Untracked files are not seen.
+    """
+    names = git("diff", "-z", "--name-only", "--no-renames", sha, "--", cwd=root).split("\0")
+    out = {}
+    for path in filter(keep, filter(None, names)):
+        diff = subprocess.run(
+            ["git", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames", sha, "--",
+             f":(literal){path}"],
+            cwd=root, capture_output=True, text=True, errors="replace", check=True).stdout
+        c = out[path] = Change(set(), set(), set())
+        for m in re.finditer(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", diff, re.M):
+            a, b, start, n = int(m[1]), int(m[2] or 1), int(m[3]), int(m[4] or 1)
+            c.old.update(range(a, a + b))
+            c.new.update(range(start, start + n))
+            c.near.update(range(start, start + n) if n else (max(start, 1), start + 1))
+    return out
+
+
+def text_at(root: Path, sha: str, path: str) -> str | None:
+    blob = subprocess.run(["git", "show", f"{sha}:{path}"], cwd=root, capture_output=True,
+                          text=True, errors="replace")
+    return blob.stdout if blob.returncode == 0 else None
+
+
+@functools.lru_cache(maxsize=None)
+def python_defs(text: str) -> list[tuple[str, int, int]] | None:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    return [(n.name, min([n.lineno] + [d.lineno for d in n.decorator_list]), n.end_lineno)
+            for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def changed_regions(path: str, text: str, lines: set[int]) -> list[tuple[int, int, str]]:
+    """Spans a mutation anchor must overlap to count as touched: the outermost
+    enclosing def for a changed Python line, else the line ± CONTEXT_MARGIN."""
+    defs = python_defs(text) if path.endswith(".py") else None
+    regions = []
+    for ln in sorted(lines):
+        enclosing = [d for d in defs or [] if d[1] <= ln <= d[2]]
+        if enclosing:
+            name, lo, hi = min(enclosing, key=lambda d: d[1])
+            regions.append((lo, hi, f"def {name}"))
+        else:
+            regions.append((ln - CONTEXT_MARGIN, ln + CONTEXT_MARGIN, f"line {ln}"))
+    return regions
+
+
+def anchor_span(text: str, find: str) -> tuple[int, int] | None:
+    idx = text.find(find)
+    if idx < 0:
+        return None
+    start = text.count("\n", 0, idx) + 1
+    return start, start + find.rstrip("\n").count("\n")
+
+
+def block_end(lines: list[str], start: int, quotes: str) -> int:
+    depth, opened = 0, False
+    for i in range(start - 1, len(lines)):
+        line, quote, j = lines[i], None, 0
+        while j < len(line):
+            ch = line[j]
+            if quote:
+                if ch == "\\":
+                    j += 1
+                elif ch == quote:
+                    quote = None
+            elif ch in quotes:
+                quote = ch
+            elif line.startswith("//", j):
+                break
+            elif ch == "{":
+                depth, opened = depth + 1, True
+            elif ch == "}":
+                depth -= 1
+                if opened and depth <= 0:
+                    return i + 1
+            j += 1
+    return start + CONTEXT_MARGIN
+
+
+@functools.lru_cache(maxsize=None)
+def test_spans(runner: str, path: str, text: str, name: str) -> list[tuple[int, int]]:
+    """Where a test named by an `expect_kills` substring is defined in one file.
+
+    unittest: a def whose name contains it, with its decorators, plus the header
+    (decorators and bases) of each enclosing class.
+    cargo: an `fn` containing its last `::` segment, from the `#[...]`, `//` and blank
+    lines above it to the matching brace.
+    vitest: an it/test/describe title containing its last ` > ` segment (modifiers
+    such as `.skip` sit on that line), to the matching brace.
+    Braces inside a one-line string or after `//` are skipped; a brace in a
+    multi-line string, block comment, char literal or regex still counts.
+    """
+    needle = name.lower()
+    if runner == "unittest":
+        return _unittest_spans(text, needle)
+    lines = text.splitlines()
+    if runner == "cargo":
+        seg = needle.rsplit("::", 1)[-1]
+        pat, quotes = re.compile(r"\bfn\s+(\w+)"), '"'
+    else:
+        seg = needle.rsplit(" > ", 1)[-1]
+        pat = re.compile(r"\b(?:it|test|describe)(?:\.\w+)*\(\s*(['\"`])(.*?)\1")
+        quotes = "\"'`"
+    if not seg:
+        return []
+    spans = []
+    for i, line in enumerate(lines, 1):
+        for m in pat.finditer(line):
+            if seg in m.group(m.lastindex).lower():
+                lo = i
+                while runner == "cargo" and lo > 1 and (not lines[lo - 2].strip()
+                                                        or lines[lo - 2].strip().startswith(("#[", "//"))):
+                    lo -= 1
+                spans.append((lo, block_end(lines, i, quotes)))
+    return spans
+
+
+def _unittest_spans(text: str, needle: str) -> list[tuple[int, int]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    spans: list[tuple[int, int]] = []
+
+    def visit(node: ast.AST, headers: list[tuple[int, int]]) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = headers
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                start = min([child.lineno] + [d.lineno for d in child.decorator_list])
+                if isinstance(child, ast.ClassDef):
+                    inner = headers + [(start, max(child.lineno, child.body[0].lineno - 1))]
+                elif needle in child.name.lower():
+                    spans.extend([(start, child.end_lineno)] + headers)
+            visit(child, inner)
+
+    visit(tree, [])
+    return spans
+
+
+def select_changed_since(spec: dict, root: Path, spec_rel: str, rev: str) -> dict[int, list[str]]:
+    sha = resolve_rev(root, rev)
+    old_spec = spec_at(root, sha, spec_rel)
     muts = spec["mutations"]
-    if only:
-        muts = [m for m in muts if only.lower() in m["name"].lower()]
-        if not muts:
-            sys.exit(f"--only {only!r} matched no mutation")
+
+    def everything(why: str) -> dict[int, list[str]]:
+        return {i: [why + " — every entry selected"] for i in range(len(muts))}
+
+    for key in ("runner", "cwd", "command", "node"):
+        if old_spec.get(key) != spec.get(key):
+            return everything(f"spec `{key}` changed since {sha[:8]}")
+    was, now_count = old_spec.get("baseline_tests"), spec.get("baseline_tests")
+    if isinstance(was, int) and isinstance(now_count, int) and now_count < was:
+        return everything(f"baseline_tests fell {was}→{now_count}: a test may have dropped out of discovery")
+    exts = TEST_EXTS.get(spec["runner"], ())
+    targets = {m["file"] for m in muts}
+    changed = changed_files(root, sha, lambda p: p in targets or p.endswith(exts))
+    now: dict[str, str | None] = {}
+
+    def read(path: str) -> str | None:
+        if path not in now:
+            f = root / path
+            now[path] = f.read_text(errors="replace") if f.is_file() else None
+        return now[path]
+
+    then = {p: text_at(root, sha, p) for p in changed}
+    for p in (p for p in changed if p.endswith(".py")):
+        for text, when in ((read(p), "now"), (then[p], f"at {sha[:8]}")):
+            if text is not None and python_defs(text) is None:
+                return everything(f"{p} does not parse {when}")
+    regions = {p: changed_regions(p, read(p), changed[p].near) for p in changed if read(p) is not None}
+    test_files = [p for p in changed if p.endswith(exts)]
+    old_by_name: dict[str, list[dict]] = {}
+    for o in old_spec.get("mutations", []):
+        old_by_name.setdefault(o.get("name"), []).append(o)
+
+    def changed_test(name: str) -> str | None:
+        for p in test_files:
+            for text, lines, where in ((read(p), changed[p].new, f"changed at {p}"),
+                                       (then[p], changed[p].old, f"changed or removed: was {p}")):
+                for lo, hi in test_spans(spec["runner"], p, text, name) if text is not None else ():
+                    if any(lo <= ln <= hi for ln in lines):
+                        return f"{where}:{lo}"
+        return None
+
+    picked: dict[int, list[str]] = {}
+    for i, m in enumerate(muts):
+        why = []
+        prior = old_by_name.get(m["name"])
+        if not prior:
+            why.append("(a) new spec entry")
+        elif m not in prior:
+            why.append("(a) spec entry changed")
+        text = read(m["file"])
+        want, found = m.get("occurrences", 1), text.count(m["find"]) if text is not None else 0
+        if found != want:
+            why.append(f"(b) anchor appears {found}x, spec expects {want}x — preflight will report it")
+        else:
+            span = anchor_span(text, m["find"])
+            for lo, hi, what in regions.get(m["file"], []):
+                if lo <= span[1] and span[0] <= hi:
+                    why.append(f"(b) anchor at {m['file']}:{span[0]} is in changed {what}")
+                    break
+        for name in m.get("expect_kills", []):
+            hit = changed_test(name)
+            if hit:
+                why.append(f"(c) test {name!r} {hit}")
+        if why:
+            picked[i] = why
+    return picked
+
+
+def select(spec: dict, root: Path, spec_rel: str, only: list[str],
+           changed_since: str | None) -> list[tuple[dict, list[str]]]:
+    muts = spec["mutations"]
+    if not only and changed_since is None:
+        return [(m, ["full run"]) for m in muts]
+    picked = select_only(muts, only)
+    if changed_since is not None:
+        for i, why in select_changed_since(spec, root, spec_rel, changed_since).items():
+            picked.setdefault(i, []).extend(why)
+    return [(muts[i], picked[i]) for i in sorted(picked)]
+
+
+def print_selection(selected: list[tuple[dict, list[str]]], total: int) -> None:
+    for m, why in selected:
+        print(f"  {m['name']}")
+        for w in why:
+            print(f"      {w}")
+    print(f"\n{len(selected)}/{total} mutation(s) selected")
+
+
+def cmd_run(spec: dict, root: Path, muts: list[dict], verbose: bool) -> int:
+    with deferred_signals():
+        return _cmd_run(spec, root, muts, verbose)
+
+
+def _cmd_run(spec: dict, root: Path, muts: list[dict], verbose: bool) -> int:
+    if not muts:
+        print("0 mutation(s) selected — nothing to run")
+        return 0
     files = sorted({m["file"] for m in muts})
     assert_clean(root, files)
     preflight(root, muts)
@@ -338,6 +693,7 @@ def cmd_run(spec: dict, root: Path, only: str | None, verbose: bool) -> int:
 
     results: list[Result] = []
     for m in muts:
+        check_signal()
         path = root / m["file"]
         original = path.read_text()
         print(f"  {m['name']} …", end=" ", flush=True)
@@ -416,11 +772,18 @@ def cmd_verify(spec: dict, root: Path, rev: str) -> int:
 
 
 def main() -> int:
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, _exit_on_signal)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="apply mutations and assert the named tests die")
     r.add_argument("spec", type=Path)
-    r.add_argument("--only", help="substring: run just the matching mutation(s)")
+    r.add_argument("--only", action="append", default=[],
+                   help="substring: run the matching mutation(s); repeatable, runs the union")
+    r.add_argument("--changed-since", metavar="REV",
+                   help="run only mutations targeted by changes since REV (fix rounds)")
+    r.add_argument("--list", action="store_true",
+                   help="print the selected mutations and why, without running")
     r.add_argument("-v", "--verbose", action="store_true", help="stream runner output")
     v = sub.add_parser("verify", help="assert claims about COMMITTED content")
     v.add_argument("spec", type=Path)
@@ -431,7 +794,17 @@ def main() -> int:
     validate_spec(spec, args.cmd)
     root = repo_root()
     if args.cmd == "run":
-        return cmd_run(spec, root, args.only, args.verbose)
+        try:
+            spec_rel = args.spec.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            spec_rel = ""
+            if args.changed_since is not None:
+                sys.exit(f"ERROR: {args.spec} is outside the repository; --changed-since needs it inside")
+        selected = select(spec, root, spec_rel, args.only, args.changed_since)
+        if args.list:
+            print_selection(selected, len(spec["mutations"]))
+            return 0
+        return cmd_run(spec, root, [m for m, _ in selected], args.verbose)
     return cmd_verify(spec, root, args.sha)
 
 

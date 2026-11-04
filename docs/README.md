@@ -106,9 +106,6 @@ If you are looking for a per-crate README (e.g. `videocall-client`, `dioxus-ui`,
 
 - [bot README](../bot/README.md) — overview of the synthetic-client bot used
   for load testing.
-- [Bot adaptive-quality / network-impairment validation log](../bot/VALIDATION.md) —
-  rolling log of what the bot's network-condition simulation has been proven
-  to do.
 
 ## Native mobile SDKs
 

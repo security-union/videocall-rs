@@ -27,7 +27,7 @@ use videocall_transport::webtransport::FrameDropMeta;
 use videocall_transport::webtransport::WebTransportTask;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
+use super::webmedia::{ConnectOptions, MediaStreamKey, StreamQueueDepth, WebMedia};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -79,6 +79,7 @@ pub(super) struct StubTask {
     sends: RefCell<Vec<(StubSendKind, MediaStreamKey)>>,
     transport: UplinkTransport,
     buffered_amount: std::cell::Cell<Option<u64>>,
+    wt_stream_depth: std::cell::Cell<u64>,
 }
 
 #[cfg(test)]
@@ -93,6 +94,7 @@ impl StubTask {
             sends: RefCell::new(Vec::new()),
             transport,
             buffered_amount: std::cell::Cell::new(buffered_amount),
+            wt_stream_depth: std::cell::Cell::new(0),
         }
     }
 
@@ -116,6 +118,10 @@ impl StubTask {
 
     pub(super) fn set_send_queue_depth_for_test(&self, bytes: u64) {
         self.buffered_amount.set(Some(bytes));
+    }
+
+    pub(super) fn set_wt_stream_depth_for_test(&self, bytes: u64) {
+        self.wt_stream_depth.set(bytes);
     }
 }
 
@@ -202,6 +208,26 @@ impl Task {
         }
     }
 
+    /// Bytes queued for `stream_key`'s media: WebSocket's shared socket, or
+    /// this WebTransport session's own persistent stream for that key.
+    pub fn stream_send_queue_depth(&self, stream_key: MediaStreamKey) -> Option<StreamQueueDepth> {
+        match self {
+            Task::WebSocket(ws) => ws.get_buffered_amount().map(StreamQueueDepth::WebSocket),
+            Task::WebTransport(wt) => Some(StreamQueueDepth::WebTransport(
+                wt.stream_queue_depth_bytes(stream_key.as_u8()),
+            )),
+            #[cfg(test)]
+            Task::Stub(stub) => match stub.transport {
+                UplinkTransport::WebSocket => {
+                    stub.buffered_amount.get().map(StreamQueueDepth::WebSocket)
+                }
+                UplinkTransport::WebTransport => {
+                    Some(StreamQueueDepth::WebTransport(stub.wt_stream_depth.get()))
+                }
+            },
+        }
+    }
+
     /// Bytes queued in the active transport's uplink, for the `send_queue_bytes`
     /// health field (#2722). Both arms are an INSTANTANEOUS GAUGE in bytes, so
     /// one Grafana panel reads correctly for either transport. The WebTransport
@@ -277,10 +303,103 @@ impl Task {
     }
 
     #[cfg(test)]
+    pub(super) fn set_wt_stream_depth_for_test(&self, bytes: u64) {
+        if let Task::Stub(stub) = self {
+            stub.set_wt_stream_depth_for_test(bytes);
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn take_sends_for_test(&self) -> Vec<(StubSendKind, MediaStreamKey)> {
         match self {
             Task::Stub(stub) => stub.take_sends_for_test(),
             _ => Vec::new(),
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod webtransport_stream_depth_tests {
+    use super::*;
+    use videocall_transport::downlink_stream::StreamKey;
+    use videocall_transport::inbound::InboundFrame;
+    use videocall_transport::webtransport::{WebTransportService, WebTransportStatus};
+    use videocall_types::Callback;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A real `WebTransportTask` over a stand-in `WebTransport` that never
+    /// opens; the page's constructor is restored before anything can await.
+    fn unopened_session() -> WebTransportTask {
+        js_sys::eval(
+            r#"
+            window.__vcRealWebTransport = window.WebTransport;
+            window.WebTransport = class {
+                constructor() {
+                    this.ready = new Promise(() => {});
+                    this.closed = new Promise(() => {});
+                    this.datagrams = {
+                        readable: new ReadableStream(),
+                        writable: new WritableStream(),
+                        incomingHighWaterMark: 1,
+                        incomingMaxAge: 0,
+                    };
+                    this.incomingUnidirectionalStreams = new ReadableStream();
+                    this.incomingBidirectionalStreams = new ReadableStream();
+                }
+                close() {}
+            };
+            "#,
+        )
+        .expect("install the stand-in WebTransport");
+        let task = WebTransportService::connect_here(
+            "https://fake.invalid/lobby",
+            Callback::from(|_: (Option<StreamKey>, InboundFrame)| {}),
+            Callback::from(|_: WebTransportStatus| {}),
+        );
+        js_sys::eval("window.WebTransport = window.__vcRealWebTransport;")
+            .expect("restore WebTransport");
+        task.expect("the stand-in constructor does not throw")
+    }
+
+    #[wasm_bindgen_test]
+    fn the_webtransport_arm_reports_this_sessions_own_screen_stream() {
+        let session = unopened_session();
+        let queued = session
+            .uplink_depth
+            .admit(MediaStreamKey::Screen.as_u8(), 311_000);
+        let task = Task::WebTransport(session);
+        assert_eq!(
+            task.stream_send_queue_depth(MediaStreamKey::Screen),
+            Some(StreamQueueDepth::WebTransport(311_000))
+        );
+        assert_eq!(
+            task.stream_send_queue_depth(MediaStreamKey::Video),
+            Some(StreamQueueDepth::WebTransport(0)),
+            "the camera stream's depth is its own"
+        );
+        drop(queued);
+        assert_eq!(
+            task.stream_send_queue_depth(MediaStreamKey::Screen),
+            Some(StreamQueueDepth::WebTransport(0))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_websocket_arm_reports_the_shared_sockets_buffered_amount() {
+        use videocall_transport::websocket::{Binary, WebSocketService, WebSocketStatus};
+        let socket = WebSocketService::connect_binary(
+            "ws://127.0.0.1:9/never-opens",
+            Callback::from(|_: Binary| {}),
+            Callback::from(|_: WebSocketStatus| {}),
+        )
+        .expect("a CONNECTING socket");
+        let task = Task::WebSocket(socket);
+        assert_eq!(
+            task.stream_send_queue_depth(MediaStreamKey::Screen),
+            Some(StreamQueueDepth::WebSocket(0)),
+            "a WS session reports its socket's bufferedAmount, tagged WebSocket"
+        );
     }
 }

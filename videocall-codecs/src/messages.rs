@@ -372,10 +372,6 @@ pub struct KeyframeArrivalMessage {
     /// `true` when the buffer REJECTED this keyframe as old/duplicate, so it never
     /// entered the buffer and cannot recover the picture.
     pub rejected_as_old: bool,
-    /// `true` when this was the STREAM-RESTART keyframe (flush-and-return, so it did not
-    /// enter the buffer either — but it is not a duplicate rejection). Disambiguates
-    /// `rejected_as_old: false` on that path. `#[serde(default)]` so an older worker build
-    /// that omits it still deserializes.
     #[serde(default)]
     pub stream_restart: bool,
 }
@@ -985,8 +981,7 @@ mod keyframe_arrival_console_line_tests {
         );
         assert!(
             line.contains("stream_restart=false"),
-            "missing stream_restart= token — without it `rejected_as_old=false` is ambiguous \
-             on the restart path, where the keyframe also never entered the buffer: {line}"
+            "missing stream_restart= token: {line}"
         );
     }
 

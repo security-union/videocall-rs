@@ -167,19 +167,11 @@ The `PeerHealthData` struct stored `last_neteq_stats` and `last_video_stats` but
 
 ---
 
-### 2.7 Tab Backgrounding Freezes All NetEQ Diagnostics
+### 2.7 Covered Window Slows the NetEQ Worker Timer
 
-**File**: `neteq/src/bin/neteq_worker.rs` (architectural issue, not yet fixed)
+**File**: `neteq/src/bin/neteq_worker.rs`
 
-The NetEQ WASM decoder runs in a Web Worker driven by a 5ms `setInterval`. When a browser tab is backgrounded (`document.hidden = true`), Chrome throttles JavaScript timers to a minimum of **1000ms**. The `setInterval` at 5ms fires once per second instead of 200 times per second, causing:
-
-1. Audio decode starves — the participant hears silence or severe stuttering
-2. The 1000ms stats `setInterval` also stops firing — vcprobe shows frozen/stale jitter values
-3. FPS drops to 0-1, RTT may spike, but NetEQ metrics cease updating
-
-This is not a bug in a counter — it is an architectural limitation: the audio receive path runs in a throttleable JavaScript context, unlike WebRTC which uses the OS audio thread.
-
-**Fix documented**: `docs/ISSUE_NETEQ_AUDIOWORKLET_MIGRATION.md` describes migrating NetEQ from a Web Worker into an `AudioWorkletProcessor`, which runs on the OS audio clock and is explicitly exempt from browser throttling. **Not yet implemented** — estimated 1 week of effort.
+The NetEQ WASM decoder runs in a Web Worker driven by a 5ms `setInterval`. On the old worker, a covered window (`document.hidden = true`) slowed that timer to about 95 ticks per second (one Windows laptop, issue 3141); it was not throttled to one tick per second. The callback made at most one 10 ms frame per tick, so supply fell below the 100 frames per second the playback worklet needs. The worker now pulls up to 2 frames per tick when behind.
 
 **Current mitigation**: `is_tab_visible` and `is_tab_throttled` fields in `HealthPacket` allow vcprobe and Grafana to flag when a participant's degraded metrics are likely due to tab backgrounding rather than a real network or hardware problem.
 
@@ -610,7 +602,6 @@ Here, 2fps is below the threshold where it represents a functional call (score 2
 | Add quality scores to Prometheus metrics_server | Not started | 2–3 hours |
 | Fix session_id → email at source (`peer_decode_manager.rs`) | Not started | 2–4 hours |
 | Send HEALTH when peer map is empty (solo monitoring) | Not started | 30 min |
-| AudioWorklet migration for tab-throttling fix | Not started | ~1 week |
 | Grafana dashboard with quality score panels and alert rules | Not started | 2–3 days |
 | Diagnosis rule engine in vcprobe (network congestion, CPU overload, etc.) | Not started | 3–5 days |
 | Expose `decode_errors_per_sec` rate in Prometheus (currently lifetime) | Not started | 1–2 hours |

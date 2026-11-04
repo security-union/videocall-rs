@@ -112,16 +112,19 @@ test.describe("Theme initialization from localStorage", () => {
       .toBe("light");
   });
 
-  // 7. System theme resolves based on prefers-color-scheme media query.
-  //    In headless Chromium without explicit emulation, the resolved value
-  //    is implementation-dependent, so we only assert that data-theme is set.
+  // 7. System theme resolves based on the emulated prefers-color-scheme.
   test("reads system theme from plain-text localStorage", async ({ page }) => {
     await page.goto("/");
     await page.evaluate(() => localStorage.setItem("ui-theme", "system"));
-    await page.reload();
 
-    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-    expect(theme).toBeTruthy();
-    expect(["light", "dark"]).toContain(theme);
+    for (const scheme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme: scheme });
+      await page.reload();
+      await expect
+        .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+          timeout: 10_000,
+        })
+        .toBe(scheme);
+    }
   });
 });

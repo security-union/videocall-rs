@@ -105,11 +105,8 @@ impl MediaStreamKey {
     /// Audio first (unconcealable delay), then Control (mostly tiny packets that
     /// gate something large — the #2721 RTT probe, KEYFRAME_REQUEST, AES_KEY —
     /// though oversized datagrams also fall back onto it), then Screen, then
-    /// camera Video LAST: camera is the adaptive source, stepping its own tier
-    /// down on its own stream's stalls, while screen has neither a send-side
-    /// drop nor an age-out on WebTransport and is the content when someone is
-    /// presenting. Values are spaced so a future lane can be inserted between
-    /// any two; only their ORDER is load-bearing.
+    /// camera Video LAST. Values are spaced so a future lane can be inserted
+    /// between any two; only their ORDER is load-bearing.
     pub const fn send_order(self) -> i32 {
         match self {
             MediaStreamKey::Audio => 300,
@@ -121,6 +118,15 @@ impl MediaStreamKey {
 }
 
 const _: () = assert!(MediaStreamKey::Control.as_u8() == MediaStreamKey::MAX_WIRE_VALUE);
+
+/// Bytes queued for one media kind, tagged by the transport that holds them.
+/// WebSocket reports its shared socket's `bufferedAmount`; WebTransport reports
+/// the active session's own persistent stream for that kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamQueueDepth {
+    WebSocket(u64),
+    WebTransport(u64),
+}
 
 pub(super) trait WebMedia<TASK> {
     fn connect(options: ConnectOptions) -> anyhow::Result<TASK>;

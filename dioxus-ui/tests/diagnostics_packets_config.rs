@@ -18,12 +18,12 @@ use support::{inject_app_config, inject_app_config_with_diagnostics_packets, rem
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 #[wasm_bindgen_test]
-fn absent_key_resolves_to_enabled_by_default() {
+fn absent_key_resolves_to_disabled_by_default() {
     inject_app_config();
     assert_eq!(diagnostics_packets_config_value(), None);
     assert_eq!(
         diagnostics_packets_resolution(),
-        (true, DiagnosticsPacketsSource::Default)
+        (false, DiagnosticsPacketsSource::Default)
     );
     remove_app_config();
 }
@@ -40,11 +40,21 @@ fn config_key_disables_sending() {
 }
 
 #[wasm_bindgen_test]
-fn unrecognised_config_value_falls_back_to_enabled() {
+fn config_key_enables_sending() {
+    inject_app_config_with_diagnostics_packets("true");
+    assert_eq!(
+        diagnostics_packets_resolution(),
+        (true, DiagnosticsPacketsSource::Config)
+    );
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+fn unrecognised_config_value_falls_back_to_disabled() {
     inject_app_config_with_diagnostics_packets("maybe");
     assert_eq!(
         diagnostics_packets_resolution(),
-        (true, DiagnosticsPacketsSource::Default)
+        (false, DiagnosticsPacketsSource::Default)
     );
     remove_app_config();
 }
@@ -81,6 +91,18 @@ fn load_with_search(search: &str) -> UrlRestore {
     snapshot_diagnostics_packets_url_param();
     replace_url(&restore.0);
     restore
+}
+
+#[wasm_bindgen_test]
+fn url_param_enables_without_config_via_page_url_snapshot() {
+    inject_app_config();
+    let _restore = load_with_search("?diag_packets=1");
+
+    assert_eq!(
+        diagnostics_packets_resolution(),
+        (true, DiagnosticsPacketsSource::Url)
+    );
+    remove_app_config();
 }
 
 #[wasm_bindgen_test]

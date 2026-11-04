@@ -1,7 +1,8 @@
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { type DiagPacketsObservation, participantEmail } from "./bot";
+import { diagPacketsExpected, type DiagPacketsObservation, participantEmail } from "./bot";
+import { SOLO_CLOCK_SLOT, speechWeightFor } from "./clock-init";
 import {
   type DecodeBudget,
   DECODE_BUDGET_OFF_VALUE,
@@ -9,6 +10,20 @@ import {
   DECODE_BUDGET_WAIVER_NOTE,
   isClientDecodeBudget,
 } from "./decode-budget";
+import { SKIP_CANVAS_PAINT_WAIVER_NOTE } from "./receiver-caps";
+import {
+  SIMULCAST_LADDER_DEPTH,
+  SIMULCAST_MAX_LAYERS_CONFIG_KEY,
+  SIMULCAST_READBACK_UNREAD,
+  type SimulcastMaxLayersObserved,
+} from "./simulcast-layers";
+import {
+  isClientSpeakingGlow,
+  type SpeakingGlow,
+  SPEAKING_GLOW_OFF_VALUE,
+  SPEAKING_GLOW_STORAGE_KEY,
+  SPEAKING_GLOW_WAIVER_NOTE,
+} from "./speaking-glow";
 import {
   isNetemProfileName,
   type NetemAction,
@@ -19,6 +34,25 @@ import {
 import { JOIN_MEDIA_ON, type JoinMedia, type JoinMediaState } from "./meeting-join";
 import type { BotTask } from "./orchestrator";
 import { localImageRevision } from "./resource/session";
+import { effectiveVideoNoise, videoNoiseFor } from "./video-noise";
+import { SPEECH_PLAN_DEFAULT, type SpeechPlan } from "./speech-plan";
+import {
+  type CameraPersona,
+  type MicPersona,
+  personaShortfalls,
+  type RoomPersonas,
+} from "./persona";
+import type { PersonaTally } from "./persona-driver";
+import {
+  type ActiveTransport,
+  isFallback,
+  isPinned,
+  type PinnedTransport,
+  type TransportApplied,
+  type TransportEvent,
+  type TransportIntent,
+  transportMismatch,
+} from "./transport";
 
 /** Wrapper schema; `participant` uses `call-quality-run-manifest/v1` field names (#2913 §5.2). */
 export const PARTICIPANT_RECORD_SCHEMA = "bots-app-participant-record/v0";
@@ -44,7 +78,7 @@ export interface ManifestParticipantDraft {
   talker: false;
   publishes: { camera: boolean | null; mic: boolean | null; screen: false } | null;
   network: ManifestNetwork;
-  transport_intended: "auto";
+  transport_intended: TransportIntent;
   join_ts: number | null;
   leave_ts: number | null;
   placement: { ordinal: number | null; node: string | null } | null;
@@ -63,7 +97,7 @@ export interface ParticipantRecord {
   unverified: Array<{ field: string; reason: string }>;
   /** Not a manifest participant field. */
   diagnostics_packets: {
-    requested: "off" | "default";
+    requested: "on" | "off" | "default";
     observed: DiagPacketsObservation["state"] | null;
     source: DiagPacketsObservation["source"] | null;
   };
@@ -73,7 +107,62 @@ export interface ParticipantRecord {
     /** `vc_decode_budget_override` read back after the latest join; `null` before it or when absent. */
     observed: string | null;
   };
+  /** Not a manifest participant field. `requested: "off"` is a fidelity waiver. */
+  speaking_glow: {
+    requested: SpeakingGlow;
+    /** `vc_appearance_glow_enabled` read back after the latest join; `null` before it or when absent. */
+    observed: string | null;
+  };
+  /** Not a manifest participant field. Clock mode only; `requested: null` = the geometry's default. */
+  video_noise: { requested: number | null; alpha: number } | null;
+  speech: (SpeechPlan & { weight: number }) | null;
+  /** Not a manifest participant field. `null` unless personas are on; `toggles` is `null` until the first toggle. */
+  persona: {
+    mic: MicPersona;
+    camera: CameraPersona;
+    room: Pick<RoomPersonas, "counts" | "expected" | "target">;
+    toggles: PersonaTally | null;
+  } | null;
+  /** Not a manifest participant field. The latest `Transport preference applied:` line; reset by a ctl rejoin. */
+  transport_applied: TransportApplied | null;
+  /** Not a manifest participant field. `active=` of the latest `Election decision:` line; reset by a ctl rejoin. */
+  transport_observed: ActiveTransport | null;
+  /** WebTransport-to-WebSocket moves while WebTransport was preferred and offered; counts across ctl rejoins. */
+  transport_fallbacks: number;
+  /** Not a manifest participant field. `requested: null` inherits the deployment. */
+  skip_canvas_paint: {
+    requested: boolean | null;
+    /** `__APP_CONFIG.skipCanvasPaint` read back after the latest join; `null` before it or when absent. */
+    observed: string | null;
+  };
+  /** Not a manifest participant field. `requested: null` inherits the deployment. */
+  simulcast_max_layers: {
+    requested: number | null;
+    /** `__APP_CONFIG.experimentalSimulcastMaxLayers` after the latest join; `null` before it or when absent, `"unread"` when the read timed out or threw. */
+    observed: SimulcastMaxLayersObserved;
+  };
   participant: ManifestParticipantDraft;
+}
+
+function syncTransportUnverified(rec: ParticipantRecord): void {
+  rec.unverified = rec.unverified.filter((u) => u.field !== "transport_intended");
+  const intended = rec.participant.transport_intended;
+  const a = rec.transport_applied;
+  let reason: string | null = null;
+  if (a === null) {
+    if (isPinned(intended)) {
+      reason =
+        "no 'Transport preference applied:' line since the latest launch: it has not joined yet, logLevel is above info, or the client predates the line";
+    }
+  } else if (isPinned(intended) && transportMismatch(intended, a) !== null) {
+    reason = transportMismatch(intended, a);
+  } else if (!isPinned(intended) && a.source !== "default") {
+    reason = `auto requested but a remembered choice (source=${a.source}) set pref=${a.preference}`;
+  } else if (a.preference === "webtransport" && a.wt_urls === 0) {
+    reason =
+      "WebTransport was not offered (wt_urls=0): the deployment disables it, so this bot's WebSocket session is not a fallback";
+  }
+  if (reason !== null) rec.unverified.push({ field: "transport_intended", reason });
 }
 
 function syncDecodeBudgetUnverified(rec: ParticipantRecord): void {
@@ -93,17 +182,86 @@ function syncDecodeBudgetUnverified(rec: ParticipantRecord): void {
   if (reason !== null) rec.unverified.push({ field: "decode_budget", reason });
 }
 
+function syncSpeakingGlowUnverified(rec: ParticipantRecord): void {
+  rec.unverified = rec.unverified.filter((u) => u.field !== "speaking_glow");
+  const g = rec.speaking_glow;
+  const read = `${SPEAKING_GLOW_STORAGE_KEY}=${g.observed}`;
+  let reason: string | null = null;
+  if (g.requested === "client") {
+    if (!isClientSpeakingGlow(g.observed)) {
+      reason = `client requested but ${read} was in storage after join (a captured storage state?), so this bot ran with the glow off`;
+    }
+  } else if (g.observed === SPEAKING_GLOW_OFF_VALUE) {
+    reason = `${SPEAKING_GLOW_WAIVER_NOTE}: ${read} read back after join`;
+  } else {
+    reason = `${SPEAKING_GLOW_WAIVER_NOTE} requested but ${SPEAKING_GLOW_STORAGE_KEY} was not read back after the latest join: that join has not happened yet, or the launch failed`;
+  }
+  if (reason !== null) rec.unverified.push({ field: "speaking_glow", reason });
+}
+
+function syncSkipCanvasPaintUnverified(rec: ParticipantRecord): void {
+  rec.unverified = rec.unverified.filter((u) => u.field !== "skip_canvas_paint");
+  const s = rec.skip_canvas_paint;
+  if (s.requested !== true && s.observed !== "true") return;
+  rec.unverified.push({
+    field: "skip_canvas_paint",
+    reason:
+      s.observed === "true"
+        ? `${SKIP_CANVAS_PAINT_WAIVER_NOTE}: skipCanvasPaint="true" read back from __APP_CONFIG after join`
+        : `${SKIP_CANVAS_PAINT_WAIVER_NOTE} requested but __APP_CONFIG.skipCanvasPaint read back ${JSON.stringify(s.observed)} after the latest join: that join has not happened yet, the launch failed, or the injection did not land`,
+  });
+}
+
+function syncSimulcastMaxLayersUnverified(rec: ParticipantRecord): void {
+  rec.unverified = rec.unverified.filter((u) => u.field !== "simulcast_max_layers");
+  const { requested, observed } = rec.simulcast_max_layers;
+  const read = `__APP_CONFIG.${SIMULCAST_MAX_LAYERS_CONFIG_KEY}=${JSON.stringify(observed)}`;
+  let reason: string | null = null;
+  if (requested !== null && observed !== requested) {
+    reason = `requested ${requested} but ${read} after the latest join: that join has not happened yet, or the launch failed`;
+  } else if (observed === SIMULCAST_READBACK_UNREAD) {
+    reason = `the after-join read-back of __APP_CONFIG.${SIMULCAST_MAX_LAYERS_CONFIG_KEY} timed out or failed, so this bot's video layer ceiling is unknown`;
+  } else if (observed !== null && observed < SIMULCAST_LADDER_DEPTH) {
+    reason = `${read} after join caps this bot at ${observed} video layer(s); production omits the key, so a real client publishes up to ${SIMULCAST_LADDER_DEPTH}`;
+  }
+  if (reason !== null) rec.unverified.push({ field: "simulcast_max_layers", reason });
+}
+
 function syncDiagPacketsUnverified(rec: ParticipantRecord): void {
   rec.unverified = rec.unverified.filter((u) => u.field !== "diagnostics_packets");
   const d = rec.diagnostics_packets;
-  if (d.requested !== "off" || d.observed === "DISABLED") return;
+  if (d.requested === "default" || d.observed === diagPacketsExpected(d.requested)) return;
   rec.unverified.push({
     field: "diagnostics_packets",
     reason:
       d.observed === null
         ? "no 'diagnostics packets:' console line: the client predates #2970, logLevel is above info, or the bot never mounted the meeting"
-        : `requested off but the client logged ENABLED (source=${d.source}): this bot still sends DIAGNOSTICS`,
+        : `requested ${d.requested} but the client logged ${d.observed} (source=${d.source}): this bot ${d.observed === "ENABLED" ? "still sends" : "sends no"} DIAGNOSTICS`,
   });
+}
+
+function syncPersonaUnverified(rec: ParticipantRecord, room: RoomPersonas | null): void {
+  rec.unverified = rec.unverified.filter((u) => u.field !== "persona.toggles");
+  const t = rec.persona?.toggles;
+  if (room !== null) {
+    for (const gap of personaShortfalls(room))
+      rec.unverified.push({ field: "persona.room", reason: gap });
+  }
+  if (t == null) return;
+  const reasons: string[] = [];
+  if (t.failed > 0)
+    reasons.push(`${t.failed} toggles failed, so this bot's duty cycle is not the planned one`);
+  if (t.unrendered > 0) {
+    reasons.push(
+      `${t.unrendered} clicked toggles had no 'Host render:' line (logLevel above info, or the page closed first), so their actual times are unknown`,
+    );
+  }
+  if (reasons.length > 0)
+    rec.unverified.push({ field: "persona.toggles", reason: reasons.join("; ") });
+}
+
+function recordedSpeech(plan: SpeechPlan, task: BotTask): SpeechPlan & { weight: number } {
+  return { ...plan, weight: speechWeightFor(plan, task.talkingClock ?? SOLO_CLOCK_SLOT) };
 }
 
 const NO_SHAPING: ManifestNetwork = {
@@ -278,6 +436,7 @@ function atomicWrite(path: string, json: string): void {
 export class ParticipantRecorder {
   private readonly records = new Map<string, ParticipantRecord>();
   private readonly netsim = new Map<string, string | null | undefined>();
+  private readonly lastTransport = new Map<string, PinnedTransport>();
   private lastNetem: { network: ManifestNetwork; reason: string } | null = null;
   private readonly dir: string;
   private readonly write: (path: string, json: string) => void;
@@ -339,11 +498,32 @@ export class ParticipantRecorder {
           ? `auth ${task.authBackend}: no meeting-api join response named this session; read it back from the labels`
           : "the JWT subject; not checked against a relay label, which must carry it verbatim",
     });
+    const persona = task.persona ?? null;
+    for (const [kind, toggles] of [
+      ["mic", persona?.mic === "push-to-talk"],
+      ["camera", persona?.camera === "with-voice"],
+    ] as const) {
+      if (toggles) {
+        unverified.push({
+          field: `publishes.${kind}`,
+          reason: "the persona toggles it during the run; this is the join-time state",
+        });
+      }
+    }
     if (task.cameraCycle) {
       unverified.push({
         field: "publishes.camera",
         reason:
           "the camera duty cycle toggles the camera during the run; this is the join-time state",
+      });
+    }
+    const clock = task.videoMode === "clock";
+    const noiseOverride = clock ? (task.videoNoise ?? null) : null;
+    if (noiseOverride !== null) {
+      const { width, height } = task.sourceGeometry;
+      unverified.push({
+        field: "video_noise",
+        reason: `override ${noiseOverride} replaced the ${videoNoiseFor(task.sourceGeometry)} default for ${width}x${height}, so this bot's video upload is not the modelled camera's`,
       });
     }
     const rec: ParticipantRecord = {
@@ -354,11 +534,35 @@ export class ParticipantRecorder {
       outcome: null,
       unverified,
       diagnostics_packets: {
-        requested: task.diagPackets === "off" ? "off" : "default",
+        requested: task.diagPackets ?? "default",
         observed: null,
         source: null,
       },
       decode_budget: { requested: task.decodeBudget ?? "client", observed: null },
+      speaking_glow: { requested: task.speakingGlow ?? "client", observed: null },
+      video_noise: clock ? { requested: noiseOverride, alpha: effectiveVideoNoise(task) } : null,
+      speech:
+        task.videoMode === "clock"
+          ? recordedSpeech(task.speechPlan ?? SPEECH_PLAN_DEFAULT, task)
+          : null,
+      persona:
+        persona === null
+          ? null
+          : {
+              mic: persona.mic,
+              camera: persona.camera,
+              room: {
+                counts: persona.room.counts,
+                expected: persona.room.expected,
+                target: persona.room.target,
+              },
+              toggles: null,
+            },
+      transport_applied: null,
+      transport_observed: null,
+      transport_fallbacks: 0,
+      skip_canvas_paint: { requested: task.skipCanvasPaint ?? null, observed: null },
+      simulcast_max_layers: { requested: task.simulcastMaxLayers ?? null, observed: null },
       participant: {
         user_id: userId,
         fleet: "browser",
@@ -367,7 +571,7 @@ export class ParticipantRecorder {
         talker: false,
         publishes: null,
         network,
-        transport_intended: "auto",
+        transport_intended: task.transport ?? "auto",
         join_ts: null,
         leave_ts: null,
         placement:
@@ -379,6 +583,11 @@ export class ParticipantRecorder {
     };
     syncDiagPacketsUnverified(rec);
     syncDecodeBudgetUnverified(rec);
+    syncSpeakingGlowUnverified(rec);
+    syncTransportUnverified(rec);
+    syncSkipCanvasPaintUnverified(rec);
+    syncSimulcastMaxLayersUnverified(rec);
+    syncPersonaUnverified(rec, persona?.room ?? null);
     this.records.set(task.botId, rec);
     this.flush(task.botId);
   }
@@ -389,11 +598,20 @@ export class ParticipantRecorder {
     media: JoinMediaState | null,
     sessionUserId: string | null,
     decodeBudgetReadback: string | null = null,
+    skipCanvasPaintReadback: string | null = null,
+    speakingGlowReadback: string | null = null,
+    simulcastMaxLayersReadback: SimulcastMaxLayersObserved = null,
   ): void {
     const rec = this.records.get(botId);
     if (rec === undefined) return;
     rec.decode_budget.observed = decodeBudgetReadback;
     syncDecodeBudgetUnverified(rec);
+    rec.skip_canvas_paint.observed = skipCanvasPaintReadback;
+    syncSkipCanvasPaintUnverified(rec);
+    rec.speaking_glow.observed = speakingGlowReadback;
+    syncSpeakingGlowUnverified(rec);
+    rec.simulcast_max_layers.observed = simulcastMaxLayersReadback;
+    syncSimulcastMaxLayersUnverified(rec);
     if (rec.participant.join_ts !== null) {
       this.flush(botId);
       return;
@@ -439,6 +657,16 @@ export class ParticipantRecorder {
     syncDiagPacketsUnverified(rec);
     rec.decode_budget.observed = null;
     syncDecodeBudgetUnverified(rec);
+    rec.transport_applied = null;
+    rec.transport_observed = null;
+    this.lastTransport.delete(botId);
+    syncTransportUnverified(rec);
+    rec.skip_canvas_paint.observed = null;
+    syncSkipCanvasPaintUnverified(rec);
+    rec.speaking_glow.observed = null;
+    syncSpeakingGlowUnverified(rec);
+    rec.simulcast_max_layers.observed = null;
+    syncSimulcastMaxLayersUnverified(rec);
     if (!rec.unverified.some((u) => u.field === "rejoin")) {
       rec.unverified.push({
         field: "rejoin",
@@ -455,6 +683,31 @@ export class ParticipantRecorder {
     rec.diagnostics_packets.observed = obs.state;
     rec.diagnostics_packets.source = obs.source;
     syncDiagPacketsUnverified(rec);
+    this.flush(botId);
+  }
+
+  transportObserved(botId: string, event: TransportEvent): void {
+    const rec = this.records.get(botId);
+    if (rec === undefined) return;
+    if (event.kind === "applied") {
+      rec.transport_applied = event.applied;
+      syncTransportUnverified(rec);
+    } else {
+      const previous = this.lastTransport.get(botId) ?? null;
+      if (isFallback(previous, event.active, rec.transport_applied)) {
+        rec.transport_fallbacks += 1;
+      }
+      if (event.active !== "none") this.lastTransport.set(botId, event.active);
+      rec.transport_observed = event.active;
+    }
+    this.flush(botId);
+  }
+
+  personaToggled(botId: string, tally: PersonaTally): void {
+    const rec = this.records.get(botId);
+    if (rec?.persona == null) return;
+    rec.persona.toggles = tally;
+    syncPersonaUnverified(rec, null);
     this.flush(botId);
   }
 

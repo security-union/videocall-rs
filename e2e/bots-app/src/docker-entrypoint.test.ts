@@ -260,6 +260,8 @@ function runEntrypoint(
       'echo "STUB_NETEM_APPLIED=${BOT_NETEM_APPLIED-<unset>}"',
       'echo "STUB_RECORD_CTX=${BOT_POD_ORDINAL-<unset>}|${BOT_JOIN_STAGGER_MS-<unset>}|${BOT_JOIN_STAGGER_INCOMPLETE-<unset>}"',
       'echo "STUB_PASSWORD=${BOT_PASSWORD-<unset>}"',
+      'echo "STUB_TRANSPORT_WS_EVERY=${BOT_TRANSPORT_WS_EVERY-<unset>}"',
+      'echo "STUB_SIMULCAST_MAX_LAYERS=${BOT_SIMULCAST_MAX_LAYERS-<unset>}"',
       // The camera cycle is consumed from the INHERITED env by cli.ts, not from
       // argv, so what the bot process sees is the contract (#2362).
       'echo "STUB_CAMERA=${BOT_CAMERA_ON_SECS_MIN-<unset>}|${BOT_CAMERA_ON_SECS_MAX-<unset>}|${BOT_CAMERA_OFF_SECS_MIN-<unset>}|${BOT_CAMERA_OFF_SECS_MAX-<unset>}"',
@@ -453,6 +455,66 @@ describe("docker-entrypoint.sh — ordinal identity resolution (#2035)", () => {
     expect(status).toBe(0);
     expect(stdout).toContain("STUB_ARGS=");
     expect(stdout).not.toContain("--bot-index");
+  });
+
+  it("passes BOT_FLEET_SIZE as --fleet-size, and warns an ordinal pod that runs without it (issue 3072)", () => {
+    const ordinal = {
+      BOT_IDENTITY_MODE: "ordinal",
+      BOT_AUTH: "form-login",
+      HOSTNAME: "videocall-bots-1",
+      ...ORDINAL_ACCOUNTS,
+    };
+    const sized = runEntrypoint({ ...ordinal, BOT_FLEET_SIZE: "3" });
+    expect(sized.status).toBe(0);
+    expect(sized.argv[sized.argv.indexOf("--fleet-size") + 1]).toBe("3");
+    expect(sized.stderr).not.toContain("BOT_FLEET_SIZE is unset");
+
+    const unsized = runEntrypoint(ordinal);
+    expect(unsized.status).toBe(0);
+    expect(unsized.argv).not.toContain("--fleet-size");
+    expect(unsized.stderr).toContain("BOT_FLEET_SIZE is unset");
+  });
+
+  it("reports BOT_TRANSPORT_WS_EVERY on the launch line and leaves it in the bot's env (issue 3087)", () => {
+    const ordinal = {
+      BOT_IDENTITY_MODE: "ordinal",
+      BOT_AUTH: "form-login",
+      HOSTNAME: "videocall-bots-3",
+      BOT_EMAIL_3: "dave@example.test",
+      BOT_PASSWORD_3: "pw-dave",
+    };
+    const set = runEntrypoint({ ...ordinal, BOT_TRANSPORT_WS_EVERY: "4" });
+    expect(set.status).toBe(0);
+    expect(set.stdout).toContain("transport_ws_every=4 ");
+    expect(set.stdout).toContain("STUB_TRANSPORT_WS_EVERY=4\n");
+    expect(set.argv[set.argv.indexOf("--bot-index") + 1]).toBe("3");
+    expect(runEntrypoint(ordinal).stdout).toContain("transport_ws_every=<omitted> ");
+  });
+
+  it("leaves BOT_SIMULCAST_MAX_LAYERS in the bot's env for the CLI to read (issue 3246)", () => {
+    const ordinal = {
+      BOT_IDENTITY_MODE: "ordinal",
+      BOT_AUTH: "form-login",
+      HOSTNAME: "videocall-bots-0",
+      ...ORDINAL_ACCOUNTS,
+    };
+    const set = runEntrypoint({ ...ordinal, BOT_SIMULCAST_MAX_LAYERS: "3" });
+    expect(set.status).toBe(0);
+    expect(set.stdout).toContain("STUB_SIMULCAST_MAX_LAYERS=3\n");
+    expect(runEntrypoint(ordinal).stdout).toContain("STUB_SIMULCAST_MAX_LAYERS=<unset>\n");
+  });
+
+  it("reports BOT_PERSONAS and BOT_CAMERA on the launch line (issue 3091)", () => {
+    const base = {
+      BOT_IDENTITY_MODE: "ordinal",
+      BOT_AUTH: "form-login",
+      HOSTNAME: "videocall-bots-0",
+      ...ORDINAL_ACCOUNTS,
+    };
+    const set = runEntrypoint({ ...base, BOT_PERSONAS: "on", BOT_CAMERA: "always-on" });
+    expect(set.status).toBe(0);
+    expect(set.stdout).toContain(" personas=on camera=always-on ");
+    expect(runEntrypoint(base).stdout).toContain(" personas=<omitted> camera=<omitted> ");
   });
 
   it("passes --hardware-concurrency through when BOT_HW_CONCURRENCY is set, omits it when empty", () => {
@@ -1855,6 +1917,11 @@ describe("docker-entrypoint.sh — CR/LF rejected at the operator boundary (#237
     ["BOT_RUN_DIR", (v) => ({ BOT_RUN_DIR: `/tmp/bots-run${v}` })],
     ["BOT_HW_CONCURRENCY", (v) => ({ BOT_HW_CONCURRENCY: `10${v}` })],
     ["BOT_INDEX", (v) => ({ BOT_INDEX: `3${v}` })],
+    ["BOT_FLEET_SIZE", (v) => ({ BOT_FLEET_SIZE: `3${v}` })],
+    ["BOT_TRANSPORT", (v) => ({ BOT_TRANSPORT: `ws${v}` })],
+    ["BOT_TRANSPORT_WS_EVERY", (v) => ({ BOT_TRANSPORT_WS_EVERY: `4${v}` })],
+    ["BOT_PERSONAS", (v) => ({ BOT_PERSONAS: `on${v}` })],
+    ["BOT_CAMERA", (v) => ({ BOT_CAMERA: `always-on${v}` })],
     ["BOT_CTL_PORT", (v) => ({ BOT_CTL_PORT: `8080${v}`, BOT_CTL_TOKEN: "t" })],
     [
       "BOT_CTL_BIND",
@@ -2012,6 +2079,7 @@ describe("docker-entrypoint.sh → orchestrator.ts [label] writers (#2375)", () 
       launchBot: vi.fn(async () => ({
         userHangupDetected: new Promise<void>(() => {}),
         crashDetected: new Promise<string>(() => {}),
+        pageReloaded: new Promise(() => {}),
         leaveMeeting: vi.fn(async () => {}),
         shutdown: vi.fn(async () => {}),
       })),
@@ -2146,7 +2214,7 @@ describe("docker-entrypoint.sh — camera duty cycle (#2362)", () => {
     ["000000", "at most 5 digits"],
     ["0", ">= 1 second"],
     [String(CAMERA_CYCLE_SECS_CEILING + 1), `<= ${CAMERA_CYCLE_SECS_CEILING}`],
-  ])("rejects BOT_CAMERA_OFF_SECS_MAX=%j rather than running always-on", (value, reason) => {
+  ])("rejects BOT_CAMERA_OFF_SECS_MAX=%j", (value, reason) => {
     const { status, stderr } = runEntrypoint({
       ...ORDINAL_ENV,
       ...CYCLE,

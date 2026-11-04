@@ -570,3 +570,331 @@ async fn test_update_meeting_returns_stats_fields() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+// ── REST /leave after the relay already reported the host gone ──────────
+
+async fn post(
+    pool: &sqlx::PgPool,
+    nats: &async_nats::Client,
+    uri: String,
+    caller: &str,
+    body: serde_json::Value,
+) -> StatusCode {
+    let req = request_with_cookie("POST", &uri, caller)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    build_app_on_nats(pool.clone(), nats.clone())
+        .oneshot(req)
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn relay(pool: &sqlx::PgPool, room_id: &str, user: &str, session_id: u64, present: bool) {
+    let meeting = meeting_api::db::meetings::get_by_room_id(pool, room_id)
+        .await
+        .unwrap()
+        .expect("meeting exists");
+    let (feed_tx, _feed_rx) = meeting_api::feed_events::new_feed_channel();
+    meeting_api::nats_consumers::apply_participant_presence(
+        pool,
+        None,
+        &feed_tx,
+        &meeting,
+        &meeting_api::nats_events::ParticipantPresencePayload {
+            room_id: room_id.to_string(),
+            user_id: user.to_string(),
+            session_id,
+            present,
+        },
+    )
+    .await;
+}
+
+async fn state_and_due(pool: &sqlx::PgPool, room_id: &str) -> (Option<String>, bool) {
+    sqlx::query_as(
+        "SELECT state, host_left_end_due_at IS NOT NULL FROM meetings WHERE room_id = $1",
+    )
+    .bind(room_id)
+    .fetch_one(pool)
+    .await
+    .expect("meeting row")
+}
+
+/// Hang-up disconnects the transport before `/leave`; a `/leave` landing after
+/// the relay's LEFT still ends the meeting at once.
+#[tokio::test]
+#[serial]
+async fn host_leave_after_the_relay_left_ends_the_meeting_now() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping leave-after-relay-left test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-leave-after-relay-left";
+    cleanup_test_data(&pool, room_id).await;
+    let host = "host-leave-after-left@example.com";
+    let attendee = "host-leave-after-left-attendee@example.com";
+    let base = "/api/v1/meetings";
+    let create = serde_json::json!({
+        "meeting_id": room_id, "attendees": [], "waiting_room_enabled": false
+    });
+    assert_eq!(
+        post(&pool, &nats, base.into(), host, create).await,
+        StatusCode::CREATED
+    );
+    let join = format!("{base}/{room_id}/join");
+    let empty = serde_json::json!({});
+    for user in [host, attendee] {
+        let status = post(&pool, &nats, join.clone(), user, empty.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    relay(&pool, room_id, host, 0x31, true).await;
+    relay(&pool, room_id, attendee, 0x32, true).await;
+    relay(&pool, room_id, host, 0x31, false).await;
+    relay(&pool, room_id, attendee, 0x32, false).await;
+    assert_eq!(
+        state_and_due(&pool, room_id).await,
+        (Some("idle".into()), true)
+    );
+    let leave = format!("{base}/{room_id}/leave");
+    let status = post(&pool, &nats, leave.clone(), attendee, empty.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a non-host stays not-in-meeting"
+    );
+    assert_eq!(
+        state_and_due(&pool, room_id).await,
+        (Some("idle".into()), true)
+    );
+
+    let mut system = nats
+        .subscribe(format!("room.{room_id}.system"))
+        .await
+        .expect("subscribe to room system subject");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let status = post(&pool, &nats, leave.clone(), host, empty.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        state_and_due(&pool, room_id).await,
+        (Some("ended".into()), false)
+    );
+    assert_eq!(
+        count_meeting_ended(&mut system, std::time::Duration::from_secs(2)).await,
+        1
+    );
+    let status = post(&pool, &nats, leave, host, empty).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a second /leave");
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn host_leave_after_the_relay_left_keeps_a_meeting_with_a_present_host() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping leave-after-relay-left test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-leave-after-relay-left-cohost";
+    cleanup_test_data(&pool, room_id).await;
+    let host = "host-leave-after-left-owner@example.com";
+    let co = "host-leave-after-left-co@example.com";
+    let attendee = "host-leave-after-left-attendee@example.com";
+    let base = "/api/v1/meetings";
+    let create = serde_json::json!({
+        "meeting_id": room_id, "attendees": [], "co_hosts": [co], "waiting_room_enabled": false
+    });
+    assert_eq!(
+        post(&pool, &nats, base.into(), host, create).await,
+        StatusCode::CREATED
+    );
+    let join = format!("{base}/{room_id}/join");
+    let empty = serde_json::json!({});
+    assert_eq!(
+        post(&pool, &nats, join.clone(), host, empty.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&pool, &nats, join.clone(), attendee, empty.clone()).await,
+        StatusCode::OK
+    );
+    relay(&pool, room_id, host, 0x41, true).await;
+    relay(&pool, room_id, attendee, 0x42, true).await;
+    relay(&pool, room_id, host, 0x41, false).await;
+    assert_eq!(
+        state_and_due(&pool, room_id).await,
+        (Some("active".into()), true)
+    );
+    assert_eq!(
+        post(&pool, &nats, join, co, empty.clone()).await,
+        StatusCode::OK
+    );
+    relay(&pool, room_id, co, 0x43, true).await;
+
+    let leave = format!("{base}/{room_id}/leave");
+    assert_eq!(
+        post(&pool, &nats, leave, host, empty).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        state_and_due(&pool, room_id).await.0.as_deref(),
+        Some("active")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+async fn create_and_join(
+    pool: &sqlx::PgPool,
+    nats: &async_nats::Client,
+    room_id: &str,
+    owner: &str,
+    extra: serde_json::Value,
+    joiners: &[&str],
+) {
+    cleanup_test_data(pool, room_id).await;
+    let mut create = serde_json::json!({ "meeting_id": room_id, "attendees": [] });
+    for (k, v) in extra.as_object().expect("object") {
+        create[k] = v.clone();
+    }
+    let status = post(pool, nats, "/api/v1/meetings".into(), owner, create).await;
+    assert_eq!(status, StatusCode::CREATED);
+    for user in joiners {
+        let join = format!("/api/v1/meetings/{room_id}/join");
+        let status = post(pool, nats, join, user, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "join {user}");
+    }
+}
+
+async fn leave(
+    pool: &sqlx::PgPool,
+    nats: &async_nats::Client,
+    room_id: &str,
+    user: &str,
+) -> StatusCode {
+    let uri = format!("/api/v1/meetings/{room_id}/leave");
+    post(pool, nats, uri, user, serde_json::json!({})).await
+}
+
+/// The owner hung up earlier; only the co-host's later departure armed the end.
+#[tokio::test]
+#[serial]
+async fn an_earlier_leave_does_not_end_a_co_hosts_pending_host_left_end() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping leave-after-relay-left test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-leave-earlier-owner-cohost";
+    let owner = "leave-earlier-owner@example.com";
+    let co = "leave-earlier-co@example.com";
+    let extra = serde_json::json!({ "co_hosts": [co], "waiting_room_enabled": false });
+    create_and_join(&pool, &nats, room_id, owner, extra, &[owner, co]).await;
+    relay(&pool, room_id, owner, 0x51, true).await;
+    relay(&pool, room_id, co, 0x52, true).await;
+    assert_eq!(leave(&pool, &nats, room_id, owner).await, StatusCode::OK);
+    relay(&pool, room_id, co, 0x52, false).await;
+    assert_eq!(
+        state_and_due(&pool, room_id).await,
+        (Some("idle".into()), true)
+    );
+
+    assert_eq!(
+        leave(&pool, &nats, room_id, owner).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        state_and_due(&pool, room_id).await,
+        (Some("idle".into()), true)
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_late_leave_keeps_the_meeting_once_end_on_host_leave_is_off() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping leave-after-relay-left test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-leave-late-option-off";
+    let host = "leave-late-option-off@example.com";
+    create_and_join(&pool, &nats, room_id, host, serde_json::json!({}), &[host]).await;
+    relay(&pool, room_id, host, 0x61, true).await;
+    relay(&pool, room_id, host, 0x61, false).await;
+    meeting_api::db::meetings::update_meeting_settings(
+        &pool,
+        room_id,
+        None,
+        None,
+        Some(false),
+        None,
+        None,
+        None,
+        Default::default(),
+        &meeting_api::password::PasswordUpdate::Unchanged,
+    )
+    .await
+    .expect("update settings")
+    .expect("meeting exists");
+
+    assert_eq!(
+        leave(&pool, &nats, room_id, host).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        state_and_due(&pool, room_id).await.0.as_deref(),
+        Some("idle")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+/// A relay LEFT whose meeting lookup predates a delete can still arm a deadline.
+#[tokio::test]
+#[serial]
+async fn a_late_leave_does_not_end_a_deleted_meeting() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping leave-after-relay-left test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room_id = "test-leave-late-deleted";
+    let host = "leave-late-deleted@example.com";
+    create_and_join(&pool, &nats, room_id, host, serde_json::json!({}), &[host]).await;
+    relay(&pool, room_id, host, 0x71, true).await;
+    relay(&pool, room_id, host, 0x71, false).await;
+    let pk = meeting_api::db::meetings::get_by_room_id(&pool, room_id)
+        .await
+        .unwrap()
+        .expect("meeting")
+        .id;
+    meeting_api::db::meetings::soft_delete(&pool, room_id, host)
+        .await
+        .expect("soft delete")
+        .expect("deleted");
+    sqlx::query(
+        "UPDATE meetings SET host_left_end_due_at = \
+         (SELECT left_at FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2) \
+         + INTERVAL '65 seconds' WHERE id = $1",
+    )
+    .bind(pk)
+    .bind(host)
+    .execute(&pool)
+    .await
+    .expect("re-arm on the deleted row");
+
+    let ended = meeting_api::db::participants::end_host_left_now(&pool, pk, host, false)
+        .await
+        .expect("end now");
+    assert!(ended.is_none());
+
+    cleanup_test_data(&pool, room_id).await;
+}

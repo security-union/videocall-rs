@@ -47,7 +47,7 @@ provides three services:
 | Service | Image | Purpose |
 |---------|-------|---------|
 | `postgres` | `postgres:12` | Database for meetings, sessions, and participants |
-| `nats` | `nats:2.10-alpine` | Message broker with JetStream enabled |
+| `nats` | `nats:2.14.8` | Message broker with JetStream enabled |
 | `rust-tests` | Built from `docker/Dockerfile.actix` | Test runner container |
 
 The `rust-tests` container mounts the repo at `/app` and runs:

@@ -41,6 +41,8 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+            - name: CAPTIONS_ENABLED
+              value: {{ .Values.captions.enabled | quote }}
             {{- if .Values.consoleLogs.enabled }}
             - name: CONSOLE_LOG_UPLOAD_ENABLED
               value: "true"

@@ -1,7 +1,7 @@
 import { ACTION_BAR_SELECTOR, CAMERA_TOOLTIP, cameraButtonSelector } from "./control-buttons";
 
-// camera-cycle.ts — opt-in per-bot camera duty cycle (#2362). Unset ⇒ camera on
-// for the whole run. Set ⇒ cameras-off time is load the run does not represent.
+// camera-cycle.ts — opt-in per-bot camera duty cycle (#2362). Set ⇒ cameras-off
+// time is load the run does not represent.
 
 export const CAMERA_CYCLE_ENV = {
   onMin: "BOT_CAMERA_ON_SECS_MIN",
@@ -43,7 +43,7 @@ function invalid(message: string): CameraCycleResult {
 }
 
 /**
- * All four unset ⇒ `undefined` (camera always on). A PARTIAL set is rejected
+ * All four unset ⇒ `undefined`. A PARTIAL set is rejected
  * rather than silently disabling the cycle.
  */
 export function resolveCameraCycle(raw: CameraCycleRaw): CameraCycleResult {
@@ -58,7 +58,7 @@ export function resolveCameraCycle(raw: CameraCycleRaw): CameraCycleResult {
   if (set.length === 0) return { kind: "ok", value: undefined };
   if (unset.length > 0) {
     return invalid(
-      `camera cycling needs all four of ${CAMERA_CYCLE_ENV_NAMES.join(", ")}; missing: ${unset.join(", ")}. Set them all, or none (none = camera on for the whole run).`,
+      `camera cycling needs all four of ${CAMERA_CYCLE_ENV_NAMES.join(", ")}; missing: ${unset.join(", ")}. Set them all, or none.`,
     );
   }
 

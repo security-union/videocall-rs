@@ -34,6 +34,7 @@
 //! - `bot_packets_sent_total`, `bot_packets_received_total`
 //! - `bot_packets_parsed_error_total`
 //! - `bot_websocket_pong_drops_total`
+//! - `bot_replay_forced_keyframes_total`
 //!
 //! All series are labeled `bot=<user_id>` and `meeting=<meeting_id>`; some
 //! additionally carry `direction` (up/down), `media_type`
@@ -133,6 +134,7 @@ pub struct BotMetrics {
     pub packets_received_total: IntCounterVec,
     pub packets_parsed_error_total: IntCounterVec,
     pub websocket_pong_drops_total: IntCounterVec,
+    pub replay_forced_keyframes_total: IntCounterVec,
 }
 
 #[cfg(feature = "metrics")]
@@ -242,6 +244,12 @@ impl BotMetrics {
             &["bot", "meeting", "reason"],
             registry
         )?;
+        let replay_forced_keyframes_total = register_int_counter_vec_with_registry!(
+            "bot_replay_forced_keyframes_total",
+            "Keyframes a replay publisher sent only because a KEYFRAME_REQUEST (cause=request) or an AQ tier change, including any active video layer count change (cause=tier_change), asked for one",
+            &["bot", "meeting", "layer", "cause"],
+            registry
+        )?;
 
         Ok(Arc::new(Self {
             registry,
@@ -258,6 +266,7 @@ impl BotMetrics {
             packets_received_total,
             packets_parsed_error_total,
             websocket_pong_drops_total,
+            replay_forced_keyframes_total,
         }))
     }
 
@@ -416,6 +425,10 @@ mod tests {
             .packets_parsed_error_total
             .with_label_values(&["b", "m", "wrapper"])
             .inc();
+        metrics
+            .replay_forced_keyframes_total
+            .with_label_values(&["b", "m", "2", "request"])
+            .inc();
 
         // Encoding must succeed and include at least one of our families.
         let encoder = TextEncoder::new();
@@ -430,6 +443,7 @@ mod tests {
             body
         );
         assert!(body.contains("bot_netsim_dropped_total"));
+        assert!(body.contains("bot_replay_forced_keyframes_total"));
         assert!(body.contains("bot_media_owd_ms_bucket"));
         assert!(body.contains("bot_media_excess_delay_ms_bucket"));
     }

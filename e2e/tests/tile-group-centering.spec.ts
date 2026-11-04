@@ -268,7 +268,7 @@ test.describe("The tile group is centred in the free band (#2700)", () => {
     }
   });
 
-  // Hiding the self view drops `self_cell`, so three tiles become two: tw 612,
+  // Hiding the self view drops the self cell, so three tiles become two: tw 612,
   // lefts 20 and 648. On fe2b470d the hidden host stayed out of flow but
   // inflated to the 612px tile width, overlapping tile one at its static spot.
   test("a hidden self view leaves the flex line entirely", async ({ baseURL }) => {

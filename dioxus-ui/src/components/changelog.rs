@@ -15,6 +15,17 @@ const INITIAL_BUILDS: usize = 3;
 const OLDER_BUILDS_STEP: usize = 10;
 const MIN_SHA_PREFIX: usize = 7;
 
+/// `(line prefix, pill label, CSS slug)` per kind of change, in display order.
+const KINDS: [(&str, &str, &str); 6] = [
+    ("Feature", "Features", "features"),
+    ("UX", "UX", "ux"),
+    ("Perf", "Performance", "performance"),
+    ("Reliability", "Reliability", "reliability"),
+    ("bug-fix", "Fixes", "fixes"),
+    ("Security", "Security", "security"),
+];
+const OTHER_KIND: (&str, &str) = ("Miscellaneous", "miscellaneous");
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct ChangelogBuild {
@@ -25,6 +36,27 @@ struct ChangelogBuild {
     changes: Vec<String>,
     #[serde(skip)]
     built_label: String,
+    #[serde(skip)]
+    change_list: ChangeList,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChangeList {
+    Flat(Vec<String>),
+    Grouped(Vec<ChangeGroup>),
+}
+
+impl Default for ChangeList {
+    fn default() -> Self {
+        Self::Flat(Vec::new())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChangeGroup {
+    label: &'static str,
+    slug: &'static str,
+    changes: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -61,9 +93,72 @@ fn parse_changelog(body: &str) -> Result<Vec<ChangelogBuild>, String> {
         .map_err(|e| e.to_string())?
         .builds;
     for build in &mut builds {
-        build.changes.retain(|change| !change.trim().is_empty());
+        build
+            .changes
+            .retain(|change| !display_change(change).1.is_empty());
     }
-    Ok(arrange_sections(builds))
+    let mut builds = arrange_sections(builds);
+    for build in &mut builds {
+        build.change_list = group_changes(&std::mem::take(&mut build.changes));
+    }
+    Ok(builds)
+}
+
+/// The `KINDS` index a line's prefix names, and the line as shown: without
+/// that prefix or a trailing ` (#N)`.
+fn display_change(line: &str) -> (Option<usize>, &str) {
+    let named = line.split_once(": ").and_then(|(key, rest)| {
+        KINDS
+            .iter()
+            .position(|&(k, _, _)| k == key)
+            .map(|i| (i, rest))
+    });
+    let (kind, text) = match named {
+        Some((i, rest)) => (Some(i), rest),
+        None => (None, line),
+    };
+    (kind, strip_pr_number(text).trim())
+}
+
+fn strip_pr_number(text: &str) -> &str {
+    let Some((head, number)) = text.strip_suffix(')').and_then(|t| t.rsplit_once("(#")) else {
+        return text;
+    };
+    let numbered = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+    if numbered && (head.is_empty() || head.ends_with(' ')) {
+        head
+    } else {
+        text
+    }
+}
+
+fn group_changes(changes: &[String]) -> ChangeList {
+    let mut buckets = vec![Vec::<String>::new(); KINDS.len() + 1];
+    for change in changes {
+        let (kind, text) = display_change(change);
+        let bucket = &mut buckets[kind.unwrap_or(KINDS.len())];
+        if !bucket.iter().any(|shown| shown == text) {
+            bucket.push(text.to_string());
+        }
+    }
+    if buckets[..KINDS.len()].iter().all(Vec::is_empty) {
+        return ChangeList::Flat(buckets.pop().unwrap_or_default());
+    }
+    let pills = KINDS
+        .iter()
+        .map(|&(_, label, slug)| (label, slug))
+        .chain([OTHER_KIND]);
+    ChangeList::Grouped(
+        pills
+            .zip(buckets)
+            .filter(|(_, changes)| !changes.is_empty())
+            .map(|((label, slug), changes)| ChangeGroup {
+                label,
+                slug,
+                changes,
+            })
+            .collect(),
+    )
 }
 
 /// Every pending section merged into the first one (changes in file order,
@@ -378,10 +473,38 @@ fn build_section(
                     }
                 }
             }
-            ul { class: "changelog-changes",
-                for change in build.changes.iter() {
-                    li { "data-testid": "changelog-change", "{change}" }
+            {change_list(&build.change_list)}
+        }
+    }
+}
+
+fn change_list(list: &ChangeList) -> Element {
+    match list {
+        ChangeList::Flat(changes) => change_items(changes),
+        ChangeList::Grouped(groups) => rsx! {
+            for group in groups.iter() {
+                div {
+                    key: "{group.slug}",
+                    class: "changelog-group",
+                    "data-testid": "changelog-group",
+                    "data-kind": "{group.slug}",
+                    h6 {
+                        class: "changelog-kind changelog-kind--{group.slug}",
+                        "data-testid": "changelog-kind",
+                        "{group.label}"
+                    }
+                    {change_items(&group.changes)}
                 }
+            }
+        },
+    }
+}
+
+fn change_items(changes: &[String]) -> Element {
+    rsx! {
+        ul { class: "changelog-changes",
+            for change in changes.iter() {
+                li { "data-testid": "changelog-change", "{change}" }
             }
         }
     }
@@ -443,6 +566,171 @@ mod tests {
         }
     }
 
+    fn parsed(built: &str, version: &str) -> ChangelogBuild {
+        ChangelogBuild {
+            built: built.to_string(),
+            version: version.to_string(),
+            change_list: ChangeList::Flat(vec![format!("{version} change")]),
+            ..Default::default()
+        }
+    }
+
+    fn strings(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    fn group(label: &'static str, slug: &'static str, changes: &[&str]) -> ChangeGroup {
+        ChangeGroup {
+            label,
+            slug,
+            changes: strings(changes),
+        }
+    }
+
+    fn shown(line: &str) -> (Option<&'static str>, &str) {
+        let (kind, text) = display_change(line);
+        (kind.map(|i| KINDS[i].0), text)
+    }
+
+    #[test]
+    fn each_kind_gets_its_pill_in_display_order_with_miscellaneous_last() {
+        let list = group_changes(&strings(&[
+            "Uncategorised first (#11)",
+            "Security: s",
+            "bug-fix: f",
+            "Reliability: r (#12)",
+            "Perf: p",
+            "UX: u",
+            "Feature: n",
+            "UX: u2",
+        ]));
+        assert_eq!(
+            list,
+            ChangeList::Grouped(vec![
+                group("Features", "features", &["n"]),
+                group("UX", "ux", &["u", "u2"]),
+                group("Performance", "performance", &["p"]),
+                group("Reliability", "reliability", &["r"]),
+                group("Fixes", "fixes", &["f"]),
+                group("Security", "security", &["s"]),
+                group("Miscellaneous", "miscellaneous", &["Uncategorised first"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_build_with_no_categorized_line_stays_one_flat_list() {
+        assert_eq!(
+            group_changes(&strings(&[
+                "Pinning moves a tile to the front of the grid (#28)",
+                "Meeting-api: x",
+                "Clippy::y",
+            ])),
+            ChangeList::Flat(strings(&[
+                "Pinning moves a tile to the front of the grid",
+                "Meeting-api: x",
+                "Clippy::y",
+            ]))
+        );
+    }
+
+    #[test]
+    fn only_an_exact_kind_prefix_categorizes_a_line() {
+        let list = group_changes(&strings(&[
+            "Meeting-api: x (#13)",
+            "Clippy::y",
+            "ux: lower case",
+            "UX:no space",
+            "Note: UX: not first",
+            "UX: a: b",
+        ]));
+        assert_eq!(
+            list,
+            ChangeList::Grouped(vec![
+                group("UX", "ux", &["a: b"]),
+                group(
+                    "Miscellaneous",
+                    "miscellaneous",
+                    &[
+                        "Meeting-api: x",
+                        "Clippy::y",
+                        "ux: lower case",
+                        "UX:no space",
+                        "Note: UX: not first",
+                    ]
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn one_well_formed_trailing_pr_number_is_stripped() {
+        assert_eq!(
+            shown("UX: Clearer mute (#12)"),
+            (Some("UX"), "Clearer mute")
+        );
+        assert_eq!(shown("bug-fix: (#12)"), (Some("bug-fix"), ""));
+        assert_eq!(shown("Raw title (#12)"), (None, "Raw title"));
+        assert_eq!(shown("Two (#1) (#2)"), (None, "Two (#1)"));
+        assert_eq!(shown("Bad (#v2)"), (None, "Bad (#v2)"));
+        assert_eq!(shown("Empty (#)"), (None, "Empty (#)"));
+        assert_eq!(shown("Glued(#12)"), (None, "Glued(#12)"));
+        assert_eq!(shown("Mid (#12) text"), (None, "Mid (#12) text"));
+    }
+
+    #[test]
+    fn lines_with_nothing_left_to_show_are_dropped_with_any_build_they_empty() {
+        let builds = parse_changelog(
+            r#"{"builds":[
+            {"built":"2026-09-29T00:00:00Z","version":"2","changes":["UX: ","UX: (#12)","Perf: kept"]},
+            {"built":"2026-09-28T00:00:00Z","version":"1","changes":["(#13)","Security: "]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(builds.len(), 1, "build 1 has nothing left to show");
+        assert_eq!(
+            builds[0].change_list,
+            ChangeList::Grouped(vec![group("Performance", "performance", &["kept"])])
+        );
+    }
+
+    #[test]
+    fn a_repeated_line_shows_once_per_group() {
+        assert_eq!(
+            group_changes(&strings(&[
+                "UX: Same (#1)",
+                "Perf: Same",
+                "UX: Same (#2)",
+                "UX: Next",
+            ])),
+            ChangeList::Grouped(vec![
+                group("UX", "ux", &["Same", "Next"]),
+                group("Performance", "performance", &["Same"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_merged_unreleased_section_is_grouped_once() {
+        let builds = parse_changelog(
+            r#"{"builds":[
+            {"pending":true,"changes":["UX: a (#1)","Perf: b"]},
+            {"built":"2026-09-29T00:00:00Z","version":"1","changes":["Shipped"]},
+            {"pending":true,"changes":["UX: c","UX: a (#1)","Perf: b (#2)"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            builds[0].change_list,
+            ChangeList::Grouped(vec![
+                group("UX", "ux", &["a", "c"]),
+                group("Performance", "performance", &["b"]),
+            ])
+        );
+        assert_eq!(
+            builds[1].change_list,
+            ChangeList::Flat(strings(&["Shipped"]))
+        );
+    }
+
     #[test]
     fn parse_reads_the_documented_shape() {
         let body = r#"{"builds":[{"built":"2026-09-29T05:00:37Z","version":"1.1.42",
@@ -454,11 +742,9 @@ mod tests {
                 version: "1.1.42".to_string(),
                 commit: "1e7c5d00".to_string(),
                 pending: false,
-                changes: vec![
-                    "Pinning moves a tile (#2872)".to_string(),
-                    "Second".to_string()
-                ],
+                changes: Vec::new(),
                 built_label: String::new(),
+                change_list: ChangeList::Flat(strings(&["Pinning moves a tile", "Second"])),
             }]
         );
     }
@@ -486,7 +772,7 @@ mod tests {
             r#"{"schema":2,"builds":[{"version":"1.0.0","changes":["1.0.0 change"],"extra":true}]}"#,
         )
         .unwrap();
-        assert_eq!(builds, vec![build("", "1.0.0")]);
+        assert_eq!(builds, vec![parsed("", "1.0.0")]);
         assert_eq!(parse_changelog("{}").unwrap(), vec![]);
     }
 
@@ -501,7 +787,7 @@ mod tests {
     #[test]
     fn parse_drops_blank_change_lines() {
         let builds = parse_changelog(r#"{"builds":[{"changes":["  ","Kept",""]}]}"#).unwrap();
-        assert_eq!(builds[0].changes, vec!["Kept".to_string()]);
+        assert_eq!(builds[0].change_list, ChangeList::Flat(strings(&["Kept"])));
     }
 
     #[test]
@@ -630,8 +916,12 @@ mod tests {
         let body = r#"{"builds":[
             {"pending":true,"through":"1e7c5d00","prs":[2890],"changes":["Soon (#2890)"]},
             {"built":"2026-09-29T05:00:37Z","version":"1.1.42","changes":["Shipped"]}]}"#;
-        let builds = parse_changelog(body).unwrap();
-        assert_eq!(builds[0], pending(&["Soon (#2890)"]));
+        let mut builds = parse_changelog(body).unwrap();
+        assert_eq!(
+            std::mem::take(&mut builds[0].change_list),
+            ChangeList::Flat(strings(&["Soon"]))
+        );
+        assert_eq!(builds[0], pending(&[]));
         assert!(!builds[1].pending);
     }
 
@@ -667,7 +957,7 @@ mod tests {
             {"built":"2026-09-29T00:00:00Z","version":"1.1.42","changes":["1.1.42 change"]}]}"#,
         )
         .unwrap();
-        assert_eq!(builds, vec![build("2026-09-29T00:00:00Z", "1.1.42")]);
+        assert_eq!(builds, vec![parsed("2026-09-29T00:00:00Z", "1.1.42")]);
     }
 
     #[test]

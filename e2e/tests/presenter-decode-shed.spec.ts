@@ -4,6 +4,7 @@ import { BUDGET } from "../helpers/rust-mirrored-constants";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { stopScreenShare } from "../helpers/screen-share-meeting";
 
 /**
  * Presenter-aware decode-shedding E2E coverage (issue #1559).
@@ -203,56 +204,26 @@ test.describe("Presenter-aware decode shedding (#1559)", () => {
     return off;
   };
 
-  // The Screen Share control is `button.video-control-button` carrying a
-  // `span.tooltip` whose `.tooltip-title` is "Screen share — Share Screen"
-  // (idle) or "Screen share — Stop Screen Share" (active), plus a
-  // `.tooltip-desc` description span — see video_control_buttons.rs
-  // ScreenShareButton. Use a case-insensitive substring (Playwright's
-  // `hasText: "Share Screen"`) that appears in the idle title but NOT in
-  // the active title: "Stop Screen Share" does not contain "Share Screen"
-  // as a substring (the order is reversed), and neither tooltip's
-  // description text contains the phrase, so start/stop stay distinct.
-  // An anchored regex (`/^Share Screen$/`) cannot be used here because the
-  // tooltip now wraps the label in a `.tooltip-title` span plus a
-  // `.tooltip-desc` span, so `.tooltip`'s full textContent concatenates
-  // both children and can never equal just "Share Screen".
-  const idleShareBtn = (page: Page) =>
-    page.locator(".video-controls-container button.video-control-button", {
-      has: page.locator(".tooltip", { hasText: "Share Screen" }),
-    });
-  const activeShareBtn = (page: Page) =>
-    page.locator(".video-controls-container button.video-control-button", {
-      has: page.locator(".tooltip", { hasText: "Stop Screen Share" }),
-    });
+  const shareBtn = (page: Page, state: "idle" | "active") =>
+    page.locator(`#screen-share-trigger[data-state="${state}"]`);
 
   // Start the LOCAL screen share via the shimmed getDisplayMedia. Returns true
-  // once the share button flips to its active ("Stop Screen Share") state, i.e.
-  // is_sharing() == true.
+  // once the share button is active, i.e. is_sharing() == true.
   async function startLocalShare(page: Page): Promise<boolean> {
     await wakeControls(page);
     await page.waitForTimeout(400);
-    const btn = idleShareBtn(page);
+    const btn = shareBtn(page, "idle");
     if ((await btn.count()) === 0) {
       return false;
     }
-    await expect(btn.first()).toBeVisible({ timeout: 10_000 });
-    await btn.first().click();
-    // The mock resolves quickly → StreamReady/Active (is_sharing() == true),
-    // which flips the tooltip to "Stop Screen Share".
+    await expect(btn).toBeVisible({ timeout: 10_000 });
+    await btn.click();
     try {
-      await expect(activeShareBtn(page).first()).toBeVisible({ timeout: 10_000 });
+      await expect(shareBtn(page, "active")).toBeVisible({ timeout: 10_000 });
       return true;
     } catch {
       return false;
     }
-  }
-
-  async function stopLocalShare(page: Page): Promise<void> {
-    await wakeControls(page);
-    await page.waitForTimeout(400);
-    await activeShareBtn(page).first().click();
-    // Back to idle: is_sharing() == false.
-    await expect(idleShareBtn(page).first()).toBeVisible({ timeout: 10_000 });
   }
 
   // ──────────────────────────────────────────────────────────────────────
@@ -325,7 +296,7 @@ test.describe("Presenter-aware decode shedding (#1559)", () => {
     expect(decodedWhileSharing).toBeGreaterThanOrEqual(1); // MIN_CAP floor
 
     // ---- RECOVER ON STOP: stop sharing + healthy FPS → tiles re-grow. ----
-    await stopLocalShare(page);
+    await stopScreenShare(page);
     const offAfterStop = await injectUntilOffBudget(
       page,
       HIGH_FPS,

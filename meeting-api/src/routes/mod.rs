@@ -13,6 +13,8 @@
 
 //! Axum router configuration for the Meeting Backend API.
 
+pub mod avatars;
+pub mod captions;
 pub mod co_hosts;
 pub mod console_logs;
 pub mod dev;
@@ -121,6 +123,27 @@ pub fn router() -> Router<AppState> {
         // Register {base_url}/logout/frontchannel as `frontchannel_logout_uri`
         // in your OIDC client configuration.
         .route("/logout/frontchannel", get(oauth::frontchannel_logout))
+        .route("/api/v1/user/avatar", get(avatars::get_my_avatar))
+        .route(
+            "/api/v1/user/avatar",
+            put(avatars::upload_avatar).layer(DefaultBodyLimit::max(
+                videocall_meeting_types::avatar::MAX_AVATAR_UPLOAD_BYTES,
+            )),
+        )
+        .route("/api/v1/user/avatar", delete(avatars::delete_avatar))
+        .route(
+            "/api/v1/user/avatar/gravatar",
+            put(avatars::set_gravatar_avatar)
+                .layer(DefaultBodyLimit::max(avatars::MAX_GRAVATAR_BODY)),
+        )
+        .route(
+            "/api/v1/user/avatar/image",
+            get(avatars::get_my_avatar_image),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/avatar",
+            get(avatars::get_meeting_avatar_image),
+        )
         // Meeting CRUD
         .route("/api/v1/meetings", get(meetings::list_meetings))
         .route("/api/v1/meetings", post(meetings::create_meeting))
@@ -256,6 +279,10 @@ pub fn router() -> Router<AppState> {
             post(co_hosts::grant_co_host),
         )
         .route(
+            "/api/v1/meetings/{meeting_id}/co-hosts/suggestions",
+            get(co_hosts::list_co_host_suggestions),
+        )
+        .route(
             "/api/v1/meetings/{meeting_id}/co-hosts/revoke",
             post(co_hosts::revoke_co_host),
         )
@@ -266,6 +293,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/recordings/{recording_id}/stop",
             post(recordings::stop).layer(DefaultBodyLimit::max(recordings::MAX_STOP_BODY)),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/captions",
+            post(captions::set_captions).layer(DefaultBodyLimit::max(captions::MAX_BODY)),
         )
         // Console log uploads
         .route(

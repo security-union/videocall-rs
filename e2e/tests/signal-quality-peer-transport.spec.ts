@@ -30,11 +30,10 @@ import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
  * the SAME per-peer simulcast RECEIVE breakdown the Performance dialog's
  * per-peer receive rows expose (issue: tile signal-meter popup ↔ perf dialog
  * layer parity). It reuses the perf-dialog markup verbatim — `.perf-peer-row`,
- * `.perf-q-dot--{optimal|medium|low}`, `.perf-peer-row__metric` ("{Q} · {i}/{n}",
- * #1222 quality-letter + 1-based position/total), and the optional
+ * `.perf-q-dot--{optimal|medium|low}`, `.perf-peer-row__metric`, and the optional
  * `.perf-reason-chip--{network|setting|sender}`. We
  * assert the video layer row appears for the receiving host, carries a shared
- * quality-dot modifier class, and shows the 1-based "L i / n" metric.
+ * quality-dot modifier class, and shows the `peer_row_metric` text.
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
@@ -84,13 +83,10 @@ async function joinMeetingAs(
 async function ensurePrejoinCameraOn(page: Page): Promise<void> {
   const allow = page.locator('[data-testid="prejoin-permission-allow"]');
   if (await allow.isVisible().catch(() => false)) {
-    await allow.click();
-    await page
-      .locator('[data-testid="prejoin-permission-prompt"]')
-      .waitFor({ state: "hidden", timeout: 15_000 })
-      .catch(() => {
-        /* already granted / prompt absent */
-      });
+    await allow.click({ timeout: 5_000 }).catch(() => {});
+    await expect(page.locator('[data-testid="prejoin-permission-prompt"]')).toBeHidden({
+      timeout: 15_000,
+    });
   }
 
   const cameraToggle = page.locator('[data-testid="prejoin-camera-toggle"]');
@@ -287,13 +283,13 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
         const dotClass = (await videoDot.getAttribute("class")) || "";
         expect(dotClass).toMatch(/\bperf-q-dot--(optimal|medium|low)\b/);
 
-        // Metric text is the quality LETTER + 1-based position/total (#1222
-        // Directive 4: e.g. "540p · ~600k · M · 2/3"), the exact shape
-        // `peer_row_metric` produces for the perf dialog (the old "L2/3" numeric
-        // chip is gone). Match the "{Q} · {i}/{n}" tail — a quality letter
-        // (L/M/H, or "1" single-layer) followed by " · " and the position/total.
+        // `peer_row_metric`; the position tail renders only for a peer publishing
+        // more than one video layer.
         const videoMetric = videoRow.locator(".perf-peer-row__metric");
-        await expect(videoMetric).toHaveText(/\S+ · \d+\/\d+/, { timeout: 30_000 });
+        await expect(videoMetric).toHaveText(
+          /^(?:\d+p|—) · ~\d+(?:\.\d)?[kM](?: · (?:Low|Medium|High) · \d+\/\d+)?$/,
+          { timeout: 30_000 },
+        );
 
         // When the row is below the full-ladder top a tinted reason chip appears,
         // again reusing the perf-dialog chip classes. The chip is optional (an

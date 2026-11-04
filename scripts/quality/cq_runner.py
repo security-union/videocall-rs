@@ -1,7 +1,4 @@
-"""Scenario runner core (#2914): phases, events.jsonl, runner gates R1-R10 and verdict composition.
-
-The stack, fleet and source tree are injected adapters; only the scorer can say PASS, the runner only downgrades.
-"""
+"""Scenario runner core (#2914): phases, events.jsonl, runner gates R1-R12. Scorer alone says PASS; gates downgrade."""
 
 import hashlib
 import json
@@ -34,7 +31,12 @@ JOIN_SETTLE_S = 15
 MEDIA_SETTLE_S = 30
 TEARDOWN_DELAY_S = 30
 JOIN_BUDGET_EXTRA_S = 120
+RUST_READY_S = 90
 POLL_S = 5.0
+WATCH_INTERVAL_S = 15.0
+WATCH_BUDGET_S = 2.0
+WATCH_STARVE_S = 2 * WATCH_INTERVAL_S
+REPORT_ONLY = "Phase 0 is report-only on a shared stack"
 JOIN_POLL_S = 1.0
 MAX_CLOCK_DRIFT_S = 1.0
 EXIT_SLACK_S = 1.0
@@ -43,6 +45,7 @@ EVENT_SLACK_S = cq_scenario.EVENT_SLACK_S
 VALIDITY_GATES = [f"G-V{k}" for k in range(1, 17)]
 QUALITY_GATES = ["G-Q1", "G-Q2", "G-Q3", "G-Q4", "G-Q5", "G-Q7", "G-Q8", "G-Q9"]
 TOOL_TIMEOUT_S = 900
+SECRET_ENV = "JWT_SECRET"
 COLLECT_SCRIPT = os.path.join(HERE, "cq_collect.py")
 SCORE_SCRIPT = os.path.join(HERE, "call_quality_score.py")
 
@@ -88,7 +91,10 @@ class Stack(Protocol):
     """Raises only AdapterError, whose text reaches run.json; state() and images() are written verbatim to
     stack/state-*.json and stack/images.json (then the manifest). None of it may name a host, address or user path.
     Its subprocesses start in their own session, it never catches KeyboardInterrupt, and every call is time-bounded:
-    a terminal signal must not reach its children, and no second signal forces an exit."""
+    a terminal signal must not reach its children, and no second signal forces an exit.
+    Optional: watch() returns abort reasons within WATCH_BUDGET_S, drained() returns teardown drain problems; both
+    lists of non-blank strings that reach run.json, so they too may name no host. A shared target needs both.
+    A stack watched by its fleet too keeps watched_mono, the monotonic end of its last watch, so rounds stay spaced."""
 
     def preflight(self, plan): ...
     def up(self, plan, mode): ...
@@ -96,6 +102,7 @@ class Stack(Protocol):
     def images(self): ...
     def prom_url(self): ...
     def scrape_up_selector(self): ...
+    def throttle_pod_selector(self): ...
     def down(self): ...
 
 
@@ -105,7 +112,9 @@ class Fleet(Protocol):
     join and media-start times may be no later than it plus JOIN_TIME_SLACK_S, and a planned leave's exit counts as
     planned only with exit code 0. Its subprocesses start in their own session, it never catches KeyboardInterrupt,
     and every call is time-bounded: a terminal signal must not reach its children, and no second signal forces an
-    exit."""
+    exit. Optional: leaks(run_dir) returns the run folder's secret leaks, a list of non-blank strings that names no
+    secret; admit(proc) returns (admitted, detail) for a probe about to launch, the detail naming no host. A shared
+    target needs both."""
 
     def clock_facts(self): ...
     def launch(self, proc): ...
@@ -144,11 +153,15 @@ class SystemClock:
             time.sleep(seconds)
 
 
+def child_env():
+    return {k: v for k, v in os.environ.items() if k != SECRET_ENV and not k.upper().endswith("_PROXY")}
+
+
 class SubprocessTools:
     def run(self, argv):
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=TOOL_TIMEOUT_S, check=False,
-                               start_new_session=True)
+                               start_new_session=True, env=child_env())
         except subprocess.TimeoutExpired:
             return 3, "", f"TimeoutExpired: no exit after {TOOL_TIMEOUT_S} s"
         except OSError as exc:
@@ -163,7 +176,7 @@ class GitTree:
     def _git(self, *args):
         try:
             p = subprocess.run(["git", "-C", self.root, *args], capture_output=True, text=True, check=False,
-                               timeout=TOOL_TIMEOUT_S, start_new_session=True)
+                               timeout=TOOL_TIMEOUT_S, start_new_session=True, env=child_env())
         except subprocess.TimeoutExpired as exc:
             raise AdapterError(f"git {' '.join(args)} timed out") from exc
         except OSError as exc:
@@ -201,6 +214,12 @@ def _signal_name(signum):
         return str(signum)
 
 
+def _strings(v, what, owner="stack"):
+    if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
+        raise AdapterError(f"{owner} {what} must return a list of non-blank strings")
+    return v
+
+
 def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
@@ -219,12 +238,15 @@ def _dump(path, obj):
     os.replace(tmp, path)
 
 
-def prepare_run_dir(out_dir, run_id, repo_root):
+def check_out_dir(out_dir, repo_root):
     out = os.path.realpath(out_dir)
-    root = os.path.realpath(repo_root)
-    if os.path.commonpath([out, root]) == root:
+    if os.path.commonpath([out, os.path.realpath(repo_root)]) == os.path.realpath(repo_root):
         raise Refused("--out-dir must be outside the repository: a run folder inside it dirties the tree (R9)")
-    run_dir = os.path.join(out, run_id)
+    return out
+
+
+def prepare_run_dir(out_dir, run_id, repo_root):
+    run_dir = os.path.join(check_out_dir(out_dir, repo_root), run_id)
     try:
         os.makedirs(run_dir)
     except FileExistsError as exc:
@@ -291,10 +313,11 @@ def compose_generator_verdict(hosts, verdicts, window, allowed):
             "window": {"from": window[0], "to": window[1]}, "hosts": sorted(seen)}
 
 
-def forced_scorer_config(scrape_up_selector, relay_path_exemptions):
+def forced_scorer_config(scrape_up_selector, relay_path_exemptions, throttle_pod_selector):
     return {"validity_gates": {"allowed_not_measured": {"value": list(FORCED_NOT_MEASURED)},
                                "scrape_up_selector": {"value": scrape_up_selector},
-                               "relay_path_exemptions": {"value": dict(relay_path_exemptions)}}}
+                               "relay_path_exemptions": {"value": dict(relay_path_exemptions)}},
+            "server_diagnostics": {"throttle_pod_selector": {"value": throttle_pod_selector}}}
 
 
 def collector_argv(run_dir):
@@ -336,8 +359,10 @@ def check_expectation(expect, result, gates, error=None):
         if g.get("status") not in ("pass", "fail") and not (
                 g.get("status") == "not_measured" and g.get("gate") in FORCED_NOT_MEASURED):
             problems.append(f"{g.get('gate')} is {g.get('status')}")
-    if step.get("invalid_reasons"):
-        problems.append(f"blocking not-measured gates: {step['invalid_reasons']}")
+    uncertain = step.get("uncertain_gates", [])
+    for label, unsure in (("blocking not-measured gates", False), ("uncertain gates", True)):
+        if listed := [g for g in step.get("invalid_reasons", []) if (g in uncertain) == unsure]:
+            problems.append(f"{label}: {listed}")
     return {"met": not problems, "problems": problems}
 
 
@@ -396,6 +421,12 @@ class _State:
     signals: list = field(default_factory=list)
     hold_mono: dict = field(default_factory=dict)
     issued_mono: dict = field(default_factory=dict)
+    watched_mono: object = None
+    watch: dict = field(default_factory=lambda: {"rounds": 0, "max_s": 0.0, "over_budget": 0})
+    drain: object = None
+    leaks: object = None
+    admission: list = field(default_factory=list)
+    withheld: bool = False
 
 
 class Runner:
@@ -407,6 +438,7 @@ class Runner:
         self.stack_mode, self.keep_stack, self.allow_dirty = stack_mode, keep_stack, allow_dirty
         self.argv = list(argv)
         self.step = plan["steps"][0]
+        self.shared = plan.get("target") in cq_scenario.SHARED_TARGETS
         self.s = _State()
         self.log = None
         self._signal_mode = "record"
@@ -439,10 +471,11 @@ class Runner:
     def _sleep_until_mono(self, target):
         while True:
             now = self._now()
-            if now.mono >= target:
+            at = self._watch_at(now.mono, target)
+            if now.mono >= target and at > now.mono + 1e-6:
                 return now
-            self.clock.sleep(min(POLL_S, target - now.mono))
-            self._poll()
+            self.clock.sleep(max(0.0, min(POLL_S, target - now.mono, at - now.mono)))
+            self._poll(target)
 
     def _record_exit(self, ex, reaped):
         proc = self.s.launched.get(getattr(ex, "proc_id", None))
@@ -459,9 +492,44 @@ class Runner:
         self.log.write("stopped", wall=ex.exited_at, proc_id=ex.proc_id, participants=list(proc["participants"]),
                        exit_code=ex.exit_code)
 
-    def _poll(self):
+    def _watch_at(self, mono, target):
+        if not callable(getattr(self.stack, "watch", None)):
+            return math.inf
+        last, other = self.s.watched_mono, getattr(self.stack, "watched_mono", None)
+        last = max(last, other) if isinstance(other, (int, float)) else last
+        start = max(mono, last + WATCH_INTERVAL_S)
+        return start if target - start >= WATCH_BUDGET_S - 1e-6 else max(start, last + WATCH_STARVE_S)
+
+    def _watch_check(self):
+        if callable(getattr(self.stack, "watch", None)):
+            self._sleep_until_mono(self._now().mono)
+
+    def _poll(self, target):
+        go = self._watch_due(target)
         for ex in self.fleet.poll():
             self._record_exit(ex, self._now())
+        if go or self._watch_due(target):
+            self._watch()
+
+    def _watch_due(self, target):
+        now = self._now().mono
+        return self._watch_at(now, target) <= now + 1e-6
+
+    def _watch(self):
+        begin = self._now().mono
+        try:
+            out = self.stack.watch()
+        except AdapterError as exc:
+            raise Abort(f"stack watch failed: {exc}") from exc
+        finally:
+            self.s.watched_mono = self._now().mono
+            took = self.s.watched_mono - begin
+            self.s.watch["rounds"] += 1
+            self.s.watch["max_s"] = max(self.s.watch["max_s"], took)
+            self.s.watch["over_budget"] += took > WATCH_BUDGET_S
+        reasons = _strings(out, "watch()")
+        if reasons:
+            raise Abort("stack watch: " + "; ".join(reasons))
 
     def _preflight(self):
         ids = [p["proc_id"] for p in self.plan["processes"]]
@@ -471,6 +539,14 @@ class Runner:
         with open(self.path("scenario.yaml"), "wb") as fh:
             fh.write(self.scenario_bytes)
         self.log = EventLog(self.path(cq_collect.EVENTS_FILE), self._now)
+        unfit = [f"its stack adapter has no {h}()" for h in ("watch", "drained")
+                 if not callable(getattr(self.stack, h, None))]
+        unfit += [f"its fleet adapter has no {h}()" for h in ("leaks", "admit")
+                  if not callable(getattr(self.fleet, h, None))]
+        unfit += [f"it needs --stack reuse, not {self.stack_mode}"] if self.stack_mode != "reuse" else []
+        unfit += ["it does not take --allow-dirty"] if self.allow_dirty else []
+        if self.shared and unfit:
+            raise Refused(f"target {self.plan['target']} is shared: {'; '.join(unfit)}")
         self.s.commit = self.tree.commit()
         self.s.dirty_at_preflight = self.tree.dirty()
         if self.s.dirty_at_preflight and not self.allow_dirty:
@@ -482,10 +558,22 @@ class Runner:
             raise Refused("the stack adapter gives no scrape_up_selector, so G-V3 would go unmeasured")
         problems = self.stack.preflight(self.plan)
         if problems:
+            self.preflight_problems = list(problems)
             raise Refused("stack preflight: " + "; ".join(problems))
         self.log.write("preflight", run_id=self.plan["run_id"], commit=self.s.commit,
                        dirty=self.s.dirty_at_preflight, clock=clock,
                        python=sys.version.split()[0])
+
+    def preflight_only(self):
+        """The run's preflight and nothing after it: no stack up, no launch. [] when it passes, else the problems."""
+        try:
+            self._preflight()
+        except (Refused, AdapterError) as exc:
+            return getattr(self, "preflight_problems", None) or [_describe(exc)]
+        finally:
+            if self.log is not None:
+                self.log.close()
+        return []
 
     def _stack_up(self):
         self.s.phase = "stack"
@@ -501,21 +589,34 @@ class Runner:
         self.log.write("launched", proc_id=proc["proc_id"], participants=list(proc["participants"]))
 
     def _join(self):
+        """Rust first, until every Rust bot has joined and its media has started, so a replay library build never
+        overlaps a probe's start; then each admitted probe in plan order."""
         self.s.phase = "join"
         sid = self.step["step_id"]
         start = self.log.write("join_start", step_id=sid)
+        self.s.watched_mono = start["mono"] - WATCH_INTERVAL_S
         self.s.marks["join_start"] = start["wall"]
-        procs = self.plan["processes"]
+        procs = list(self.plan["processes"])
+        rust = [p for p in procs if p["fleet"] == "rust"]
+        for p in rust:
+            self._launch(p)
+            self._watch_check()
+        self._await_joins({u for p in rust for u in p["participants"]}, start["mono"] + RUST_READY_S,
+                          f"Rust media did not start within {RUST_READY_S} s")
         browsers = [p for p in procs if p["fleet"] == "browser"]
         for k, p in enumerate(browsers):
-            self._launch(p)
-            if k + 1 < len(browsers):
-                self._sleep_until_mono(self._now().mono + p["join_stagger_s"])
-        for p in (p for p in procs if p["fleet"] == "rust"):
-            self._launch(p)
-        planned = {p["user_id"]: p for p in self.plan["participants"]}
-        deadline = start["mono"] + self.step["join_window_s"] + JOIN_BUDGET_EXTRA_S
+            if self._admit(p):
+                self._launch(p)
+                if k + 1 < len(browsers):
+                    self._sleep_until_mono(self._now().mono + p["join_stagger_s"])
+                    continue
+            self._watch_check()
+        self._await_joins({p["user_id"] for p in self.plan["participants"]},
+                          start["mono"] + self.step["join_window_s"] + JOIN_BUDGET_EXTRA_S, "join budget ran out")
+
+    def _await_joins(self, want, deadline, why):
         while True:
+            planned = {p["user_id"]: p for p in self.plan["participants"]}
             reported = self.fleet.joined()
             horizon = self._now().wall + JOIN_TIME_SLACK_S
             for uid, j in sorted(reported.items()):
@@ -529,14 +630,53 @@ class Runner:
                 self.log.write("joined", participants=[uid], join_ts=j.join_ts, media_started_at=j.media_started_at)
             if self.s.exits:
                 raise Abort(f"processes exited during the join: {', '.join(sorted(self.s.exits))}")
-            if set(planned) <= set(self.s.joined):
+            now, missing = self._now(), sorted(want - set(self.s.joined))
+            if not missing and now.mono <= deadline:
                 return
-            now = self._now()
             if now.mono >= deadline:
-                missing = sorted(set(planned) - set(self.s.joined))
-                raise Abort(f"join budget ran out; not joined: {', '.join(missing)}")
-            self.clock.sleep(min(JOIN_POLL_S, deadline - now.mono))
-            self._poll()
+                raise Abort(f"{why}; " + (f"not joined: {', '.join(missing)}" if missing
+                                          else f"seen {now.mono - deadline:.1f} s after the deadline"))
+            due = self._watch_at(now.mono, math.inf) - now.mono
+            self.clock.sleep(min(JOIN_POLL_S, deadline - now.mono, due))
+            self._poll(math.inf)
+
+    def _admit(self, proc):
+        admit = getattr(self.fleet, "admit", None)
+        if not callable(admit):
+            return True
+        out = admit(proc)
+        if not (isinstance(out, tuple) and len(out) == 2 and isinstance(out[0], bool) and isinstance(out[1], str)
+                and out[1].strip()):
+            raise AdapterError("fleet admit() must return (admitted, a non-blank detail)")
+        ok, detail = out
+        pid = proc["proc_id"]
+        self.s.admission.append({"proc_id": pid, "admitted": ok, "detail": detail})
+        self.log.write("admission", proc_id=pid, participants=list(proc["participants"]), admitted=ok, detail=detail)
+        if ok:
+            return True
+        need = self._needed(proc)
+        if need:
+            raise Abort(f"{pid} was refused admission ({detail}), and {need}")
+        self._drop(proc, detail)
+        return False
+
+    def _needed(self, proc):
+        """Why the run cannot go on without this probe, or None."""
+        if next(p for p in self.plan["processes"] if p["fleet"] == "browser")["proc_id"] == proc["proc_id"]:
+            return "it owns the meeting, so no later probe could join"
+        if any(set(proc["participants"]) & set(e["participants"]) for e in self.plan["events"]):
+            return "a scenario event acts on it"
+        return None
+
+    def _drop(self, proc, detail):
+        """A refused probe leaves the plan, and plan.json with it, so the collector and R2 expect only who ran."""
+        uids = set(proc["participants"])
+        self.plan["processes"].remove(proc)
+        self.plan["participants"][:] = [p for p in self.plan["participants"] if p["user_id"] not in uids]
+        self.step["n_target"] -= len(uids)
+        self.plan.setdefault("refused", []).append({"proc_id": proc["proc_id"], "participants": sorted(uids),
+                                                    "detail": detail})
+        _dump(self.path(cq_collect.PLAN_FILE), self.plan)
 
     def hold_start_target(self):
         deadline = cq_score.cv(cq_score.load_config(), "quality_gates", "join_deadline_s")
@@ -629,6 +769,8 @@ class Runner:
             except BaseException as exc:  # noqa: B036 - the next process still gets its stop
                 self._teardown_fault(f"stopped line for {pid}", exc)
                 self._unrecorded(pid, f"exit not recorded ({_describe(exc)})")
+        if callable(getattr(self.stack, "drained", None)):
+            self.s.drain = self._try("drain check", lambda: _strings(self.stack.drained(), "drained()"))
         self.s.commit_at_teardown = self._try("git HEAD", self.tree.commit)
         self.s.dirty_at_teardown = self._try("git status", self.tree.dirty)
 
@@ -669,7 +811,8 @@ class Runner:
                                "collector accepted: a collector bug")
         self.s.config_path = self.path("score", "config.json")
         _dump(self.s.config_path, forced_scorer_config(self.stack.scrape_up_selector(),
-                                                       self.plan["scoring"]["relay_path_exemptions"]))
+                                                       self.plan["scoring"]["relay_path_exemptions"],
+                                                       self.stack.throttle_pod_selector()))
         self.s.scorer_rc = self._tool("scorer", scorer_argv(manifest, self.stack.prom_url(), self.s.config_path,
                                                             self.path("generator-verdict.json"),
                                                             self.path("score")))
@@ -780,6 +923,13 @@ class Runner:
         gate("R9", clean, f"dirty at preflight {s.dirty_at_preflight}, at teardown {s.dirty_at_teardown}, "
              f"HEAD unchanged {s.commit == s.commit_at_teardown}")
         gate("R10", *self._strict_config_echoed())
+        if self.shared:
+            gate("R11", False, REPORT_ONLY)
+        if self.shared or callable(getattr(self.stack, "drained", None)):
+            if s.drain is None:
+                gate("R12", False, "the drain check did not run or failed (teardown_problems)")
+            else:
+                gate("R12", not s.drain, "; ".join(s.drain) or "the room drained")
         return gates
 
     def _strict_config_echoed(self):
@@ -864,7 +1014,9 @@ class Runner:
                 "manifest_sha256": self.s.manifest_sha, "timeline": dict(self.s.marks),
                 "fidelity_waivers": self.plan["fidelity_waivers"],
                 "expectation": check_expectation(self.plan["scoring"]["expect"], self.s.result, gates, self.s.error),
-                "versions": {"python": sys.version.split()[0], "commit": self.s.commit}}
+                "versions": {"python": sys.version.split()[0], "commit": self.s.commit},
+                **({"watch": dict(self.s.watch)} if callable(getattr(self.stack, "watch", None)) else {}),
+                **({"admission": list(self.s.admission)} if callable(getattr(self.fleet, "admit", None)) else {})}
 
     def _commands(self):
         with open(self.path("commands.txt"), "w", encoding="utf-8") as fh:
@@ -877,20 +1029,47 @@ class Runner:
         gates = self._gates_or_error()
         if self.s.interrupted != seen:
             gates = self._gates_or_error()
-        steps = [("commands.txt", self._commands)]
-        if self.log is not None:
-            steps += [("events.jsonl done line",
-                       lambda: self.log.write("done", verdict=self._record(gates)["verdict"])),
-                      ("events.jsonl", self.log.close)]
-        for what, fn in steps:
+        for what, fn in (("commands.txt", self._commands), ("leak check", self._leak_check)):
             try:
                 fn()
             except BaseException as exc:  # noqa: B036 - run.json is written next
                 self.s.error = self.s.error or f"finish: {what} not written ({_describe(exc)})"
+        run = self._write_run(gates, scan=True)
+        if self.log is not None:
+            failed = False
+            for what, fn in (("events.jsonl done line", lambda: self.log.write("done", verdict=run["verdict"])),
+                             ("events.jsonl", self.log.close)):
+                try:
+                    fn()
+                except BaseException as exc:  # noqa: B036 - run.json is rewritten below
+                    self.s.error = self.s.error or f"finish: {what} not written ({_describe(exc)})"
+                    failed = True
+            if failed and not self.s.withheld:
+                run = self._write_run(gates, scan=False)
+        return run
+
+    def _write_run(self, gates, scan):
         run = self._record(gates)
         try:
             _dump(self.path("run.json"), run)
+            if scan and self.s.leaks == [] and self._leaks():
+                self.s.withheld = True
+                run = {"schema": RUN_SCHEMA, "run_id": self.plan["run_id"], "verdict": "ERROR",
+                       "exit_code": RANK["ERROR"], "error": f"LEAK: {'; '.join(self.s.leaks)}; the record was withheld",
+                       "gates": [], "scorer_verdict": None}
+                _dump(self.path("run.json"), run)
         except BaseException as exc:  # noqa: B036 - the exit code still says ERROR
             self.s.error = self.s.error or f"finish: run.json not written ({_describe(exc)})"
             run = self._record(gates)
         return run
+
+    def _leaks(self):
+        try:
+            self.s.leaks = _strings(self.fleet.leaks(self.dir), "leaks()", "fleet")
+        except BaseException as exc:  # noqa: B036 - an unchecked folder is never reported clean
+            self.s.leaks = [f"the leak check failed ({_describe(exc)})"]
+        return self.s.leaks
+
+    def _leak_check(self):
+        if callable(getattr(self.fleet, "leaks", None)) and self._leaks():
+            self.s.error = "LEAK: " + "; ".join(self.s.leaks) + (f"; then {self.s.error}" if self.s.error else "")

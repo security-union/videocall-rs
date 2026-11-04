@@ -114,11 +114,9 @@ pub const fn queued_ms_for(buffered_bytes: u64, baseline: ScreenBaselineKbps) ->
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenUplinkSample {
-    /// WebSocket: live `bufferedAmount` (bytes, SHARED socket) + the cumulative
-    /// screen-attributed #1921 freshness-gate drop counter.
+    /// Live bytes queued ahead of the screen + the cumulative screen send-gate
+    /// drop counter of the same transport.
     Buffered { bytes: u64, gate_drops: u64 },
-    /// WebTransport: cumulative screen-unistream drop + ready-stall counters.
-    StreamEvents { events: u64 },
     /// The transport cannot report on this tick — no elected connection, or a
     /// borrowed controller cell. Treated exactly like an unobserved interval.
     Unobservable,
@@ -132,7 +130,6 @@ pub struct ScreenUplinkGovernor {
     last_pressure_ms: Option<f64>,
     pressure_since_ms: Option<f64>,
     gate_drops_seen: u64,
-    stream_events_seen: u64,
     probes_fired: u32,
 }
 
@@ -151,7 +148,6 @@ impl ScreenUplinkGovernor {
             last_pressure_ms: None,
             pressure_since_ms: None,
             gate_drops_seen: 0,
-            stream_events_seen: 0,
             probes_fired: 0,
         }
     }
@@ -219,11 +215,6 @@ impl ScreenUplinkGovernor {
                     queued >= SCREEN_UPLINK_PRESSURE_MS || dropped,
                     queued <= SCREEN_UPLINK_RELIEF_MS && !dropped,
                 ))
-            }
-            ScreenUplinkSample::StreamEvents { events } => {
-                let prev = std::mem::replace(&mut self.stream_events_seen, events);
-                let moved = events.saturating_sub(prev) > 0;
-                observed.then_some((moved, !moved))
             }
             ScreenUplinkSample::Unobservable => {
                 // No counter to re-seed: the NEXT delta spans this window too.
@@ -651,22 +642,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unobservable_transport_is_not_a_quiet_webtransport_stream() {
+    fn an_unobservable_transport_is_not_a_quiet_one() {
         let baseline = ScreenBaselineKbps::for_geometry(2560, 1440, 10);
-        let mut quiet_wt = ScreenUplinkGovernor::new();
+        let mut quiet = ScreenUplinkGovernor::new();
         let mut blind = ScreenUplinkGovernor::new();
-        let from = drive_to_step(&mut quiet_wt, baseline, 3, 0.0);
+        let from = drive_to_step(&mut quiet, baseline, 3, 0.0);
         assert_eq!(drive_to_step(&mut blind, baseline, 3, 0.0), from);
 
         let mut t = from;
         while t <= from + 20_000.0 {
-            quiet_wt.observe(t, ScreenUplinkSample::StreamEvents { events: 0 }, baseline);
+            quiet.observe(t, pressure(0), baseline);
             blind.observe(t, ScreenUplinkSample::Unobservable, baseline);
             t += TICK_MS;
         }
         assert!(
-            quiet_wt.step().raw() < 3,
-            "a WT stream with no drops or stalls must recover"
+            quiet.step().raw() < 3,
+            "an empty queue with no gate drops must recover"
         );
         assert_eq!(
             blind.step().raw(),
@@ -699,46 +690,6 @@ mod tests {
             g.step().raw(),
             2,
             "quiet observed after the blind window must be credited from the last REAL pressure"
-        );
-    }
-
-    #[test]
-    fn stream_event_deltas_are_pressure_and_their_absence_is_relief() {
-        let baseline = ScreenBaselineKbps::for_geometry(2560, 1440, 10);
-        let mut g = ScreenUplinkGovernor::new();
-
-        let mut events = 4_000u64;
-        let mut t = 0.0;
-        while t <= 3_000.0 {
-            g.observe(t, ScreenUplinkSample::StreamEvents { events }, baseline);
-            t += TICK_MS;
-        }
-        assert_eq!(
-            g.step(),
-            ScreenPressureStep::HEALTHY,
-            "a static counter is not pressure"
-        );
-
-        while t <= 20_000.0 {
-            events += 1;
-            g.observe(t, ScreenUplinkSample::StreamEvents { events }, baseline);
-            t += TICK_MS;
-        }
-        assert_eq!(
-            g.step().raw(),
-            SCREEN_BACKOFF_MAX_STEP,
-            "a rising unistream drop/stall counter must walk the ladder down"
-        );
-
-        let quiet_from = t;
-        while t <= quiet_from + 60_000.0 {
-            g.observe(t, ScreenUplinkSample::StreamEvents { events }, baseline);
-            t += TICK_MS;
-        }
-        assert_eq!(
-            g.step(),
-            ScreenPressureStep::HEALTHY,
-            "a counter that stopped moving must recover the whole ladder"
         );
     }
 

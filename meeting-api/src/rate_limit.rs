@@ -45,6 +45,11 @@ impl KeyedRateLimiter {
         Self::new(30, Duration::from_secs(60))
     }
 
+    /// Captions enable and renew: 10 per user per meeting per minute.
+    pub fn for_captions() -> Self {
+        Self::new(10, Duration::from_secs(60))
+    }
+
     /// `true` when `key` may act now; an allowed call is counted.
     pub fn allow(&self, key: &str) -> bool {
         self.allow_at(key, Instant::now())

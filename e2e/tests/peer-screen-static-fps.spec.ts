@@ -5,6 +5,7 @@ import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 import { seedShareViewMode } from "../helpers/screen-share-meeting";
+import { settledStaticWindow } from "../helpers/static-screen-window";
 
 /**
  * Per-peer screen-share `(static)` / `(no frames)` tooltip behaviour
@@ -267,7 +268,7 @@ test.describe("Peer screen-share static-FPS tooltip", () => {
         // Here, not `joinMeetingAs`: seeding the late joiners pinned their canvas mean at 0.
         await enableDiagnosticsTileIndicators(ctx);
         // `openSignalPopup` reaches the camera disc through the split layout's
-        // `.split-peer-tile`, which is opt-in since #2792.
+        // `.split-peer-tile`.
         await seedShareViewMode(ctx, "enlarged");
         members.push({
           page: null as unknown as Page,
@@ -313,44 +314,30 @@ test.describe("Peer screen-share static-FPS tooltip", () => {
         (window as unknown as { __e2e906_emit_frames: boolean }).__e2e906_emit_frames = false;
       });
 
-      // Wait past the 1s sampling boundary plus a margin so the next
-      // signal sample carries `screen_fps == 0` and the classifier kicks
-      // in. We stay well within the 30s hold window AND well within the
-      // 5s heartbeat-freshness window, so the sample should land in the
-      // `Static` branch (held values + `(static)` annotation).
       await hostPage.waitForTimeout(3000);
 
-      // Open the signal-quality popup and hover the chart to surface the
-      // tooltip for the latest (zero) sample.
       const popup = await openSignalPopup(hostPage);
-      await hoverChartOverlay(hostPage, popup);
-
       const tooltip = hostPage.locator("#signal-chart-tooltip-global");
-      await expect(tooltip).toBeVisible({ timeout: 10_000 });
 
-      // ----- Assert: the Screen line carries a held FPS / kbps value with
-      // the `(static)` annotation. We don't pin a specific FPS / kbps
-      // number because that depends on what the encoder shipped during the
-      // live phase — only that it isn't zero and it carries the annotation.
-      const tooltipHtml = await tooltip.innerHTML();
-      const screenLine = tooltipHtml.split(/<br\s*\/?>|\n/i).find((l) => /Screen /.test(l));
-      if (!screenLine) {
-        throw new Error(`Tooltip did not contain a 'Screen ' line:\n${tooltipHtml}`);
-      }
-      // Static annotation must appear on either the FPS or the kbps part.
-      // Use a regex over the metrics-suffix tail so the test stays
-      // robust to small formatting tweaks (decimal places, separator).
-      expect(screenLine).toMatch(/fps \(static\)/);
-      expect(screenLine).toMatch(/kbps \(static\)/);
-      // The held FPS value must NOT be "0.0fps (static)" — that would
-      // mean the held lookup misfired and we're holding the zero we
-      // were trying to mask. The held value should be the prior live
-      // FPS, which in our mock is ~10fps.
-      expect(screenLine).not.toMatch(/(?<!\d)0\.0fps \(static\)/);
-      // And the no-frames annotation must NOT appear — heartbeat is
-      // fresh (peer_status is still firing every ~1s on the live
-      // session) so we should land squarely in the `Static` branch.
-      expect(screenLine).not.toMatch(/\(no frames\)/);
+      const seen: { time: string | undefined; screen: string }[] = [];
+      await expect(async () => {
+        await hoverChartOverlay(hostPage, popup);
+        await expect(tooltip).toBeVisible({ timeout: 10_000 });
+        const text = (await tooltip.innerHTML()).replace(/<[^>]*>/g, " ");
+        const time = /Time: (\d+m \d+s)/.exec(text)?.[1];
+        const screen =
+          /Screen .*?(?=\s*Server RTT|$)/.exec(text)?.[0] ?? `<no Screen line> ${text}`;
+        if (time !== seen.at(-1)?.time) {
+          seen.push({ time, screen });
+        }
+        expect(
+          settledStaticWindow(seen.map((s) => s.screen)),
+          seen.map((s) => `${s.time} ${s.screen}`).join("\n"),
+        ).not.toBeNull();
+      }).toPass({ timeout: 30_000, intervals: [250] });
+
+      const settled = settledStaticWindow(seen.map((s) => s.screen)) ?? [];
+      expect(settled.filter((l) => /(?<!\d)0\.0fps \(static\)/.test(l))).toEqual([]);
     } finally {
       for (const m of members) {
         if (m.page) {

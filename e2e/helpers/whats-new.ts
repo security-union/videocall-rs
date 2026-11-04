@@ -89,6 +89,94 @@ export const CHANGELOG_WITH_PENDING_REPLY: ChangelogReply = {
   }),
 };
 
+/** A line led by one of these keys shows under that kind's pill (issue 3253). */
+export const CHANGELOG_KIND_PREFIX = /^(Feature|UX|Perf|Reliability|bug-fix|Security): /;
+
+export interface ChangelogGroupShown {
+  kind: string;
+  pill: string;
+  changes: string[];
+}
+
+// One pending section per PR, as the curator writes them, kinds out of display order.
+const GROUPED_PENDING_SECTIONS = [
+  ["bug-fix: Muted mic icon stays in sync (#3101)"],
+  ["UX: Bigger buttons on phones (#3102)"],
+  ["Feature: Raise your hand from the footer (#3103)", "UX: (#3104)"],
+  // Shows the same text as #3102's line, so it is listed once.
+  ["UX: Bigger buttons on phones (#3105)", "UX: Clearer join screen (#3106)"],
+  ["Perf: Lighter grid in big meetings"],
+];
+
+const GROUPED_BUILD_CHANGES = [
+  "Meeting-api: Older raw title kept as is (#3201)",
+  "Security: Meeting links are harder to guess (#3202)",
+  "Reliability: Calls come back after a network drop",
+  "UX: Settings open faster on phones (#3203)",
+];
+
+const FLAT_BUILD_CHANGES = [
+  "Pinning moves a tile to the front (#3001)",
+  "Plain release note without a number",
+];
+
+export const CHANGELOG_GROUPED_UNRELEASED: ChangelogGroupShown[] = [
+  { kind: "features", pill: "Features", changes: ["Raise your hand from the footer"] },
+  {
+    kind: "ux",
+    pill: "UX",
+    changes: ["Bigger buttons on phones", "Clearer join screen"],
+  },
+  { kind: "performance", pill: "Performance", changes: ["Lighter grid in big meetings"] },
+  { kind: "fixes", pill: "Fixes", changes: ["Muted mic icon stays in sync"] },
+];
+
+export const CHANGELOG_GROUPED_BUILD: { version: string; groups: ChangelogGroupShown[] } = {
+  version: "v1.2.1",
+  groups: [
+    { kind: "ux", pill: "UX", changes: ["Settings open faster on phones"] },
+    { kind: "reliability", pill: "Reliability", changes: ["Calls come back after a network drop"] },
+    { kind: "security", pill: "Security", changes: ["Meeting links are harder to guess"] },
+    {
+      kind: "miscellaneous",
+      pill: "Miscellaneous",
+      changes: ["Meeting-api: Older raw title kept as is"],
+    },
+  ],
+};
+
+export const CHANGELOG_FLAT_BUILD = {
+  version: "v1.2.0",
+  changes: ["Pinning moves a tile to the front", "Plain release note without a number"],
+};
+
+/** Pending sections, a build with kind-named lines, and an older build with none. */
+export const CHANGELOG_GROUPED_REPLY: ChangelogReply = {
+  contentType: "application/json",
+  body: JSON.stringify({
+    builds: [
+      {
+        built: "2026-10-01T05:00:00Z",
+        version: "1.2.0",
+        commit: "fixture-flat",
+        changes: FLAT_BUILD_CHANGES,
+      },
+      ...GROUPED_PENDING_SECTIONS.map((changes, i) => ({
+        pending: true,
+        through: `fixture-pending-${i}`,
+        prs: [3101 + i],
+        changes,
+      })),
+      {
+        built: "2026-10-02T05:00:00Z",
+        version: "1.2.1",
+        commit: "fixture-grouped",
+        changes: GROUPED_BUILD_CHANGES,
+      },
+    ],
+  }),
+};
+
 /** What an SPA server answers for a file it does not have: 200 + the app shell. */
 export const CHANGELOG_HTML_SHELL_REPLY: ChangelogReply = {
   contentType: "text/html",

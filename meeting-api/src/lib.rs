@@ -18,6 +18,8 @@
 //! thin wrapper that calls into this library.
 
 pub mod auth;
+pub mod avatar;
+pub mod captions;
 pub mod config;
 pub mod console_log_purge;
 pub(crate) mod cookie;

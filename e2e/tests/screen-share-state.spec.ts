@@ -14,7 +14,7 @@ import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
  *
  * Transitions under test:
  *   Idle → (click) → Requesting → StreamReady → Active
- *   Active → (click) → Idle
+ *   Active → (click) → menu → (Stop sharing) → Idle
  */
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -165,14 +165,21 @@ test.describe("Screen-share state transitions", () => {
       await page.waitForTimeout(2000);
       await expect(screenTile).toBeVisible({ timeout: 5_000 });
 
-      // Click again to stop sharing
+      // Clicking the live share's button opens its menu; the share continues.
       await wakeControls(page); // ensure controls visible
       await page.waitForTimeout(500);
+      await expect(screenShareBtn.first()).toHaveAttribute("data-state", "active");
       await screenShareBtn.first().click();
-      await page.waitForTimeout(1000);
+      const stop = page.locator('[data-testid="screen-share-menu-stop"]');
+      await expect(stop).toBeVisible({ timeout: 5_000 });
+      await expect(screenShareBtn.first()).toHaveClass(/(^|\s)active(\s|$)/);
+      await stop.click();
 
       // After stopping, screen share state should be Idle
       // The active class should be gone
+      await expect(screenShareBtn.first()).toHaveAttribute("data-state", "idle", {
+        timeout: 10_000,
+      });
       await expect(screenShareBtn.first()).not.toHaveClass(/(^|\s)active(\s|$)/, {
         timeout: 10_000,
       });

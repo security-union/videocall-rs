@@ -10,6 +10,7 @@ import { wakeControls } from "../helpers/controls";
 // ("Turn Hiding Off, check box, checked" while hiding is ON). Must match
 // `DOCK_AUTOHIDE_LABEL` in dioxus-ui/src/components/attendants.rs.
 const AUTOHIDE_LABEL = "Auto-hide action bar";
+const AUTOSHRINK_LABEL = "Auto-shrink action bar";
 
 // The label no longer encodes the state, so every state check below reads
 // `aria-checked` — which is the contract the fix establishes as the single
@@ -91,21 +92,16 @@ test.describe("Dock settings", () => {
     const menu = page.locator(".glass-select-menu");
     await expect(menu).toBeVisible();
 
-    // The menu grew from 5 entries to 7 (Customize and Reset to Default were
-    // added under issues 1722/1756) and the settings entry was renamed from
-    // "Dock Settings" to "Action Bar…". This count is also the drift pin for
-    // `DOCK_MENU_ITEM_COUNT` in attendants.rs, which drives the roving-tabindex
-    // arithmetic — if an item is added without moving the constant, the roving
-    // index can point at an item that does not render, and this fails first.
     const options = menu.locator(".glass-select-option");
-    await expect(options).toHaveCount(7);
+    await expect(options).toHaveCount(8);
 
     await expect(options.filter({ hasText: "Bottom" })).toHaveCount(1);
     await expect(options.filter({ hasText: "Left" })).toHaveCount(1);
     await expect(options.filter({ hasText: "Right" })).toHaveCount(1);
     await expect(options.filter({ hasText: AUTOHIDE_LABEL })).toHaveCount(1);
-    await expect(options.filter({ hasText: "Customize" })).toHaveCount(1);
-    await expect(options.filter({ hasText: "Reset to Default" })).toHaveCount(1);
+    await expect(options.filter({ hasText: AUTOSHRINK_LABEL })).toHaveCount(1);
+    await expect(options.filter({ hasText: "Edit Buttons" })).toHaveCount(1);
+    await expect(options.filter({ hasText: "Reset Buttons" })).toHaveCount(1);
     // Capital "B" is load-bearing: `hasText` regexes are case-SENSITIVE, so
     // /Action Bar/ matches "Action Bar…" and NOT "Auto-hide action bar". The
     // toHaveCount(1) is what proves that separation holds.
@@ -160,7 +156,7 @@ test.describe("Dock settings", () => {
         `unchecked and "${nameWhenOn}" when checked. A name that inverts alongside ` +
         `aria-checked tells a screen-reader user the opposite of the truth (WCAG 4.1.2).`,
     ).toBe(nameWhenOff);
-    expect(nameWhenOn).toBe(AUTOHIDE_LABEL);
+    await expect(itemOn).toHaveAttribute("aria-label", AUTOHIDE_LABEL);
   });
 
   test("dock position Left changes action bar class", async ({ page }) => {

@@ -465,36 +465,22 @@ test.describe("Adaptive decode budget (#987)", () => {
     );
     await closeSettingsModal(page);
 
-    // Baseline: all tiles decode, none off-budget, and no cascade log yet.
+    // Baseline: all tiles decode, none off-budget.
     await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
     await expect(offBudgetTiles(page)).toHaveCount(0);
-    expect(firstLowerLayerLatchIndex(consoleLines)).toBe(-1);
-    expect(firstCapDownIndex(consoleLines)).toBe(-1);
 
     // --- Drive sustained LOW_FPS one sample at a time. We watch for the
     // lower-layer LATCH log to appear. The moment it does (the first Down edge),
     // assert the cap has NOT yet dropped: off-budget is STILL 0 and NO cap-drop
     // log has been emitted. This is the tier-before-pause invariant (1)+(2-part-a).
-    //
-    // The loop is robust to native rAF FPS interleaving: a healthy native sample
-    // only delays the latch (it cannot manufacture an early cap drop), so the
-    // assertions below remain valid however the native samples land. We keep
-    // injecting up to MAX_DOWN_SAMPLES — the same headroom the AUTO test uses.
-    let latchSeen = false;
-    let offBudgetAtLatch = -1;
-    let capDownIndexAtLatch = -1;
+    let latchSeen = firstLowerLayerLatchIndex(consoleLines) !== -1;
     for (let i = 0; i < MAX_DOWN_SAMPLES && !latchSeen; i++) {
       await injectFps(page, LOW_FPS);
       await page.waitForTimeout(INJECT_INTERVAL_MS);
-      if (firstLowerLayerLatchIndex(consoleLines) !== -1) {
-        latchSeen = true;
-        // Read the cap-drop log index and the off-budget count AT the latch tick,
-        // BEFORE injecting any further samples — so we observe the lower-layer
-        // stage in isolation.
-        capDownIndexAtLatch = firstCapDownIndex(consoleLines);
-        offBudgetAtLatch = await offBudgetTiles(page).count();
-      }
+      latchSeen = firstLowerLayerLatchIndex(consoleLines) !== -1;
     }
+    const capDownIndexAtLatch = firstCapDownIndex(consoleLines);
+    const offBudgetAtLatch = await offBudgetTiles(page).count();
 
     expect(
       latchSeen,

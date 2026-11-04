@@ -3,6 +3,8 @@ import { dirname } from "node:path";
 
 import { chromium, type Browser, type BrowserContext } from "@playwright/test";
 
+import { browserEnvWithoutSecrets } from "../browser-env";
+
 /**
  * Default URL the operator is navigated to when starting an SSO
  * recapture. Production HCL deployments live behind `app.videocall.fnxlabs.com`
@@ -56,6 +58,7 @@ export async function openSsoCaptureBrowser(opts: {
 }): Promise<SsoCaptureSession> {
   const browser = await chromium.launch({
     headless: false,
+    env: browserEnvWithoutSecrets(),
     // Playwright's signal-handler registry and graceful-close set are
     // process-global. A dashboard recapture can coexist with bot browsers, so
     // enabling these handlers here would let SIGTERM close every bot before the

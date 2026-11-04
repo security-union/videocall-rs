@@ -21,6 +21,9 @@ use crate::connection::{
     connection_handshake_failures, connection_session_drops, reelection_aborted_total,
     reelection_failed_total, reelection_preserved_total, reelection_proceeded_total,
 };
+use crate::decode::neteq_audio_decoder::{
+    PLAYOUT_STATS_KEY, PLAYOUT_UNDERRUN_EVENTS_KEY, PLAYOUT_UNDERRUN_MS_KEY,
+};
 use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::encode::{
@@ -2954,6 +2957,23 @@ impl HealthReporter {
                 if let Some(v) = neteq.get("playout_latency_ms").and_then(|v| v.as_f64()) {
                     ns.playout_latency_ms = v;
                 }
+                // Absent (older worker) stays None so the server can tell it from a real 0.
+                if let Some(lifetime) = neteq.get("lifetime") {
+                    ns.smart_flush_discarded_packets_total = lifetime
+                        .get("smart_flush_discarded_packets")
+                        .and_then(|v| v.as_u64());
+                    ns.resync_discarded_packets_total = lifetime
+                        .get("resync_discarded_packets")
+                        .and_then(|v| v.as_u64());
+                }
+                if let Some(playout) = neteq.get(PLAYOUT_STATS_KEY) {
+                    ns.playout_underrun_ms_total = playout
+                        .get(PLAYOUT_UNDERRUN_MS_KEY)
+                        .and_then(|v| v.as_u64());
+                    ns.playout_underrun_events_total = playout
+                        .get(PLAYOUT_UNDERRUN_EVENTS_KEY)
+                        .and_then(|v| v.as_u64());
+                }
 
                 // Windowed receive-side audio concealment for this source, from
                 // WINDOWED rates (not lifetime): expand_per_sec / packets_per_sec.
@@ -3505,6 +3525,7 @@ fn decode_eligible_from(stats: &Option<Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::neteq_audio_decoder::with_playout_totals;
 
     fn process_event(
         event: DiagEvent,
@@ -7504,7 +7525,6 @@ mod tests {
     /// `Some(v)` to include the field in the stats JSON (the shape the NetEQ worker emits at the
     /// top level of NetEqStats), or `None` to OMIT it entirely (the older-worker / pre-#1299 case).
     fn health_packet_with_neteq_playout_latency(playout_latency_ms: Option<f64>) -> PbHealthPacket {
-        let mut peer = PeerHealthData::new("peer-1".to_string());
         let mut neteq = json!({
             "current_buffer_size_ms": 200.0,
             "target_delay_ms": 80.0,
@@ -7514,6 +7534,11 @@ mod tests {
         if let Some(v) = playout_latency_ms {
             neteq["playout_latency_ms"] = json!(v);
         }
+        health_packet_with_neteq_json(neteq)
+    }
+
+    fn health_packet_with_neteq_json(neteq: Value) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
         peer.update_audio_stats(neteq);
 
         let mut health_map = HashMap::new();
@@ -7612,6 +7637,50 @@ mod tests {
             .expect("neteq stats must be present");
 
         assert_eq!(neteq.playout_latency_ms, 0.0);
+    }
+
+    #[test]
+    fn neteq_discard_counters_fold_from_lifetime_stats() {
+        let pb = health_packet_with_neteq_json(json!({
+            "lifetime": {
+                "smart_flush_discarded_packets": 0u64,
+                "resync_discarded_packets": 37u64,
+                "overflow_discarded_packets": 5u64,
+            },
+        }));
+        let neteq = pb.peer_stats["peer-1"].neteq_stats.as_ref().unwrap();
+        assert_eq!(neteq.smart_flush_discarded_packets_total, Some(0));
+        assert_eq!(neteq.resync_discarded_packets_total, Some(37));
+
+        let pb = health_packet_with_neteq_json(json!({
+            "lifetime": {
+                "smart_flush_discarded_packets": 9u64,
+                "resync_discarded_packets": 0u64,
+            },
+        }));
+        let neteq = pb.peer_stats["peer-1"].neteq_stats.as_ref().unwrap();
+        assert_eq!(neteq.resync_discarded_packets_total, Some(0));
+
+        let pb = health_packet_with_neteq_json(json!({ "lifetime": {} }));
+        let neteq = pb.peer_stats["peer-1"].neteq_stats.as_ref().unwrap();
+        assert_eq!(neteq.smart_flush_discarded_packets_total, None);
+        assert_eq!(neteq.resync_discarded_packets_total, None);
+    }
+
+    #[test]
+    fn playout_underrun_totals_fold_from_the_decoder_stats_json() {
+        let neteq_stats = |totals: Option<(u64, u64)>| {
+            let json = with_playout_totals(r#"{"lifetime":{}}"#.to_string(), totals);
+            let pb = health_packet_with_neteq_json(serde_json::from_str(&json).unwrap());
+            let neteq = pb.peer_stats["peer-1"].neteq_stats.as_ref().unwrap();
+            (
+                neteq.playout_underrun_ms_total,
+                neteq.playout_underrun_events_total,
+            )
+        };
+        assert_eq!(neteq_stats(Some((1834, 12))), (Some(1834), Some(12)));
+        assert_eq!(neteq_stats(Some((0, 0))), (Some(0), Some(0)));
+        assert_eq!(neteq_stats(None), (None, None));
     }
 
     /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.

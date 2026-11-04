@@ -1,8 +1,11 @@
 import { test, expect, chromium, Browser, BrowserContext, Locator, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
-import { openPeerList, wakeControls } from "../helpers/controls";
+import { openPeerList, wakeActionBar, wakeControls } from "../helpers/controls";
+import { expectHostChangeToast } from "../helpers/host-change-toast";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
-import { createMeeting } from "../helpers/meeting-api";
+import { createMeeting, joinMeeting } from "../helpers/meeting-api";
+import { STATUS_BAR } from "../helpers/recording-status";
+import { rosterHostActions, rosterRow } from "../helpers/roster";
 import { joinMeetingFromPage } from "../helpers/two-user-meeting";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -27,10 +30,19 @@ type JoinResult = Awaited<ReturnType<typeof joinMeetingFromPage>>;
 
 const MEETING_OPTIONS_BUTTON = '[data-testid="open-meeting-options"]';
 const KICKED_MESSAGE = "You have been removed from the meeting by the host.";
+const GRID_SELF_VIEW_SEED = `(() => { try { localStorage.setItem("vc_self_view_placement", "grid"); } catch (_) {} })();`;
+const HOST_ONLY_ROWS = [/^Record$/, /^Meeting options$/, /^Meeting timer$/];
 
-async function launch(uiURL: string, user: User): Promise<Session> {
+async function launch(
+  uiURL: string,
+  user: User,
+  opts: { selfViewInGrid?: boolean } = {},
+): Promise<Session> {
   const browser = await chromium.launch({ args: BROWSER_ARGS });
   const context = await createAuthenticatedContext(browser, user.email, user.name, uiURL);
+  if (opts.selfViewInGrid) {
+    await context.addInitScript(GRID_SELF_VIEW_SEED);
+  }
   const page = await context.newPage();
   return { browser, context, page };
 }
@@ -66,18 +78,8 @@ async function admitFromWaitingRoom(ownerPage: Page, page: Page, user: User): Pr
   expect(await joinMeetingFromPage(page)).toBe("in-meeting");
 }
 
-function rosterRow(page: Page, name: string): Locator {
-  return page.locator("#peer-list-container .peer_item", { hasText: name }).first();
-}
-
 function rosterLabel(page: Page, name: string): Locator {
   return rosterRow(page, name).locator(".peer-indicator");
-}
-
-function hostActionsButton(page: Page): Locator {
-  return page.locator(
-    '#peer-list-container .in-call-header button.menu-button[aria-label="Host actions"]',
-  );
 }
 
 async function unmute(page: Page): Promise<void> {
@@ -95,8 +97,9 @@ async function expectRosterMicOn(page: Page, name: string): Promise<void> {
   await expect(icon.locator('line[x1="1"][y1="1"]')).toHaveCount(0, { timeout: 30_000 });
 }
 
-function hostChangeToast(page: Page, text: string): Locator {
-  return page.locator(".peer-toast .toast-name", { hasText: text });
+// The name chip, and so this pill, renders only in the grid self-view placement.
+function selfTilePill(page: Page): Locator {
+  return page.locator("#host-controls-nav h4.floating-name.self-tile-name > span.self-indicator");
 }
 
 async function openRowMenu(page: Page, name: string): Promise<Locator> {
@@ -156,7 +159,7 @@ async function expectCoHostInCall(
   await expect(rosterLabel(peer.page, peerUser.name)).toHaveText("(You/Co-host)", {
     timeout: 45_000,
   });
-  await expect(hostActionsButton(peer.page)).toBeVisible({ timeout: 10_000 });
+  await expect(rosterHostActions(peer.page)).toBeVisible({ timeout: 10_000 });
   // A co-host holding the host role also gets Meeting Options.
   await expect(peer.page.locator(MEETING_OPTIONS_BUTTON)).toHaveCount(1, { timeout: 10_000 });
 
@@ -186,7 +189,7 @@ test.describe("Meeting co-hosts", () => {
     await createMeeting(OWNER.email, OWNER.name, { meetingId, waitingRoomEnabled: false });
 
     const owner = await launch(uiURL, OWNER);
-    const peer = await launch(uiURL, PEER);
+    const peer = await launch(uiURL, PEER, { selfViewInGrid: true });
     try {
       expect(await enterMeeting(owner.page, meetingId, OWNER)).toBe("in-meeting");
       expect(await enterMeeting(peer.page, meetingId, PEER)).toBe("in-meeting");
@@ -200,17 +203,20 @@ test.describe("Meeting co-hosts", () => {
       await expect(rosterLabel(owner.page, PEER.name)).toHaveCount(0);
       await expect(rosterRow(peer.page, PEER.name)).toBeVisible({ timeout: 15_000 });
       await expect(rosterLabel(peer.page, PEER.name)).toHaveText("(You)", { timeout: 15_000 });
-      await expect(hostActionsButton(peer.page)).toHaveCount(0);
+      // The peer's host set holds the owner, so a grant reads as "co-host", not "host".
+      await expect(rosterLabel(peer.page, OWNER.name)).toHaveText("(Host)", { timeout: 15_000 });
+      await expect(rosterHostActions(peer.page)).toHaveCount(0);
       // A plain participant (not yet host) gets no Meeting Options.
       await expect(peer.page.locator(MEETING_OPTIONS_BUTTON)).toHaveCount(0);
+      const peerPill = selfTilePill(peer.page);
+      await expect(peerPill).toBeVisible({ timeout: 15_000 });
+      await expect(peerPill).toHaveText("You");
 
       await makeCoHostFromRoster(owner.page, PEER);
 
       // Both are 6 s toasts, so poll them together.
       await Promise.all([
-        expect(hostChangeToast(peer.page, "You now have host controls")).toBeVisible({
-          timeout: 20_000,
-        }),
+        expectHostChangeToast(peer.page, "You're now a co-host"),
         expect(owner.page.getByTestId("co-host-notice")).toHaveText(
           `${PEER.name} is now a co-host and saved for future meetings.`,
           { timeout: 20_000 },
@@ -219,7 +225,9 @@ test.describe("Meeting co-hosts", () => {
       await expect(rosterLabel(peer.page, PEER.name)).toHaveText("(You/Co-host)", {
         timeout: 30_000,
       });
-      await expect(hostActionsButton(peer.page)).toBeVisible({ timeout: 10_000 });
+      await expect(peerPill).toBeVisible();
+      await expect(peerPill).toHaveText("You · Co-host");
+      await expect(rosterHostActions(peer.page)).toBeVisible({ timeout: 10_000 });
       await expect(rosterLabel(peer.page, OWNER.name)).toHaveText("(Host)", { timeout: 10_000 });
 
       await expect(rosterLabel(owner.page, PEER.name)).toHaveText("(Co-host)", {
@@ -330,7 +338,7 @@ test.describe("Meeting co-hosts", () => {
     await createMeeting(OWNER.email, OWNER.name, { meetingId, waitingRoomEnabled: false });
 
     const owner = await launch(uiURL, OWNER);
-    const peer = await launch(uiURL, PEER);
+    const peer = await launch(uiURL, PEER, { selfViewInGrid: true });
     try {
       expect(await enterMeeting(owner.page, meetingId, OWNER)).toBe("in-meeting");
       expect(await enterMeeting(peer.page, meetingId, PEER)).toBe("in-meeting");
@@ -344,6 +352,9 @@ test.describe("Meeting co-hosts", () => {
       await expect(rosterLabel(owner.page, PEER.name)).toHaveText("(Co-host)", {
         timeout: 30_000,
       });
+      const peerPill = selfTilePill(peer.page);
+      await expect(peerPill).toBeVisible({ timeout: 15_000 });
+      await expect(peerPill).toHaveText("You · Co-host");
 
       const items = await openRowMenu(owner.page, PEER.name);
       await expect(items).toHaveText(["Remove co-host", "Remove from meeting"], {
@@ -354,16 +365,16 @@ test.describe("Meeting co-hosts", () => {
         .click({ timeout: 10_000 });
 
       await Promise.all([
-        expect(hostChangeToast(peer.page, "You no longer have host controls")).toBeVisible({
-          timeout: 20_000,
-        }),
+        expectHostChangeToast(peer.page, "You no longer have host controls"),
         expect(owner.page.getByTestId("co-host-notice")).toHaveText(
           `${PEER.name} is no longer a co-host.`,
           { timeout: 20_000 },
         ),
       ]);
+      await expect(peerPill).toBeVisible();
+      await expect(peerPill).toHaveText("You");
       await expect(rosterLabel(peer.page, PEER.name)).toHaveText("(You)", { timeout: 30_000 });
-      await expect(hostActionsButton(peer.page)).toHaveCount(0, { timeout: 10_000 });
+      await expect(rosterHostActions(peer.page)).toHaveCount(0, { timeout: 10_000 });
 
       await expect(rosterRow(owner.page, PEER.name)).toBeVisible();
       await expect(rosterLabel(owner.page, PEER.name)).toHaveCount(0, { timeout: 30_000 });
@@ -376,14 +387,139 @@ test.describe("Meeting co-hosts", () => {
     }
   });
 
+  async function withNarrowCoHost(
+    uiURL: string,
+    label: string,
+    body: (coHost: {
+      owner: Session;
+      page: Page;
+      more: Locator;
+      rows: Locator;
+      revoke: () => Promise<void>;
+    }) => Promise<void>,
+  ): Promise<void> {
+    const meetingId = `e2e_cohost_${label}_${Date.now()}`;
+    const OWNER = { email: `cohost-${label}-owner@videocall.rs`, name: "NarrowOwner" };
+    const PEER = { email: `cohost-${label}-peer@videocall.rs`, name: "NarrowPeer" };
+    await createMeeting(OWNER.email, OWNER.name, { meetingId, waitingRoomEnabled: false });
+
+    const owner = await launch(uiURL, OWNER);
+    const peer = await launch(uiURL, PEER);
+    try {
+      await peer.context.addInitScript("window.showSaveFilePicker = undefined;");
+      expect(await enterMeeting(owner.page, meetingId, OWNER)).toBe("in-meeting");
+      expect(await enterMeeting(peer.page, meetingId, PEER)).toBe("in-meeting");
+      await openPeerList(owner.page);
+      await makeCoHostFromRoster(owner.page, PEER);
+      await expect(rosterLabel(owner.page, PEER.name)).toHaveText("(Co-host)", {
+        timeout: 30_000,
+      });
+
+      const barRecord = peer.page.getByTestId("record-button");
+      await expect(barRecord).toBeVisible({ timeout: 30_000 });
+      await peer.page.setViewportSize({ width: 400, height: 720 });
+      await expect(barRecord).toBeHidden();
+
+      await wakeActionBar(peer.page);
+      const more = peer.page.locator("#overflow-menu-trigger");
+      await more.click({ timeout: 10_000 });
+      const rows = peer.page.locator(".action-bar-overflow-popover > button.overflow-item");
+      for (const hostOnly of HOST_ONLY_ROWS) {
+        await expect(rows.filter({ hasText: hostOnly })).toHaveCount(1);
+      }
+
+      const revoke = async () => {
+        const items = await openRowMenu(owner.page, PEER.name);
+        await expect(items).toHaveText(["Remove co-host", "Remove from meeting"], {
+          timeout: 10_000,
+        });
+        await rosterRow(owner.page, PEER.name)
+          .getByTestId("peer-item-co-host-action")
+          .click({ timeout: 10_000 });
+        await expectHostChangeToast(peer.page, "You no longer have host controls");
+        await expect(barRecord).toHaveCount(0, { timeout: 30_000 });
+      };
+
+      await body({ owner, page: peer.page, more, rows, revoke });
+    } finally {
+      await closeAll([owner, peer]);
+    }
+  }
+
+  const recorderState = (page: Page) => page.evaluate(() => window.__vcRecording.getState());
+
+  test("a revoked co-host clicking the stale Record row starts nothing and keeps focus reachable", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    await withNarrowCoHost(
+      baseURL || "http://localhost:3001",
+      "stale_record",
+      async ({ owner, page, more, rows, revoke }) => {
+        await page.keyboard.press("Escape");
+        await expect(rows).toHaveCount(0);
+        await revoke();
+
+        await wakeActionBar(page);
+        await more.click({ timeout: 10_000 });
+        const record = rows.filter({ hasText: /^Record$/ });
+        await expect(record).toHaveCount(1);
+        await record.click();
+        await expect(rows).toHaveCount(0);
+        await expect(more).toBeVisible();
+        await expect.soft(more).toBeFocused();
+
+        await page.waitForTimeout(3_000);
+        expect.soft(await recorderState(page)).toBe("idle");
+        await expect.soft(owner.page.locator(STATUS_BAR)).toHaveCount(0);
+        await expect.soft(owner.page.locator(".recording-indicator")).toHaveCount(0);
+        await expect(page.locator(STATUS_BAR)).toHaveCount(0);
+      },
+    );
+  });
+
+  test("a co-host revoked while recording stops it from the stale Stop recording row", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    await withNarrowCoHost(
+      baseURL || "http://localhost:3001",
+      "stale_stop",
+      async ({ owner, page, more, rows, revoke }) => {
+        await rows.filter({ hasText: /^Record$/ }).click();
+        await expect.poll(() => recorderState(page), { timeout: 15_000 }).toBe("recording");
+        await expect(owner.page.locator(STATUS_BAR)).toBeVisible({ timeout: 20_000 });
+        await expect(owner.page.locator(".recording-indicator").first()).toBeVisible({
+          timeout: 20_000,
+        });
+
+        await revoke();
+        expect(await recorderState(page)).toBe("recording");
+
+        await wakeActionBar(page);
+        await more.click({ timeout: 10_000 });
+        const stop = rows.filter({ hasText: /^Stop recording$/ });
+        await expect(stop).toHaveCount(1);
+        const download = page.waitForEvent("download", { timeout: 30_000 });
+        await stop.click();
+        await download;
+        await expect.poll(() => recorderState(page), { timeout: 15_000 }).toBe("idle");
+        await expect(owner.page.locator(STATUS_BAR)).toHaveCount(0, { timeout: 20_000 });
+      },
+    );
+  });
+
   test("a co-host added by id before joining skips the waiting room and joins as a co-host", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
-    const meetingId = `e2e_cohost_by_id_${Date.now()}`;
-    const OWNER = { email: "cohost-byid-owner@videocall.rs", name: "ByIdOwner" };
-    const PEER = { email: "cohost-byid-peer@videocall.rs", name: "ByIdPeer" };
+    // Per-run identities: an owner with no history has no name for PEER, so
+    // the notice names the typed id.
+    const stamp = Date.now();
+    const meetingId = `e2e_cohost_by_id_${stamp}`;
+    const OWNER = { email: `cohost-byid-owner-${stamp}@videocall.rs`, name: "ByIdOwner" };
+    const PEER = { email: `cohost-byid-peer-${stamp}@videocall.rs`, name: "ByIdPeer" };
 
     const owner = await launch(uiURL, OWNER);
     const peer = await launch(uiURL, PEER);
@@ -707,6 +843,158 @@ test.describe("Meeting co-hosts", () => {
       await expect(hint).toBeHidden();
       await expect(input).toBeHidden();
       await expect.poll(chevronTransform).toBe("none");
+    } finally {
+      await closeAll([owner]);
+    }
+  });
+
+  test("owner picks a co-host by name from people they've hosted with; the pick only fills their id and Add grants @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    // Per-run identities so the owner's suggestions hold only this run's seed.
+    const stamp = Date.now();
+    const OWNER = { email: `cohost-pick-owner-${stamp}@videocall.rs`, name: "PickOwner" };
+    const PEER = { email: `cohost-pick-b-${stamp}@videocall.rs`, name: "Bea Picker" };
+    const OTHER = { email: `cohost-pick-c-${stamp}@videocall.rs`, name: "Cal Decoy" };
+    const pastMeetingId = `e2e_cohost_pick_past_${stamp}`;
+    const meetingId = `e2e_cohost_pick_${stamp}`;
+
+    await createMeeting(OWNER.email, OWNER.name, {
+      meetingId: pastMeetingId,
+      coHosts: [PEER.email, OTHER.email],
+    });
+    for (const user of [PEER, OTHER]) {
+      const { status } = await joinMeeting(user.email, user.name, pastMeetingId, user.name);
+      expect(status).toBe("admitted");
+    }
+    await createMeeting(OWNER.email, OWNER.name, { meetingId });
+
+    const owner = await launch(uiURL, OWNER);
+    try {
+      const page = owner.page;
+      const grantBodies: string[] = [];
+      page.on("request", (req) => {
+        const path = new URL(req.url()).pathname;
+        if (req.method() === "POST" && path === `/api/v1/meetings/${meetingId}/co-hosts`) {
+          grantBodies.push(req.postData() ?? "");
+        }
+      });
+
+      await fillAndSubmitJoinForm(page, meetingId, OWNER.name);
+      await expect(page.getByRole("button", { name: "Start Meeting" })).toBeVisible({
+        timeout: 20_000,
+      });
+
+      const section = page.getByTestId("co-hosts-section");
+      const summary = section.locator("details.co-hosts-details summary.co-hosts-summary");
+      const input = section.getByTestId("co-host-input");
+      const listbox = section.getByTestId("co-host-suggestions");
+      const options = listbox.getByTestId("co-host-suggestion");
+      const peerOption = listbox.locator(
+        `[data-testid="co-host-suggestion"][data-user-id="${PEER.email}"]`,
+      );
+      const suggestStatus = section.getByTestId("co-host-suggest-status");
+      const suggestNote = section.getByTestId("co-host-suggest-note");
+      const sectionStatus = section.getByTestId("co-hosts-status");
+      const addButton = section.getByTestId("co-host-add");
+      const draftError = section.locator("form.co-hosts-add > p.toggle-error");
+
+      await expect(summary).toHaveText("Co-hosts (0)", { timeout: 15_000 });
+      await summary.click({ timeout: 10_000 });
+      await expect(section.getByTestId("co-hosts-empty")).toBeVisible({ timeout: 10_000 });
+      await expect(input).toHaveAttribute("role", "combobox");
+      await expect(listbox).toBeHidden();
+
+      // The first focus fetches the suggestions; an empty input lists everyone.
+      await input.click({ timeout: 10_000 });
+      await expect(input).toHaveAttribute("placeholder", "Name or email", { timeout: 15_000 });
+      await expect(options).toHaveCount(2, { timeout: 10_000 });
+
+      // "bea" is in PEER's display name only, never in an email.
+      await input.pressSequentially("bea", { delay: 30, timeout: 10_000 });
+      await expect(options).toHaveCount(1, { timeout: 10_000 });
+      await expect(peerOption).toBeVisible();
+      await expect(peerOption.locator(".co-hosts-option-name")).toHaveText(PEER.name);
+      await expect(peerOption.locator(".co-hosts-option-id")).toHaveText(PEER.email);
+      await expect(input).toHaveAttribute("aria-expanded", "true");
+      await expect(suggestStatus).toContainText("1 suggestion", { timeout: 10_000 });
+
+      await input.press("ArrowDown", { timeout: 10_000 });
+      await expect(peerOption).toHaveAttribute("aria-selected", "true", { timeout: 5_000 });
+      await expect(input).toHaveAttribute("aria-activedescendant", /-opt-0$/);
+      await input.press("Enter", { timeout: 10_000 });
+
+      await expect(input).toHaveValue(PEER.email, { timeout: 5_000 });
+      await expect(listbox).toBeHidden();
+      await expect(input).toHaveAttribute("aria-expanded", "false");
+      const peerSelected = `${PEER.name} (${PEER.email}) selected. Choose Add to confirm.`;
+      await expect(suggestStatus).toContainText(peerSelected, { timeout: 5_000 });
+      await expect(suggestNote).toBeVisible();
+      await expect(suggestNote).toHaveText(peerSelected);
+      // A pick must not grant.
+      await expect(section.getByTestId("co-host-row")).toHaveCount(0);
+      await expect(section.getByTestId("co-hosts-empty")).toBeVisible();
+      await expect(summary).toHaveText("Co-hosts (0)");
+      expect(grantBodies).toEqual([]);
+
+      await addButton.click({ timeout: 10_000 });
+      await expect(
+        section.locator(`[data-testid="co-host-row"][data-user-id="${PEER.email}"]`),
+      ).toBeVisible({ timeout: 15_000 });
+      await expect(section.getByTestId("co-host-row")).toHaveCount(1);
+      await expect(sectionStatus).toContainText(
+        `${PEER.name} (${PEER.email}) was added as a co-host and saved for future meetings.`,
+        { timeout: 10_000 },
+      );
+      await expect(summary).toHaveText("Co-hosts (1)");
+      await expect(input).toHaveValue("");
+      await expect(suggestNote).toHaveCount(0);
+      expect(grantBodies.map((body) => JSON.parse(body).user_id)).toEqual([PEER.email]);
+
+      // The new co-host drops out of the suggestions.
+      await input.click({ timeout: 10_000 });
+      await expect(options).toHaveCount(1, { timeout: 10_000 });
+      await expect(options).toHaveAttribute("data-user-id", OTHER.email);
+
+      // An unknown name is never sent as an id.
+      await input.pressSequentially("Nobody Here", { delay: 30, timeout: 10_000 });
+      await addButton.click({ timeout: 10_000 });
+      await expect(draftError).toHaveText(
+        "No one by that name. Pick from the list, or enter their email or user ID.",
+        { timeout: 5_000 },
+      );
+      await expect(input).toHaveAttribute("aria-invalid", "true");
+      await expect(input).toHaveValue("Nobody Here");
+
+      // An exact name typed in full fills that person's id; a double-click's
+      // second Add lands inside the 500 ms double-submit guard and grants nothing.
+      await input.fill("", { timeout: 10_000 });
+      await input.pressSequentially("Cal Decoy", { delay: 30, timeout: 10_000 });
+      await addButton.dblclick({ timeout: 10_000 });
+      await expect(input).toHaveValue(OTHER.email, { timeout: 5_000 });
+      await expect(suggestNote).toHaveText(
+        `${OTHER.name} (${OTHER.email}) selected. Choose Add to confirm.`,
+      );
+      await expect(draftError).toHaveCount(0);
+      await expect(section.getByTestId("co-host-row")).toHaveCount(1);
+      expect(grantBodies).toHaveLength(1);
+
+      // Outlast the 500 ms double-submit guard before the confirming Add.
+      await page.waitForTimeout(600);
+      await addButton.click({ timeout: 10_000 });
+      await expect(
+        section.locator(`[data-testid="co-host-row"][data-user-id="${OTHER.email}"]`),
+      ).toBeVisible({ timeout: 15_000 });
+      await expect(sectionStatus).toContainText(
+        `${OTHER.name} (${OTHER.email}) was added as a co-host and saved for future meetings.`,
+        { timeout: 10_000 },
+      );
+      expect(grantBodies.map((body) => JSON.parse(body).user_id)).toEqual([
+        PEER.email,
+        OTHER.email,
+      ]);
     } finally {
       await closeAll([owner]);
     }

@@ -1,0 +1,175 @@
+{
+ "_comment": [
+  "Mutations of the bot image builder (#2914), each naming the test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-bot-image.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_bot_image.py"
+ ],
+ "baseline_tests": 13,
+ "mutations": [
+  {
+   "name": "a dirty tree is built",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    if _git(root, \"status\", \"--porcelain=v1\", \"--untracked-files=all\").strip():\n        raise Refused(",
+   "replace": "    if False:\n        raise Refused(",
+   "expect_kills": [
+    "test_a_dirty_tree_is_refused_before_any_build"
+   ]
+  },
+  {
+   "name": "the clean build is tagged dirty",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    tag = cq_local.bot_image_tag(commit, dirty=False)",
+   "replace": "    tag = cq_local.bot_image_tag(commit, dirty=True)",
+   "expect_kills": [
+    "test_the_built_image_is_the_one_the_remote_preflight_accepts"
+   ]
+  },
+  {
+   "name": "the build drops the tree label",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"--label\", f\"{TREE_LABEL}={tree}\",\n",
+   "replace": "\n",
+   "expect_kills": [
+    "test_the_built_image_is_the_one_the_remote_preflight_accepts",
+    "test_save_writes_the_gzipped_archive_of_that_tag"
+   ]
+  },
+  {
+   "name": "the labels are not checked after the build",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    if p.returncode != 0 or p.stdout.strip() != cq_local.bot_labels(commit, dirty=False):",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_an_image_without_the_preflight_labels_is_refused"
+   ]
+  },
+  {
+   "name": "the revision label is not the one Dockerfile.bot sets",
+   "file": "scripts/quality/cq_local.py",
+   "find": "REVISION_LABEL = \"org.opencontainers.image.revision\"",
+   "replace": "REVISION_LABEL = \"org.opencontainers.image.version\"",
+   "expect_kills": [
+    "test_dockerfile_bot_sets_the_revision_label_the_preflight_reads"
+   ]
+  },
+  {
+   "name": "--save writes nothing",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    if save:\n        _save(engine, tag, save)",
+   "replace": "    if False:\n        _save(engine, tag, save)",
+   "expect_kills": [
+    "test_save_writes_the_gzipped_archive_of_that_tag"
+   ]
+  },
+  {
+   "name": "a failed build is not refused",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    if rc != 0:\n        raise Refused(f\"{engine} build exited {rc}\")",
+   "replace": "    if False:\n        raise Refused(f\"{engine} build exited {rc}\")",
+   "expect_kills": [
+    "test_a_failed_build_is_refused_and_nothing_is_saved"
+   ]
+  },
+  {
+   "name": "the archive is written in place",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    tmp, p = path + \".part\", None",
+   "replace": "    tmp, p = path, None",
+   "expect_kills": [
+    "test_a_failed_export_keeps_the_previous_archive"
+   ]
+  },
+  {
+   "name": "a failed export leaves its partial file",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "        if os.path.exists(tmp):\n            os.remove(tmp)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_an_export_that_cannot_start_or_write_cleans_up_and_reaps_the_engine"
+   ]
+  },
+  {
+   "name": "the engine is not reaped",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "            if p.poll() is None:\n                p.kill()\n            p.wait()",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_an_export_that_cannot_start_or_write_cleans_up_and_reaps_the_engine"
+   ]
+  },
+  {
+   "name": "main drops --save",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "        tag = build(root, args.engine, args.save)",
+   "replace": "        tag = build(root, args.engine)",
+   "expect_kills": [
+    "test_main_saves_with_the_named_engine"
+   ]
+  },
+  {
+   "name": "main ignores --engine",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "        tag = build(root, args.engine, args.save)",
+   "replace": "        tag = build(root, \"docker\", args.save)",
+   "expect_kills": [
+    "test_main_saves_with_the_named_engine"
+   ]
+  },
+  {
+   "name": "main lets a failed git through",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    except (Refused, subprocess.CalledProcessError, OSError) as exc:",
+   "replace": "    except (Refused, OSError) as exc:",
+   "expect_kills": [
+    "test_main_exits_3_on_a_missing_engine_or_a_failed_git"
+   ]
+  },
+  {
+   "name": "main lets a missing engine through",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    except (Refused, subprocess.CalledProcessError, OSError) as exc:",
+   "replace": "    except (Refused, subprocess.CalledProcessError) as exc:",
+   "expect_kills": [
+    "test_main_exits_3_on_a_missing_engine_or_a_failed_git"
+   ]
+  },
+  {
+   "name": "a save path inside the checkout accepted",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    if args.save and os.path.commonpath([os.path.realpath(args.save), root]) == root:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_main_refuses_a_save_path_inside_the_checkout"
+   ]
+  },
+  {
+   "name": "a symlinked save path is not resolved",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "os.path.commonpath([os.path.realpath(args.save), root])",
+   "replace": "os.path.commonpath([os.path.abspath(args.save), root])",
+   "expect_kills": [
+    "test_main_resolves_symlinks_on_both_sides_of_the_inside_check"
+   ]
+  },
+  {
+   "name": "a symlinked checkout path is not resolved",
+   "file": "scripts/quality/cq_bot_image.py",
+   "find": "    root = os.path.realpath(ROOT)\n",
+   "replace": "    root = os.path.abspath(ROOT)\n",
+   "expect_kills": [
+    "test_main_resolves_symlinks_on_both_sides_of_the_inside_check"
+   ]
+  }
+ ]
+}

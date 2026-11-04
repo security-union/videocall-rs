@@ -525,10 +525,8 @@ pub fn format_send_layer_short(width: u32, height: u32) -> String {
 
 /// A RECEIVED-audio bitrate label with `unit` appended (`" kbps"` or `"k"`).
 ///
-/// `0` is the "no reading" sentinel `received_layer_snapshot` sets for audio, and it
-/// renders [`SEND_LAYER_DIMS_UNKNOWN`] — a publisher's audio rate comes from its own
-/// AQ tier, not from the layer a receiver decodes, so there is no number to show.
-/// Pure / host-tested.
+/// `0` (the publisher has not stamped its audio bitrate) renders
+/// [`SEND_LAYER_DIMS_UNKNOWN`]. Pure / host-tested.
 pub fn format_recv_audio_kbps(kbps: u32, unit: &str) -> String {
     if kbps == 0 {
         return format!("{SEND_LAYER_DIMS_UNKNOWN}{unit}");
@@ -1032,7 +1030,7 @@ pub fn peer_row_res_or_bitrate(snap: &ReceivedLayerSnapshot) -> String {
         if snap.kbps == 0 {
             return "bitrate not reported".to_string();
         }
-        format_recv_audio_kbps(snap.kbps, "k")
+        format_recv_audio_kbps(snap.kbps, " kilobits per second")
     } else if snap.width == 0 || snap.height == 0 {
         "resolution not reported".to_string()
     } else {
@@ -1124,7 +1122,7 @@ pub fn layer_position_suffix(layer_index: u32, layer_count: u32) -> Option<Strin
 /// signal — this sentence carries label, kind, state, the res/bitrate, and (when
 /// present) the reason clause. The layer clause is included only when the peer
 /// publishes more than one rung. `kind_noun` is the spoken kind; `res_or_bitrate`
-/// is the human detail ("360p" or "24k"). Pure / host-tested.
+/// is the human detail ("360p" or "24 kilobits per second"). Pure / host-tested.
 pub fn peer_row_aria_label(
     label: &str,
     kind_noun: &str,
@@ -5027,8 +5025,6 @@ pub mod receive {
                 layer_count: 3,
                 width: 0,
                 height: 0,
-                // The production shape: `received_layer_snapshot` reports no audio
-                // bitrate, so the detail is the em-dash, never "0 kbps".
                 kbps: 0,
                 reason: None,
             };
@@ -5433,7 +5429,6 @@ mod tests {
             format_peer_kind_line("video", Some(&v)),
             Some("video High · 3/3 · 1280×720".to_string())
         );
-        // Audio → the em-dash detail: the resolver reports no bitrate for audio.
         let a = ReceivedLayerSnapshot {
             kind: PrefMediaKind::Audio,
             layer_index: 0,
@@ -7221,40 +7216,41 @@ mod tests {
         );
     }
 
-    /// Every RECEIVE readout that renders a peer's audio bitrate shows the em-dash,
-    /// and none prints a literal zero — the resolver reports no rate.
     #[test]
-    fn every_receive_audio_readout_em_dashes_the_bitrate() {
+    fn every_receive_audio_readout_em_dashes_only_an_unstamped_bitrate() {
         let dash = SEND_LAYER_DIMS_UNKNOWN;
         assert_eq!(format_recv_audio_kbps(0, " kbps"), format!("{dash} kbps"));
         assert_eq!(format_recv_audio_kbps(0, "k"), format!("{dash}k"));
-        // A nonzero reading still renders, so the sentinel is `0` and not the unit.
         assert_eq!(format_recv_audio_kbps(48, "k"), "48k");
 
-        // The value the production resolver actually hands these formatters.
-        let live = videocall_client::decode::layer_chooser::received_layer_snapshot(
+        let unstamped = videocall_client::decode::layer_chooser::received_layer_snapshot(
             PrefMediaKind::Audio,
             2,
             3,
         );
         assert_eq!(
-            live.kbps, 0,
-            "premise: the resolver reports no audio bitrate"
+            unstamped.kbps, 0,
+            "premise: the bare resolver stamps nothing"
         );
-        for rendered in [
-            format_peer_kind_line("audio", Some(&live)).expect("flowing"),
-            peer_row_metric(&live, receive::index_label(PrefMediaKind::Audio, 2)),
-            receive::format_readout(&live),
-            format_recv_audio_kbps(live.kbps, "k"),
-        ] {
-            assert!(
-                rendered.contains(dash),
-                "audio readout must carry the em-dash; got {rendered:?}"
-            );
-            assert!(
-                !rendered.contains('0'),
-                "audio readout must not print a literal zero; got {rendered:?}"
-            );
+        let renders = |s: &ReceivedLayerSnapshot| {
+            [
+                format_peer_kind_line("audio", Some(s)).expect("flowing"),
+                peer_row_metric(s, receive::index_label(PrefMediaKind::Audio, 2)),
+                receive::format_readout(s),
+                format_recv_audio_kbps(s.kbps, "k"),
+            ]
+        };
+        for rendered in renders(&unstamped) {
+            assert!(rendered.contains(dash), "got {rendered:?}");
+            assert!(!rendered.contains('0'), "got {rendered:?}");
+        }
+        let stamped = ReceivedLayerSnapshot {
+            kbps: 24,
+            ..unstamped
+        };
+        for rendered in renders(&stamped) {
+            assert!(rendered.contains("24"), "got {rendered:?}");
+            assert!(!rendered.contains(dash), "got {rendered:?}");
         }
     }
 
@@ -7266,6 +7262,16 @@ mod tests {
         assert_eq!(peer_row_res_or_bitrate(&video), "360p");
         let screen = snap(PrefMediaKind::Screen, 0, 1, 1400, 700, 0, None);
         assert_eq!(peer_row_res_or_bitrate(&screen), "700p");
+    }
+
+    #[test]
+    fn a_stamped_audio_bitrate_is_spoken_with_its_unit_and_shown_compact() {
+        let audio = snap(PrefMediaKind::Audio, 0, 1, 0, 0, 48, None);
+        assert_eq!(
+            layer_row_aria_label("Alice", "audio", &audio),
+            "Alice, receiving audio, optimal quality, 48 kilobits per second"
+        );
+        assert_eq!(peer_row_metric(&audio, "as sent"), "48k · as sent");
     }
 
     #[test]
@@ -7302,10 +7308,11 @@ mod tests {
             peer_row_metric(&v, "ignored"),
             "360p · ~350k · Medium · 2/3"
         );
-        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}", where the resolver reports no
-        // bitrate — so the leading segment is the em-dash, never "0k".
+        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}"; unstamped leads with the em-dash.
         let a = snap(PrefMediaKind::Audio, 1, 3, 0, 0, 0, None);
         assert_eq!(peer_row_metric(&a, "mid"), "\u{2014}k · mid · Medium · 2/3");
+        let a = snap(PrefMediaKind::Audio, 1, 3, 0, 0, 24, None);
+        assert_eq!(peer_row_metric(&a, "mid"), "24k · mid · Medium · 2/3");
     }
 
     /// MUTATION: flip `layer_position_suffix`'s `compact` back to `true`. The same

@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 use crate::components::login::Login;
 use crate::components::search_modal::SearchModal;
 use crate::pages::guest_join::GuestJoinPage;
+use crate::pages::help::Help;
 use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
 
@@ -22,6 +23,8 @@ pub enum Route {
     Home {},
     #[route("/login")]
     Login {},
+    #[route("/help")]
+    Help {},
     #[route("/auth/callback?:..query_params")]
     OAuthCallback { query_params: String },
     #[route("/meeting/:id/settings")]
@@ -37,6 +40,21 @@ pub enum Route {
     },
     #[route("/404")]
     NotFound {},
+}
+
+const FROM_CALL_QUERY: &str = "from=call";
+
+/// The help page as the in-call footer links to it.
+pub fn call_help_href() -> String {
+    format!("{}?{FROM_CALL_QUERY}", Route::Help {})
+}
+
+/// Whether a location's query marks a help page opened from a call.
+pub fn is_from_call(search: &str) -> bool {
+    search
+        .trim_start_matches('?')
+        .split('&')
+        .any(|pair| pair == FROM_CALL_QUERY)
 }
 
 #[component]
@@ -80,5 +98,45 @@ fn NotFound() -> Element {
                 a { href: "/", style: "color: #7928CA;", "Go Home" }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_exact_from_call_query_turns_on_call_mode() {
+        for search in [
+            "?from=call",
+            "from=call",
+            "?x=1&from=call",
+            "?from=call&x=1",
+        ] {
+            assert!(is_from_call(search), "{search:?}");
+        }
+        for search in [
+            "",
+            "?",
+            "?from=calls",
+            "?from=",
+            "?xfrom=call",
+            "?from=Call",
+        ] {
+            assert!(!is_from_call(search), "{search:?}");
+        }
+    }
+
+    #[test]
+    fn the_call_link_still_routes_to_the_help_page() {
+        let href = call_help_href();
+        let (path, search) = href.split_once('?').expect("a query string");
+        assert_eq!(path, Route::Help {}.to_string());
+        assert!(is_from_call(search), "{href}");
+        assert_eq!(href.parse::<Route>().ok(), Some(Route::Help {}));
+        assert_eq!(
+            format!("{href}#faq").parse::<Route>().ok(),
+            Some(Route::Help {})
+        );
     }
 }

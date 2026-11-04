@@ -86,7 +86,7 @@ spec:
         - name: hclcr-io
       # Non-root at the pod level. Chromium runs WITHOUT --no-sandbox (see
       # src/bot.ts CHROME_ARGS), so it uses the setuid chrome-sandbox, which
-      # requires a non-root caller. uid 1000 == the image's `pwuser`.
+      # requires a non-root caller. uid 1000 is the image's `ubuntu`.
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -163,29 +163,38 @@ spec:
             # Figures and tile geometry: #2248.
             - name: BOT_HW_CONCURRENCY
               value: "10"
-            # Receiver low-power caps (issues #2068/#2069, increment 5) are
-            # DELIBERATELY UNSET here: the fleet default is a REALISTIC
-            # full-decode client, so a run reproduces the same total-room decode
-            # load (and any decode-saturation freeze) a real participant would.
-            # They are OPT-IN levers — enable them ONLY to trade realism for
-            # scale (cap per-bot DECODE + PAINT CPU so the box holds more bots
-            # while you load the SERVER with many participants). To opt in, add:
-            #   - name: BOT_MAX_RECEIVED_LAYER   # 0 = base rung only (cuts decode)
-            #     value: "0"
-            #   - name: BOT_SKIP_CANVAS_PAINT    # decode-and-drop (cuts paint only)
-            #     value: "true"
-            # Injected at launch as window.__APP_CONFIG overrides (the client
-            # parses that once + prod config.js freezes it, so they are NOT
-            # runtime-toggleable); effect requires the DEPLOYED client to carry
-            # videocall-client PR #2078 (bot logs a post-join assertion either way).
-            # DIAGNOSTICS sends (#2970) stay ON. Opt out only for a run where
-            # every participant has them off (Phase 0 arm 3):
+            # Talking-clock fleet size N (issue 3072): must equal `replicas:`.
+            # `kubectl scale` does not update it; pair it with `kubectl set env`.
+            - name: BOT_FLEET_SIZE
+              value: "3"
+            # Indices 2, 7, 12, ... on WebSocket, the rest WebTransport (README: Transport mix).
+            - name: BOT_TRANSPORT_WS_EVERY
+              value: "5"
+            # Speaking schedule (issue 3090): unset = weighted, the default. Fleet-wide knobs:
+            #   BOT_SPEECH_MODEL (weighted|rotation) · BOT_SPEECH_SEED · BOT_SPEECH_DOMINANT
+            #   BOT_SPEECH_OBSERVERS · BOT_SPEECH_KEEP · BOT_SPEECH_OVERLAP (README: Talking clock)
+            # Skips canvas paint of received tiles (issue 3086). Set "false" to
+            # watch the clock tiles.
+            - name: BOT_SKIP_CANVAS_PAINT
+              value: "true"
+            # BOT_MAX_RECEIVED_LAYER (#2068) stays unset: it cuts decode, an
+            # opt-in trade of realism for scale.
+            # BOT_SIMULCAST_MAX_LAYERS (issue 3246) stays unset: the target's own
+            # experimentalSimulcastMaxLayers applies, as it does for a real client.
+            # DIAGNOSTICS sends (#2970) follow the deployment, as a real client's
+            # do. Force "on" or "off" only when every participant matches:
             #   - name: BOT_DIAG_PACKETS
             #     value: "off"
             # Camera duty cycle (#2362) UNSET — cycling LOWERS published load. Opt in
             # with all four, in seconds (a partial set is rejected at startup):
             #   BOT_CAMERA_ON_SECS_MIN "20" · BOT_CAMERA_ON_SECS_MAX "90"
             #   BOT_CAMERA_OFF_SECS_MIN "60" · BOT_CAMERA_OFF_SECS_MAX "240"
+            # Clock noise background (issue 3089) UNSET: each pod takes its source
+            # geometry's default alpha. A value overrides EVERY pod, SD and HD alike:
+            #   - name: BOT_VIDEO_NOISE
+            #     value: "0"     # no noise: under-represents camera upload
+            # Personas (issue 3091) UNSET: mic and camera follow speech by persona. Opt in
+            # with BOT_PERSONAS "on"; also BOT_CAMERA · BOT_PERSONA_MIC_ON · BOT_PERSONA_CAMERA_ON (README: Personas)
             # Control server (Increment 3, #2072). Setting BOT_CTL_PORT turns the
             # control server ON in the entrypoint; it binds 0.0.0.0 so the headless
             # Service name resolves to it on the pod network. The token is a single

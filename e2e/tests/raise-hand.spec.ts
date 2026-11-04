@@ -110,8 +110,7 @@ const PAUSED_PILL_ACTION = '[data-testid="decode-paused-pill-show-all"]';
 // never suppresses the pill (the two are mutually exclusive).
 const FORCED_BUDGET_SEED = `localStorage.setItem("vc_decode_budget_override", "1");`;
 
-// The pill collision lives in the split layout, which a received share opens
-// in only by preference since #2792.
+// The pill collision lives in the split layout.
 const ENLARGED_SHARE_VIEW_SEED = `localStorage.setItem("${RECEIVED_SHARE_VIEW_KEY}", "enlarged");`;
 
 // Mock peers needed to push the shed count above zero. Any number > the forced

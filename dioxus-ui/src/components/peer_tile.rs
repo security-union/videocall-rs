@@ -20,13 +20,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::components::attendants::try_set;
+use crate::components::attendants_layout::EnlargedTiles;
 use crate::components::canvas_generator::{
     generate_for_peer, is_portrait_resolution, AudioLevels, HostPromotionHandlers, PinnedTile,
-    SignalPopupHandlers, TileMode,
+    SignalPopupHandlers, TileEnlarge, TileMode,
 };
 use crate::components::co_hosts::{
-    kick_failure_text, owner_holds_host, peer_holds_host, peer_host_menu, post_co_host_notice,
-    CoHostNoticeCtx, CoHostRequest, CoHostTarget, MeetingOwnership,
+    owner_holds_host, peer_holds_host, peer_host_menu, post_host_action_failure, shared_name,
+    CoHostNoticeCtx, CoHostRequest, CoHostTarget, HostAction, MeetingOwnership,
 };
 use crate::components::decode_budget::TileRenderMode;
 use crate::components::icons::signal_spark::spark_svg_markup;
@@ -112,6 +114,7 @@ pub fn PeerTile(
     /// Issue 2792: view state of the `ScreenOnly` share tile.
     #[props(default)]
     share_view: Option<ShareTileView>,
+    #[props(default)] enlarge: TileEnlarge,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -252,6 +255,7 @@ pub fn PeerTile(
     // All three default to 0 / empty so older publishers (and the
     // unconstrained-tier path on newer publishers) skip the Cause line.
     let mut screen_encoder_target_bitrate = use_signal(|| 0_u32);
+    let mut stamped_audio_kbps = use_signal(|| 0.0_f64);
     // Current transport for this peer ("webtransport" / "websocket" /
     // "unknown"), sourced from the `peer_status` diagnostics metric. Stored
     // as a per-tile signal because each `PeerTile` only renders its own
@@ -547,11 +551,16 @@ pub fn PeerTile(
                         *screen_enabled.peek(),
                         sample_is_decoding,
                     );
+                let audio_kbps_now =
+                    overlay_audio_kbps(sample_client.peer_stamped_audio_kbps(&sample_peer_id));
+                if *stamped_audio_kbps.peek() != audio_kbps_now {
+                    stamped_audio_kbps.set(audio_kbps_now);
+                }
                 let data = SampleData {
                     video_fps: *fps_received.peek(),
                     video_bitrate_kbps: *video_bitrate.peek(),
                     video_resolution: res,
-                    audio_bitrate_kbps: overlay_audio_kbps(),
+                    audio_bitrate_kbps: audio_kbps_now,
                     audio_expand_rate: *expand_rate.peek(),
                     audio_buffer_ms: *audio_buffer_ms.peek(),
                     screen_enabled: sample_screen_en,
@@ -758,29 +767,28 @@ pub fn PeerTile(
             owner_holds_host: owner_holds_host(host_set.as_ref(), owner),
         },
     );
+    let peer_display_name = client
+        .get_peer_display_name(&peer_id)
+        .unwrap_or_else(|| peer_uid_for_mute.clone());
+    let name_for_handlers = std::cell::OnceCell::<Rc<str>>::new();
+    let handler_name = || shared_name(&name_for_handlers, &peer_display_name);
     let on_mute: Option<EventHandler<()>> = if host_menu.mute_and_disable_video && audio_enabled() {
         if let Some(ref meeting_id) = room_id {
             let meeting_id = meeting_id.clone();
             let peer_uid = peer_uid_for_mute.clone();
+            let peer_name = handler_name();
             Some(EventHandler::new(move |_: ()| {
                 let meeting_id = meeting_id.clone();
                 let peer_uid = peer_uid.clone();
-                let mut audio_enabled = audio_enabled;
-                audio_enabled.set(false);
-                spawn(async move {
-                    match crate::constants::meeting_api_client() {
-                        Ok(api_client) => {
-                            if let Err(e) =
-                                api_client.mute_participant(&meeting_id, &peer_uid).await
-                            {
-                                log::warn!("mute_participant failed: {e}");
-                                audio_enabled.set(true);
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("meeting_api_client error: {e}");
-                            audio_enabled.set(true);
-                        }
+                let peer_name = peer_name.clone();
+                try_set(audio_enabled, false);
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) =
+                        crate::meeting_api::mute_participant(&meeting_id, &peer_uid).await
+                    {
+                        log::warn!("mute_participant failed: {e}");
+                        try_set(audio_enabled, true);
+                        post_host_action_failure(co_host_notice, HostAction::Mute(&peer_name), &e);
                     }
                 });
             }))
@@ -790,69 +798,53 @@ pub fn PeerTile(
     } else {
         None
     };
-    let on_disable_video: Option<EventHandler<()>> =
-        if host_menu.mute_and_disable_video && video_enabled() {
-            if let Some(ref meeting_id) = room_id {
-                let meeting_id = meeting_id.clone();
-                let peer_uid = peer_uid_for_mute.clone();
-                Some(EventHandler::new(move |_: ()| {
-                    let meeting_id = meeting_id.clone();
-                    let peer_uid = peer_uid.clone();
-                    let mut video_enabled = video_enabled;
-                    video_enabled.set(false);
-                    spawn(async move {
-                        match crate::constants::meeting_api_client() {
-                            Ok(api_client) => {
-                                if let Err(e) = api_client
-                                    .disable_video_participant(&meeting_id, &peer_uid)
-                                    .await
-                                {
-                                    log::warn!("disable_video_participant failed: {e}");
-                                    video_enabled.set(true);
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("meeting_api_client error: {e}");
-                                video_enabled.set(true);
-                            }
-                        }
-                    });
-                }))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-    let peer_display_name = client
-        .get_peer_display_name(&peer_id)
-        .unwrap_or_else(|| peer_uid_for_mute.clone());
-    let on_kick: Option<EventHandler<()>> = if host_menu.kick {
+    let on_disable_video: Option<EventHandler<()>> = if host_menu.mute_and_disable_video
+        && video_enabled()
+    {
         if let Some(ref meeting_id) = room_id {
             let meeting_id = meeting_id.clone();
             let peer_uid = peer_uid_for_mute.clone();
-            let peer_name = peer_display_name.clone();
+            let peer_name = handler_name();
             Some(EventHandler::new(move |_: ()| {
                 let meeting_id = meeting_id.clone();
                 let peer_uid = peer_uid.clone();
                 let peer_name = peer_name.clone();
-                spawn(async move {
-                    match crate::constants::meeting_api_client() {
-                        Ok(api_client) => {
-                            if let Err(e) =
-                                api_client.kick_participant(&meeting_id, &peer_uid).await
-                            {
-                                log::warn!("kick_participant failed: {e}");
-                                if let Some(ctx) = co_host_notice {
-                                    post_co_host_notice(
-                                        ctx,
-                                        kick_failure_text(&peer_name, &e),
-                                        true,
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => log::warn!("meeting_api_client error: {e}"),
+                try_set(video_enabled, false);
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) =
+                        crate::meeting_api::disable_video_participant(&meeting_id, &peer_uid).await
+                    {
+                        log::warn!("disable_video_participant failed: {e}");
+                        try_set(video_enabled, true);
+                        post_host_action_failure(
+                            co_host_notice,
+                            HostAction::DisableVideo(&peer_name),
+                            &e,
+                        );
+                    }
+                });
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let on_kick: Option<EventHandler<()>> = if host_menu.kick {
+        if let Some(ref meeting_id) = room_id {
+            let meeting_id = meeting_id.clone();
+            let peer_uid = peer_uid_for_mute.clone();
+            let peer_name = handler_name();
+            Some(EventHandler::new(move |_: ()| {
+                let meeting_id = meeting_id.clone();
+                let peer_uid = peer_uid.clone();
+                let peer_name = peer_name.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) =
+                        crate::meeting_api::kick_participant(&meeting_id, &peer_uid).await
+                    {
+                        log::warn!("kick_participant failed: {e}");
+                        post_host_action_failure(co_host_notice, HostAction::Kick(&peer_name), &e);
                     }
                 });
             }))
@@ -868,17 +860,20 @@ pub fn PeerTile(
         if let Some(ref meeting_id) = room_id {
             let meeting_id = meeting_id.clone();
             let peer_uid = peer_uid_for_mute.clone();
+            let peer_name = handler_name();
             Some(EventHandler::new(move |_: ()| {
                 let meeting_id = meeting_id.clone();
                 let peer_uid = peer_uid.clone();
-                spawn(async move {
-                    match crate::constants::meeting_api_client() {
-                        Ok(api_client) => {
-                            if let Err(e) = api_client.transfer_host(&meeting_id, &peer_uid).await {
-                                log::warn!("transfer_host failed: {e}");
-                            }
-                        }
-                        Err(e) => log::warn!("meeting_api_client error: {e}"),
+                let peer_name = peer_name.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = crate::meeting_api::transfer_host(&meeting_id, &peer_uid).await
+                    {
+                        log::warn!("transfer_host failed: {e}");
+                        post_host_action_failure(
+                            co_host_notice,
+                            HostAction::TransferHost(&peer_name),
+                            &e,
+                        );
                     }
                 });
             }))
@@ -910,7 +905,7 @@ pub fn PeerTile(
     // so a SPEAKING tile re-renders at several Hz), but each rebuild is now just
     // O(1) reads of per-tile signals this component already maintains at the ~1 Hz
     // diagnostics cadence — decoded resolution, the smoothed received fps (#1772),
-    // and the received-audio kbps signal (#1769). There is NO per-render
+    // and the stamped audio kbps signal. There is NO per-render
     // `per_peer_received_snapshots()` scan any more, so the payload build is O(1)
     // per tile instead of the previous O(N²)-across-N-speaking-tiles snapshot walk.
     let metrics_overlay: Option<MediaMetricsOverlay> = if overlay_enabled {
@@ -930,14 +925,14 @@ pub fn PeerTile(
             //     drawn to the canvas, NOT the decode-call `fps_received` bucket,
             //     so the readout matches what the viewer sees (capped at the source
             //     rate once #1783 coalesces late-frame bursts to one draw);
-            //   * audio kbps — always the em-dash for a remote peer.
+            //   * audio kbps — the publisher's stamped bitrate from `stamped_audio_kbps`.
             let resolution = parse_resolution(&video_resolution());
             let fps_now = fps_painted();
             Some(MediaMetricsOverlay {
                 is_self: false,
                 resolution,
                 fps: (fps_now > 0.0).then_some(fps_now),
-                audio_kbps: overlay_audio_kbps_display(overlay_audio_kbps()),
+                audio_kbps: overlay_audio_kbps_display(stamped_audio_kbps()),
             })
         }
     } else {
@@ -1021,6 +1016,7 @@ pub fn PeerTile(
         hand_raised(),
         share_view,
         portrait_source(),
+        enlarge,
     )
 }
 
@@ -1028,6 +1024,8 @@ pub fn PeerTile(
 pub struct CameraTiles<'a> {
     pub tiles: &'a [(String, TileRenderMode)],
     pub pin_rank: &'a HashMap<String, usize>,
+    pub enlarged: &'a EnlargedTiles,
+    pub on_toggle_enlarge: EventHandler<PinnedTile>,
     pub full_bleed: &'a dyn Fn(&str) -> bool,
     pub host_user_id: &'a Option<String>,
     pub render_mode: &'a TileMode,
@@ -1071,6 +1069,11 @@ pub fn camera_tiles(list: CameraTiles) -> Element {
                     on_request_decode: list.on_request_decode,
                     room_id: Some(list.room_id.to_string()),
                     is_current_user_host: list.is_host,
+                    enlarge: TileEnlarge {
+                        rank: list.enlarged.rank.get(tile_id).copied(),
+                        offered: list.enlarged.offered,
+                        on_toggle: Some(list.on_toggle_enlarge),
+                    },
                 }
             }
         };

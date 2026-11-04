@@ -78,7 +78,8 @@ const MAX_PLAUSIBLE_SEQ_GAP_FRAMES: u64 = videocall_aq::constants::MAX_PLAUSIBLE
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_DATAGRAM_LOSS_PER_SEC, AUDIO_DATAGRAM_RAW_LOSS_PER_SEC,
-    AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_CHARGING, BATTERY_LEVEL,
+    AUDIO_PACKETS_DISCARDED_TOTAL, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_PLAYOUT_UNDERRUN_EVENTS_TOTAL,
+    AUDIO_PLAYOUT_UNDERRUN_MS_TOTAL, AUDIO_QUALITY_SCORE, BATTERY_CHARGING, BATTERY_LEVEL,
     CALL_QUALITY_SCORE, CAMERA_WS_STALE_DELTA_DROPS_TOTAL, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER,
     CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_AUDIO_CONCEALMENT_PCT,
     CLIENT_CPU_THROTTLED, CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS, CLIENT_INFO,
@@ -568,11 +569,11 @@ fn publish_or_clear(gauge: &prometheus::GaugeVec, peer_labels: &[&str; 4], value
     }
 }
 
+const AUDIO_DISCARD_CAUSES: [&str; 2] = ["smart_flush", "resync_to_live"];
+
 /// Remove all per-peer Prometheus metrics for a specific reporter→peer pair.
 /// Used for session cleanup and for pruning a peer that has left a still-live
-/// reporter's view (issue #1092). Per-pair series are keyed only by the four
-/// stable ids `[meeting_id, session_id, from_peer, to_peer]` (#1954 dropped the
-/// user-supplied `reporter_name`/`peer_name` PII labels).
+/// reporter's view (issue #1092).
 fn remove_per_peer_metrics(
     meeting_id: &str,
     session_id: &str,
@@ -585,6 +586,17 @@ fn remove_per_peer_metrics(
     let _ = PEER_CAN_SEE.remove_label_values(&labels);
     let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
     let _ = AUDIO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
+    for cause in AUDIO_DISCARD_CAUSES {
+        let _ = AUDIO_PACKETS_DISCARDED_TOTAL.remove_label_values(&[
+            meeting_id,
+            session_id,
+            reporting_user_id,
+            to_peer,
+            cause,
+        ]);
+    }
+    let _ = AUDIO_PLAYOUT_UNDERRUN_MS_TOTAL.remove_label_values(&labels);
+    let _ = AUDIO_PLAYOUT_UNDERRUN_EVENTS_TOTAL.remove_label_values(&labels);
     let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
@@ -1979,9 +1991,7 @@ fn process_health_packet_to_metrics_pb(
             // Record the peers this reporter observes in the per-pair tracking set
             // (`to_peers`, which drives the #1092 per-packet prune) and the
             // lifetime-of-session `peer_ids` set (which drives the meeting-scoped
-            // PEER_CONNECTIONS_TOTAL reap in remove_session_metrics). Per-pair series
-            // are keyed only by stable ids after #1954, so there is no display-name
-            // rename to detect here anymore.
+            // PEER_CONNECTIONS_TOTAL reap in remove_session_metrics).
             {
                 let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
@@ -2041,6 +2051,31 @@ fn process_health_packet_to_metrics_pb(
                     NETEQ_PACKETS_PER_SEC
                         .with_label_values(&peer_labels)
                         .set_finite(neteq_stats.packets_per_sec);
+
+                    for (cause, total) in AUDIO_DISCARD_CAUSES.into_iter().zip([
+                        neteq_stats.smart_flush_discarded_packets_total,
+                        neteq_stats.resync_discarded_packets_total,
+                    ]) {
+                        let labels = [meeting_id, session_id, reporting_user_id, peer_id, cause];
+                        if let Some(total) = total {
+                            AUDIO_PACKETS_DISCARDED_TOTAL
+                                .with_label_values(&labels)
+                                .set(total as f64);
+                        } else {
+                            let _ = AUDIO_PACKETS_DISCARDED_TOTAL.remove_label_values(&labels);
+                        }
+                    }
+
+                    publish_or_clear(
+                        &AUDIO_PLAYOUT_UNDERRUN_MS_TOTAL,
+                        &peer_labels,
+                        neteq_stats.playout_underrun_ms_total.map(|v| v as f64),
+                    );
+                    publish_or_clear(
+                        &AUDIO_PLAYOUT_UNDERRUN_EVENTS_TOTAL,
+                        &peer_labels,
+                        neteq_stats.playout_underrun_events_total.map(|v| v as f64),
+                    );
 
                     // Core NetEQ operation counters (high diagnostic value only)
                     if let Some(network) = neteq_stats.network.as_ref() {
@@ -5014,6 +5049,125 @@ mod tests {
     }
 
     #[test]
+    fn audio_packets_discarded_exports_per_cause_and_is_gc_d() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut peer_stats = std::collections::HashMap::new();
+        for (peer, smart, resync) in [
+            ("bob_apd", Some(3), Some(41)),
+            ("carol_apd", None, None),
+            ("dave_apd", Some(0), None),
+        ] {
+            let mut ns = PbNetEqStats::new();
+            ns.smart_flush_discarded_packets_total = smart;
+            ns.resync_discarded_packets_total = resync;
+            let mut ps = PbPeerStats::new();
+            ps.neteq_stats = ::protobuf::MessageField::some(ns);
+            peer_stats.insert(peer.to_string(), ps);
+        }
+        let hp = create_test_health_packet("sess_apd", "meet_apd", "alice_apd", peer_stats);
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let value = |to_peer: &str, cause: &str| {
+            gauge_value(
+                "videocall_audio_packets_discarded_total",
+                &[
+                    ("meeting_id", "meet_apd"),
+                    ("session_id", "sess_apd"),
+                    ("from_peer", "alice_apd"),
+                    ("to_peer", to_peer),
+                    ("cause", cause),
+                ],
+            )
+        };
+        assert_eq!(value("bob_apd", "smart_flush"), Some(3.0));
+        assert_eq!(value("bob_apd", "resync_to_live"), Some(41.0));
+        assert_eq!(value("carol_apd", "smart_flush"), None);
+        assert_eq!(value("carol_apd", "resync_to_live"), None);
+        assert_eq!(value("dave_apd", "smart_flush"), Some(0.0));
+        assert_eq!(value("dave_apd", "resync_to_live"), None);
+
+        remove_per_peer_metrics("meet_apd", "sess_apd", "alice_apd", "bob_apd");
+        assert_eq!(value("bob_apd", "smart_flush"), None);
+        assert_eq!(value("bob_apd", "resync_to_live"), None);
+    }
+
+    #[test]
+    fn audio_packets_discarded_cause_series_dropped_when_field_goes_absent() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let send = |smart: Option<u64>, resync: Option<u64>| {
+            let mut ns = PbNetEqStats::new();
+            ns.smart_flush_discarded_packets_total = smart;
+            ns.resync_discarded_packets_total = resync;
+            let mut ps = PbPeerStats::new();
+            ps.neteq_stats = ::protobuf::MessageField::some(ns);
+            let mut peer_stats = std::collections::HashMap::new();
+            peer_stats.insert("bob_apd2".to_string(), ps);
+            let hp = create_test_health_packet("sess_apd2", "meet_apd2", "alice_apd2", peer_stats);
+            assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        };
+        let value = |cause: &str| {
+            gauge_value(
+                "videocall_audio_packets_discarded_total",
+                &[
+                    ("meeting_id", "meet_apd2"),
+                    ("session_id", "sess_apd2"),
+                    ("from_peer", "alice_apd2"),
+                    ("to_peer", "bob_apd2"),
+                    ("cause", cause),
+                ],
+            )
+        };
+
+        send(Some(3), Some(41));
+        assert_eq!(value("smart_flush"), Some(3.0));
+        send(None, Some(42));
+        assert_eq!(value("smart_flush"), None);
+        assert_eq!(value("resync_to_live"), Some(42.0));
+    }
+
+    #[test]
+    fn audio_playout_underrun_totals_export_and_are_gc_d() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let send = |ms: Option<u64>, events: Option<u64>| {
+            let mut ns = PbNetEqStats::new();
+            ns.playout_underrun_ms_total = ms;
+            ns.playout_underrun_events_total = events;
+            let mut ps = PbPeerStats::new();
+            ps.neteq_stats = ::protobuf::MessageField::some(ns);
+            let mut peer_stats = std::collections::HashMap::new();
+            peer_stats.insert("bob_apu".to_string(), ps);
+            let hp = create_test_health_packet("sess_apu", "meet_apu", "alice_apu", peer_stats);
+            assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        };
+        let labels = [
+            ("meeting_id", "meet_apu"),
+            ("session_id", "sess_apu"),
+            ("from_peer", "alice_apu"),
+            ("to_peer", "bob_apu"),
+        ];
+        let ms = || gauge_value("videocall_audio_playout_underrun_ms_total", &labels);
+        let events = || gauge_value("videocall_audio_playout_underrun_events_total", &labels);
+
+        send(Some(1834), Some(12));
+        assert_eq!(ms(), Some(1834.0));
+        assert_eq!(events(), Some(12.0));
+        send(Some(0), Some(0));
+        assert_eq!(ms(), Some(0.0), "an explicit 0 is a report, not an absence");
+        send(None, Some(3));
+        assert_eq!(ms(), None, "a field that goes absent drops its series");
+        assert_eq!(events(), Some(3.0));
+
+        send(Some(7), Some(4));
+        assert_eq!((ms(), events()), (Some(7.0), Some(4.0)));
+        remove_per_peer_metrics("meet_apu", "sess_apu", "alice_apu", "bob_apu");
+        assert_eq!(
+            (ms(), events()),
+            (None, None),
+            "a departed pair must not leave either series behind"
+        );
+    }
+
+    #[test]
     fn fps_decoder_output_exports_per_bucket_and_is_gc_d() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
@@ -5906,7 +6060,6 @@ mod tests {
         assert!(result.is_ok());
 
         // from_peer = reporter (reporting_user_id); to_peer = the reported peer (peer_stats key).
-        // #1954: per-pair series are keyed only by the 4 stable ids (no reporter_name/peer_name).
         let labels = [
             ("meeting_id", "meet_scr_1660"),
             ("session_id", "sess_scr_1660"),
@@ -6074,7 +6227,6 @@ mod tests {
         let peer = "bob_fps0_2145";
 
         // from_peer = reporter (reporting_user_id); to_peer = the reported peer (peer_stats key).
-        // #1954: per-pair series are keyed only by the 4 stable ids.
         let labels = [
             ("meeting_id", meeting_id),
             ("session_id", session_id),
@@ -7084,7 +7236,6 @@ mod tests {
 
     #[test]
     fn test_per_pair_metrics_carry_no_name_labels() {
-        // #1954: per-pair series keyed only by (meeting_id, session_id, from_peer, to_peer).
         // Reverting metrics.rs + peer_labels back to 6 labels re-attaches the name labels and
         // fails the !matching_series_has_label asserts below — the mutation guard.
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));

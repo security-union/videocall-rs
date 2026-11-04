@@ -163,6 +163,20 @@ impl WebNetEq {
     }
 }
 
+impl WebNetEq {
+    /// `get_audio` plus the frame's RMS, taken from the Rust samples before the copy to JS.
+    pub fn get_audio_with_rms(&self) -> Result<(js_sys::Float32Array, f32), JsValue> {
+        let mut neteq_ref = self.neteq.borrow_mut();
+        let neteq = neteq_ref
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("NetEq not initialized. Call init() first."))?;
+
+        let frame = neteq.get_audio().map_err(Self::map_err)?;
+        let rms = crate::frame_rms(&frame.samples);
+        Ok((js_sys::Float32Array::from(frame.samples.as_slice()), rms))
+    }
+}
+
 /// Initialization hook for WebAssembly workers. Currently a no-op; retained
 /// for API compatibility with existing worker bootstrap scripts.
 #[wasm_bindgen(js_name = initNetEq)]

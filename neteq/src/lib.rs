@@ -47,9 +47,30 @@ pub use packet::{AudioPacket, RtpHeader};
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use web::WebNetEq;
 
+/// RMS of one PCM frame; the same left-to-right `f32` sum as `videocall_client`'s
+/// `rms_of_samples`, which the main thread uses for the VAD on the old path.
+pub fn frame_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sum_squares: f32 = 0.0;
+    for &sample in samples {
+        sum_squares += sample * sample;
+    }
+    (sum_squares / samples.len() as f32).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rms_matches_hand_computed_frames() {
+        assert_eq!(frame_rms(&[]), 0.0);
+        assert_eq!(frame_rms(&[0.0; 480]), 0.0);
+        assert_eq!(frame_rms(&[0.5; 480]), 0.5);
+        assert_eq!(frame_rms(&[3.0, -4.0]), (12.5f32).sqrt());
+    }
 
     #[test]
     fn basic_functionality() {

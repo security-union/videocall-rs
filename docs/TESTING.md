@@ -44,7 +44,7 @@ Prerequisites: `docker` (with Compose v2), `make`, `node` (LTS), `openssl`.
 make e2e-doctor                           # one-shot diagnostic — run this first
 make e2e-install                          # `npm ci` + `playwright install chromium`
 make e2e-build                            # build E2E stack images
-make e2e-up                               # start the stack (ports 3001/8080/8081/4433/5321)
+make e2e-up                               # start the stack (ports 3001/8080/8081/4433/5321, NATS 127.0.0.1:14222)
 make e2e SPEC=two-users-meeting           # run a single spec
 make e2e                                  # run all specs
 make e2e-down                             # tear down the stack and remove volumes
@@ -360,8 +360,11 @@ Run one browser test binary locally:
 
 ```bash
 cd dioxus-ui
-CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --test home_integration
+CHROMEDRIVER=$(which chromedriver) ../scripts/wasm-browser-test cargo test --target wasm32-unknown-unknown --test home_integration
 ```
+
+Wrap every local wasm browser test run in `scripts/wasm-browser-test`. Unwrapped,
+a run that times out hangs on, and leaks, the Chrome its runner orphaned.
 
 Build all Dioxus wasm test binaries without launching Chrome:
 
@@ -384,10 +387,12 @@ cargo test --target wasm32-unknown-unknown --test device_integration
 cargo test --target wasm32-unknown-unknown --test home_integration
 cargo test --target wasm32-unknown-unknown --test login_provider_logo
 cargo test --target wasm32-unknown-unknown --test meeting_ended_overlay
+cargo test --target wasm32-unknown-unknown --test meeting_restarted_overlay
 cargo test --target wasm32-unknown-unknown --test meeting_footer
 cargo test --target wasm32-unknown-unknown --test meetings_list_owner_gating
 cargo test --target wasm32-unknown-unknown --test meeting_password_prompt
 cargo test --target wasm32-unknown-unknown --test grid_overflow_badge
+cargo test --target wasm32-unknown-unknown --test overflow_participant_list
 cargo test --target wasm32-unknown-unknown --test screen_share_detach
 cargo test --target wasm32-unknown-unknown --test screen_share_state
 cargo test --target wasm32-unknown-unknown --test speaking_indicators
@@ -412,19 +417,13 @@ cargo test --target wasm32-unknown-unknown --test speaker_highlight_panel
 cargo test --target wasm32-unknown-unknown --test self_tile_inline_rename
 cargo test --target wasm32-unknown-unknown --test portrait_camera_fit
 cargo test --target wasm32-unknown-unknown --test diagnostics_packets_config
+cargo test --target wasm32-unknown-unknown --test captions_overlay
 ```
 
-If you want to match the CI workflow even more closely, kill leftover browser
-processes between binaries:
-
-```bash
-pkill -f chromedriver || true
-pkill -f chrome || true
-sleep 1
-```
-
-Use that cleanup between `cargo test` invocations if you see renderer hangs or
-cross-test browser state issues locally.
+Prefix each `cargo test` line above with `../scripts/wasm-browser-test`; it kills the
+Chrome its own run orphans. Do not clean up with `pkill -f chrome` (it also matches
+your own browser's processes and Electron apps' helpers) or `pkill -f chromedriver`
+(it also kills other sessions' live test drivers).
 
 ### When to add a Dioxus browser integration test
 
@@ -493,7 +492,7 @@ separate native `cargo test -p <crate> --lib` steps in the same workflow.
 
 ```bash
 export CHROMEDRIVER=/path/to/chrome-for-testing/chromedriver
-cd videocall-transport && wasm-pack test --headless --chrome
+cd videocall-transport && ../scripts/wasm-browser-test wasm-pack test --headless --chrome
 ```
 
 A Homebrew `chromedriver` is often a dangling symlink on macOS and the version
@@ -531,7 +530,7 @@ remedy; the suites above are the correct layer.
 
 One real-Chromium harness does exist in this tree, and it is easy to miss:
 `e2e/bots-app/src/clock-source.browser.spec.ts`, run manually via
-`npx playwright test --config bots-app/src/playwright.clock.config.ts` (see
+`make e2e-bots-clock` (see
 `e2e/bots-app/README.md`). No workflow ever **executes** it (CI does lint and
 type-check it, like everything under `e2e/`), so a test added there proves nothing
 on a PR — prefer the CI-run suites above, and reach for this one only for a local
@@ -544,7 +543,7 @@ a regression test to **fail on the un-fixed code**. `scripts/mutation-check.py`
 runs that check from a declared spec instead of ad-hoc shell:
 
 ```bash
-scripts/mutation-check.py run    <spec>.json
+scripts/mutation-check.py run    <spec>.json [--only NAME]... [--changed-since REV] [--list]
 scripts/mutation-check.py verify <spec>.json [--sha REV]
 ```
 
@@ -557,6 +556,66 @@ reproduce.
 so a mutation that kills some *other* test is reported as an error rather than a
 pass. `verify` asserts claims against **committed blobs** (`git show <sha>:<path>`),
 which is the check to use after a fix round; `--sha` audits an older commit.
+
+`run` with no filter runs every mutation. `--only` is a name substring and
+repeats (`--only a --only b` runs the union); a filter that matches nothing is an
+error. `--changed-since REV` picks the targeted set itself — a mutation is selected
+when:
+
+- its spec entry is new or edited since REV (compared by name and content);
+- its `find` anchor overlaps lines changed since REV — for a Python file, the whole
+  outermost function or method around any changed line; otherwise the changed
+  lines ±3. An anchor whose occurrence count no longer matches `occurrences`
+  (gone, or newly duplicated) is selected so preflight reports it;
+- a test in its `expect_kills` is defined in a changed region now, or was at REV
+  (so an edited or deleted test counts). The name maps to a definition per
+  runner: `unittest` — a `def` whose name contains it, with its decorators and the
+  header (decorators, bases) of each enclosing class; `cargo` — an `fn`
+  containing the last `::` segment, with the `#[...]`, `//` and blank lines
+  above it; `vitest` — an `it`/`test`/`describe` title containing the last ` > `
+  segment (a `.skip`/`.only`/`.todo` sits on that line). The `cargo`/`vitest` span runs to the
+  matching brace; braces in a one-line string or after `//` are skipped, but a
+  brace in a multi-line string, a block comment, a char literal or a regex still
+  counts and can end the span early.
+
+Every entry is selected when the spec's `runner`, `cwd`, `command` or `node`
+changed since REV, when `baseline_tests` fell (a test may have dropped out of
+discovery), or when a changed Python file does not parse (now or at REV). A spec
+with no `baseline_tests` at REV gets no fall check. Attribute and decorator spans
+can reach into the previous Rust item or a class's first method, which only
+over-selects.
+
+Pass a **pinned SHA** — the last commit the reviewer saw — never a branch name.
+Changes are read from `git diff REV` (the working tree against REV), so a REV that
+moves changes the selection, and a base branch that moved since you branched
+compares against code you never touched.
+
+**Not seen** — run the full spec when one of these is what changed:
+
+- production code outside the mutated file, such as a module it imports;
+- production code in the mutated file but outside the changed function (Python)
+  or the ±3-line window (other files), such as a module constant or a helper the
+  mutated function calls;
+- test helpers, fixtures and shared setup (only the test's own definition is read);
+- a skip or `cfg` on an enclosing Rust module or `describe` block, unless
+  `baseline_tests` fell with it;
+- untracked files.
+
+`--list` prints each selected mutation, why, and the count, and runs nothing.
+`--only` and `--changed-since` combine as a union.
+
+The suite runs in its own session, and its whole process group is killed when it
+exits or times out. While a run is in progress, Ctrl-C, SIGTERM, SIGHUP and GNU
+`timeout` are held until the next safe point: the tool kills the suite's group,
+restores the mutated file, then exits with 128 + the first signal's number. A second
+signal does not cut that short. Not covered: SIGKILL (`kill -9`, `timeout -k`), which
+leaves the suite and the mutation, and a grandchild that starts its own session.
+The suite's output goes to files, so a grandchild that keeps stdout open does not
+hold a finished run.
+
+**Fix rounds.** While fixing review findings, run only the targeted set:
+`run <spec>.json --changed-since <last-reviewed-sha>` (check it first with
+`--list`). Run the full spec once after approval, before merge.
 
 It exists because every one of these produced a wrong conclusion that a reviewer
 then had to catch:

@@ -98,6 +98,13 @@ pub enum ApiError {
     #[error("Incorrect meeting password.")]
     InvalidMeetingPassword,
 
+    /// The signed-in user is not the expected user, so nothing was written
+    /// (HTTP 409, code AVATAR_IDENTITY_MISMATCH).
+    #[error(
+        "The signed-in account is not the account this change was made for; nothing was changed."
+    )]
+    IdentityMismatch,
+
     /// A server error with status code and body.
     #[error("Server error ({status}): {body}")]
     ServerError { status: u16, body: String },

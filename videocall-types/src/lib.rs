@@ -129,6 +129,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::MEETING_TIMER => {
                 write!(f, "MEETING_TIMER")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::CAPTION => {
+                write!(f, "CAPTION")
+            }
         }
     }
 }
@@ -162,7 +165,7 @@ mod video_stats_wire_tests {
     //! (`protobuf::Message::{write_to_bytes, parse_from_bytes}`) — not an in-memory field set — so
     //! they fail if the field is mis-tagged, dropped, or read with the wrong wire type, and they
     //! pin the proto3 backward-compatibility default for peers that predate the field.
-    use crate::protos::health_packet::VideoStats;
+    use crate::protos::health_packet::{NetEqStats, VideoStats};
     use protobuf::Message;
 
     #[test]
@@ -280,6 +283,69 @@ mod video_stats_wire_tests {
             "a pre-#2201 peer must decode as None so the server can OMIT the series rather \
              than publish a 0 that reads as total keyframe delivery loss"
         );
+    }
+
+    #[test]
+    fn neteq_playout_underrun_totals_round_trip_and_preserve_presence() {
+        let round_trip = |ms: Option<u64>, events: Option<u64>| {
+            let mut stats = NetEqStats::new();
+            stats.playout_underrun_ms_total = ms;
+            stats.playout_underrun_events_total = events;
+            let decoded = NetEqStats::parse_from_bytes(
+                &stats.write_to_bytes().expect("NetEqStats must serialize"),
+            )
+            .expect("serialized NetEqStats must parse back");
+            (
+                decoded.playout_underrun_ms_total,
+                decoded.playout_underrun_events_total,
+            )
+        };
+        assert_eq!(round_trip(None, None), (None, None));
+        assert_eq!(round_trip(Some(0), Some(0)), (Some(0), Some(0)));
+        assert_eq!(round_trip(Some(1834), None), (Some(1834), None));
+    }
+
+    #[test]
+    fn neteq_discard_totals_round_trip_and_preserve_presence() {
+        let round_trip = |smart_flush: Option<u64>, resync: Option<u64>| {
+            let mut stats = NetEqStats::new();
+            stats.smart_flush_discarded_packets_total = smart_flush;
+            stats.resync_discarded_packets_total = resync;
+            let decoded = NetEqStats::parse_from_bytes(
+                &stats.write_to_bytes().expect("NetEqStats must serialize"),
+            )
+            .expect("serialized NetEqStats must parse back");
+            (
+                decoded.smart_flush_discarded_packets_total,
+                decoded.resync_discarded_packets_total,
+            )
+        };
+
+        assert_eq!(round_trip(None, None), (None, None), "unset must stay None");
+        assert_eq!(
+            round_trip(Some(0), Some(41)),
+            (Some(0), Some(41)),
+            "an explicit 0 must not collapse to None"
+        );
+        assert_eq!(
+            round_trip(Some(0), None),
+            (Some(0), None),
+            "field 8 must stay None while field 7 is set"
+        );
+        assert_eq!(
+            round_trip(None, Some(0)),
+            (None, Some(0)),
+            "an explicit 0 on field 8 must not collapse to None"
+        );
+
+        let wire = |smart_flush: Option<u64>, resync: Option<u64>| {
+            let mut stats = NetEqStats::new();
+            stats.smart_flush_discarded_packets_total = smart_flush;
+            stats.resync_discarded_packets_total = resync;
+            stats.write_to_bytes().expect("NetEqStats must serialize")
+        };
+        assert_eq!(wire(Some(0), None), [0x38, 0x00], "field 7, varint 0");
+        assert_eq!(wire(None, Some(0)), [0x40, 0x00], "field 8, varint 0");
     }
 
     /// Issue #2657: guards codegen/toolchain drift that would zero-elide an explicitly-set
@@ -590,5 +656,10 @@ mod reaction_packet_wire_tests {
             "MEETING_TIMER (client-authored, re-broadcast) must never collide with MEETING \
              (server-authored, dropped on client ingress) — they have opposite trust models"
         );
+    }
+
+    #[test]
+    fn caption_packet_type_is_wire_value_20() {
+        assert_eq!(PacketType::CAPTION.value(), 20);
     }
 }

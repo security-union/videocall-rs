@@ -176,9 +176,9 @@ pre_env() {
 
 preflight() {
   local n="${1:-}" quota="${BOT_QUOTA:-bot-load-quota}" out rc line
-  local spec_replicas status_replicas update_rev gen obs k v dim need head cap fails_before
+  local spec_replicas status_replicas update_rev gen obs fleet_size k v dim need head cap fails_before
   local listed=0 active=0 add bind="" bind_cap=-1 bind_need=0 bind_head=0 stale_pods=""
-  local committed name phase rev tmpl=""
+  local committed name phase rev tmpl="" fleet_sed="" fleet_note=""
   if [[ ! "$n" =~ ^[0-9]{1,4}$ ]]; then
     echo "bot-ctl: preflight requires a replica count of 0-9999 (got \"$n\")" >&2
     return 1
@@ -187,8 +187,12 @@ preflight() {
 
   rc=0
   # shellcheck disable=SC2016
-  out="$(kubectl get statefulset "$STS" -n "$NS" -o go-template='{{.spec.replicas}} {{.status.replicas}} {{.status.updateRevision}} {{.metadata.generation}} {{.status.observedGeneration}}{{"\n"}}{{if .spec.template.spec.initContainers}}initContainers{{"\n"}}{{end}}{{range .spec.template.spec.containers}}{{range $k, $v := .resources.limits}}limits.{{$k}} {{$v}}{{"\n"}}{{end}}{{range $k, $v := .resources.requests}}requests.{{$k}} {{$v}}{{"\n"}}{{end}}{{end}}')" || rc=$?
-  read -r spec_replicas status_replicas update_rev gen obs <<<"$out" || true
+  out="$(kubectl get statefulset "$STS" -n "$NS" -o go-template='{{.spec.replicas}} {{.status.replicas}} {{.status.updateRevision}} {{.metadata.generation}} {{.status.observedGeneration}} {{range .spec.template.spec.containers}}{{range .env}}{{if eq .name "BOT_FLEET_SIZE"}}{{if .valueFrom}}valueFrom{{else}}={{or .value ""}}{{end}}{{end}}{{end}}{{end}}{{"\n"}}{{if .spec.template.spec.initContainers}}initContainers{{"\n"}}{{end}}{{range .spec.template.spec.containers}}{{range $k, $v := .resources.limits}}limits.{{$k}} {{$v}}{{"\n"}}{{end}}{{range $k, $v := .resources.requests}}requests.{{$k}} {{$v}}{{"\n"}}{{end}}{{end}}')" || rc=$?
+  read -r spec_replicas status_replicas update_rev gen obs fleet_size <<<"$out" || true
+  case "$fleet_size" in
+  valueFrom) fleet_size="set by valueFrom" ;;
+  =*) fleet_size="${fleet_size#=}" ;;
+  esac
   if ((rc != 0)) || [[ ! "$spec_replicas" =~ ^[0-9]+$ || ! "$status_replicas" =~ ^[0-9]+$ ]]; then
     echo "✗ could not read statefulset/$STS in namespace $NS (exit $rc); nothing checked" >&2
     return 1
@@ -283,17 +287,31 @@ preflight() {
   committed="$(grep -E '^  replicas: [0-9]+$' "$SCRIPT_DIR/statefulset.yaml" || true)"
   if [[ "$(grep -c . <<<"$committed")" != 1 ]]; then
     pre_bad "could not find exactly one spec.replicas line in k8s/statefulset.yaml; drift unknown"
+  elif [[ "$(grep -cE '^ +- name: BOT_FLEET_SIZE$' "$SCRIPT_DIR/statefulset.yaml")" != 1 ]]; then
+    pre_bad "could not find exactly one BOT_FLEET_SIZE in k8s/statefulset.yaml; drift unknown"
   else
-    pre_diff "statefulset/$STS (replicas ignored: live $spec_replicas, committed ${committed##* })" statefulset.yaml \
-      < <(sed -E "s/^  replicas: [0-9]+\$/  replicas: $spec_replicas/" "$SCRIPT_DIR/statefulset.yaml")
+    fleet_note="BOT_FLEET_SIZE compared: live ${fleet_size:-unset} is not a number"
+    if [[ "$fleet_size" =~ ^[0-9]+$ ]]; then
+      fleet_sed="/^ +- name: BOT_FLEET_SIZE\$/{n;s/^( +value: )\"[0-9]+\"\$/\\1\"$fleet_size\"/;}"
+      fleet_note="BOT_FLEET_SIZE ignored: live $fleet_size"
+    fi
+    pre_diff "statefulset/$STS (replicas ignored: live $spec_replicas, committed ${committed##* }; $fleet_note)" statefulset.yaml \
+      < <(sed -E -e "s/^  replicas: [0-9]+\$/  replicas: $spec_replicas/" -e "${fleet_sed:-}" "$SCRIPT_DIR/statefulset.yaml")
   fi
   pre_env
+  if ((n > 0)) && [[ "$fleet_size" != "$n" ]]; then
+    pre_bad "BOT_FLEET_SIZE is ${fleet_size:-unset}, not $n: the talking-clock schedule would leave pods silent or overlapping. Set it before scaling up (it restarts running pods): kubectl -n $NS set env statefulset/$STS BOT_FLEET_SIZE=$n"
+  elif ((n > 0)); then
+    pre_ok "BOT_FLEET_SIZE is $n, the target replica count"
+  fi
 
   if ((PRE_FAILS > 0)); then
     echo "preflight: $PRE_FAILS check(s) failed; do not scale to $n" >&2
     return 1
   fi
-  echo "preflight: all checks passed; scale with: kubectl -n $NS scale statefulset/$STS --replicas=$n"
+  echo "preflight: all checks passed; scale with:"
+  ((n == 0)) || echo "  kubectl -n $NS set env statefulset/$STS BOT_FLEET_SIZE=$n"
+  echo "  kubectl -n $NS scale statefulset/$STS --replicas=$n"
 }
 
 if [[ "$1" == preflight ]]; then

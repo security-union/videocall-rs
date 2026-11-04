@@ -4,6 +4,7 @@
 import contextlib
 import io
 import json
+import math
 import os
 import shutil
 import sys
@@ -111,6 +112,27 @@ class Reproduces20261001(unittest.TestCase):
         self.assertEqual(rc, 0, out.getvalue())
         self.assertIn("manifest OK: 7 participants", out.getvalue())
 
+    def test_a_rust_record_carries_its_video_source_into_the_manifest(self):
+        run = RunDir(self)
+        run.rust("bot-002", video_source="ekg-replay", replay_answer_keyframe_requests=False,
+                 replay_forced_keyframes=[0, 0, 0])
+        run.rust("bot-004", video_source="ekg-replay", replay_answer_keyframe_requests=True,
+                 replay_forced_keyframes=[3, 2, 1], replay_tier_change_keyframes=[2, 1, 0])
+        run.rust("bot-003", video_source=None, replay_answer_keyframe_requests=None)
+        got = by_uid(run.collect().manifest)
+        self.assertEqual(got["bot-002"]["video_source"], "ekg-replay")
+        self.assertIs(got["bot-002"]["replay_answer_keyframe_requests"], False)
+        self.assertEqual(got["bot-002"]["replay_forced_keyframes"], [0, 0, 0])
+        self.assertEqual(got["bot-004"]["replay_forced_keyframes"], [3, 2, 1])
+        self.assertEqual(got["bot-004"]["replay_tier_change_keyframes"], [2, 1, 0])
+        self.assertIsNone(got["bot-003"]["video_source"])
+        self.assertIsNone(got["bot-003"]["replay_answer_keyframe_requests"])
+        for uid in ("alice", PROBE):
+            self.assertNotIn("video_source", got[uid])
+            self.assertNotIn("replay_answer_keyframe_requests", got[uid])
+            self.assertNotIn("replay_forced_keyframes", got[uid])
+            self.assertNotIn("replay_tier_change_keyframes", got[uid])
+
     def test_the_confirmed_mute_is_written_at_t_issued(self):
         events = RunDir(self).collect().manifest["events"]
         self.assertEqual([(e["action"], e["at"]) for e in events], [("mute", 1790867561.964954976)])
@@ -203,6 +225,42 @@ class Errors(unittest.TestCase):
         run = RunDir(self)
         run.edit(PROBE_RECORD, lambda r: r["unverified"].append({"field": "publishes.mic", "reason": "not found"}))
         self.assertCollectError(run, f"{PROBE}: publishes.mic is unverified")
+
+    def test_an_unverified_transport_intended_is_an_error(self):
+        run = RunDir(self)
+        reason = "no 'Transport preference applied:' line since the latest launch"
+        run.edit(PROBE_RECORD, lambda r: r["unverified"].append({"field": "transport_intended", "reason": reason}))
+        self.assertCollectError(run, f"{PROBE}: transport_intended is unverified: {reason}")
+
+    def test_the_recorded_transport_and_fallbacks_reach_the_manifest(self):
+        run = RunDir(self)
+        run.edit(PROBE_RECORD, lambda r: r.update(transport_observed="websocket", transport_fallbacks=1,
+                                                  transport_applied={"preference": "webtransport", "source": "default",
+                                                                     "wt_urls": 1, "ws_urls": 1}))
+        got = by_uid(run.collect().manifest)
+        self.assertEqual((got[PROBE]["transport_observed"], got[PROBE]["transport_fallbacks"],
+                          got[PROBE]["transport_preferred"]), ("websocket", 1, "webtransport"))
+        self.assertEqual(cq_manifest.validate_manifest(run.collect().manifest), [])
+        self.assertNotIn("transport_fallbacks", got["bot-002"])
+
+    def test_a_record_without_the_transport_fields_leaves_them_out(self):
+        run = RunDir(self)
+        run.edit(PROBE_RECORD, lambda r: [r.pop(k, None) for k in ("transport_observed", "transport_fallbacks")])
+        self.assertNotIn("transport_fallbacks", by_uid(run.collect().manifest)[PROBE])
+
+    def test_a_malformed_fallback_count_is_an_error(self):
+        for bad in (-1, True, "1", None):
+            with self.subTest(bad=bad):
+                run = RunDir(self)
+                run.edit(PROBE_RECORD, lambda r, bad=bad: r.update(transport_observed="websocket",
+                                                                  transport_fallbacks=bad))
+                self.assertCollectError(run, f"{PROBE}: transport_observed 'websocket' / transport_fallbacks")
+
+    def test_an_unverified_stagger_ms_is_an_error(self):
+        run = RunDir(self)
+        reason = "the stagger sleep failed, so the bot joined before the drawn delay elapsed"
+        run.edit(PROBE_RECORD, lambda r: r["unverified"].append({"field": "stagger_ms", "reason": reason}))
+        self.assertCollectError(run, f"{PROBE}: stagger_ms is unverified: {reason}")
 
     def test_an_unknown_network_is_an_error(self):
         run = RunDir(self)
@@ -784,6 +842,78 @@ class AntonioRoundOne(unittest.TestCase):
         os.remove(os.path.join(run.path, PROBE_RECORD))
         run.edit(RUST, lambda f: f.update(participants=f["participants"] + [probe], planned=7))
         self.assertIn(f"{PROBE}: record fleet 'browser' but {RUST} is a rust record", self.errors(run))
+
+
+class DecodeBudgetWaiver(unittest.TestCase):
+    """#2914 PR-5: the probe's decode-budget posture reaches the manifest as recorded; nothing is loosened by it."""
+
+    def run_with(self, budget, plan=None):
+        run = RunDir(self)
+        run.edit(PROBE_RECORD, lambda r: r.update(decode_budget=budget))
+        if plan is not None:
+            run.plan_participant(PROBE, decode_budget=plan)
+        return run
+
+    def test_an_off_probe_carries_its_waiver_into_a_valid_manifest(self):
+        run = self.run_with({"requested": "off", "observed": "all"}, plan="off")
+        got = run.collect()
+        self.assertEqual(by_uid(got.manifest)[PROBE]["decode_budget"], {"requested": "off", "observed": "all"})
+        self.assertEqual(cq_manifest.validate_manifest(got.manifest), [])
+        self.assertNotIn("decode_budget", by_uid(got.manifest)["alice"])
+        self.assertEqual(run.cli(), cq_collect.EXIT_OK)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = call_quality_score.main(["--manifest", os.path.join(run.path, "manifest.json"), "--validate-only"])
+        self.assertEqual(rc, 0)
+
+    def test_a_client_probe_is_carried_too(self):
+        got = self.run_with({"requested": "client", "observed": None}).collect()
+        self.assertEqual(by_uid(got.manifest)[PROBE]["decode_budget"], {"requested": "client", "observed": None})
+
+    def assertRefused(self, run, text):
+        with self.assertRaises(cq_collect.CollectError) as cm:
+            run.collect()
+        self.assertTrue(any(text in e for e in cm.exception.errors), cm.exception.errors)
+
+    def test_a_planned_posture_without_a_record_of_it_is_refused(self):
+        run = RunDir(self)
+        run.plan_participant(PROBE, decode_budget="off")
+        self.assertRefused(run, "the plan sets decode budget 'off'")
+
+    def test_a_posture_other_than_planned_is_refused(self):
+        self.assertRefused(self.run_with({"requested": "client", "observed": None}, plan="off"),
+                           "differs from the plan's 'off'")
+
+    def test_a_waiver_that_did_not_stick_is_refused(self):
+        self.assertRefused(self.run_with({"requested": "off", "observed": None}, plan="off"),
+                           "'off' requested but None read back")
+
+    def test_an_undeclared_override_is_refused(self):
+        self.assertRefused(self.run_with({"requested": "client", "observed": "all"}, plan="client"),
+                           "'client' requested but 'all' read back")
+
+    def test_a_malformed_posture_is_refused(self):
+        self.assertRefused(self.run_with({"requested": "maybe", "observed": None}), "must be {requested")
+
+
+class MillisecondMarks(unittest.TestCase):
+    def test_marks_land_on_the_millisecond_lattice(self):
+        run = RunDir(self)
+        shift = {"join_start": 0.3272026, "hold_start": 0.1294928, "hold_end": 0.6775823}
+        run.events(keep=lambda e: True)
+        p = os.path.join(run.path, cq_collect.EVENTS_FILE)
+        with open(p, encoding="utf-8") as fh:
+            lines = [json.loads(line) for line in fh if line.strip()]
+        for e in lines:
+            e["wall"] += shift.get(e["type"], 0)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(e) + "\n" for e in lines)
+        step = run.collect().manifest["steps"][0]
+        self.assertEqual((step["join_start"], step["hold_start"], step["hold_end"]),
+                         (JS + 0.327, HS + 0.13, HE + 0.677))
+        self.assertEqual(RunDir(self).collect().manifest["steps"][0]["hold_start"], HS)
+        exact = 1791366066.129
+        for up in (True, False):
+            self.assertEqual(cq_collect._ms_mark(math.nextafter(exact, math.inf if up else -math.inf), up), exact)
 
 
 class Code(unittest.TestCase):

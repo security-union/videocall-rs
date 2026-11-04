@@ -644,7 +644,7 @@ describe("control server", () => {
     expect(launch).toContain(`"videoMode":"clock"`);
   });
 
-  it("POST /launch carries diagPackets off and refuses on (#2970)", async () => {
+  it("POST /launch carries diagPackets on and off and refuses junk (#2970)", async () => {
     const body = {
       meetingURL: "https://example.com/meeting/X",
       participant: "probe",
@@ -654,20 +654,29 @@ describe("control server", () => {
       authBackend: "none",
     };
     const auth = { authorization: `Bearer ${token}` };
+    const bad = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: auth,
+      body: { ...body, diagPackets: "maybe" },
+    });
+    expect(bad.status).toBe(400);
+    expect(surface.callLog.filter((l) => l.startsWith("launch:"))).toHaveLength(0);
     const on = await fetchJson(handle.port, `/launch`, {
       method: "POST",
       headers: auth,
-      body: { ...body, diagPackets: "on" },
+      body: { ...body, participant: "probe-on", diagPackets: "on" },
     });
-    expect(on.status).toBe(400);
-    expect(surface.callLog.filter((l) => l.startsWith("launch:"))).toHaveLength(0);
+    expect(on.status).toBe(201);
+    expect(surface.callLog.find((l) => l.startsWith("launch:"))).toContain(`"diagPackets":"on"`);
     const off = await fetchJson(handle.port, `/launch`, {
       method: "POST",
       headers: auth,
       body: { ...body, diagPackets: "off" },
     });
     expect(off.status).toBe(201);
-    expect(surface.callLog.find((l) => l.startsWith("launch:"))).toContain(`"diagPackets":"off"`);
+    expect(surface.callLog.filter((l) => l.startsWith("launch:"))[1]).toContain(
+      `"diagPackets":"off"`,
+    );
   });
 
   it("POST /launch rejects an unknown video mode", async () => {
@@ -1070,7 +1079,7 @@ describe("control server: run profiles", () => {
       headers: auth,
       body: {
         name: "diag-bad",
-        source: { bots: [{ ...bot, participant: "a", diagPackets: "on" }] },
+        source: { bots: [{ ...bot, participant: "a", diagPackets: "maybe" }] },
       },
     });
     expect(bad.status).toBe(400);

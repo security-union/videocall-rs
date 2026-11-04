@@ -91,7 +91,10 @@ pub struct JoinRoom {
     pub downlink_congested_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The room token's `iat` claim; `None` for a token without one (#2934).
     pub token_iat: Option<i64>,
-    /// Closes this session's transport when its participant is kicked (#2934).
+    pub meeting_started_at_ms: Option<u64>,
+    /// Client-supplied `?conn_seq=`: shared by one election's candidates, strictly
+    /// higher for each later election or reconnect of the same `instance_id`.
+    pub conn_seq: Option<u64>,
     pub closer: Option<Recipient<ForceClose>>,
 }
 

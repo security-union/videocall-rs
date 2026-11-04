@@ -42,9 +42,34 @@ pub struct Message {
     pub msg: Bytes,
 }
 
-/// Server-initiated close of a transport session whose participant was
-/// removed by the host (#2934). The transport closes after a short flush
-/// delay so a notice queued ahead of it can still reach the client.
-#[derive(ActixMessage, Debug, Clone, Copy)]
+/// Server-initiated close of a transport session. The transport closes after
+/// a short flush delay so a notice queued ahead of it can still reach the client.
+#[derive(ActixMessage, Debug, Clone, Copy, PartialEq, Eq)]
 #[rtype(result = "()")]
-pub struct ForceClose;
+pub enum ForceClose {
+    RemovedByHost,
+    InstanceSuperseded,
+}
+
+impl ForceClose {
+    pub fn description(self) -> &'static str {
+        match self {
+            ForceClose::RemovedByHost => "removed by host",
+            ForceClose::InstanceSuperseded => "meeting instance superseded",
+        }
+    }
+
+    pub fn wt_close(self) -> (u32, &'static [u8]) {
+        use videocall_types::wt_close::*;
+        match self {
+            ForceClose::RemovedByHost => (
+                WT_CLOSE_CODE_REMOVED_BY_HOST,
+                WT_CLOSE_REASON_REMOVED_BY_HOST,
+            ),
+            ForceClose::InstanceSuperseded => (
+                WT_CLOSE_CODE_INSTANCE_SUPERSEDED,
+                WT_CLOSE_REASON_INSTANCE_SUPERSEDED,
+            ),
+        }
+    }
+}

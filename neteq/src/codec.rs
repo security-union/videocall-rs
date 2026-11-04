@@ -53,6 +53,11 @@ pub trait AudioDecoder {
     }
 }
 
+/// The Opus module embedded in `scripts/opus-decoder.min.js`, inflated (#3210).
+/// `opus_decoder_wasm_tests` keeps the two files in step.
+#[cfg(any(feature = "web", test))]
+pub const OPUS_DECODER_WASM: &[u8] = include_bytes!("scripts/opus-decoder.wasm");
+
 // Platform-specific codec implementations
 #[cfg(feature = "web")]
 mod browser_detect;
@@ -225,3 +230,102 @@ pub type OpusDecoder = native_opus::NativeOpusDecoder;
 // For non-wasm32 targets without native feature, use stub
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
 pub type OpusDecoder = StubOpusDecoder;
+
+#[cfg(test)]
+mod opus_decoder_wasm_tests {
+    use super::OPUS_DECODER_WASM;
+
+    const SCRIPT: &str = include_str!("scripts/opus-decoder.min.js");
+
+    /// The library's `simple-yenc` decoder (with its `dynEncode` header and crc32 check), as the
+    /// script runs it before inflating.
+    fn yenc_decode(text: &str) -> Vec<u8> {
+        const CP1252: [u32; 33] = [
+            0, 8364, 0, 8218, 402, 8222, 8230, 8224, 8225, 710, 8240, 352, 8249, 338, 0, 381, 0, 0,
+            8216, 8217, 8220, 8221, 8226, 8211, 8212, 732, 8482, 353, 8250, 339, 0, 382, 376,
+        ];
+        let units: Vec<u32> = text.encode_utf16().map(u32::from).collect();
+        assert!(text.starts_with("dynEncode"));
+        let hex = |from: usize, to: usize| {
+            u32::from_str_radix(&text[from..to], 16).expect("hex in the dynEncode header")
+        };
+        let version = hex(9, 11);
+        assert_eq!(version, 1, "the dynEncode version this test decodes");
+        let offset = hex(11, 13);
+        let crc = i32::from_le_bytes(
+            (0..4)
+                .map(|k| hex(13 + 2 * k, 15 + 2 * k) as u8)
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        );
+        let mut out = Vec::with_capacity(units.len());
+        let mut escaped = false;
+        let mut s = 21;
+        while s < units.len() {
+            let mut n = units[s];
+            if n == 61 && !escaped {
+                escaped = true;
+                s += 1;
+                continue;
+            }
+            if n == 92 && s + 5 < units.len() && (units[s + 1] == 117 || units[s + 1] == 85) {
+                let digits: String = units[s + 2..s + 6]
+                    .iter()
+                    .map(|&u| char::from_u32(u).unwrap())
+                    .collect();
+                n = u32::from_str_radix(&digits, 16).unwrap();
+                s += 5;
+            }
+            if n > 255 {
+                if let Some(index) = CP1252.iter().position(|&c| c != 0 && c == n) {
+                    n = index as u32 + 127;
+                }
+            }
+            if escaped {
+                escaped = false;
+                n = n.wrapping_sub(64);
+            }
+            let byte = if n < offset && n > 0 {
+                n.wrapping_add(256 - offset)
+            } else {
+                n.wrapping_sub(offset)
+            };
+            out.push(byte as u8);
+            s += 1;
+        }
+        let mut table = [0u32; 256];
+        for (i, entry) in table.iter_mut().enumerate() {
+            let mut h = (i as u32) << 24;
+            for _ in 0..8 {
+                h = if h & 0x8000_0000 != 0 {
+                    (h << 1) ^ 0x04C1_1DB7
+                } else {
+                    h << 1
+                };
+            }
+            *entry = h;
+        }
+        let sum = out.iter().fold(u32::MAX, |n, &b| {
+            (n << 8) ^ table[(((n >> 24) as u8) ^ b) as usize]
+        });
+        assert_eq!(sum as i32, crc, "simple-yenc crc32");
+        out
+    }
+
+    #[test]
+    fn yenc_decode_maps_the_last_cp1252_entry() {
+        assert_eq!(yenc_decode("dynEncode0158c69fc964\u{178}"), [71]);
+    }
+
+    #[test]
+    fn the_inflated_module_is_the_one_the_script_embeds() {
+        let getter = "Object.defineProperty(n,\"I\",{get:()=>String.raw`";
+        let start = SCRIPT.find(getter).expect("the Opus module getter") + getter.len();
+        let len = SCRIPT[start..].find('`').expect("end of the module string");
+        let deflated = yenc_decode(&SCRIPT[start..start + len]);
+        let inflated = miniz_oxide::inflate::decompress_to_vec(&deflated).expect("raw deflate");
+        assert_eq!(inflated.len(), OPUS_DECODER_WASM.len());
+        assert!(inflated == OPUS_DECODER_WASM);
+    }
+}

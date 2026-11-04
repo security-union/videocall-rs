@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Mutation receipts for #3204 in the jitter buffer:",
+    "  scripts/mutation-check.py run videocall-codecs/mutation-spec-3204.json"
+  ],
+  "runner": "cargo",
+  "cwd": ".",
+  "command": [
+    "cargo",
+    "test",
+    "--no-fail-fast",
+    "-p",
+    "videocall-codecs",
+    "--lib"
+  ],
+  "baseline_tests": 124,
+  "mutations": [
+    {
+      "name": "the stream-restart keyframe is discarded again",
+      "file": "videocall-codecs/src/jitter_buffer.rs",
+      "find": "                    // Fall through: the keyframe starts the flushed stream (#3204).\n",
+      "replace": "                    return;\n",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_keyframe_from_a_lower_sequence_space_is_decoded_not_discarded",
+        "a_publisher_restart_decodes_from_its_first_keyframe",
+        "a_publisher_restart_that_loses_its_keyframe_recovers_at_the_next_one"
+      ]
+    },
+    {
+      "name": "an old frame is no longer rejected",
+      "file": "videocall-codecs/src/jitter_buffer.rs",
+      "find": "                        self.last_keyframe_arrival = arrival;\n                    }\n                    return;\n                }",
+      "replace": "                        self.last_keyframe_arrival = arrival;\n                    }\n                }",
+      "occurrences": 1,
+      "expect_kills": [
+        "old_frames_are_ignored",
+        "flush_on_too_many_consecutive_old_frames"
+      ]
+    },
+    {
+      "name": "the stream-open request holds the gate for the full arrival timeout",
+      "file": "videocall-codecs/src/jitter_buffer.rs",
+      "find": "            self.awaiting_proactive_keyframe_timeout_ms = MAX_PLAYOUT_AGE_MS;\n",
+      "replace": "            self.awaiting_proactive_keyframe_timeout_ms = PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS;\n",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_denied_first_request_after_a_switch_is_retried_within_the_freshness_deadline"
+      ]
+    },
+    {
+      "name": "the eviction request inherits the short stream-open gate",
+      "file": "videocall-codecs/src/jitter_buffer.rs",
+      "find": "                    self.awaiting_proactive_keyframe_timeout_ms =\n                        PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS;\n",
+      "replace": "",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_denied_first_request_after_a_switch_is_retried_within_the_freshness_deadline"
+      ]
+    }
+  ]
+}

@@ -27,7 +27,10 @@ exclude = [
     "videocall-cli/nokhwa/nokhwa-bindings-macos",
     "videocall-cli/nokhwa/nokhwa-bindings-windows",
     "videocall-cli/nokhwa/nokhwa-bindings-linux",
-    "videocall-cli/nokhwa/nokhwa-core"
+    "videocall-cli/nokhwa/nokhwa-core",
+    "vendor/quinn-proto",
+    "vendor/quinn",
+    "vendor/web-transport-quinn"
 ]
 
 [workspace.dependencies]
@@ -39,3 +42,10 @@ web-transport-quinn = "0.11.9"
 # Compile-time embedded Unicode emoji table (no_std, wasm-compatible). Backs the
 # CUSTOM reaction picker + its exact-emoji validation allowlist (issue 1884).
 emojis = "0.9"
+
+# Vendored from crates.io to carry the issue 3116 send-reserve patch; a [patch] applies to
+# every workspace crate that depends on these (actix-api, bot, vcprobe, videocall-cli, videocall-sdk).
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
+quinn = { path = "vendor/quinn" }
+web-transport-quinn = { path = "vendor/web-transport-quinn" }

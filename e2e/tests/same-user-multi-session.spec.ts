@@ -413,7 +413,7 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
       );
       await pinWebSocketTransport(contextA);
       await pinWebSocketTransport(contextB);
-      // Session B asserts the split layout, opt-in for a received share since #2792.
+      // Session B asserts the split layout.
       await seedShareViewMode(contextB, "enlarged");
       const pageA = await contextA.newPage();
       const pageB = await contextB.newPage();

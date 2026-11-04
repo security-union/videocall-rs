@@ -15,7 +15,9 @@ use crate::auth::{
     check_session, get_user_profile, handle_not_authenticated, redirect_not_authenticated,
     UserProfile,
 };
+use crate::components::announcement_overrides::AnnouncementOverrides;
 use crate::components::attendants::AttendantsComponent;
+use crate::components::avatar::AvatarCacheProvider;
 use crate::components::invalid_meeting_id::{
     invalid_meeting_id_message, meeting_route_id_error, InvalidMeetingIdNotice,
 };
@@ -31,13 +33,16 @@ use crate::context::{
     display_name_owner_id, email_to_display_name, get_or_create_local_user_id, is_guid_like,
     load_display_name_from_storage, load_transport_preference_with_source,
     resolve_transport_config, save_display_name_owner_to_storage, save_display_name_to_storage,
-    validate_display_name, DisplayNameCtx, HostRefreshNonceCtx, TransportPreferenceCtx,
+    validate_display_name, DisplayNameCtx, HostRefreshNonceCtx, MeetingRejoinCtx,
+    TransportPreferenceCtx,
 };
 use crate::meeting_api::{
     get_meeting_guest_info, get_meeting_info, join_meeting, JoinError, JoinMeetingResponse,
 };
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
 
@@ -68,6 +73,7 @@ pub enum MeetingStatus {
         allow_guests: bool,
         recording_allowed_for_all: bool,
         chat_allowed_for_all: bool,
+        announcement_overrides: AnnouncementOverrides,
     },
     Rejected,
     InvalidMeetingId(String),
@@ -78,7 +84,12 @@ pub enum MeetingStatus {
 pub fn MeetingPage(id: String) -> Element {
     match meeting_route_id_error(&id) {
         Some(reason) => rsx! { InvalidMeetingIdNotice { reason } },
-        None => rsx! { MeetingPageContent { id } },
+        // Dioxus compares keys only inside a list, so a new id remounts.
+        None => rsx! {
+            for id in std::iter::once(id) {
+                MeetingPageContent { key: "{id}", id }
+            }
+        },
     }
 }
 
@@ -129,7 +140,7 @@ fn MeetingPageContent(id: String) -> Element {
         use_effect(move || {
             if oauth_enabled().unwrap_or(false) {
                 let id_for_auth = id_for_auth.clone();
-                wasm_bindgen_futures::spawn_local(async move {
+                spawn(async move {
                     let (session_result, guest_info_result) =
                         futures::join!(check_session(), get_meeting_guest_info(&id_for_auth),);
                     match session_result {
@@ -152,7 +163,7 @@ fn MeetingPageContent(id: String) -> Element {
     use_effect(move || {
         let auth_done = auth_checked();
         if auth_done && oauth_enabled().unwrap_or(false) {
-            wasm_bindgen_futures::spawn_local(async move {
+            spawn(async move {
                 if let Ok(profile) = get_user_profile().await {
                     if !profile.user_id.starts_with("anon-") {
                         // Pre-fill the display name from the OAuth profile when the
@@ -197,15 +208,30 @@ fn MeetingPageContent(id: String) -> Element {
     // another variant) and clears `observer_token_signal` to None. Because the
     // effect only watches `observer_token_signal`, writing to `meeting_status`
     // does not cause re-entrant execution of this effect.
-    let mut observer_client = use_signal(|| None::<VideoCallClient>);
+    let observer_client: Rc<RefCell<Option<VideoCallClient>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    // Cleared on unmount, so a push callback that outlives the page writes nothing.
+    let alive = use_hook(|| Rc::new(Cell::new(true)));
+    {
+        let observer_client = observer_client.clone();
+        let alive = alive.clone();
+        use_drop(move || {
+            alive.set(false);
+            if let Some(client) = observer_client.borrow_mut().take() {
+                let _ = client.disconnect();
+            }
+        });
+    }
     {
         let meeting_id = id.clone();
+        let observer_client = observer_client.clone();
+        let alive = alive.clone();
         use_effect(move || {
             let observer_token = match observer_token_signal() {
                 Some(t) if !t.is_empty() => t,
                 _ => {
                     // Clean up observer client when leaving WaitingForMeeting
-                    if let Some(client) = observer_client.write().take() {
+                    if let Some(client) = observer_client.borrow_mut().take() {
                         let _ = client.disconnect();
                     }
                     return;
@@ -232,7 +258,6 @@ fn MeetingPageContent(id: String) -> Element {
             let applied_pref = (transport_pref_ctx.0)();
             let (effective_wt_enabled, websocket_urls, webtransport_urls) =
                 resolve_transport_config(
-                    applied_pref,
                     webtransport_enabled().unwrap_or(false),
                     websocket_urls,
                     webtransport_urls,
@@ -254,6 +279,8 @@ fn MeetingPageContent(id: String) -> Element {
             // push-notification `target_user_id` to this observer client.
             let user_id_for_client = current_user_id().unwrap_or_else(|| display_name.clone());
 
+            let (webtransport_connect_timeout_ms, websocket_connect_timeout_ms) =
+                crate::constants::connect_timeouts_ms();
             let opts = VideoCallClientOptions {
                 user_id: user_id_for_client,
                 display_name: display_name.clone(),
@@ -263,6 +290,11 @@ fn MeetingPageContent(id: String) -> Element {
                 webtransport_urls,
                 enable_e2ee: false,
                 enable_webtransport: effective_wt_enabled,
+                prefer_webtransport: applied_pref
+                    == crate::context::TransportPreference::WebTransport,
+                on_election_progress: None,
+                start_in_fallback: crate::context::load_transport_fallback(applied_pref),
+                on_fallback_memory: Some(crate::context::fallback_memory_callback(applied_pref)),
                 max_received_layer: crate::constants::max_received_layer(),
                 skip_canvas_paint: crate::constants::skip_canvas_paint(),
                 // Issue #1884: this is the pre-meeting OBSERVER client (waiting for
@@ -276,6 +308,7 @@ fn MeetingPageContent(id: String) -> Element {
                 // callback would be unreachable code, not a missing feature.
                 // There is deliberately no timer in the waiting room.
                 on_meeting_timer: None,
+                on_caption: None,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting for meeting)");
                 }),
@@ -294,12 +327,14 @@ fn MeetingPageContent(id: String) -> Element {
                 enable_health_reporting: false,
                 health_reporting_interval_ms: None,
                 on_encoder_settings_update: None,
-                rtt_testing_period_ms: 3000,
+                webtransport_connect_timeout_ms,
+                websocket_connect_timeout_ms,
                 rtt_probe_interval_ms: None,
                 on_meeting_info: None,
                 on_meeting_ended: None,
                 on_meeting_activated: Some(VcCallback::from({
                     let meeting_id = meeting_id.clone();
+                    let alive = alive.clone();
                     move |_| {
                         log::info!("Meeting activated push received, re-joining...");
                         let meeting_id = meeting_id.clone();
@@ -309,7 +344,11 @@ fn MeetingPageContent(id: String) -> Element {
                         // handler (Inner::on_inbound_media) which runs
                         // outside any Dioxus runtime context. Calling
                         // dioxus::spawn() here would panic.
+                        let alive = alive.clone();
                         wasm_bindgen_futures::spawn_local(async move {
+                            if !alive.get() {
+                                return;
+                            }
                             // Clear the observer token FIRST so the observer
                             // effect tears down the client without re-entering.
                             observer_token_signal.set(None);
@@ -339,6 +378,7 @@ fn MeetingPageContent(id: String) -> Element {
                             )
                             .await
                             {
+                                _ if !alive.get() => {}
                                 Ok(response) => {
                                     // Issue 1613: the meeting is active now, so
                                     // no later request in this session can need
@@ -355,6 +395,8 @@ fn MeetingPageContent(id: String) -> Element {
                                     current_user_id.set(Some(effective_user_id));
                                     let determined_host = response.host_display_name.clone();
                                     let determined_host_uid = response.host_user_id.clone();
+                                    let announcement_overrides =
+                                        AnnouncementOverrides::from_status(&response);
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
@@ -374,6 +416,7 @@ fn MeetingPageContent(id: String) -> Element {
                                                         .recording_allowed_for_all,
                                                     chat_allowed_for_all: response
                                                         .chat_allowed_for_all,
+                                                    announcement_overrides,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -446,6 +489,7 @@ fn MeetingPageContent(id: String) -> Element {
                 on_host_mute: None,
                 on_host_disable_video: None,
                 on_participant_kicked: None,
+                on_instance_superseded: None,
                 on_host_granted: None,
                 on_host_revoked: None,
                 on_peer_event: None,
@@ -455,6 +499,7 @@ fn MeetingPageContent(id: String) -> Element {
                 on_peer_left: None,
                 on_peer_joined: None,
                 on_display_name_changed: None,
+                on_avatar_changed: None,
                 // Observer-only client: never decode or play back media.
                 // Users waiting for the meeting to start must not hear audio
                 // from the active call.
@@ -477,7 +522,7 @@ fn MeetingPageContent(id: String) -> Element {
             if let Err(e) = client.connect() {
                 log::error!("Failed to connect observer client: {e}");
             }
-            observer_client.set(Some(client));
+            *observer_client.borrow_mut() = Some(client);
         });
     }
 
@@ -517,7 +562,7 @@ fn MeetingPageContent(id: String) -> Element {
                 meeting_status.set(MeetingStatus::Joining);
             }
 
-            wasm_bindgen_futures::spawn_local(async move {
+            spawn(async move {
                 match join_meeting(&meeting_id, Some(&display_name), password.as_deref()).await {
                     Ok(response) => {
                         // Use the API-provided user_id when available;
@@ -546,6 +591,7 @@ fn MeetingPageContent(id: String) -> Element {
                         });
                         host_display_name.set(determined_host.clone());
                         host_user_id.set(determined_host_uid.clone());
+                        let announcement_overrides = AnnouncementOverrides::from_status(&response);
                         match response.status.as_str() {
                             "admitted" => {
                                 observer_token_signal.set(None);
@@ -562,6 +608,7 @@ fn MeetingPageContent(id: String) -> Element {
                                         recording_allowed_for_all: response
                                             .recording_allowed_for_all,
                                         chat_allowed_for_all: response.chat_allowed_for_all,
+                                        announcement_overrides,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -662,6 +709,7 @@ fn MeetingPageContent(id: String) -> Element {
         move |status: JoinMeetingResponse| {
             let determined_host = status.host_display_name.clone();
             let determined_host_uid = status.host_user_id.clone();
+            let announcement_overrides = AnnouncementOverrides::from_status(&status);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
             host_user_id.set(determined_host_uid.clone());
@@ -677,6 +725,7 @@ fn MeetingPageContent(id: String) -> Element {
                 allow_guests: status.allow_guests,
                 recording_allowed_for_all: status.recording_allowed_for_all,
                 chat_allowed_for_all: status.chat_allowed_for_all,
+                announcement_overrides,
             });
         }
     };
@@ -699,7 +748,7 @@ fn MeetingPageContent(id: String) -> Element {
             let mut meeting_status = meeting_status;
             let mut host_display_name = host_display_name;
             let mut host_user_id = host_user_id;
-            wasm_bindgen_futures::spawn_local(async move {
+            spawn(async move {
                 match crate::meeting_api::check_status(&id).await {
                     Ok(status) => {
                         if status.status == "admitted" {
@@ -719,6 +768,9 @@ fn MeetingPageContent(id: String) -> Element {
                                     allow_guests: status.allow_guests,
                                     recording_allowed_for_all: status.recording_allowed_for_all,
                                     chat_allowed_for_all: status.chat_allowed_for_all,
+                                    announcement_overrides: AnnouncementOverrides::from_status(
+                                        &status,
+                                    ),
                                 });
                             }
                         }
@@ -752,6 +804,15 @@ fn MeetingPageContent(id: String) -> Element {
             });
         }
     };
+
+    {
+        let mut on_join = on_join_meeting.clone();
+        let rejoin = use_callback(move |_: ()| {
+            came_from_waiting_room.set(false);
+            on_join(None);
+        });
+        use_context_provider(|| MeetingRejoinCtx(rejoin));
+    }
 
     // Auto-join: when the username is already set and the meeting status is
     // NotJoined, trigger the join flow automatically so the user does not
@@ -827,10 +888,15 @@ fn MeetingPageContent(id: String) -> Element {
                     end_on_host_leave,
                     recording_allowed_for_all,
                     chat_allowed_for_all,
+                    announcement_overrides,
 
                     // Waiting room
                 },
             ) => rsx! {
+                AvatarCacheProvider {
+                    meeting_id: id.clone(),
+                    room_token: room_token.clone(),
+                    own_user_id: current_user_id(),
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
@@ -850,6 +916,8 @@ fn MeetingPageContent(id: String) -> Element {
                     allow_guests:*allow_guests,
                     recording_allowed_for_all: *recording_allowed_for_all,
                     chat_allowed_for_all: *chat_allowed_for_all,
+                    announcement_overrides: *announcement_overrides,
+                }
                 }
             },
             (Some(_), MeetingStatus::Waiting { observer_token }) => {

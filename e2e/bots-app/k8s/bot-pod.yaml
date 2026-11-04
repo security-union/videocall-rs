@@ -34,7 +34,7 @@ spec:
     - name: hclcr-io
   # Non-root at the pod level. Chromium runs WITHOUT --no-sandbox (see
   # src/bot.ts CHROME_ARGS), so it uses the setuid chrome-sandbox, which
-  # requires a non-root caller. uid 1000 == the image's `pwuser`.
+  # requires a non-root caller. uid 1000 is the image's `ubuntu`.
   securityContext:
     runAsNonRoot: true
     runAsUser: 1000

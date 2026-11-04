@@ -462,7 +462,9 @@ test.describe("Guest join flow", () => {
       await expect(admittedGuestAdmitButton).not.toBeVisible({ timeout: 5_000 });
 
       await hostPage.goto(`/meeting/${meetingId}/settings`);
-      await expect(hostPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
+      await expect(hostPage.getByRole("heading", { name: "Options", exact: true })).toBeVisible({
+        timeout: 10_000,
+      });
       // The rendered label is "Admitted can admit"
       // (dioxus-ui/src/components/meeting_options_controls.rs:197). This filter
       // previously used the retired string "Participants can admit others", which
@@ -797,7 +799,8 @@ test.describe("Guest join flow", () => {
       await expect(guestPage.getByRole("heading", { name: "Too many attempts" })).toBeVisible({
         timeout: 20_000,
       });
-      await expect(error).toContainText("your password was not checked");
+      await expect(error).toContainText("was not checked");
+      await expect(error).not.toContainText(/incorrect|wrong|invalid/i);
       // Still in the prompt, not on the generic "Unable to join" dead end.
       await expect(guestPage.getByTestId("meeting-password-prompt")).toBeVisible();
       await expect(guestPage.getByText("Unable to join")).toHaveCount(0);
@@ -848,7 +851,9 @@ test.describe("Guest join flow", () => {
         timeout: 20_000,
       });
 
-      await guestPage.getByRole("button", { name: "Use a different name" }).click();
+      await guestPage
+        .getByRole("button", { name: "Change name", exact: true })
+        .click({ timeout: 10_000 });
 
       // Back on the guest form, with the typed name intact and focus on it.
       await expect(guestPage.getByTestId("meeting-password-prompt")).toHaveCount(0);

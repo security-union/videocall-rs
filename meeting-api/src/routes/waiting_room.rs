@@ -23,6 +23,7 @@ use videocall_meeting_types::{
 };
 
 use crate::auth::AuthUser;
+use crate::captions;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
@@ -103,6 +104,8 @@ pub async fn admit_participant(
     let (row, activation) = db_participants::admit(&state.db, meeting.id, &body.user_id, healthy)
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.user_id))?;
+    captions::spawn_new_instance_revoke(state.nats.clone(), &meeting_id, &activation);
+    nats_events::publish_instance_started(state.nats.as_ref(), &meeting_id, &activation).await;
     nats_events::announce_demotions(
         state.nats.as_ref(),
         &meeting_id,
@@ -147,6 +150,8 @@ pub async fn admit_all(
     let healthy = state.presence_healthy().await?;
     let (rows, activation) = db_participants::admit_all(&state.db, meeting.id, healthy).await?;
     let admitted_count = rows.len();
+    captions::spawn_new_instance_revoke(state.nats.clone(), &meeting_id, &activation);
+    nats_events::publish_instance_started(state.nats.as_ref(), &meeting_id, &activation).await;
     nats_events::announce_demotions(
         state.nats.as_ref(),
         &meeting_id,

@@ -66,6 +66,47 @@ impl AnnouncedIds {
     }
 }
 
+pub(crate) const PANEL_BOTTOM_VAR: &str = "--waiting-panel-bottom";
+
+pub fn publish_panel_bottom(panel: &web_sys::Element, toasts: &web_sys::HtmlElement) {
+    let bottom = format!("{}px", panel.get_bounding_client_rect().bottom());
+    let _ = toasts.style().set_property(PANEL_BOTTOM_VAR, &bottom);
+}
+
+struct PanelBottom {
+    toasts: web_sys::HtmlElement,
+    observer: web_sys::ResizeObserver,
+    _on_resize: wasm_bindgen::closure::Closure<dyn FnMut(js_sys::Array)>,
+}
+
+impl PanelBottom {
+    fn observe(panel: web_sys::Element) -> Option<Self> {
+        let toasts: web_sys::HtmlElement = panel
+            .parent_element()?
+            .query_selector(":scope > .peer-toasts")
+            .ok()??
+            .unchecked_into();
+        let (target, stack) = (panel.clone(), toasts.clone());
+        let on_resize = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(
+            move |_: js_sys::Array| publish_panel_bottom(&target, &stack),
+        );
+        let observer = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()).ok()?;
+        observer.observe(&panel);
+        Some(Self {
+            toasts,
+            observer,
+            _on_resize: on_resize,
+        })
+    }
+}
+
+impl Drop for PanelBottom {
+    fn drop(&mut self) {
+        self.observer.disconnect();
+        let _ = self.toasts.style().remove_property(PANEL_BOTTOM_VAR);
+    }
+}
+
 #[component]
 pub fn HostControls(
     meeting_id: String,
@@ -79,6 +120,7 @@ pub fn HostControls(
     let mut error = use_signal(|| None::<String>);
     let mut expanded = use_signal(|| true);
     let announced: AnnouncedIds = use_hook(AnnouncedIds::default);
+    let panel_bottom = use_hook(|| Rc::new(RefCell::new(None::<PanelBottom>)));
 
     let fetch_waiting_list = {
         let meeting_id = meeting_id.clone();
@@ -202,6 +244,7 @@ pub fn HostControls(
     }
 
     if !is_admitted || waiting().is_empty() {
+        drop(panel_bottom.borrow_mut().take());
         return rsx! {};
     }
 
@@ -260,6 +303,11 @@ pub fn HostControls(
 
     rsx! {
         div { class: "host-controls-container",
+            onmounted: move |evt: MountedEvent| {
+                if let Some(panel) = evt.data().downcast::<web_sys::Element>() {
+                    *panel_bottom.borrow_mut() = PanelBottom::observe(panel.clone());
+                }
+            },
             button { class: "host-controls-toggle", onclick: move |_| expanded.set(!expanded()),
                 span { class: "waiting-badge", "{waiting().len()}" }
                 span { "Waiting to join" }
@@ -488,6 +536,7 @@ mod dom_tests {
             MOUNTED.with(|m| *m.borrow_mut() = Some(mounted));
         });
         rsx! {
+            div { class: "peer-toasts" }
             if mounted() {
                 HostControls {
                     meeting_id: "m-knock".to_string(),
@@ -764,5 +813,55 @@ mod dom_tests {
         assert_eq!(decisions(), ["admit:bob"], "the held button admits bob");
 
         unmount(root).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_panel_publishes_its_bottom_edge_until_it_closes() {
+        js_sys::eval(
+            "window.__panelErrors = []; \
+             window.addEventListener('error', (e) => window.__panelErrors.push(String(e.message)));",
+        )
+        .unwrap();
+        let root = mount_with_waiting(&["alice", "bob"]).await;
+        root.set_attribute("style", "position: fixed; top: 0")
+            .unwrap();
+        let toasts: web_sys::HtmlElement = root
+            .query_selector(".peer-toasts")
+            .unwrap()
+            .expect("the toast stack")
+            .unchecked_into();
+        let panel = || root.query_selector(".host-controls-container").unwrap();
+        let edge = || panel().map(|p| format!("{}px", p.get_bounding_client_rect().bottom()));
+        let published = || toasts.style().get_property_value(PANEL_BOTTOM_VAR).unwrap();
+        wait_until("the open panel's edge", || Some(published()) == edge()).await;
+        let expanded = published();
+
+        let toggle = || {
+            root.query_selector(".host-controls-toggle")
+                .unwrap()
+                .expect("the toggle")
+                .unchecked_into::<web_sys::HtmlElement>()
+                .click()
+        };
+        toggle();
+        wait_until("the collapsed panel's edge", || {
+            Some(published()) == edge() && published() != expanded
+        })
+        .await;
+        toggle();
+
+        host_sees(&root, &[]).await;
+        wait_until("the edge withdrawn", || published().is_empty()).await;
+        host_sees(&root, &["alice"]).await;
+        wait_until("the reopened panel's edge", || Some(published()) == edge()).await;
+        MOUNTED.with(|m| m.borrow().expect("mounted signal").set(false));
+        wait_until("the edge withdrawn on unmount", || published().is_empty()).await;
+        unmount(root).await;
+        TimeoutFuture::new(50).await;
+        let errors = js_sys::eval("window.__panelErrors").unwrap();
+        assert_eq!(
+            js_sys::Array::from(&errors).to_vec(),
+            Vec::<wasm_bindgen::JsValue>::new()
+        );
     }
 }

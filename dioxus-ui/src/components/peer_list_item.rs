@@ -26,7 +26,36 @@ use crate::components::icons::recording::RecordingIcon;
 use crate::components::raised_hands::raised_hand_badge_label;
 use crate::context::AppearanceSettingsCtx;
 use dioxus::prelude::*;
+use std::collections::HashSet;
 use std::rc::Rc;
+
+/// Which roster rows have their action menu open, keyed by session id, so the
+/// roster can hold its order while one is (issue 3123).
+#[derive(Clone, PartialEq)]
+pub struct RosterMenuTracker {
+    pub open_rows: Signal<HashSet<String>>,
+    pub row: String,
+}
+
+impl RosterMenuTracker {
+    fn report(&self, open: bool) {
+        let mut open_rows = self.open_rows;
+        let changed = open_rows
+            .try_peek()
+            .is_ok_and(|rows| rows.contains(&self.row) != open);
+        if !changed {
+            return;
+        }
+        let Ok(mut rows) = open_rows.try_write() else {
+            return;
+        };
+        if open {
+            rows.insert(self.row.clone());
+        } else {
+            rows.remove(&self.row);
+        }
+    }
+}
 
 #[component]
 pub fn PeerListItem(
@@ -59,6 +88,7 @@ pub fn PeerListItem(
     #[props(default)] on_kick: Option<EventHandler<()>>,
     #[props(default)] on_transfer_host: Option<EventHandler<()>>,
     #[props(default)] co_host_request: Option<CoHostRequest>,
+    #[props(default)] menu_tracker: Option<RosterMenuTracker>,
 ) -> Element {
     let effective_tooltip = if tooltip.is_empty() {
         name.clone()
@@ -104,6 +134,17 @@ pub fn PeerListItem(
             });
         }
     };
+    let has_menu = on_mute.is_some()
+        || on_disable_video.is_some()
+        || on_kick.is_some()
+        || on_transfer_host.is_some()
+        || co_host_request.is_some();
+    use_effect(use_reactive((&has_menu,), move |(has_menu,)| {
+        let open = peer_menu_open() && has_menu;
+        if let Some(tracker) = &menu_tracker {
+            tracker.report(open);
+        }
+    }));
 
     rsx! {
         div { class: "peer_item", title,
@@ -169,9 +210,7 @@ pub fn PeerListItem(
                     }
                 }
             }
-            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some()
-                || on_transfer_host.is_some() || co_host_request.is_some()
-            {
+            if has_menu {
                 div { class: "peer_item_menu_wrapper",
                     button {
                         class: "peer_item_menu_btn",

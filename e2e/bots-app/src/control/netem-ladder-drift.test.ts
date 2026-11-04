@@ -358,7 +358,7 @@ describe("BOT_HW_CONCURRENCY vs the audio a bot publishes (#2359)", () => {
   });
 });
 
-describe("a clock bot's audio term is nominal, not measured (#2359)", () => {
+describe("a clock bot's audio term is nominal, not measured (#2359, issue 3072)", () => {
   it("keeps the clock source's audio track at a gain of 0, exclusively", () => {
     const src = readFileSync(CLOCK_SOURCE, "utf8");
     const node = /const (\w+) = audioContext\.createGain\(\);/.exec(src);
@@ -384,7 +384,7 @@ describe("a clock bot's audio term is nominal, not measured (#2359)", () => {
 
   it("states in the README that a clock bot's audio term is nominal", () => {
     expect(rateCaveat()).toMatch(
-      /a clock-mode bot's audio term is nominal because `src\/clock-source\.js` routes its oscillator through a gain of 0/,
+      /a clock-mode bot's audio term is nominal because `src\/clock-source\.js` routes its oscillator through a gain of 0 and speaks only one turn in N/,
     );
   });
 });

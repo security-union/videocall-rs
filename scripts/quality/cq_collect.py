@@ -52,14 +52,16 @@ BROWSER_SCHEMA = "bots-app-participant-record/v0"
 PARTIAL_SCHEMA = cq_manifest.SCHEMA + "-partial"
 IMAGE_KEYS = ("ui", "relay_ws", "relay_wt", "bots_app", "rust_bot")
 STEP_MARKS = ("join_start", "hold_start", "hold_end")
+MARK_ROUND_UP = {"join_start": False, "hold_start": True, "hold_end": False}
 AT_CONFIRMED = ("unmute",)
 CLOCK_TOLERANCE_S = 2.0
 MAX_ABS_SKEW_MS = 30000
-RESERVED_NODES = ("local", "ci")
+RESERVED_NODES = ("local", "ci", "load-a")
 RECORD_TIMES = ("join_ts", "leave_ts")
 FILE_TIMES = ("started_at", "ended_at", "media_started_at")
 NETEM_UNVERIFIED = re.compile(r"set by POST /netem at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z); "
                               r"the shaping params are not read back")
+DECODE_BUDGET_READBACK = {"off": ("all",), "client": (None, "auto")}
 EXIT_OK, EXIT_PARTIAL, EXIT_ERROR = 0, 2, 3
 
 
@@ -85,6 +87,8 @@ class _Record:
     outcome: object = None
     file_times: dict = field(default_factory=dict)
     fleet: str = "browser"
+    decode_budget: object = None
+    transport: object = None
 
 
 def _num(v):
@@ -182,7 +186,10 @@ def _load_records(run_dir, meeting_id, errors):
         if not isinstance(unverified, list):
             errors.append(f"{path}: unverified must be a list")
             continue
-        recs.append(_Record(path, r["participant"], False, unverified, r.get("outcome")))
+        seen = ({k: r.get(k) for k in ("transport_observed", "transport_fallbacks", "transport_applied")}
+                if "transport_fallbacks" in r else None)
+        recs.append(_Record(path, r["participant"], False, unverified, r.get("outcome"),
+                            decode_budget=r.get("decode_budget"), transport=seen))
     return recs
 
 
@@ -199,6 +206,12 @@ def _match(recs, planned, errors):
         else:
             by_uid[uid] = rec
     return by_uid
+
+
+def _ms_mark(t, up):
+    v = t * 1000
+    ms = round(v) if abs(v - round(v)) < 1e-3 else (math.ceil(v) if up else math.floor(v))
+    return ms / 1000
 
 
 def _step_windows(plan_steps, events, missing, errors):
@@ -220,7 +233,7 @@ def _step_windows(plan_steps, events, missing, errors):
         row = {"step_id": s["step_id"], "n_target": s["n_target"]}
         for kind in STEP_MARKS:
             if (s["step_id"], kind) in marks:
-                row[kind] = marks[(s["step_id"], kind)]
+                row[kind] = _ms_mark(marks[(s["step_id"], kind)], MARK_ROUND_UP[kind])
             else:
                 missing.append(f"step {s['step_id']}: no {kind} in {EVENTS_FILE}")
         row["headline"] = s["headline"]
@@ -337,6 +350,40 @@ def _netem_excused(reason, windows, tol):
     return any(lo - tol <= t <= hi + tol for lo, hi in windows)
 
 
+def _decode_budget(uid, planned, rec, errors):
+    """The probe's decode-budget posture as recorded; carried only, so a waiver is visible in the manifest."""
+    want, got = planned.get("decode_budget"), rec.decode_budget
+    if got is None:
+        if want is not None:
+            errors.append(f"{uid}: the plan sets decode budget {want!r} but {rec.source} records none")
+        return None
+    observed = got.get("observed") if isinstance(got, dict) else None
+    if not isinstance(got, dict) or got.get("requested") not in DECODE_BUDGET_READBACK or not (
+            observed is None or isinstance(observed, str)):
+        errors.append(f"{uid}: decode_budget in {rec.source} must be {{requested: off|client, observed: str|null}}")
+        return None
+    if want is not None and got["requested"] != want:
+        errors.append(f"{uid}: decode budget {got['requested']!r} in {rec.source} differs from the plan's {want!r}")
+    if observed not in DECODE_BUDGET_READBACK[got["requested"]]:
+        errors.append(f"{uid}: decode budget {got['requested']!r} requested but {observed!r} read back after join")
+    return {"requested": got["requested"], "observed": observed}
+
+
+def _transport_seen(uid, rec, errors):
+    observed, fallbacks = rec.transport.get("transport_observed"), rec.transport.get("transport_fallbacks")
+    if observed not in cq_manifest.OBSERVED_TRANSPORTS or isinstance(fallbacks, bool) or not isinstance(
+            fallbacks, int) or fallbacks < 0:
+        errors.append(f"{uid}: transport_observed {observed!r} / transport_fallbacks {fallbacks!r} in {rec.source} "
+                      "must be websocket|webtransport|none|null and a count")
+        return {}
+    applied = rec.transport.get("transport_applied")
+    preferred = applied.get("preference") if isinstance(applied, dict) else None
+    if preferred is not None and not isinstance(preferred, str):
+        errors.append(f"{uid}: transport_applied.preference in {rec.source} must be a string")
+        return {}
+    return {"transport_observed": observed, "transport_fallbacks": fallbacks, "transport_preferred": preferred}
+
+
 def _participant(planned, rec, aliases, died, declared, netem, errors):
     uid, p = planned["user_id"], rec.part
     for k in ("fleet", "observer", "talker"):
@@ -349,7 +396,8 @@ def _participant(planned, rec, aliases, died, declared, netem, errors):
     if p.get("publishes") != planned["publishes"]:
         errors.append(f"{uid}: observed publishes {p.get('publishes')} differ from the plan's {planned['publishes']}")
     for u in rec.unverified:
-        if isinstance(u, dict) and str(u.get("field", "")).startswith("publishes"):
+        if isinstance(u, dict) and (str(u.get("field", "")).startswith("publishes")
+                                    or u.get("field") in ("transport_intended", "stagger_ms")):
             errors.append(f"{uid}: {u['field']} is unverified: {u.get('reason')}")
     net = p.get("network")
     why = [u.get("reason") for u in rec.unverified if isinstance(u, dict) and u.get("field") == "network"]
@@ -365,6 +413,8 @@ def _participant(planned, rec, aliases, died, declared, netem, errors):
     out = {"user_id": uid, "fleet": planned["fleet"], "role": planned["role"], "observer": planned["observer"],
            "talker": planned["talker"], "publishes": p.get("publishes"), "network": net,
            "transport_intended": p.get("transport_intended")}
+    if rec.transport is not None:
+        out.update(_transport_seen(uid, rec, errors))
     if "placement" in p:
         placement = p["placement"]
         if isinstance(placement, dict) and placement.get("node") is not None:
@@ -378,6 +428,13 @@ def _participant(planned, rec, aliases, died, declared, netem, errors):
         out["placement"] = placement
     if "stagger_ms" in p:
         out["stagger_ms"] = p["stagger_ms"]
+    for k in ("video_source", "replay_answer_keyframe_requests", "replay_forced_keyframes",
+              "replay_tier_change_keyframes"):
+        if k in p:
+            out[k] = p[k]
+    budget = _decode_budget(uid, planned, rec, errors)
+    if budget is not None:
+        out["decode_budget"] = budget
     out["join_ts"] = p["join_ts"]
     if p.get("leave_ts") is not None or not died:
         out["leave_ts"] = p.get("leave_ts")

@@ -596,7 +596,7 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
           await ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
         } else {
           // The host views the share in the split layout (its right-strip
-          // popup is the case under test), opt-in since #2792.
+          // popup is the case under test).
           await seedShareViewMode(ctx, "enlarged");
         }
         members.push({

@@ -740,6 +740,8 @@ export interface RemoteLaunchCmd {
    */
   ssoStateFileRaw?: string | null;
   diagPackets?: DiagPackets | null;
+  /** The run's deadline in epoch seconds, passed on as `--deadline`. */
+  deadlineSecs?: number | null;
 }
 
 export function buildRemoteLaunchCommand(spec: RemoteLaunchCmd): string {
@@ -765,8 +767,11 @@ export function buildRemoteLaunchCommand(spec: RemoteLaunchCmd): string {
   if (spec.ssoStateFileRaw !== undefined && spec.ssoStateFileRaw !== null) {
     cmd.push("--sso-state-file", spec.ssoStateFileRaw);
   }
-  if (spec.diagPackets === "off") {
-    cmd.push("--diag-packets", "off");
+  if (spec.diagPackets) {
+    cmd.push("--diag-packets", spec.diagPackets);
+  }
+  if (spec.deadlineSecs != null) {
+    cmd.push("--deadline", String(spec.deadlineSecs));
   }
   parts.push(cmd.join(" "));
   return parts.join(" && ");

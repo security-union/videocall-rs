@@ -1,5 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
+import { wakeActionBar } from "../helpers/controls";
 import { waitForServices } from "../helpers/wait-for-services";
 
 test.describe("Dock Settings section switching", () => {
@@ -80,6 +81,19 @@ test.describe("Dock Settings section switching", () => {
   async function closeSettingsModal(page: Page): Promise<void> {
     await page.locator('.device-settings-modal button[aria-label="Close settings"]').click();
     await expect(page.locator(".device-settings-modal")).not.toBeVisible({ timeout: 5_000 });
+  }
+
+  const TIMER_TRIGGER = "#meeting-timer-trigger";
+  const TIMER_POPOVER = '[data-testid="meeting-timer-popover"]';
+
+  async function openTimerPopover(page: Page): Promise<void> {
+    await wakeActionBar(page);
+    const trigger = page.locator(TIMER_TRIGGER);
+    await expect(trigger).toBeVisible({ timeout: 15_000 });
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await trigger.click();
+    await expect(page.locator(TIMER_POPOVER)).toBeVisible({ timeout: 10_000 });
+    await expect(trigger).toHaveAttribute("aria-expanded", "true");
   }
 
   test("Action Bar… opens modal on Preferences section when closed", async ({ page }) => {
@@ -163,5 +177,46 @@ test.describe("Dock Settings section switching", () => {
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
     await expect(page.locator(".settings-nav-button.active")).toContainText("Preferences");
     await expect(page.locator("#settings-panel-preferences")).toBeVisible();
+  });
+
+  test("Action Bar… closes the host's meeting-timer popover when it opens Settings", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "timer_popover");
+    await openTimerPopover(page);
+
+    await openDockMenu(page);
+    await clickDockSettings(page);
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('[data-testid="settings-nav-preferences"]')).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await expect(page.locator(TIMER_POPOVER)).toHaveCount(0);
+
+    await closeSettingsModal(page);
+    await expect(page.locator(TIMER_POPOVER)).toHaveCount(0);
+    await expect(page.locator(TIMER_TRIGGER)).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("the self avatar button closes the host's meeting-timer popover when it opens Settings", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "timer_avatar");
+    const avatar = page.locator(
+      "#host-controls-nav .placeholder-content > button#self-avatar-edit-button",
+    );
+    await expect(avatar).toHaveCount(1, { timeout: 15_000 });
+    await openTimerPopover(page);
+
+    await avatar.click();
+    await expect(page.locator("#settings-tab-profile")).toHaveAttribute("aria-selected", "true", {
+      timeout: 10_000,
+    });
+    await expect(page.locator(TIMER_POPOVER)).toHaveCount(0);
+
+    await closeSettingsModal(page);
+    await expect(page.locator(TIMER_POPOVER)).toHaveCount(0);
+    await expect(page.locator(TIMER_TRIGGER)).toHaveAttribute("aria-expanded", "false");
   });
 });

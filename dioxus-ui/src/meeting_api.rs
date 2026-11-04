@@ -7,6 +7,7 @@ use futures::future::{FutureExt, Shared};
 use std::cell::{Cell, RefCell};
 pub use videocall_meeting_client::ApiError as JoinError;
 pub use videocall_meeting_types::responses::CoHostEntry;
+pub use videocall_meeting_types::responses::CoHostSuggestion;
 pub use videocall_meeting_types::responses::CreateMeetingResponse;
 pub use videocall_meeting_types::responses::MeetingGuestInfoResponse;
 pub use videocall_meeting_types::responses::MeetingInfoResponse as MeetingInfo;
@@ -293,6 +294,31 @@ pub async fn refresh_room_token(meeting_id: &str) -> Result<String, JoinError> {
     with_refresh_retry(|| async { client()?.refresh_room_token(meeting_id).await }).await
 }
 
+/// Outcome of asking for a fresh room token after a connection was lost.
+#[derive(Debug)]
+pub enum ReconnectToken {
+    Token(String),
+    /// No token, and this user's row is `left`.
+    NoLongerInMeeting,
+}
+
+pub fn reconnect_token_from_status(
+    status: JoinMeetingResponse,
+) -> Result<ReconnectToken, JoinError> {
+    match status.room_token {
+        Some(token) => Ok(ReconnectToken::Token(token)),
+        None if status.status == "left" => Ok(ReconnectToken::NoLongerInMeeting),
+        None => Err(JoinError::ServerError {
+            status: 200,
+            body: format!("No room token for participant status {}", status.status),
+        }),
+    }
+}
+
+pub async fn refresh_reconnect_token(meeting_id: &str) -> Result<ReconnectToken, JoinError> {
+    reconnect_token_from_status(check_status(meeting_id).await?)
+}
+
 pub async fn update_meeting(
     meeting_id: &str,
     waiting_room_enabled: Option<bool>,
@@ -309,6 +335,32 @@ pub async fn update_meeting(
         allow_guests,
         recording_allowed_for_all,
         chat_allowed_for_all,
+        entry_message_override: None,
+        entry_sound_override: None,
+        exit_message_override: None,
+        exit_sound_override: None,
+        password: None,
+        remove_password: None,
+    };
+    let req = &req;
+    with_refresh_retry(|| async move { client()?.update_meeting(meeting_id, req).await }).await
+}
+
+pub async fn update_announcement_overrides(
+    meeting_id: &str,
+    patch: crate::components::announcement_overrides::OverridePatch,
+) -> Result<MeetingInfo, JoinError> {
+    let req = videocall_meeting_types::requests::UpdateMeetingRequest {
+        waiting_room_enabled: None,
+        admitted_can_admit: None,
+        end_on_host_leave: None,
+        allow_guests: None,
+        recording_allowed_for_all: None,
+        chat_allowed_for_all: None,
+        entry_message_override: patch.entry_message,
+        entry_sound_override: patch.entry_sound,
+        exit_message_override: patch.exit_message,
+        exit_sound_override: patch.exit_sound,
         password: None,
         remove_password: None,
     };
@@ -375,6 +427,31 @@ pub async fn admit_all(meeting_id: &str) -> Result<(), JoinError> {
         .map(|_| ())
 }
 
+pub async fn mute_participant(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.mute_participant(meeting_id, user_id).await }).await
+}
+
+pub async fn mute_all(meeting_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.mute_all(meeting_id).await }).await
+}
+
+pub async fn disable_video_participant(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async {
+        client()?
+            .disable_video_participant(meeting_id, user_id)
+            .await
+    })
+    .await
+}
+
+pub async fn disable_video_all(meeting_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.disable_video_all(meeting_id).await }).await
+}
+
+pub async fn kick_participant(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.kick_participant(meeting_id, user_id).await }).await
+}
+
 /// Wall-clock budget a leave request may hold the page before navigation.
 pub const LEAVE_DEADLINE_MS: u32 = 4_000;
 
@@ -401,13 +478,21 @@ where
 
 pub async fn transfer_host(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
     log::info!("Transferring host via API: {meeting_id} -> {user_id}");
-    client()?.transfer_host(meeting_id, user_id).await
+    with_refresh_retry(|| async { client()?.transfer_host(meeting_id, user_id).await }).await
 }
 
 pub async fn list_co_hosts(meeting_id: &str) -> Result<Vec<CoHostEntry>, JoinError> {
     with_refresh_retry(|| async { client()?.list_co_hosts(meeting_id).await })
         .await
         .map(|r| r.co_hosts)
+}
+
+pub async fn list_co_host_suggestions(
+    meeting_id: &str,
+) -> Result<Vec<CoHostSuggestion>, JoinError> {
+    with_refresh_retry(|| async { client()?.list_co_host_suggestions(meeting_id).await })
+        .await
+        .map(|r| r.suggestions)
 }
 
 /// `persist: None` keeps an existing entry's saved flag and still lifts a suspension.
@@ -462,6 +547,10 @@ pub async fn create_meeting(
         end_on_host_leave: None,
         recording_allowed_for_all: None,
         chat_allowed_for_all: None,
+        entry_message_override: None,
+        entry_sound_override: None,
+        exit_message_override: None,
+        exit_sound_override: None,
         co_hosts: vec![],
     };
     let req = &req;
@@ -552,6 +641,18 @@ pub async fn presence_keepalive_guest(
 ) -> Result<(), JoinError> {
     make_guest_client(observer_token)?
         .presence_keepalive_guest(meeting_id)
+        .await
+}
+
+/// `POST /api/v1/meetings/{meeting_id}/captions`, authenticated by the room token.
+pub async fn set_captions(
+    meeting_id: &str,
+    room_token: &str,
+    enabled: bool,
+    renew: bool,
+) -> Result<(), JoinError> {
+    make_guest_client(room_token)?
+        .set_captions(meeting_id, enabled, renew)
         .await
 }
 
@@ -884,5 +985,58 @@ mod guest_join_auth_tests {
         let (auth, claimed) = guest_join_auth(None);
         assert!(matches!(auth, AuthMode::Cookie));
         assert_eq!(claimed, None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod reconnect_token_tests {
+    use super::*;
+
+    pub(crate) fn status(status: &str, token: Option<&str>) -> JoinMeetingResponse {
+        serde_json::from_value(serde_json::json!({
+            "user_id": "u@example.com",
+            "status": status,
+            "is_host": false,
+            "joined_at": 0,
+            "room_token": token,
+        }))
+        .expect("a status response")
+    }
+
+    #[test]
+    fn a_token_wins_whatever_the_status() {
+        for s in ["admitted", "left"] {
+            assert!(matches!(
+                reconnect_token_from_status(status(s, Some("tok"))),
+                Ok(ReconnectToken::Token(t)) if t == "tok"
+            ));
+        }
+    }
+
+    #[test]
+    fn a_left_row_without_a_token_is_no_longer_in_meeting() {
+        assert!(matches!(
+            reconnect_token_from_status(status("left", None)),
+            Ok(ReconnectToken::NoLongerInMeeting)
+        ));
+    }
+
+    #[test]
+    fn any_other_status_without_a_token_keeps_the_reconnect_retrying() {
+        for s in [
+            "kicked",
+            "rejected",
+            "waiting",
+            "waiting_for_meeting",
+            "admitted",
+        ] {
+            assert!(
+                matches!(
+                    reconnect_token_from_status(status(s, None)),
+                    Err(JoinError::ServerError { status: 200, .. })
+                ),
+                "{s}"
+            );
+        }
     }
 }

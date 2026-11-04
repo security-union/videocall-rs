@@ -2,7 +2,9 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
-use crate::components::transport_fallback::{transport_fallback_active, FALLBACK_NOTE};
+use crate::components::avatar_settings::focus_with_fallback;
+use crate::components::recent_actions::SettingsTarget;
+use crate::components::transport_fallback::{fallback_note, transport_fallback_active};
 use crate::context::{
     apply_transport_decision, displayed_default_transport, effective_default_transport,
     load_transport_sticky, pinned_protocol_advice, transport_option_label, TransportPreference,
@@ -63,6 +65,18 @@ fn click_target_is_within_glass_select(event: &MouseEvent) -> bool {
         .and_then(|target: web_sys::EventTarget| target.dyn_into::<web_sys::Element>().ok())
         .and_then(|element: web_sys::Element| element.closest(".glass-select").ok().flatten())
         .is_some()
+}
+
+fn arrow_switches_tabs(event: &KeyboardEvent) -> bool {
+    event
+        .data()
+        .downcast::<web_sys::KeyboardEvent>()
+        .and_then(|key_event| key_event.target())
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        .is_some_and(|element| {
+            element.id() == SETTINGS_DIALOG_ID
+                || element.closest("[role='tablist']").ok().flatten().is_some()
+        })
 }
 
 #[derive(Clone, PartialEq)]
@@ -216,10 +230,22 @@ fn SettingsGlassSelect(
     }
 }
 
+/// The `initial_section` that opens the Profile tab.
+pub const PROFILE_SECTION: &str = "profile";
+pub(crate) const SETTINGS_DIALOG_ID: &str = "device-settings-dialog";
+
+/// Focus the open modal's Profile tab, else the dialog.
+pub fn focus_profile_tab() {
+    focus_with_fallback(
+        SettingsSection::Profile.tab_id(),
+        &format!("#{SETTINGS_DIALOG_ID}"),
+    );
+}
+
 // The `Performance` tab was removed in #1131: the Performance controls moved
-// into the Diagnostics drawer. The tablist is now five tabs. (The transitional
-// "moved to Diagnostics" redirect row was also removed; users find Performance
-// in the drawer, and the "performance" deep link routes there via attendants.)
+// into the Diagnostics drawer. (The transitional "moved to Diagnostics" redirect
+// row was also removed; users find Performance in the drawer, and the
+// "performance" deep link routes there via attendants.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsSection {
     Audio,
@@ -227,6 +253,7 @@ enum SettingsSection {
     Network,
     Appearance,
     Preferences,
+    Profile,
 }
 
 impl SettingsSection {
@@ -237,6 +264,7 @@ impl SettingsSection {
             SettingsSection::Network => "Network",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Preferences => "Preferences",
+            SettingsSection::Profile => "Profile",
         }
     }
 
@@ -247,6 +275,7 @@ impl SettingsSection {
             SettingsSection::Network => "settings-tab-network",
             SettingsSection::Appearance => "settings-tab-appearance",
             SettingsSection::Preferences => "settings-tab-preferences",
+            SettingsSection::Profile => "settings-tab-profile",
         }
     }
 
@@ -257,6 +286,7 @@ impl SettingsSection {
             SettingsSection::Network => "settings-panel-network",
             SettingsSection::Appearance => "settings-panel-appearance",
             SettingsSection::Preferences => "settings-panel-preferences",
+            SettingsSection::Profile => "settings-panel-profile",
         }
     }
 
@@ -267,16 +297,18 @@ impl SettingsSection {
             SettingsSection::Network => "settings-nav-network",
             SettingsSection::Appearance => "settings-nav-appearance",
             SettingsSection::Preferences => "settings-nav-preferences",
+            SettingsSection::Profile => "settings-nav-profile",
         }
     }
 
-    fn all() -> [SettingsSection; 5] {
+    fn all() -> [SettingsSection; 6] {
         [
             SettingsSection::Audio,
             SettingsSection::Video,
             SettingsSection::Network,
             SettingsSection::Appearance,
             SettingsSection::Preferences,
+            SettingsSection::Profile,
         ]
     }
 
@@ -286,17 +318,19 @@ impl SettingsSection {
             SettingsSection::Video => SettingsSection::Network,
             SettingsSection::Network => SettingsSection::Appearance,
             SettingsSection::Appearance => SettingsSection::Preferences,
-            SettingsSection::Preferences => SettingsSection::Audio,
+            SettingsSection::Preferences => SettingsSection::Profile,
+            SettingsSection::Profile => SettingsSection::Audio,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            SettingsSection::Audio => SettingsSection::Preferences,
+            SettingsSection::Audio => SettingsSection::Profile,
             SettingsSection::Video => SettingsSection::Audio,
             SettingsSection::Network => SettingsSection::Video,
             SettingsSection::Appearance => SettingsSection::Network,
             SettingsSection::Preferences => SettingsSection::Appearance,
+            SettingsSection::Profile => SettingsSection::Preferences,
         }
     }
 }
@@ -327,6 +361,7 @@ pub fn DeviceSettingsModal(
     let requested = match initial_section.as_deref() {
         Some("appearance") => SettingsSection::Appearance,
         Some("preferences") => SettingsSection::Preferences,
+        Some(PROFILE_SECTION) => SettingsSection::Profile,
         Some("network") => SettingsSection::Network,
         Some("video") => SettingsSection::Video,
         _ => SettingsSection::Audio,
@@ -358,7 +393,7 @@ pub fn DeviceSettingsModal(
             onclick: move |_| on_close.call(()),
 
             div {
-                id: "device-settings-dialog",
+                id: SETTINGS_DIALOG_ID,
                 class: "device-settings-modal settings-modal",
                 role: "dialog",
                 "aria-modal": "true",
@@ -377,11 +412,11 @@ pub fn DeviceSettingsModal(
                             evt.stop_propagation();
                             on_close.call(());
                         }
-                        Key::ArrowDown | Key::ArrowRight => {
+                        Key::ArrowDown | Key::ArrowRight if arrow_switches_tabs(&evt) => {
                             evt.stop_propagation();
                             active_section.set(active_section().next());
                         }
-                        Key::ArrowUp | Key::ArrowLeft => {
+                        Key::ArrowUp | Key::ArrowLeft if arrow_switches_tabs(&evt) => {
                             evt.stop_propagation();
                             active_section.set(active_section().prev());
                         }
@@ -468,6 +503,7 @@ pub fn DeviceSettingsModal(
                                     }
 
                                     div { class: "device-setting-group",
+                                        "data-recent-action": SettingsTarget::Microphone.slug(),
                                         label { r#for: "modal-audio-select", "Microphone" }
                                         SettingsGlassSelect {
                                             id: "modal-audio-select",
@@ -493,6 +529,7 @@ pub fn DeviceSettingsModal(
 
                                     if !is_ios_safari {
                                         div { class: "device-setting-group",
+                                            "data-recent-action": SettingsTarget::Speaker.slug(),
                                             label { r#for: "modal-speaker-select", "Speaker" }
                                             SettingsGlassSelect {
                                                 id: "modal-speaker-select",
@@ -536,6 +573,7 @@ pub fn DeviceSettingsModal(
                                     p { class: "settings-section-description", "Choose the camera used during the call." }
 
                                     div { class: "device-setting-group",
+                                        "data-recent-action": SettingsTarget::Camera.slug(),
                                         label { r#for: "modal-video-select", "Camera" }
                                         SettingsGlassSelect {
                                             id: "modal-video-select",
@@ -568,11 +606,18 @@ pub fn DeviceSettingsModal(
                                     default_transport,
                                     server_wt_enabled,
                                 );
-                                let in_fallback = transport_fallback_active(
-                                    transport_preference,
-                                    server_wt_enabled,
-                                    active_transport,
-                                ) == Some(true);
+                                let mismatch_note = active_transport
+                                    .filter(|_| {
+                                        transport_fallback_active(
+                                            transport_preference,
+                                            server_wt_enabled,
+                                            active_transport,
+                                        ) == Some(true)
+                                    })
+                                    .map(fallback_note);
+                                let (current_state, current_label) =
+                                    current_transport_readout(active_transport);
+                                let current_badge = current_transport_badge(active_transport);
                                 rsx! {
                                 div {
                                     id: SettingsSection::Network.panel_id(),
@@ -587,7 +632,32 @@ pub fn DeviceSettingsModal(
 
                                     p { class: "settings-section-description", "Choose the transport protocol for media connections." }
 
-                                    if in_fallback {
+                                    p {
+                                        id: "transport-current",
+                                        class: "transport-current",
+                                        "data-testid": "transport-current",
+                                        "data-state": current_state,
+                                        "aria-live": "polite",
+                                        "aria-atomic": "true",
+                                        span { "Currently using: " }
+                                        span { class: "transport-current-reading",
+                                            span {
+                                                class: "transport-current-value",
+                                                "data-testid": "transport-current-value",
+                                                "{current_label}"
+                                            }
+                                            if let Some((badge_class, badge_text)) = current_badge {
+                                                span {
+                                                    class: badge_class,
+                                                    "data-testid": "transport-current-badge",
+                                                    "aria-hidden": "true",
+                                                    "{badge_text}"
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(note_text) = mismatch_note {
                                         div {
                                             class: "settings-info-panel",
                                             role: "note",
@@ -622,22 +692,24 @@ pub fn DeviceSettingsModal(
                                             }
                                             div { class: "settings-info-panel-body",
                                                 p { class: "settings-info-panel-title", "Not using your preferred protocol" }
-                                                p { class: "settings-info-panel-text", "{FALLBACK_NOTE}" }
+                                                p { class: "settings-info-panel-text", "{note_text}" }
                                             }
                                         }
                                     }
 
                                     // Selection is staged in `pending_protocol`; "Apply" commits and reloads.
                                     div { class: "device-setting-group",
+                                        "data-recent-action": SettingsTarget::PreferredProtocol.slug(),
                                         span {
                                             id: "transport-segmented-label",
                                             class: "transport-segmented-label",
-                                            "Protocol"
+                                            "Preferred protocol"
                                         }
                                         div {
                                             class: "transport-segmented",
                                             role: "radiogroup",
                                             "aria-labelledby": "transport-segmented-label",
+                                            "aria-describedby": "transport-current",
                                             for option in [
                                                 (TransportPreference::WebTransport, "transport-radio-webtransport"),
                                                 (TransportPreference::WebSocket, "transport-radio-websocket"),
@@ -702,7 +774,7 @@ pub fn DeviceSettingsModal(
                                             id: "transport-webtransport-desc",
                                             class: "visually-hidden",
                                             if server_wt_enabled {
-                                                "Preferred, with an automatic switch to WebSocket when a network blocks it."
+                                                {TRANSPORT_WEBTRANSPORT_DESC}
                                             } else {
                                                 "Unavailable on this deployment."
                                             }
@@ -710,7 +782,7 @@ pub fn DeviceSettingsModal(
                                         span {
                                             id: "transport-websocket-desc",
                                             class: "visually-hidden",
-                                            "Skips WebTransport entirely. Useful if this network or device has trouble with it."
+                                            {TRANSPORT_WEBSOCKET_DESC}
                                         }
                                     }
 
@@ -756,7 +828,7 @@ pub fn DeviceSettingsModal(
                                                 div { class: "settings-info-panel-body",
                                                     p { class: "settings-info-panel-title", "WebSocket is the compatibility fallback" }
                                                     p { class: "settings-info-panel-text",
-                                                        "WebSocket skips WebTransport entirely, which helps if this network or device has trouble with it. Otherwise WebTransport switches to WebSocket on its own when a network blocks it, so most people never need to change this."
+                                                        {TRANSPORT_WEBSOCKET_NOTE}
                                                     }
                                                 }
                                             }
@@ -879,6 +951,20 @@ pub fn DeviceSettingsModal(
                                     "aria-labelledby": SettingsSection::Preferences.tab_id(),
 
                                     crate::components::preferences_settings_panel::PreferencesSettingsPanel {}
+                                }
+                            },
+                            SettingsSection::Profile => rsx! {
+                                div {
+                                    id: SettingsSection::Profile.panel_id(),
+                                    class: "settings-section",
+                                    "data-recent-action": SettingsTarget::Avatar.slug(),
+                                    role: "tabpanel",
+                                    "aria-labelledby": SettingsSection::Profile.tab_id(),
+
+                                    crate::components::avatar_settings::AvatarSettingsPanel {
+                                        variant: crate::components::avatar_settings::AvatarPanelVariant::InMeeting,
+                                        can_edit: crate::components::avatar::avatar_editing_allowed(),
+                                    }
                                 }
                             },
                         }
@@ -1019,6 +1105,22 @@ fn render_nav_icon(section: SettingsSection) -> Element {
                 circle { cx: "10", cy: "18", r: "2", fill: "currentColor", stroke: "none" }
             }
         },
+        SettingsSection::Profile => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                circle { cx: "12", cy: "8", r: "3.5" }
+                path { d: "M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6" }
+            }
+        },
     }
 }
 
@@ -1029,21 +1131,80 @@ fn find_device_by_id(devices: &[MediaDeviceInfo], device_id: &str) -> Option<Dev
         .map(DeviceInfo::from_media_device_info)
 }
 
+fn current_transport_readout(active: Option<TransportPreference>) -> (&'static str, &'static str) {
+    match active {
+        Some(TransportPreference::WebTransport) => ("webtransport", "WebTransport"),
+        Some(TransportPreference::WebSocket) => ("websocket", "WebSocket"),
+        None => ("none", "Not connected"),
+    }
+}
+
+fn current_transport_badge(
+    active: Option<TransportPreference>,
+) -> Option<(&'static str, &'static str)> {
+    match active? {
+        TransportPreference::WebTransport => Some(("transport-badge transport-badge--wt", "WT")),
+        TransportPreference::WebSocket => Some(("transport-badge transport-badge--ws", "WS")),
+    }
+}
+
+pub const TRANSPORT_WEBTRANSPORT_DESC: &str =
+    "Switches to WebSocket automatically when a network blocks it.";
+pub const TRANSPORT_WEBSOCKET_DESC: &str =
+    "Tries WebSocket first; uses WebTransport only if WebSocket can't connect.";
+pub const TRANSPORT_WEBSOCKET_NOTE: &str = "WebSocket is tried first, which helps if this network or device has trouble with WebTransport. WebTransport is used only if WebSocket can't connect. Otherwise WebTransport switches to WebSocket on its own when a network blocks it, so most people never need to change this.";
+
+#[cfg(test)]
+mod transport_readout_tests {
+    use super::*;
+
+    #[test]
+    fn current_transport_readout_names_the_elected_protocol_or_not_connected() {
+        assert_eq!(
+            current_transport_readout(Some(TransportPreference::WebTransport)),
+            ("webtransport", "WebTransport")
+        );
+        assert_eq!(
+            current_transport_readout(Some(TransportPreference::WebSocket)),
+            ("websocket", "WebSocket")
+        );
+        assert_eq!(current_transport_readout(None), ("none", "Not connected"));
+    }
+
+    #[test]
+    fn current_transport_badge_uses_the_tile_badge_classes_and_is_absent_when_not_connected() {
+        assert_eq!(
+            current_transport_badge(Some(TransportPreference::WebTransport)),
+            Some(("transport-badge transport-badge--wt", "WT"))
+        );
+        assert_eq!(
+            current_transport_badge(Some(TransportPreference::WebSocket)),
+            Some(("transport-badge transport-badge--ws", "WS"))
+        );
+        assert_eq!(current_transport_badge(None), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The tablist is now FIVE tabs — Performance was removed (#1131) and
-    /// Preferences was added. If a Performance variant is reintroduced into
-    /// `all()` this length flips, catching an accidental revert.
+    /// Performance was removed (#1131); Profile is the last tab.
     #[test]
-    fn tablist_has_five_sections_without_performance() {
+    fn tablist_has_six_sections_with_profile_last_and_without_performance() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 5, "tablist must have exactly 5 tabs");
+        assert_eq!(all.len(), 6, "tablist must have exactly 6 tabs");
         let titles: Vec<&str> = all.iter().map(|s| s.title()).collect();
         assert_eq!(
             titles,
-            ["Audio", "Video", "Network", "Appearance", "Preferences"]
+            [
+                "Audio",
+                "Video",
+                "Network",
+                "Appearance",
+                "Preferences",
+                "Profile"
+            ]
         );
         assert!(
             !titles.contains(&"Performance"),
@@ -1051,9 +1212,27 @@ mod tests {
         );
     }
 
-    /// `next()` cycles through all five sections and wraps.
     #[test]
-    fn next_cycles_five_sections_and_wraps() {
+    fn a_selected_option_keeps_a_focus_ring() {
+        let css: String = include_str!("../../static/style.css")
+            .split_whitespace()
+            .collect();
+        for selector in [".transport-segmented-option", ".theme-icon-button"] {
+            let ring = format!(
+                "{selector}:focus-visible{{outline:2pxsolidvar(--accent-hover);outline-offset:-2px;"
+            );
+            assert!(css.contains(&ring), "{selector}");
+        }
+        assert!(css.contains(concat!(
+            "@media(forced-colors:active){.transport-segmented-option.selected:not(:focus-visible),",
+            ".theme-icon-button.theme-icon-button--active:not(:focus-visible){",
+            "outline:2pxsolidHighlight;"
+        )));
+    }
+
+    /// `next()` cycles through all six sections and wraps.
+    #[test]
+    fn next_cycles_six_sections_and_wraps() {
         assert_eq!(SettingsSection::Audio.next(), SettingsSection::Video);
         assert_eq!(SettingsSection::Video.next(), SettingsSection::Network);
         assert_eq!(SettingsSection::Network.next(), SettingsSection::Appearance);
@@ -1061,10 +1240,33 @@ mod tests {
             SettingsSection::Appearance.next(),
             SettingsSection::Preferences
         );
-        assert_eq!(SettingsSection::Preferences.next(), SettingsSection::Audio);
+        assert_eq!(
+            SettingsSection::Preferences.next(),
+            SettingsSection::Profile
+        );
+        assert_eq!(SettingsSection::Profile.next(), SettingsSection::Audio);
+        assert_eq!(SettingsSection::Audio.prev(), SettingsSection::Profile);
     }
 
-    /// `prev()` is the exact inverse of `next()` over the five-section ring.
+    #[test]
+    fn every_section_has_its_own_ids() {
+        let all = SettingsSection::all();
+        assert_eq!(SettingsSection::Profile.tab_id(), "settings-tab-profile");
+        assert_eq!(
+            SettingsSection::Profile.panel_id(),
+            "settings-panel-profile"
+        );
+        assert_eq!(SettingsSection::Profile.test_id(), "settings-nav-profile");
+        let mut ids: Vec<&str> = all
+            .iter()
+            .flat_map(|s| [s.tab_id(), s.panel_id(), s.test_id()])
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), all.len() * 3);
+    }
+
+    /// `prev()` is the exact inverse of `next()` over the six-section ring.
     #[test]
     fn prev_is_inverse_of_next() {
         for s in SettingsSection::all() {
@@ -1082,8 +1284,17 @@ mod dom_tests {
 
     #[allow(non_snake_case)]
     fn NetworkHarness() -> Element {
+        let theme = use_signal(|| crate::context::Theme::System);
+        use_context_provider(|| crate::context::ThemePreferenceCtx(theme));
+        let appearance = use_signal(crate::context::AppearanceSettings::default);
+        use_context_provider(|| crate::context::AppearanceSettingsCtx(appearance));
         let mut active = use_signal(|| Some(TransportPreference::WebSocket));
+        let mut preferred = use_signal(|| TransportPreference::WebTransport);
         rsx! {
+            button {
+                id: "pref-ws",
+                onclick: move |_| preferred.set(TransportPreference::WebSocket),
+            }
             button {
                 id: "active-wt",
                 onclick: move |_| active.set(Some(TransportPreference::WebTransport)),
@@ -1105,7 +1316,7 @@ mod dom_tests {
                 on_speaker_select: move |_| {},
                 visible: true,
                 on_close: move |_| {},
-                transport_preference: TransportPreference::WebTransport,
+                transport_preference: preferred(),
                 active_transport: active(),
                 initial_section: Some("network".to_string()),
             }
@@ -1144,6 +1355,66 @@ mod dom_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn arrows_switch_tabs_only_from_the_dialog_or_the_tablist() {
+        inject_app_config(true);
+        let doc = gloo_utils::document();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(NetworkHarness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        TimeoutFuture::new(30).await;
+        let press = |selector: &str, key: &str| {
+            let target = mount.query_selector(selector).unwrap().unwrap();
+            js_sys::Function::new_with_args(
+                "el, key",
+                "el.dispatchEvent(new KeyboardEvent('keydown', \
+                 { key, bubbles: true, cancelable: true }));",
+            )
+            .call2(&wasm_bindgen::JsValue::NULL, &target, &key.into())
+            .unwrap();
+        };
+        let selected = || {
+            mount
+                .query_selector("[role='tab'][aria-selected='true']")
+                .unwrap()
+                .unwrap()
+                .id()
+        };
+        for key in ["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp"] {
+            press("[data-testid='transport-radio-websocket']", key);
+            press("#sticky-transport-checkbox", key);
+            press(".settings-modal-close", key);
+            TimeoutFuture::new(30).await;
+            assert_eq!(selected(), "settings-tab-network", "{key} on a control");
+        }
+        press(&format!("#{SETTINGS_DIALOG_ID}"), "ArrowLeft");
+        TimeoutFuture::new(30).await;
+        assert_eq!(selected(), "settings-tab-video", "on the dialog");
+        press("#settings-tab-video", "ArrowLeft");
+        TimeoutFuture::new(30).await;
+        assert_eq!(selected(), "settings-tab-audio", "on a tab");
+        for key in ["ArrowRight", "ArrowLeft"] {
+            press("#modal-audio-select", key);
+            TimeoutFuture::new(30).await;
+            assert_eq!(selected(), "settings-tab-audio", "{key} on a glass select");
+        }
+        mount
+            .query_selector("#settings-tab-appearance")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<web_sys::HtmlElement>()
+            .click();
+        TimeoutFuture::new(30).await;
+        press(".color-swatch", "ArrowRight");
+        TimeoutFuture::new(30).await;
+        assert_eq!(selected(), "settings-tab-appearance", "on a swatch");
+        mount.remove();
+        remove_app_config();
+    }
+
+    #[wasm_bindgen_test]
     async fn the_network_panel_notes_a_webtransport_fallback_only_while_one_is_active() {
         inject_app_config(true);
         let doc = gloo_utils::document();
@@ -1176,7 +1447,10 @@ mod dom_tests {
             "the Network section must be the one rendered"
         );
         let shown = note().expect("preferred WebTransport, using WebSocket");
-        assert!(shown.contains(FALLBACK_NOTE), "{shown}");
+        assert!(
+            shown.contains(fallback_note(TransportPreference::WebSocket)),
+            "{shown}"
+        );
 
         click("active-wt");
         TimeoutFuture::new(30).await;
@@ -1189,6 +1463,17 @@ mod dom_tests {
         click("active-ws");
         TimeoutFuture::new(30).await;
         assert!(note().is_some(), "the note follows a live transport change");
+
+        click("pref-ws");
+        TimeoutFuture::new(30).await;
+        assert_eq!(note(), None, "preferred WebSocket, using WebSocket");
+        click("active-wt");
+        TimeoutFuture::new(30).await;
+        let reverse = note().expect("preferred WebSocket, using WebTransport");
+        assert!(
+            reverse.contains(fallback_note(TransportPreference::WebTransport)),
+            "{reverse}"
+        );
 
         inject_app_config(false);
         click("active-none");
@@ -1211,5 +1496,395 @@ mod dom_tests {
             disabled_note, None,
             "WebSocket on a deployment without WebTransport is not a fallback"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_network_panel_names_the_protocol_in_use_and_follows_it_live() {
+        inject_app_config(true);
+        let doc = gloo_utils::document();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(NetworkHarness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        let click = |id: &str| {
+            mount
+                .query_selector(&format!("#{id}"))
+                .unwrap()
+                .unwrap()
+                .unchecked_into::<web_sys::HtmlElement>()
+                .click();
+        };
+        let readout = || {
+            let row = mount
+                .query_selector("[data-testid='transport-current']")
+                .unwrap()?;
+            let reading = row
+                .query_selector(":scope > .transport-current-reading")
+                .unwrap()?;
+            let value = reading
+                .query_selector(":scope > [data-testid='transport-current-value']")
+                .unwrap()?;
+            let badge = reading
+                .query_selector(":scope > [data-testid='transport-current-badge']")
+                .unwrap()
+                .map(|badge| {
+                    (
+                        badge.get_attribute("class").unwrap_or_default(),
+                        badge.text_content().unwrap_or_default(),
+                        badge.get_attribute("aria-hidden"),
+                        value
+                            .next_element_sibling()
+                            .is_some_and(|next| next.is_same_node(Some(&badge)))
+                            && badge.next_element_sibling().is_none(),
+                    )
+                });
+            Some((
+                row.get_attribute("data-state").unwrap_or_default(),
+                value.text_content().unwrap_or_default(),
+                row.text_content().unwrap_or_default(),
+                row.last_element_child()
+                    .is_some_and(|last| last.is_same_node(Some(&reading))),
+                badge,
+            ))
+        };
+        let readout_of = |state: &str, value: &str, text: &str, badge: Option<(&str, &str)>| {
+            Some((
+                state.to_string(),
+                value.to_string(),
+                text.to_string(),
+                true,
+                badge.map(|(modifier, label)| {
+                    (
+                        format!("transport-badge transport-badge--{modifier}"),
+                        label.to_string(),
+                        Some("true".to_string()),
+                        true,
+                    )
+                }),
+            ))
+        };
+        TimeoutFuture::new(30).await;
+        let row = mount
+            .query_selector("[data-testid='transport-current']")
+            .unwrap();
+        let group = mount
+            .query_selector("[role='radiogroup'][aria-labelledby='transport-segmented-label']")
+            .unwrap();
+        let note = mount
+            .query_selector("[data-testid='transport-in-use-mismatch']")
+            .unwrap();
+        let row_attr = |name: &str| row.as_ref().and_then(|el| el.get_attribute(name));
+        let live = row_attr("aria-live");
+        let atomic = row_attr("aria-atomic");
+        let describedby = group
+            .as_ref()
+            .and_then(|el| el.get_attribute("aria-describedby"));
+        let precedes = |later: &Option<web_sys::Element>| match (&row, later) {
+            (Some(row), Some(later)) => {
+                row.compare_document_position(later) & web_sys::Node::DOCUMENT_POSITION_FOLLOWING
+                    != 0
+            }
+            _ => false,
+        };
+        let precedes_note = precedes(&note);
+        let precedes_group = precedes(&group);
+        let same_row = || {
+            let now = mount
+                .query_selector("[data-testid='transport-current']")
+                .unwrap();
+            matches!((&row, now), (Some(first), Some(now)) if first.is_same_node(Some(&now)))
+        };
+        let initial = readout();
+
+        click("active-wt");
+        TimeoutFuture::new(30).await;
+        let on_webtransport = (readout(), same_row());
+
+        click("active-none");
+        TimeoutFuture::new(30).await;
+        let on_none = (readout(), same_row());
+
+        click("active-ws");
+        TimeoutFuture::new(30).await;
+        let back_on_websocket = (readout(), same_row());
+
+        remove_app_config();
+        mount.remove();
+
+        assert!(row.is_some(), "the current-protocol readout must render");
+        assert!(group.is_some(), "the protocol radiogroup must render");
+        assert!(
+            note.is_some(),
+            "the fallback note must render in this state"
+        );
+        assert_eq!(live.as_deref(), Some("polite"));
+        assert_eq!(atomic.as_deref(), Some("true"));
+        assert_eq!(describedby.as_deref(), Some("transport-current"));
+        assert!(precedes_note, "the readout comes before the fallback note");
+        assert!(precedes_group, "the readout comes before the radiogroup");
+        assert_eq!(
+            initial,
+            readout_of(
+                "websocket",
+                "WebSocket",
+                "Currently using: WebSocketWS",
+                Some(("ws", "WS"))
+            )
+        );
+        assert_eq!(
+            on_webtransport,
+            (
+                readout_of(
+                    "webtransport",
+                    "WebTransport",
+                    "Currently using: WebTransportWT",
+                    Some(("wt", "WT"))
+                ),
+                true
+            ),
+            "the live region updates in place, never remounts"
+        );
+        assert_eq!(
+            on_none,
+            (
+                readout_of(
+                    "none",
+                    "Not connected",
+                    "Currently using: Not connected",
+                    None
+                ),
+                true
+            ),
+            "the readout stays rendered, in place, with no connection"
+        );
+        assert_eq!(
+            back_on_websocket,
+            (
+                readout_of(
+                    "websocket",
+                    "WebSocket",
+                    "Currently using: WebSocketWS",
+                    Some(("ws", "WS"))
+                ),
+                true
+            ),
+            "the readout follows a live transport change in place"
+        );
+    }
+
+    const GLOBAL_CSS: &str = include_str!("../../static/global.css");
+    const STYLE_CSS: &str = include_str!("../../static/style.css");
+
+    fn add_sheet(css: &str) -> web_sys::Element {
+        let doc = gloo_utils::document();
+        let style = doc.create_element("style").unwrap();
+        style.set_text_content(Some(css));
+        doc.head().unwrap().append_child(&style).unwrap();
+        style
+    }
+
+    fn mount_harness() -> web_sys::Element {
+        let doc = gloo_utils::document();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(NetworkHarness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        mount
+    }
+
+    fn click(mount: &web_sys::Element, id: &str) {
+        mount
+            .query_selector(&format!("#{id}"))
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<web_sys::HtmlElement>()
+            .click();
+    }
+
+    fn paint(el: &web_sys::Element) -> (String, String, String) {
+        let cs = gloo_utils::window()
+            .get_computed_style(el)
+            .unwrap()
+            .unwrap();
+        let get = |p: &str| cs.get_property_value(p).unwrap();
+        (
+            get("background-color"),
+            get("color"),
+            get("border-top-color"),
+        )
+    }
+
+    fn font_size(el: &web_sys::Element) -> String {
+        gloo_utils::window()
+            .get_computed_style(el)
+            .unwrap()
+            .unwrap()
+            .get_property_value("font-size")
+            .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_network_badge_looks_like_the_tile_badge_in_both_themes() {
+        const SMALL_TILE: &str = "--tile-h: 140px";
+        inject_app_config(true);
+        let global = add_sheet(GLOBAL_CSS);
+        let style = add_sheet(STYLE_CSS);
+        let doc = gloo_utils::document();
+        let root = doc.document_element().unwrap();
+        let body = doc.body().unwrap();
+        let tile_badge = |parent: &web_sys::Element, modifier: &str| {
+            let el = doc.create_element("span").unwrap();
+            el.set_class_name(&format!("transport-badge transport-badge--{modifier}"));
+            parent.append_child(&el).unwrap();
+            el
+        };
+        let tile_ws = tile_badge(&body, "ws");
+        let tile_wt = tile_badge(&body, "wt");
+        let small_tile = doc.create_element("div").unwrap();
+        small_tile.set_attribute("style", SMALL_TILE).unwrap();
+        body.append_child(&small_tile).unwrap();
+        let shrunk = font_size(&tile_badge(&small_tile, "ws")) != font_size(&tile_ws);
+        let mount = mount_harness();
+        mount.set_attribute("style", SMALL_TILE).unwrap();
+        TimeoutFuture::new(30).await;
+
+        let mut sizes = Vec::new();
+        let mut seen = Vec::new();
+        for (modifier, button, tile) in
+            [("ws", "active-ws", &tile_ws), ("wt", "active-wt", &tile_wt)]
+        {
+            click(&mount, button);
+            TimeoutFuture::new(30).await;
+            let badge = mount
+                .query_selector(&format!(
+                    ".settings-panel [data-testid='transport-current-badge'].transport-badge--{modifier}"
+                ))
+                .unwrap();
+            sizes.push((modifier, badge.as_ref().map(font_size), font_size(tile)));
+            for theme in ["dark", "light"] {
+                root.set_attribute("data-theme", theme).unwrap();
+                seen.push((
+                    theme,
+                    modifier,
+                    badge.as_ref().map(paint),
+                    paint(tile),
+                    paint(&tile_ws) != paint(&tile_wt),
+                ));
+            }
+        }
+
+        root.remove_attribute("data-theme").unwrap();
+        tile_ws.remove();
+        tile_wt.remove();
+        small_tile.remove();
+        style.remove();
+        global.remove();
+        remove_app_config();
+        mount.remove();
+
+        assert!(
+            shrunk,
+            "`{SMALL_TILE}` no longer shrinks a tile badge, so the size check guards nothing"
+        );
+        for (modifier, row, tile) in sizes {
+            assert_eq!(
+                row,
+                Some(tile),
+                "{modifier}: the Network badge shrinks with an inherited --tile-h"
+            );
+        }
+        for (theme, modifier, row, tile, distinct) in seen {
+            assert!(
+                distinct,
+                "{theme}: the tile badges paint alike, so the sheets did not load"
+            );
+            assert_eq!(
+                row,
+                Some(tile),
+                "{theme}/{modifier}: the Network badge drifted off the tile badge's palette"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_network_badge_wraps_with_the_protocol_name_never_alone() {
+        inject_app_config(true);
+        let global = add_sheet(GLOBAL_CSS);
+        let style = add_sheet(STYLE_CSS);
+        let mount = mount_harness();
+        TimeoutFuture::new(30).await;
+
+        let mut seen = Vec::new();
+        for button in ["active-ws", "active-wt"] {
+            click(&mount, button);
+            TimeoutFuture::new(30).await;
+            let one = |sel: &str| {
+                mount
+                    .query_selector(&format!("[data-testid='transport-current']{sel}"))
+                    .unwrap()
+            };
+            let (Some(row), Some(label), Some(value), Some(badge)) = (
+                one(""),
+                one(" > :first-child"),
+                one(" [data-testid='transport-current-value']"),
+                one(" [data-testid='transport-current-badge']"),
+            ) else {
+                seen.push((button, None));
+                continue;
+            };
+            let gap: f64 = gloo_utils::window()
+                .get_computed_style(&row)
+                .unwrap()
+                .unwrap()
+                .get_property_value("column-gap")
+                .unwrap()
+                .trim_end_matches("px")
+                .parse()
+                .unwrap_or(0.0);
+            let width = |el: &web_sys::Element| el.get_bounding_client_rect().width();
+            // Room for the label and the name, but not the pill after them.
+            let orphaning = width(&label) + gap + width(&value) + gap + width(&badge) / 2.0;
+            let row_style = row.clone().unchecked_into::<web_sys::HtmlElement>().style();
+            row_style
+                .set_property("width", &format!("{orphaning}px"))
+                .unwrap();
+            let (r, l, v, b) = (
+                row.get_bounding_client_rect(),
+                label.get_bounding_client_rect(),
+                value.get_bounding_client_rect(),
+                badge.get_bounding_client_rect(),
+            );
+            row_style.remove_property("width").unwrap();
+            seen.push((
+                button,
+                Some((
+                    b.top() >= l.bottom(),
+                    b.top() < v.bottom() && v.top() < b.bottom(),
+                    (b.left() - v.right() - gap).abs() < 0.5,
+                    b.right() <= r.right() + 0.5,
+                )),
+            ));
+        }
+
+        style.remove();
+        global.remove();
+        remove_app_config();
+        mount.remove();
+
+        for (button, lines) in seen {
+            let (wrapped, shared, spaced, contained) =
+                lines.unwrap_or_else(|| panic!("{button}: the readout did not render"));
+            assert!(
+                wrapped,
+                "{button}: the width forced no wrap, so this guards nothing"
+            );
+            assert!(shared, "{button}: the pill wrapped onto a line of its own");
+            assert!(spaced, "{button}: the pill is not one gap from the name");
+            assert!(contained, "{button}: the pill overflows the row");
+        }
     }
 }

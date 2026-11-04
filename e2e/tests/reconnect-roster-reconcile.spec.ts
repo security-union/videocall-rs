@@ -9,12 +9,14 @@ import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 import { joinMeetingFromPage } from "../helpers/two-user-meeting";
 import { createMeeting } from "../helpers/meeting-api";
 import { installMediaSocketRecorder, severMediaWebSocket } from "../helpers/media-socket-sever";
+import { PEER_MONITOR_TICK_MS } from "../helpers/rust-mirrored-constants";
 
 /**
  * #2267: on transport loss the client stages a roster reconcile (`Reconnecting =>
  * handle_reconnecting_roster_stage`, video_call_client.rs:2222) and reaps sessions the
  * relay's replay never confirms on the first monitor pass, not the 3-miss/5s watchdog.
- * Measured 3.08s fixed vs 7.9s/12.9s un-fixed, so the budget is one monitor period.
+ * The observer is held down until the resumer re-registers, so it misses the
+ * PARTICIPANT_SESSION_RESUMED (#2269) that would otherwise retire the tile first.
  * Sever OBSERVER ONCE: re-closing hits `Failed` -> clear_all_peers() (:2140), a false
  * green. WS only; UNTAGGED, so run it with --project=dioxus.
  */
@@ -30,15 +32,34 @@ const STAYER_NAME = "ReconcileStayer";
 const PEER_TILE = '[id^="peer-video-"][id$="-div"]';
 
 const CONNECTED_LOG = "Connection state changed: Connected";
-
-/** MUST stay under 2.4s: with OBSERVER's ~2.6s reconnect this keeps the gap under one
- *  5s period, so the phantom banks <=1 miss. Raising it silently re-breaks (a). */
-const RESUMER_REKEY_MS = 1_500;
+const RESUMED_LOG = "Session resumed for";
+const FAILED_LOG = "Connection state changed: Failed";
 
 const PHANTOM_BUDGET_MS = 5_000;
 
+/** `Peer::check_heartbeat` reaps on the third consecutive missed monitor pass. */
+const WATCHDOG_REAP_MISSES = 3;
+
+/** The first miss can bank at the sever, so the un-fixed watchdog may reap this long after it;
+ *  a later reconnect would let it reap inside PHANTOM_BUDGET_MS and pass on un-fixed code. */
+const MAX_RECONNECT_GAP_MS = (WATCHDOG_REAP_MISSES - 1) * PEER_MONITOR_TICK_MS - PHANTOM_BUDGET_MS;
+
 async function peerTileIds(page: Page): Promise<string[]> {
   return page.locator(PEER_TILE).evaluateAll((els) => els.map((el) => el.id));
+}
+
+async function tileIdsNamed(page: Page, name: string): Promise<string[]> {
+  return page
+    .locator(PEER_TILE)
+    .evaluateAll(
+      (els, wanted) =>
+        els
+          .filter(
+            (el) => (el.querySelector(".floating-name-text")?.textContent || "").trim() === wanted,
+          )
+          .map((el) => el.id),
+      name,
+    );
 }
 
 async function tileIdsByName(page: Page): Promise<Record<string, string>> {
@@ -104,6 +125,15 @@ test.describe("Reconnect roster reconcile (#2267)", () => {
       for (const ctx of [observerCtx, resumerCtx]) {
         await ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
       }
+      // Holds the observer's reconnect socket CONNECTING until released, so it cannot
+      // hear the resumer's PARTICIPANT_SESSION_RESUMED (#2269). Installed before the
+      // recorder, which must wrap this route's WebSocket to sever it.
+      let releaseObserver: () => void = () => {};
+      let observerHold: Promise<void> = Promise.resolve();
+      await observerCtx.routeWebSocket(/\/lobby/, async (ws) => {
+        await observerHold;
+        ws.connectToServer();
+      });
       await installMediaSocketRecorder(observerCtx);
       await installMediaSocketRecorder(resumerCtx);
 
@@ -137,21 +167,40 @@ test.describe("Reconnect roster reconcile (#2267)", () => {
         `no observer tile is named ${STAYER_NAME} (saw ${JSON.stringify(baseline)})`,
       ).toMatch(/^peer-video-\d+-div$/);
 
-      const resumerSever = await severMediaWebSocket(resumerPage);
-      expect(
-        resumerSever.severed,
-        `no live media socket closed on ${RESUMER_NAME} (recorder saw ` +
-          `${resumerSever.recorded} socket(s)) — nothing was superseded`,
-      ).toBeGreaterThanOrEqual(1);
-      await observerPage.waitForTimeout(RESUMER_REKEY_MS);
-
+      observerHold = new Promise((resolve) => {
+        releaseObserver = resolve;
+      });
       const connectedMark = observerConsole.filter((l) => l.includes(CONNECTED_LOG)).length;
+      const observerSeveredAt = Date.now();
       const observerSever = await severMediaWebSocket(observerPage);
       expect(
         observerSever.severed,
         `no live media socket closed on ${OBSERVER_NAME} (recorder saw ` +
           `${observerSever.recorded} socket(s)) — the reconcile never armed`,
       ).toBeGreaterThanOrEqual(1);
+
+      const resumerSever = await severMediaWebSocket(resumerPage);
+      expect(
+        resumerSever.severed,
+        `no live media socket closed on ${RESUMER_NAME} (recorder saw ` +
+          `${resumerSever.recorded} socket(s)) — nothing was superseded`,
+      ).toBeGreaterThanOrEqual(1);
+
+      await expect
+        .poll(
+          async () =>
+            (await tileIdsNamed(stayerPage, RESUMER_NAME)).some((id) => id !== phantomTileId),
+          {
+            timeout: Math.max(1_000, MAX_RECONNECT_GAP_MS - (Date.now() - observerSeveredAt)),
+            intervals: [200],
+            message:
+              `${STAYER_NAME} never saw ${RESUMER_NAME} re-register within ` +
+              `${MAX_RECONNECT_GAP_MS}ms of the observer's sever`,
+          },
+        )
+        .toBe(true);
+      const phantomHeldToRelease = (await observerPage.locator(`#${phantomTileId}`).count()) === 1;
+      releaseObserver();
 
       await expect
         .poll(() => observerConsole.filter((l) => l.includes(CONNECTED_LOG)).length, {
@@ -161,6 +210,9 @@ test.describe("Reconnect roster reconcile (#2267)", () => {
         })
         .toBeGreaterThan(connectedMark);
       const reconnectedAt = Date.now();
+      const reconnectGapMs = reconnectedAt - observerSeveredAt;
+      const resumedBeforeReconnect = observerConsole.some((l) => l.includes(RESUMED_LOG));
+      const failedBeforeReconnect = observerConsole.some((l) => l.includes(FAILED_LOG));
       const phantomTile = observerPage.locator(`#${phantomTileId}`);
       const phantomHeldToReconnect = (await phantomTile.count()) === 1;
 
@@ -201,8 +253,17 @@ test.describe("Reconnect roster reconcile (#2267)", () => {
         `the superseded tile ${phantomTileId} was already gone the moment the observer ` +
           "reconnected, so nothing here is about the reconcile. Either the observer hit " +
           "ConnectionState::Failed and clear_all_peers() wiped the roster, or a " +
-          "PARTICIPANT_SESSION_RESUMED (#2269) retired the tile before the reconnect.",
+          "PARTICIPANT_SESSION_RESUMED (#2269) retired the tile before the reconnect. " +
+          `Tile present when the observer was released: ${phantomHeldToRelease}; ` +
+          `observer logged "${RESUMED_LOG}" before reconnecting: ${resumedBeforeReconnect}; ` +
+          `observer logged "${FAILED_LOG}": ${failedBeforeReconnect}.`,
       ).toBe(true);
+      expect(
+        reconnectGapMs,
+        `the observer reconnected ${reconnectGapMs}ms after its sever, over the ` +
+          `${MAX_RECONNECT_GAP_MS}ms bound: the un-fixed watchdog could reap the phantom ` +
+          `inside PHANTOM_BUDGET_MS, so this run cannot discriminate`,
+      ).toBeLessThanOrEqual(MAX_RECONNECT_GAP_MS);
       expect(
         phantomGoneAfterMs,
         `DISCRIMINATOR (a): the superseded tile ${phantomTileId} was STILL PRESENT on the ` +

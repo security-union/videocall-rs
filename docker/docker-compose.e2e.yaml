@@ -26,8 +26,10 @@ services:
       retries: 10
 
   nats:
-    image: nats:2.10-alpine
+    image: nats:2.14.8
     command: ["-js", "--http_port", "8222"]
+    ports:
+      - "127.0.0.1:${E2E_NATS_HOST_PORT:-14222}:4222"
 
   # Per-client downlink-impairment proxy (issue #1080). OFF by default: gated
   # behind the `impair` compose profile so normal e2e runs never start it and
@@ -134,6 +136,7 @@ services:
       # stack; the handler canonicalizes the base dir, so it must be writable).
       - CONSOLE_LOG_UPLOAD_ENABLED=true
       - CONSOLE_LOG_DIR=/tmp/console-logs
+      - CAPTIONS_ENABLED=${CAPTIONS_ENABLED:-true}
       - RUST_LOG=info
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1
@@ -322,6 +325,7 @@ services:
       # helpers/show-build-git-info-config.ts).
       - SHOW_BUILD_GIT_INFO=true
       - E2EE_ENABLED=false
+      - CAPTIONS_ENABLED=false
       - FIREFOX_ENABLED=false
       # Enable the mock-peers debug feature so layout-driven specs (e.g.
       # decode-budget.spec.ts, issue #987 task 1a.6) can synthesize peer tiles

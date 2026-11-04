@@ -18,7 +18,7 @@ COMMIT = "0123abcd0123abcd0123abcd0123abcd0123abcd"
 
 
 class FakeClock:
-    def __init__(self, wall=900.0, mono=50.0, max_sleeps=None):
+    def __init__(self, wall=900.0, mono=50.0, max_sleeps=20000):
         self.wall, self.mono, self.jumps = wall, mono, []
         self.sleeps, self.max_sleeps = 0, max_sleeps
 
@@ -26,6 +26,8 @@ class FakeClock:
         return Stamp(self.wall, self.mono)
 
     def sleep(self, seconds):
+        if seconds < 0:
+            raise ValueError("sleep length must be non-negative")
         self.sleeps += 1
         if self.max_sleeps is not None and self.sleeps > self.max_sleeps:
             raise AssertionError(f"more than {self.max_sleeps} sleeps")
@@ -60,8 +62,8 @@ class FakeTree:
 
 class FakeStack:
     def __init__(self, clock, up_s=40.0, selector='up{job="relay-ws"}', prom_url="http://prom.invalid",
-                 restart=False, problems=(), fail_up=False, images=None):
-        self.clock, self.up_s, self.selector, self.url = clock, up_s, selector, prom_url
+                 restart=False, problems=(), fail_up=False, images=None, throttle=None):
+        self.clock, self.up_s, self.selector, self.url, self.throttle = clock, up_s, selector, prom_url, throttle
         self.restart, self.problems, self.fail_up = restart, list(problems), fail_up
         self._images = images if images is not None else {k: f"sha256:{k}" for k in cq_collect.IMAGE_KEYS}
         self.calls, self.states = [], 0
@@ -89,8 +91,38 @@ class FakeStack:
     def scrape_up_selector(self):
         return self.selector
 
+    def throttle_pod_selector(self):
+        return self.throttle
+
     def down(self):
         self.calls.append(("down",))
+
+
+class FakeSharedStack(FakeStack):
+    """A FakeStack with the optional watch() and drained() hooks; watch reasons appear from wall time abort_at."""
+
+    def __init__(self, clock, abort_at=None, reasons=("a real meeting started",), drain=(), watch_s=0.0, fail_at=None,
+                 **kw):
+        super().__init__(clock, **kw)
+        self.abort_at, self.reasons, self.drain = abort_at, list(reasons), drain
+        self.watch_s = list(watch_s) if isinstance(watch_s, list) else [watch_s]
+        self.fail_at = fail_at
+        self.watched, self.watch_ends = [], []
+
+    def watch(self):
+        self.watched.append((self.clock.wall, self.clock.mono))
+        due = self.abort_at is not None and self.clock.wall >= self.abort_at
+        self.clock.advance(self.watch_s.pop(0) if len(self.watch_s) > 1 else self.watch_s[0])
+        self.watch_ends.append(self.clock.mono)
+        if self.fail_at is not None and self.clock.wall >= self.fail_at:
+            raise AdapterError("prometheus timed out")
+        return list(self.reasons) if due else []
+
+    def drained(self):
+        self.calls.append(("drained",))
+        if isinstance(self.drain, Exception):
+            raise self.drain
+        return self.drain if not isinstance(self.drain, tuple) else list(self.drain)
 
 
 class FakeFleet:
@@ -98,7 +130,8 @@ class FakeFleet:
                  extra_joined=(), crash=None, crash_leave_ts=False, event_results=None, confirm_delay=0.5,
                  stop_s=5.0, stop_fails=(), exit_time=None, hosts=("local",), verdict_ok=None,
                  missing_verdicts=(), extra_verdicts=(), window_shift=0.0, facts=None, interrupt_at=None,
-                 leave_exit_delay=1.0, silent_crash=False, confirm_skew=0.0, leave_exit_code=0, crash_code=137):
+                 leave_exit_delay=1.0, silent_crash=False, confirm_skew=0.0, leave_exit_code=0, crash_code=137,
+                 leaks=None, admit=None):
         self.clock, self.plan = clock, plan
         self.parts = {p["user_id"]: p for p in plan["participants"]}
         self.procs = {p["proc_id"]: p for p in plan["processes"]}
@@ -114,6 +147,24 @@ class FakeFleet:
         self.leave_exit_code, self.crash_code = leave_exit_code, crash_code
         self.launched, self.exited, self.reported, self.left, self.scheduled = {}, {}, set(), {}, {}
         self.calls = []
+        if leaks is not None:
+            self.leak_results = list(leaks) if isinstance(leaks, list) else [leaks]
+            self.leaks = self._leaks
+        if admit is not None:
+            self.refuse = set(admit) if isinstance(admit, (list, tuple, set)) else set()
+            self.admit = self._admit
+
+    def _admit(self, proc):
+        self.calls.append(("admit", proc["proc_id"]))
+        ok = proc["proc_id"] not in self.refuse
+        return ok, f"host 1.00 + probe 3.00 cores {'<=' if ok else '>'} 5.30"
+
+    def _leaks(self, run_dir):
+        self.calls.append(("leaks", sorted(os.listdir(run_dir))))
+        out = self.leak_results.pop(0) if len(self.leak_results) > 1 else self.leak_results[0]
+        if isinstance(out, Exception):
+            raise out
+        return list(out) if isinstance(out, tuple) else out
 
     def _interrupt(self):
         if self.interrupt_at is not None and self.clock.wall >= self.interrupt_at:
@@ -243,7 +294,9 @@ class FakeFleet:
             rec.update(placement=None, stagger_ms=None)
             _write(os.path.join(run_dir, "probes", str(proc["probe_index"]), "participants", f"bot-{uid}.json"),
                    {"schema": cq_collect.BROWSER_SCHEMA, "bot_id": f"bot-{proc['proc_id']}", "outcome": outcome,
-                    "unverified": [], "participant": rec})
+                    "unverified": [], "participant": rec, "decode_budget": {
+                        "requested": proc.get("decode_budget", "client"),
+                        "observed": "all" if proc.get("decode_budget") == "off" else None}})
 
 
 def _write(path, obj):

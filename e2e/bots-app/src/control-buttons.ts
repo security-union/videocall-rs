@@ -1,3 +1,5 @@
+import { notVisible, withTimeLimit } from "./time-limit";
+
 /** State a control's `aria-label` describes: the CURRENT state, not the action. */
 export type ControlState = "on" | "off";
 
@@ -25,10 +27,13 @@ export const CAMERA_TOOLTIP: Record<ControlState, string> = {
   off: "Start Video",
 };
 
+// A live share's button opens a menu rather than stopping the share (#3173).
 export const SCREEN_SHARE_TOOLTIP: Record<ControlState, string> = {
-  on: "Screen share — Stop Screen Share",
+  on: "Screen share — Sharing options",
   off: "Screen share — Share Screen",
 };
+
+export const SCREEN_SHARE_MENU_STOP_SELECTOR = '[data-testid="screen-share-menu-stop"]';
 
 export const PEER_LIST_TOOLTIP: Record<ControlState, string> = {
   on: "Participants — Close Peers",
@@ -53,6 +58,17 @@ export function cameraControlSelector(state: ControlState): string {
   return cameraButtonSelector(CAMERA_TOOLTIP[state]);
 }
 
+export const UNAVAILABLE_TOOLTIP: Record<"mic" | "camera", string> = {
+  mic: "Microphone unavailable",
+  camera: "Camera unavailable",
+};
+
+// An unavailable device's aria-label drops its on/off state; the `off` class still carries it.
+export function unavailableOffSelector(medium: "mic" | "camera"): string {
+  const testid = medium === "mic" ? MIC_TESTID_SELECTOR : CAMERA_TESTID_SELECTOR;
+  return `${LIVE_ACTION_BAR_BUTTON}${testid}.off[aria-label*="${UNAVAILABLE_TOOLTIP[medium]}"]`;
+}
+
 export function screenShareControlSelector(state: ControlState): string {
   return liveSlotButton(SCREEN_SHARE_TESTID_SELECTOR, SCREEN_SHARE_TOOLTIP[state]);
 }
@@ -66,6 +82,7 @@ export const PRE_MARKER_UI_BANNER = "PRE_MARKER_UI";
 // Pre-#2441 needles. Playwright's `:has-text` is case-insensitive, so casing may differ.
 export const HANG_UP_LEGACY_TOOLTIP = "Hang Up";
 
+// `on` also matches a pre-#3173 UI, whose live share's button stops it on click.
 export const SCREEN_SHARE_LEGACY_TOOLTIP: Record<ControlState, string> = {
   on: "Stop Screen Share",
   off: "Share Screen",
@@ -109,7 +126,7 @@ export interface CandidatePage {
 
 /**
  * First candidate with a visible match, or null. A non-first match means the
- * target predates the #2441 markers, so its control coverage is degraded.
+ * target predates the selectors this build expects, so its control coverage is degraded.
  */
 export async function resolveControlSelector(
   page: CandidatePage,
@@ -120,15 +137,14 @@ export async function resolveControlSelector(
 ): Promise<string | null> {
   for (let i = 0; i < candidates.length; i++) {
     const selector = candidates[i];
-    const visible = await page
-      .locator(selector)
-      .isVisible({ timeout: timeoutMs })
-      .catch(() => false);
+    const visible = await withTimeLimit(`${label}: isVisible ${selector}`, timeoutMs, () =>
+      page.locator(selector).isVisible(),
+    ).catch(notVisible(onFallback));
     if (!visible) continue;
     if (i > 0) {
       onFallback(
         `${PRE_MARKER_UI_BANNER} ${label}: matched by tooltip text, not data-testid — ` +
-          `the target UI predates the #2441 markers`,
+          `the target UI predates the selectors this build expects`,
       );
     }
     return selector;

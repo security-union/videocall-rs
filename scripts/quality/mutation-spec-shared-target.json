@@ -1,0 +1,783 @@
+{
+ "_comment": [
+  "Mutations of the shared-target hooks (#2914 PR-8a), each naming the unit test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-shared-target.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_shared_target.py"
+ ],
+ "baseline_tests": 57,
+ "mutations": [
+  {
+   "name": "hcl-daily not shared",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "SHARED_TARGETS = frozenset({\"hcl-daily\", *profile_targets()})",
+   "replace": "SHARED_TARGETS = frozenset(set(profile_targets()) - {\"hcl-daily\"})",
+   "expect_kills": [
+    "test_hcl_daily_compiles_as_a_shared_report_mode_plan",
+    "test_a_shared_run_whose_scorer_says_pass_ends_invalid_through_r11"
+   ]
+  },
+  {
+   "name": "gate accepted on a shared target",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if target in SHARED_TARGETS and scoring[\"mode\"] != \"report\":",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_report_mode_is_accepted_exactly_on_shared_targets",
+    "test_gate_on_hcl_daily_is_refused_also_by_default"
+   ]
+  },
+  {
+   "name": "report accepted on local and ci",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    elif target not in SHARED_TARGETS and scoring[\"mode\"] != \"gate\":",
+   "replace": "    elif False:",
+   "expect_kills": [
+    "test_report_mode_is_accepted_exactly_on_shared_targets"
+   ]
+  },
+  {
+   "name": "0-probe shared run accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if run.get(\"target\") in SHARED_TARGETS and all(",
+   "replace": "    if False and all(",
+   "expect_kills": [
+    "test_a_shared_target_with_no_probe_is_refused",
+    "test_a_shared_target_whose_probes_all_leave_is_refused"
+   ]
+  },
+  {
+   "name": "leaving probes still count",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "p[\"fleet\"] != \"browser\" or p[\"user_id\"] in leavers for p in parts)",
+   "replace": "p[\"fleet\"] != \"browser\" for p in parts)",
+   "expect_kills": [
+    "test_a_shared_target_whose_probes_all_leave_is_refused"
+   ]
+  },
+  {
+   "name": "shared run without an explicit --target",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "(args.target is None or args.stack != \"reuse\")",
+   "replace": "(args.stack != \"reuse\")",
+   "expect_kills": [
+    "test_hcl_daily_needs_an_explicit_target_and_stack_reuse"
+   ]
+  },
+  {
+   "name": "shared run with --stack up",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "(args.target is None or args.stack != \"reuse\")",
+   "replace": "(args.target is None)",
+   "expect_kills": [
+    "test_hcl_daily_needs_an_explicit_target_and_stack_reuse"
+   ]
+  },
+  {
+   "name": "runner sees no shared target",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.shared = plan.get(\"target\") in cq_scenario.SHARED_TARGETS",
+   "replace": "        self.shared = False",
+   "expect_kills": [
+    "test_a_shared_run_whose_scorer_says_pass_ends_invalid_through_r11",
+    "test_a_shared_target_refuses_a_stack_without_watch_or_drained"
+   ]
+  },
+  {
+   "name": "R11 dropped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            gate(\"R11\", False, REPORT_ONLY)",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_a_shared_run_whose_scorer_says_pass_ends_invalid_through_r11",
+    "test_r11_caps_every_scorer_verdict_at_invalid",
+    "test_hcl_daily_with_an_injected_adapter_exits_invalid_through_r11"
+   ]
+  },
+  {
+   "name": "R11 passes",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            gate(\"R11\", False, REPORT_ONLY)",
+   "replace": "            gate(\"R11\", True, REPORT_ONLY)",
+   "expect_kills": [
+    "test_a_shared_run_whose_scorer_says_pass_ends_invalid_through_r11",
+    "test_r11_caps_every_scorer_verdict_at_invalid"
+   ]
+  },
+  {
+   "name": "R11 on every run",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.shared:\n            gate(\"R11\"",
+   "replace": "        if True:\n            gate(\"R11\"",
+   "expect_kills": [
+    "test_a_local_run_has_neither_r11_nor_r12"
+   ]
+  },
+  {
+   "name": "R12 only on shared targets",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.shared or callable(getattr(self.stack, \"drained\", None)):",
+   "replace": "        if self.shared:",
+   "expect_kills": [
+    "test_a_local_stack_with_drain_data_gets_r12"
+   ]
+  },
+  {
+   "name": "R12 only for a stack with drained()",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.shared or callable(getattr(self.stack, \"drained\", None)):",
+   "replace": "        if callable(getattr(self.stack, \"drained\", None)):",
+   "expect_kills": [
+    "test_a_shared_target_refuses_a_stack_without_watch_or_drained"
+   ]
+  },
+  {
+   "name": "drain check not run",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self.s.drain = self._try(\"drain check\", lambda: _strings(self.stack.drained(), \"drained()\"))",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_a_shared_run_whose_scorer_says_pass_ends_invalid_through_r11",
+    "test_the_drain_check_runs_once_after_every_stop"
+   ]
+  },
+  {
+   "name": "drain result not validated",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "lambda: _strings(self.stack.drained(), \"drained()\")",
+   "replace": "lambda: self.stack.drained()",
+   "expect_kills": [
+    "test_a_failing_or_malformed_drain_check_fails_r12"
+   ]
+  },
+  {
+   "name": "watch reasons ignored",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if reasons:\n            raise Abort",
+   "replace": "        if False:\n            raise Abort",
+   "expect_kills": [
+    "test_a_watch_reason_mid_hold_aborts_tears_down_and_fails_r1",
+    "test_a_watch_reason_during_the_join_aborts_before_the_hold"
+   ]
+  },
+  {
+   "name": "watch interval 150 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_INTERVAL_S = 15.0",
+   "replace": "WATCH_INTERVAL_S = 150.0",
+   "expect_kills": [
+    "test_the_watch_runs_once_per_15_s_and_no_more"
+   ]
+  },
+  {
+   "name": "load-a not a reserved node",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "RESERVED_NODES = (\"local\", \"ci\", \"load-a\")",
+   "replace": "RESERVED_NODES = (\"local\", \"ci\")",
+   "expect_kills": [
+    "test_load_a_is_accepted_as_a_clock_node_and_a_generator_host"
+   ]
+  },
+  {
+   "name": "R12 passes when the drain check failed",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "gate(\"R12\", False, \"the drain check did not run",
+   "replace": "gate(\"R12\", True, \"the drain check did not run",
+   "expect_kills": [
+    "test_a_failing_or_malformed_drain_check_fails_r12"
+   ]
+  },
+  {
+   "name": "R12 passes with drain problems",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                gate(\"R12\", not s.drain,",
+   "replace": "                gate(\"R12\", True,",
+   "expect_kills": [
+    "test_drain_problems_fail_r12",
+    "test_a_local_stack_with_drain_data_gets_r12"
+   ]
+  },
+  {
+   "name": "shared stack without hooks or reuse accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if self.shared and unfit:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_shared_target_refuses_a_stack_without_watch_or_drained",
+    "test_a_shared_target_refuses_a_stack_mode_other_than_reuse"
+   ]
+  },
+  {
+   "name": "shared stack mode not checked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        unfit += [f\"it needs --stack reuse, not {self.stack_mode}\"] if self.stack_mode != \"reuse\" else []",
+   "replace": "        unfit += []",
+   "expect_kills": [
+    "test_a_shared_target_refuses_a_stack_mode_other_than_reuse"
+   ]
+  },
+  {
+   "name": "watch budget 0",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_BUDGET_S = 2.0",
+   "replace": "WATCH_BUDGET_S = 0.0",
+   "expect_kills": [
+    "test_a_watch_within_its_budget_does_not_stretch_the_probe_stagger"
+   ]
+  },
+  {
+   "name": "blank strings accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "isinstance(x, str) and x.strip() for x in v",
+   "replace": "isinstance(x, str) for x in v",
+   "expect_kills": [
+    "test_a_watch_that_returns_no_list_is_an_error_and_still_tears_down",
+    "test_a_failing_or_malformed_drain_check_fails_r12"
+   ]
+  },
+  {
+   "name": "stale PR-8 note in the target refusal",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "must be one of {', '.join(TARGETS)}\")",
+   "replace": "must be one of {', '.join(TARGETS)} (cluster runs come with PR-8)\")",
+   "expect_kills": [
+    "test_an_unknown_target_lists_the_targets_and_nothing_else"
+   ]
+  },
+  {
+   "name": "watch never called",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            out = self.stack.watch()",
+   "replace": "            out = []",
+   "expect_kills": [
+    "test_a_watch_reason_mid_hold_aborts_tears_down_and_fails_r1",
+    "test_the_watch_runs_once_per_15_s_and_no_more"
+   ]
+  },
+  {
+   "name": "watch interval stamped at the start of a round",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self.s.watched_mono = self._now().mono",
+   "replace": "            self.s.watched_mono = begin",
+   "expect_kills": [
+    "test_the_watch_interval_runs_from_the_end_of_a_round"
+   ]
+  },
+  {
+   "name": "watch result not validated",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        reasons = _strings(out, \"watch()\")",
+   "replace": "        reasons = out",
+   "expect_kills": [
+    "test_a_watch_that_returns_no_list_is_an_error_and_still_tears_down"
+   ]
+  },
+  {
+   "name": "watch failure ends the run as ERROR",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            raise Abort(f\"stack watch failed: {exc}\") from exc",
+   "replace": "            raise",
+   "expect_kills": [
+    "test_a_failing_watch_aborts_and_the_run_is_still_torn_down_and_scored",
+    "test_a_failing_watch_in_the_join_is_an_abort_not_an_error"
+   ]
+  },
+  {
+   "name": "slowest watch not kept",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self.s.watch[\"max_s\"] = max(self.s.watch[\"max_s\"], took)",
+   "replace": "            self.s.watch[\"max_s\"] = took",
+   "expect_kills": [
+    "test_run_json_records_the_slowest_watch_and_rounds_over_budget"
+   ]
+  },
+  {
+   "name": "rounds over budget not counted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self.s.watch[\"over_budget\"] += took > WATCH_BUDGET_S",
+   "replace": "            self.s.watch[\"over_budget\"] += 0",
+   "expect_kills": [
+    "test_run_json_records_the_slowest_watch_and_rounds_over_budget"
+   ]
+  },
+  {
+   "name": "watch timing in every run.json",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "**({\"watch\": dict(self.s.watch)} if callable(getattr(self.stack, \"watch\", None)) else {})",
+   "replace": "**{\"watch\": dict(self.s.watch)}",
+   "expect_kills": [
+    "test_a_local_run_has_neither_r11_nor_r12"
+   ]
+  },
+  {
+   "name": "non-callable watch called",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if not callable(getattr(self.stack, \"watch\", None)):\n            return math.inf",
+   "replace": "        if getattr(self.stack, \"watch\", None) is None:\n            return math.inf",
+   "expect_kills": [
+    "test_a_stack_whose_watch_is_not_callable_is_not_watched"
+   ]
+  },
+  {
+   "name": "watch starts without the budget",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        return start if target - start >= WATCH_BUDGET_S - 1e-6 else",
+   "replace": "        return start if True else",
+   "expect_kills": [
+    "test_a_watch_slower_than_the_slack_delays_events_and_hold_end_by_at_most_its_overrun"
+   ]
+  },
+  {
+   "name": "starvation override off",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "else max(start, last + WATCH_STARVE_S)",
+   "replace": "else math.inf",
+   "expect_kills": [
+    "test_no_stretch_goes_unwatched_past_the_ceiling_with_events_2_s_apart",
+    "test_no_stretch_goes_unwatched_past_the_ceiling_in_a_1_5_s_stagger",
+    "test_a_starving_round_over_budget_fails_closed_through_r6"
+   ]
+  },
+  {
+   "name": "watch not rate-limited",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        start = max(mono, last + WATCH_INTERVAL_S)",
+   "replace": "        start = mono",
+   "expect_kills": [
+    "test_the_watch_runs_once_per_15_s_and_no_more"
+   ]
+  },
+  {
+   "name": "watch rate limit one poll too long",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        start = max(mono, last + WATCH_INTERVAL_S)",
+   "replace": "        start = max(mono, last + WATCH_INTERVAL_S + POLL_S)",
+   "expect_kills": [
+    "test_the_watch_runs_once_per_15_s_and_no_more"
+   ]
+  },
+  {
+   "name": "join loop not watched",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._poll(math.inf)",
+   "replace": "            self._poll(0.0)",
+   "expect_kills": [
+    "test_a_watch_reason_during_the_join_aborts_before_the_hold"
+   ]
+  },
+  {
+   "name": "sleep not cut at the due watch",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "min(POLL_S, target - now.mono, at - now.mono)",
+   "replace": "min(POLL_S, target - now.mono)",
+   "expect_kills": [
+    "test_events_6_s_apart_still_get_a_watch_about_every_15_s",
+    "test_a_staggered_probe_launch_is_watched_and_its_stagger_stays_exact"
+   ]
+  },
+  {
+   "name": "starving round skipped at a reached target",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if now.mono >= target and at > now.mono + 1e-6:",
+   "replace": "            if now.mono >= target:",
+   "expect_kills": [
+    "test_slow_launches_of_many_rust_leavers_stay_under_the_ceiling",
+    "test_the_first_round_comes_within_one_slow_launch_of_its_forced_time"
+   ]
+  },
+  {
+   "name": "first round not due at join start",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.s.watched_mono = start[\"mono\"] - WATCH_INTERVAL_S",
+   "replace": "        self.s.watched_mono = start[\"mono\"]",
+   "expect_kills": [
+    "test_the_first_round_follows_the_rust_launch_and_a_stagger_defers_one_only_to_its_forced_time"
+   ]
+  },
+  {
+   "name": "starve 45 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_STARVE_S = 2 * WATCH_INTERVAL_S",
+   "replace": "WATCH_STARVE_S = 45.0",
+   "expect_kills": [
+    "test_no_stretch_goes_unwatched_past_the_ceiling_with_events_2_s_apart",
+    "test_slow_launches_of_many_rust_leavers_stay_under_the_ceiling"
+   ]
+  },
+  {
+   "name": "starve 32 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_STARVE_S = 2 * WATCH_INTERVAL_S",
+   "replace": "WATCH_STARVE_S = 32.0",
+   "expect_kills": [
+    "test_no_stretch_goes_unwatched_past_the_ceiling_with_events_2_s_apart"
+   ]
+  },
+  {
+   "name": "join sleep not cut at the due round",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "deadline - now.mono, due))",
+   "replace": "deadline - now.mono))",
+   "expect_kills": [
+    "test_a_due_round_in_the_join_loop_waits_only_for_fleet_joined"
+   ]
+  },
+  {
+   "name": "no check after a Rust launch",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._launch(p)\n            self._watch_check()\n",
+   "replace": "            self._launch(p)\n",
+   "expect_kills": [
+    "test_slow_launches_of_many_rust_leavers_stay_under_the_ceiling"
+   ]
+  },
+  {
+   "name": "no check after the last probe launch or a refusal",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                    continue\n            self._watch_check()\n",
+   "replace": "                    continue\n",
+   "expect_kills": [
+    "test_a_slow_last_probe_launch_gets_its_forced_round_before_a_slow_join_poll",
+    "test_slow_refusals_still_get_their_watch_rounds"
+   ]
+  },
+  {
+   "name": "watch check does nothing",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._sleep_until_mono(self._now().mono)\n",
+   "replace": "            pass\n",
+   "expect_kills": [
+    "test_slow_launches_of_many_rust_leavers_stay_under_the_ceiling",
+    "test_the_first_round_comes_within_one_slow_launch_of_its_forced_time"
+   ]
+  },
+  {
+   "name": "no re-check after poll",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if go or self._watch_due(target):",
+   "replace": "        if go:",
+   "expect_kills": [
+    "test_a_poll_slower_than_the_apply_still_meets_the_ceiling"
+   ]
+  },
+  {
+   "name": "go decided only after the fleet poll",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        go = self._watch_due(target)\n",
+   "replace": "        go = False\n",
+   "expect_kills": [
+    "test_a_slow_fleet_poll_does_not_cancel_the_rounds_between_events_3_s_apart"
+   ]
+  },
+  {
+   "name": "go and the sleep cut disagree",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        return self._watch_at(now, target) <= now + 1e-6",
+   "replace": "        return self._watch_at(now, target) < now - 1e-6",
+   "expect_kills": [
+    "test_the_watch_runs_once_per_15_s_and_no_more"
+   ]
+  },
+  {
+   "name": "watch budget 1.5 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_BUDGET_S = 2.0",
+   "replace": "WATCH_BUDGET_S = 1.5",
+   "expect_kills": [
+    "test_a_watch_within_its_budget_does_not_stretch_the_probe_stagger"
+   ]
+  },
+  {
+   "name": "watch budget 1.9 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_BUDGET_S = 2.0",
+   "replace": "WATCH_BUDGET_S = 1.9",
+   "expect_kills": [
+    "test_a_watch_within_its_budget_does_not_stretch_the_probe_stagger"
+   ]
+  },
+  {
+   "name": "a round of exactly the budget counted over budget",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "took > WATCH_BUDGET_S",
+   "replace": "took >= WATCH_BUDGET_S",
+   "expect_kills": [
+    "test_a_round_of_exactly_the_budget_is_not_over_budget"
+   ]
+  },
+  {
+   "name": "expectation accepted on a shared target",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    if target in SHARED_TARGETS and scoring[\"expect\"] is not None:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_an_expectation_is_refused_on_a_shared_target"
+   ]
+  },
+  {
+   "name": "watch budget 1.95 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_BUDGET_S = 2.0",
+   "replace": "WATCH_BUDGET_S = 1.95",
+   "expect_kills": [
+    "test_a_watch_within_its_budget_does_not_stretch_the_probe_stagger",
+    "test_a_round_of_exactly_the_budget_is_not_over_budget"
+   ]
+  },
+  {
+   "name": "watch budget 1.99 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_BUDGET_S = 2.0",
+   "replace": "WATCH_BUDGET_S = 1.99",
+   "expect_kills": [
+    "test_a_watch_within_its_budget_does_not_stretch_the_probe_stagger",
+    "test_a_round_of_exactly_the_budget_is_not_over_budget"
+   ]
+  },
+  {
+   "name": "watch budget 2.01 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_BUDGET_S = 2.0",
+   "replace": "WATCH_BUDGET_S = 2.01",
+   "expect_kills": [
+    "test_a_watch_within_its_budget_does_not_stretch_the_probe_stagger"
+   ]
+  },
+  {
+   "name": "watch budget 2.1 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_BUDGET_S = 2.0",
+   "replace": "WATCH_BUDGET_S = 2.1",
+   "expect_kills": [
+    "test_a_watch_within_its_budget_does_not_stretch_the_probe_stagger"
+   ]
+  },
+  {
+   "name": "drain check only on a shared target",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if callable(getattr(self.stack, \"drained\", None)):\n            self.s.drain",
+   "replace": "        if self.shared and callable(getattr(self.stack, \"drained\", None)):\n            self.s.drain",
+   "expect_kills": [
+    "test_a_local_stack_with_drain_data_gets_r12"
+   ]
+  },
+  {
+   "name": "a failing round not recorded",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        finally:\n            self.s.watched_mono = self._now().mono",
+   "replace": "        else:\n            self.s.watched_mono = self._now().mono",
+   "expect_kills": [
+    "test_a_failing_watch_aborts_and_the_run_is_still_torn_down_and_scored"
+   ]
+  },
+  {
+   "name": "starve 29.5 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "WATCH_STARVE_S = 2 * WATCH_INTERVAL_S",
+   "replace": "WATCH_STARVE_S = 2 * WATCH_INTERVAL_S - 0.5",
+   "expect_kills": [
+    "test_watch_at_gives_the_due_time_the_budget_fit_and_the_forced_time"
+   ]
+  },
+  {
+   "name": "first round due 1 s after join_start",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "start[\"mono\"] - WATCH_INTERVAL_S",
+   "replace": "start[\"mono\"] - 14.0",
+   "expect_kills": [
+    "test_the_first_round_follows_the_rust_launch_and_a_stagger_defers_one_only_to_its_forced_time"
+   ]
+  },
+  {
+   "name": "exactly the budget left does not fit",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "target - start >= WATCH_BUDGET_S - 1e-6",
+   "replace": "target - start > WATCH_BUDGET_S + 1e-6",
+   "expect_kills": [
+    "test_watch_at_gives_the_due_time_the_budget_fit_and_the_forced_time"
+   ]
+  },
+  {
+   "name": "any watch exception is an abort",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        except AdapterError as exc:\n            raise Abort(f\"stack watch failed",
+   "replace": "        except Exception as exc:\n            raise Abort(f\"stack watch failed",
+   "expect_kills": [
+    "test_a_watch_raising_anything_but_adapter_error_is_an_internal_error"
+   ]
+  },
+  {
+   "name": "R12 detail empty when drained",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "\"; \".join(s.drain) or \"the room drained\"",
+   "replace": "\"; \".join(s.drain)",
+   "expect_kills": [
+    "test_a_shared_run_whose_scorer_says_pass_ends_invalid_through_r11"
+   ]
+  },
+  {
+   "name": "forced-time tolerance 0.5 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "at > now.mono + 1e-6:",
+   "replace": "at > now.mono + 0.5:",
+   "expect_kills": [
+    "test_no_round_starts_before_it_is_due"
+   ]
+  },
+  {
+   "name": "due tolerance 0.5 s",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "<= now + 1e-6",
+   "replace": "<= now + 0.5",
+   "expect_kills": [
+    "test_no_round_starts_before_it_is_due"
+   ]
+  },
+  {
+   "name": "a refused probe is launched anyway",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if self._admit(p):\n                self._launch(p)",
+   "replace": "            self._admit(p)\n            if True:\n                self._launch(p)",
+   "expect_kills": [
+    "test_a_refused_probe_is_left_out_and_recorded_and_the_run_goes_on"
+   ]
+  },
+  {
+   "name": "admission skipped",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        admit = getattr(self.fleet, \"admit\", None)\n",
+   "replace": "        admit = None\n",
+   "expect_kills": [
+    "test_each_probe_is_admitted_just_before_its_launch_once_rust_media_started"
+   ]
+  },
+  {
+   "name": "a refused owner does not end the run",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            return \"it owns the meeting, so no later probe could join\"",
+   "replace": "            return None",
+   "expect_kills": [
+    "test_a_refused_owner_probe_aborts_before_any_probe_launch"
+   ]
+  },
+  {
+   "name": "a refused event target does not end the run",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            return \"a scenario event acts on it\"",
+   "replace": "            return None",
+   "expect_kills": [
+    "test_a_refused_probe_that_an_event_acts_on_aborts"
+   ]
+  },
+  {
+   "name": "a malformed admission answer accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            raise AdapterError(\"fleet admit() must return (admitted, a non-blank detail)\")",
+   "replace": "            out = (True, \"x\")",
+   "expect_kills": [
+    "test_a_malformed_admission_answer_is_an_error_and_launches_nothing_more"
+   ]
+  },
+  {
+   "name": "a blank admission detail accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                and out[1].strip()):",
+   "replace": "                ):",
+   "expect_kills": [
+    "test_a_malformed_admission_answer_is_an_error_and_launches_nothing_more"
+   ]
+  },
+  {
+   "name": "a refusal is not written to plan.json",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                                                    \"detail\": detail})\n        _dump(self.path(cq_collect.PLAN_FILE), self.plan)\n",
+   "replace": "                                                    \"detail\": detail})\n",
+   "expect_kills": [
+    "test_a_refused_probe_is_left_out_and_recorded_and_the_run_goes_on"
+   ]
+  },
+  {
+   "name": "a refusal keeps n_target",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.step[\"n_target\"] -= len(uids)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_refused_probe_is_left_out_and_recorded_and_the_run_goes_on"
+   ]
+  },
+  {
+   "name": "a refused participant stays planned",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.plan[\"participants\"][:] = [p for p in self.plan[\"participants\"] if p[\"user_id\"] not in uids]\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_refused_probe_is_left_out_and_recorded_and_the_run_goes_on"
+   ]
+  },
+  {
+   "name": "a refused process stays planned",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.plan[\"processes\"].remove(proc)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_refused_probe_is_left_out_and_recorded_and_the_run_goes_on"
+   ]
+  },
+  {
+   "name": "admission missing from run.json",
+   "file": "scripts/quality/cq_runner.py",
+   "find": ",\n                **({\"admission\": list(self.s.admission)} if callable(getattr(self.fleet, \"admit\", None)) else {})}",
+   "replace": "}",
+   "expect_kills": [
+    "test_a_refused_probe_is_left_out_and_recorded_and_the_run_goes_on",
+    "test_each_probe_is_admitted_just_before_its_launch_once_rust_media_started"
+   ]
+  },
+  {
+   "name": "admission missing from events.jsonl",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self.log.write(\"admission\", proc_id=pid, participants=list(proc[\"participants\"]), admitted=ok, detail=detail)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_refused_probe_is_left_out_and_recorded_and_the_run_goes_on"
+   ]
+  },
+  {
+   "name": "a shared fleet without admit() accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "for h in (\"leaks\", \"admit\")",
+   "replace": "for h in (\"leaks\",)",
+   "expect_kills": [
+    "test_a_shared_target_refuses_a_fleet_without_admit"
+   ]
+  },
+  {
+   "name": "the summary line omits refused probes",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "          f\"{'; probes refused at admission: ' + ', '.join(refused) if refused else ''}\", file=sys.stderr)",
+   "replace": "          \"\", file=sys.stderr)",
+   "expect_kills": [
+    "test_the_summary_line_names_the_probes_refused_at_admission"
+   ]
+  },
+  {
+   "name": "the runner ignores a later watch by the fleet",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        last = max(last, other) if isinstance(other, (int, float)) else last\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_round_is_due_from_the_stacks_last_watch_when_the_fleet_watched_later"
+   ]
+  }
+ ]
+}

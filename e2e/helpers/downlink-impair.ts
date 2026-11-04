@@ -285,12 +285,6 @@ export async function routeDownlinkThroughProxy(
   context: BrowserContext,
   wsUrl: string = SHAPED_WS_URL,
 ): Promise<void> {
-  // Pin to WebSocket so the client cannot elect WebTransport and bypass the
-  // TCP proxy. The UI reads the sticky flag under `vc_transport_sticky` and the
-  // preference under `vc_transport_preference` at boot
-  // (dioxus-ui/src/context.rs::load_transport_preference, keys at
-  // context.rs:913-914). The earlier `vc_transport_preference_sticky` key was a
-  // typo the UI never reads, so the pin silently did nothing.
   await context.addInitScript((pref) => {
     try {
       window.localStorage.setItem("vc_transport_preference", pref);
@@ -304,9 +298,11 @@ export async function routeDownlinkThroughProxy(
   // onto the live `window.__APP_CONFIG` (creating it if absent) so the single
   // `wsUrl` key is rewritten while every other key set by the prior layer is
   // preserved.
+  // WebTransport off too: a WebSocket preference now falls back to it (#3044),
+  // which would carry a severed or shaped client around the proxy.
   const injection = `;window.__APP_CONFIG=Object.assign(window.__APP_CONFIG||{},{"wsUrl":${JSON.stringify(
     wsUrl,
-  )}});`;
+  )},"webTransportEnabled":"false"});`;
 
   // AUTHORITATIVE layer: `/config.local.js` runs last, after `config.js`, and
   // before the wasm reads `__APP_CONFIG` (see the doc comment above). Appending

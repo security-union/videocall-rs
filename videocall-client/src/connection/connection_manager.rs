@@ -18,15 +18,17 @@
 
 use std::collections::VecDeque;
 
-use super::connection::Connection;
+use super::connection::{Connection, Status as ConnectionStatus};
 use super::url_log::strip_query_for_log;
-use super::webmedia::{ConnectOptions, InboundLane, MediaStreamKey, ReceivedAtMs};
+use super::webmedia::{
+    ConnectOptions, InboundLane, MediaStreamKey, ReceivedAtMs, StreamQueueDepth,
+};
 use crate::adaptive_quality_constants::{
-    ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, HEARTBEAT_KEEPALIVE_INTERVAL_MS,
-    POST_REBASE_RETRY_DELAY_MS, POST_REBASE_RETRY_MAX_ATTEMPTS, RECONNECT_BACKOFF_MULTIPLIER,
-    RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_PHASE1_MS,
-    RECONNECT_MAX_DELAY_PHASE2_MS, RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS,
-    RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CATASTROPHIC_RTT_MS, REELECTION_CONSECUTIVE_SAMPLES,
+    ELECTION_MIN_RTT_SAMPLES, HEARTBEAT_KEEPALIVE_INTERVAL_MS, POST_REBASE_RETRY_DELAY_MS,
+    POST_REBASE_RETRY_MAX_ATTEMPTS, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT,
+    RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_PHASE1_MS, RECONNECT_MAX_DELAY_PHASE2_MS,
+    RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS, RECONNECT_PHASE2_MAX_ATTEMPTS,
+    REELECTION_CATASTROPHIC_RTT_MS, REELECTION_CONSECUTIVE_SAMPLES,
     REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD, REELECTION_MIN_IMPROVEMENT_MS,
     REELECTION_PRESERVATION_FRESHNESS_MS, REELECTION_PRESERVATION_RETRY_MS,
     REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
@@ -46,6 +48,8 @@ use videocall_transport::downlink_stream::DOWNLINK_STREAMS_QUERY;
 use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -108,19 +112,14 @@ mod url_redact {
 /// discarded as they likely result from clock anomalies or extreme outliers.
 const RTT_SANITY_MAX_MS: f64 = 10_000.0;
 
-/// Extra `Testing` rounds granted while every live candidate is still without a
-/// usable RTT sample. Bounded, so a silent set still reaches the terminal path.
-const ELECTION_NO_MEASUREMENT_MAX_RETRIES: u32 = 3;
-
-/// One such round. Same quantum as `ELECTION_EXTENSION_STEP_MS`.
-const ELECTION_NO_MEASUREMENT_RETRY_MS: u64 = 1_000;
-
-const ELECTION_EXTENSION_STEP_MS: u64 = 1_000;
-
 /// Settle allowance covering the 100ms election-check timer's granularity.
 const RECONNECT_ELECTION_SETTLE_MARGIN_MS: u64 = 500;
 
 const RECONNECT_ELECTION_POLL_MS: u64 = 250;
+
+/// How long a terminal join phase outlives its deadline while a candidate is
+/// still handshaking or has no RTT sample.
+pub const ELECTION_STARVED_GRACE_MS: u64 = 3_000;
 
 /// Maximum time to wait for the room-token refresh callback to resolve before
 /// falling back to the cached-URL path inside `request_reelection`.
@@ -267,46 +266,10 @@ pub(super) const SUPPRESSION_RESET_QUIET_MS: f64 = 30_000.0;
 /// values guard against it. On a 1.5s RTT link, in-flight is about 2 (well
 /// under cap) and probes return before the 5s deadline, so it is NOT flagged
 /// stale.
-///
-/// Dual cadence: during election the probe cadence is faster (~5 Hz / 200ms in
-/// the Testing phase) while prune still runs at 1 Hz, so the in-flight queue
-/// fills faster then and the MAX_INFLIGHT_PROBES cap is the intended safety
-/// valve in that phase (a dropped probe is expendable).
 pub(super) const PROBE_TIMEOUT_MS: f64 = 5000.0; // per-probe deadline
 pub(super) const MAX_INFLIGHT_PROBES: usize = 6; // cap on in-flight probes
 pub(super) const STALE_THRESHOLD: u32 = 3; // consecutive timeouts before stale
 pub(super) const RTT_SAMPLE_WINDOW: usize = 10; // rolling samples kept per lane
-
-/// How much worse a WebTransport candidate's `election_score()` may be than the
-/// best WebSocket candidate's and still win the election (issue #2725). The
-/// asserts below are declared ordering choices, not derivations.
-pub(super) const WT_ELECTION_BONUS_MS: f64 = 30.0;
-
-const _: () = assert!(
-    WT_ELECTION_BONUS_MS > REELECTION_MIN_IMPROVEMENT_MS,
-    "the WT election bonus must not be finer than the smallest RTT difference \
-     this client will act on at all"
-);
-const _: () = assert!(
-    WT_ELECTION_BONUS_MS < REELECTION_RTT_MIN_THRESHOLD_MS,
-    "the WT election bonus must stay below the absolute RTT rise the \
-     degradation watchdog treats as significant"
-);
-
-/// Election-lane samples each compared mean needs before [`WT_ELECTION_BONUS_MS`]
-/// may be applied. Below this
-/// bar the rule is plain lowest-score-wins.
-pub(super) const ELECTION_BONUS_MIN_SAMPLES: usize = 5;
-
-const _: () = assert!(
-    ELECTION_BONUS_MIN_SAMPLES > ELECTION_MIN_RTT_SAMPLES,
-    "the bonus sample bar must be stricter than the tier bar, which exists for \
-     the 200ms+ join case and must not be raised"
-);
-const _: () = assert!(
-    ELECTION_BONUS_MIN_SAMPLES <= RTT_SAMPLE_WINDOW,
-    "a bar above the rolling window size could never be met"
-);
 
 /// Pure cap-decision helper extracted so the in-flight cap is unit-testable on
 /// host (a live datagram Connection cannot be constructed off-wasm).
@@ -512,16 +475,36 @@ fn wt_audio_demotion_should_engage(window: &[WtAudioLossSample]) -> bool {
     )
 }
 
-/// Pure: whether the issue-1924 demotion overrides the re-election RTT
-/// hysteresis. RTT asks the wrong question when the old link is a WebTransport
-/// one losing audio datagrams — the switch trades latency for delivery on
-/// purpose, so hysteresis would abort it every time. WT-old → WS-winner only.
-fn wt_audio_loss_overrides_rtt_hysteresis(
-    demote_active: bool,
-    old_active_is_webtransport: bool,
-    winner_is_webtransport: bool,
+/// Pure: whether a re-election keeps its old connection.
+fn reelection_keeps_old(
+    first_wt: bool,
+    old_wt: Option<bool>,
+    old_live: bool,
+    winner_wt: bool,
+    winner_established: bool,
+    rtt_keeps_old: bool,
 ) -> bool {
-    demote_active && old_active_is_webtransport && !winner_is_webtransport
+    match old_wt {
+        Some(old_wt) if old_wt != winner_wt => {
+            !(winner_wt == first_wt && winner_established) && old_live
+        }
+        _ => rtt_keeps_old,
+    }
+}
+
+/// Pure: servers a re-election could switch to under [`reelection_keeps_old`].
+fn reelection_alternatives(
+    first_wt: bool,
+    active_wt: Option<bool>,
+    ws_servers: usize,
+    wt_servers: usize,
+) -> usize {
+    let first = if first_wt { wt_servers } else { ws_servers };
+    match active_wt {
+        Some(active_wt) if active_wt == first_wt => first.saturating_sub(1),
+        Some(_) => first,
+        None => (ws_servers + wt_servers).saturating_sub(1),
+    }
 }
 
 fn wt_audio_demote_hold_ms(demotions: u32) -> f64 {
@@ -636,11 +619,27 @@ fn build_election_candidates(
     }
 }
 
+/// Pure: `(dial_now, deferred)` for an election's candidates.
+fn defer_fallback_candidates(
+    candidates: Vec<ElectionCandidate>,
+    prefer_webtransport: bool,
+) -> (Vec<ElectionCandidate>, Vec<ElectionCandidate>) {
+    if prefer_webtransport {
+        return (candidates, Vec::new());
+    }
+    candidates.into_iter().partition(|c| !c.is_webtransport)
+}
+
 /// Pure: build the URL a candidate is dialled with from its configured base.
 /// `instance_id` lets the server evict this instance's stale sessions.
-fn build_connect_url(base_url: &str, instance_id: &str, is_webtransport: bool) -> String {
+fn build_connect_url(
+    base_url: &str,
+    instance_id: &str,
+    conn_seq: u64,
+    is_webtransport: bool,
+) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
-    let mut url = format!("{base_url}{separator}instance_id={instance_id}");
+    let mut url = format!("{base_url}{separator}instance_id={instance_id}&conn_seq={conn_seq}");
     if is_webtransport {
         url.push('&');
         url.push_str(DOWNLINK_STREAMS_QUERY);
@@ -731,18 +730,35 @@ fn format_election_candidate(
     transport_is_wt: bool,
     id: &str,
     redacted_url: &str,
-    is_connected: bool,
+    status: ConnectionStatus,
     rtt_samples: usize,
     avg_rtt_ms: Option<f64>,
     qualifies_for_best: bool,
 ) -> String {
-    let transport = if transport_is_wt { "wt" } else { "ws" };
     format!(
-        "Election candidate: transport={transport} id={id} url={redacted_url} \
-         is_connected={is_connected} rtt_samples={rtt_samples} \
+        "Election candidate: transport={} id={id} url={redacted_url} \
+         status={} rtt_samples={rtt_samples} \
          avg_rtt_ms={} qualifies_for_best={qualifies_for_best}",
+        transport_label(transport_is_wt),
+        connection_status_label(status),
         fmt_opt_rtt(avg_rtt_ms),
     )
+}
+
+fn transport_label(is_webtransport: bool) -> &'static str {
+    if is_webtransport {
+        "wt"
+    } else {
+        "ws"
+    }
+}
+
+fn connection_status_label(status: ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Connecting => "connecting",
+        ConnectionStatus::Connected => "connected",
+        ConnectionStatus::Closed => "closed",
+    }
 }
 
 /// Test observation seam for the `Election decision:` emission. `log_election_decision`
@@ -755,6 +771,8 @@ fn format_election_candidate(
 #[derive(Clone, Debug, PartialEq)]
 struct RecordedElectionDecision {
     reason: &'static str,
+    preferred: &'static str,
+    phase: &'static str,
     rtt_lane: &'static str,
     transport_pick: &'static str,
     outcome: ElectionOutcome,
@@ -773,6 +791,8 @@ thread_local! {
 #[allow(clippy::too_many_arguments)]
 fn record_election_decision(
     reason: &'static str,
+    preferred: &'static str,
+    phase: &'static str,
     rtt_lane: &'static str,
     transport_pick: &'static str,
     outcome: ElectionOutcome,
@@ -783,6 +803,8 @@ fn record_election_decision(
     LAST_ELECTION_DECISION.with(|slot| {
         *slot.borrow_mut() = Some(RecordedElectionDecision {
             reason,
+            preferred,
+            phase,
             rtt_lane,
             transport_pick,
             outcome,
@@ -846,7 +868,7 @@ fn spawn_reconnection_loop(
     on_state_changed: Callback<ConnectionState>,
     server_url: String,
     manager_ref: Weak<RefCell<ConnectionManager>>,
-    election_period_ms: u64,
+    election_timeouts_ms: u64,
     intentionally_disconnected: Rc<RefCell<bool>>,
 ) {
     let reconnection_loop = ConnectionManager::run_reconnection_loop(
@@ -855,7 +877,7 @@ fn spawn_reconnection_loop(
         on_state_changed,
         server_url,
         manager_ref,
-        election_period_ms,
+        election_timeouts_ms,
         intentionally_disconnected,
     );
     #[cfg(test)]
@@ -872,6 +894,8 @@ fn spawn_reconnection_loop(
 /// ran (before abort/preserve restore old state).
 struct ElectionDecisionSnapshot {
     reason: &'static str,
+    preferred: &'static str,
+    phase: &'static str,
     /// Lane the winner's RTT was measured on ([`ElectionRttLane::label`]), or
     /// `none` when no candidate was selectable.
     rtt_lane: &'static str,
@@ -879,8 +903,6 @@ struct ElectionDecisionSnapshot {
     ws_samples: usize,
     wt_avg_rtt_ms: Option<f64>,
     ws_avg_rtt_ms: Option<f64>,
-    /// [`ElectionScan::transport_pick`], then the two best-tier
-    /// `election_score()` values it compared.
     transport_pick: &'static str,
     best_wt_score_ms: Option<f64>,
     best_ws_score_ms: Option<f64>,
@@ -938,7 +960,8 @@ fn format_election_decision(
         "Election decision: reason={} rtt_lane={} outcome={} elected={} active={} \
          wt_samples={} ws_samples={} wt_avg_rtt_ms={} \
          ws_avg_rtt_ms={} transport_pick={} best_wt_score_ms={} best_ws_score_ms={} \
-         wt_bonus_ms={:.0} election_duration_ms={} prior_close={prior_close}",
+         election_duration_ms={} prior_close={prior_close} \
+         preferred={} phase={}",
         snapshot.reason,
         snapshot.rtt_lane,
         outcome.as_str(),
@@ -951,10 +974,11 @@ fn format_election_decision(
         snapshot.transport_pick,
         fmt_opt_rtt(snapshot.best_wt_score_ms),
         fmt_opt_rtt(snapshot.best_ws_score_ms),
-        WT_ELECTION_BONUS_MS,
         election_duration_ms
             .map(|duration| duration.to_string())
             .unwrap_or_else(|| "null".to_string()),
+        snapshot.preferred,
+        snapshot.phase,
     )
 }
 
@@ -972,9 +996,7 @@ struct ElectionScan {
     live_wt_exists: bool,
     wt_with_measurements_exists: bool,
     demote_wt: bool,
-    /// Present-and-connected candidates — the only ones a probe can still answer on.
-    live_candidates: usize,
-    max_implausible_discards: u32,
+    first_wt: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -983,6 +1005,16 @@ enum ElectionCandidateTier {
     BestWs,
     FallbackWt,
     FallbackWs,
+}
+
+impl ElectionCandidateTier {
+    fn is_webtransport(self) -> bool {
+        matches!(self, Self::BestWt | Self::FallbackWt)
+    }
+
+    fn is_best(self) -> bool {
+        matches!(self, Self::BestWt | Self::BestWs)
+    }
 }
 
 impl ElectionScan {
@@ -1008,74 +1040,12 @@ impl ElectionScan {
         }
     }
 
-    fn transport_pick(&self) -> &'static str {
-        match (self.best_wt.is_some(), self.best_ws.is_some()) {
-            (true, true) if self.demote_wt => "wt_demoted",
-            (true, true) if self.best_wt_score <= self.best_ws_score => "wt_faster",
-            (true, true) if self.wt_wins_best_tier() => "wt_within_bonus",
-            (true, true) if self.best_wt_score > self.best_ws_score + WT_ELECTION_BONUS_MS => {
-                "ws_faster"
-            }
-            (true, true) if !self.wt_bonus_lane_is_reliable() => "ws_bonus_unearned_lane",
-            (true, true) => "ws_bonus_unearned_samples",
-            (true, false) => "wt_only",
-            (false, true) => "ws_only",
-            (false, false) => "no_best_tier",
-        }
-    }
-
-    /// Whether the WebTransport score came from [`ElectionRttLane::Reliable`].
-    fn wt_bonus_lane_is_reliable(&self) -> bool {
-        self.best_wt.as_ref().is_some_and(|(_, measurement)| {
-            measurement.election_lane() == ElectionRttLane::Reliable
-        })
-    }
-
-    fn wt_bonus_has_samples(&self) -> bool {
-        let deep = |candidate: &Option<(String, ServerRttMeasurement)>| {
-            candidate
-                .as_ref()
-                .is_some_and(|(_, m)| m.election_series().2 >= ELECTION_BONUS_MIN_SAMPLES)
-        };
-        deep(&self.best_wt) && deep(&self.best_ws)
-    }
-
-    /// Cross-transport best-tier rule (issue #2725). A lower score wins outright;
-    /// the bonus only rescues a WebTransport candidate that is behind. The
-    /// issue-1924 demotion removes the bonus AND the tie.
-    fn wt_wins_best_tier(&self) -> bool {
-        if self.demote_wt {
-            return false;
-        }
-        if self.best_wt_score <= self.best_ws_score {
-            return true;
-        }
-        self.wt_bonus_lane_is_reliable()
-            && self.wt_bonus_has_samples()
-            && self.best_wt_score <= self.best_ws_score + WT_ELECTION_BONUS_MS
-    }
-
-    fn best_tier(&self) -> Option<ElectionCandidateTier> {
-        match (self.best_wt.is_some(), self.best_ws.is_some()) {
-            (true, true) if self.wt_wins_best_tier() => Some(ElectionCandidateTier::BestWt),
-            (true, true) => Some(ElectionCandidateTier::BestWs),
-            (true, false) => Some(ElectionCandidateTier::BestWt),
-            (false, true) => Some(ElectionCandidateTier::BestWs),
-            (false, false) => None,
-        }
-    }
-
-    fn fallback_tier(&self) -> Option<ElectionCandidateTier> {
-        let order = if self.demote_wt {
-            [
-                ElectionCandidateTier::FallbackWs,
-                ElectionCandidateTier::FallbackWt,
-            ]
+    fn selected_tier(&self) -> Option<ElectionCandidateTier> {
+        use ElectionCandidateTier::{BestWs, BestWt, FallbackWs, FallbackWt};
+        let order = if self.first_wt {
+            [BestWt, BestWs, FallbackWt, FallbackWs]
         } else {
-            [
-                ElectionCandidateTier::FallbackWt,
-                ElectionCandidateTier::FallbackWs,
-            ]
+            [BestWs, BestWt, FallbackWs, FallbackWt]
         };
         order
             .into_iter()
@@ -1083,7 +1053,7 @@ impl ElectionScan {
     }
 
     fn selected(&self) -> Option<(ElectionCandidateTier, &(String, ServerRttMeasurement))> {
-        let tier = self.best_tier().or_else(|| self.fallback_tier())?;
+        let tier = self.selected_tier()?;
         self.candidate_for(tier).map(|candidate| (tier, candidate))
     }
 }
@@ -1097,20 +1067,16 @@ fn scan_election_candidates(
     rtt_measurements: &HashMap<String, ServerRttMeasurement>,
     connections: &HashMap<String, Connection>,
     demote_wt: bool,
+    first_wt: bool,
 ) -> ElectionScan {
     let mut scan = ElectionScan::new();
     scan.demote_wt = demote_wt;
+    scan.first_wt = first_wt;
 
     for (connection_id, measurement) in rtt_measurements {
         let connection = connections.get(connection_id);
         if !election_candidate_is_eligible(connection) {
             continue;
-        }
-        if connection.is_some() {
-            scan.live_candidates += 1;
-            scan.max_implausible_discards = scan
-                .max_implausible_discards
-                .max(measurement.consecutive_implausible_discards);
         }
 
         let (_, lane_avg_rtt, lane_samples, _) = measurement.election_series();
@@ -1164,7 +1130,7 @@ fn classify_election_reason(
     rtt_measurements: &HashMap<String, ServerRttMeasurement>,
     connections: &HashMap<String, Connection>,
 ) -> &'static str {
-    let scan = scan_election_candidates(rtt_measurements, connections, false);
+    let scan = scan_election_candidates(rtt_measurements, connections, false, true);
     classify_election_reason_from_scan(&scan)
 }
 
@@ -1196,69 +1162,12 @@ fn classify_election_reason_from_scan(scan: &ElectionScan) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ElectionFailure {
-    AwaitingMeasurements,
-    NoCandidates,
-}
-
-/// Pure: why `find_best_connection` would fail, or `None` when it would not.
-fn classify_election_failure(scan: &ElectionScan) -> Option<ElectionFailure> {
-    if scan.selected().is_some() {
-        return None;
-    }
-    if scan.live_candidates > 0 {
-        Some(ElectionFailure::AwaitingMeasurements)
-    } else {
-        Some(ElectionFailure::NoCandidates)
-    }
-}
-
-/// Pure: whether a measurement-less election gets another `Testing` round
-/// instead of failing the join. `retries_used` only rises within one election
-/// and is reset only when a new one starts, so a permanently silent candidate
-/// set exhausts the budget and reaches the terminal path.
-fn election_retries_for_measurements(failure: Option<ElectionFailure>, retries_used: u32) -> bool {
-    matches!(failure, Some(ElectionFailure::AwaitingMeasurements))
-        && retries_used < ELECTION_NO_MEASUREMENT_MAX_RETRIES
-}
-
-/// `(is_webtransport, election-lane samples, still answering)` per candidate.
-type ElectionLaneDepth = (bool, usize, bool);
-
-/// Pure: may the expired election deadline complete now?
-fn election_may_complete(
-    lane_depth: &[ElectionLaneDepth],
-    any_candidate_qualifies: bool,
-    extensions_used: u32,
-) -> bool {
-    if extensions_used >= ELECTION_MAX_EXTENSIONS {
-        return true;
-    }
-    if !any_candidate_qualifies {
-        return false;
-    }
-    let racing = |(is_wt, samples, answering): &ElectionLaneDepth, want_wt: bool| {
-        *is_wt == want_wt && *samples > 0 && *answering
-    };
-    let answering = |want_wt: bool| lane_depth.iter().any(|d| racing(d, want_wt));
-    if !(answering(true) && answering(false)) {
-        return true;
-    }
-    lane_depth.iter().all(|d| {
-        let (_, samples, answering) = d;
-        !*answering || *samples == 0 || *samples >= ELECTION_BONUS_MIN_SAMPLES
-    })
-}
-
 /// `ElectionWaitBudget` has a private field and no constructor outside this
 /// module, so `reconnect_election_wait_ms` is the only way to obtain one. A
 /// caller cannot hand the reconnection loop a hand-rolled margin instead.
 mod election_wait {
     use super::{
-        ELECTION_EXTENSION_STEP_MS, ELECTION_MAX_EXTENSIONS, ELECTION_NO_MEASUREMENT_MAX_RETRIES,
-        ELECTION_NO_MEASUREMENT_RETRY_MS, RECONNECT_ELECTION_POLL_MS,
-        RECONNECT_ELECTION_SETTLE_MARGIN_MS,
+        ELECTION_STARVED_GRACE_MS, RECONNECT_ELECTION_POLL_MS, RECONNECT_ELECTION_SETTLE_MARGIN_MS,
     };
 
     pub(super) struct ElectionWaitBudget {
@@ -1278,22 +1187,139 @@ mod election_wait {
         }
     }
 
-    /// Worst case before a `Testing` window terminates: the base period, every
-    /// in-window extension, then every measurement-less retry round.
-    pub(super) fn max_election_duration_ms(election_period_ms: u64) -> u64 {
-        election_period_ms
-            + u64::from(ELECTION_MAX_EXTENSIONS) * ELECTION_EXTENSION_STEP_MS
-            + u64::from(ELECTION_NO_MEASUREMENT_MAX_RETRIES) * ELECTION_NO_MEASUREMENT_RETRY_MS
+    /// Worst case before a `Testing` window terminates: both phase timeouts
+    /// and the grace.
+    pub(super) fn max_election_duration_ms(phase_timeouts_ms: u64) -> u64 {
+        phase_timeouts_ms.saturating_add(ELECTION_STARVED_GRACE_MS)
     }
 
-    pub(super) fn reconnect_election_wait_ms(election_period_ms: u64) -> ElectionWaitBudget {
+    pub(super) fn reconnect_election_wait_ms(phase_timeouts_ms: u64) -> ElectionWaitBudget {
         ElectionWaitBudget {
-            ms: max_election_duration_ms(election_period_ms) + RECONNECT_ELECTION_SETTLE_MARGIN_MS,
+            ms: max_election_duration_ms(phase_timeouts_ms)
+                .saturating_add(RECONNECT_ELECTION_SETTLE_MARGIN_MS),
         }
     }
 }
 
 use election_wait::reconnect_election_wait_ms;
+
+/// Pure: a decision line's `transport_pick=` for the selected tier.
+fn election_transport_pick(
+    selected: Option<ElectionCandidateTier>,
+    preferred_wt: bool,
+    demoted: bool,
+    latched: bool,
+    phase: ElectionPhase,
+) -> &'static str {
+    let Some(tier) = selected else {
+        return "none";
+    };
+    let preferred_won = tier.is_webtransport() == preferred_wt;
+    if !tier.is_best() {
+        "best_effort"
+    } else if preferred_won && latched {
+        "ws_only_latched"
+    } else if preferred_won {
+        "preferred"
+    } else if demoted {
+        "demoted"
+    } else if matches!(
+        phase,
+        ElectionPhase::Fallback {
+            preferred_failed: true
+        }
+    ) {
+        "fallback_failed"
+    } else {
+        "fallback_timeout"
+    }
+}
+
+/// One join-election candidate as the deadline check sees it.
+#[derive(Clone, Copy, Debug)]
+struct CandidateView {
+    is_webtransport: bool,
+    status: ConnectionStatus,
+    established: bool,
+    samples: usize,
+}
+
+impl CandidateView {
+    fn is_established(&self) -> bool {
+        self.established
+    }
+
+    fn pending(&self) -> bool {
+        !self.established && self.status != ConnectionStatus::Closed
+    }
+
+    fn warming(&self) -> bool {
+        self.pending() && self.samples > 0
+    }
+
+    fn electable(&self) -> bool {
+        self.status == ConnectionStatus::Connected && self.samples > 0
+    }
+
+    fn unanswered(&self) -> bool {
+        self.pending() && self.samples == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElectionVerdict {
+    Wait,
+    EnterFallback { preferred_failed: bool },
+    Complete,
+}
+
+/// Pure: the next step of a running election. `first_wt` names the protocol
+/// that wins first; a candidate missing from `candidates` counts as failed.
+fn election_verdict(
+    candidates: &[CandidateView],
+    first_wt: bool,
+    fallback_deferred: bool,
+    phase: ElectionPhase,
+    phase_elapsed_ms: f64,
+    phase_timeout_ms: f64,
+    failure_hold_ms: f64,
+) -> ElectionVerdict {
+    use ElectionVerdict::{Complete, Wait};
+    let any = |wt: Option<bool>, pred: fn(&CandidateView) -> bool| {
+        candidates
+            .iter()
+            .any(|c| wt.is_none_or(|wt| c.is_webtransport == wt) && pred(c))
+    };
+    let (first, second) = (Some(first_wt), Some(!first_wt));
+    let expired = phase_elapsed_ms >= phase_timeout_ms;
+    let complete_if = |done: bool| if done { Complete } else { Wait };
+    let verdict = match phase {
+        ElectionPhase::Preferred if any(first, CandidateView::is_established) => {
+            complete_if(expired || !any(first, CandidateView::pending))
+        }
+        ElectionPhase::Preferred if any(first, CandidateView::pending) && !expired => Wait,
+        ElectionPhase::Preferred if fallback_deferred || any(second, |_| true) => {
+            ElectionVerdict::EnterFallback {
+                preferred_failed: !any(first, CandidateView::pending),
+            }
+        }
+        ElectionPhase::Preferred => Complete,
+        ElectionPhase::Fallback { .. } if any(first, CandidateView::is_established) => Complete,
+        ElectionPhase::Fallback { .. } if expired => Complete,
+        ElectionPhase::Fallback { .. } => {
+            complete_if(!any(second, CandidateView::pending) && !any(first, CandidateView::warming))
+        }
+    };
+    let held = !any(None, CandidateView::electable)
+        && (failure_hold_ms > 0.0
+            || (any(None, CandidateView::unanswered)
+                && phase_elapsed_ms < phase_timeout_ms + ELECTION_STARVED_GRACE_MS as f64));
+    if verdict == Complete && held {
+        Wait
+    } else {
+        verdict
+    }
+}
 
 /// Sample count and average of the lane the election actually scored.
 fn best_transport_measurement_for_log(
@@ -1591,9 +1617,6 @@ pub struct ProbeLaneState {
     /// Count of consecutive probes on this lane that hit [`PROBE_TIMEOUT_MS`]
     /// without a response; reset to 0 when any response arrives on this lane.
     pub consecutive_probe_timeouts: u32,
-    /// Monotonic stamp of the last PLAUSIBLE echo on this lane. `None` until the
-    /// first one lands.
-    pub last_echo_ms: Option<f64>,
 }
 
 /// Which lane produced the RTT the election scored for one candidate.
@@ -1640,8 +1663,6 @@ pub struct ServerRttMeasurement {
     /// Count of consecutive default-lane probes that hit `PROBE_TIMEOUT_MS`
     /// without a response; reset to 0 by a response on that lane.
     pub consecutive_probe_timeouts: u32,
-    /// Default-lane counterpart of [`ProbeLaneState::last_echo_ms`].
-    pub last_echo_ms: Option<f64>,
     /// Reliable-lane series, fed only on WebTransport by the Control-stream
     /// probe and by echoes that arrive on [`InboundLane::Reliable`]. Stays
     /// empty on WebSocket, whose one lane is the default series above.
@@ -1651,26 +1672,6 @@ pub struct ServerRttMeasurement {
 impl ServerRttMeasurement {
     fn election_lane_is_reliable_series(&self) -> bool {
         self.is_webtransport && !self.reliable_lane.measurements.is_empty()
-    }
-
-    /// Answering NOW (#2765): not stale, and its last ECHO newer than
-    /// `max(2 x average, ELECTION_EXTENSION_STEP_MS)`.
-    pub fn election_lane_answering(&self, now: f64) -> bool {
-        let (_, average, _, penalty) = self.election_series();
-        if election_candidate_is_stale(penalty) {
-            return false;
-        }
-        let last_echo = if self.election_lane_is_reliable_series() {
-            self.reliable_lane.last_echo_ms
-        } else {
-            self.last_echo_ms
-        };
-        let bound = average
-            .map(|avg| 2.0 * avg)
-            .unwrap_or(0.0)
-            .max(ELECTION_EXTENSION_STEP_MS as f64)
-            .min(PROBE_TIMEOUT_MS);
-        last_echo.is_none_or(|echo| now - echo <= bound)
     }
 
     /// The lane the election scores, with that lane's average, sample count and
@@ -1775,14 +1776,6 @@ fn lane_series_mut(measurement: &mut ServerRttMeasurement, reliable: bool) -> La
     }
 }
 
-fn lane_last_echo_mut(measurement: &mut ServerRttMeasurement, reliable: bool) -> &mut Option<f64> {
-    if reliable {
-        &mut measurement.reliable_lane.last_echo_ms
-    } else {
-        &mut measurement.last_echo_ms
-    }
-}
-
 fn prune_lane_probes(in_flight: &mut VecDeque<f64>, consecutive_timeouts: &mut u32, now: f64) {
     while let Some(&front) = in_flight.front() {
         if now - front > PROBE_TIMEOUT_MS {
@@ -1802,7 +1795,7 @@ fn record_lane_sample(measurements: &mut VecDeque<f64>, average_rtt: &mut Option
     *average_rtt = Some(measurements.iter().sum::<f64>() / measurements.len() as f64);
 }
 
-/// One inbound RTT echo awaiting processing on the next diagnostics tick.
+/// One inbound RTT echo awaiting processing.
 #[derive(Debug)]
 struct QueuedRttResponse {
     connection_id: String,
@@ -1811,16 +1804,39 @@ struct QueuedRttResponse {
     lane: InboundLane,
 }
 
+/// Which protocol a running election is waiting on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElectionPhase {
+    Preferred,
+    Fallback { preferred_failed: bool },
+}
+
+impl ElectionPhase {
+    fn label(self) -> &'static str {
+        match self {
+            ElectionPhase::Preferred => "preferred",
+            ElectionPhase::Fallback { .. } => "fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PhasedElection {
+    preferred_wt: bool,
+    /// The audio-loss demotion as it stood when the election began.
+    demoted: bool,
+    /// Started by [`ConnectionManager::restart_election_quietly`].
+    quiet: bool,
+    phase: ElectionPhase,
+    phase_started_at: f64,
+}
+
 #[derive(Debug)]
 pub enum ElectionState {
     Testing {
         start_time: f64,
         duration_ms: u64,
         probe_timer: Option<Interval>,
-        /// Number of 1-second deadline extensions applied because no connection
-        /// had enough RTT samples when the timer expired. Capped at
-        /// `ELECTION_MAX_EXTENSIONS`.
-        extensions_used: u32,
     },
     Elected {
         connection_id: String,
@@ -1832,6 +1848,15 @@ pub enum ElectionState {
     },
 }
 
+/// Progress of a join election, for a connection-status UI. `timeout_ms` is
+/// the phase's budget from the moment the event is emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElectionProgress {
+    Preferred { webtransport: bool, timeout_ms: u64 },
+    Fallback { webtransport: bool, timeout_ms: u64 },
+    Connected { webtransport: bool },
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectionManagerOptions {
     pub websocket_urls: Vec<String>,
@@ -1840,7 +1865,16 @@ pub struct ConnectionManagerOptions {
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
-    pub election_period_ms: u64,
+    pub webtransport_connect_timeout_ms: u64,
+    pub websocket_connect_timeout_ms: u64,
+    /// The user's network preference.
+    pub prefer_webtransport: bool,
+    pub on_election_progress: Option<Callback<ElectionProgress>>,
+    /// Whether this tab's last join fell back; shared across managers.
+    pub fallback_memory: Rc<Cell<bool>>,
+    pub on_fallback_memory: Option<Callback<bool>>,
+    /// Last `conn_seq` handed to an election; shared across managers.
+    pub conn_seq: Rc<Cell<u64>>,
     /// Stable client instance identifier (UUID). Generated once per meeting join,
     /// survives reconnects, dies on tab close. Sent to the server so it can
     /// correlate reconnections and silently evict stale sessions.
@@ -2226,8 +2260,17 @@ pub struct ConnectionManager {
     /// Demotions engaged this session, counting the current one.
     wt_audio_demotions: u32,
 
-    /// Issue 2281: `Testing` rounds already spent in the CURRENT election.
-    election_no_measurement_retries: u32,
+    phased_election: Option<PhasedElection>,
+
+    /// Candidates of a WebSocket-preferred election, dialled when its fallback
+    /// phase starts.
+    deferred_candidates: Vec<ElectionCandidate>,
+
+    /// Consumed by the next [`Self::begin_phased_election`].
+    quiet_election: bool,
+
+    /// The `conn_seq` every candidate of the current election is dialled with.
+    election_conn_seq: u64,
 }
 
 /// Whether an inbound packet is this client's own and must be dropped before it
@@ -2281,6 +2324,16 @@ pub(crate) fn should_filter_self_packet(
     packet.packet_type != PacketType::CONGESTION.into()
         && packet.packet_type != PacketType::LAYER_HINT.into()
         && packet.packet_type != PacketType::DOWNLINK_CONGESTION.into()
+}
+
+/// A candidate's join was refused for a stale room token; it is delivered even
+/// though a different connection is elected.
+pub(crate) fn is_instance_superseded_notice(packet: &PacketWrapper) -> bool {
+    packet.packet_type == PacketType::MEETING.into()
+        && packet.user_id[..] == *videocall_types::SYSTEM_USER_ID.as_bytes()
+        && MeetingPacket::parse_from_bytes(&packet.data).is_ok_and(|meeting| {
+            meeting.event_type == MeetingEventType::MEETING_INSTANCE_SUPERSEDED.into()
+        })
 }
 
 impl ConnectionManager {
@@ -2357,7 +2410,10 @@ impl ConnectionManager {
             wt_audio_fallback_latched: false,
             wt_audio_demote_until_ms: None,
             wt_audio_demotions: 0,
-            election_no_measurement_retries: 0,
+            phased_election: None,
+            deferred_candidates: Vec::new(),
+            quiet_election: false,
+            election_conn_seq: 0,
         };
 
         Ok(manager)
@@ -2397,7 +2453,17 @@ impl ConnectionManager {
     /// Called by the reconnection loop instead of creating a throwaway
     /// `ConnectionManager`.
     pub fn reset_and_start_election(&mut self) -> Result<()> {
+        self.restart_election(false)
+    }
+
+    /// [`Self::reset_and_start_election`] without election progress events.
+    pub fn restart_election_quietly(&mut self) -> Result<()> {
+        self.restart_election(true)
+    }
+
+    fn restart_election(&mut self, quiet: bool) -> Result<()> {
         info!("Resetting connections and starting fresh election for reconnection");
+        self.quiet_election = quiet;
 
         // Drop old active connection if a re-election was in progress.
         self.old_active_connection = None;
@@ -2469,28 +2535,29 @@ impl ConnectionManager {
         }
 
         // Start fresh election — creates new connections and begins RTT probing.
-        self.start_election()
+        let started = self.start_election();
+        if started.is_err() {
+            self.quiet_election = false;
+        }
+        started
     }
 
     /// Start the election process by creating all connections upfront
     fn start_election(&mut self) -> Result<()> {
-        let election_duration = self.options.election_period_ms;
         let start_time = monotonic_now_ms();
+        let preferred_wt = self.plan_prefers_webtransport();
 
-        info!("Starting connection election for {election_duration}ms");
-
-        self.election_no_measurement_retries = 0;
+        info!(
+            "Starting connection election: preferred={} preferred_timeout_ms={} fallback_timeout_ms={}",
+            transport_label(preferred_wt),
+            self.connect_timeout_ms(preferred_wt),
+            self.connect_timeout_ms(!preferred_wt),
+        );
 
         // Create all connections upfront
         self.create_all_connections()?;
 
-        // Set election state
-        self.election_state = ElectionState::Testing {
-            start_time,
-            duration_ms: election_duration,
-            probe_timer: None, // Will be set externally
-            extensions_used: 0,
-        };
+        self.begin_phased_election(start_time);
 
         // Start RTT reporting to diagnostics
         self.start_diagnostics_reporting();
@@ -2501,8 +2568,190 @@ impl ConnectionManager {
         Ok(())
     }
 
+    fn begin_phased_election(&mut self, start_time: f64) {
+        let preferred_wt = self.plan_prefers_webtransport();
+        let demoted = self.wt_audio_demote_active(monotonic_now_ms());
+        let first_wt = preferred_wt && !demoted;
+        let in_fallback = self.starts_in_fallback_given(demoted);
+        let timeout_ms = self.connect_timeout_ms(first_wt != in_fallback);
+        self.election_state = ElectionState::Testing {
+            start_time,
+            duration_ms: timeout_ms,
+            probe_timer: None, // Will be set externally
+        };
+        self.phased_election = Some(PhasedElection {
+            preferred_wt,
+            demoted,
+            quiet: std::mem::take(&mut self.quiet_election),
+            phase: if in_fallback {
+                ElectionPhase::Fallback {
+                    preferred_failed: false,
+                }
+            } else {
+                ElectionPhase::Preferred
+            },
+            phase_started_at: start_time,
+        });
+        self.emit_election_progress(if in_fallback {
+            ElectionProgress::Fallback {
+                webtransport: !first_wt,
+                timeout_ms,
+            }
+        } else {
+            ElectionProgress::Preferred {
+                webtransport: first_wt,
+                timeout_ms,
+            }
+        });
+    }
+
+    fn defers_fallback_candidates(&self) -> bool {
+        !self.plan_prefers_webtransport() && !self.starts_in_fallback()
+    }
+
+    fn starts_in_fallback(&self) -> bool {
+        self.starts_in_fallback_given(self.wt_audio_demote_active(monotonic_now_ms()))
+    }
+
+    fn starts_in_fallback_given(&self, demoted: bool) -> bool {
+        self.options.fallback_memory.get()
+            && !self.reelection_in_progress
+            && !self.options.websocket_urls.is_empty()
+            && !self.options.webtransport_urls.is_empty()
+            && wt_election_includes_wt(self.wt_audio_fallback_latched)
+            && !demoted
+    }
+
+    fn connect_timeout_ms(&self, webtransport: bool) -> u64 {
+        if webtransport {
+            self.options.webtransport_connect_timeout_ms
+        } else {
+            self.options.websocket_connect_timeout_ms
+        }
+    }
+
+    fn election_timeouts_ms(&self) -> u64 {
+        self.options
+            .webtransport_connect_timeout_ms
+            .saturating_add(self.options.websocket_connect_timeout_ms)
+    }
+
+    /// Whether a win on `winner_wt` is off the user's preference, or `None`
+    /// when this election was not run under that preference.
+    fn fallback_memory_outcome(&self, winner_wt: bool) -> Option<bool> {
+        let under_preference = !self.options.websocket_urls.is_empty()
+            && !self.options.webtransport_urls.is_empty()
+            && !self.wt_audio_fallback_latched
+            && !self.election_demoted(monotonic_now_ms());
+        let off_preference = winner_wt != self.options.prefer_webtransport;
+        (under_preference && !(off_preference && self.election_prior_close != PRIOR_CLOSE_NONE))
+            .then_some(off_preference)
+    }
+
+    fn set_fallback_memory(&self, fell_back: bool) {
+        if self.options.fallback_memory.replace(fell_back) != fell_back {
+            if let Some(callback) = &self.options.on_fallback_memory {
+                callback.emit(fell_back);
+            }
+        }
+    }
+
+    /// Re-elections have no UI.
+    fn emit_election_progress(&self, progress: ElectionProgress) {
+        if self.reelection_in_progress || self.phased_election.is_some_and(|e| e.quiet) {
+            return;
+        }
+        if let Some(callback) = &self.options.on_election_progress {
+            callback.emit(progress);
+        }
+    }
+
+    fn user_prefers_webtransport(&self) -> bool {
+        self.options.prefer_webtransport && !self.options.webtransport_urls.is_empty()
+    }
+
+    fn plan_prefers_webtransport(&self) -> bool {
+        self.user_prefers_webtransport() && !self.wt_audio_fallback_latched
+    }
+
+    fn election_candidate_views(&self) -> Vec<CandidateView> {
+        self.rtt_measurements
+            .iter()
+            .map(|(id, m)| {
+                let status = self
+                    .connections
+                    .get(id)
+                    .map_or(ConnectionStatus::Connected, Connection::status);
+                let (_, average, samples, _) = m.election_series();
+                CandidateView {
+                    is_webtransport: m.is_webtransport,
+                    status,
+                    established: status == ConnectionStatus::Connected
+                        && average.is_some()
+                        && qualifies_for_best_tier(samples, m.election_penalty_timeouts()),
+                    samples,
+                }
+            })
+            .collect()
+    }
+
+    /// Advance an election: wait, move to the fallback phase, or complete.
+    fn advance_election(&mut self, election: PhasedElection, start_time: f64) {
+        self.process_queued_rtt_responses();
+        let now = monotonic_now_ms();
+        let first_wt = election.preferred_wt && !election.demoted;
+        let phase_wt = match election.phase {
+            ElectionPhase::Preferred => first_wt,
+            ElectionPhase::Fallback { .. } => !first_wt,
+        };
+        match election_verdict(
+            &self.election_candidate_views(),
+            first_wt,
+            !self.deferred_candidates.is_empty(),
+            election.phase,
+            now - election.phase_started_at,
+            self.connect_timeout_ms(phase_wt) as f64,
+            start_time + self.connect_timeout_ms(first_wt) as f64 - now,
+        ) {
+            ElectionVerdict::Wait => {}
+            ElectionVerdict::Complete => self.complete_election(),
+            ElectionVerdict::EnterFallback { preferred_failed } => {
+                let timeout_ms = self.connect_timeout_ms(!first_wt);
+                info!(
+                    "Election: no {} candidate established ({}) — waiting up to {timeout_ms}ms for {}",
+                    transport_label(first_wt),
+                    if preferred_failed {
+                        "all failed"
+                    } else {
+                        "deadline reached"
+                    },
+                    transport_label(!first_wt),
+                );
+                self.phased_election = Some(PhasedElection {
+                    phase: ElectionPhase::Fallback { preferred_failed },
+                    phase_started_at: now,
+                    ..election
+                });
+                if let ElectionState::Testing { duration_ms, .. } = &mut self.election_state {
+                    *duration_ms = (now - start_time).max(0.0) as u64 + timeout_ms;
+                }
+                let deferred = std::mem::take(&mut self.deferred_candidates);
+                self.dial_candidates(&deferred);
+                self.emit_election_progress(ElectionProgress::Fallback {
+                    webtransport: !first_wt,
+                    timeout_ms,
+                });
+            }
+        }
+    }
+
     fn connect_url(&self, base_url: &str, is_webtransport: bool) -> String {
-        build_connect_url(base_url, &self.options.instance_id, is_webtransport)
+        build_connect_url(
+            base_url,
+            &self.options.instance_id,
+            self.election_conn_seq,
+            is_webtransport,
+        )
     }
 
     /// Build a candidate connection ID, applying the re-election generation
@@ -2550,6 +2799,8 @@ impl ConnectionManager {
     }
 
     fn create_all_connections(&mut self) -> Result<()> {
+        self.election_conn_seq = self.options.conn_seq.get().saturating_add(1);
+        self.options.conn_seq.set(self.election_conn_seq);
         // Build the ordered candidate set (WS first, then WT) with the pure,
         // natively-tested [`build_election_candidates`] — which is also where the
         // issue-2029 WS-only latch excludes every WebTransport candidate. This
@@ -2582,7 +2833,15 @@ impl ConnectionManager {
             );
         }
 
-        for candidate in &candidates {
+        let (now, deferred) =
+            defer_fallback_candidates(candidates, !self.defers_fallback_candidates());
+        self.deferred_candidates = deferred;
+        self.dial_candidates(&now);
+        Ok(())
+    }
+
+    fn dial_candidates(&mut self, candidates: &[ElectionCandidate]) {
+        for candidate in candidates {
             let is_wt = candidate.is_webtransport;
             let (prefix, transport_label) = if is_wt {
                 ("wt", "WebTransport")
@@ -2595,7 +2854,8 @@ impl ConnectionManager {
             let connect_options = ConnectOptions {
                 websocket_url: if is_wt { String::new() } else { url.clone() },
                 webtransport_url: if is_wt { url.clone() } else { String::new() },
-                on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
+                on_inbound_media: self
+                    .create_inbound_media_callback_for(conn_id.clone(), closed_by_manager.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
                 on_connection_lost: self.create_connection_lost_callback(
                     conn_id.clone(),
@@ -2625,7 +2885,6 @@ impl ConnectionManager {
                             consecutive_implausible_discards: 0,
                             in_flight_probes: VecDeque::new(),
                             consecutive_probe_timeouts: 0,
-                            last_echo_ms: None,
                             reliable_lane: ProbeLaneState::default(),
                         },
                     );
@@ -2663,6 +2922,11 @@ impl ConnectionManager {
             // wt_count == 0 here is INTENTIONAL (issue 2029 WS-only latch), not a
             // connect failure — do not emit the "all WT failed" warning.
             info!("WebSocket only -- issue 2029 audio-datagram-loss fallback latch engaged");
+        } else if !self.deferred_candidates.is_empty() {
+            info!(
+                "{} WebTransport candidate(s) deferred until the WebSocket phase ends",
+                self.deferred_candidates.len()
+            );
         } else if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
             warn!(
                 "All {} WebTransport connections failed -- falling back to WebSocket only",
@@ -2677,14 +2941,21 @@ impl ConnectionManager {
         if self.connections.len() == 1 {
             info!("Only one connection created, waiting for it to be established before election");
         }
-
-        Ok(())
     }
 
-    /// Create callback for handling inbound media packets
+    #[cfg(test)]
     fn create_inbound_media_callback(
         &self,
         connection_id: String,
+    ) -> Callback<(PacketWrapper, InboundLane, ReceivedAtMs)> {
+        self.create_inbound_media_callback_for(connection_id, Rc::new(Cell::new(false)))
+    }
+
+    /// Create callback for handling inbound media packets
+    fn create_inbound_media_callback_for(
+        &self,
+        connection_id: String,
+        closed_by_manager: Rc<Cell<bool>>,
     ) -> Callback<(PacketWrapper, InboundLane, ReceivedAtMs)> {
         let userid = self.options.userid.clone();
         let aes = self.aes.clone();
@@ -2777,8 +3048,12 @@ impl ConnectionManager {
                     return;
                 }
 
+                if closed_by_manager.get() && is_instance_superseded_notice(&packet) {
+                    return;
+                }
+
                 if let Some(ref elected_id) = *active_connection_id.borrow() {
-                    if *elected_id != connection_id {
+                    if *elected_id != connection_id && !is_instance_superseded_notice(&packet) {
                         return;
                     }
                 }
@@ -2814,7 +3089,7 @@ impl ConnectionManager {
         let active_connection_id = self.active_connection_id.clone();
         let reconnection_phase = self.reconnection_phase.clone();
         let manager_ref = self.manager_ref.clone();
-        let election_period_ms = self.options.election_period_ms;
+        let election_timeouts_ms = self.election_timeouts_ms();
         let intentionally_disconnected = self.intentionally_disconnected.clone();
         let downlink_close_pending = self.downlink_close_pending.clone();
         let created_at_ms = monotonic_now_ms();
@@ -2910,7 +3185,7 @@ impl ConnectionManager {
                 on_state_changed.clone(),
                 server_url.clone(),
                 manager_ref.clone(),
-                election_period_ms,
+                election_timeouts_ms,
                 intentionally_disconnected.clone(),
             );
         })
@@ -3132,7 +3407,6 @@ impl ConnectionManager {
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
             // Reset the discard streak — we just got a usable measurement.
             measurement.consecutive_implausible_discards = 0;
-            *lane_last_echo_mut(measurement, reliable_echo) = Some(reception_time);
             let (in_flight, timeouts, samples, average) =
                 lane_series_mut(measurement, reliable_echo);
             *timeouts = 0;
@@ -3143,19 +3417,16 @@ impl ConnectionManager {
 
     /// Emit one `Election candidate:` line per RTT-measured candidate. These are
     /// honest pre-decision snapshots, so this is called early in
-    /// `complete_election` (before the RTT winner is even known). The
-    /// `is_connected` here matches the election predicate's connected-check:
-    /// a candidate whose connection entry is ABSENT is treated as connected
-    /// (eligible), the same as `scan_election_candidates` / `find_best_connection`.
+    /// `complete_election` (before the RTT winner is even known).
     fn log_election_candidates(&self) {
         for (connection_id, measurement) in &self.rtt_measurements {
             // Match the election predicate: only a PRESENT-and-disconnected
             // connection is ineligible; an absent entry is eligible.
-            let is_connected = self
+            let status = self
                 .connections
                 .get(connection_id)
-                .map(|c| c.is_connected())
-                .unwrap_or(true);
+                .map_or(ConnectionStatus::Connected, Connection::status);
+            let is_connected = status == ConnectionStatus::Connected;
             let (_, lane_avg_rtt, lane_samples, _) = measurement.election_series();
             let qualifies_for_best = lane_avg_rtt.is_some()
                 && qualifies_for_best_tier(lane_samples, measurement.election_penalty_timeouts())
@@ -3167,7 +3438,7 @@ impl ConnectionManager {
                     measurement.is_webtransport,
                     &measurement.connection_id,
                     &strip_query_for_log(&measurement.url),
-                    is_connected,
+                    status,
                     lane_samples,
                     lane_avg_rtt,
                     qualifies_for_best,
@@ -3182,7 +3453,12 @@ impl ConnectionManager {
     /// abort and preserve paths restore the old connection into those maps, so a
     /// re-scan at the log site would describe the post-restore state and report
     /// the wrong `reason=` for the very outcome being logged (codex review).
-    fn snapshot_election_decision(scan: &ElectionScan) -> ElectionDecisionSnapshot {
+    fn snapshot_election_decision(
+        scan: &ElectionScan,
+        preferred_wt: bool,
+        phase: ElectionPhase,
+        latched: bool,
+    ) -> ElectionDecisionSnapshot {
         let reason = classify_election_reason_from_scan(scan);
         let rtt_lane = election_rtt_lane_label(scan);
         let (wt_samples, wt_avg_rtt_ms) = best_transport_measurement_for_log(
@@ -3199,12 +3475,20 @@ impl ConnectionManager {
         );
         ElectionDecisionSnapshot {
             reason,
+            preferred: transport_label(preferred_wt),
+            phase: phase.label(),
             rtt_lane,
             wt_samples,
             ws_samples,
             wt_avg_rtt_ms,
             ws_avg_rtt_ms,
-            transport_pick: scan.transport_pick(),
+            transport_pick: election_transport_pick(
+                scan.selected().map(|(tier, _)| tier),
+                preferred_wt,
+                scan.demote_wt,
+                latched,
+                phase,
+            ),
             best_wt_score_ms: scan.best_wt.as_ref().map(|_| scan.best_wt_score),
             best_ws_score_ms: scan.best_ws.as_ref().map(|_| scan.best_ws_score),
         }
@@ -3231,6 +3515,8 @@ impl ConnectionManager {
         #[cfg(test)]
         record_election_decision(
             snapshot.reason,
+            snapshot.preferred,
+            snapshot.phase,
             snapshot.rtt_lane,
             snapshot.transport_pick,
             outcome,
@@ -3251,10 +3537,7 @@ impl ConnectionManager {
             )
         );
         // Every terminal election outcome passes through here.
-        if self.options.adopt_wt_spare_worker
-            && !self.wt_audio_fallback_latched
-            && !self.options.webtransport_urls.is_empty()
-        {
+        if self.options.adopt_wt_spare_worker && self.plan_prefers_webtransport() {
             refill_wt_session_worker_spare();
         }
     }
@@ -3291,7 +3574,15 @@ impl ConnectionManager {
         // mutate the candidate maps by restoring the old connection — otherwise
         // the decision line would report a reason for the post-restore state
         // instead of the election that just ran (codex review).
-        let decision_snapshot = Self::snapshot_election_decision(&election_scan);
+        let preferred_wt = self.election_preferred_wt();
+        let decision_snapshot = Self::snapshot_election_decision(
+            &election_scan,
+            preferred_wt,
+            self.phased_election
+                .map_or(ElectionPhase::Preferred, |election| election.phase),
+            self.wt_audio_fallback_latched,
+        );
+        self.deferred_candidates.clear();
         let elected_winner_id = election_result
             .as_ref()
             .ok()
@@ -3322,18 +3613,6 @@ impl ConnectionManager {
                     winner_rtt,
                 );
 
-                // --- Re-election fallback check ---
-                // During a re-election, compare the new winner's RTT against
-                // the old active connection's current RTT. If the winner is
-                // not meaningfully better (by at least REELECTION_MIN_IMPROVEMENT_MS),
-                // abort the re-election and keep the existing connection —
-                // switching to a marginally-different path causes a needless
-                // session reset (new peer, lost keyframe state, video freeze)
-                // with no benefit.
-                //
-                // Exception: if the old connection's RTT exceeds the
-                // catastrophic threshold, accept any winner regardless — the
-                // connection is so degraded that any alternative is worth trying.
                 if self.reelection_in_progress {
                     if let Some(snapshot_rtt) = self.old_active_rtt {
                         // Prefer live RTT if the old connection is still in the
@@ -3360,43 +3639,35 @@ impl ConnectionManager {
                             })
                             .unwrap_or(snapshot_rtt);
 
-                        // Catastrophic override: if old RTT is extreme, accept
-                        // any winner — the user is stuck on a near-dead path.
-                        let catastrophic = comparison_rtt >= REELECTION_CATASTROPHIC_RTT_MS;
-                        if catastrophic {
-                            warn!(
-                                "Re-election: old active RTT ({:.0}ms) exceeds catastrophic \
-                                 threshold ({:.0}ms), accepting winner regardless",
-                                comparison_rtt, REELECTION_CATASTROPHIC_RTT_MS,
-                            );
-                        }
-
-                        // Hysteresis: the winner must be at least
-                        // REELECTION_MIN_IMPROVEMENT_MS better than the old.
-                        let dominated =
-                            winner_rtt >= comparison_rtt - REELECTION_MIN_IMPROVEMENT_MS;
-
-                        let audio_loss_switch = wt_audio_loss_overrides_rtt_hysteresis(
-                            self.wt_audio_demote_active(monotonic_now_ms()),
+                        let rtt_keeps_old = winner_rtt
+                            >= comparison_rtt - REELECTION_MIN_IMPROVEMENT_MS
+                            && comparison_rtt < REELECTION_CATASTROPHIC_RTT_MS;
+                        let keep_old = reelection_keeps_old(
+                            election_scan.first_wt,
                             self.old_active_connection
                                 .as_ref()
-                                .is_some_and(|(_, conn)| conn.is_webtransport()),
+                                .map(|(_, conn)| conn.is_webtransport())
+                                .or(self
+                                    .old_active_rtt_measurement
+                                    .as_ref()
+                                    .map(|m| m.is_webtransport)),
+                            self.old_active_connection
+                                .as_ref()
+                                .is_some_and(|(_, conn)| conn.is_connected()),
                             measurement.is_webtransport,
+                            election_scan
+                                .selected()
+                                .is_some_and(|(tier, _)| tier.is_best()),
+                            rtt_keeps_old,
                         );
-                        if audio_loss_switch && dominated {
-                            warn!(
-                                "Re-election: accepting WebSocket winner ({winner_rtt:.1}ms) over \
-                                 a WebTransport link losing audio datagrams ({comparison_rtt:.1}ms) \
-                                 despite the worse RTT (issue 1924)"
-                            );
-                        }
 
-                        if dominated && !catastrophic && !audio_loss_switch {
+                        if keep_old {
                             warn!(
-                                "Re-election aborted: new winner RTT ({:.1}ms) is not \
-                                 {:.0}ms better than current connection RTT ({:.1}ms) \
-                                 — keeping existing connection",
-                                winner_rtt, REELECTION_MIN_IMPROVEMENT_MS, comparison_rtt,
+                                "Re-election aborted: winner {} RTT ({:.1}ms) vs current \
+                                 connection RTT ({:.1}ms) — keeping existing connection",
+                                transport_label(measurement.is_webtransport),
+                                winner_rtt,
+                                comparison_rtt,
                             );
 
                             // Restore the old active connection: move it back
@@ -3429,7 +3700,6 @@ impl ConnectionManager {
                                             consecutive_implausible_discards: 0,
                                             in_flight_probes: VecDeque::new(),
                                             consecutive_probe_timeouts: 0,
-                                            last_echo_ms: None,
                                             reliable_lane: ProbeLaneState::default(),
                                         },
                                     );
@@ -3602,6 +3872,16 @@ impl ConnectionManager {
                 if self.reelection_in_progress {
                     REELECTION_PROCEEDED.fetch_add(1, Ordering::Relaxed);
                 }
+                if let Some(off_preference) =
+                    self.fallback_memory_outcome(measurement.is_webtransport)
+                {
+                    if !(self.reelection_in_progress && off_preference) {
+                        self.set_fallback_memory(off_preference);
+                    }
+                }
+                self.emit_election_progress(ElectionProgress::Connected {
+                    webtransport: measurement.is_webtransport,
+                });
                 self.reelection_in_progress = false;
                 // Successful election — restore the full post-rebase retry budget.
                 self.post_rebase_retry_count = 0;
@@ -3686,35 +3966,6 @@ impl ConnectionManager {
                         active_id.as_deref(),
                         election_duration_ms,
                     );
-                    return;
-                }
-
-                // Issue 2281: a live candidate that has not answered a probe yet
-                // is not a dead session. Re-arm `Testing` — the state the
-                // controller's probe and deadline timers gate on — with its
-                // extensions already spent, so the round is exactly one window.
-                if election_retries_for_measurements(
-                    classify_election_failure(&election_scan),
-                    self.election_no_measurement_retries,
-                ) {
-                    self.election_no_measurement_retries += 1;
-                    warn!(
-                        "Election produced no winner but {} candidate(s) are still live \
-                         (max implausible-discard streak {}) — retrying the scan in {}ms \
-                         (retry {}/{})",
-                        election_scan.live_candidates,
-                        election_scan.max_implausible_discards,
-                        ELECTION_NO_MEASUREMENT_RETRY_MS,
-                        self.election_no_measurement_retries,
-                        ELECTION_NO_MEASUREMENT_MAX_RETRIES,
-                    );
-                    self.election_state = ElectionState::Testing {
-                        start_time: monotonic_now_ms(),
-                        duration_ms: ELECTION_NO_MEASUREMENT_RETRY_MS,
-                        probe_timer: None,
-                        extensions_used: ELECTION_MAX_EXTENSIONS,
-                    };
-                    self.report_state();
                     return;
                 }
 
@@ -3861,7 +4112,6 @@ impl ConnectionManager {
                         consecutive_implausible_discards: 0,
                         in_flight_probes: VecDeque::new(),
                         consecutive_probe_timeouts: 0,
-                        last_echo_ms: None,
                         reliable_lane: ProbeLaneState::default(),
                     },
                 );
@@ -4051,7 +4301,7 @@ impl ConnectionManager {
         on_state_changed: Callback<ConnectionState>,
         last_server_url: String,
         manager_ref: Weak<RefCell<ConnectionManager>>,
-        election_period_ms: u64,
+        election_timeouts_ms: u64,
         intentionally_disconnected: Rc<RefCell<bool>>,
     ) {
         let mut attempt: u32 = 0;
@@ -4160,7 +4410,7 @@ impl ConnectionManager {
             // decides when to stop waiting. A budget shorter than the worst case
             // resets an election that was still running, so it is derived rather
             // than a bare margin, and polled rather than slept through.
-            let wait_budget = reconnect_election_wait_ms(election_period_ms);
+            let wait_budget = reconnect_election_wait_ms(election_timeouts_ms);
             let mut waited_ms: u64 = 0;
             let mut connected = false;
             while let Some(slice_ms) = wait_budget.next_slice_ms(waited_ms) {
@@ -4566,13 +4816,11 @@ impl ConnectionManager {
             // Re-electing to the only server is pointless (would just produce
             // the same brokenness). Reset the streak so we do not log every
             // tick, and surrender — there is nothing else to swap to.
-            if self.total_server_count() <= 1 {
+            if self.reelection_alternatives() == 0 {
                 warn!(
                     "Sustained implausible RTT on {} ({} consecutive discards) but \
-                     only {} server configured — cannot re-elect; resetting streak",
-                    active_id,
-                    discard_streak,
-                    self.total_server_count(),
+                     no server could win a re-election — resetting streak",
+                    active_id, discard_streak,
                 );
                 if let Some(m) = self.rtt_measurements.get_mut(&active_id) {
                     m.consecutive_implausible_discards = 0;
@@ -4590,7 +4838,7 @@ impl ConnectionManager {
 
         if reliable_lane_wedged && !self.reliable_lane_wedge_fired {
             self.reliable_lane_wedge_fired = true;
-            if self.total_server_count() > 1 {
+            if self.reelection_alternatives() > 0 {
                 warn!(
                     "Reliable lane wedged on {} ({} consecutive Control-stream probe \
                      timeouts at or past threshold {}) — triggering re-election",
@@ -4646,11 +4894,10 @@ impl ConnectionManager {
                 // to the same server, causing a needless session reset (new peer,
                 // lost keyframe state, video freeze). Instead, adapt the baseline
                 // to the current RTT so the detector adjusts to the new normal.
-                if self.total_server_count() <= 1 {
+                if self.reelection_alternatives() == 0 {
                     info!(
-                        "RTT degradation threshold reached but only {} server configured \
-                         — skipping re-election and rebasing RTT to {:.1}ms",
-                        self.total_server_count(),
+                        "RTT degradation threshold reached but no server could win a \
+                         re-election — rebasing RTT to {:.1}ms",
                         current_rtt,
                     );
                     self.degradation_counter = 0;
@@ -4697,10 +4944,10 @@ impl ConnectionManager {
     /// re-election would simply re-fail. Instead we emit
     /// [`ConnectionState::Failed`], which `VideoCallClient` maps to
     /// `on_connection_lost` and the dioxus-ui `schedule_reconnect` handler then
-    /// drives through `refresh_room_token` — the fresh-token path that builds a
+    /// drives through `refresh_reconnect_token` — the fresh-token path that builds a
     /// brand-new `ConnectionManager` with re-issued URLs. (Verified chain:
     /// `video_call_client.rs` `ConnectionState::Failed` arm → `on_connection_lost`
-    /// → `attendants.rs::schedule_reconnect` → `meeting_api::refresh_room_token`.)
+    /// → `attendants.rs::schedule_reconnect` → `meeting_api::refresh_reconnect_token`.)
     ///
     /// The cumulative accumulator is reset to zero here so the `error!` log and
     /// the `Failed` emission fire exactly once per exhausted budget rather than
@@ -4838,17 +5085,7 @@ impl ConnectionManager {
 
         // Create fresh candidate connections to all servers for testing.
         self.create_all_connections()?;
-
-        self.election_no_measurement_retries = 0;
-
-        // Reset election state to Testing so the normal election flow runs.
-        let start_time = monotonic_now_ms();
-        self.election_state = ElectionState::Testing {
-            start_time,
-            duration_ms: self.options.election_period_ms,
-            probe_timer: None,
-            extensions_used: 0,
-        };
+        self.begin_phased_election(monotonic_now_ms());
 
         Ok(())
     }
@@ -5126,6 +5363,10 @@ impl ConnectionManager {
                 );
             }
         }
+        if !self.is_connected() {
+            info!("request_reelection: no elected connection any more — skipping re-election");
+            return Ok(());
+        }
         self.start_reelection()
     }
 
@@ -5147,13 +5388,6 @@ impl ConnectionManager {
     // list is still single-server, we either schedule another retry up to
     // `POST_REBASE_RETRY_MAX_ATTEMPTS` or give up to avoid infinite background
     // timers when the relay never returns more than one URL.
-    //
-    // The retry only fires when `options.allow_post_rebase_retry == true`.
-    // The dioxus-ui sets this to `true` only when the user's
-    // `TransportPreference` is the default `WebTransport` (WT-with-WS-fallback)
-    // mode — i.e. the single-candidate state is system-side, not the user's
-    // deliberate choice. A manual `WebSocket` selection sets this to `false`
-    // so the retry never overrides an explicit user choice.
     // -----------------------------------------------------------------------
 
     /// Schedules the post-rebase re-election retry timer if and only if the
@@ -5261,7 +5495,7 @@ impl ConnectionManager {
             // no longer applies.
             return PostRebaseRetryAction::Skip;
         }
-        if self.total_server_count() > 1 {
+        if self.reelection_alternatives() > 0 {
             PostRebaseRetryAction::FireElection
         } else {
             PostRebaseRetryAction::Reschedule
@@ -5319,7 +5553,24 @@ impl ConnectionManager {
         self.reelection_completed_signal.clone()
     }
 
-    /// Returns the total number of configured servers (WebSocket + WebTransport).
+    fn reelection_alternatives(&self) -> usize {
+        let active_wt = self.active_transport().or_else(|| {
+            let id = self.active_connection_id.borrow().clone()?;
+            self.rtt_measurements.get(&id).map(|m| m.is_webtransport)
+        });
+        let wt_servers = if wt_election_includes_wt(self.wt_audio_fallback_latched) {
+            self.options.webtransport_urls.len()
+        } else {
+            0
+        };
+        reelection_alternatives(
+            self.plan_prefers_webtransport() && !self.wt_audio_demote_active(monotonic_now_ms()),
+            active_wt,
+            self.options.websocket_urls.len(),
+            wt_servers,
+        )
+    }
+
     fn total_server_count(&self) -> usize {
         self.options.websocket_urls.len() + self.options.webtransport_urls.len()
     }
@@ -5619,14 +5870,28 @@ impl ConnectionManager {
             .observe(peer_id, loss_per_sec, now_ms);
     }
 
-    /// Issue 2029: 1 Hz evaluation of the WebTransport→WebSocket audio fallback.
-    /// On SUSTAINED, cross-sender-UNIFORM audio-datagram loss it latches the
-    /// session WebSocket-only and re-elects through the unified reconnect path
-    /// ([`Self::reset_and_start_election`]) — mirroring what the manual
-    /// diagnostics WebSocket toggle produces (election with no WT candidates),
-    /// but session-scoped and WITHOUT persisting to the user's stored transport
-    /// preference.
-    ///
+    /// The 1 Hz checks of a connected session; the audio check runs first so
+    /// a re-election started this tick sees a demotion engaged this tick.
+    pub fn run_connected_watchdogs(&mut self, now_ms: f64) {
+        self.run_audio_datagram_fallback(now_ms);
+        if self.check_rtt_degradation() {
+            if let Err(e) = self.request_reelection() {
+                error!("Failed to start re-election: {e}");
+            }
+        }
+    }
+
+    /// On a WebSocket-only latch, re-elect without a status card.
+    pub fn run_audio_datagram_fallback(&mut self, now_ms: f64) {
+        if !self.check_audio_datagram_fallback(now_ms) {
+            return;
+        }
+        info!("[WT_AUDIO_FALLBACK] session switched to WebSocket-only after sustained uniform audio-datagram loss");
+        if let Err(e) = self.restart_election_quietly() {
+            error!("[WT_AUDIO_FALLBACK] re-election after WebSocket fallback failed: {e}");
+        }
+    }
+
     /// SUPPRESSION BYPASS: unlike [`Self::check_rtt_degradation`], this
     /// deliberately does NOT consult `cpu_overloaded` / `recent_inbound`. A
     /// constrained-receiver CPU stall is exactly what produces the uniform
@@ -5634,15 +5899,6 @@ impl ConnectionManager {
     /// not share a gate — the stall is the reason to switch, not a reason to
     /// wait. This does not weaken that RTT suppression for its own purpose; it
     /// is an independent detector on the same tick.
-    ///
-    /// Returns whether the fallback fired THIS tick — the caller then re-elects
-    /// via [`Self::reset_and_start_election`] (the unified full-election path),
-    /// mirroring how [`Self::check_rtt_degradation`] returns a decision the 1 Hz
-    /// timer acts on. The decision is separated from the (wasm-only) election so
-    /// it is host-unit-testable. One way: the latch short-circuits every
-    /// subsequent call, so it fires at most once per session — no probe-back, no
-    /// flap. Latching here (before the caller re-elects) is what makes the
-    /// ensuing `create_all_connections` skip every WebTransport candidate.
     pub fn check_audio_datagram_fallback(&mut self, now_ms: f64) -> bool {
         if self.wt_audio_fallback_latched {
             return false;
@@ -5650,7 +5906,7 @@ impl ConnectionManager {
         // ONE window advance per tick: the demotion reads what this tick produced.
         let should_latch = self.audio_loss_tracker.tick(now_ms);
         self.update_wt_audio_demotion(now_ms);
-        if !should_latch {
+        if !should_latch || !self.user_prefers_webtransport() {
             return false;
         }
 
@@ -5708,11 +5964,25 @@ impl ConnectionManager {
             .is_some_and(|until| now_ms < until)
     }
 
+    fn election_preferred_wt(&self) -> bool {
+        self.phased_election
+            .map_or(self.plan_prefers_webtransport(), |election| {
+                election.preferred_wt
+            })
+    }
+
+    fn election_demoted(&self, now_ms: f64) -> bool {
+        self.phased_election
+            .map_or_else(|| self.wt_audio_demote_active(now_ms), |e| e.demoted)
+    }
+
     fn election_scan(&self, now_ms: f64) -> ElectionScan {
+        let demote_wt = self.election_demoted(now_ms);
         scan_election_candidates(
             &self.rtt_measurements,
             &self.connections,
-            self.wt_audio_demote_active(now_ms),
+            demote_wt,
+            self.election_preferred_wt() && !demote_wt,
         )
     }
 
@@ -6187,6 +6457,17 @@ impl ConnectionManager {
 
         // Drop all connections (stops heartbeats, closes transports).
         self.connections.clear();
+        self.phased_election = None;
+        self.deferred_candidates.clear();
+        if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
+            if let Some(timer) = probe_timer.take() {
+                timer.cancel();
+            }
+        }
+        self.election_state = ElectionState::Failed {
+            reason: "Disconnected".to_string(),
+            failed_at: monotonic_now_ms(),
+        };
 
         self.reliable_lane_stalled_last_check = false;
         // Drop inbound-freshness timestamps — they refer to closed transports.
@@ -6211,86 +6492,12 @@ impl ConnectionManager {
         Ok(())
     }
 
-    fn election_lane_depth(&self) -> Vec<ElectionLaneDepth> {
-        let connections = &self.connections;
-        let now = monotonic_now_ms();
-        self.rtt_measurements
-            .iter()
-            .filter(|(id, _)| election_candidate_is_eligible(connections.get(*id)))
-            .map(|(_, m)| {
-                (
-                    m.is_webtransport,
-                    m.election_series().2,
-                    m.election_lane_answering(now),
-                )
-            })
-            .collect()
-    }
-
-    /// Check if election should be completed and do so if needed.
-    ///
-    /// When the timer expires, we verify that at least one connection has
-    /// accumulated `ELECTION_MIN_RTT_SAMPLES` measurements. If not, we
-    /// extend the deadline by 1 second, up to `ELECTION_MAX_EXTENSIONS`
-    /// times. This prevents high-latency connections (200ms+ RTT) from
-    /// being misjudged or missed entirely because the handshake consumed
-    /// most of the original election window.
+    /// Advance a running election; see [`election_verdict`].
     pub fn check_and_complete_election(&mut self) {
-        if let ElectionState::Testing {
-            start_time,
-            duration_ms,
-            extensions_used,
-            ..
-        } = &self.election_state
+        if let (Some(election), ElectionState::Testing { start_time, .. }) =
+            (self.phased_election, &self.election_state)
         {
-            let elapsed = monotonic_now_ms() - *start_time;
-            if elapsed < *duration_ms as f64 {
-                return;
-            }
-
-            // Timer expired. Check if any connection has enough RTT samples.
-            let has_enough_samples = self.rtt_measurements.values().any(|m| {
-                m.measurements.len() >= ELECTION_MIN_RTT_SAMPLES && m.average_rtt.is_some()
-            });
-            let may_complete = election_may_complete(
-                &self.election_lane_depth(),
-                has_enough_samples,
-                *extensions_used,
-            );
-
-            if may_complete {
-                if !has_enough_samples {
-                    warn!(
-                        "Election deadline reached after {} extensions with no connection \
-                         having {} RTT samples — completing with best available data",
-                        extensions_used, ELECTION_MIN_RTT_SAMPLES,
-                    );
-                }
-                self.complete_election();
-            } else {
-                // Extend the deadline by 1 second.
-                let ext = *extensions_used;
-                if let ElectionState::Testing {
-                    duration_ms,
-                    extensions_used,
-                    ..
-                } = &mut self.election_state
-                {
-                    *duration_ms += ELECTION_EXTENSION_STEP_MS;
-                    *extensions_used = ext + 1;
-                    info!(
-                        "Election extended by {}ms (extension {}/{}) — \
-                         waiting for {} RTT samples on one candidate, then {} on every \
-                         answering candidate of both transports, new deadline {}ms",
-                        ELECTION_EXTENSION_STEP_MS,
-                        ext + 1,
-                        ELECTION_MAX_EXTENSIONS,
-                        ELECTION_MIN_RTT_SAMPLES,
-                        ELECTION_BONUS_MIN_SAMPLES,
-                        *duration_ms,
-                    );
-                }
-            }
+            self.advance_election(election, *start_time);
         }
     }
 
@@ -6426,6 +6633,23 @@ impl ConnectionManager {
     /// `send_packet`'s fallback, so the depth must resolve the same way.
     pub fn get_send_queue_depth(&self) -> Option<u64> {
         self.get_active_connection()?.get_send_queue_depth()
+    }
+
+    /// `stream_key`'s queued bytes on the connection `send_packet_with_drop_meta`
+    /// writes to, including the old active one during re-election.
+    pub fn stream_send_queue_depth(&self, stream_key: MediaStreamKey) -> Option<StreamQueueDepth> {
+        self.get_active_connection()?
+            .stream_send_queue_depth(stream_key)
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn mark_elected_for_test(&mut self) {
+        let id = "test_elected".to_string();
+        *self.active_connection_id.borrow_mut() = Some(id.clone());
+        self.election_state = ElectionState::Elected {
+            connection_id: id,
+            elected_at: monotonic_now_ms(),
+        };
     }
 
     /// Test-only: install a connection and elect it in one step (#2722).
@@ -6567,7 +6791,13 @@ mod tests {
             on_inbound_media: Callback::from(|_: PacketWrapper| {}),
             on_state_changed: Callback::from(|_: ConnectionState| {}),
             peer_monitor: Callback::from(|_: ()| {}),
-            election_period_ms: 3000,
+            webtransport_connect_timeout_ms: 3000,
+            websocket_connect_timeout_ms: 3000,
+            prefer_webtransport: true,
+            on_election_progress: None,
+            fallback_memory: Rc::new(Cell::new(false)),
+            on_fallback_memory: None,
+            conn_seq: Rc::new(Cell::new(0)),
             instance_id: "test-instance-id".to_string(),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             // Default test fixture mirrors production for `Auto` users:
@@ -6640,7 +6870,10 @@ mod tests {
             wt_audio_fallback_latched: false,
             wt_audio_demote_until_ms: None,
             wt_audio_demotions: 0,
-            election_no_measurement_retries: 0,
+            phased_election: None,
+            deferred_candidates: Vec::new(),
+            quiet_election: false,
+            election_conn_seq: 0,
         }
     }
 
@@ -6665,7 +6898,6 @@ mod tests {
                 consecutive_implausible_discards: 0,
                 in_flight_probes: VecDeque::new(),
                 consecutive_probe_timeouts: 0,
-                last_echo_ms: None,
                 reliable_lane: ProbeLaneState::default(),
             },
         );
@@ -6724,6 +6956,111 @@ mod tests {
 
         let packets = forwarded.borrow().clone();
         packets
+    }
+
+    fn superseded_notice() -> PacketWrapper {
+        let meeting = MeetingPacket {
+            event_type: MeetingEventType::MEETING_INSTANCE_SUPERSEDED.into(),
+            room_id: "room".to_string(),
+            target_user_id: b"test-user".to_vec(),
+            ..Default::default()
+        };
+        PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: videocall_types::SYSTEM_USER_ID.as_bytes().to_vec(),
+            data: meeting.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+    }
+
+    /// Drive `packet` through the REAL `create_inbound_media_callback` of a
+    /// connection that is NOT the elected one ("elected" holds the election).
+    fn forwarded_from_a_non_elected_connection(packet: PacketWrapper) -> Vec<PacketWrapper> {
+        let forwarded = Rc::new(RefCell::new(Vec::<PacketWrapper>::new()));
+        let sink = forwarded.clone();
+        let mut mgr = make_test_manager();
+        mgr.options.on_inbound_media = Callback::from(move |packet: PacketWrapper| {
+            sink.borrow_mut().push(packet);
+        });
+        *mgr.active_connection_id.borrow_mut() = Some("elected".to_string());
+        let callback = mgr.create_inbound_media_callback("candidate".to_string());
+        callback.emit((
+            packet,
+            InboundLane::Reliable,
+            ReceivedAtMs(monotonic_now_ms()),
+        ));
+        let packets = forwarded.borrow().clone();
+        packets
+    }
+
+    #[test]
+    fn instance_superseded_notice_from_a_non_elected_connection_is_forwarded() {
+        let forwarded = forwarded_from_a_non_elected_connection(superseded_notice());
+        assert_eq!(forwarded.len(), 1);
+        assert!(is_instance_superseded_notice(&forwarded[0]));
+    }
+
+    /// The notice through the REAL inbound callback of a non-elected connection
+    /// whose `closed_by_manager` flag is `closed`.
+    fn superseded_notice_from_candidate(closed: bool) -> Vec<PacketWrapper> {
+        let forwarded = Rc::new(RefCell::new(Vec::<PacketWrapper>::new()));
+        let sink = forwarded.clone();
+        let mut mgr = make_test_manager();
+        mgr.options.on_inbound_media = Callback::from(move |packet: PacketWrapper| {
+            sink.borrow_mut().push(packet);
+        });
+        *mgr.active_connection_id.borrow_mut() = Some("elected".to_string());
+        let callback = mgr
+            .create_inbound_media_callback_for("candidate".to_string(), Rc::new(Cell::new(closed)));
+        callback.emit((
+            superseded_notice(),
+            InboundLane::Reliable,
+            ReceivedAtMs(monotonic_now_ms()),
+        ));
+        let packets = forwarded.borrow().clone();
+        packets
+    }
+
+    #[test]
+    fn instance_superseded_notice_from_a_connection_the_manager_already_dropped_is_ignored() {
+        assert!(
+            superseded_notice_from_candidate(true).is_empty(),
+            "a dropped candidate's late notice must not reach the UI"
+        );
+        assert_eq!(
+            superseded_notice_from_candidate(false).len(),
+            1,
+            "control: a live non-elected candidate's notice is forwarded"
+        );
+    }
+
+    #[test]
+    fn other_packets_from_a_non_elected_connection_are_still_dropped() {
+        let other_meeting_event = MeetingPacket {
+            event_type: MeetingEventType::MEETING_ENDED.into(),
+            ..Default::default()
+        };
+        let forged_from_a_peer = PacketWrapper {
+            user_id: b"peer@x".to_vec(),
+            ..superseded_notice()
+        };
+        for dropped in [
+            packet(PacketType::MEDIA, 7),
+            PacketWrapper {
+                data: other_meeting_event.write_to_bytes().unwrap(),
+                ..superseded_notice()
+            },
+            forged_from_a_peer,
+            PacketWrapper {
+                data: vec![0xff, 0xff, 0xff],
+                ..superseded_notice()
+            },
+        ] {
+            assert!(
+                forwarded_from_a_non_elected_connection(dropped).is_empty(),
+                "only the system-authored superseded notice may cross the election gate"
+            );
+        }
     }
 
     /// Build a [`SessionIdHistory`] holding exactly `ids`, in order.
@@ -6789,13 +7126,13 @@ mod tests {
                 true,
                 "wt_0",
                 "https://relay.example/lobby",
-                true,
+                ConnectionStatus::Connected,
                 3,
                 Some(42.74),
                 true,
             ),
             "Election candidate: transport=wt id=wt_0 url=https://relay.example/lobby \
-             is_connected=true rtt_samples=3 avg_rtt_ms=42.7 qualifies_for_best=true"
+             status=connected rtt_samples=3 avg_rtt_ms=42.7 qualifies_for_best=true"
         );
     }
 
@@ -6806,13 +7143,13 @@ mod tests {
                 false,
                 "ws_0",
                 "wss://relay.example/lobby",
-                false,
+                ConnectionStatus::Connecting,
                 0,
                 None,
                 false,
             ),
             "Election candidate: transport=ws id=ws_0 url=wss://relay.example/lobby \
-             is_connected=false rtt_samples=0 avg_rtt_ms=null qualifies_for_best=false"
+             status=connecting rtt_samples=0 avg_rtt_ms=null qualifies_for_best=false"
         );
     }
 
@@ -6830,6 +7167,8 @@ mod tests {
     ) -> ElectionDecisionSnapshot {
         ElectionDecisionSnapshot {
             reason,
+            preferred: "wt",
+            phase: "preferred",
             rtt_lane,
             wt_samples,
             ws_samples,
@@ -6852,7 +7191,7 @@ mod tests {
                     2,
                     Some(42.74),
                     Some(58.14),
-                    "wt_faster",
+                    "preferred",
                     Some(42.74),
                     Some(58.14),
                 ),
@@ -6864,8 +7203,9 @@ mod tests {
             ),
             "Election decision: reason=best_wt_min_samples rtt_lane=reliable outcome=elected \
              elected=wt_0 active=wt_0 wt_samples=3 ws_samples=2 wt_avg_rtt_ms=42.7 \
-             ws_avg_rtt_ms=58.1 transport_pick=wt_faster best_wt_score_ms=42.7 \
-             best_ws_score_ms=58.1 wt_bonus_ms=30 election_duration_ms=1500 prior_close=none"
+             ws_avg_rtt_ms=58.1 transport_pick=preferred best_wt_score_ms=42.7 \
+             best_ws_score_ms=58.1 election_duration_ms=1500 prior_close=none \
+             preferred=wt phase=preferred"
         );
     }
 
@@ -6880,7 +7220,7 @@ mod tests {
                     0,
                     None,
                     None,
-                    "no_best_tier",
+                    "none",
                     None,
                     None,
                 ),
@@ -6892,9 +7232,9 @@ mod tests {
             ),
             "Election decision: reason=election_failed_no_candidates rtt_lane=none \
              outcome=failed elected=none active=none wt_samples=0 ws_samples=0 \
-             wt_avg_rtt_ms=null ws_avg_rtt_ms=null transport_pick=no_best_tier \
-             best_wt_score_ms=null best_ws_score_ms=null wt_bonus_ms=30 \
-             election_duration_ms=null prior_close=none"
+             wt_avg_rtt_ms=null ws_avg_rtt_ms=null transport_pick=none \
+             best_wt_score_ms=null best_ws_score_ms=null \
+             election_duration_ms=null prior_close=none preferred=wt phase=preferred"
         );
     }
 
@@ -6914,7 +7254,7 @@ mod tests {
                 2,
                 Some(40.0),
                 Some(41.0),
-                "wt_faster",
+                "preferred",
                 Some(40.0),
                 Some(41.0),
             ),
@@ -6949,33 +7289,25 @@ mod tests {
     #[test]
     fn election_winner_and_reason_share_candidate_selection() {
         let mut best_wt = make_test_manager();
+        offer_a_wt_candidate(&mut best_wt);
         insert_measurement(&mut best_wt, "wt_best", true, Some(80.0), vec![80.0, 80.0]);
         insert_measurement(&mut best_wt, "ws_best", false, Some(120.0), vec![120.0; 2]);
         assert_election_selection(&best_wt, "wt_best", "best_wt_min_samples");
 
-        let mut outside_bonus = make_test_manager();
-        insert_measurement(
-            &mut outside_bonus,
-            "wt_best",
-            true,
-            Some(80.0),
-            vec![80.0; 2],
-        );
-        insert_measurement(
-            &mut outside_bonus,
-            "ws_best",
-            false,
-            Some(20.0),
-            vec![20.0; 2],
-        );
-        assert_election_selection(&outside_bonus, "ws_best", "best_ws_min_samples");
+        let mut faster_ws = make_test_manager();
+        offer_a_wt_candidate(&mut faster_ws);
+        insert_measurement(&mut faster_ws, "wt_best", true, Some(80.0), vec![80.0; 2]);
+        insert_measurement(&mut faster_ws, "ws_best", false, Some(20.0), vec![20.0; 2]);
+        assert_election_selection(&faster_ws, "wt_best", "best_wt_min_samples");
 
         let mut best_ws = make_test_manager();
+        offer_a_wt_candidate(&mut best_ws);
         insert_measurement(&mut best_ws, "wt_fallback", true, Some(10.0), vec![10.0]);
         insert_measurement(&mut best_ws, "ws_best", false, Some(60.0), vec![60.0, 60.0]);
         assert_election_selection(&best_ws, "ws_best", "best_ws_min_samples");
 
         let mut fallback_wt = make_test_manager();
+        offer_a_wt_candidate(&mut fallback_wt);
         insert_measurement(
             &mut fallback_wt,
             "wt_fallback",
@@ -6993,6 +7325,7 @@ mod tests {
         assert_election_selection(&fallback_wt, "wt_fallback", "fallback_wt_any_samples");
 
         let mut disconnected_wt = make_test_manager();
+        offer_a_wt_candidate(&mut disconnected_wt);
         insert_measurement(
             &mut disconnected_wt,
             "wt_disconnected",
@@ -7142,6 +7475,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn screen_stream_depth_resolves_the_old_active_session_during_reelection() {
+        let mut mgr = make_test_manager();
+
+        let old_active = Connection::new_for_test_with_uplink(true, None);
+        old_active.set_wt_stream_depth_for_test(900_000);
+        mgr.old_active_connection = Some(("wt_old".to_string(), old_active));
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        let candidate = Connection::new_for_test_with_uplink(true, None);
+        candidate.set_wt_stream_depth_for_test(1);
+        mgr.connections.insert("wt_new".to_string(), candidate);
+
+        assert_eq!(
+            mgr.stream_send_queue_depth(MediaStreamKey::Screen),
+            Some(StreamQueueDepth::WebTransport(900_000)),
+            "the gate must read the session the screen frames are still written to"
+        );
+    }
+
     /// PRODUCTION-PATH regression for BOTH #1745 review findings, driven through
     /// the real `complete_election` re-election ABORT branch (host-runnable — the
     /// pre-existing `complete_election_aborts_*` tests are `#[cfg(target_arch =
@@ -7188,7 +7541,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
         mgr.old_active_connection = Some((
@@ -7281,7 +7633,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
         mgr.old_active_connection = Some((
@@ -8117,22 +8468,41 @@ mod tests {
     }
 
     #[test]
-    fn rtt_degradation_still_triggers_with_multiple_servers() {
-        let mut mgr = make_test_manager();
-        // Two servers — re-election should still happen normally.
-        mgr.options.websocket_urls = vec!["ws://a".into()];
-        mgr.options.webtransport_urls = vec!["https://b".into()];
-        let baseline = 50.0;
-        mgr.baseline_rtt = Some(baseline);
-        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
-
-        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0]);
-
-        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
-            assert!(!mgr.check_rtt_degradation());
+    fn rtt_degradation_reelects_only_when_a_server_could_win() {
+        let urls = |prefix: &str, n: usize| (0..n).map(|i| format!("{prefix}{i}")).collect();
+        for (ws, wt, prefer_wt, active_wt, reelects) in [
+            (1, 1, true, true, false),
+            (1, 1, false, false, false),
+            (1, 2, true, true, true),
+            (1, 1, true, false, true),
+            (2, 1, false, false, true),
+        ] {
+            let mut mgr = make_test_manager();
+            mgr.options.websocket_urls = urls("ws://", ws);
+            mgr.options.webtransport_urls = urls("https://", wt);
+            mgr.options.prefer_webtransport = prefer_wt;
+            mgr.baseline_rtt = Some(50.0);
+            *mgr.active_connection_id.borrow_mut() = Some("active".to_string());
+            insert_measurement(&mut mgr, "active", active_wt, Some(200.0), vec![200.0]);
+            for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
+                assert!(!mgr.check_rtt_degradation());
+            }
+            assert_eq!(
+                mgr.check_rtt_degradation(),
+                reelects,
+                "{ws} WS, {wt} WT, prefer_wt={prefer_wt}, active_wt={active_wt}"
+            );
         }
-        // With 2 servers, re-election IS triggered.
-        assert!(mgr.check_rtt_degradation());
+    }
+
+    #[test]
+    fn reelection_alternatives_count_only_servers_that_could_win() {
+        assert_eq!(reelection_alternatives(true, Some(true), 3, 1), 0);
+        assert_eq!(reelection_alternatives(true, Some(true), 1, 3), 2);
+        assert_eq!(reelection_alternatives(true, Some(false), 3, 1), 1);
+        assert_eq!(reelection_alternatives(false, Some(false), 1, 3), 0);
+        assert_eq!(reelection_alternatives(false, Some(true), 2, 3), 2);
+        assert_eq!(reelection_alternatives(true, None, 1, 1), 1);
     }
 
     #[test]
@@ -8385,14 +8755,6 @@ mod tests {
     // ===================================================================
     // 3b-ter. update_server_urls propagation (Finding 1 from PR #542 review)
     //
-    // The post-rebase retry's decision is gated on `total_server_count()`,
-    // which reads `self.options.{websocket_urls,webtransport_urls}` on the
-    // ConnectionManager itself — NOT on the outer `VideoCallClient.options`.
-    // If the public `update_server_urls` path doesn't propagate into the
-    // manager's own options, the retry timer keeps seeing a stale URL list
-    // and never fires re-election even after the URL list grows. These
-    // tests lock in the propagation invariant so the bug class doesn't
-    // regress on a future refactor.
     // ===================================================================
 
     #[test]
@@ -8915,7 +9277,7 @@ mod tests {
         let mut mgr = make_test_manager();
         // Need >= 2 servers so re-election is not skipped as "only one server".
         mgr.options.websocket_urls = vec!["ws://a".into()];
-        mgr.options.webtransport_urls = vec!["https://b".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into(), "https://c".into()];
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
         insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
 
@@ -9068,7 +9430,7 @@ mod tests {
 
     /// Drive one RTT echo through the REAL inbound callback on `lane`, then run
     /// the production drain that feeds `handle_rtt_response`.
-    fn deliver_rtt_echo(
+    fn queue_rtt_echo(
         mgr: &mut ConnectionManager,
         conn_id: &str,
         rtt_ms: f64,
@@ -9093,6 +9455,16 @@ mod tests {
         };
         let callback = mgr.create_inbound_media_callback(conn_id.to_string());
         callback.emit((packet, lane, ReceivedAtMs(monotonic_now_ms())));
+        sent_timestamp
+    }
+
+    fn deliver_rtt_echo(
+        mgr: &mut ConnectionManager,
+        conn_id: &str,
+        rtt_ms: f64,
+        lane: InboundLane,
+    ) -> f64 {
+        let sent_timestamp = queue_rtt_echo(mgr, conn_id, rtt_ms, lane);
         mgr.process_queued_rtt_responses();
         sent_timestamp
     }
@@ -9471,6 +9843,7 @@ mod tests {
     #[test]
     fn a_stale_reliable_lane_demotes_a_wt_candidate_below_a_clean_ws_candidate() {
         let mut mgr = make_test_manager();
+        offer_a_wt_candidate(&mut mgr);
         mgr.connections.insert(
             "wt_0".to_string(),
             Connection::new_for_test_with_transport(true),
@@ -9489,7 +9862,7 @@ mod tests {
 
         for (timeouts, expected_winner, expect_best_tier) in [
             (0, "wt_0", true),
-            (STALE_THRESHOLD - 1, "ws_0", true),
+            (STALE_THRESHOLD - 1, "wt_0", true),
             (STALE_THRESHOLD, "ws_0", false),
         ] {
             mgr.rtt_measurements
@@ -9523,7 +9896,12 @@ mod tests {
         );
         insert_measurement(&mut mgr, "wt_0", true, Some(20.0), vec![20.0, 20.0]);
 
-        let fallback = ConnectionManager::snapshot_election_decision(&mgr.election_scan(0.0));
+        let fallback = ConnectionManager::snapshot_election_decision(
+            &mgr.election_scan(0.0),
+            true,
+            ElectionPhase::Preferred,
+            false,
+        );
         assert_eq!(fallback.rtt_lane, "datagram-fallback");
 
         {
@@ -9531,7 +9909,12 @@ mod tests {
             wt.reliable_lane.measurements = VecDeque::from(vec![300.0, 300.0]);
             wt.reliable_lane.average_rtt = Some(300.0);
         }
-        let reliable = ConnectionManager::snapshot_election_decision(&mgr.election_scan(0.0));
+        let reliable = ConnectionManager::snapshot_election_decision(
+            &mgr.election_scan(0.0),
+            true,
+            ElectionPhase::Preferred,
+            false,
+        );
         assert_eq!(reliable.rtt_lane, "reliable");
         assert_eq!(
             reliable.wt_avg_rtt_ms,
@@ -9541,7 +9924,13 @@ mod tests {
 
         let empty = make_test_manager();
         assert_eq!(
-            ConnectionManager::snapshot_election_decision(&empty.election_scan(0.0)).rtt_lane,
+            ConnectionManager::snapshot_election_decision(
+                &empty.election_scan(0.0),
+                true,
+                ElectionPhase::Preferred,
+                false
+            )
+            .rtt_lane,
             "none"
         );
 
@@ -10060,7 +10449,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
         mgr.old_active_connection = Some((
@@ -10169,7 +10557,7 @@ mod tests {
     fn cpu_stall_guard_does_not_suppress_implausible_when_inbound_stale() {
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://a".into()];
-        mgr.options.webtransport_urls = vec!["https://b".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into(), "https://c".into()];
         setup_active_elected(&mut mgr, "wt_0");
         insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
         mgr.rtt_measurements
@@ -10513,15 +10901,15 @@ mod tests {
 
     #[test]
     fn the_downlink_capability_rides_on_webtransport_and_only_webtransport() {
-        let wt = build_connect_url("https://relay.example/lobby/room/user", "inst-1", true);
+        let wt = build_connect_url("https://relay.example/lobby/room/user", "inst-1", 3, true);
         assert_eq!(
-            wt, "https://relay.example/lobby/room/user?instance_id=inst-1&ds=1",
+            wt, "https://relay.example/lobby/room/user?instance_id=inst-1&conn_seq=3&ds=1",
             "the WebTransport URL must carry both the instance id and the capability"
         );
 
-        let ws = build_connect_url("wss://relay.example/lobby/room/user", "inst-1", false);
+        let ws = build_connect_url("wss://relay.example/lobby/room/user", "inst-1", 3, false);
         assert_eq!(
-            ws, "wss://relay.example/lobby/room/user?instance_id=inst-1",
+            ws, "wss://relay.example/lobby/room/user?instance_id=inst-1&conn_seq=3",
             "WebSocket has one downlink connection and no stream to split"
         );
         assert!(!ws.contains("ds="));
@@ -10529,9 +10917,9 @@ mod tests {
 
     #[test]
     fn the_connect_url_keeps_the_existing_query_and_its_separator() {
-        let wt = build_connect_url("https://relay.example/lobby?token=abc", "inst-2", true);
+        let wt = build_connect_url("https://relay.example/lobby?token=abc", "inst-2", 4, true);
         assert_eq!(
-            wt, "https://relay.example/lobby?token=abc&instance_id=inst-2&ds=1",
+            wt, "https://relay.example/lobby?token=abc&instance_id=inst-2&conn_seq=4&ds=1",
             "an existing query must be extended with `&`, never restarted with `?`"
         );
         assert_eq!(
@@ -10539,6 +10927,123 @@ mod tests {
             1,
             "a second `?` would fold the whole tail into one parameter value"
         );
+    }
+
+    #[test]
+    fn the_connect_url_carries_conn_seq() {
+        for (base, sep) in [
+            ("wss://relay.example/lobby", '?'),
+            ("wss://relay.example/lobby?token=abc", '&'),
+        ] {
+            let ws = build_connect_url(base, "inst", 7, false);
+            assert_eq!(ws, format!("{base}{sep}instance_id=inst&conn_seq=7"));
+            let wt = build_connect_url(base, "inst", 7, true);
+            assert_eq!(wt, format!("{base}{sep}instance_id=inst&conn_seq=7&ds=1"));
+            assert_eq!(wt.matches("conn_seq=").count(), 1);
+            assert_eq!(wt.matches('?').count(), 1);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn query_conn_seq(url: &str) -> u64 {
+        let query = url.split_once('?').map_or("", |(_, q)| q);
+        let values: Vec<&str> = query
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("conn_seq="))
+            .collect();
+        assert_eq!(values.len(), 1, "exactly one conn_seq in {url}");
+        values[0].parse().expect("conn_seq is a u64")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dialed_conn_seqs() -> Vec<u64> {
+        super::super::webtransport::host_seam::take_dialed_urls()
+            .iter()
+            .map(|url| query_conn_seq(url))
+            .collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wt_only_manager() -> ConnectionManager {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec![lobby("https://wt-a", "jwt")];
+        mgr
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn one_election_dials_every_candidate_with_one_conn_seq() {
+        let mut mgr = two_wt_one_ws_manager("jwt");
+        mgr.options.websocket_urls.clear();
+        let _ = dialed_conn_seqs();
+        mgr.create_all_connections().unwrap();
+        assert_eq!(dialed_conn_seqs(), vec![1, 1]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_deferred_fallback_dial_reuses_its_elections_conn_seq() {
+        let mut mgr = wt_only_manager();
+        mgr.options.prefer_webtransport = false;
+        let _ = dialed_conn_seqs();
+        mgr.start_election().unwrap();
+        assert!(dialed_conn_seqs().is_empty(), "WebTransport is deferred");
+        assert!(!mgr.deferred_candidates.is_empty());
+        let ws_seq = query_conn_seq(&mgr.connect_url(&lobby("wss://ws-a", "jwt"), false));
+
+        mgr.check_and_complete_election();
+
+        assert_eq!(dialed_conn_seqs(), vec![ws_seq]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn start_reelection_dials_with_a_strictly_higher_conn_seq() {
+        let mut mgr = wt_only_manager();
+        let _ = dialed_conn_seqs();
+        mgr.start_election().unwrap();
+        let first = dialed_conn_seqs();
+        assert_eq!(first.len(), 1);
+
+        mgr.start_reelection().unwrap();
+
+        let second = dialed_conn_seqs();
+        assert_eq!(second.len(), 1);
+        assert!(second[0] > first[0], "{second:?} must exceed {first:?}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn restarted_elections_keep_conn_seq_climbing() {
+        let mut mgr = wt_only_manager();
+        let _ = dialed_conn_seqs();
+        mgr.start_election().unwrap();
+        mgr.start_reelection().unwrap();
+        mgr.reset_and_start_election().unwrap();
+        mgr.restart_election_quietly().unwrap();
+
+        let seqs = dialed_conn_seqs();
+        assert_eq!(seqs.len(), 4);
+        assert!(seqs.windows(2).all(|w| w[1] > w[0]), "{seqs:?}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_rebuilt_manager_continues_the_shared_conn_seq() {
+        let shared = Rc::new(Cell::new(0));
+        let mut first = wt_only_manager();
+        first.options.conn_seq = shared.clone();
+        let mut second = wt_only_manager();
+        second.options.conn_seq = shared;
+        let _ = dialed_conn_seqs();
+
+        first.start_election().unwrap();
+        first.start_reelection().unwrap();
+        second.start_election().unwrap();
+
+        let seqs = dialed_conn_seqs();
+        assert_eq!(seqs.len(), 3);
+        assert!(seqs[2] > seqs[1], "{seqs:?}");
     }
 
     #[test]
@@ -10905,6 +11410,7 @@ mod tests {
     #[test]
     fn check_audio_datagram_fallback_fires_latches_and_is_one_way() {
         let mut mgr = make_test_manager();
+        offer_a_wt_candidate(&mut mgr);
         assert!(!mgr.wt_audio_fallback_latched, "cold start: not latched");
 
         assert!(
@@ -10965,6 +11471,7 @@ mod tests {
 
     /// Both clear `ELECTION_MIN_RTT_SAMPLES` (same tier); WT is 10x faster.
     fn seed_fast_wt_slow_ws(mgr: &mut ConnectionManager) {
+        offer_a_wt_candidate(mgr);
         insert_measurement(
             mgr,
             "wt_0",
@@ -11041,16 +11548,14 @@ mod tests {
         );
     }
 
-    // 5c. Issue 2725 — cross-transport election with an explicit WT bonus
-
     /// A best-tier WT/WS pair; no probe timeouts, so score == RTT.
     fn seed_wt_ws_pair(mgr: &mut ConnectionManager, wt_rtt: f64, ws_rtt: f64) {
         seed_wt_ws_pair_with_depth(
             mgr,
             wt_rtt,
             ws_rtt,
-            ELECTION_BONUS_MIN_SAMPLES,
-            ELECTION_BONUS_MIN_SAMPLES,
+            ELECTION_MIN_RTT_SAMPLES,
+            ELECTION_MIN_RTT_SAMPLES,
             true,
         );
     }
@@ -11065,6 +11570,7 @@ mod tests {
         ws_samples: usize,
         wt_reliable_lane: bool,
     ) {
+        offer_a_wt_candidate(mgr);
         insert_measurement(mgr, "wt_0", true, Some(wt_rtt), vec![wt_rtt; wt_samples]);
         if wt_reliable_lane {
             let wt = mgr.rtt_measurements.get_mut("wt_0").unwrap();
@@ -11072,403 +11578,6 @@ mod tests {
             wt.reliable_lane.average_rtt = Some(wt_rtt);
         }
         insert_measurement(mgr, "ws_0", false, Some(ws_rtt), vec![ws_rtt; ws_samples]);
-    }
-
-    fn elected_for_pair(wt_rtt: f64, ws_rtt: f64) -> String {
-        let mut mgr = make_test_manager();
-        seed_wt_ws_pair(&mut mgr, wt_rtt, ws_rtt);
-        elected_id(&mgr, 0.0)
-    }
-
-    #[test]
-    fn a_far_slower_wt_loses_the_election_to_ws() {
-        assert_eq!(
-            elected_for_pair(500.0, 20.0),
-            "ws_0",
-            "a 500ms WT link must lose to a 20ms WS link"
-        );
-        assert_eq!(
-            elected_for_pair(20.0, 500.0),
-            "wt_0",
-            "the mirrored numbers must still elect WT"
-        );
-    }
-
-    #[test]
-    fn wt_wins_inside_the_bonus_and_loses_just_outside_it() {
-        let ws = 20.0;
-        assert_eq!(
-            elected_for_pair(ws + WT_ELECTION_BONUS_MS, ws),
-            "wt_0",
-            "exactly WT_ELECTION_BONUS_MS worse is still inside the bonus"
-        );
-        assert_eq!(
-            elected_for_pair(ws + WT_ELECTION_BONUS_MS + 0.1, ws),
-            "ws_0",
-            "one tenth of a millisecond past the bonus hands it to WS"
-        );
-    }
-
-    #[test]
-    fn a_demoted_wt_loses_inside_the_bonus_too() {
-        let mut mgr = make_test_manager();
-        seed_wt_ws_pair(&mut mgr, 20.0 + WT_ELECTION_BONUS_MS, 20.0);
-        assert_eq!(elected_id(&mgr, 0.0), "wt_0");
-
-        let now = drive_uniform_wt_audio_loss(&mut mgr, 0.0, 6, 30.0);
-        assert!(
-            !mgr.wt_audio_fallback_latched,
-            "6 of 12 stays under the #2029 latch bar — this must isolate the ranking"
-        );
-        assert!(mgr.wt_audio_demote_active(now));
-        assert_eq!(
-            elected_id(&mgr, now),
-            "ws_0",
-            "a demoted WT loses to a qualifying WS at every gap, bonus included"
-        );
-    }
-
-    #[test]
-    fn the_bonus_is_wider_than_the_reelection_hysteresis_deadband() {
-        assert_eq!(
-            elected_for_pair(20.0 + REELECTION_MIN_IMPROVEMENT_MS, 20.0),
-            "wt_0",
-            "a gap at the hysteresis deadband must still be inside the bonus"
-        );
-        assert_eq!(
-            elected_for_pair(20.0 + WT_ELECTION_BONUS_MS + 0.1, 20.0),
-            "ws_0",
-            "past the bonus the election concedes, and the gap clears the deadband"
-        );
-    }
-
-    #[test]
-    fn a_datagram_fallback_wt_candidate_does_not_win_on_the_bonus() {
-        let deep = ELECTION_BONUS_MIN_SAMPLES;
-        let inside = 20.0 + WT_ELECTION_BONUS_MS;
-
-        let mut fallback = make_test_manager();
-        seed_wt_ws_pair_with_depth(&mut fallback, inside, 20.0, deep, deep, false);
-        let scan = fallback.election_scan(0.0);
-        assert_eq!(
-            scan.best_wt.as_ref().unwrap().1.election_lane(),
-            ElectionRttLane::DatagramFallback,
-            "fixture must actually be on the fallback lane"
-        );
-        assert_eq!(
-            ConnectionManager::find_best_connection(&scan).unwrap().0,
-            "ws_0"
-        );
-        assert_eq!(scan.transport_pick(), "ws_bonus_unearned_lane");
-
-        let mut reliable = make_test_manager();
-        seed_wt_ws_pair_with_depth(&mut reliable, inside, 20.0, deep, deep, true);
-        assert_eq!(
-            elected_id(&reliable, 0.0),
-            "wt_0",
-            "the lane is the only difference from the case above"
-        );
-
-        let mut faster = make_test_manager();
-        seed_wt_ws_pair_with_depth(&mut faster, 15.0, 20.0, deep, deep, false);
-        assert_eq!(
-            elected_id(&faster, 0.0),
-            "wt_0",
-            "the gate withholds the concession, never an outright win"
-        );
-    }
-
-    #[test]
-    fn a_thin_sample_wt_candidate_does_not_win_on_the_bonus() {
-        let deep = ELECTION_BONUS_MIN_SAMPLES;
-        let thin = ELECTION_BONUS_MIN_SAMPLES - 1;
-        let inside = 20.0 + WT_ELECTION_BONUS_MS;
-
-        let mut wt_thin = make_test_manager();
-        seed_wt_ws_pair_with_depth(&mut wt_thin, inside, 20.0, thin, deep, true);
-        assert_eq!(elected_id(&wt_thin, 0.0), "ws_0");
-        assert_eq!(
-            wt_thin.election_scan(0.0).transport_pick(),
-            "ws_bonus_unearned_samples"
-        );
-
-        let mut ws_thin = make_test_manager();
-        seed_wt_ws_pair_with_depth(&mut ws_thin, inside, 20.0, deep, thin, true);
-        assert_eq!(
-            elected_id(&ws_thin, 0.0),
-            "ws_0",
-            "the standard error depends on both means, so the WS depth counts too"
-        );
-
-        let mut both_deep = make_test_manager();
-        seed_wt_ws_pair_with_depth(&mut both_deep, inside, 20.0, deep, deep, true);
-        assert_eq!(elected_id(&both_deep, 0.0), "wt_0");
-
-        let mut thin_faster = make_test_manager();
-        seed_wt_ws_pair_with_depth(&mut thin_faster, 15.0, 20.0, thin, thin, true);
-        assert_eq!(
-            elected_id(&thin_faster, 0.0),
-            "wt_0",
-            "a thin WT that is genuinely faster still wins"
-        );
-    }
-
-    #[test]
-    fn the_election_deadline_waits_only_for_a_real_cross_transport_race() {
-        let deep = ELECTION_BONUS_MIN_SAMPLES;
-        let thin = ELECTION_MIN_RTT_SAMPLES;
-
-        assert!(
-            !election_may_complete(&[(true, thin, true), (false, deep, true)], true, 0),
-            "both answering but one thin: extend"
-        );
-        assert!(election_may_complete(
-            &[(true, deep, true), (false, deep, true)],
-            true,
-            0
-        ));
-        assert!(
-            election_may_complete(&[(false, thin, true)], true, 0),
-            "a WS-only room must not be slowed down"
-        );
-        assert!(
-            election_may_complete(&[(true, 0, true), (false, thin, true)], true, 0),
-            "a silent candidate is never waited on"
-        );
-        assert!(
-            !election_may_complete(&[(true, 0, true), (false, 0, true)], false, 0),
-            "the original bar still extends when nothing qualifies"
-        );
-        assert!(
-            election_may_complete(
-                &[(true, thin, true), (false, deep, true)],
-                true,
-                ELECTION_MAX_EXTENSIONS
-            ),
-            "the extension budget terminates the wait"
-        );
-    }
-
-    #[test]
-    fn a_candidate_that_stopped_answering_does_not_hold_the_election_deadline() {
-        let deep = ELECTION_BONUS_MIN_SAMPLES;
-        let thin = ELECTION_MIN_RTT_SAMPLES;
-
-        assert!(
-            !election_may_complete(&[(true, thin, true), (false, deep, true)], true, 0),
-            "anti-vacuity: while it IS answering, a thin candidate must still hold"
-        );
-        assert!(
-            election_may_complete(&[(true, thin, false), (false, deep, true)], true, 0),
-            "a thin candidate that stopped answering must not hold the deadline"
-        );
-        assert!(
-            election_may_complete(&[(true, deep, false), (false, thin, true)], true, 0),
-            "with the only WT candidate silent this is a one-transport race, so \
-             the #2725 hold must not engage for the remaining thin WS candidate"
-        );
-        assert!(
-            !election_may_complete(
-                &[(true, thin, true), (true, deep, false), (false, deep, true)],
-                true,
-                0
-            ),
-            "a second, live WT candidate must keep the hold: dropping the silent \
-             one must not drop the race it is not part of"
-        );
-    }
-
-    #[test]
-    fn election_lane_answering_reads_silence_staleness_and_its_own_rtt() {
-        let mut mgr = make_test_manager();
-        insert_measurement(&mut mgr, "wt_0", true, Some(600.0), vec![600.0; 3]);
-        let now = 100_000.0;
-
-        let m = mgr.rtt_measurements.get_mut("wt_0").unwrap();
-        assert!(
-            m.election_lane_answering(now),
-            "a candidate that has never echoed is excluded by the hold's own \
-             `samples > 0` test, not called silent here"
-        );
-
-        m.last_echo_ms = Some(now - 1_200.0);
-        assert!(
-            m.election_lane_answering(now),
-            "2 x its own 600ms average is the bound, not the 1s floor"
-        );
-
-        m.last_echo_ms = Some(now - 1_300.0);
-        assert!(
-            !m.election_lane_answering(now),
-            "past 2 x its own average with nothing coming back, it is silent"
-        );
-
-        m.average_rtt = Some(20.0);
-        m.measurements = VecDeque::from(vec![20.0; 3]);
-        m.last_echo_ms = Some(now - (ELECTION_EXTENSION_STEP_MS as f64) + 1.0);
-        assert!(
-            m.election_lane_answering(now),
-            "inside one extension step a fast candidate is still answering"
-        );
-        m.last_echo_ms = Some(now - (ELECTION_EXTENSION_STEP_MS as f64) - 1.0);
-        assert!(
-            !m.election_lane_answering(now),
-            "the floor is one extension step, the unit the hold spends"
-        );
-
-        m.last_echo_ms = Some(now);
-        m.consecutive_probe_timeouts = STALE_THRESHOLD;
-        assert!(
-            !m.election_lane_answering(now),
-            "a stale candidate must leave the hold however recent its echoes"
-        );
-    }
-
-    #[test]
-    fn one_lost_probe_does_not_make_a_healthy_candidate_read_as_silent() {
-        let mut mgr = make_test_manager();
-        insert_measurement(&mut mgr, "ws_0", false, Some(600.0), vec![600.0; 3]);
-
-        let now = monotonic_now_ms();
-        let lost_at = now - 4_000.0;
-        mgr.rtt_measurements
-            .get_mut("ws_0")
-            .unwrap()
-            .in_flight_probes
-            .push_back(lost_at);
-
-        let sent_at = now - 600.0;
-        mgr.rtt_measurements
-            .get_mut("ws_0")
-            .unwrap()
-            .in_flight_probes
-            .push_back(sent_at);
-        let echo = MediaPacket {
-            timestamp: sent_at,
-            ..Default::default()
-        };
-        mgr.handle_rtt_response("ws_0", &echo, now, InboundLane::Reliable);
-
-        let m = mgr.rtt_measurements.get("ws_0").unwrap();
-        assert_eq!(
-            m.in_flight_probes.front().copied(),
-            Some(lost_at),
-            "anti-vacuity: the lost probe must still be at the FRONT, which is \
-             exactly what the old predicate read"
-        );
-        assert!(
-            m.election_lane_answering(monotonic_now_ms()),
-            "a candidate echoing on time must keep the hold even with one lost \
-             probe stuck at the front of its queue"
-        );
-
-        let stamp = m.last_echo_ms.expect("the echo must have stamped");
-        mgr.rtt_measurements.get_mut("ws_0").unwrap().last_echo_ms =
-            Some(stamp - 2.0 * 600.0 - 1.0);
-        assert!(
-            !mgr.rtt_measurements["ws_0"].election_lane_answering(monotonic_now_ms()),
-            "the predicate must still detect a candidate that stopped echoing"
-        );
-    }
-
-    #[test]
-    fn an_expired_deadline_extends_while_one_transport_is_still_thin() {
-        let mut mgr = make_test_manager();
-        seed_wt_ws_pair_with_depth(
-            &mut mgr,
-            25.0,
-            20.0,
-            ELECTION_MIN_RTT_SAMPLES,
-            ELECTION_BONUS_MIN_SAMPLES,
-            true,
-        );
-        mgr.election_state = ElectionState::Testing {
-            start_time: monotonic_now_ms() - 5_000.0,
-            duration_ms: 2_000,
-            probe_timer: None,
-            extensions_used: 0,
-        };
-
-        mgr.check_and_complete_election();
-        assert!(
-            matches!(
-                mgr.election_state,
-                ElectionState::Testing {
-                    extensions_used: 1,
-                    duration_ms: 3_000,
-                    ..
-                }
-            ),
-            "an asymmetric candidate set must extend, not elect: {:?}",
-            mgr.get_connection_state()
-        );
-
-        let wt = mgr.rtt_measurements.get_mut("wt_0").unwrap();
-        wt.reliable_lane.measurements = VecDeque::from(vec![25.0; ELECTION_BONUS_MIN_SAMPLES]);
-        if let ElectionState::Testing {
-            ref mut start_time, ..
-        } = mgr.election_state
-        {
-            *start_time = monotonic_now_ms() - 9_000.0;
-        }
-        mgr.check_and_complete_election();
-        assert!(
-            !matches!(mgr.election_state, ElectionState::Testing { .. }),
-            "once both lanes are comparable the deadline completes"
-        );
-    }
-
-    #[test]
-    fn a_disconnected_candidate_does_not_hold_the_election_deadline() {
-        let mut mgr = make_test_manager();
-        seed_wt_ws_pair_with_depth(
-            &mut mgr,
-            25.0,
-            20.0,
-            ELECTION_MIN_RTT_SAMPLES,
-            ELECTION_BONUS_MIN_SAMPLES,
-            true,
-        );
-        mgr.connections.insert(
-            "ws_0".to_string(),
-            Connection::new_for_test_with_transport(false),
-        );
-        mgr.connections.insert(
-            "wt_0".to_string(),
-            Connection::new_for_test_with_transport(true),
-        );
-        mgr.election_state = ElectionState::Testing {
-            start_time: monotonic_now_ms() - 5_000.0,
-            duration_ms: 2_000,
-            probe_timer: None,
-            extensions_used: 0,
-        };
-
-        mgr.check_and_complete_election();
-        assert!(
-            matches!(
-                mgr.election_state,
-                ElectionState::Testing {
-                    extensions_used: 1,
-                    ..
-                }
-            ),
-            "a connected but thin candidate still holds the deadline"
-        );
-
-        mgr.connections.insert(
-            "wt_0".to_string(),
-            Connection::new_for_test_disconnected(true),
-        );
-        let depth = mgr.election_lane_depth();
-        assert!(
-            !depth.iter().any(|(is_wt, _, _)| *is_wt),
-            "a disconnected candidate must leave the race: {depth:?}"
-        );
-        assert!(
-            election_may_complete(&depth, true, 0),
-            "the same thin candidate, now disconnected, must not hold the deadline"
-        );
     }
 
     #[test]
@@ -11501,125 +11610,19 @@ mod tests {
     }
 
     #[test]
-    fn the_decision_line_carries_the_cross_transport_comparison() {
-        let mut inside = make_test_manager();
-        seed_wt_ws_pair(&mut inside, 20.0 + WT_ELECTION_BONUS_MS, 20.0);
-        let snapshot = ConnectionManager::snapshot_election_decision(&inside.election_scan(0.0));
-        assert_eq!(snapshot.transport_pick, "wt_within_bonus");
-        assert_eq!(snapshot.best_wt_score_ms, Some(20.0 + WT_ELECTION_BONUS_MS));
-        assert_eq!(snapshot.best_ws_score_ms, Some(20.0));
-
-        let line = format_election_decision(
-            &snapshot,
-            ElectionOutcome::Elected,
-            Some("wt_0"),
-            Some("wt_0"),
-            None,
-            PRIOR_CLOSE_NONE,
-        );
-        for token in [
-            "transport_pick=wt_within_bonus".to_string(),
-            format!("best_wt_score_ms={:.1}", 20.0 + WT_ELECTION_BONUS_MS),
-            "best_ws_score_ms=20.0".to_string(),
-            format!("wt_bonus_ms={WT_ELECTION_BONUS_MS:.0}"),
-        ] {
-            assert!(line.contains(&token), "missing {token} in: {line}");
-        }
-
-        let mut outside = make_test_manager();
-        seed_wt_ws_pair(&mut outside, 500.0, 20.0);
-        assert_eq!(
-            ConnectionManager::snapshot_election_decision(&outside.election_scan(0.0))
-                .transport_pick,
-            "ws_faster"
-        );
-
-        let mut demoted = make_test_manager();
-        seed_wt_ws_pair(&mut demoted, 20.0, 200.0);
-        let now = drive_uniform_wt_audio_loss(&mut demoted, 0.0, 6, 30.0);
-        assert_eq!(
-            ConnectionManager::snapshot_election_decision(&demoted.election_scan(now))
-                .transport_pick,
-            "wt_demoted"
-        );
-
-        let deep = ELECTION_BONUS_MIN_SAMPLES;
-        let mut unearned_lane = make_test_manager();
-        seed_wt_ws_pair_with_depth(
-            &mut unearned_lane,
-            20.0 + WT_ELECTION_BONUS_MS,
-            20.0,
-            deep,
-            deep,
-            false,
-        );
-        assert_eq!(
-            ConnectionManager::snapshot_election_decision(&unearned_lane.election_scan(0.0))
-                .transport_pick,
-            "ws_bonus_unearned_lane"
-        );
-
-        let mut unearned_samples = make_test_manager();
-        seed_wt_ws_pair_with_depth(
-            &mut unearned_samples,
-            20.0 + WT_ELECTION_BONUS_MS,
-            20.0,
-            deep - 1,
-            deep,
-            true,
-        );
-        assert_eq!(
-            ConnectionManager::snapshot_election_decision(&unearned_samples.election_scan(0.0))
-                .transport_pick,
-            "ws_bonus_unearned_samples"
-        );
-    }
-
-    #[test]
-    fn a_single_transport_room_is_unchanged_by_the_bonus() {
-        let mut wt_only = make_test_manager();
-        insert_measurement(
-            &mut wt_only,
-            "wt_0",
-            true,
-            Some(500.0),
-            vec![500.0; ELECTION_MIN_RTT_SAMPLES],
-        );
-        assert_eq!(elected_id(&wt_only, 0.0), "wt_0");
-        assert_eq!(
-            ConnectionManager::snapshot_election_decision(&wt_only.election_scan(0.0))
-                .transport_pick,
-            "wt_only"
-        );
-
-        let mut ws_only = make_test_manager();
-        insert_measurement(
-            &mut ws_only,
-            "ws_0",
-            false,
-            Some(500.0),
-            vec![500.0; ELECTION_MIN_RTT_SAMPLES],
-        );
-        assert_eq!(elected_id(&ws_only, 0.0), "ws_0");
-        assert_eq!(
-            ConnectionManager::snapshot_election_decision(&ws_only.election_scan(0.0))
-                .transport_pick,
-            "ws_only"
-        );
-    }
-
-    #[test]
     fn fallback_tiers_stay_below_the_best_tier_and_keep_their_order() {
         let mut fallbacks = make_test_manager();
+        offer_a_wt_candidate(&mut fallbacks);
         insert_measurement(&mut fallbacks, "wt_0", true, Some(500.0), vec![500.0]);
         insert_measurement(&mut fallbacks, "ws_0", false, Some(20.0), vec![20.0]);
         assert_eq!(
             elected_id(&fallbacks, 0.0),
             "wt_0",
-            "the bonus does not reach the fallback tiers"
+            "the preferred protocol ranks first within the fallback tier"
         );
 
         let mut mixed = make_test_manager();
+        offer_a_wt_candidate(&mut mixed);
         insert_measurement(&mut mixed, "wt_0", true, Some(20.0), vec![20.0]);
         insert_measurement(
             &mut mixed,
@@ -11756,14 +11759,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wt_audio_loss_rtt_hysteresis_override_truth_table() {
-        assert!(wt_audio_loss_overrides_rtt_hysteresis(true, true, false));
-        assert!(!wt_audio_loss_overrides_rtt_hysteresis(false, true, false));
-        assert!(!wt_audio_loss_overrides_rtt_hysteresis(true, false, false));
-        assert!(!wt_audio_loss_overrides_rtt_hysteresis(true, true, true));
-    }
-
     /// Without the override the RTT hysteresis silently undoes the whole fix: the
     /// demoted election elects `ws_0`, then `complete_election` aborts back to the
     /// lossy `wt_old`. Sibling of
@@ -11790,7 +11785,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
         mgr.old_active_connection = Some((
@@ -11833,6 +11827,7 @@ mod tests {
     #[test]
     fn latching_clears_the_demotion() {
         let mut mgr = make_test_manager();
+        offer_a_wt_candidate(&mut mgr);
         let engaged = drive_uniform_wt_audio_loss(&mut mgr, 0.0, 6, 30.0);
         assert!(mgr.wt_audio_demote_active(engaged));
 
@@ -11992,7 +11987,7 @@ mod tests {
         match &captured.borrow()[0] {
             ConnectionState::Failed { error, .. } => assert_eq!(
                 error, "cpu-stall suppression budget exhausted",
-                "must emit the documented string that drives refresh_room_token"
+                "must emit the documented string that drives refresh_reconnect_token"
             ),
             other => panic!("expected ConnectionState::Failed, got {other:?}"),
         }
@@ -12183,155 +12178,7 @@ mod tests {
             start_time: monotonic_now_ms(),
             duration_ms: 3000,
             probe_timer: None,
-            extensions_used: ELECTION_MAX_EXTENSIONS,
         };
-    }
-
-    #[test]
-    fn scan_counts_a_connected_candidate_as_live() {
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        let scan = mgr.election_scan(0.0);
-        assert_eq!(scan.live_candidates, 1);
-        assert!(scan.selected().is_none());
-    }
-
-    #[test]
-    fn classify_election_failure_awaits_measurements_when_a_candidate_is_live() {
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        assert_eq!(
-            classify_election_failure(&mgr.election_scan(0.0)),
-            Some(ElectionFailure::AwaitingMeasurements)
-        );
-    }
-
-    #[test]
-    fn classify_election_failure_is_no_candidates_when_the_connection_is_closed() {
-        let mut mgr = make_test_manager();
-        mgr.connections.insert(
-            "ws_0".to_string(),
-            Connection::new_for_test_disconnected(false),
-        );
-        insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
-        assert_eq!(
-            classify_election_failure(&mgr.election_scan(0.0)),
-            Some(ElectionFailure::NoCandidates)
-        );
-    }
-
-    #[test]
-    fn classify_election_failure_is_none_when_a_winner_exists() {
-        let mut mgr = make_test_manager();
-        mgr.connections
-            .insert("ws_0".to_string(), Connection::new_for_test());
-        insert_measurement(&mut mgr, "ws_0", false, Some(40.0), vec![40.0, 40.0]);
-        assert_eq!(classify_election_failure(&mgr.election_scan(0.0)), None);
-    }
-
-    #[test]
-    fn measurement_less_election_stays_testing_instead_of_failing_the_join() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        seed_testing_state(&mut mgr);
-
-        mgr.complete_election();
-
-        assert!(
-            matches!(mgr.election_state, ElectionState::Testing { .. }),
-            "expected a retryable Testing state, got {:?}",
-            mgr.get_connection_state()
-        );
-        assert!(
-            matches!(mgr.get_connection_state(), ConnectionState::Testing { .. }),
-            "the controller's probe/deadline timers gate on this state"
-        );
-        assert_eq!(mgr.election_no_measurement_retries, 1);
-    }
-
-    #[test]
-    fn measurement_less_election_falls_through_to_failed_once_the_budget_is_spent() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-
-        for round in 1..=ELECTION_NO_MEASUREMENT_MAX_RETRIES {
-            seed_testing_state(&mut mgr);
-            mgr.complete_election();
-            assert!(
-                matches!(mgr.election_state, ElectionState::Testing { .. }),
-                "round {round} should still be retryable"
-            );
-            assert_eq!(mgr.election_no_measurement_retries, round);
-        }
-
-        seed_testing_state(&mut mgr);
-        mgr.complete_election();
-        assert!(
-            matches!(mgr.election_state, ElectionState::Failed { .. }),
-            "the budget is bounded: round {} must be terminal",
-            ELECTION_NO_MEASUREMENT_MAX_RETRIES + 1
-        );
-    }
-
-    #[test]
-    fn retry_round_starts_with_its_extensions_already_spent() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        seed_testing_state(&mut mgr);
-
-        mgr.complete_election();
-
-        match mgr.election_state {
-            ElectionState::Testing {
-                duration_ms,
-                extensions_used,
-                ..
-            } => {
-                assert_eq!(duration_ms, ELECTION_NO_MEASUREMENT_RETRY_MS);
-                assert_eq!(extensions_used, ELECTION_MAX_EXTENSIONS);
-            }
-            ref other => panic!("expected Testing, got {other:?}"),
-        }
-    }
-
-    /// `error!("Election failed: {e}")` sits at the top of the same `Err` arm as
-    /// the retry gate, so it fires on retried rounds too; the decision line does
-    /// not, because the retry arm returns before `log_election_decision`.
-    #[test]
-    fn only_the_terminal_round_emits_an_election_decision() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        let _ = take_last_election_decision(); // clear any prior capture
-
-        for round in 1..=ELECTION_NO_MEASUREMENT_MAX_RETRIES {
-            seed_testing_state(&mut mgr);
-            mgr.complete_election();
-            assert!(
-                take_last_election_decision().is_none(),
-                "retry round {round} must not emit a terminal decision line"
-            );
-        }
-
-        seed_testing_state(&mut mgr);
-        mgr.complete_election();
-        assert_eq!(
-            take_last_election_decision()
-                .expect("the budget-exhausted round must emit a decision line")
-                .outcome,
-            ElectionOutcome::Failed,
-        );
     }
 
     fn offer_a_wt_candidate(mgr: &mut ConnectionManager) {
@@ -12343,7 +12190,6 @@ mod tests {
         seed_live_candidate_without_samples(&mut mgr, "ws_0");
         offer_a_wt_candidate(&mut mgr);
         block(&mut mgr);
-        mgr.election_no_measurement_retries = ELECTION_NO_MEASUREMENT_MAX_RETRIES;
         seed_testing_state(&mut mgr);
         let _ = take_wt_spare_refills();
         mgr.complete_election();
@@ -12352,7 +12198,7 @@ mod tests {
     }
 
     #[test]
-    fn an_election_refills_the_wt_spare_only_when_a_later_one_could_adopt_it() {
+    fn a_failed_election_refills_the_wt_spare_only_for_a_webtransport_preferring_adopter() {
         let _guard = REELECTION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12372,6 +12218,11 @@ mod tests {
             0,
             "no WT URL"
         );
+        assert_eq!(
+            refills_after_a_failed_election(|m| m.options.prefer_webtransport = false),
+            0,
+            "WebSocket preferred"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -12388,27 +12239,6 @@ mod tests {
                 Some(adopt)
             );
         }
-    }
-
-    #[test]
-    fn a_failed_election_refills_the_wt_spare_and_a_retry_round_does_not() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        offer_a_wt_candidate(&mut mgr);
-        let _ = take_wt_spare_refills();
-
-        for _ in 1..=ELECTION_NO_MEASUREMENT_MAX_RETRIES {
-            seed_testing_state(&mut mgr);
-            mgr.complete_election();
-            assert_eq!(take_wt_spare_refills(), 0, "a retry round is not an end");
-        }
-        seed_testing_state(&mut mgr);
-        mgr.complete_election();
-        assert!(matches!(mgr.election_state, ElectionState::Failed { .. }));
-        assert_eq!(take_wt_spare_refills(), 1);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -12430,103 +12260,6 @@ mod tests {
         mgr.complete_election();
         assert!(matches!(mgr.election_state, ElectionState::Elected { .. }));
         assert_eq!(take_wt_spare_refills(), 1);
-    }
-
-    #[test]
-    fn election_without_a_live_candidate_fails_without_retrying() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        mgr.connections.insert(
-            "ws_0".to_string(),
-            Connection::new_for_test_disconnected(false),
-        );
-        insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
-        seed_testing_state(&mut mgr);
-
-        mgr.complete_election();
-
-        assert!(matches!(mgr.election_state, ElectionState::Failed { .. }));
-        assert_eq!(mgr.election_no_measurement_retries, 0);
-    }
-
-    #[test]
-    fn a_webtransport_candidate_counts_as_live_too() {
-        let mut mgr = make_test_manager();
-        mgr.connections.insert(
-            "wt_0".to_string(),
-            Connection::new_for_test_with_transport(true),
-        );
-        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
-        assert_eq!(mgr.election_scan(0.0).live_candidates, 1);
-        assert_eq!(
-            classify_election_failure(&mgr.election_scan(0.0)),
-            Some(ElectionFailure::AwaitingMeasurements)
-        );
-    }
-
-    #[test]
-    fn scan_reports_the_worst_implausible_discard_streak_across_live_candidates() {
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        seed_live_candidate_without_samples(&mut mgr, "ws_1");
-        mgr.rtt_measurements
-            .get_mut("ws_0")
-            .unwrap()
-            .consecutive_implausible_discards = 7;
-        mgr.rtt_measurements
-            .get_mut("ws_1")
-            .unwrap()
-            .consecutive_implausible_discards = 76;
-
-        let scan = mgr.election_scan(0.0);
-        assert_eq!(scan.live_candidates, 2);
-        assert_eq!(scan.max_implausible_discards, 76);
-    }
-
-    /// Run the REAL state machine to termination, expiring each deadline
-    /// rather than sleeping, and return the virtual ms it consumed.
-    fn virtual_ms_until_election_terminates(
-        mgr: &mut ConnectionManager,
-        election_period_ms: u64,
-    ) -> u64 {
-        mgr.election_state = ElectionState::Testing {
-            start_time: monotonic_now_ms(),
-            duration_ms: election_period_ms,
-            probe_timer: None,
-            extensions_used: 0,
-        };
-
-        let mut consumed = 0u64;
-        for _ in 0..64 {
-            let window_duration = match mgr.election_state {
-                ElectionState::Testing { duration_ms, .. } => duration_ms,
-                _ => return consumed,
-            };
-
-            let expired_start = monotonic_now_ms() - window_duration as f64 - 1.0;
-            if let ElectionState::Testing {
-                ref mut start_time, ..
-            } = mgr.election_state
-            {
-                *start_time = expired_start;
-            }
-
-            mgr.check_and_complete_election();
-
-            // An in-window extension keeps the same `start_time` and only grows
-            // `duration_ms`; a retry round installs a fresh window.
-            let extended_in_place = matches!(
-                mgr.election_state,
-                ElectionState::Testing { start_time, .. }
-                    if start_time.to_bits() == expired_start.to_bits()
-            );
-            if !extended_in_place {
-                consumed += window_duration;
-            }
-        }
-        panic!("election never terminated");
     }
 
     #[test]
@@ -12554,83 +12287,6 @@ mod tests {
             waited += slice;
         }
         assert_eq!(waited, budget.ms());
-    }
-
-    /// Lockstep: left side is the production derivation, right side is the
-    /// state machine executed — not a second copy of the formula.
-    #[test]
-    fn reconnect_wait_covers_the_worst_case_election() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for election_period_ms in [1_000u64, 2_000, 3_000] {
-            let mut mgr = make_test_manager();
-            seed_live_candidate_without_samples(&mut mgr, "ws_0");
-            let consumed = virtual_ms_until_election_terminates(&mut mgr, election_period_ms);
-            assert!(
-                reconnect_election_wait_ms(election_period_ms).ms() >= consumed,
-                "the reconnection loop would reset a still-running election: it waits {}ms \
-                 but the election consumes {}ms at election_period_ms={}",
-                reconnect_election_wait_ms(election_period_ms).ms(),
-                consumed,
-                election_period_ms,
-            );
-        }
-    }
-
-    #[test]
-    fn worst_case_election_consumes_exactly_the_derived_duration() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        seed_live_candidate_without_samples(&mut mgr, "ws_0");
-        assert_eq!(
-            virtual_ms_until_election_terminates(&mut mgr, 2_000),
-            max_election_duration_ms(2_000),
-        );
-    }
-
-    /// A closed candidate classifies `NoCandidates`, so no retry rounds run.
-    #[test]
-    fn reconnect_wait_covers_the_pre_existing_extension_path_alone() {
-        let _guard = REELECTION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut mgr = make_test_manager();
-        mgr.connections.insert(
-            "ws_0".to_string(),
-            Connection::new_for_test_disconnected(false),
-        );
-        insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
-
-        let consumed = virtual_ms_until_election_terminates(&mut mgr, 2_000);
-
-        assert_eq!(
-            consumed,
-            2_000 + u64::from(ELECTION_MAX_EXTENSIONS) * ELECTION_EXTENSION_STEP_MS,
-        );
-        assert!(reconnect_election_wait_ms(2_000).ms() >= consumed);
-        assert!(
-            2_000 + RECONNECT_ELECTION_SETTLE_MARGIN_MS < consumed,
-            "a bare settle margin already fell short of the extension path"
-        );
-    }
-
-    #[test]
-    fn a_fresh_election_refills_the_retry_budget() {
-        let mut mgr = make_test_manager();
-        mgr.election_no_measurement_retries = ELECTION_NO_MEASUREMENT_MAX_RETRIES;
-        mgr.start_election().expect("no urls configured to dial");
-        assert_eq!(mgr.election_no_measurement_retries, 0);
-    }
-
-    #[test]
-    fn a_fresh_reelection_refills_the_retry_budget() {
-        let mut mgr = make_test_manager();
-        mgr.election_no_measurement_retries = ELECTION_NO_MEASUREMENT_MAX_RETRIES;
-        mgr.start_reelection().expect("no urls configured to dial");
-        assert_eq!(mgr.election_no_measurement_retries, 0);
     }
 
     // ===================================================================
@@ -13719,7 +13375,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
         // old_active_connection is None (no real Connection object).
@@ -13791,7 +13446,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
         *mgr.active_connection_id.borrow_mut() = Some("custom_id".to_string());
@@ -13820,7 +13474,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
 
@@ -13957,7 +13610,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         });
         *mgr.active_connection_id.borrow_mut() = Some(old_id.to_string());
@@ -14616,6 +14268,7 @@ mod tests {
         // re-election to in-progress with the new generation. This is the
         // observable contract the wasm spawn_local body relies on.
         let mut mgr = make_test_manager();
+        setup_active_elected(&mut mgr, "wt_0");
         mgr.options.websocket_urls = vec!["ws://stale?token=expired".into()];
         mgr.options.webtransport_urls = vec!["https://stale?token=expired".into()];
         let pre_generation = mgr.reelection_generation;
@@ -14653,6 +14306,7 @@ mod tests {
         // the cached (possibly expired) URLs. The cached URLs persist;
         // re-election still progresses to in-progress.
         let mut mgr = make_test_manager();
+        setup_active_elected(&mut mgr, "wt_0");
         let cached_ws = vec!["ws://relay/lobby?token=cached".to_string()];
         let cached_wt = vec!["https://relay/lobby?token=cached".to_string()];
         mgr.options.websocket_urls = cached_ws.clone();
@@ -14687,8 +14341,8 @@ mod tests {
         for (id, connection) in &mgr.connections {
             assert_eq!(
                 connection.dropped_mark_holders(),
-                2,
-                "{id}: mark must be held by its connection and its loss callback only"
+                3,
+                "{id}: mark must be held by its connection, its loss callback and its inbound callback only"
             );
         }
     }
@@ -15102,7 +14756,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
@@ -15166,7 +14819,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
@@ -15234,7 +14886,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
@@ -15296,7 +14947,6 @@ mod tests {
             consecutive_implausible_discards: 0,
             in_flight_probes: VecDeque::new(),
             consecutive_probe_timeouts: 0,
-            last_echo_ms: None,
             reliable_lane: ProbeLaneState::default(),
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
@@ -15460,5 +15110,975 @@ mod tests {
             connection_session_drops_wt() + connection_session_drops_ws(),
             "combined session-drop reader must equal WT + WS"
         );
+    }
+
+    // ===================================================================
+    // Preferred-protocol election (#3044)
+    // ===================================================================
+
+    fn joining(timeout_ms: u64, prefer_wt: bool) -> ConnectionManager {
+        joining_with(timeout_ms, timeout_ms, prefer_wt)
+    }
+
+    fn joining_with(wt_ms: u64, ws_ms: u64, prefer_wt: bool) -> ConnectionManager {
+        let mut mgr = make_test_manager();
+        if prefer_wt {
+            offer_a_wt_candidate(&mut mgr);
+        }
+        mgr.options.webtransport_connect_timeout_ms = wt_ms;
+        mgr.options.websocket_connect_timeout_ms = ws_ms;
+        mgr.begin_phased_election(monotonic_now_ms());
+        mgr
+    }
+
+    /// A candidate whose connection is still handshaking or has closed.
+    fn unready(mgr: &mut ConnectionManager, id: &str, connection: Connection) {
+        let wt = connection.is_webtransport();
+        mgr.connections.insert(id.to_string(), connection);
+        insert_measurement(mgr, id, wt, None, vec![]);
+    }
+
+    /// A connected candidate, absent from `connections`.
+    fn measured(mgr: &mut ConnectionManager, id: &str, wt: bool, rtts: &[f64]) {
+        mgr.connections.remove(id);
+        let avg = rtts.iter().sum::<f64>() / rtts.len() as f64;
+        insert_measurement(mgr, id, wt, Some(avg), rtts.to_vec());
+    }
+
+    /// Age the running join: its start and its current phase.
+    fn age(mgr: &mut ConnectionManager, since_start_ms: f64, phase_ms: f64) {
+        let now = monotonic_now_ms();
+        if let ElectionState::Testing {
+            ref mut start_time, ..
+        } = mgr.election_state
+        {
+            *start_time = now - since_start_ms;
+        }
+        if let Some(join) = mgr.phased_election.as_mut() {
+            join.phase_started_at = now - phase_ms;
+        }
+    }
+
+    fn join_phase(mgr: &ConnectionManager) -> Option<ElectionPhase> {
+        matches!(mgr.election_state, ElectionState::Testing { .. })
+            .then(|| mgr.phased_election.map(|join| join.phase))
+            .flatten()
+    }
+
+    fn elected(mgr: &ConnectionManager) -> Option<&str> {
+        match &mgr.election_state {
+            ElectionState::Elected { connection_id, .. } => Some(connection_id),
+            _ => None,
+        }
+    }
+
+    fn tick(mgr: &mut ConnectionManager) -> Option<RecordedElectionDecision> {
+        let _ = take_last_election_decision();
+        mgr.check_and_complete_election();
+        take_last_election_decision()
+    }
+
+    fn tick_pick(mgr: &mut ConnectionManager) -> Option<&'static str> {
+        tick(mgr).map(|d| d.transport_pick)
+    }
+
+    /// Candidates as `<t|s><X|H|C><samples>`: WebTransport or WebSocket, then
+    /// Closed, Connecting (handshaking) or Connected.
+    fn views(spec: &str) -> Vec<CandidateView> {
+        spec.split(' ')
+            .map(|c| {
+                let b = c.as_bytes();
+                let status = match b[1] {
+                    b'X' => ConnectionStatus::Closed,
+                    b'H' => ConnectionStatus::Connecting,
+                    _ => ConnectionStatus::Connected,
+                };
+                let samples = usize::from(b[2] - b'0');
+                CandidateView {
+                    is_webtransport: b[0] == b't',
+                    status,
+                    established: status == ConnectionStatus::Connected && samples >= 2,
+                    samples,
+                }
+            })
+            .collect()
+    }
+
+    /// Rows run at a 2000 ms phase timeout; the grace ends at 5000 ms.
+    #[test]
+    fn the_verdict_waits_on_the_preferred_protocol_then_falls_back() {
+        use ElectionVerdict::{Complete, EnterFallback, Wait};
+        type Case = (
+            &'static str,
+            &'static str,
+            ElectionPhase,
+            u32,
+            ElectionVerdict,
+        );
+        let p = ElectionPhase::Preferred;
+        let fb = ElectionPhase::Fallback {
+            preferred_failed: false,
+        };
+        let failed = EnterFallback {
+            preferred_failed: true,
+        };
+        let deadline = EnterFallback {
+            preferred_failed: false,
+        };
+        let cases: &[Case] = &[
+            ("failed handshake", "tX0 sC2", p, 0, failed),
+            ("never created", "sC2", p, 0, failed),
+            ("handshaking", "tH0 sC2", p, 1999, Wait),
+            ("deadline", "tH0 sC2", p, 2000, deadline),
+            ("sole preferred", "tC2 sC2", p, 0, Complete),
+            ("several preferred", "tC2 tC2 sC2", p, 0, Complete),
+            (
+                "several preferred, one handshaking",
+                "tC2 tH0 sC2",
+                p,
+                1999,
+                Wait,
+            ),
+            (
+                "several preferred, one failed",
+                "tC2 tX0 sC2",
+                p,
+                0,
+                Complete,
+            ),
+            (
+                "several preferred, deadline",
+                "tC2 tC2 sC2",
+                p,
+                2000,
+                Complete,
+            ),
+            ("all failed", "tX0", p, 0, Complete),
+            ("handshaking at expiry", "tH0", p, 2000, Wait),
+            ("starved in grace", "tC0", p, 4999, Wait),
+            ("grace bound", "tC0", p, 5000, Complete),
+            ("first echo", "tC1", p, 2500, Complete),
+            ("failed fallback", "tH0 sX0", fb, 100, Wait),
+            ("warming preferred", "tC1 sC2", fb, 100, Wait),
+            ("preferred in fallback", "tC2 sC1", fb, 100, Complete),
+            ("fallback settled", "tH0 sC2", fb, 100, Complete),
+            ("dual all failed", "tX0 sX0", fb, 0, Complete),
+            ("fallback handshaking", "tX0 sH0", fb, 4999, Wait),
+            ("fallback grace bound", "tX0 sH0", fb, 5000, Complete),
+            ("electable beats grace", "tC0 sC2", fb, 2000, Complete),
+        ];
+        for &(name, spec, phase, phase_ms, want) in cases {
+            let got = election_verdict(
+                &views(spec),
+                true,
+                false,
+                phase,
+                f64::from(phase_ms),
+                2_000.0,
+                0.0,
+            );
+            assert_eq!(got, want, "{name}");
+        }
+        let all_failed =
+            |hold| election_verdict(&views("tX0 sX0"), true, false, fb, 0.0, 2_000.0, hold);
+        assert_eq!(all_failed(1.0), Wait, "an all-failed election is held");
+        assert_eq!(
+            election_verdict(&views("tX0 sC2"), true, false, fb, 0.0, 2_000.0, 1.0),
+            Complete,
+            "the hold never delays an electable candidate"
+        );
+    }
+
+    #[test]
+    fn a_websocket_preferred_election_falls_back_to_its_deferred_webtransport() {
+        let verdict = |deferred| {
+            election_verdict(
+                &views("sX0"),
+                false,
+                deferred,
+                ElectionPhase::Preferred,
+                0.0,
+                2_000.0,
+                0.0,
+            )
+        };
+        assert_eq!(
+            verdict(true),
+            ElectionVerdict::EnterFallback {
+                preferred_failed: true
+            }
+        );
+        assert_eq!(verdict(false), ElectionVerdict::Complete);
+    }
+
+    #[test]
+    fn transport_pick_names_why_the_join_winner_won() {
+        use ElectionCandidateTier::{BestWs, BestWt, FallbackWs};
+        let p = ElectionPhase::Preferred;
+        let fb = |preferred_failed| ElectionPhase::Fallback { preferred_failed };
+        let pick = election_transport_pick;
+        assert_eq!(pick(None, true, false, false, p), "none");
+        assert_eq!(pick(Some(BestWt), true, false, false, p), "preferred");
+        assert_eq!(
+            pick(Some(FallbackWs), true, false, false, fb(false)),
+            "best_effort"
+        );
+        assert_eq!(pick(Some(BestWs), true, true, false, p), "demoted");
+        assert_eq!(
+            pick(Some(BestWs), true, false, false, fb(true)),
+            "fallback_failed"
+        );
+        assert_eq!(
+            pick(Some(BestWs), true, false, false, fb(false)),
+            "fallback_timeout"
+        );
+        assert_eq!(pick(Some(BestWs), false, false, true, p), "ws_only_latched");
+    }
+
+    #[test]
+    fn an_unready_preferred_candidate_is_waited_for_then_beats_a_faster_fallback() {
+        let mut mgr = joining(5_000, true);
+        unready(&mut mgr, "wt_0", Connection::new_for_test_connecting(true));
+        measured(&mut mgr, "ws_0", false, &[20.0, 20.0]);
+        age(&mut mgr, 2_500.0, 2_500.0);
+        assert_eq!(tick_pick(&mut mgr), None);
+        assert_eq!(join_phase(&mgr), Some(ElectionPhase::Preferred));
+
+        measured(&mut mgr, "wt_0", true, &[80.0, 80.0]);
+        assert_eq!(tick_pick(&mut mgr), Some("preferred"));
+        assert_eq!(elected(&mgr), Some("wt_0"));
+    }
+
+    #[test]
+    fn a_webtransport_candidate_with_datagram_samples_is_established() {
+        let mut mgr = joining(5_000, true);
+        insert_measurement(&mut mgr, "wt_0", true, Some(20.0), vec![20.0, 20.0]);
+        measured(&mut mgr, "ws_0", false, &[90.0, 90.0]);
+        assert_eq!(tick_pick(&mut mgr), Some("preferred"));
+        assert_eq!(elected(&mgr), Some("wt_0"));
+    }
+
+    #[test]
+    fn a_closed_preferred_candidate_with_samples_is_not_established() {
+        let mut mgr = joining(5_000, true);
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_disconnected(true),
+        );
+        insert_measurement(&mut mgr, "wt_0", true, Some(20.0), vec![20.0, 20.0]);
+        measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+        assert_eq!(tick_pick(&mut mgr), None);
+        assert_eq!(
+            join_phase(&mgr),
+            Some(ElectionPhase::Fallback {
+                preferred_failed: true
+            })
+        );
+        assert_eq!(tick_pick(&mut mgr), Some("fallback_failed"));
+    }
+
+    #[test]
+    fn an_election_whose_candidates_all_failed_fails_at_the_first_protocols_timeout() {
+        for dual in [false, true] {
+            let mut mgr = joining_with(2_000, 3_000, dual);
+            unready(
+                &mut mgr,
+                "ws_0",
+                Connection::new_for_test_disconnected(false),
+            );
+            if dual {
+                unready(
+                    &mut mgr,
+                    "wt_0",
+                    Connection::new_for_test_disconnected(true),
+                );
+                assert_eq!(tick_pick(&mut mgr), None, "enters the fallback phase");
+                assert!(matches!(
+                    join_phase(&mgr),
+                    Some(ElectionPhase::Fallback { .. })
+                ));
+            }
+            assert_eq!(tick_pick(&mut mgr), None, "held (dual: {dual})");
+            age(&mut mgr, 1_900.0, 1_900.0);
+            assert_eq!(tick_pick(&mut mgr), None, "held (dual: {dual})");
+            let first_timeout = if dual { 2_000.0 } else { 3_000.0 };
+            age(&mut mgr, first_timeout, first_timeout);
+            assert_eq!(tick_pick(&mut mgr), Some("none"));
+            assert!(matches!(mgr.election_state, ElectionState::Failed { .. }));
+        }
+    }
+
+    #[test]
+    fn the_fallback_phase_runs_on_the_fallback_protocols_timeout() {
+        let mut mgr = joining_with(2_000, 3_000, true);
+        unready(&mut mgr, "wt_0", Connection::new_for_test_connecting(true));
+        measured(&mut mgr, "ws_0", false, &[40.0]);
+        age(&mut mgr, 2_001.0, 2_001.0);
+        let started = match mgr.election_state {
+            ElectionState::Testing { start_time, .. } => start_time,
+            _ => unreachable!(),
+        };
+        assert_eq!(tick_pick(&mut mgr), None);
+        assert!(
+            matches!(mgr.election_state, ElectionState::Testing { start_time, .. } if start_time == started)
+        );
+        let join = mgr.phased_election.unwrap();
+        assert!(monotonic_now_ms() - join.phase_started_at < 1_000.0);
+
+        age(&mut mgr, 4_002.0, 2_001.0);
+        assert_eq!(tick_pick(&mut mgr), None, "inside the WebSocket timeout");
+        age(&mut mgr, 5_002.0, 3_001.0);
+        let decision = tick(&mut mgr).unwrap();
+        assert_eq!(
+            (decision.transport_pick, decision.preferred, decision.phase),
+            ("best_effort", "wt", "fallback")
+        );
+    }
+
+    #[test]
+    fn the_audio_loss_demotion_reorders_the_join_win_without_dialling_anything() {
+        let demoted_join = || {
+            let mut mgr = joining(5_000, true);
+            mgr.wt_audio_demote_until_ms = Some(monotonic_now_ms() + 60_000.0);
+            mgr.begin_phased_election(monotonic_now_ms());
+            mgr
+        };
+        let mut mgr = demoted_join();
+        unready(&mut mgr, "wt_0", Connection::new_for_test_connecting(true));
+        measured(&mut mgr, "ws_0", false, &[90.0, 90.0]);
+        assert_eq!(tick_pick(&mut mgr), Some("demoted"), "no wait for WT");
+
+        let mut mgr = demoted_join();
+        measured(&mut mgr, "wt_0", true, &[10.0, 10.0]);
+        measured(&mut mgr, "ws_0", false, &[90.0, 90.0]);
+        assert_eq!(tick_pick(&mut mgr), Some("demoted"));
+        assert_eq!(elected(&mgr), Some("ws_0"));
+    }
+
+    #[test]
+    fn the_ws_only_latch_engages_only_when_webtransport_is_preferred() {
+        for prefer_wt in [false, true] {
+            let mut mgr = make_test_manager();
+            offer_a_wt_candidate(&mut mgr);
+            mgr.options.prefer_webtransport = prefer_wt;
+            let mut fired = false;
+            for i in 1..=(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
+                let now = i as f64 * 1000.0;
+                mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, now);
+                mgr.observe_peer_audio_datagram_loss("peer-b", 30.0, now);
+                fired |= mgr.check_audio_datagram_fallback(now);
+            }
+            assert_eq!(fired, prefer_wt);
+            assert_eq!(mgr.wt_audio_fallback_latched, prefer_wt);
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_manager_starts_from_the_tabs_current_fallback_memory() {
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = remembering_fallback(true);
+        mgr.options.fallback_memory.set(false);
+        let sink = changes.clone();
+        mgr.options.on_fallback_memory = Some(Callback::from(move |v| sink.borrow_mut().push(v)));
+        mgr.begin_phased_election(monotonic_now_ms());
+        unready(
+            &mut mgr,
+            "wt_0",
+            Connection::new_for_test_disconnected(true),
+        );
+        measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+        tick(&mut mgr);
+        tick(&mut mgr);
+        assert_eq!(elected(&mgr), Some("ws_0"));
+        assert_eq!(changes.take(), vec![true]);
+
+        let mut rebuilt = make_test_manager();
+        rebuilt.options = mgr.options.clone();
+        assert!(rebuilt.starts_in_fallback());
+    }
+
+    #[test]
+    fn a_reelection_onto_the_preferred_protocol_clears_the_fallback_memory() {
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = reelecting_from("ws_0", false, 20.0);
+        mgr.options.websocket_urls = vec!["ws://relay/lobby".into()];
+        mgr.options.fallback_memory.set(true);
+        let sink = changes.clone();
+        mgr.options.on_fallback_memory = Some(Callback::from(move |v| sink.borrow_mut().push(v)));
+        measured(&mut mgr, "wt_0_g1", true, &[500.0, 500.0]);
+        tick(&mut mgr);
+        assert_eq!(elected(&mgr), Some("wt_0_g1"));
+        assert!(!mgr.options.fallback_memory.get());
+        assert_eq!(changes.take(), vec![false]);
+    }
+
+    #[test]
+    fn a_reelection_won_off_preference_leaves_the_fallback_memory_alone() {
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = reelecting_from("wt_0", true, 20.0);
+        mgr.options.websocket_urls = vec!["ws://relay/lobby".into()];
+        mgr.options.fallback_memory.set(false);
+        let sink = changes.clone();
+        mgr.options.on_fallback_memory = Some(Callback::from(move |v| sink.borrow_mut().push(v)));
+        *mgr.active_connection_id.borrow_mut() = None;
+        mgr.old_active_connection = None;
+        mgr.old_active_rtt = None;
+        mgr.old_active_rtt_measurement = None;
+        measured(&mut mgr, "ws_0_g1", false, &[40.0, 40.0]);
+        mgr.complete_election();
+        assert_eq!(elected(&mgr), Some("ws_0_g1"));
+        assert!(!mgr.options.fallback_memory.get());
+        assert!(changes.borrow().is_empty());
+    }
+
+    #[test]
+    fn only_an_election_under_the_users_preference_writes_the_fallback_memory() {
+        for (demoted, latched, memory) in [(true, false, false), (false, true, false)] {
+            let mut mgr = remembering_fallback(true);
+            mgr.options.fallback_memory.set(memory);
+            mgr.wt_audio_fallback_latched = latched;
+            if demoted {
+                mgr.wt_audio_demote_until_ms = Some(monotonic_now_ms() + 60_000.0);
+            }
+            mgr.begin_phased_election(monotonic_now_ms());
+            measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+            tick(&mut mgr);
+            assert_eq!(elected(&mgr), Some("ws_0"));
+            assert_eq!(
+                mgr.options.fallback_memory.get(),
+                memory,
+                "demoted={demoted} latched={latched}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_election_that_excluded_the_closed_server_does_not_write_the_fallback_memory() {
+        let mut mgr = remembering_fallback(true);
+        mgr.options.fallback_memory.set(false);
+        *mgr.downlink_close_pending.borrow_mut() =
+            ExcludedCandidate::new(true, "https://wt.test:4433");
+        assert!(mgr.take_election_exclusion().is_some());
+        mgr.begin_phased_election(monotonic_now_ms());
+        measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+        age(&mut mgr, 4_100.0, 4_100.0);
+        tick(&mut mgr);
+        tick(&mut mgr);
+        assert_eq!(elected(&mgr), Some("ws_0"));
+        assert!(!mgr.options.fallback_memory.get());
+    }
+
+    #[test]
+    fn an_election_won_by_the_preferred_protocol_after_a_closed_server_clears_the_fallback_memory()
+    {
+        let mut mgr = remembering_fallback(true);
+        assert!(mgr.options.fallback_memory.get());
+        *mgr.downlink_close_pending.borrow_mut() =
+            ExcludedCandidate::new(false, "ws://relay/lobby");
+        assert!(mgr.take_election_exclusion().is_some());
+        mgr.begin_phased_election(monotonic_now_ms());
+        measured(&mut mgr, "wt_0", true, &[40.0, 40.0]);
+        tick(&mut mgr);
+        assert_eq!(elected(&mgr), Some("wt_0"));
+        assert!(!mgr.options.fallback_memory.get());
+    }
+
+    #[test]
+    fn a_demoted_join_shows_the_protocol_it_tries_first() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = remembering_fallback(true);
+        mgr.options.fallback_memory.set(false);
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        mgr.wt_audio_demote_until_ms = Some(monotonic_now_ms() + 60_000.0);
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(
+            events.take(),
+            vec![ElectionProgress::Preferred {
+                webtransport: false,
+                timeout_ms: 3_000
+            }]
+        );
+    }
+
+    #[test]
+    fn a_demoted_join_with_the_fallback_memory_set_tries_websocket_first() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = remembering_fallback(true);
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        mgr.wt_audio_demote_until_ms = Some(monotonic_now_ms() + 60_000.0);
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(join_phase(&mgr), Some(ElectionPhase::Preferred));
+        assert_eq!(
+            events.take(),
+            vec![ElectionProgress::Preferred {
+                webtransport: false,
+                timeout_ms: 3_000
+            }]
+        );
+    }
+
+    #[test]
+    fn a_demoted_join_of_a_websocket_preferring_user_keeps_websocket_first_and_the_memory() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = remembering_fallback(false);
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        mgr.wt_audio_demote_until_ms = Some(monotonic_now_ms() + 60_000.0);
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(join_phase(&mgr), Some(ElectionPhase::Preferred));
+        assert_eq!(
+            events.take(),
+            vec![ElectionProgress::Preferred {
+                webtransport: false,
+                timeout_ms: 3_000
+            }]
+        );
+        assert!(mgr.defers_fallback_candidates());
+        measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+        tick(&mut mgr);
+        assert_eq!(elected(&mgr), Some("ws_0"));
+        assert!(mgr.options.fallback_memory.get());
+    }
+
+    #[test]
+    fn the_ws_only_latch_reelects_without_a_status_card() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = make_test_manager();
+        offer_a_wt_candidate(&mut mgr);
+        mgr.wt_audio_fallback_latched = true;
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        mgr.restart_election_quietly().unwrap();
+        assert!(events.borrow().is_empty());
+        mgr.reset_and_start_election().unwrap();
+        assert_eq!(events.borrow().len(), 1, "a reconnect still shows the card");
+    }
+
+    #[test]
+    fn a_demotion_expiring_mid_election_keeps_the_order_the_election_began_with() {
+        let mut mgr = remembering_fallback(true);
+        mgr.options.fallback_memory.set(false);
+        mgr.wt_audio_demote_until_ms = Some(monotonic_now_ms() + 60_000.0);
+        mgr.begin_phased_election(monotonic_now_ms());
+        mgr.wt_audio_demote_until_ms = None;
+        unready(&mut mgr, "wt_0", Connection::new_for_test_connecting(true));
+        measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+        assert_eq!(tick_pick(&mut mgr), Some("demoted"));
+        assert_eq!(elected(&mgr), Some("ws_0"));
+        assert!(!mgr.options.fallback_memory.get());
+    }
+
+    #[test]
+    fn the_audio_loss_latch_reelects_without_a_status_card() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = make_test_manager();
+        offer_a_wt_candidate(&mut mgr);
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        for i in 1..=(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
+            let now = i as f64 * 1000.0;
+            mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, now);
+            mgr.observe_peer_audio_datagram_loss("peer-b", 30.0, now);
+            mgr.run_audio_datagram_fallback(now);
+        }
+        assert!(mgr.wt_audio_fallback_latched);
+        assert!(join_phase(&mgr).is_some(), "the latch re-elected");
+        assert!(events.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_reelection_started_on_the_tick_a_demotion_engages_is_demoted() {
+        let connected = || {
+            let mut mgr = make_test_manager();
+            mgr.options.webtransport_urls = vec!["https://a".into(), "https://b".into()];
+            mgr.options.websocket_urls = vec!["ws://relay".into()];
+            // Keeps the re-election from dialling WebSocket, which needs a browser.
+            *mgr.downlink_close_pending.borrow_mut() = ExcludedCandidate::new(false, "ws://relay");
+            *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+            mgr.baseline_rtt = Some(50.0);
+            insert_measurement(&mut mgr, "wt_0", true, Some(40.0), vec![40.0]);
+            mgr
+        };
+        let lossy_tick = |mgr: &mut ConnectionManager, tick: usize| {
+            let now = tick as f64 * 1000.0;
+            mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, now);
+            mgr.observe_peer_audio_datagram_loss("peer-b", 30.0, now);
+            now
+        };
+        let mut probe = connected();
+        let engage_tick = (1..=WT_AUDIO_LOSS_WINDOW_SAMPLES)
+            .find(|&tick| {
+                let now = lossy_tick(&mut probe, tick);
+                probe.run_connected_watchdogs(now);
+                probe.wt_audio_demote_active(now)
+            })
+            .expect("the demotion engages inside one window");
+
+        let mut mgr = connected();
+        for tick in 1..engage_tick {
+            let now = lossy_tick(&mut mgr, tick);
+            mgr.run_connected_watchdogs(now);
+        }
+        insert_measurement(&mut mgr, "wt_0", true, Some(400.0), vec![400.0]);
+        mgr.degradation_counter = REELECTION_CONSECUTIVE_SAMPLES - 1;
+        let now = lossy_tick(&mut mgr, engage_tick);
+        mgr.run_connected_watchdogs(now);
+        assert!(mgr.is_reelection_in_progress());
+        assert!(mgr.phased_election.is_some_and(|e| e.demoted));
+    }
+
+    #[test]
+    fn a_quiet_restart_does_not_silence_the_next_election() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = make_test_manager();
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        mgr.restart_election_quietly().unwrap();
+        assert!(events.borrow().is_empty());
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(events.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_disconnect_leaves_no_election_running() {
+        let mut mgr = joining(2_000, true);
+        mgr.disconnect().unwrap();
+        assert!(matches!(mgr.election_state, ElectionState::Failed { .. }));
+        assert!(!matches!(
+            mgr.get_connection_state(),
+            ConnectionState::Testing { .. }
+        ));
+    }
+
+    #[test]
+    fn the_fallback_phase_rebases_the_progress_bar() {
+        let mut mgr = joining_with(2_000, 3_000, true);
+        unready(&mut mgr, "wt_0", Connection::new_for_test_connecting(true));
+        measured(&mut mgr, "ws_0", false, &[40.0]);
+        age(&mut mgr, 2_001.0, 2_001.0);
+        tick(&mut mgr);
+        assert!(matches!(
+            join_phase(&mgr),
+            Some(ElectionPhase::Fallback { .. })
+        ));
+        let ConnectionState::Testing { progress, .. } = mgr.get_connection_state() else {
+            panic!("still testing");
+        };
+        assert!(progress < 0.5, "{progress}");
+    }
+
+    fn starved_websocket_join() -> ConnectionManager {
+        let mut mgr = joining(2_000, false);
+        insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
+        age(&mut mgr, 4_900.0, 4_900.0);
+        assert_eq!(tick_pick(&mut mgr), None, "inside the grace");
+        mgr
+    }
+
+    #[test]
+    fn a_connected_candidate_without_samples_gets_a_bounded_grace_then_fails() {
+        let mut mgr = starved_websocket_join();
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        age(&mut mgr, 5_000.0, 5_000.0);
+        assert_eq!(tick_pick(&mut mgr), Some("none"));
+        assert!(matches!(mgr.election_state, ElectionState::Failed { .. }));
+    }
+
+    #[test]
+    fn a_first_echo_inside_the_grace_elects() {
+        let mut mgr = starved_websocket_join();
+        queue_rtt_echo(&mut mgr, "ws_0", 30.0, InboundLane::Reliable);
+        assert_eq!(tick_pick(&mut mgr), Some("best_effort"));
+        assert_eq!(elected(&mgr), Some("ws_0"));
+    }
+
+    #[test]
+    fn the_join_tick_books_queued_rtt_echoes_before_deciding() {
+        let mut mgr = joining(5_000, true);
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        for _ in 0..ELECTION_MIN_RTT_SAMPLES {
+            queue_rtt_echo(&mut mgr, "wt_0", 30.0, InboundLane::Reliable);
+        }
+        assert_eq!(tick_pick(&mut mgr), Some("preferred"));
+        assert_eq!(elected(&mgr), Some("wt_0"));
+    }
+
+    /// Virtual ms until a silent election terminates on a 100 ms tick.
+    fn virtual_ms_until_join_terminates(wt_ms: u64, ws_ms: u64) -> u64 {
+        let mut mgr = joining_with(wt_ms, ws_ms, true);
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
+        let (mut now, mut phase_start) = (0u64, 0u64);
+        loop {
+            assert!(now <= 2 * (wt_ms + ws_ms) + 8_000);
+            let before = join_phase(&mgr);
+            age(&mut mgr, now as f64, (now - phase_start) as f64);
+            mgr.check_and_complete_election();
+            match join_phase(&mgr) {
+                None => return now,
+                phase if phase != before => phase_start = now,
+                _ => {}
+            }
+            now += 100;
+        }
+    }
+
+    #[test]
+    fn reconnect_wait_covers_the_worst_case_election() {
+        for (wt_ms, ws_ms) in [
+            (500u64, 500u64),
+            (1_000, 5_000),
+            (5_000, 2_000),
+            (5_000, 5_000),
+        ] {
+            let consumed = virtual_ms_until_join_terminates(wt_ms, ws_ms);
+            assert!(
+                reconnect_election_wait_ms(wt_ms + ws_ms).ms() >= consumed,
+                "a {consumed}ms election outlasts the reconnect wait at {wt_ms}/{ws_ms}ms"
+            );
+            assert_eq!(consumed, max_election_duration_ms(wt_ms + ws_ms));
+        }
+    }
+
+    #[test]
+    fn reelection_switches_protocol_only_to_an_established_first_ranked_winner() {
+        let keeps = reelection_keeps_old;
+        assert!(
+            keeps(true, Some(true), true, false, true, false),
+            "live preferred kept"
+        );
+        assert!(
+            !keeps(true, Some(true), false, false, true, true),
+            "dead preferred left"
+        );
+        assert!(
+            !keeps(true, Some(false), true, true, true, true),
+            "upgrade ignores RTT"
+        );
+        assert!(
+            keeps(true, Some(false), true, true, false, false),
+            "upgrade needs establishment"
+        );
+        assert!(
+            !keeps(false, Some(true), true, false, true, true),
+            "demotion ranks WS first"
+        );
+        assert!(
+            keeps(true, Some(true), true, true, true, true),
+            "same protocol: RTT"
+        );
+        assert!(
+            !keeps(true, Some(true), true, true, true, false),
+            "same protocol: RTT"
+        );
+        assert!(
+            !keeps(true, None, true, false, true, false),
+            "unknown old: RTT"
+        );
+    }
+
+    /// A re-election away from a live `old_id`, with the dialled candidates removed.
+    fn reelecting_from(old_id: &str, old_wt: bool, old_rtt: f64) -> ConnectionManager {
+        let mut mgr = joining(2_000, true);
+        mgr.connections.insert(
+            old_id.to_string(),
+            Connection::new_for_test_with_transport(old_wt),
+        );
+        insert_measurement(&mut mgr, old_id, old_wt, Some(old_rtt), vec![old_rtt; 5]);
+        *mgr.active_connection_id.borrow_mut() = Some(old_id.to_string());
+        mgr.start_reelection().unwrap();
+        mgr.connections.clear();
+        mgr.rtt_measurements.clear();
+        mgr
+    }
+
+    #[test]
+    fn a_reelection_keeps_a_live_preferred_connection_over_a_faster_fallback() {
+        let mut mgr = reelecting_from("wt_0", true, 500.0);
+        unready(
+            &mut mgr,
+            "wt_0_g1",
+            Connection::new_for_test_disconnected(true),
+        );
+        measured(&mut mgr, "ws_0_g1", false, &[20.0, 20.0]);
+        assert_eq!(tick_pick(&mut mgr), None, "enters the fallback phase");
+        let decision = tick(&mut mgr).unwrap();
+        assert_eq!(decision.outcome, ElectionOutcome::AbortedKeptOld);
+        assert_eq!((decision.preferred, decision.phase), ("wt", "fallback"));
+        assert_eq!(mgr.active_connection_id.borrow().as_deref(), Some("wt_0"));
+    }
+
+    #[test]
+    fn a_reelection_upgrades_to_an_established_preferred_candidate_whatever_its_rtt() {
+        let mut mgr = reelecting_from("ws_0", false, 20.0);
+        measured(&mut mgr, "wt_0_g1", true, &[500.0, 500.0]);
+        measured(&mut mgr, "ws_0_g1", false, &[20.0, 20.0]);
+        let decision = tick(&mut mgr).unwrap();
+        assert_eq!(decision.outcome, ElectionOutcome::Elected);
+        assert_eq!(decision.transport_pick, "preferred");
+        assert_eq!(elected(&mgr), Some("wt_0_g1"));
+    }
+
+    #[test]
+    fn a_join_reports_its_phases_and_a_reelection_reports_nothing() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = make_test_manager();
+        offer_a_wt_candidate(&mut mgr);
+        mgr.options.webtransport_connect_timeout_ms = 4_000;
+        mgr.options.websocket_connect_timeout_ms = 3_000;
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        mgr.begin_phased_election(monotonic_now_ms());
+        unready(
+            &mut mgr,
+            "wt_0",
+            Connection::new_for_test_disconnected(true),
+        );
+        measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+        tick(&mut mgr);
+        tick(&mut mgr);
+        assert_eq!(elected(&mgr), Some("ws_0"));
+        assert_eq!(
+            events.take(),
+            vec![
+                ElectionProgress::Preferred {
+                    webtransport: true,
+                    timeout_ms: 4_000
+                },
+                ElectionProgress::Fallback {
+                    webtransport: false,
+                    timeout_ms: 3_000
+                },
+                ElectionProgress::Connected {
+                    webtransport: false,
+                },
+            ]
+        );
+
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        mgr.start_reelection().unwrap();
+        assert!(events.borrow().is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_websocket_preferred_election_dials_webtransport_only_in_its_fallback_phase() {
+        use super::super::webtransport::host_seam::take_adopt_spare_worker;
+        let mut mgr = make_test_manager();
+        mgr.options.prefer_webtransport = false;
+        offer_a_wt_candidate(&mut mgr);
+        let _ = take_adopt_spare_worker();
+        mgr.create_all_connections().unwrap();
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(take_adopt_spare_worker(), None, "not dialled yet");
+
+        assert_eq!(tick_pick(&mut mgr), None);
+        assert_eq!(
+            join_phase(&mgr),
+            Some(ElectionPhase::Fallback {
+                preferred_failed: true
+            })
+        );
+        assert_eq!(take_adopt_spare_worker(), Some(true), "dialled on fallback");
+    }
+
+    fn remembering_fallback(prefer_wt: bool) -> ConnectionManager {
+        let mut mgr = make_test_manager();
+        mgr.options.prefer_webtransport = prefer_wt;
+        mgr.options.websocket_urls = vec!["ws://relay/lobby".into()];
+        offer_a_wt_candidate(&mut mgr);
+        mgr.options.webtransport_connect_timeout_ms = 4_000;
+        mgr.options.websocket_connect_timeout_ms = 3_000;
+        mgr.options.fallback_memory.set(true);
+        mgr
+    }
+
+    #[test]
+    fn a_tab_that_fell_back_starts_its_next_join_in_the_fallback_phase() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = remembering_fallback(true);
+        let sink = events.clone();
+        mgr.options.on_election_progress = Some(Callback::from(move |p| sink.borrow_mut().push(p)));
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(
+            join_phase(&mgr),
+            Some(ElectionPhase::Fallback {
+                preferred_failed: false
+            })
+        );
+        assert_eq!(
+            events.take(),
+            vec![ElectionProgress::Fallback {
+                webtransport: false,
+                timeout_ms: 3_000
+            }]
+        );
+
+        unready(&mut mgr, "wt_0", Connection::new_for_test_connecting(true));
+        measured(&mut mgr, "ws_0", false, &[40.0, 40.0]);
+        assert_eq!(
+            tick_pick(&mut mgr),
+            Some("fallback_timeout"),
+            "no preferred wait"
+        );
+        assert!(mgr.options.fallback_memory.get());
+    }
+
+    #[test]
+    fn the_preferred_protocol_still_wins_a_remembered_fallback_join_and_clears_the_memory() {
+        let mut mgr = remembering_fallback(true);
+        mgr.begin_phased_election(monotonic_now_ms());
+        measured(&mut mgr, "wt_0", true, &[90.0, 90.0]);
+        measured(&mut mgr, "ws_0", false, &[20.0, 20.0]);
+        tick(&mut mgr);
+        assert_eq!(elected(&mgr), Some("wt_0"));
+        assert!(!mgr.options.fallback_memory.get());
+
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(join_phase(&mgr), Some(ElectionPhase::Preferred));
+    }
+
+    #[test]
+    fn a_reelection_ignores_the_remembered_fallback() {
+        let mut mgr = remembering_fallback(true);
+        mgr.reelection_in_progress = true;
+        mgr.begin_phased_election(monotonic_now_ms());
+        assert_eq!(join_phase(&mgr), Some(ElectionPhase::Preferred));
+    }
+
+    #[test]
+    fn a_remembered_fallback_dials_both_protocols_at_once() {
+        let mgr = remembering_fallback(false);
+        assert!(!mgr.defers_fallback_candidates());
+        mgr.options.fallback_memory.set(false);
+        assert!(mgr.defers_fallback_candidates());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_disconnect_ends_the_election_before_its_deferred_fallback_is_dialled() {
+        use super::super::webtransport::host_seam::take_adopt_spare_worker;
+        let mut mgr = make_test_manager();
+        mgr.options.prefer_webtransport = false;
+        offer_a_wt_candidate(&mut mgr);
+        mgr.create_all_connections().unwrap();
+        mgr.begin_phased_election(monotonic_now_ms());
+        let _ = take_adopt_spare_worker();
+        mgr.disconnect().unwrap();
+        mgr.check_and_complete_election();
+        assert_eq!(take_adopt_spare_worker(), None);
+    }
+
+    #[test]
+    fn a_late_token_refresh_does_not_turn_a_running_join_into_a_reelection() {
+        let mut mgr = joining(2_000, false);
+        mgr.apply_refresh_and_start_reelection(None).unwrap();
+        assert!(!mgr.is_reelection_in_progress());
+        assert!(mgr.phased_election.is_some());
     }
 }

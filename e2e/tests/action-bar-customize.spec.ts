@@ -1,10 +1,13 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
+import { enterCustomizeMode, openDockMenu } from "../helpers/action-bar-customize";
 import { injectSessionCookie } from "../helpers/auth";
+import { MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT } from "../helpers/screen-share-meeting";
 import { waitForServices } from "../helpers/wait-for-services";
 
 // The two always-mounted action-bar live regions (`.controls` children, NOT
 // descendants of the nav). `action_bar_announce` writes into the second one.
-const LIVE_REGIONS = '.controls .visually-hidden[role="status"][aria-live="polite"]';
+const LIVE_REGIONS =
+  '.controls .visually-hidden[role="status"][aria-live="polite"]:not([data-testid="self-view-announcer"])';
 
 // Must match `ACTION_BAR_RESET_ANNOUNCEMENT` in
 // dioxus-ui/src/components/attendants.rs (issue 1765).
@@ -18,6 +21,23 @@ const SLOT_HINT_ID = "action-bar-slot-reorder-hint";
 // excluded).
 const SLOT_PRIMARY_BUTTONS =
   ".video-controls-container .action-bar-slot-wrapper[data-slot] > button.video-control-button";
+
+// Must match `HOLD_TO_EDIT_MS`, `HOLD_EDIT_IDLE_MS` and the announcement
+// strings in dioxus-ui/src/components/action_bar_layout.rs (issue 2782).
+const HOLD_MS = 2_000;
+const IDLE_MS = 5_000;
+const HOLD_ENTRY_ANNOUNCEMENT =
+  "Editing action bar buttons. Drag to move one. Press Done or Escape to finish.";
+const MENU_ENTRY_ANNOUNCEMENT =
+  "Editing action bar buttons. Use arrow keys to move the focused button, or drag with the pointer. Press the minus button to hide one. Press Done or Escape to finish.";
+const IDLE_EXIT_ANNOUNCEMENT = "Finished editing action bar buttons.";
+
+const NAV = "nav.video-controls-container";
+// The entry/exit region: not the self-view announcer, not the aria-atomic reorder region.
+const ENTRY_REGION =
+  '.controls > .visually-hidden[role="status"][aria-live="polite"]:not([data-testid]):not([aria-atomic])';
+const EDIT_BUTTONS_ITEM =
+  '.dock-position-wrapper .glass-select-menu [role="menuitem"][aria-label="Edit Buttons"]';
 
 test.describe("Action bar customize mode", () => {
   test.beforeAll(async () => {
@@ -60,19 +80,6 @@ test.describe("Action bar customize mode", () => {
     await expect(grid).toBeVisible({ timeout: 15_000 });
   }
 
-  async function openDockMenu(page: Page): Promise<void> {
-    await page.locator(".video-controls-container").hover();
-    await page.waitForTimeout(300);
-    // Address the trigger by its stable id, not by `aria-haspopup`: issue 1762
-    // re-roled the popup from listbox to menu, so the haspopup VALUE is now the
-    // subject of a dedicated assertion (see "dock menu exposes menu semantics")
-    // rather than a navigation handle every helper depends on.
-    const toggleBtn = page.locator("#dock-menu-trigger");
-    await expect(toggleBtn).toBeVisible({ timeout: 10_000 });
-    await toggleBtn.click();
-    await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 5_000 });
-  }
-
   // Reload the current /meeting/<id> page and land back in the grid.
   //
   // Reloading a meeting URL returns the app to the pre-join lobby (the
@@ -104,18 +111,6 @@ test.describe("Action bar customize mode", () => {
     await expect(grid).toBeVisible({ timeout: 15_000 });
   }
 
-  async function enterCustomizeMode(page: Page): Promise<void> {
-    await openDockMenu(page);
-    const customizeOption = page.locator(".glass-select-option", {
-      hasText: "Customize",
-    });
-    await customizeOption.click();
-    // Wait for customize-mode class on the container
-    await expect(page.locator(".video-controls-container.customize-mode")).toBeVisible({
-      timeout: 5_000,
-    });
-  }
-
   test("entering customize mode shows Done button and disables HangUp", async ({ page }) => {
     await joinMeeting(page, "enter_mode");
 
@@ -124,7 +119,8 @@ test.describe("Action bar customize mode", () => {
     // The "Done" button should be visible (inside .dock-position-wrapper)
     const doneBtn = page.locator("button.action-bar-done-trigger");
     await expect(doneBtn).toBeVisible({ timeout: 5_000 });
-    await expect(doneBtn).toHaveAttribute("title", "Done customizing");
+    await expect(doneBtn).toHaveAttribute("title", "Done editing buttons");
+    await expect(doneBtn).toHaveAttribute("aria-label", "Done editing buttons");
 
     // HangUp button onclick is a no-op during customize mode.
     // Verify the HangUp button is present but clicking it does NOT navigate away.
@@ -768,37 +764,45 @@ test.describe("Action bar customize mode", () => {
     await reloadToGrid(page);
     await enterCustomizeMode(page);
 
-    const chatInner = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="chat"] > button')
+    const readOrder = () =>
+      page
+        .locator(".video-controls-container .action-bar-slot-wrapper[data-slot]")
+        .evaluateAll((els) =>
+          els
+            .map((el) => ({
+              slot: el.getAttribute("data-slot") as string,
+              order: parseInt(window.getComputedStyle(el as HTMLElement).order || "0", 10),
+            }))
+            .sort((a, b) => a.order - b.order)
+            .map((s) => s.slot),
+        );
+    const readStored = () => page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
+
+    const before = await readOrder();
+    const storedBefore = await readStored();
+    const participantsIdx = before.indexOf("participants");
+    expect(
+      participantsIdx,
+      `Participants must sit mid-bar so a stray End/ArrowRight would move it: ${before}`,
+    ).toBeGreaterThan(0);
+    expect(participantsIdx).toBeLessThan(before.length - 1);
+
+    const participantsInner = page
+      .locator(
+        '.video-controls-container .action-bar-slot-wrapper[data-slot="participants"] > button',
+      )
       .first();
-    await chatInner.focus();
+    await participantsInner.focus();
 
     // Try every reasonable modifier + ArrowRight combination. None must move
-    // Chat and none must persist a layout change.
+    // Participants and none must persist a layout change.
     for (const mod of ["Meta", "Control", "Alt", "Shift"] as const) {
       await page.keyboard.press(`${mod}+ArrowRight`);
       await page.waitForTimeout(80);
     }
 
-    const order = await page
-      .locator(".video-controls-container .action-bar-slot-wrapper[data-slot]")
-      .evaluateAll((els) =>
-        els
-          .map((el) => ({
-            slot: el.getAttribute("data-slot") as string,
-            order: parseInt(window.getComputedStyle(el as HTMLElement).order || "0", 10),
-          }))
-          .sort((a, b) => a.order - b.order)
-          .map((s) => s.slot),
-      );
-    expect(order.indexOf("chat")).toBe(2); // still at default position 3 (0-indexed 2)
-
-    // Nothing was persisted (storage still absent or reflects default).
-    const stored = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
-    if (stored) {
-      const layout = JSON.parse(stored);
-      expect(layout.slots?.[2]).toBe("chat");
-    }
+    expect(await readOrder()).toEqual(before);
+    expect(await readStored()).toBe(storedBefore);
   });
 
   test("customize-mode slot wrappers do NOT add a second tab stop", async ({ page }) => {
@@ -1025,7 +1029,7 @@ test.describe("Action bar customize mode", () => {
     page,
   }) => {
     // WCAG 2.1.1 regression: before this fix the dock-menu options
-    // (Bottom/Left/Right, auto-hide, Customize, Reset to Default,
+    // (Bottom/Left/Right, auto-hide, Edit Buttons, Reset Buttons,
     // Action Bar…) were `<div role="option">` with only `onclick` — no
     // `tabindex`, no `onkeydown`. A keyboard-only user could not enter
     // customize mode or reset the bar at all.
@@ -1059,7 +1063,7 @@ test.describe("Action bar customize mode", () => {
     // item is in the tab sequence and the rest are `tabindex="-1"`.
     const options = page.locator(".dock-position-wrapper .glass-select-menu .glass-select-option");
     const optionCount = await options.count();
-    expect(optionCount).toBeGreaterThanOrEqual(6); // Bottom, Left, Right, autohide, Customize, Reset, Action Bar…
+    expect(optionCount).toBe(8); // Bottom, Left, Right, autohide, autoshrink, Edit Buttons, Reset Buttons, Action Bar…
     const tabindices = await options.evaluateAll((els) =>
       els.map((el) => el.getAttribute("tabindex")),
     );
@@ -1171,13 +1175,13 @@ test.describe("Action bar customize mode", () => {
     ).toBeFocused({ timeout: 2_000 });
   });
 
-  test("keyboard user can enter customize mode via the dock menu (Enter on Customize)", async ({
+  test("keyboard user can enter customize mode via the dock menu (Enter on Edit Buttons)", async ({
     page,
   }) => {
     // The whole customize feature is unreachable to a keyboard-only user
-    // if the "Customize" option is not activatable by keyboard. This test
+    // if the "Edit Buttons" option is not activatable by keyboard. This test
     // exercises the full path: focus trigger → Space to open → arrow to
-    // Customize → Enter to activate → assert customize-mode is on and
+    // Edit Buttons → Enter to activate → assert customize-mode is on and
     // focus lands on the first slot button (Mic/Sound by default).
     await joinMeeting(page, "kbd_enter_customize");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
@@ -1190,10 +1194,10 @@ test.describe("Action bar customize mode", () => {
     await page.keyboard.press("Space");
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 3_000 });
 
-    // Focus the Customize option directly (arrow-walk would work too, but
+    // Focus the Edit Buttons option directly (arrow-walk would work too, but
     // focusing it directly makes the test independent of option order).
     const customize = page.locator(".dock-position-wrapper .glass-select-option", {
-      hasText: "Customize",
+      hasText: "Edit Buttons",
     });
     await customize.focus();
     await expect(customize).toBeFocused();
@@ -1227,8 +1231,7 @@ test.describe("Action bar customize mode", () => {
   test("re-entering customize mode still focuses Mic/Sound (not Done)", async ({ page }) => {
     await joinMeeting(page, "kbd_customize_reenter_focus");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     const enterCustomizeViaKeyboard = async () => {
       await page.locator(".video-controls-container").hover();
@@ -1238,7 +1241,7 @@ test.describe("Action bar customize mode", () => {
       await page.keyboard.press("Space");
       await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 3_000 });
       const customize = page.locator(".dock-position-wrapper .glass-select-option", {
-        hasText: "Customize",
+        hasText: "Edit Buttons",
       });
       await customize.focus();
       await page.keyboard.press("Enter");
@@ -1272,10 +1275,10 @@ test.describe("Action bar customize mode", () => {
     ).toBeFocused({ timeout: 3_000 });
   });
 
-  test("keyboard user can reset the action bar via the dock menu (Space on Reset to Default)", async ({
+  test("keyboard user can reset the action bar via the dock menu (Space on Reset Buttons)", async ({
     page,
   }) => {
-    // Same reachability guarantee for "Reset to Default": before the fix
+    // Same reachability guarantee for "Reset Buttons": before the fix
     // this option was unreachable by keyboard. A regression here would
     // silently strand a screen-reader user who removed a slot they wanted
     // back — they had no way to undo without a pointer.
@@ -1313,9 +1316,9 @@ test.describe("Action bar customize mode", () => {
     await page.keyboard.press("Space");
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 3_000 });
 
-    // Focus Reset to Default and press Space to activate.
+    // Focus Reset Buttons and press Space to activate.
     const reset = page.locator(".dock-position-wrapper .glass-select-option", {
-      hasText: "Reset to Default",
+      hasText: "Reset Buttons",
     });
     await reset.focus();
     await expect(reset).toBeFocused();
@@ -1329,7 +1332,7 @@ test.describe("Action bar customize mode", () => {
     const after = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
     expect(
       after,
-      "Reset to Default must clear the persisted layout when activated via keyboard",
+      "Reset Buttons must clear the persisted layout when activated via keyboard",
     ).toBeNull();
 
     // issue 1765: the KEYBOARD activation path must also push a confirmation
@@ -1370,9 +1373,7 @@ test.describe("Action bar customize mode", () => {
     // `nav.video-controls-container` (attendants.rs renders them before the
     // nav inside `div.controls`). A `.video-controls-container .visually-hidden`
     // descendant selector matches nothing.
-    const liveRegions = page.locator(
-      '.controls .visually-hidden[role="status"][aria-live="polite"]',
-    );
+    const liveRegions = page.locator(LIVE_REGIONS);
 
     // BEFORE customize mode: both regions must already be mounted with
     // empty text.  The regression this pins is: they were previously
@@ -1399,7 +1400,7 @@ test.describe("Action bar customize mode", () => {
     const midCount = await liveRegions.count();
     expect(midCount, "regions stay mounted after enter (same count)").toBe(2);
     const midTexts = await liveRegions.allTextContents();
-    expect(midTexts.some((t) => /Customizing action bar/i.test(t))).toBe(true);
+    expect(midTexts).toContain(MENU_ENTRY_ANNOUNCEMENT);
 
     // Exit customize mode via the Done button.  Text must return to
     // empty on both regions, so re-entering later produces the same
@@ -1507,7 +1508,7 @@ test.describe("Action bar customize mode", () => {
     // Before this fix the popup was `role="listbox"` with `role="option"`
     // children and NO accessible name, so a screen reader announced an
     // unnamed listbox and told the user they were picking a value — while
-    // half the items ("Customize", "Reset to Default", "Action Bar…") are
+    // half the items ("Edit Buttons", "Reset Buttons", "Action Bar…") are
     // commands that select nothing.
     //
     // Reverting any of `role="menu"`, the `aria-label`, `menuitemradio`,
@@ -1574,8 +1575,8 @@ test.describe("Action bar customize mode", () => {
     // comes first in DOM order, `.first()` would return the checkbox and this
     // assertion would read `menuitemcheckbox`.
     const commands: Array<[string, string | RegExp]> = [
-      ["Customize", "Customize"],
-      ["Reset to Default", "Reset to Default"],
+      ["Edit Buttons", "Edit Buttons"],
+      ["Reset Buttons", "Reset Buttons"],
       ["Action Bar…", /Action Bar/],
     ];
     for (const [name, matcher] of commands) {
@@ -1584,6 +1585,11 @@ test.describe("Action bar customize mode", () => {
         "menuitem",
       );
     }
+
+    const edit = page.locator(EDIT_BUTTONS_ITEM);
+    await expect(edit).toHaveCount(1);
+    await expect(edit).toHaveAttribute("aria-describedby", "dock-menu-edit-hint");
+    await expect(edit.locator("#dock-menu-edit-hint")).toHaveText("or hold a button for 2 seconds");
 
     // Separators inside a `menu` must be exposed as separators, not as
     // anonymous generics that AT cannot group by.
@@ -1717,7 +1723,7 @@ test.describe("Action bar customize mode", () => {
     ).toEqual(afterFirst);
   });
 
-  test("Reset to Default announces the reset to screen readers", async ({ page }) => {
+  test("Reset Buttons announces the reset to screen readers", async ({ page }) => {
     // Reset restored the default layout silently: nothing was pushed into the
     // always-mounted `action_bar_announce` live region, so an AT user got no
     // confirmation anything had happened. Reverting the
@@ -1752,7 +1758,7 @@ test.describe("Action bar customize mode", () => {
 
     // Now activate Reset with the pointer.
     await openDockMenu(page);
-    await page.locator(".glass-select-option").filter({ hasText: "Reset to Default" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Reset Buttons" }).click();
 
     // The reset really happened...
     await expect
@@ -1801,13 +1807,13 @@ test.describe("Action bar customize mode", () => {
     const readRegion = async () => (await page.locator(LIVE_REGIONS).allTextContents()).join(" | ");
 
     await openDockMenu(page);
-    await page.locator(".glass-select-option").filter({ hasText: "Reset to Default" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Reset Buttons" }).click();
     await expect.poll(readRegion, { timeout: 5_000 }).toContain(RESET_ANNOUNCEMENT);
     const afterFirst = await readRegion();
 
     // Second press, no state change in between.
     await openDockMenu(page);
-    await page.locator(".glass-select-option").filter({ hasText: "Reset to Default" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Reset Buttons" }).click();
     await expect.poll(readRegion, { timeout: 5_000 }).not.toBe(afterFirst);
 
     const afterSecond = await readRegion();
@@ -1901,5 +1907,547 @@ test.describe("Action bar customize mode", () => {
       timeout: 5_000,
     });
     await expect(page.locator(`#${SLOT_HINT_ID}`)).toHaveCount(0);
+  });
+
+  const slotWrapper = (page: Page, slug: string) =>
+    page.locator(`${NAV} > .action-bar-slot-wrapper[data-slot="${slug}"]`);
+  const slotButton = (page: Page, slug: string) =>
+    slotWrapper(page, slug).locator("> button.video-control-button");
+
+  async function boxOf(locator: Locator) {
+    await expect(locator).toBeVisible({ timeout: 10_000 });
+    const box = await locator.boundingBox();
+    if (!box) throw new Error("a visible element returned no bounding box");
+    return box;
+  }
+
+  async function centerOf(locator: Locator) {
+    const box = await boxOf(locator);
+    return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+  }
+
+  async function expectMicOn(page: Page, on: boolean): Promise<void> {
+    const mic = slotButton(page, "mic");
+    if (on) {
+      await expect(mic).toHaveClass(/\bactive\b/, { timeout: 10_000 });
+    } else {
+      await expect(mic).not.toHaveClass(/\bactive\b/, { timeout: 10_000 });
+    }
+  }
+
+  const isEditing = (page: Page) =>
+    page.locator(NAV).evaluate((el) => el.classList.contains("customize-mode"));
+  const isHidden = (page: Page) =>
+    page.locator(NAV).evaluate((el) => el.classList.contains("controls-hidden"));
+
+  // 50 ms polling: the default back-off would blur the timing bounds below.
+  async function waitForEditing(page: Page, on: boolean, timeout: number): Promise<void> {
+    await expect.poll(() => isEditing(page), { intervals: [50], timeout }).toBe(on);
+  }
+
+  async function expectStillEditingAt(page: Page, at: number, message: string): Promise<void> {
+    await page.waitForTimeout(Math.max(0, at - Date.now()));
+    expect(await isEditing(page), message).toBe(true);
+  }
+
+  async function expectIdleExit(page: Page, lastActivityAt: number): Promise<void> {
+    await waitForEditing(
+      page,
+      false,
+      Math.max(1_000, lastActivityAt + IDLE_MS + 3_000 - Date.now()),
+    );
+    const quietMs = Date.now() - lastActivityAt;
+    expect(quietMs, "ended before 5 s without activity").toBeGreaterThanOrEqual(IDLE_MS - 300);
+    expect(quietMs, "ended late after the last activity").toBeLessThanOrEqual(IDLE_MS + 1_500);
+  }
+
+  // Returns with the pointer still down, after customize mode is on.
+  async function pressAndHoldSlot(page: Page, slug: string) {
+    const { x, y } = await centerOf(slotButton(page, slug));
+    await page.mouse.move(x, y);
+    const downAt = Date.now();
+    await page.mouse.down();
+    await waitForEditing(page, true, HOLD_MS + 3_000);
+    const heldMs = Date.now() - downAt;
+    expect(heldMs, "the hold fired before 2 s").toBeGreaterThanOrEqual(HOLD_MS - 100);
+    expect(heldMs, "the hold fired late").toBeLessThanOrEqual(HOLD_MS + 700);
+    return { x, y };
+  }
+
+  test("holding a slot button for 2 s enters customize mode without firing its click", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "hold_enters");
+    const nav = page.locator(NAV);
+    await nav.hover();
+    const mic = slotButton(page, "mic");
+    await expect(mic).toBeVisible({ timeout: 10_000 });
+    expect(await isEditing(page)).toBe(false);
+    const micOnBefore = await mic.evaluate((el) => el.classList.contains("active"));
+    const labelBefore = await mic.getAttribute("aria-label");
+    expect(labelBefore).toMatch(/^Microphone/);
+
+    await pressAndHoldSlot(page, "mic");
+
+    await page.mouse.up();
+    // The release clicks the mic; that click must not reach it.
+    await page.waitForTimeout(1_000);
+    await expectMicOn(page, micOnBefore);
+    await expect(mic).toHaveAttribute("aria-label", labelBefore as string);
+    expect(await isEditing(page), "the release must not end the session").toBe(true);
+    await expect(page.locator(ENTRY_REGION)).toHaveText(HOLD_ENTRY_ANNOUNCEMENT);
+  });
+
+  test("a short click or a 1.5 s press on a slot button still toggles it", async ({ page }) => {
+    await joinMeeting(page, "hold_short_press");
+    const nav = page.locator(NAV);
+    await nav.hover();
+    const mic = slotButton(page, "mic");
+    const micWrapper = slotWrapper(page, "mic");
+    await expect(mic).toBeVisible({ timeout: 10_000 });
+    const micOnBefore = await mic.evaluate((el) => el.classList.contains("active"));
+
+    await mic.click();
+    await expectMicOn(page, !micOnBefore);
+    await expect(micWrapper).not.toHaveAttribute("data-hold");
+
+    const { x, y } = await centerOf(mic);
+    await page.mouse.move(x, y);
+    const downAt = Date.now();
+    await page.mouse.down();
+    await expect(micWrapper).toHaveAttribute("data-hold", "pending", { timeout: 1_000 });
+    await page.waitForTimeout(Math.max(0, 1_500 - (Date.now() - downAt)));
+    await page.mouse.up();
+    expect(Date.now() - downAt, "premise: released before the hold time").toBeLessThan(
+      HOLD_MS - 200,
+    );
+    await expect(micWrapper, "an early release cancels the hold").not.toHaveAttribute("data-hold", {
+      timeout: 500,
+    });
+    await expectMicOn(page, micOnBefore);
+
+    // A hold timer that survived the release would fire at the 2 s mark.
+    await page.waitForTimeout(Math.max(0, HOLD_MS + 800 - (Date.now() - downAt)));
+    expect(await isEditing(page)).toBe(false);
+  });
+
+  test("a hold continues straight into a drag that moves the held slot", async ({ page }) => {
+    await joinMeeting(page, "hold_then_drag");
+    await page.locator(NAV).hover();
+    const readDomOrder = () =>
+      page
+        .locator(`${NAV} > .action-bar-slot-wrapper[data-slot]`)
+        .evaluateAll((els) => els.map((el) => el.getAttribute("data-slot") as string));
+
+    const before = await readDomOrder();
+    expect(before.slice(0, 2), "premise: default layout starts mic, camera").toEqual([
+      "mic",
+      "camera",
+    ]);
+    const micBox = await boxOf(slotWrapper(page, "mic"));
+    const camBox = await boxOf(slotWrapper(page, "camera"));
+    const pitch = camBox.x - micBox.x;
+    expect(pitch).toBeGreaterThan(10);
+
+    const { x, y } = await pressAndHoldSlot(page, "mic");
+    const steps = 5;
+    for (let i = 1; i <= steps; i++) {
+      await page.mouse.move(x + (2 * pitch * i) / steps, y);
+      await page.waitForTimeout(50);
+    }
+    await page.mouse.up();
+
+    await expect
+      .poll(
+        async () => {
+          const order = await readDomOrder();
+          return order.indexOf("mic") > order.indexOf("camera");
+        },
+        { timeout: 3_000 },
+      )
+      .toBe(true);
+    const stored = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
+    expect(stored, "the drag must persist on release").not.toBeNull();
+    const slots: string[] = JSON.parse(stored as string).slots;
+    expect(slots.indexOf("mic")).toBeGreaterThan(slots.indexOf("camera"));
+  });
+
+  test("a hold-entered session ends after 5 s without activity, and activity extends it", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await joinMeeting(page, "hold_idle_exit");
+    const nav = page.locator(NAV);
+    await nav.hover();
+    const { x, y } = await pressAndHoldSlot(page, "mic");
+    await page.mouse.up();
+    const releasedAt = Date.now();
+    await expect(page.locator(ENTRY_REGION)).toHaveText(HOLD_ENTRY_ANNOUNCEMENT);
+    await expectStillEditingAt(page, releasedAt + 3_000, "the session ended early");
+
+    await page.mouse.move(x + 3, y);
+    const activityAt = Date.now();
+    // 1.5 s past the window the release alone would have allowed.
+    await expectStillEditingAt(
+      page,
+      releasedAt + IDLE_MS + 1_500,
+      "pointer activity over the bar must extend the session",
+    );
+
+    await expectIdleExit(page, activityAt);
+    await expect(page.locator(ENTRY_REGION)).toHaveText(IDLE_EXIT_ANNOUNCEMENT);
+  });
+
+  test("a session entered from Edit Buttons has no idle timeout, and Participants ignores activation while editing", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await joinMeeting(page, "menu_untimed");
+    await openDockMenu(page);
+    const edit = page.locator(EDIT_BUTTONS_ITEM);
+    await expect(edit).toBeVisible();
+    await edit.click();
+    const nav = page.locator(NAV);
+    await expect(nav).toHaveClass(/\bcustomize-mode\b/, { timeout: 5_000 });
+    await expect(page.locator(ENTRY_REGION)).toHaveText(MENU_ENTRY_ANNOUNCEMENT);
+
+    await page.waitForTimeout(IDLE_MS + 1_500);
+    await expect(nav, "a menu-entered session must not time out").toHaveClass(
+      /\bcustomize-mode\b/,
+      { timeout: 500 },
+    );
+
+    const peers = slotWrapper(page, "participants").locator("> button#peer-list-trigger");
+    const peerList = page.locator("#peer-list-container");
+    await expect(peerList).not.toHaveClass(/\bvisible\b/);
+    await peers.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    await expect(peerList, "Participants must not open while editing").not.toHaveClass(
+      /\bvisible\b/,
+    );
+
+    const done = page.locator("button.action-bar-done-trigger");
+    await expect(done).toHaveAttribute("aria-label", "Done editing buttons");
+    await done.click();
+    await expect(nav).not.toHaveClass(/\bcustomize-mode\b/, { timeout: 5_000 });
+    await peers.focus();
+    await page.keyboard.press("Enter");
+    await expect(peerList, "the same activation opens Participants after editing").toHaveClass(
+      /\bvisible\b/,
+    );
+  });
+
+  test("holding Hang Up for 2 s does not leave the call; a click still does", async ({ page }) => {
+    await joinMeeting(page, "hangup_hold");
+    const meetingUrl = page.url();
+    const nav = page.locator(NAV);
+    await nav.hover();
+    const hangup = page.locator(`${NAV} > .hangup-wrapper > button[data-testid="hang-up-button"]`);
+    const { x, y } = await centerOf(hangup);
+
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.waitForTimeout(HOLD_MS + 200);
+    await page.mouse.up();
+    // Window for the leave and navigation a click triggers.
+    await page.waitForTimeout(2_500);
+    await expect(page).toHaveURL(meetingUrl);
+    await expect(page.locator("#grid-container")).toBeVisible();
+    expect(await isEditing(page)).toBe(false);
+
+    await hangup.click();
+    await expect(page).not.toHaveURL(/\/meeting\//, { timeout: 15_000 });
+  });
+
+  test("moving more than 10 px during a hold cancels it; a smaller tremor does not", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "hold_slop");
+    const nav = page.locator(NAV);
+    await nav.hover();
+    const micWrapper = slotWrapper(page, "mic");
+    const { x, y } = await centerOf(slotButton(page, "mic"));
+    const wrap = await boxOf(micWrapper);
+    // Premise: both moves stay inside the wrapper, so only distance can cancel.
+    expect(x + 12).toBeLessThan(wrap.x + wrap.width - 1);
+    expect(y + 6).toBeLessThan(wrap.y + wrap.height - 1);
+
+    await page.mouse.move(x, y);
+    const downAt = Date.now();
+    await page.mouse.down();
+    await expect(micWrapper).toHaveAttribute("data-hold", "pending", { timeout: 1_000 });
+    await page.mouse.move(x + 12, y, { steps: 3 });
+    await expect(micWrapper, "a 12 px move cancels the pending hold").not.toHaveAttribute(
+      "data-hold",
+      { timeout: 1_000 },
+    );
+    await page.waitForTimeout(Math.max(0, downAt + HOLD_MS + 800 - Date.now()));
+    await expect(nav).not.toHaveClass(/\bcustomize-mode\b/, { timeout: 500 });
+    await page.mouse.up();
+
+    // 6 px on each axis is 8.5 px straight-line, under the 10 px slop.
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await expect(micWrapper).toHaveAttribute("data-hold", "pending", { timeout: 1_000 });
+    await page.mouse.move(x + 6, y + 6, { steps: 3 });
+    await expect(nav).toHaveClass(/\bcustomize-mode\b/, { timeout: HOLD_MS + 3_000 });
+    await page.mouse.up();
+  });
+
+  test("a hold does not arm when edit mode cannot fit the bar; the press stays a click", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 400, height: 800 });
+    await joinMeeting(page, "hold_band_too_narrow");
+    const nav = page.locator(NAV);
+    await nav.hover();
+    await expect(
+      page.locator(`${NAV} > .dock-position-wrapper`),
+      "premise: the band is too narrow for edit mode",
+    ).toBeHidden();
+    const mic = slotButton(page, "mic");
+    const micWrapper = slotWrapper(page, "mic");
+    const { x, y } = await centerOf(mic);
+    const micOnBefore = await mic.evaluate((el) => el.classList.contains("active"));
+
+    await page.mouse.move(x, y);
+    const downAt = Date.now();
+    await page.mouse.down();
+    // Snapshot reads: a retrying `not` would pass once a fired hold is torn down.
+    await page.waitForTimeout(300);
+    expect(await micWrapper.getAttribute("data-hold"), "no hold may arm").toBeNull();
+    await page.waitForTimeout(Math.max(0, downAt + HOLD_MS + 500 - Date.now()));
+    expect(await micWrapper.getAttribute("data-hold")).toBeNull();
+    expect(await isEditing(page)).toBe(false);
+    expect(await page.locator('[data-testid="drawer-resize-notice"]').count()).toBe(0);
+    await page.mouse.up();
+
+    await expectMicOn(page, !micOnBefore);
+  });
+
+  test("the Edit Buttons hint stays legible on the dark dock menu in light theme", async ({
+    page,
+    context,
+  }) => {
+    await context.addInitScript(() => localStorage.setItem("ui-theme", "light"));
+    await joinMeeting(page, "edit_hint_light");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await openDockMenu(page);
+    const hint = page.locator(`${EDIT_BUTTONS_ITEM} > #dock-menu-edit-hint`);
+    await expect(hint).toBeVisible();
+    // `--on-dark-text-secondary` (global.css).
+    await expect(hint).toHaveCSS("color", "rgba(255, 255, 255, 0.7)");
+  });
+
+  test("a key pressed in the bar turns off a hold session's idle timeout", async ({ page }) => {
+    test.setTimeout(90_000);
+    await joinMeeting(page, "hold_keydown_untimes");
+    await page.locator(NAV).hover();
+    await pressAndHoldSlot(page, "mic");
+    await page.mouse.up();
+    await expect(slotButton(page, "mic")).toBeFocused();
+    // Shift moves nothing, so no refocus can turn the timer off in the keydown's place.
+    await page.keyboard.press("Shift");
+    const keyAt = Date.now();
+    await expectStillEditingAt(page, keyAt + IDLE_MS + 1_500, "a keydown must turn the timer off");
+  });
+
+  test("keyboard focus entering the bar turns off a hold session's idle timeout", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await joinMeeting(page, "hold_focus_untimes");
+    await page.locator(NAV).hover();
+    await pressAndHoldSlot(page, "mic");
+    await page.mouse.up();
+    // Keyboard modality from a key pressed outside the bar, so its keydown handler never runs.
+    await page.evaluate(() => (document.activeElement as HTMLElement).blur());
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
+    await page.keyboard.press("Shift");
+    const camera = slotButton(page, "camera");
+    await camera.focus();
+    expect(
+      await camera.evaluate((el) => el.matches(":focus-visible")),
+      "premise: keyboard-modality focus",
+    ).toBe(true);
+    const focusAt = Date.now();
+    await expectStillEditingAt(
+      page,
+      focusAt + IDLE_MS + 1_500,
+      "keyboard focus must turn the timer off",
+    );
+  });
+
+  test("a pointer held down pauses a hold session's idle timeout until it is released", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await joinMeeting(page, "hold_pointer_pauses");
+    await page.locator(NAV).hover();
+    await pressAndHoldSlot(page, "mic");
+    const firedAt = Date.now();
+    await expectStillEditingAt(
+      page,
+      firedAt + IDLE_MS + 1_500,
+      "a held pointer must pause the timer",
+    );
+    await page.mouse.up();
+    await expectIdleExit(page, Date.now());
+  });
+
+  test("a hold focuses the held slot's button, not the first slot's", async ({ page }) => {
+    await joinMeeting(page, "hold_focuses_held_slot");
+    await page.locator(NAV).hover();
+    await pressAndHoldSlot(page, "camera");
+    await page.mouse.up();
+    await expect(slotButton(page, "camera")).toBeFocused();
+  });
+
+  test("an idle exit that removes the focused control returns focus to the dock menu trigger", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await joinMeeting(page, "hold_idle_focus_fallback");
+    await page.locator(NAV).hover();
+    await pressAndHoldSlot(page, "mic");
+    await page.mouse.up();
+    const remove = slotWrapper(page, "participants").locator("> button.action-bar-remove-btn");
+    await remove.focus();
+    await expect(remove).toBeFocused();
+    expect(
+      await remove.evaluate((el) => el.matches(":focus-visible")),
+      "premise: script focus after a pointer press is not keyboard focus",
+    ).toBe(false);
+    const focusAt = Date.now();
+    await expectIdleExit(page, focusAt);
+    await expect(page.locator("#dock-menu-trigger")).toBeFocused({ timeout: 2_000 });
+  });
+
+  test("Done and Escape each end a hold session without the idle-exit announcement", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "hold_done_escape");
+    await page.locator(NAV).hover();
+    const region = page.locator(ENTRY_REGION);
+
+    await pressAndHoldSlot(page, "mic");
+    await page.mouse.up();
+    await expect(region).toHaveText(HOLD_ENTRY_ANNOUNCEMENT);
+    await page.locator("button.action-bar-done-trigger").click();
+    await waitForEditing(page, false, 3_000);
+    await expect(region, "Done must not announce an idle exit").toHaveText("", { timeout: 2_000 });
+
+    await pressAndHoldSlot(page, "mic");
+    await page.mouse.up();
+    await expect(region).toHaveText(HOLD_ENTRY_ANNOUNCEMENT);
+    await expect(slotButton(page, "mic")).toBeFocused();
+    await page.keyboard.press("Escape");
+    await waitForEditing(page, false, 3_000);
+    await expect(region, "Escape must not announce an idle exit").toHaveText("", {
+      timeout: 2_000,
+    });
+  });
+
+  test("auto-hide leaves a hold session's bar up, and an idle exit wakes the bar", async ({
+    page,
+    context,
+  }) => {
+    test.setTimeout(90_000);
+    await context.addInitScript(() => {
+      localStorage.setItem("vc_dock_autohide", "true");
+      localStorage.setItem("vc_dock_autoshrink", "false");
+    });
+    await joinMeeting(page, "hold_autohide");
+    await expect(page.locator(NAV), "premise: auto-hide is on").toHaveClass(/\bcontrols-hidden\b/, {
+      timeout: 10_000,
+    });
+    await page.locator(NAV).hover();
+    await slotButton(page, "mic").hover();
+    await pressAndHoldSlot(page, "mic");
+    await page.mouse.up();
+    const releasedAt = Date.now();
+    // The 4 s auto-hide timer from the last mouse move has run out by now.
+    await page.waitForTimeout(Math.max(0, releasedAt + IDLE_MS - 600 - Date.now()));
+    expect(await isEditing(page)).toBe(true);
+    expect(await isHidden(page), "editing must keep the bar up").toBe(false);
+
+    await expectIdleExit(page, releasedAt);
+    expect(await isHidden(page), "an idle exit must wake the bar").toBe(false);
+  });
+
+  test("a hold does not arm on Screen Share while its menu is open", async ({ page, context }) => {
+    await context.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
+    await joinMeeting(page, "hold_share_menu_open");
+    await page.locator(NAV).hover();
+    const wrapper = slotWrapper(page, "screen");
+    const trigger = wrapper.locator("> button#screen-share-trigger");
+    await expect(trigger).toBeVisible({ timeout: 10_000 });
+    await trigger.click();
+    await expect(trigger).toHaveAttribute("data-state", "active", { timeout: 15_000 });
+
+    const { x, y } = await centerOf(trigger);
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await expect(wrapper, "premise: with the menu closed a press arms").toHaveAttribute(
+      "data-hold",
+      "pending",
+      { timeout: 1_000 },
+    );
+    await page.mouse.up();
+    await expect(page.locator('[data-testid="screen-share-menu"]')).toBeVisible();
+
+    await page.mouse.down();
+    const downAt = Date.now();
+    await page.waitForTimeout(300);
+    expect(await wrapper.getAttribute("data-hold"), "no hold may arm").toBeNull();
+    await page.waitForTimeout(Math.max(0, downAt + HOLD_MS + 500 - Date.now()));
+    expect(await wrapper.getAttribute("data-hold")).toBeNull();
+    expect(await isEditing(page)).toBe(false);
+    await page.mouse.up();
+  });
+
+  test.describe("on a touch screen", () => {
+    test.use({ hasTouch: true });
+
+    test("a touch hold continues into a drag that moves the held slot", async ({ page }) => {
+      await joinMeeting(page, "touch_hold_drag");
+      await page.locator(NAV).hover();
+      const readDomOrder = () =>
+        page
+          .locator(`${NAV} > .action-bar-slot-wrapper[data-slot]`)
+          .evaluateAll((els) => els.map((el) => el.getAttribute("data-slot") as string));
+      expect((await readDomOrder()).slice(0, 2)).toEqual(["mic", "camera"]);
+      const micBox = await boxOf(slotWrapper(page, "mic"));
+      const camBox = await boxOf(slotWrapper(page, "camera"));
+      const pitch = camBox.x - micBox.x;
+      expect(pitch).toBeGreaterThan(10);
+      const { x, y } = await centerOf(slotButton(page, "mic"));
+
+      const cdp = await page.context().newCDPSession(page);
+      const touch = (
+        type: "touchStart" | "touchMove" | "touchEnd",
+        at?: { x: number; y: number },
+      ) => cdp.send("Input.dispatchTouchEvent", { type, touchPoints: at ? [at] : [] });
+      await touch("touchStart", { x, y });
+      await waitForEditing(page, true, HOLD_MS + 3_000);
+      const steps = 5;
+      for (let i = 1; i <= steps; i++) {
+        await touch("touchMove", { x: x + (2 * pitch * i) / steps, y });
+        await page.waitForTimeout(50);
+      }
+      await touch("touchEnd");
+
+      await expect
+        .poll(
+          async () => {
+            const order = await readDomOrder();
+            return order.indexOf("mic") > order.indexOf("camera");
+          },
+          { timeout: 3_000 },
+        )
+        .toBe(true);
+      expect(await isEditing(page)).toBe(true);
+    });
   });
 });

@@ -1,4 +1,4 @@
-import { test, expect, chromium, Page } from "@playwright/test";
+import { test, expect, chromium, Locator, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { DRAWER } from "../helpers/rust-mirrored-constants";
@@ -87,30 +87,34 @@ async function joinMeetingFromPage(page: Page): Promise<void> {
   await expect(grid).toBeVisible({ timeout: 15_000 });
 }
 
-/** Open a drawer, waking the auto-hiding bar first. At 400px every secondary
- *  slot is shed behind `#overflow-menu-trigger` (pre-dates #2701), so the
- *  inline button reports `hidden` and the fallback uses "More actions". */
-async function openDrawer(page: Page, spec: DrawerSpec): Promise<void> {
+/** Activate an action-bar slot, waking the auto-hiding bar first. At 400px every
+ *  secondary slot is shed behind `#overflow-menu-trigger` (pre-dates #2701), so
+ *  the inline button reports `hidden` and the fallback uses "More actions". */
+async function activateBarSlot(page: Page, inline: Locator, overflowLabel: string): Promise<void> {
   await page.locator(".video-controls-container").hover();
   const vp = page.viewportSize() ?? { width: 800, height: 600 };
   await page.mouse.move(Math.floor(vp.width / 2), Math.floor(vp.height / 2));
   await page.waitForTimeout(300);
 
-  const openBtn = page.locator("button.video-control-button", {
-    has: page.locator("span.tooltip", { hasText: spec.openTooltip }),
-  });
-  if (await openBtn.isVisible()) {
-    await openBtn.click();
+  if (await inline.isVisible()) {
+    await inline.click();
   } else {
     const trigger = page.locator("#overflow-menu-trigger");
     await expect(trigger).toBeVisible({ timeout: 10_000 });
     await trigger.click();
     const item = page.locator(".action-bar-overflow-popover button.overflow-item", {
-      has: page.locator(`span:text-is("${spec.overflowLabel}")`),
+      has: page.locator(`span:text-is("${overflowLabel}")`),
     });
     await expect(item).toBeVisible({ timeout: 10_000 });
     await item.click();
   }
+}
+
+async function openDrawer(page: Page, spec: DrawerSpec): Promise<void> {
+  const openBtn = page.locator("button.video-control-button", {
+    has: page.locator("span.tooltip", { hasText: spec.openTooltip }),
+  });
+  await activateBarSlot(page, openBtn, spec.overflowLabel);
   await expect(page.locator(`#${spec.containerId}`)).toHaveClass(/visible/, { timeout: 10_000 });
 }
 
@@ -128,19 +132,21 @@ function containerWidthPx(page: Page, spec: DrawerSpec): Promise<number> {
   return inlineStylePx(page, `#${spec.containerId}`, "width");
 }
 
-/**
- * Drag the drawer's resize handle so the pointer ends at viewport `targetX`,
- * driving the resize with REAL trusted mouse events.
- */
-async function dragResizeHandleTo(page: Page, spec: DrawerSpec, targetX: number): Promise<void> {
-  const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
+async function handleCentre(page: Page, handleSelector: string): Promise<{ x: number; y: number }> {
+  const handle = page.locator(handleSelector);
   await expect(handle).toBeVisible({ timeout: 10_000 });
   const box = await handle.boundingBox();
   expect(box).not.toBeNull();
-  if (!box) throw new Error(`${spec.side} resize handle has no bounding box`);
+  if (!box) throw new Error(`${handleSelector} has no bounding box`);
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
 
-  const grabX = box.x + box.width / 2;
-  const grabY = box.y + box.height / 2;
+/**
+ * Drag a resize handle from its centre so the pointer ends at viewport
+ * `targetX`, driving the resize with REAL trusted mouse events.
+ */
+async function dragHandleTo(page: Page, handleSelector: string, targetX: number): Promise<void> {
+  const { x: grabX, y: grabY } = await handleCentre(page, handleSelector);
 
   await page.mouse.move(grabX, grabY);
   await page.mouse.down();
@@ -152,6 +158,10 @@ async function dragResizeHandleTo(page: Page, spec: DrawerSpec, targetX: number)
   // Let Dioxus flush the final signal write + re-render and the pointerup
   // persistence.
   await page.waitForTimeout(300);
+}
+
+async function dragResizeHandleTo(page: Page, spec: DrawerSpec, targetX: number): Promise<void> {
+  await dragHandleTo(page, `#${spec.containerId} .drawer-resize-handle`, targetX);
 }
 
 /**

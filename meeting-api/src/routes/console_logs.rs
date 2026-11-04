@@ -278,14 +278,7 @@ pub async fn upload_console_logs(
     // --- Feature gate ---
     let enabled = std::env::var(CONSOLE_LOG_UPLOAD_ENABLED_ENV).unwrap_or_default();
     if enabled != "true" {
-        return Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            videocall_meeting_types::APIError {
-                code: "NOT_FOUND".to_string(),
-                message: "Not found".to_string(),
-                engineering_error: None,
-            },
-        ));
+        return Err(AppError::feature_not_found());
     }
 
     validate_id(&meeting_id, "meeting_id", is_valid_meeting_id)?;

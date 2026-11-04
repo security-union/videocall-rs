@@ -189,6 +189,7 @@ export interface BotRegistryEntry {
    *   - `"meeting-rejected:error"`   (failed — server-reported error)
    *   - `"launch-error"`             (failed)
    *   - `"browser-crash"`            (failed — browser or page died after joining)
+   *   - `"page-reloaded"`            (failed — the meeting page loaded a new document after joining)
    */
   finishReason?: string;
   /**

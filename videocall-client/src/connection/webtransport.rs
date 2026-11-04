@@ -179,6 +179,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
         WebTransportTask::send_on_persistent_stream(
             self.host.clone(),
             self.persistent_streams.clone(),
+            &self.uplink_depth,
             stream_key.as_u8(),
             stream_key.send_order(),
             bytes,
@@ -217,6 +218,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             WebTransportTask::send_on_persistent_stream(
                 self.host.clone(),
                 self.persistent_streams.clone(),
+                &self.uplink_depth,
                 MediaStreamKey::Control.as_u8(),
                 MediaStreamKey::Control.send_order(),
                 bytes,
@@ -237,6 +239,7 @@ pub(crate) mod host_seam {
 
     thread_local! {
         static ADOPT_SPARE_WORKER: Cell<Option<bool>> = const { Cell::new(None) };
+        static DIALED_URLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static NOTIFICATION: RefCell<Option<Callback<WebTransportStatus>>> =
             const { RefCell::new(None) };
     }
@@ -245,12 +248,13 @@ pub(crate) mod host_seam {
 
     impl WebTransportService {
         pub(crate) fn connect(
-            _url: &str,
+            url: &str,
             adopt_spare_worker: bool,
             _on_frame: Callback<InboundFrame>,
             notification: Callback<WebTransportStatus>,
         ) -> Result<WebTransportTask, WebTransportError> {
             ADOPT_SPARE_WORKER.with(|slot| slot.set(Some(adopt_spare_worker)));
+            DIALED_URLS.with(|urls| urls.borrow_mut().push(url.to_owned()));
             NOTIFICATION.with(|slot| *slot.borrow_mut() = Some(notification));
             Err(WebTransportError::CreationError("host test".to_string()))
         }
@@ -258,6 +262,10 @@ pub(crate) mod host_seam {
 
     pub(crate) fn take_adopt_spare_worker() -> Option<bool> {
         ADOPT_SPARE_WORKER.with(Cell::take)
+    }
+
+    pub(crate) fn take_dialed_urls() -> Vec<String> {
+        DIALED_URLS.with(|urls| std::mem::take(&mut *urls.borrow_mut()))
     }
 
     pub(crate) fn take_notification() -> Option<Callback<WebTransportStatus>> {

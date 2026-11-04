@@ -11,6 +11,7 @@ import {
   resolveMaxReceivedLayer,
   resolveSkipCanvasPaint,
 } from "./receiver-caps";
+import { SIMULCAST_MAX_LAYERS_CONFIG_KEY } from "./simulcast-layers";
 
 const APP_ORIGIN = "https://app.example.test";
 
@@ -173,14 +174,17 @@ describe("buildReceiverConfigInitScript (setter-merge injection seam)", () => {
 });
 
 describe("diagnostics packets switch (#2970)", () => {
-  it("resolves off-tokens to off, unset/default to inherit, and refuses anything else", () => {
+  it("resolves boolean tokens to on/off, unset/default to inherit, and refuses anything else", () => {
     for (const t of ["off", "OFF", " 0 ", "false", "no"]) {
       expect(resolveDiagPackets(t)).toEqual({ kind: "ok", value: "off" });
+    }
+    for (const t of ["on", "ON", " 1 ", "true", "yes"]) {
+      expect(resolveDiagPackets(t)).toEqual({ kind: "ok", value: "on" });
     }
     for (const t of [undefined, "", "  ", "default", "Default"]) {
       expect(resolveDiagPackets(t)).toEqual({ kind: "ok", value: undefined });
     }
-    for (const t of ["on", "1", "true", "yes", "maybe"]) {
+    for (const t of ["maybe", "2", "enabled"]) {
       expect(resolveDiagPackets(t).kind).toBe("invalid");
     }
   });
@@ -190,12 +194,16 @@ describe("diagnostics packets switch (#2970)", () => {
     expect(parseDiagPacketsField(null)).toEqual({ kind: "ok", value: undefined });
     expect(parseDiagPacketsField("off")).toEqual({ kind: "ok", value: "off" });
     expect(parseDiagPacketsField(0).kind).toBe("invalid");
-    expect(parseDiagPacketsField("on").kind).toBe("invalid");
+    expect(parseDiagPacketsField("on")).toEqual({ kind: "ok", value: "on" });
+    expect(parseDiagPacketsField("maybe").kind).toBe("invalid");
   });
 
-  it('injects the STRING "0" (the client field is Option<String>) and nothing when unset', () => {
+  it('injects the STRING "1"/"0" (the client field is Option<String>) and nothing when unset', () => {
     expect(buildReceiverConfigOverrides({ diagPackets: "off" })).toEqual({
       diagnosticsPacketsEnabled: "0",
+    });
+    expect(buildReceiverConfigOverrides({ diagPackets: "on" })).toEqual({
+      diagnosticsPacketsEnabled: "1",
     });
     expect(buildReceiverConfigOverrides({ diagPackets: undefined })).toBeNull();
   });
@@ -207,6 +215,11 @@ describe("diagnostics packets switch (#2970)", () => {
       'Object.freeze({ apiBaseUrl: "x", diagnosticsPacketsEnabled: "1" })',
     );
     expect(cfg).toEqual({ apiBaseUrl: "x", diagnosticsPacketsEnabled: "0", maxReceivedLayer: 0 });
+    const on = afterConfigJs(
+      buildReceiverConfigOverrides({ diagPackets: "on" })!,
+      'Object.freeze({ apiBaseUrl: "x", diagnosticsPacketsEnabled: "0" })',
+    );
+    expect(on.cfg).toEqual({ apiBaseUrl: "x", diagnosticsPacketsEnabled: "1" });
   });
 
   it("installs nothing on another origin (an IdP or SSO page)", () => {
@@ -217,5 +230,18 @@ describe("diagnostics packets switch (#2970)", () => {
     );
     expect(cfg).toEqual({ idp: "y" });
     expect(isFrozen).toBe(true);
+  });
+});
+
+describe("simulcast max layers override (#3246)", () => {
+  it("lands over the e2e config.js pin of 1 through the same merge, and only when set", () => {
+    const overrides = buildReceiverConfigOverrides({ simulcastMaxLayers: 3 });
+    expect(overrides).toEqual({ [SIMULCAST_MAX_LAYERS_CONFIG_KEY]: 3 });
+    const { cfg } = afterConfigJs(
+      overrides!,
+      'Object.freeze({ apiBaseUrl: "x", experimentalSimulcastMaxLayers: 1 })',
+    );
+    expect(cfg).toEqual({ apiBaseUrl: "x", experimentalSimulcastMaxLayers: 3 });
+    expect(buildReceiverConfigOverrides({ simulcastMaxLayers: undefined })).toBeNull();
   });
 });

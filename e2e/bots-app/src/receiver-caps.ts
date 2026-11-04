@@ -35,6 +35,9 @@
 //     `drawImage`) — it saves paint/GPU cost only. To cut DECODE CPU, use
 //     `maxReceivedLayer`. The two are independent and composable.
 
+import { SIMULCAST_MAX_LAYERS_CONFIG_KEY } from "./simulcast-layers";
+import { DEFAULT_TRANSPORT_CONFIG_KEY, type PinnedTransport } from "./transport";
+
 /**
  * Result of resolving a raw `--max-received-layer` / `BOT_MAX_RECEIVED_LAYER`.
  * - `ok` + `value: number`    → a non-negative integer receive cap (`0` = base
@@ -77,14 +80,23 @@ export interface ReceiverCaps {
   /** `window.__APP_CONFIG.skipCanvasPaint` — `undefined` = inherit deployment. */
   skipCanvasPaint?: boolean;
   diagPackets?: DiagPackets;
+  /** `window.__APP_CONFIG.defaultTransport`; `undefined` = the deployment's default. */
+  defaultTransport?: PinnedTransport;
+  /** `window.__APP_CONFIG.experimentalSimulcastMaxLayers`, the publish-side video layer ceiling. */
+  simulcastMaxLayers?: number;
 }
+
+export const SKIP_CANVAS_PAINT_ENV = "BOT_SKIP_CANVAS_PAINT";
+
+export const SKIP_CANVAS_PAINT_WAIVER_NOTE =
+  "Fidelity waiver: compare paint-sensitive health only between runs with the same skip_canvas_paint setting";
 
 export const DIAG_PACKETS_ENV = "BOT_DIAG_PACKETS";
 
 /** dioxus-ui `RuntimeConfig.diagnostics_packets_enabled` (#2970), an `Option<String>`. */
 export const DIAG_PACKETS_CONFIG_KEY = "diagnosticsPacketsEnabled";
 
-export type DiagPackets = "off";
+export type DiagPackets = "on" | "off";
 
 export type DiagPacketsResult =
   | { kind: "ok"; value: DiagPackets | undefined }
@@ -93,19 +105,20 @@ export type DiagPacketsResult =
 export function parseDiagPacketsField(raw: unknown): DiagPacketsResult {
   if (raw === undefined || raw === null) return { kind: "ok", value: undefined };
   if (typeof raw !== "string") {
-    return { kind: "invalid", message: '"diagPackets" must be "off" or "default"' };
+    return { kind: "invalid", message: '"diagPackets" must be "on", "off" or "default"' };
   }
   return resolveDiagPackets(raw);
 }
 
-/** `--diag-packets` / `BOT_DIAG_PACKETS`: unset, empty or `default` inherit; `off`/`0`/`false`/`no` disable. */
+/** `--diag-packets` / `BOT_DIAG_PACKETS`: unset, empty or `default` inherit; boolean tokens force on or off. */
 export function resolveDiagPackets(raw: string | undefined): DiagPacketsResult {
   const token = raw?.trim().toLowerCase() ?? "";
   if (token === "" || token === "default") return { kind: "ok", value: undefined };
+  if (TRUE_TOKENS.has(token)) return { kind: "ok", value: "on" };
   if (FALSE_TOKENS.has(token)) return { kind: "ok", value: "off" };
   return {
     kind: "invalid",
-    message: `--diag-packets (or BOT_DIAG_PACKETS) must be "off" or "default", got "${raw}"`,
+    message: `--diag-packets (or BOT_DIAG_PACKETS) must be "on", "off" or "default", got "${raw}"`,
   };
 }
 
@@ -197,8 +210,14 @@ export function buildReceiverConfigOverrides(caps: ReceiverCaps): Record<string,
     // String, not boolean — the client's RuntimeConfig field is `String`.
     overrides.skipCanvasPaint = caps.skipCanvasPaint ? "true" : "false";
   }
-  if (caps.diagPackets === "off") {
-    overrides[DIAG_PACKETS_CONFIG_KEY] = "0";
+  if (caps.diagPackets !== undefined) {
+    overrides[DIAG_PACKETS_CONFIG_KEY] = caps.diagPackets === "on" ? "1" : "0";
+  }
+  if (caps.defaultTransport !== undefined) {
+    overrides[DEFAULT_TRANSPORT_CONFIG_KEY] = caps.defaultTransport;
+  }
+  if (caps.simulcastMaxLayers !== undefined) {
+    overrides[SIMULCAST_MAX_LAYERS_CONFIG_KEY] = caps.simulcastMaxLayers;
   }
   return Object.keys(overrides).length > 0 ? overrides : null;
 }

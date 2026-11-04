@@ -175,7 +175,7 @@ sequenceDiagram
 | `ended` | Meeting has ended |
 
 > **Note:** A meeting automatically transitions to `ended` when:
-> - The last present host leaves and `end_on_host_leave` is on, OR
+> - The last present host leaves and `end_on_host_leave` is on (after a transport disconnect, only once `HOST_LEFT_END_DEBOUNCE` has passed with no host back), OR
 > - The last admitted participant leaves with REST `/leave`
 >
 > Otherwise it goes `idle` once nobody is present.
@@ -509,7 +509,7 @@ GET /api/v1/meetings/{meeting_id}
 
 ### Update Meeting Options
 
-Changes meeting OPTIONS: the waiting room, `admitted_can_admit`, `end_on_host_leave`, `allow_guests`, the recording/chat policy flags, and the meeting password.
+Changes meeting OPTIONS: the waiting room, `admitted_can_admit`, `end_on_host_leave`, `allow_guests`, the recording/chat policy flags, the join/leave announcement overrides, and the meeting password.
 
 ```
 PATCH /api/v1/meetings/{meeting_id}
@@ -524,10 +524,16 @@ PATCH /api/v1/meetings/{meeting_id}
   "allow_guests": false,
   "recording_allowed_for_all": false,
   "chat_allowed_for_all": true,
+  "entry_message_override": "participant",
+  "entry_sound_override": "off",
+  "exit_message_override": "on",
+  "exit_sound_override": "off",
   "password": "new-password",
   "remove_password": false
 }
 ```
+
+The four `*_override` fields (issue 3168) set the meeting-wide join ("entry") and leave ("exit") message and sound: `"participant"` (the default) leaves each participant's own preference in effect, `"on"` / `"off"` forces it for everyone in the meeting. Any other value is rejected with `422` and nothing is written. `POST /api/v1/meetings` accepts the same four fields. They are returned by create, get, list, the home feed, PATCH and `/end`, and by the join, guest-join, `/status` and `/guest-status` responses — each omitted while `"participant"`, so read an absent field as `"participant"`; a PATCH carrying any of them publishes `MEETING_SETTINGS_UPDATED` to the room.
 
 **Authorization**: allowed for the owner, a live (unsuspended) co-host entry, or anyone currently a present host of the active meeting (e.g. a `transfer-host` target) — see `viewer_can_edit_options` above. `password` / `remove_password` are the exception: they stay **owner-only**. A non-owner sending either is rejected with `403 NOT_OWNER` before any hashing or DB write — nothing in the request is applied, even other, otherwise-valid fields in the same body. Granting/revoking co-hosts, ending the meeting for everyone (`/end`), and deleting it (`DELETE`) stay owner-only; listing co-hosts uses this same broader rule (see [Co-Hosts](#co-hosts)).
 
@@ -678,7 +684,7 @@ The `room_token` is only present when `status` is `"admitted"`. Attendees receiv
 | 429 | `TOO_MANY_PASSWORD_ATTEMPTS` | Failed-password budget exhausted for this client + meeting |
 | 503 | `VERIFIER_OVERLOADED` | Password verifier at capacity; retry shortly |
 | 403 | `JOINING_NOT_ALLOWED` | Host has left and no one can admit new participants |
-| 400 | `MEETING_NOT_ACTIVE` | Meeting has ended and this caller cannot restart it |
+| 400 | `MEETING_NOT_ACTIVE` | Meeting has ended, or its host-left end is pending, and this caller cannot restart it |
 | 429 | `RATE_LIMIT_EXCEEDED` | Display-name change budget exhausted (only when `display_name` is sent) |
 
 > **Note:** If the meeting doesn't exist, it is created automatically with the joining user as the host.
@@ -1087,12 +1093,13 @@ A co-host joining an **active** meeting skips the waiting room and is admitted w
 
 When the owner arrives at an instance a co-host already started, their first join of that instance makes them host too (alongside the co-host — this system allows several simultaneous hosts) — UNLESS the owner already joined this exact instance and transferred host away, in which case rejoining does not reclaim it (today's rule for a mid-instance rejoin). meeting-api tells the two apart by comparing the owner's participant row's `admitted_at` against the meeting's `started_at`: both `upsert_host` and `admit_creator_preserve_host` stamp `admitted_at = NOW()` on every admission, and starting a new instance refreshes `started_at` to that same transaction's `NOW()`, so an owner row with no `admitted_at`, or one from before the current `started_at`, has not been admitted into the current instance under any activation kind.
 
-The meeting ends on `end_on_host_leave` only when the **last present host** leaves. meeting-api decides this from the database, for both REST `/leave` and transport disconnects (see [Transport presence and deploy order](#transport-presence-and-deploy-order)), and broadcasts `MEETING_ENDED`.
+The meeting ends on `end_on_host_leave` only when the **last present host** leaves. meeting-api decides this from the database (see [Transport presence and deploy order](#transport-presence-and-deploy-order)) and broadcasts `MEETING_ENDED`. A REST `/leave` ends it at once, also from the host whose own departure the relay already reported and whose leaving armed that pending end. A transport disconnect reported by a relay marks the host left at once but sets `meetings.host_left_end_due_at` to `HOST_LEFT_END_DEBOUNCE` (65 s) later instead of ending; the meeting ends at that time only if no host is present then, so a host whose reload reaches a different relay keeps the meeting. While that end is pending and nobody is present, only the owner or a persistent co-host can restart the meeting; any other joiner gets `MEETING_NOT_ACTIVE`, as for an ended meeting.
 
 ```
 GET  /api/v1/meetings/{meeting_id}/co-hosts
 POST /api/v1/meetings/{meeting_id}/co-hosts          {"user_id": "a@example.com", "persist": true}   # persist optional
 POST /api/v1/meetings/{meeting_id}/co-hosts/revoke   {"user_id": "a@example.com"}
+GET  /api/v1/meetings/{meeting_id}/co-hosts/suggestions
 ```
 
 **Response (200 OK):**
@@ -1118,12 +1125,34 @@ POST /api/v1/meetings/{meeting_id}/co-hosts/revoke   {"user_id": "a@example.com"
 - Only the owner may kick another host or a designated co-host; nobody may kick the owner. A kicked host loses the role (`HOST_REVOKED`); kicking a user with no participant row is `404 PARTICIPANT_NOT_FOUND`, and `PARTICIPANT_KICKED` is published only when someone admitted was kicked.
 - `HOST_GRANTED` / `HOST_REVOKED` are published only when the host role actually changes, never for a repeat join.
 
+**Suggestions** (owner only) list people the owner can pick instead of typing an id, at most 100, most recent first:
+
+- co-hosts the owner designated in any meeting they own;
+- participants holding the host role in any meeting they own;
+- owners of meetings the owner was admitted to.
+
+Deleted meetings, the owner, guests, and the meeting's existing co-host entries are left out. Ids are deduplicated case-insensitively and use the participant's real case when they were admitted to one of those meetings. `display_name` is the most recent non-empty name on the person's admitted participant rows in meetings the owner owns or was admitted to; the two need not have been there at the same time, and the owner need not have joined a meeting they own. Failing that, a meeting owner falls back to the `host_display_name` of a meeting the owner was admitted to. A name from any other meeting is never returned, and the field is omitted when unknown. Recency is the latest `updated_at` of the co-host entry or participant row that links the person.
+
+```json
+{
+  "success": true,
+  "result": {
+    "suggestions": [
+      { "user_id": "Ann@example.com", "display_name": "Ann" },
+      { "user_id": "bob@example.com" }
+    ]
+  }
+}
+```
+
+> **Rust types**: `APIResponse<ListCoHostSuggestionsResponse>`
+
 **Errors:**
 
 | Status | Code | Description |
 |--------|------|-------------|
 | 400 | `BAD_REQUEST` | Empty, over 254 chars, the owner, a `guest:` ID, over 100 entries, or an instance-only grant on a non-active meeting |
-| 403 | `NOT_OWNER` | Grant or revoke by a non-owner |
+| 403 | `NOT_OWNER` | Grant, revoke, or suggestions by a non-owner |
 | 403 | `NOT_HOST` | List by someone who is none of: owner, live co-host, present host |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 | 404 | `CO_HOST_NOT_FOUND` | Revoke target is neither a co-host nor a host |
@@ -1137,7 +1166,7 @@ Presence is a **lease**, not a latch. Every `PRESENCE_HEARTBEAT_INTERVAL_SECS` (
 
 The [Presence Keepalive](#presence-keepalive) endpoints are a third way `presence_seen_at` is renewed, alongside a relay heartbeat: a client sitting in the manual pre-join lobby has no live session for a relay to heartbeat on its behalf, so it renews its own lease directly. The lease check itself does not care which of the two set `presence_seen_at` — a fresh timestamp is a fresh timestamp regardless of `live_session_id` — so the 60 s connect window only ever covers a client that never gets the chance to call either one (it died, or its network dropped, before its first keepalive or its transport's first heartbeat).
 
-Each meeting-api replica sweeps every 30 s, starting one lease after it starts: a participant whose lease ran out (their relay crashed or was killed, their client died before connecting, or an admitted waiter never came) is marked left — keeping its `live_session_id` rather than resetting it, so a later heartbeat or `PRESENT` for that exact session restores the row within the same instance — and the meeting ends if they were its last present host with `end_on_host_leave`, or goes idle if nobody is left. One replica sweeps per tick (`pg_try_advisory_lock`); a row's failure is logged and skipped rather than aborting the batch.
+Each meeting-api replica sweeps every 30 s, starting one lease after it starts: a participant whose lease ran out (their relay crashed or was killed, their client died before connecting, or an admitted waiter never came) is marked left — keeping its `live_session_id` rather than resetting it, so a later heartbeat or `PRESENT` for that exact session restores the row within the same instance — and the meeting ends if they were its last present host with `end_on_host_leave`, or goes idle if nobody is left. Each tick also ends meetings whose `host_left_end_due_at` has passed. The lease sweep and that settle pass each take their own `pg_try_advisory_lock`, so one replica runs each per tick; a row's failure is logged and skipped rather than aborting the batch.
 
 A relay's "room became empty" report only idles a meeting nobody is present in, since the relay sees just its own binary's copy of the room. A new instance (non-owner hosts demoted with `HOST_REVOKED`, the previous instance's admitted participants marked left, instance-only co-hosts removed, suspensions lifted) starts only from `ended`, or when nobody is present, whether the meeting is `idle` or still `active`. A transport reconnecting with a room token from an earlier instance, or to an ended meeting, is never counted or promoted.
 
@@ -1145,7 +1174,7 @@ A relay's "room became empty" report only idles a meeting nobody is present in, 
 
 A lease is only as trustworthy as the pipeline that renews it. `presence_heartbeat_watermark` is a singleton row holding the newest time **any** meeting-api replica successfully applied a heartbeat batch — not per meeting, per relay's own connectivity to *some* meeting-api. `db::participants::presence_healthy(pool, nats)` is `true` only when that watermark is fresher than two heartbeat intervals (60 s) **and** the calling replica's own NATS client reports `Connected` (vacuously `true` when no client was even passed in, which is what lets tests exercise routes without wiring a live NATS connection). Every lease-based "nobody present" decision — `present_sql` and everything built on it: `set_idle`, `start_instance_in`, `count_present_hosts`, the waiting-room host guard, and every participant/waiting count — takes this as a parameter and is computed through it, never through a hardcoded assumption of health.
 
-When unhealthy, `present_sql` falls back to latch semantics (`admitted AND left_at IS NULL`, no freshness check at all) and the sweeper (`spawn_presence_sweeper`) skips its tick entirely. This is what keeps a NATS outage, a lagging heartbeat consumer, or a relay fleet that does not yet send heartbeats from departing every connected participant, ending every `end_on_host_leave` meeting, and starting spurious new instances the moment leases would otherwise lapse. Recovery is automatic and non-destructive: once heartbeats resume reaching the database the watermark goes fresh again, normal sweeping resumes, and any row the sweeper wrongly departed while unhealthy — its `live_session_id` was kept, not reset — comes back the moment its own session's heartbeat or `PRESENT` report is seen again, provided the meeting has not ended and no new instance has started since.
+When unhealthy, `present_sql` falls back to latch semantics (`admitted AND left_at IS NULL`, no freshness check at all) and the sweeper (`spawn_presence_sweeper`) skips its lease sweep. It still ends meetings whose `host_left_end_due_at` has passed, counting present hosts with latch semantics. This is what keeps a NATS outage, a lagging heartbeat consumer, or a relay fleet that does not yet send heartbeats from departing every connected participant, ending every `end_on_host_leave` meeting, and starting spurious new instances the moment leases would otherwise lapse. Recovery is automatic and non-destructive: once heartbeats resume reaching the database the watermark goes fresh again, normal sweeping resumes, and any row the sweeper wrongly departed while unhealthy — its `live_session_id` was kept, not reset — comes back the moment its own session's heartbeat or `PRESENT` report is seen again, provided the meeting has not ended and no new instance has started since.
 
 **Deploy the relays before meeting-api, and roll back in the reverse order.** Relays publish both the legacy `internal.participant_left` / `internal.participant_present` subjects and the current `internal.participant_presence`; an old meeting-api reads only the legacy pair, so a closed tab does not end an `end_on_host_leave` meeting and no co-hosts exist while it is running. The other deploy order runs the new meeting-api, which reads only `internal.participant_presence`, against old relays that never publish it and that end the meeting whenever a host disconnects, even with co-hosts present.
 
@@ -1179,6 +1208,122 @@ After every change meeting-api publishes `RECORDING_STATE` on `room.{meeting_id}
 | 409 | `USER_CAP` | Caller already holds an active lease from another attempt |
 | 409 | `MEETING_CAP` | Five active non-host leases already; hosts are exempt |
 | 429 | `RATE_LIMITED` | 6 registers per user per fixed minute per replica, or (non-hosts only) more than 20 permitted attempts per meeting in a two-bucket sliding minute, hosts' attempts included |
+
+---
+
+### Live Captions
+
+```
+POST /api/v1/meetings/{meeting_id}/captions    Body: {"enabled": bool, "renew": bool}
+```
+
+Dark-launched: unless meeting-api runs with `CAPTIONS_ENABLED=true` the route answers `404` with a `NOT_FOUND` envelope before authentication (the same answer as console-logs; GET still answers 405, so the route is not invisible). The caller presents the meeting's room token (`Authorization: Bearer`), not a session: the control lives in the meeting UI, where guests have no session, and the token only names the user. Whether they are a host is read from `meeting_participants` inside the request's transaction, which locks the meeting row first (the order transfer, co-host revoke, kick and end use), so a demotion either commits before the check and the request gets `NOT_HOST`, or waits until the request's change is committed.
+
+- `{"enabled": true}` turns captions on (or re-publishes the lease if they already are) while the meeting is active.
+- `{"enabled": true, "renew": true}` re-publishes the current lease; the client renews about every 40 s against a 120 s lease.
+- `{"enabled": false}` turns captions off and always bumps the generation, so the published revoke outranks any lease.
+
+Every accepted request answers `204` after publishing JSON on NATS subject `captions.control.{meeting_id}`: `{room_id, enabled, revoke, requested_by, ttl_secs, generation}` (`ttl_secs` is 120 for a lease and 0 for a revoke). The state change is committed before the publish. If the publish fails after the commit the request still answers `204` and meeting-api retries the publish itself (a client-side repeat of a committed revoke could outrank another host's newer lease); a lost lease is also re-published by the client's next renewal, a lost revoke lapses on the bridge within 120 s. `503` is answered only when NATS is disconnected before anything is written. A body over 256 bytes gets `413`; enable and renew are limited to 10 per user per meeting per minute per replica, revokes are never throttled. The `MEETING_NOT_ACTIVE` code is `409` here (a conflict with the meeting's state, like `CAPTIONS_OFF`), while the join routes answer it with `400`. Generations continue across a room id's lifetimes: a meeting re-created under a soft-deleted one's id starts from that one's generation, so the bridge's per-room ordering holds.
+
+**Errors:**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 400 | `BAD_REQUEST` | `renew` without `enabled` |
+| 401 | `UNAUTHORIZED` | Missing or invalid room token |
+| 403 | `FORBIDDEN` | Room token issued for another meeting |
+| 403 | `NOT_HOST` | Caller is not an admitted host |
+| 404 | `NOT_FOUND` | `CAPTIONS_ENABLED` is off |
+| 404 | `MEETING_NOT_FOUND` | Meeting does not exist, was deleted, or has ended |
+| 409 | `MEETING_NOT_ACTIVE` | Enable while the meeting is not active |
+| 409 | `CAPTIONS_OFF` | Renew while captions are off |
+| 429 | `RATE_LIMIT_EXCEEDED` | More than 10 enable or renew requests per minute for this user and meeting (revokes are not counted) |
+| 503 | `CAPTIONS_UNAVAILABLE` | NATS is disconnected (nothing was written) |
+
+---
+
+### Avatars
+
+```
+GET    /api/v1/user/avatar
+PUT    /api/v1/user/avatar[?expected_user_id=<id>]          Body: the raw image; Content-Type: image/png, image/jpeg or image/webp
+PUT    /api/v1/user/avatar/gravatar[?expected_user_id=<id>] Body: {"gravatar": "<e-mail or Gravatar avatar link>"}
+DELETE /api/v1/user/avatar[?expected_user_id=<id>]
+GET    /api/v1/user/avatar/image
+GET    /api/v1/meetings/{meeting_id}/avatar?user_id=<id>   Authorization: Bearer <room_token>
+```
+
+Each signed-in user has at most one avatar. The five `/user/avatar` routes act on the caller and authenticate like every other session route (see [How to authenticate](#how-to-authenticate)); guest identities get `401`. The meeting route reads a co-participant's image with the meeting's room token, so guests in the meeting can read it too; observer tokens get `401`.
+
+- **Upload** takes at most 262,144 bytes (`MAX_AVATAR_UPLOAD_BYTES`). The `Content-Type` is compared case-insensitively, its parameters are ignored, and it must match the format sniffed from the bytes. Each side must be 16–1024 px. The server applies the EXIF orientation, keeps the first frame of an animation, flattens transparency onto `#3a3a3a`, crops the centre square, scales it down to at most 256×256 (never up) and stores it as a JPEG of at most 65,536 bytes, so no metadata from the file is kept.
+- **Gravatar** takes an e-mail address (trimmed and lowercased, then SHA-256 hashed) or a link on `gravatar.com` or any `*.gravatar.com` host whose path is `/avatar/<32 or 64 hex>`, optionally ending in `.jpg`, `.jpeg` or `.png`. Input over 2048 bytes is refused. The server only ever fetches `https://gravatar.com/avatar/<hash>?s=256&d=404&r=g`, so anything else in the link is ignored. It does not follow redirects, gives up after a 3 s connect or 5 s total timeout, reads at most 262,144 bytes, and stores the result exactly like an upload. A failed import leaves the previous avatar in place. `GRAVATAR_ENABLED=false` (or `0`, `no`, `off`) turns the route off and makes `GET /user/avatar` report `gravatar_enabled: false`. Unset, empty, `true`, `1`, `yes` and `on` keep it on; meeting-api refuses to start on any other value.
+- **Delete** answers `204`, whether or not an avatar existed.
+- **`expected_user_id`** (optional, on the three writes) only guards the write: when present and not exactly the caller's user id, the write is refused with `409 AVATAR_IDENTITY_MISMATCH` and nothing is stored or deleted. It never selects whose avatar is written. It keeps a client's write from landing on another user once the session has switched. With cookie sign-in every tab of a browser shares one session, so this happens when another tab signs in as someone else; PKCE sign-in keeps a token per tab. Without it, writes behave as before.
+- **Budgets** (per replica, fixed 60 s windows): upload, Gravatar and delete share 10 writes per user, counted after the `expected_user_id` check and before the body is checked. The meeting route allows 300 reads per viewer per meeting. At most 2 images are re-encoded and 4 Gravatar fetches run at once; past that the request gets `503 SERVICE_BUSY`.
+- **The meeting route** answers only if the token's room is `{meeting_id}`, the meeting exists and has not ended, and both the caller and `user_id` were admitted into its current instance: admitted now, or left after being admitted into it. This is the rule [Get Participants](#get-participants) uses, without its owner exception. A `user_id` that is not such a participant, is empty, is over 255 bytes, contains a control character or has no avatar gets the same `404 AVATAR_NOT_FOUND` body.
+- **Change broadcast**: after a successful upload or Gravatar save, and after a delete that removed an avatar, meeting-api publishes `PARTICIPANT_AVATAR_CHANGED` (`MeetingEventType` 20) with `room_id` and `target_user_id` (the caller) on `room.{meeting_id}.system` of each meeting the caller is currently in: not deleted, not ended, and the caller admitted now or left after being admitted into its current instance. At most 32 meetings are told, admitted ones first, then the most recently admitted. A delete that found no avatar publishes nothing; a failed room lookup or publish is logged and does not fail the write.
+
+**Response (200 OK)** of `GET /api/v1/user/avatar`:
+```json
+{
+  "success": true,
+  "result": {
+    "avatar": {
+      "source": "gravatar",
+      "gravatar_url": "https://gravatar.com/avatar/16c18d336f0b250f0e2d907452ceb9658a74ecdae8bc94864c23122a72cc27a5",
+      "content_type": "image/jpeg",
+      "etag": "0123456789abcdef0123456789abcdef",
+      "updated_at": 1760371200000
+    },
+    "gravatar_enabled": true,
+    "user_id": "alice@example.com"
+  }
+}
+```
+
+`user_id` is the caller's user id. `avatar` is `null` when none is stored. `source` is `upload` or `gravatar`, and `gravatar_url` is present only for `gravatar`. `updated_at` is in Unix milliseconds. Both `PUT` routes return the stored avatar's `AvatarInfo` (the `avatar` object above) as `result`.
+
+> **Rust types**: `APIResponse<UserAvatarResponse>`, `APIResponse<AvatarInfo>`, `SetGravatarRequest` (`videocall_meeting_types::avatar`)
+
+**Image responses.** Both image `GET`s answer `200` with the JPEG. They answer `304` with no body when an `If-None-Match` tag matches the stored `ETag`: weak and strong tags compare equal, `*` matches any stored avatar, and only the first 16 tags are read. `200` and `304` both carry:
+
+| Header | Value |
+|--------|-------|
+| `Content-Type` | `image/jpeg` |
+| `ETag` | `"<32 hex>"`, a strong tag of the stored bytes |
+| `Cache-Control` | `private, no-cache` |
+| `Vary` | `Authorization, Cookie` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Content-Security-Policy` | `default-src 'none'; sandbox` |
+| `Cross-Origin-Resource-Policy` | `same-site` |
+
+Errors from the two image `GET`s:
+
+- **Returned by the handler**: `403 FORBIDDEN`, `404 MEETING_NOT_FOUND`, `404 NOT_IN_MEETING`, `404 AVATAR_NOT_FOUND`, `429 RATE_LIMIT_EXCEEDED`, and any `500`. They carry `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox` and `Cross-Origin-Resource-Policy: same-site`.
+- **Rejected before the handler runs**, with none of those four headers set by meeting-api: the meeting route's `400` for a malformed `{meeting_id}`; a `401` on either route; and on the own-image route, the error status passed through when the identity provider fails while a Bearer token is checked.
+
+**Errors:**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 400 | `INVALID_INPUT` | Writes: `expected_user_id` is over 255 bytes or repeated, or none is sent and the caller's user id is over 255 bytes (with one of 255 bytes or fewer, that caller gets `409`). Gravatar: the body is not JSON with a `gravatar` string, or is over 4096 bytes |
+| 400 | `INVALID_GRAVATAR` | Not an e-mail address or a Gravatar avatar link |
+| 400 | `INVALID_MEETING_ID` | Malformed `{meeting_id}` |
+| 401 | `UNAUTHORIZED` | No valid session, a guest identity, or (meeting route) a missing, invalid or observer room token |
+| 403 | `FORBIDDEN` | Room token issued for another meeting |
+| 404 | `NOT_FOUND` | Gravatar route while `GRAVATAR_ENABLED` is off |
+| 404 | `MEETING_NOT_FOUND` | Meeting does not exist, was deleted, or has ended |
+| 404 | `NOT_IN_MEETING` | Caller was not admitted into the current instance |
+| 404 | `AVATAR_NOT_FOUND` | No avatar, or a `user_id` the caller may not see |
+| 409 | `AVATAR_IDENTITY_MISMATCH` | Writes: `expected_user_id` is not the caller's user id; nothing was written |
+| 413 | `PAYLOAD_TOO_LARGE` | Upload body over 262,144 bytes |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | `Content-Type` is not PNG, JPEG or WebP, or does not match the bytes |
+| 422 | `INVALID_IMAGE` | Not a decodable PNG, JPEG or WebP; a side outside 16–1024 px; too detailed to store in 64 KiB; or a Gravatar body over 262,144 bytes |
+| 422 | `GRAVATAR_NOT_FOUND` | Gravatar has no image for the input |
+| 429 | `RATE_LIMIT_EXCEEDED` | Write or read budget spent |
+| 502 | `GRAVATAR_UNAVAILABLE` | Gravatar could not be reached, redirected, or answered anything but `200` or `404` |
+| 503 | `SERVICE_BUSY` | Re-encode or Gravatar fetch limit reached; retry |
+| 504 | `GRAVATAR_UNAVAILABLE` | Gravatar did not answer in time |
 
 ---
 
@@ -1394,6 +1539,8 @@ All tables are owned by the Meeting Backend. The Media Server does not access th
 | ended_at | TIMESTAMPTZ | When meeting ended |
 | deleted_at | TIMESTAMPTZ | Soft delete timestamp |
 | host_display_name | VARCHAR(255) | Cached host display name |
+| captions_on | BOOLEAN | Live captions lease held (see [Live Captions](#live-captions)) |
+| captions_generation | BIGINT | Bumped on every captions change; orders leases and revokes |
 
 ### meeting_participants table
 
@@ -1420,6 +1567,18 @@ Single source of truth for participant state. Replaces the legacy `session_parti
 | persistent | BOOLEAN | Saved for future instances, or this instance only |
 | suspended | BOOLEAN | Set by transfer-host or kick; cleared at the next instance or on re-grant |
 | added_by | VARCHAR(255) | Owner who designated them |
+
+### user_avatars table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| user_id | VARCHAR(255) | Primary key; never a `guest:` id. No foreign key to `users` |
+| source | TEXT | `upload` or `gravatar` |
+| content_type | TEXT | Always `image/jpeg` today |
+| image | BYTEA | The stored image, 1–65,536 bytes (`STORAGE EXTERNAL`) |
+| gravatar_hash | TEXT | Lowercase 32- or 64-hex hash; set exactly when `source` is `gravatar` |
+| etag | TEXT | Served as the image's `ETag` |
+| created_at / updated_at | TIMESTAMPTZ | `updated_at` is maintained by a trigger |
 
 ---
 

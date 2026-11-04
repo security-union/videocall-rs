@@ -14,6 +14,7 @@ import {
   redactUrl,
   resolveFormLoginCredentials,
 } from "./form-login";
+import { UI_PROBE_TIME_LIMIT_MS } from "../time-limit";
 
 const APP_BASE = "https://app.videocall.labsworkspace.fnxlabs.com";
 const SECRET_PASSWORD = "hunter2-DO-NOT-LOG";
@@ -236,6 +237,32 @@ describe("performFormLogin", () => {
 
     expect(submit.click).not.toHaveBeenCalled();
     expect(password.press).toHaveBeenCalledWith("Enter", expect.anything());
+  });
+
+  it("falls back to pressing Enter when the submit button's probe stalls", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const submit = mockLocator({ isVisible: vi.fn(pending) });
+      const { page, password } = makePage({ submit });
+      let done = false;
+      void performFormLogin({
+        page,
+        email: EMAIL,
+        password: SECRET_PASSWORD,
+        appBaseUrl: APP_BASE,
+        meetingId: "bottest",
+        label: "bot",
+      }).then(() => (done = true));
+      await vi.advanceTimersByTimeAsync(UI_PROBE_TIME_LIMIT_MS);
+      expect(done).toBe(true);
+      expect(submit.click).not.toHaveBeenCalled();
+      expect(password.press).toHaveBeenCalledWith("Enter", expect.anything());
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("did not settle"));
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("clicks an app-side login trigger before filling when the app does not auto-redirect", async () => {

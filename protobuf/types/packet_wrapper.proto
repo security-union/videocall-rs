@@ -89,6 +89,10 @@ message PacketWrapper {
     // is server-authored by meeting-api and which `classify_packet` drops
     // unconditionally when a client sends it. See MeetingTimerPacket.
     MEETING_TIMER = 19;
+    // Server -> all-peers live caption; see CaptionPacket. Server-authored
+    // like MEETING: classify_packet drops it when a client sends it.
+    // 15/16 stay informally reserved by #1843; 20 has never been used.
+    CAPTION = 20;
   }
 
   // Cleartext media-kind discriminator on the OUTER envelope.

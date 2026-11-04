@@ -2,6 +2,7 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { stopScreenShare } from "../helpers/screen-share-meeting";
 
 /**
  * Screen-share visibility toast E2E (HCL issue 893).
@@ -128,28 +129,14 @@ async function admitGuestIfNeeded(
  *
  * The `ScreenShareButton` (dioxus-ui/src/components/video_control_buttons.rs)
  * has NO `title` attribute — it is a `button.video-control-button` whose
- * `.tooltip-title` reads "Screen share — Share Screen" when inactive and
- * "Screen share — Stop Screen Share" when active. Match by tooltip text, the
- * same proven approach the bvt1 screen-share-panel.spec.ts uses. The old
+ * `.tooltip-title` reads "Screen share — Share Screen" when inactive. Match by
+ * tooltip text, the same proven approach the bvt1 screen-share-panel.spec.ts uses. The old
  * `title=`/`slot-secondary button:first-child` selector matched nothing (or the
  * wrong slot — Reactions is the first secondary slot in DEFAULT_SLOTS).
  */
 async function clickScreenShareButton(page: Page): Promise<void> {
   const btn = page.locator("button.video-control-button", {
     has: page.locator(".tooltip", { hasText: "Share Screen" }),
-  });
-  await expect(btn).toBeVisible({ timeout: 10_000 });
-  await btn.click();
-}
-
-/**
- * Stop an in-progress screen share by clicking the (active) screen-share
- * control. When active the tooltip reads "…Stop Screen Share" — which never
- * contains the substring "Share Screen", so the two selectors are unambiguous.
- */
-async function stopScreenShareButton(page: Page): Promise<void> {
-  const btn = page.locator("button.video-control-button", {
-    has: page.locator(".tooltip", { hasText: "Stop Screen Share" }),
   });
   await expect(btn).toBeVisible({ timeout: 10_000 });
   await btn.click();
@@ -342,8 +329,8 @@ test.describe("Screen-share visibility toast", () => {
    * share → success → STOP → share AGAIN → the success toast must fire on the
    * SECOND share too.
    *
-   * The screen decoder is reused across stop→restart (only flushed, never
-   * recreated), so its once-per-lifetime first-render ack latch survives. On
+   * Within its 30 s hold the screen decoder is reused across stop→restart, so
+   * its once-per-lifetime first-render ack latch survives. On
    * the screen-off heartbeat edge the manager calls `rearm_first_render_ack()`
    * to reset that latch; without it the second share's decode() never returns
    * first_frame:true again (even with the injection hook firing, because
@@ -439,9 +426,7 @@ test.describe("Screen-share visibility toast", () => {
       );
 
       // ---- Stop the share: this is the screen-off edge that must re-arm. ----
-      await wakeControls(hostPage);
-      await hostPage.waitForTimeout(300);
-      await stopScreenShareButton(hostPage);
+      await stopScreenShare(hostPage);
 
       // The guest's split layout tears down when the share stops, confirming
       // the screen-off heartbeat reached the guest (where rearm_first_render_ack

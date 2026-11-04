@@ -1,0 +1,145 @@
+{
+ "_comment": [
+  "Mutations of the Rust bot's run deadline (#2914), each naming the test that must catch it:",
+  "  scripts/mutation-check.py run scripts/mutation-spec-run-deadline.json"
+ ],
+ "runner": "cargo",
+ "cwd": ".",
+ "command": [
+  "cargo",
+  "test",
+  "--no-fail-fast",
+  "-p",
+  "bot",
+  "-p",
+  "videocall-meeting-types",
+  "--lib",
+  "--test",
+  "wire_media",
+  "--",
+  "deadline",
+  "a_hard_stop",
+  "saturates_a_huge_ttl"
+ ],
+ "baseline_tests": 5,
+ "mutations": [
+  {
+   "name": "the minted token ignores the deadline",
+   "file": "videocall-meeting-types/src/mint.rs",
+   "find": "now.saturating_add(ttl_secs).min(not_after),",
+   "replace": "now.saturating_add(ttl_secs),",
+   "expect_kills": [
+    "mint_room_token_until_caps_the_expiry_at_the_deadline_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "a token is minted after the deadline",
+   "file": "videocall-meeting-types/src/mint.rs",
+   "find": "    if now >= not_after {\n        return Err(MintError::PastDeadline);",
+   "replace": "    if false {\n        return Err(MintError::PastDeadline);",
+   "expect_kills": [
+    "mint_room_token_until_caps_the_expiry_at_the_deadline_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "the run duration ignores the deadline",
+   "file": "bot/src/config.rs",
+   "find": "Ok(Some(duration.map_or(left, |d| d.min(left))))",
+   "replace": "Ok(duration)",
+   "expect_kills": [
+    "a_run_deadline_caps_the_duration_and_every_minted_token_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "a bot starts after the deadline",
+   "file": "bot/src/config.rs",
+   "find": "Some(end) if end as f64 <= now =>",
+   "replace": "Some(end) if false =>",
+   "expect_kills": [
+    "a_run_deadline_caps_the_duration_and_every_minted_token_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "connections mint without the deadline",
+   "file": "bot/src/config.rs",
+   "find": "mint::mint_room_token_until(&secret, user_id, room, ttl_secs, end)?",
+   "replace": "mint::mint_room_token(&secret, user_id, room, ttl_secs + end * 0)?",
+   "expect_kills": [
+    "a_run_deadline_caps_the_duration_and_every_minted_token_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "the expiry overflows on a huge TTL",
+   "file": "videocall-meeting-types/src/mint.rs",
+   "find": "now.saturating_add(ttl_secs).min(not_after),",
+   "replace": "(now + ttl_secs).min(not_after),",
+   "expect_kills": [
+    "mint_room_token_until_caps_the_expiry_at_the_deadline_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "the run duration drops fractions of a second",
+   "file": "bot/src/config.rs",
+   "find": "std::time::Duration::from_secs_f64(end as f64 - now)",
+   "replace": "std::time::Duration::from_secs((end as f64 - now) as u64)",
+   "expect_kills": [
+    "a_run_deadline_caps_the_duration_and_every_minted_token_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "the binary runs to --duration",
+   "file": "bot/src/main.rs",
+   "find": "    let run_duration = config.run_duration_at(run_started_at)?;",
+   "replace": "    let run_duration = config.run_duration()?;",
+   "expect_kills": [
+    "the_binary_ends_its_run_and_its_room_tokens_by_the_deadline"
+   ]
+  },
+  {
+   "name": "the binary mints without the deadline",
+   "file": "bot/src/main.rs",
+   "find": "    let lobby_auth = bot_config.connect_auth(&client_config.user_id, &client_config.meeting_id)?;",
+   "replace": "    let lobby_auth = bot_config.resolve_lobby_auth()?;",
+   "expect_kills": [
+    "the_binary_ends_its_run_and_its_room_tokens_by_the_deadline"
+   ]
+  },
+  {
+   "name": "the binary gives stalled clients the full grace",
+   "file": "bot/src/main.rs",
+   "find": "            hard_stop,\n            &mut stop_deadline,",
+   "replace": "            None,\n            &mut stop_deadline,",
+   "expect_kills": [
+    "the_binary_ends_its_run_and_its_room_tokens_by_the_deadline"
+   ]
+  },
+  {
+   "name": "join_or_abort ignores the hard stop",
+   "file": "bot/src/shutdown.rs",
+   "find": "*deadline = Some(hard_stop.map_or(end, |stop| stop.min(end)));",
+   "replace": "*deadline = Some(end);",
+   "expect_kills": [
+    "a_hard_stop_cuts_the_grace_short",
+    "the_binary_ends_its_run_and_its_room_tokens_by_the_deadline"
+   ]
+  },
+  {
+   "name": "a run deadline any distance away is accepted",
+   "file": "bot/src/config.rs",
+   "find": "            Some(end) if end as f64 - now > MAX_DEADLINE_AHEAD.as_secs_f64() => Err(anyhow!(",
+   "replace": "            Some(end) if false => Err(anyhow!(",
+   "expect_kills": [
+    "a_run_deadline_caps_the_duration_and_every_minted_token_and_refuses_after_it"
+   ]
+  },
+  {
+   "name": "a huge token expiry wraps negative",
+   "file": "videocall-meeting-types/src/mint.rs",
+   "find": "        exp: i64::try_from(exp).unwrap_or(i64::MAX),",
+   "replace": "        exp: exp as i64,",
+   "expect_kills": [
+    "mint_room_token_saturates_a_huge_ttl_instead_of_going_negative"
+   ]
+  }
+ ]
+}

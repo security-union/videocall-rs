@@ -1,0 +1,239 @@
+{
+ "_comment": [
+  "Mutations of the scenario compiler's probe posture (#2914 PR-5):",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-scenario-posture.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_scenario.py"
+ ],
+ "baseline_tests": 39,
+ "mutations": [
+  {
+   "name": "probes default to client",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "budget = r.get(\"decode_budget\", \"off\")",
+   "replace": "budget = r.get(\"decode_budget\", \"client\")",
+   "expect_kills": [
+    "test_off_is_the_default_and_is_labelled"
+   ]
+  },
+  {
+   "name": "the waiver is not labelled",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    auto = [w for w, on in ((DECODE_BUDGET_WAIVER, any(r.get(\"decode_budget\") == \"off\" for r in roles)),",
+   "replace": "    auto = [w for w, on in ((DECODE_BUDGET_WAIVER, False),",
+   "expect_kills": [
+    "test_off_is_the_default_and_is_labelled"
+   ]
+  },
+  {
+   "name": "a declared waiver repeated",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "    return list(declared) + [w for w in auto if w not in declared]",
+   "replace": "    return list(declared) + auto",
+   "expect_kills": [
+    "test_a_declared_waiver_is_not_repeated",
+    "test_skip_paint_and_diag_packets_off_reach_the_probe_process_and_skip_paint_is_a_waiver"
+   ]
+  },
+  {
+   "name": "a Rust decode budget accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        for k in (k for k in PROBE_ONLY_KEYS if k in r):",
+   "replace": "        for k in ():",
+   "expect_kills": [
+    "test_bad_postures_are_refused",
+    "test_bad_paint_and_diag_postures_are_refused"
+   ]
+  },
+  {
+   "name": "any decode budget accepted",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if budget not in DECODE_BUDGETS:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_bad_postures_are_refused"
+   ]
+  },
+  {
+   "name": "the probe process loses its posture",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "                      \"decode_budget\": role[\"decode_budget\"], \"skip_canvas_paint\": role[\"skip_canvas_paint\"],",
+   "replace": "                      \"decode_budget\": \"client\", \"skip_canvas_paint\": role[\"skip_canvas_paint\"],",
+   "expect_kills": [
+    "test_off_is_the_default_and_is_labelled"
+   ]
+  },
+  {
+   "name": "skip paint is not a waiver",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "                            (SKIP_PAINT_WAIVER, any(r.get(\"skip_canvas_paint\") for r in roles)),",
+   "replace": "                            (SKIP_PAINT_WAIVER, False),",
+   "expect_kills": [
+    "test_skip_paint_and_diag_packets_off_reach_the_probe_process_and_skip_paint_is_a_waiver"
+   ]
+  },
+  {
+   "name": "skip paint dropped from the probe process",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "\"skip_canvas_paint\": role[\"skip_canvas_paint\"],",
+   "replace": "\"skip_canvas_paint\": False,",
+   "expect_kills": [
+    "test_skip_paint_and_diag_packets_off_reach_the_probe_process_and_skip_paint_is_a_waiver"
+   ]
+  },
+  {
+   "name": "diag packets dropped from the probe process",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "\"diag_packets\": role[\"diag_packets\"],",
+   "replace": "\"diag_packets\": \"default\",",
+   "expect_kills": [
+    "test_skip_paint_and_diag_packets_off_reach_the_probe_process_and_skip_paint_is_a_waiver"
+   ]
+  },
+  {
+   "name": "skip paint takes any value",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if not isinstance(skip, bool):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_bad_paint_and_diag_postures_are_refused"
+   ]
+  },
+  {
+   "name": "diag packets take any value",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if diag not in DIAG_PACKETS:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_bad_paint_and_diag_postures_are_refused"
+   ]
+  },
+  {
+   "name": "probes skip paint by default",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "skip = r.get(\"skip_canvas_paint\", False)",
+   "replace": "skip = r.get(\"skip_canvas_paint\", True)",
+   "expect_kills": [
+    "test_probes_paint_and_keep_diag_packets_by_default"
+   ]
+  },
+  {
+   "name": "probes turn diag packets off by default",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "diag = r.get(\"diag_packets\", \"default\")",
+   "replace": "diag = r.get(\"diag_packets\", \"off\")",
+   "expect_kills": [
+    "test_probes_paint_and_keep_diag_packets_by_default"
+   ]
+  },
+  {
+   "name": "a Rust role may skip paint",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "PROBE_ONLY_KEYS = (\"decode_budget\", \"skip_canvas_paint\", \"diag_packets\", \"speaking_glow\")",
+   "replace": "PROBE_ONLY_KEYS = (\"decode_budget\", \"diag_packets\", \"speaking_glow\")",
+   "expect_kills": [
+    "test_bad_paint_and_diag_postures_are_refused"
+   ]
+  },
+  {
+   "name": "bot diagnostics on is not a waiver",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "(BOT_DIAGNOSTICS_ON_WAIVER, bot_diagnostics == \"on\"),\n",
+   "replace": "(BOT_DIAGNOSTICS_ON_WAIVER, False),\n",
+   "expect_kills": [
+    "test_rust_bot_diagnostics_are_off_by_default_and_on_is_a_waiver"
+   ]
+  },
+  {
+   "name": "probe diag packets off is not a waiver",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "(PROBE_DIAG_PACKETS_OFF_WAIVER, any(r.get(\"diag_packets\") == \"off\" for r in roles))",
+   "replace": "(PROBE_DIAG_PACKETS_OFF_WAIVER, False)",
+   "expect_kills": [
+    "test_skip_paint_and_diag_packets_off_reach_the_probe_process_and_skip_paint_is_a_waiver"
+   ]
+  },
+  {
+   "name": "bot diagnostics take any value",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if run.get(\"bot_diagnostics\", BOT_DIAGNOSTICS_DEFAULT) not in ON_OFF:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_rust_bot_diagnostics_are_off_by_default_and_on_is_a_waiver"
+   ]
+  },
+  {
+   "name": "bot diagnostics dropped from the plan",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "\"bot_diagnostics\": bot_diagnostics,",
+   "replace": "\"bot_diagnostics\": \"off\",",
+   "expect_kills": [
+    "test_rust_bot_diagnostics_are_off_by_default_and_on_is_a_waiver"
+   ]
+  },
+  {
+   "name": "scenario bot diagnostics default back on",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "BOT_DIAGNOSTICS_DEFAULT = \"off\"\n",
+   "replace": "BOT_DIAGNOSTICS_DEFAULT = \"on\"\n",
+   "expect_kills": [
+    "test_rust_bot_diagnostics_are_off_by_default_and_on_is_a_waiver"
+   ]
+  },
+  {
+   "name": "speaking glow is not a waiver",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "(SPEAKING_GLOW_WAIVER, any(r.get(\"speaking_glow\") == \"off\" for r in roles)),",
+   "replace": "(SPEAKING_GLOW_WAIVER, False),",
+   "expect_kills": [
+    "test_speaking_glow_off_reaches_the_probe_process_and_is_a_waiver"
+   ]
+  },
+  {
+   "name": "speaking glow dropped from the probe process",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "\"speaking_glow\": role[\"speaking_glow\"]})",
+   "replace": "\"speaking_glow\": \"client\"})",
+   "expect_kills": [
+    "test_speaking_glow_off_reaches_the_probe_process_and_is_a_waiver"
+   ]
+  },
+  {
+   "name": "speaking glow takes any value",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if glow not in SPEAKING_GLOWS:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_speaking_glow_off_reaches_the_probe_process_and_is_a_waiver"
+   ]
+  },
+  {
+   "name": "probes turn the glow off by default",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "glow = r.get(\"speaking_glow\", \"client\")",
+   "replace": "glow = r.get(\"speaking_glow\", \"off\")",
+   "expect_kills": [
+    "test_speaking_glow_off_reaches_the_probe_process_and_is_a_waiver"
+   ]
+  },
+  {
+   "name": "a Rust role may set the glow",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "PROBE_ONLY_KEYS = (\"decode_budget\", \"skip_canvas_paint\", \"diag_packets\", \"speaking_glow\")",
+   "replace": "PROBE_ONLY_KEYS = (\"decode_budget\", \"skip_canvas_paint\", \"diag_packets\")",
+   "expect_kills": [
+    "test_speaking_glow_off_reaches_the_probe_process_and_is_a_waiver"
+   ]
+  }
+ ]
+}

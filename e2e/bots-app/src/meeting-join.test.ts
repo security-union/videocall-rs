@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 
 import {
   type ClickAttemptDiagnostics,
@@ -16,8 +16,14 @@ import {
   installClickDiagnostics,
   isSessionUserIdResponse,
   JOIN_MEDIA_ON,
+  JoinMediaNotAppliedError,
   type JoinMediaPage,
   joinMeetingAndEnableMedia,
+  MEDIA_CLICK_TIMEOUT_MS,
+  MEDIA_CONFIRM_MS,
+  MEDIA_CONTROL_WAIT_MS,
+  MEDIA_SETTLE_TIMEOUT_MS,
+  MEDIA_TOGGLE_ATTEMPTS,
   logPostClickDiagnostics,
   sessionUserIdFromBody,
   waitForJoinButton,
@@ -29,8 +35,9 @@ import {
   cameraControlSelector,
   micControlSelector,
   peerListControlSelector,
+  unavailableOffSelector,
 } from "./control-buttons";
-import { ParticipantRecorder } from "./run-record";
+import { UI_PROBE_TIME_LIMIT_MS } from "./time-limit";
 
 // #865 regression lock (the deterministic one). The end-to-end Playwright
 // spec (bot-join-flow.spec.ts) is smoke coverage of the real join flow but is
@@ -238,6 +245,92 @@ describe("ensureDisplayNameInMeeting", () => {
       (fakePage as unknown as { locator: ReturnType<typeof vi.fn> }).locator,
     ).not.toHaveBeenCalled();
   });
+
+  describe("on a renderer that never answers its untimed calls", () => {
+    afterEach(() => vi.useRealTimers());
+    const never = (): Promise<never> => new Promise(() => {});
+    const renamePage = (hang: { inputs: boolean; visibility: boolean }) => {
+      const loc: Record<string, unknown> = {
+        isVisible: hang.visibility ? never : async () => true,
+        click: async () => {},
+        fill: async () => {},
+        pressSequentially: async () => {},
+        textContent: async () => "Old (You)",
+        waitFor: async (o?: { state?: string }) => {
+          if (o?.state === "hidden") throw new Error("modal still open");
+        },
+      };
+      for (const k of ["filter", "first", "last", "locator", "getByRole"]) loc[k] = () => loc;
+      const move = vi.fn(hang.inputs ? never : async () => {});
+      const press = vi.fn(hang.inputs ? never : async () => {});
+      const page = {
+        locator: () => loc,
+        mouse: { move },
+        keyboard: { press },
+        waitForTimeout: async () => {},
+      } as unknown as Parameters<typeof ensureDisplayNameInMeeting>[0]["page"];
+      return { page, move, press };
+    };
+
+    it.each([
+      ["mouse and key inputs", { inputs: true, visibility: false }, 3],
+      ["visibility reads", { inputs: false, visibility: true }, 1],
+    ])("still finishes the rename when its %s never settle", async (_c, hang, moves) => {
+      vi.useFakeTimers();
+      const { page, move, press } = renamePage(hang);
+      let finished = false;
+      void ensureDisplayNameInMeeting({ page, participant: "alice", displayName: "New" }).then(
+        () => (finished = true),
+      );
+      await vi.advanceTimersByTimeAsync(6 * UI_PROBE_TIME_LIMIT_MS);
+      expect(finished).toBe(true);
+      expect(move.mock.calls.length + press.mock.calls.length).toBe(moves);
+    });
+  });
+
+  describe("on a renderer whose untimed calls reject", () => {
+    afterEach(() => vi.useRealTimers());
+    const gone = (): Promise<never> => Promise.reject(new Error("Target closed"));
+
+    it.each([
+      ["mouse moves", "move", 2, 1],
+      ["key presses", "press", 2, 1],
+      ["visibility reads", "isVisible", 1, 0],
+    ] as const)(
+      "still finishes the rename when its %s reject",
+      async (_c, fails, moves, presses) => {
+        vi.useFakeTimers();
+        const loc: Record<string, unknown> = {
+          isVisible: fails === "isVisible" ? gone : async () => true,
+          click: async () => {},
+          fill: async () => {},
+          pressSequentially: async () => {},
+          textContent: async () => "Old (You)",
+          waitFor: async (o?: { state?: string }) => {
+            if (o?.state === "hidden") throw new Error("modal still open");
+          },
+        };
+        for (const k of ["filter", "first", "last", "locator", "getByRole"]) loc[k] = () => loc;
+        const move = vi.fn(fails === "move" ? gone : async () => {});
+        const press = vi.fn(fails === "press" ? gone : async () => {});
+        const page = {
+          locator: () => loc,
+          mouse: { move },
+          keyboard: { press },
+          waitForTimeout: async () => {},
+        } as unknown as Parameters<typeof ensureDisplayNameInMeeting>[0]["page"];
+        const rename = ensureDisplayNameInMeeting({
+          page,
+          participant: "alice",
+          displayName: "New",
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(rename).resolves.toBeUndefined();
+        expect(move).toHaveBeenCalledTimes(moves);
+        expect(press).toHaveBeenCalledTimes(presses);
+      },
+    );
+  });
 });
 
 describe("MeetingNavigatedAwayError", () => {
@@ -360,9 +453,14 @@ function makeJoinHarness(initialState: JoinHarnessState): {
   const other = locator("other");
   const openPeers = locator("open-peers");
   const button = locator("button");
+  const media = mediaPage([MIC_UNMUTE_SELECTOR, cameraControlSelector("off")]).page;
   const page = {
     locator: vi.fn((selector: string) =>
-      selector === peerListControlSelector("off") ? openPeers : (locators.get(selector) ?? other),
+      selector === peerListControlSelector("off")
+        ? openPeers
+        : selector.includes("-toggle-button")
+          ? media.locator(selector)
+          : (locators.get(selector) ?? other),
     ),
     getByRole: vi.fn(() => button),
     on: vi.fn(),
@@ -380,8 +478,8 @@ function makeJoinHarness(initialState: JoinHarnessState): {
   };
 }
 
-/** The harness renders no mic/camera control, so the join cannot observe either. */
-const UNSEEN_MEDIA = { camera: null, mic: null };
+/** The harness renders both controls off, so the default join turns both on. */
+const JOINED_MEDIA = { camera: true, mic: true };
 
 const MIC_ON = micControlSelector("on");
 const CAM_ON = cameraControlSelector("on");
@@ -392,61 +490,126 @@ const TOGGLES = new Map([
   [CAM_ON, cameraControlSelector("off")],
 ]);
 
-/** A click swaps the medium's control as the product does, unless `stuck`. */
+interface BarOptions {
+  /** Virtual ms at which the controls first render. */
+  renderAtMs?: number;
+  /** Clicks that time out without landing, as on a CPU-starved renderer. */
+  failedClicks?: number;
+  /** Clicks that land and then still report a timeout. */
+  landedThenTimedOut?: number;
+  /** Virtual ms a click needs to become actionable; a shorter timeout never lands it. */
+  clickLatencyMs?: number;
+  /** No click ever flips the control. A landed click otherwise toggles it, as the product's button does. */
+  stuck?: boolean;
+  /** Virtual ms from a landed click to the control's label flip; per landing, the last repeating. */
+  flipAfterMs?: number | readonly number[];
+  /** Virtual ms after the first flip at which it reverts, as a failed encoder start does. */
+  revertFirstAfterMs?: number;
+}
+
+/**
+ * An action bar on a virtual clock: `waitForTimeout` and expiring `waitFor`/`click`
+ * timeouts advance it, and a landed click swaps the medium's control as the product does.
+ */
 function mediaPage(
-  visible: Set<string>,
-  stuck = false,
-  flipAfterMs = 0,
-): {
-  page: JoinMediaPage;
-  clicked: string[];
-} {
+  initial: readonly string[],
+  opts: BarOptions = {},
+): { page: JoinMediaPage; clicked: string[]; visible: Set<string>; now: () => number } {
+  let now = 0;
+  let failedClicks = opts.failedClicks ?? 0;
+  let landedThenTimedOut = opts.landedThenTimedOut ?? 0;
+  const visible = new Set<string>();
+  const pending: Array<{ at: number; apply: () => void }> = [];
+  const schedule = (at: number, apply: () => void): void => {
+    pending.push({ at, apply });
+    pending.sort((a, b) => a.at - b.at);
+  };
+  const tick = (): void => {
+    while (pending.length > 0 && pending[0].at <= now) pending.shift()?.apply();
+  };
+  const shows = (sel: string): boolean => {
+    tick();
+    return sel.split(", ").some((part) => visible.has(part));
+  };
+  /** Advances to the first moment `sel` shows within `timeout`, or throws at the deadline. */
+  const waitUntilShown = (sel: string, timeout: number, what: string): void => {
+    const deadline = now + timeout;
+    while (!shows(sel)) {
+      const next = pending[0];
+      if (next === undefined || next.at > deadline) {
+        now = deadline;
+        throw new Error(`locator.${what}: Timeout ${timeout}ms exceeded.`);
+      }
+      now = next.at;
+    }
+  };
+  schedule(opts.renderAtMs ?? 0, () => initial.forEach((sel) => visible.add(sel)));
   const clicked: string[] = [];
   const page = {
-    locator: vi.fn((sel: string) => ({
-      first: vi.fn().mockReturnThis(),
-      hover: vi.fn(async () => undefined),
-      isVisible: vi.fn(async () => visible.has(sel)),
-      click: vi.fn(async () => {
-        clicked.push(sel);
-        const next = TOGGLES.get(sel);
-        if (stuck || next === undefined) return;
-        const flip = (): void => {
-          visible.delete(sel);
-          visible.add(next);
-        };
-        if (flipAfterMs > 0) setTimeout(flip, flipAfterMs);
-        else flip();
-      }),
-      waitFor: vi.fn(async ({ timeout = 0 }: { timeout?: number } = {}) => {
-        if (stuck && !visible.has(sel)) throw new Error(`timeout waiting for ${sel}`);
-        const until = Date.now() + timeout;
-        while (!visible.has(sel)) {
-          if (Date.now() > until) throw new Error(`timeout waiting for ${sel}`);
-          await new Promise((r) => setTimeout(r, 5));
-        }
-      }),
-    })),
-    waitForTimeout: vi.fn(async () => undefined),
+    locator: vi.fn((sel: string) => {
+      const loc = {
+        first: () => loc,
+        hover: vi.fn(async () => undefined),
+        isVisible: vi.fn(async () => shows(sel)),
+        click: vi.fn(async ({ timeout = 0 }: { timeout?: number } = {}) => {
+          const latency = opts.clickLatencyMs ?? 0;
+          if (failedClicks > 0 || timeout < latency) {
+            failedClicks = Math.max(0, failedClicks - 1);
+            now += timeout;
+            throw new Error(`locator.click: Timeout ${timeout}ms exceeded.`);
+          }
+          waitUntilShown(sel, timeout - latency, "click");
+          now += latency;
+          clicked.push(sel);
+          const next = TOGGLES.get(sel);
+          if (opts.stuck || next === undefined) return;
+          const delays = [opts.flipAfterMs ?? 0].flat();
+          const flipAt = now + delays[Math.min(clicked.length - 1, delays.length - 1)];
+          schedule(flipAt, () => {
+            const [from, to] = visible.has(sel) ? [sel, next] : [next, sel];
+            visible.delete(from);
+            visible.add(to);
+          });
+          if (opts.revertFirstAfterMs !== undefined && clicked.length === 1) {
+            schedule(flipAt + opts.revertFirstAfterMs, () => {
+              visible.delete(next);
+              visible.add(sel);
+            });
+          }
+          if (landedThenTimedOut > 0) {
+            landedThenTimedOut--;
+            now += timeout;
+            throw new Error(`locator.click: Timeout ${timeout}ms exceeded.`);
+          }
+        }),
+        waitFor: vi.fn(async ({ timeout = 0 }: { timeout?: number } = {}) =>
+          waitUntilShown(sel, timeout, "waitFor"),
+        ),
+      };
+      return loc;
+    }),
+    waitForTimeout: vi.fn(async (ms: number) => {
+      now += ms;
+    }),
   };
-  return { page: page as unknown as JoinMediaPage, clicked };
+  return { page: page as unknown as JoinMediaPage, clicked, visible, now: () => now };
 }
 
 describe("enableJoinMedia (#2914)", () => {
   const MIC = MIC_UNMUTE_SELECTOR;
   const CAM = cameraButtonSelector(CAMERA_TOOLTIP.off);
-
   it("turns both on by default and reports them on", async () => {
-    const { page, clicked } = mediaPage(new Set([MIC, CAM]));
+    const { page, clicked, now } = mediaPage([MIC, CAM]);
     await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
       camera: true,
       mic: true,
     });
     expect(clicked).toEqual([MIC, CAM]);
+    expect(now()).toBe(2 * MEDIA_CONFIRM_MS);
   });
 
   it("leaves an opted-off medium untouched and reports it off only when its enable control shows", async () => {
-    const { page, clicked } = mediaPage(new Set([MIC, CAM]));
+    const { page, clicked } = mediaPage([MIC, CAM]);
     await expect(enableJoinMedia(page, "alice", { camera: false, mic: true })).resolves.toEqual({
       camera: false,
       mic: true,
@@ -455,7 +618,7 @@ describe("enableJoinMedia (#2914)", () => {
   });
 
   it("turns off a medium the product joined on when it was requested off (storage-state prefs)", async () => {
-    const { page, clicked } = mediaPage(new Set([MIC_ON, CAM_ON]));
+    const { page, clicked } = mediaPage([MIC_ON, CAM_ON]);
     await expect(enableJoinMedia(page, "alice", { camera: false, mic: false })).resolves.toEqual({
       camera: false,
       mic: false,
@@ -464,7 +627,7 @@ describe("enableJoinMedia (#2914)", () => {
   });
 
   it("waits for an async enable to flip the control before reading it back", async () => {
-    const { page, clicked } = mediaPage(new Set([MIC, CAM]), false, 50);
+    const { page, clicked } = mediaPage([MIC, CAM], { flipAfterMs: 50 });
     await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
       camera: true,
       mic: true,
@@ -472,57 +635,220 @@ describe("enableJoinMedia (#2914)", () => {
     expect(clicked).toEqual([MIC, CAM]);
   });
 
-  it("reports what the control reads after the click, and the record flags a mismatch", async () => {
-    const { page } = mediaPage(new Set([MIC_ON, CAM]), true);
-    const media = await enableJoinMedia(page, "alice", { camera: true, mic: false });
-    expect(media).toEqual({ camera: false, mic: true });
-    const rec = new ParticipantRecorder({
-      runDir: "/nonexistent",
-      role: null,
-      kernelNetem: undefined,
-      pod: {
-        ordinal: null,
-        node: null,
-        staggerMs: null,
-        staggerIncomplete: false,
-        imageRevision: "x",
-      },
-      write: () => {},
+  it("retries a click that timed out on a starved renderer until the camera reads on", async () => {
+    const { page, clicked, now } = mediaPage([MIC_ON, CAM], { failedClicks: 1 });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
     });
-    const t = {
-      botId: "b",
-      meetingURL: "https://example.test/meeting/R",
-      participant: "alice",
-      displayName: "alice",
-      headless: true,
-      authBackend: "storage-state" as const,
-      joinMedia: { camera: true, mic: false },
-    } as Parameters<ParticipantRecorder["register"]>[0];
-    rec.register(t);
-    rec.joined("b", 1_000, media, null);
-    expect(rec.snapshot("b")?.unverified).toEqual(
-      expect.arrayContaining([
-        { field: "publishes.camera", reason: "requested on at join but observed off" },
-        { field: "publishes.mic", reason: "requested off at join but observed on" },
-      ]),
-    );
+    expect(clicked).toEqual([CAM]);
+    expect(now()).toBeGreaterThanOrEqual(MEDIA_CLICK_TIMEOUT_MS);
   });
 
-  it("reports unknown, not off, when the control is not visible", async () => {
-    const { page, clicked } = mediaPage(new Set());
-    await expect(enableJoinMedia(page, "alice", { camera: false, mic: true })).resolves.toEqual({
-      camera: null,
-      mic: null,
+  it("accepts a click that lands on the last attempt", async () => {
+    const { page, clicked } = mediaPage([MIC_ON, CAM], {
+      failedClicks: MEDIA_TOGGLE_ATTEMPTS - 1,
+    });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([CAM]);
+  });
+
+  it("gives a control that is slow to become actionable the whole click budget", async () => {
+    const { page, clicked } = mediaPage([MIC_ON, CAM], { clickLatencyMs: 4_000 });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([CAM]);
+  });
+
+  it("never clicks an off-requested control that renders after the first wait", async () => {
+    const { page, clicked } = mediaPage([MIC, CAM], { renderAtMs: 12_000 });
+    await expect(enableJoinMedia(page, "alice", { camera: false, mic: false })).resolves.toEqual({
+      camera: false,
+      mic: false,
     });
     expect(clicked).toEqual([]);
   });
 
+  it("waits for controls that render late instead of reporting them unknown", async () => {
+    const { page, clicked } = mediaPage([MIC, CAM], { renderAtMs: 4_000 });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([MIC, CAM]);
+  });
+
+  it("does not click again when a landed click's label flips after the settle wait", async () => {
+    const flipAfterMs = MEDIA_SETTLE_TIMEOUT_MS + 1_500;
+    const { page, clicked } = mediaPage([MIC_ON, CAM], { flipAfterMs });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([CAM]);
+  });
+
+  it("clicks again when the camera reads on but its encoder start turns it back off", async () => {
+    const { page, clicked } = mediaPage([MIC_ON, CAM], { revertFirstAfterMs: 500 });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([CAM, CAM]);
+  });
+
+  it("does not click a landed click's control back while its label is still unflipped", async () => {
+    const { page, clicked } = mediaPage([MIC_ON, CAM], { flipAfterMs: 25_000 });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([CAM]);
+  });
+
+  it("fails with the observed state when the camera never takes", async () => {
+    const { page, clicked } = mediaPage([MIC_ON, CAM], { stuck: true });
+    const err = await enableJoinMedia(page, "alice", JOIN_MEDIA_ON).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(JoinMediaNotAppliedError);
+    expect(err).toMatchObject({ medium: "camera", requested: true, observed: false });
+    expect(String(err)).toContain("camera requested on but reads off");
+    expect(clicked).toEqual([CAM]);
+  });
+
+  it("backs off 1 s, then 2 s, between attempts", async () => {
+    const { page } = mediaPage([MIC_ON, CAM], { stuck: true });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).rejects.toBeInstanceOf(
+      JoinMediaNotAppliedError,
+    );
+    const waits = vi.mocked(page.waitForTimeout).mock.calls.map(([ms]) => ms);
+    const C = MEDIA_CONFIRM_MS;
+    expect(waits).toEqual([C, C, 1_000, C, 2_000, C]);
+  });
+
+  it("fails when a medium turned off by the bot stays on", async () => {
+    const { page } = mediaPage([MIC_ON, CAM], { stuck: true });
+    await expect(
+      enableJoinMedia(page, "alice", { camera: false, mic: false }),
+    ).rejects.toMatchObject({ medium: "microphone", requested: false, observed: true });
+  });
+
+  it("fails an on request whose control never renders", async () => {
+    const { page, clicked } = mediaPage([]);
+    await expect(
+      enableJoinMedia(page, "alice", { camera: false, mic: true }),
+    ).rejects.toMatchObject({ medium: "microphone", requested: true, observed: null });
+    expect(clicked).toEqual([]);
+  });
+
+  it("fails an off request whose control never renders, since replayed preferences can join it on", async () => {
+    const { page, clicked } = mediaPage([]);
+    await expect(
+      enableJoinMedia(page, "alice", { camera: false, mic: false }),
+    ).rejects.toMatchObject({ medium: "microphone", requested: false, observed: null });
+    expect(clicked).toEqual([]);
+  });
+
+  it("meets an off request on a device that is unavailable and off, without clicking it, and says so", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { page, clicked } = mediaPage([
+      unavailableOffSelector("mic"),
+      unavailableOffSelector("camera"),
+    ]);
+    await expect(enableJoinMedia(page, "alice", { camera: false, mic: false })).resolves.toEqual({
+      camera: false,
+      mic: false,
+    });
+    expect(clicked).toEqual([]);
+    const lines = warn.mock.calls.map((a) => a.join(" "));
+    warn.mockRestore();
+    expect(lines.filter((l) => l.includes("device is unavailable"))).toEqual([
+      "[alice] microphone off as requested, but its device is unavailable",
+      "[alice] camera off as requested, but its device is unavailable",
+    ]);
+  });
+
+  it("warns of an unavailable device only for the medium requested off", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { page } = mediaPage([unavailableOffSelector("mic"), CAM_ON]);
+    await expect(enableJoinMedia(page, "alice", { camera: true, mic: false })).resolves.toEqual({
+      camera: true,
+      mic: false,
+    });
+    const lines = warn.mock.calls.map((a) => a.join(" "));
+    warn.mockRestore();
+    expect(lines.filter((l) => l.includes("device is unavailable"))).toEqual([
+      "[alice] microphone off as requested, but its device is unavailable",
+    ]);
+  });
+
+  it("still fails an on request on an unavailable device", async () => {
+    const { page } = mediaPage([MIC_ON, unavailableOffSelector("camera")]);
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).rejects.toMatchObject({
+      medium: "camera",
+      requested: true,
+      observed: null,
+    });
+  });
+
+  it("waits out a click that timed out after landing instead of clicking it back", async () => {
+    const { page, clicked } = mediaPage([MIC_ON, CAM], {
+      landedThenTimedOut: 1,
+      flipAfterMs: MEDIA_CLICK_TIMEOUT_MS + 5_000,
+    });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    await page.waitForTimeout(2 * MEDIA_SETTLE_TIMEOUT_MS);
+    expect(clicked).toEqual([CAM]);
+    await expect(page.locator(CAM_ON).isVisible()).resolves.toBe(true);
+  });
+
+  it("outlasts a timed-out click given up on, so its late landing cannot undo a success", async () => {
+    const { page } = mediaPage([MIC_ON, CAM], {
+      landedThenTimedOut: 1,
+      flipAfterMs: [MEDIA_CLICK_TIMEOUT_MS + MEDIA_SETTLE_TIMEOUT_MS + 5_000, 0],
+    });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    await page.waitForTimeout(3 * MEDIA_SETTLE_TIMEOUT_MS);
+    await expect(page.locator(CAM_ON).isVisible()).resolves.toBe(true);
+  });
+
+  it("clicks again after an on that appeared during a backoff reverted", async () => {
+    const { page, clicked } = mediaPage([MIC_ON, CAM], {
+      flipAfterMs: [11_500, 0],
+      revertFirstAfterMs: 600,
+    });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).resolves.toEqual({
+      camera: true,
+      mic: true,
+    });
+    expect(clicked).toEqual([CAM, CAM]);
+  });
+
+  it("confirms an on that appeared during a backoff, and fails when it reverts", async () => {
+    const { page } = mediaPage([MIC_ON, CAM], { flipAfterMs: 11_500, revertFirstAfterMs: 600 });
+    await expect(enableJoinMedia(page, "alice", JOIN_MEDIA_ON)).rejects.toMatchObject({
+      medium: "camera",
+      requested: true,
+      observed: false,
+    });
+  });
+
   it("is what joinMeetingAndEnableMedia runs with its media argument", async () => {
     const { page } = makeJoinHarness("button");
-    const { page: controls, clicked } = mediaPage(new Set([MIC, CAM]));
+    const { page: controls, clicked } = mediaPage([MIC, CAM]);
     const base = page.locator.bind(page);
     (page as unknown as { locator: (s: string) => unknown }).locator = (s: string) =>
-      s === MIC || s === CAM ? controls.locator(s) : base(s);
+      s.includes("-toggle-button") ? controls.locator(s) : base(s);
     await expect(
       joinMeetingAndEnableMedia({
         page,
@@ -557,7 +883,7 @@ describe("joinMeetingAndEnableMedia state machine", () => {
       }),
     ]);
 
-    await expect(boundedJoin).resolves.toEqual(UNSEEN_MEDIA);
+    await expect(boundedJoin).resolves.toEqual(JOINED_MEDIA);
     expect(promptFill).toHaveBeenCalledWith("Alice", {
       delay: 30,
       timeout: 5_000,
@@ -575,7 +901,7 @@ describe("joinMeetingAndEnableMedia state machine", () => {
         setTimeout(() => reject(new Error("auto-join did not resolve")), 500);
       }),
     ]);
-    await expect(boundedJoin).resolves.toEqual(UNSEEN_MEDIA);
+    await expect(boundedJoin).resolves.toEqual(JOINED_MEDIA);
 
     const requested = (page.locator as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
       (c) => c[0],
@@ -620,9 +946,42 @@ describe("joinMeetingAndEnableMedia state machine", () => {
     );
   });
 
+  it("reports a hang-up during the media toggle as a navigation, not a media failure", async () => {
+    const { page } = makeJoinHarness("button");
+    const { page: controls, now } = mediaPage([]);
+    const base = page.locator.bind(page);
+    const on = page.on as unknown as { mock: { calls: Array<[string, (f: unknown) => void]> } };
+    (page as unknown as { locator: (s: string) => unknown }).locator = (s: string) => {
+      if (!s.includes("-toggle-button")) return base(s);
+      const navigate = on.mock.calls.find(([ev]) => ev === "framenavigated")?.[1];
+      navigate?.({ parentFrame: () => null, url: () => "https://example.test/" });
+      return controls.locator(s);
+    };
+    await expect(joinMeetingAndEnableMedia({ page, ...args })).rejects.toBeInstanceOf(
+      MeetingNavigatedAwayError,
+    );
+    expect(now()).toBeLessThan(2 * MEDIA_CONTROL_WAIT_MS);
+  });
+
+  it("stops the media retries once the launch is aborted", async () => {
+    const { page } = makeJoinHarness("button");
+    const { page: controls, now } = mediaPage([]);
+    const abort = new AbortController();
+    const base = page.locator.bind(page);
+    (page as unknown as { locator: (s: string) => unknown }).locator = (s: string) => {
+      if (!s.includes("-toggle-button")) return base(s);
+      abort.abort();
+      return controls.locator(s);
+    };
+    await expect(
+      joinMeetingAndEnableMedia({ page, ...args, signal: abort.signal }),
+    ).rejects.toBeInstanceOf(JoinMediaNotAppliedError);
+    expect(now()).toBeLessThan(2 * MEDIA_CONTROL_WAIT_MS);
+  });
+
   it("clicks the normal Join button and succeeds when the grid follows", async () => {
     const { page, joinClick } = makeJoinHarness("button");
-    await expect(joinMeetingAndEnableMedia({ page, ...args })).resolves.toEqual(UNSEEN_MEDIA);
+    await expect(joinMeetingAndEnableMedia({ page, ...args })).resolves.toEqual(JOINED_MEDIA);
     expect(joinClick).toHaveBeenCalledTimes(1);
     expect(joinClick).toHaveBeenCalledWith({ timeout: 5_000 });
   });
@@ -922,6 +1281,27 @@ function fakeResponse(url: string, status: number): { url: () => string; status:
   return { url: () => url, status: () => status };
 }
 
+describe("joinMeetingAndEnableMedia onInMeeting", () => {
+  it("calls onInMeeting once the grid is visible, before the rename and media steps", async () => {
+    const { page } = makeJoinHarness("prompt");
+    const asked = (page.locator as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    const seenAtHook: unknown[][] = [];
+    await joinMeetingAndEnableMedia({
+      page,
+      participant: "alice",
+      meetingId: "TestRoom",
+      displayName: "Alice",
+      onInMeeting: async () => void seenAtHook.push(...asked.map((c) => [...c])),
+    });
+    const selectors = (calls: unknown[][]): unknown[] => calls.map((c) => c[0]);
+    expect(selectors(seenAtHook)).toContain("#grid-container");
+    for (const later of [peerListControlSelector("off"), MIC_UNMUTE_SELECTOR]) {
+      expect(selectors(seenAtHook)).not.toContain(later);
+      expect(selectors(asked)).toContain(later);
+    }
+  });
+});
+
 describe("installClickDiagnostics", () => {
   it('captures console.error events of type "error" into diag.consoleErrors', () => {
     const page = makeFakePage("https://example.com/meeting/Foo");
@@ -1209,4 +1589,155 @@ describe("logPostClickDiagnostics", () => {
 
     expect(logs.some((l) => l.includes("meeting-api join request failed"))).toBe(false);
   });
+});
+
+describe("a stalled renderer cannot hang the join's UI probes", () => {
+  const NEVER = (): Promise<never> => new Promise<never>(() => {});
+  const PENDING = Symbol("pending");
+  let quiet: ReturnType<typeof vi.spyOn>[];
+  beforeEach(() => {
+    vi.useFakeTimers();
+    quiet = [
+      vi.spyOn(console, "log").mockImplementation(() => {}),
+      vi.spyOn(console, "warn").mockImplementation(() => {}),
+    ];
+  });
+  afterEach(() => {
+    for (const spy of quiet) spy.mockRestore();
+    vi.useRealTimers();
+  });
+  const timeoutWarnings = (): string[] =>
+    (quiet[1].mock.calls as unknown[][])
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes("did not settle"));
+  async function after(work: Promise<unknown>, ms: number): Promise<unknown> {
+    const settled = work.then(
+      (v) => v,
+      (e: unknown) => e,
+    );
+    await vi.advanceTimersByTimeAsync(ms);
+    return Promise.race([settled, Promise.resolve(PENDING)]);
+  }
+  function stubPage(
+    isVisible: (sel: string) => Promise<boolean>,
+    mouseMove = vi.fn(async () => {}),
+  ) {
+    const click = vi.fn(async () => {});
+    const page = {
+      locator: vi.fn((sel: string) => {
+        const l = {
+          first: () => l,
+          hover: vi.fn(async () => {}),
+          isVisible: () => isVisible(sel),
+          click,
+          waitFor: vi.fn(async () => {
+            throw new Error("not visible");
+          }),
+        };
+        return l;
+      }),
+      waitForTimeout: vi.fn(async () => {}),
+      mouse: { move: mouseMove },
+    };
+    return { page, click };
+  }
+
+  it("enableJoinMedia fails as unknown media once each probe's limit passes", async () => {
+    const { page, click } = stubPage(NEVER);
+    const probes = 2 * MEDIA_TOGGLE_ATTEMPTS;
+    const out = await after(
+      enableJoinMedia(page as unknown as JoinMediaPage, "alice", JOIN_MEDIA_ON),
+      probes * UI_PROBE_TIME_LIMIT_MS,
+    );
+    expect(out).toBeInstanceOf(JoinMediaNotAppliedError);
+    expect(out).toMatchObject({ medium: "microphone", requested: true, observed: null });
+    expect(click).not.toHaveBeenCalled();
+    expect(timeoutWarnings()).toHaveLength(probes);
+  });
+
+  it("enableJoinMedia does not click a control whose state probe stalled", async () => {
+    const { page, click } = stubPage(async (sel) =>
+      sel === MIC_UNMUTE_SELECTOR ? NEVER() : false,
+    );
+    const out = await after(
+      enableJoinMedia(page as unknown as JoinMediaPage, "alice", { camera: false, mic: true }),
+      MEDIA_TOGGLE_ATTEMPTS * UI_PROBE_TIME_LIMIT_MS,
+    );
+    expect(out).toMatchObject({ medium: "microphone", requested: true, observed: null });
+    expect(click).not.toHaveBeenCalled();
+    expect(timeoutWarnings()).toEqual(
+      Array(MEDIA_TOGGLE_ATTEMPTS).fill(expect.stringContaining(MIC_UNMUTE_SELECTOR)),
+    );
+  });
+
+  it("ensureWaitingRoomOff moves on when the toggle probe stalls", async () => {
+    const toggle = { first: () => toggle, isVisible: NEVER, getAttribute: vi.fn() };
+    const row = { locator: () => toggle, filter: () => row };
+    const out = await after(
+      ensureWaitingRoomOff({ locator: () => row } as never, "bot-1"),
+      UI_PROBE_TIME_LIMIT_MS,
+    );
+    expect(out).toBeUndefined();
+    expect(toggle.getAttribute).not.toHaveBeenCalled();
+    expect(timeoutWarnings()).toHaveLength(1);
+  });
+
+  it.each([
+    [
+      "ensureDisplayNameInMeeting",
+      (page: never) =>
+        ensureDisplayNameInMeeting({ page, participant: "alice", displayName: "Alice Bot" }),
+    ],
+    ["closePeerList", (page: never) => closePeerList(page, "alice")],
+  ] as const)("%s moves on when the mouse nudge stalls", async (_what, run) => {
+    const { page } = stubPage(async () => false, vi.fn(NEVER));
+    expect(await after(run(page as never), UI_PROBE_TIME_LIMIT_MS)).toBeUndefined();
+  });
+
+  function renamePage(failAt: "save" | "open") {
+    const press = vi.fn(NEVER);
+    const stub = (path: string): Record<string, unknown> => {
+      const self: Record<string, unknown> = {
+        first: () => self,
+        last: () => self,
+        filter: () => self,
+        locator: (sel: string) => stub(`${path} ${sel}`),
+        getByRole: (_role: string, o?: { name?: string }) => stub(`${path} role=${o?.name}`),
+        isVisible: async () => true,
+        click: async () => {},
+        textContent: async () => "Old Name (You)",
+        fill: async () => {},
+        pressSequentially: async () => {},
+        waitFor: async (o?: { state?: string }) => {
+          if (!path.includes("input.input-apple")) return;
+          if (o?.state === "hidden" || failAt === "open") throw new Error("modal stuck");
+        },
+      };
+      return self;
+    };
+    const page = {
+      locator: (sel: string) => stub(sel),
+      mouse: { move: async () => {} },
+      keyboard: { press },
+      waitForTimeout: async () => {},
+    };
+    return { page, press };
+  }
+
+  it.each(["save", "open"] as const)(
+    "ensureDisplayNameInMeeting moves on when the Escape after a stuck rename modal (%s) stalls",
+    async (failAt) => {
+      const { page, press } = renamePage(failAt);
+      const out = await after(
+        ensureDisplayNameInMeeting({
+          page: page as never,
+          participant: "alice",
+          displayName: "Alice Bot",
+        }),
+        UI_PROBE_TIME_LIMIT_MS,
+      );
+      expect(out).toBeUndefined();
+      expect(press).toHaveBeenCalledExactlyOnceWith("Escape");
+    },
+  );
 });

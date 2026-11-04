@@ -11,6 +11,8 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 use videocall_client::VideoCallClient;
 
+use crate::components::action_bar_layout::{ActionBarSlot, ShrunkButtons};
+
 /// Per-tile crop state: canvas ID → is-cropped.
 /// Survives re-renders caused by peer list changes so crop toggles persist.
 #[derive(Clone, Copy)]
@@ -52,9 +54,7 @@ impl Default for ScreenZoomState {
 pub struct ScreenZoomCtx(pub Signal<std::collections::HashMap<String, ScreenZoomState>>);
 
 /// Issue 1175: the single peer whose shared content is currently detached into
-/// a separate window, or `None`. One-at-a-time by design (the Document
-/// Picture-in-Picture API allows only one window; the `window.open` fallback
-/// keeps the same invariant). The key is a peer session id, or
+/// a separate window, or `None`. One-at-a-time by design. The key is a peer session id, or
 /// `share_view::OWN_SHARE_KEY` for the local share (issue 2792). The detached
 /// tile moves OFF-SCREEN (and `inert`) while its canvas stays mounted,
 /// composited, and painting so the detached-window mirror keeps flowing and
@@ -99,12 +99,23 @@ pub struct DockPositionCtx(pub Signal<DockPosition>);
 #[derive(Clone, Copy)]
 pub struct AutohideCtx(pub Signal<bool>);
 
+#[derive(Clone, Copy)]
+pub struct AutoshrinkCtx(pub Signal<bool>);
+
+#[derive(Clone, Copy)]
+pub struct ShrunkButtonsCtx(pub Signal<ShrunkButtons>);
+
+/// The action-bar slots this user can see, in bar order.
+#[derive(Clone, Copy)]
+pub struct ShrinkChoicesCtx(pub Signal<Vec<ActionBarSlot>>);
+
 // ---------------------------------------------------------------------------
 // Dock position & autohide persistence
 // ---------------------------------------------------------------------------
 
 const DOCK_POSITION_KEY: &str = "vc_dock_position";
 const DOCK_AUTOHIDE_KEY: &str = "vc_dock_autohide";
+const DOCK_AUTOSHRINK_KEY: &str = "vc_dock_autoshrink";
 
 /// Load dock position from localStorage. Defaults to Bottom.
 pub fn load_dock_position() -> DockPosition {
@@ -138,6 +149,34 @@ pub fn load_dock_autohide() -> bool {
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten());
     resolve_dock_autohide(stored.as_deref())
+}
+
+pub fn resolve_dock_autoshrink(stored_shrink: Option<&str>, stored_autohide: Option<&str>) -> bool {
+    match stored_shrink {
+        Some(v) => v != "false",
+        None => resolve_dock_autohide(stored_autohide),
+    }
+}
+
+/// Load dock auto-shrink, persisting the first resolved value so inheriting
+/// from auto-hide happens once.
+pub fn load_dock_autoshrink() -> bool {
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return false;
+    };
+    let stored = storage.get_item(DOCK_AUTOSHRINK_KEY).ok().flatten();
+    let autohide = storage.get_item(DOCK_AUTOHIDE_KEY).ok().flatten();
+    let enabled = resolve_dock_autoshrink(stored.as_deref(), autohide.as_deref());
+    if stored.is_none() {
+        save_dock_autoshrink(enabled);
+    }
+    enabled
+}
+
+pub fn save_dock_autoshrink(enabled: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(DOCK_AUTOSHRINK_KEY, if enabled { "true" } else { "false" });
+    }
 }
 
 /// Persist dock position to localStorage.
@@ -939,6 +978,11 @@ pub struct HostSetCtx(pub Signal<std::collections::HashSet<String>>);
 #[derive(Clone, Copy)]
 pub struct HostRefreshNonceCtx(pub Signal<u64>);
 
+/// Re-runs the page's join flow from the start, so a client whose room token
+/// was superseded goes back through admission (#3287).
+#[derive(Clone, Copy)]
+pub struct MeetingRejoinCtx(pub Callback<()>);
+
 impl HostSetCtx {
     /// Whether `user_id` is currently a host.
     pub fn is_host(&self, user_id: &str) -> bool {
@@ -1536,6 +1580,7 @@ pub struct TransportPreferenceCtx(pub Signal<TransportPreference>);
 const TRANSPORT_PREF_KEY: &str = "vc_transport_preference";
 const TRANSPORT_STICKY_KEY: &str = "vc_transport_sticky";
 const TRANSPORT_SESSION_KEY: &str = "vc_transport_session";
+const TRANSPORT_FALLBACK_KEY: &str = "vc_transport_fallback";
 
 /// `None`, empty or unrecognised yields the compiled default.
 pub fn resolve_default_transport(config_value: Option<&str>) -> TransportPreference {
@@ -1744,6 +1789,29 @@ pub fn save_transport_preference_session(pref: TransportPreference) {
     }
 }
 
+/// Whether a join in this tab fell back from `pref`.
+pub fn load_transport_fallback(pref: TransportPreference) -> bool {
+    web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(TRANSPORT_FALLBACK_KEY).ok().flatten())
+        .is_some_and(|raw| raw == pref.to_string())
+}
+
+/// The client's `on_fallback_memory`.
+pub fn fallback_memory_callback(pref: TransportPreference) -> videocall_client::Callback<bool> {
+    videocall_client::Callback::from(move |fell_back| save_transport_fallback(pref, fell_back))
+}
+
+pub fn save_transport_fallback(pref: TransportPreference, fell_back: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = if fell_back {
+            storage.set_item(TRANSPORT_FALLBACK_KEY, &pref.to_string())
+        } else {
+            storage.remove_item(TRANSPORT_FALLBACK_KEY)
+        };
+    }
+}
+
 /// Read whether the user has opted to remember the transport choice.
 pub fn load_transport_sticky() -> bool {
     web_sys::window()
@@ -1776,33 +1844,19 @@ pub fn clear_transport_sticky_and_pref() {
     }
 }
 
-/// Resolve effective transport configuration from the user's preference and
-/// the server-provided WebTransport flag.
-///
-/// Returns `(enable_webtransport, websocket_urls, webtransport_urls)`.
-///
-/// **WebTransport-with-WS-fallback**: BOTH URL lists are
-/// returned. The connection manager creates candidates for every URL and runs
-/// an election
-/// — if any WebTransport candidate completes its handshake it wins, but if
-/// every WT candidate fails (browser support missing, UDP blocked, server
-/// rejected the handshake) the WS candidates become the only ones that can
-/// be elected and the client automatically uses WebSocket. The fallback is
-/// thus structural, not a separate retry: see
-/// `videocall-client/src/connection/connection_manager.rs::create_all_connections`.
-///
-/// `WebSocket` forces a single-transport configuration with the WT list
-/// emptied, and so does a `server_wt_enabled = false` deployment.
+/// Resolve `(enable_webtransport, websocket_urls, webtransport_urls)` from the
+/// server-provided WebTransport flag. Both lists are kept whatever the user's
+/// preference: the client dials the preferred protocol first and the other one
+/// as its fallback.
 pub fn resolve_transport_config(
-    pref: TransportPreference,
     server_wt_enabled: bool,
     ws_urls: Vec<String>,
     wt_urls: Vec<String>,
 ) -> (bool, Vec<String>, Vec<String>) {
-    match pref {
-        TransportPreference::WebTransport if server_wt_enabled => (true, ws_urls, wt_urls),
-        TransportPreference::WebTransport => (false, ws_urls, vec![]),
-        TransportPreference::WebSocket => (false, ws_urls, vec![]),
+    if server_wt_enabled {
+        (true, ws_urls, wt_urls)
+    } else {
+        (false, ws_urls, vec![])
     }
 }
 
@@ -1816,8 +1870,8 @@ pub fn wt_would_be_attempted(
         .filter(|h| !h.trim().is_empty())
         .map(str::to_string)
         .collect();
-    let (enabled, _, wt_urls) = resolve_transport_config(pref, server_wt_enabled, vec![], hosts);
-    enabled && !wt_urls.is_empty()
+    let (enabled, _, wt_urls) = resolve_transport_config(server_wt_enabled, vec![], hosts);
+    pref == TransportPreference::WebTransport && enabled && !wt_urls.is_empty()
 }
 
 /// From `ready` until unmount, when a join would try WT, hold a spare-worker lease and
@@ -2260,6 +2314,25 @@ mod tests {
         assert!(!resolve_dock_autohide(Some("false")));
     }
 
+    #[test]
+    fn resolve_dock_autoshrink_defaults_to_off() {
+        assert!(!resolve_dock_autoshrink(None, None));
+        assert!(!resolve_dock_autoshrink(None, Some("false")));
+    }
+
+    #[test]
+    fn resolve_dock_autoshrink_inherits_auto_hide_only_while_unset() {
+        assert!(resolve_dock_autoshrink(None, Some("true")));
+        assert!(!resolve_dock_autoshrink(Some("false"), Some("true")));
+    }
+
+    #[test]
+    fn resolve_dock_autoshrink_honors_its_own_stored_value() {
+        assert!(resolve_dock_autoshrink(Some("true"), None));
+        assert!(resolve_dock_autoshrink(Some("true"), Some("false")));
+        assert!(!resolve_dock_autoshrink(Some("false"), None));
+    }
+
     // -----------------------------------------------------------------------
     // Pre-join device preference helpers (issue #959)
     // -----------------------------------------------------------------------
@@ -2374,56 +2447,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_transport_config_default_pref_advertises_both_lists() {
+    fn resolve_transport_config_keeps_both_lists_when_the_server_offers_webtransport() {
         let ws = vec!["ws://a:8080".to_string(), "ws://b:8080".to_string()];
         let wt = vec!["https://a:4433".to_string()];
-        let (enable_wt, ws_out, wt_out) =
-            resolve_transport_config(TransportPreference::default(), true, ws.clone(), wt.clone());
-        assert!(
-            enable_wt,
-            "default (WebTransport) must honour the server's WebTransport flag"
-        );
-        assert_eq!(ws_out, ws, "default must keep the WebSocket fallback URLs");
-        assert_eq!(
-            wt_out, wt,
-            "default (WebTransport) must surface the WebTransport candidates"
-        );
-    }
-
-    #[test]
-    fn resolve_transport_config_explicit_websocket_unchanged_by_flip() {
-        let ws = vec!["ws://a:8080".to_string()];
-        let wt = vec!["https://a:4433".to_string(), "https://b:4433".to_string()];
-        let (enable_wt, ws_out, wt_out) =
-            resolve_transport_config(TransportPreference::WebSocket, true, ws.clone(), wt);
-        assert!(
-            !enable_wt,
-            "explicit WebSocket forces enable_webtransport = false"
-        );
-        assert_eq!(ws_out, ws, "explicit WebSocket keeps the WS list");
-        assert!(
-            wt_out.is_empty(),
-            "explicit WebSocket must surface an empty WebTransport candidate list"
-        );
+        let (enable_wt, ws_out, wt_out) = resolve_transport_config(true, ws.clone(), wt.clone());
+        assert!(enable_wt);
+        assert_eq!(ws_out, ws);
+        assert_eq!(wt_out, wt);
     }
 
     #[test]
     fn server_disabled_webtransport_empties_the_candidate_list() {
         let ws = vec!["ws://a:8080".to_string()];
         let wt = vec!["https://a:4433".to_string()];
-        for pref in [
-            TransportPreference::WebTransport,
-            TransportPreference::WebSocket,
-        ] {
-            let (enable_wt, ws_out, wt_out) =
-                resolve_transport_config(pref, false, ws.clone(), wt.clone());
-            assert!(!enable_wt, "server flag off must disable WebTransport");
-            assert_eq!(ws_out, ws, "the WebSocket list survives either way");
-            assert!(
-                wt_out.is_empty(),
-                "a server-disabled deployment must surface NO WebTransport candidate for {pref}"
-            );
-        }
+        let (enable_wt, ws_out, wt_out) = resolve_transport_config(false, ws.clone(), wt);
+        assert!(!enable_wt, "server flag off must disable WebTransport");
+        assert_eq!(ws_out, ws);
+        assert!(wt_out.is_empty());
     }
 
     #[test]

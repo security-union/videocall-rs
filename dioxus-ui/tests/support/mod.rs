@@ -160,6 +160,24 @@ pub fn inject_app_config_oauth_enabled() {
     inject_app_config_with_oauth_enabled(true);
 }
 
+pub fn inject_app_config_pkce(token_url: &str) {
+    inject_app_config_with_oauth_enabled(true);
+    let window = gloo_utils::window();
+    let config = js_sys::Reflect::get(&window, &"__APP_CONFIG".into()).unwrap();
+    let next = js_sys::Object::assign(&js_sys::Object::new(), &config.into());
+    let pkce = [
+        ("oauthFlow", "pkce"),
+        ("oauthClientId", "videocall-test-client"),
+        ("oauthTokenUrl", token_url),
+    ];
+    for (key, value) in pkce {
+        js_sys::Reflect::set(&next, &key.into(), &value.into()).unwrap();
+    }
+    let frozen = js_sys::Object::freeze(&next);
+    js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+    dioxus_ui::constants::reset_config_cache_for_test();
+}
+
 /// Inject a `window.__APP_CONFIG` with the `transportBadgeEnabled` deploy flag
 /// ON, so a test can reach the tile transport badge at all.
 pub fn inject_app_config_transport_badge_on() {

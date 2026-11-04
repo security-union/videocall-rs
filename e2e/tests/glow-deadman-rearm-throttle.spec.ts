@@ -124,11 +124,11 @@ const OBSERVE_MS = 15_000;
  */
 const ARM_BUDGET = Math.ceil(OBSERVE_MS / GLOW_DEADMAN_REARM_THROTTLE_MS) + 2;
 
-/**
- * The absolute non-vacuity floor on level updates: 2 per second across the
- * window.
- */
-const MIN_STYLE_WRITES = Math.round((2 * OBSERVE_MS) / 1_000);
+/** An un-fixed build arms at least once per write, so this many writes overrun the budget. */
+const MIN_STYLE_WRITES = ARM_BUDGET + 1;
+
+/** Window-boundary arms, as in [`ARM_BUDGET`]. */
+const ARM_BOUNDARY_SLACK = 2;
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const AUDIO_CONSTANTS_RS = "videocall-client/src/audio_constants.rs";
@@ -201,8 +201,9 @@ const RENDER_CHAIN = [
   `  14 + ${BLUR_PX_PER_LEVEL.toFixed(1)} * level, quantised to whole px by {:.0}`,
 ].join("\n");
 
-const MIN_RENDERED_STYLES = 30;
 const MIN_NONZERO_STEPS = 20;
+/** Each step is the difference of two consecutive rendered styles. */
+const MIN_RENDERED_STYLES = MIN_NONZERO_STEPS + 1;
 const MIN_PEAK_BLUR_PX = 45;
 
 // PLAIN text, not JSON: `context.rs::load_appearance_settings_from_storage` reads
@@ -625,9 +626,9 @@ test.describe("Speaking-glow deadman re-arm throttle", () => {
           `about the event rate a machine achieves: the signal is only ever fed values the ` +
           `decoder emitted (peer_tile.rs::apply_resolved_level), and 2289's UI gate (0.04) is ` +
           `WIDER than the codec-side AUDIO_LEVEL_DELTA_THRESHOLD (0.02), so writes are a subset ` +
-          `of qualifying events and the un-fixed build has arms >= styleWrites. At most ` +
-          `${2 * ARM_BUDGET} writes are required (2 * ARM_BUDGET)`,
-      ).toBeGreaterThanOrEqual(2 * arms.length);
+          `of qualifying events and the un-fixed build has arms >= styleWrites. Writes must ` +
+          `exceed arms by more than the ${ARM_BOUNDARY_SLACK} window-boundary arms`,
+      ).toBeGreaterThan(arms.length + ARM_BOUNDARY_SLACK);
 
       expect(
         classifyGlow((await tile.getAttribute("style")) || ""),

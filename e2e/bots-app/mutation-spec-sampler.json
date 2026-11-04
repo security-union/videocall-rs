@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "Mutations of the resource sampler's command-line match (#2914), each naming the vitest case that must catch it:",
+    "  scripts/mutation-check.py run e2e/bots-app/mutation-spec-sampler.json"
+  ],
+  "runner": "vitest",
+  "cwd": "e2e",
+  "command": ["npx", "vitest", "run", "bots-app/src/resource/sampler.test.ts"],
+  "baseline_tests": 4,
+  "mutations": [
+    {
+      "name": "a command-line match keeps its own comm",
+      "file": "e2e/bots-app/scripts/resource-sampler.sh",
+      "find": "      comm=\"$CMDLINE_NAME\"\n",
+      "replace": "      :\n",
+      "expect_kills": ["samples a process whose command line matches, under the given name"]
+    },
+    {
+      "name": "a command-line match is not sampled",
+      "file": "e2e/bots-app/scripts/resource-sampler.sh",
+      "find": "[ \"$comm\" = \"$CMDLINE_NAME\" ] || ",
+      "replace": "",
+      "expect_kills": ["samples a process whose command line matches, under the given name"]
+    },
+    {
+      "name": "the command-line match reads argv[0] only",
+      "file": "e2e/bots-app/scripts/resource-sampler.sh",
+      "find": "[[ \"${args[*]-}\" =~ $CMDLINE_GREP ]]",
+      "replace": "[[ \"${args[0]-}\" =~ $CMDLINE_GREP ]]",
+      "expect_kills": ["samples a process whose command line matches, under the given name"]
+    }
+  ]
+}

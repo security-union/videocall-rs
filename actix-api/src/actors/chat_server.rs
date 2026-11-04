@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::instance_registry::InstanceRegistry;
 use crate::kick_denylist::{issued_through, KickDenylist, KickRevocation};
 use crate::{
     constants::{
@@ -37,6 +38,9 @@ use crate::{
     models::build_subject_and_queue,
     session_manager::SessionManager,
 };
+use videocall_meeting_types::instance::{
+    MeetingInstanceStartedPayload, MEETING_INSTANCE_STARTED_SUBJECT,
+};
 use videocall_meeting_types::kick::{ParticipantKickedPayload, PARTICIPANT_KICKED_SUBJECT};
 
 use actix::{
@@ -55,11 +59,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::actors::packet_handler::stamp_wrapper_for_broadcast;
+use crate::actors::packet_handler::{keyframe_request_target, stamp_wrapper_for_broadcast};
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_CONGESTION_FILTERED_TOTAL, RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
     RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_INNER_SESSION_SELF_FILTERED_TOTAL,
+    RELAY_INSTANCE_REGISTRY_EVICTIONS_TOTAL, RELAY_JOIN_INSTANCE_UNCHECKED_TOTAL,
+    RELAY_JOIN_STALE_INSTANCE_REFUSED_TOTAL, RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL,
     RELAY_KICK_DENYLIST_EVICTIONS_TOTAL, RELAY_KICK_ENFORCEMENTS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
     RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
@@ -82,7 +88,9 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::validation::validate_display_name;
 use videocall_types::SYSTEM_USER_ID;
 
-use super::session_logic::{ConnectionState, SessionId, JOIN_REFUSED_KICKED};
+use super::session_logic::{
+    ConnectionState, SessionId, JOIN_REFUSED_KICKED, JOIN_REFUSED_STALE_INSTANCE,
+};
 
 /// Internal message sent via `notify_later` after the reconnection grace period
 /// expires. If the user has not reconnected by the time this message is handled,
@@ -150,8 +158,8 @@ const PARTICIPANT_PRESENT_SUBJECT: &str = "internal.participant_present";
 /// became present or left (issue #2702). Every report goes through the single
 /// ordered publisher (`ChatServer::presence_tx`), so a session's PRESENT always
 /// precedes its LEFT on the wire. When the session a relay last reported for a
-/// user departs while another of that user's local sessions remains, the relay
-/// reports the remaining session PRESENT instead of a LEFT.
+/// user departs while another of that user's local sessions is Active, the relay
+/// reports that session PRESENT instead of a LEFT.
 const PARTICIPANT_PRESENCE_SUBJECT: &str = "internal.participant_presence";
 
 /// Payload published to NATS for cross-server stale session eviction.
@@ -163,6 +171,9 @@ struct EvictInstancePayload {
     room: String,
     user_id: String,
     new_session_id: SessionId,
+    origin_relay: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new_conn_seq: Option<u64>,
 }
 
 /// Payload for [`MEETING_BECAME_EMPTY_SUBJECT`].
@@ -228,6 +239,11 @@ struct UpdateMemberHostFlag(MeetingHostChangePayload);
 #[rtype(result = "()")]
 struct ParticipantKicked(ParticipantKickedPayload);
 
+/// A [`MEETING_INSTANCE_STARTED_SUBJECT`] notice from meeting-api (#3287).
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct MeetingInstanceStarted(MeetingInstanceStartedPayload);
+
 /// What a joined session authenticated as, kept from `JoinRoom` until its
 /// `Disconnect` so a host kick can find and close it (#2934).
 struct SessionCredential {
@@ -245,6 +261,13 @@ fn unix_now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -279,11 +302,11 @@ struct PendingDepartureState {
     spawn_handle: SpawnHandle,
     /// The old session ID that disconnected — used for cleanup.
     old_session: SessionId,
-    /// Whether the disconnecting session had been activated (Testing -> Active).
-    /// Only Active sessions should trigger PARTICIPANT_LEFT, because only Active
-    /// sessions had their PARTICIPANT_JOINED broadcast. Testing sessions (e.g.,
-    /// the losing connection during RTT election) never announced themselves.
+    /// Whether peers are owed a PARTICIPANT_LEFT for the disconnecting session:
+    /// it was Active or in [`ChatServer::resumed_unactivated`].
     was_active: bool,
+    /// Set when `was_active` holds only through [`ChatServer::resumed_unactivated`].
+    resumed: bool,
 }
 
 /// Origin of a [`RoomMemberInfo`] row (issue #1202).
@@ -1340,8 +1363,8 @@ pub struct ChatServer {
     room_host_overrides: HashMap<String, HashMap<String, bool>>,
     /// Rooms in which THIS binary has taken a local session `Testing -> Active`
     /// since the room's `room_members` entry was created (issue #2711). Written
-    /// only by [`Handler<ActivateConnection>`], read only by the
-    /// never-activated-expiry branch of [`Handler<ExecutePendingDeparture>`],
+    /// only by [`Handler<ActivateConnection>`], read only by
+    /// [`ChatServer::retire_never_announced_session`],
     /// and evicted on both edges that drop a `room_members` entry.
     rooms_with_activated_local_member: HashSet<String>,
     /// Pending departures keyed by `(room_id, user_id, instance_key)`, where
@@ -1354,12 +1377,17 @@ pub struct ChatServer {
     /// This is used for reconnection sessions: the user never "left" from peers'
     /// perspective, so announcing a "join" would be misleading.
     suppress_join_broadcast: std::collections::HashSet<SessionId>,
+    /// Never-activated sessions named by a PARTICIPANT_SESSION_RESUMED: peers were
+    /// told this user is present and are owed a PARTICIPANT_LEFT.
+    resumed_unactivated: std::collections::HashSet<SessionId>,
     /// Maps `instance_id` → `SessionId` for the current active session of each
     /// client instance. Used to find and evict stale sessions on reconnection.
     instance_index: HashMap<String, SessionId>,
     /// Reverse map: `SessionId` → `instance_id`. Enables O(1) cleanup of
     /// `instance_index` when a session disconnects, instead of an O(n) retain scan.
     session_instance: HashMap<SessionId, String>,
+    /// Client-supplied `?conn_seq=` of each local session with an `instance_id`.
+    session_conn_seq: HashMap<SessionId, u64>,
     /// Per-session server-authoritative guest flag, sourced from the JWT
     /// `is_guest` claim captured at `JoinRoom`.
     session_is_guest: HashMap<SessionId, bool>,
@@ -1396,6 +1424,8 @@ pub struct ChatServer {
     /// sweep; the spawned NATS task reads the same shared state on the forwarding
     /// path. Entries are removed on `leave_rooms`/`forget_session`.
     session_layer_prefs: HashMap<SessionId, LayerPrefs>,
+    /// Shared with the session's NATS task; set once the session is `Active` (#3058).
+    session_downlink_activated: HashMap<SessionId, Arc<std::sync::atomic::AtomicBool>>,
     /// Reverse index: `SessionId` → `room_id`. Enables O(1) room lookup in
     /// paths like `RebroadcastPresence` instead of scanning all rooms.
     /// Populated for non-observer sessions at JoinRoom; removed at
@@ -1497,12 +1527,12 @@ pub struct ChatServer {
     ///
     /// That distinction matters because a session can also exit through a THIRD
     /// path that runs neither: the #1311 grace period. A non-observer `Disconnect`
-    /// parks the session in `pending_departures` without calling `leave_rooms`
-    /// (only the observer branch leaves immediately), and if the same tab
-    /// reconnects inside the grace window, `JoinRoom` cancels the departure timer,
-    /// so `leave_rooms` never runs for the OLD session id. Any stamp that session
-    /// left behind is therefore released by the `retain`, one interval later, and
-    /// not before — correct, just not immediate.
+    /// can park the session in `pending_departures` without calling `leave_rooms`,
+    /// and if the same tab reconnects inside the grace window after an Active
+    /// session, `JoinRoom` cancels the departure timer, so `leave_rooms` never
+    /// runs for the OLD session id. Any stamp that session left behind is
+    /// therefore released by the `retain`, one interval later, and not before —
+    /// correct, just not immediate.
     last_rebroadcast_at: HashMap<SessionId, std::time::Instant>,
     /// Cross-instance membership mirror master switch (issue #1202). Read ONCE
     /// from the `MEMBERSHIP_MIRROR_ENABLED` env var at actor construction and
@@ -1520,8 +1550,12 @@ pub struct ChatServer {
     /// per-room caches it survives the room draining, so a later reconnect with
     /// a pre-kick token is still refused.
     kick_denylist: KickDenylist,
+    /// Latest meeting-instance start per room (#3287); like the kick
+    /// denylist it survives the room draining.
+    instance_registry: InstanceRegistry,
     /// Every session between its `JoinRoom` and its `Disconnect` (#2934).
     session_credentials: HashMap<SessionId, SessionCredential>,
+    relay_id: u64,
 }
 
 impl ChatServer {
@@ -1541,6 +1575,7 @@ impl ChatServer {
             }
         });
         ChatServer {
+            relay_id: uuid::Uuid::new_v4().as_u128() as u64,
             presence_tx,
             presence_pending,
             reported_present: HashMap::new(),
@@ -1560,11 +1595,14 @@ impl ChatServer {
             rooms_with_activated_local_member: HashSet::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
+            resumed_unactivated: std::collections::HashSet::new(),
             instance_index: HashMap::new(),
             session_instance: HashMap::new(),
+            session_conn_seq: HashMap::new(),
             session_is_guest: HashMap::new(),
             session_desired_streams: HashMap::new(),
             session_layer_prefs: HashMap::new(),
+            session_downlink_activated: HashMap::new(),
             session_room: HashMap::new(),
             layer_hint_state: HashMap::new(),
             pending_recompute_rooms: std::collections::HashSet::new(),
@@ -1580,6 +1618,7 @@ impl ChatServer {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             kick_denylist: KickDenylist::default(),
+            instance_registry: InstanceRegistry::default(),
             session_credentials: HashMap::new(),
         }
     }
@@ -1605,11 +1644,14 @@ impl ChatServer {
         // Drop the per-session layer-preference map (#989, Phase 1b). Same
         // teardown invariant as the viewport set above.
         let _ = self.session_layer_prefs.remove(session_id);
+        let _ = self.session_downlink_activated.remove(session_id);
 
         // Drop this session's presence re-announce cooldown stamp (#1600 item 1).
         // Same teardown invariant again: the map is otherwise only pruned at
         // flush time, so a departing session must release its entry here.
         let _ = self.last_rebroadcast_at.remove(session_id);
+        let resumed = self.resumed_unactivated.remove(session_id);
+        self.session_conn_seq.remove(session_id);
 
         // Clean up instance_index via reverse map: O(1) instead of O(n) retain.
         // If the entry was already replaced by a newer session (eviction), the
@@ -1702,10 +1744,11 @@ impl ChatServer {
                 return;
             }
 
-            let active = self
-                .connection_states
-                .get(session_id)
-                .is_none_or(|state| *state == ConnectionState::Active);
+            let active = resumed
+                || self
+                    .connection_states
+                    .get(session_id)
+                    .is_none_or(|state| *state == ConnectionState::Active);
             if active {
                 info!("Participant {} left room {}", uid, room_id);
                 // Client PARTICIPANT_LEFT first: any MEETING_ENDED meeting-api
@@ -1811,10 +1854,6 @@ impl ChatServer {
         }
     }
 
-    /// After a session of `user_id` left `room`'s members: if the session last
-    /// reported present for the user is gone, report the user's remaining
-    /// local session present (an Active one first) or, when none remains,
-    /// report the gone session left.
     fn presence_after_departure(
         &mut self,
         room: &str,
@@ -1830,19 +1869,22 @@ impl ChatServer {
             return None;
         }
         let successor = remaining
-            .into_iter()
-            .max_by_key(|s| self.connection_states.get(s) == Some(&ConnectionState::Active));
-        Some(match successor {
-            Some(next) => self.mark_reported(room, user_id, next, true),
-            None => self.mark_reported(room, user_id, reported, false),
-        })
+            .iter()
+            .copied()
+            .find(|s| self.connection_states.get(s) == Some(&ConnectionState::Active));
+        match successor {
+            Some(next) => Some(self.mark_reported(room, user_id, next, true)),
+            None if remaining.is_empty() => {
+                Some(self.mark_reported(room, user_id, reported, false))
+            }
+            None => None,
+        }
     }
 
     /// Evict a stale session for the given `instance_id`, if present locally.
     ///
     /// Returns `true` if a session was evicted.
-    /// `skip_session_id` is the new session's ID — used as a self-delivery guard
-    /// to prevent the publishing server from double-evicting.
+    /// `skip_session_id` is the new session's ID.
     fn evict_stale_session(
         &mut self,
         instance_id: &str,
@@ -1908,6 +1950,37 @@ impl ChatServer {
         true
     }
 
+    /// Whether an eviction carrying `new_conn_seq` is stale for this relay's
+    /// `(room, user_id, instance_id)`: its holder's seq is >= the payload's, or a
+    /// resumed, never-activated sibling's seq is > it. Unknown seq is never stale.
+    fn eviction_is_stale(
+        &self,
+        instance_id: &str,
+        room: &str,
+        user_id: &str,
+        new_conn_seq: Option<u64>,
+    ) -> bool {
+        let Some(new) = new_conn_seq else {
+            return false;
+        };
+        let seq_of_same_key = |session: SessionId| {
+            if self.session_room.get(&session).map(String::as_str) != Some(room)
+                || self.session_user_id(session) != Some(user_id)
+            {
+                return None;
+            }
+            self.session_conn_seq.get(&session).copied()
+        };
+        self.instance_index
+            .get(instance_id)
+            .and_then(|&holder| seq_of_same_key(holder))
+            .is_some_and(|seq| seq >= new)
+            || self.resumed_unactivated.iter().any(|&sibling| {
+                self.session_instance.get(&sibling).map(String::as_str) == Some(instance_id)
+                    && seq_of_same_key(sibling).is_some_and(|seq| seq > new)
+            })
+    }
+
     fn session_was_announced(
         &self,
         session: SessionId,
@@ -1927,6 +2000,42 @@ impl ChatServer {
                 .map(|pending| (pending.old_session, pending.was_active)),
             session,
         )
+    }
+
+    /// Activation of `winner` supersedes its resumed, never-activated siblings
+    /// of the same `(room, user_id, instance_id)`: they owe no PARTICIPANT_LEFT.
+    fn supersede_resumed_siblings(
+        &mut self,
+        instance_id: &str,
+        room: &str,
+        user_id: &str,
+        winner: SessionId,
+    ) {
+        let superseded: Vec<SessionId> = self
+            .resumed_unactivated
+            .iter()
+            .filter(|s| {
+                **s != winner
+                    && self.session_instance.get(s).map(String::as_str) == Some(instance_id)
+                    && self.session_room.get(s).map(String::as_str) == Some(room)
+                    && self.session_user_id(**s) == Some(user_id)
+            })
+            .copied()
+            .collect();
+        for session in superseded {
+            self.resumed_unactivated.remove(&session);
+        }
+        let key = (
+            room.to_string(),
+            user_id.to_string(),
+            instance_id.to_string(),
+        );
+        if let Some(pending) = self.pending_departures.get_mut(&key) {
+            if pending.resumed && pending.old_session != winner {
+                pending.was_active = false;
+                pending.resumed = false;
+            }
+        }
     }
 
     fn publish_session_resumed(
@@ -2006,10 +2115,11 @@ impl ChatServer {
     ///
     /// The single source of truth for "is this room locally drained?", replacing
     /// the bare `members.is_empty()` reads at the teardown sites (`leave_rooms`
-    /// c1, `forget_room_if_empty` c4, `forget_session` c5, `ExecutePendingDeparture`
-    /// c6). A missing room entry counts as empty. A room that still holds only
-    /// `Remote` rows is LOCALLY empty here — so teardown/became-empty fires and a
-    /// stranded remote row never wedges the meeting active.
+    /// c1, `forget_room_if_empty` c4, `forget_session` c5,
+    /// `retire_never_announced_session` c6). A missing room entry counts as
+    /// empty. A room that still holds only `Remote` rows is LOCALLY empty here —
+    /// so teardown/became-empty fires and a stranded remote row never wedges the
+    /// meeting active.
     fn local_is_empty(&self, room: &str) -> bool {
         self.room_members
             .get(room)
@@ -2047,9 +2157,7 @@ impl ChatServer {
 
     /// Tear down all per-session state for `session_id` and cancel any
     /// pending departure for this session's `(room, user_id, instance_key)`.
-    /// Shared by both eviction paths so the cleanup surface stays in lockstep —
-    /// if a new per-session HashMap is added to [`ChatServer`], it MUST be
-    /// cleaned up here.
+    /// Shared by both eviction paths.
     ///
     /// Does NOT broadcast `PARTICIPANT_LEFT` — the caller emits
     /// PARTICIPANT_SESSION_RESUMED first (#2269), which is what makes the
@@ -2095,22 +2203,7 @@ impl ChatServer {
             }
         }
 
-        if let Some(task) = self.active_subs.remove(&session_id) {
-            task.abort();
-        }
-
-        let _ = self.sessions.remove(&session_id);
-        let _ = self.connection_states.remove(&session_id);
-        let _ = self.suppress_join_broadcast.remove(&session_id);
-        let _ = self.session_is_guest.remove(&session_id);
-        let _ = self.session_desired_streams.remove(&session_id);
-        // Drop the per-session layer-preference map (#989, Phase 1b). Mirrors
-        // the `leave_rooms` cleanup; both teardown paths must release it.
-        let _ = self.session_layer_prefs.remove(&session_id);
-        let _ = self.session_room.remove(&session_id);
-        // Presence re-announce cooldown stamp (#1600 item 1) — mirrors the
-        // `leave_rooms` cleanup; both teardown paths must release it.
-        let _ = self.last_rebroadcast_at.remove(&session_id);
+        self.release_session_state(session_id);
 
         // Publish-side suppression teardown + restore (#1108, Stage 3) — the
         // eviction analog of the `leave_rooms` trigger. An evicted session may
@@ -2141,6 +2234,84 @@ impl ChatServer {
                 user_id, room
             );
         }
+    }
+
+    fn sync_downlink_activation(&mut self, session: SessionId) {
+        if let Some(flag) = self.session_downlink_activated.get(&session) {
+            flag.store(
+                self.connection_states.get(&session) == Some(&ConnectionState::Active),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn retire_never_announced_session(
+        &mut self,
+        room: &str,
+        user_id: &str,
+        session: SessionId,
+        ctx: &mut Context<Self>,
+    ) {
+        // empty→idle only for a room this binary activated someone in:
+        // otherwise the drain is just an election loser retiring (#2711).
+        // Read BEFORE `forget_room_if_empty`, which clears the record.
+        let announced_locally = self.rooms_with_activated_local_member.contains(room);
+        let mut room_became_empty = false;
+        if let Some(members) = self.room_members.get_mut(room) {
+            members.retain(|m| m.session != session);
+            // c6 (#1202): LOCAL-only emptiness — mirrored Remote rows must
+            // not suppress the transition.
+            room_became_empty = slice_is_locally_empty(members);
+        }
+        self.forget_layer_hint_state_for_source(room, session, ctx);
+        if !room_became_empty {
+            self.schedule_coalesced_recompute(room, ctx);
+        }
+        if let Some(report) = self.presence_after_departure(room, user_id) {
+            self.publish_json_ordered(PARTICIPANT_PRESENCE_SUBJECT, &report);
+        }
+        self.forget_room_if_empty(room);
+        self.release_session_state(session);
+        if room_became_empty && !announced_locally {
+            info!(
+                "Room {} drained on this binary after a never-activated session \
+                 departed, but no local session was ever activated here - \
+                 NOT notifying meeting-api (empty->idle)",
+                room
+            );
+        }
+        if room_became_empty && announced_locally {
+            info!(
+                "Room {} became empty after a never-activated session departed - \
+                 notifying meeting-api (empty->idle)",
+                room
+            );
+            self.publish_json_ordered(
+                MEETING_BECAME_EMPTY_SUBJECT,
+                &MeetingBecameEmptyPayload {
+                    room_id: room.to_string(),
+                },
+            );
+        }
+    }
+
+    fn release_session_state(&mut self, session_id: SessionId) {
+        if let Some(task) = self.active_subs.remove(&session_id) {
+            task.abort();
+        }
+
+        let _ = self.sessions.remove(&session_id);
+        let _ = self.connection_states.remove(&session_id);
+        let _ = self.suppress_join_broadcast.remove(&session_id);
+        let _ = self.session_is_guest.remove(&session_id);
+        let _ = self.session_desired_streams.remove(&session_id);
+        // Drop the per-session layer-preference map (#989, Phase 1b).
+        let _ = self.session_layer_prefs.remove(&session_id);
+        let _ = self.session_downlink_activated.remove(&session_id);
+        let _ = self.session_room.remove(&session_id);
+        // Presence re-announce cooldown stamp (#1600 item 1).
+        let _ = self.last_rebroadcast_at.remove(&session_id);
+        let _ = self.session_conn_seq.remove(&session_id);
 
         // instance_index uses instance_id as the key, so we look it up via
         // the reverse map and only delete the forward entry if it still
@@ -2198,7 +2369,7 @@ impl ChatServer {
             self.suppress_join_broadcast.remove(&session);
         }
         if let Some(closer) = credential.closer {
-            closer.do_send(ForceClose);
+            closer.do_send(ForceClose::RemovedByHost);
         }
         RELAY_KICK_ENFORCEMENTS_TOTAL
             .with_label_values(&["closed"])
@@ -2228,7 +2399,7 @@ impl ChatServer {
                 .insert(session, ConnectionState::Revoked);
         }
         if let Some(closer) = closer {
-            closer.do_send(ForceClose);
+            closer.do_send(ForceClose::RemovedByHost);
         }
         RELAY_KICK_ENFORCEMENTS_TOTAL
             .with_label_values(&["refused"])
@@ -2237,6 +2408,44 @@ impl ChatServer {
             "Refused session {} of kicked user {} in room {}: token revoked by the kick",
             session, user_id, room
         );
+    }
+
+    /// Refuse a `JoinRoom` presenting a room token minted for an earlier
+    /// meeting instance: deliver the notice, then close the transport (#3287).
+    fn refuse_stale_instance_join(
+        &mut self,
+        session: SessionId,
+        room: &str,
+        user_id: &str,
+        transport: &str,
+        closer: Option<Recipient<ForceClose>>,
+    ) {
+        if let Some(recipient) = self.sessions.remove(&session) {
+            let notice = SessionManager::build_meeting_instance_superseded_packet(room, user_id);
+            recipient.do_send(Message {
+                session,
+                msg: bytes::Bytes::from(notice),
+            });
+            self.connection_states
+                .insert(session, ConnectionState::Revoked);
+        }
+        if let Some(closer) = closer {
+            closer.do_send(ForceClose::InstanceSuperseded);
+        }
+        RELAY_JOIN_STALE_INSTANCE_REFUSED_TOTAL
+            .with_label_values(&[transport])
+            .inc();
+        info!(
+            "Refused session {} of user {} in room {}: token predates the current meeting instance",
+            session, user_id, room
+        );
+    }
+
+    fn record_instance_start(&mut self, room: &str, started_at_ms: i64, now_ms: i64) {
+        let evicted = self.instance_registry.record(room, started_at_ms, now_ms);
+        if evicted > 0 {
+            RELAY_INSTANCE_REGISTRY_EVICTIONS_TOTAL.inc_by(evicted as f64);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2800,8 +3009,44 @@ impl Actor for ChatServer {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
+        let nc_instance = self.nats_connection.clone();
+        let addr_instance = ctx.address();
+        tokio::spawn(async move {
+            loop {
+                match nc_instance
+                    .subscribe(MEETING_INSTANCE_STARTED_SUBJECT)
+                    .await
+                {
+                    Ok(mut sub) => {
+                        while let Some(msg) = sub.next().await {
+                            match serde_json::from_slice::<MeetingInstanceStartedPayload>(
+                                &msg.payload,
+                            ) {
+                                Ok(payload) => {
+                                    addr_instance.do_send(MeetingInstanceStarted(payload))
+                                }
+                                Err(e) => warn!(
+                                    "Failed to deserialize {} payload: {}",
+                                    MEETING_INSTANCE_STARTED_SUBJECT, e
+                                ),
+                            }
+                        }
+                        warn!(
+                            "{} subscription stream ended, re-subscribing in 1s",
+                            MEETING_INSTANCE_STARTED_SUBJECT
+                        );
+                    }
+                    Err(e) => error!(
+                        "Failed to subscribe to {}: {}, retrying in 1s",
+                        MEETING_INSTANCE_STARTED_SUBJECT, e
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
         ctx.run_interval(KICK_DENYLIST_SWEEP_INTERVAL, |act, _ctx| {
             act.kick_denylist.sweep(unix_now_secs());
+            act.instance_registry.sweep(unix_now_ms());
         });
 
         // Arm the periodic DEMAND-side gauge cycle (#1170 item 2, #1284). The
@@ -2884,7 +3129,6 @@ impl Handler<Disconnect> for ChatServer {
         ctx: &mut Self::Context,
     ) -> Self::Result {
         self.session_credentials.remove(&session);
-        // A session closed for a host kick already left the room (#2934).
         if self.connection_states.get(&session) == Some(&ConnectionState::Revoked) {
             self.connection_states.remove(&session);
             self.session_is_guest.remove(&session);
@@ -2908,18 +3152,13 @@ impl Handler<Disconnect> for ChatServer {
         }
 
         // Clean up session-level state immediately — the transport is gone.
-        // Capture whether the session was Active before removing the state,
-        // so we can store it in PendingDepartureState for the grace period.
-        let was_active = self
-            .connection_states
-            .get(&session)
-            .map(|s| *s == ConnectionState::Active)
-            .unwrap_or(false);
+        let resumed = self.resumed_unactivated.remove(&session);
+        let was_active =
+            resumed || self.connection_states.get(&session) == Some(&ConnectionState::Active);
         let _ = self.connection_states.remove(&session);
         let _ = self.suppress_join_broadcast.remove(&session);
 
-        // Observers and non-active sessions bypass the grace period — they
-        // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
+        // Observers bypass the grace period — they are never announced.
         if observer {
             self.leave_rooms(
                 LeaveContext {
@@ -2935,36 +3174,43 @@ impl Handler<Disconnect> for ChatServer {
         }
 
         // Remove the NATS subscription task immediately so the old session
-        // stops receiving media. Keep room_members intact for now — they
-        // will be cleaned up either on reconnection or when the grace
-        // period expires.
+        // stops receiving media.
         if let Some(task) = self.active_subs.remove(&session) {
             task.abort();
         }
 
-        // If there is already a pending departure for THIS tab / client
-        // instance (same `(room, user_id, instance_key)`), cancel the old timer
-        // and replace it. This handles the edge case of rapid
-        // disconnect-reconnect-disconnect cycles within a single tab.
-        //
-        // BUG FIX (introduced by 0844f062 / batch merge of PRs #793 et al.):
-        // The original code cancelled the old timer but did NOT remove the
-        // replaced session from room_members. During RTT election, N candidate
-        // connections all call JoinRoom (adding N room_members entries for the
-        // same user_id). When the N-1 losers disconnect in rapid succession,
-        // each Disconnect replaces the previous pending departure — but only
-        // the *last* replacement's session gets cleaned up when the grace
-        // period expires. The earlier sessions become permanent orphans in
-        // room_members, appearing as phantom peers that trigger PLI storms
-        // and freeze real participants' video.
         let instance_key = self.pending_departure_instance_key(session);
         let key = (room.clone(), user_id.clone(), instance_key.clone());
         if let Some(old) = self.pending_departures.remove(&key) {
+            if old.was_active && !was_active {
+                info!(
+                    "Keeping pending departure of announced session {} for instance {} \
+                     (user {}) in room {}; retiring never-activated session {}",
+                    old.old_session, instance_key, user_id, room, session
+                );
+                self.pending_departures.insert(key, old);
+                self.retire_never_announced_session(&room, &user_id, session, ctx);
+                return;
+            }
             ctx.cancel_future(old.spawn_handle);
-            // Clean up the replaced session's room_members entry to prevent
-            // orphaned phantom peers.
-            if let Some(members) = self.room_members.get_mut(&room) {
-                members.retain(|m| m.session != old.old_session);
+            if old.was_active {
+                let old_display_name = self
+                    .room_members
+                    .get(&room)
+                    .and_then(|members| members.iter().find(|m| m.session == old.old_session))
+                    .map(|m| m.display_name.clone());
+                self.leave_rooms(
+                    LeaveContext {
+                        session_id: &old.old_session,
+                        room: Some(&room),
+                        user_id: Some(&user_id),
+                        display_name: old_display_name.as_deref(),
+                        observer: false,
+                    },
+                    ctx,
+                );
+            } else {
+                self.retire_never_announced_session(&room, &user_id, old.old_session, ctx);
             }
             info!(
                 "Replaced existing pending departure for instance {} (user {}) in \
@@ -2996,6 +3242,7 @@ impl Handler<Disconnect> for ChatServer {
                 spawn_handle: handle,
                 old_session: session,
                 was_active,
+                resumed,
             },
         );
     }
@@ -3054,6 +3301,7 @@ impl Handler<ActivateConnection> for ChatServer {
 
     fn handle(&mut self, msg: ActivateConnection, ctx: &mut Self::Context) -> Self::Result {
         let ActivateConnection { session } = msg;
+        self.resumed_unactivated.remove(&session);
         let was_testing = if let Some(state) = self.connection_states.get_mut(&session) {
             if *state == ConnectionState::Testing {
                 *state = ConnectionState::Active;
@@ -3073,6 +3321,7 @@ impl Handler<ActivateConnection> for ChatServer {
             // still broadcast PARTICIPANT_JOINED.
             true
         };
+        self.sync_downlink_activation(session);
 
         // Resolve this session's (room, user_id) ONCE via the O(1) `session_room`
         // reverse index over every room's members.
@@ -3104,6 +3353,7 @@ impl Handler<ActivateConnection> for ChatServer {
                     if evicted {
                         self.suppress_join_broadcast.insert(session);
                     }
+                    self.supersede_resumed_siblings(&iid, room_id, user_id, session);
                 }
                 // Claim the forward mapping now that we are the elected winner.
                 let claimant = room_user.as_ref().map(|(_, u)| u.as_str());
@@ -3139,6 +3389,8 @@ impl Handler<ActivateConnection> for ChatServer {
                         room: room_id.clone(),
                         user_id: user_id.clone(),
                         new_session_id: session,
+                        origin_relay: Some(self.relay_id),
+                        new_conn_seq: self.session_conn_seq.get(&session).copied(),
                     };
                     match serde_json::to_vec(&payload) {
                         Ok(json) => {
@@ -3556,6 +3808,7 @@ impl Handler<TestSetConnectionState> for ChatServer {
 
     fn handle(&mut self, msg: TestSetConnectionState, _ctx: &mut Self::Context) -> Self::Result {
         self.connection_states.insert(msg.session, msg.state);
+        self.sync_downlink_activation(msg.session);
     }
 }
 
@@ -4094,6 +4347,15 @@ impl Handler<UpdateMemberHostFlag> for ChatServer {
     }
 }
 
+/// Record a new meeting instance's start; live sessions are left alone (#3287).
+impl Handler<MeetingInstanceStarted> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: MeetingInstanceStarted, _ctx: &mut Self::Context) -> Self::Result {
+        self.record_instance_start(&msg.0.room_id, msg.0.started_at_ms, unix_now_ms());
+    }
+}
+
 /// Record a host kick and close every local session of the kicked user in that
 /// room whose room token's `iat` is at or before `revoke_iat_through` (#2934).
 impl Handler<ParticipantKicked> for ChatServer {
@@ -4168,7 +4430,13 @@ impl Handler<EvictInstance> for ChatServer {
             room,
             user_id,
             new_session_id,
+            origin_relay,
+            new_conn_seq,
         } = msg.0;
+
+        if origin_relay == Some(self.relay_id) {
+            return;
+        }
 
         // Validate inbound fields — the JoinRoom path sanitizes instance_id to
         // max 64 chars, but NATS messages come from untrusted peers.
@@ -4186,6 +4454,16 @@ impl Handler<EvictInstance> for ChatServer {
             return;
         }
 
+        if self.eviction_is_stale(&instance_id, &room, &user_id, new_conn_seq) {
+            info!(
+                "Ignoring stale cross-server eviction for instance {} naming session {} \
+                 (conn_seq {:?})",
+                instance_id, new_session_id, new_conn_seq
+            );
+            return;
+        }
+
+        self.supersede_resumed_siblings(&instance_id, &room, &user_id, new_session_id);
         if self.evict_stale_session(&instance_id, &room, &user_id, new_session_id, ctx) {
             info!(
                 "Cross-server eviction completed: instance {} (user {} in room {}) — \
@@ -4229,70 +4507,13 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 return;
             }
 
-            // Only broadcast PARTICIPANT_LEFT if the session was Active when it
-            // disconnected. Testing sessions (e.g., the losing connection during
-            // RTT election) never had PARTICIPANT_JOINED broadcast, so emitting
-            // PARTICIPANT_LEFT would cause ghost leave events for other participants.
             if !pending.was_active {
                 info!(
                     "Grace period expired for user {} (session {}) in room {} — \
                      skipping PARTICIPANT_LEFT (session was never activated)",
                     user_id, session, room
                 );
-                // Still clean up room_members and instance_index for the old
-                // session, through the same `forget_room_if_empty` as `leave_rooms`.
-                //
-                // empty→idle only for a room this binary activated someone in:
-                // otherwise the drain is just an election loser retiring (#2711).
-                // Read BEFORE `forget_room_if_empty`, which clears the record.
-                let announced_locally = self.rooms_with_activated_local_member.contains(&room);
-                let mut room_became_empty = false;
-                if let Some(members) = self.room_members.get_mut(&room) {
-                    members.retain(|m| m.session != session);
-                    // c6 (#1202): LOCAL-only emptiness — mirrored Remote rows must
-                    // not suppress the transition.
-                    room_became_empty = slice_is_locally_empty(members);
-                }
-                // Unlike `leave_rooms` / `forget_session`, this branch does NOT
-                // call `forget_layer_hint_state_for_source`, and deliberately so:
-                // both LAYER_HINT maps (`layer_hint_state` and the #1118 N1
-                // `layer_hint_recheck_handles`) are keyed by SOURCE publisher, and
-                // a never-activated session (an RTT-election loser) never broadcast
-                // PARTICIPANT_JOINED, so no peer ever subscribed to it, sent a
-                // LAYER_PREFERENCE against it, or caused a union/hint to be computed
-                // for it as a source. It therefore holds no entry in either map —
-                // there is nothing to reap, and the per-`(source, kind)` recheck
-                // invariant is not stranded.
-                if let Some(report) = self.presence_after_departure(&room, &user_id) {
-                    self.publish_json_ordered(PARTICIPANT_PRESENCE_SUBJECT, &report);
-                }
-                self.forget_room_if_empty(&room);
-                if let Some(iid) = self.session_instance.remove(&session) {
-                    if self.instance_index.get(&iid).copied() == Some(session) {
-                        self.instance_index.remove(&iid);
-                    }
-                }
-                if room_became_empty && !announced_locally {
-                    info!(
-                        "Room {} drained on this binary after a never-activated session \
-                         expired, but no local session was ever activated here - \
-                         NOT notifying meeting-api (empty->idle)",
-                        room
-                    );
-                }
-                if room_became_empty && announced_locally {
-                    info!(
-                        "Room {} became empty after a never-activated session expired - \
-                         notifying meeting-api (empty->idle)",
-                        room
-                    );
-                    self.publish_json_ordered(
-                        MEETING_BECAME_EMPTY_SUBJECT,
-                        &MeetingBecameEmptyPayload {
-                            room_id: room.clone(),
-                        },
-                    );
-                }
+                self.retire_never_announced_session(&room, &user_id, session, ctx);
                 return;
             }
 
@@ -4473,6 +4694,8 @@ impl Handler<JoinRoom> for ChatServer {
             transport,
             downlink_congested_epoch,
             token_iat,
+            meeting_started_at_ms,
+            conn_seq,
             closer,
         }: JoinRoom,
         ctx: &mut Self::Context,
@@ -4507,6 +4730,31 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Err(JOIN_REFUSED_KICKED.into()));
         }
 
+        let Some(session_recipient) = self.sessions.get(&session).cloned() else {
+            return MessageResult(Err("Session not found".into()));
+        };
+
+        if !observer {
+            match meeting_started_at_ms.and_then(|ms| i64::try_from(ms).ok()) {
+                None => RELAY_JOIN_INSTANCE_UNCHECKED_TOTAL
+                    .with_label_values(&[&transport])
+                    .inc(),
+                Some(started_at_ms) => {
+                    let now_ms = unix_now_ms();
+                    if self
+                        .instance_registry
+                        .supersedes(&room, started_at_ms, now_ms)
+                    {
+                        self.refuse_stale_instance_join(
+                            session, &room, &user_id, &transport, closer,
+                        );
+                        return MessageResult(Err(JOIN_REFUSED_STALE_INSTANCE.into()));
+                    }
+                    self.record_instance_start(&room, started_at_ms, now_ms);
+                }
+            }
+        }
+
         // Persist the server-authoritative guest flag so downstream
         // handlers (ActivateConnection, Disconnect, leave_rooms, and the
         // "existing members" broadcast in this handler) can retrieve it
@@ -4532,6 +4780,9 @@ impl Handler<JoinRoom> for ChatServer {
         // responses.
         if let Some(ref iid) = instance_id {
             self.session_instance.insert(session, iid.clone());
+            if let Some(seq) = conn_seq {
+                self.session_conn_seq.insert(session, seq);
+            }
         }
 
         // --- Multi-session-per-user is allowed (issue #828) ---
@@ -4556,61 +4807,55 @@ impl Handler<JoinRoom> for ChatServer {
         //     tiles for the same user_id.
 
         // --- Reconnection grace period: cancel pending departure ---
-        // If the SAME TAB (same `instance_id`) is reconnecting to the same
-        // room within the grace window, suppress both PARTICIPANT_LEFT
-        // (already deferred) and the PARTICIPANT_JOINED that would normally
-        // follow. A fresh second session of the same user (different
-        // `instance_id`) will NOT match this lookup — it is a real new
-        // participant and must be announced.
+        // If the SAME TAB (same `instance_id`) whose previous session was
+        // announced is reconnecting to the same room within the grace window,
+        // suppress both PARTICIPANT_LEFT (already deferred) and the
+        // PARTICIPANT_JOINED that would normally follow. A fresh second session
+        // of the same user (different `instance_id`) will NOT match this
+        // lookup — it is a real new participant and must be announced.
         //
         // Joins with no `instance_id` cannot be classified as a reconnection
         // because they have no stable identity that could match a prior
         // session's pending entry — they always fall through as fresh joins.
         let mut reconnect_display_name: Option<String> = None;
-        // Last-known host flag of the reconnecting tab, captured from its prior
-        // `room_members` entry before that entry is removed below.
-        // The room JWT's `is_host` claim is frozen at mint time and a
-        // fast cached-URL transport reconnect re-presents that SAME token, so a
-        // demoted ex-host reconnecting after a transfer-host would otherwise
-        // re-seed `is_host=true` and override the authoritative
-        // `internal.meeting_host_changed` fanout — a phantom host in the
-        // presence map. The prior entry already reflects
-        // that fanout (correct in BOTH directions: demoted→false, promoted→true),
-        // so we prefer it ONLY on a reconnection. When no transfer occurred the
-        // prior entry equals the JWT claim, so this is a strict no-op; it diverges
-        // from the JWT only in exactly the buggy post-transfer reconnect case.
         let mut reconnect_is_host: Option<bool> = None;
         let mut resumed_predecessor: Option<SessionId> = None;
-        let is_reconnection = if let Some(ref iid) = instance_id {
+        let is_reconnection = if let (false, Some(iid)) = (observer, &instance_id) {
             let departure_key = (room.clone(), user_id.clone(), iid.clone());
             if let Some(pending) = self.pending_departures.remove(&departure_key) {
                 ctx.cancel_future(pending.spawn_handle);
 
-                // Capture the old session's display_name AND host flag before
-                // cleanup — both are more current than the JWT's frozen-at-login
-                // values (rename via PARTICIPANT_DISPLAY_NAME_CHANGED, host flag
-                // via the host-change fanout).
-                if let Some(members) = self.room_members.get_mut(&room) {
-                    if let Some(old) = members
+                if let Some(old) = self.room_members.get(&room).and_then(|members| {
+                    members
                         .iter()
                         .find(|m| m.session == pending.old_session && m.user_id == user_id)
-                    {
+                }) {
+                    if pending.was_active {
                         reconnect_display_name = Some(old.display_name.clone());
-                        reconnect_is_host = Some(old.is_host);
                     }
+                    reconnect_is_host = Some(old.is_host);
+                }
+
+                if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|m| m.session != pending.old_session);
                 }
-
                 if pending.was_active {
                     resumed_predecessor = Some(pending.old_session);
+                    info!(
+                        "Reconnection detected for instance {} (user {}) in room {} — cancelled \
+                         pending PARTICIPANT_LEFT (old session {}, new session {})",
+                        iid, user_id, room, pending.old_session, session
+                    );
+                } else {
+                    self.release_session_state(pending.old_session);
+                    self.forget_layer_hint_state_for_source(&room, pending.old_session, ctx);
+                    info!(
+                        "Instance {} (user {}) in room {}: superseded never-activated session {} \
+                         with fresh join {}",
+                        iid, user_id, room, pending.old_session, session
+                    );
                 }
-
-                info!(
-                    "Reconnection detected for instance {} (user {}) in room {} — cancelled \
-                     pending PARTICIPANT_LEFT (old session {}, new session {})",
-                    iid, user_id, room, pending.old_session, session
-                );
-                true
+                pending.was_active
             } else {
                 false
             }
@@ -4658,12 +4903,9 @@ impl Handler<JoinRoom> for ChatServer {
 
         let session_str = session.to_string();
         let (subject, queue) = build_subject_and_queue(&room, &session_str);
-        let session_recipient = match self.sessions.get(&session) {
-            Some(addr) => addr.clone(),
-            None => {
-                return MessageResult(Err("Session not found".into()));
-            }
-        };
+        if resumed_predecessor.is_some() {
+            self.resumed_unactivated.insert(session);
+        }
         self.session_credentials.insert(
             session,
             SessionCredential {
@@ -4696,6 +4938,12 @@ impl Handler<JoinRoom> for ChatServer {
         let layer_prefs: LayerPrefs = Default::default();
         self.session_layer_prefs
             .insert(session, layer_prefs.clone());
+
+        let downlink_activated = Arc::new(std::sync::atomic::AtomicBool::new(
+            self.connection_states.get(&session) == Some(&ConnectionState::Active),
+        ));
+        self.session_downlink_activated
+            .insert(session, downlink_activated.clone());
 
         // Collect existing non-observer room members for notifying the new joiner.
         // On reconnection, we still send the existing member list so the
@@ -4755,8 +5003,6 @@ impl Handler<JoinRoom> for ChatServer {
                     // (which reflects any renames) over the JWT's
                     // frozen-at-login name.
                     display_name: reconnect_display_name.unwrap_or_else(|| display_name.clone()),
-                    // On a reconnection, prefer the fanout-reconciled flag from
-                    // the prior entry over the (same, possibly stale) JWT seed.
                     is_host: reconnect_is_host.unwrap_or(is_host),
                     // The sole production add-site: a session this actor owns.
                     origin: MemberOrigin::Local,
@@ -4818,10 +5064,8 @@ impl Handler<JoinRoom> for ChatServer {
             // The reserved-user-ID check is performed synchronously at the top
             // of this handler, so we can proceed directly to NATS setup.
 
-            let start_time_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            let (start_time_ms, start_time_authoritative) =
+                crate::session_manager::meeting_start_time_ms(meeting_started_at_ms);
 
             info!(
                 "JoinRoom task running for user {} in room {} (session {})",
@@ -4836,7 +5080,14 @@ impl Handler<JoinRoom> for ChatServer {
             // to every connecting client, so subsequent joins would just
             // produce redundant events for existing participants.
             if is_first_in_room {
-                send_meeting_info(&nc, &room_clone, start_time_ms, &user_id_clone).await;
+                send_meeting_info(
+                    &nc,
+                    &room_clone,
+                    start_time_ms,
+                    start_time_authoritative,
+                    &user_id_clone,
+                )
+                .await;
             }
 
             // PARTICIPANT_JOINED broadcast is deferred until
@@ -4921,6 +5172,7 @@ impl Handler<JoinRoom> for ChatServer {
                         layer_prefs_for_loop.clone(),
                         transport_for_loop.clone(),
                         downlink_epoch_for_loop.clone(),
+                        downlink_activated.clone(),
                     );
                     let self_subject =
                         format!("room.{room_clone}.{session_clone}").replace(' ', "_");
@@ -5124,10 +5376,15 @@ async fn send_meeting_info(
     nc: &async_nats::client::Client,
     room: &str,
     start_time_ms: u64,
+    start_time_authoritative: bool,
     creator_id: &str,
 ) {
-    let packet_bytes =
-        SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id);
+    let packet_bytes = SessionManager::build_meeting_started_packet(
+        room,
+        start_time_ms,
+        start_time_authoritative,
+        creator_id,
+    );
 
     let subject = format!("room.{}.system", room.replace(' ', "_"));
     match nc.publish(subject.clone(), packet_bytes.into()).await {
@@ -6041,6 +6298,37 @@ fn downlink_shed_candidate(
     matches!(media_kind, Ok(MediaKind::VIDEO)) && simulcast_layer_id != 0
 }
 
+/// Clients send KEYFRAME_REQUEST with an UNSPECIFIED outer `media_kind` (#3206).
+fn keyframe_request_for_other_user(pw: &PacketWrapper, receiver_user_id: &str) -> bool {
+    use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+    pw.packet_type == PacketType::MEDIA.into()
+        && pw.media_kind.enum_value() == Ok(MediaKind::MEDIA_KIND_UNSPECIFIED)
+        && keyframe_request_target(&pw.data).is_some_and(|t| t != receiver_user_id.as_bytes())
+}
+
+/// On a `Full` mailbox a priority with a drop label attributes the sacrifice to
+/// it, otherwise the legacy `mailbox_full`.
+fn nats_delivery_drop_reason(parsed: Option<&PacketWrapper>, is_full: bool) -> &'static str {
+    let priority = match parsed {
+        Some(pw) => OutboundPriority::classify_outer(
+            true,
+            pw.packet_type
+                .enum_value()
+                .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
+            pw.media_kind.enum_value().unwrap_or(
+                videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+        )
+        .refine_caption(&pw.data),
+        // Unparseable outer wrapper → fail-open Control (never a media shed).
+        None => OutboundPriority::Control,
+    };
+    match (is_full, priority.priority_drop_label()) {
+        (true, Some(label)) => label,
+        _ => "mailbox_full",
+    }
+}
+
 /// Server-authoritative packet filter for observer (waiting-room) sessions.
 ///
 /// # Enforcement Model
@@ -6095,6 +6383,7 @@ fn handle_msg(
     layer_prefs: LayerPrefs,
     transport: String,
     downlink_congested_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    downlink_activated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (
     impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -6150,6 +6439,7 @@ fn handle_msg(
     // issue #630: room + session are stable for the forwarder's lifetime, so the
     // self-subject is precomputed once here instead of re-allocating it per packet.
     let self_subject = format!("room.{room}.{session}").replace(' ', "_");
+    let captions_subject = format!("room.{room}.captions").replace(' ', "_");
 
     let forward = move |msg: async_nats::Message,
                         parsed: Option<&PacketWrapper>|
@@ -6330,6 +6620,14 @@ fn handle_msg(
             return Ok(());
         }
 
+        // Only the captions service's subject may carry a CAPTION.
+        let is_caption = parsed
+            .map(|pw| pw.packet_type == PacketType::CAPTION.into())
+            .unwrap_or(false);
+        if is_caption && msg.subject.as_str() != captions_subject {
+            return Ok(());
+        }
+
         // PEER_EVENT packets are unicast at the application layer: the
         // publisher addresses one specific peer via `target_peer_id` in the
         // inner `PeerEvent` payload. Because the NATS subject fan-out
@@ -6367,33 +6665,40 @@ fn handle_msg(
             }
         }
 
-        // Observer sessions (waiting room) only need meeting-control packets.
-        // The client-side `decode_media: false` check is bypassable (WASM
-        // patching, raw WebSocket capture, custom client), so the server
-        // enforces this as the authoritative filter.
+        // Observer sessions (waiting room) and sessions not yet `Active` only
+        // need meeting-control packets. The client-side `decode_media: false`
+        // check is bypassable (WASM patching, raw WebSocket capture, custom
+        // client), so the server enforces this as the authoritative filter.
         //
-        // Allowlist: only MEETING and SESSION_ASSIGNED are forwarded.
-        // Everything else — including any future packet types — is dropped.
+        // Allowlist: only MEETING and SESSION_ASSIGNED are forwarded, plus
+        // a non-observer's own LAYER_HINT. Everything else — including any
+        // future packet types — is dropped.
         // This is fail-closed by default: new PacketTypes must be explicitly
         // added here to reach observer sessions.
-        if observer {
+        if observer || !downlink_activated.load(AtomicOrdering::Relaxed) {
             let allowed = parsed
-                .map(|pw| {
-                    matches!(
-                        pw.packet_type.enum_value(),
-                        Ok(PacketType::MEETING) | Ok(PacketType::SESSION_ASSIGNED)
-                    )
+                .map(|pw| match pw.packet_type.enum_value() {
+                    Ok(PacketType::MEETING) | Ok(PacketType::SESSION_ASSIGNED) => true,
+                    Ok(PacketType::LAYER_HINT) => !observer && subject_self && inner_session_self,
+                    _ => false,
                 })
                 .unwrap_or(false); // unparseable → drop (fail-closed)
 
             if !allowed {
                 trace!(
-                    "Dropping non-allowed packet for observer session {} in room {}",
+                    "Dropping non-allowed packet for observer or unactivated session {} in room {}",
                     session,
                     room
                 );
                 return Ok(());
             }
+        }
+
+        if parsed.is_some_and(|pw| keyframe_request_for_other_user(pw, &receiver_user_id)) {
+            RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL
+                .with_label_values(&[&room])
+                .inc();
+            return Ok(());
         }
 
         // Viewport-aware VIDEO filtering (HCL issue #988).
@@ -6417,7 +6722,7 @@ fn handle_msg(
         //   - SCREEN is NEVER filtered by the camera-tile viewport (a separate
         //     future signal governs screen-share).
         //   - HEARTBEAT / RTT / KEYFRAME_REQUEST and every non-MEDIA packet
-        //     type are NEVER filtered (control/liveness).
+        //     type are not filtered here.
         //   - `media_kind` UNSPECIFIED (0) fails OPEN (forwards) so older
         //     clients and any packet without the discriminator are unaffected.
         //   - An empty desired set fails OPEN (no viewport signal yet).
@@ -6798,10 +7103,7 @@ fn handle_msg(
             // We classify off the OUTER cleartext wrapper that was already
             // parsed ONCE per packet (`parsed`) — `packet_type` + the outer
             // `media_kind` (field 5) — NEVER the inner `MediaPacket`, which is
-            // AES-sealed under E2EE. This is the SAME data the #988/#989
-            // filters above already read, so the added per-receiver work here
-            // is O(1): two enum reads on already-decoded fields, no parse, no
-            // allocation, no lock. Fail-open: an unparseable wrapper
+            // AES-sealed under E2EE. Fail-open: an unparseable wrapper
             // (`parsed == None`) or UNSPECIFIED/unknown media_kind classifies
             // as Control and is attributed `mailbox_full` (never preferentially
             // blamed as a media shed).
@@ -6811,31 +7113,7 @@ fn handle_msg(
             // `Full` is a shed scenario; a `Closed` drop keeps the plain
             // `mailbox_full` label and the warn, exactly as before.
             let is_full = matches!(e, SendError::Full(_));
-            let priority = match parsed {
-                    Some(pw) => OutboundPriority::classify_outer(
-                        true,
-                        pw.packet_type
-                            .enum_value()
-                            .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
-                        pw.media_kind.enum_value().unwrap_or(
-                            videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
-                        ),
-                    ),
-                    // Unparseable outer wrapper → fail-open Control (never a media shed).
-                    None => OutboundPriority::Control,
-                };
-
-            // Pick the per-room `drop_reason` label. On a `Full` mailbox a
-            // droppable media kind (VIDEO/SCREEN → `priority_drop_video`,
-            // AUDIO → `priority_drop_audio`) attributes the sacrifice to that
-            // kind; everything else (Critical/Control, or a `Closed` mailbox)
-            // keeps the legacy `mailbox_full` label. The labels mirror the
-            // OUTBOUND taxonomy documented on `OUTBOUND_CHANNEL_DROPS_TOTAL`
-            // (`metrics.rs`), so a single dashboard query spans both hops.
-            let drop_reason = match (is_full, priority.priority_drop_label()) {
-                (true, Some(label)) => label,
-                _ => "mailbox_full",
-            };
+            let drop_reason = nats_delivery_drop_reason(parsed, is_full);
 
             // Room-tagged forensic series (kept for per-room drill-down). The
             // `transport="nats_delivery"` here is the publish-side identity, not
@@ -7217,6 +7495,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -7296,6 +7576,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -7360,6 +7642,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -7398,6 +7682,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -7464,6 +7750,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -7486,6 +7774,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -7739,6 +8029,176 @@ mod tests {
         assert!(
             published.load(Ordering::Relaxed),
             "Message should be published while in Active state"
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_testing_session_receives_room_media_only_after_activation() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let count_of = |received: &Arc<Mutex<Vec<bytes::Bytes>>>, kind: PacketType| {
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|b| <PacketWrapper as ProtobufMessage>::parse_from_bytes(b).ok())
+                .filter(|pw| pw.packet_type == kind.into())
+                .count()
+        };
+
+        let session_id = 3_058_001u64;
+        let room = "test-room-3058-gate".to_string();
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: CapturingSession {
+                    received: received.clone(),
+                }
+                .start()
+                .recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.clone(),
+                user_id: "candidate@example.com".to_string(),
+                display_name: "candidate".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
+                closer: None,
+            })
+            .await
+            .expect("JoinRoom delivery")
+            .expect("JoinRoom should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        let peer_subject = format!("room.{room}.3058999");
+        let media = bytes::Bytes::from(make_media_packet_bytes(MediaKind::AUDIO, 3_058_999));
+        nats_client
+            .publish(peer_subject.clone(), media.clone())
+            .await
+            .expect("publish");
+        nats_client
+            .publish(
+                peer_subject.clone(),
+                bytes::Bytes::from(make_packet_bytes(PacketType::SESSION_ASSIGNED)),
+            )
+            .await
+            .expect("publish");
+        nats_client.flush().await.expect("flush");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            count_of(&received, PacketType::SESSION_ASSIGNED),
+            1,
+            "the subscription must be live and still forward SESSION_ASSIGNED"
+        );
+        assert_eq!(
+            count_of(&received, PacketType::MEDIA),
+            0,
+            "a Testing candidate must not receive room media"
+        );
+
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        nats_client
+            .publish(peer_subject, media)
+            .await
+            .expect("publish");
+        nats_client.flush().await.expect("flush");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            count_of(&received, PacketType::MEDIA),
+            1,
+            "room media must flow once the session is activated"
+        );
+
+        let pre_activated: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let pre_activated_id = 3_058_002u64;
+        chat_server
+            .send(Connect {
+                id: pre_activated_id,
+                addr: CapturingSession {
+                    received: pre_activated.clone(),
+                }
+                .start()
+                .recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(ActivateConnection {
+                session: pre_activated_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: pre_activated_id,
+                room: room.clone(),
+                user_id: "early@example.com".to_string(),
+                display_name: "early".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                transport: "webtransport".to_string(),
+                downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
+                closer: None,
+            })
+            .await
+            .expect("JoinRoom delivery")
+            .expect("JoinRoom should succeed");
+        sleep(Duration::from_millis(300)).await;
+        nats_client
+            .publish(
+                format!("room.{room}.3058999"),
+                bytes::Bytes::from(make_media_packet_bytes(MediaKind::AUDIO, 3_058_999)),
+            )
+            .await
+            .expect("publish");
+        nats_client.flush().await.expect("flush");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            count_of(&pre_activated, PacketType::MEDIA),
+            1,
+            "a session activated before JoinRoom must receive room media"
         );
     }
 
@@ -8142,6 +8602,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8171,6 +8633,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn join_room_meeting_started(
+        room: &str,
+        session_id: u64,
+        meeting_started_at_ms: Option<u64>,
+    ) -> videocall_types::protos::meeting_packet::MeetingPacket {
+        use futures::StreamExt;
+        use tokio::time::{timeout, Duration};
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut system = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("subscribe");
+        nats_client.flush().await.expect("flush");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: DummySession.start().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "alice@example.com".to_string(),
+                display_name: "alice@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                meeting_started_at_ms,
+                conn_seq: None,
+                closer: None,
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(result.is_ok(), "JoinRoom should succeed");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = system.next().await.expect("subscription open");
+                let wrapper = <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                    .expect("PacketWrapper");
+                let meeting = <MeetingPacket as ProtobufMessage>::parse_from_bytes(&wrapper.data)
+                    .expect("MeetingPacket");
+                if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
+                    return meeting;
+                }
+            }
+        })
+        .await
+        .expect("MEETING_STARTED broadcast")
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn join_room_broadcasts_the_token_meeting_start() {
+        let started =
+            join_room_meeting_started("test-room-broadcast-3237", 1008, Some(1_707_000_000_123))
+                .await;
+        assert_eq!(started.start_time_ms, 1_707_000_000_123);
+        assert!(started.start_time_authoritative);
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn join_room_without_a_token_start_broadcasts_the_relay_clock_as_non_authoritative() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let started =
+            join_room_meeting_started("test-room-broadcast-3237-claimless", 1009, None).await;
+        assert!(started.start_time_ms >= before);
+        assert!(!started.start_time_authoritative);
     }
 
     // ==========================================================================
@@ -8257,6 +8817,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8358,6 +8920,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8465,6 +9029,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8536,6 +9102,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8650,6 +9218,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8765,6 +9335,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8891,6 +9463,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -8915,6 +9489,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -9028,6 +9604,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9063,6 +9640,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9098,6 +9676,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9133,6 +9712,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9148,6 +9728,70 @@ mod tests {
             1,
             "Observer MUST receive MEETING packets"
         );
+    }
+
+    #[test]
+    fn a_full_mailbox_never_books_a_caption_status_as_a_priority_shed() {
+        use crate::actors::priority_drop::{
+            caption_bytes, caption_wrapper, PRIORITY_DROP_CAPTION_REASON,
+        };
+        use videocall_types::protos::caption_packet::caption_packet::Kind;
+        let wrapper = |kind| caption_wrapper(caption_bytes(kind));
+        assert_eq!(
+            nats_delivery_drop_reason(Some(&wrapper(Kind::TEXT)), true),
+            PRIORITY_DROP_CAPTION_REASON
+        );
+        for kind in [Kind::STATUS_ACTIVE, Kind::STATUS_STOPPED] {
+            assert_eq!(
+                nats_delivery_drop_reason(Some(&wrapper(kind)), true),
+                "mailbox_full",
+                "{kind:?}",
+            );
+        }
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_caption_only_from_the_captions_subject_and_not_to_observers() {
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::CAPTION.into();
+        pw.user_id = videocall_types::SYSTEM_USER_ID.as_bytes().to_vec();
+        let caption = pw.write_to_bytes().expect("serialize caption");
+
+        for (subject, observer, expected) in [
+            ("room.room-cc.captions", false, 1),
+            ("room.room-cc.captions", true, 0),
+            ("room.room-cc.123", false, 0),
+            ("room.room-cc.system", false, 0),
+            ("room.other.captions", false, 0),
+        ] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let actor = RecordingSession {
+                count: count.clone(),
+            }
+            .start();
+            let (handler, _emit_downlink_congestion) = handle_msg(
+                actor.recipient(),
+                "room-cc".to_string(),
+                9050,
+                observer,
+                "recv-user".to_string(),
+                DesiredStreams::default(),
+                empty_layer_prefs(),
+                "websocket".to_string(),
+                never_epoch(),
+                activated_downlink(),
+            );
+            let nats_msg = make_nats_message(subject, caption.clone());
+            let parsed = parse_pw(&nats_msg);
+            handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+            tokio::task::yield_now().await;
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                expected,
+                "subject={subject} observer={observer}"
+            );
+        }
     }
 
     #[actix_rt::test]
@@ -9168,6 +9812,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Send garbage bytes that cannot be parsed as a PacketWrapper.
@@ -9204,6 +9849,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9218,6 +9864,105 @@ mod tests {
             count.load(Ordering::Relaxed),
             1,
             "Observer MUST receive SESSION_ASSIGNED packets"
+        );
+    }
+
+    async fn forwarded_count(
+        observer: bool,
+        activated: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        subject: &str,
+        session_id: u64,
+        packet_type: PacketType,
+    ) -> usize {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            "room3058".to_string(),
+            3058,
+            observer,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+            activated.clone(),
+        );
+        let nats_msg = make_nats_message(
+            subject,
+            make_packet_bytes_with_session(packet_type, session_id),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+        tokio::task::yield_now().await;
+        count.load(Ordering::Relaxed)
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_unactivated_session_receives_only_control_until_activated() {
+        let activated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer = "room.room3058.other_session";
+        let own = "room.room3058.3058";
+
+        for dropped in [PacketType::MEDIA, PacketType::AES_KEY, PacketType::HEALTH] {
+            assert_eq!(
+                forwarded_count(false, &activated, peer, 4242, dropped).await,
+                0,
+                "unactivated session must not receive {dropped:?}"
+            );
+        }
+        assert_eq!(
+            forwarded_count(false, &activated, peer, 4242, PacketType::MEETING).await,
+            1
+        );
+        assert_eq!(
+            forwarded_count(false, &activated, peer, 4242, PacketType::SESSION_ASSIGNED).await,
+            1
+        );
+        assert_eq!(
+            forwarded_count(false, &activated, own, 3058, PacketType::LAYER_HINT).await,
+            1,
+            "an unactivated publisher must still receive its LAYER_HINT"
+        );
+        assert_eq!(
+            forwarded_count(true, &activated, own, 3058, PacketType::LAYER_HINT).await,
+            0,
+            "observers still drop LAYER_HINT"
+        );
+        assert_eq!(
+            forwarded_count(false, &activated, peer, 4242, PacketType::LAYER_HINT).await,
+            0,
+            "an unactivated session must not receive another publisher's LAYER_HINT"
+        );
+        assert_eq!(
+            forwarded_count(false, &activated, own, 4242, PacketType::LAYER_HINT).await,
+            0,
+            "own subject with a foreign session_id is not an own LAYER_HINT"
+        );
+        assert_eq!(
+            forwarded_count(false, &activated, peer, 3058, PacketType::LAYER_HINT).await,
+            0,
+            "peer subject with the receiver's session_id is not an own LAYER_HINT"
+        );
+
+        activated.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            forwarded_count(false, &activated, peer, 4242, PacketType::MEDIA).await,
+            1,
+            "MEDIA forwards once the session is activated"
+        );
+        assert_eq!(
+            forwarded_count(true, &activated, peer, 4242, PacketType::MEDIA).await,
+            0,
+            "activation never lifts the observer gate"
+        );
+        assert_eq!(
+            forwarded_count(false, &activated, peer, 4242, PacketType::LAYER_HINT).await,
+            1,
+            "an activated session's LAYER_HINT delivery is unchanged"
         );
     }
 
@@ -9239,6 +9984,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9274,6 +10020,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9323,6 +10070,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9363,6 +10111,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Subject points at a DIFFERENT session id; payload session_id is
@@ -9408,6 +10157,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9447,6 +10197,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9503,6 +10254,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9574,6 +10326,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9644,6 +10397,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9718,6 +10472,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9793,6 +10548,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -9849,6 +10605,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Subject == the receiver's own self-subject, mirroring the real
@@ -9894,6 +10651,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Subject points at a DIFFERENT session id; embedded session_id is ours
@@ -9938,6 +10696,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Identical addressing to test_handle_msg_layer_hint_passes_self_filter_*
@@ -9979,6 +10738,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10020,6 +10780,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10075,6 +10836,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10110,6 +10872,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10145,6 +10908,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10180,6 +10944,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let mut pw = PacketWrapper::new();
@@ -10235,6 +11000,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10273,6 +11039,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Reply addressed to session 9999, not us (7001).
@@ -10312,6 +11079,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10365,6 +11133,10 @@ mod tests {
     /// layer filter forwards everything (byte-identical to pre-#989 behaviour).
     fn empty_layer_prefs() -> LayerPrefs {
         LayerPrefs::default()
+    }
+
+    fn activated_downlink() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true))
     }
 
     /// Build the shared receiver-downlink-congestion epoch a `handle_msg` call
@@ -10525,6 +11297,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10568,6 +11341,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Forged payload session_id = 200 (visible), but arrives on 999's subject.
@@ -10609,6 +11383,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10644,6 +11419,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Subject-derived source = 200 (in the viewport set).
@@ -10681,6 +11457,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10718,6 +11495,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10754,6 +11532,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10791,6 +11570,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -10831,6 +11611,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -11124,6 +11905,18 @@ mod tests {
         }
     }
 
+    #[derive(ActixMessage)]
+    #[rtype(result = "Vec<SessionId>")]
+    struct ResumedUnactivated;
+
+    impl Handler<ResumedUnactivated> for ChatServer {
+        type Result = MessageResult<ResumedUnactivated>;
+
+        fn handle(&mut self, _: ResumedUnactivated, _ctx: &mut Self::Context) -> Self::Result {
+            MessageResult(self.resumed_unactivated.iter().copied().collect())
+        }
+    }
+
     /// Check whether a session is registered in the sessions map.
     #[derive(ActixMessage)]
     #[rtype(result = "bool")]
@@ -11240,6 +12033,24 @@ mod tests {
         }
     }
 
+    #[derive(ActixMessage)]
+    #[rtype(result = "bool")]
+    struct TestHasSessionState(SessionId);
+
+    impl Handler<TestHasSessionState> for ChatServer {
+        type Result = bool;
+
+        fn handle(&mut self, msg: TestHasSessionState, _ctx: &mut Self::Context) -> bool {
+            self.session_room.contains_key(&msg.0)
+                || self.session_is_guest.contains_key(&msg.0)
+                || self.session_instance.contains_key(&msg.0)
+                || self.session_desired_streams.contains_key(&msg.0)
+                || self.session_layer_prefs.contains_key(&msg.0)
+                || self.session_downlink_activated.contains_key(&msg.0)
+                || self.last_rebroadcast_at.contains_key(&msg.0)
+        }
+    }
+
     impl Handler<TestMaxRequestedLayer> for ChatServer {
         type Result = MessageResult<TestMaxRequestedLayer>;
 
@@ -11280,6 +12091,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -11822,6 +12635,18 @@ mod tests {
         }
     }
 
+    #[derive(ActixMessage)]
+    #[rtype(result = "Option<u64>")]
+    struct GetSessionConnSeq(SessionId);
+
+    impl Handler<GetSessionConnSeq> for ChatServer {
+        type Result = Option<u64>;
+
+        fn handle(&mut self, msg: GetSessionConnSeq, _ctx: &mut Self::Context) -> Self::Result {
+            self.session_conn_seq.get(&msg.0).copied()
+        }
+    }
+
     // ==========================================================================
     // TEST: EvictInstance handler evicts the correct session
     // ==========================================================================
@@ -11872,6 +12697,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -11903,6 +12730,8 @@ mod tests {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 new_session_id: 99999,
+                origin_relay: None,
+                new_conn_seq: None,
             }))
             .await
             .expect("EvictInstance should succeed");
@@ -11975,6 +12804,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -11996,6 +12827,8 @@ mod tests {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 new_session_id: 99999,
+                origin_relay: None,
+                new_conn_seq: None,
             }))
             .await
             .expect("EvictInstance should succeed");
@@ -12071,6 +12904,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -12092,6 +12927,8 @@ mod tests {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 new_session_id: session_id, // SAME as stored — self-delivery
+                origin_relay: None,
+                new_conn_seq: None,
             }))
             .await
             .expect("EvictInstance should succeed");
@@ -12116,6 +12953,241 @@ mod tests {
             .await
             .expect("Query should succeed");
         assert!(has, "Session should still exist after self-delivery");
+    }
+
+    struct EvictTestSession;
+    impl Actor for EvictTestSession {
+        type Context = actix::Context<Self>;
+    }
+    impl Handler<Message> for EvictTestSession {
+        type Result = ();
+        fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+    }
+
+    async fn reconnect_same_instance(
+        room: &str,
+        user_id: &str,
+        instance_id: &str,
+        c1: SessionId,
+        c2: SessionId,
+    ) -> (actix::Addr<ChatServer>, u64) {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let server = ChatServer::new(nats_client).await;
+        let relay_id = server.relay_id;
+        let chat_server = server.start();
+
+        connect_and_join(
+            &chat_server,
+            c1,
+            room,
+            user_id,
+            EvictTestSession.start().recipient(),
+            Some(instance_id.to_string()),
+        )
+        .await;
+        chat_server
+            .send(ActivateConnection { session: c1 })
+            .await
+            .expect("ActivateConnection should succeed");
+        chat_server
+            .send(Disconnect {
+                session: c1,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                is_guest: false,
+                observer: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        connect_and_join(
+            &chat_server,
+            c2,
+            room,
+            user_id,
+            EvictTestSession.start().recipient(),
+            Some(instance_id.to_string()),
+        )
+        .await;
+        chat_server
+            .send(ActivateConnection { session: c2 })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let holder = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.to_string(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(
+            holder,
+            Some(c2),
+            "C2 should hold the instance after reconnect"
+        );
+
+        (chat_server, relay_id)
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_self_echo_eviction_does_not_evict_newer_holder() {
+        let room = "test-room-3184-self-echo";
+        let user_id = "echo@example.com";
+        let instance_id = "inst-3184-self-echo";
+        let (c1, c2): (SessionId, SessionId) = (31841, 31842);
+        let (chat_server, relay_id) =
+            reconnect_same_instance(room, user_id, instance_id, c1, c2).await;
+
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id: instance_id.to_string(),
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                new_session_id: c1,
+                origin_relay: Some(relay_id),
+                new_conn_seq: None,
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+
+        let holder = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.to_string(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(holder, Some(c2), "self-echo must not evict C2");
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert!(
+            members.iter().any(|m| m.session == c2),
+            "C2 must remain in room_members after a self-echo"
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_foreign_origin_eviction_still_evicts_older_holder() {
+        let room = "test-room-3184-foreign";
+        let user_id = "foreign@example.com";
+        let instance_id = "inst-3184-foreign";
+        let (c1, c2): (SessionId, SessionId) = (31843, 31844);
+        let (chat_server, relay_id) =
+            reconnect_same_instance(room, user_id, instance_id, c1, c2).await;
+
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id: instance_id.to_string(),
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                new_session_id: 31845,
+                origin_relay: Some(relay_id ^ 1),
+                new_conn_seq: None,
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+
+        let holder = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.to_string(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(holder, None, "a foreign-origin eviction must evict C2");
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert!(
+            !members.iter().any(|m| m.session == c2),
+            "C2 must leave room_members after a foreign-origin eviction"
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_activation_eviction_broadcast_carries_own_relay_id() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut sub = nats_client
+            .subscribe(EVICT_INSTANCE_SUBJECT)
+            .await
+            .expect("subscribe should succeed");
+        nats_client.flush().await.expect("flush should succeed");
+        let server = ChatServer::new(nats_client).await;
+        let relay_id = server.relay_id;
+        let chat_server = server.start();
+
+        let instance_id = "inst-3184-publish";
+        let session: SessionId = 31846;
+        connect_and_join(
+            &chat_server,
+            session,
+            "test-room-3184-publish",
+            "publish@example.com",
+            EvictTestSession.start().recipient(),
+            Some(instance_id.to_string()),
+        )
+        .await;
+        chat_server
+            .send(ActivateConnection { session })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let payload = loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), sub.next())
+                .await
+                .expect("eviction broadcast should arrive")
+                .expect("subscription should stay open");
+            let payload: EvictInstancePayload =
+                serde_json::from_slice(&msg.payload).expect("payload should deserialise");
+            if payload.instance_id == instance_id {
+                break payload;
+            }
+        };
+        assert_eq!(payload.new_session_id, session);
+        assert_eq!(payload.origin_relay, Some(relay_id));
+    }
+
+    #[test]
+    fn evict_payload_omits_unknown_conn_seq_3285() {
+        let mut payload = EvictInstancePayload {
+            instance_id: "i".to_string(),
+            room: "r".to_string(),
+            user_id: "u".to_string(),
+            new_session_id: 7,
+            origin_relay: Some(1),
+            new_conn_seq: None,
+        };
+        let json = serde_json::to_value(&payload).expect("payload should serialise");
+        assert!(json.get("new_conn_seq").is_none(), "got {json}");
+
+        payload.new_conn_seq = Some(4);
+        let json = serde_json::to_value(&payload).expect("payload should serialise");
+        assert_eq!(json.get("new_conn_seq"), Some(&serde_json::json!(4)));
+    }
+
+    #[test]
+    fn evict_payload_without_origin_relay_deserialises_to_none() {
+        let json = r#"{"instance_id":"i","room":"r","user_id":"u","new_session_id":7}"#;
+        let payload: EvictInstancePayload =
+            serde_json::from_str(json).expect("legacy payload should deserialise");
+        assert_eq!(payload.origin_relay, None);
+        assert_eq!(payload.new_conn_seq, None);
+        assert_eq!(payload.new_session_id, 7);
     }
 
     // ==========================================================================
@@ -12167,6 +13239,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -12188,6 +13262,8 @@ mod tests {
                 room: room.clone(),
                 user_id: "mallory@example.com".to_string(), // WRONG user
                 new_session_id: 99999,
+                origin_relay: None,
+                new_conn_seq: None,
             }))
             .await
             .expect("EvictInstance should succeed");
@@ -12406,6 +13482,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -12517,6 +13595,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -12586,6 +13666,235 @@ mod tests {
             presence_reports(&mut sub, room, Duration::from_secs(2)).await,
             vec![(s1, true), (s2, true), (s3, true), (s2, true), (s2, false)],
             "s1 was never the reported session; s3 hands off to s2; s2 leaves last"
+        );
+    }
+
+    /// Connect and join `session` without activating it (an election candidate).
+    async fn join_testing(
+        chat_server: &Addr<ChatServer>,
+        dummy: &Addr<EohlDummySession>,
+        session: SessionId,
+        room: &str,
+        user_id: &str,
+    ) {
+        chat_server
+            .send(Connect {
+                id: session,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
+                closer: None,
+            })
+            .await
+            .expect("JoinRoom should deliver")
+            .expect("JoinRoom should return Ok");
+    }
+
+    async fn presence_fixture() -> (
+        Addr<ChatServer>,
+        Addr<EohlDummySession>,
+        async_nats::Subscriber,
+    ) {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let sub = nats_client
+            .subscribe(PARTICIPANT_PRESENCE_SUBJECT)
+            .await
+            .expect("subscribe presence");
+        let chat_server = ChatServer::new(nats_client).await.start();
+        (chat_server, EohlDummySession.start(), sub)
+    }
+
+    fn leave_msg(session: SessionId, room: &str, user: &str) -> Leave {
+        Leave {
+            session,
+            room: room.to_string(),
+            user_id: user.to_string(),
+        }
+    }
+
+    fn disconnect_msg(session: SessionId, room: &str, user: &str) -> Disconnect {
+        Disconnect {
+            session,
+            room: room.to_string(),
+            user_id: user.to_string(),
+            display_name: user.to_string(),
+            is_guest: false,
+            observer: false,
+        }
+    }
+
+    /// A never-activated election candidate is never handed the presence.
+    #[actix_rt::test]
+    #[serial]
+    async fn presence_is_not_handed_to_a_never_activated_candidate() {
+        use tokio::time::Duration;
+
+        let (chat_server, dummy, mut sub) = presence_fixture().await;
+        let (room, user) = (
+            "test-3044-candidate-never-activates",
+            "reload-host@example.com",
+        );
+        let (active, candidate): (SessionId, SessionId) = (9_821, 9_822);
+        join_and_activate(&chat_server, &dummy, active, room, user).await;
+        join_testing(&chat_server, &dummy, candidate, room, user).await;
+        for session in [active, candidate] {
+            chat_server
+                .send(leave_msg(session, room, user))
+                .await
+                .expect("Leave should succeed");
+        }
+        assert_eq!(
+            presence_reports(&mut sub, room, Duration::from_secs(2)).await,
+            vec![(active, true), (active, false)]
+        );
+    }
+
+    /// The reported session leaving while only a candidate remains reports
+    /// nothing; the candidate that then activates reports itself present.
+    #[actix_rt::test]
+    #[serial]
+    async fn presence_waits_for_a_remaining_candidate_that_activates() {
+        use tokio::time::Duration;
+
+        let (chat_server, dummy, mut sub) = presence_fixture().await;
+        let (room, user) = (
+            "test-3044-candidate-activates-later",
+            "reconnect-host@example.com",
+        );
+        let (active, candidate): (SessionId, SessionId) = (9_811, 9_812);
+        join_and_activate(&chat_server, &dummy, active, room, user).await;
+        join_testing(&chat_server, &dummy, candidate, room, user).await;
+        chat_server
+            .send(leave_msg(active, room, user))
+            .await
+            .expect("Leave should succeed");
+        assert_eq!(
+            presence_reports(&mut sub, room, Duration::from_secs(2)).await,
+            vec![(active, true)],
+            "no LEFT while a candidate may still win"
+        );
+        chat_server
+            .send(ActivateConnection { session: candidate })
+            .await
+            .expect("ActivateConnection should succeed");
+        chat_server
+            .send(leave_msg(candidate, room, user))
+            .await
+            .expect("Leave should succeed");
+        assert_eq!(
+            presence_reports(&mut sub, room, Duration::from_secs(2)).await,
+            vec![(candidate, true), (candidate, false)]
+        );
+    }
+
+    /// A cross-server eviction of the reported session neither hands the
+    /// presence to a remaining never-activated candidate nor reports a LEFT.
+    #[actix_rt::test]
+    #[serial]
+    async fn presence_eviction_of_the_reported_session_does_not_hand_off_to_a_candidate() {
+        use tokio::time::Duration;
+
+        let (chat_server, dummy, mut sub) = presence_fixture().await;
+        let (room, user) = ("test-3044-evict-reported", "evicted-host@example.com");
+        let (active, candidate): (SessionId, SessionId) = (9_841, 9_842);
+        let instance_id = "test-3044-evict-reported-instance".to_string();
+        chat_server
+            .send(Connect {
+                id: active,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: active,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(instance_id.clone()),
+                is_host: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
+                closer: None,
+            })
+            .await
+            .expect("JoinRoom should deliver")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection { session: active })
+            .await
+            .expect("ActivateConnection should succeed");
+        join_testing(&chat_server, &dummy, candidate, room, user).await;
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                new_session_id: 99_999,
+                origin_relay: None,
+                new_conn_seq: None,
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+        assert_eq!(
+            presence_reports(&mut sub, room, Duration::from_secs(2)).await,
+            vec![(active, true)]
+        );
+    }
+
+    /// Through the grace-expiry paths: the reported session's LEFT waits for
+    /// the remaining candidate and is sent when it expires never activated.
+    #[actix_rt::test]
+    #[serial]
+    async fn presence_left_is_sent_when_the_remaining_candidate_expires_unactivated() {
+        use tokio::time::Duration;
+
+        let (chat_server, dummy, mut sub) = presence_fixture().await;
+        let (room, user) = ("test-3044-candidate-expires", "grace-host@example.com");
+        let (active, candidate): (SessionId, SessionId) = (9_831, 9_832);
+        join_and_activate(&chat_server, &dummy, active, room, user).await;
+        join_testing(&chat_server, &dummy, candidate, room, user).await;
+        chat_server
+            .send(disconnect_msg(active, room, user))
+            .await
+            .expect("Disconnect should succeed");
+        let grace = RECONNECT_GRACE_PERIOD + Duration::from_secs(1);
+        assert_eq!(
+            presence_reports(&mut sub, room, grace).await,
+            vec![(active, true)],
+            "no LEFT while a candidate may still win"
+        );
+        chat_server
+            .send(disconnect_msg(candidate, room, user))
+            .await
+            .expect("Disconnect should succeed");
+        assert_eq!(
+            presence_reports(&mut sub, room, grace).await,
+            vec![(active, false)]
         );
     }
 
@@ -12787,6 +14096,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -12821,6 +14132,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -12885,6 +14198,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -12968,6 +14283,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -13057,6 +14374,8 @@ mod tests {
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                     token_iat: None,
+                    meeting_started_at_ms: None,
+                    conn_seq: None,
                     closer: None,
                 })
                 .await
@@ -13380,6 +14699,8 @@ mod tests {
             transport: "websocket".to_string(),
             downlink_congested_epoch: never_epoch(),
             token_iat: None,
+            meeting_started_at_ms: None,
+            conn_seq: None,
             closer: None,
         })
         .await
@@ -13877,6 +15198,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -13935,6 +15258,27 @@ mod tests {
         user_id: &str,
         instance_id: &str,
     ) {
+        connect_and_join_seq_3285(
+            chat_server,
+            dummy,
+            session,
+            room,
+            user_id,
+            instance_id,
+            None,
+        )
+        .await;
+    }
+
+    async fn connect_and_join_seq_3285(
+        chat_server: &actix::Addr<ChatServer>,
+        dummy: &actix::Addr<EohlDummySession>,
+        session: SessionId,
+        room: &str,
+        user_id: &str,
+        instance_id: &str,
+        conn_seq: Option<u64>,
+    ) {
         chat_server
             .send(Connect {
                 id: session,
@@ -13955,6 +15299,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq,
                 closer: None,
             })
             .await
@@ -14364,6 +15710,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14414,6 +15762,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14495,6 +15845,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14558,6 +15910,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14612,6 +15966,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14651,6 +16007,1831 @@ mod tests {
             found_alice,
             "Bob should have received PARTICIPANT_JOINED for Alice"
         );
+    }
+
+    /// Drives JoinRoom(A) -> [ActivateConnection(A)] -> Disconnect(A) ->
+    /// JoinRoom(B, same instance, inside grace) -> ActivateConnection(B) and
+    /// returns the JOINED and SESSION_RESUMED session ids seen on the room
+    /// system subject, plus the room roster afterwards (#3056).
+    async fn rejoin_same_instance_within_grace_3056(
+        room: &str,
+        activate_predecessor: bool,
+        session_a: SessionId,
+        session_b: SessionId,
+    ) -> (Vec<u64>, Vec<u64>, Vec<RoomMemberInfo>, bool) {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let user = "candidate@example.com";
+        let iid = "iid-3056";
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        connect_and_join_2711(&chat_server, &dummy, session_a, room, user, iid).await;
+        if activate_predecessor {
+            chat_server
+                .send(ActivateConnection { session: session_a })
+                .await
+                .expect("ActivateConnection should succeed");
+            sleep(Duration::from_millis(300)).await;
+            let pre = collect_joined_sessions(&mut system_sub, Duration::from_millis(500)).await;
+            assert_eq!(pre, vec![session_a], "control: A's own join is announced");
+        }
+        disconnect_2711(&chat_server, session_a, room, user).await;
+
+        sleep(Duration::from_millis(500)).await;
+        connect_and_join_2711(&chat_server, &dummy, session_b, room, user, iid).await;
+        let suppressed = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_b })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let mut joined = Vec::new();
+        let mut resumed = Vec::new();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            let remaining = Duration::from_millis(1500).saturating_sub(start.elapsed());
+            let Ok(Some(msg)) = tokio::time::timeout(remaining, system_sub.next()).await else {
+                break;
+            };
+            let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+            else {
+                continue;
+            };
+            let Ok(inner) =
+                videocall_types::protos::meeting_packet::MeetingPacket::parse_from_bytes(
+                    &wrapper.data,
+                )
+            else {
+                continue;
+            };
+            if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                joined.push(inner.session_id);
+            } else if inner.event_type == MeetingEventType::PARTICIPANT_SESSION_RESUMED.into() {
+                assert_eq!(inner.previous_session_id, session_a);
+                resumed.push(inner.session_id);
+            }
+        }
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        (joined, resumed, members, suppressed)
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_never_activated_predecessor_does_not_suppress_successor_join() {
+        let (joined, resumed, members, suppressed) = rejoin_same_instance_within_grace_3056(
+            "test-3056-never-activated",
+            false,
+            30_561,
+            30_562,
+        )
+        .await;
+        assert_eq!(joined, vec![30_562], "peers must see B join");
+        assert!(!suppressed, "B must not be classified as a reconnection");
+        assert!(resumed.is_empty(), "A was never announced; nothing resumes");
+        let sessions: Vec<SessionId> = members.iter().map(|m| m.session).collect();
+        assert_eq!(sessions, vec![30_562], "A's stale row must be gone");
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_active_predecessor_still_resumes_without_join() {
+        let (joined, resumed, members, suppressed) =
+            rejoin_same_instance_within_grace_3056("test-3056-active", true, 30_563, 30_564).await;
+        assert!(suppressed, "an Active predecessor makes B a reconnection");
+        assert!(joined.is_empty(), "B's JOINED must stay suppressed");
+        assert_eq!(resumed, vec![30_564], "B must resume A");
+        let sessions: Vec<SessionId> = members.iter().map(|m| m.session).collect();
+        assert_eq!(sessions, vec![30_564]);
+    }
+
+    #[derive(Default, Debug)]
+    struct RoomEvents3181 {
+        joined: Vec<u64>,
+        left: Vec<u64>,
+        resumed: Vec<(u64, u64)>,
+    }
+
+    async fn drain_room_events_3181(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> RoomEvents3181 {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let mut events = RoomEvents3181::default();
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            let Ok(Some(msg)) = tokio::time::timeout(remaining, sub.next()).await else {
+                break;
+            };
+            let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+            else {
+                continue;
+            };
+            let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) else {
+                continue;
+            };
+            if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                events.joined.push(inner.session_id);
+            } else if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                events.left.push(inner.session_id);
+            } else if inner.event_type == MeetingEventType::PARTICIPANT_SESSION_RESUMED.into() {
+                events
+                    .resumed
+                    .push((inner.previous_session_id, inner.session_id));
+            }
+        }
+        events
+    }
+
+    /// Active A disconnects, B (same instance) resumes A inside grace. Returns
+    /// the server, the room system subscription, and a dummy session actor.
+    async fn resume_active_predecessor_3181(
+        room: &str,
+        user: &str,
+        iid: &str,
+        session_a: SessionId,
+        session_b: SessionId,
+    ) -> (
+        actix::Addr<ChatServer>,
+        async_nats::Subscriber,
+        actix::Addr<EohlDummySession>,
+    ) {
+        let (chat_server, system_sub, dummy, _) =
+            resume_active_predecessor_relay_3181(room, user, iid, session_a, session_b).await;
+        (chat_server, system_sub, dummy)
+    }
+
+    /// [`resume_active_predecessor_3181`] that also returns the server's own relay id.
+    async fn resume_active_predecessor_relay_3181(
+        room: &str,
+        user: &str,
+        iid: &str,
+        session_a: SessionId,
+        session_b: SessionId,
+    ) -> (
+        actix::Addr<ChatServer>,
+        async_nats::Subscriber,
+        actix::Addr<EohlDummySession>,
+        u64,
+    ) {
+        use tokio::time::Duration;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let server = ChatServer::new(nats_client.clone()).await;
+        let relay_id = server.relay_id;
+        let chat_server = server.start();
+        let dummy = EohlDummySession.start();
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        connect_and_join_2711(&chat_server, &dummy, session_a, room, user, iid).await;
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection should succeed");
+        disconnect_2711(&chat_server, session_a, room, user).await;
+        connect_and_join_2711(&chat_server, &dummy, session_b, room, user, iid).await;
+
+        let setup = drain_room_events_3181(&mut system_sub, Duration::from_millis(700)).await;
+        assert_eq!(setup.joined, vec![session_a], "control: A is announced");
+        assert_eq!(
+            setup.resumed,
+            vec![(session_a, session_b)],
+            "control: peers re-key A's tile to B"
+        );
+        assert!(setup.left.is_empty(), "control: A's LEFT is cancelled");
+        (chat_server, system_sub, dummy, relay_id)
+    }
+
+    async fn evict_instance_3181(
+        chat_server: &actix::Addr<ChatServer>,
+        room: &str,
+        user: &str,
+        iid: &str,
+        new_session_id: SessionId,
+    ) {
+        evict_instance_from_3181(
+            chat_server,
+            room,
+            user,
+            iid,
+            new_session_id,
+            REMOTE_RELAY_3181,
+        )
+        .await;
+    }
+
+    /// A relay id no `ChatServer` (random u64) will realistically draw.
+    const REMOTE_RELAY_3181: u64 = 31_810;
+
+    async fn evict_instance_from_3181(
+        chat_server: &actix::Addr<ChatServer>,
+        room: &str,
+        user: &str,
+        iid: &str,
+        new_session_id: SessionId,
+        origin_relay: u64,
+    ) {
+        evict_instance_seq_3285(
+            chat_server,
+            room,
+            user,
+            iid,
+            new_session_id,
+            origin_relay,
+            None,
+        )
+        .await;
+    }
+
+    async fn evict_instance_seq_3285(
+        chat_server: &actix::Addr<ChatServer>,
+        room: &str,
+        user: &str,
+        iid: &str,
+        new_session_id: SessionId,
+        origin_relay: u64,
+        new_conn_seq: Option<u64>,
+    ) {
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id: iid.to_string(),
+                room: room.to_string(),
+                user_id: user.to_string(),
+                new_session_id,
+                origin_relay: Some(origin_relay),
+                new_conn_seq,
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+    }
+
+    async fn instance_holder_3285(
+        chat_server: &actix::Addr<ChatServer>,
+        iid: &str,
+    ) -> Option<SessionId> {
+        chat_server
+            .send(GetInstanceSession {
+                instance_id: iid.to_string(),
+            })
+            .await
+            .expect("GetInstanceSession should succeed")
+    }
+
+    /// One relay's holder `C2` joined with `holder_seq`, activated, its own
+    /// eviction echo settled. Returns the server.
+    async fn active_holder_3285(
+        room: &str,
+        user: &str,
+        iid: &str,
+        c2: SessionId,
+        holder_seq: Option<u64>,
+    ) -> actix::Addr<ChatServer> {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        connect_and_join_seq_3285(&chat_server, &dummy, c2, room, user, iid, holder_seq).await;
+        chat_server
+            .send(ActivateConnection { session: c2 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, Some(c2));
+        chat_server
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_late_foreign_eviction_spares_newer_cross_relay_holder_3285() {
+        use tokio::time::Duration;
+
+        let room = "test-3285-late-evict";
+        let user = "late@example.com";
+        let iid = "iid-3285-late";
+        let (c1, c2): (SessionId, SessionId) = (32_851, 32_852);
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let r1 = ChatServer::new(nats_client.clone()).await;
+        let r1_relay_id = r1.relay_id;
+        let r1 = r1.start();
+        let r2 = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("subscribe system subject");
+
+        connect_and_join_seq_3285(&r1, &dummy, c1, room, user, iid, Some(1)).await;
+        r1.send(ActivateConnection { session: c1 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+        disconnect_2711(&r1, c1, room, user).await;
+
+        connect_and_join_seq_3285(&r2, &dummy, c2, room, user, iid, Some(2)).await;
+        r2.send(ActivateConnection { session: c2 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+        assert_eq!(instance_holder_3285(&r2, iid).await, Some(c2));
+        let _ = drain_room_events_3181(&mut system_sub, Duration::from_millis(300)).await;
+
+        evict_instance_seq_3285(&r2, room, user, iid, c1, r1_relay_id, Some(1)).await;
+
+        assert_eq!(
+            instance_holder_3285(&r2, iid).await,
+            Some(c2),
+            "a late eviction naming the older C1 must not evict the newer C2"
+        );
+        let after = drain_room_events_3181(&mut system_sub, Duration::from_millis(500)).await;
+        assert!(
+            !after.resumed.contains(&(c2, c1)),
+            "no backwards SESSION_RESUMED C2 -> C1, got {:?}",
+            after.resumed
+        );
+    }
+
+    async fn conn_seq_of_3285(
+        chat_server: &actix::Addr<ChatServer>,
+        session: SessionId,
+    ) -> Option<u64> {
+        chat_server
+            .send(GetSessionConnSeq(session))
+            .await
+            .expect("GetSessionConnSeq should succeed")
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_grace_expiry_releases_conn_seq_3285() {
+        let (room, user, iid) = ("test-3285-release-leave", "rl@example.com", "iid-3285-rl");
+        let chat_server = active_holder_3285(room, user, iid, 32_961, Some(5)).await;
+        assert_eq!(conn_seq_of_3285(&chat_server, 32_961).await, Some(5));
+
+        disconnect_2711(&chat_server, 32_961, room, user).await;
+        tokio::time::sleep(RECONNECT_GRACE_PERIOD + std::time::Duration::from_millis(500)).await;
+
+        assert_eq!(conn_seq_of_3285(&chat_server, 32_961).await, None);
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cross_server_eviction_releases_conn_seq_3285() {
+        let (room, user, iid) = ("test-3285-release-evict", "re@example.com", "iid-3285-re");
+        let chat_server = active_holder_3285(room, user, iid, 32_971, Some(5)).await;
+        assert_eq!(conn_seq_of_3285(&chat_server, 32_971).await, Some(5));
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_972,
+            REMOTE_RELAY_3181,
+            Some(6),
+        )
+        .await;
+
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, None);
+        assert_eq!(conn_seq_of_3285(&chat_server, 32_971).await, None);
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_newer_seq_foreign_eviction_evicts_holder_3285() {
+        let (room, user, iid) = ("test-3285-newer", "newer@example.com", "iid-3285-newer");
+        let chat_server = active_holder_3285(room, user, iid, 32_861, Some(2)).await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_862,
+            REMOTE_RELAY_3181,
+            Some(3),
+        )
+        .await;
+
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, None);
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_equal_seq_foreign_eviction_is_stale_3285() {
+        let (room, user, iid) = ("test-3285-equal", "equal@example.com", "iid-3285-equal");
+        let chat_server = active_holder_3285(room, user, iid, 32_871, Some(2)).await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_872,
+            REMOTE_RELAY_3181,
+            Some(2),
+        )
+        .await;
+
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, Some(32_871));
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_eviction_without_payload_seq_falls_back_to_evicting_3285() {
+        let (room, user, iid) = ("test-3285-no-payload", "nop@example.com", "iid-3285-nop");
+        let chat_server = active_holder_3285(room, user, iid, 32_881, Some(2)).await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_882,
+            REMOTE_RELAY_3181,
+            None,
+        )
+        .await;
+
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, None);
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_eviction_against_holder_without_seq_falls_back_to_evicting_3285() {
+        let (room, user, iid) = ("test-3285-no-holder", "noh@example.com", "iid-3285-noh");
+        let chat_server = active_holder_3285(room, user, iid, 32_891, None).await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_892,
+            REMOTE_RELAY_3181,
+            Some(1),
+        )
+        .await;
+
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, None);
+    }
+
+    /// `c0` activates and drops; `c2` (same instance, room, user) resumes it and
+    /// stays unactivated.
+    #[allow(clippy::too_many_arguments)]
+    async fn resumed_sibling_3285(
+        chat_server: &actix::Addr<ChatServer>,
+        dummy: &actix::Addr<EohlDummySession>,
+        room: &str,
+        user: &str,
+        iid: &str,
+        c0: SessionId,
+        c2: SessionId,
+        c2_seq: u64,
+    ) {
+        connect_and_join_seq_3285(chat_server, dummy, c0, room, user, iid, Some(c2_seq - 1)).await;
+        chat_server
+            .send(ActivateConnection { session: c0 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+        disconnect_2711(chat_server, c0, room, user).await;
+        connect_and_join_seq_3285(chat_server, dummy, c2, room, user, iid, Some(c2_seq)).await;
+        assert!(resumed_unactivated_3181(chat_server).await.contains(&c2));
+    }
+
+    async fn fresh_server_3285() -> (actix::Addr<ChatServer>, actix::Addr<EohlDummySession>) {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        (
+            ChatServer::new(nats_client).await.start(),
+            EohlDummySession.start(),
+        )
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_late_eviction_spares_newer_resumed_sibling_3285() {
+        let (room, user, iid) = ("test-3285-sibling", "sib@example.com", "iid-3285-sib");
+        let (chat_server, dummy) = fresh_server_3285().await;
+        resumed_sibling_3285(&chat_server, &dummy, room, user, iid, 32_901, 32_902, 3).await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_903,
+            REMOTE_RELAY_3181,
+            Some(2),
+        )
+        .await;
+
+        assert_eq!(resumed_unactivated_3181(&chat_server).await, vec![32_902]);
+    }
+
+    /// One election's losing candidate resumed C0 here; its winner, at the same
+    /// seq, activated on the other relay.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_equal_seq_eviction_supersedes_resumed_sibling_3285() {
+        use tokio::time::Duration;
+
+        let (room, user, iid) = ("test-3285-sib-equal", "sibeq@example.com", "iid-3285-sibeq");
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("subscribe system subject");
+        let (chat_server, dummy) = fresh_server_3285().await;
+        resumed_sibling_3285(&chat_server, &dummy, room, user, iid, 32_951, 32_952, 3).await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_953,
+            REMOTE_RELAY_3181,
+            Some(3),
+        )
+        .await;
+
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+        disconnect_2711(&chat_server, 32_952, room, user).await;
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+        assert_eq!(
+            after.left,
+            Vec::<u64>::new(),
+            "the user is present on the remote winner"
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_newer_eviction_supersedes_resumed_sibling_3285() {
+        let (room, user, iid) = ("test-3285-sib-new", "sibn@example.com", "iid-3285-sibn");
+        let (chat_server, dummy) = fresh_server_3285().await;
+        resumed_sibling_3285(&chat_server, &dummy, room, user, iid, 32_911, 32_912, 3).await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_913,
+            REMOTE_RELAY_3181,
+            Some(4),
+        )
+        .await;
+
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_other_user_holder_does_not_make_eviction_stale_3285() {
+        let (room, iid) = ("test-3285-other-user", "iid-3285-ou");
+        let (holder_user, user) = ("holder@example.com", "victim@example.com");
+        let (chat_server, dummy) = fresh_server_3285().await;
+        connect_and_join_seq_3285(
+            &chat_server,
+            &dummy,
+            32_921,
+            room,
+            holder_user,
+            iid,
+            Some(9),
+        )
+        .await;
+        chat_server
+            .send(ActivateConnection { session: 32_921 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+        resumed_sibling_3285(&chat_server, &dummy, room, user, iid, 32_922, 32_923, 2).await;
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, Some(32_921));
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_924,
+            REMOTE_RELAY_3181,
+            Some(3),
+        )
+        .await;
+
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_other_room_holder_does_not_make_eviction_stale_3285() {
+        let (room, other_room) = ("test-3285-room-y", "test-3285-room-x");
+        let (user, iid) = ("rooms@example.com", "iid-3285-rooms");
+        let (chat_server, dummy) = fresh_server_3285().await;
+        connect_and_join_seq_3285(&chat_server, &dummy, 32_931, room, user, iid, Some(1)).await;
+        chat_server
+            .send(ActivateConnection { session: 32_931 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+        disconnect_2711(&chat_server, 32_931, room, user).await;
+        connect_and_join_seq_3285(&chat_server, &dummy, 32_932, other_room, user, iid, Some(9))
+            .await;
+        chat_server
+            .send(ActivateConnection { session: 32_932 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+        connect_and_join_seq_3285(&chat_server, &dummy, 32_933, room, user, iid, Some(2)).await;
+        assert_eq!(resumed_unactivated_3181(&chat_server).await, vec![32_933]);
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, Some(32_932));
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_934,
+            REMOTE_RELAY_3181,
+            Some(3),
+        )
+        .await;
+
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_sibling_of_other_instance_does_not_make_eviction_stale_3285() {
+        let (room, user) = ("test-3285-other-iid", "iids@example.com");
+        let (iid, other_iid) = ("iid-3285-target", "iid-3285-other");
+        let (chat_server, dummy) = fresh_server_3285().await;
+        resumed_sibling_3285(
+            &chat_server,
+            &dummy,
+            room,
+            user,
+            other_iid,
+            32_941,
+            32_942,
+            9,
+        )
+        .await;
+        connect_and_join_seq_3285(&chat_server, &dummy, 32_943, room, user, iid, Some(1)).await;
+        chat_server
+            .send(ActivateConnection { session: 32_943 })
+            .await
+            .expect("ActivateConnection should succeed");
+        settle_eviction_echo_3180().await;
+
+        evict_instance_seq_3285(
+            &chat_server,
+            room,
+            user,
+            iid,
+            32_944,
+            REMOTE_RELAY_3181,
+            Some(3),
+        )
+        .await;
+
+        assert_eq!(instance_holder_3285(&chat_server, iid).await, None);
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_activation_eviction_broadcast_carries_conn_seq_3285() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut sub = nats_client
+            .subscribe(EVICT_INSTANCE_SUBJECT)
+            .await
+            .expect("subscribe should succeed");
+        nats_client.flush().await.expect("flush should succeed");
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let iid = "iid-3285-publish";
+        let session: SessionId = 32_895;
+        connect_and_join_seq_3285(
+            &chat_server,
+            &dummy,
+            session,
+            "test-3285-publish",
+            "pub@example.com",
+            iid,
+            Some(7),
+        )
+        .await;
+        chat_server
+            .send(ActivateConnection { session })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let payload = loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), sub.next())
+                .await
+                .expect("eviction broadcast should arrive")
+                .expect("subscription should stay open");
+            let payload: EvictInstancePayload =
+                serde_json::from_slice(&msg.payload).expect("payload should deserialise");
+            if payload.instance_id == iid {
+                break payload;
+            }
+        };
+        assert_eq!(payload.new_session_id, session);
+        assert_eq!(payload.new_conn_seq, Some(7));
+    }
+
+    async fn resumed_unactivated_3181(chat_server: &actix::Addr<ChatServer>) -> Vec<SessionId> {
+        chat_server
+            .send(ResumedUnactivated)
+            .await
+            .expect("ResumedUnactivated should succeed")
+    }
+
+    /// #3181: B1 resumes A and B2 (the other election candidate) joins fresh;
+    /// B2 wins. Loser B1 owes no LEFT, whether it drops before or after B2 wins.
+    async fn election_loser_3181(b1_drops_first: bool) {
+        use tokio::time::Duration;
+
+        let room = if b1_drops_first {
+            "test-3181-loser-drops-first"
+        } else {
+            "test-3181-winner-first"
+        };
+        let (user, iid) = ("loser@example.com", "iid-3181-loser");
+        let (session_a, session_b1, session_b2) = if b1_drops_first {
+            (31_818u64, 31_819u64, 31_820u64)
+        } else {
+            (31_821u64, 31_822u64, 31_823u64)
+        };
+        let (chat_server, mut system_sub, dummy) =
+            resume_active_predecessor_3181(room, user, iid, session_a, session_b1).await;
+        connect_and_join_2711(&chat_server, &dummy, session_b2, room, user, iid).await;
+
+        if b1_drops_first {
+            disconnect_2711(&chat_server, session_b1, room, user).await;
+        }
+        chat_server
+            .send(ActivateConnection {
+                session: session_b2,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+        if !b1_drops_first {
+            disconnect_2711(&chat_server, session_b1, room, user).await;
+        }
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(after.joined, vec![session_b2]);
+        assert_eq!(after.left, Vec::<u64>::new(), "the user is present on B2");
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_election_loser_dropped_after_winner_activates_emits_no_left() {
+        election_loser_3181(false).await;
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_election_loser_dropped_before_winner_activates_emits_no_left() {
+        election_loser_3181(true).await;
+    }
+
+    /// #3181: the winner B2 is on the other relay binary; only its EvictInstance
+    /// reaches the binary holding resumed B1.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_successor_superseded_by_remote_winner_emits_no_left() {
+        use tokio::time::Duration;
+
+        let (room, user, iid) = (
+            "test-3181-remote-winner",
+            "remote@example.com",
+            "iid-3181-r",
+        );
+        let (session_a, session_b1, remote_b2) = (31_824u64, 31_825u64, 31_826u64);
+        let (chat_server, mut system_sub, _dummy) =
+            resume_active_predecessor_3181(room, user, iid, session_a, session_b1).await;
+
+        assert_eq!(
+            resumed_unactivated_3181(&chat_server).await,
+            vec![session_b1]
+        );
+        evict_instance_3181(&chat_server, room, user, iid, remote_b2).await;
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+        disconnect_2711(&chat_server, session_b1, room, user).await;
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(
+            after.left,
+            Vec::<u64>::new(),
+            "the user is present on remote B2"
+        );
+    }
+
+    /// #3181: the relay's own activation echo (new_session_id == A, the session
+    /// B1 resumed) is skipped by the #3184 origin guard, so B1 stays owed.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_own_eviction_echo_keeps_resumed_successor_left() {
+        use tokio::time::Duration;
+
+        let (room, user, iid) = ("test-3181-own-echo", "echo@example.com", "iid-3181-e");
+        let (session_a, session_b1) = (31_834u64, 31_835u64);
+        let (chat_server, mut system_sub, _dummy, relay_id) =
+            resume_active_predecessor_relay_3181(room, user, iid, session_a, session_b1).await;
+
+        evict_instance_from_3181(&chat_server, room, user, iid, session_a, relay_id).await;
+        assert_eq!(
+            resumed_unactivated_3181(&chat_server).await,
+            vec![session_b1],
+            "the own-relay echo must not supersede resumed B1"
+        );
+        disconnect_2711(&chat_server, session_b1, room, user).await;
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(after.left, vec![session_b1], "B1's owed LEFT is emitted");
+    }
+
+    /// #3181: only an activation of the same room, user and instance supersedes
+    /// resumed B; a second tab of the same user is a separate participant.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_unrelated_activation_keeps_resumed_successor_left() {
+        use tokio::time::Duration;
+
+        let (room, user, iid) = (
+            "test-3181-other-instance",
+            "tabs@example.com",
+            "iid-3181-tab1",
+        );
+        let (session_a, session_b, other_tab) = (31_827u64, 31_828u64, 31_829u64);
+        let (chat_server, mut system_sub, dummy) =
+            resume_active_predecessor_3181(room, user, iid, session_a, session_b).await;
+        connect_and_join_2711(&chat_server, &dummy, other_tab, room, user, "iid-3181-tab2").await;
+        chat_server
+            .send(ActivateConnection { session: other_tab })
+            .await
+            .expect("ActivateConnection should succeed");
+        evict_instance_3181(&chat_server, room, "intruder@example.com", iid, 31_832).await;
+        evict_instance_3181(&chat_server, "test-3181-elsewhere", user, iid, 31_833).await;
+        assert_eq!(
+            resumed_unactivated_3181(&chat_server).await,
+            vec![session_b]
+        );
+
+        disconnect_2711(&chat_server, session_b, room, user).await;
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(after.joined, vec![other_tab]);
+        assert_eq!(after.left, vec![session_b]);
+    }
+
+    /// #3181: kicking a resumed, never-activated B announces its departure.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_kicked_resumed_successor_emits_left() {
+        use tokio::time::Duration;
+
+        let (room, user) = ("test-3181-kicked", "kicked3181@example.com");
+        let (session_a, session_b) = (31_830u64, 31_831u64);
+        let (chat_server, mut system_sub, _dummy) =
+            resume_active_predecessor_3181(room, user, "iid-3181-k", session_a, session_b).await;
+
+        let through = unix_now_secs();
+        chat_server
+            .send(ParticipantKicked(ParticipantKickedPayload {
+                room_id: room.to_string(),
+                user_id: user.to_string(),
+                kicked_at: through,
+                revoke_iat_through: through,
+                deny_until: through + 3600,
+            }))
+            .await
+            .expect("ParticipantKicked should succeed");
+        let after = drain_room_events_3181(&mut system_sub, Duration::from_millis(700)).await;
+
+        assert_eq!(after.left, vec![session_b]);
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+    }
+
+    /// #3181: a resumed B that drops before `ActivateConnection` must still be
+    /// announced as LEFT when its grace expires.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_successor_dropped_before_activation_emits_left() {
+        use tokio::time::Duration;
+
+        let (room, user, iid) = (
+            "test-3181-unactivated-left",
+            "resumed@example.com",
+            "iid-3181-a",
+        );
+        let (session_a, session_b) = (31_811u64, 31_812u64);
+        let (chat_server, mut system_sub, _dummy) =
+            resume_active_predecessor_3181(room, user, iid, session_a, session_b).await;
+
+        disconnect_2711(&chat_server, session_b, room, user).await;
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(
+            after.left,
+            vec![session_b],
+            "peers were told B is present and are owed its LEFT"
+        );
+        assert!(after.joined.is_empty());
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+    }
+
+    /// #3181: B1 resumes A, B2 joins fresh, and both drop before either
+    /// activates, in either order: exactly one LEFT, for B1.
+    async fn resumed_and_fresh_both_drop_3181(b2_drops_first: bool) {
+        use tokio::time::Duration;
+
+        let room = if b2_drops_first {
+            "test-3181-gap-b2-first"
+        } else {
+            "test-3181-gap-b1-first"
+        };
+        let (user, iid) = ("gap@example.com", "iid-3181-gap");
+        let (session_a, session_b1, session_b2) = if b2_drops_first {
+            (31_834u64, 31_835u64, 31_836u64)
+        } else {
+            (31_837u64, 31_838u64, 31_839u64)
+        };
+        let (chat_server, mut system_sub, dummy) =
+            resume_active_predecessor_3181(room, user, iid, session_a, session_b1).await;
+        connect_and_join_2711(&chat_server, &dummy, session_b2, room, user, iid).await;
+
+        if b2_drops_first {
+            disconnect_2711(&chat_server, session_b2, room, user).await;
+            disconnect_2711(&chat_server, session_b1, room, user).await;
+        } else {
+            disconnect_2711(&chat_server, session_b1, room, user).await;
+            disconnect_2711(&chat_server, session_b2, room, user).await;
+        }
+        let early = drain_room_events_3181(&mut system_sub, Duration::from_millis(700)).await;
+        assert!(
+            early.left.is_empty(),
+            "B1's LEFT waits for its grace period"
+        );
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(
+            after.left,
+            vec![session_b1],
+            "peers were told B1 is present: exactly one LEFT, for B1"
+        );
+        assert!(after.joined.is_empty());
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_and_fresh_siblings_dropped_resumed_first_emits_one_left() {
+        resumed_and_fresh_both_drop_3181(false).await;
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_and_fresh_siblings_dropped_fresh_first_emits_one_left() {
+        resumed_and_fresh_both_drop_3181(true).await;
+    }
+
+    /// #3181: B drops before activation and C reconnects inside B's grace. C
+    /// must resume B, not join fresh.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_successor_dropped_before_activation_is_resumed_by_next_join() {
+        use tokio::time::Duration;
+
+        let (room, user, iid) = ("test-3181-resume-chain", "chain@example.com", "iid-3181-b");
+        let (session_a, session_b, session_c) = (31_813u64, 31_814u64, 31_815u64);
+        let (chat_server, mut system_sub, dummy) =
+            resume_active_predecessor_3181(room, user, iid, session_a, session_b).await;
+
+        disconnect_2711(&chat_server, session_b, room, user).await;
+        connect_and_join_2711(&chat_server, &dummy, session_c, room, user, iid).await;
+        chat_server
+            .send(ActivateConnection { session: session_c })
+            .await
+            .expect("ActivateConnection should succeed");
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(after.resumed, vec![(session_b, session_c)]);
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+        assert!(after.joined.is_empty(), "C's JOINED must stay suppressed");
+        assert!(after.left.is_empty(), "nobody left: C continues B");
+        let sessions: Vec<SessionId> = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed")
+            .iter()
+            .map(|m| m.session)
+            .collect();
+        assert_eq!(sessions, vec![session_c]);
+    }
+
+    /// #3181: once a resumed B activates, its later departure yields exactly one
+    /// LEFT and no JOINED.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_resumed_successor_activated_then_dropped_emits_one_left() {
+        use tokio::time::Duration;
+
+        let (room, user) = ("test-3181-activated-left", "activated@example.com");
+        let (session_a, session_b) = (31_816u64, 31_817u64);
+        let (chat_server, mut system_sub, _dummy) =
+            resume_active_predecessor_3181(room, user, "iid-3181-c", session_a, session_b).await;
+
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection should succeed");
+        assert!(resumed_unactivated_3181(&chat_server).await.is_empty());
+        disconnect_2711(&chat_server, session_b, room, user).await;
+        let after = drain_room_events_3181(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+
+        assert_eq!(after.left, vec![session_b]);
+        assert!(after.joined.is_empty(), "B's JOINED stays suppressed");
+        assert_eq!(room_member_count_2711(&chat_server, room).await, 0);
+    }
+
+    /// Active A disconnects, then B sends a JoinRoom presenting A's instance_id
+    /// (B unknown to the actor unless `connect_b`). A's pending departure must
+    /// survive and expire normally.
+    async fn join_must_not_consume_pending_3182(
+        room: &str,
+        session_a: SessionId,
+        session_b: SessionId,
+        connect_b: bool,
+        observer_b: bool,
+    ) -> Result<(), String> {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let user = "pending-3182@example.com";
+        let iid = "iid-3182";
+        let system_subject = format!("room.{room}.system");
+        let mut left_sub = nats_client
+            .subscribe(system_subject.clone())
+            .await
+            .expect("Failed to subscribe to system subject");
+        let mut resumed_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("Failed to subscribe to became-empty subject");
+
+        connect_and_join_2711(&chat_server, &dummy, session_a, room, user, iid).await;
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+        disconnect_2711(&chat_server, session_a, room, user).await;
+
+        if connect_b {
+            chat_server
+                .send(Connect {
+                    id: session_b,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .expect("Connect should succeed");
+        }
+        let join = chat_server
+            .send(JoinRoom {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: observer_b,
+                instance_id: Some(iid.to_string()),
+                is_host: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+                token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
+                closer: None,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        let pending = chat_server
+            .send(CountPendingDeparturesForRoom {
+                room: room.to_string(),
+            })
+            .await
+            .expect("CountPendingDeparturesForRoom should succeed");
+        assert_eq!(pending, 1, "A's pending departure must not be consumed");
+        let sessions: Vec<SessionId> = room_members_3182(&chat_server, room).await;
+        assert_eq!(sessions, vec![session_a], "A must stay in the roster");
+        if !connect_b {
+            assert!(
+                !chat_server
+                    .send(TestHasSessionState(session_b))
+                    .await
+                    .expect("TestHasSessionState"),
+                "a refused join must not record state for the dead session"
+            );
+        }
+
+        let left = collect_left_sessions(
+            &mut left_sub,
+            RECONNECT_GRACE_PERIOD + Duration::from_millis(1500),
+        )
+        .await;
+        assert_eq!(
+            left,
+            vec![session_a],
+            "A's timer must announce its departure"
+        );
+        let resumed = collect_event_sessions(
+            &mut resumed_sub,
+            Duration::from_millis(200),
+            MeetingEventType::PARTICIPANT_SESSION_RESUMED,
+        )
+        .await;
+        assert!(resumed.is_empty(), "nothing may resume A, got {resumed:?}");
+        assert!(room_members_3182(&chat_server, room).await.is_empty());
+        let empty = drain_empty_events_for(&mut empty_sub, room, Duration::from_millis(500)).await;
+        assert_eq!(empty, vec![room.to_string()], "the room must idle once");
+        join
+    }
+
+    async fn room_members_3182(chat_server: &actix::Addr<ChatServer>, room: &str) -> Vec<u64> {
+        chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed")
+            .iter()
+            .map(|m| m.session)
+            .collect()
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_for_unknown_session_keeps_pending_departure_3182() {
+        let (session_a, session_b) = (31_821, 31_822);
+        let join = join_must_not_consume_pending_3182(
+            "test-3182-unknown-session",
+            session_a,
+            session_b,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(join, Err("Session not found".to_string()));
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_observer_join_with_predecessor_instance_keeps_pending_departure_3182() {
+        let (session_a, session_b) = (31_823, 31_824);
+        let join = join_must_not_consume_pending_3182(
+            "test-3182-observer",
+            session_a,
+            session_b,
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(join, Ok(()));
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_never_activated_successor_keeps_fanout_host_flag_but_own_name() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3056-host-and-name";
+        let user = "demoted@example.com";
+        let (session_a, session_b) = (30_565u64, 30_566u64);
+
+        for (session, name) in [(session_a, "A-token-name"), (session_b, "B-token-name")] {
+            chat_server
+                .send(Connect {
+                    id: session,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .expect("Connect should succeed");
+            chat_server
+                .send(JoinRoom {
+                    session,
+                    room: room.to_string(),
+                    user_id: user.to_string(),
+                    display_name: name.to_string(),
+                    is_guest: false,
+                    observer: false,
+                    instance_id: Some("iid-3056-host".to_string()),
+                    is_host: true,
+                    transport: "websocket".to_string(),
+                    downlink_congested_epoch: never_epoch(),
+                    token_iat: None,
+                    meeting_started_at_ms: None,
+                    conn_seq: None,
+                    closer: None,
+                })
+                .await
+                .expect("Message delivery should succeed")
+                .expect("JoinRoom should return Ok");
+            if session == session_a {
+                chat_server
+                    .send(UpdateMemberHostFlag(MeetingHostChangePayload {
+                        room_id: room.to_string(),
+                        user_id: user.to_string(),
+                        is_host: false,
+                    }))
+                    .await
+                    .expect("demote fanout should succeed");
+                disconnect_2711(&chat_server, session_a, room, user).await;
+            }
+        }
+
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].session, session_b);
+        assert!(!members[0].is_host, "the fanout-demoted flag carries over");
+        assert_eq!(members[0].display_name, "B-token-name");
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_never_activated_predecessor_releases_session_and_layer_hint_state() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3056-hint-reap";
+        let user = "solo@example.com";
+        let (session_a, session_b) = (30_570u64, 30_571u64);
+        let counts = |source| {
+            chat_server.send(TestLayerHintEntryCounts {
+                room: room.to_string(),
+                source,
+            })
+        };
+
+        connect_and_join_2711(&chat_server, &dummy, session_a, room, user, "iid-3056-hint").await;
+        chat_server
+            .send(RecomputeLayerHints {
+                room: room.to_string(),
+                source: None,
+            })
+            .await
+            .expect("RecomputeLayerHints should succeed");
+        let before = counts(session_a).await.expect("counts before");
+        assert!(
+            before.0 > 0,
+            "control: the Testing sole member gets hint state"
+        );
+        assert!(before.1 > 0, "control: and an armed recheck timer");
+        disconnect_2711(&chat_server, session_a, room, user).await;
+        assert!(chat_server
+            .send(TestHasSessionState(session_a))
+            .await
+            .expect("control: TestHasSessionState"));
+
+        connect_and_join_2711(&chat_server, &dummy, session_b, room, user, "iid-3056-hint").await;
+        assert_eq!(counts(session_a).await.expect("counts after"), (0, 0));
+        assert!(!chat_server
+            .send(TestHasSessionState(session_a))
+            .await
+            .expect("TestHasSessionState"));
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_never_activated_grace_expiry_reaps_layer_hint_state() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3056-expiry-hint-reap";
+        let user = "loser@example.com";
+        let session: SessionId = 30_572;
+        let counts = || {
+            chat_server.send(TestLayerHintEntryCounts {
+                room: room.to_string(),
+                source: session,
+            })
+        };
+
+        connect_and_join_2711(&chat_server, &dummy, session, room, user, "iid-3056-exp").await;
+        chat_server
+            .send(RecomputeLayerHints {
+                room: room.to_string(),
+                source: None,
+            })
+            .await
+            .expect("RecomputeLayerHints should succeed");
+        let before = counts().await.expect("counts before");
+        assert!(
+            before.0 > 0,
+            "control: the Testing sole member gets hint state"
+        );
+        disconnect_2711(&chat_server, session, room, user).await;
+
+        tokio::time::sleep(RECONNECT_GRACE_PERIOD + std::time::Duration::from_millis(1000)).await;
+        assert_eq!(room_member_count_2711(&chat_server, room).await, 0);
+        assert_eq!(counts().await.expect("counts after").0, 0);
+        assert!(!chat_server
+            .send(TestHasSessionState(session))
+            .await
+            .expect("TestHasSessionState"));
+    }
+
+    #[derive(Default, Debug)]
+    struct RoomEvents3180 {
+        joined: Vec<u64>,
+        left: Vec<u64>,
+        resumed: Vec<(u64, u64)>,
+    }
+
+    async fn collect_room_events_3180(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> RoomEvents3180 {
+        use std::time::Instant;
+        use tokio::time::timeout;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let start = Instant::now();
+        let mut events = RoomEvents3180::default();
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            let Ok(Some(msg)) = timeout(remaining, sub.next()).await else {
+                break;
+            };
+            let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+            else {
+                continue;
+            };
+            let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) else {
+                continue;
+            };
+            if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                events.joined.push(inner.session_id);
+            } else if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                events.left.push(inner.session_id);
+            } else if inner.event_type == MeetingEventType::PARTICIPANT_SESSION_RESUMED.into() {
+                events
+                    .resumed
+                    .push((inner.session_id, inner.previous_session_id));
+            }
+        }
+        events
+    }
+
+    /// Let an `ActivateConnection`'s own `EvictInstance` NATS echo land before
+    /// the next same-instance session joins.
+    async fn settle_eviction_echo_3180() {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_never_activated_disconnect_keeps_announced_pending_departure_3180() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3180-keep-announced";
+        let user = "ana@example.com";
+        let iid = "iid-3180-keep";
+        let (session_a, session_b) = (31_800u64, 31_801u64);
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("subscribe system subject");
+
+        connect_and_join_2711(&chat_server, &dummy, session_a, room, user, iid).await;
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection A should succeed");
+        settle_eviction_echo_3180().await;
+        connect_and_join_2711(&chat_server, &dummy, session_b, room, user, iid).await;
+        assert!(chat_server
+            .send(TestHasSessionState(session_b))
+            .await
+            .expect("control: TestHasSessionState B"));
+
+        disconnect_2711(&chat_server, session_a, room, user).await;
+        disconnect_2711(&chat_server, session_b, room, user).await;
+
+        assert!(!chat_server
+            .send(TestHasSessionState(session_b))
+            .await
+            .expect("TestHasSessionState B"));
+
+        let events = collect_room_events_3180(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + std::time::Duration::from_millis(1500),
+        )
+        .await;
+        assert!(
+            events.joined.contains(&session_a),
+            "control: A's join was observed, got {events:?}"
+        );
+        assert_eq!(events.left, vec![session_a], "got {events:?}");
+        assert_eq!(room_member_count_2711(&chat_server, room).await, 0);
+        assert!(!chat_server
+            .send(TestHasSessionState(session_a))
+            .await
+            .expect("TestHasSessionState A"));
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_announced_disconnect_retires_displaced_never_activated_pending_3180() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3180-retire-displaced";
+        let user = "dee@example.com";
+        let iid = "iid-3180-retire";
+        let (session_a, session_b) = (31_830u64, 31_831u64);
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("subscribe system subject");
+
+        connect_and_join_2711(&chat_server, &dummy, session_a, room, user, iid).await;
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection A should succeed");
+        settle_eviction_echo_3180().await;
+        connect_and_join_2711(&chat_server, &dummy, session_b, room, user, iid).await;
+
+        disconnect_2711(&chat_server, session_b, room, user).await;
+        assert!(chat_server
+            .send(TestHasSessionState(session_b))
+            .await
+            .expect("control: TestHasSessionState B"));
+        disconnect_2711(&chat_server, session_a, room, user).await;
+        assert!(!chat_server
+            .send(TestHasSessionState(session_b))
+            .await
+            .expect("TestHasSessionState B"));
+
+        let events = collect_room_events_3180(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + std::time::Duration::from_millis(1500),
+        )
+        .await;
+        assert!(
+            events.joined.contains(&session_a),
+            "control: A's join was observed, got {events:?}"
+        );
+        assert_eq!(events.left, vec![session_a], "got {events:?}");
+        assert_eq!(room_member_count_2711(&chat_server, room).await, 0);
+        assert!(!chat_server
+            .send(TestHasSessionState(session_a))
+            .await
+            .expect("TestHasSessionState A"));
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_reconnect_after_never_activated_disconnect_resumes_announced_session_3180() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3180-resume";
+        let user = "ben@example.com";
+        let iid = "iid-3180-resume";
+        let (session_a, session_b, session_c) = (31_810u64, 31_811u64, 31_812u64);
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("subscribe system subject");
+
+        connect_and_join_2711(&chat_server, &dummy, session_a, room, user, iid).await;
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection A should succeed");
+        settle_eviction_echo_3180().await;
+        connect_and_join_2711(&chat_server, &dummy, session_b, room, user, iid).await;
+        disconnect_2711(&chat_server, session_a, room, user).await;
+        disconnect_2711(&chat_server, session_b, room, user).await;
+        connect_and_join_2711(&chat_server, &dummy, session_c, room, user, iid).await;
+        chat_server
+            .send(ActivateConnection { session: session_c })
+            .await
+            .expect("ActivateConnection C should succeed");
+        settle_eviction_echo_3180().await;
+
+        let events = collect_room_events_3180(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + std::time::Duration::from_millis(1500),
+        )
+        .await;
+        assert!(
+            events.joined.contains(&session_a),
+            "control: A's join was observed, got {events:?}"
+        );
+        assert_eq!(
+            events.resumed,
+            vec![(session_c, session_a)],
+            "got {events:?}"
+        );
+        assert!(!events.joined.contains(&session_c), "got {events:?}");
+        assert!(events.left.is_empty(), "got {events:?}");
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].session, session_c);
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_displaced_active_pending_departure_still_announces_left_3180() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3180-both-active";
+        let user = "cal@example.com";
+        let iid = "iid-3180-collide";
+        let (session_x, session_a, session_b) = (31_820u64, 31_821u64, 31_822u64);
+        let mut system_sub = nats_client
+            .subscribe(format!("room.{room}.system"))
+            .await
+            .expect("subscribe system subject");
+
+        // Another user holding the instance slot stops A and B evicting each other.
+        connect_and_join_2711(&chat_server, &dummy, session_x, room, "x@example.com", iid).await;
+        for session in [session_x, session_a, session_b] {
+            if session != session_x {
+                connect_and_join_2711(&chat_server, &dummy, session, room, user, iid).await;
+            }
+            chat_server
+                .send(ActivateConnection { session })
+                .await
+                .expect("ActivateConnection should succeed");
+            settle_eviction_echo_3180().await;
+        }
+        disconnect_2711(&chat_server, session_a, room, user).await;
+        disconnect_2711(&chat_server, session_b, room, user).await;
+
+        let events = collect_room_events_3180(
+            &mut system_sub,
+            RECONNECT_GRACE_PERIOD + std::time::Duration::from_millis(1500),
+        )
+        .await;
+        assert!(
+            events.joined.contains(&session_a) && events.joined.contains(&session_b),
+            "control: A and B were both announced, got {events:?}"
+        );
+        let mut left = events.left.clone();
+        left.sort_unstable();
+        assert_eq!(left, vec![session_a, session_b], "got {events:?}");
+        assert!(!chat_server
+            .send(TestHasSessionState(session_a))
+            .await
+            .expect("TestHasSessionState A"));
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_never_activated_grace_expiry_recomputes_publisher_union_3057() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3057-expiry-recompute";
+        let (publisher, receiver, loser) = (3_057_001u64, 3_057_002u64, 3_057_003u64);
+        const VIDEO: i32 = 1;
+
+        connect_and_join_2711(&chat_server, &dummy, publisher, room, "p@x", "iid-3057-p").await;
+        connect_and_join_2711(&chat_server, &dummy, receiver, room, "r@x", "iid-3057-r").await;
+        connect_and_join_2711(&chat_server, &dummy, loser, room, "t@x", "iid-3057-t").await;
+        for session in [publisher, receiver] {
+            chat_server
+                .send(ActivateConnection { session })
+                .await
+                .expect("ActivateConnection should succeed");
+        }
+        chat_server
+            .send(TestSeedPrefAndRecompute {
+                room: room.to_string(),
+                receiver,
+                source: publisher,
+                kind: VIDEO,
+                desired: Some(0),
+            })
+            .await
+            .expect("seed receiver preference");
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 100,
+        ))
+        .await;
+
+        let union = || {
+            chat_server.send(TestMaxRequestedLayer {
+                room: room.to_string(),
+                source: publisher,
+                kind: VIDEO,
+            })
+        };
+        let recheck_timers = || async {
+            chat_server
+                .send(TestLayerHintEntryCounts {
+                    room: room.to_string(),
+                    source: publisher,
+                })
+                .await
+                .expect("TestLayerHintEntryCounts")
+                .1
+        };
+        assert_eq!(
+            union().await.expect("union"),
+            LAYER_HINT_FULL_LADDER_SENTINEL
+        );
+        assert_eq!(recheck_timers().await, 0);
+
+        disconnect_2711(&chat_server, loser, room, "t@x").await;
+        tokio::time::sleep(
+            RECONNECT_GRACE_PERIOD
+                + std::time::Duration::from_millis(LAYER_HINT_RECOMPUTE_COALESCE_MS + 500),
+        )
+        .await;
+
+        assert_eq!(room_member_count_2711(&chat_server, room).await, 2);
+        assert_eq!(union().await.expect("union"), 0);
+        assert_eq!(
+            recheck_timers().await,
+            1,
+            "the grace expiry must recompute the publisher's hint, arming its \
+             video layer 0 suppress re-check"
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn test_never_activated_successor_keeps_became_empty_obligation() {
+        use tokio::time::Duration;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-3056-became-empty";
+        let (elected_user, loser_user) = ("elected@example.com", "loser@example.com");
+        let (elected, loser_a, loser_b) = (30_567u64, 30_568u64, 30_569u64);
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("Failed to subscribe to became-empty subject");
+
+        connect_and_join_2711(&chat_server, &dummy, elected, room, elected_user, "iid-x").await;
+        chat_server
+            .send(ActivateConnection { session: elected })
+            .await
+            .expect("ActivateConnection should succeed");
+        connect_and_join_2711(&chat_server, &dummy, loser_a, room, loser_user, "iid-t").await;
+        chat_server
+            .send(Leave {
+                session: elected,
+                room: room.to_string(),
+                user_id: elected_user.to_string(),
+            })
+            .await
+            .expect("Leave should succeed");
+        disconnect_2711(&chat_server, loser_a, room, loser_user).await;
+        connect_and_join_2711(&chat_server, &dummy, loser_b, room, loser_user, "iid-t").await;
+        disconnect_2711(&chat_server, loser_b, room, loser_user).await;
+
+        let events = drain_empty_events_for(&mut empty_sub, room, Duration::from_secs(5)).await;
+        assert_eq!(events.len(), 1, "the drain must still report empty->idle");
     }
 
     // ======================================================================
@@ -14730,6 +17911,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14764,6 +17947,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14893,6 +18078,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14920,6 +18107,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -14966,6 +18155,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15036,6 +18227,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15064,6 +18257,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15144,6 +18339,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15179,6 +18376,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15288,6 +18487,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15337,6 +18538,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15457,6 +18660,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15487,6 +18692,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15587,6 +18794,8 @@ mod tests {
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                     token_iat: None,
+                    meeting_started_at_ms: None,
+                    conn_seq: None,
                     closer: None,
                 })
                 .await
@@ -15675,6 +18884,8 @@ mod tests {
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                     token_iat: None,
+                    meeting_started_at_ms: None,
+                    conn_seq: None,
                     closer: None,
                 })
                 .await
@@ -15784,6 +18995,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15828,6 +19041,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15910,6 +19125,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -15957,6 +19174,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -16063,6 +19282,8 @@ mod tests {
                     transport: "websocket".to_string(),
                     downlink_congested_epoch: never_epoch(),
                     token_iat: None,
+                    meeting_started_at_ms: None,
+                    conn_seq: None,
                     closer: None,
                 })
                 .await
@@ -16398,6 +19619,7 @@ mod tests {
             empty_layer_prefs(),       // empty prefs = no-op (forward all layers)
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -16435,6 +19657,7 @@ mod tests {
             layer_prefs_with(&[(999, 1)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -16471,6 +19694,7 @@ mod tests {
             layer_prefs_with(&[(999, 2)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -16522,6 +19746,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             epoch,
+            activated_downlink(),
         )
     }
 
@@ -16668,6 +19893,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -16710,6 +19936,7 @@ mod tests {
             layer_prefs_with(&[(999, 2)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -16750,6 +19977,7 @@ mod tests {
             layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO)
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // AUDIO layer 2 with only a VIDEO preference for 999 → forward.
@@ -16828,6 +20056,7 @@ mod tests {
             layer_prefs_with(&[(999, 2)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -16887,6 +20116,7 @@ mod tests {
             layer_prefs_with(&[(999, 0)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -16938,6 +20168,7 @@ mod tests {
             empty_layer_prefs(),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // A forged layer id well above the real ladder.
@@ -17303,6 +20534,7 @@ mod tests {
             layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 0)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -17340,6 +20572,7 @@ mod tests {
             layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 1)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -17377,6 +20610,7 @@ mod tests {
             layer_prefs_with_kinds(&[(999, 2 /* AUDIO */, 0)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -17415,6 +20649,7 @@ mod tests {
             layer_prefs_with_kinds(&[(999, 1 /* VIDEO */, 2), (999, 3 /* SCREEN */, 0)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // VIDEO layer 2 matches the VIDEO pref → forward.
@@ -17462,6 +20697,7 @@ mod tests {
             layer_prefs_with(&[(999, 1)]),
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -17505,6 +20741,7 @@ mod tests {
             layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO) only
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // SCREEN layer 2 with only a VIDEO preference for 999 → forward (the
@@ -17548,6 +20785,7 @@ mod tests {
             layer_prefs_with(&[(999, 0)]), // (999, VIDEO) → desired layer 0 (base only)
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Layer 2 from 999 must be DROPPED (preference selects base 0, layer 2 != 0).
@@ -17619,6 +20857,7 @@ mod tests {
             prefs,
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         // Layer 2 from 999: the preference selects layer 1, so WITHOUT the
@@ -17754,6 +20993,7 @@ mod tests {
             prefs,
             "websocket".to_string(),
             never_epoch(),
+            activated_downlink(),
         );
 
         let nats_msg = make_nats_message(
@@ -20132,6 +23372,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -20200,6 +23442,8 @@ mod tests {
             room: room_a.clone(),
             user_id: format!("{}@example.com", a2.1),
             new_session_id: 1_235_999,
+            origin_relay: None,
+            new_conn_seq: None,
         }))
         .await
         .expect("EvictInstance delivery should succeed");
@@ -20333,6 +23577,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -20471,6 +23717,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -20882,6 +24130,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -20925,6 +24175,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -21055,6 +24307,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -21175,6 +24429,8 @@ mod tests {
                 transport: "websocket".to_string(),
                 downlink_congested_epoch: never_epoch(),
                 token_iat: None,
+                meeting_started_at_ms: None,
+                conn_seq: None,
                 closer: None,
             })
             .await
@@ -21222,3 +24478,11 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_server_kick_tests.rs"]
 mod kick_tests;
+
+#[cfg(test)]
+#[path = "chat_server_instance_tests.rs"]
+mod instance_tests;
+
+#[cfg(test)]
+#[path = "chat_server_keyframe_target_tests.rs"]
+mod keyframe_target_tests;

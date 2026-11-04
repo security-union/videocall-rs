@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().with_name("check_dashboard_metric_refs.py")
+
 ROOT = SCRIPT.parent.parent
 
 METRICS_RS = textwrap.dedent(
@@ -87,8 +88,13 @@ class Guard(unittest.TestCase):
             text=True,
         )
 
-    def assert_flags(self, root, name):
-        res = self.run_guard(root)
+    def run_with_pending(self, root, name):
+        code = (f"import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import check_dashboard_metric_refs as g; "
+                f"g.PENDING = {{{name!r}: '#0'}}; sys.exit(g.main(['--root', {str(root)!r}]))")
+        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+
+    def assert_flags(self, root, name, pending=None):
+        res = self.run_with_pending(root, pending) if pending else self.run_guard(root)
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn(name, res.stdout)
 
@@ -199,6 +205,37 @@ class Guard(unittest.TestCase):
             'const T: [(&str, u32); 1] = [("relay_nats_in_messages_total", 1)];\n'
         )
         self.assert_flags(root, "relay_nats_in_messages_total")
+
+    def test_a_pending_name_passes_until_it_is_registered(self):
+        name = "videocall_not_yet_registered_total"
+        root = self.tree(dash_text=dashboard("videocall_live_gauge", name))
+        self.assert_flags(root, f"{name} is not registered")
+        res = self.run_with_pending(root, name)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn(f"pending: {name}", res.stdout)
+        (root / "crate/src/pending.rs").write_text(f'register_counter_vec!("{name}", "h", &["a"]);\n')
+        self.assert_flags(root, f"{name} is registered now", pending=name)
+
+    def test_only_tracked_rust_counts_in_a_git_checkout(self):
+        name = "videocall_not_yet_registered_total"
+        root = self.tree(dash_text=dashboard("videocall_live_gauge", name))
+        git = ["git", "-C", str(root)]
+        subprocess.run(git + ["init", "-q"], check=True)
+        subprocess.run(git + ["add", "-A"], check=True)
+        (root / "crate/src/leftover.rs").write_text(f'register_counter_vec!("{name}", "h", &["a"]);\n')
+        res = self.run_with_pending(root, name)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        subprocess.run(git + ["add", "crate/src/leftover.rs"], check=True)
+        self.assert_flags(root, f"{name} is registered now", pending=name)
+
+    def test_a_failing_git_ls_files_in_a_checkout_is_an_error_not_a_walk(self):
+        root = self.tree()
+        subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        (root / ".git/index").write_bytes(b"not an index")
+        res = self.run_guard(root)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("git ls-files failed", res.stderr)
 
     def test_a_root_without_rust_is_a_usage_error(self):
         root = Path(tempfile.mkdtemp(prefix="metric-refs-empty-"))

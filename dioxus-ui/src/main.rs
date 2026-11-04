@@ -20,6 +20,8 @@ mod token_endpoint;
 mod types;
 mod util;
 
+use crate::components::announcement_overrides::OrphanedOverrideSavesCtx;
+use crate::components::avatar::{OwnAvatar, OwnAvatarCtx};
 use crate::components::search_modal::SearchVisibleCtx;
 use crate::routing::Route;
 use context::{
@@ -73,6 +75,7 @@ fn main() {
         let _ = videocall_client::install_netsim_window_hook();
     }
 
+    pages::help::remember_arrival();
     dioxus::launch(App);
 }
 
@@ -107,6 +110,12 @@ fn App() -> Element {
 
     let transport_pref = use_signal(load_transport_preference);
     use_context_provider(|| TransportPreferenceCtx(transport_pref));
+
+    let own_avatar = use_signal(OwnAvatar::default);
+    use_context_provider(|| OwnAvatarCtx(own_avatar));
+
+    let orphaned_override_saves = use_signal(std::collections::HashMap::new);
+    use_context_provider(|| OrphanedOverrideSavesCtx(orphaned_override_saves));
 
     // Signal shared with the Cmd-K / Ctrl-K global shortcut and with
     // `SearchModal` via `SearchVisibleCtx`.  There is exactly ONE provider —

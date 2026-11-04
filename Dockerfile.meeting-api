@@ -11,6 +11,20 @@ COPY . /app
 WORKDIR /app/meeting-api
 RUN cargo build --release --bin meeting-api
 
+FROM debian:trixie-slim as dbmate
+
+RUN apt-get --yes update && apt-get --yes install --no-install-recommends ca-certificates curl
+# sha256 = GitHub release-asset digest; dbmate publishes no checksum file.
+RUN arch="$(dpkg --print-architecture)" && \
+    case "$arch" in \
+      amd64) sum=f855e99a0f0a81322014bf686b1cb820d2b4d8074e4eadafd64b851b80ecb15a ;; \
+      arm64) sum=42de2bf27989192b9ca8db4cfaa0a9d6b4aee154a03abef30239b7186b1baf82 ;; \
+      *) echo "no pinned dbmate for $arch" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /dbmate "https://github.com/amacneil/dbmate/releases/download/v2.37.0/dbmate-linux-$arch" && \
+    echo "$sum  /dbmate" | sha256sum -c - && \
+    chmod 0755 /dbmate
+
 FROM debian:trixie-slim as production
 
 ARG GIT_SHA=unknown
@@ -20,7 +34,7 @@ LABEL org.opencontainers.image.ref.name=${GIT_BRANCH}
 
 RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
 
-COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
+COPY --from=dbmate /dbmate /usr/bin/dbmate
 COPY --from=build /app/meeting-api/target/release/meeting-api /usr/bin/meeting-api
 COPY --from=build /app/dbmate /app/dbmate
 

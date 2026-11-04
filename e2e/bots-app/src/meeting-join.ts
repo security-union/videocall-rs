@@ -13,8 +13,10 @@ import {
   micControlSelector,
   peerListCandidates,
   resolveControlSelector,
+  unavailableOffSelector,
 } from "./control-buttons";
 import { isDevServerNoise } from "./dev-noise";
+import { notVisible, UI_PROBE_TIME_LIMIT_MS, withTimeLimit } from "./time-limit";
 
 /**
  * The mode the pre-join card was rendered in:
@@ -63,6 +65,9 @@ export function classifyJoinModeText(rawText: string): JoinMode {
   if (/^Join Meeting/i.test(normalized)) return "join";
   return "unknown";
 }
+
+/** The in-meeting grid; its presence is what the join waits for. */
+export const GRID_SELECTOR = "#grid-container";
 
 /**
  * Sentinel thrown by `joinMeetingAndEnableMedia` when the page navigates
@@ -161,7 +166,10 @@ export async function joinMeetingAndEnableMedia(args: {
   participant: string;
   displayName: string;
   meetingId: string;
+  /** Awaited once the grid is visible, before the rename and media steps. */
+  onInMeeting?: () => Promise<void>;
   media?: JoinMedia;
+  signal?: AbortSignal;
 }): Promise<JoinMediaState> {
   const { page, participant, displayName, meetingId } = args;
 
@@ -179,7 +187,7 @@ export async function joinMeetingAndEnableMedia(args: {
   const joinButton = page
     .getByRole("button", { name: /Start Meeting|Join Meeting/ })
     .and(page.locator(':not([disabled]):not([aria-disabled="true"])'));
-  const grid = page.locator("#grid-container");
+  const grid = page.locator(GRID_SELECTOR);
 
   // Subscribe to top-frame navigations so a manual in-browser hang-up
   // (which routes the page back to `/`) doesn't strand us inside a
@@ -226,6 +234,7 @@ export async function joinMeetingAndEnableMedia(args: {
     throwIfNavigatedAway(navigatedAway, participant);
 
     console.log(`[${participant}] in-meeting (grid visible)`);
+    await args.onInMeeting?.();
 
     // ── Step 2: ensure display name is set via the in-meeting rename ───
     //
@@ -248,7 +257,17 @@ export async function joinMeetingAndEnableMedia(args: {
     await ensureDisplayNameInMeeting({ page, participant, displayName });
 
     // ── Step 3: enable mic + camera so the prep'd fake devices flow ───
-    return await enableJoinMedia(page, participant, args.media ?? JOIN_MEDIA_ON);
+    try {
+      return await enableJoinMedia(
+        page,
+        participant,
+        args.media ?? JOIN_MEDIA_ON,
+        () => navigatedAway || args.signal?.aborted === true,
+      );
+    } catch (e) {
+      throwIfNavigatedAway(navigatedAway, participant);
+      throw e;
+    }
   } finally {
     page.off("framenavigated", onFrameNavigated);
   }
@@ -293,71 +312,153 @@ export interface JoinMediaState {
 export type JoinMediaPage = Pick<Page, "locator" | "waitForTimeout">;
 
 export const MEDIA_SETTLE_TIMEOUT_MS = 10_000;
+export const MEDIA_CONTROL_WAIT_MS = 10_000;
+export const MEDIA_CLICK_TIMEOUT_MS = 10_000;
+export const MEDIA_TOGGLE_ATTEMPTS = 3;
+/** Retry N waits `MEDIA_RETRY_BACKOFF_MS * 2 ** (N - 2)` first. */
+export const MEDIA_RETRY_BACKOFF_MS = 1_000;
+export const MEDIA_CONFIRM_MS = 1_000;
 
+type MediaLabel = "microphone" | "camera";
+
+const onOff = (on: boolean | null): string => (on === null ? "unknown" : on ? "on" : "off");
+
+export class JoinMediaNotAppliedError extends Error {
+  constructor(
+    readonly medium: MediaLabel,
+    readonly requested: boolean,
+    readonly observed: boolean | null,
+  ) {
+    super(
+      `${medium} requested ${onOff(requested)} but reads ${onOff(observed)} after ${MEDIA_TOGGLE_ATTEMPTS} attempts: failing the launch rather than running in the wrong media state`,
+    );
+    this.name = "JoinMediaNotAppliedError";
+  }
+}
+
+/** Resolves only once each medium reads as requested; otherwise throws `JoinMediaNotAppliedError`. */
 export async function enableJoinMedia(
   page: JoinMediaPage,
   participant: string,
   request: JoinMedia,
+  stop: () => boolean = () => false,
 ): Promise<JoinMediaState> {
-  // The action bar auto-hides by default; hover it so the buttons are
-  // visible to Playwright's isVisible check.
-  const controlsContainer = page.locator(ACTION_BAR_SELECTOR).first();
-  await controlsContainer.hover({ timeout: 5_000 }).catch(() => {
-    // Fine — some layouts may not need the hover.
-  });
-  await page.waitForTimeout(200);
-
   const visible = (sel: string): Promise<boolean> =>
-    page
-      .locator(sel)
-      .isVisible({ timeout: 2_000 })
-      .catch(() => false);
+    withTimeLimit(`isVisible ${sel}`, UI_PROBE_TIME_LIMIT_MS, () =>
+      page.locator(sel).isVisible(),
+    ).catch(notVisible((m) => console.warn(`[${participant}] ${m}`)));
   // The control a medium shows names its current state: "Mute" / "Stop Video" means on.
   const read = async (onSel: string, offSel: string): Promise<boolean | null> => {
     if (await visible(onSel)) return true;
     return (await visible(offSel)) ? false : null;
   };
+  const awaitControl = async (onSel: string, offSel: string): Promise<boolean | null> => {
+    // Hover the auto-hiding action bar so it is shown and settled before a click.
+    await page
+      .locator(ACTION_BAR_SELECTOR)
+      .first()
+      .hover({ timeout: 5_000 })
+      .catch(() => {});
+    await page
+      .locator(`${onSel}, ${offSel}`)
+      .first()
+      .waitFor({ state: "visible", timeout: MEDIA_CONTROL_WAIT_MS })
+      .catch(() => {});
+    return read(onSel, offSel);
+  };
   const settle = async (
-    label: string,
+    label: MediaLabel,
     onSel: string,
     offSel: string,
     want: boolean,
   ): Promise<boolean | null> => {
-    const before = await read(onSel, offSel);
-    if (before === null || before === want) {
-      if (before === null)
-        console.warn(`[${participant}] ${label} control not visible — state unknown`);
-      else console.log(`[${participant}] ${label} already ${want ? "on" : "off"} at join`);
-      return before;
+    let state: boolean | null = null;
+    let clicked = false;
+    // A click whose flip is not yet seen; another click could toggle it back.
+    let pending = false;
+    let pendingTimedOut = false;
+    // A timed-out click given up on may still land, so a later success must outlast a settle period.
+    let straggler = false;
+    for (let attempt = 1; attempt <= MEDIA_TOGGLE_ATTEMPTS && !stop(); attempt++) {
+      if (attempt > 1) {
+        console.warn(
+          `[${participant}] ${label} requested ${onOff(want)} but reads ${onOff(state)} — retry ${attempt}/${MEDIA_TOGGLE_ATTEMPTS}`,
+        );
+        await page.waitForTimeout(MEDIA_RETRY_BACKOFF_MS * 2 ** (attempt - 2));
+      }
+      state = await awaitControl(onSel, offSel);
+      if (state === null) continue;
+      if (state === want) {
+        pending = false;
+      } else {
+        if (!pending) {
+          clicked = true;
+          pending = true;
+          try {
+            await page.locator(state ? onSel : offSel).click({ timeout: MEDIA_CLICK_TIMEOUT_MS });
+            console.log(`[${participant}] ${label} ${onOff(want)}: clicked`);
+            pendingTimedOut = false;
+          } catch (e) {
+            pendingTimedOut = true;
+            console.warn(
+              `[${participant}] ${label} ${onOff(want)} click failed: ${(e as Error).message}`,
+            );
+          }
+        }
+        // An ON click resolves through an async device probe.
+        const flipped = await page
+          .locator(want ? onSel : offSel)
+          .waitFor({ state: "visible", timeout: MEDIA_SETTLE_TIMEOUT_MS })
+          .then(
+            () => true,
+            () => false,
+          );
+        if (flipped) pending = false;
+      }
+      // Every success needs a second read after a pause: an encoder start error within it reverts the medium.
+      await page.waitForTimeout(MEDIA_CONFIRM_MS);
+      state = await read(onSel, offSel);
+      if (state === want && straggler) {
+        await page.waitForTimeout(MEDIA_SETTLE_TIMEOUT_MS);
+        state = await read(onSel, offSel);
+        if (state !== want) {
+          straggler = false;
+          continue;
+        }
+      }
+      if (state === want) {
+        if (!clicked) console.log(`[${participant}] ${label} already ${onOff(want)} at join`);
+        return state;
+      }
+      if (pending && pendingTimedOut) {
+        pending = false;
+        straggler = true;
+      }
     }
-    await clickWhenVisible(page, participant, `${label} ${want ? "on" : "off"}`, [
-      before ? onSel : offSel,
-    ]);
-    // An ON click resolves through an async device probe, so wait for the label to flip.
-    await page
-      .locator(want ? onSel : offSel)
-      .waitFor({ state: "visible", timeout: MEDIA_SETTLE_TIMEOUT_MS })
-      .catch(() => {});
-    const after = await read(onSel, offSel);
-    if (after !== want) {
-      console.warn(
-        `[${participant}] ${label} requested ${want ? "on" : "off"} but reads ${after === null ? "unknown" : after ? "on" : "off"} after the click`,
-      );
-    }
-    return after;
+    throw new JoinMediaNotAppliedError(label, want, state);
   };
+  const off = (sel: string, medium: "mic" | "camera", want: boolean): string =>
+    want ? sel : `${sel}, ${unavailableOffSelector(medium)}`;
   const mic = await settle(
     "microphone",
     micControlSelector("on"),
-    MIC_UNMUTE_SELECTOR,
+    off(MIC_UNMUTE_SELECTOR, "mic", request.mic),
     request.mic,
   );
   const camera = await settle(
     "camera",
     cameraControlSelector("on"),
-    cameraControlSelector("off"),
+    off(cameraControlSelector("off"), "camera", request.camera),
     request.camera,
   );
+  for (const [medium, label] of [
+    ["mic", "microphone"],
+    ["camera", "camera"],
+  ] as const) {
+    if (!request[medium] && (await visible(unavailableOffSelector(medium)))) {
+      console.warn(`[${participant}] ${label} off as requested, but its device is unavailable`);
+    }
+  }
   return { camera, mic };
 }
 
@@ -416,7 +517,11 @@ export async function ensureWaitingRoomOff(page: Page, participant: string): Pro
   // present (bot is joining an existing meeting), we don't want to
   // burn 30s waiting on a UI element that won't appear. Absent toggle
   // ⇒ not in Start mode ⇒ nothing to do; not an error.
-  const toggleVisible = await toggle.isVisible({ timeout: 2_000 }).catch(() => false);
+  const toggleVisible = await withTimeLimit(
+    "isVisible Waiting Room toggle",
+    UI_PROBE_TIME_LIMIT_MS,
+    () => toggle.isVisible(),
+  ).catch(notVisible((m) => console.warn(`[${participant}] ${m}`)));
   if (!toggleVisible) {
     console.log(`[${participant}] Waiting Room toggle not present — skipping`);
     return;
@@ -1080,7 +1185,9 @@ export async function ensureDisplayNameInMeeting(args: {
 
   // The action bar auto-hides; nudge the mouse to reveal it so the
   // peer-list toggle is interactable.
-  await page.mouse.move(400, 400).catch(() => {});
+  await withTimeLimit("mouse.move", UI_PROBE_TIME_LIMIT_MS, () => page.mouse.move(400, 400)).catch(
+    () => {},
+  );
   await page.waitForTimeout(300);
 
   const openSelector = await resolveControlSelector(
@@ -1190,14 +1297,18 @@ export async function ensureDisplayNameInMeeting(args: {
         `[${participant}] in-meeting rename: modal still open after Save click — ` +
           `validation likely rejected "${displayName}". Closing modal via Escape.`,
       );
-      await page.keyboard.press("Escape").catch(() => undefined);
+      await withTimeLimit("keyboard.press", UI_PROBE_TIME_LIMIT_MS, () =>
+        page.keyboard.press("Escape"),
+      ).catch(() => undefined);
     }
   } catch (e) {
     console.warn(
       `[${participant}] in-meeting rename: modal interaction failed (${(e as Error).message})`,
     );
     // Best-effort: try to close any stuck modal before continuing.
-    await page.keyboard.press("Escape").catch(() => undefined);
+    await withTimeLimit("keyboard.press", UI_PROBE_TIME_LIMIT_MS, () =>
+      page.keyboard.press("Escape"),
+    ).catch(() => undefined);
   }
 
   await closePeerList(page, participant);
@@ -1211,7 +1322,9 @@ export async function ensureDisplayNameInMeeting(args: {
 export async function closePeerList(page: Page, participant: string): Promise<void> {
   // Re-reveal the action bar in case it auto-hid while the rename
   // modal was open.
-  await page.mouse.move(400, 400).catch(() => undefined);
+  await withTimeLimit("mouse.move", UI_PROBE_TIME_LIMIT_MS, () => page.mouse.move(400, 400)).catch(
+    () => undefined,
+  );
   await page.waitForTimeout(150);
 
   const closeSelector = await resolveControlSelector(
@@ -1236,32 +1349,4 @@ export async function closePeerList(page: Page, participant: string): Promise<vo
         `to fight a still-open panel — check the bot's mic / camera enable logs.`,
     );
   }
-}
-
-async function clickWhenVisible(
-  page: JoinMediaPage,
-  participant: string,
-  label: string,
-  selectors: readonly string[],
-): Promise<boolean> {
-  for (const sel of selectors) {
-    const candidate: Locator = page.locator(sel);
-    try {
-      if (await candidate.isVisible({ timeout: 2_000 }).catch(() => false)) {
-        await candidate.click({ timeout: 2_000 });
-        console.log(`[${participant}] ${label}: clicked`);
-        await page.waitForTimeout(300);
-        return true;
-      }
-    } catch (e) {
-      console.warn(
-        `[${participant}] enable ${label} failed for selector ${sel}:`,
-        (e as Error).message,
-      );
-    }
-  }
-  console.warn(
-    `[${participant}] could not find a visible ${label} button — selectors tried: ${selectors.join(" | ")}. The action bar may have autohidden, the device may be unavailable, or the aria-label changed.`,
-  );
-  return false;
 }

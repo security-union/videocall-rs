@@ -52,28 +52,34 @@ describe("diag-packets drift locks", () => {
     }
   });
 
-  it("injects the serde key of an Option<String> field with a value the client reads as off", () => {
-    const rs = readText(REPO_ROOT, CONSTANTS_REL);
-    const key = match(
-      /#\[serde\(rename = "(\w+)"\)\]\s*(?:#\[serde\(default\)\]\s*)?pub diagnostics_packets_enabled: Option<String>,/,
-      rs,
-      "RuntimeConfig.diagnostics_packets_enabled is gone or no longer an Option<String>",
-    )[1];
-    expect(DIAG_PACKETS_CONFIG_KEY).toBe(key);
-    const injected = buildReceiverConfigOverrides({ diagPackets: "off" })?.[key];
-    expect(typeof injected).toBe("string");
-    const parser = match(
-      /fn parse_diagnostics_packets_switch\([\s\S]*?\n\}/,
-      rs,
-      "constants.rs no longer defines parse_diagnostics_packets_switch",
-    )[0];
-    const offArm = match(
-      /((?:"[^"]+"\s*\|\s*)*"[^"]+")\s*=>\s*Some\(false\)/,
-      parser,
-      "no off arm",
-    )[1];
-    expect(offArm.split("|").map((t) => t.trim().replace(/"/g, ""))).toContain(injected);
-  });
+  it.each([
+    ["off", "false"],
+    ["on", "true"],
+  ] as const)(
+    "injects the serde key of an Option<String> field with a value the client reads as %s",
+    (diagPackets, arm) => {
+      const rs = readText(REPO_ROOT, CONSTANTS_REL);
+      const key = match(
+        /#\[serde\(rename = "(\w+)"\)\]\s*(?:#\[serde\(default\)\]\s*)?pub diagnostics_packets_enabled: Option<String>,/,
+        rs,
+        "RuntimeConfig.diagnostics_packets_enabled is gone or no longer an Option<String>",
+      )[1];
+      expect(DIAG_PACKETS_CONFIG_KEY).toBe(key);
+      const injected = buildReceiverConfigOverrides({ diagPackets })?.[key];
+      expect(typeof injected).toBe("string");
+      const parser = match(
+        /fn parse_config_switch\([\s\S]*?\n\}/,
+        rs,
+        "constants.rs no longer defines parse_config_switch",
+      )[0];
+      const tokens = match(
+        new RegExp(`((?:"[^"]+"\\s*\\|\\s*)*"[^"]+")\\s*=>\\s*Some\\(${arm}\\)`),
+        parser,
+        `no Some(${arm}) arm`,
+      )[1];
+      expect(tokens.split("|").map((t) => t.trim().replace(/"/g, ""))).toContain(injected);
+    },
+  );
 
   it("a falsy config value is checked before the URL param (the injection is a ceiling)", () => {
     const body = match(

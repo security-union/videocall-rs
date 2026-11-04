@@ -43,6 +43,7 @@ serde-wasm-bindgen = "0.6.5"
 serde_bytes = "0.11"
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }
 serde_json = { version = "1.0" }
+unicode-normalization = "0.1.25"
 async-broadcast = "0.7.2"
 # Phase 3b (discussion #793): optional dep that powers the per-tab
 # NetSimShim. Pulled in only when the `netsim` feature is enabled so
@@ -101,11 +102,13 @@ features = [
     "EncodedVideoChunkInit",
     "EncodedVideoChunkType",
     "MediaStreamAudioDestinationNode",
+    "MessageChannel",
     "MessagePort",
     "OffscreenCanvas",
     "OffscreenCanvasRenderingContext2d",
     "AudioDestinationNode",
     "AudioContextOptions",
+    "AudioContextState",
     "AudioDataCopyToOptions",
     "HtmlCanvasElement",
     "HtmlImageElement",

@@ -11,12 +11,15 @@
  * at your option.
  */
 
-//! Co-host management: grant/revoke are owner-only; list also allows a live co-host or present host.
+//! Co-host management: grant/revoke/suggestions are owner-only; list also allows a live co-host or present host.
 
 use axum::{extract::State, Json};
 use videocall_meeting_types::{
     requests::{GrantCoHostRequest, RevokeCoHostRequest},
-    responses::{APIResponse, CoHostEntry, ListCoHostsResponse},
+    responses::{
+        APIResponse, CoHostEntry, CoHostSuggestion, ListCoHostSuggestionsResponse,
+        ListCoHostsResponse,
+    },
     GUEST_USER_ID_PREFIX,
 };
 
@@ -31,6 +34,9 @@ use crate::state::AppState;
 
 /// Maximum co-host entries per meeting.
 pub const MAX_CO_HOSTS: usize = 100;
+
+/// Maximum entries returned by [`list_co_host_suggestions`].
+pub const MAX_CO_HOST_SUGGESTIONS: usize = 100;
 
 const MAX_USER_ID_LEN: usize = 254;
 
@@ -122,6 +128,31 @@ pub async fn list_co_hosts(
         return Err(AppError::not_host());
     }
     list_response(&state, meeting.id, healthy).await
+}
+
+/// `GET /api/v1/meetings/{meeting_id}/co-hosts/suggestions` — owner only.
+pub async fn list_co_host_suggestions(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    ValidMeetingId(meeting_id): ValidMeetingId,
+) -> Result<Json<APIResponse<ListCoHostSuggestionsResponse>>, AppError> {
+    let meeting = require_owner(&state, &meeting_id, &user_id).await?;
+    let suggestions = db_co_hosts::suggestions(
+        &state.db,
+        &user_id,
+        meeting.id,
+        MAX_CO_HOST_SUGGESTIONS as i64,
+    )
+    .await?
+    .into_iter()
+    .map(|row| CoHostSuggestion {
+        user_id: row.user_id,
+        display_name: row.display_name,
+    })
+    .collect();
+    Ok(Json(APIResponse::ok(ListCoHostSuggestionsResponse {
+        suggestions,
+    })))
 }
 
 /// `POST /api/v1/meetings/{meeting_id}/co-hosts` — owner only; returns the updated list.

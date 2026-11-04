@@ -62,7 +62,7 @@
    Unlike in-flow grid tiles, `.grid-item.full-bleed` is `position: absolute;
    inset: 0`, so it escapes the grid's `pad_top` and the bar
    would otherwise overlap its `.floating-name` label (the reported 2-participant
-   bug). When attendants.rs mounts the bar it adds `status-bar-active` to
+   bug). While the bar is visible attendants.rs adds `status-bar-active` to
    `#grid-container` and sets `--status-bar-reserve` (px) to the SAME value it
    adds to `pad_top`, so the tile's top inset always matches the painted bar
    height. Overriding `top`/`height`/`max-height` shrinks and re-centers the
@@ -1175,6 +1175,7 @@ html[data-theme="dark"] {
   --settings-modal-text-primary: rgba(255, 255, 255, 0.96);
   --settings-modal-text-secondary: rgba(230, 238, 255, 0.78);
   --settings-modal-text-tertiary: rgba(210, 220, 240, 0.6);
+  --announce-lock-note-text: rgba(230, 238, 255, 0.78);
 
   /* Appearance section heading text (dark) */
   --appearance-section-text-dark: rgba(255, 255, 255, 0.92);
@@ -1326,6 +1327,7 @@ html[data-theme="light"] {
   --appearance-slider-active-shadow-2: rgba(20, 40, 80, 0.18);
   --appearance-section-text: rgba(22, 34, 54, 0.95);
   --appearance-text-muted: rgba(66, 86, 116, 0.72);
+  --announce-lock-note-text: rgba(22, 28, 38, 0.72);
   --appearance-toggle-bg: linear-gradient(
     180deg,
     rgba(140, 130, 120, 0.08) 0%,
@@ -1556,6 +1558,7 @@ html[data-theme="light"] #invite-overlay p {
   --meeting-footer-h: 32px;
   --meeting-footer-bg: rgba(16, 17, 20, 0.6);
   --meeting-footer-bg-hover: rgba(16, 17, 20, 0.8);
+  --meeting-footer-target-hover: rgba(255, 255, 255, 0.12);
   --meeting-footer-border: rgba(255, 255, 255, 0.08);
 
   /* ─── Dock popover surface (issue 2091) ───────────────────────────────────
@@ -1620,6 +1623,8 @@ html[data-theme="light"] #invite-overlay p {
      Used to anchor the decode-paused pill just above the controls dock in grid
      mode. Issue 1142. */
   --controls-dock-clearance: calc(112px + var(--meeting-footer-h));
+  --self-corner-right: clamp(1rem, 2vw, 1.5rem);
+  --self-corner-w: clamp(10rem, 18vw, 15rem);
 
   /* Gradient tokens — consolidated fade/rim/reflection effects */
   --gradient-fade-video: linear-gradient(
@@ -2233,21 +2238,100 @@ html[data-theme="light"] #invite-overlay p {
     inset 0 1px rgba(255, 255, 255, 0.07);
 }
 
-/* === (в) Secondary slots hidden by default; expand on hover/customize ===
-   The action-bar slots are now ALL direct flex children of
-   `.video-controls-container` (no wrapping `.controls-secondary`) so flex
-   `order:` resolves in a single context — required for drag-reorder to
-   work. Each secondary slot is tagged `.slot-secondary` and toggled
-   individually: hidden when the bar is collapsed, shown when it is
-   expanded (`.controls-expanded` / `:hover`) or being customized. */
-.action-bar-slot-wrapper.slot-secondary {
-  display: none;
+.video-controls-container.controls-hidden:has(:focus-visible) {
+  opacity: 1;
+}
+.video-controls-container.dock-bottom.controls-hidden:has(:focus-visible) {
+  transform: translateX(-50%) translateY(0);
+}
+.video-controls-container.dock-left.controls-hidden:has(:focus-visible) {
+  transform: translateY(-50%) translateX(0);
+}
+.video-controls-container.dock-right.controls-hidden:has(:focus-visible) {
+  transform: translateY(-50%) translateX(0);
 }
 
-.video-controls-container.controls-expanded .action-bar-slot-wrapper.slot-secondary,
-.video-controls-container:hover .action-bar-slot-wrapper.slot-secondary,
-.video-controls-container.customize-mode .action-bar-slot-wrapper.slot-secondary {
-  display: inline-flex;
+/* === (в) Auto-shrink (issue 2781): clipped, so a hidden control stays focusable. === */
+.video-controls-container:not(.controls-expanded, .customize-mode, [data-hover-open], :has(:focus-visible)) .slot-shrinkable {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px;
+  overflow: hidden !important;
+  clip-path: inset(50%) !important;
+}
+
+.video-controls-container:not(.controls-expanded, .customize-mode, [data-hover-open], :has(:focus-visible)) .slot-shrinkable .chat-unread-badge,
+.video-controls-container:not(.controls-expanded, .customize-mode, [data-hover-open], :has(:focus-visible)) .slot-shrinkable .record-active,
+.video-controls-container:not(.controls-expanded, .customize-mode, [data-hover-open], :has(:focus-visible)) .slot-shrinkable .captions-button[aria-busy="true"] svg {
+  animation-play-state: paused !important;
+}
+
+.video-controls-container.shrink-empty:not(.controls-expanded, .customize-mode, [data-hover-open], :has(:focus-visible)) {
+  padding: 0;
+}
+
+.action-bar-expand-handle {
+  display: none;
+  order: -1;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  width: 72px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.action-bar-expand-handle::before {
+  content: "";
+  width: 32px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--on-dark-text-secondary);
+}
+
+.dock-left .action-bar-expand-handle,
+.dock-right .action-bar-expand-handle {
+  width: 24px;
+  height: 72px;
+}
+
+.dock-left .action-bar-expand-handle::before,
+.dock-right .action-bar-expand-handle::before {
+  width: 4px;
+  height: 32px;
+}
+
+.video-controls-container.shrink-empty:not(.controls-expanded, .customize-mode, [data-hover-open], :has(:focus-visible)) .action-bar-expand-handle {
+  display: flex;
+}
+
+@media (any-pointer: coarse) {
+  .action-bar-expand-handle {
+    display: flex;
+    width: 96px;
+    height: 44px;
+    flex-shrink: 1;
+    min-width: 44px;
+  }
+
+  .dock-left .action-bar-expand-handle,
+  .dock-right .action-bar-expand-handle {
+    width: 44px;
+    height: 96px;
+  }
+}
+
+@media (forced-colors: active) {
+  .action-bar-expand-handle::before {
+    background-color: CanvasText;
+    forced-color-adjust: none;
+  }
 }
 
 /* Slots the JS overflow detector can't fit at the current width are hidden
@@ -2255,8 +2339,7 @@ html[data-theme="light"] #invite-overlay p {
    inline style: Dioxus did not reliably clear an inline `display:none
    !important` when it diffed back to empty, so a slot that overflowed at a
    narrow width stayed stuck-hidden after the window widened again even though
-   the overflow set had emptied. `!important` beats the `.controls-expanded` /
-   `:hover` reveal rules above. */
+   the overflow set had emptied. */
 .action-bar-slot-wrapper.is-overflow-hidden {
   display: none !important;
 }
@@ -2336,8 +2419,13 @@ html[data-theme="light"] #invite-overlay p {
   background: var(--glass-popover-item-hover-bg);
 }
 
-/* Issue 2135: the RaiseHand overflow item while the local hand is UP. The only
-   stateful item in this menu, and the path existing users meet the control on
+.action-bar-overflow-popover .overflow-item:focus-visible {
+  outline: 2px solid var(--accent-hover);
+  outline-offset: -2px;
+}
+
+/* Issue 2135: a pressed overflow item (RaiseHand while the local hand is UP,
+   Captions while on). RaiseHand is the path existing users meet the control on
    first (the layout migration appends the new slot at the END, so it overflows).
 
    Text colour is deliberately UNTOUCHED at --on-dark-text (~15:1 on this fixed
@@ -2345,11 +2433,17 @@ html[data-theme="light"] #invite-overlay p {
    rail, so no foreground drops toward the accent's poor ratio the way the
    action-bar toggle's did. --glass-popover-item-active-bg is the token already
    defined for "selected item on this surface"; --accent-hover on the popover
-   base measures ~5.2:1, clearing 1.4.11's 3:1 for a non-text indicator. The
-   authoritative state signal for AT is `aria-pressed` on the button itself. */
-.action-bar-overflow-popover .overflow-item.raised {
+   base measures ~5.2:1, clearing 1.4.11's 3:1 for a non-text indicator. */
+.action-bar-overflow-popover .overflow-item.raised,
+.action-bar-overflow-popover .overflow-item[aria-pressed="true"],
+.action-bar-overflow-popover .overflow-item[aria-checked="true"] {
   background: var(--glass-popover-item-active-bg);
   box-shadow: inset 3px 0 0 var(--accent-hover);
+}
+
+.action-bar-overflow-popover .overflow-item[aria-busy="true"] {
+  background: var(--glass-popover-item-hover-bg);
+  box-shadow: inset 1px 0 0 var(--accent-hover);
 }
 
 .action-bar-overflow-popover .overflow-item svg {
@@ -2374,7 +2468,119 @@ html[data-theme="light"] #invite-overlay p {
   transform: translateY(-50%);
 }
 
-/* HangUp ("Leave") wrapper — always visible at the end of the bar. */
+.action-bar-overflow-popover.recent-actions-popover {
+  position: fixed;
+  right: auto;
+  bottom: calc(104px + var(--meeting-footer-h, 0px));
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
+  transform: translateX(-50%);
+  z-index: 9100;
+  width: max-content;
+  min-width: min(260px, calc(100vw - 24px));
+  max-width: min(360px, calc(100vw - 24px));
+  max-height: calc(100dvh - 124px - var(--meeting-footer-h, 0px));
+  animation-name: recent-actions-fade-in;
+}
+
+[data-dock="dock-left"] .action-bar-overflow-popover.recent-actions-popover,
+[data-dock="dock-right"] .action-bar-overflow-popover.recent-actions-popover {
+  bottom: auto;
+  top: calc(50% - var(--meeting-footer-h, 0px) / 2);
+  transform: translateY(-50%);
+  min-width: 0;
+  max-width: min(360px, calc(100vw - var(--recents-dock-offset) - 12px));
+  max-height: calc(100dvh - 32px - var(--meeting-footer-h, 0px));
+}
+
+[data-dock="dock-left"] .action-bar-overflow-popover.recent-actions-popover {
+  --recents-dock-offset: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap) + var(--drawer-left-reserve, 0px));
+  left: var(--recents-dock-offset);
+}
+
+[data-dock="dock-right"] .action-bar-overflow-popover.recent-actions-popover {
+  --recents-dock-offset: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap) + var(--drawer-right-reserve, 0px));
+  left: auto;
+  right: var(--recents-dock-offset);
+}
+
+/* Opacity only: the inherited keyframes would override `translateX(-50%)`. */
+@keyframes recent-actions-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.recent-actions-heading {
+  padding: 0.25rem 0.65rem 0.35rem;
+  color: var(--on-dark-text-secondary);
+  font-size: var(--fs-5);
+  font-weight: 600;
+}
+
+.recent-actions-popover [role="menu"] {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.recent-actions-row {
+  display: contents;
+}
+
+.action-bar-overflow-popover .overflow-item.recent-actions-empty {
+  cursor: default;
+}
+
+.recent-actions-item-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  text-align: left;
+  white-space: normal;
+}
+
+.recent-actions-item-hint {
+  color: var(--on-dark-text-secondary);
+  font-size: var(--fs-3);
+}
+
+.recent-target-flash {
+  position: relative;
+}
+
+.recent-target-flash::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: var(--radius-md);
+  box-shadow: 0 0 0 2px var(--accent-hover);
+  pointer-events: none;
+  animation: recent-target-flash 1.6s ease-out forwards;
+}
+
+@keyframes recent-target-flash {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .action-bar-overflow-popover.recent-actions-popover,
+  .recent-target-flash::after {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .action-bar-overflow-popover .overflow-item[aria-pressed="true"]:not(:focus-visible),
+  .action-bar-overflow-popover .overflow-item[aria-checked="true"]:not(:focus-visible),
+  .recent-target-flash::after {
+    outline: 2px solid Highlight;
+  }
+}
+
 .hangup-wrapper {
   display: inline-flex;
   flex-shrink: 0;
@@ -2412,6 +2618,7 @@ html[data-theme="light"] #invite-overlay p {
   right: auto;
   transform: translateX(-50%);
   min-width: 160px;
+  max-height: min(440px, calc(100vh - 140px));
   border: 1px solid var(--glass-popover-border);
   border-radius: 10px;
   border-top: 1px solid var(--glass-popover-border);
@@ -2439,6 +2646,10 @@ html[data-theme="light"] #invite-overlay p {
    below DOES change dark theme — see its own note. */
 .dock-position-wrapper .glass-select-menu .glass-select-option {
   color: var(--on-dark-text);
+}
+
+.dock-position-wrapper .glass-select-menu .glass-select-option-hint {
+  color: var(--on-dark-text-secondary);
 }
 
 .dock-position-wrapper .glass-select-menu .glass-select-option:hover {
@@ -2476,19 +2687,28 @@ html[data-theme="light"] #invite-overlay p {
   outline-offset: -2px;
 }
 
-/* Side dock: menu opens to the side */
+/* Side dock: menu opens to the side, anchored to the bottom of the bar, which is
+   always on screen. The wrapper and select are static so the bar anchors it. */
+.dock-left .dock-position-wrapper,
+.dock-right .dock-position-wrapper,
+.dock-left .dock-position-wrapper .glass-select,
+.dock-right .dock-position-wrapper .glass-select {
+  position: static;
+}
 .dock-left .dock-position-wrapper .glass-select-menu {
-  bottom: auto;
+  top: auto;
+  bottom: 0;
   left: calc(100% + 12px);
-  top: 50%;
-  transform: translateY(-50%);
+  transform: none;
+  max-height: min(440px, calc(50vh - var(--meeting-footer-h, 0px) / 2 + 150px), calc(100vh - 140px));
 }
 .dock-right .dock-position-wrapper .glass-select-menu {
-  bottom: auto;
+  top: auto;
+  bottom: 0;
   right: calc(100% + 12px);
   left: auto;
-  top: 50%;
-  transform: translateY(-50%);
+  transform: none;
+  max-height: min(440px, calc(50vh - var(--meeting-footer-h, 0px) / 2 + 150px), calc(100vh - 140px));
 }
 
 .video-control-button {
@@ -3772,7 +3992,7 @@ html[data-theme="light"] #invite-overlay p {
     padding: 4px;
   }
 
-  .ss-zoom-controls .ss-tier-s {
+  .share-tile:not([data-share-role="secondary"]) .ss-zoom-controls .ss-tier-s {
     display: none;
   }
 }
@@ -4418,9 +4638,25 @@ html[data-theme="light"] #invite-overlay p {
 
 .about-footer {
   display: flex;
+  flex-wrap: wrap;
   justify-content: center;
   align-items: center;
+  gap: var(--space-1);
   margin-top: var(--space-2);
+}
+
+.about-footer-sep {
+  color: var(--text-secondary);
+}
+
+@media (max-width: 639px) {
+  .about-footer {
+    flex-direction: column;
+  }
+
+  .about-footer-sep {
+    display: none;
+  }
 }
 
 .about-footer-link {
@@ -4429,7 +4665,7 @@ html[data-theme="light"] #invite-overlay p {
   padding: var(--space-1) var(--space-2);
   font-size: var(--fs-4);
   letter-spacing: 0.01em;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   cursor: pointer;
   text-decoration: none;
   border-radius: var(--radius-pill);
@@ -4474,6 +4710,39 @@ html[data-theme="light"] #invite-overlay p {
 
 .about-modal-close {
   flex-shrink: 0;
+}
+
+.about-modal-help {
+  margin: 0;
+  font-size: var(--fs-5);
+  color: var(--text-secondary);
+}
+
+.about-modal-help-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-primary);
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: var(--focus-ring);
+  text-underline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
+.about-modal-help-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+.about-modal-help-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.about-modal-help-link svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
 }
 
 .about-modal-section {
@@ -4681,6 +4950,53 @@ html[data-theme="light"] #invite-overlay p {
 .changelog-changes li + li {
   margin-top: 2px;
 }
+/* issue 3253: a build's changes grouped under a coloured kind pill */
+.changelog-group {
+  margin-top: var(--space-2);
+}
+.changelog-group + .changelog-group {
+  margin-top: var(--space-3);
+}
+.changelog-kind {
+  --changelog-kind-hue: var(--text-tertiary);
+  display: flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 0 var(--space-1) 0;
+  padding: 0 var(--space-2);
+  font-size: var(--fs-3);
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--changelog-kind-hue) 22%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--changelog-kind-hue) 55%, var(--surface));
+  border-radius: var(--radius-pill);
+}
+.changelog-kind--features {
+  --changelog-kind-hue: var(--success);
+}
+.changelog-kind--ux {
+  --changelog-kind-hue: var(--accent-2);
+}
+.changelog-kind--performance {
+  --changelog-kind-hue: var(--warning);
+}
+.changelog-kind--reliability {
+  --changelog-kind-hue: color-mix(in srgb, var(--accent), var(--success));
+}
+.changelog-kind--fixes {
+  --changelog-kind-hue: var(--accent);
+}
+.changelog-kind--security {
+  --changelog-kind-hue: color-mix(in srgb, var(--accent-3) 65%, var(--warning));
+}
+@media (prefers-contrast: more) {
+  .changelog-kind {
+    border-color: currentColor;
+  }
+}
 .changelog-show-older,
 .changelog-retry {
   align-self: flex-start;
@@ -4707,47 +5023,145 @@ html[data-theme="light"] #invite-overlay p {
 }
 .meeting-footer-trigger {
   appearance: none;
-  display: flex;
-  align-items: center;
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  inset: 0;
   margin: 0;
-  padding: 0 var(--space-3);
+  padding: 0;
   border: 0;
   background: transparent;
-  color: var(--on-dark-text-secondary);
-  font: inherit;
-  font-size: var(--fs-3);
-  line-height: 1;
-  text-align: left;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
-  transition: color var(--motion-fast) ease;
 }
 .meeting-footer-trigger:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -3px;
   border-radius: var(--radius-sm);
+}
+.meeting-footer-content {
+  position: relative;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  height: 100%;
+  min-width: 0;
+  padding: 0 var(--space-3);
+  color: var(--on-dark-text-secondary);
+  font-size: var(--fs-3);
+  line-height: 1;
+  pointer-events: none;
+  transition: color var(--motion-fast) ease;
+}
+.meeting-footer-trigger:focus-visible + .meeting-footer-content {
   color: var(--on-dark-text-high);
 }
-.meeting-footer-trigger:active {
+.meeting-footer-trigger:active + .meeting-footer-content {
+  color: var(--on-dark-text);
+}
+.meeting-footer-participants-trigger {
+  appearance: none;
+  box-sizing: border-box;
+  align-self: stretch;
+  margin: 0 0 0 calc(-1 * var(--space-1));
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  pointer-events: auto;
+  -webkit-tap-highlight-color: transparent;
+  transition: color var(--motion-fast) ease;
+}
+.meeting-footer-participants-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  min-height: 24px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  transition: background-color var(--motion-fast) ease;
+}
+.meeting-footer-participants-trigger:focus-visible {
+  outline: none;
+  color: var(--on-dark-text-high);
+}
+.meeting-footer-participants-trigger:focus-visible .meeting-footer-participants-pill {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.meeting-footer-participants-trigger:active {
+  color: var(--on-dark-text);
+}
+.meeting-footer-help {
+  flex: none;
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: calc(-1 * var(--space-3));
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  pointer-events: auto;
+  -webkit-tap-highlight-color: transparent;
+  transition: color var(--motion-fast) ease;
+}
+.meeting-footer-help::before {
+  content: "";
+  flex: none;
+  width: 1px;
+  height: 16px;
+  background: var(--on-dark-text-muted);
+}
+.meeting-footer-help-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  box-sizing: border-box;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  transition: background-color var(--motion-fast) ease;
+}
+.meeting-footer-help-pill svg {
+  width: 14px;
+  height: 14px;
+}
+.meeting-footer-help:focus-visible {
+  outline: none;
+  color: var(--on-dark-text-high);
+}
+.meeting-footer-help:focus-visible .meeting-footer-help-pill {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.meeting-footer-help:active {
   color: var(--on-dark-text);
 }
 @media (hover: hover) {
   .meeting-footer:hover {
     background: var(--meeting-footer-bg-hover);
   }
-  .meeting-footer-trigger:hover {
+  .meeting-footer-trigger:hover + .meeting-footer-content,
+  .meeting-footer-participants-trigger:hover,
+  .meeting-footer-help:hover {
     color: var(--on-dark-text-high);
   }
-}
-.meeting-footer-content {
-  display: flex;
-  flex: 1 1 auto;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  min-width: 0;
+  .meeting-footer-trigger:hover
+    + .meeting-footer-content
+    .meeting-footer-participants-trigger:not(:focus-visible),
+  .meeting-footer-trigger:hover + .meeting-footer-content .meeting-footer-help:not(:focus-visible) {
+    color: var(--on-dark-text-secondary);
+  }
+  .meeting-footer-participants-trigger:hover .meeting-footer-participants-pill,
+  .meeting-footer-help:hover .meeting-footer-help-pill {
+    background: var(--meeting-footer-target-hover);
+  }
 }
 .meeting-footer-group {
   display: flex;
@@ -4757,10 +5171,23 @@ html[data-theme="light"] #invite-overlay p {
 }
 .meeting-footer-group--meeting {
   flex: 1 1 auto;
+  align-self: stretch;
   overflow-x: clip;
 }
 .meeting-footer-group--app {
-  flex: 0 0 auto;
+  flex: 0 9999 auto;
+  min-width: calc(14px + var(--space-2));
+}
+.meeting-footer-app-text {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  height: 1lh;
+  overflow: hidden;
+}
+.meeting-footer-app-text::before {
+  content: "";
+  height: 1lh;
 }
 .meeting-footer-live-dot {
   flex: none;
@@ -4798,6 +5225,7 @@ html[data-theme="light"] #invite-overlay p {
   height: 12px;
 }
 .meeting-footer-affordance {
+  flex: none;
   display: inline-flex;
   margin-left: var(--space-2);
 }
@@ -4814,7 +5242,8 @@ html[data-theme="light"] #invite-overlay p {
 .meeting-footer-count-text,
 .meeting-footer-app-name,
 .meeting-footer-built-label,
-.meeting-footer-built--full {
+.meeting-footer-built--full,
+.meeting-footer-help-label {
   display: none;
 }
 @container meeting-footer (min-width: 400px) {
@@ -4824,7 +5253,7 @@ html[data-theme="light"] #invite-overlay p {
   }
 }
 @container meeting-footer (min-width: 560px) {
-  .meeting-footer-trigger {
+  .meeting-footer-content {
     padding: 0 var(--space-4);
   }
   .meeting-footer-status-label,
@@ -4837,7 +5266,7 @@ html[data-theme="light"] #invite-overlay p {
     display: none;
   }
 }
-@container meeting-footer (min-width: 760px) {
+@container meeting-footer (min-width: 840px) {
   .meeting-footer-app-name,
   .meeting-footer-built--full {
     display: inline;
@@ -4846,9 +5275,22 @@ html[data-theme="light"] #invite-overlay p {
     display: none;
   }
 }
+@container meeting-footer (min-width: 900px) {
+  .meeting-footer-help {
+    gap: var(--space-2);
+    margin-left: 0;
+  }
+  .meeting-footer-help-label {
+    display: inline;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .meeting-footer,
-  .meeting-footer-trigger {
+  .meeting-footer-content,
+  .meeting-footer-participants-trigger,
+  .meeting-footer-participants-pill,
+  .meeting-footer-help,
+  .meeting-footer-help-pill {
     transition: none;
   }
 }
@@ -4858,6 +5300,14 @@ html[data-theme="light"] #invite-overlay p {
   }
   .meeting-footer-live-dot {
     forced-color-adjust: none;
+  }
+  .meeting-footer-participants-trigger:hover:not(:focus-visible) .meeting-footer-participants-pill,
+  .meeting-footer-help:hover:not(:focus-visible) .meeting-footer-help-pill {
+    outline: 1px solid ButtonText;
+    outline-offset: -1px;
+  }
+  .meeting-footer-help::before {
+    background: CanvasText;
   }
 }
 
@@ -4886,7 +5336,8 @@ html[data-theme="light"] #invite-overlay p {
   backdrop-filter: none;
 }
 .meeting-info-card:focus,
-.meeting-ended-card:focus {
+.meeting-ended-card:focus,
+.meeting-restarted-card:focus {
   outline: none;
 }
 .meeting-info-row {
@@ -4985,7 +5436,7 @@ html[data-theme="light"] #invite-overlay p {
 /* Issue 1483: per-peer-tile WT/WS transport badge. A small pill that sits
    beside the .signal-indicator meter in .tile-top-icons. Sized to match the
    signal-popup .connection-type pill (11px/600/letter-spacing) but styled as
-   an independent rule here (server-gated, default OFF). Distinct colors via
+   an independent rule here. Distinct colors via
    the --transport-badge-wt-* / --transport-badge-ws-* theme vars so WT and WS
    are visually separable. */
 .transport-badge {
@@ -5083,6 +5534,16 @@ html[data-theme="light"] #invite-overlay p {
   border: 1px solid rgba(255, 69, 58, 0.5);
 }
 
+.recording-saved-banner .toast-text {
+  display: flex;
+  gap: 0.4em;
+  min-width: 0;
+}
+
+.recording-saved-banner .toast-name {
+  flex-shrink: 0;
+}
+
 /* Brief error shown to the local user when a Record click could not hand off
    to the JS recorder (recording.js missing / stale / 404). Amber border to
    distinguish it from the red recording-active/saved banners. */
@@ -5096,13 +5557,9 @@ html[data-theme="light"] #invite-overlay p {
    A general-purpose, in-flow horizontal strip anchored to the TOP of
    `#main-container`, ABOVE the video-tile grid. Unlike a floating pill,
    it reserves real vertical space: attendants.rs adds its height
-   (`STATUS_BAR_RESERVE`) to the grid's `pad_top` while it is mounted, so
+   (`STATUS_BAR_RESERVE`) to the grid's `pad_top` while it is visible, so
    the tiles resize/shift below it and its contents never overlap tile
    chrome such as the per-tile `.floating-name` label.
-
-   It currently hosts a single item — the meeting-wide recording status —
-   but is structured generically so future meeting-level statuses can be
-   appended as sibling `.meeting-status-item`s.
 
    The bar's `height` here MUST stay in sync with `STATUS_BAR_RESERVE`
    (desktop) / `STATUS_BAR_RESERVE_MOBILE` (mobile) in attendants.rs, and
@@ -5112,8 +5569,7 @@ html[data-theme="light"] #invite-overlay p {
    Deliberately NOT built on `.peer-toast` — so it never inherits that
    class's `toast-exit ... 7.5s forwards` auto-fade, which would silently
    hide it after ~8s while recording continues. It has only an entrance
-   animation; there is no exit animation, so it stays fully visible until
-   Dioxus unmounts the whole bar when `any_session_recording` flips false.
+   animation.
    --------------------------------------------------------------- */
 .meeting-status-bar {
   position: absolute;
@@ -5130,6 +5586,7 @@ html[data-theme="light"] #invite-overlay p {
   box-sizing: border-box;
   pointer-events: none;
   animation: status-bar-enter 0.3s ease-out;
+  container: status-bar / inline-size;
 }
 
 .meeting-status-item {
@@ -5149,6 +5606,246 @@ html[data-theme="light"] #invite-overlay p {
 
 .meeting-status-item-label {
   white-space: nowrap;
+}
+
+.meeting-status-rec-slot,
+.meeting-status-rec-area {
+  display: contents;
+}
+
+/* The self pill's share of the bar: the free space, but never narrower than
+   its label (the sizer), so live-captions items yield first. */
+.meeting-status-rec-slot--self {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+}
+
+.meeting-status-rec-slot--self > .meeting-status-rec-area {
+  display: flex;
+  container: rec-slot / inline-size;
+}
+
+.rec-slot-sizer {
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  white-space: nowrap;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding-inline: calc(0.9rem + 1px + 8px + 0.5rem) calc(0.9rem + 1px + 1rem + 0.5em);
+}
+
+/* The recorder's own item, with a middle-ellipsised file name. */
+.meeting-status-item--self {
+  flex: 0 1 auto;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: min(680px, 100%);
+  pointer-events: auto;
+}
+
+.meeting-status-item--self .meeting-status-item-label {
+  flex-shrink: 0;
+}
+
+.rec-target {
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+  color: var(--on-dark-text-secondary);
+}
+
+.rec-target-verb {
+  flex-shrink: 0;
+  white-space: pre;
+}
+
+.rec-target-head {
+  flex: 0 1000000 auto;
+  min-width: 2em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+
+.rec-target-head:empty {
+  display: none;
+}
+
+.rec-target-tail {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+
+@container rec-slot (max-width: 459px) {
+  .meeting-status-item--self {
+    gap: 0.3rem;
+  }
+
+  .rec-target-verb {
+    display: none;
+  }
+}
+
+@container rec-slot (max-width: 579px) {
+  .meeting-status-item--with-others .rec-target-verb {
+    display: none;
+  }
+
+  .meeting-status-item--with-others {
+    gap: 0.3rem;
+  }
+}
+
+@container rec-slot (max-width: 379px) {
+  .meeting-status-item--with-others .rec-sep,
+  .meeting-status-item--with-others .rec-target {
+    display: none;
+  }
+}
+
+.rec-label-short,
+.captions-language__code {
+  display: none;
+}
+
+@container status-bar (max-width: 459px) {
+  .meeting-status-rec-slot--self:has(.meeting-status-item--with-others):has(~ .meeting-status-item--captions)
+    :is(.rec-slot-sizer, .rec-sep, .rec-target) {
+    display: none;
+  }
+
+  .meeting-status-rec-slot--self:has(.meeting-status-item--with-others):has(~ .meeting-status-item--captions)
+    > .meeting-status-rec-area {
+    container-type: normal;
+  }
+
+  .meeting-status-rec-slot--self:has(.meeting-status-item--with-others)
+    ~ .meeting-status-item--captions:has(+ .captions-language) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .meeting-status-rec-slot--self:has(.meeting-status-item--with-others) ~ .captions-language {
+    position: relative;
+  }
+
+  .meeting-status-rec-slot--self:has(.meeting-status-item--with-others) ~ .captions-language .captions-language__code {
+    display: inline-flex;
+  }
+
+  .meeting-status-rec-slot--self:has(.meeting-status-item--with-others) ~ .captions-language .captions-language__select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    opacity: 0;
+  }
+
+  .meeting-status-rec-slot--self:has(.meeting-status-item--with-others) ~ .captions-language:has(:focus-visible) {
+    outline: 2px solid var(--accent-hover);
+    outline-offset: 2px;
+  }
+}
+
+@container status-bar (max-width: 379px) {
+  .meeting-status-rec-slot--self:has(~ .meeting-status-item--captions)
+    :is(.rec-slot-sizer, .rec-sep, .rec-target) {
+    display: none;
+  }
+
+  .meeting-status-rec-slot--self:has(~ .meeting-status-item--captions) > .meeting-status-rec-area {
+    container-type: normal;
+  }
+
+  .meeting-status-rec-slot--self ~ .meeting-status-item--captions:has(+ .captions-language) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .meeting-status-rec-slot--self ~ .captions-language {
+    position: relative;
+  }
+
+  .meeting-status-rec-slot--self ~ .captions-language .captions-language__code {
+    display: inline-flex;
+  }
+
+  .meeting-status-rec-slot--self ~ .captions-language .captions-language__select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    opacity: 0;
+  }
+
+  .meeting-status-rec-slot--self ~ .captions-language:has(:focus-visible) {
+    outline: 2px solid var(--accent-hover);
+    outline-offset: 2px;
+  }
+}
+
+@container status-bar (max-width: 359px) {
+  .meeting-status-rec-slot--self:has(~ .meeting-status-item--captions)
+    .meeting-status-item--with-others .meeting-status-item-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .meeting-status-rec-slot--self:has(~ .meeting-status-item--captions)
+    .meeting-status-item--with-others .rec-label-short {
+    display: inline;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+}
+
+.captions-language__code {
+  align-items: center;
+  gap: 0.35em;
+}
+
+.captions-language__code::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-hover);
+  flex-shrink: 0;
+}
+
+.captions-language__code::after {
+  content: "";
+  width: 0.35em;
+  height: 0.35em;
+  margin: 0 0.15em 0.2em 0.1em;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
 }
 
 @keyframes status-bar-enter {
@@ -5180,5 +5877,413 @@ html[data-theme="light"] #invite-overlay p {
   .meeting-status-item {
     font-size: 0.8rem;
     padding: 0.3rem 0.7rem;
+  }
+
+  .rec-slot-sizer {
+    font-size: 0.8rem;
+    padding-inline: calc(0.7rem + 1px + 8px + 0.5rem) calc(0.7rem + 1px + 1rem + 0.5em);
+  }
+}
+
+/* Help & FAQ page (issue 3351) */
+@media (prefers-reduced-motion: no-preference) {
+  html.help-smooth-scroll {
+    scroll-behavior: smooth;
+  }
+}
+
+.help-page {
+  isolation: isolate;
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: var(--space-5) var(--space-4) calc(var(--space-5) * 2);
+  color: var(--text-primary);
+}
+
+.help-page::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-color: var(--bg);
+  background-image: var(--bg-image);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  pointer-events: none;
+}
+
+.help-shell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 760px;
+  margin: 0 auto;
+  container: help-shell / inline-size;
+}
+
+.help-header {
+  padding: var(--space-2) var(--space-1) var(--space-2);
+}
+
+.help-back,
+.help-top-link .help-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  box-sizing: border-box;
+  min-height: 28px;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-overlay);
+  font-size: var(--fs-5);
+  transition: color var(--motion-fast) ease, border-color var(--motion-fast) ease;
+}
+
+.help-back {
+  padding-left: var(--space-2);
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.help-back svg {
+  width: 16px;
+  height: 16px;
+}
+
+.help-back:hover,
+.help-top-link .help-link:hover {
+  color: var(--text-primary);
+  border-color: var(--glass-border-hover);
+}
+
+.help-title {
+  margin: var(--space-3) 0 var(--space-2);
+  font-size: var(--fs-12);
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.help-title:focus,
+.help-section-title:focus {
+  outline: none;
+}
+
+.help-call-note {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--glass-border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+  font-size: var(--fs-6);
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+.help-intro {
+  box-sizing: border-box;
+  max-width: 60ch;
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+  font-size: var(--fs-7);
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.help-toc,
+.help-section {
+  box-sizing: border-box;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card);
+  background: var(--surface-overlay);
+}
+
+.help-toc {
+  padding: var(--space-4) var(--space-5);
+}
+
+.help-toc-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-4);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.help-toc-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 2px var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: help-toc;
+}
+
+.help-toc-list li {
+  display: flex;
+  align-items: baseline;
+  counter-increment: help-toc;
+  font-size: var(--fs-5);
+  line-height: 1.4;
+}
+
+.help-toc-list li::before {
+  content: counter(help-toc);
+  flex: none;
+  min-width: 1.25em;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.help-toc-list a {
+  flex: 1;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  text-decoration: none;
+  transition: background-color var(--motion-fast) ease;
+}
+
+.help-toc-list a:hover {
+  background: var(--field-bg-hover);
+}
+
+.help-section {
+  scroll-margin-top: var(--space-4);
+  padding: var(--space-5) calc(var(--space-5) + var(--space-1));
+  font-size: var(--fs-6);
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.help-section-title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--fs-10);
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+.help-section h3 {
+  margin: var(--space-5) 0 var(--space-2);
+  font-size: var(--fs-7);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.help-section p {
+  margin: 0 0 var(--space-3);
+}
+
+.help-section b,
+.help-defs dt {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.help-list,
+.help-steps {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  padding-left: 1.25em;
+}
+
+.help-list {
+  list-style: disc;
+}
+
+.help-steps {
+  padding-left: 1.5em;
+  list-style: decimal;
+}
+
+.help-list:last-child,
+.help-steps:last-child,
+.help-section p:last-child {
+  margin-bottom: 0;
+}
+
+.help-list li::marker,
+.help-steps li::marker {
+  color: var(--text-secondary);
+}
+
+.help-section p,
+.help-list,
+.help-steps,
+.help-defs dd {
+  max-width: 68ch;
+}
+
+.help-defs {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+
+.help-def {
+  display: grid;
+  grid-template-columns: minmax(9rem, 12rem) 1fr;
+  gap: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--hairline);
+}
+
+.help-def:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.help-defs dd {
+  margin: 0;
+}
+
+.help-section kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--glass-border);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--field-bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-4);
+  line-height: 1.5;
+  text-align: center;
+  color: var(--text-primary);
+}
+
+.help-key-alt {
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.help-faq {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.help-faq-item {
+  scroll-margin-top: var(--space-4);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--field-bg);
+}
+
+.help-faq-question {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: inherit;
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: pointer;
+  list-style: none;
+  transition: background-color var(--motion-fast) ease;
+}
+
+.help-faq-question::-webkit-details-marker {
+  display: none;
+}
+
+.help-faq-question::after {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin: -4px var(--space-1) 0 0;
+  border-right: 2px solid var(--text-secondary);
+  border-bottom: 2px solid var(--text-secondary);
+  transform: rotate(45deg);
+  transition: transform var(--motion-fast) ease;
+}
+
+.help-faq-item[open] > .help-faq-question::after {
+  margin-top: 4px;
+  transform: rotate(-135deg);
+}
+
+.help-faq-question:hover {
+  background: var(--field-bg-hover);
+}
+
+.help-faq-answer {
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+.help-faq-answer .help-defs {
+  margin-bottom: var(--space-3);
+}
+
+.help-link {
+  color: var(--text-primary);
+  text-decoration: underline;
+  text-decoration-color: var(--focus-ring);
+  text-underline-offset: 3px;
+}
+
+.help-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+.help-back:focus-visible,
+.help-toc-list a:focus-visible,
+.help-faq-question:focus-visible,
+.help-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.help-top-link {
+  margin: var(--space-2) 0 0;
+  text-align: center;
+  font-size: var(--fs-5);
+}
+
+@media (max-width: 640px) {
+  .help-page {
+    padding: var(--space-3) var(--space-4) var(--space-5);
+  }
+}
+
+@container help-shell (max-width: 600px) {
+  .help-title {
+    font-size: var(--fs-11);
+  }
+
+  .help-toc,
+  .help-section {
+    padding: var(--space-4);
+  }
+
+  .help-section-title {
+    font-size: var(--fs-9);
+  }
+
+  .help-def {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .help-back,
+  .help-toc-list a,
+  .help-faq-question,
+  .help-faq-question::after {
+    transition: none;
   }
 }

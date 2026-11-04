@@ -463,8 +463,8 @@ while [[ "$attempt" -le "$MAX_ATTEMPTS" ]]; do
   # Having to kill the streamer means it did NOT honour --pid. The attempt log
   # remains complete for classification, but live CI output may be incomplete if
   # the streamer itself blocked. The full drain bound is also a silent tax:
-  # roughly 5s plus host scheduling overhead, up to 12 steps x 3 attempts against
-  # a 20-minute job cap.
+  # roughly 5s plus host scheduling overhead, on every attempt of every step,
+  # against the job's timeout-minutes.
   if [[ "${STREAM_KILLED}" -eq 1 ]]; then
     echo "::warning::retry-wasm-component-test.sh: the log streamer did not exit on its own after the attempt finished and had to be stopped; this costs roughly $((STREAM_DRAIN_TICKS / 10))s plus scheduling overhead per attempt. The attempt log used for classification is intact, but live CI output may be incomplete if the streamer blocked — check whether this host's \`tail\` honours --pid."
   fi

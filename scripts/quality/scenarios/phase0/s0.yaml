@@ -1,0 +1,17 @@
+# S0: 10 Rust bots and 1 probe on hcl-daily, report-only. It proves the flow on daily and measures the load host.
+schema: scale-scenario/v1
+run: {id_prefix: p0s0, seed: 1, target: hcl-daily, video_mode: replay, bot_diagnostics: off, fidelity_waivers: []}
+population:
+  - {role: probes, fleet: browser, count: 1, media: {camera: off, mic: muted},
+     transport: websocket, join_stagger: 4s, decode_budget: client, skip_canvas_paint: true, diag_packets: off,
+     speaking_glow: off}
+  - {role: talkers, fleet: rust, count: 2, media: {camera: on, mic: continuous, video_layers: 3}}
+  - {role: cameras, fleet: rust, count: 2, media: {camera: on, mic: muted, video_layers: 3}}
+  - {role: viewers, fleet: rust, count: 6, media: {camera: off, mic: off}, receive: {pin_video_layer: 0}}
+steps: [{id: s0, hold: 3m, headline: true, join_window: 6m}]
+events: []
+scoring:
+  mode: report
+  relay_path_exemptions:
+    relay_viewport_filtered_total: "Phase 0 sets no viewport, so relay egress is not under-loaded (runbook 4.3)"
+  expect: null

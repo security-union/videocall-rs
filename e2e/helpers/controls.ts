@@ -1,4 +1,4 @@
-import { Page, expect } from "@playwright/test";
+import { Locator, Page, expect } from "@playwright/test";
 
 /**
  * Wake the auto-hiding video-call action bar.
@@ -93,6 +93,28 @@ export async function openPeerList(page: Page): Promise<void> {
   await expect(page.locator("#peer-list-container")).toHaveClass(/\bvisible\b/, {
     timeout: 10_000,
   });
+}
+
+export async function openMeetingOptions(page: Page): Promise<Locator> {
+  await wakeControls(page);
+  await page.waitForTimeout(300);
+  const inline = page.locator('[data-testid="open-meeting-options"]');
+  await expect(inline).toHaveCount(1, { timeout: 10_000 });
+  if (await inline.isVisible()) {
+    await inline.click({ timeout: 10_000 });
+  } else {
+    const trigger = page.locator("#overflow-menu-trigger");
+    await expect(trigger).toBeVisible({ timeout: 10_000 });
+    await trigger.click({ timeout: 10_000 });
+    const item = page.locator(".action-bar-overflow-popover button.overflow-item", {
+      has: page.locator('span:text-is("Meeting options")'),
+    });
+    await expect(item).toBeVisible({ timeout: 10_000 });
+    await item.click({ timeout: 10_000 });
+  }
+  const panel = page.getByTestId("meeting-options-panel");
+  await expect(panel).toBeVisible({ timeout: 10_000 });
+  return panel;
 }
 
 // The tooltip flips to "Stop Video" once capture is live, so this locator only

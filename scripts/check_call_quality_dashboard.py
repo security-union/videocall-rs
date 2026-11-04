@@ -113,13 +113,38 @@ def canonical(cfg):
 
     info = sel(cq_score.M_PEER_INFO, 'peer_id=~"$talkers"')
     talkers = f'max by (to_peer) (label_replace({info}, "to_peer", "$1", "session_id", "(.*)"))'
-    gap = f"clamp_min(1 - {pps} / {nominal}, 0)"
-    bad = f"((clamp_max({expand}, {full}) / {full} > {gap}) or {gap})"
-    a_sample = newest(f"((({bad} and on ({pair}) {listen} == 1) or on ({pair}) ({bad} * 0 + 1))"
-                      f" * on (to_peer) group_left () {talkers})")
 
-    prev = f"last_over_time({freeze}[{LOOKBACK}] offset {step})"
-    inc = newest(f"(({freeze} - {prev}) >= 0 or {freeze} * 1)")
+    def increase(counter):
+        """Scorer's lower reading: a reset books the new value; the newest session's first sample books its rise over
+        the largest older-series value at or below it in the hold (0 if all are higher), nothing with no older series."""
+        key = "from_peer, to_peer, cause"
+        prev = f"last_over_time({counter}[$__range] offset {step})"
+        seen = f"(({counter} - {prev}) >= 0 or ({counter} * 1 and ({counter} - {prev}) < 0))"
+        first = f"(({counter} * 1 unless on ({pair}, cause) {prev}) and on (session_id) {newest_session})"
+        in_hold = f"(count_over_time({counter}[$__range] @ end()) or {counter} @ end() offset $__range)"
+        last = f"(last_over_time({counter}[$__range]) * 1 or {counter} @ end() offset $__range * 1)"
+        chain = (f"(({last} and on ({pair}, cause) {in_hold})"
+                 f" unless on (session_id) {newest_session})")
+        fit = f"max by ({key}) ({chain} <= on ({key}) group_left () max by ({key}) ({first}))"
+        base = f"({fit} or on ({key}) max by ({key}) ({chain}) * 0)"
+        return f"({seen} or ({first} - on ({key}) group_left () {base}))"
+
+    bucket_ms = num(cv(cfg, "sampling", "scrape_step_s") * 1000)
+    silence = (f"sum by ({pair}) ({increase(sel(cq_score.M_UNDERRUN, obs))})"
+               f" * {num(cv(cfg, 'dimensions', 'playout_underrun_weight'))} / {bucket_ms}")
+    cut = (f"sum by ({pair}) ({increase(sel(cq_score.M_DISCARDS, obs))})"
+           f" * {num(cq_score.AUDIO_PACKET_MS * cv(cfg, 'dimensions', 'discard_weight'))} / {bucket_ms}")
+    gap = f"clamp_min(1 - {pps} / {nominal}, 0)"
+    held = f"((clamp_max({expand}, {full}) / {full} > {gap}) or {gap})"
+    silent = (f'sum by ({pair}) (label_replace({held}, "term", "held", "", "")'
+              f' or label_replace({silence}, "term", "silence", "", ""))')
+    bad = (f'clamp_max(max by ({pair}) (label_replace({silent}, "term", "silent", "", "")'
+           f' or label_replace({cut}, "term", "cut", "", "")) and on ({pair}) {held}, 1)')
+    a_sample = newest(f"((({bad} and on ({pair}) {listen} == 1) or on ({pair}) ({held} * 0 + 1))"
+                      f" * on (to_peer) group_left () {talkers})")
+    a_seen = newest(f"(({held} * 0 + 1) * on (to_peer) group_left () {talkers})")
+
+    inc = newest(increase(freeze))
     decoding = newest(f"({num(cv(cfg, 'sampling', 'scrape_step_s'))} * ({fps} > bool 0))")
     exposure = f'max by (from_peer, to_peer) (label_replace({inc}, "term", "freeze", "", "") or {decoding})'
     decoded = newest(f"({fps} > bool 0)")
@@ -137,7 +162,7 @@ def canonical(cfg):
     def per_observer(dim, win):
         if dim == "A":
             return (f"sum by (from_peer) (sum_over_time({a_sample}[{win}:{step}]))\n/\n"
-                    f"sum by (from_peer) (count_over_time({a_sample}[{win}:{step}]))")
+                    f"sum by (from_peer) (count_over_time({a_seen}[{win}:{step}]))")
         if dim == "V":
             return (f"sum by (from_peer) (sum_over_time({inc}[{win}:{step}]))\n/\n"
                     f"(sum by (from_peer) (sum_over_time({exposure}[{win}:{step}])) > 0)")

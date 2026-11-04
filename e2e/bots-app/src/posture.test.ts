@@ -7,8 +7,13 @@ import {
   captureGeometryToken,
   HD_SOURCE,
   resolveBaseBotIndex,
+  resolveFleetSize,
+  resolveTransportWsEvery,
   SD_SOURCE,
   sourceGeometryForIndex,
+  strideHdSkew,
+  transportForIndex,
+  websocketIndices,
 } from "./posture";
 
 const README_PATH = fileURLToPath(new URL("../README.md", import.meta.url));
@@ -115,5 +120,90 @@ describe("resolveBaseBotIndex (#2236)", () => {
 
   it("rejects a token too large to be an exact index", () => {
     expect(resolveBaseBotIndex("99999999999999999999", undefined).kind).toBe("invalid");
+  });
+});
+
+describe("resolveFleetSize (issue 3072)", () => {
+  it("uses the fallback when neither flag nor env is set", () => {
+    expect(resolveFleetSize(undefined, undefined, 4)).toEqual({ kind: "ok", value: 4 });
+    expect(resolveFleetSize(" ", "", 4)).toEqual({ kind: "ok", value: 4 });
+  });
+
+  it("lets the flag win over the env", () => {
+    expect(resolveFleetSize("6", "9", 1)).toEqual({ kind: "ok", value: 6 });
+    expect(resolveFleetSize(undefined, "9", 1)).toEqual({ kind: "ok", value: 9 });
+  });
+
+  it("rejects zero, a numeric prefix, a float and a negative", () => {
+    for (const raw of ["0", "3junk", "1.5", "-2"]) {
+      expect(resolveFleetSize(raw, undefined, 1).kind, raw).toBe("invalid");
+    }
+  });
+});
+
+describe("transportForIndex (issue 3087)", () => {
+  it.each([
+    [4, 8, [3, 7]],
+    [4, 4, [3]],
+    [4, 3, []],
+    [5, 12, [2, 7]],
+    [7, 8, [0, 7]],
+    [8, 16, [7, 15]],
+    [1, 3, [0, 1, 2]],
+  ])("every %i over a fleet of %i puts websocket on %j", (k, n, ws) => {
+    expect(websocketIndices(k, n)).toEqual(ws);
+    for (let i = 0; i < n; i++) {
+      expect(transportForIndex(i, k)).toBe(ws.includes(i) ? "websocket" : "webtransport");
+    }
+  });
+
+  it("refuses k > 1 exactly when it divides or is a multiple of 6, for every k up to 400", () => {
+    for (let k = 1; k <= 400; k++) {
+      const refused = resolveTransportWsEvery(String(k)).kind === "invalid";
+      expect(refused, `k=${k}`).toBe(k > 1 && (6 % k === 0 || k % 6 === 0));
+    }
+  });
+
+  it("puts an HD and a non-HD bot on each transport in a fleet of k + 8, for every accepted k up to 400", () => {
+    for (let k = 1; k <= 400; k++) {
+      const r = resolveTransportWsEvery(String(k));
+      if (r.kind === "invalid") continue;
+      const n = k + 8;
+      const kinds = new Set(
+        Array.from({ length: n }, (_, i) =>
+          [transportForIndex(i, r.value as number), sourceGeometryForIndex(i) === HD_SOURCE].join(
+            ":",
+          ),
+        ),
+      );
+      const expected =
+        k === 1
+          ? ["websocket:true", "websocket:false"]
+          : ["websocket:true", "websocket:false", "webtransport:true", "webtransport:false"];
+      expect([...kinds].sort(), `k=${k}`).toEqual(expected.sort());
+    }
+  });
+
+  it("names the balanced strides in the refusal and warns only for a stride sharing a factor with 6", () => {
+    const r = resolveTransportWsEvery("12");
+    expect(r.kind === "invalid" && r.message).toContain("e.g. 5, 7, 11, 13 (");
+    expect(strideHdSkew(5, 8)).toBeNull();
+    expect(strideHdSkew(4, 8)).toContain("at 1 of 2 websocket bots against 2 of 8 in the fleet");
+    expect(strideHdSkew(9, 8)).toContain("at 1 of 1 websocket bots against 2 of 8 in the fleet");
+    expect(strideHdSkew(4, 8)).not.toContain("(5, 7");
+  });
+
+  it("rejects a non-positive stride and a bad index", () => {
+    expect(() => transportForIndex(0, 0)).toThrow();
+    expect(() => transportForIndex(-1, 4)).toThrow();
+  });
+
+  it("resolves BOT_TRANSPORT_WS_EVERY", () => {
+    expect(resolveTransportWsEvery(undefined)).toEqual({ kind: "ok", value: null });
+    expect(resolveTransportWsEvery(" ")).toEqual({ kind: "ok", value: null });
+    expect(resolveTransportWsEvery(" 4 ")).toEqual({ kind: "ok", value: 4 });
+    for (const raw of ["0", "4x", "-1", "1.5"]) {
+      expect(resolveTransportWsEvery(raw).kind, raw).toBe("invalid");
+    }
   });
 });

@@ -151,6 +151,56 @@ async fn home_page_renders() {
 }
 
 #[wasm_bindgen_test]
+async fn the_home_footer_links_to_help_beside_about_in_the_same_tab() {
+    reset_test_browser_state();
+    ensure_root_url();
+    inject_app_config_oauth_enabled();
+    mock_fetch_401();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    let found = wait_for_selector(&mount, "[data-testid='home-help-link']", 2000).await;
+    let link = mount
+        .query_selector("[data-testid='home-help-link']")
+        .unwrap();
+    let row = link.as_ref().and_then(|l| l.parent_element());
+    let about_in_row = row.as_ref().is_some_and(|r| {
+        r.class_list().contains("about-footer")
+            && r.query_selector("[data-testid='about-footer-link']")
+                .unwrap()
+                .is_some()
+            && r.query_selector(".about-footer-sep[aria-hidden='true']")
+                .unwrap()
+                .is_some()
+    });
+    let attrs = link.as_ref().map(|l| {
+        (
+            l.tag_name(),
+            l.get_attribute("href"),
+            l.get_attribute("target"),
+            l.text_content().unwrap_or_default(),
+        )
+    });
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+    reset_test_browser_state();
+
+    assert!(found, "the home page links to the help page");
+    assert!(about_in_row, "the link sits in the About row");
+    assert_eq!(
+        attrs,
+        Some((
+            "A".to_string(),
+            Some("/help".to_string()),
+            None,
+            "Help & FAQ".to_string()
+        ))
+    );
+}
+
+#[wasm_bindgen_test]
 async fn home_shows_login_when_unauthenticated() {
     reset_test_browser_state();
     ensure_root_url();

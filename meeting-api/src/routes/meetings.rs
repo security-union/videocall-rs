@@ -33,6 +33,7 @@ use videocall_meeting_types::{
 };
 
 use crate::auth::AuthUser;
+use crate::captions;
 use crate::db::{
     co_hosts as db_co_hosts, meetings as db_meetings, participants as db_participants,
 };
@@ -97,6 +98,12 @@ pub async fn create_meeting(
     let allow_guests = body.allow_guests.unwrap_or(false);
     let recording_allowed_for_all = body.recording_allowed_for_all.unwrap_or(false);
     let chat_allowed_for_all = body.chat_allowed_for_all.unwrap_or(true);
+    let announcements = db_meetings::Announcements {
+        entry_message: body.entry_message_override.unwrap_or_default(),
+        entry_sound: body.entry_sound_override.unwrap_or_default(),
+        exit_message: body.exit_message_override.unwrap_or_default(),
+        exit_sound: body.exit_sound_override.unwrap_or_default(),
+    };
 
     let mut tx = state.db.begin().await?;
     let row = db_meetings::create_with_options(
@@ -111,6 +118,7 @@ pub async fn create_meeting(
         allow_guests,
         recording_allowed_for_all,
         chat_allowed_for_all,
+        announcements,
     )
     .await
     .map_err(|e| match e {
@@ -144,6 +152,10 @@ pub async fn create_meeting(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        entry_message_override: row.entry_message_override,
+        entry_sound_override: row.entry_sound_override,
+        exit_message_override: row.exit_message_override,
+        exit_sound_override: row.exit_sound_override,
         co_hosts,
     };
 
@@ -202,6 +214,10 @@ pub async fn list_meetings(
             allow_guests: row.allow_guests,
             recording_allowed_for_all: row.recording_allowed_for_all,
             chat_allowed_for_all: row.chat_allowed_for_all,
+            entry_message_override: row.entry_message_override,
+            entry_sound_override: row.entry_sound_override,
+            exit_message_override: row.exit_message_override,
+            exit_sound_override: row.exit_sound_override,
         });
     }
 
@@ -312,6 +328,10 @@ pub async fn list_feed(
                 allow_guests: row.allow_guests,
                 recording_allowed_for_all: row.recording_allowed_for_all,
                 chat_allowed_for_all: row.chat_allowed_for_all,
+                entry_message_override: row.entry_message_override,
+                entry_sound_override: row.entry_sound_override,
+                exit_message_override: row.exit_message_override,
+                exit_sound_override: row.exit_sound_override,
                 waiting_room_enabled: row.waiting_room_enabled,
                 admitted_can_admit: row.admitted_can_admit,
                 end_on_host_leave: row.end_on_host_leave,
@@ -365,6 +385,10 @@ pub async fn get_meeting(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        entry_message_override: row.entry_message_override,
+        entry_sound_override: row.entry_sound_override,
+        exit_message_override: row.exit_message_override,
+        exit_sound_override: row.exit_sound_override,
         viewer_is_owner,
         viewer_can_edit_options,
     })))
@@ -391,6 +415,15 @@ pub async fn delete_meeting(
     }
 
     let deleted = db_meetings::soft_delete(&state.db, &meeting_id, &user_id).await?;
+    if let Some(deleted) = &deleted {
+        captions::spawn_revoke_if_inactive(
+            state.db.clone(),
+            state.nats.clone(),
+            deleted.id,
+            captions::RevokeReason::Deleted,
+            Some(user_id.clone()),
+        );
+    }
 
     if delete_should_broadcast(&deleted) {
         nats_events::publish_meeting_ended(
@@ -457,12 +490,23 @@ pub async fn end_meeting_handler(
             allow_guests: meeting.allow_guests,
             recording_allowed_for_all: meeting.recording_allowed_for_all,
             chat_allowed_for_all: meeting.chat_allowed_for_all,
+            entry_message_override: meeting.entry_message_override,
+            entry_sound_override: meeting.entry_sound_override,
+            exit_message_override: meeting.exit_message_override,
+            exit_sound_override: meeting.exit_sound_override,
             viewer_is_owner: true,
             viewer_can_edit_options: true,
         })));
     }
 
     db_meetings::end_meeting(&state.db, meeting.id).await?;
+    captions::spawn_revoke_if_inactive(
+        state.db.clone(),
+        state.nats.clone(),
+        meeting.id,
+        captions::RevokeReason::Ended,
+        Some(user_id.clone()),
+    );
 
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -511,6 +555,10 @@ pub async fn end_meeting_handler(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        entry_message_override: row.entry_message_override,
+        entry_sound_override: row.entry_sound_override,
+        exit_message_override: row.exit_message_override,
+        exit_sound_override: row.exit_sound_override,
         // `end_meeting_handler` is owner-only (checked above), on both its
         // idempotent and real-end response.
         viewer_is_owner: true,
@@ -547,7 +595,11 @@ pub async fn update_meeting(
         || body.end_on_host_leave.is_some()
         || body.allow_guests.is_some()
         || body.recording_allowed_for_all.is_some()
-        || body.chat_allowed_for_all.is_some();
+        || body.chat_allowed_for_all.is_some()
+        || body.entry_message_override.is_some()
+        || body.entry_sound_override.is_some()
+        || body.exit_message_override.is_some()
+        || body.exit_sound_override.is_some();
 
     let mut auto_admitted_user_ids: Vec<String> = Vec::new();
 
@@ -580,6 +632,12 @@ pub async fn update_meeting(
             body.allow_guests,
             body.recording_allowed_for_all,
             body.chat_allowed_for_all,
+            db_meetings::Announcements {
+                entry_message: body.entry_message_override,
+                entry_sound: body.entry_sound_override,
+                exit_message: body.exit_message_override,
+                exit_sound: body.exit_sound_override,
+            },
             &password_update,
         )
         .await?
@@ -671,6 +729,10 @@ pub async fn update_meeting(
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
         chat_allowed_for_all: row.chat_allowed_for_all,
+        entry_message_override: row.entry_message_override,
+        entry_sound_override: row.entry_sound_override,
+        exit_message_override: row.exit_message_override,
+        exit_sound_override: row.exit_sound_override,
         viewer_is_owner: is_owner,
         // Reaching here means `can_edit_options` already authorized this
         // caller above (owner, live co-host, or present host).

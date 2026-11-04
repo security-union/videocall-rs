@@ -101,8 +101,7 @@
  *
  *       5. Performance panel renders ALL THREE received-quality controls
  *          (video + audio + content) — #1082 structural assertion.
- *       6. AUDIO publishes one layer under the flag (#2279). The receive readout
- *          reports no receiver-observable bitrate, while the send rung strip is
+ *       6. AUDIO publishes one layer under the flag (#2279). The send rung strip is
  *          covered in `performance-settings.spec.ts`.
  *
  *   - FLAG-OFF CONTROL (separate describe block at the bottom):
@@ -168,9 +167,9 @@
  *       text format: `{Q} · {idx+1}/{count} · {w}x{h}` or "Not receiving"
  *       (#1222: `{Q}` is the quality letter L/M/H, or "1" single-layer)
  *   - `#perf-vu-recv-audio-readout`                 audio received-quality readout
- *       text format: `— kbps` — one audio layer means no position chip and no
- *       receiver-observable bitrate (#2279) — or "Not receiving" before the
- *       first audio frame is decoded
+ *       text format: `{kbps} kbps` — one audio layer means no position chip
+ *       (#2279); the kbps is the publisher's stamped Opus bitrate (#3170) — or
+ *       "Not receiving" before the first audio frame is decoded
  *   - `[data-testid="perf-recv-video-range-max"]`   video max-layer range thumb
  *   - `[data-testid="perf-recv-video-auto"]`        video "Reset" button (#1131 §D
  *       REPURPOSED this testid off the former Auto TOGGLE; it is now a plain
@@ -179,7 +178,7 @@
  *       to the full automatic range.)
  */
 
-import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
+import { test, expect, chromium, Browser, BrowserContext, Locator, Page } from "@playwright/test";
 import {
   createAuthenticatedContext as createUnpinnedContext,
   BROWSER_ARGS,
@@ -417,13 +416,10 @@ async function joinMeeting(
     // + await a live preview track, then click the action button.
     const allow = page.locator('[data-testid="prejoin-permission-allow"]');
     if (await allow.isVisible().catch(() => false)) {
-      await allow.click();
-      await page
-        .locator('[data-testid="prejoin-permission-prompt"]')
-        .waitFor({ state: "hidden", timeout: 15_000 })
-        .catch(() => {
-          /* already granted / prompt absent */
-        });
+      await allow.click({ timeout: 5_000 }).catch(() => {});
+      await expect(page.locator('[data-testid="prejoin-permission-prompt"]')).toBeHidden({
+        timeout: 15_000,
+      });
     }
 
     // HOST ONLY: disable the Waiting Room before starting. The first joiner
@@ -601,7 +597,7 @@ async function joinMeetingAudioOnly(
     // video track is published.
     const allow = page.locator('[data-testid="prejoin-permission-allow"]');
     if (await allow.isVisible().catch(() => false)) {
-      await allow.click();
+      await allow.click({ timeout: 5_000 }).catch(() => {});
       await page
         .locator('[data-testid="prejoin-permission-prompt"]')
         .waitFor({ state: "hidden", timeout: 15_000 })
@@ -873,6 +869,27 @@ function assertNeverZeroByZero(text: string, surface: string): void {
     text,
     `${surface} rendered a measured 0x0; unknown geometry must read the em-dash`,
   ).not.toMatch(/\b0\s*[x×]\s*0\b/);
+}
+
+/** Opus's bitrate range in kbps. */
+const OPUS_MIN_KBPS = 1;
+const OPUS_MAX_KBPS = 510;
+
+/** Poll a received-audio readout until `re` matches (group 1 = kbps), then bound it. */
+async function expectReceivedAudioKbps(readout: Locator, re: RegExp): Promise<void> {
+  let text = "";
+  await expect
+    .poll(
+      async () => {
+        text = ((await readout.textContent()) ?? "").trim();
+        return text;
+      },
+      { timeout: 45_000, intervals: [500, 1000, 2000] },
+    )
+    .toMatch(re);
+  const kbps = Number(re.exec(text)![1]);
+  expect(kbps, `received audio readout: "${text}"`).toBeGreaterThanOrEqual(OPUS_MIN_KBPS);
+  expect(kbps, `received audio readout: "${text}"`).toBeLessThanOrEqual(OPUS_MAX_KBPS);
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,6 +1467,30 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // receiver's layer index must drop BELOW where it started. We feed samples until
       // the index drops or we exhaust the budget.
       const phase2ConsoleStart = rxConsole.length;
+      // #3204: time the step-down to the first frame of the new layer. The tile's
+      // dimensions change with the layer, so the first sample with new dims is it.
+      const switches: number[] = [];
+      rxPage.on("console", (msg) => {
+        if (/LAYER_SWITCH .*kind=video .*site=downlink_seed/.test(msg.text())) {
+          switches.push(Date.now());
+        }
+      });
+      const tile: { at: number; dims: string | null }[] = [];
+      let sampling = true;
+      const sampler = (async () => {
+        while (sampling) {
+          const checksum = await samplePeerVideoChecksum(rxPage).catch(() => undefined);
+          if (checksum === undefined) break;
+          tile.push({ at: Date.now(), dims: checksum?.split(":")[0] ?? null });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      })();
+      await expect
+        .poll(() => tile.filter((s) => s.dims !== null).length, {
+          message: "the receiver tile never became sampleable",
+          timeout: 10_000,
+        })
+        .toBeGreaterThanOrEqual(10);
       await expect
         .poll(
           async () => {
@@ -1476,6 +1517,27 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             `stepped-down rung (< start ${startIndex}); sample ${i}`,
         ).toBeLessThan(startIndex);
       }
+      sampling = false;
+      await sampler;
+
+      expect(switches.length, "no LAYER_SWITCH site=downlink_seed was logged").toBeGreaterThan(0);
+      const switchAt = switches[0];
+      const windowEnd = switches[1] ?? Infinity;
+      const baseline = tile.filter((s) => s.at < switchAt && s.dims !== null).slice(-5);
+      const oldDims = baseline[0]?.dims;
+      expect(
+        baseline.length === 5 && baseline.every((s) => s.dims === oldDims),
+        `no stable pre-switch baseline: ${JSON.stringify(baseline)}`,
+      ).toBe(true);
+      expect(switchAt - baseline[4].at, "the baseline must end at the switch").toBeLessThan(500);
+      const newDims = tile.filter((s) => s.at < windowEnd && s.dims !== null).pop()?.dims;
+      expect(newDims, "the two video layers must have distinct dimensions").not.toBe(oldDims);
+      const firstNew = tile.find((s) => s.at >= switchAt && s.dims === newDims);
+      const stepDownToFirstFrameMs = firstNew ? firstNew.at - switchAt : Infinity;
+      expect(
+        stepDownToFirstFrameMs,
+        `the tile froze on ${oldDims} after the step-down instead of decoding the new layer`,
+      ).toBeLessThan(1_000);
 
       // A 1:1 drop lowers the layer only: no pressured latch, no tile cascade.
       const budgetLines = rxConsole.filter((l) => l.includes("DecodeBudget:"));
@@ -2006,18 +2068,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         ).toBeAttached();
       }
 
-      // The audio readout must be present and reflect a valid state: an em-dash
-      // bitrate while receiving, or the placeholder before the first audio frame.
       await expect(panel.locator("#perf-vu-recv-audio-readout")).toBeVisible();
-      await expect
-        .poll(
-          async () => (await rxPage.locator("#perf-vu-recv-audio-readout").textContent())?.trim(),
-          {
-            timeout: 45_000,
-            intervals: [500, 1000, 2000],
-          },
-        )
-        .toMatch(/^(—\s+kbps|Not receiving)$/);
+      await expectReceivedAudioKbps(panel.locator("#perf-vu-recv-audio-readout"), /^(\d+)\s+kbps$/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -2025,38 +2077,12 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 5b. Every received-layer readout agrees on the DENOMINATOR (issue #2343).
+  // 5b. A one-video-layer peer's receive readouts name NO video layer position (#2343).
   //
-  // Three surfaces describe one decoded stream in the same open drawer. Before
-  // #2343 the per-peer row resolved `{i}/{n}` against `full_ladder_len`
-  // (`max_layers_for_kind`, 3 for video) while the meter and the diagnostics line
-  // used `snap.layer_count` (what the peer actually publishes) — so the row read
-  // `1/3` beside two `1/1`s. #2343 dropped `peer_row_metric`'s `full_ladder_len`
-  // parameter, and moved `peer_row_aria_label`'s call site to `snap.layer_count`
-  // with it. Restore either and this test goes red at the row.
-  //
-  // The denominators only differ when the peer publishes fewer layers than the
-  // kind ceiling, so this runs on the COMMITTED config (`experimentalSimulcastMaxLayers: 1`)
-  // and asserts both halves before relying on them:
-  //   PREMISE A — the receive slider's `max` is `2` (`top_index(Video)`, a 3-rung
-  //     ladder). A different constant from the old denominator, but the only one
-  //     with a DOM surface; if video is ever cut to 1 rung the way screen was, the
-  //     two denominators converge and this assertion fires instead of going green.
-  //   PREMISE B — the meter denominator is `1` (this peer publishes one layer).
-  //
-  // DO NOT add `enableSimulcastFlag` here. This test sits in the "(flag-on)"
-  // describe only to reuse its serial mode; turning the flag on raises
-  // `layer_count` to 3, collapses the two denominators, and makes the test prove
-  // nothing. PREMISE B fails loudly if that edit is ever made.
-  //
-  // SELECTORS: `diag-simulcast-recv-peer-{sid}` is NOT kind-qualified — the same
-  // session id renders one such div under each of video/audio/screen — so it must
-  // be scoped by its `diag-simulcast-recv-video` ancestor. The row metric has no
-  // testid; it is `span.perf-peer-row__metric`, a direct child of `li.perf-peer-row`.
-  // The per-peer list is behind a `<details>` that mounts collapsed and renders
-  // rows lazily, so the summary must be clicked before any row exists.
+  // A surface resolved against the kind ceiling (3) instead of `layer_count`
+  // renders `1/3`. Needs the committed one-video-layer config: no `enableSimulcastFlag`.
   // -------------------------------------------------------------------------
-  test("every received-layer readout reports the SAME layer denominator (#2343)", async ({
+  test("a one-video-layer peer's receive readouts name no video layer position (#2343)", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -2103,19 +2129,16 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           "`layer_count` and this test cannot discriminate the #2343 fix",
       ).toHaveAttribute("max", "2");
 
-      // ── PREMISE B: this peer publishes ONE layer (the NEW denominator). ───────
-      // Poll until the meter shows a real decoded layer ("Not receiving" until the
-      // first frame). `readVideoLayer` returns null while the placeholder is up.
+      // ── PREMISE B + SURFACE 1: a decoded one-video-layer meter readout is bare dims. ─
       await expect
-        .poll(async () => (await readVideoLayer(rxPage))?.layerCount ?? null, {
+        .poll(async () => readVideoReadoutText(rxPage, 5_000), {
           timeout: 60_000,
           intervals: [500, 1000, 2000],
+          message:
+            "the video meter never showed a decoded one-video-layer readout ({w}x{h} with no " +
+            "position chip) — either nothing decoded, or the peer publishes more than one video layer",
         })
-        .toBe(1);
-
-      const meterLayer = await readVideoLayer(rxPage);
-      expect(meterLayer, "the video meter readout never reported a decoded layer").not.toBeNull();
-      const denominator = meterLayer!.layerCount;
+        .toMatch(/^\d+x\d+$/);
 
       // ── SURFACE 2: the diagnostics per-peer line, scoped to the VIDEO block. ──
       const videoBlock = drawer.locator('[data-testid="diag-simulcast-recv-video"]');
@@ -2124,16 +2147,10 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "the diagnostics video block must be rendered before its line is read",
       ).toBeVisible({ timeout: 30_000 });
       const diagLine = videoBlock.locator(".simulcast-recv-peer-line").first();
-      await expect(diagLine).toBeVisible({ timeout: 30_000 });
+      await expect(diagLine).toHaveText(/: video .*(?:\d+×\d+|—)$/, { timeout: 30_000 });
       const diagText = (await diagLine.textContent())?.trim() ?? "";
-      const diagFraction = diagText.match(/(\d+)\/(\d+)/);
-      expect(
-        diagFraction,
-        `the diagnostics peer line carried no {i}/{n} fraction, got: ${diagText}`,
-      ).not.toBeNull();
 
       // ── SURFACE 3: the per-peer row inside the receive disclosure. ────────────
-      // The <details> mounts collapsed and builds its rows only once open.
       const peersSummary = drawer.locator('[data-testid="perf-recv-video-peers-summary"]');
       await expect(
         peersSummary,
@@ -2148,37 +2165,25 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       ).toBeVisible({ timeout: 15_000 });
 
       const rowMetric = peerRow.locator(".perf-peer-row__metric");
-      await expect(rowMetric).toBeVisible({ timeout: 10_000 });
+      await expect(rowMetric).toHaveText(/^(?:\d+p|—) · ~\d+(?:\.\d)?[kM]/, { timeout: 10_000 });
       const rowText = (await rowMetric.textContent())?.trim() ?? "";
-      const rowFraction = rowText.match(/(\d+)\/(\d+)/);
-      expect(
-        rowFraction,
-        `the per-peer row metric carried no {i}/{n} fraction, got: ${rowText}`,
-      ).not.toBeNull();
 
-      // ── THE ASSERTION: all three surfaces name the same ladder depth. ─────────
-      // Un-fixed, the row alone reports the compile-time ceiling (3) while the
-      // meter and the diagnostics line report the published depth (1).
       expect(
-        Number(rowFraction![2]),
-        `the per-peer row says the peer publishes ${rowFraction![2]} layers while the ` +
-          `meter readout says ${denominator}. Both describe the SAME snapshot, so the ` +
-          `row is resolving its denominator against the kind ceiling instead of the ` +
-          `peer's own layer_count (issue #2343). Row: "${rowText}"`,
-      ).toBe(denominator);
+        rowText,
+        `the per-peer row names a video layer position for a peer whose meter readout carries ` +
+          `none — the row is resolving the position against the kind ceiling instead of ` +
+          `the peer's own layer_count (issue #2343). Row: "${rowText}"`,
+      ).not.toMatch(/\d+\/\d+/);
       expect(
-        Number(diagFraction![2]),
-        `the diagnostics peer line says ${diagFraction![2]} layers, the meter says ` +
-          `${denominator}. Diagnostics line: "${diagText}"`,
-      ).toBe(denominator);
-
-      // And the spoken sentence must move with the visible text — `peer_row_aria_label`
-      // is the SECOND call site #2343 re-pointed at `snap.layer_count`, and a screen
-      // reader user would otherwise still hear the stale ceiling.
-      await expect(
-        peerRow,
-        "the row's aria-label must speak the same ladder depth as its visible metric",
-      ).toHaveAttribute("aria-label", new RegExp(`layer \\d+ of ${denominator}\\b`));
+        diagText,
+        `the diagnostics peer line names a video layer position for a one-video-layer peer: "${diagText}"`,
+      ).not.toMatch(/\d+\/\d+/);
+      const rowAria = (await peerRow.getAttribute("aria-label")) ?? "";
+      expect(rowAria, "the per-peer row has no aria-label to read").toMatch(/receiving video/);
+      expect(
+        rowAria,
+        "the row's aria-label must not speak a video layer position its visible metric omits",
+      ).not.toMatch(/layer \d+ of \d+/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -2564,6 +2569,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       );
       await enableSimulcastFlag(pubCtx, 3);
       await enableSimulcastFlag(rxCtx, 3);
+      await enableDiagnosticsTileIndicators(rxCtx);
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
@@ -2582,20 +2588,49 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           timeout: 60_000,
           intervals: [1000, 2000, 3000],
           message:
-            "issue 2279: NetEq must report audio packets arriving before the readout " +
-            "shape is asserted — without this the shape assertion also passes on a " +
-            "receiver getting no audio at all",
+            "issue 2279: NetEq must report audio packets arriving before the readout is asserted",
         })
         .toBeGreaterThan(0);
 
-      // Pre-#2279 this same flag rendered `H · 3/3 · 48 kbps`.
-      await expect
-        .poll(
-          async () =>
-            (await rxPage.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "",
-          { timeout: 45_000, intervals: [500, 1000, 2000] },
-        )
-        .toMatch(/^—\s+kbps$/);
+      const readout = drawer.locator("#perf-vu-recv-audio-readout");
+      await expect(readout).toBeVisible();
+      await expectReceivedAudioKbps(readout, /^(\d+)\s+kbps$/);
+
+      // #3170: the Signal Quality popup's Layers audio row, a second call site.
+      await drawer.locator(".sidebar-header > button.close-button").click({ timeout: 10_000 });
+      await expect(rxPage.locator("#diagnostics-sidebar")).not.toHaveClass(/\bvisible\b/, {
+        timeout: 10_000,
+      });
+      const signalButton = rxPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      await expect(signalButton).toHaveCount(1, { timeout: 15_000 });
+      await expect(signalButton).toBeVisible({ timeout: 15_000 });
+      await signalButton.click({ timeout: 15_000 });
+
+      const popup = rxPage.locator(".signal-quality-popup");
+      await expect(popup).toHaveCount(1, { timeout: 10_000 });
+      await expect(popup).toBeVisible({ timeout: 10_000 });
+      const popupId = (await popup.getAttribute("id")) ?? "";
+      expect(popupId, "the popup id prefixes its Layers testids").toMatch(
+        /^signal-quality-popup-\S+$/,
+      );
+      const audioRow = popup.locator(
+        `div.signal-popup-layers[data-testid="${popupId}-layers"]` +
+          " > ul.signal-popup-layers__list" +
+          ` > li.signal-popup-layer-row[data-testid="${popupId}-layer-audio"]`,
+      );
+      const audioMetric = audioRow.locator(
+        `:scope > span.perf-peer-row__metric[data-testid="${popupId}-layer-audio-metric"]`,
+      );
+      await expect(
+        audioRow,
+        "the popup's Layers section never rendered an audio row for this peer",
+      ).toHaveCount(1, { timeout: 45_000 });
+      await expect(audioMetric).toHaveCount(1, { timeout: 15_000 });
+      await expect(audioMetric).toBeVisible({ timeout: 15_000 });
+      await expectReceivedAudioKbps(audioMetric, /^(\d+)k · /);
+      await expect(audioRow).toHaveAttribute("aria-label", /\b\d+ kilobits per second\b/, {
+        timeout: 15_000,
+      });
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -4333,7 +4368,7 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
         timeout: 30_000,
       });
 
-      await openPerformancePanel(rxPage);
+      const drawer = await openPerformancePanel(rxPage);
 
       let readout = "";
       await expect
@@ -4360,13 +4395,9 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
         readout = await readVideoReadoutText(rxPage, 5_000);
       }
 
-      await expect
-        .poll(
-          async () =>
-            (await rxPage.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "",
-          { timeout: 45_000, intervals: [500, 1000, 2000] },
-        )
-        .toMatch(/^—\s+kbps$/);
+      const audioReadout = drawer.locator("#perf-vu-recv-audio-readout");
+      await expect(audioReadout).toBeVisible();
+      await expectReceivedAudioKbps(audioReadout, /^(\d+)\s+kbps$/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();

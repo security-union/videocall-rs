@@ -7,9 +7,12 @@ import re
 from cq_prom import promql_string, re2_escape
 
 IDENTITY_LABELS = ("from_peer", "peer_id", "customer_email")
-IDENTITY_KEYED = ("participants", "audio_loss_share", "stability", "transport", "zero_packet_receivers", "talker_A")
+IDENTITY_KEYED = ("participants", "audio_loss_share", "stability", "transport", "zero_packet_receivers", "talker_A",
+                  "correlated_freeze", "audio_delay", "audio_counter_coverage", "by_user", "transport_timeline",
+                  "transport_fallbacks")
 IDENTITY_TEXT = ("detail", "flags", "max_staleness_pair", "max_freeze_pair", "excluded_reporters",
-                 "rust_bot_reporters")
+                 "rust_bot_reporters", "counter_lineage_unproven", "session_id", "unknown_publisher_sessions")
+SESSION_LABELS = ("session_id", "to_peer")
 MIN_IDENTITY_LEN = 3
 
 
@@ -17,11 +20,13 @@ def identities_to_hide(manifest, datasets, real):
     """Real meetings: every identity. Runs: humans and identities outside the manifest; bot ids stay."""
     seen = {labels[k] for data in datasets.values() for series in data.values()
             for labels, _ in series for k in IDENTITY_LABELS if labels.get(k)}
+    sessions = {labels[k] for data in datasets.values() for series in data.values()
+                for labels, _ in series for k in SESSION_LABELS if labels.get(k)}
     parts = [p for p in manifest["participants"] if p["user_id"] is not None]
     if real:
-        return seen | {p["user_id"] for p in parts}
+        return seen | sessions | {p["user_id"] for p in parts}
     bots = {p["user_id"] for p in parts if p["fleet"] != "human"}
-    return (seen | {p["user_id"] for p in parts if p["fleet"] == "human"}) - bots
+    return ((seen | {p["user_id"] for p in parts if p["fleet"] == "human"}) - bots) | sessions
 
 
 def raw_manifest_identities(manifest):
@@ -50,7 +55,13 @@ def text_pseudonymiser(identities, salt):
 
 def pseudonymise(obj, identities, salt):
     """Copy of obj with identities replaced, only in the fields that carry them."""
-    sub = text_pseudonymiser(identities, salt)
+    exact = {i: pseudonym(i, salt) for i in identities}
+    words = text_pseudonymiser(identities, salt)
+
+    def sub(text):
+        head, sep, rest = text.partition(": ")
+        text = exact[head] + sep + rest if sep and head in exact else text
+        return words(" <- ".join(exact.get(p, p) for p in text.split(" <- ")))
 
     def walk(x, keyed=False, text=False):
         if isinstance(x, str):

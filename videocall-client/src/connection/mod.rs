@@ -22,7 +22,7 @@ mod connection_controller;
 mod connection_lost_reason;
 mod connection_manager;
 #[cfg(test)]
-mod log_capture {
+pub(crate) mod log_capture {
     use std::cell::RefCell;
 
     struct CaptureLogger;
@@ -110,14 +110,15 @@ pub use connection_manager::ReconnectionPhase;
 pub use connection_manager::{
     connection_handshake_failures, connection_session_drops, reelection_aborted_total,
     reelection_failed_total, reelection_preserved_total, reelection_proceeded_total,
-    ConnectionManagerOptions, ConnectionState, SessionIdHistory,
+    ConnectionManagerOptions, ConnectionState, ElectionProgress, SessionIdHistory,
+    ELECTION_STARVED_GRACE_MS,
 };
 #[allow(unused_imports)]
 pub use connection_manager::{
     connection_handshake_failures_ws, connection_handshake_failures_wt,
     connection_session_drops_ws, connection_session_drops_wt,
 };
-pub use webmedia::{ConnectOptions, MediaStreamKey};
+pub use webmedia::{ConnectOptions, MediaStreamKey, StreamQueueDepth};
 // #2746: test-only, to pin this whitelist against the peer-creation gate.
 #[cfg(test)]
 pub(crate) use connection_manager::should_filter_self_packet;
@@ -134,8 +135,10 @@ pub use netsim_control::install_window_hook as install_netsim_window_hook;
 #[cfg(all(test, feature = "netsim"))]
 pub(crate) use netsim_control::{
     force_camera_keyframe_for_netsim, set_ws_buffered_override_for_netsim,
+    set_wt_screen_queue_override_for_netsim,
 };
 #[cfg(feature = "netsim")]
 pub(crate) use netsim_control::{
-    register_camera_force_keyframe_for_netsim, ws_buffered_override_for_netsim,
+    register_camera_force_keyframe_for_netsim, screen_queue_depth_with_netsim_override,
+    ws_buffered_override_for_netsim,
 };

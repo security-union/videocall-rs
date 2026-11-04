@@ -46,7 +46,7 @@ export const CQI = {
   SAMPLE_GAP_RESET_MS: 10_000,
 } as const;
 
-/** Drawer drag clamp bounds and chat's fixed width (`attendants_layout.rs`).
+/** Drawer drag clamp bounds and chat's default width (`attendants_layout.rs`).
  * The floor was mirrored as a stale 240 in `drawer-resize.spec.ts` for as long
  * as the Rust value has been 300, which is the drift this lock exists to catch. */
 export const DRAWER = {
@@ -61,6 +61,13 @@ export const DRAWER = {
 export const MEETING_FOOTER = {
   MEETING_FOOTER_RESERVE: 32,
 } as const;
+
+/** Under this width a fine-pointer tile is not offered enlarge (issue 3367). */
+export const ENLARGE_MIN_TILE_W_FINE_POINTER = 240;
+
+/** CSS `order` of the rank-0 enlarged tile and the rank-0 pin (`pin_order.rs`). */
+export const ENLARGED_ORDER_BASE = -2000;
+export const PIN_ORDER_BASE = -1000;
 
 /** Camera AQ forced-step-down axes: per-axis drop thresholds, windows, and the tick they are served on. */
 export const CAMERA_AQ_AXES = {
@@ -83,7 +90,15 @@ export const CAMERA_WS_KEYFRAME_HOLD = {
   CAMERA_WS_CONGESTED_KEYFRAME_COOLDOWN_MS: 2000,
 } as const;
 
+/** How long past its connect timeout an election waits on an unanswered candidate. */
+export const ELECTION_STARVED_GRACE_MS = 3000;
+
+export const SCREEN_STATIC_HEARTBEAT_FRESH_MS = 5000;
+
+export const CANVAS_LIMIT = 30;
+
 export const RUST_MIRRORS: Record<string, Record<string, number>> = {
+  "dioxus-ui/src/constants.rs": { CANVAS_LIMIT },
   "videocall-aq/src/constants.rs": {
     HEARTBEAT_KEEPALIVE_INTERVAL_MS,
     LAYER_AVAILABILITY_WINDOW_MS,
@@ -94,6 +109,9 @@ export const RUST_MIRRORS: Record<string, Record<string, number>> = {
     MAX_PLAYOUT_AGE_MS,
     MAX_KEYFRAME_LESS_HOLD_MS,
   },
+  "videocall-client/src/connection/connection_manager.rs": {
+    ELECTION_STARVED_GRACE_MS,
+  },
   "videocall-client/src/decode/layer_chooser.rs": {
     LID_DWELL_BASE_MS,
     PEER_MONITOR_TICK_MS,
@@ -101,5 +119,11 @@ export const RUST_MIRRORS: Record<string, Record<string, number>> = {
   "dioxus-ui/src/components/decode_budget.rs": { ...BUDGET },
   "dioxus-ui/src/components/density.rs": { ...DENSITY },
   "dioxus-ui/src/components/connection_quality_indicator.rs": { ...CQI },
-  "dioxus-ui/src/components/attendants_layout.rs": { ...DRAWER, ...MEETING_FOOTER },
+  "dioxus-ui/src/components/attendants_layout.rs": {
+    ...DRAWER,
+    ...MEETING_FOOTER,
+    ENLARGE_MIN_TILE_W_FINE_POINTER,
+  },
+  "dioxus-ui/src/components/pin_order.rs": { ENLARGED_ORDER_BASE, PIN_ORDER_BASE },
+  "dioxus-ui/src/components/signal_quality.rs": { SCREEN_STATIC_HEARTBEAT_FRESH_MS },
 };

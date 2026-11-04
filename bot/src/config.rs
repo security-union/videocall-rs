@@ -44,7 +44,39 @@ pub enum VideoMode {
     Ekg,
     /// Pre-rendered costume sprite sheets (idle + talking).
     Costume,
+    /// EKG encoded once per process at startup, then replayed (#3132).
+    Replay,
 }
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+impl VideoMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "ekg" => Ok(VideoMode::Ekg),
+            "costume" => Ok(VideoMode::Costume),
+            "replay" => Ok(VideoMode::Replay),
+            other => Err(anyhow!(
+                "video mode must be ekg, costume or replay, not '{other}'"
+            )),
+        }
+    }
+}
+
+/// Default length of each replay variant (#3132).
+pub const REPLAY_LOOP_SECS_DEFAULT: u64 = 20;
+
+/// How far ahead `--deadline` may be; the bots-app refuses one past about 24.8 days.
+pub const MAX_DEADLINE_AHEAD: std::time::Duration = std::time::Duration::from_secs(24 * 86_400);
+
+/// Longest accepted `replay_loop_secs`.
+pub const REPLAY_LOOP_SECS_MAX: u64 = 40;
 
 /// Bot connection configuration (YAML file).
 ///
@@ -81,9 +113,24 @@ pub struct BotConfig {
     /// Path to conversation asset directory (contains manifest.yaml + lines/).
     /// Defaults to "conversation".
     pub conversation_dir: Option<String>,
-    /// Video rendering mode (ekg or costume). Defaults to ekg.
+    /// Video rendering mode (ekg, costume or replay). Defaults to ekg.
+    /// CLI: `--video-mode <mode>`. Env: `BOT_VIDEO_MODE`.
     #[serde(default)]
     pub video_mode: VideoMode,
+    /// Seconds of each replay variant, rounded up to whole GOPs. CLI:
+    /// `--replay-loop-secs <s>`.
+    #[serde(default)]
+    pub replay_loop_secs: Option<u64>,
+    /// Replay keys every active video layer on a KEYFRAME_REQUEST or an AQ
+    /// tier change (default true); false does neither. CLI:
+    /// `--replay-answer-keyframe-requests <true|false>`. Env:
+    /// `BOT_REPLAY_ANSWER_KEYFRAME_REQUESTS`.
+    #[serde(default)]
+    pub replay_answer_keyframe_requests: Option<bool>,
+    /// Seed for every replay publisher's keyframe phase and tick offset, so a
+    /// run can be repeated (default: random). CLI: `--replay-seed <u64>`.
+    #[serde(default)]
+    pub replay_seed: Option<u64>,
     /// Warmup delay (seconds) after all bots are spawned before media starts.
     pub warmup_secs: Option<u64>,
     /// Number of manifest participants, in manifest order, that publish mic and
@@ -193,7 +240,7 @@ pub struct BotConfig {
     pub control_timing: Option<String>,
     /// `false` stops DIAGNOSTICS entirely: no reporter, no packets.
     ///
-    /// CLI: `--diagnostics <on|off>`. Env: `BOT_DIAGNOSTICS=<on|off>`. Default on.
+    /// CLI: `--diagnostics <on|off>`. Env: `BOT_DIAGNOSTICS=<on|off>`. Default off.
     #[serde(default)]
     pub diagnostics: Option<bool>,
     /// Override the heartbeat keepalive interval (ms). CLI: `--heartbeat-interval-ms`.
@@ -211,6 +258,12 @@ pub struct BotConfig {
     /// CLI: `--duration <d>`.
     #[serde(default)]
     pub duration: Option<String>,
+    /// Absolute end of the run (epoch seconds): the run duration and every minted room token end by it, and
+    /// the bot refuses to start or mint once it has passed.
+    ///
+    /// CLI: `--deadline <epoch-seconds>`.
+    #[serde(default)]
+    pub run_deadline: Option<u64>,
     /// Run-wide number of presenters: broadcasters that send every 20 ms audio
     /// frame, silence included. Default [`DEFAULT_TALKERS`].
     ///
@@ -391,6 +444,10 @@ impl BotConfig {
         let mut pin_layer: Option<u32> = None;
         let mut pin_layer_kind: Option<String> = None;
         let mut simulcast_layers: Option<u32> = None;
+        let mut video_mode: Option<VideoMode> = None;
+        let mut replay_loop_secs: Option<u64> = None;
+        let mut replay_answer_keyframe_requests: Option<bool> = None;
+        let mut replay_seed: Option<u64> = None;
         let mut id_prefix: Option<String> = None;
         let mut control_timing: Option<String> = None;
         let mut diagnostics: Option<bool> = None;
@@ -398,6 +455,7 @@ impl BotConfig {
         let mut health_interval_ms: Option<u64> = None;
         let mut diagnostics_interval_ms: Option<u64> = None;
         let mut duration: Option<String> = None;
+        let mut run_deadline: Option<u64> = None;
         let mut talkers: Option<usize> = None;
         let mut cameras: Option<usize> = None;
         let mut roster_offset: Option<usize> = None;
@@ -556,6 +614,14 @@ impl BotConfig {
                     }
                     i += 2;
                 }
+                "--deadline" => {
+                    run_deadline = Some(
+                        args.get(i + 1)
+                            .and_then(|v| v.parse().ok())
+                            .ok_or_else(|| anyhow!("--deadline requires epoch seconds"))?,
+                    );
+                    i += 2;
+                }
                 "--duration" => {
                     if i + 1 < args.len() {
                         duration = Some(args[i + 1].clone());
@@ -610,6 +676,38 @@ impl BotConfig {
                     } else {
                         return Err(anyhow!("--simulcast-layers requires a count argument"));
                     }
+                }
+                "--video-mode" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--video-mode requires <ekg|costume|replay>"))?;
+                    video_mode = Some(VideoMode::parse(value)?);
+                    i += 2;
+                }
+                "--replay-loop-secs" => {
+                    let value = args
+                        .get(i + 1)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or_else(|| {
+                            anyhow!("--replay-loop-secs requires a whole number of seconds")
+                        })?;
+                    replay_loop_secs = Some(value);
+                    i += 2;
+                }
+                "--replay-seed" => {
+                    let value = args
+                        .get(i + 1)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or_else(|| anyhow!("--replay-seed requires a u64"))?;
+                    replay_seed = Some(value);
+                    i += 2;
+                }
+                "--replay-answer-keyframe-requests" => {
+                    let value = args.get(i + 1).and_then(|v| parse_bool(v)).ok_or_else(|| {
+                        anyhow!("--replay-answer-keyframe-requests requires true or false")
+                    })?;
+                    replay_answer_keyframe_requests = Some(value);
+                    i += 2;
                 }
                 "--help" | "-h" => {
                     println!("{}", help_text());
@@ -667,6 +765,9 @@ impl BotConfig {
 
         if duration.is_some() {
             config.duration = duration;
+        }
+        if run_deadline.is_some() {
+            config.run_deadline = run_deadline;
         }
         for (cli, env, field) in [
             (talkers, "BOT_TALKERS", &mut config.talkers),
@@ -746,6 +847,39 @@ impl BotConfig {
                     .parse()
                     .map_err(|_| anyhow!("BOT_SIMULCAST_LAYERS must be a u32 layer count"))?,
             );
+        }
+
+        if let Some(mode) = video_mode {
+            config.video_mode = mode;
+        } else if let Ok(env_mode) = std::env::var("BOT_VIDEO_MODE") {
+            config.video_mode =
+                VideoMode::parse(&env_mode).map_err(|e| anyhow!("BOT_VIDEO_MODE: {e}"))?;
+        }
+        if replay_loop_secs.is_some() {
+            config.replay_loop_secs = replay_loop_secs;
+        }
+        if config
+            .replay_loop_secs
+            .is_some_and(|secs| secs > REPLAY_LOOP_SECS_MAX)
+        {
+            return Err(anyhow!(
+                "replay_loop_secs must be at most {REPLAY_LOOP_SECS_MAX}"
+            ));
+        }
+        if replay_seed.is_some() {
+            config.replay_seed = replay_seed;
+        }
+        if replay_answer_keyframe_requests.is_some() {
+            config.replay_answer_keyframe_requests = replay_answer_keyframe_requests;
+        } else if let Ok(raw) = std::env::var("BOT_REPLAY_ANSWER_KEYFRAME_REQUESTS") {
+            config.replay_answer_keyframe_requests = Some(parse_bool(&raw).ok_or_else(|| {
+                anyhow!("BOT_REPLAY_ANSWER_KEYFRAME_REQUESTS must be true or false")
+            })?);
+        }
+        if config.video_mode == VideoMode::Replay && config.simulcast_layer_count() < 2 {
+            return Err(anyhow!(
+                "video_mode replay needs --simulcast-layers 2 or 3: the single-stream path follows the AQ tier, which a fixed library cannot"
+            ));
         }
 
         // Room-access-token credentials. Precedence: YAML file value > env var.
@@ -921,7 +1055,7 @@ impl BotConfig {
     }
 
     pub fn diagnostics_enabled(&self) -> bool {
-        self.diagnostics.unwrap_or(true)
+        self.diagnostics.unwrap_or(false)
     }
 
     pub fn diag_video_tracker_cap(&self) -> usize {
@@ -943,6 +1077,35 @@ impl BotConfig {
             .as_deref()
             .map(crate::shutdown::parse_duration)
             .transpose()
+    }
+
+    /// The run duration from `now` (epoch seconds), cut at the run deadline; an error once it has passed.
+    pub fn run_duration_at(&self, now: f64) -> anyhow::Result<Option<std::time::Duration>> {
+        let duration = self.run_duration()?;
+        match self.run_deadline {
+            None => Ok(duration),
+            Some(end) if end as f64 <= now => {
+                Err(anyhow!("the run deadline {end} has passed (now {now:.3})"))
+            }
+            Some(end) if end as f64 - now > MAX_DEADLINE_AHEAD.as_secs_f64() => Err(anyhow!(
+                "the run deadline {end} is more than {} days away",
+                MAX_DEADLINE_AHEAD.as_secs() / 86_400
+            )),
+            Some(end) => {
+                let left = std::time::Duration::from_secs_f64(end as f64 - now);
+                Ok(Some(duration.map_or(left, |d| d.min(left))))
+            }
+        }
+    }
+
+    /// The lobby auth for one connection: with a run deadline, a token minted now that expires by it.
+    pub fn connect_auth(&self, user_id: &str, room: &str) -> Result<LobbyAuth, MintError> {
+        match (self.resolve_lobby_auth()?, self.run_deadline) {
+            (LobbyAuth::Secret { secret, ttl_secs }, Some(end)) => Ok(LobbyAuth::Token(
+                mint::mint_room_token_until(&secret, user_id, room, ttl_secs, end)?,
+            )),
+            (auth, _) => Ok(auth),
+        }
     }
 
     /// Resolve the control-packet cadence: the preset, then per-packet overrides.
@@ -995,6 +1158,35 @@ impl BotConfig {
             .as_deref()
             .and_then(PinMediaKind::parse)
             .unwrap_or(PinMediaKind::Video)
+    }
+
+    /// GOPs in each replay variant: `replay_loop_secs` rounded up to whole
+    /// top-layer GOPs, at least one.
+    pub fn replay_loop_gops(&self) -> usize {
+        let ladder =
+            videocall_aq::constants::simulcast_layers(self.simulcast_layer_count() as usize);
+        let gop_ms = ladder
+            .last()
+            .map(|t| t.keyframe_interval_frames as u64 * 1000 / t.target_fps.max(1) as u64)
+            .unwrap_or(5000)
+            .max(1);
+        let secs = self
+            .replay_loop_secs
+            .unwrap_or(REPLAY_LOOP_SECS_DEFAULT)
+            .min(REPLAY_LOOP_SECS_MAX);
+        ((secs * 1000).div_ceil(gop_ms) as usize).max(1)
+    }
+
+    /// Whether a replay publisher answers KEYFRAME_REQUESTs (default true).
+    pub fn replay_answers_keyframe_requests(&self) -> bool {
+        self.replay_answer_keyframe_requests.unwrap_or(true)
+    }
+
+    /// Whether this bot's camera answers KEYFRAME_REQUESTs: live modes always,
+    /// replay unless `replay_answer_keyframe_requests` is false.
+    pub fn answers_keyframe_requests(&self, enable_video: bool) -> bool {
+        enable_video
+            && (self.video_mode != VideoMode::Replay || self.replay_answers_keyframe_requests())
     }
 
     /// Resolve how many simultaneous simulcast VIDEO layers this bot produces.
@@ -1375,7 +1567,8 @@ fn help_text() -> String {
          \x20 --broadcasters <N>            Manifest participants with mic and camera on (default all).\n\
          \x20 --run-size <N>                Participants in the whole run across hosts (cameras are\n\
          \x20                               spread over it; default: this process's last position).\n\
-         \x20 --diagnostics <on|off>        off sends no DIAGNOSTICS at all (default on). BOT_DIAGNOSTICS.\n\
+         \x20 --diagnostics <on|off>        on sends DIAGNOSTICS as a client from before #3116 did;\n\
+         \x20                               off sends none (default off). BOT_DIAGNOSTICS.\n\
          \x20 --diag-video-trackers <N>     Most video streams one bot sends DIAGNOSTICS for (default\n\
          \x20                               12, a default desktop browser; 30 = its maximum).\n\
          \x20 --cameras <N>                 Muted participants with the camera on (default 0). Run-wide.\n\
@@ -1384,13 +1577,26 @@ fn help_text() -> String {
          \x20                               (bot-NNN) never send audio.\n\
          \x20 --duration <d>                Stop after d (90s, 30m, 2h) from process start; also stops\n\
          \x20                               on Ctrl-C or SIGTERM. Unknown arguments are rejected.\n\
+         \x20 --deadline <epoch-seconds>    End the run, and every room token, by this time; refuse to\n\
+         \x20                               start or mint after it.\n\
          \x20 --users, -n <N>               Number of participants (0 = all in manifest). Values\n\
          \x20                               above the manifest length add bot-NNN participants.\n\
          \x20 --id-prefix <p>               Prefix every user id as <p>-<name> (unique across load\n\
          \x20                               machines). Also via BOT_ID_PREFIX.\n\
+         \x20 --video-mode <mode>           ekg (default), costume, or replay: EKG encoded once per\n\
+         \x20                               process at startup and replayed by every publisher\n\
+         \x20                               (needs 2 or 3 simulcast layers). Also via BOT_VIDEO_MODE.\n\
+         \x20 --replay-loop-secs <s>        Length of each replay variant (default 20, at most 40;\n\
+         \x20                               whole 5 s GOPs).\n\
+         \x20 --replay-seed <u64>           Seed for every replay publisher's keyframe phase and tick\n\
+         \x20                               offset (default: random), so a run can be repeated.\n\
+         \x20 --replay-answer-keyframe-requests <true|false>  Replay starts a new GOP on a\n\
+         \x20                               KEYFRAME_REQUEST or an AQ tier change (default true; false\n\
+         \x20                               sends neither; live modes always answer requests).\n\
+         \x20                               BOT_REPLAY_ANSWER_KEYFRAME_REQUESTS.\n\
          \n\
          Control-packet cadence (default: browser = heartbeat 5s + on speaking change,\n\
-         HEALTH 5s, DIAGNOSTICS 500ms for every tracked stream):\n\
+         HEALTH 5s, DIAGNOSTICS 500ms for every tracked stream when --diagnostics on):\n\
          \x20 --control-timing <browser|legacy>  legacy = 1s for all three, active streams only.\n\
          \x20 --heartbeat-interval-ms <ms>  Override the heartbeat keepalive.\n\
          \x20 --health-interval-ms <ms>     Override the HEALTH interval.\n\
@@ -1442,7 +1648,7 @@ mod tests {
     use super::{
         append_instance_id, build_roster, evaluate_costume_memory, generate_instance_id, help_text,
         validate_id_prefix, validate_pin_layer, wire_user_id, BotConfig, CostumeMemoryDecision,
-        Participant, Population, Role, RosterEntry,
+        Participant, Population, Role, RosterEntry, VideoMode,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -1648,17 +1854,36 @@ mod tests {
             12,
             "default desktop browser"
         );
-        assert!(config.diagnostics_enabled(), "DIAGNOSTICS default on");
-        let (args, path3) = args_with(&["--diagnostics", "off"]);
-        assert!(!BotConfig::from_args_inner(&args, None)
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn diagnostics_are_off_unless_the_run_turns_them_on() {
+        let parse = |extra: &[&str]| {
+            let (args, path) = args_with(extra);
+            let parsed = BotConfig::from_args_inner(&args, None);
+            let _ = fs::remove_file(path);
+            parsed
+        };
+        assert!(!parse(&[]).unwrap().0.diagnostics_enabled());
+        assert!(parse(&["--diagnostics", "on"])
             .unwrap()
             .0
             .diagnostics_enabled());
-        let (args, path4) = args_with(&["--diagnostics", "maybe"]);
-        assert!(BotConfig::from_args_inner(&args, None).is_err());
-        let _ = fs::remove_file(path3);
-        let _ = fs::remove_file(path4);
+        assert!(!parse(&["--diagnostics", "off"])
+            .unwrap()
+            .0
+            .diagnostics_enabled());
+        assert!(parse(&["--diagnostics", "maybe"]).is_err());
+        let path = write_temp_config_with("diagnostics: true\n");
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        let parsed = BotConfig::from_args_inner(&args, None);
         let _ = fs::remove_file(path);
+        assert!(parsed.unwrap().0.diagnostics_enabled());
     }
 
     #[test]
@@ -1708,6 +1933,73 @@ mod tests {
         let (args, path) = args_with(&["--duration", "soon"]);
         assert!(BotConfig::from_args_inner(&args, None).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_run_deadline_caps_the_duration_and_every_minted_token_and_refuses_after_it() {
+        use jsonwebtoken::{decode, DecodingKey, Validation};
+        use videocall_meeting_types::token::RoomAccessTokenClaims;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (args, path) =
+            args_with(&["--duration", "30m", "--deadline", &(now + 100).to_string()]);
+        let (mut config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        let _ = fs::remove_file(path);
+        assert_eq!(config.run_deadline, Some(now + 100));
+        assert_eq!(
+            config.run_duration_at(now as f64).unwrap(),
+            Some(std::time::Duration::from_secs(100))
+        );
+        assert_eq!(
+            config.run_duration_at(now as f64 + 99.75).unwrap(),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert!(config.run_duration_at((now + 100) as f64).is_err());
+        let ahead = super::MAX_DEADLINE_AHEAD.as_secs();
+        config.run_deadline = Some(now + ahead);
+        assert_eq!(
+            config.run_duration_at(now as f64).unwrap(),
+            Some(std::time::Duration::from_secs(30 * 60))
+        );
+        for too_far in [now + ahead + 1, u64::MAX] {
+            config.run_deadline = Some(too_far);
+            assert!(config.run_duration_at(now as f64).is_err());
+        }
+        config.run_deadline = Some(now + 100);
+        config.jwt_secret = Some("secret".into());
+        config.token_ttl_secs = Some(86400);
+        let mut validation = Validation::default();
+        validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
+        for transport in [super::Transport::WebSocket, super::Transport::WebTransport] {
+            let auth = config.connect_auth("bot-1", "room-1").unwrap();
+            let url = crate::transport::TransportClient::build_lobby_url(
+                &transport,
+                &url::Url::parse("https://relay.example.com").unwrap(),
+                &auth,
+                "bot-1",
+                "room-1",
+            )
+            .unwrap();
+            let token = url.query_pairs().find(|(k, _)| k == "token").unwrap().1;
+            let exp = decode::<RoomAccessTokenClaims>(
+                &token,
+                &DecodingKey::from_secret(b"secret"),
+                &validation,
+            )
+            .unwrap()
+            .claims
+            .exp;
+            assert!(
+                exp <= (now + 100) as i64,
+                "{:?} token expires at {}",
+                transport,
+                exp
+            );
+        }
+        config.run_deadline = Some(now);
+        assert!(config.connect_auth("bot-1", "room-1").is_err());
     }
 
     #[test]
@@ -1901,6 +2193,156 @@ mod tests {
             config.pin_media_kind(),
             crate::layer_preference_sender::PinMediaKind::Video
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn video_mode_replay_comes_from_yaml_or_the_flag() {
+        let path = write_temp_config_with("video_mode: replay\nreplay_loop_secs: 12\n");
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.video_mode, VideoMode::Replay);
+        assert_eq!(
+            config.replay_loop_gops(),
+            3,
+            "12 s rounds up to three 5 s GOPs"
+        );
+        let _ = fs::remove_file(path);
+
+        let (args, path) = args_with(&["--video-mode", "replay", "--replay-loop-secs", "5"]);
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.video_mode, VideoMode::Replay);
+        assert_eq!(config.replay_loop_gops(), 1);
+        let _ = fs::remove_file(path);
+
+        let (args, path) = args_with(&[]);
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.video_mode, VideoMode::Ekg);
+        assert_eq!(config.replay_loop_gops(), 4, "default 20 s");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn video_mode_flag_overrides_yaml_and_rejects_unknown_modes() {
+        let path = write_temp_config_with("video_mode: replay\n");
+        let mut args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--video-mode".to_string(),
+            "ekg".to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.video_mode, VideoMode::Ekg);
+        args[4] = "camera".to_string();
+        let err = BotConfig::from_args_inner(&args, None).unwrap_err();
+        assert!(
+            err.to_string().contains("ekg, costume or replay"),
+            "{}",
+            err
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn replay_loop_secs_is_capped() {
+        let (args, path) = args_with(&["--video-mode", "replay", "--replay-loop-secs", "41"]);
+        let err = BotConfig::from_args_inner(&args, None).unwrap_err();
+        assert!(err.to_string().contains("at most 40"), "{}", err);
+        let _ = fs::remove_file(path);
+        let (args, path) = args_with(&["--replay-loop-secs", "40"]);
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.replay_loop_gops(), 8);
+        let _ = fs::remove_file(path);
+        let config = BotConfig {
+            replay_loop_secs: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(config.replay_loop_gops(), 8, "no overflow past the cap");
+    }
+
+    #[test]
+    fn live_modes_always_answer_keyframe_requests_and_replay_can_opt_out() {
+        for (yaml, video, expected) in [
+            ("video_mode: ekg\n", true, true),
+            ("video_mode: costume\n", true, true),
+            (
+                "video_mode: ekg\nreplay_answer_keyframe_requests: false\n",
+                true,
+                true,
+            ),
+            ("video_mode: replay\n", true, true),
+            (
+                "video_mode: replay\nreplay_answer_keyframe_requests: false\n",
+                true,
+                false,
+            ),
+            ("video_mode: ekg\n", false, false),
+        ] {
+            let path = write_temp_config_with(yaml);
+            let args = vec![
+                "bot".to_string(),
+                "--config".to_string(),
+                path.display().to_string(),
+            ];
+            let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+            assert_eq!(
+                config.answers_keyframe_requests(video),
+                expected,
+                "{:?} with video {}",
+                yaml,
+                video
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn replay_answers_keyframe_requests_unless_told_not_to() {
+        let (args, path) = args_with(&[]);
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert!(config.replay_answers_keyframe_requests());
+        let _ = fs::remove_file(path);
+
+        let path = write_temp_config_with("replay_answer_keyframe_requests: false\n");
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert!(!config.replay_answers_keyframe_requests());
+        let mut args = args;
+        args.extend([
+            "--replay-answer-keyframe-requests".to_string(),
+            "true".to_string(),
+        ]);
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert!(
+            config.replay_answers_keyframe_requests(),
+            "the flag overrides YAML"
+        );
+        args[4] = "maybe".to_string();
+        assert!(BotConfig::from_args_inner(&args, None).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn replay_refuses_a_single_simulcast_layer() {
+        let (args, path) = args_with(&["--video-mode", "replay", "--simulcast-layers", "1"]);
+        let err = BotConfig::from_args_inner(&args, None).unwrap_err();
+        assert!(
+            err.to_string().contains("--simulcast-layers 2 or 3"),
+            "{}",
+            err
+        );
+        let _ = fs::remove_file(path);
+        let (args, path) = args_with(&["--video-mode", "replay", "--simulcast-layers", "2"]);
+        assert!(BotConfig::from_args_inner(&args, None).is_ok());
         let _ = fs::remove_file(path);
     }
 

@@ -8,6 +8,7 @@ import {
   CAMERA_TOOLTIP,
   HANG_UP_SELECTOR,
   MIC_TOOLTIP,
+  SCREEN_SHARE_MENU_STOP_SELECTOR,
   SCREEN_SHARE_TOOLTIP,
   cameraControlSelector,
   micControlSelector,
@@ -64,6 +65,28 @@ describe("bot.ts leaveMeeting call site", () => {
     );
     expect([...new Set(seen)]).toEqual([HANG_UP_SELECTOR]);
   });
+
+  it("gives up without a click when every visibility probe stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      const click = vi.fn();
+      const page = {
+        locator: () => ({ isVisible: () => new Promise<boolean>(() => {}), click }),
+        waitForURL: vi.fn(),
+      };
+      const warn = vi.fn();
+      let done = false;
+      void clickHangUp(page, () => undefined, warn).then(() => (done = true));
+      await vi.advanceTimersByTimeAsync(HANG_UP_CANDIDATES.length * 1_000);
+      expect(done).toBe(true);
+      expect(click).not.toHaveBeenCalled();
+      expect(warn.mock.calls.map((c) => String(c[0]))).toEqual(
+        HANG_UP_CANDIDATES.map((sel) => expect.stringContaining(`isVisible ${sel} did not settle`)),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("orchestrator.ts control call sites", () => {
@@ -103,11 +126,72 @@ describe("orchestrator.ts control call sites", () => {
     expect(controlSelectors(seen)).toEqual([screenShareControlSelector("off")]);
     expect(screenShareControlSelector("off")).toContain(SCREEN_SHARE_TOOLTIP.off);
   });
+});
 
-  it("setScreenShare stop drives the sharing-state screen-share selector", async () => {
-    const { page, seen } = fakePage();
+// The trigger toggles the menu, and its items render only while it is open.
+function sharePage(opts: { visible: (selector: string) => boolean; menuOpen?: boolean }): {
+  page: unknown;
+  clicked: string[];
+  attempted: string[];
+} {
+  const clicked: string[] = [];
+  const attempted: string[] = [];
+  let menuOpen = opts.menuOpen ?? false;
+  const shown = (selector: string): boolean =>
+    selector === SCREEN_SHARE_MENU_STOP_SELECTOR ? menuOpen : opts.visible(selector);
+  const page = {
+    locator: (selector: string) => {
+      const loc = {
+        first: () => loc,
+        hover: async () => undefined,
+        isVisible: async () => shown(selector),
+        click: async () => {
+          attempted.push(selector);
+          if (!shown(selector)) throw new Error(`timeout waiting for ${selector}`);
+          clicked.push(selector);
+          if (selector === screenShareControlSelector("on")) menuOpen = !menuOpen;
+          if (selector === SCREEN_SHARE_MENU_STOP_SELECTOR) menuOpen = false;
+        },
+      };
+      return loc;
+    },
+  };
+  return { page, clicked, attempted };
+}
+
+describe("orchestrator.ts share-stop call site", () => {
+  it("opens the live share's menu and clicks Stop sharing", async () => {
+    const trigger = screenShareControlSelector("on");
+    const { page, clicked } = sharePage({ visible: (s) => s === trigger });
     await toggleScreenShare(fakeEntry(page), false);
-    expect(controlSelectors(seen)).toEqual([screenShareControlSelector("on")]);
+    expect(clicked).toEqual([trigger, SCREEN_SHARE_MENU_STOP_SELECTOR]);
+  });
+
+  it("uses an already-open menu instead of toggling it shut", async () => {
+    const trigger = screenShareControlSelector("on");
+    const { page, clicked } = sharePage({ visible: (s) => s === trigger, menuOpen: true });
+    await toggleScreenShare(fakeEntry(page), false);
+    expect(clicked).toEqual([SCREEN_SHARE_MENU_STOP_SELECTOR]);
+  });
+
+  it("stops on the button itself on a target that predates the menu, and reports it", async () => {
+    const [, preMenu] = screenShareCandidates("on");
+    const { page, clicked } = sharePage({ visible: (s) => s === preMenu });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await toggleScreenShare(fakeEntry(page), false);
+    const reported = warn.mock.calls.flat().join("\n");
+    warn.mockRestore();
+    expect(clicked).toEqual([preMenu]);
+    expect(reported).toContain(PRE_MARKER_UI_BANNER);
+  });
+
+  it("on a target that predates the menu, clicks the old button once and never waits for the stop item", async () => {
+    const [, preMenu] = screenShareCandidates("on");
+    const { page, attempted } = sharePage({ visible: (s) => s === preMenu });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await toggleScreenShare(fakeEntry(page), false);
+    warn.mockRestore();
+    expect(attempted).toEqual([preMenu]);
   });
 });
 

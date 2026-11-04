@@ -1249,7 +1249,7 @@ pub struct ReceivedLayerSnapshot {
     /// the sender's own fit (#2659 video, #2343 screen).
     pub width: u32,
     pub height: u32,
-    /// Approximate bitrate of the decoded layer in kbps, from the ladder.
+    /// Approximate bitrate of the decoded layer in kbps.
     pub kbps: u32,
     /// Why this stream is below the FULL-ladder top, when it is (issue #1131).
     /// `None` when the reception is optimal (top of the full ladder, or a
@@ -1538,10 +1538,6 @@ pub fn received_layer_snapshot(
     let count = layer_count.clamp(1, max_layers);
     let idx = layer_index.min(count.saturating_sub(1));
 
-    // AUDIO and SCREEN carry no ladder geometry OR bitrate. Screen's is enriched from
-    // the publisher's own reported target (`enrich_screen_snapshot`); audio has no
-    // such report, and its rate is set by the publisher's AQ audio tier rather than
-    // by the layer a receiver decodes.
     if audio || matches!(kind, PrefMediaKind::Screen) {
         return ReceivedLayerSnapshot {
             kind,

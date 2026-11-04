@@ -443,7 +443,25 @@ class FreezeSectionTest(unittest.TestCase):
         return self.section("### Layer Gate Skips", "### ProtectiveMode Episodes")
 
     def protective(self):
-        return self.section("### ProtectiveMode Episodes", "### Peer ID")
+        return self.section("### ProtectiveMode Episodes", "### Audio Workers That Never Started")
+
+    def never_ready(self):
+        return self.section("### Audio Workers That Never Started", "### Peer ID")
+
+    @staticmethod
+    def worker_made(peer, seq, ts="2026-10-07T15:12:07.155Z"):
+        return rec(f"NetEq audio decoder initialized for peer {peer} (muted: true)",
+                   level="info", ts=ts, seq=seq)
+
+    @staticmethod
+    def worker_ready(peer, seq):
+        return rec(f"✅ Worker ready for peer {peer} (worker mute: true)",
+                   level="info", ts="2026-10-07T15:12:07.200Z", seq=seq)
+
+    @staticmethod
+    def queued(peer, seq):
+        return rec(f"🔄 Queueing message for peer {peer} (worker not ready)",
+                   level="log", ts="2026-10-07T15:20:03.749Z", seq=seq)
 
     @staticmethod
     def skip(ts, recv="", pub="", head=1800, dropped=1, escalated="false"):
@@ -622,6 +640,141 @@ class FreezeSectionTest(unittest.TestCase):
                            [rec("nothing to see", level="info")])
         self.assertIn("| _none_ |", self.protective())
 
+    def test_never_ready_worker_is_listed_with_its_queue_and_name(self):
+        lines = [rec("Received MEETING packet: event_type=Ok(PARTICIPANT_JOINED), "
+                     "room=planning, target=x, creator=, display_name=Bui Tuan Anh, "
+                     "session=222", level="info", seq=1),
+                 self.worker_made("222", 2), self.worker_made("333", 3),
+                 self.worker_ready("333", 4)]
+        lines += [self.queued("222", 10 + i) for i in range(60)]
+        self.write_session("tanya@x.com", "1791385928697", lines)
+        section = self.never_ready()
+        rows = [ln for ln in section.splitlines() if "`222`" in ln]
+        self.assertEqual(len(rows), 1, section)
+        cells = self.cells(rows[0])
+        self.assertIn("Bui Tuan Anh", cells[1])
+        self.assertEqual(cells[3], "end of log")
+        self.assertEqual(cells[4], "60 ⚠")
+        self.assertNotIn("`333`", section, "a worker that became ready is not a row")
+        self.assertIn("1 never-started worker(s) dropped", section)
+
+    def test_never_ready_queue_counts_a_reshipped_chunk_once(self):
+        lines = [self.worker_made("222", 1)] + [self.queued("222", 10 + i) for i in range(60)]
+        self.write_session("tanya@x.com", "1791385928697", lines)
+        path = os.path.join(self.dir, "tanya@x.com_1791385928697_00002.log.gz")
+        with gzip.open(path, "wt") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+        rows = [ln for ln in self.never_ready().splitlines() if "`222`" in ln]
+        self.assertEqual(len(rows), 1, "a re-shipped chunk must not add a second instance")
+        self.assertEqual(self.cells(rows[0])[4], "60 ⚠", "duplicated chunk lines must not double the count")
+
+    def test_never_ready_with_a_silent_peer_is_listed_but_not_flagged(self):
+        self.write_session("tanya@x.com", "1791385928697", [self.worker_made("222", 1)])
+        section = self.never_ready()
+        cells = self.cells([ln for ln in section.splitlines() if "`222`" in ln][0])
+        self.assertEqual(cells[4], "0")
+        self.assertNotIn("dropped a participant", section)
+
+    def test_all_workers_ready_reports_none(self):
+        self.write_session("tanya@x.com", "1791385928697",
+                           [self.worker_made("222", 1), self.worker_ready("222", 2)])
+        self.assertIn("| _none_ |", self.never_ready())
+
+    def end_status(self, email):
+        section = self.section("### Sessions", "### Error Census")
+        rows = [ln for ln in section.splitlines() if ln.startswith(f"| {email} |")]
+        self.assertEqual(len(rows), 1, section)
+        return self.cells(rows[0])[16]
+
+    def test_a_failed_election_that_kept_the_old_connection_is_not_lost(self):
+        self.write_session("aaron@x.com", "1791385511279", [
+            rec("Election failed: No valid connections with RTT measurements found",
+                ts="2026-10-07T15:37:19.474Z", seq=1),
+            rec("Election decision: reason=election_failed_no_candidates rtt_lane=none "
+                "outcome=preserved_old elected=none active=ws_0", level="info",
+                ts="2026-10-07T15:37:19.475Z", seq=2)])
+        self.assertEqual(self.end_status("aaron@x.com"), "?")
+
+    def test_an_intentional_disconnect_is_not_lost(self):
+        self.write_session("kent@x.com", "1791385187034", [
+            rec("Connection lost after intentional disconnect — not reconnecting",
+                level="info", ts="2026-10-07T15:41:16.000Z", seq=1)])
+        self.assertEqual(self.end_status("kent@x.com"), "?")
+
+    def test_a_loss_with_no_later_recovery_is_lost(self):
+        self.write_session("bob@x.com", "1791385511279", [
+            rec("Election decision: reason=best_ws_min_samples outcome=elected elected=ws_0",
+                level="info", ts="2026-10-07T15:00:00.000Z", seq=1),
+            rec("Election failed: No valid connections with RTT measurements found",
+                ts="2026-10-07T15:37:19.474Z", seq=2)])
+        self.assertEqual(self.end_status("bob@x.com"), "**LOST**")
+
+    def test_a_recreated_worker_that_never_starts_is_listed(self):
+        lines = [self.worker_made("222", 1), self.worker_ready("222", 2),
+                 self.worker_made("222", 3, ts="2026-10-07T15:30:16.000Z")]
+        lines += [self.queued("222", 10 + i) for i in range(60)]
+        self.write_session("srini@x.com", "1791385752258", lines)
+        rows = [ln for ln in self.never_ready().splitlines() if "`222`" in ln]
+        self.assertEqual(len(rows), 1, self.never_ready())
+        cells = self.cells(rows[0])
+        self.assertEqual(cells[2], "15:30:16")
+        self.assertEqual(cells[4], "60 ⚠")
+
+    def test_each_dead_instance_of_one_peer_is_its_own_row(self):
+        lines = [self.worker_made("222", 1)] + [self.queued("222", 10 + i) for i in range(70)]
+        lines += [self.worker_made("222", 100, ts="2026-10-07T15:30:16.000Z")]
+        lines += [self.queued("222", 200 + i) for i in range(55)]
+        self.write_session("srini@x.com", "1791385752258", lines)
+        rows = sorted((self.cells(ln)[3], self.cells(ln)[4])
+                      for ln in self.never_ready().splitlines() if "`222`" in ln)
+        self.assertEqual(rows, [("15:30:16", "70 ⚠"), ("end of log", "55 ⚠")])
+
+    def test_same_millisecond_recovery_is_not_lost(self):
+        self.write_session("aaron@x.com", "1791385511279", [
+            rec("Election failed: No valid connections with RTT measurements found",
+                ts="2026-10-07T15:37:19.474Z", seq=1),
+            rec("Election decision: reason=election_failed_no_candidates rtt_lane=none "
+                "outcome=preserved_old elected=none active=ws_0", level="info",
+                ts="2026-10-07T15:37:19.474Z", seq=2)])
+        self.assertEqual(self.end_status("aaron@x.com"), "?")
+
+    def test_missing_worker_phrase_in_a_multi_session_corpus_is_flagged(self):
+        self.write_session("a@x.com", "1791385511279", [rec("hello", level="info", seq=1)])
+        self.write_session("b@x.com", "1791385511280", [rec("hello", level="info", seq=1)])
+        self.assertIn("NOT a clean result", self.never_ready())
+
+    def test_all_started_two_sessions_with_a_truncated_chunk_is_not_flagged(self):
+        self.write_session("a@x.com", "1791385511279",
+                           [self.worker_made("222", 1), self.worker_ready("222", 2)])
+        self.write_session("b@x.com", "1791385511280",
+                           [rec(f"filler {i}", level="info", seq=i) for i in range(200)])
+        truncate(os.path.join(self.dir, "b@x.com_1791385511280_00001.log.gz"), 0.5)
+        section = self.never_ready()
+        self.assertIn("| _none_ |", section)
+        self.assertNotIn("NOT a clean result", section)
+
+    def test_preserved_old_with_no_active_connection_is_lost(self):
+        self.write_session("aaron@x.com", "1791385511279", [
+            rec("Election failed: No valid connections with RTT measurements found",
+                ts="2026-10-07T15:37:19.474Z", seq=1),
+            rec("Election decision: reason=election_failed_no_candidates rtt_lane=none "
+                "outcome=preserved_old elected=none active=none", level="info",
+                ts="2026-10-07T15:37:19.475Z", seq=2)])
+        self.assertEqual(self.end_status("aaron@x.com"), "**LOST**")
+
+    def test_a_truncated_chunk_does_not_hide_the_next_chunks_lines(self):
+        first = [self.worker_made("222", 1)] + [rec(f"filler {i}", level="info", seq=2 + i) for i in range(300)]
+        self.write_session("tanya@x.com", "1791385928697", first)
+        truncate(os.path.join(self.dir, "tanya@x.com_1791385928697_00001.log.gz"), 0.6)
+        path = os.path.join(self.dir, "tanya@x.com_1791385928697_00002.log.gz")
+        with gzip.open(path, "wt") as fh:
+            for line in [rec("glue target", level="info", seq=900)] + [self.queued("222", 1000 + i) for i in range(60)]:
+                fh.write(line + "\n")
+        rows = [ln for ln in self.never_ready().splitlines() if "`222`" in ln]
+        self.assertEqual(len(rows), 1, self.never_ready())
+        self.assertEqual(self.cells(rows[0])[4], "60 ⚠")
+
     def test_verify_reports_every_protective_mode_phrase(self):
         """The optional loop never sets verify_failed, so registration IS the
         whole guard: an unregistered phrase is invisible to --verify."""
@@ -647,6 +800,23 @@ class FreezeSectionTest(unittest.TestCase):
                        "ProtectiveMode: audio-driven pressured latch"):
             self.assertRegex(out, rf"\[OK\]\s+1 matches: {re.escape(phrase)}\n",
                              f"{phrase} missing from VERIFY_OPTIONAL")
+
+
+class PromCopyPasteTest(unittest.TestCase):
+    def test_every_emitted_prometheus_curl_authenticates_without_k(self):
+        d = tempfile.mkdtemp(prefix="prom-test-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with gzip.open(os.path.join(d, "a@x.com_1786546775631_00001.log.gz"), "wt") as fh:
+            fh.write(preamble("a@x.com") + "\n" + rec("boom") + "\n")
+        out = subprocess.run(["bash", SCRIPT, d], capture_output=True, text=True, timeout=300).stdout
+        start = out.find("### Prometheus Copy-Paste")
+        self.assertNotEqual(start, -1, f"no copy-paste section in output:\n{out[:2000]}")
+        block = out[start:].split("```bash\n", 1)[1].split("\n```", 1)[0]
+        curls = [ln for ln in block.splitlines() if "curl " in ln]
+        self.assertGreater(len(curls), 0)
+        for ln in curls:
+            self.assertIn('-u "$PROM_USER:$PROM_PASSWORD"', ln)
+            self.assertNotRegex(ln, r"curl\s+-\w*k")
 
 
 if __name__ == "__main__":

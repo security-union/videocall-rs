@@ -31,6 +31,7 @@ services:
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
       - WT_DEV_CERT_HASH_INJECT=${WT_DEV_CERT_HASH_INJECT:-true}
       - TRANSPORT_BADGE_ENABLED=${TRANSPORT_BADGE_ENABLED:-false}
+      - CAPTIONS_ENABLED=${CAPTIONS_ENABLED:-false}
       - E2EE_ENABLED=${E2EE_ENABLED:-false}
       - FIREFOX_ENABLED=${FIREFOX_ENABLED:-false}
       - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}
@@ -151,6 +152,7 @@ services:
       - OAUTH_BROWSER_PKCE=${OAUTH_BROWSER_PKCE:-false}
       - ALLOWED_REDIRECT_URLS=${ALLOWED_REDIRECT_URLS:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
       - NATS_URL=nats:4222
+      - CAPTIONS_ENABLED=${CAPTIONS_ENABLED:-false}
       # Local dev only: when OAuth is unconfigured, this synthetic user is
       # auto-logged-in via /api/v1/dev/auto-login so the UI works with zero
       # setup. Production deployments set OAUTH_CLIENT_ID, which makes the

@@ -1,5 +1,6 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { expectHostChangeToast } from "../helpers/host-change-toast";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 
@@ -13,7 +14,7 @@ import { wakeControls } from "../helpers/controls";
  *
  *   - The TARGET re-fetches its status so the `is_owner` prop flips and host UI
  *     appears WITHOUT a reload or rejoin (the meeting view re-renders in place —
- *     no remount), including a one-shot "You now have host controls" toast.
+ *     no remount), including a one-shot "You're now a host" toast.
  *   - EVERY client (incl. the target) updates the live host set so the
  *     promoted peer's `(Host)` indicator / crown appears immediately.
  *
@@ -188,6 +189,11 @@ test.describe("Transfer host", () => {
       // ---- Host transfers host to the participant ----
       await openPeerListSidebar(hostPage);
       await clickPeerRowAction(hostPage, PEER_NAME, "Transfer host");
+
+      await Promise.all([
+        expectHostChangeToast(peerPage, "You're now a host"),
+        expectHostChangeToast(hostPage, "You no longer have host controls"),
+      ]);
 
       // ---- Target becomes host ----
       await openPeerListSidebar(peerPage);

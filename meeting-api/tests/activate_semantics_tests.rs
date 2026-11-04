@@ -59,6 +59,7 @@ async fn create_idle_meeting(
         false,
         false,
         true,
+        db_meetings::Announcements::default(),
     )
     .await
     .expect("create_with_options must succeed")

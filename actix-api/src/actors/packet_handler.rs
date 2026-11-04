@@ -434,6 +434,10 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
         return PacketKind::Dropped;
     }
 
+    if packet_wrapper.packet_type == PacketType::CAPTION.into() {
+        return PacketKind::Dropped;
+    }
+
     // Validate and classify client-originated REACTION packets (#1884).
     //
     // A REACTION is the ONLY client-authored packet the relay RE-BROADCASTS to
@@ -1756,6 +1760,43 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
     Some((target, kind))
 }
 
+/// The target `user_id` a KEYFRAME_REQUEST's inner `MediaPacket` names, read in
+/// place (#3206). `None` unless every field's wire framing reads to the end, the
+/// media type is KEYFRAME_REQUEST and the target is non-empty; field contents
+/// other than those two are not validated.
+pub fn keyframe_request_target(inner: &[u8]) -> Option<&[u8]> {
+    const FIELD_MEDIA_TYPE: u32 = 1;
+    const FIELD_USER_ID: u32 = 2;
+
+    let mut is = CodedInputStream::from_bytes(inner);
+    let mut media_type: i32 = 0;
+    let mut user_id_range: Option<(usize, usize)> = None;
+
+    loop {
+        let raw_tag = match is.read_raw_tag_or_eof() {
+            Ok(Some(t)) => t,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
+        let wire_type = WireType::new(raw_tag & 0x7)?;
+        match (raw_tag >> 3, wire_type) {
+            (FIELD_MEDIA_TYPE, WireType::Varint) => {
+                media_type = is.read_enum_or_unknown::<MediaType>().ok()?.value();
+            }
+            (FIELD_USER_ID, WireType::LengthDelimited) => {
+                user_id_range = Some(length_delimited_range(&mut is, inner)?);
+            }
+            (_, wt) => is.skip_field(wt).ok()?,
+        }
+    }
+
+    if media_type != MediaType::KEYFRAME_REQUEST.value() {
+        return None;
+    }
+    let (start, end) = user_id_range?;
+    Some(&inner[start..end]).filter(|target| !target.is_empty())
+}
+
 /// Maximum payload size for WebTransport datagrams (bytes).
 ///
 /// Datagrams are used for control packets (heartbeats, RTT probes,
@@ -1974,6 +2015,29 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_forged_meeting_instance_superseded_notice_is_dropped() {
+        use videocall_types::protos::meeting_packet::{
+            meeting_packet::MeetingEventType, MeetingPacket,
+        };
+        let forged = MeetingPacket {
+            event_type: MeetingEventType::MEETING_INSTANCE_SUPERSEDED.into(),
+            room_id: "room".to_string(),
+            target_user_id: b"victim@x".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: videocall_types::SYSTEM_USER_ID.as_bytes().to_vec(),
+            data: forged.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_packet(&wrapper.write_to_bytes().unwrap()),
+            PacketKind::Dropped
+        );
+    }
+
+    #[test]
     fn test_classify_meeting_packet_as_dropped() {
         // #1704: a client-sent MEETING packet is always forged — MEETING events
         // (HOST_MUTE_PARTICIPANT, MEETING_ENDED, etc.) are server-authoritative,
@@ -2017,6 +2081,88 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
+    fn test_classify_client_caption_packet_as_dropped() {
+        use videocall_types::protos::caption_packet::CaptionPacket;
+        let forged = CaptionPacket {
+            speaker_session_id: 42,
+            text: "forged caption".to_string(),
+            is_final: true,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::CAPTION.into(),
+            user_id: videocall_types::SYSTEM_USER_ID.as_bytes().to_vec(),
+            data: forged.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    fn inner_bytes(media_type: MediaType, user_id: &[u8]) -> Vec<u8> {
+        MediaPacket {
+            media_type: media_type.into(),
+            user_id: user_id.to_vec(),
+            target_session_id: u64::MAX,
+            data: b"VIDEO".to_vec(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    #[test]
+    fn keyframe_request_target_reads_the_named_target() {
+        let inner = inner_bytes(MediaType::KEYFRAME_REQUEST, b"alice@example.com");
+        assert_eq!(
+            keyframe_request_target(&inner),
+            Some(&b"alice@example.com"[..])
+        );
+    }
+
+    #[test]
+    fn keyframe_request_target_does_not_depend_on_field_order() {
+        let mut inner = Vec::new();
+        let mut os = protobuf::CodedOutputStream::vec(&mut inner);
+        os.write_bytes(3, b"VIDEO").unwrap();
+        os.write_bytes(2, b"alice").unwrap();
+        os.write_enum(1, MediaType::KEYFRAME_REQUEST.value())
+            .unwrap();
+        os.flush().unwrap();
+        drop(os);
+        assert_eq!(keyframe_request_target(&inner), Some(&b"alice"[..]));
+    }
+
+    #[test]
+    fn keyframe_request_target_is_none_without_a_readable_target() {
+        assert_eq!(
+            keyframe_request_target(&inner_bytes(MediaType::KEYFRAME_REQUEST, b"")),
+            None
+        );
+        assert_eq!(
+            keyframe_request_target(&inner_bytes(MediaType::HEARTBEAT, b"alice")),
+            None
+        );
+        assert_eq!(
+            keyframe_request_target(&inner_bytes(MediaType::VIDEO, b"alice")),
+            None
+        );
+        let mut truncated = inner_bytes(MediaType::KEYFRAME_REQUEST, b"alice");
+        truncated.truncate(truncated.len() - 3);
+        assert_eq!(keyframe_request_target(&truncated), None);
+        assert_eq!(keyframe_request_target(&[0xff, 0xff, 0xff]), None);
+
+        let mut explicit_empty = Vec::new();
+        let mut os = protobuf::CodedOutputStream::vec(&mut explicit_empty);
+        os.write_enum(1, MediaType::KEYFRAME_REQUEST.value())
+            .unwrap();
+        os.write_bytes(2, b"").unwrap();
+        os.flush().unwrap();
+        drop(os);
+        assert_eq!(keyframe_request_target(&explicit_empty), None);
     }
 
     #[test]

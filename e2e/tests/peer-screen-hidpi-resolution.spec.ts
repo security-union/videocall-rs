@@ -294,8 +294,7 @@ async function maxDecodedScreenWidth(
   windowMs: number,
   /**
    * Width at which polling can stop early — the widest value this share can
-   * legitimately reach. Defaults to the un-capped source width. The capped case
-   * passes the CEILING instead, because the decode can never reach the source.
+   * legitimately reach. Defaults to the un-capped source width.
    */
   settleAtWidth: number = SOURCE_WIDTH,
 ): Promise<{ width: number; height: number }> {
@@ -318,6 +317,21 @@ async function maxDecodedScreenWidth(
     await viewerPage.waitForTimeout(500);
   }
   return best;
+}
+
+async function pollUntil<T>(
+  read: () => Promise<T>,
+  done: (value: T) => boolean,
+  timeoutMs: number,
+  intervalMs: number,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let value = await read();
+  while (!done(value) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    value = await read();
+  }
+  return value;
 }
 
 test.describe("Peer screen-share HiDPI resolution (issues #2179, #2343)", () => {
@@ -542,35 +556,27 @@ test.describe("Peer screen-share HiDPI resolution (issues #2179, #2343)", () => 
       // and the meter driver writes into it BY ID, so with the drawer closed there is
       // no node to read and the poll below would time out for the wrong reason.
       await openPerfDrawer(guestPage);
-      // Poll for a SETTLED readout, not merely a present one. The meter publishes an
-      // early frame where the geometry is still the raw capture and the bitrate is
-      // `0kbps` — measured: `3840x2160·10fps·0kbps` before the encoder configures,
-      // then `2560x1440·10fps·4423kbps` after. Matching on shape alone reads the
-      // transient and reports a cap failure that is really a race, so the poll
-      // requires a NON-ZERO bitrate, which only the configured encoder publishes.
-      let sendReadout = "";
-      await expect
-        .poll(
-          async () => {
-            sendReadout =
-              (await guestPage.locator("#perf-vu-screen-readout").textContent())?.trim() ?? "";
-            return sendReadout;
-          },
-          { timeout: 90_000, intervals: [1000, 2000] },
-        )
-        .toMatch(/^\d+x\d+·\d+fps·[1-9]\d*kbps/);
-
-      const sendDims = sendReadout.match(/^(\d+)x(\d+)·/);
-      expect(sendDims, `send readout had no {w}x{h} prefix: "${sendReadout}"`).not.toBeNull();
+      const readSendReadout = async () =>
+        (
+          await guestPage.locator("#perf-vu-screen-readout").textContent({ timeout: 5_000 })
+        )?.trim() ?? "";
+      const sendReadout = await pollUntil(
+        readSendReadout,
+        (text) => {
+          const m = text.match(/^(\d+)x\d+·\d+fps·[1-9]\d*kbps/);
+          return m !== null && Number(m[1]) < OVERSIZE_WIDTH;
+        },
+        90_000,
+        1_000,
+      );
+      const sendDims = sendReadout.match(/^(\d+)x(\d+)·\d+fps·[1-9]\d*kbps/);
+      expect(sendDims, `send readout never settled: "${sendReadout}"`).not.toBeNull();
       expect(
         Number(sendDims![1]),
-        `the sender configured a ${sendDims![1]}px-wide encode for a ${OVERSIZE_WIDTH}px ` +
-          `capture — the encode ceiling did not bite. Readout: "${sendReadout}"`,
+        `the sender's encode stayed ${sendDims![1]}px wide for a ${OVERSIZE_WIDTH}px ` +
+          `capture — the encode ceiling did not bite. Last readout: "${sendReadout}"`,
       ).toBeLessThan(OVERSIZE_WIDTH);
 
-      // Poll the viewer. `settleAtWidth` is the source width, which this share can
-      // never reach — so this deliberately runs the full window and reports the
-      // high-water mark rather than exiting early on a partial frame.
       const decoded = await maxDecodedScreenWidth(hostPage, 60_000, OVERSIZE_WIDTH);
 
       expect(

@@ -7,8 +7,14 @@
 //! scrubbing). This module just exposes two helpers so Rust code can call
 //! `setContext` and `flush` on `window.__consoleLogCollector`.
 
+use std::cell::RefCell;
+
 use videocall_client::capability::{run_capability_benchmark_now, DEFAULT_BUDGET_MS};
 use wasm_bindgen::prelude::*;
+
+thread_local! {
+    static CONTEXT_MEETING: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// Attach the per-page capability score (Phase 8a / TELEM-2) to the JS
 /// preamble before forwarding the rest of the context. Running the
@@ -66,5 +72,32 @@ pub fn set_console_log_context(meeting_id: &str, user_id: &str, display_name: &s
     } else {
         score as u32
     };
+    CONTEXT_MEETING.with(|m| *m.borrow_mut() = Some(meeting_id.to_string()));
     set_console_log_context_with_capability(meeting_id, user_id, display_name, score_u32);
+}
+
+fn token_applies_to_context(meeting_id: &str) -> bool {
+    CONTEXT_MEETING.with(|m| m.borrow().as_deref().is_none_or(|cur| cur == meeting_id))
+}
+
+/// [`set_console_log_auth_token`] for a token refreshed for `meeting_id`;
+/// ignored once the collector's context is another meeting.
+pub fn set_console_log_auth_token_for(meeting_id: &str, token: &str) {
+    if token_applies_to_context(meeting_id) {
+        set_console_log_auth_token(token);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refreshed_token_applies_only_to_the_context_meeting() {
+        CONTEXT_MEETING.with(|m| *m.borrow_mut() = None);
+        assert!(token_applies_to_context("meeting-a"));
+        CONTEXT_MEETING.with(|m| *m.borrow_mut() = Some("meeting-b".to_string()));
+        assert!(token_applies_to_context("meeting-b"));
+        assert!(!token_applies_to_context("meeting-a"));
+    }
 }

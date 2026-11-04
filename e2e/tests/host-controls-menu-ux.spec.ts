@@ -61,12 +61,6 @@ async function joinMeetingFromPage(page: Page): Promise<void> {
   await expect(grid).toBeVisible({ timeout: 15_000 });
 }
 
-/**
- * Open the peer-list sidebar by clicking the "Open Peers" video-controls
- * button. The button is gated by the auto-hide behaviour of
- * `.controls-secondary` (collapses after 1s of mouse-inactivity), so we wake
- * the controls bar by hovering and moving the mouse before clicking.
- */
 async function openPeerListSidebar(page: Page): Promise<void> {
   await page.locator(".video-controls-container").hover();
   await wakeControls(page);

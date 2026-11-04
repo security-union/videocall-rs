@@ -1,12 +1,25 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { test, expect, chromium, Browser, Locator, Page } from "@playwright/test";
+import { enterCustomizeMode } from "../helpers/action-bar-customize";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
-import { joinMeetingFromPage } from "../helpers/two-user-meeting";
+import {
+  enterMeetingAsHost,
+  guestJoinsMeeting,
+  joinMeetingFromPage,
+} from "../helpers/two-user-meeting";
+import { setTransportBadgeFlag } from "../helpers/transport-badge-config";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { setShowBuildGitInfoFlag } from "../helpers/show-build-git-info-config";
 import { openPeerList } from "../helpers/controls";
+import {
+  MEETING_FOOTER_LINE,
+  MEETING_FOOTER_TRIGGER,
+  MEETING_FOOTER_VERSION,
+  clickMeetingInfoTriggerAt,
+} from "../helpers/meeting-footer";
 import { MEETING_FOOTER } from "../helpers/rust-mirrored-constants";
 import {
   CHANGELOG_JSON_REPLY,
@@ -18,22 +31,30 @@ import {
 /**
  * The in-call meeting footer and its "Meeting info" dialog (issue 2791).
  *
- * The footer is the last child of the in-call `#main-container`: one
- * `#meeting-footer-trigger` button over an aria-hidden line. The dialog renders
- * outside `#main-container`, so neither the background light-dismiss nor the
- * Escape chain there sees its events. Only the open -> Escape -> focus-return
- * core is `@bvt1`; the rest runs under `--project=dioxus`.
+ * The footer is the last child of the in-call `#main-container`: an empty
+ * `#meeting-footer-trigger` button under a sibling line whose one clickable
+ * part is the participant count, which toggles the peer list (issue 3122). The
+ * dialog renders outside `#main-container`, so neither the background
+ * light-dismiss nor the Escape chain there sees its events. The Meeting info
+ * core and the participant count's click, keyboard and both narrow-window tests
+ * are `@bvt1`; the rest runs under `--project=dioxus`.
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
 const DESKTOP = { width: 1280, height: 720 };
 const SHORT_LAPTOP = { width: 1366, height: 650 };
+// Wide enough for the count's 400px tier, narrow enough that a 300px peer list
+// pushes the footer under it.
+const NARROW = { width: 640, height: 720 };
 const EPS = 1;
 const FOOTER_H = MEETING_FOOTER.MEETING_FOOTER_RESERVE;
 
 const FOOTER = '[data-testid="meeting-footer"]';
-const TRIGGER_ID = "meeting-footer-trigger";
-const TRIGGER = `#${TRIGGER_ID}`;
+const TRIGGER = MEETING_FOOTER_TRIGGER;
+const TRIGGER_ID = TRIGGER.slice(1);
+const COUNT_ID = "meeting-footer-participants-trigger";
+const COUNT = `${MEETING_FOOTER_LINE} > .meeting-footer-group--meeting > button#${COUNT_ID}`;
+const FOOTER_MEETING_ID = `${MEETING_FOOTER_LINE} > .meeting-footer-group--meeting > [data-testid="meeting-footer-meeting-id"]`;
 const DIALOG = "#meeting-info-dialog";
 const BACKDROP_TESTID = "meeting-info-dialog-backdrop";
 const BACKDROP = `[data-testid="${BACKDROP_TESTID}"]`;
@@ -47,7 +68,41 @@ const GRID = "#grid-container";
 // own `display: contents` slot since #2866.
 const GRID_TILES = "#grid-container > .ss-peer-panel > .tile-slot > .grid-item";
 const PEER_LIST = "#peer-list-container";
+const PEER_LIST_CLOSE = `${PEER_LIST} > div > .sidebar-header > .header-actions > button.close-button`;
+const CUSTOMIZING = "nav.video-controls-container.customize-mode";
+const CUSTOMIZE_BACKDROP = ".controls > .customize-backdrop";
+const PEER_LIST_TRIGGER_ID = "peer-list-trigger";
+const PEER_LIST_TRIGGER = `.action-bar-slot-wrapper[data-slot="participants"] button#${PEER_LIST_TRIGGER_ID}`;
+const FOCUS_OFF_HIDDEN_COUNT =
+  /^(button#peer-list-trigger|button#overflow-menu-trigger|div#grid-container)$/;
+// `vc_action_bar_layout`, v2 (`action_bar_layout.rs::StoredLayoutV2`).
+const PARTICIPANTS_FIRST_LAYOUT = {
+  v: 2,
+  slots: [
+    "mic",
+    "camera",
+    "participants",
+    "reactions",
+    "raise_hand",
+    "chat",
+    "screen",
+    "density",
+    "diagnostics",
+    "settings",
+    "recording",
+    "meeting_options",
+    "meeting_timer",
+  ],
+  hidden: [],
+};
 const TIMER_RE = /^\d{2}:\d{2}(:\d{2})?$/;
+const FOOTER_TIMER = `${FOOTER} [data-testid="meeting-footer-timer"]`;
+const pinTransport = (pref: "webtransport" | "websocket") => ({
+  vc_transport_preference: pref,
+  vc_transport_sticky: "true",
+});
+const selfTransportBadge = (name: "WebTransport" | "WebSocket") =>
+  `.transport-badge[aria-label="Your connection transport: ${name}"]`;
 const WHATS_NEW_TOGGLE =
   'section[aria-labelledby="meeting-info-section-app"] > .changelog > [data-testid="changelog-toggle"]';
 const WHATS_NEW_PANEL_ID = "meeting-info-changelog-panel";
@@ -258,6 +313,12 @@ async function expectFooter(page: Page): Promise<Locator> {
   return footer;
 }
 
+async function timerSeconds(timer: Locator): Promise<number> {
+  const text = ((await timer.textContent()) ?? "").trim();
+  expect(text, "the footer timer must show an elapsed time").toMatch(TIMER_RE);
+  return text.split(":").reduce((total, part) => total * 60 + Number(part), 0);
+}
+
 async function wakeBar(page: Page): Promise<void> {
   await page.mouse.move(Math.floor(DESKTOP.width / 2), Math.floor(DESKTOP.height / 2));
   await page.waitForTimeout(300);
@@ -299,7 +360,7 @@ async function holdDock(page: Page): Promise<Rect> {
 }
 
 async function openDialog(page: Page): Promise<Locator> {
-  await page.locator(TRIGGER).click({ timeout: 10_000 });
+  await clickMeetingInfoTriggerAt(page);
   const dialog = page.locator(DIALOG);
   await expect(dialog).toBeVisible({ timeout: 5_000 });
   return dialog;
@@ -315,6 +376,47 @@ async function expectDialogClosedWithFocusOnTrigger(page: Page, how: string): Pr
       message: `${how} must return focus to #${TRIGGER_ID}`,
     })
     .toBe(TRIGGER_ID);
+}
+
+async function focusedElement(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const el = document.activeElement;
+    const hidden = el && !el.checkVisibility() ? ":hidden" : "";
+    return `${el?.tagName.toLowerCase()}#${el?.id}${hidden}`;
+  });
+}
+
+/** Opens the peer list from the focused footer count, which the drawer then hides. */
+async function openFromHiddenCount(page: Page): Promise<Locator> {
+  await expectFooter(page);
+  const count = page.locator(COUNT);
+  await expect(count, "premise: the count is shown before the panel opens").toBeVisible({
+    timeout: 10_000,
+  });
+  const peerList = page.locator(PEER_LIST);
+  await expect(peerList).toHaveCount(1);
+
+  await count.focus();
+  await expect(count).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(peerList).toHaveClass(/\bvisible\b/, { timeout: 5_000 });
+  await expect(count, "premise: the open panel squeezes the count out").toBeHidden({
+    timeout: 5_000,
+  });
+  return peerList;
+}
+
+async function expectFocusSettlesOnShownControl(page: Page): Promise<void> {
+  await expect
+    .poll(() => focusedElement(page), {
+      timeout: 5_000,
+      message: "focus must leave the hidden count for a shown action-bar control or the grid",
+    })
+    .toMatch(FOCUS_OFF_HIDDEN_COUNT);
+  await page.waitForTimeout(500); // window for a later render to drop it
+  expect(await focusedElement(page), "focus must stay on a shown control").toMatch(
+    FOCUS_OFF_HIDDEN_COUNT,
+  );
 }
 
 test.describe("In-call meeting footer and Meeting info dialog (issue 2791)", () => {
@@ -497,6 +599,92 @@ test.describe("In-call meeting footer and Meeting info dialog (issue 2791)", () 
       );
       await expect(row("commit"), "showBuildGitInfo is on for this context").toHaveCount(1);
       await expect(row("branch")).toHaveCount(1);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("a later joiner on the other relay does not restart the host's meeting timer (issue 3061)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const host = await newMeetingPage(browser, uiURL, "FooterWtHost", {
+        storage: pinTransport("webtransport"),
+      });
+      const guest = await newMeetingPage(browser, uiURL, "FooterWsGuest", {
+        storage: pinTransport("websocket"),
+      });
+      for (const page of [host, guest]) {
+        await setTransportBadgeFlag(page.context());
+        await enableDiagnosticsTileIndicators(page.context());
+      }
+      const meetingId = `e2e_footer_relays_${Date.now()}`;
+
+      await enterMeetingAsHost(host, meetingId, "FooterWtHost");
+      await expect(
+        host.locator(selfTransportBadge("WebTransport")),
+        "the host must have ELECTED WebTransport, not merely preferred it",
+      ).toHaveCount(1, { timeout: 30_000 });
+      const timer = host.locator(FOOTER_TIMER);
+      await expect(timer).toHaveText(TIMER_RE, { timeout: 30_000 });
+
+      await host.waitForTimeout(10_000);
+      const before = await timerSeconds(timer);
+      const beforeAt = Date.now();
+      expect(before, "premise: the host's meeting has run for the gap").toBeGreaterThanOrEqual(10);
+
+      await guestJoinsMeeting(host, guest, meetingId, "FooterWsGuest");
+      await expect(
+        guest.locator(selfTransportBadge("WebSocket")),
+        "the guest must have ELECTED WebSocket, so it is first on the other relay",
+      ).toHaveCount(1, { timeout: 30_000 });
+      await host.waitForTimeout(5_000);
+
+      const after = await timerSeconds(timer);
+      const wallSeconds = Math.floor((Date.now() - beforeAt) / 1000);
+      expect(
+        after,
+        `the host's timer read ${before}s before the guest joined and ${after}s ` +
+          `${wallSeconds}s later; it must not restart at the guest's join`,
+      ).toBeGreaterThanOrEqual(before + wallSeconds - 2);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("a late joiner's timer counts from the meeting's start, not their own join (issue 3237)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const host = await newMeetingPage(browser, uiURL, "FooterStartHost");
+      const guest = await newMeetingPage(browser, uiURL, "FooterLateGuest");
+      const meetingId = `e2e_footer_late_${Date.now()}`;
+
+      await enterMeetingAsHost(host, meetingId, "FooterStartHost");
+      await expect(host.locator(FOOTER_TIMER)).toHaveText(TIMER_RE, { timeout: 30_000 });
+      await host.waitForTimeout(15_000);
+
+      await guestJoinsMeeting(host, guest, meetingId, "FooterLateGuest");
+      const guestTimer = guest.locator(FOOTER_TIMER);
+      await expect(guestTimer).toHaveText(TIMER_RE, { timeout: 30_000 });
+      const guestSeconds = await timerSeconds(guestTimer);
+      const hostSeconds = await timerSeconds(host.locator(FOOTER_TIMER));
+      expect(
+        Math.abs(hostSeconds - guestSeconds),
+        `host timer ${hostSeconds}s and late guest timer ${guestSeconds}s must agree: both count from the meeting's start`,
+      ).toBeLessThanOrEqual(3);
+      expect(
+        guestSeconds,
+        `the guest joined about 15s after the host started the meeting, but its timer read ${guestSeconds}s`,
+      ).toBeGreaterThanOrEqual(12);
     } finally {
       await browser.close();
     }
@@ -743,6 +931,255 @@ test.describe("In-call meeting footer and Meeting info dialog (issue 2791)", () 
         (await clipboardWrites(page)).length,
         "with no clipboard there is nothing to write to",
       ).toBe(2);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("the participant count toggles the peer list and leaves Meeting info closed (issue 3122) @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterCount");
+      await joinSoloMeeting(page, `e2e_footer_count_${Date.now()}`, "FooterCount");
+      await expectFooter(page);
+
+      const count = page.locator(COUNT);
+      await expect(count).toBeVisible({ timeout: 10_000 });
+      await expect(count).toHaveAccessibleName("1 participant");
+      await expect(count).toHaveAttribute("aria-controls", PEER_LIST.slice(1));
+      await expect(count).toHaveAttribute("aria-expanded", "false");
+      const peerList = page.locator(PEER_LIST);
+      await expect(peerList).toHaveCount(1);
+      await expect(peerList).not.toHaveClass(/\bvisible\b/);
+
+      await count.click({ timeout: 10_000 });
+      await expect(peerList, "the count opens the peer list").toHaveClass(/\bvisible\b/, {
+        timeout: 5_000,
+      });
+      await expect(count).toHaveAttribute("aria-expanded", "true");
+      await expect(page.locator(DIALOG), "the count must not open Meeting info").toHaveCount(0);
+
+      await count.click({ timeout: 10_000 });
+      await expect(peerList, "a second click closes it").not.toHaveClass(/\bvisible\b/, {
+        timeout: 5_000,
+      });
+      await expect(count).toHaveAttribute("aria-expanded", "false");
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("clicks on the footer line beside the participant count still open Meeting info (issue 3122)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterAreas");
+      await joinSoloMeeting(page, `e2e_footer_areas_${Date.now()}`, "FooterAreas");
+      await expectFooter(page);
+      const count = page.locator(COUNT);
+      await expect(count).toBeVisible({ timeout: 10_000 });
+      const peerList = page.locator(PEER_LIST);
+      await expect(peerList).toHaveCount(1);
+
+      for (const [label, what] of [
+        [FOOTER_MEETING_ID, "the meeting ID"],
+        [MEETING_FOOTER_VERSION, "the version"],
+      ] as const) {
+        await clickMeetingInfoTriggerAt(page, label);
+        await expect(page.locator(DIALOG), `a click on ${what} opens Meeting info`).toBeVisible({
+          timeout: 5_000,
+        });
+        await expect(peerList, `a click on ${what} must not open the peer list`).not.toHaveClass(
+          /\bvisible\b/,
+        );
+        await expect(count).toHaveAttribute("aria-expanded", "false");
+        await page.keyboard.press("Escape");
+        await expectDialogClosedWithFocusOnTrigger(page, `Escape after a click on ${what}`);
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("the participant count opens the peer list from the keyboard and Escape hands focus back to it (issue 3122) @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterCountKeys");
+      await joinSoloMeeting(page, `e2e_footer_count_keys_${Date.now()}`, "FooterCountKeys");
+      await expectFooter(page);
+      const count = page.locator(COUNT);
+      await expect(count).toBeVisible({ timeout: 10_000 });
+      const peerList = page.locator(PEER_LIST);
+      await expect(peerList).toHaveCount(1);
+
+      await page.locator(TRIGGER).focus();
+      await page.keyboard.press("Tab");
+      await expect(count, "the count is the tab stop after Meeting info").toBeFocused();
+      await page.keyboard.press("Enter");
+      await expect(peerList).toHaveClass(/\bvisible\b/, { timeout: 5_000 });
+      await expect(count).toHaveAttribute("aria-expanded", "true");
+      await expect(page.locator(DIALOG)).toHaveCount(0);
+      await expect(count, "the count is still shown, so it keeps focus").toBeFocused();
+
+      // From inside the drawer, so the focus return is Escape's doing.
+      const close = page.locator(PEER_LIST_CLOSE);
+      await close.focus();
+      await expect(close).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(peerList).not.toHaveClass(/\bvisible\b/, { timeout: 5_000 });
+      await expect
+        .poll(() => page.evaluate(() => document.activeElement?.id), {
+          timeout: 5_000,
+          message: "Escape must return focus to the count that opened the panel",
+        })
+        .toBe(COUNT_ID);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("on a narrow window the participant count hides under its own peer list without dropping focus (issue 3122) @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterCountNarrow");
+      await page.setViewportSize(NARROW);
+      await joinSoloMeeting(page, `e2e_footer_count_narrow_${Date.now()}`, "FooterCountNarrow");
+      const peerList = await openFromHiddenCount(page);
+      await expectFocusSettlesOnShownControl(page);
+
+      const close = page.locator(PEER_LIST_CLOSE);
+      await close.focus();
+      await expect(close).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(peerList).not.toHaveClass(/\bvisible\b/, { timeout: 5_000 });
+      await expect(page.locator(COUNT), "closing the panel widens the footer again").toBeVisible();
+      await expect
+        .poll(() => focusedElement(page), {
+          timeout: 5_000,
+          message: "Escape from the unmounting drawer must return focus to the reappeared count",
+        })
+        .toBe(`button#${COUNT_ID}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("on a narrow window a participant count open settles focus after the action bar hides its Participants button (issue 3122) @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      // Participants first among the secondary slots, so it fits the bar until
+      // the drawer narrows it.
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterCountBar", {
+        storage: { vc_action_bar_layout: JSON.stringify(PARTICIPANTS_FIRST_LAYOUT) },
+      });
+      await page.setViewportSize(NARROW);
+      await joinSoloMeeting(page, `e2e_footer_count_bar_${Date.now()}`, "FooterCountBar");
+      const barTrigger = page.locator(PEER_LIST_TRIGGER);
+      await expect(barTrigger, "premise: Participants fits the bar before the open").toBeVisible({
+        timeout: 10_000,
+      });
+
+      await openFromHiddenCount(page);
+      await expect(barTrigger, "premise: the open drawer pushes it into the overflow").toBeHidden({
+        timeout: 5_000,
+      });
+      await expectFocusSettlesOnShownControl(page);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("the participant count does nothing while the action bar is being customized (issue 3122)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "FooterCountCustomize");
+      await joinSoloMeeting(
+        page,
+        `e2e_footer_count_customize_${Date.now()}`,
+        "FooterCountCustomize",
+      );
+      await expectFooter(page);
+      const count = page.locator(COUNT);
+      await expect(count).toBeVisible({ timeout: 10_000 });
+      const peerList = page.locator(PEER_LIST);
+      await expect(peerList).toHaveCount(1);
+      await expect(peerList).not.toHaveClass(/\bvisible\b/);
+
+      await enterCustomizeMode(page);
+      await expect(page.locator(CUSTOMIZING), "premise: customize mode is on").toBeVisible();
+      await expect(page.locator(CUSTOMIZE_BACKDROP)).toHaveCount(1);
+
+      // The backdrop over the footer is `pointer-events: none`, so this is a
+      // real hit on the count, not a forced one.
+      await count.click({ timeout: 10_000 });
+      await page.waitForTimeout(500); // window for an unwanted open to render
+      await expect(peerList, "the count must not open the peer list").not.toHaveClass(
+        /\bvisible\b/,
+      );
+      await expect(count).toHaveAttribute("aria-expanded", "false");
+      await expect(
+        page.locator(CUSTOMIZING),
+        "the click must not end customize mode",
+      ).toBeVisible();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("Escape from inside a peer list opened from the action bar returns focus to its trigger (issue 3122)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newMeetingPage(browser, baseURL || DEFAULT_UI_URL, "BarListEscape");
+      await joinSoloMeeting(page, `e2e_bar_list_escape_${Date.now()}`, "BarListEscape");
+      const peerList = page.locator(PEER_LIST);
+      await expect(peerList).toHaveCount(1);
+      await wakeBar(page);
+      const barTrigger = page.locator(PEER_LIST_TRIGGER);
+      await expect(barTrigger, "premise: Participants is a direct bar slot here").toBeVisible({
+        timeout: 10_000,
+      });
+
+      await barTrigger.click({ timeout: 10_000 });
+      await expect(peerList).toHaveClass(/\bvisible\b/, { timeout: 5_000 });
+
+      const close = page.locator(PEER_LIST_CLOSE);
+      await close.focus();
+      await expect(close).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(peerList).not.toHaveClass(/\bvisible\b/, { timeout: 5_000 });
+      await expect
+        .poll(() => page.evaluate(() => document.activeElement?.id), {
+          timeout: 5_000,
+          message: "Escape from the unmounting drawer must return focus to the bar trigger",
+        })
+        .toBe(PEER_LIST_TRIGGER_ID);
     } finally {
       await browser.close();
     }

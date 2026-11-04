@@ -1,7 +1,7 @@
 // Copyright 2025 Security Union LLC
 // Licensed under MIT OR Apache-2.0
 //
-// Component rendering tests for DeviceSelector and DeviceSettingsModal (Dioxus).
+// Component rendering tests for DeviceSelector, DeviceSettingsModal and Host's device settings (Dioxus).
 //
 // Uses constructed mock MediaDeviceInfo objects so we can control the exact
 // device count, labels, and IDs.
@@ -10,15 +10,25 @@
 
 mod support;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use support::{
-    cleanup, create_mount_point, mock_camera, mock_mic, mock_speaker, render_into, yield_now,
+    cleanup, create_mount_point, mock_camera, mock_mic, mock_speaker, render_into,
+    wait_for_selector, yield_now,
 };
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::*;
 
 use dioxus::prelude::*;
+use dioxus_ui::components::attendants::PreAcquiredScreenStream;
 use dioxus_ui::components::device_selector::DeviceSelector;
 use dioxus_ui::components::device_settings_modal::DeviceSettingsModal;
+use dioxus_ui::components::host::Host;
+use dioxus_ui::components::share_actions::ScreenReplacementCell;
+use dioxus_ui::context::{TransportPreference, TransportPreferenceCtx};
+use videocall_client::VideoCallClient;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -592,8 +602,8 @@ async fn device_settings_modal_renders_expected_navigation_tabs() {
     let nav_buttons = mount.query_selector_all(".settings-nav-button").unwrap();
     assert_eq!(
         nav_buttons.length(),
-        5,
-        "should render exactly five nav buttons (Audio, Video, Network, Appearance, Preferences)"
+        6,
+        "should render exactly six nav buttons (Audio, Video, Network, Appearance, Preferences, Profile)"
     );
 
     let text = mount.text_content().unwrap_or_default();
@@ -610,7 +620,16 @@ async fn device_settings_modal_renders_expected_navigation_tabs() {
         "should not render a Performance nav or any performance affordance (panel moved to the Diagnostics drawer, #1131)"
     );
     assert!(!text.contains("Devices"), "should not render Devices nav");
-    assert!(!text.contains("Profile"), "should not render Profile nav");
+    assert!(text.contains("Profile"), "should render Profile nav");
+    let last = nav_buttons
+        .item(nav_buttons.length() - 1)
+        .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| el.get_attribute("data-testid"));
+    assert_eq!(
+        last.as_deref(),
+        Some("settings-nav-profile"),
+        "Profile is the last tab"
+    );
     assert!(!text.contains("Advanced"), "should not render Advanced nav");
 
     // The Performance tab was removed in #1131: the simulcast layer-bounds panel
@@ -624,4 +643,153 @@ async fn device_settings_modal_renders_expected_navigation_tabs() {
         "Performance nav button must NOT exist (moved to the Diagnostics drawer, #1131)"
     );
     cleanup(&mount);
+}
+
+const PREF_KEYS: [&str; 3] = [
+    "vc_prejoin_camera_id",
+    "vc_prejoin_mic_id",
+    "vc_prejoin_speaker_id",
+];
+
+fn storage() -> web_sys::Storage {
+    web_sys::window().unwrap().local_storage().unwrap().unwrap()
+}
+
+fn js(source: &str) {
+    js_sys::Function::new_no_args(source)
+        .call0(&wasm_bindgen::JsValue::NULL)
+        .unwrap();
+}
+
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
+            .unwrap();
+    });
+    JsFuture::from(promise).await.unwrap();
+}
+
+#[allow(non_snake_case)]
+fn HostWithSettings() -> Element {
+    let client = use_hook(|| VideoCallClient::new_for_test("local-user"));
+    use_context_provider(|| client.clone());
+    let transport = use_signal(|| TransportPreference::WebTransport);
+    use_context_provider(|| TransportPreferenceCtx(transport));
+    use_context_provider(|| -> PreAcquiredScreenStream { Rc::new(RefCell::new(None)) });
+    use_context_provider(ScreenReplacementCell::default);
+    let mut mounted = use_signal(|| true);
+    let mut settings_open = use_signal(|| false);
+    rsx! {
+        button { "data-testid": "open-settings", onclick: move |_| settings_open.set(true) }
+        button { "data-testid": "unmount-host", onclick: move |_| mounted.set(false) }
+        if mounted() {
+            Host {
+                share_screen: false,
+                mic_enabled: false,
+                video_enabled: false,
+                on_encoder_settings_update: move |_| {},
+                device_settings_open: settings_open(),
+                on_device_settings_toggle: move |_| {},
+                on_edit_avatar: move |_| {},
+                device_settings_initial_section: Some("video".to_string()),
+                on_screen_share_state: move |_| {},
+                reload_devices_counter: 0,
+                self_hidden: true,
+                in_call: true,
+            }
+        }
+    }
+}
+
+fn shown_label(mount: &web_sys::Element, select_id: &str) -> String {
+    mount
+        .query_selector(&format!("#{select_id} .glass-select-label"))
+        .unwrap()
+        .unwrap_or_else(|| panic!("#{select_id} should be rendered"))
+        .text_content()
+        .unwrap_or_default()
+}
+
+async fn click(mount: &web_sys::Element, selector: &str) {
+    mount
+        .query_selector(selector)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{selector} should be rendered"))
+        .dyn_into::<web_sys::HtmlElement>()
+        .unwrap()
+        .click();
+    yield_now().await;
+}
+
+async fn pick(mount: &web_sys::Element, select_id: &str, label: &str) -> String {
+    click(mount, &format!("#{select_id}")).await;
+    let options = mount.query_selector_all(".glass-select-option").unwrap();
+    let option = (0..options.length())
+        .filter_map(|i| options.item(i))
+        .find(|o| o.text_content().as_deref() == Some(label))
+        .unwrap_or_else(|| panic!("{select_id} has no option {label}"));
+    option.dyn_into::<web_sys::HtmlElement>().unwrap().click();
+    yield_now().await;
+    sleep_ms(50).await;
+    shown_label(mount, select_id)
+}
+
+#[wasm_bindgen_test]
+async fn host_settings_show_an_in_call_device_pick_at_once() {
+    for key in PREF_KEYS {
+        let _ = storage().remove_item(key);
+    }
+    js(
+        "const d = (deviceId, kind, label) => ({ deviceId, kind, label, groupId: 'g' });
+        navigator.mediaDevices.enumerateDevices = () => Promise.resolve([
+            d('cam-a', 'videoinput', 'Camera A'), d('cam-b', 'videoinput', 'Camera B'),
+            d('mic-a', 'audioinput', 'Mic A'), d('mic-b', 'audioinput', 'Mic B'),
+            d('spk-a', 'audiooutput', 'Speaker A'), d('spk-b', 'audiooutput', 'Speaker B'),
+        ]);",
+    );
+    let mount = create_mount_point();
+    render_into(&mount, HostWithSettings);
+    yield_now().await;
+    let mut waited = 0;
+    while storage().get_item(PREF_KEYS[0]).unwrap().is_none() && waited < 2000 {
+        sleep_ms(50).await;
+        waited += 50;
+    }
+
+    click(&mount, "[data-testid='open-settings']").await;
+    assert!(wait_for_selector(&mount, "#modal-video-select", 2000).await);
+    assert_eq!(shown_label(&mount, "modal-video-select"), "Camera A");
+
+    let camera = pick(&mount, "modal-video-select", "Camera B").await;
+    click(&mount, "[data-testid='settings-nav-audio']").await;
+    let microphone = pick(&mount, "modal-audio-select", "Mic B").await;
+    let speaker = pick(&mount, "modal-speaker-select", "Speaker B").await;
+
+    let stored: Vec<Option<String>> = PREF_KEYS
+        .iter()
+        .map(|key| storage().get_item(key).unwrap())
+        .collect();
+    assert_eq!(
+        stored,
+        [
+            Some("cam-b".to_string()),
+            Some("mic-b".to_string()),
+            Some("spk-b".to_string()),
+        ],
+        "the picks did not reach Host"
+    );
+    assert_eq!(
+        [camera, microphone, speaker],
+        ["Camera B", "Mic B", "Speaker B"],
+        "Settings kept showing the previous device"
+    );
+
+    click(&mount, "[data-testid='unmount-host']").await;
+    cleanup(&mount);
+    js("delete navigator.mediaDevices.enumerateDevices;");
+    for key in PREF_KEYS {
+        let _ = storage().remove_item(key);
+    }
 }

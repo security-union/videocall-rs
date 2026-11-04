@@ -16,19 +16,21 @@
  * conditions.
  */
 
-mod bridge;
+pub(crate) mod bridge;
 mod cert_preflight;
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::priority_drop::SharedQueueByteMeter;
+use crate::actors::session_logic::{parse_conn_seq, CONN_SEQ_QUERY_PARAM};
 use crate::actors::shed_escalation::DownlinkShedEscalation;
 use crate::actors::transports::wt_chat_session::{
     WtChatSession, WtOutboundFrame, WT_HEARTBEAT_INTERVAL,
 };
 use crate::constants::{
-    wt_audio_downlink_lane, AudioDownlinkLane, WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES,
-    WT_QUIC_KEEP_ALIVE_DEFAULT_SECS, WT_QUIC_MAX_IDLE_TIMEOUT_DEFAULT_SECS,
-    WT_QUIC_SEND_WINDOW_BYTES, WT_QUIC_UDP_BUFFER_DEFAULT_BYTES,
+    wt_audio_downlink_lane, AudioDownlinkLane, WT_AUDIO_SEND_RESERVE_DEFAULT_BYTES,
+    WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES, WT_QUIC_KEEP_ALIVE_DEFAULT_SECS,
+    WT_QUIC_MAX_IDLE_TIMEOUT_DEFAULT_SECS, WT_QUIC_SEND_WINDOW_BYTES,
+    WT_QUIC_UDP_BUFFER_DEFAULT_BYTES,
 };
 use crate::metrics::{
     duration_to_millis_f64, forget_connection_path_stats, publish_connection_path_stats,
@@ -81,6 +83,37 @@ fn quic_override_usize(var: &str, default: usize) -> usize {
     usize::try_from(resolved).unwrap_or(default)
 }
 
+/// `0` turns the reserve off; `max` is the send window. Returns the bytes and every warning to log.
+pub(crate) fn resolve_audio_send_reserve(
+    raw: Option<&str>,
+    default: u64,
+    max: u64,
+) -> (u64, Vec<String>) {
+    let mut warnings = Vec::new();
+    let (wanted, from_env) = match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => (default, false),
+        Some(text) => match text.parse::<u64>() {
+            Ok(value) => (value, true),
+            Err(_) => {
+                warnings.push(format!(
+                    "WT_AUDIO_SEND_RESERVE_BYTES={text:?} is not an integer; using {default}"
+                ));
+                (default, false)
+            }
+        },
+    };
+    if wanted > max {
+        warnings.push(if from_env {
+            format!(
+                "WT_AUDIO_SEND_RESERVE_BYTES={wanted} exceeds the {max}B send window; using {max}"
+            )
+        } else {
+            format!("QUIC_SEND_WINDOW_BYTES={max} is below the {wanted}B default audio send reserve; using {max}")
+        });
+    }
+    (wanted.min(max), warnings)
+}
+
 lazy_static::lazy_static! {
     static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 =
         quic_override_u64("QUIC_MAX_IDLE_TIMEOUT_SECS", WT_QUIC_MAX_IDLE_TIMEOUT_DEFAULT_SECS);
@@ -99,6 +132,18 @@ lazy_static::lazy_static! {
 
     static ref QUIC_SEND_WINDOW_BYTES: u64 =
         quic_override_u64("QUIC_SEND_WINDOW_BYTES", WT_QUIC_SEND_WINDOW_BYTES);
+
+    pub(crate) static ref WT_AUDIO_SEND_RESERVE_BYTES: u64 = {
+        let (bytes, warnings) = resolve_audio_send_reserve(
+            std::env::var("WT_AUDIO_SEND_RESERVE_BYTES").ok().as_deref(),
+            WT_AUDIO_SEND_RESERVE_DEFAULT_BYTES,
+            *QUIC_SEND_WINDOW_BYTES,
+        );
+        for warning in warnings {
+            warn!("{warning}");
+        }
+        bytes
+    };
 
     static ref QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = quic_override_usize(
         "QUIC_DATAGRAM_SEND_BUFFER_BYTES",
@@ -210,6 +255,87 @@ impl CongestionController {
     }
 }
 
+/// `WT_QUIC_MTU_MAX`: the largest UDP payload the relay sends, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuicMtuMax {
+    Default,
+    Fixed,
+    UpperBound(u16),
+}
+
+impl QuicMtuMax {
+    const FLOOR: u16 = 1200;
+    const CEILING: u16 = 1452;
+    // FLOOR + quinn's default MtuDiscoveryConfig::minimum_change (20): a smaller upper_bound is never probed.
+    const MIN_PROBED_BOUND: u16 = 1220;
+
+    pub(crate) fn resolve(raw: Option<&str>) -> (Self, Vec<String>) {
+        let raw = match raw.map(str::trim) {
+            None | Some("") => return (Self::Default, Vec::new()),
+            Some(raw) => raw,
+        };
+        match raw.parse::<u16>() {
+            Ok(Self::FLOOR) => (Self::Fixed, Vec::new()),
+            Ok(n) if (Self::FLOOR..Self::MIN_PROBED_BOUND).contains(&n) => (
+                Self::Fixed,
+                vec![format!(
+                    "WT_QUIC_MTU_MAX={n}: quinn's MTU discovery never probes a bound \
+                     below {}; using {} with discovery off",
+                    Self::MIN_PROBED_BOUND,
+                    Self::FLOOR
+                )],
+            ),
+            Ok(n) if (Self::MIN_PROBED_BOUND..=Self::CEILING).contains(&n) => {
+                (Self::UpperBound(n), Vec::new())
+            }
+            _ => (
+                Self::Default,
+                vec![format!(
+                    "WT_QUIC_MTU_MAX={raw:?} is not an integer in {}..={}; \
+                     using quinn's default",
+                    Self::FLOOR,
+                    Self::CEILING
+                )],
+            ),
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Default => "max=default discovery=default".to_string(),
+            Self::Fixed => format!("max={} discovery=off", Self::FLOOR),
+            Self::UpperBound(n) => format!("max={n} discovery=upper_bound={n}"),
+        }
+    }
+
+    fn apply(self, transport_config: &mut quinn::TransportConfig) {
+        match self {
+            Self::Default => {}
+            Self::Fixed => {
+                transport_config.mtu_discovery_config(None);
+            }
+            Self::UpperBound(n) => {
+                let mut discovery = quinn::MtuDiscoveryConfig::default();
+                discovery.upper_bound(n);
+                transport_config.mtu_discovery_config(Some(discovery));
+            }
+        }
+    }
+}
+
+fn quic_mtu_max_from_env() -> QuicMtuMax {
+    let (mtu_max, warnings) = QuicMtuMax::resolve(std::env::var("WT_QUIC_MTU_MAX").ok().as_deref());
+    for warning in warnings {
+        warn!("{warning}");
+    }
+    mtu_max
+}
+
+fn relay_transport_config() -> Result<(quinn::TransportConfig, QuicMtuMax)> {
+    let mtu_max = quic_mtu_max_from_env();
+    Ok((build_transport_config(mtu_max)?, mtu_max))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UdpBufferSizes {
     pub(crate) requested_recv: usize,
@@ -287,7 +413,7 @@ fn granted_buffer_bytes(readback: usize, kernel_doubles: bool) -> usize {
 
 /// Build the relay's quinn [`quinn::TransportConfig`]. Extracted from `start`
 /// (#2716) so `transport_config_pins_the_2716_values` can read it back.
-fn build_transport_config() -> Result<quinn::TransportConfig> {
+fn build_transport_config(mtu_max: QuicMtuMax) -> Result<quinn::TransportConfig> {
     let mut transport_config = quinn::TransportConfig::default();
 
     // Detect disconnection after inactivity (configurable via QUIC_MAX_IDLE_TIMEOUT_SECS)
@@ -309,6 +435,7 @@ fn build_transport_config() -> Result<quinn::TransportConfig> {
     transport_config.send_window(*QUIC_SEND_WINDOW_BYTES);
 
     QUIC_CONGESTION_CONTROLLER.apply(&mut transport_config);
+    mtu_max.apply(&mut transport_config);
 
     // Pinned to quinn's current default: the bridge spawns one reader task per
     // accepted uni stream, each holding up to `MAX_FRAME_SIZE`.
@@ -425,7 +552,8 @@ pub async fn start(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto_config)?,
     ));
 
-    server_config.transport_config(std::sync::Arc::new(build_transport_config()?));
+    let (transport_config, mtu_max) = relay_transport_config()?;
+    server_config.transport_config(std::sync::Arc::new(transport_config));
 
     // #2716: `Endpoint::server` would bind on the kernel default instead.
     let (socket, udp_buffers) = bind_udp_socket(
@@ -444,19 +572,21 @@ pub async fn start(
 
     info!(
         "listening on {} with {}s idle timeout, {}s keep-alive, {} congestion \
-         control, {}B datagram send buffer, {}B send window, UDP buffers \
-         rcv {}->{} snd {}->{} (requested->effective)",
+         control, {}B datagram send buffer, {}B send window, {}B audio send \
+         reserve, UDP buffers rcv {}->{} snd {}->{} (requested->effective)",
         opt.listen,
         *QUIC_MAX_IDLE_TIMEOUT_SECS,
         *QUIC_KEEP_ALIVE_INTERVAL_SECS,
         QUIC_CONGESTION_CONTROLLER.label(),
         *QUIC_DATAGRAM_SEND_BUFFER_BYTES,
         *QUIC_SEND_WINDOW_BYTES,
+        *WT_AUDIO_SEND_RESERVE_BYTES,
         udp_buffers.requested_recv,
         udp_buffers.effective_recv,
         udp_buffers.requested_send,
         udp_buffers.effective_send,
     );
+    warn!("[WT_QUIC_MTU] {}", mtu_max.label());
 
     // #2727: the connection is placed on a session arbiter and everything it owns
     // stays there for the session's life; `ShardLease` releases the slot.
@@ -498,6 +628,7 @@ struct WtConnectIdentity {
     is_guest: bool,
     is_host: bool,
     token_iat: Option<i64>,
+    meeting_started_at_ms: Option<u64>,
 }
 
 /// Resolve who is connecting, from the JWT when one is presented and otherwise
@@ -531,6 +662,9 @@ fn resolve_wt_connect_identity(
             is_guest: claims.is_guest,
             is_host: claims.is_host,
             token_iat: claims.iat,
+            meeting_started_at_ms: claims
+                .meeting_started_at_ms
+                .and_then(|ms| u64::try_from(ms).ok()),
         });
     }
 
@@ -561,6 +695,7 @@ fn resolve_wt_connect_identity(
         is_guest: false,
         is_host: false,
         token_iat: None,
+        meeting_started_at_ms: None,
     })
 }
 
@@ -634,6 +769,44 @@ fn wt_request_log_line(url: &str) -> String {
     )
 }
 
+/// The connect URL's `?instance_id=` and `?conn_seq=`.
+#[derive(Debug)]
+struct WtReconnectHints {
+    instance_id: Option<String>,
+    conn_seq: Option<u64>,
+}
+
+/// Both hints bind reconnect handling to identity, so an unauthenticated
+/// connect gets neither.
+fn wt_reconnect_hints<K, V>(
+    query_pairs: impl IntoIterator<Item = (K, V)>,
+    authenticated: bool,
+) -> WtReconnectHints
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    if !authenticated {
+        return WtReconnectHints {
+            instance_id: None,
+            conn_seq: None,
+        };
+    }
+    let mut instance_id = None;
+    let mut conn_seq = None;
+    for (key, val) in query_pairs {
+        match key.as_ref() {
+            "instance_id" if instance_id.is_none() => instance_id = Some(val.as_ref().to_owned()),
+            CONN_SEQ_QUERY_PARAM if conn_seq.is_none() => conn_seq = Some(val.as_ref().to_owned()),
+            _ => {}
+        }
+    }
+    WtReconnectHints {
+        instance_id,
+        conn_seq: parse_conn_seq(conn_seq.as_deref()),
+    }
+}
+
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     chat_server: Addr<ChatServer>,
@@ -653,15 +826,10 @@ async fn run_webtransport_connection_from_request(
         return Err(anyhow!("Invalid path: must start with /lobby"));
     }
 
-    // Extract ?token= and ?instance_id= from query string
+    // Extract ?token= from query string
     let token = uri
         .query_pairs()
         .find(|(key, _)| key == "token")
-        .map(|(_, val)| val.into_owned());
-
-    let instance_id: Option<String> = uri
-        .query_pairs()
-        .find(|(key, _)| key == "instance_id")
         .map(|(_, val)| val.into_owned());
 
     // #2723: read BEFORE the session is accepted. Unauthenticated by design — a
@@ -681,10 +849,10 @@ async fn run_webtransport_connection_from_request(
         is_guest,
         is_host,
         token_iat,
+        meeting_started_at_ms,
     } = identity;
 
-    // `instance_id` binds reconnect adoption to identity; this path has no verified one.
-    let instance_id = if token.is_some() { instance_id } else { None };
+    let reconnect_hints = wt_reconnect_hints(uri.query_pairs(), token.is_some());
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
@@ -702,9 +870,10 @@ async fn run_webtransport_connection_from_request(
         tracker_sender,
         session_manager,
         observer,
-        instance_id,
+        reconnect_hints,
         is_host,
         token_iat,
+        meeting_started_at_ms,
         downlink_mode,
     )
     .await
@@ -811,8 +980,7 @@ async fn sample_connection_path_stats(
 
         // Read every path/frame value from ONE `stats()` snapshot so they reflect a single
         // consistent connection state. `ConnectionStats.path.rtt` is the SAME value
-        // as `Connection::rtt()` — both return `self.path.rtt.get()`
-        // (quinn-proto-0.11.13 connection/mod.rs:1269 vs :1381), the current
+        // as `Connection::rtt()` — both return `self.path.rtt.get()`, the current
         // smoothed round-trip estimate. `lost_packets` / `congestion_events` /
         // `sent_packets` are CUMULATIVE for the connection; the gauges publish the
         // running totals (chart with rate()/increase()). The field→gauge mapping
@@ -877,6 +1045,50 @@ pub(crate) fn stop_connection_path_sampler(
     forget_connection_path_stats(room, session_id);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn new_wt_chat_session(
+    chat_server: Addr<ChatServer>,
+    lobby_id: &str,
+    username: &str,
+    display_name: &str,
+    is_guest: bool,
+    unistream_tx: mpsc::Sender<WtOutboundFrame>,
+    datagram_tx: mpsc::Sender<WtOutboundFrame>,
+    unistream_bytes: Arc<SharedQueueByteMeter>,
+    nats_client: async_nats::client::Client,
+    tracker_sender: TrackerSender,
+    session_manager: SessionManager,
+    observer: bool,
+    reconnect_hints: WtReconnectHints,
+    is_host: bool,
+    token_iat: Option<i64>,
+    meeting_started_at_ms: Option<u64>,
+    audio_lane: AudioDownlinkLane,
+    escalation: DownlinkShedEscalation,
+) -> WtChatSession {
+    WtChatSession::new(
+        chat_server,
+        lobby_id.to_string(),
+        username.to_string(),
+        display_name.to_string(),
+        is_guest,
+        unistream_tx,
+        datagram_tx,
+        unistream_bytes,
+        nats_client,
+        tracker_sender,
+        session_manager,
+        observer,
+        reconnect_hints.instance_id,
+        is_host,
+        audio_lane,
+        escalation,
+    )
+    .with_token_iat(token_iat)
+    .with_conn_seq(reconnect_hints.conn_seq)
+    .with_meeting_started_at_ms(meeting_started_at_ms)
+}
+
 /// Handle a WebTransport session using the WtChatSession actor
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
@@ -894,9 +1106,10 @@ async fn handle_webtransport_session(
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
     observer: bool,
-    instance_id: Option<String>,
+    reconnect_hints: WtReconnectHints,
     is_host: bool,
     token_iat: Option<i64>,
+    meeting_started_at_ms: Option<u64>,
     downlink_mode: DownlinkStreamMode,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
@@ -924,11 +1137,11 @@ async fn handle_webtransport_session(
     let unistream_fallback_tx = unistream_tx.clone();
 
     // Start the WtChatSession actor
-    let actor = WtChatSession::new(
+    let actor = new_wt_chat_session(
         chat_server,
-        lobby_id.to_string(),
-        username.to_string(),
-        display_name.to_string(),
+        lobby_id,
+        username,
+        display_name,
         is_guest,
         unistream_tx,
         datagram_tx,
@@ -937,12 +1150,13 @@ async fn handle_webtransport_session(
         tracker_sender,
         session_manager,
         observer,
-        instance_id,
+        reconnect_hints,
         is_host,
+        token_iat,
+        meeting_started_at_ms,
         audio_lane,
         escalation.clone(),
-    )
-    .with_token_iat(token_iat);
+    );
     // Capture the canonical per-session id BEFORE `start()` consumes the actor.
     // It is the SAME id `relay_session_drops_total` uses, so the #1637 relay RTT
     // gauge joins with the per-session drop series for this connection.
@@ -950,7 +1164,7 @@ async fn handle_webtransport_session(
     let metrics_room = lobby_id.to_string();
     // #2718: same capture-before-`start()` rule as the session id above.
     let downlink_drops = actor.downlink_drop_sink();
-    let removed_by_host = actor.removed_by_host();
+    let forced_close = actor.forced_close();
 
     let actor_addr = actor.start();
 
@@ -998,11 +1212,9 @@ async fn handle_webtransport_session(
     );
     let close_cause = bridge.wait_for_disconnect().await;
     bridge.shutdown().await;
-    if removed_by_host.load(std::sync::atomic::Ordering::Acquire) {
-        session_for_close.close(
-            videocall_types::wt_close::WT_CLOSE_CODE_REMOVED_BY_HOST,
-            videocall_types::wt_close::WT_CLOSE_REASON_REMOVED_BY_HOST,
-        );
+    if let Some(reason) = forced_close.get() {
+        let (code, text) = reason.wt_close();
+        session_for_close.close(code, text);
     } else {
         session_for_close.close(0, b"");
     }
@@ -1404,6 +1616,13 @@ mod tests {
             ..Default::default()
         };
         let bytes = packet.write_to_bytes().expect("serialize wrapper");
+
+        send_packet(
+            &session_b,
+            create_test_packet(user_b, VcMediaType::HEARTBEAT, String::new()),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         println!("Sending packet from A to B (size: {} bytes)", bytes.len());
         send_packet(&session_a, bytes.clone()).await;
@@ -3155,7 +3374,7 @@ mod tests {
     fn transport_config_pins_the_2716_values() {
         let rendered = format!(
             "{:?}",
-            build_transport_config().expect("the idle timeout must convert")
+            build_transport_config(QuicMtuMax::Default).expect("the idle timeout must convert")
         );
 
         for expected in [
@@ -3258,6 +3477,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_audio_send_reserve_override_accepts_zero_as_off_and_clamps_to_the_window() {
+        const DEFAULT: u64 = WT_AUDIO_SEND_RESERVE_DEFAULT_BYTES;
+        const MAX: u64 = WT_QUIC_SEND_WINDOW_BYTES;
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_audio_send_reserve(absent, DEFAULT, MAX),
+                (DEFAULT, vec![])
+            );
+        }
+        assert_eq!(
+            resolve_audio_send_reserve(Some("0"), DEFAULT, MAX),
+            (0, vec![])
+        );
+        assert_eq!(
+            resolve_audio_send_reserve(Some(" 131072 "), DEFAULT, MAX),
+            (131_072, vec![])
+        );
+        for garbage in ["256KiB", "-1", "0x100"] {
+            let (bytes, warnings) = resolve_audio_send_reserve(Some(garbage), DEFAULT, MAX);
+            assert_eq!(bytes, DEFAULT);
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("is not an integer"), "{warnings:?}");
+        }
+        let (bytes, warnings) = resolve_audio_send_reserve(Some("99999999999"), DEFAULT, MAX);
+        assert_eq!(bytes, MAX);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("WT_AUDIO_SEND_RESERVE_BYTES=99999999999"),
+            "{warnings:?}"
+        );
+        let (bytes, warnings) = resolve_audio_send_reserve(None, DEFAULT, 65_536);
+        assert_eq!(bytes, 65_536);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("QUIC_SEND_WINDOW_BYTES=65536")
+                && !warnings[0].contains("WT_AUDIO_SEND_RESERVE_BYTES"),
+            "{warnings:?}"
+        );
+        // Malformed value AND a window below the default: both warnings survive.
+        let (bytes, warnings) = resolve_audio_send_reserve(Some("junk"), DEFAULT, 65_536);
+        assert_eq!(bytes, 65_536);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("is not an integer"), "{warnings:?}");
+        assert!(
+            warnings[1].starts_with("QUIC_SEND_WINDOW_BYTES=65536"),
+            "{warnings:?}"
+        );
+    }
+
     /// #2716: the keep-alive must stay inside a typical UDP conntrack timeout,
     /// fire several times within `max_idle_timeout`, and not out-wake the app
     /// heartbeat. Reads the resolved values, so env overrides too.
@@ -3311,9 +3580,9 @@ mod tests {
         }
     }
 
-    /// #2716: the two gauges replacing the dead `frame_tx_*_blocked` pair must be
-    /// REACHABLE. The client's windows are small on purpose: a default quinn peer
-    /// never sends MAX_DATA at all, while browsers do.
+    /// #2716: the two `frame_rx` credit-grant gauges must be REACHABLE. The
+    /// client's windows are small on purpose: a default quinn peer never sends
+    /// MAX_DATA at all, while browsers do.
     #[actix_rt::test]
     #[serial_test::serial]
     async fn peer_credit_grant_stats_are_reachable_over_loopback() {
@@ -3430,28 +3699,15 @@ mod tests {
             assert!(
                 frame_rx.max_stream_data > 0,
                 "frame_rx.max_stream_data stayed 0 after draining {PAYLOAD}B \
-                 through a {STREAM_WINDOW}B stream window — the gauge replacing \
-                 frame_tx_stream_data_blocked would be just as dead",
+                 through a {STREAM_WINDOW}B stream window — its gauge would be dead",
             );
             assert!(
                 frame_rx.max_data > 0,
                 "frame_rx.max_data stayed 0 after draining {PAYLOAD}B through a \
-                 {CONNECTION_WINDOW}B connection window — the gauge replacing \
-                 frame_tx_data_blocked would be just as dead",
+                 {CONNECTION_WINDOW}B connection window — its gauge would be dead",
             );
 
-            // quinn-proto has no TX construction site for the frames this pair
-            // replaces, so frame_tx stays 0 even here.
-            let frame_tx = server_conn.stats().frame_tx;
-            assert_eq!(
-                (frame_tx.data_blocked, frame_tx.stream_data_blocked),
-                (0, 0),
-                "quinn-proto started transmitting DATA_BLOCKED/STREAM_DATA_BLOCKED; \
-                 the #2716 rationale for dropping those gauges no longer holds",
-            );
-
-            // Drive the PRODUCTION sampler over the same connection: a gauge that
-            // stays 0 here was sampled from the dead `frame_tx` side.
+            // Drive the PRODUCTION sampler over the same connection.
             let room = "credit-grants-2716";
             let session_id = "credit-session-1";
             let sampler = spawn_connection_path_sampler(
@@ -3486,7 +3742,7 @@ mod tests {
                     && stream_credit > 0.0,
                 "the sampler must publish the frame_RX credit grants (read \
                  conn={conn_credit} stream={stream_credit}, snapshot \
-                 conn={} stream={}); reading the frame_tx side leaves both at 0",
+                 conn={} stream={})",
                 frame_rx.max_data,
                 frame_rx.max_stream_data,
             );
@@ -3498,6 +3754,108 @@ mod tests {
         .await;
 
         outcome.expect("credit-grant reachability test timed out after 30s");
+    }
+
+    /// BITES: drop the `mtu_max.apply` call from `build_transport_config`.
+    #[test]
+    fn transport_config_carries_the_quic_mtu_max() {
+        for (mtu_max, expected) in [
+            (QuicMtuMax::Default, "upper_bound: 1452"),
+            (QuicMtuMax::Fixed, "mtu_discovery_config: None"),
+            (QuicMtuMax::UpperBound(1280), "upper_bound: 1280"),
+        ] {
+            let rendered = format!(
+                "{:?}",
+                build_transport_config(mtu_max).expect("the idle timeout must convert")
+            );
+            assert!(
+                rendered.contains(expected),
+                "{mtu_max:?} must render {expected:?}; quinn rendered {rendered}",
+            );
+            assert!(
+                rendered.contains("initial_mtu: 1200, min_mtu: 1200"),
+                "{mtu_max:?} must leave initial_mtu and min_mtu at 1200; quinn rendered {rendered}",
+            );
+        }
+    }
+
+    /// BITES: accept 1199 or 1453, move the 1220 boundary, or warn on 1200.
+    #[test]
+    fn quic_mtu_max_accepts_only_1200_through_1452() {
+        let quiet = |raw: Option<&str>, expected: QuicMtuMax| {
+            assert_eq!(QuicMtuMax::resolve(raw), (expected, Vec::new()), "{raw:?}");
+        };
+        quiet(None, QuicMtuMax::Default);
+        quiet(Some(""), QuicMtuMax::Default);
+        quiet(Some("  "), QuicMtuMax::Default);
+        quiet(Some("1200"), QuicMtuMax::Fixed);
+        quiet(Some("1220"), QuicMtuMax::UpperBound(1220));
+        quiet(Some(" 1280 "), QuicMtuMax::UpperBound(1280));
+        quiet(Some("1452"), QuicMtuMax::UpperBound(1452));
+
+        for raw in ["1201", "1219"] {
+            let (mtu_max, warnings) = QuicMtuMax::resolve(Some(raw));
+            assert_eq!(mtu_max, QuicMtuMax::Fixed, "{raw:?}");
+            assert_eq!(warnings.len(), 1, "{raw:?}: {warnings:?}");
+            assert!(
+                warnings[0].starts_with(&format!("WT_QUIC_MTU_MAX={raw}")),
+                "{warnings:?}"
+            );
+        }
+        for raw in ["1199", "1453", "0", "-1", "abc", "1200B"] {
+            let (mtu_max, warnings) = QuicMtuMax::resolve(Some(raw));
+            assert_eq!(
+                mtu_max,
+                QuicMtuMax::Default,
+                "{raw:?} must fall back to the default, not fail startup",
+            );
+            assert_eq!(warnings.len(), 1, "{raw:?}: {warnings:?}");
+        }
+        assert_eq!(QuicMtuMax::Default.label(), "max=default discovery=default");
+        let quinn_default = format!("{:?}", quinn::MtuDiscoveryConfig::default());
+        assert!(
+            quinn_default.contains("minimum_change: 20,"),
+            "MIN_PROBED_BOUND assumes quinn's minimum_change is 20; quinn rendered {quinn_default}",
+        );
+        assert!(
+            quinn_default.contains("upper_bound: 1452,"),
+            "CEILING assumes quinn's default upper_bound is 1452; quinn rendered {quinn_default}",
+        );
+        assert_eq!(QuicMtuMax::Fixed.label(), "max=1200 discovery=off");
+        assert_eq!(
+            QuicMtuMax::UpperBound(1280).label(),
+            "max=1280 discovery=upper_bound=1280"
+        );
+    }
+
+    /// BITES: misspell the env var name, or build the config from QuicMtuMax::Default.
+    #[test]
+    #[serial_test::serial]
+    fn relay_transport_config_reads_wt_quic_mtu_max() {
+        let prior = std::env::var_os("WT_QUIC_MTU_MAX");
+        std::env::set_var("WT_QUIC_MTU_MAX", "1200");
+        let set = relay_transport_config();
+        std::env::remove_var("WT_QUIC_MTU_MAX");
+        let unset = relay_transport_config();
+        if let Some(prior) = prior {
+            std::env::set_var("WT_QUIC_MTU_MAX", prior);
+        }
+
+        let (config, mtu_max) = set.expect("the idle timeout must convert");
+        assert_eq!(mtu_max, QuicMtuMax::Fixed);
+        let rendered = format!("{config:?}");
+        assert!(
+            rendered.contains("mtu_discovery_config: None"),
+            "WT_QUIC_MTU_MAX=1200 must turn discovery off; quinn rendered {rendered}",
+        );
+
+        let (config, mtu_max) = unset.expect("the idle timeout must convert");
+        assert_eq!(mtu_max, QuicMtuMax::Default);
+        let rendered = format!("{config:?}");
+        assert!(
+            rendered.contains("upper_bound: 1452"),
+            "an unset WT_QUIC_MTU_MAX must keep quinn's default; quinn rendered {rendered}",
+        );
     }
 
     /// #2716: BBR only on an exact opt-in, never on a typo.
@@ -3647,6 +4005,43 @@ mod tests {
         assert_eq!(identity.lobby_id, "claimed-room");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn wt_carries_the_token_meeting_start_and_drops_a_negative_one() {
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+        std::env::set_var("JWT_SECRET", TOKENLESS_JWT_SECRET);
+
+        let token = |started| {
+            meeting_api::token::generate_room_token_at(
+                TOKENLESS_JWT_SECRET,
+                60,
+                chrono::Utc::now().timestamp(),
+                "carol",
+                "room-3237",
+                false,
+                "Carol",
+                true,
+                false,
+                started,
+            )
+            .expect("should generate a room token")
+        };
+        let with_start =
+            resolve_wt_connect_identity(&["lobby"], Some(&token(Some(1_707_000_000_123))));
+        let negative = resolve_wt_connect_identity(&["lobby"], Some(&token(Some(-1))));
+        let without = resolve_wt_connect_identity(&["lobby"], Some(&token(None)));
+
+        std::env::remove_var("JWT_SECRET");
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        assert_eq!(
+            with_start.expect("valid token").meeting_started_at_ms,
+            Some(1_707_000_000_123)
+        );
+        assert_eq!(negative.expect("valid token").meeting_started_at_ms, None);
+        assert_eq!(without.expect("valid token").meeting_started_at_ms, None);
+    }
+
     /// Serving per-publisher streams to a client that cannot read them breaks
     /// its downlink, so anything uninterpretable must stay on one stream.
     #[test]
@@ -3707,6 +4102,105 @@ mod tests {
     fn the_audio_lane_labels_name_their_primitive() {
         assert_eq!(audio_lane_label(AudioDownlinkLane::Reliable), "reliable");
         assert_eq!(audio_lane_label(AudioDownlinkLane::Datagram), "datagram");
+    }
+
+    struct ForceCloseSink3285;
+    impl actix::Actor for ForceCloseSink3285 {
+        type Context = actix::Context<Self>;
+    }
+    impl actix::Handler<crate::messages::session::ForceClose> for ForceCloseSink3285 {
+        type Result = ();
+        fn handle(&mut self, _msg: crate::messages::session::ForceClose, _ctx: &mut Self::Context) {
+        }
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn connect_url_hints_reach_join_room_3285() {
+        use actix::Actor;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let (unistream_tx, _unistream_rx) = mpsc::channel::<WtOutboundFrame>(8);
+        let (datagram_tx, _datagram_rx) = mpsc::channel::<WtOutboundFrame>(8);
+        let (tracker_sender, _tracker_rx) = mpsc::unbounded_channel();
+        let url =
+            url::Url::parse("https://r.example/lobby?token=t&instance_id=iid-3285-wt&conn_seq=9")
+                .expect("parse url");
+        let actor = new_wt_chat_session(
+            chat_server,
+            "room-3285",
+            "wt@example.com",
+            "WT",
+            false,
+            unistream_tx,
+            datagram_tx,
+            Arc::new(SharedQueueByteMeter::default()),
+            nats_client,
+            tracker_sender,
+            SessionManager::new(),
+            false,
+            wt_reconnect_hints(url.query_pairs(), true),
+            false,
+            Some(11),
+            Some(1_707_000_000_123),
+            AudioDownlinkLane::Reliable,
+            DownlinkShedEscalation::new(),
+        );
+
+        let join = actor.join_room_message_for_test(ForceCloseSink3285.start().recipient());
+
+        assert_eq!(join.conn_seq, Some(9));
+        assert_eq!(join.token_iat, Some(11));
+        assert_eq!(join.meeting_started_at_ms, Some(1_707_000_000_123));
+        assert_eq!(join.instance_id.as_deref(), Some("iid-3285-wt"));
+    }
+
+    fn reconnect_hints(url: &str, authenticated: bool) -> (Option<String>, Option<u64>) {
+        let url = url::Url::parse(url).expect("parse url");
+        let hints = wt_reconnect_hints(url.query_pairs(), authenticated);
+        (hints.instance_id, hints.conn_seq)
+    }
+
+    #[test]
+    fn wt_reconnect_hints_read_instance_id_and_conn_seq() {
+        assert_eq!(
+            reconnect_hints(
+                "https://r.example/lobby?token=t&instance_id=i&conn_seq=9",
+                true
+            ),
+            (Some("i".to_string()), Some(9))
+        );
+    }
+
+    #[test]
+    fn wt_reconnect_hints_without_or_with_malformed_conn_seq_are_none() {
+        assert_eq!(
+            reconnect_hints("https://r.example/lobby?token=t&instance_id=i", true),
+            (Some("i".to_string()), None)
+        );
+        for raw in ["abc", "-1", "", "18446744073709551616"] {
+            let url = format!("https://r.example/lobby?token=t&instance_id=i&conn_seq={raw}");
+            assert_eq!(
+                reconnect_hints(&url, true),
+                (Some("i".to_string()), None),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wt_reconnect_hints_are_dropped_without_a_token() {
+        assert_eq!(
+            reconnect_hints(
+                "https://r.example/lobby/u/room?instance_id=i&conn_seq=9",
+                false
+            ),
+            (None, None)
+        );
     }
 
     /// Renaming it on one side silently downgrades every session.
@@ -3776,6 +4270,7 @@ mod tests {
             user,
             false,
             false,
+            None,
         )
         .expect("room token")
     }
@@ -3817,10 +4312,23 @@ mod tests {
         session: &web_transport_quinn::Session,
         wait: Duration,
     ) -> bool {
+        closed_with_code_within(
+            session,
+            videocall_types::wt_close::WT_CLOSE_CODE_REMOVED_BY_HOST,
+            wait,
+        )
+        .await
+    }
+
+    async fn closed_with_code_within(
+        session: &web_transport_quinn::Session,
+        expected: u32,
+        wait: Duration,
+    ) -> bool {
         match tokio::time::timeout(wait, session.closed()).await {
             Ok(web_transport_quinn::SessionError::WebTransportError(
                 web_transport_quinn::WebTransportError::Closed(code, _),
-            )) => code == videocall_types::wt_close::WT_CLOSE_CODE_REMOVED_BY_HOST,
+            )) => code == expected,
             _ => false,
         }
     }
@@ -3914,5 +4422,98 @@ mod tests {
             "a post-kick token must not be closed"
         );
         publisher.abort();
+    }
+
+    fn instance_room_token(user: &str, room: &str, meeting_started_at_ms: i64) -> String {
+        meeting_api::token::generate_room_token_at(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            chrono::Utc::now().timestamp(),
+            user,
+            room,
+            false,
+            user,
+            false,
+            false,
+            Some(meeting_started_at_ms),
+        )
+        .expect("room token")
+    }
+
+    /// The target user of the MEETING_INSTANCE_SUPERSEDED notice the relay
+    /// delivers on a downlink uni stream within `wait`.
+    async fn superseded_notice_target_within(
+        session: &web_transport_quinn::Session,
+        wait: Duration,
+    ) -> Option<Vec<u8>> {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        tokio::time::timeout(wait, async {
+            loop {
+                let mut downlink = session.accept_uni().await.ok()?;
+                while let Some(frame) = read_length_prefixed_frame(&mut downlink).await {
+                    let Ok(w) = VcPacketWrapper::parse_from_bytes(&frame) else {
+                        continue;
+                    };
+                    if w.packet_type.enum_value() != Ok(VcPacketType::MEETING) {
+                        continue;
+                    }
+                    if let Ok(m) = MeetingPacket::parse_from_bytes(&w.data) {
+                        if m.event_type.enum_value()
+                            == Ok(MeetingEventType::MEETING_INSTANCE_SUPERSEDED)
+                        {
+                            return Some(m.target_user_id);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// A WebTransport client holding a room token from an earlier meeting
+    /// instance receives MEETING_INSTANCE_SUPERSEDED on its downlink BEFORE the
+    /// relay closes it, while a current-instance token joins and stays up
+    /// (#3287).
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn test_wt_stale_instance_token_gets_the_superseded_notice_then_is_closed() {
+        setup_jwt_wt().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let room = format!("wt-inst-3287-{now_ms}");
+
+        let current =
+            connect_client_with_token(&instance_room_token("new@test.com", &room, now_ms))
+                .await
+                .expect("connect with the current instance token");
+        wait_for_session_ready(&current, "current")
+            .await
+            .expect("a current-instance token joins");
+
+        let stale =
+            connect_client_with_token(&instance_room_token("old@test.com", &room, now_ms - 60_000))
+                .await
+                .expect("the session is accepted before JoinRoom refuses it");
+        let target = superseded_notice_target_within(&stale, Duration::from_secs(5)).await;
+        assert_eq!(
+            target.as_deref(),
+            Some(b"old@test.com".as_slice()),
+            "the notice must reach the stale client before the close"
+        );
+        assert!(
+            closed_with_code_within(
+                &stale,
+                videocall_types::wt_close::WT_CLOSE_CODE_INSTANCE_SUPERSEDED,
+                Duration::from_secs(5)
+            )
+            .await,
+            "a stale-instance session must be closed"
+        );
+        assert!(
+            !closed_within(&current, Duration::from_millis(1500)).await,
+            "the current-instance session must stay connected"
+        );
     }
 }

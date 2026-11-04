@@ -142,6 +142,10 @@ class UltraFastPCMBuffer {
     }
 }
 
+const MAX_PENDING_DIRECT = 200;
+// About 250 ms of 128-frame render quanta at 48 kHz.
+const REPORT_EVERY_QUANTA = 94;
+
 class PCMPlayerProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
@@ -157,6 +161,25 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         this.dropWarnCooldownMs = 1000; // rate-limit warnings
         this.alive = true;
         this.processCalls = 0;
+        // Direct NetEq-worker input (a transferred MessagePort). Its messages wait in pendingDirect until
+        // the main thread forwards 'handoff', which follows the last frame the worker sent the old way.
+        this.input = null;
+        this.direct = false;
+        this.pendingDirect = [];
+        // Silent output: render quanta zero-filled while the stream was flowing (armed and not paused).
+        // Counting starts only on 'countUnderruns': a worker that never sends 'pause' would book mutes.
+        this.counting = false;
+        this.armed = false;
+        this.paused = false;
+        this.inUnderrun = false;
+        this.silentSamples = 0;
+        this.underrunEvents = 0;
+        this.reportedSamples = 0;
+        this.reported = false;
+        this.callsSinceReport = 0;
+        this.framesIn = 0;
+        this.framesIgnored = 0;
+        this.pausesIn = 0;
 
         console.log('Ultra-Fast PCM Player Worklet initialized - JavaScript optimized for maximum performance');
         
@@ -164,10 +187,54 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         this.port.onmessage = (event) => this.handleMessage(event.data);
     }
     
-    handleMessage(data) {
-        const { command, pcm, sampleRate, channels } = data;
+    handleInput(data) {
+        if (this.direct) {
+            this.handleMessage(data, true);
+            return;
+        }
+        if (this.pendingDirect.length >= MAX_PENDING_DIRECT) {
+            const oldestFrame = this.pendingDirect.findIndex((m) => m && m.command === 'play');
+            if (oldestFrame >= 0) {
+                this.pendingDirect.splice(oldestFrame, 1);
+            } else if (data && data.command === 'play') {
+                return;
+            }
+        }
+        this.pendingDirect.push(data);
+    }
+
+    handleMessage(data, fromInput = false) {
+        const { command, pcm, sampleRate, channels, port } = data;
         
         switch (command) {
+            case 'attachInput':
+                if (port && !this.input) {
+                    this.input = port;
+                    this.input.onmessage = (event) => this.handleInput(event.data);
+                    this.input.postMessage({ type: 'inputReady' });
+                }
+                break;
+
+            case 'handoff':
+                if (!this.direct && !fromInput) {
+                    this.direct = true;
+                    for (const queued of this.pendingDirect.splice(0)) {
+                        this.handleMessage(queued, true);
+                    }
+                }
+                break;
+
+            case 'countUnderruns':
+                this.counting = true;
+                break;
+
+            case 'pause':
+                this.pausesIn++;
+                // Frames already queued still play; nothing is counted until the next frame arrives.
+                this.paused = true;
+                this.armed = false;
+                break;
+
             case 'configure':
                 this.sampleRate = sampleRate || 48000;
                 this.channels = channels || 2;
@@ -176,7 +243,13 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
                 break;
                 
             case 'play':
+                if (this.direct && !fromInput) {
+                    this.framesIgnored++;
+                    break;
+                }
                 if (pcm && pcm instanceof Float32Array) {
+                    this.framesIn++;
+                    this.paused = false;
                     // Apply burst-drop policy before enqueuing
                     const frameLength = pcm.length / this.channels;
                     const highWM = Math.floor(this.buffer.maxSamples * this.highWatermarkRatio);
@@ -210,10 +283,23 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
 
             case 'stop':
                 this.alive = false;
+                if (this.input) {
+                    this.input.onmessage = null;
+                    this.input.close();
+                    this.input = null;
+                }
                 break;
 
             case 'reportProcessCount':
-                this.port.postMessage({ type: 'processCount', count: this.processCalls });
+                this.port.postMessage({
+                    type: 'processCount',
+                    count: this.processCalls,
+                    framesIn: this.framesIn,
+                    framesIgnored: this.framesIgnored,
+                    paused: this.paused,
+                    direct: this.direct,
+                    pausesIn: this.pausesIn,
+                });
                 break;
         }
     }
@@ -226,17 +312,51 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         this.processCalls++;
         const output = outputs[0];
 
+        let played;
         if (output.length >= 2) {
             // Stereo output - use direct channel access for maximum speed
-            this.buffer.pullToChannels(output[0], output[1]);
+            played = this.buffer.pullToChannels(output[0], output[1]);
         } else {
             // Mono output - pass the same channel twice
-            this.buffer.pullToChannels(output[0], output[0]);
+            played = this.buffer.pullToChannels(output[0], output[0]);
         }
+        this.countUnderrun(played, output[0] ? output[0].length : 0);
 
         return this.alive;
     }
-    
+
+    countUnderrun(played, frameLength) {
+        if (!this.counting) {
+            return;
+        }
+        if (this.paused) {
+            // draining the frames sent before the pause
+        } else if (played) {
+            this.armed = true;
+            this.inUnderrun = false;
+        } else if (this.armed) {
+            this.silentSamples += frameLength;
+            if (!this.inUnderrun) {
+                this.underrunEvents++;
+                this.inUnderrun = true;
+            }
+        }
+        if (++this.callsSinceReport < REPORT_EVERY_QUANTA) {
+            return;
+        }
+        this.callsSinceReport = 0;
+        if (this.silentSamples === this.reportedSamples && (this.reported || !this.armed)) {
+            return;
+        }
+        this.reported = true;
+        this.reportedSamples = this.silentSamples;
+        this.port.postMessage({
+            type: 'underrun',
+            silentMs: (this.silentSamples * 1000) / sampleRate,
+            events: this.underrunEvents,
+        });
+    }
+
     static get parameterDescriptors() {
         return [];
     }

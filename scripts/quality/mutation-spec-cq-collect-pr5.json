@@ -1,0 +1,122 @@
+{
+ "_comment": [
+  "Mutations of the collector's PR-5 additions (#2914): the decode-budget carry and millisecond marks:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-collect-pr5.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_collect.py"
+ ],
+ "baseline_tests": 102,
+ "mutations": [
+  {
+   "name": "waiver not carried",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "        out[\"decode_budget\"] = budget\n",
+   "replace": "        pass\n",
+   "expect_kills": [
+    "test_an_off_probe_carries_its_waiver_into_a_valid_manifest",
+    "test_a_client_probe_is_carried_too"
+   ]
+  },
+  {
+   "name": "a posture other than planned accepted",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "    if want is not None and got[\"requested\"] != want:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_posture_other_than_planned_is_refused"
+   ]
+  },
+  {
+   "name": "a waiver that did not stick accepted",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "    if observed not in DECODE_BUDGET_READBACK[got[\"requested\"]]:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_waiver_that_did_not_stick_is_refused",
+    "test_an_undeclared_override_is_refused"
+   ]
+  },
+  {
+   "name": "off accepts no readback",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "\"off\": (\"all\",)",
+   "replace": "\"off\": (\"all\", None)",
+   "expect_kills": [
+    "test_a_waiver_that_did_not_stick_is_refused"
+   ]
+  },
+  {
+   "name": "client accepts an override",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "\"client\": (None, \"auto\")",
+   "replace": "\"client\": (None, \"auto\", \"all\")",
+   "expect_kills": [
+    "test_an_undeclared_override_is_refused"
+   ]
+  },
+  {
+   "name": "a planned posture without a record accepted",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "        if want is not None:\n            errors.append(f\"{uid}: the plan sets",
+   "replace": "        if False:\n            errors.append(f\"{uid}: the plan sets",
+   "expect_kills": [
+    "test_a_planned_posture_without_a_record_of_it_is_refused"
+   ]
+  },
+  {
+   "name": "a malformed posture carried",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "    if not isinstance(got, dict) or got.get(\"requested\") not in DECODE_BUDGET_READBACK or not (",
+   "replace": "    if not isinstance(got, dict) or not (",
+   "expect_kills": [
+    "test_a_malformed_posture_is_refused"
+   ]
+  },
+  {
+   "name": "marks copied raw",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "                row[kind] = _ms_mark(marks[(s[\"step_id\"], kind)], MARK_ROUND_UP[kind])",
+   "replace": "                row[kind] = marks[(s[\"step_id\"], kind)]",
+   "expect_kills": [
+    "test_marks_land_on_the_millisecond_lattice"
+   ]
+  },
+  {
+   "name": "hold_start rounded down",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "\"hold_start\": True,",
+   "replace": "\"hold_start\": False,",
+   "expect_kills": [
+    "test_marks_land_on_the_millisecond_lattice"
+   ]
+  },
+  {
+   "name": "hold_end rounded up",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "\"hold_end\": False}",
+   "replace": "\"hold_end\": True}",
+   "expect_kills": [
+    "test_marks_land_on_the_millisecond_lattice"
+   ]
+  },
+  {
+   "name": "an exact mark nudged",
+   "file": "scripts/quality/cq_collect.py",
+   "find": "if abs(v - round(v)) < 1e-3 else",
+   "replace": "if False else",
+   "expect_kills": [
+    "test_marks_land_on_the_millisecond_lattice"
+   ]
+  }
+ ]
+}

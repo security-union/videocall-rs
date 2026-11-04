@@ -40,6 +40,7 @@
 //! window.__vcNetsim.bumpWsStaleDeltaDrop(15); // camera WS freshness-gate drops
 //! window.__vcNetsim.bumpCameraUplinkStall(8); // camera WT slow-ready() events
 //! window.__vcNetsim.setWsBufferedOverride(131072); // stand-in WS bufferedAmount; null clears
+//! window.__vcNetsim.setWtScreenQueueOverride(400000); // stand-in WT screen-stream depth; null clears
 //! window.__vcNetsim.forceCameraKeyframe(); // raise the camera PLI flag
 //! ```
 //!
@@ -76,10 +77,11 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 
 use super::netsim_hook::{clear_hook, install_hook_for_direction};
-use super::webmedia::MediaStreamKey;
+use super::webmedia::{MediaStreamKey, StreamQueueDepth};
 
 thread_local! {
     static WS_BUFFERED_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+    static WT_SCREEN_QUEUE_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
     static CAMERA_FORCE_KEYFRAME: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
 }
 
@@ -104,6 +106,34 @@ pub(crate) fn ws_buffered_override_for_netsim() -> Option<u64> {
 
 pub(crate) fn set_ws_buffered_override_for_netsim(bytes: Option<u64>) {
     WS_BUFFERED_OVERRIDE.with(|cell| cell.set(bytes));
+}
+
+pub(crate) fn set_wt_screen_queue_override_for_netsim(bytes: Option<u64>) {
+    WT_SCREEN_QUEUE_OVERRIDE.with(|cell| cell.set(bytes));
+}
+
+/// The screen send gate's reading with the override for the ACTIVE transport
+/// applied; the governor keeps the real one.
+pub(crate) fn screen_queue_depth_with_netsim_override(
+    real: Option<StreamQueueDepth>,
+) -> Option<StreamQueueDepth> {
+    apply_screen_queue_override(
+        real,
+        WS_BUFFERED_OVERRIDE.with(Cell::get),
+        WT_SCREEN_QUEUE_OVERRIDE.with(Cell::get),
+    )
+}
+
+fn apply_screen_queue_override(
+    real: Option<StreamQueueDepth>,
+    ws: Option<u64>,
+    wt: Option<u64>,
+) -> Option<StreamQueueDepth> {
+    match real {
+        Some(StreamQueueDepth::WebSocket(_)) => ws.map(StreamQueueDepth::WebSocket).or(real),
+        Some(StreamQueueDepth::WebTransport(_)) => wt.map(StreamQueueDepth::WebTransport).or(real),
+        None => None,
+    }
 }
 
 /// Parse the `"up"` / `"down"` direction string. Case-insensitive,
@@ -346,6 +376,29 @@ fn register_on_window() -> bool {
         },
     );
 
+    let set_wt_screen_queue_override = Closure::<dyn Fn(JsValue) -> JsValue>::new(
+        |bytes: JsValue| -> JsValue {
+            if bytes.is_null() || bytes.is_undefined() {
+                set_wt_screen_queue_override_for_netsim(None);
+                info!("__vcNetsim.setWtScreenQueueOverride: cleared");
+                return JsValue::from_bool(true);
+            }
+            match bytes.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64) {
+                Some(b) => {
+                    set_wt_screen_queue_override_for_netsim(Some(b));
+                    info!("__vcNetsim.setWtScreenQueueOverride: {b} bytes");
+                    JsValue::from_bool(true)
+                }
+                None => {
+                    warn!(
+                        "__vcNetsim.setWtScreenQueueOverride: argument must be a non-negative number or null"
+                    );
+                    JsValue::from_bool(false)
+                }
+            }
+        },
+    );
+
     let force_camera_keyframe = Closure::<dyn Fn() -> JsValue>::new(|| -> JsValue {
         let raised = force_camera_keyframe_for_netsim();
         if raised {
@@ -420,6 +473,13 @@ fn register_on_window() -> bool {
     .and_then(|_| {
         js_sys::Reflect::set(
             &obj,
+            &JsValue::from_str("setWtScreenQueueOverride"),
+            set_wt_screen_queue_override.as_ref().unchecked_ref(),
+        )
+    })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
             &JsValue::from_str("forceCameraKeyframe"),
             force_camera_keyframe.as_ref().unchecked_ref(),
         )
@@ -434,7 +494,7 @@ fn register_on_window() -> bool {
 
     // Leak the closures so they outlive this function for the tab's
     // lifetime — the window object now holds them and may call back at
-    // any time. This is a one-time, bounded leak (ten closures per tab,
+    // any time. This is a one-time, bounded leak (eleven closures per tab,
     // installed once via the `Once` in `install_window_hook`).
     install.forget();
     clear.forget();
@@ -445,10 +505,11 @@ fn register_on_window() -> bool {
     bump_ws_stale_delta_drop.forget();
     bump_camera_uplink_stall.forget();
     set_ws_buffered_override.forget();
+    set_wt_screen_queue_override.forget();
     force_camera_keyframe.forget();
 
     info!(
-        "netsim: window.__vcNetsim installed (install/clear/bumpUplinkStall/bumpWsDrop/bumpWtDrop/bumpStaleDeltaDrop/bumpWsStaleDeltaDrop/bumpCameraUplinkStall/setWsBufferedOverride/forceCameraKeyframe)"
+        "netsim: window.__vcNetsim installed (install/clear/bumpUplinkStall/bumpWsDrop/bumpWtDrop/bumpStaleDeltaDrop/bumpWsStaleDeltaDrop/bumpCameraUplinkStall/setWsBufferedOverride/setWtScreenQueueOverride/forceCameraKeyframe)"
     );
     true
 }
@@ -469,6 +530,30 @@ mod tests {
         assert_eq!(parse_direction(""), None);
         assert_eq!(parse_direction("sideways"), None);
         assert_eq!(parse_direction("updown"), None);
+    }
+
+    #[test]
+    fn the_screen_queue_override_replaces_only_the_active_transports_reading() {
+        use StreamQueueDepth::{WebSocket, WebTransport};
+        assert_eq!(
+            apply_screen_queue_override(Some(WebTransport(10)), Some(1), Some(400_000)),
+            Some(WebTransport(400_000))
+        );
+        assert_eq!(
+            apply_screen_queue_override(Some(WebTransport(10)), Some(131_072), None),
+            Some(WebTransport(10)),
+            "a WS override must not leak onto a WT session"
+        );
+        assert_eq!(
+            apply_screen_queue_override(Some(WebSocket(10)), None, Some(400_000)),
+            Some(WebSocket(10)),
+            "a WT override must not leak onto a WS session"
+        );
+        assert_eq!(
+            apply_screen_queue_override(Some(WebSocket(10)), Some(131_072), None),
+            Some(WebSocket(131_072))
+        );
+        assert_eq!(apply_screen_queue_override(None, Some(1), Some(1)), None);
     }
 
     #[test]

@@ -35,6 +35,16 @@ pub const WT_CLOSE_REASON_REMOVED_BY_HOST: &[u8] = b"removed-by-host";
 
 const _: () = assert!(WT_CLOSE_CODE_REMOVED_BY_HOST >= 1000);
 
+/// Sent by the relay when it closes a session whose room token predates the
+/// meeting's current instance (#3287). The MEETING_INSTANCE_SUPERSEDED notice
+/// precedes it.
+pub const WT_CLOSE_CODE_INSTANCE_SUPERSEDED: u32 = 1003;
+
+/// Trace and log text for [`WT_CLOSE_CODE_INSTANCE_SUPERSEDED`].
+pub const WT_CLOSE_REASON_INSTANCE_SUPERSEDED: &[u8] = b"meeting-instance-superseded";
+
+const _: () = assert!(WT_CLOSE_CODE_INSTANCE_SUPERSEDED >= 1000);
+
 const _: () = assert!(
     WT_CLOSE_CODE_DOWNLINK_UNRECOVERABLE >= 1000,
     "code 0 is the clean close every pre-existing relay path uses, so a \

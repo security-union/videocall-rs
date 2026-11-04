@@ -82,14 +82,17 @@ declare global {
  *
  * Source of truth: `videocall-client/src/diagnostics/diagnostics_manager.rs:42`
  *   `const HEARTBEAT_PERIOD_MS: u32 = 500;`
- * passed to `HeartbeatTimer::start(HEARTBEAT_PERIOD_MS, ..)` at both call
- * sites (`:250` receive-side, `:706` send-side), and forwarded to the Worker
- * as `periodMs` (`heartbeat.rs:263-272`), which the Worker script uses as its
- * `setInterval` period (`heartbeat.rs:107-110`).
+ * passed to `HeartbeatTimer::start("diagnostics heartbeat", HEARTBEAT_PERIOD_MS, ..)`
+ * by the receive-side and send-side managers, and forwarded to the Worker
+ * as `periodMs` (`start_worker` in `heartbeat.rs`), which the Worker script
+ * (`HEARTBEAT_WORKER_JS`) uses as its `setInterval` period.
  *
  * Every wait below is DERIVED from this constant — no magic sleeps.
  */
 const HEARTBEAT_PERIOD_MS = 500;
+
+/** `HEARTBEAT_KEEPALIVE_INTERVAL_MS` in `videocall-aq/src/constants.rs`. */
+const KEEPALIVE_PERIOD_MS = 5000;
 
 /**
  * How many ticks a single heartbeat Worker must deliver AFTER the visibility
@@ -121,7 +124,7 @@ const tickBudgetMs = (ticks: number) => ticks * HEARTBEAT_PERIOD_MS * 4;
  * we counted ticks from is the heartbeat one and not some other Worker the
  * app happens to run (decoder / neteq).
  *
- * Source: `videocall-client/src/diagnostics/heartbeat.rs:99-118`
+ * Source: `videocall-client/src/diagnostics/heartbeat.rs`
  *   (`HEARTBEAT_WORKER_JS` — `setInterval(() => { self.postMessage({ type: 'tick' }) }, periodMs)`)
  */
 const HEARTBEAT_WORKER_JS_MARKERS = ["self.postMessage({ type: 'tick' })", "setInterval"];
@@ -143,7 +146,7 @@ const HEARTBEAT_WORKER_JS_MARKERS = ["self.postMessage({ type: 'tick' })", "setI
  *
  * WHAT IT HOOKS — we wrap the global `Worker` in a `Proxy` whose `construct`
  * trap records each instance, and per instance we wrap the `onmessage`
- * *setter*. The handler the wasm client installs (`heartbeat.rs:242-247`,
+ * *setter*. The handler the wasm client installs (`start_worker` in `heartbeat.rs`,
  * `Closure::wrap(..)` + `worker.set_onmessage(..)`) is decorated with a
  * counter and then forwarded to the native setter, so:
  *
@@ -153,7 +156,7 @@ const HEARTBEAT_WORKER_JS_MARKERS = ["self.postMessage({ type: 'tick' })", "setI
  *     message at a bystander listener the app knows nothing about;
  *   - if the Worker stops posting, the count stops;
  *   - if the client took the fallback `setInterval` backend
- *     (`heartbeat.rs:295`), no Worker exists and the count stays 0.
+ *     (`start_interval` in `heartbeat.rs`), no Worker exists and the count stays 0.
  *
  * `{ type: 'tick' }` is unique to the heartbeat Worker in this codebase (grep
  * for `'tick'` across `videocall-client`, `videocall-codecs`, `dioxus-ui`,
@@ -250,10 +253,10 @@ async function readHeartbeatWorkers(page: Page): Promise<Array<{ url: string; ti
 }
 
 /**
- * Ticks delivered by the single busiest Worker. The client runs TWO heartbeat
- * timers (receive-side `DiagnosticManager` + send-side
- * `SenderDiagnosticManager`, `diagnostics_manager.rs:240` and `:700`), so the
- * total ticks at ~2x cadence. Measuring the max keeps the timing derivation
+ * Ticks delivered by the single busiest Worker. The client runs THREE heartbeat
+ * Workers: receive-side `DiagnosticManager` and send-side
+ * `SenderDiagnosticManager` at `HEARTBEAT_PERIOD_MS`, plus the connection
+ * keepalive at `KEEPALIVE_PERIOD_MS`. Measuring the max keeps the timing derivation
  * honest: the bound below is satisfiable by ONE worker at
  * `HEARTBEAT_PERIOD_MS`, so it cannot be met by two half-dead ones.
  */
@@ -308,19 +311,24 @@ test.describe("Diagnostics heartbeat — tab-visibility throttling fix", () => {
 
     // The diagnostics managers are constructed up front when the client is
     // created. Give the wasm log a moment to flush its initial messages so
-    // the `diagnostics heartbeat: spawned worker` line lands in
-    // `consoleLines`. Polling is preferred over a fixed timeout because the
-    // initial wasm boot has variable latency.
+    // the spawn line lands in `consoleLines`. Polling is preferred over a
+    // fixed timeout because the initial wasm boot has variable latency.
+    const diagSpawn = `diagnostics heartbeat: spawned worker (period=${HEARTBEAT_PERIOD_MS}ms, backend=worker)`;
     await expect
-      .poll(
-        () => consoleLines.some((line) => line.includes("diagnostics heartbeat: spawned worker")),
-        {
-          timeout: 15_000,
-          message:
-            'Expected the heartbeat to spawn a Worker (log line "diagnostics heartbeat: spawned worker"). ' +
-            "If you see the fallback line instead, the blob:-Worker construction failed and the fix is not active.",
-        },
-      )
+      .poll(() => consoleLines.some((line) => line.includes(diagSpawn)), {
+        timeout: 15_000,
+        message:
+          `Expected the heartbeat to spawn a Worker (log line "${diagSpawn}"). ` +
+          "If you see the fallback line instead, the blob:-Worker construction failed and the fix is not active.",
+      })
+      .toBeTruthy();
+
+    const keepaliveSpawn = `keepalive heartbeat: spawned worker (period=${KEEPALIVE_PERIOD_MS}ms, backend=worker)`;
+    await expect
+      .poll(() => consoleLines.some((line) => line.includes(keepaliveSpawn)), {
+        timeout: 20_000,
+        message: `Expected the connection keepalive to spawn a Worker (log line "${keepaliveSpawn}").`,
+      })
       .toBeTruthy();
 
     // Sanity check: we did NOT fall back to the throttled main-thread path.

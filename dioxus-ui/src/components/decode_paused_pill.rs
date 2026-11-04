@@ -327,9 +327,9 @@ pub fn DecodePausedPill(
     /// Number of off-budget avatar tiles — the live count of paused-video tiles
     /// the user actually sees (the same value the banner receives).
     avatar_count: usize,
-    /// The uncapped natural tile count. Carries the count named in the action
-    /// button's accessible label ("Show all N videos"); the action itself sets
-    /// the override to `All`, which tracks the live count.
+    /// The natural tile count (`total_tiles`). Carries the count named in the
+    /// action button's accessible label ("Show all N videos"); the action itself
+    /// sets the override to `All`, which tracks the live count.
     natural: usize,
     /// The banner's TRUE on-screen visibility, published by the sibling
     /// [`crate::components::decode_budget_banner::DecodeBudgetBanner`] into a

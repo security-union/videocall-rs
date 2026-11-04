@@ -6,7 +6,9 @@
 mod support;
 
 use dioxus::prelude::*;
-use dioxus_ui::components::device_settings_modal::DeviceSettingsModal;
+use dioxus_ui::components::device_settings_modal::{
+    DeviceSettingsModal, TRANSPORT_WEBSOCKET_DESC, TRANSPORT_WEBSOCKET_NOTE,
+};
 use dioxus_ui::components::diagnostics::Diagnostics;
 use dioxus_ui::components::media_metrics_overlay::MediaMetricsOverlayCtx;
 use dioxus_ui::context::{TransportPreference, TransportPreferenceCtx};
@@ -241,4 +243,35 @@ async fn diagnostics_select_marks_websocket_and_flags_webtransport_unavailable()
 
     assert_eq!(wt_label, "WebTransport (unavailable)");
     assert_eq!(ws_label, "WebSocket (default)");
+}
+
+/// Fails if the WebSocket description or note again claims WebSocket skips
+/// WebTransport: a WebSocket preference falls back to WebTransport.
+#[wasm_bindgen_test]
+async fn websocket_copy_says_webtransport_is_used_only_if_websocket_cannot_connect() {
+    support::reset_test_browser_state();
+    support::inject_app_config_webtransport_disabled();
+    let mount = create_mount_point();
+    render_into(&mount, ModalParent);
+    yield_now().await;
+
+    click(&mount, "[data-testid='settings-nav-network']");
+    yield_now().await;
+    click(&mount, "[data-testid='transport-radio-websocket']");
+    yield_now().await;
+
+    let desc = text_of(&mount, "#transport-websocket-desc");
+    let note = text_of(&mount, "[data-testid='transport-websocket-note']");
+    support::remove_app_config();
+    cleanup(&mount);
+
+    assert_eq!(desc, TRANSPORT_WEBSOCKET_DESC);
+    assert!(note.contains(TRANSPORT_WEBSOCKET_NOTE), "{note}");
+    for text in [&desc, &note] {
+        assert!(
+            text.contains("only if WebSocket can't connect"),
+            "WebSocket copy must say WebTransport is the fallback: {text}"
+        );
+        assert!(!text.contains("skips"), "{text}");
+    }
 }

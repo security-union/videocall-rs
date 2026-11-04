@@ -14,6 +14,27 @@ export async function openPerformancePanel(page: Page): Promise<Locator> {
   return drawer;
 }
 
+// The dock's Diagnostics button moves into the overflow popover at narrow widths.
+export async function openDiagnosticsDrawer(page: Page): Promise<Locator> {
+  await page.mouse.move(200, 200);
+  const direct = page.locator("button", {
+    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+  });
+  if ((await direct.count()) > 0 && (await direct.first().isVisible())) {
+    await direct.first().click({ timeout: 10_000 });
+  } else {
+    await page.locator("#overflow-menu-trigger").click({ timeout: 10_000 });
+    await page
+      .locator(".action-bar-overflow-popover button.overflow-item", {
+        has: page.locator('span:text-is("Diagnostics")'),
+      })
+      .click({ timeout: 10_000 });
+  }
+  const drawer = page.locator("#diagnostics-sidebar");
+  await expect(drawer).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+  return drawer;
+}
+
 /** The selected peer's NetEq `Packets / s`; `NaN` when the row reads `"--"`. */
 export async function readNetEqPacketsPerSec(drawer: Locator): Promise<number> {
   const rows = drawer.locator(".neteq-status .status-secondary .status-row");

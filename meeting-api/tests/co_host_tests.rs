@@ -25,8 +25,8 @@ use test_helpers::*;
 use tower::ServiceExt;
 use videocall_meeting_types::{
     responses::{
-        APIResponse, CreateMeetingResponse, ListCoHostsResponse, MeetingInfoResponse,
-        ParticipantStatusResponse,
+        APIResponse, CreateMeetingResponse, ListCoHostSuggestionsResponse, ListCoHostsResponse,
+        MeetingInfoResponse, ParticipantStatusResponse,
     },
     APIError, RoomAccessTokenClaims,
 };
@@ -63,11 +63,20 @@ async fn create_meeting(
     room_id: &str,
     extra: serde_json::Value,
 ) -> axum::response::Response {
+    create_meeting_as(pool, room_id, OWNER, extra).await
+}
+
+async fn create_meeting_as(
+    pool: &sqlx::PgPool,
+    room_id: &str,
+    creator: &str,
+    extra: serde_json::Value,
+) -> axum::response::Response {
     let mut body = serde_json::json!({ "meeting_id": room_id, "attendees": [] });
     for (k, v) in extra.as_object().expect("extra must be an object") {
         body[k] = v.clone();
     }
-    send(pool, "POST", "/api/v1/meetings", OWNER, Some(body)).await
+    send(pool, "POST", "/api/v1/meetings", creator, Some(body)).await
 }
 
 async fn join(pool: &sqlx::PgPool, room_id: &str, user: &str) -> axum::response::Response {
@@ -105,11 +114,15 @@ async fn leave(pool: &sqlx::PgPool, room_id: &str, user: &str) {
 }
 
 async fn admit(pool: &sqlx::PgPool, room_id: &str, user: &str) {
+    admit_as(pool, room_id, OWNER, user).await
+}
+
+async fn admit_as(pool: &sqlx::PgPool, room_id: &str, host: &str, user: &str) {
     let resp = send(
         pool,
         "POST",
         &format!("/api/v1/meetings/{room_id}/admit"),
-        OWNER,
+        host,
         Some(serde_json::json!({ "user_id": user })),
     )
     .await;
@@ -1545,13 +1558,13 @@ async fn repeat_join_by_a_present_co_host_reports_no_host_change() {
     join_ok(&pool, room, OWNER).await;
     let pk = meeting_pk(&pool, room).await;
 
-    let (_, promoted) = db_participants::admit_as_co_host(&pool, pk, CO, None)
+    let (_, promoted, _) = db_participants::admit_as_co_host(&pool, pk, CO, None)
         .await
         .expect("admit_as_co_host")
         .expect("co-host is admitted");
     assert!(promoted, "the first join is a real false->true change");
 
-    let (again, promoted) = db_participants::admit_as_co_host(&pool, pk, CO, None)
+    let (again, promoted, _) = db_participants::admit_as_co_host(&pool, pk, CO, None)
         .await
         .expect("admit_as_co_host")
         .expect("a present host re-joining keeps the fast path");
@@ -1710,6 +1723,14 @@ async fn transport_departure_ends_the_meeting_only_when_the_last_host_leaves() {
     assert_eq!(row(&pool, room, CO).await.status, "left");
 
     transport(&pool, room, OWNER, 21, false).await;
+    sqlx::query("UPDATE meetings SET host_left_end_due_at = NOW() WHERE id = $1")
+        .bind(meeting_pk(&pool, room).await)
+        .execute(&pool)
+        .await
+        .expect("elapse the host-left debounce");
+    db_participants::end_host_left_if_due(&pool, meeting_pk(&pool, room).await, true)
+        .await
+        .expect("settle the host-left end");
     assert_eq!(
         state(&pool, room).await.as_deref(),
         Some("ended"),
@@ -1846,7 +1867,7 @@ async fn co_host_fast_path_follows_the_connect_rule_and_never_readmits_a_kicked_
     .execute(&pool)
     .await
     .expect("demote CO out of band");
-    let (_, promoted) = db_participants::admit_as_co_host(&pool, pk, CO, None)
+    let (_, promoted, _) = db_participants::admit_as_co_host(&pool, pk, CO, None)
         .await
         .expect("admit_as_co_host")
         .expect("an admitted co-host with a live entry is promoted, as on connect");
@@ -2339,4 +2360,539 @@ async fn co_host_list_and_announce_use_the_participants_real_case() {
     );
 
     cleanup_test_data(&pool, room).await;
+}
+
+const SUGG_OWNER: &str = "sugg-owner@example.com";
+
+async fn cleanup_suggestion_rooms(pool: &sqlx::PgPool) {
+    sqlx::query("DELETE FROM meetings WHERE room_id LIKE 'test-sugg-%'")
+        .execute(pool)
+        .await
+        .expect("delete suggestion test meetings");
+}
+
+async fn join_named(
+    pool: &sqlx::PgPool,
+    room_id: &str,
+    user: &str,
+    name: &str,
+) -> ParticipantStatusResponse {
+    let resp = send(
+        pool,
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        user,
+        Some(serde_json::json!({ "display_name": name })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "join as {user} must succeed");
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    body.result
+}
+
+async fn delete_meeting(pool: &sqlx::PgPool, room_id: &str, owner: &str) {
+    let resp = send(
+        pool,
+        "DELETE",
+        &format!("/api/v1/meetings/{room_id}"),
+        owner,
+        None,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "delete {room_id} must succeed"
+    );
+}
+
+async fn suggestions(pool: &sqlx::PgPool, room_id: &str, caller: &str) -> axum::response::Response {
+    send(
+        pool,
+        "GET",
+        &format!("/api/v1/meetings/{room_id}/co-hosts/suggestions"),
+        caller,
+        None,
+    )
+    .await
+}
+
+async fn suggested(pool: &sqlx::PgPool, room_id: &str) -> Vec<(String, Option<String>)> {
+    let resp = suggestions(pool, room_id, SUGG_OWNER).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: APIResponse<ListCoHostSuggestionsResponse> = response_json(resp).await;
+    body.result
+        .suggestions
+        .into_iter()
+        .map(|s| (s.user_id, s.display_name))
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_are_owner_only() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let room = "test-sugg-owner-only";
+    create_meeting_as(
+        &pool,
+        room,
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [CO] }),
+    )
+    .await;
+    join_ok(&pool, room, SUGG_OWNER).await;
+    assert!(join_ok(&pool, room, CO).await.is_host);
+
+    for caller in [CO, ATTENDEE] {
+        let resp = suggestions(&pool, room, caller).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "suggestions by {caller}"
+        );
+        assert_eq!(error_code(resp).await, "NOT_OWNER");
+    }
+    let resp = suggestions(&pool, "test-sugg-no-such-meeting", SUGG_OWNER).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(resp).await, "MEETING_NOT_FOUND");
+    assert_eq!(
+        suggestions(&pool, room, SUGG_OWNER).await.status(),
+        StatusCode::OK
+    );
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_cover_co_hosts_hosts_and_owners_who_admitted_the_caller() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let designated = "sugg-designated@example.com";
+    let host = "sugg-host@example.com";
+    let plain = "sugg-plain@example.com";
+    let admitter = "sugg-admitter@example.com";
+
+    create_meeting_as(
+        &pool,
+        "test-sugg-src-a",
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [designated] }),
+    )
+    .await;
+
+    let hosted = "test-sugg-src-b";
+    create_meeting_as(&pool, hosted, SUGG_OWNER, serde_json::json!({})).await;
+    join_ok(&pool, hosted, SUGG_OWNER).await;
+    join_named(&pool, hosted, host, "Hana Host").await;
+    admit_as(&pool, hosted, SUGG_OWNER, host).await;
+    join_named(&pool, hosted, plain, "Pat Plain").await;
+    admit_as(&pool, hosted, SUGG_OWNER, plain).await;
+    let resp = host_action(&pool, hosted, "transfer-host", SUGG_OWNER, host).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let visited = "test-sugg-src-c";
+    create_meeting_as(&pool, visited, admitter, serde_json::json!({})).await;
+    join_named(&pool, visited, admitter, "Ada Admitter").await;
+    assert_eq!(join_ok(&pool, visited, SUGG_OWNER).await.status, "waiting");
+    admit_as(&pool, visited, admitter, SUGG_OWNER).await;
+
+    let room = "test-sugg-src-new";
+    create_meeting_as(&pool, room, SUGG_OWNER, serde_json::json!({})).await;
+    assert_eq!(
+        suggested(&pool, room).await,
+        vec![
+            (admitter.to_string(), Some("Ada Admitter".to_string())),
+            (host.to_string(), Some("Hana Host".to_string())),
+            (designated.to_string(), None),
+        ]
+    );
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_exclude_self_guests_this_meetings_co_hosts_and_other_meetings() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let kept = "sugg-kept@example.com";
+    let already = "sugg-already@example.com";
+    let flagged_guest = "sugg-flagged-guest@example.com";
+    let deleted_co = "sugg-deleted-co@example.com";
+    let deleted_owner = "sugg-deleted-owner@example.com";
+    let unadmitting_owner = "sugg-unadmitting-owner@example.com";
+
+    let own = "test-sugg-excl-own";
+    create_meeting_as(
+        &pool,
+        own,
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [kept, already] }),
+    )
+    .await;
+    join_ok(&pool, own, SUGG_OWNER).await;
+    let own_pk = meeting_pk(&pool, own).await;
+    sqlx::query(
+        "INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, admitted_at) \
+         VALUES ($1, $2, 'admitted', TRUE, TRUE, NOW())",
+    )
+    .bind(own_pk)
+    .bind(flagged_guest)
+    .execute(&pool)
+    .await
+    .expect("insert a guest-flagged host row");
+    sqlx::query(
+        "INSERT INTO meeting_co_hosts (meeting_id, user_id, persistent, added_by) \
+         VALUES ($1, 'guest:sugg-legacy', TRUE, $2)",
+    )
+    .bind(own_pk)
+    .bind(SUGG_OWNER)
+    .execute(&pool)
+    .await
+    .expect("insert a guest-prefixed co-host entry");
+
+    let deleted = "test-sugg-excl-deleted";
+    create_meeting_as(
+        &pool,
+        deleted,
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [deleted_co] }),
+    )
+    .await;
+    delete_meeting(&pool, deleted, SUGG_OWNER).await;
+
+    let deleted_visit = "test-sugg-excl-deleted-visit";
+    create_meeting_as(&pool, deleted_visit, deleted_owner, serde_json::json!({})).await;
+    join_ok(&pool, deleted_visit, deleted_owner).await;
+    join_ok(&pool, deleted_visit, SUGG_OWNER).await;
+    admit_as(&pool, deleted_visit, deleted_owner, SUGG_OWNER).await;
+    delete_meeting(&pool, deleted_visit, deleted_owner).await;
+
+    let waited = "test-sugg-excl-waited";
+    create_meeting_as(&pool, waited, unadmitting_owner, serde_json::json!({})).await;
+    join_ok(&pool, waited, unadmitting_owner).await;
+    assert_eq!(join_ok(&pool, waited, SUGG_OWNER).await.status, "waiting");
+
+    let room = "test-sugg-excl-this";
+    create_meeting_as(
+        &pool,
+        room,
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [already] }),
+    )
+    .await;
+    assert_eq!(suggested(&pool, room).await, vec![(kept.to_string(), None)]);
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestion_names_come_only_from_meetings_the_owner_shares() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let unnamed = "sugg-unnamed@example.com";
+    let named = "sugg-named@example.com";
+    let met = "sugg-met@example.com";
+    let stranger = "sugg-stranger@example.com";
+    let fallback_owner = "sugg-fallback-owner@example.com";
+
+    let older = "test-sugg-name-older";
+    create_meeting_as(&pool, older, SUGG_OWNER, serde_json::json!({})).await;
+    join_ok(&pool, older, SUGG_OWNER).await;
+    join_named(&pool, older, named, "Old Name").await;
+    admit_as(&pool, older, SUGG_OWNER, named).await;
+
+    let own = "test-sugg-name-own";
+    create_meeting_as(
+        &pool,
+        own,
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [unnamed, named, met] }),
+    )
+    .await;
+    join_ok(&pool, own, SUGG_OWNER).await;
+    join_named(&pool, own, named, "Shared Name").await;
+
+    let elsewhere = "test-sugg-name-elsewhere";
+    create_meeting_as(&pool, elsewhere, stranger, serde_json::json!({})).await;
+    join_ok(&pool, elsewhere, stranger).await;
+    join_named(&pool, elsewhere, unnamed, "Secret Unnamed").await;
+    join_named(&pool, elsewhere, named, "Secret Named").await;
+
+    let waited = "test-sugg-name-waited";
+    create_meeting_as(&pool, waited, stranger, serde_json::json!({})).await;
+    join_ok(&pool, waited, stranger).await;
+    assert_eq!(join_ok(&pool, waited, SUGG_OWNER).await.status, "waiting");
+    join_named(&pool, waited, named, "Waiting Room Name").await;
+
+    let visited = "test-sugg-name-fallback";
+    create_meeting_as(&pool, visited, fallback_owner, serde_json::json!({})).await;
+    join_named(&pool, visited, fallback_owner, "Fay Fallback").await;
+    join_ok(&pool, visited, SUGG_OWNER).await;
+    admit_as(&pool, visited, fallback_owner, SUGG_OWNER).await;
+    join_named(&pool, visited, met, "Met There").await;
+    admit_as(&pool, visited, fallback_owner, met).await;
+    sqlx::query(
+        "UPDATE meeting_participants SET display_name = NULL WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(meeting_pk(&pool, visited).await)
+    .bind(fallback_owner)
+    .execute(&pool)
+    .await
+    .expect("clear the owner's participant name");
+
+    let room = "test-sugg-name-new";
+    create_meeting_as(&pool, room, SUGG_OWNER, serde_json::json!({})).await;
+    assert_eq!(
+        suggested(&pool, room).await,
+        vec![
+            (fallback_owner.to_string(), Some("Fay Fallback".to_string())),
+            (named.to_string(), Some("Shared Name".to_string())),
+            (met.to_string(), Some("Met There".to_string())),
+            (unnamed.to_string(), None),
+        ]
+    );
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_ignore_rows_that_were_never_admitted() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let unseen = "Sugg.Unseen@Example.com";
+    let host = "sugg-unseen-host@example.com";
+
+    create_meeting_as(
+        &pool,
+        "test-sugg-unadmitted-own",
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [unseen] }),
+    )
+    .await;
+
+    let visited = "test-sugg-unadmitted-visited";
+    create_meeting_as(&pool, visited, host, serde_json::json!({})).await;
+    join_ok(&pool, visited, host).await;
+    join_ok(&pool, visited, SUGG_OWNER).await;
+    admit_as(&pool, visited, host, SUGG_OWNER).await;
+    assert_eq!(
+        join_named(&pool, visited, unseen, "Unseen Name")
+            .await
+            .status,
+        "waiting"
+    );
+
+    let room = "test-sugg-unadmitted-new";
+    create_meeting_as(&pool, room, SUGG_OWNER, serde_json::json!({})).await;
+    assert_eq!(
+        suggested(&pool, room).await,
+        vec![(host.to_string(), None), (unseen.to_lowercase(), None)]
+    );
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_dedupe_case_insensitively_and_return_the_real_case_id() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let promoted = "Sugg.Promoted@Example.com";
+    let attended = "Sugg.Attended@Example.com";
+
+    create_meeting_as(
+        &pool,
+        "test-sugg-case-saved",
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [promoted, attended] }),
+    )
+    .await;
+
+    let hosted = "test-sugg-case-hosted";
+    create_meeting_as(&pool, hosted, SUGG_OWNER, serde_json::json!({})).await;
+    join_ok(&pool, hosted, SUGG_OWNER).await;
+    join_ok(&pool, hosted, promoted).await;
+    admit_as(&pool, hosted, SUGG_OWNER, promoted).await;
+    join_ok(&pool, hosted, attended).await;
+    admit_as(&pool, hosted, SUGG_OWNER, attended).await;
+    let resp = host_action(&pool, hosted, "transfer-host", SUGG_OWNER, promoted).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let room = "test-sugg-case-new";
+    create_meeting_as(&pool, room, SUGG_OWNER, serde_json::json!({})).await;
+    assert_eq!(
+        suggested(&pool, room).await,
+        vec![(promoted.to_string(), None), (attended.to_string(), None)]
+    );
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_are_most_recent_first_and_capped() {
+    use meeting_api::routes::co_hosts::MAX_CO_HOST_SUGGESTIONS;
+
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let id = |n: usize| format!("sugg-cap-{n}@example.com");
+    let oldest = MAX_CO_HOST_SUGGESTIONS + 5;
+
+    let bulk = "test-sugg-cap-bulk";
+    create_meeting_as(&pool, bulk, SUGG_OWNER, serde_json::json!({})).await;
+    sqlx::query(
+        "INSERT INTO meeting_co_hosts (meeting_id, user_id, persistent, added_by, updated_at) \
+         SELECT $1, 'sugg-cap-' || g || '@example.com', TRUE, $2, NOW() - g * INTERVAL '1 minute' \
+         FROM generate_series(1, $3) AS g",
+    )
+    .bind(meeting_pk(&pool, bulk).await)
+    .bind(SUGG_OWNER)
+    .bind(oldest as i32)
+    .execute(&pool)
+    .await
+    .expect("insert aged co-host entries");
+    create_meeting_as(
+        &pool,
+        "test-sugg-cap-recent",
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [id(oldest)] }),
+    )
+    .await;
+
+    let room = "test-sugg-cap-new";
+    create_meeting_as(&pool, room, SUGG_OWNER, serde_json::json!({})).await;
+    let ids: Vec<String> = suggested(&pool, room)
+        .await
+        .into_iter()
+        .map(|(user_id, _)| user_id)
+        .collect();
+    let expected: Vec<String> = std::iter::once(id(oldest))
+        .chain((1..MAX_CO_HOST_SUGGESTIONS).map(id))
+        .collect();
+    assert_eq!(ids, expected);
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_exclude_a_mixed_case_host_already_designated_here() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let host = "Sugg.Mixed.Host@Example.com";
+
+    let hosted = "test-sugg-lower-hosted";
+    create_meeting_as(&pool, hosted, SUGG_OWNER, serde_json::json!({})).await;
+    join_ok(&pool, hosted, SUGG_OWNER).await;
+    join_ok(&pool, hosted, host).await;
+    admit_as(&pool, hosted, SUGG_OWNER, host).await;
+    let resp = host_action(&pool, hosted, "transfer-host", SUGG_OWNER, host).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let other = "test-sugg-lower-other";
+    create_meeting_as(&pool, other, SUGG_OWNER, serde_json::json!({})).await;
+    assert_eq!(
+        suggested(&pool, other).await,
+        vec![(host.to_string(), None)]
+    );
+
+    let room = "test-sugg-lower-new";
+    create_meeting_as(
+        &pool,
+        room,
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [host] }),
+    )
+    .await;
+    assert_eq!(
+        suggested(&pool, room).await,
+        Vec::<(String, Option<String>)>::new()
+    );
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_return_the_real_case_id_of_an_owner_who_never_joined() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let absent = "Sugg.Absent.Owner@Example.com";
+
+    let visited = "test-sugg-absent-visited";
+    create_meeting_as(
+        &pool,
+        visited,
+        absent,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    assert_eq!(join_ok(&pool, visited, SUGG_OWNER).await.status, "admitted");
+
+    let room = "test-sugg-absent-new";
+    create_meeting_as(&pool, room, SUGG_OWNER, serde_json::json!({})).await;
+    assert_eq!(
+        suggested(&pool, room).await,
+        vec![(absent.to_string(), None)]
+    );
+
+    cleanup_suggestion_rooms(&pool).await;
+}
+
+async fn named_statements(pool: &sqlx::PgPool, pattern: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM pg_prepared_statements WHERE statement LIKE $1")
+        .bind(pattern)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_prepared_statements")
+}
+
+#[tokio::test]
+#[serial]
+async fn co_host_suggestions_run_as_an_unnamed_statement() {
+    let pool = get_test_pool().await;
+    cleanup_suggestion_rooms(&pool).await;
+    let co = "sugg-stmt-co@example.com";
+    create_meeting_as(
+        &pool,
+        "test-sugg-stmt-own",
+        SUGG_OWNER,
+        serde_json::json!({ "co_hosts": [co] }),
+    )
+    .await;
+    let room = "test-sugg-stmt-new";
+    create_meeting_as(&pool, room, SUGG_OWNER, serde_json::json!({})).await;
+    let room_pk = meeting_pk(&pool, room).await;
+
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+    let one_conn = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect a single-connection pool");
+    let rows = meeting_api::db::co_hosts::suggestions(&one_conn, SUGG_OWNER, room_pk, 10)
+        .await
+        .expect("suggestions");
+    assert_eq!(
+        rows.iter().map(|r| r.user_id.as_str()).collect::<Vec<_>>(),
+        vec![co]
+    );
+    meeting_api::db::co_hosts::has_live_entry(&one_conn, room_pk, co)
+        .await
+        .expect("has_live_entry");
+
+    assert_eq!(named_statements(&one_conn, "%WITH owned AS%").await, 0);
+    assert_eq!(
+        named_statements(&one_conn, "%AND user_id = $2 AND NOT suspended)").await,
+        1,
+        "a persistent query on the same connection must be visible"
+    );
+
+    one_conn.close().await;
+    cleanup_suggestion_rooms(&pool).await;
 }

@@ -24,6 +24,7 @@
 //! deserialize from JSON, dispatch to a handler, and re-subscribe on stream
 //! end. The functions are no-ops when NATS is not configured.
 
+use crate::captions::{self, RevokeReason};
 use crate::db::meetings as db_meetings;
 use crate::db::participants as db_participants;
 use crate::feed_events::{FeedChange, FeedChangeReason};
@@ -97,6 +98,7 @@ pub fn spawn_meeting_ended_by_host_consumer_inner(
     feed_tx: broadcast::Sender<FeedChange>,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    let nats_for_captions = nats.clone();
     spawn_room_state_consumer::<crate::nats_events::MeetingEndedByHostPayload, _>(
         nats,
         pool,
@@ -105,8 +107,14 @@ pub fn spawn_meeting_ended_by_host_consumer_inner(
         ready_tx,
         MEETING_ENDED_BY_HOST_SUBJECT,
         "host-disconnect DB-write fanout",
-        |pool, meeting_id| {
-            Box::pin(async move { db_meetings::end_meeting(&pool, meeting_id).await })
+        move |pool, meeting_id| {
+            let nats = nats_for_captions.clone();
+            Box::pin(async move {
+                db_meetings::end_meeting(&pool, meeting_id).await?;
+                let reason = RevokeReason::Ended;
+                captions::revoke_if_inactive(&pool, nats.as_ref(), meeting_id, reason, None).await;
+                Ok(())
+            })
         },
     )
 }
@@ -121,7 +129,7 @@ pub fn spawn_meeting_became_empty_consumer_inner(
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Cloned before `nats` moves into `spawn_room_state_consumer`, so the
-    // per-message closure can compute presence health on its own copy.
+    // per-message closure has its own copy.
     let nats_for_health = nats.clone();
     spawn_room_state_consumer::<crate::nats_events::MeetingBecameEmptyPayload, _>(
         nats,
@@ -137,9 +145,10 @@ pub fn spawn_meeting_became_empty_consumer_inner(
                 let healthy = db_participants::presence_healthy(&pool, nats_for_health.as_ref())
                     .await
                     .unwrap_or(false);
-                db_meetings::set_idle(&pool, meeting_id, healthy)
-                    .await
-                    .map(|_| ())
+                db_meetings::set_idle(&pool, meeting_id, healthy).await?;
+                let (nats, reason) = (nats_for_health.as_ref(), RevokeReason::Idle);
+                captions::revoke_if_inactive(&pool, nats, meeting_id, reason, None).await;
+                Ok(())
             })
         },
     )
@@ -252,7 +261,7 @@ pub fn spawn_participant_presence_consumer_inner(
 
 /// Apply one relay presence report: [`db_participants::record_present`] or
 /// [`db_participants::record_left`], then publish what changed — HOST_GRANTED
-/// for a co-host promoted on connect, MEETING_ENDED when the last present host
+/// for a co-host promoted on connect, a deferred end when the last present host
 /// left with `end_on_host_leave` — and nudge the local feed.
 pub async fn apply_participant_presence(
     pool: &PgPool,
@@ -272,7 +281,23 @@ pub async fn apply_participant_presence(
         match db_participants::record_left(pool, meeting.id, &report.user_id, session_id, healthy)
             .await
         {
-            Ok(Some((_, end))) => announce_departure(nats, feed_tx, &meeting.room_id, end).await,
+            Ok(Some(departed)) => {
+                announce_departure(pool, nats, feed_tx, meeting.id, &meeting.room_id, None).await;
+                if departed.end_deferred {
+                    tracing::info!(
+                        "Last host of meeting {} left; ending it in {}s unless a host returns",
+                        meeting.room_id,
+                        db_participants::HOST_LEFT_END_DEBOUNCE.as_secs()
+                    );
+                    spawn_host_left_end(
+                        pool.clone(),
+                        nats.cloned(),
+                        feed_tx.clone(),
+                        meeting.id,
+                        meeting.room_id.clone(),
+                    );
+                }
+            }
             Ok(None) => {}
             Err(e) => tracing::error!(
                 "Failed to record {} left meeting {} (session {}): {e}",
@@ -329,14 +354,113 @@ pub async fn apply_participant_presence(
     }
 }
 
-/// After a participant departed `room_id`: broadcast MEETING_ENDED when the
-/// departure ended the meeting, and nudge the local feed.
-pub async fn announce_departure(
+/// Best-effort prompt settle; [`sweep_tick`] backstops it.
+fn spawn_host_left_end(
+    pool: PgPool,
+    nats: Option<async_nats::Client>,
+    feed_tx: broadcast::Sender<FeedChange>,
+    meeting_id: i32,
+    room_id: String,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(db_participants::HOST_LEFT_END_DEBOUNCE + Duration::from_secs(1)).await;
+        let healthy = db_participants::presence_healthy(&pool, nats.as_ref())
+            .await
+            .unwrap_or(false);
+        end_host_left_if_due(
+            &pool,
+            nats.as_ref(),
+            &feed_tx,
+            meeting_id,
+            &room_id,
+            healthy,
+        )
+        .await;
+    });
+}
+
+/// [`db_participants::end_host_left_if_due`], announcing an end like an immediate last-host departure.
+pub async fn end_host_left_if_due(
+    pool: &PgPool,
     nats: Option<&async_nats::Client>,
     feed_tx: &broadcast::Sender<FeedChange>,
+    meeting_id: i32,
+    room_id: &str,
+    healthy: bool,
+) -> bool {
+    match db_participants::end_host_left_if_due(pool, meeting_id, healthy).await {
+        Ok(true) => {
+            tracing::info!("Host of meeting {room_id} did not return; ending it");
+            announce_departure(
+                pool,
+                nats,
+                feed_tx,
+                meeting_id,
+                room_id,
+                Some(db_participants::DepartureEnd::LastHostLeft),
+            )
+            .await;
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::error!("Failed to settle deferred host-left end of meeting {room_id}: {e}");
+            false
+        }
+    }
+}
+
+const HOST_LEFT_END_ADVISORY_LOCK: i64 = 3_156_001;
+
+/// Settle every due deferred last-host-left end under an advisory lock, like [`sweep_presence`]; returns how many ended.
+pub async fn end_due_host_left_meetings(
+    pool: &PgPool,
+    nats: Option<&async_nats::Client>,
+    feed_tx: &broadcast::Sender<FeedChange>,
+    healthy: bool,
+) -> Result<usize, sqlx::Error> {
+    Ok(under_advisory_lock(
+        pool,
+        HOST_LEFT_END_ADVISORY_LOCK,
+        end_due_host_left_meetings_locked(pool, nats, feed_tx, healthy),
+    )
+    .await?
+    .unwrap_or(0))
+}
+
+async fn end_due_host_left_meetings_locked(
+    pool: &PgPool,
+    nats: Option<&async_nats::Client>,
+    feed_tx: &broadcast::Sender<FeedChange>,
+    healthy: bool,
+) -> Result<usize, sqlx::Error> {
+    let mut ended = 0;
+    for (meeting_id, room_id) in
+        db_participants::host_left_ends_due(pool, PRESENCE_SWEEP_BATCH).await?
+    {
+        if end_host_left_if_due(pool, nats, feed_tx, meeting_id, &room_id, healthy).await {
+            ended += 1;
+        }
+    }
+    Ok(ended)
+}
+
+/// After a participant departed `room_id`: revoke captions if it left the meeting idle or ended,
+/// broadcast MEETING_ENDED if it ended it, then nudge the local feed.
+pub async fn announce_departure(
+    pool: &PgPool,
+    nats: Option<&async_nats::Client>,
+    feed_tx: &broadcast::Sender<FeedChange>,
+    meeting_id: i32,
     room_id: &str,
     end: Option<db_participants::DepartureEnd>,
 ) {
+    let reason = if end.is_some() {
+        RevokeReason::Ended
+    } else {
+        RevokeReason::Departure
+    };
+    captions::revoke_if_inactive(pool, nats, meeting_id, reason, None).await;
     let reason = if end.is_some() {
         crate::nats_events::publish_meeting_ended(
             nats,
@@ -540,13 +664,15 @@ pub fn spawn_presence_sweeper(
 /// holds, so a heartbeat outage can't make the sweeper depart everyone it can
 /// no longer hear from. `None` means skipped (including a failed health
 /// check — unhealthy is the safe default). Split out so a test can drive one
-/// tick synchronously instead of waiting on the real interval.
+/// tick synchronously instead of waiting on the real interval. Due host-left
+/// ends are settled every tick, healthy or not.
 async fn sweep_tick(
     pool: &PgPool,
     nats: &async_nats::Client,
     feed_tx: &broadcast::Sender<FeedChange>,
 ) -> Option<usize> {
-    match db_participants::presence_healthy(pool, Some(nats)).await {
+    let health = db_participants::presence_healthy(pool, Some(nats)).await;
+    let swept = match &health {
         Ok(true) => match sweep_presence(pool, Some(nats), feed_tx).await {
             Ok(departed) => Some(departed),
             Err(e) => {
@@ -557,15 +683,20 @@ async fn sweep_tick(
         Ok(false) => {
             tracing::warn!(
                 "Presence heartbeat pipeline unhealthy (stale watermark or NATS down); \
-                 skipping this sweep tick"
+                 skipping this tick's lease sweep"
             );
             None
         }
         Err(e) => {
-            tracing::error!("Presence health check failed, skipping sweep tick: {e}");
+            tracing::error!("Presence health check failed, skipping this tick's lease sweep: {e}");
             None
         }
+    };
+    let healthy = matches!(health, Ok(true));
+    if let Err(e) = end_due_host_left_meetings(pool, Some(nats), feed_tx, healthy).await {
+        tracing::error!("Deferred host-left end sweep failed: {e}");
     }
+    swept
 }
 
 /// Test-only: drive one [`sweep_tick`] synchronously. Takes a live client
@@ -593,30 +724,41 @@ pub async fn sweep_presence(
     nats: Option<&async_nats::Client>,
     feed_tx: &broadcast::Sender<FeedChange>,
 ) -> Result<usize, sqlx::Error> {
+    Ok(under_advisory_lock(
+        pool,
+        PRESENCE_SWEEP_ADVISORY_LOCK,
+        sweep_presence_locked(pool, nats, feed_tx),
+    )
+    .await?
+    .unwrap_or(0))
+}
+
+/// Run `work` under advisory lock `key`; `Ok(None)` when another session holds it.
+async fn under_advisory_lock<T>(
+    pool: &PgPool,
+    key: i64,
+    work: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<Option<T>, sqlx::Error> {
     // Advisory lock/unlock are session-scoped: both must run on the same
     // physical connection.
     let mut lock_conn = pool.acquire().await?;
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(PRESENCE_SWEEP_ADVISORY_LOCK)
+        .bind(key)
         .fetch_one(&mut *lock_conn)
         .await?;
     if !acquired {
-        return Ok(0);
+        return Ok(None);
     }
-    // Unlock the same connection whether the sweep finishes, errors, or
-    // panics: without `catch_unwind` here, a panic mid-sweep would unwind
-    // past the unlock below, and the connection would return to the pool
-    // (not closed) still holding the session-scoped advisory lock — wedging
-    // every future sweep tick that draws that connection.
-    let result = std::panic::AssertUnwindSafe(sweep_presence_locked(pool, nats, feed_tx))
-        .catch_unwind()
-        .await;
+    // Unlock the same connection whether `work` finishes, errors, or panics:
+    // without `catch_unwind` a panic would return the connection to the pool
+    // still holding the session-scoped lock, wedging every later holder.
+    let result = std::panic::AssertUnwindSafe(work).catch_unwind().await;
     let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(PRESENCE_SWEEP_ADVISORY_LOCK)
+        .bind(key)
         .execute(&mut *lock_conn)
         .await;
     match result {
-        Ok(departed) => departed,
+        Ok(done) => done.map(Some),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
@@ -635,7 +777,7 @@ async fn sweep_presence_locked(
                 tracing::info!(
                     "Presence lease of {user_id} in meeting {room_id} ran out (ended={end:?})"
                 );
-                announce_departure(nats, feed_tx, &room_id, end).await;
+                announce_departure(pool, nats, feed_tx, meeting_id, &room_id, end).await;
                 departed += 1;
             }
             Ok(None) => {}
@@ -647,6 +789,7 @@ async fn sweep_presence_locked(
             }
         }
     }
+    captions::reconcile(pool, nats).await;
     Ok(departed)
 }
 

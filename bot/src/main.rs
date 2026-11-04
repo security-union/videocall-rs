@@ -40,7 +40,8 @@ use bot::shutdown;
 use bot::transport::{
     self, OutboundFrame, OutboundFrameSender, TransportClient, WebSocketStreamByteCounters,
 };
-use bot::video_producer::VideoProducer;
+use bot::video_producer::replay::{self, ReplayLibrary, ReplayPublisher, SpeechTrack};
+use bot::video_producer::{ForcedKeyframeGate, VideoProducer};
 use bot::viewport_sender::ViewportSender;
 use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
@@ -73,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
 
     // One shutdown flag for the whole run: Ctrl-C, SIGTERM or --duration.
     let (shutdown_tx, mut shutdown_rx) = shutdown::shutdown_channel();
-    let run_duration = config.run_duration()?;
+    let run_duration = config.run_duration_at(run_started_at)?;
+    let hard_stop = config.run_deadline.map(|end| {
+        tokio::time::Instant::now()
+            + Duration::from_secs_f64((end as f64 - run_started_at).max(0.0))
+    });
     let _shutdown_trigger = shutdown::spawn_shutdown_trigger(shutdown_tx, run_duration);
     if let Some(d) = run_duration {
         info!("Run duration: {:?} (from process start)", d);
@@ -231,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
     for (index, entry) in roster.iter().enumerate() {
         let p = &entry.participant;
         let (transport, _) = config.resolve_transport(roster_offset + index)?;
+        let replay_camera = config.video_mode == VideoMode::Replay && entry.role.sends_video();
         records.push(run_manifest::ParticipantRecord {
             user_id: config.wire_user_id(&p.name),
             fleet: "rust",
@@ -242,6 +248,16 @@ async fn main() -> anyhow::Result<()> {
                 mic: entry.role.sends_audio(),
                 screen: false,
             },
+            video_source: entry
+                .role
+                .sends_video()
+                .then(|| run_manifest::video_source(&config.video_mode, p.costume_dir.is_some())),
+            replay_answer_keyframe_requests: replay_camera
+                .then(|| config.replay_answers_keyframe_requests()),
+            replay_forced_keyframes: replay_camera
+                .then(|| vec![0; config.simulcast_layer_count() as usize]),
+            replay_tier_change_keyframes: replay_camera
+                .then(|| vec![0; config.simulcast_layer_count() as usize]),
             network: run_manifest::network_record(
                 &config.network_label(p),
                 &config.resolve_network(p)?,
@@ -357,6 +373,57 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let replay_library: Option<Arc<ReplayLibrary>> = if config.video_mode == VideoMode::Replay
+        && roster.iter().any(|e| e.role.sends_video())
+    {
+        let publishers: Vec<_> = roster.iter().filter(|e| e.role.sends_video()).collect();
+        let ekg_fps = BotAq::with_default_clock()
+            .snapshot_video()
+            .target_fps
+            .max(1);
+        let talkers: Vec<SpeechTrack> = publishers
+            .iter()
+            .filter(|e| e.role.sends_audio())
+            .filter_map(|e| participant_audio.get(&e.participant.name))
+            .map(|audio| {
+                let rms = ekg_renderer::compute_rms_per_frame(audio, 48000, ekg_fps);
+                let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
+                SpeechTrack { rms, max_rms }
+            })
+            .collect();
+        let color = publishers[0].participant.ekg_color;
+        let layers = config.simulcast_layer_count();
+        let gops = config.replay_loop_gops();
+        let quit = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let build = tokio::task::spawn_blocking({
+            let quit = Arc::clone(&quit);
+            move || replay::build_library(layers, color, &talkers, ekg_fps, gops, &quit)
+        });
+        tokio::select! {
+            built = build => {
+                let library = built.map_err(|e| anyhow::anyhow!("replay library build: {e}"))??;
+                info!(
+                    "Replay library built in {:.1}s on {} threads: {} layers, {} GOPs per variant, speaking variant {}, {} bytes",
+                    started.elapsed().as_secs_f64(),
+                    library.build_threads(),
+                    library.layers().len(),
+                    gops,
+                    if library.layers()[0].gops(replay::Variant::Speaking) > 0 { "yes" } else { "no" },
+                    library.total_bytes(),
+                );
+                Some(Arc::new(library))
+            }
+            _ = shutdown::wait_for_shutdown(&mut shutdown_rx) => {
+                quit.store(true, Ordering::Relaxed);
+                warn!("Shutdown requested while building the replay library");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Media start via OnceCell -- set AFTER all bots are spawned + warmup sleep
     let media_start_cell: Arc<tokio::sync::OnceCell<Instant>> =
         Arc::new(tokio::sync::OnceCell::new());
@@ -413,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
         let meeting_id = config.meeting_id.clone();
         let ekg_color = p.ekg_color;
         let costume_dir = p.costume_dir.clone();
+        let library = replay_library.clone();
         let cell = media_start_cell.clone();
         let ld = loop_duration;
         let position = roster_offset + index;
@@ -429,6 +497,7 @@ async fn main() -> anyhow::Result<()> {
                 audio_data,
                 ekg_color,
                 costume_dir,
+                library,
                 insecure,
                 cell,
                 ld,
@@ -492,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
             handle,
             &mut shutdown_rx,
             CLIENT_STOP_GRACE,
+            hard_stop,
             &mut stop_deadline,
         )
         .await;
@@ -535,6 +605,7 @@ async fn run_client(
     audio_data: Vec<f32>,
     ekg_color: [u8; 3],
     costume_dir: Option<String>,
+    replay_library: Option<Arc<ReplayLibrary>>,
     insecure: bool,
     media_start_cell: Arc<tokio::sync::OnceCell<Instant>>,
     loop_duration: Duration,
@@ -556,7 +627,7 @@ async fn run_client(
     let client_config =
         ClientConfig::for_role(user_id.clone(), meeting_id, role, timings.heartbeat);
 
-    let lobby_auth = bot_config.resolve_lobby_auth()?;
+    let lobby_auth = bot_config.connect_auth(&client_config.user_id, &client_config.meeting_id)?;
     let lobby_url = TransportClient::build_lobby_url(
         &resolved_transport,
         &server_url,
@@ -644,6 +715,16 @@ async fn run_client(
 
     // Shared is_speaking flag -- audio producer sets, heartbeat/video reads
     let is_speaking = Arc::new(AtomicBool::new(false));
+
+    let keyframe_requests = bot_config
+        .answers_keyframe_requests(client_config.enable_video)
+        .then(|| Arc::new(AtomicU64::new(0)));
+    if let Some(signal) = &keyframe_requests {
+        stats
+            .lock()
+            .unwrap()
+            .set_keyframe_request_signal(Arc::clone(signal));
+    }
 
     // Construct the inbound shim (if any) before connecting, so the hook is
     // installed as the transport comes up and we don't race the first packet.
@@ -987,7 +1068,53 @@ async fn run_client(
                     // Resolved simulcast layer count (#989): default 3, clamped to
                     // 1..=SIMULCAST_MAX_LAYERS. N==1 = legacy single-stream path.
                     let simulcast_layers = bot_config.simulcast_layer_count();
-                    if *video_mode == VideoMode::Costume {
+                    if *video_mode == VideoMode::Replay {
+                        let library = replay_library
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("no replay library was built"))?;
+                        let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
+                        let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
+                        let counts = replay::ForcedKeyframeCounts::new(library.layers().len());
+                        #[cfg(feature = "metrics")]
+                        let counts = match &metrics {
+                            Some(m) => counts.with_metrics(m, &user_id, &client_config.meeting_id),
+                            None => counts,
+                        };
+                        let counts = Mutex::new(counts);
+                        let forced_registry = Arc::clone(&registry);
+                        let forced_user = user_id.clone();
+                        let on_forced_keyframe =
+                            Box::new(move |layer: u32, by_request: bool, by_tier: bool| {
+                                let mut counts = counts.lock().unwrap_or_else(|e| e.into_inner());
+                                counts.record(layer, by_request, by_tier);
+                                forced_registry.set_replay_forced_keyframes(
+                                    &forced_user,
+                                    counts.request(),
+                                    counts.tier_change(),
+                                );
+                            });
+                        let uplink = replay::uplink_probe(uplink_shim.clone(), &resolved_transport);
+                        video_producer = Some(VideoProducer::from_replay(
+                            library,
+                            ReplayPublisher {
+                                user_id: user_id.clone(),
+                                rms,
+                                max_rms,
+                                rms_fps: ekg_fps,
+                                packet_sender: packet_tx.clone(),
+                                media_start,
+                                loop_duration,
+                                aq: aq.clone(),
+                                encoder_output_fps: encoder_output_fps.clone(),
+                                encoder_frames_ok: encoder_frames_ok.clone(),
+                                transport_drops_counter: transport_drops_counter.clone(),
+                                keyframe_requests: keyframe_requests.clone(),
+                                uplink,
+                                seed: bot_config.replay_seed,
+                                on_forced_keyframe,
+                            },
+                        ));
+                    } else if *video_mode == VideoMode::Costume {
                         if let Some(ref dir) = costume_dir {
                             let renderer = CostumeRenderer::load(Path::new(dir))?;
                             video_producer = Some(VideoProducer::from_costume(
@@ -1003,6 +1130,10 @@ async fn run_client(
                                 encoder_frames_ok.clone(),
                                 transport_drops_counter.clone(),
                                 simulcast_layers,
+                                ForcedKeyframeGate::new(
+                                    keyframe_requests.clone(),
+                                    replay::uplink_probe(uplink_shim.clone(), &resolved_transport),
+                                ),
                             )?);
                             info!("Costume video producer started for {} ({})", user_id, dir);
                         } else {
@@ -1032,6 +1163,10 @@ async fn run_client(
                                 encoder_frames_ok.clone(),
                                 transport_drops_counter.clone(),
                                 simulcast_layers,
+                                ForcedKeyframeGate::new(
+                                    keyframe_requests.clone(),
+                                    replay::uplink_probe(uplink_shim.clone(), &resolved_transport),
+                                ),
                             )?);
                             info!("EKG video producer started for {} (fallback)", user_id);
                         }
@@ -1056,6 +1191,10 @@ async fn run_client(
                             encoder_frames_ok.clone(),
                             transport_drops_counter.clone(),
                             simulcast_layers,
+                            ForcedKeyframeGate::new(
+                                keyframe_requests.clone(),
+                                replay::uplink_probe(uplink_shim.clone(), &resolved_transport),
+                            ),
                         )?);
                         info!("EKG video producer started for {}", user_id);
                     }

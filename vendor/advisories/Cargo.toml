@@ -1,0 +1,12 @@
+[package]
+name = "vendored-advisories"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+quinn-proto = "=0.11.19"
+quinn = "=0.11.9"
+web-transport-quinn = "=0.11.9"
+
+[workspace]

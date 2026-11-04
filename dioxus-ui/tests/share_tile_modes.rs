@@ -15,15 +15,15 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 use dioxus_ui::components::canvas_generator::{
-    OwnShareTile, PinnedTile, ScreenDetachAnnouncer, TileMode,
+    OwnShareTile, PinnedTile, ScreenDetachAnnouncer, ShareWindowToast, TileMode,
 };
 use dioxus_ui::components::decode_budget::TileRenderMode;
 use dioxus_ui::components::peer_tile::{camera_tiles, CameraTiles, PeerTile};
 use dioxus_ui::components::pin_order;
 use dioxus_ui::components::screen_share_detach as ssd;
 use dioxus_ui::components::share_view::{
-    self, effective_mode, CtaState, ShareAction, ShareBase, ShareOrigin, ShareSlot, ShareSlots,
-    ShareTarget, ShareTileView, ShareTracker, ShareViewCtx, TeardownCause, CTA_HINT, DETACH_FAILED,
+    self, effective_mode, CtaState, ReceivedStage, ShareAction, ShareBase, ShareOrigin, ShareSlot,
+    ShareSlots, ShareTarget, ShareTileView, ShareTracker, ShareViewCtx, CTA_HINT, DETACH_FAILED,
     OWN_SHARE_KEY,
 };
 use dioxus_ui::context::{
@@ -38,6 +38,7 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const PREF_KEY: &str = "vc_own_share_view_mode";
+const METRICS_KEY: &str = dioxus_ui::components::media_metrics_overlay::MEDIA_METRICS_OVERLAY_KEY;
 const TILE: &str = "[data-testid='own-share-tile']";
 const DETACH_BTN: &str = "own-screen-share-detach-btn";
 
@@ -48,6 +49,7 @@ thread_local! {
     static SEED_PINS: RefCell<Vec<PinnedTile>> = const { RefCell::new(Vec::new()) };
     static SEED_BOX: Cell<Option<u32>> = const { Cell::new(None) };
     static STREAM: RefCell<Option<web_sys::MediaStream>> = const { RefCell::new(None) };
+    static NEXT_CAPTURE: RefCell<Option<web_sys::MediaStream>> = const { RefCell::new(None) };
 }
 
 fn storage() -> web_sys::Storage {
@@ -78,10 +80,15 @@ fn reset_page() {
         }
     }
     ssd::close_all();
-    js("if (window.__pipResolve) window.__pipResolve(null); \
-        delete window.documentPictureInPicture; delete window.__pipResolve;");
+    js(
+        "delete window.documentPictureInPicture; delete window.__pipCalls; \
+        if (window.__realOpen) window.open = window.__realOpen; \
+        delete window.__popupDoc; delete window.__openCalls; delete window.__popupBlocked; \
+        delete window.__popupHasNoPagehide;",
+    );
     let _ = storage().remove_item(PREF_KEY);
     let _ = storage().remove_item(ShareOrigin::Received.pref_key());
+    let _ = storage().remove_item(METRICS_KEY);
     SEED_GUARD.with(|g| g.set(false));
     SEED_CTA.with(|c| c.set(CtaState::Hidden));
     SEED_RECEIVED_ENLARGED.with(|r| r.set(false));
@@ -105,39 +112,34 @@ fn marked_mount() -> web_sys::Element {
     mount
 }
 
-/// A Document PiP whose `requestWindow` resolves only when the test says so.
-fn install_pip_stub() {
+fn install_popup_stub() {
     js(
-        "Object.defineProperty(window, 'documentPictureInPicture', { configurable: true, \
-         value: { requestWindow: () => new Promise(r => { window.__pipResolve = r; }) } });",
+        "window.__realOpen = window.__realOpen || window.open; window.__openCalls = []; \
+         window.open = function (url, target, features) { \
+           window.__openCalls.push(String(features)); \
+           if (window.__popupBlocked) return null; \
+           const frame = document.createElement('iframe'); \
+           frame.setAttribute('data-share-tile-test', ''); \
+           document.body.appendChild(frame); \
+           frame.contentWindow.close = function () { this.__closedByApp = true; }; \
+           const timers = frame.contentWindow.setInterval.bind(frame.contentWindow); \
+           frame.contentWindow.__intervals = []; \
+           frame.contentWindow.setInterval = (...args) => { \
+             const id = timers(...args); frame.contentWindow.__intervals.push(id); return id; }; \
+           const listen = frame.contentWindow.addEventListener.bind(frame.contentWindow); \
+           frame.contentWindow.addEventListener = (type, cb, opts) => \
+             type === 'pagehide' && window.__popupHasNoPagehide ? undefined : listen(type, cb, opts); \
+           window.__popupDoc = frame.contentDocument; \
+           return frame.contentWindow; };",
     );
 }
 
-/// Resolves the pending `requestWindow` with a same-origin frame's window and
-/// returns that frame's document.
-fn resolve_pip_with_frame() -> web_sys::Document {
-    let frame = gloo_utils::document().create_element("iframe").unwrap();
-    mark(&frame);
-    gloo_utils::document()
-        .body()
-        .unwrap()
-        .append_child(&frame)
-        .unwrap();
-    let resolve: js_sys::Function =
-        js_sys::Reflect::get(&gloo_utils::window(), &"__pipResolve".into())
-            .unwrap()
-            .unchecked_into();
-    let frame_window = js_sys::Reflect::get(&frame, &"contentWindow".into()).unwrap();
-    js_sys::Reflect::set(
-        &frame_window,
-        &"close".into(),
-        &js("return function () { this.__closedByApp = true; };"),
-    )
-    .unwrap();
-    resolve.call1(&JsValue::NULL, &frame_window).unwrap();
-    js_sys::Reflect::get(&frame, &"contentDocument".into())
-        .unwrap()
-        .unchecked_into()
+fn block_popups(blocked: bool) {
+    js(&format!("window.__popupBlocked = {blocked};"));
+}
+
+fn popup_doc() -> web_sys::Document {
+    js("return window.__popupDoc;").unchecked_into()
 }
 
 fn frame_closed(doc: &web_sys::Document) -> bool {
@@ -191,15 +193,17 @@ fn Harness() -> Element {
     let own_stream = use_signal(|| STREAM.with(|s| s.borrow().as_ref().map(Clone::clone)));
     let mut show = use_signal(|| true);
     let mut twin = use_signal(|| false);
+    let stage = use_signal(ReceivedStage::default);
     use_context_provider(|| ScreenZoomCtx(zoom));
     use_context_provider(|| DetachedShareCtx(detached));
     use_context_provider(|| ScreenActualSizeCtx(actual));
-    use_context_provider(|| ShareViewCtx {
+    let ctx = use_context_provider(|| ShareViewCtx {
         slots,
         pins,
         detached,
         announce,
         own_stream,
+        stage,
     });
     let target = ShareTarget {
         origin: ShareOrigin::Own,
@@ -207,6 +211,7 @@ fn Harness() -> Element {
         pin: PinnedTile::own_screen("me"),
         name: ShareOrigin::Own.subject().to_string(),
     };
+    let replaced = target.clone();
     let slot = slots.read().own;
     let mode = effective_mode(
         detached.read().as_deref() == Some(OWN_SHARE_KEY),
@@ -219,8 +224,14 @@ fn Harness() -> Element {
         mode,
         cta: slot.cta,
         guard: slot.guard,
+        demoted: false,
     };
     let pin_probe = pin_list_probe(&pins.read());
+    let own_is_next = own_stream
+        .read()
+        .as_ref()
+        .zip(NEXT_CAPTURE.with(|n| n.borrow().clone()))
+        .is_some_and(|(own, next)| js_sys::Object::is(own, &next));
     let zoom_probe = zoom
         .read()
         .get(OWN_SHARE_KEY)
@@ -243,6 +254,13 @@ fn Harness() -> Element {
             ScreenDetachAnnouncer {}
             button { id: "h-unmount", onclick: move |_| show.set(false) }
             button { id: "h-twin", onclick: move |_| twin.set(true) }
+            button {
+                id: "h-replace",
+                onclick: move |_| {
+                    let next = NEXT_CAPTURE.with(|n| n.borrow().clone()).unwrap();
+                    share_view::own_capture_replaced(ctx, &replaced, &next, true, zoom);
+                },
+            }
             button { id: "h-detach-on", onclick: move |_| detached.set(Some(OWN_SHARE_KEY.to_string())) }
             button { id: "h-detach-off", onclick: move |_| detached.set(None) }
             button {
@@ -262,6 +280,7 @@ fn Harness() -> Element {
             span { id: "h-received-base", "{slots.read().received.base:?}" }
             span { id: "h-pin", "{pin_probe}" }
             span { id: "h-zoom", "{zoom_probe}" }
+            span { id: "h-own-is-next", "{own_is_next}" }
             span { id: "h-detached", "{detached.read().clone().unwrap_or_default()}" }
         }
     }
@@ -504,6 +523,14 @@ async fn view_buttons_change_the_mode_on_the_same_nodes_and_escape_leaves_the_pi
         attr(&page, "[data-testid='ss-enlarge']", "aria-pressed").as_deref(),
         Some("true")
     );
+    assert_eq!(
+        attr(&page, "[data-testid='ss-enlarge']", "title").as_deref(),
+        Some("Return to grid")
+    );
+    assert_eq!(
+        attr(&page, "[data-testid='ss-enlarge']", "aria-label").as_deref(),
+        Some("Enlarge shared content")
+    );
     assert_eq!(announced(&page), "Your shared content enlarged");
     assert_eq!(
         storage().get_item(PREF_KEY).unwrap().as_deref(),
@@ -533,6 +560,10 @@ async fn view_buttons_change_the_mode_on_the_same_nodes_and_escape_leaves_the_pi
         attr(&page, "[data-testid='ss-enlarge']", "aria-pressed").as_deref(),
         Some("false"),
         "R2: Enlarge reads unpressed while pinned"
+    );
+    assert_eq!(
+        attr(&page, "[data-testid='ss-enlarge']", "title").as_deref(),
+        Some("Enlarge")
     );
     assert_eq!(announced(&page), "Your shared content pinned");
     assert_eq!(active_id(), "own-screen-share-pin-btn");
@@ -669,25 +700,35 @@ async fn pin_on_one_share_leaves_the_other_alone() {
 
 #[wasm_bindgen_test]
 async fn a_synchronous_detach_failure_reverts_and_keeps_focus() {
-    let page = mount_with(install_pip_stub).await;
-    let detach = el(&page, "[data-testid='ss-detach']");
-    detach.focus().unwrap();
-    detach.click();
-    settle().await;
-    assert_eq!(mode(&page), "tile", "T15: back to the previous mode");
-    assert_eq!(announced(&page), DETACH_FAILED);
-    assert_eq!(storage().get_item(PREF_KEY).unwrap(), None, "R1");
-    assert_eq!(
-        active_id(),
-        DETACH_BTN,
-        "T15: focus stays on the pressed button"
-    );
+    for blocked in [false, true] {
+        let page = if blocked {
+            mount_with(|| {
+                drop(seed_live_capture());
+                block_popups(true);
+            })
+            .await
+        } else {
+            mount_with(install_popup_stub).await
+        };
+        let detach = el(&page, "[data-testid='ss-detach']");
+        detach.focus().unwrap();
+        detach.click();
+        settle().await;
+        assert_eq!(mode(&page), "tile", "T15: back to the previous mode");
+        assert_eq!(announced(&page), DETACH_FAILED, "blocked: {blocked}");
+        assert_eq!(storage().get_item(PREF_KEY).unwrap(), None, "R1");
+        assert_eq!(
+            active_id(),
+            DETACH_BTN,
+            "T15: focus stays on the pressed button (blocked: {blocked})"
+        );
+    }
 }
 
 fn seed_live_capture() -> web_sys::MediaStream {
     let (stream, _paint) = live_canvas_stream();
     let seeded = Clone::clone(&stream);
-    install_pip_stub();
+    install_popup_stub();
     STREAM.with(|s| *s.borrow_mut() = Some(seeded));
     stream
 }
@@ -697,17 +738,18 @@ async fn the_detached_pref_is_committed_only_once_the_window_opens() {
     let mut stream = None;
     let page = mount_with(|| stream = Some(seed_live_capture())).await;
     let stream = stream.unwrap();
+    block_popups(true);
     el(&page, "[data-testid='ss-detach']").click();
     settle().await;
-    assert_eq!(mode(&page), "detached", "the layout switch is optimistic");
+    assert_eq!(announced(&page), DETACH_FAILED, "premise: no window opened");
     assert_eq!(
         storage().get_item(PREF_KEY).unwrap(),
         None,
-        "R3: nothing is written while the window is pending"
+        "R3: nothing is written for a window that never opened"
     );
 
-    let frame = resolve_pip_with_frame();
-    settle().await;
+    block_popups(false);
+    let frame = detach_own_share(&page).await;
     assert_eq!(
         storage().get_item(PREF_KEY).unwrap().as_deref(),
         Some("detached")
@@ -734,34 +776,38 @@ async fn the_detached_pref_is_committed_only_once_the_window_opens() {
     );
 }
 
+fn install_counting_pip_stub() {
+    js(
+        "window.__pipCalls = 0; \
+        Object.defineProperty(window, 'documentPictureInPicture', { configurable: true, \
+        value: { requestWindow: () => { window.__pipCalls++; return Promise.resolve(null); } } });",
+    );
+}
+
+fn assert_one_popup_and_no_pip() {
+    assert_eq!(js("return window.__pipCalls;").as_f64(), Some(0.0));
+    let opened: Vec<String> = js_sys::Array::from(&js("return window.__openCalls;"))
+        .iter()
+        .filter_map(|f| f.as_string())
+        .collect();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert!(opened[0].starts_with("popup=yes,"), "{opened:?}");
+    assert!(popup_doc()
+        .get_element_by_id("ss-detached-reattach")
+        .is_some());
+}
+
 #[wasm_bindgen_test]
-async fn a_system_teardown_cancels_a_pending_open() {
+async fn detach_opens_a_regular_window_where_document_pip_exists() {
     let page = mount_with(|| {
-        install_pip_stub();
-        STREAM.with(|s| *s.borrow_mut() = Some(web_sys::MediaStream::new().unwrap()));
+        drop(seed_live_capture());
+        install_counting_pip_stub();
     })
     .await;
     el(&page, "[data-testid='ss-detach']").click();
     settle().await;
-    assert!(
-        ssd::is_pending(OWN_SHARE_KEY),
-        "premise: the open is in flight"
-    );
-
-    share_view::teardown_with_cause(OWN_SHARE_KEY, TeardownCause::System);
-    let frame = resolve_pip_with_frame();
-    settle().await;
-    assert!(!ssd::is_busy(), "the late window must not be installed");
-    assert!(
-        frame.get_element_by_id("ss-detached-reattach").is_none(),
-        "the late window must not be built"
-    );
-    assert_eq!(text(&page, "#h-detached"), "");
-    assert_ne!(
-        announced(&page),
-        DETACH_FAILED,
-        "a system cancel is not a failed open"
-    );
+    assert_one_popup_and_no_pip();
+    assert_eq!(mode(&page), "detached");
 }
 
 #[wasm_bindgen_test]
@@ -796,10 +842,102 @@ fn page_leave() {
 async fn detach_own_share(page: &Page) -> web_sys::Document {
     el(page, "[data-testid='ss-detach']").click();
     settle().await;
-    let frame = resolve_pip_with_frame();
-    settle().await;
     assert!(ssd::is_busy(), "premise: a window is open");
-    frame
+    popup_doc()
+}
+
+async fn replace_own_capture(page: &Page, surface: &str) -> web_sys::MediaStream {
+    let (next, _paint) = live_canvas_stream();
+    let track = next.get_video_tracks().get(0);
+    let settings = format!("return () => ({{ displaySurface: '{surface}' }});");
+    js_sys::Reflect::set(&track, &"getSettings".into(), &js(&settings)).unwrap();
+    NEXT_CAPTURE.with(|n| *n.borrow_mut() = Some(Clone::clone(&next)));
+    el(page, "#h-replace").click();
+    settle().await;
+    next
+}
+
+#[wasm_bindgen_test]
+async fn a_replaced_capture_plays_in_the_open_own_window() {
+    let page = mount_with(|| drop(seed_live_capture())).await;
+    let frame = detach_own_share(&page).await;
+    frame_el(&frame, "ss-detached-zoom-in").click();
+    assert_ne!(
+        frame_text(&frame, "ss-detached-zoom-label"),
+        "100%",
+        "premise"
+    );
+    let next = replace_own_capture(&page, "window").await;
+    assert!(ssd::is_busy(), "the own window stays open");
+    assert!(js_sys::Object::is(&frame_video_source(&frame), &next));
+    assert_eq!(frame_text(&frame, "ss-detached-zoom-label"), "100%");
+    assert_capture_live(&next, "the UI never stops the new capture");
+    assert_eq!(announced(&page), "Switched to sharing a window");
+}
+
+#[wasm_bindgen_test]
+async fn a_replaced_capture_becomes_the_own_preview_unzoomed() {
+    let page = mount_with(|| drop(seed_live_capture())).await;
+    el(&page, "#h-seed-zoom").click();
+    settle().await;
+    assert_eq!(text(&page, "#h-zoom"), "5000", "premise");
+    let next = replace_own_capture(&page, "window").await;
+    assert_eq!(text(&page, "#h-own-is-next"), "true");
+    assert_eq!(text(&page, "#h-zoom"), "");
+    assert_capture_live(&next, "the preview holds the capture itself");
+}
+
+#[wasm_bindgen_test]
+async fn a_capture_replaced_by_the_whole_screen_hides_the_preview() {
+    let page = mount_with(|| drop(seed_live_capture())).await;
+    let frame = detach_own_share(&page).await;
+    replace_own_capture(&page, "monitor").await;
+    assert!(frame_closed(&frame), "a window would record itself");
+    assert!(!ssd::is_busy());
+    assert_eq!(attr(&page, TILE, "data-guard").as_deref(), Some("true"));
+    assert_eq!(
+        announced(&page),
+        format!(
+            "Switched to sharing your entire screen. {}",
+            share_view::MIRROR_GUARD_ON
+        )
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_preview_hidden_by_hand_stays_hidden_across_a_swap() {
+    let page = mount_with(|| drop(seed_live_capture())).await;
+    el(&page, "[data-testid='ss-hide-preview']").click();
+    settle().await;
+    assert_eq!(
+        attr(&page, TILE, "data-guard").as_deref(),
+        Some("true"),
+        "premise"
+    );
+    replace_own_capture(&page, "window").await;
+    assert_eq!(attr(&page, TILE, "data-guard").as_deref(), Some("true"));
+    assert_eq!(announced(&page), "Switched to sharing a window");
+}
+
+#[wasm_bindgen_test]
+async fn a_whole_screen_share_replaced_by_a_window_shows_the_preview_again() {
+    let page = mount_with(|| {
+        drop(seed_live_capture());
+        SEED_GUARD.with(|g| g.set(true));
+        storage().set_item(PREF_KEY, "detached").unwrap();
+    })
+    .await;
+    assert_eq!(
+        attr(&page, TILE, "data-guard").as_deref(),
+        Some("true"),
+        "premise"
+    );
+    replace_own_capture(&page, "window").await;
+    assert_eq!(attr(&page, TILE, "data-guard"), None);
+    assert_eq!(
+        announced(&page),
+        format!("Switched to sharing a window. {}", share_view::CTA_HINT)
+    );
 }
 
 #[wasm_bindgen_test]
@@ -844,39 +982,6 @@ async fn a_page_kept_in_the_back_forward_cache_gets_its_share_tile_back() {
     );
 }
 
-async fn open_detached(key: &str) -> (web_sys::Document, web_sys::MediaStream) {
-    let (stream, _paint) = live_canvas_stream();
-    ssd::open_stream(key, Clone::clone(&stream), Box::new(|| {}), Box::new(|| {}));
-    assert!(ssd::is_pending(key), "premise: the open is in flight");
-    page_leave();
-    let frame = resolve_pip_with_frame();
-    settle().await;
-    (frame, stream)
-}
-
-#[wasm_bindgen_test]
-async fn the_page_leave_listener_goes_with_the_window() {
-    fresh().await;
-    install_pip_stub();
-    let (_, stream) = open_detached("a").await;
-    ssd::close_all();
-    assert_capture_live(&stream, "close_all");
-
-    let (frame, stream) = open_detached("b").await;
-    assert!(
-        ssd::is_busy() && !frame_closed(&frame),
-        "close_all must remove the listener"
-    );
-    ssd::reattach("b");
-    assert_capture_live(&stream, "reattach");
-
-    let (frame, _) = open_detached("c").await;
-    assert!(
-        ssd::is_busy() && !frame_closed(&frame),
-        "a teardown must remove the listener"
-    );
-}
-
 #[wasm_bindgen_test]
 async fn show_preview_over_a_whole_screen_announces_the_detach_hint() {
     let (stream, _paint) = live_canvas_stream();
@@ -888,7 +993,7 @@ async fn show_preview_over_a_whole_screen_announces_the_detach_hint() {
     )
     .unwrap();
     let page = mount_with(move || {
-        install_pip_stub();
+        install_popup_stub();
         storage().set_item(PREF_KEY, "detached").unwrap();
         SEED_GUARD.with(|g| g.set(true));
         STREAM.with(|s| *s.borrow_mut() = Some(stream));
@@ -916,6 +1021,7 @@ fn ArrivalHarness() -> Element {
         detached: use_signal(|| None::<String>),
         announce: use_signal(|| (String::new(), 0u32)),
         own_stream: use_signal(|| None::<web_sys::MediaStream>),
+        stage: use_signal(ReceivedStage::default),
     };
     let mut resolved = use_signal(|| false);
     let tracker = use_hook(|| Rc::new(RefCell::new(ShareTracker::default())));
@@ -930,10 +1036,12 @@ fn ArrivalHarness() -> Element {
         &mut tracker.borrow_mut(),
         ctx,
         Some(&target),
+        &[],
         known,
         &|_| true,
         None,
         false,
+        (1280.0, 800.0),
         zoom,
         actual,
     );
@@ -1005,7 +1113,7 @@ async fn a_choice_made_before_the_sharer_id_resolves_settles_the_arrival_pin() {
 
 #[wasm_bindgen_test]
 async fn reattach_focus_returns_to_the_detach_button() {
-    let page = mount_with(install_pip_stub).await;
+    let page = mount_with(install_popup_stub).await;
     el(&page, "#h-detach-on").click();
     settle().await;
     assert_eq!(active_id(), "grid-container", "premise: ENTER moved focus");
@@ -1456,6 +1564,8 @@ fn CameraTileList() -> Element {
                 {camera_tiles(CameraTiles {
                     tiles: &tiles.read(),
                     pin_rank: &ranks,
+                    enlarged: &Default::default(),
+                    on_toggle_enlarge: pin,
                     full_bleed: &no_bleed,
                     host_user_id: &None,
                     render_mode: &mode,
@@ -1746,6 +1856,7 @@ fn SharingPeer() -> Element {
         detached,
         announce: use_signal(|| (String::new(), 0u32)),
         own_stream: use_signal(|| None::<web_sys::MediaStream>),
+        stage: use_signal(ReceivedStage::default),
     };
     use_context_provider(|| ctx);
     let pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
@@ -1863,6 +1974,7 @@ fn share_root_style(origin: ShareOrigin, pin_rank: Option<usize>) -> String {
         cta: CtaState::Hidden,
         guard: false,
         pin_rank,
+        demoted: false,
     }
     .root_style()
 }
@@ -2181,7 +2293,7 @@ fn forced_colors_keep_the_pressed_pin_distinct() {
 
 async fn boxed_tile(width: u32, rewrite: &[(&str, &str)]) -> Page {
     let page = mount_with(|| {
-        install_pip_stub();
+        install_popup_stub();
         install_stylesheets(rewrite);
         SEED_BOX.with(|b| b.set(Some(width)));
         SEED_CTA.with(|c| c.set(CtaState::Shown));
@@ -2247,4 +2359,857 @@ async fn the_preview_toggle_is_reachable_on_touch() {
     assert_eq!(computed(&page, toggle, "opacity"), "0.9");
     assert_eq!(computed(&page, toggle, "pointer-events"), "auto");
     assert_eq!(computed(&page, toggle, "width"), "44px");
+}
+
+// ---------------------------------------------------------------------------
+// Issue 3173: the received window follows new shares and waits for the next
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static SHARERS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static CANVASES_SHOWN: Cell<bool> = const { Cell::new(true) };
+    static NAME_SUFFIX: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn set_sharers(keys: &[&str]) {
+    SHARERS.with(|s| *s.borrow_mut() = keys.iter().map(|k| k.to_string()).collect());
+}
+
+fn sharer_target(key: &str) -> ShareTarget {
+    let name = ["Ann", "Bea", "Cy", ""][key.parse::<usize>().unwrap() - 7];
+    let name = format!("{name}{}", NAME_SUFFIX.with(|s| s.borrow().clone()));
+    ShareTarget {
+        origin: ShareOrigin::Received,
+        key: key.to_string(),
+        pin: PinnedTile::screen(name.to_lowercase()),
+        name,
+    }
+}
+
+/// Stands in for the meeting view: `AttendantsComponent` runs the same hook.
+#[component]
+fn MeetingView(over: Signal<bool>) -> Element {
+    share_view::use_received_window_lifetime(move || over());
+    rsx! {}
+}
+
+/// The production `follow_stage` + `track_shares` wiring for received shares,
+/// rendering each share as the meeting does: a `PeerTile` with its view.
+#[allow(non_snake_case)]
+fn StageHarness() -> Element {
+    let zoom = use_signal(HashMap::new);
+    let actual = use_signal(|| None::<String>);
+    let detached = use_signal(|| None::<String>);
+    let ctx = ShareViewCtx {
+        slots: use_signal(ShareSlots::default),
+        pins: use_signal(Vec::<PinnedTile>::new),
+        detached,
+        announce: use_signal(|| (String::new(), 0u32)),
+        own_stream: use_signal(|| None::<web_sys::MediaStream>),
+        stage: use_signal(ReceivedStage::default),
+    };
+    let client = use_hook(|| {
+        let client = VideoCallClient::new_for_test("local-user");
+        for (sid, uid) in [(7, "ann"), (8, "bea"), (9, "cy"), (10, "dee")] {
+            client.insert_peer_for_test(sid, uid);
+            client.set_peer_media_for_test(sid, false, true);
+        }
+        client
+    });
+    use_context_provider(|| client.clone());
+    let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
+    use_context_provider(|| history_map);
+    let liveness_map: PeerAudioLivenessMap = use_signal(HashMap::new);
+    use_context_provider(|| liveness_map);
+    let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
+    use_context_provider(|| popup_map);
+    let appearance = use_signal(AppearanceSettings::default);
+    use_context_provider(|| AppearanceSettingsCtx(appearance));
+    let meeting_time = use_signal(MeetingTime::default);
+    use_context_provider(|| meeting_time);
+    let pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+    let decode: EventHandler<String> = use_callback(|_: String| {});
+    use_context_provider(|| ScreenZoomCtx(zoom));
+    use_context_provider(|| DetachedShareCtx(detached));
+    use_context_provider(|| ScreenActualSizeCtx(actual));
+    use_context_provider(|| ctx);
+    let mut renders = use_signal(|| 0u32);
+    let _ = renders();
+    let mut in_meeting = use_signal(|| true);
+    let mut over = use_signal(|| false);
+    let tracker = use_hook(|| Rc::new(RefCell::new(ShareTracker::default())));
+    let sharers = SHARERS.with(|s| s.borrow().clone());
+    share_view::follow_stage(ctx, &sharers);
+    let stage = ctx.stage.read().clone();
+    let received = stage.primary.as_deref().map(sharer_target);
+    let demoted: Vec<ShareTarget> = stage.demoted.iter().map(|k| sharer_target(k)).collect();
+    let live = sharers.clone();
+    share_view::track_shares(
+        &mut tracker.borrow_mut(),
+        ctx,
+        received.as_ref(),
+        &demoted,
+        true,
+        &move |k| live.contains(&k.to_string()),
+        None,
+        true,
+        (1280.0, 800.0),
+        zoom,
+        actual,
+    );
+    let slot = ctx.slots.read().received;
+    let detached_now = detached.read().clone().unwrap_or_default();
+    let primary_view = received.map(|target| ShareTileView {
+        mode: effective_mode(detached_now == target.key, false, slot.base),
+        target,
+        cta: slot.cta,
+        guard: false,
+        pin_rank: None,
+        demoted: false,
+    });
+    let demoted_views = share_view::demoted_views(&demoted, &vec![false; demoted.len()], false);
+    let zoom_keys = zoom.read().keys().cloned().collect::<Vec<_>>().join(",");
+    rsx! {
+        if CANVASES_SHOWN.with(|c| c.get()) {
+            if let Some(view) = primary_view {
+                PeerTile {
+                    key: "ss-active-{view.target.key}",
+                    peer_id: view.target.key.clone(),
+                    render_mode: TileMode::ScreenOnly,
+                    on_toggle_pin: pin,
+                    on_request_decode: decode,
+                    share_view: Some(view),
+                }
+            }
+            for view in demoted_views {
+                PeerTile {
+                    key: "ss-demoted-{view.target.key}",
+                    peer_id: view.target.key.clone(),
+                    render_mode: TileMode::ScreenOnly,
+                    on_toggle_pin: pin,
+                    on_request_decode: decode,
+                    share_view: Some(view),
+                }
+            }
+        }
+        if in_meeting() {
+            MeetingView { over }
+        }
+        button { id: "h-rerender", onclick: move |_| renders += 1 }
+        button { id: "h-leave", onclick: move |_| in_meeting.set(false) }
+        button { id: "h-end", onclick: move |_| over.set(true) }
+        button {
+            id: "h-replace-own",
+            onclick: move |_| {
+                let own = ShareTarget {
+                    origin: ShareOrigin::Own,
+                    key: OWN_SHARE_KEY.to_string(),
+                    pin: PinnedTile::own_screen("me"),
+                    name: ShareOrigin::Own.subject().to_string(),
+                };
+                let next = NEXT_CAPTURE.with(|n| n.borrow().clone()).unwrap();
+                share_view::own_capture_replaced(ctx, &own, &next, true, zoom);
+            },
+        }
+        button {
+            id: "h-detach-own",
+            onclick: move |_| {
+                let own = ShareTarget {
+                    origin: ShareOrigin::Own,
+                    key: OWN_SHARE_KEY.to_string(),
+                    pin: PinnedTile::own_screen("me"),
+                    name: ShareOrigin::Own.subject().to_string(),
+                };
+                share_view::dispatch(ctx, &own, ShareAction::Detach);
+            },
+        }
+        span { id: "h-primary", "{stage.primary.clone().unwrap_or_default()}" }
+        span { id: "h-demoted", "{stage.demoted.join(\",\")}" }
+        span { id: "h-window", "{stage.window}" }
+        span { id: "h-detached", "{detached_now}" }
+        span { id: "h-base", "{slot.base:?}" }
+        span { id: "h-pre", "{slot.pre_detach:?}" }
+        span { id: "h-zoom-keys", "{zoom_keys}" }
+        span { id: "h-pins", "{ctx.pins.read().len()}" }
+        div { id: "grid-container", tabindex: "-1" }
+        ScreenDetachAnnouncer {}
+        ShareWindowToast {}
+    }
+}
+
+async fn mount_stage(sharers: &[&str], seed: impl FnOnce()) -> Page {
+    fresh().await;
+    inject_app_config();
+    install_popup_stub();
+    CANVASES_SHOWN.with(|c| c.set(true));
+    NAME_SUFFIX.with(|s| s.borrow_mut().clear());
+    set_sharers(sharers);
+    seed();
+    let mount = marked_mount();
+    render_into(&mount, StageHarness);
+    settle().await;
+    Page { mount }
+}
+
+async fn rerender(page: &Page, sharers: &[&str]) {
+    set_sharers(sharers);
+    el(page, "#h-rerender").click();
+    settle().await;
+    settle().await;
+}
+
+fn call(args: &str, body: &str, a: &JsValue, b: &JsValue) -> JsValue {
+    js_sys::Function::new_with_args(args, body)
+        .call2(&JsValue::NULL, a, b)
+        .unwrap()
+}
+
+fn frame_el(frame: &web_sys::Document, id: &str) -> web_sys::HtmlElement {
+    frame.get_element_by_id(id).unwrap().unchecked_into()
+}
+
+fn frame_has(frame: &web_sys::Document, id: &str) -> bool {
+    frame.get_element_by_id(id).is_some()
+}
+
+fn frame_text(frame: &web_sys::Document, id: &str) -> String {
+    frame_el(frame, id).text_content().unwrap_or_default()
+}
+
+fn frame_state(frame: &web_sys::Document) -> String {
+    let body = frame.body().unwrap();
+    body.get_attribute("data-ss-state").unwrap()
+}
+
+fn frame_video_source(frame: &web_sys::Document) -> JsValue {
+    js_sys::Reflect::get(&frame_el(frame, "ss-detached-video"), &"srcObject".into()).unwrap()
+}
+
+fn frame_display(frame: &web_sys::Document, id: &str) -> String {
+    let src = "return d.defaultView.getComputedStyle(d.getElementById(id)).display";
+    call("d, id", src, frame, &id.into()).as_string().unwrap()
+}
+
+fn capture_ended(stream: &JsValue) -> bool {
+    let src =
+        "const t = s.getTracks(); return t.length > 0 && t.every(k => k.readyState === 'ended')";
+    call("s, _", src, stream, &JsValue::NULL).is_truthy()
+}
+
+fn reattach_description(frame: &web_sys::Document) -> String {
+    let id = frame_el(frame, "ss-detached-reattach").get_attribute("aria-describedby");
+    frame_text(frame, &id.unwrap_or_default())
+}
+
+/// A popup that is fullscreen until `exitFullscreen`; returns that state.
+fn fullscreen(frame: &web_sys::Document, enter: bool) -> bool {
+    let src = "if (on) { d.__fs = true; d.exitFullscreen = () => { d.__fs = false; }; \
+               Object.defineProperty(d, 'fullscreenElement', { configurable: true, \
+               get: () => (d.__fs ? d.body : null) }); } return !!d.__fs";
+    call("d, on", src, frame, &enter.into()).is_truthy()
+}
+
+fn break_capture(broken: bool) {
+    js(if broken {
+        "window.__capture = window.__capture || HTMLCanvasElement.prototype.captureStream; \
+         HTMLCanvasElement.prototype.captureStream = () => { throw new Error('tainted'); };"
+    } else {
+        "HTMLCanvasElement.prototype.captureStream = window.__capture;"
+    });
+}
+
+const PRIMARY_DETACH: &str =
+    ".share-tile[data-share-origin='received']:not([data-share-role]) [data-testid='ss-detach']";
+const WINDOW_TOAST: &str = "[data-testid='ss-window-toast']";
+const HANDOVER: &str = "ss-detached-handover-toast";
+const DEMOTED_TILE: &str = ".share-tile[data-share-role='secondary']";
+
+async fn open_received_window(page: &Page) -> web_sys::Document {
+    el(page, PRIMARY_DETACH).click();
+    settle().await;
+    assert!(ssd::is_busy(), "premise: the received window is open");
+    popup_doc()
+}
+
+#[wasm_bindgen_test]
+async fn the_received_window_opens_as_a_regular_popup_where_document_pip_exists() {
+    let page = mount_stage(&["7"], install_counting_pip_stub).await;
+    el(&page, PRIMARY_DETACH).click();
+    settle().await;
+    assert_one_popup_and_no_pip();
+    assert!(ssd::is_busy());
+}
+
+fn mirrored_canvases() -> Vec<String> {
+    let all = gloo_utils::document().query_selector_all("canvas").unwrap();
+    (0..all.length())
+        .filter_map(|i| all.item(i))
+        .filter_map(|n| n.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+        .filter(videocall_client::is_mirrored_canvas)
+        .map(|c| c.id())
+        .collect()
+}
+
+#[wasm_bindgen_test]
+async fn maximize_fills_the_screen_with_the_whole_window_so_its_controls_stay_visible() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    let record = "d.defaultView.Element.prototype.requestFullscreen = function () { \
+                  d.__fullscreenTarget = this; return Promise.resolve(); }";
+    call("d, _", record, &frame, &JsValue::NULL);
+    frame_el(&frame, "ss-detached-maximize").click();
+    let target = js_sys::Reflect::get(&frame, &"__fullscreenTarget".into()).unwrap();
+    let root = frame.document_element().unwrap();
+    assert!(js_sys::Object::is(&target, &root), "{target:?}");
+}
+
+#[wasm_bindgen_test]
+async fn a_drop_cannot_navigate_the_separate_window() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    for kind in ["dragover", "drop"] {
+        let dispatch =
+            "const e = new d.defaultView.Event(kind, { bubbles: true, cancelable: true }); \
+                        d.body.dispatchEvent(e); return e.defaultPrevented";
+        assert!(
+            call("d, kind", dispatch, &frame, &kind.into()).is_truthy(),
+            "{kind}"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+async fn a_popup_that_refuses_clear_interval_still_reattaches() {
+    let page = mount_stage(&["7"], || storage().set_item(METRICS_KEY, "true").unwrap()).await;
+    let frame = open_received_window(&page).await;
+    assert!(frame_has(&frame, "ss-detached-metrics"), "premise");
+    let started = js_sys::Array::from(&call(
+        "d, _",
+        "return d.defaultView.__intervals.slice()",
+        &frame,
+        &JsValue::NULL,
+    ));
+    assert_eq!(started.length(), 1, "premise: the metrics sampler");
+    let refuse = "d.defaultView.clearInterval = (id) => { d.__cleared = id; \
+                  throw new DOMException('cross-origin', 'SecurityError'); }";
+    call("d, _", refuse, &frame, &JsValue::NULL);
+    frame_el(&frame, "ss-detached-reattach").click();
+    settle().await;
+    let cleared = call("d, _", "return d.__cleared", &frame, &JsValue::NULL);
+    assert_eq!(
+        cleared.as_f64(),
+        started.get(0).as_f64(),
+        "clearInterval gets the sampler's id"
+    );
+    assert!(!ssd::is_busy());
+    assert!(frame_closed(&frame));
+    assert_eq!(text(&page, "#h-window"), "false");
+}
+
+#[wasm_bindgen_test]
+async fn only_the_canvas_the_received_window_mirrors_is_registered() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    assert_eq!(mirrored_canvases(), ["screen-share-7"]);
+
+    rerender(&page, &["7", "8"]).await;
+    assert_eq!(
+        mirrored_canvases(),
+        ["screen-share-8"],
+        "a handover moves it"
+    );
+    let bea: web_sys::HtmlCanvasElement = gloo_utils::document()
+        .get_element_by_id("screen-share-8")
+        .unwrap()
+        .unchecked_into();
+    rerender(&page, &[]).await;
+    assert_eq!(frame_state(&frame), "waiting", "premise");
+    assert!(!videocall_client::is_mirrored_canvas(&bea));
+
+    frame_el(&frame, "ss-detached-reattach").click();
+    settle().await;
+    assert!(!ssd::is_busy(), "premise");
+    assert!(mirrored_canvases().is_empty());
+
+    let page = mount_stage(&["7"], || {}).await;
+    open_received_window(&page).await;
+    assert_eq!(mirrored_canvases(), ["screen-share-7"], "premise");
+    ssd::close_all();
+    assert!(mirrored_canvases().is_empty(), "close_all");
+}
+
+#[wasm_bindgen_test]
+async fn a_window_that_closes_without_pagehide_still_reattaches() {
+    let page = mount_stage(&["7"], || {
+        js("window.__popupHasNoPagehide = true;");
+    })
+    .await;
+    open_received_window(&page).await;
+    js("window.__popupDoc.defaultView.frameElement.remove();");
+    gloo_timers::future::TimeoutFuture::new(1000).await;
+    settle().await;
+    assert!(!ssd::is_busy(), "the close poll saw the window close");
+    assert_eq!(text(&page, "#h-window"), "false");
+}
+
+#[wasm_bindgen_test]
+async fn a_new_share_takes_the_window_and_the_shown_one_becomes_a_tile() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    assert_eq!(frame_text(&frame, "ss-detached-name"), "Ann");
+    let ann_mirror = frame_video_source(&frame);
+    assert!(ann_mirror.is_object(), "premise: Ann's canvas is mirrored");
+    frame_el(&frame, "ss-detached-reattach").focus().unwrap();
+    let before = announced(&page);
+
+    rerender(&page, &["7", "8"]).await;
+    assert_eq!(text(&page, "#h-primary"), "8");
+    assert_eq!(text(&page, "#h-demoted"), "7");
+    assert_eq!(text(&page, "#h-detached"), "8");
+    assert_eq!(frame_text(&frame, "ss-detached-name"), "Bea");
+    let bea_mirror = frame_video_source(&frame);
+    assert!(bea_mirror.is_object() && !js_sys::Object::is(&ann_mirror, &bea_mirror));
+    assert!(capture_ended(&ann_mirror));
+    let note = frame_text(&frame, "ss-detached-announce");
+    assert_eq!(note, "Now showing Bea's shared content");
+    assert_eq!(announced(&page), before, "only the focused window speaks");
+    let toast = text(&page, WINDOW_TOAST);
+    assert_eq!(toast, "Bea is sharing in the separate window");
+    assert!(frame_has(&frame, HANDOVER));
+
+    let demoted = el(&page, DEMOTED_TILE);
+    assert_eq!(demoted.id(), "screen-share-7-div");
+    for control in ["ss-enlarge", "ss-pin"] {
+        assert!(
+            demoted
+                .query_selector(&format!("[data-testid='{control}']"))
+                .unwrap()
+                .is_none(),
+            "a demoted tile offers no {control}"
+        );
+    }
+    let swap = format!("{DEMOTED_TILE} [data-testid='ss-detach']");
+    assert_eq!(attr(&page, &swap, "data-swap").as_deref(), Some("true"));
+    assert_eq!(
+        attr(&page, &swap, "aria-label").as_deref(),
+        Some("Swap Ann's shared content into the separate window")
+    );
+    assert_eq!(
+        attr(&page, &swap, "title").as_deref(),
+        Some("Swap with the separate window")
+    );
+    assert_eq!(
+        attr(&page, &swap, "aria-pressed"),
+        None,
+        "an action, not a toggle"
+    );
+
+    el(&page, &swap).focus().unwrap();
+    el(&page, &swap).click();
+    settle().await;
+    assert_eq!(
+        text(&page, "#h-primary"),
+        "7",
+        "a demoted share swaps into the window"
+    );
+    assert_eq!(text(&page, "#h-demoted"), "8");
+    assert_eq!(text(&page, "#h-detached"), "7");
+    assert_eq!(frame_text(&frame, "ss-detached-name"), "Ann");
+    assert_eq!(
+        announced(&page),
+        "Showing Ann's shared content in the separate window. Bea's shared content moved to the \
+         meeting."
+    );
+    assert!(
+        page.mount.query_selector(WINDOW_TOAST).unwrap().is_none(),
+        "the toast named the share that left the window"
+    );
+    assert!(ssd::is_busy(), "a swap reuses the open window");
+    let note = frame_text(&frame, "ss-detached-announce");
+    assert_eq!(
+        note, "",
+        "the focused meeting speaks the swap, the window does not"
+    );
+    assert_eq!(el(&page, DEMOTED_TILE).id(), "screen-share-8-div");
+    assert_eq!(
+        active_id(),
+        "screen-share-8-detach-btn",
+        "focus lands on the share that left the window, to swap straight back"
+    );
+
+    rerender(&page, &[]).await;
+    assert_eq!(frame_state(&frame), "waiting");
+    assert!(!frame_has(&frame, HANDOVER), "waiting drops it");
+    let toast = page.mount.query_selector(WINDOW_TOAST).unwrap();
+    assert!(toast.is_none(), "the ended share's toast leaves with it");
+}
+
+const DEMOTED_SWAP: &str = ".share-tile[data-share-role='secondary'] [data-testid='ss-detach']";
+
+async fn close_window_over_a_demoted_tile(page: &Page) {
+    let frame = open_received_window(page).await;
+    rerender(page, &["7", "8"]).await;
+    frame_el(&frame, "ss-detached-reattach").click();
+    settle().await;
+    assert_eq!(text(page, "#h-demoted"), "7", "premise: Ann stays a tile");
+}
+
+#[wasm_bindgen_test]
+async fn a_demoted_share_that_stops_is_announced_and_leaves_nothing_behind() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    rerender(&page, &["7", "8", "9"]).await;
+    el(&page, "#screen-share-7-div [data-testid='ss-zoom-in']").click();
+    settle().await;
+    assert_eq!(
+        text(&page, "#h-zoom-keys"),
+        "7",
+        "premise: Ann's tile is zoomed"
+    );
+    frame_el(&frame, "ss-detached-reattach").focus().unwrap();
+    let before = announced(&page);
+
+    rerender(&page, &["8", "9"]).await;
+    let note = frame_text(&frame, "ss-detached-announce");
+    assert_eq!(note, "Ann stopped sharing", "the focused window speaks it");
+    assert_eq!(announced(&page), before);
+    assert_eq!(text(&page, "#h-zoom-keys"), "", "its zoom is dropped");
+
+    el(&page, "#screen-share-8-div [data-testid='ss-detach']")
+        .focus()
+        .unwrap();
+    rerender(&page, &["9"]).await;
+    assert_eq!(announced(&page), "Bea stopped sharing");
+    assert_eq!(
+        active_id(),
+        "grid-container",
+        "focus leaves the tile it was in"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_narrow_demoted_tile_keeps_its_zoom_and_swap() {
+    let page = mount_stage(&["7"], || {}).await;
+    install_stylesheets(&[]);
+    open_received_window(&page).await;
+    rerender(&page, &["7", "8"]).await;
+    el(&page, DEMOTED_TILE)
+        .style()
+        .set_property("width", "150px")
+        .unwrap();
+    settle().await;
+    assert_ne!(computed(&page, DEMOTED_SWAP, "display"), "none");
+    let zoom_in = format!("{DEMOTED_TILE} [data-testid='ss-zoom-in']");
+    assert_ne!(computed(&page, &zoom_in, "display"), "none");
+}
+
+#[wasm_bindgen_test]
+async fn with_the_window_closed_a_demoted_share_takes_the_slot_when_the_shown_one_stops() {
+    let page = mount_stage(&["7"], || {}).await;
+    close_window_over_a_demoted_tile(&page).await;
+    rerender(&page, &["7"]).await;
+    assert_eq!(text(&page, "#h-primary"), "7", "Ann takes the slot");
+    assert_eq!(text(&page, "#h-demoted"), "");
+    let enlarge = ".share-tile[data-share-origin='received'] [data-testid='ss-enlarge']";
+    assert!(page.mount.query_selector(enlarge).unwrap().is_some());
+
+    el(&page, PRIMARY_DETACH).click();
+    settle().await;
+    let said = announced(&page);
+    assert!(
+        !said.contains("started sharing"),
+        "Ann was already sharing: {said}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_new_own_capture_never_plays_in_the_received_window() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    let (next, _paint) = live_canvas_stream();
+    NEXT_CAPTURE.with(|n| *n.borrow_mut() = Some(Clone::clone(&next)));
+    el(&page, "#h-replace-own").click();
+    settle().await;
+    assert!(frame_video_source(&frame).is_object(), "premise: Ann plays");
+    assert!(!js_sys::Object::is(&frame_video_source(&frame), &next));
+    assert_eq!(frame_text(&frame, "ss-detached-name"), "Ann");
+}
+
+#[wasm_bindgen_test]
+async fn a_failed_open_from_a_demoted_tile_leaves_the_tiles_as_they_were() {
+    for (sharers, shown) in [(&["7", "8"][..], "8"), (&["7", "8", "9"][..], "9")] {
+        let page = mount_stage(&["7"], || {}).await;
+        close_window_over_a_demoted_tile(&page).await;
+        rerender(&page, sharers).await;
+        break_capture(true);
+        el(&page, DEMOTED_SWAP).click();
+        settle().await;
+        break_capture(false);
+        assert!(!ssd::is_busy());
+        assert_eq!(announced(&page), DETACH_FAILED);
+        assert_eq!(
+            text(&page, "#h-primary"),
+            shown,
+            "the shown share keeps the slot"
+        );
+        assert_eq!(text(&page, "#h-demoted"), "7", "with {sharers:?}");
+    }
+}
+
+#[wasm_bindgen_test]
+async fn opening_the_window_from_a_demoted_tile_announces_the_swap() {
+    let page = mount_stage(&["7"], || {}).await;
+    close_window_over_a_demoted_tile(&page).await;
+    el(&page, DEMOTED_SWAP).click();
+    settle().await;
+    assert_eq!(text(&page, "#h-primary"), "7");
+    assert_eq!(
+        announced(&page),
+        "Showing Ann's shared content in the separate window. Bea's shared content stays in the \
+         meeting."
+    );
+}
+
+#[wasm_bindgen_test]
+async fn shares_that_stop_together_are_announced_together() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    rerender(&page, &["7", "8", "9"]).await;
+    assert_eq!(text(&page, "#h-demoted"), "7,8", "premise");
+    el(&page, "#h-rerender").focus().unwrap();
+    rerender(&page, &["9"]).await;
+    assert_eq!(announced(&page), "Ann stopped sharing. Bea stopped sharing");
+
+    rerender(&page, &["9", "7", "8"]).await;
+    assert_eq!(text(&page, "#h-primary"), "8", "premise");
+    frame_el(&frame, "ss-detached-reattach").focus().unwrap();
+    rerender(&page, &["9"]).await;
+    assert_eq!(
+        frame_text(&frame, "ss-detached-announce"),
+        "Ann stopped sharing. Bea stopped sharing. Now showing Cy's shared content."
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_stop_spoken_in_the_window_survives_a_renamed_share() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    rerender(&page, &["7", "8", "9"]).await;
+    frame_el(&frame, "ss-detached-reattach").focus().unwrap();
+    NAME_SUFFIX.with(|s| *s.borrow_mut() = " (guest)".to_string());
+    rerender(&page, &["7", "9"]).await;
+    assert_eq!(
+        frame_text(&frame, "ss-detached-name"),
+        "Cy (guest)",
+        "premise"
+    );
+    assert_eq!(
+        frame_text(&frame, "ss-detached-announce"),
+        "Bea stopped sharing"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn opening_the_window_shows_a_share_hidden_under_it_as_a_tile() {
+    let page = mount_stage(&["7", "8"], || {}).await;
+    assert!(
+        page.mount.query_selector(DEMOTED_TILE).unwrap().is_none(),
+        "premise: Ann is hidden under Bea"
+    );
+    open_received_window(&page).await;
+    rerender(&page, &["7", "8"]).await;
+    assert_eq!(text(&page, "#h-detached"), "8");
+    assert_eq!(el(&page, DEMOTED_TILE).id(), "screen-share-7-div");
+}
+
+#[wasm_bindgen_test]
+async fn the_window_waits_when_its_share_ends_and_takes_the_next_one() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    let reattach = frame_el(&frame, "ss-detached-reattach");
+    assert_eq!(reattach.get_attribute("aria-label"), None);
+    assert_eq!(reattach.text_content().unwrap(), "Reattach");
+    let keys = reattach.get_attribute("aria-keyshortcuts");
+    assert_eq!(keys.as_deref(), Some("Escape"));
+    let live_description = "Return shared content to the meeting window";
+    assert_eq!(reattach_description(&frame), live_description);
+    let ann_mirror = frame_video_source(&frame);
+    assert!(fullscreen(&frame, true));
+    el(&page, "#h-rerender").focus().unwrap();
+
+    rerender(&page, &[]).await;
+    assert!(ssd::is_busy(), "the window stays open");
+    assert_eq!(frame_state(&frame), "waiting");
+    assert!(frame_video_source(&frame).is_null(), "no frozen frame");
+    assert!(capture_ended(&ann_mirror), "no capture while waiting");
+    assert!(!fullscreen(&frame, false), "waiting leaves fullscreen");
+    assert_eq!(frame_display(&frame, "ss-detached-waiting"), "flex");
+    assert_eq!(frame_display(&frame, "ss-detached-viewport"), "none");
+    let name = frame_text(&frame, "ss-detached-name");
+    assert_eq!(name, "Waiting for shared content");
+    let panel = frame_text(&frame, "ss-detached-waiting");
+    assert!(panel.contains("Shared content will be displayed here"));
+    assert!(reattach_description(&frame).ends_with("instead, select Reattach."));
+    assert_eq!(frame_text(&frame, "ss-detached-announce"), "");
+    let message = "Ann stopped sharing. The separate window stays open for the next share.";
+    assert_eq!(announced(&page), message);
+
+    rerender(&page, &["9"]).await;
+    assert_eq!(frame_state(&frame), "live");
+    assert_eq!(frame_text(&frame, "ss-detached-name"), "Cy");
+    assert!(frame_video_source(&frame).is_object());
+    assert_eq!(text(&page, "#h-detached"), "9");
+    assert_eq!(reattach_description(&frame), live_description);
+    let message = "Cy started sharing. Showing it in the separate window.";
+    assert_eq!(announced(&page), message);
+    let toast = text(&page, WINDOW_TOAST);
+    assert_eq!(toast, "Cy is sharing in the separate window");
+
+    rerender(&page, &["10"]).await;
+    assert_eq!(
+        frame_state(&frame),
+        "live",
+        "a sharer with no name still shows"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_demoted_share_moves_back_into_the_window_when_its_share_stops() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    rerender(&page, &["7", "8"]).await;
+    frame_el(&frame, "ss-detached-reattach").focus().unwrap();
+    rerender(&page, &["7"]).await;
+    assert_eq!(frame_state(&frame), "live", "a share is still live");
+    assert_eq!(frame_text(&frame, "ss-detached-name"), "Ann");
+    assert!(frame_video_source(&frame).is_object());
+    assert_eq!(text(&page, "#h-primary"), "7");
+    assert_eq!(text(&page, "#h-demoted"), "");
+    assert_eq!(text(&page, "#h-detached"), "7");
+    let note = frame_text(&frame, "ss-detached-announce");
+    let shown = "Bea stopped sharing. Now showing Ann's shared content.";
+    assert_eq!(note, shown);
+}
+
+#[wasm_bindgen_test]
+async fn closing_a_waiting_window_announces_it_and_closing_a_live_one_lands_its_share() {
+    let enlarged = || {
+        let key = ShareOrigin::Received.pref_key();
+        storage().set_item(key, "enlarged").unwrap();
+    };
+    let page = mount_stage(&["7"], enlarged).await;
+    let frame = open_received_window(&page).await;
+    rerender(&page, &[]).await;
+    frame_el(&frame, "ss-detached-reattach").click();
+    settle().await;
+    assert!(!ssd::is_busy());
+    assert!(frame_closed(&frame));
+    assert_eq!(text(&page, "#h-window"), "false");
+    assert_eq!(announced(&page), "Separate window closed");
+    let pref = storage().get_item(ShareOrigin::Received.pref_key());
+    assert_eq!(pref.unwrap().as_deref(), Some("enlarged"));
+    assert_eq!(active_id(), "grid-container");
+
+    let page = mount_stage(&["7"], enlarged).await;
+    let frame = open_received_window(&page).await;
+    rerender(&page, &["7", "8"]).await;
+    frame_el(&frame, "ss-detached-reattach").click();
+    settle().await;
+    assert!(!ssd::is_busy());
+    assert_eq!(text(&page, "#h-detached"), "");
+    assert_eq!(text(&page, "#h-base"), "Enlarged", "pre-detach view");
+    assert_eq!(announced(&page), "Shared content returned to the meeting");
+    let toast = page.mount.query_selector(WINDOW_TOAST).unwrap();
+    assert!(toast.is_none(), "the handover toast leaves with the window");
+    assert_eq!(text(&page, "#h-demoted"), "7", "the demoted tile stays");
+}
+
+#[wasm_bindgen_test]
+async fn a_later_window_still_shows_its_handover_toast() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    rerender(&page, &["7", "8"]).await;
+    frame_el(&frame, "ss-detached-reattach").click();
+    settle().await;
+    gloo_timers::future::TimeoutFuture::new(8_000).await;
+
+    open_received_window(&page).await;
+    rerender(&page, &["7", "8", "9"]).await;
+    let toast = text(&page, WINDOW_TOAST);
+    assert_eq!(toast, "Cy is sharing in the separate window");
+}
+
+#[wasm_bindgen_test]
+async fn an_unmounted_canvas_never_leaves_a_frozen_mirror() {
+    let page = mount_stage(&["7"], || {}).await;
+    let frame = open_received_window(&page).await;
+    let mirror = frame_video_source(&frame);
+
+    CANVASES_SHOWN.with(|c| c.set(false));
+    rerender(&page, &["7"]).await;
+    assert!(frame_video_source(&frame).is_null(), "the canvas is gone");
+    assert!(capture_ended(&mirror), "its capture is stopped");
+    assert_eq!(frame_state(&frame), "live", "the share is still bound");
+
+    CANVASES_SHOWN.with(|c| c.set(true));
+    rerender(&page, &["7"]).await;
+    assert!(frame_video_source(&frame).is_object(), "mirrored again");
+}
+
+#[wasm_bindgen_test]
+async fn a_capture_that_fails_never_leaves_a_live_black_window() {
+    let page = mount_stage(&["7"], || {}).await;
+    break_capture(true);
+    el(&page, PRIMARY_DETACH).click();
+    settle().await;
+    let frame = popup_doc();
+    break_capture(false);
+    assert!(!ssd::is_busy(), "a window that cannot mirror does not open");
+    assert!(frame_closed(&frame));
+    assert_eq!(announced(&page), DETACH_FAILED);
+
+    let frame = open_received_window(&page).await;
+    break_capture(true);
+    rerender(&page, &["7", "8"]).await;
+    break_capture(false);
+    assert!(!ssd::is_busy(), "a window whose new capture fails closes");
+    assert!(frame_closed(&frame));
+    assert_eq!(announced(&page), DETACH_FAILED);
+    assert_eq!(
+        text(&page, "#h-detached"),
+        "",
+        "the share lands in the meeting"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn the_received_window_closes_when_the_meeting_ends_or_its_view_unmounts() {
+    for button in ["#h-end", "#h-leave"] {
+        let page = mount_stage(&["7"], || {}).await;
+        let frame = open_received_window(&page).await;
+        let mirror = frame_video_source(&frame);
+        el(&page, button).click();
+        settle().await;
+        assert!(frame_closed(&frame), "{button}");
+        assert!(capture_ended(&mirror), "{button}: the capture stops");
+        assert!(!ssd::is_busy(), "{button}: a later detach is not blocked");
+        assert_eq!(text(&page, "#h-window"), "false", "{button}");
+    }
+}
+
+#[wasm_bindgen_test]
+async fn detaching_the_own_share_closes_a_waiting_or_live_received_window() {
+    for sharers in [&["7"][..], &[][..]] {
+        let page = mount_stage(&["7"], || {}).await;
+        let frame = open_received_window(&page).await;
+        rerender(&page, sharers).await;
+
+        el(&page, "#h-detach-own").click();
+        settle().await;
+        assert!(frame_closed(&frame), "{sharers:?}: one window at a time");
+        assert_eq!(text(&page, "#h-window"), "false", "{sharers:?}");
+        if !sharers.is_empty() {
+            assert_eq!(text(&page, "#h-pre"), "None", "the displaced share lands");
+        }
+    }
 }

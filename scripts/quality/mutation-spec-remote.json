@@ -1,0 +1,3473 @@
+{
+ "_comment": [
+  "Mutations of the remote adapters (#2914 PR-8b), each naming the unit test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-remote.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_remote.py"
+ ],
+ "baseline_tests": 185,
+ "mutations": [
+  {
+   "name": "the key stays in the environment",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    secret = env.pop(cq_runner.SECRET_ENV, None)\n",
+   "replace": "    secret = env.get(cq_runner.SECRET_ENV)\n",
+   "expect_kills": [
+    "test_the_key_leaves_the_environment_even_when_the_run_is_refused"
+   ]
+  },
+  {
+   "name": "children keep the key",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "CHILD_ENV_DROP = (cq_runner.SECRET_ENV, \"KUBECONFIG\")",
+   "replace": "CHILD_ENV_DROP = (\"KUBECONFIG\",)",
+   "expect_kills": [
+    "test_child_env_drops_the_key_and_kubeconfig_even_if_set_again"
+   ]
+  },
+  {
+   "name": "children keep KUBECONFIG",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "CHILD_ENV_DROP = (cq_runner.SECRET_ENV, \"KUBECONFIG\")",
+   "replace": "CHILD_ENV_DROP = (cq_runner.SECRET_ENV,)",
+   "expect_kills": [
+    "test_no_child_process_inherits_the_key",
+    "test_child_env_drops_the_key_and_kubeconfig_even_if_set_again"
+   ]
+  },
+  {
+   "name": "runner children keep the key",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "    return {k: v for k, v in os.environ.items() if k != SECRET_ENV and not k.upper().endswith(\"_PROXY\")}",
+   "replace": "    return dict(os.environ)",
+   "expect_kills": [
+    "test_the_runners_own_git_and_tool_children_get_no_key",
+    "test_child_env_drops_the_key_and_kubeconfig_even_if_set_again"
+   ]
+  },
+  {
+   "name": "git children keep the key",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "timeout=TOOL_TIMEOUT_S, start_new_session=True, env=child_env())",
+   "replace": "timeout=TOOL_TIMEOUT_S, start_new_session=True)",
+   "expect_kills": [
+    "test_the_runners_own_git_and_tool_children_get_no_key"
+   ]
+  },
+  {
+   "name": "tool children keep the key",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                               start_new_session=True, env=child_env())",
+   "replace": "                               start_new_session=True)",
+   "expect_kills": [
+    "test_the_runners_own_git_and_tool_children_get_no_key"
+   ]
+  },
+  {
+   "name": "no confirmation needed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    if env.get(CONFIRM_ENV) != target:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_the_key_leaves_the_environment_even_when_the_run_is_refused",
+    "test_hcl_daily_runs_through_the_remote_adapter_and_its_guard"
+   ]
+  },
+  {
+   "name": "dev secret accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    if secret == profile[\"dev_secret\"]:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_the_key_leaves_the_environment_even_when_the_run_is_refused"
+   ]
+  },
+  {
+   "name": "stack up accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    if stack_mode != \"reuse\":\n        raise AdapterError(f\"{target} is shared: pass --stack reuse\")",
+   "replace": "    if False:\n        raise AdapterError(f\"{target} is shared: pass --stack reuse\")",
+   "expect_kills": [
+    "test_the_key_leaves_the_environment_even_when_the_run_is_refused"
+   ]
+  },
+  {
+   "name": "any meeting id embedded",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    if not ROOM_RE.match(plan[\"meeting_id\"]):",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_meeting_id_that_could_break_out_of_a_promql_string_is_refused"
+   ]
+  },
+  {
+   "name": "hcl-daily not wired",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "            **{t: cq_remote.factory for t in sorted(cq_scenario.SHARED_TARGETS)}}",
+   "replace": "            }",
+   "expect_kills": [
+    "test_hcl_daily_runs_through_the_remote_adapter_and_its_guard",
+    "test_a_profile_file_alone_adds_a_shared_target_guarded_by_its_own_values"
+   ]
+  },
+  {
+   "name": "profile urls not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    problems += [k for k in (\"ui_url\", \"api_url\", \"prom_url\", \"kube_server\") if not HTTPS_RE.match(str(doc[k]))]\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_malformed_profile_is_refused"
+   ]
+  },
+  {
+   "name": "profile pod patterns not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "all(isinstance(v, str) and POD_RE_RE.match(v) for v in pods.values())",
+   "replace": "all(isinstance(v, str) for v in pods.values())",
+   "expect_kills": [
+    "test_a_malformed_profile_is_refused"
+   ]
+  },
+  {
+   "name": "kuberc honoured",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "env=self.env(KUBERC=\"off\"))",
+   "replace": "env=self.env())",
+   "expect_kills": [
+    "test_no_child_process_inherits_the_key"
+   ]
+  },
+  {
+   "name": "kubectl unbounded by the runner budget",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "KUBECTL_S = 20\n",
+   "replace": "KUBECTL_S = 900\n",
+   "expect_kills": [
+    "test_state_is_one_bounded_kubectl_read"
+   ]
+  },
+  {
+   "name": "kubeconfig readable by others",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if st.st_mode & 0o077:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "kubeconfig symlink followed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            st = os.lstat(path)",
+   "replace": "            st = os.stat(path)",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "kubeconfig server not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems = [] if cluster.get(\"server\") == self.profile[\"kube_server\"] else [",
+   "replace": "        problems = [] if True else [",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "kubeconfig exec plugin accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "for k in (\"exec\", \"auth-provider\")",
+   "replace": "for k in (\"auth-provider\",)",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "images keep the registry host",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    name = str(image or \"\").rsplit(\"/\", 1)[-1]",
+   "replace": "    name = str(image or \"\")",
+   "expect_kills": [
+    "test_state_names_pods_but_no_node_address_or_registry_and_sees_a_restart"
+   ]
+  },
+  {
+   "name": "restarts not counted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"restart_count\": sum(int(c.get(\"restartCount\", 0)) for c in cs),",
+   "replace": "\"restart_count\": 0,",
+   "expect_kills": [
+    "test_state_names_pods_but_no_node_address_or_registry_and_sees_a_restart"
+   ]
+  },
+  {
+   "name": "window start not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not self.start <= day < self.end:",
+   "replace": "        if not day < self.end:",
+   "expect_kills": [
+    "test_the_window_refuses_outside_its_hours_any_day"
+   ]
+  },
+  {
+   "name": "watch gap shorter than a starved round",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "WATCH_GAP_S = 60\n",
+   "replace": "WATCH_GAP_S = 30\n",
+   "expect_kills": [
+    "test_the_watch_stops_with_the_teardown_budget_left_before_the_window_end"
+   ]
+  },
+  {
+   "name": "planned run omits the hold",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "+ settle + step[\"hold_s\"] + cq_runner.EVENT_SLACK_S",
+   "replace": "+ settle + cq_runner.EVENT_SLACK_S",
+   "expect_kills": [
+    "test_a_run_that_cannot_finish_with_teardown_before_the_window_end_is_refused"
+   ]
+  },
+  {
+   "name": "one real session tolerated",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if real >= 1 or meetings >= 1:",
+   "replace": "        if real >= 2 or meetings >= 1:",
+   "expect_kills": [
+    "test_a_real_meeting_count_of_1_refuses_and_names_no_room"
+   ]
+  },
+  {
+   "name": "one real meeting tolerated",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if real >= 1 or meetings >= 1:",
+   "replace": "        if real >= 1 or meetings >= 2:",
+   "expect_kills": [
+    "test_a_real_meeting_count_of_1_refuses_and_names_no_room"
+   ]
+  },
+  {
+   "name": "real meeting watched only at preflight",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        out += self._rules(v)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_real_meeting_starting_mid_run_aborts"
+   ]
+  },
+  {
+   "name": "another scale run tolerated",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if v.get(\"other_runs\", 0) >= 1:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_real_meeting_count_of_1_refuses_and_names_no_room"
+   ]
+  },
+  {
+   "name": "used meeting id accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if seen:\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_a_used_meeting_id_or_a_blind_session_family_refuses"
+   ]
+  },
+  {
+   "name": "blind session family accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if family is not None and not family:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_used_meeting_id_or_a_blind_session_family_refuses"
+   ]
+  },
+  {
+   "name": "no relay up series accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if \"relay_up_count\" not in v or \"relay_up_min\" not in v:\n            out.append(\"Prometheus has no relay up series\")\n        else:",
+   "replace": "        if False:\n            pass\n        elif \"relay_up_count\" in v and \"relay_up_min\" in v:",
+   "expect_kills": [
+    "test_a_watcher_without_data_or_a_relay_down_refuses"
+   ]
+  },
+  {
+   "name": "no slow-consumer series accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            out.append(\"Prometheus has no relay slow-consumer series\")",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_a_watcher_without_data_or_a_relay_down_refuses"
+   ]
+  },
+  {
+   "name": "a relay down at preflight accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if v.get(\"relay_up_min\", 1) < 1:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_watcher_without_data_or_a_relay_down_refuses"
+   ]
+  },
+  {
+   "name": "a relay read down twice aborts, however close the reads",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        elif mono - self.relay_down_since >= RELAY_DOWN_S:\n",
+   "replace": "        elif True:\n",
+   "expect_kills": [
+    "test_a_relay_read_down_past_one_scrape_or_a_lost_relay_aborts"
+   ]
+  },
+  {
+   "name": "a relay read down one scrape apart aborts",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "RELAY_DOWN_S = 2 * PROM_SCRAPE_S + WATCH_DEADLINE_S\n",
+   "replace": "RELAY_DOWN_S = PROM_SCRAPE_S - 1\n",
+   "expect_kills": [
+    "test_a_relay_read_down_past_one_scrape_or_a_lost_relay_aborts"
+   ]
+  },
+  {
+   "name": "lost relay not noticed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if self.relay_count is not None and v[\"relay_up_count\"] < self.relay_count:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_a_relay_read_down_past_one_scrape_or_a_lost_relay_aborts"
+   ]
+  },
+  {
+   "name": "slow consumers equal to the baseline abort",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if v[\"slow_consumers\"] > self.slow_base:",
+   "replace": "            if v[\"slow_consumers\"] >= self.slow_base:",
+   "expect_kills": [
+    "test_one_small_instant_query_per_round_with_a_1_s_server_timeout"
+   ]
+  },
+  {
+   "name": "slow-consumer counter reset not rebased",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self.slow_base = min(self.slow_base, v[\"slow_consumers\"])",
+   "replace": "            self.slow_base = self.slow_base",
+   "expect_kills": [
+    "test_a_rise_in_relay_slow_consumers_aborts_and_a_counter_reset_rebases"
+   ]
+  },
+  {
+   "name": "own room canary off",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if self.own_max < n and mono - self.first_watch > step[\"join_window_s\"]",
+   "replace": "        if False and mono - self.first_watch > step[\"join_window_s\"]",
+   "expect_kills": [
+    "test_a_room_that_never_shows_in_prometheus_is_a_blind_watch"
+   ]
+  },
+  {
+   "name": "own room canary without the join budget",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "step[\"join_window_s\"] + cq_runner.JOIN_BUDGET_EXTRA_S + \\",
+   "replace": "step[\"join_window_s\"] + 0 + \\",
+   "expect_kills": [
+    "test_a_room_that_never_shows_in_prometheus_is_a_blind_watch"
+   ]
+  },
+  {
+   "name": "watch deadline 3 s",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "WATCH_DEADLINE_S = 1.5\n",
+   "replace": "WATCH_DEADLINE_S = 3.0\n",
+   "expect_kills": [
+    "test_one_small_instant_query_per_round_with_a_1_s_server_timeout",
+    "test_a_hung_prometheus_costs_a_round_at_most_its_deadline_and_is_absorbed"
+   ]
+  },
+  {
+   "name": "no kill backstop on curl",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "timeout=max_time + WATCH_KILL_S",
+   "replace": "timeout=max_time + 30",
+   "expect_kills": [
+    "test_a_hung_prometheus_costs_a_round_at_most_its_deadline_and_is_absorbed"
+   ]
+  },
+  {
+   "name": "no server-side query timeout",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        v = self._values(WATCH_DEADLINE_S, PROM_TIMEOUT)",
+   "replace": "        v = self._values(WATCH_DEADLINE_S)",
+   "expect_kills": [
+    "test_one_small_instant_query_per_round_with_a_1_s_server_timeout"
+   ]
+  },
+  {
+   "name": "a watch query with a rate window",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"relay_up_min\": f\"min(up{{{relay}}})\",",
+   "replace": "            \"relay_up_min\": f\"min(min_over_time(up{{{relay}}}[1m]))\",",
+   "expect_kills": [
+    "test_one_small_instant_query_per_round_with_a_1_s_server_timeout"
+   ]
+  },
+  {
+   "name": "one failure is a reason",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if self.last_ok is None or mono - self.last_ok >= BLIND_S:",
+   "replace": "            if True:",
+   "expect_kills": [
+    "test_isolated_failures_are_absorbed_until_30_s_blind",
+    "test_a_hung_prometheus_costs_a_round_at_most_its_deadline_and_is_absorbed"
+   ]
+  },
+  {
+   "name": "blind forever",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if self.last_ok is None or mono - self.last_ok >= BLIND_S:",
+   "replace": "            if self.last_ok is None:",
+   "expect_kills": [
+    "test_isolated_failures_are_absorbed_until_30_s_blind"
+   ]
+  },
+  {
+   "name": "blind 45 s",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "BLIND_S = 2 * cq_runner.WATCH_INTERVAL_S\n",
+   "replace": "BLIND_S = 3 * cq_runner.WATCH_INTERVAL_S\n",
+   "expect_kills": [
+    "test_isolated_failures_are_absorbed_until_30_s_blind"
+   ]
+  },
+  {
+   "name": "a success does not end the blind spell",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        self.last_ok = mono\n        out += self._rules(v)",
+   "replace": "        out += self._rules(v)",
+   "expect_kills": [
+    "test_isolated_failures_are_absorbed_until_30_s_blind"
+   ]
+  },
+  {
+   "name": "a missing curl is absorbed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            raise AdapterError(f\"curl could not start: {exc.strerror}\") from None",
+   "replace": "            return None, b\"\"",
+   "expect_kills": [
+    "test_malformed_answers_are_failures_and_only_misconfiguration_raises"
+   ]
+  },
+  {
+   "name": "a malformed sample accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            except (KeyError, IndexError, TypeError, ValueError):\n                return None\n        return out",
+   "replace": "            except (KeyError, IndexError, TypeError, ValueError):\n                continue\n        return out",
+   "expect_kills": [
+    "test_malformed_answers_are_failures_and_only_misconfiguration_raises"
+   ]
+  },
+  {
+   "name": "fresh pods accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "FRESH_POD_S = 600\n",
+   "replace": "FRESH_POD_S = 60\n",
+   "expect_kills": [
+    "test_readiness_needs_the_ui_api_scrape_targets_and_settled_pods"
+   ]
+  },
+  {
+   "name": "unready pods accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            elif not all(f[\"ready\"] and f[\"phase\"] == \"Running\" for f in mine.values()):",
+   "replace": "            elif False:",
+   "expect_kills": [
+    "test_readiness_needs_the_ui_api_scrape_targets_and_settled_pods"
+   ]
+  },
+  {
+   "name": "a missing pod kind accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if not mine:\n                problems.append(f\"no {kind} pod\")",
+   "replace": "            if False:\n                pass",
+   "expect_kills": [
+    "test_readiness_needs_the_ui_api_scrape_targets_and_settled_pods"
+   ]
+  },
+  {
+   "name": "scrape interval not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if any(t.get(\"scrapeInterval\") != cq_local.SCRAPE_INTERVAL for t in ts):",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_readiness_needs_the_ui_api_scrape_targets_and_settled_pods"
+   ]
+  },
+  {
+   "name": "a down scrape target accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if any(t.get(\"health\") != \"up\" for t in ts):",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_readiness_needs_the_ui_api_scrape_targets_and_settled_pods"
+   ]
+  },
+  {
+   "name": "a missing scrape target accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if not ts:\n                problems.append(f\"no {kind} scrape target\")",
+   "replace": "            if False:\n                pass",
+   "expect_kills": [
+    "test_readiness_needs_the_ui_api_scrape_targets_and_settled_pods"
+   ]
+  },
+  {
+   "name": "ui redirect accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if status != 200:\n                problems.append(f\"{name} answered {status}\")",
+   "replace": "            if status is None:\n                problems.append(f\"{name} answered {status}\")",
+   "expect_kills": [
+    "test_readiness_needs_the_ui_api_scrape_targets_and_settled_pods"
+   ]
+  },
+  {
+   "name": "skew limit 1.5 s",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "MAX_SKEW_MS = 1000.0\n",
+   "replace": "MAX_SKEW_MS = 1500.0\n",
+   "expect_kills": [
+    "test_the_clock_must_be_within_1_s_of_prometheus"
+   ]
+  },
+  {
+   "name": "unknown skew accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            raise AdapterError(\"Prometheus gave no time(), so the clock skew to it is unknown\")",
+   "replace": "            at = before",
+   "expect_kills": [
+    "test_the_clock_must_be_within_1_s_of_prometheus"
+   ]
+  },
+  {
+   "name": "drain gives up at 30 s",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "DRAIN_S = 90\n",
+   "replace": "DRAIN_S = 30\n",
+   "expect_kills": [
+    "test_a_room_still_busy_after_the_drain_wait_or_a_blind_drain_check_is_a_problem"
+   ]
+  },
+  {
+   "name": "non-object labels accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if not isinstance(s[\"metric\"], dict):\n                    return None\n",
+   "replace": "",
+   "expect_kills": [
+    "test_malformed_answers_are_failures_and_only_misconfiguration_raises"
+   ]
+  },
+  {
+   "name": "rust bots off the host network",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"--network\", \"host\", \"-e\", f\"RUST_LOG={cq_local.RUST_LOG}\",",
+   "replace": "            \"-e\", f\"RUST_LOG={cq_local.RUST_LOG}\",",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "rust metrics on every interface",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"--metrics-bind\", \"127.0.0.1\",",
+   "replace": "\"--metrics-bind\", \"0.0.0.0\",",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "rust metrics on node-exporter's port",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "METRICS_PORT_BASE = 19100\n",
+   "replace": "METRICS_PORT_BASE = 9100\n",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "busy metrics port accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems += [f\"Rust metrics ports in use on 127.0.0.1: {', '.join(busy)}\"] if busy else []\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_busy_metrics_port_refuses_the_run"
+   ]
+  },
+  {
+   "name": "probes on the host network",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                \"--label\", f\"{cq_local.PROC_LABEL}={proc['proc_id']}\", \"--user\", f\"{c.uid}:{c.gid}\"]",
+   "replace": "                \"--label\", f\"{cq_local.PROC_LABEL}={proc['proc_id']}\", \"--user\", f\"{c.uid}:{c.gid}\", \"--network\", \"host\"]",
+   "expect_kills": [
+    "test_probes_get_no_host_network_no_host_ipc_and_log_in_over_websocket"
+   ]
+  },
+  {
+   "name": "probes share host IPC",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"--shm-size\", \"1g\", ",
+   "replace": "            \"--ipc\", \"host\", \"--shm-size\", \"1g\", ",
+   "expect_kills": [
+    "test_probes_get_no_host_network_no_host_ipc_and_log_in_over_websocket"
+   ]
+  },
+  {
+   "name": "probe transport not passed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "PROBE_TRANSPORTS = {\"websocket\": \"ws\", \"webtransport\": \"wt\"}",
+   "replace": "PROBE_TRANSPORTS = {\"websocket\": \"auto\", \"webtransport\": \"wt\"}",
+   "expect_kills": [
+    "test_probes_get_no_host_network_no_host_ipc_and_log_in_over_websocket"
+   ]
+  },
+  {
+   "name": "probe auto transport accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "for p in probes if p[\"transport\"] not in PROBE_TRANSPORTS]",
+   "replace": "for p in probes if p[\"transport\"] == \"x\"]",
+   "expect_kills": [
+    "test_a_remote_probe_must_name_its_transport"
+   ]
+  },
+  {
+   "name": "probe sso state loaded",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"--auth\", \"jwt\", \"--sso-state-file\", \"\",",
+   "replace": "\"--auth\", \"jwt\",",
+   "expect_kills": [
+    "test_probes_get_no_host_network_no_host_ipc_and_log_in_over_websocket"
+   ]
+  },
+  {
+   "name": "probe without the preload",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"--import\", \"tsx\", \"--import\", \"/cq/preload.mjs\",",
+   "replace": "\"--import\", \"tsx\",",
+   "expect_kills": [
+    "test_probes_get_no_host_network_no_host_ipc_and_log_in_over_websocket"
+   ]
+  },
+  {
+   "name": "probe cookie name not passed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"-e\", f\"COOKIE_NAME={c.profile['cookie_name']}\", ",
+   "replace": "            ",
+   "expect_kills": [
+    "test_probes_get_no_host_network_no_host_ipc_and_log_in_over_websocket"
+   ]
+  },
+  {
+   "name": "podman userns not kept",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"--pull\", \"never\", \"--userns\", \"keep-id\", ",
+   "replace": "\"--pull\", \"never\", ",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "podman logs to journald",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"--log-driver\", \"k8s-file\", \"--ulimit\"",
+   "replace": "\"--ulimit\"",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only",
+    "test_probes_get_no_host_network_no_host_ipc_and_log_in_over_websocket"
+   ]
+  },
+  {
+   "name": "podman may pull",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return [\"--pull\", \"never\", ",
+   "replace": "        return [",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "core dumps allowed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": ", \"--ulimit\", \"core=0\"]",
+   "replace": "]",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "secret file world readable",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)",
+   "replace": "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)",
+   "expect_kills": [
+    "test_the_key_is_never_on_argv_and_reaches_bots_only_as_tmpfs_files"
+   ]
+  },
+  {
+   "name": "secret folder world readable",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            os.mkdir(d, 0o700)",
+   "replace": "            os.mkdir(d, 0o755)",
+   "expect_kills": [
+    "test_the_key_is_never_on_argv_and_reaches_bots_only_as_tmpfs_files"
+   ]
+  },
+  {
+   "name": "the run-folder config carries the key",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        with open(c.path(\"in\", f\"{pid}.yaml\"), \"w\", encoding=\"utf-8\") as fh:\n            json.dump(cfg, fh, indent=1)",
+   "replace": "        with open(c.path(\"in\", f\"{pid}.yaml\"), \"w\", encoding=\"utf-8\") as fh:\n            json.dump(dict(cfg, jwt_secret=c.jwt_secret), fh, indent=1)",
+   "expect_kills": [
+    "test_the_key_is_never_on_argv_and_reaches_bots_only_as_tmpfs_files"
+   ]
+  },
+  {
+   "name": "key passed with -e",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"--network\", \"host\", \"-e\", f\"RUST_LOG={cq_local.RUST_LOG}\",",
+   "replace": "            \"--network\", \"host\", \"-e\", \"JWT_SECRET\", \"-e\", f\"RUST_LOG={cq_local.RUST_LOG}\",",
+   "expect_kills": [
+    "test_the_key_is_never_on_argv_and_reaches_bots_only_as_tmpfs_files"
+   ]
+  },
+  {
+   "name": "secret folder not a tmpfs accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not os.path.isdir(c.secret_parent) or c.fs(c.secret_parent) != \"tmpfs\":",
+   "replace": "        if not os.path.isdir(c.secret_parent):",
+   "expect_kills": [
+    "test_the_secret_parent_must_be_tmpfs_and_hold_no_earlier_run"
+   ]
+  },
+  {
+   "name": "an earlier run's secret folder accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return [f\"{len(left)} tmpfs secret folder(s) of an earlier run remain: remove them\"] if left else []",
+   "replace": "        return []",
+   "expect_kills": [
+    "test_the_secret_parent_must_be_tmpfs_and_hold_no_earlier_run"
+   ]
+  },
+  {
+   "name": "secret folder kept after collect",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            shutil.rmtree(self.ctx.secret_dir(), ignore_errors=True)",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_secret_files_go_once_each_bot_joined_and_all_go_at_collect"
+   ]
+  },
+  {
+   "name": "probe env not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if proc[\"fleet\"] == \"browser\":\n                    self._env_check(pid)",
+   "replace": "                if False:\n                    self._env_check(pid)",
+   "expect_kills": [
+    "test_a_probe_holding_the_key_in_its_environment_or_without_the_preload_ends_the_run"
+   ]
+  },
+  {
+   "name": "probe env hits ignored",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if hits:\n            raise AdapterError(f\"{pid}: {len(hits)} process(es)",
+   "replace": "        if False:\n            raise AdapterError(f\"{pid}: {len(hits)} process(es)",
+   "expect_kills": [
+    "test_a_probe_holding_the_key_in_its_environment_or_without_the_preload_ends_the_run"
+   ]
+  },
+  {
+   "name": "preload marker not needed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not os.path.exists(c.path(\"probes\", str(self.procs[pid][\"probe_index\"]), KEY_READ)):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_probe_holding_the_key_in_its_environment_or_without_the_preload_ends_the_run"
+   ]
+  },
+  {
+   "name": "bots-app without the strip accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if not STRIP_RE.search(fh.read()):",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_a_checkout_whose_bots_app_passes_the_key_to_chromium_is_refused"
+   ]
+  },
+  {
+   "name": "sampler records every host process",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    PROC_GREP = PROC_GREP\n",
+   "replace": "    PROC_GREP = \".\"\n",
+   "expect_kills": [
+    "test_the_load_host_sampler_records_only_bot_and_runtime_processes"
+   ]
+  },
+  {
+   "name": "offset FinishedAt unparsed",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(?:Z|([+-])(\\d\\d):(\\d\\d))$",
+   "replace": "Z$",
+   "expect_kills": [
+    "test_an_offset_finished_at_parses",
+    "test_podman_state_keys_give_each_exit_its_own_time_and_code"
+   ]
+  },
+  {
+   "name": "offset sign inverted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    sign = {None: 0, \"+\": 1, \"-\": -1}[m.group(8)]",
+   "replace": "    sign = {None: 0, \"+\": 1, \"-\": 1}[m.group(8)]",
+   "expect_kills": [
+    "test_an_offset_finished_at_parses"
+   ]
+  },
+  {
+   "name": "offset added, not subtracted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "int(frac) / 10 ** len(frac) - offset",
+   "replace": "int(frac) / 10 ** len(frac) + offset",
+   "expect_kills": [
+    "test_an_offset_finished_at_parses",
+    "test_podman_state_keys_give_each_exit_its_own_time_and_code"
+   ]
+  },
+  {
+   "name": "podman's lowercase no such is an error",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if p.returncode != 0 and not out and \"no such\" not in p.stderr.lower():\n",
+   "replace": "        if p.returncode != 0 and not out and \"No such\" not in p.stderr:\n",
+   "expect_kills": [
+    "test_podmans_lowercase_no_such_container_is_absent_not_an_error"
+   ]
+  },
+  {
+   "name": "owner wait 120 s",
+   "file": "scripts/quality/cq_local.py",
+   "find": "OWNER_WAIT_S = 3 * 45 + 60\n",
+   "replace": "OWNER_WAIT_S = 120\n",
+   "expect_kills": [
+    "test_the_owner_wait_outlasts_the_bots_app_join_budget"
+   ]
+  },
+  {
+   "name": "hex form not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    forms = {secret, raw.hex(), ",
+   "replace": "    forms = {secret, ",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "JSON utf-8 form not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "             json.dumps(secret, ensure_ascii=False)[1:-1], *quoted,",
+   "replace": "             *quoted,",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "URL-encoded forms not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "             json.dumps(secret, ensure_ascii=False)[1:-1], *quoted,",
+   "replace": "             json.dumps(secret, ensure_ascii=False)[1:-1],",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "gzip logs scanned compressed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                plain = gzip.decompress(data) if packed else data",
+   "replace": "                plain = data",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak",
+    "test_room_token_jwts_are_redacted_in_place_not_called_a_leak"
+   ]
+  },
+  {
+   "name": "unreadable files pass",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    problems += [f\"{', '.join(unreadable)} could not be read or redacted, so they are unchecked\"] if unreadable else []\n",
+   "replace": "",
+   "expect_kills": [
+    "test_the_scan_fails_closed"
+   ]
+  },
+  {
+   "name": "an empty folder is clean",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    problems += [] if n else [\"the run folder has no files to scan\"]\n",
+   "replace": "",
+   "expect_kills": [
+    "test_the_scan_fails_closed"
+   ]
+  },
+  {
+   "name": "no key is clean",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return [\"no signing key to scan for\"]",
+   "replace": "        return []",
+   "expect_kills": [
+    "test_the_scan_fails_closed"
+   ]
+  },
+  {
+   "name": "leftover secret folder not a leak",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        left = [\"the run's tmpfs secret folder still exists\"] if os.path.lexists(c.secret_dir()) else []",
+   "replace": "        left = []",
+   "expect_kills": [
+    "test_the_leftover_secret_folder_is_a_leak"
+   ]
+  },
+  {
+   "name": "leak check not run",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        for what, fn in ((\"commands.txt\", self._commands), (\"leak check\", self._leak_check)):",
+   "replace": "        for what, fn in ((\"commands.txt\", self._commands),):",
+   "expect_kills": [
+    "test_a_planted_secret_in_the_run_folder_ends_the_run_error_leak",
+    "test_a_clean_folder_keeps_the_verdict_and_writes_the_scan_summary"
+   ]
+  },
+  {
+   "name": "leak is not an error",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if callable(getattr(self.fleet, \"leaks\", None)) and self._leaks():\n            self.s.error =",
+   "replace": "        if callable(getattr(self.fleet, \"leaks\", None)) and self._leaks():\n            self.s.error_ =",
+   "expect_kills": [
+    "test_a_planted_secret_in_the_run_folder_ends_the_run_error_leak"
+   ]
+  },
+  {
+   "name": "record not re-checked",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if scan and self.s.leaks == [] and self._leaks():",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_a_leak_found_only_in_the_record_withholds_it"
+   ]
+  },
+  {
+   "name": "a failing leak check passes",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self.s.leaks = [f\"the leak check failed ({_describe(exc)})\"]",
+   "replace": "            self.s.leaks = []",
+   "expect_kills": [
+    "test_a_failing_or_malformed_leak_check_is_an_error"
+   ]
+  },
+  {
+   "name": "a malformed leak result accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self.s.leaks = _strings(self.fleet.leaks(self.dir), \"leaks()\", \"fleet\")",
+   "replace": "            self.s.leaks = self.fleet.leaks(self.dir) or []",
+   "expect_kills": [
+    "test_a_failing_or_malformed_leak_check_is_an_error"
+   ]
+  },
+  {
+   "name": "shared fleet without leaks() accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "for h in (\"leaks\", \"admit\")",
+   "replace": "for h in (\"admit\",)",
+   "expect_kills": [
+    "test_a_shared_target_needs_a_fleet_with_a_leak_check"
+   ]
+  },
+  {
+   "name": "kubectl may delete",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "KUBECTL_CALLS = ((\"get\", \"pods\", \"-o\", \"json\"), ",
+   "replace": "KUBECTL_CALLS = ((\"delete\", \"pod\", \"x\"), (\"get\", \"pods\", \"-o\", \"json\"), ",
+   "expect_kills": [
+    "test_every_mutating_verb_is_refused_before_a_process_starts"
+   ]
+  },
+  {
+   "name": "kubectl allows any argv after an allowed verb",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if tuple(args) not in KUBECTL_CALLS:",
+   "replace": "        if not any(tuple(args[:2]) == c[:2] for c in KUBECTL_CALLS):",
+   "expect_kills": [
+    "test_every_mutating_verb_is_refused_before_a_process_starts"
+   ]
+  },
+  {
+   "name": "kubectl get without the server pin",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        argv += [\"--server\", self.profile[\"kube_server\"], \"-n\", self.ns] if args[0] == \"get\" else []",
+   "replace": "        argv += [\"-n\", self.ns] if args[0] == \"get\" else []",
+   "expect_kills": [
+    "test_every_mutating_verb_is_refused_before_a_process_starts",
+    "test_every_url_comes_from_the_profile"
+   ]
+  },
+  {
+   "name": "config view gets the server override",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "self.ns] if args[0] == \"get\" else []",
+   "replace": "self.ns]",
+   "expect_kills": [
+    "test_every_mutating_verb_is_refused_before_a_process_starts"
+   ]
+  },
+  {
+   "name": "kubectl context not pinned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        argv += [\"--context\", self.kube_context] if self.kube_context else []\n",
+   "replace": "",
+   "expect_kills": [
+    "test_every_mutating_verb_is_refused_before_a_process_starts"
+   ]
+  },
+  {
+   "name": "context read at preflight not kept",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        self.kube_context = current\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "another context than the profile's accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not isinstance(current, str) or not current or (self.kube_context and current != self.kube_context):",
+   "replace": "        if not isinstance(current, str) or not current:",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "insecure TLS accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "for k in (\"proxy-url\", \"insecure-skip-tls-verify\") if cluster.get(k)]",
+   "replace": "for k in (\"proxy-url\",) if cluster.get(k)]",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "kubeconfig proxy-url accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "for k in (\"proxy-url\", \"insecure-skip-tls-verify\") if cluster.get(k)]",
+   "replace": "for k in (\"insecure-skip-tls-verify\",) if cluster.get(k)]",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "no certificate authority accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems += [] if cluster.get(\"certificate-authority-data\") else [",
+   "replace": "        problems += [] if True else [",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "kubectl's default kubeconfig accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not self.kubeconfig_from_env and os.path.realpath(path) == os.path.realpath(",
+   "replace": "        if False and os.path.realpath(path) == os.path.realpath(",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "curl reads curlrc",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "[\"curl\", \"-q\", \"-sS\", ",
+   "replace": "[\"curl\", \"-sS\", ",
+   "expect_kills": [
+    "test_proxies_reach_no_child_and_curl_ignores_curlrc"
+   ]
+  },
+  {
+   "name": "curl follows any protocol",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"-sS\", \"--proto\", \"=https\", ",
+   "replace": "\"-sS\", ",
+   "expect_kills": [
+    "test_one_small_instant_query_per_round_with_a_1_s_server_timeout"
+   ]
+  },
+  {
+   "name": "runner stays dumpable",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)\n",
+   "replace": "        pass\n",
+   "expect_kills": [
+    "test_the_runner_becomes_undumpable"
+   ]
+  },
+  {
+   "name": "window end ignores teardown",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        need = run_s + self.teardown + WATCH_GAP_S\n",
+   "replace": "        need = run_s\n",
+   "expect_kills": [
+    "test_a_run_that_cannot_finish_with_teardown_before_the_window_end_is_refused"
+   ]
+  },
+  {
+   "name": "window fit without the float tolerance",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if day + need > self.end + 1e-6:",
+   "replace": "        if day + need >= self.end:",
+   "expect_kills": [
+    "test_a_run_that_cannot_finish_with_teardown_before_the_window_end_is_refused"
+   ]
+  },
+  {
+   "name": "watch stops at the window end",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        self.stop = self.end - teardown - WATCH_GAP_S",
+   "replace": "        self.stop = self.end",
+   "expect_kills": [
+    "test_the_watch_stops_with_the_teardown_budget_left_before_the_window_end"
+   ]
+  },
+  {
+   "name": "watch stop leaves no watch gap",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        self.stop = self.end - teardown - WATCH_GAP_S",
+   "replace": "        self.stop = self.end - teardown",
+   "expect_kills": [
+    "test_the_watch_stops_with_the_teardown_budget_left_before_the_window_end"
+   ]
+  },
+  {
+   "name": "watch ignores the window",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        out = (self.window.reasons(c.now()) if self.window else []) + c.load.check(mono)",
+   "replace": "        out = c.load.check(mono)",
+   "expect_kills": [
+    "test_the_watch_stops_with_the_teardown_budget_left_before_the_window_end"
+   ]
+  },
+  {
+   "name": "up does not recheck the window",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems = (self.window.problems(c.now(), planned_s(plan)) if self.window else []) + self.meeting_problems()",
+   "replace": "        problems = self.meeting_problems()",
+   "expect_kills": [
+    "test_up_checks_the_window_again_before_the_join"
+   ]
+  },
+  {
+   "name": "teardown slack 30 s short",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "TEARDOWN_SLACK_S = 10\n",
+   "replace": "TEARDOWN_SLACK_S = -20\n",
+   "expect_kills": [
+    "test_a_teardown_whose_every_call_takes_its_full_timeout_fits_the_teardown_budget"
+   ]
+  },
+  {
+   "name": "teardown slack 30 s long",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "TEARDOWN_SLACK_S = 10\n",
+   "replace": "TEARDOWN_SLACK_S = 40\n",
+   "expect_kills": [
+    "test_a_teardown_whose_every_call_takes_its_full_timeout_fits_the_teardown_budget"
+   ]
+  },
+  {
+   "name": "teardown budget without the kill fallback",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                + len(procs) * (KILL_S + FLEET_INSPECT_S) for fleet, procs in groups.items())",
+   "replace": "                + len(procs) * FLEET_INSPECT_S for fleet, procs in groups.items())",
+   "expect_kills": [
+    "test_a_teardown_whose_every_call_takes_its_full_timeout_fits_the_teardown_budget"
+   ]
+  },
+  {
+   "name": "teardown budget without the drain",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    return KUBECTL_S + stops + DRAIN_S + DRAIN_QUERY_S + WATCH_KILL_S + TEARDOWN_SLACK_S",
+   "replace": "    return KUBECTL_S + stops + TEARDOWN_SLACK_S",
+   "expect_kills": [
+    "test_a_teardown_whose_every_call_takes_its_full_timeout_fits_the_teardown_budget"
+   ]
+  },
+  {
+   "name": "stop waits like docker",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                                      stop_s + STOP_EXTRA_S, check=False),",
+   "replace": "                                      stop_s + cq_local.DOCKER_S, check=False),",
+   "expect_kills": [
+    "test_a_teardown_whose_every_call_takes_its_full_timeout_fits_the_teardown_budget"
+   ]
+  },
+  {
+   "name": "no kill after a failed stop",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                c.sh([c.docker, \"kill\", \"--signal\", \"KILL\", c.container(pid)], KILL_S, check=False)",
+   "replace": "                pass",
+   "expect_kills": [
+    "test_a_container_that_ignores_stop_is_killed_before_the_drain"
+   ]
+  },
+  {
+   "name": "group not inspected in one call",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                         lambda: self.stopped.update(c.inspect([c.container(p) for p in group], FLEET_INSPECT_S))):",
+   "replace": "                         lambda: None):",
+   "expect_kills": [
+    "test_a_container_that_ignores_stop_is_killed_before_the_drain"
+   ]
+  },
+  {
+   "name": "fleet poll bounded like docker",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            states = c.inspect([c.container(p) for p in alive], FLEET_INSPECT_S)",
+   "replace": "            states = c.inspect([c.container(p) for p in alive])",
+   "expect_kills": [
+    "test_poll_is_one_batched_inspect_bounded_well_under_the_runner_timeout"
+   ]
+  },
+  {
+   "name": "poll raises on the first failure",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if c.mono() - self.poll_ok >= BLIND_S:\n                raise",
+   "replace": "            if True:\n                raise",
+   "expect_kills": [
+    "test_poll_absorbs_an_isolated_inspect_failure_and_raises_after_30_s"
+   ]
+  },
+  {
+   "name": "poll never raises",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if c.mono() - self.poll_ok >= BLIND_S:\n                raise",
+   "replace": "            if False:\n                raise",
+   "expect_kills": [
+    "test_poll_absorbs_an_isolated_inspect_failure_and_raises_after_30_s"
+   ]
+  },
+  {
+   "name": "in-meeting not sticky",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if pid not in self.in_meeting:\n            left = self._budget_left()\n",
+   "replace": "        self.in_meeting.discard(pid)\n        if True:\n            left = self._budget_left()\n",
+   "expect_kills": [
+    "test_join_checks_are_sticky_and_spaced"
+   ]
+  },
+  {
+   "name": "Prometheus asked every pass",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if mono - self.prom_asked.get(uid, -math.inf) < JOIN_PROM_EVERY_S:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_join_checks_are_sticky_and_spaced"
+   ]
+  },
+  {
+   "name": "join query unbounded like a preflight query",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        vec = self.ctx.prom_vector(q, JOIN_PROM_S, PROM_TIMEOUT)",
+   "replace": "        vec = self.ctx.prom_vector(q, HTTP_S, PROM_TIMEOUT)",
+   "expect_kills": [
+    "test_join_checks_are_sticky_and_spaced"
+   ]
+  },
+  {
+   "name": "control exec bound like docker",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    CTL_S = CTL_S\n",
+   "replace": "    CTL_S = cq_local.DOCKER_S\n",
+   "expect_kills": [
+    "test_join_checks_are_sticky_and_spaced"
+   ]
+  },
+  {
+   "name": "owner wait not watched",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if self.stack is not None and c.mono() >= due:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_the_owner_wait_is_watched_and_ends_inside_the_join_budget"
+   ]
+  },
+  {
+   "name": "owner-wait watch reasons ignored",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if reasons:\n                    raise AdapterError(f\"stack watch during {what}: \"",
+   "replace": "                if False:\n                    raise AdapterError(f\"stack watch during {what}: \"",
+   "expect_kills": [
+    "test_the_owner_wait_is_watched_and_ends_inside_the_join_budget"
+   ]
+  },
+  {
+   "name": "TTL ignores the window",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return int(min(self.run_end, window.end_epoch(now) if window is not None else math.inf))",
+   "replace": "        return int(self.run_end)",
+   "expect_kills": [
+    "test_bots_end_by_the_window_close_even_if_the_runner_dies"
+   ]
+  },
+  {
+   "name": "a launch with too little of the run left goes ahead",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if left < MIN_LAUNCH_S:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_launch_with_too_little_of_the_run_left_is_refused_not_stretched",
+    "test_bots_end_by_the_window_close_even_if_the_runner_dies"
+   ]
+  },
+  {
+   "name": "probe TTL in rounded-up minutes",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"--ttl\", f\"{self._ttl_s()}s\",",
+   "replace": "\"--ttl\", f\"{-(-self._ttl_s() // 60)}m\",",
+   "expect_kills": [
+    "test_without_a_window_every_lifetime_ends_at_one_run_deadline"
+   ]
+  },
+  {
+   "name": "e2e mounted writable",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "*((\"ro\",) if dst == \"/app/e2e\" and \"ro\" not in opts else ()), \"z\")",
+   "replace": "\"z\")",
+   "expect_kills": [
+    "test_the_e2e_tree_is_mounted_read_only_into_every_container"
+   ]
+  },
+  {
+   "name": "mounts not relabelled",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "*((\"ro\",) if dst == \"/app/e2e\" and \"ro\" not in opts else ()), \"z\")",
+   "replace": "*((\"ro\",) if dst == \"/app/e2e\" and \"ro\" not in opts else ()))",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "probe key kept until the join",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if os.path.exists(self.ctx.path(\"probes\", str(self.procs[pid][\"probe_index\"]), KEY_READ)):\n                self.ctx.drop_secret(pid)",
+   "replace": "            if False:\n                self.ctx.drop_secret(pid)",
+   "expect_kills": [
+    "test_a_probes_key_file_goes_as_soon_as_its_preload_read_it"
+   ]
+  },
+  {
+   "name": "secret files kept after the join",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                    self._env_check(pid)\n                self.ctx.drop_secret(pid)\n",
+   "replace": "                    self._env_check(pid)\n",
+   "expect_kills": [
+    "test_secret_files_go_once_each_bot_joined_and_all_go_at_collect"
+   ]
+  },
+  {
+   "name": "hard stop over the whole window",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            b = busy_pct(self.samples[-1], now)\n            if b is not None and b > LOAD_HARD_PCT:",
+   "replace": "            b = busy_pct(self.samples[0], now)\n            if b is not None and b > LOAD_HARD_PCT:",
+   "expect_kills": [
+    "test_the_load_line_samples_on_its_own_and_a_hot_sample_stops_the_run_at_once"
+   ]
+  },
+  {
+   "name": "hard stop at 90%",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LOAD_HARD_PCT = 85.0\n",
+   "replace": "LOAD_HARD_PCT = 90.0\n",
+   "expect_kills": [
+    "test_the_load_host_above_85_percent_is_a_hard_stop_at_once",
+    "test_the_load_line_samples_on_its_own_and_a_hot_sample_stops_the_run_at_once"
+   ]
+  },
+  {
+   "name": "hard stop at 80%",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LOAD_HARD_PCT = 85.0\n",
+   "replace": "LOAD_HARD_PCT = 80.0\n",
+   "expect_kills": [
+    "test_the_70_percent_line_is_a_mean_so_a_dip_does_not_reset_it"
+   ]
+  },
+  {
+   "name": "70% line at 74%",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LOAD_LINE_PCT = 70.0\n",
+   "replace": "LOAD_LINE_PCT = 74.0\n",
+   "expect_kills": [
+    "test_the_70_percent_line_is_exact"
+   ]
+  },
+  {
+   "name": "70% line at 68%",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LOAD_LINE_PCT = 70.0\n",
+   "replace": "LOAD_LINE_PCT = 68.0\n",
+   "expect_kills": [
+    "test_the_70_percent_line_is_exact"
+   ]
+  },
+  {
+   "name": "70% line over 45 s",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LOAD_SUSTAIN_S = 60.0\n",
+   "replace": "LOAD_SUSTAIN_S = 45.0\n",
+   "expect_kills": [
+    "test_the_load_host_above_70_percent_for_60_s_aborts"
+   ]
+  },
+  {
+   "name": "70% line over 75 s",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LOAD_SUSTAIN_S = 60.0\n",
+   "replace": "LOAD_SUSTAIN_S = 75.0\n",
+   "expect_kills": [
+    "test_the_load_host_above_70_percent_for_60_s_aborts"
+   ]
+  },
+  {
+   "name": "70% line on the last interval only",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        b = busy_pct(old[-1], last) if old else None",
+   "replace": "        b = busy_pct(self.samples[-2], last) if len(self.samples) > 1 else None",
+   "expect_kills": [
+    "test_one_busy_interval_inside_a_quiet_minute_is_not_the_70_percent_line"
+   ]
+  },
+  {
+   "name": "load line not sampled by the fleet",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        hard = self.ctx.load.sample(self.ctx.mono())\n        if hard:",
+   "replace": "        hard = []\n        if hard:",
+   "expect_kills": [
+    "test_the_load_line_samples_on_its_own_and_a_hot_sample_stops_the_run_at_once"
+   ]
+  },
+  {
+   "name": "load sampled on every call",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if self.samples and mono - self.samples[-1][0] < LOAD_EVERY_S:\n            return []",
+   "replace": "        if False:\n            return []",
+   "expect_kills": [
+    "test_the_load_line_reads_proc_stat_at_most_every_5_s"
+   ]
+  },
+  {
+   "name": "load host never watched",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        out = (self.window.reasons(c.now()) if self.window else []) + c.load.check(mono)",
+   "replace": "        out = (self.window.reasons(c.now()) if self.window else [])",
+   "expect_kills": [
+    "test_the_load_host_above_70_percent_for_60_s_aborts",
+    "test_the_load_host_above_85_percent_is_a_hard_stop_at_once"
+   ]
+  },
+  {
+   "name": "busy load host accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if b is None or b > LOAD_LINE_PCT:\n            return [f\"load host CPU is",
+   "replace": "        if b is None:\n            return [f\"load host CPU is",
+   "expect_kills": [
+    "test_a_busy_load_host_refuses_the_run"
+   ]
+  },
+  {
+   "name": "remote image missing accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if p.returncode != 0 or p.stdout.strip() != cq_local.bot_labels(c.commit, c.dirty):",
+   "replace": "        if p.returncode != 0:",
+   "expect_kills": [
+    "test_the_remote_stack_never_builds_and_refuses_a_missing_or_foreign_bot_image"
+   ]
+  },
+  {
+   "name": "replay without the replay source accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if plan.get(\"video_mode\", cq_local.RUST_VIDEO_MODE) == \"replay\" and \"replay\" not in h:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_replay_needs_a_bot_image_with_the_replay_source"
+   ]
+  },
+  {
+   "name": "video mode not passed to the bot",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"video_mode\": c.plan.get(\"video_mode\", RUST_VIDEO_MODE),",
+   "replace": "\"video_mode\": RUST_VIDEO_MODE,",
+   "expect_kills": [
+    "test_replay_needs_a_bot_image_with_the_replay_source"
+   ]
+  },
+  {
+   "name": "linger not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if p.returncode != 0 or p.stdout.strip() != \"yes\":",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_linger_must_be_on"
+   ]
+  },
+  {
+   "name": "no tmux warning",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not held:\n            print(",
+   "replace": "        if False:\n            print(",
+   "expect_kills": [
+    "test_a_runner_outside_tmux_is_warned"
+   ]
+  },
+  {
+   "name": "base64 at offset 0 only",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    for k, lead in ((0, 0), (1, 2), (2, 3)):",
+   "replace": "    for k, lead in ((0, 0),):",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "base64 at offset 2 missed",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    for k, lead in ((0, 0), (1, 2), (2, 3)):",
+   "replace": "    for k, lead in ((0, 0), (1, 2)):",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "base64 keeps the last partial character",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        end = (k + len(raw)) * 8 // 6\n",
+   "replace": "        end = -(-(k + len(raw)) * 8 // 6)\n",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "base64url form not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        for enc in (base64.b64encode, base64.urlsafe_b64encode):\n            out.add(",
+   "replace": "        for enc in (base64.b64encode,):\n            out.add(",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "base64 form not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        for enc in (base64.b64encode, base64.urlsafe_b64encode):\n            out.add(",
+   "replace": "        for enc in (base64.urlsafe_b64encode,):\n            out.add(",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "upper-case hex not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "raw.hex(), raw.hex().upper(), ",
+   "replace": "raw.hex(), ",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "JSON-escaped form not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    forms = {secret, raw.hex(), raw.hex().upper(), json.dumps(secret)[1:-1],\n",
+   "replace": "    forms = {secret, raw.hex(), raw.hex().upper(),\n",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "lower-case URL escapes not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "             *(re.sub(r\"%[0-9A-F]{2}\", lambda m: m.group(0).lower(), q) for q in quoted)}",
+   "replace": "             }",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak"
+   ]
+  },
+  {
+   "name": "gzip sniffed by name",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                packed = data[:2] == GZIP_MAGIC",
+   "replace": "                packed = name.endswith(\".gz\")",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak",
+    "test_the_scan_fails_closed"
+   ]
+  },
+  {
+   "name": "JWT payload not decoded",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    for token in JWT_BYTES_RE.findall(data):\n        for seg in token.split(b\".\"):",
+   "replace": "    for token in []:\n        for seg in token.split(b\".\"):",
+   "expect_kills": [
+    "test_a_jwt_carrying_the_key_at_any_alignment_is_a_leak_not_redacted"
+   ]
+  },
+  {
+   "name": "JWT padding not restored",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                decoded = base64.urlsafe_b64decode(seg + b\"=\" * (-len(seg) % 4))",
+   "replace": "                decoded = base64.urlsafe_b64decode(seg)",
+   "expect_kills": [
+    "test_a_jwt_carrying_the_key_at_any_alignment_is_a_leak_not_redacted"
+   ]
+  },
+  {
+   "name": "room tokens left in place",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                elif JWT_BYTES_RE.search(plain):\n",
+   "replace": "                elif False:\n",
+   "expect_kills": [
+    "test_room_token_jwts_are_redacted_in_place_not_called_a_leak"
+   ]
+  },
+  {
+   "name": "control tokens not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                elif any(t in plain for t in toks):",
+   "replace": "                elif False:",
+   "expect_kills": [
+    "test_the_scan_fails_closed"
+   ]
+  },
+  {
+   "name": "links followed on open",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)",
+   "replace": "                fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK, dir_fd=dirfd)",
+   "expect_kills": [
+    "test_a_planted_link_never_makes_the_scan_write_outside_the_run_folder",
+    "test_the_scan_fails_closed"
+   ]
+  },
+  {
+   "name": "hard links accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:\n                    links.append(rel)",
+   "replace": "                if not stat.S_ISREG(st.st_mode):\n                    links.append(rel)",
+   "expect_kills": [
+    "test_the_scan_fails_closed"
+   ]
+  },
+  {
+   "name": "directory links not reported",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        for name in [d for d in dirs if stat.S_ISLNK(os.lstat(d, dir_fd=dirfd).st_mode)]:",
+   "replace": "        for name in []:",
+   "expect_kills": [
+    "test_a_planted_link_never_makes_the_scan_write_outside_the_run_folder"
+   ]
+  },
+  {
+   "name": "non-regular files pass",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    problems += [f\"{', '.join(links)} are not single-link regular files, and the scan does not follow them\"] \\\n        if links else []\n",
+   "replace": "",
+   "expect_kills": [
+    "test_the_scan_fails_closed",
+    "test_a_planted_link_never_makes_the_scan_write_outside_the_run_folder"
+   ]
+  },
+  {
+   "name": "a scrubbed key is not a leak",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if self._forms and has_key(text.encode(\"utf-8\", \"surrogateescape\"), self._forms):\n            self.key_scrubs += 1",
+   "replace": "        if False:\n            self.key_scrubs += 1",
+   "expect_kills": [
+    "test_a_container_printing_the_key_is_a_leak_although_its_log_is_redacted"
+   ]
+  },
+  {
+   "name": "scrubbed keys not reported",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                 \"was saved: rotate the key and tell the target's owner\"] if c.key_scrubs else []",
+   "replace": "                 \"was saved: rotate the key and tell the target's owner\"] if False else []",
+   "expect_kills": [
+    "test_a_container_printing_the_key_is_a_leak_although_its_log_is_redacted"
+   ]
+  },
+  {
+   "name": "env scan without done accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if \"done\" not in lines:\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_a_probe_holding_the_key_in_its_environment_or_without_the_preload_ends_the_run"
+   ]
+  },
+  {
+   "name": "env scan greps another name",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "grep -q \"^JWT_SECRET=\" ",
+   "replace": "grep -q \"^JWT_SECRETS=\" ",
+   "expect_kills": [
+    "test_the_env_scan_script_finds_a_process_holding_the_key"
+   ]
+  },
+  {
+   "name": "video mode not checked at compile",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "        if run.get(\"video_mode\", VIDEO_MODES[0]) not in VIDEO_MODES:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_video_mode_other_than_ekg_or_replay_is_refused"
+   ]
+  },
+  {
+   "name": "drain passes without an answer",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if v is not None:\n                live = ",
+   "replace": "            if v is None:\n                return []\n            if True:\n                live = ",
+   "expect_kills": [
+    "test_a_room_still_busy_after_the_drain_wait_or_a_blind_drain_check_is_a_problem"
+   ]
+  },
+  {
+   "name": "drain does not wait",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            c.sleep(min(DRAIN_POLL_S, max(0.0, deadline - c.mono())))",
+   "replace": "            return []",
+   "expect_kills": [
+    "test_the_room_drains_when_its_sessions_reach_0_or_vanish_with_every_relay_up",
+    "test_a_room_still_busy_after_the_drain_wait_or_a_blind_drain_check_is_a_problem"
+   ]
+  },
+  {
+   "name": "drain query bounded at 10 s",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            v = self._values(DRAIN_QUERY_S)",
+   "replace": "            v = self._values(HTTP_S)",
+   "expect_kills": [
+    "test_the_drain_query_is_bounded_at_5_s_and_one_session_is_not_drained"
+   ]
+  },
+  {
+   "name": "drain passes with one session",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if live and (n <= 0 if n is not None else self.own_max > 0):",
+   "replace": "                if live and (n <= 1 if n is not None else self.own_max > 0):",
+   "expect_kills": [
+    "test_the_drain_query_is_bounded_at_5_s_and_one_session_is_not_drained"
+   ]
+  },
+  {
+   "name": "an absent room with a relay down is drained",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if live and (n <= 0 if n is not None else self.own_max > 0):",
+   "replace": "                if (n <= 0 if n is not None else self.own_max > 0):",
+   "expect_kills": [
+    "test_an_absent_room_with_a_relay_down_or_missing_is_not_drained"
+   ]
+  },
+  {
+   "name": "a lost relay is drained",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                    (self.relay_count is None or v[\"relay_up_count\"] >= self.relay_count)",
+   "replace": "                    True",
+   "expect_kills": [
+    "test_an_absent_room_with_a_relay_down_or_missing_is_not_drained"
+   ]
+  },
+  {
+   "name": "proxies reach the children",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "if k not in CHILD_ENV_DROP and not k.upper().endswith(\"_PROXY\")}",
+   "replace": "if k not in CHILD_ENV_DROP}",
+   "expect_kills": [
+    "test_proxies_reach_no_child_and_curl_ignores_curlrc",
+    "test_every_proxy_variable_is_dropped_from_child_environments"
+   ]
+  },
+  {
+   "name": "only the usual proxy names dropped",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "if k not in CHILD_ENV_DROP and not k.upper().endswith(\"_PROXY\")}",
+   "replace": "if k not in CHILD_ENV_DROP and k.upper() not in (\"HTTP_PROXY\", \"HTTPS_PROXY\", \"NO_PROXY\", \"ALL_PROXY\", \"FTP_PROXY\")}",
+   "expect_kills": [
+    "test_every_proxy_variable_is_dropped_from_child_environments"
+   ]
+  },
+  {
+   "name": "UTF-16 not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": " | {secret.encode(\"utf-16-le\"), secret.encode(\"utf-16-be\")}",
+   "replace": "",
+   "expect_kills": [
+    "test_the_key_in_any_encoded_form_is_a_leak",
+    "test_utf_16_be_is_a_leak"
+   ]
+  },
+  {
+   "name": "UTF-16-BE not scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "{secret.encode(\"utf-16-le\"), secret.encode(\"utf-16-be\")}",
+   "replace": "{secret.encode(\"utf-16-le\")}",
+   "expect_kills": [
+    "test_utf_16_be_is_a_leak"
+   ]
+  },
+  {
+   "name": "archives scanned as plain bytes",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                elif unscannable(plain) or (packed and plain[:2] == GZIP_MAGIC):",
+   "replace": "                elif False:",
+   "expect_kills": [
+    "test_compressed_or_archived_files_beyond_one_gzip_layer_are_unchecked"
+   ]
+  },
+  {
+   "name": "double gzip scanned as one layer",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                elif unscannable(plain) or (packed and plain[:2] == GZIP_MAGIC):",
+   "replace": "                elif unscannable(plain):",
+   "expect_kills": [
+    "test_compressed_or_archived_files_beyond_one_gzip_layer_are_unchecked"
+   ]
+  },
+  {
+   "name": "zlib scanned as plain bytes",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    return data.startswith(PACKED_MAGIC) or zlib_head",
+   "replace": "    return data.startswith(PACKED_MAGIC)",
+   "expect_kills": [
+    "test_compressed_or_archived_files_beyond_one_gzip_layer_are_unchecked"
+   ]
+  },
+  {
+   "name": "archives unchecked silently",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    problems += [f\"{', '.join(packed_files)} are compressed or archived beyond one gzip layer, so they are unchecked\"] \\\n        if packed_files else []\n",
+   "replace": "",
+   "expect_kills": [
+    "test_compressed_or_archived_files_beyond_one_gzip_layer_are_unchecked"
+   ]
+  },
+  {
+   "name": "a live container after stop and kill is a clean exit",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if st.get(\"Running\"):\n            raise AdapterError(f\"{pid} is still running after podman stop and kill\")",
+   "replace": "        if False:\n            raise AdapterError(f\"{pid} is still running after podman stop and kill\")",
+   "expect_kills": [
+    "test_a_container_that_survives_stop_and_kill_is_an_error_not_a_clean_exit"
+   ]
+  },
+  {
+   "name": "a container gone at stop exits 0",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if st is None:\n            self.reported.add(pid)\n            return cq_runner.Exit(pid, None, None)",
+   "replace": "        if st is None:\n            self.reported.add(pid)\n            return cq_runner.Exit(pid, None, 0)",
+   "expect_kills": [
+    "test_a_container_gone_at_stop_or_poll_has_no_exit_code"
+   ]
+  },
+  {
+   "name": "a container gone at poll exits 0",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                out.append(cq_runner.Exit(pid, None, None) if st is None else self._exit(pid, st))",
+   "replace": "                out.append(cq_runner.Exit(pid, None, 0) if st is None else self._exit(pid, st))",
+   "expect_kills": [
+    "test_a_container_gone_at_stop_or_poll_has_no_exit_code"
+   ]
+  },
+  {
+   "name": "either preflight query answering is enough",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if seen is None or family is None:",
+   "replace": "        if seen is None and family is None:",
+   "expect_kills": [
+    "test_an_unanswered_uniqueness_query_refuses_even_if_the_family_query_answers"
+   ]
+  },
+  {
+   "name": "up skips the readiness wait",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            problems = self.ready_problems()\n            if not problems:\n                break",
+   "replace": "            problems = self.ready_problems()\n            if True:\n                break",
+   "expect_kills": [
+    "test_up_waits_for_readiness_and_gives_up_after_120_s"
+   ]
+  },
+  {
+   "name": "a target in another namespace counts",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            ts = [t for t in active if isinstance(t, dict) and (t.get(\"labels\") or {}).get(\"namespace\") == self.ctx.ns\n                  and ",
+   "replace": "            ts = [t for t in active if isinstance(t, dict)\n                  and ",
+   "expect_kills": [
+    "test_a_scrape_target_in_another_namespace_does_not_count"
+   ]
+  },
+  {
+   "name": "a poll success does not end the blind spell",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            return []\n        self.poll_ok = c.mono()\n",
+   "replace": "            return []\n",
+   "expect_kills": [
+    "test_a_poll_success_ends_the_blind_spell"
+   ]
+  },
+  {
+   "name": "an unremovable secret folder passes",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if os.path.lexists(path):\n            raise AdapterError(\"a tmpfs secret folder could not be removed; remove it by hand\")",
+   "replace": "        if False:\n            raise AdapterError(\"a tmpfs secret folder could not be removed; remove it by hand\")",
+   "expect_kills": [
+    "test_a_secret_folder_that_cannot_be_removed_is_an_error"
+   ]
+  },
+  {
+   "name": "a shared target takes --allow-dirty",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        unfit += [\"it does not take --allow-dirty\"] if self.allow_dirty else []\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_shared_target_refuses_allow_dirty_before_any_stack_or_fleet_call"
+   ]
+  },
+  {
+   "name": "runner children keep proxies",
+   "file": "scripts/quality/cq_runner.py",
+   "find": " and not k.upper().endswith(\"_PROXY\")}\n\n\nclass SubprocessTools:",
+   "replace": "}\n\n\nclass SubprocessTools:",
+   "expect_kills": [
+    "test_the_scorer_and_other_runner_children_get_no_proxy"
+   ]
+  },
+  {
+   "name": "watch and drain see only the WebSocket relays",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        relay = f'{sel},pod=~\"{p[\"pods\"][\"relay_ws\"]}|{p[\"pods\"][\"relay_wt\"]}\"'",
+   "replace": "        relay = f'{sel},pod=~\"{p[\"pods\"][\"relay_ws\"]}\"'",
+   "expect_kills": [
+    "test_one_small_instant_query_per_round_with_a_1_s_server_timeout"
+   ]
+  },
+  {
+   "name": "a packed file is unchecked before its plain bytes are scanned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if has_key(plain, key) or (packed and has_key(data, key)):\n                    keyed.append(rel)\n                elif unscannable(plain) or (packed and plain[:2] == GZIP_MAGIC):\n                    packed_files.append(rel)",
+   "replace": "                if unscannable(plain) or (packed and plain[:2] == GZIP_MAGIC):\n                    packed_files.append(rel)\n                elif has_key(plain, key) or (packed and has_key(data, key)):\n                    keyed.append(rel)",
+   "expect_kills": [
+    "test_every_packed_header_is_unchecked_and_a_plain_key_in_a_packed_file_is_still_a_leak"
+   ]
+  },
+  {
+   "name": "zstd header typo",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "b\"\\x28\\xb5\\x2f\\xfd\"",
+   "replace": "b\"\\x28\\xb5\\x2f\\xfe\"",
+   "expect_kills": [
+    "test_every_packed_header_is_unchecked_and_a_plain_key_in_a_packed_file_is_still_a_leak"
+   ]
+  },
+  {
+   "name": "7z header typo",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "b\"7z\\xbc\\xaf\\x27\\x1c\"",
+   "replace": "b\"7z\\xbc\\xaf\\x27\\x1d\"",
+   "expect_kills": [
+    "test_every_packed_header_is_unchecked_and_a_plain_key_in_a_packed_file_is_still_a_leak"
+   ]
+  },
+  {
+   "name": "rar header typo",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "b\"Rar!\\x1a\\x07\"",
+   "replace": "b\"Rar!\\x1a\\x08\"",
+   "expect_kills": [
+    "test_every_packed_header_is_unchecked_and_a_plain_key_in_a_packed_file_is_still_a_leak"
+   ]
+  },
+  {
+   "name": "lz4 header typo",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "b\"\\x04\\x22\\x4d\\x18\"",
+   "replace": "b\"\\x04\\x22\\x4d\\x19\"",
+   "expect_kills": [
+    "test_every_packed_header_is_unchecked_and_a_plain_key_in_a_packed_file_is_still_a_leak"
+   ]
+  },
+  {
+   "name": "an old busy reading outlives a relay drop",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                last = n if live else None",
+   "replace": "                last = n if live else last",
+   "expect_kills": [
+    "test_a_relay_lost_after_a_busy_reading_is_reported_as_unconfirmed"
+   ]
+  },
+  {
+   "name": "real sessions summed with negative series",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"real_sessions\": f'sum(relay_active_sessions_per_room{{{sel},room!~\"scale-.*\"}} > 0)',",
+   "replace": "            \"real_sessions\": f'sum(relay_active_sessions_per_room{{{sel},room!~\"scale-.*\"}})',",
+   "expect_kills": [
+    "test_session_gauges_count_only_positive_series"
+   ]
+  },
+  {
+   "name": "own sessions summed with negative series",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"own_sessions\": f'sum(relay_active_sessions_per_room{{{sel},room=\"{ctx.room}\"}} > 0)',",
+   "replace": "            \"own_sessions\": f'sum(relay_active_sessions_per_room{{{sel},room=\"{ctx.room}\"}})',",
+   "expect_kills": [
+    "test_session_gauges_count_only_positive_series"
+   ]
+  },
+  {
+   "name": "a negative own-room reading waits out the drain",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if live and (n <= 0 if n is not None else self.own_max > 0):",
+   "replace": "                if live and (n == 0 if n is not None else self.own_max > 0):",
+   "expect_kills": [
+    "test_session_gauges_count_only_positive_series"
+   ]
+  },
+  {
+   "name": "the real leak check only reports the secret folder",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return left + leak_scan(run_dir, c.jwt_secret, list(c.tokens.values()))",
+   "replace": "        return left",
+   "expect_kills": [
+    "test_the_real_leak_check_reports_a_planted_key_and_a_control_token"
+   ]
+  },
+  {
+   "name": "up does not recheck the meeting",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems = (self.window.problems(c.now(), planned_s(plan)) if self.window else []) + self.meeting_problems()",
+   "replace": "        problems = (self.window.problems(c.now(), planned_s(plan)) if self.window else [])",
+   "expect_kills": [
+    "test_up_refuses_a_real_meeting_that_starts_during_the_readiness_wait"
+   ]
+  },
+  {
+   "name": "kubeconfig auth-provider accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "for k in (\"exec\", \"auth-provider\")",
+   "replace": "for k in (\"exec\",)",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "kubeconfig tokenFile accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "for k in (\"client-certificate\", \"client-key\", \"tokenFile\")",
+   "replace": "for k in (\"client-certificate\", \"client-key\")",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "probe key folder mounted writable",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"-v\", c.mount(out, \"/out\"), \"-v\", c.mount(cfg_dir, \"/cfg\", \"ro\"),",
+   "replace": "\"-v\", c.mount(out, \"/out\"), \"-v\", c.mount(cfg_dir, \"/cfg\"),",
+   "expect_kills": [
+    "test_the_probe_key_folder_is_mounted_read_only"
+   ]
+  },
+  {
+   "name": "factory leaves the runner dumpable",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                 kubeconfig_from_env=bool(env.get(KUBECONFIG_ENV)))\n    undumpable()\n",
+   "replace": "                 kubeconfig_from_env=bool(env.get(KUBECONFIG_ENV)))\n",
+   "expect_kills": [
+    "test_the_factory_makes_the_runner_undumpable"
+   ]
+  },
+  {
+   "name": "the probe TTL is the whole run, not what is left",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"--ttl\", f\"{self._ttl_s()}s\",",
+   "replace": "\"--ttl\", f\"{int(run_need_s(c.plan))}s\",",
+   "expect_kills": [
+    "test_without_a_window_every_lifetime_ends_at_one_run_deadline"
+   ]
+  },
+  {
+   "name": "done line written before the record check",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "lambda: self.log.write(\"done\", verdict=run[\"verdict\"])",
+   "replace": "lambda: self.log.write(\"done\", verdict=self._record(gates)[\"verdict\"])",
+   "expect_kills": [
+    "test_a_leak_found_only_in_the_record_withholds_it"
+   ]
+  },
+  {
+   "name": "own-room canary satisfied by one session",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        n = len(c.plan[\"participants\"])\n",
+   "replace": "        n = 1\n",
+   "expect_kills": [
+    "test_only_every_planned_session_in_this_runs_room_ends_the_blind_canary"
+   ]
+  },
+  {
+   "name": "own-room canary needs one session more than planned",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        n = len(c.plan[\"participants\"])\n",
+   "replace": "        n = len(c.plan[\"participants\"]) + 1\n",
+   "expect_kills": [
+    "test_only_every_planned_session_in_this_runs_room_ends_the_blind_canary"
+   ]
+  },
+  {
+   "name": "watch readings never mark the room seen",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        self.own_max = max(self.own_max, v.get(\"own_sessions\", 0))\n",
+   "replace": "",
+   "expect_kills": [
+    "test_only_every_planned_session_in_this_runs_room_ends_the_blind_canary",
+    "test_a_room_seen_during_the_run_drains_when_its_series_is_gone"
+   ]
+  },
+  {
+   "name": "drain readings never mark the room seen",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                self.own_max = max(self.own_max, n or 0)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_the_room_drains_when_its_sessions_reach_0_or_vanish_with_every_relay_up"
+   ]
+  },
+  {
+   "name": "an absent room never seen is drained",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if live and (n <= 0 if n is not None else self.own_max > 0):",
+   "replace": "                if live and (n <= 0 if n is not None else True):",
+   "expect_kills": [
+    "test_an_absent_room_never_seen_with_a_session_is_not_drained"
+   ]
+  },
+  {
+   "name": "a never-seen room reads as a blind drain",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if v is not None and live and n is None:",
+   "replace": "                if False:",
+   "expect_kills": [
+    "test_an_absent_room_never_seen_with_a_session_is_not_drained"
+   ]
+  },
+  {
+   "name": "Rust log without the replay render counters",
+   "file": "scripts/quality/cq_local.py",
+   "find": "RUST_LOG = \"info,bot::video_producer::replay=debug\"",
+   "replace": "RUST_LOG = \"info\"",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "admission ignores the probe cost",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        ok = now + cost <= limit\n",
+   "replace": "        ok = now <= limit\n",
+   "expect_kills": [
+    "test_a_probe_is_admitted_only_if_host_now_plus_its_cost_fits_the_line_less_overhead"
+   ]
+  },
+  {
+   "name": "admission without the overhead",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LOAD_LINE_PCT / 100 * ncpu - ADMIT_OVERHEAD_CORES",
+   "replace": "LOAD_LINE_PCT / 100 * ncpu",
+   "expect_kills": [
+    "test_a_probe_is_admitted_only_if_host_now_plus_its_cost_fits_the_line_less_overhead"
+   ]
+  },
+  {
+   "name": "admission reads host cores on 8 CPUs always",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        now, limit = pct / 100 * ncpu,",
+   "replace": "        now, limit = pct / 100 * 8,",
+   "expect_kills": [
+    "test_a_probe_is_admitted_only_if_host_now_plus_its_cost_fits_the_line_less_overhead"
+   ]
+  },
+  {
+   "name": "admission without its own CPU sample",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self._wait_watched(c.mono() + ADMIT_SAMPLE_S, \"the admission sample\")\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_probe_is_admitted_only_if_host_now_plus_its_cost_fits_the_line_less_overhead"
+   ]
+  },
+  {
+   "name": "an unpriced probe is admitted on the camera-off cost",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        cost = c.profile[\"probe_cores\"][kind]\n",
+   "replace": "        cost = c.profile[\"probe_cores\"][kind] or c.profile[\"probe_cores\"][\"camera_off\"]\n",
+   "expect_kills": [
+    "test_a_camera_on_probe_needs_a_cost_from_the_profile"
+   ]
+  },
+  {
+   "name": "an unpriced probe passes preflight",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        unpriced = [p[\"proc_id\"] for p in probes if c.profile[\"probe_cores\"][c.probe_kind(p)] is None]",
+   "replace": "        unpriced = []",
+   "expect_kills": [
+    "test_a_camera_on_probe_needs_a_cost_from_the_profile"
+   ]
+  },
+  {
+   "name": "probe kind ignores the camera",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if pub[\"camera\"]:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_camera_on_probe_needs_a_cost_from_the_profile"
+   ]
+  },
+  {
+   "name": "profile probe costs not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems.append(\"probe_cores\")",
+   "replace": "        pass",
+   "expect_kills": [
+    "test_a_malformed_profile_is_refused"
+   ]
+  },
+  {
+   "name": "a zero probe cost accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "cq_runner._num(v) and v > 0 for v in cores.values()",
+   "replace": "cq_runner._num(v) and v >= 0 for v in cores.values()",
+   "expect_kills": [
+    "test_a_malformed_profile_is_refused"
+   ]
+  },
+  {
+   "name": "a profile without a window is refused at preflight",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems += self.window.problems(c.now(), planned_s(plan)) if self.window else []",
+   "replace": "        problems += self.window.problems(c.now(), planned_s(plan)) if self.window else [\"no window\"]",
+   "expect_kills": [
+    "test_a_profile_without_a_window_passes_preflight_at_any_hour"
+   ]
+  },
+  {
+   "name": "preflight skips a profile's window",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems += self.window.problems(c.now(), planned_s(plan)) if self.window else []",
+   "replace": "        problems += []",
+   "expect_kills": [
+    "test_the_window_refuses_outside_its_hours_any_day"
+   ]
+  },
+  {
+   "name": "TTL capped by the old join-window-plus-hold budget",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self.run_end = now + run_need_s(c.plan)",
+   "replace": "            self.run_end = now + cq_local.LocalFleet._ttl_s(self)",
+   "expect_kills": [
+    "test_without_a_window_every_lifetime_ends_at_one_run_deadline"
+   ]
+  },
+  {
+   "name": "remote probes get no posture flags",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        argv += cq_local.probe_flags(proc)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_s0s_probe_skips_paint_turns_diag_packets_off_and_keeps_the_client_decode_budget"
+   ]
+  },
+  {
+   "name": "remote Rust bots get no diagnostics flag",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            *cq_local.rust_flags(c.plan), *cq_local.rust_layout(c.plan)[1][pid]]",
+   "replace": "            *cq_local.rust_layout(c.plan)[1][pid]]",
+   "expect_kills": [
+    "test_rust_bots_get_the_host_network_and_a_loopback_metrics_port_only"
+   ]
+  },
+  {
+   "name": "the image's diagnostics switch is not checked",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not has_option(h, \"--diagnostics\"):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_either_diagnostics_value_needs_a_bot_image_with_the_switch"
+   ]
+  },
+  {
+   "name": "only an off plan checks the diagnostics switch",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not has_option(h, \"--diagnostics\"):",
+   "replace": "        if plan[\"bot_diagnostics\"] == \"off\" and not has_option(h, \"--diagnostics\"):",
+   "expect_kills": [
+    "test_either_diagnostics_value_needs_a_bot_image_with_the_switch"
+   ]
+  },
+  {
+   "name": "an image option matched as a substring",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    return re.search(rf\"(?<![\\w-]){re.escape(option)}(?![\\w-])\", help_text) is not None",
+   "replace": "    return option in help_text",
+   "expect_kills": [
+    "test_either_diagnostics_value_needs_a_bot_image_with_the_switch",
+    "test_the_bot_image_needs_the_deadline_option"
+   ]
+  },
+  {
+   "name": "each launch gets a fresh lifetime",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if self.run_end is None:\n",
+   "replace": "        if True:\n",
+   "expect_kills": [
+    "test_without_a_window_every_lifetime_ends_at_one_run_deadline"
+   ]
+  },
+  {
+   "name": "admission samples before the owner wait",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self._await_in_meeting(prev, proc[\"proc_id\"])\n",
+   "replace": "            self._in_meeting(prev)\n",
+   "expect_kills": [
+    "test_a_later_probe_is_sampled_after_the_owner_wait_not_before_it"
+   ]
+  },
+  {
+   "name": "an impossible busy share or cpu count accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if pct is None or not 0 <= pct <= 100 or not ncpu:",
+   "replace": "        if pct is None:",
+   "expect_kills": [
+    "test_an_impossible_cpu_reading_or_cpu_count_refuses"
+   ]
+  },
+  {
+   "name": "the bot image need not take --deadline",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems = [] if has_option(h, \"--deadline\") else [",
+   "replace": "        problems = [] if True else [",
+   "expect_kills": [
+    "test_the_bot_image_needs_the_deadline_option"
+   ]
+  },
+  {
+   "name": "Rust bots get no deadline",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"--deadline\", str(self._deadline()),\n",
+   "replace": "",
+   "expect_kills": [
+    "test_without_a_window_every_lifetime_ends_at_one_run_deadline"
+   ]
+  },
+  {
+   "name": "probes get no deadline",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "f\"{self._ttl_s()}s\", \"--deadline\", str(self._deadline()),\n",
+   "replace": "f\"{self._ttl_s()}s\",\n",
+   "expect_kills": [
+    "test_without_a_window_every_lifetime_ends_at_one_run_deadline"
+   ]
+  },
+  {
+   "name": "a mic-on probe is priced as a muted one",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return \"camera_off_mic_on\" if pub[\"mic\"] else \"camera_off\"",
+   "replace": "        return \"camera_off\"",
+   "expect_kills": [
+    "test_a_mic_on_probe_is_priced_and_launched_as_one"
+   ]
+  },
+  {
+   "name": "a remote mic-on probe joins muted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        argv += [] if part[\"publishes\"][\"mic\"] else [\"--join-mic-muted\"]",
+   "replace": "        argv += [\"--join-mic-muted\"]",
+   "expect_kills": [
+    "test_a_mic_on_probe_is_priced_and_launched_as_one"
+   ]
+  },
+  {
+   "name": "admission refuses a probe exactly on the line",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            ok = now + cost <= limit\n",
+   "replace": "            ok = now + cost < limit\n",
+   "expect_kills": [
+    "test_a_probe_exactly_on_the_line_less_overhead_is_admitted"
+   ]
+  },
+  {
+   "name": "the owner gets no second sample",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "OWNER_SAMPLES = 2\n",
+   "replace": "OWNER_SAMPLES = 1\n",
+   "expect_kills": [
+    "test_the_owner_is_admitted_on_a_second_sample"
+   ]
+  },
+  {
+   "name": "run_need_s without the watch gap",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    return planned_s(plan) + teardown_s(plan) + WATCH_GAP_S\n",
+   "replace": "    return planned_s(plan) + teardown_s(plan)\n",
+   "expect_kills": [
+    "test_without_a_window_every_lifetime_ends_at_one_run_deadline"
+   ]
+  },
+  {
+   "name": "a later probe is sampled during the previous probe's join",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self._wait_watched(self.in_meeting_at[prev] + ADMIT_SETTLE_S, \"the admission wait\")\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_later_probe_is_sampled_after_the_previous_probes_join_transient"
+   ]
+  },
+  {
+   "name": "a later probe gets one sample",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "LATER_SAMPLES = int((ADMIT_SETTLE_CAP_S - ADMIT_SETTLE_S) // ADMIT_SAMPLE_S)\n",
+   "replace": "LATER_SAMPLES = 1\n",
+   "expect_kills": [
+    "test_a_later_probe_is_resampled_until_the_cap_then_refused"
+   ]
+  },
+  {
+   "name": "the hcl-daily mic-on cost stays at the old guess",
+   "file": "scripts/quality/targets/hcl-daily.json",
+   "find": "\"camera_off_mic_on\": 1.2,",
+   "replace": "\"camera_off_mic_on\": 3.2,",
+   "expect_kills": [
+    "test_the_committed_probe_costs_cover_s0s_measured_probe_and_admit_a_second_on_s0s_host",
+    "test_the_committed_profile_matches_dailys_deploy_and_names_no_window"
+   ]
+  },
+  {
+   "name": "an admission sample skips the load line and the watch",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self._wait_watched(c.mono() + ADMIT_SAMPLE_S, \"the admission sample\")\n            self._tick()\n",
+   "replace": "            c.sleep(ADMIT_SAMPLE_S)\n",
+   "expect_kills": [
+    "test_a_hot_admission_sample_hits_the_hard_stop_instead_of_admitting"
+   ]
+  },
+  {
+   "name": "a join window short of the worst case accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if probes and join_floor_s(plan) > plan[\"steps\"][0][\"join_window_s\"]:\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it",
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "the model leaves out the owner's samples",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "OWNER_SAMPLES * SAMPLE_S))",
+   "replace": "0))",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "the model leaves out the later probe's admission",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                         ADMIT_SETTLE_S + WATCH_S + LATER_SAMPLES * SAMPLE_S))\n",
+   "replace": "                         0))\n",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "confirmation leaves out the env check",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "2 * JOIN_LOOP_S + cq_local.DOCKER_S\n",
+   "replace": "2 * JOIN_LOOP_S\n",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "confirmation leaves out the Prometheus scrape",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "CONFIRM_S = max(PROM_SCRAPE_S, JOIN_PROM_EVERY_S) + ",
+   "replace": "CONFIRM_S = ",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "the floor rounds down",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    return math.ceil(round(sum(s for _, _, s in join_timeline(plan)) - cq_runner.JOIN_BUDGET_EXTRA_S, 1))",
+   "replace": "    return math.floor(round(sum(s for _, _, s in join_timeline(plan)) - cq_runner.JOIN_BUDGET_EXTRA_S, 1))",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "the estimate leaves out the Rust deadline",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"Rust bots launched and joined, media started\", cq_runner.RUST_READY_S)",
+   "replace": "\"Rust bots launched and joined, media started\", 0)",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "the estimate leaves out a probe's readiness",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "f\"{pid} launched and in the meeting\", PROBE_READY_S))",
+   "replace": "f\"{pid} launched and in the meeting\", 0))",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it",
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "the estimate leaves out seeing the previous probe",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "f\"{probes[k - 1]['proc_id']} seen in the meeting\", SEEN_S))",
+   "replace": "f\"{probes[k - 1]['proc_id']} seen in the meeting\", 0))",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "the estimate leaves out the earlier confirmations",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                     CONFIRM_S + max(0, earlier)))\n",
+   "replace": "                     CONFIRM_S))\n",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "the estimate leaves out the last confirmation",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                     CONFIRM_S + max(0, earlier)))\n",
+   "replace": "                     max(0, earlier)))\n",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it",
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "a Rust launch gets podman's full timeout",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return min(cq_local.DOCKER_S, left)\n",
+   "replace": "        return cq_local.DOCKER_S\n",
+   "expect_kills": [
+    "test_a_launch_gets_only_what_is_left_of_its_readiness_deadline",
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "a launch past its readiness deadline goes ahead",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if left <= 0:\n            raise AdapterError(f\"{pid}: its readiness deadline passed before its launch\")\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_launch_gets_only_what_is_left_of_its_readiness_deadline"
+   ]
+  },
+  {
+   "name": "the Rust bots get no readiness deadline",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self.ready_by[proc[\"proc_id\"]] = self.join_mono + cq_runner.RUST_READY_S\n",
+   "replace": "            self.ready_by[proc[\"proc_id\"]] = math.inf\n",
+   "expect_kills": [
+    "test_a_launch_gets_only_what_is_left_of_its_readiness_deadline",
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "a probe's readiness deadline is longer than the estimate's",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        self.ready_by[pid] = c.mono() + PROBE_READY_S\n",
+   "replace": "        self.ready_by[pid] = c.mono() + PROBE_READY_S + 60\n",
+   "expect_kills": [
+    "test_the_owner_wait_ends_at_the_owners_readiness_deadline_and_says_so"
+   ]
+  },
+  {
+   "name": "bots-app gets no join deadline",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            \"--join-deadline\", str(join_by), \"--manifest\", \"\",",
+   "replace": "            \"--manifest\", \"\",",
+   "expect_kills": [
+    "test_the_owner_wait_ends_at_the_owners_readiness_deadline_and_says_so"
+   ]
+  },
+  {
+   "name": "the owner wait ignores the readiness deadline",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "self._wait_watched(self.ready_by[prev], \"the owner wait\"",
+   "replace": "self._wait_watched(self.ready_by[prev] + 600, \"the owner wait\"",
+   "expect_kills": [
+    "test_the_owner_wait_ends_at_the_owners_readiness_deadline_and_says_so"
+   ]
+  },
+  {
+   "name": "a late probe is waited for until the budget",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if late:\n            raise AdapterError(",
+   "replace": "        if False:\n            raise AdapterError(",
+   "expect_kills": [
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "the env check gets podman's full timeout",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "min(cq_local.DOCKER_S, left),\n                 check=False)",
+   "replace": "cq_local.DOCKER_S,\n                 check=False)",
+   "expect_kills": [
+    "test_the_env_check_gets_only_what_is_left_of_the_join_budget"
+   ]
+  },
+  {
+   "name": "the env check runs past the join budget",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if left <= 0:\n            raise AdapterError(f\"{pid}: the join budget ran out before its environment check\")\n",
+   "replace": "        left = max(left, 1)\n",
+   "expect_kills": [
+    "test_the_env_check_gets_only_what_is_left_of_the_join_budget"
+   ]
+  },
+  {
+   "name": "a long join stagger accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                     if p[\"join_stagger_s\"] > MAX_STAGGER_S]\n",
+   "replace": "                     if False]\n",
+   "expect_kills": [
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "the stagger cap leaves out the launch",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "MAX_STAGGER_S = PROBE_READY_S - cq_local.DOCKER_S - FLEET_INSPECT_S - WATCH_S\n",
+   "replace": "MAX_STAGGER_S = PROBE_READY_S - FLEET_INSPECT_S - WATCH_S\n",
+   "expect_kills": [
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "readiness is cached without the join record",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            if seen and self._joined_in_time(pid):\n",
+   "replace": "            if seen:\n",
+   "expect_kills": [
+    "test_a_probe_is_in_the_meeting_only_if_its_own_record_has_it_joined_by_its_deadline",
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "a join after the deadline counts as in time",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        return isinstance(ts, (int, float)) and ts <= self.join_by[pid]\n",
+   "replace": "        return isinstance(ts, (int, float))\n",
+   "expect_kills": [
+    "test_a_probe_is_in_the_meeting_only_if_its_own_record_has_it_joined_by_its_deadline"
+   ]
+  },
+  {
+   "name": "a healthz call gets its full timeout",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                seen = super()._in_meeting(pid, min(CTL_S, left))\n",
+   "replace": "                seen = super()._in_meeting(pid, CTL_S)\n",
+   "expect_kills": [
+    "test_a_healthz_call_gets_only_what_is_left_of_the_join_budget"
+   ]
+  },
+  {
+   "name": "a clipped healthz timeout stops the run",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                if left >= CTL_S:\n                    raise\n                return False\n",
+   "replace": "                raise\n",
+   "expect_kills": [
+    "test_a_healthz_call_gets_only_what_is_left_of_the_join_budget"
+   ]
+  },
+  {
+   "name": "a probe past its deadline with a timely record waits on",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                and self.ctx.mono() > self.ready_by[p]]\n",
+   "replace": "                and self.ctx.mono() > self.ready_by[p] and not self._joined_in_time(p)]\n",
+   "expect_kills": [
+    "test_a_probe_healthz_does_not_show_in_after_its_deadline_stops_the_run_whatever_its_record_says"
+   ]
+  },
+  {
+   "name": "the last probe's stagger is capped",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "\"its readiness deadline leaves after its launch\" for p in probes[:-1]",
+   "replace": "\"its readiness deadline leaves after its launch\" for p in probes",
+   "expect_kills": [
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "the runner skips the join stagger",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                    self._sleep_until_mono(self._now().mono + p[\"join_stagger_s\"])\n",
+   "replace": "                    pass\n",
+   "expect_kills": [
+    "test_each_participant_is_in_by_its_deadline_or_the_run_stops_there_and_says_who"
+   ]
+  },
+  {
+   "name": "a watched wait can ask for a negative sleep",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            c.sleep(max(0.0, min(cq_local.OWNER_POLL_S, until - c.mono())))\n",
+   "replace": "            c.sleep(min(cq_local.OWNER_POLL_S, until - c.mono()))\n",
+   "expect_kills": [
+    "test_a_watch_that_ends_past_the_owners_deadline_still_accepts_an_owner_in_by_then"
+   ]
+  },
+  {
+   "name": "a watched wait is due from the fleet's own last watch, not the stack's",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            due = self.watch_at if last is None else last + cq_runner.WATCH_INTERVAL_S\n",
+   "replace": "            due = self.watch_at\n",
+   "expect_kills": [
+    "test_no_two_watches_of_a_two_probe_join_are_closer_than_the_watch_interval"
+   ]
+  },
+  {
+   "name": "preflight-only launches a process",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._preflight()\n        except (Refused, AdapterError) as exc:\n            return getattr",
+   "replace": "            self._preflight()\n            self.fleet.launch(self.plan[\"processes\"][0])\n        except (Refused, AdapterError) as exc:\n            return getattr",
+   "expect_kills": [
+    "test_preflight_only_makes_the_remote_checks_and_starts_no_bot_or_probe"
+   ]
+  },
+  {
+   "name": "a profile file adds no shared target",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "SHARED_TARGETS = frozenset({\"hcl-daily\", *profile_targets()})",
+   "replace": "SHARED_TARGETS = frozenset({\"hcl-daily\"})",
+   "expect_kills": [
+    "test_a_profile_file_alone_adds_a_shared_target_guarded_by_its_own_values"
+   ]
+  },
+  {
+   "name": "a profile may take a built-in target's name",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "\n                  and n[:-5] not in (\"local\", \"ci\"))",
+   "replace": ")",
+   "expect_kills": [
+    "test_profile_targets_are_the_profile_files_named_like_targets"
+   ]
+  },
+  {
+   "name": "any profile file name is a target",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "n.endswith(\".json\") and TARGET_NAME_RE.fullmatch(n[:-5])",
+   "replace": "n.endswith(\".json\")",
+   "expect_kills": [
+    "test_profile_targets_are_the_profile_files_named_like_targets"
+   ]
+  },
+  {
+   "name": "a profile name may end in a newline",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "TARGET_NAME_RE.fullmatch(n[:-5])",
+   "replace": "TARGET_NAME_RE.match(n[:-5])",
+   "expect_kills": [
+    "test_profile_targets_are_the_profile_files_named_like_targets"
+   ]
+  },
+  {
+   "name": "the key is read without the runner's kubeconfig checks",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        problems = ctx.kubeconfig_problems()\n",
+   "replace": "        problems = ctx.kubeconfig_problems() and []\n",
+   "expect_kills": [
+    "test_a_kubeconfig_on_another_context_or_server_is_refused_before_the_secret_is_read"
+   ]
+  },
+  {
+   "name": "a short key is accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if len(value) < cq_remote.MIN_SECRET_LEN:",
+   "replace": "    if not value:",
+   "expect_kills": [
+    "test_a_missing_short_blank_or_dev_default_key_is_refused"
+   ]
+  },
+  {
+   "name": "the dev default key is accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if value == profile[\"dev_secret\"]:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_missing_short_blank_or_dev_default_key_is_refused"
+   ]
+  },
+  {
+   "name": "the key is printed with a newline",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    sys.stdout.write(value)\n",
+   "replace": "    print(value)\n",
+   "expect_kills": [
+    "test_main_prints_only_the_key_or_exits_3"
+   ]
+  },
+  {
+   "name": "kubectl reads the original kubeconfig, not the checked copy",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "\"--kubeconfig\", copy,",
+   "replace": "\"--kubeconfig\", os.path.expanduser(env.get(cq_remote.KUBECONFIG_ENV) or profile[\"kubeconfig\"]),",
+   "expect_kills": [
+    "test_the_kubeconfig_is_read_once_so_a_swap_after_the_checks_is_not_used",
+    "test_the_key_is_read_over_verified_tls_in_this_process_with_the_checked_context"
+   ]
+  },
+  {
+   "name": "a symlinked kubeconfig is followed",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC",
+   "replace": "os.O_RDONLY | os.O_CLOEXEC",
+   "expect_kills": [
+    "test_a_symlinked_kubeconfig_is_refused_before_any_kubectl_call"
+   ]
+  },
+  {
+   "name": "a key with control characters is accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_key_with_a_control_character_is_refused"
+   ]
+  },
+  {
+   "name": "core files stay on",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n",
+   "replace": "",
+   "expect_kills": [
+    "test_harden_drops_core_files_and_dumpability"
+   ]
+  },
+  {
+   "name": "the helper stays dumpable",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "libc.prctl(cq_remote.PR_SET_DUMPABLE, 0, 0, 0, 0) == 0 and",
+   "replace": "True and",
+   "expect_kills": [
+    "test_harden_drops_core_files_and_dumpability"
+   ]
+  },
+  {
+   "name": "the key is read before hardening",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if not harden():\n        raise AdapterError(\"this process could not be made undumpable, so another process of this user could read \"\n                           \"the key from its memory\")\n",
+   "replace": "",
+   "expect_kills": [
+    "test_the_key_is_read_over_verified_tls_in_this_process_with_the_checked_context"
+   ]
+  },
+  {
+   "name": "a kubeconfig naming a certificate-authority file is accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "files = [f\"cluster {k}\" for k in (\"certificate-authority\",) if cluster.get(k)]",
+   "replace": "files = []",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "client certificate and key files are accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "for k in (\"client-certificate\", \"client-key\", \"tokenFile\")",
+   "replace": "for k in (\"tokenFile\",)",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "a user without an embedded credential is accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        problems += [] if embedded else [",
+   "replace": "        problems += [] if True else [",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "a client certificate without its key is accepted",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "user.get(\"client-certificate-data\") and user.get(\"client-key-data\")",
+   "replace": "user.get(\"client-certificate-data\")",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "a token alone is refused",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "embedded = user.get(\"token\") or ",
+   "replace": "embedded = ",
+   "expect_kills": [
+    "test_a_kubeconfig_that_is_shared_elsewhere_or_runs_code_is_refused"
+   ]
+  },
+  {
+   "name": "the runner relays kubectl's stderr",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            raise AdapterError(f\"kubectl {' '.join(args[:2])} exited {p.returncode}\")",
+   "replace": "            raise AdapterError(f\"kubectl {' '.join(args[:2])} exited {p.returncode}: {p.stderr.strip()}\")",
+   "expect_kills": [
+    "test_failures_report_the_step_and_code_and_never_kubectl_or_server_output"
+   ]
+  },
+  {
+   "name": "the raw view's stderr is relayed",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "raise AdapterError(f\"kubectl config view --raw exited {p.returncode}\")",
+   "replace": "raise AdapterError(f\"kubectl config view --raw exited {p.returncode}: {p.stderr}\")",
+   "expect_kills": [
+    "test_failures_report_the_step_and_code_and_never_kubectl_or_server_output"
+   ]
+  },
+  {
+   "name": "the API server's error body is relayed",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "raise AdapterError(f\"reading {where} answered HTTP status {status}\")",
+   "replace": "raise AdapterError(f\"reading {where} answered HTTP status {status}: {body}\")",
+   "expect_kills": [
+    "test_failures_report_the_step_and_code_and_never_kubectl_or_server_output"
+   ]
+  },
+  {
+   "name": "proxies from the environment are used",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    host, port = url.hostname, url.port or 443\n",
+   "replace": "    via = urllib.parse.urlsplit(os.environ.get(\"HTTPS_PROXY\") or server)\n    host, port = via.hostname, via.port or 443\n",
+   "expect_kills": [
+    "test_a_client_certificate_authenticates_and_proxies_are_ignored"
+   ]
+  },
+  {
+   "name": "the API server's certificate is not verified",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n",
+   "replace": "        tls = ssl._create_unverified_context()\n",
+   "expect_kills": [
+    "test_a_server_certificate_from_another_ca_is_refused"
+   ]
+  },
+  {
+   "name": "the raw view is not pinned to the checked context",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": ", copy,\n                \"--context\", ctx.kube_context]",
+   "replace": ", copy]",
+   "expect_kills": [
+    "test_the_key_is_read_over_verified_tls_in_this_process_with_the_checked_context"
+   ]
+  },
+  {
+   "name": "a raw view on another server is used",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if cluster.get(\"server\") != profile[\"kube_server\"]:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_a_kubeconfig_on_another_context_or_server_is_refused_before_the_secret_is_read"
+   ]
+  },
+  {
+   "name": "a 3xx answer is taken as success",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if status != 200:\n        raise AdapterError(f\"reading {where} answered",
+   "replace": "    if status not in (200, 302):\n        raise AdapterError(f\"reading {where} answered",
+   "expect_kills": [
+    "test_a_redirect_is_a_failure_and_the_credential_never_reaches_its_target"
+   ]
+  },
+  {
+   "name": "the response size is not capped",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "            if len(body) > MAX_BODY:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_a_malformed_huge_or_slow_response_fails_without_showing_any_of_it"
+   ]
+  },
+  {
+   "name": "no overall deadline",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        _start_without_stop_signals(watchdog)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_malformed_huge_or_slow_response_fails_without_showing_any_of_it"
+   ]
+  },
+  {
+   "name": "a cut-off read is taken as the whole body",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "            if expired.is_set() or not chunk and resp.length:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_a_malformed_huge_or_slow_response_fails_without_showing_any_of_it"
+   ]
+  },
+  {
+   "name": "a token with a control character is sent",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        if not isinstance(token, str) or any(ord(c) < 0x21 or ord(c) == 0x7F for c in token):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_a_token_with_a_control_character_or_space_is_refused_before_any_request"
+   ]
+  },
+  {
+   "name": "a fetch exception's text is shown",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    except Exception:  # noqa: BLE001 - an exception's text may carry the response, so it is never shown\n        raise AdapterError(f\"reading {where} failed\") from None",
+   "replace": "    except Exception as exc:  # noqa: BLE001\n        raise AdapterError(f\"reading {where} failed: {exc}\") from None",
+   "expect_kills": [
+    "test_a_malformed_huge_or_slow_response_fails_without_showing_any_of_it"
+   ]
+  },
+  {
+   "name": "main lets an unexpected exception through",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    except Exception as exc:  # noqa: BLE001 - its text could carry a credential, so only its type is shown\n        print(f\"cq-target-key: internal error ({type(exc).__name__})\", file=sys.stderr)\n        return EXIT_REFUSED\n",
+   "replace": "",
+   "expect_kills": [
+    "test_main_shows_no_exception_text"
+   ]
+  },
+  {
+   "name": "the TLS context applies SSLKEYLOGFILE",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n",
+   "replace": "        tls = ssl.create_default_context()\n",
+   "expect_kills": [
+    "test_no_tls_secret_is_logged_while_sslkeylogfile_stays_set"
+   ]
+  },
+  {
+   "name": "the name lookup has no deadline",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    resolver.join(left())\n",
+   "replace": "    resolver.join()\n",
+   "expect_kills": [
+    "test_no_request_goes_out_after_a_slow_name_lookup_or_handshake"
+   ]
+  },
+  {
+   "name": "the TCP connect has no deadline",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        raw.settimeout(left())\n",
+   "replace": "        raw.settimeout(None)\n",
+   "expect_kills": [
+    "test_no_request_goes_out_after_a_slow_name_lookup_or_handshake"
+   ]
+  },
+  {
+   "name": "the handshake has no deadline",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        sock.settimeout(left())\n        sock.do_handshake()\n",
+   "replace": "        sock.settimeout(None)\n        sock.do_handshake()\n",
+   "expect_kills": [
+    "test_no_request_goes_out_after_a_slow_name_lookup_or_handshake"
+   ]
+  },
+  {
+   "name": "the TLS socket is not watched",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        sockets.append(sock)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_malformed_huge_or_slow_response_fails_without_showing_any_of_it"
+   ]
+  },
+  {
+   "name": "no expiry check before the request",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        conn.sock.settimeout(left())\n",
+   "replace": "        conn.sock.settimeout(FETCH_DEADLINE_S)\n",
+   "expect_kills": [
+    "test_no_request_goes_out_after_a_slow_name_lookup_or_handshake"
+   ]
+  },
+  {
+   "name": "the context's verify flags are not the default's",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        tls.load_verify_locations(cadata=base64.b64decode(cluster[\"certificate-authority-data\"]).decode())\n",
+   "replace": "        tls.load_verify_locations(cadata=base64.b64decode(cluster[\"certificate-authority-data\"]).decode())\n        tls.verify_flags = ssl.VERIFY_DEFAULT\n",
+   "expect_kills": [
+    "test_the_tls_context_verifies_as_the_stdlib_default_does"
+   ]
+  },
+  {
+   "name": "the read takes SSLKEYLOGFILE out of the environment",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n",
+   "replace": "        os.environ.pop(\"SSLKEYLOGFILE\", None)\n        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n",
+   "expect_kills": [
+    "test_the_environment_is_unchanged_after_a_read_that_succeeds_or_fails"
+   ]
+  },
+  {
+   "name": "the join floor ceils the float sum unrounded",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    return math.ceil(round(sum(s for _, _, s in join_timeline(plan)) - cq_runner.JOIN_BUDGET_EXTRA_S, 1))\n",
+   "replace": "    return math.ceil(sum(s for _, _, s in join_timeline(plan)) - cq_runner.JOIN_BUDGET_EXTRA_S)\n",
+   "expect_kills": [
+    "test_the_join_model_its_floor_and_the_refusal_that_lists_it"
+   ]
+  },
+  {
+   "name": "a later probe waits on the owner, not the previous probe",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "prev = next((p for p in reversed(self.launched) if",
+   "replace": "prev = next((p for p in self.launched if",
+   "expect_kills": [
+    "test_a_third_probe_waits_out_the_second_probes_join_not_the_owners"
+   ]
+  },
+  {
+   "name": "a join stagger of exactly the cap refused",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "                     if p[\"join_stagger_s\"] > MAX_STAGGER_S]\n",
+   "replace": "                     if p[\"join_stagger_s\"] >= MAX_STAGGER_S]\n",
+   "expect_kills": [
+    "test_a_join_stagger_of_at_most_max_stagger_s_is_accepted"
+   ]
+  },
+  {
+   "name": "no load-line tick after an admission sample",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self._wait_watched(c.mono() + ADMIT_SAMPLE_S, \"the admission sample\")\n            self._tick()\n",
+   "replace": "            self._wait_watched(c.mono() + ADMIT_SAMPLE_S, \"the admission sample\")\n",
+   "expect_kills": [
+    "test_a_hot_last_admission_sample_hits_the_hard_stop_before_the_refusal"
+   ]
+  },
+  {
+   "name": "an admission's watch restarts from its own start",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        kind = c.probe_kind(proc)\n        cost = c.profile[\"probe_cores\"][kind]\n",
+   "replace": "        self.watch_at = None\n        kind = c.probe_kind(proc)\n        cost = c.profile[\"probe_cores\"][kind]\n",
+   "expect_kills": [
+    "test_an_admission_after_the_owners_watches_at_once_when_15_s_have_passed"
+   ]
+  },
+  {
+   "name": "a group-readable kubeconfig accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:\n",
+   "replace": "    if not stat.S_ISREG(st.st_mode):\n",
+   "expect_kills": [
+    "test_a_kubeconfig_open_to_others_not_a_file_or_kubectls_default_is_refused"
+   ]
+  },
+  {
+   "name": "a folder accepted as the kubeconfig",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:\n",
+   "replace": "    if st.st_mode & 0o077:\n",
+   "expect_kills": [
+    "test_a_kubeconfig_open_to_others_not_a_file_or_kubectls_default_is_refused",
+    "test_a_fifo_kubeconfig_is_refused_without_waiting_for_a_writer"
+   ]
+  },
+  {
+   "name": "kubectl's default kubeconfig accepted from the profile",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if not from_env and os.path.realpath(full) ==",
+   "replace": "    if False and os.path.realpath(full) ==",
+   "expect_kills": [
+    "test_a_kubeconfig_open_to_others_not_a_file_or_kubectls_default_is_refused"
+   ]
+  },
+  {
+   "name": "the TLS context also trusts the system CAs",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        tls.load_verify_locations(cadata=",
+   "replace": "        tls.load_default_certs()\n        tls.load_verify_locations(cadata=",
+   "expect_kills": [
+    "test_the_tls_context_verifies_as_the_stdlib_default_does"
+   ]
+  },
+  {
+   "name": "a token with a space is sent",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "any(ord(c) < 0x21 or ord(c) == 0x7F for c in token)",
+   "replace": "any(ord(c) < 0x20 or ord(c) == 0x7F for c in token)",
+   "expect_kills": [
+    "test_a_token_with_a_control_character_or_space_is_refused_before_any_request"
+   ]
+  },
+  {
+   "name": "a key with DEL accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):",
+   "replace": "    if any(ord(c) < 0x20 for c in value):",
+   "expect_kills": [
+    "test_a_key_with_a_control_character_is_refused"
+   ]
+  },
+  {
+   "name": "a non-ASCII Secret value is an internal error",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    except (ValueError, TypeError):\n        raise AdapterError(f\"{where} is not base64 UTF-8 text\")",
+   "replace": "    except (UnicodeDecodeError, TypeError, __import__(\"binascii\").Error):\n        raise AdapterError(f\"{where} is not base64 UTF-8 text\")",
+   "expect_kills": [
+    "test_a_secret_value_that_is_not_ascii_base64_is_refused_cleanly"
+   ]
+  },
+  {
+   "name": "a process that stays dumpable reads the key",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if not harden():\n",
+   "replace": "    harden()\n    if False:\n",
+   "expect_kills": [
+    "test_a_process_that_cannot_be_made_undumpable_reads_no_key"
+   ]
+  },
+  {
+   "name": "harden reports success when prctl fails",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        pass\n    return False\n\n\ndef _key_parent",
+   "replace": "        pass\n    return True\n\n\ndef _key_parent",
+   "expect_kills": [
+    "test_a_process_that_cannot_be_made_undumpable_reads_no_key"
+   ]
+  },
+  {
+   "name": "the key folder is not on the tmpfs parent",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "tempfile.mkdtemp(prefix=\"cq-key-\", dir=parent)",
+   "replace": "tempfile.mkdtemp(prefix=\"cq-key-\")",
+   "expect_kills": [
+    "test_the_key_is_read_over_verified_tls_in_this_process_with_the_checked_context"
+   ]
+  },
+  {
+   "name": "a key parent open to others accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "st.st_uid != os.getuid() or st.st_mode & 0o077 \\",
+   "replace": "st.st_uid != os.getuid() \\",
+   "expect_kills": [
+    "test_the_key_folder_needs_an_owner_only_tmpfs_parent"
+   ]
+  },
+  {
+   "name": "a key parent that is not tmpfs accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "            or cq_remote.fs_type(path) != \"tmpfs\":",
+   "replace": "            or False:",
+   "expect_kills": [
+    "test_the_key_folder_needs_an_owner_only_tmpfs_parent"
+   ]
+  },
+  {
+   "name": "a missing key parent accepted",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if st is None or not stat.S_ISDIR(st.st_mode)",
+   "replace": "    if st is not None and not stat.S_ISDIR(st.st_mode)",
+   "expect_kills": [
+    "test_the_key_folder_needs_an_owner_only_tmpfs_parent"
+   ]
+  },
+  {
+   "name": "a signal leaves the key folder",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    old, tmp = _stop_on_signals(held), None\n",
+   "replace": "    old, tmp = {}, None\n",
+   "expect_kills": [
+    "test_a_signal_during_the_read_removes_the_key_folder"
+   ]
+  },
+  {
+   "name": "a key folder left behind passes silently",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        if tmp is not None and os.path.lexists(tmp):\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_a_key_folder_that_cannot_be_removed_is_named"
+   ]
+  },
+  {
+   "name": "the key folder is removed only on success",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        encoded = _get_secret(ctx, copy, profile, secret, key, where, tmp)\n    finally:\n        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)\n        if tmp is not None:\n            shutil.rmtree(tmp, ignore_errors=True)\n",
+   "replace": "        encoded = _get_secret(ctx, copy, profile, secret, key, where, tmp)\n        shutil.rmtree(tmp, ignore_errors=True)\n    finally:\n        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)\n",
+   "expect_kills": [
+    "test_a_kubeconfig_on_another_context_or_server_is_refused_before_the_secret_is_read"
+   ]
+  },
+  {
+   "name": "a stop signal exits 3",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        return 128 + exc.signum\n",
+   "replace": "        return EXIT_REFUSED\n",
+   "expect_kills": [
+    "test_a_signal_during_the_read_removes_the_key_folder"
+   ]
+  },
+  {
+   "name": "the resolver thread takes the stop signals",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    _start_without_stop_signals(resolver)\n",
+   "replace": "    resolver.start()\n",
+   "expect_kills": [
+    "test_the_read_threads_leave_the_stop_signals_to_the_main_thread"
+   ]
+  },
+  {
+   "name": "the watchdog thread takes the stop signals",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        _start_without_stop_signals(watchdog)\n",
+   "replace": "        watchdog.start()\n",
+   "expect_kills": [
+    "test_the_read_threads_leave_the_stop_signals_to_the_main_thread"
+   ]
+  },
+  {
+   "name": "a stop claims the folder is gone without checking",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "        left = exc.folder is not None and os.path.lexists(exc.folder)\n",
+   "replace": "        left = False\n",
+   "expect_kills": [
+    "test_a_signal_just_before_the_cleanup_mask_names_the_folder_it_leaves"
+   ]
+  },
+  {
+   "name": "a stop does not carry the folder",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "            raise Stopped(signum, held.get(\"folder\"))\n",
+   "replace": "            raise Stopped(signum)\n",
+   "expect_kills": [
+    "test_a_signal_just_before_the_cleanup_mask_names_the_folder_it_leaves"
+   ]
+  },
+  {
+   "name": "a SIGINT after the handlers are restored prints a traceback",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    except KeyboardInterrupt:\n        print(\"cq-target-key: stopped by SIGINT\", file=sys.stderr)\n        return 128 + signal.SIGINT\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_sigint_during_the_cleanup_shows_no_traceback"
+   ]
+  },
+  {
+   "name": "a profile name may start with a dash",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "TARGET_NAME_RE = re.compile(r\"[a-z0-9][a-z0-9-]*\")",
+   "replace": "TARGET_NAME_RE = re.compile(r\"[a-z0-9-][a-z0-9-]*\")",
+   "expect_kills": [
+    "test_a_profile_name_with_a_leading_dash_is_not_a_target"
+   ]
+  },
+  {
+   "name": "the key is printed to a terminal",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": "    if sys.stdout.isatty():\n",
+   "replace": "    if False:\n",
+   "expect_kills": [
+    "test_main_refuses_a_terminal_and_reads_no_key"
+   ]
+  },
+  {
+   "name": "the kubeconfig open blocks on a FIFO",
+   "file": "scripts/quality/cq_target_key.py",
+   "find": " | os.O_CLOEXEC | os.O_NONBLOCK)",
+   "replace": " | os.O_CLOEXEC)",
+   "expect_kills": [
+    "test_a_fifo_kubeconfig_is_refused_without_waiting_for_a_writer"
+   ]
+  },
+  {
+   "name": "a relay read down never clears",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        if not down:\n            self.relay_down_since = None\n",
+   "replace": "        if not down:\n            pass\n",
+   "expect_kills": [
+    "test_a_relay_read_down_past_one_scrape_or_a_lost_relay_aborts"
+   ]
+  },
+  {
+   "name": "slow consumers read while a relay is down",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "        elif self.slow_base is not None and v.get(\"relay_up_min\", 0) >= 1:\n",
+   "replace": "        elif self.slow_base is not None:\n",
+   "expect_kills": [
+    "test_a_failed_relay_scrape_that_drops_its_slow_consumer_series_neither_rebases_nor_aborts"
+   ]
+  },
+  {
+   "name": "the stack keeps no last watch",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self.watched_mono = self.ctx.mono()\n",
+   "replace": "            pass\n",
+   "expect_kills": [
+    "test_no_two_watches_of_a_two_probe_join_are_closer_than_the_watch_interval"
+   ]
+  },
+  {
+   "name": "the fleet anchors on its own watches only",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            last = getattr(self.stack, \"watched_mono\", None)\n",
+   "replace": "            last = getattr(self, \"own_watch\", None)\n",
+   "expect_kills": [
+    "test_no_two_watches_of_a_two_probe_join_are_closer_than_the_watch_interval"
+   ]
+  },
+  {
+   "name": "a later probe settles from its own admission, not the previous probe's join",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "            self._wait_watched(self.in_meeting_at[prev] + ADMIT_SETTLE_S, \"the admission wait\")\n",
+   "replace": "            self._wait_watched(c.mono() + ADMIT_SETTLE_S, \"the admission wait\")\n",
+   "expect_kills": [
+    "test_a_later_probe_admitted_long_after_the_previous_probe_joined_samples_at_once"
+   ]
+  },
+  {
+   "name": "a runner that stays dumpable goes on",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "    if not ok:\n        raise AdapterError(",
+   "replace": "    if False:\n        raise AdapterError(",
+   "expect_kills": [
+    "test_a_runner_that_cannot_become_undumpable_refuses_the_run"
+   ]
+  },
+  {
+   "name": "the throttle selector takes a non-relay pod",
+   "file": "scripts/quality/cq_remote.py",
+   "find": "THROTTLE_KINDS = (\"relay_ws\", \"relay_wt\", \"nats\")",
+   "replace": "THROTTLE_KINDS = (\"relay_ws\", \"relay_wt\", \"nats\", \"ui\")",
+   "expect_kills": [
+    "test_the_throttle_selector_names_the_relay_and_nats_pods_only"
+   ]
+  }
+ ]
+}

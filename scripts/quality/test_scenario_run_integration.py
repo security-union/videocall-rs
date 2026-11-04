@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -38,15 +39,15 @@ class WorldRun:
         stagger = rng.choice([0, 1])
         plan = plan or ut.make_plan(probes=probes, viewers=viewers or rng.randint(1, 3), stagger=f"{stagger}s",
                                     events=events, expect=expect)
-        delays, launch = {}, sq.JOIN
+        media = rng.randint(1, 4)
+        delays, launch = {}, sq.JOIN + media
         browsers = [p for p in plan["processes"] if p["fleet"] == "browser"]
         stagger = browsers[0]["join_stagger_s"]
         for k, proc in enumerate(browsers):
             room = LAST_BROWSER_JOIN - launch
             delays[proc["participants"][0]] = room if k == len(browsers) - 1 else rng.randint(1, int(room * 4)) / 4
             launch += stagger if k + 1 < len(browsers) else 0
-        fleet = dict({"join_delay": delays, "media_delay": rng.randint(20, int(sq.HS - 30 - launch) * 4) / 4},
-                     **(fleet or {}))
+        fleet = dict({"join_delay": delays, "media_delay": media}, **(fleet or {}))
         self.tc, self.rng, self.gone = tc, rng, {}
         self.h = ut.Harness(tc, plan=plan, fleet=fleet, stack=stack, tree=tree, allow_dirty=allow_dirty,
                             tools=tools or fakes.InProcessTools())
@@ -153,6 +154,35 @@ class EndToEnd(unittest.TestCase):
         run = r.run()
         self.assertEqual((run["verdict"], r.h.failed()), ("PASS", []), (run["error"], r.h.log("scorer")))
         self.assertIn("manifest OK: ", r.h.log("validate"))
+
+
+class MillisecondMarks(unittest.TestCase):
+    """The runner's marks carry sub-millisecond fractions; Prometheus answers a range on whole milliseconds."""
+
+    @staticmethod
+    def prometheus(fake):
+        def query_range(url, body, headers):
+            form = urllib.parse.parse_qs(body.decode())
+            lo, hi = (round(float(form[k][0]) * 1000) for k in ("start", "end"))
+            step = round(float(form["step"][0].rstrip("s")) * 1000)
+            payload = json.loads(fake(url, body, headers))
+            for series in payload["data"]["result"]:
+                raw = [(float(t), v) for t, v in series["values"]]
+                series["values"] = [[ms / 1000, live[-1]] for ms in range(lo, hi + 1, step)
+                                    for live in [[v for t, v in raw if ms / 1000 - sq.STEP < t <= ms / 1000]] if live]
+            return json.dumps(payload).encode()
+        return query_range
+
+    def test_a_hold_marked_off_the_millisecond_lattice_still_scores(self):
+        r = WorldRun(self, random.Random("ms-marks"))
+        r.h.tools.transport = self.prometheus(r.transport)
+        r.h.clock.wall += 0.1294928
+        run = r.run()
+        self.assertNotEqual(r.h.mark("hold_start"), round(r.h.mark("hold_start"), 3))
+        self.assertEqual((run["verdict"], r.h.failed()), ("PASS", []), r.result() and failing(r.result()))
+        step = sq.read_json(os.path.join(r.h.dir, "manifest.json"))["steps"][0]
+        self.assertEqual(step["hold_start"], round(r.h.mark("hold_start") + 0.0005, 3))
+        self.assertLessEqual(step["hold_end"], r.h.mark("hold_end"))
 
 
 def _answer(r):
@@ -280,7 +310,7 @@ def reap_time_counterfactual(r):
 def _forced(run_dir, r):
     path = os.path.join(run_dir, "forced-config.json")
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(cq_runner.forced_scorer_config(r.h.stack.selector, {}), fh)
+        json.dump(cq_runner.forced_scorer_config(r.h.stack.selector, {}, r.h.stack.throttle), fh)
     return path
 
 
@@ -569,7 +599,7 @@ class CollectorContractNotes(unittest.TestCase):
                 r = WorldRun(self, random.Random("skew"), fleet={"facts": {
                     "sync": "ntp", "max_abs_skew_ms": 0,
                     "per_node": [{"node": "local", "skew_ms": 0}, {"node": "ci", "skew_ms": skew}]}})
-                r.h.fleet.join_delay[r.h.plan["participants"][0]["user_id"]] = -3.0
+                r.h.fleet.join_delay[r.h.plan["participants"][0]["user_id"]] = -3.0 - r.h.fleet.media_delay
                 run = r.run()
                 self.assertEqual(run["verdict"], verdict, (r.h.failed(), r.h.log("collector")))
                 if skew:
@@ -630,7 +660,7 @@ class CliWorld:
         self.tools = fakes.InProcessTools()
         self.dir, self.r, self.fired, self.factory_calls = os.path.join(self.out, ut.RUN_ID), None, None, 0
 
-    def factory(self, plan):
+    def factory(self, plan, run_dir=None, stack_mode=None):
         self.factory_calls += 1
         self.r = self.world(self.tc, random.Random("cli"), plan=plan, fleet=self.fleet_kw, stack=self.stack_kw)
         self.clock.target = self.r.h.clock

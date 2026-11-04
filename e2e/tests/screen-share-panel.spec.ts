@@ -3,7 +3,7 @@ import { createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
-import { seedShareViewMode } from "../helpers/screen-share-meeting";
+import { seedShareViewMode, stopScreenShare } from "../helpers/screen-share-meeting";
 
 /**
  * Screen-share right panel layout E2E tests.
@@ -171,7 +171,7 @@ async function setupTwoUserMeeting(
     await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
     await guestCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
   }
-  // Every test here measures the split layout, which is opt-in since #2792.
+  // Every test here measures the split layout.
   await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();
@@ -195,8 +195,8 @@ async function setupTwoUserMeeting(
 /**
  * Click the screen share button on a page.
  *
- * The ScreenShareButton renders with a tooltip "Share Screen" (inactive)
- * or "Stop Screen Share" (active). We locate the button by its tooltip text.
+ * The idle ScreenShareButton's tooltip reads "Share Screen"; we locate the
+ * button by that text.
  *
  * Returns true if the split layout activated (screen share succeeded),
  * false otherwise.
@@ -709,8 +709,8 @@ test.describe("Screen share right panel layout", () => {
   // 5. Layout switches back to normal grid when screen sharing stops
   //
   // When screen sharing is active the meeting uses a split layout
-  // (.split-screen-tile + .split-peer-tile). When the sharer clicks the
-  // "Stop Screen Share" button, the meeting must revert to the normal
+  // (.split-screen-tile + .split-peer-tile). When the sharer picks "Stop
+  // sharing" from the share button's menu, the meeting must revert to the normal
   // CSS-grid layout with .grid-item tiles inside #grid-container and no
   // split-layout artifacts remaining.
   // ──────────────────────────────────────────────────────────────────────
@@ -749,17 +749,7 @@ test.describe("Screen share right panel layout", () => {
       await expect(hostPage.locator(".split-peer-tile").first()).toBeVisible({ timeout: 10_000 });
 
       // ---- ACT: guest stops screen sharing ----
-      // Wake the auto-hidden controls bar on the guest page.
-      await wakeControls(guestPage);
-      await guestPage.waitForTimeout(300);
-      await guestPage.locator(".video-controls-container").hover();
-      await guestPage.waitForTimeout(500);
-
-      const stopButton = guestPage.locator("button.video-control-button", {
-        has: guestPage.locator(".tooltip", { hasText: /Stop.*Shar/ }),
-      });
-      await expect(stopButton).toBeVisible({ timeout: 10_000 });
-      await stopButton.click();
+      await stopScreenShare(guestPage);
 
       // ---- ASSERT: split layout disappears, normal grid is restored ----
       // Wait for the split-screen-tile to disappear from the host's view.

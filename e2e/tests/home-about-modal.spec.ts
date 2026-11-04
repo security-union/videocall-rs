@@ -1,17 +1,23 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { test, expect } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { setShowBuildGitInfoFlag } from "../helpers/show-build-git-info-config";
 import {
   CHANGELOG_EMPTY_VERSIONS,
+  CHANGELOG_FLAT_BUILD,
+  CHANGELOG_GROUPED_BUILD,
+  CHANGELOG_GROUPED_REPLY,
+  CHANGELOG_GROUPED_UNRELEASED,
   CHANGELOG_HTML_SHELL_REPLY,
   CHANGELOG_JSON_REPLY,
+  CHANGELOG_KIND_PREFIX,
   CHANGELOG_NEWEST_CHANGES,
   CHANGELOG_NEWEST_FIRST,
   CHANGELOG_PENDING_CHANGES,
   CHANGELOG_WITH_PENDING_REPLY,
+  ChangelogGroupShown,
   aboutWhatsNewToggle,
   openAboutModal,
   routeChangelog,
@@ -53,6 +59,42 @@ function readClientVersionFromCargoToml(): string {
 }
 
 const CLIENT_VERSION = readClientVersionFromCargoToml();
+
+/** The grouped fixture's sections in the About modal: Unreleased, then v1.2.1 and v1.2.0. */
+async function openGroupedChangelog(page: Page): Promise<Locator> {
+  await routeChangelog(page, [CHANGELOG_GROUPED_REPLY]);
+  const modal = await openAboutModal(page);
+  const toggle = aboutWhatsNewToggle(modal);
+  await expect(toggle).toBeVisible();
+  await toggle.click();
+  const builds = modal.locator('#about-changelog-panel > [data-testid="changelog-build"]');
+  await expect(builds).toHaveCount(3);
+  await expect(builds.first()).toHaveAttribute("data-pending", "true");
+  await expect(builds.locator("h5 > .changelog-build-version")).toHaveText([
+    CHANGELOG_GROUPED_BUILD.version,
+    CHANGELOG_FLAT_BUILD.version,
+  ]);
+  return builds;
+}
+
+async function expectGroupedSection(section: Locator, expected: ChangelogGroupShown[]) {
+  const groups = section.locator(':scope > [data-testid="changelog-group"]');
+  await expect(groups, "one group per kind the section names").toHaveCount(expected.length);
+  expect(
+    await groups.evaluateAll((els) => els.map((el) => el.getAttribute("data-kind"))),
+    "groups follow the kinds' display order, Miscellaneous last",
+  ).toEqual(expected.map((group) => group.kind));
+  await expect(
+    groups.locator(':scope > h6.changelog-kind[data-testid="changelog-kind"]'),
+  ).toHaveText(expected.map((group) => group.pill));
+  for (const [i, group] of expected.entries()) {
+    await expect(
+      groups.nth(i).locator(':scope > ul.changelog-changes > li[data-testid="changelog-change"]'),
+      `${group.pill} lists its lines once each, without the kind or PR number`,
+    ).toHaveText(group.changes);
+  }
+  await expect(section.locator(":scope > ul"), "no flat list beside the groups").toHaveCount(0);
+}
 
 const MOCK_VERSIONS_BODY = {
   components: [
@@ -467,6 +509,85 @@ test.describe("Homepage About modal", () => {
       1,
     );
     await expect(showOlder).toHaveCount(0);
+  });
+
+  test("What's new groups kind-named lines under pills in display order, Miscellaneous last (issue 3253)", async ({
+    page,
+  }) => {
+    const builds = await openGroupedChangelog(page);
+
+    await expectGroupedSection(builds.nth(0), CHANGELOG_GROUPED_UNRELEASED);
+    await expectGroupedSection(builds.nth(1), CHANGELOG_GROUPED_BUILD.groups);
+    const miscellaneousGroup = builds
+      .nth(1)
+      .locator(':scope > [data-testid="changelog-group"]')
+      .last();
+    await expect(miscellaneousGroup, "the uncategorized line comes last").toHaveAttribute(
+      "data-kind",
+      "miscellaneous",
+    );
+
+    const changes = builds.locator('[data-testid="changelog-change"]');
+    const shown = [...CHANGELOG_GROUPED_UNRELEASED, ...CHANGELOG_GROUPED_BUILD.groups]
+      .flatMap((group) => group.changes)
+      .concat(CHANGELOG_FLAT_BUILD.changes);
+    await expect(changes, "a line left empty and a repeated line are not listed").toHaveCount(
+      shown.length,
+    );
+    for (const text of await changes.allTextContents()) {
+      expect(text, "no line keeps its kind").not.toMatch(CHANGELOG_KIND_PREFIX);
+      expect(text, "no line keeps its PR number").not.toContain("(#");
+    }
+  });
+
+  test("What's new keeps a build with no kind-named line as one flat list (issue 3253)", async ({
+    page,
+  }) => {
+    const flat = (await openGroupedChangelog(page)).nth(2);
+
+    await expect(flat.locator("h5 > .changelog-build-version")).toHaveText(
+      CHANGELOG_FLAT_BUILD.version,
+    );
+    await expect(
+      flat.locator(':scope > ul.changelog-changes > li[data-testid="changelog-change"]'),
+      "the lines sit straight under the build, PR numbers stripped",
+    ).toHaveText(CHANGELOG_FLAT_BUILD.changes);
+    await expect(flat.locator('[data-testid="changelog-group"]')).toHaveCount(0);
+    await expect(flat.locator('[data-testid="changelog-kind"]')).toHaveCount(0);
+  });
+
+  test("What's new kind pills are visible and coloured by kind (issue 3253)", async ({ page }) => {
+    const builds = await openGroupedChangelog(page);
+    const pills = builds.locator(
+      ':scope > [data-testid="changelog-group"] > h6[data-testid="changelog-kind"]',
+    );
+    const expectedKinds = [...CHANGELOG_GROUPED_UNRELEASED, ...CHANGELOG_GROUPED_BUILD.groups].map(
+      (group) => group.kind,
+    );
+    await expect(pills).toHaveCount(expectedKinds.length);
+    for (let i = 0; i < expectedKinds.length; i++) {
+      await expect(pills.nth(i)).toBeVisible();
+    }
+
+    const shown = await pills.evaluateAll((els) =>
+      els.map((el) => ({
+        kind: el.parentElement?.getAttribute("data-kind") ?? "",
+        background: getComputedStyle(el).backgroundColor,
+      })),
+    );
+    expect(shown.map((pill) => pill.kind)).toEqual(expectedKinds);
+    const backgroundOf = new Map<string, string>();
+    for (const { kind, background } of shown) {
+      expect(background, `the ${kind} pill is filled`).not.toBe("rgba(0, 0, 0, 0)");
+      expect(backgroundOf.get(kind) ?? background, `every ${kind} pill shares one colour`).toBe(
+        background,
+      );
+      backgroundOf.set(kind, background);
+    }
+    expect(
+      new Set(backgroundOf.values()).size,
+      `each kind has its own colour: ${JSON.stringify([...backgroundOf])}`,
+    ).toBe(backgroundOf.size);
   });
 
   test("the About dialog keeps Tab inside it and hands focus back to the footer link on close (issue 2882)", async ({

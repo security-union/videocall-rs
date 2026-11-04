@@ -120,10 +120,6 @@ const _: () = assert!(
         < PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS
 );
 /// Compile-time guard: the arrival-gate timeout must exceed the backoff-reset quiet interval.
-/// When the gate times out, the backoff exponent has already been zeroed (since the quiet
-/// interval elapsed), so the retry fires at the base cadence. If a future re-tune inverted
-/// this, the retry would fire with a stale high exponent (up to 8s delay on top of the 15s
-/// wait — 23s total freeze, far worse than the pre-fix storm).
 const _: () =
     assert!(PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS > PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS);
 
@@ -713,21 +709,10 @@ pub struct KeyframeArrival {
     /// old-frame check), but it cannot recover the picture — so "keyframe arrived
     /// and the freeze continued" reads very differently depending on this flag.
     /// Stamped after the pre-insertion checks run.
-    ///
-    /// NOT the same as "entered the buffer" — read it with [`Self::stream_restart`]. The
-    /// restart path (an old keyframe far enough back to look like a publisher restart)
-    /// flushes and RETURNS, so that keyframe also never enters the buffer while reporting
-    /// `rejected_as_old: false`. `stream_restart` disambiguates the two.
     pub rejected_as_old: bool,
     /// `true` when this arrival was the STREAM-RESTART keyframe: old enough
     /// (`last_decoded - seq > STREAM_RESTART_BACKTRACK_THRESHOLD`) that `insert_frame`
-    /// treated it as a publisher restart, flushed the buffer, and returned.
-    ///
-    /// Recorded because without it `rejected_as_old: false` is misleading on this path: the
-    /// keyframe did NOT enter the buffer (the flush-and-return happens before insertion), yet
-    /// it is not a duplicate rejection either. It is the arrival that ENDS a
-    /// publisher-restart freeze, so a field reader needs to see it as its own outcome rather
-    /// than as an ordinary accepted arrival.
+    /// flushed the buffer and started the new stream from it.
     pub stream_restart: bool,
 }
 
@@ -851,13 +836,15 @@ pub struct JitterBuffer<T> {
 
     /// Keyframe-arrival gate (issue #1479): `true` when a proactive PLI has been fired and we
     /// are waiting for the resulting keyframe to arrive (be inserted into the buffer). While
-    /// this is `true`, NO further proactive PLIs fire — each freeze episode produces exactly 1
-    /// PLI per receiver. Cleared when a keyframe is inserted (`insert_frame`) or when
-    /// `PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS` expires since the last fire (backstop against
+    /// this is `true`, NO further proactive PLIs fire. Cleared when a keyframe is inserted
+    /// (`insert_frame`) or when
+    /// `awaiting_proactive_keyframe_timeout_ms` expires since the last fire (backstop against
     /// publisher crash or relay suppression). This is the primary #1479 loop-breaker: it
     /// decouples the freshness-deadline eviction cadence (~10ms) from PLI emission cadence,
     /// which was the 1:1 coupling that created the storm.
     awaiting_proactive_keyframe: bool,
+    /// How long the request that closed the gate may hold it (#3204).
+    awaiting_proactive_keyframe_timeout_ms: f64,
 
     /// Stream-open one-shot for the proactive keyframe request (issue 1899 / discussion 1960).
     /// `true` once the buffer has fired its FIRST-frame keyframe request for the current stream —
@@ -1069,6 +1056,7 @@ impl<T> JitterBuffer<T> {
             last_keyframe_request_ms: None,
             consecutive_proactive_keyframe_requests: 0,
             awaiting_proactive_keyframe: false,
+            awaiting_proactive_keyframe_timeout_ms: PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS,
             stream_open_keyframe_request_fired: false,
             keyframe_less_hold_since_ms: None,
             last_tick_time_ms: None,
@@ -1284,28 +1272,14 @@ impl<T> JitterBuffer<T> {
                     log::debug!(
                         "[JITTER_BUFFER] Detected keyframe with older sequence ({seq} <= {last_decoded}). Assuming stream restart – flushing buffer."
                     );
-                    // Issue #2201: re-stash the arrival record ACROSS the flush, and mark it
-                    // `stream_restart`.
-                    //
-                    // Be precise about what happens to THIS frame: it is NOT inserted. The
-                    // flush below is followed by an unconditional `return`, so the restart
-                    // keyframe is DISCARDED and recovery waits on the publisher's next
-                    // keyframe. That is why `stream_restart` exists as its own flag — the
-                    // frame did not enter the buffer, yet it is not a duplicate rejection
-                    // either, so reporting `rejected_as_old: false` alone would read as an
-                    // ordinary accepted arrival and hide the discard.
-                    //
-                    // The re-stash is still required: `flush()` clears
-                    // `last_keyframe_arrival` (correctly — its buffer-state fields describe a
-                    // buffer the flush destroys), and without take/restore this arrival, the
-                    // one that signals a publisher restart, would be the only kind never
-                    // reported at all.
+                    // `flush()` clears `last_keyframe_arrival`; keep this one (issue #2201).
                     let mut arrival = self.last_keyframe_arrival.take();
                     if let Some(a) = arrival.as_mut() {
                         a.stream_restart = true;
                     }
                     self.flush();
                     self.last_keyframe_arrival = arrival;
+                    // Fall through: the keyframe starts the flushed stream (#3204).
                 } else {
                     log::trace!("[JITTER_BUFFER] Ignoring old frame: {seq}");
                     // Issue #2201: this keyframe is REJECTED as old/duplicate — it never
@@ -1339,8 +1313,8 @@ impl<T> JitterBuffer<T> {
                         self.flush();
                         self.last_keyframe_arrival = arrival;
                     }
+                    return;
                 }
-                return;
             }
         }
 
@@ -1361,7 +1335,8 @@ impl<T> JitterBuffer<T> {
 
         log::trace!("[JITTER_BUFFER] Received frame: {seq}");
 
-        self.jitter_estimator.update_estimate(seq, arrival_time_ms);
+        self.jitter_estimator
+            .update_estimate(seq, frame.timestamp, arrival_time_ms);
         self.update_target_playout_delay();
 
         let fb = FrameBuffer::new(frame, arrival_time_ms);
@@ -1375,14 +1350,7 @@ impl<T> JitterBuffer<T> {
         // Rather than wait the full `MAX_PLAYOUT_AGE_MS` (~1.8s) for the keyframe-less eviction path
         // to fire its first PLI, request a keyframe NOW, once, the moment we can prove "frames
         // present, no keyframe, never decoded". The gap-driven and freshness-deadline paths remain
-        // the backstops; this only pulls the FIRST request earlier for the cold-open case.
-        //
-        // Bounded exactly like the eviction PLI it front-runs: ONE request per stream-open (the
-        // `stream_open_keyframe_request_fired` one-shot, re-armed only by `flush()`), gated by the
-        // #1479 `awaiting_proactive_keyframe` flag it sets, and routed through the SAME
-        // `request_keyframe` hook — so on the main thread it flows through the identical per-receiver
-        // PLI budget and relay per-(receiver,session) limiter as every other proactive request and
-        // cannot storm the publisher. Fires for BOTH transports (the hook is transport-agnostic).
+        // the backstops.
         if self.last_decoded_sequence_number.is_none()
             && !self.stream_open_keyframe_request_fired
             && !self.awaiting_proactive_keyframe
@@ -1397,6 +1365,9 @@ impl<T> JitterBuffer<T> {
             // reopens it. Anchor the throttle clock so the eviction path measures its backoff from
             // this request, not from `None`.
             self.awaiting_proactive_keyframe = true;
+            // Held only one freshness deadline, so a request the relay denied is retried by
+            // the eviction path below rather than waiting out the publisher's GOP (#3204).
+            self.awaiting_proactive_keyframe_timeout_ms = MAX_PLAYOUT_AGE_MS;
             self.last_keyframe_request_ms = Some(arrival_time_ms);
             // Head-of-line age is ~0 for a just-opened stream; a first-in-window request is always
             // admitted by the main-thread budget regardless, so 0.0 is the honest value.
@@ -1888,13 +1859,13 @@ impl<T> JitterBuffer<T> {
                 let gate_timed_out = self.awaiting_proactive_keyframe
                     && self.last_keyframe_request_ms.is_some_and(|last| {
                         (current_time_ms.saturating_sub(last)) as f64
-                            >= PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS
+                            >= self.awaiting_proactive_keyframe_timeout_ms
                     });
                 if gate_timed_out {
                     self.awaiting_proactive_keyframe = false;
                     log::debug!(
                         "[JITTER_BUFFER] Proactive-PLI arrival gate timed out ({}ms); re-arming (#1479).",
-                        PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS
+                        self.awaiting_proactive_keyframe_timeout_ms
                     );
                 }
 
@@ -1960,6 +1931,8 @@ impl<T> JitterBuffer<T> {
                         .consecutive_proactive_keyframe_requests
                         .saturating_add(1);
                     self.awaiting_proactive_keyframe = true;
+                    self.awaiting_proactive_keyframe_timeout_ms =
+                        PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS;
                     // Issue #1479: forward the head-of-line backlog age that tripped the deadline
                     // so the main thread's per-receiver cross-sender PLI budget can prioritize the
                     // stalest stream when its global cap is reached.
@@ -2349,10 +2322,7 @@ impl<T> JitterBuffer<T> {
         // long idle gap should NOT stamp a huge `tick_gap` onto its first routine skip (attribution
         // cleanliness), nor could it — the post-flush buffer is empty, so `enforce_freshness_deadline`
         // returns at its empty guard and no escalation is reachable until real content re-accrues a
-        // fresh freeze from zero anyway. The resume fast-path this fix targets arrives via a delta
-        // insert or a poll (NOT a flush: a keyframe-restart is rejected+flushed before its own
-        // find-and-move, and streaming deltas keep `num_consecutive_old_frames` at 0), so clearing on
-        // flush does not blunt it.
+        // fresh freeze from zero anyway.
         self.last_tick_time_ms = None;
         // NOTE (issue #1662): the keyframe-less hold-ceiling escalation cooldown anchor is NOT a
         // field of this buffer — it lives in the worker thread-local (`LAST_KEYFRAME_LESS_ESCALATION_MS`
@@ -2756,6 +2726,37 @@ mod tests {
         let queue = decoded_frames.lock().unwrap();
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[1].sequence_number, 2);
+    }
+
+    #[test]
+    fn video_layer_fps_below_30_keeps_playout_delay_at_floor() {
+        for fps in [15.0, 7.0] {
+            let (mut jb, decoded_frames) = create_test_jitter_buffer();
+            let frames = 600u64;
+            for i in 0..frames {
+                let t = i as f64 / fps;
+                let frame_type = if i == 0 {
+                    FrameType::KeyFrame
+                } else {
+                    FrameType::DeltaFrame
+                };
+                jb.insert_frame(
+                    create_test_frame_with_media_ts(i + 1, frame_type, t * 1_000_000.0),
+                    (1000.0 + t * 1000.0).round() as u128,
+                );
+            }
+            assert!(
+                jb.get_jitter_estimate_ms() < 1.0,
+                "{fps} fps: jitter {}",
+                jb.get_jitter_estimate_ms()
+            );
+            assert!(
+                jb.get_target_playout_delay_ms() < MIN_PLAYOUT_DELAY_MS + 1.0,
+                "{fps} fps: target playout delay {}",
+                jb.get_target_playout_delay_ms()
+            );
+            assert_eq!(decoded_frames.lock().unwrap().len() as u64, frames - 1);
+        }
     }
 
     #[test]
@@ -6681,9 +6682,7 @@ mod tests {
         assert_eq!(arrival.seq, 1);
         assert!(
             arrival.stream_restart,
-            "the restart arrival must be flagged as such: it was DISCARDED (flush-and-return, \
-             never inserted), so `rejected_as_old: false` alone would read as an ordinary \
-             accepted arrival and hide the discard: {arrival:?}"
+            "the restart arrival must be flagged as such: {arrival:?}"
         );
         assert!(
             !arrival.rejected_as_old,
@@ -6695,6 +6694,172 @@ mod tests {
             2,
             "the restart arrival counts too"
         );
+    }
+
+    /// Jitter buffer with a decoder that records sequence numbers and a counted
+    /// keyframe-request hook, the two outputs the #3204 tests assert on.
+    fn create_counting_jitter_buffer() -> (
+        JitterBuffer<crate::decoder::DecodedFrame>,
+        Arc<Mutex<Vec<DecodedFrame>>>,
+        Arc<AtomicU32>,
+    ) {
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(AtomicU32::new(0));
+        let req = requests.clone();
+        let jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move |_head_age_ms| {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (jb, decoded, requests)
+    }
+
+    fn decoded_seqs(decoded: &Arc<Mutex<Vec<DecodedFrame>>>) -> Vec<u64> {
+        decoded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.sequence_number)
+            .collect()
+    }
+
+    /// Inserts `seq` at `*time` and polls past the playout delay, advancing `*time`.
+    fn insert_and_poll(
+        jb: &mut JitterBuffer<DecodedFrame>,
+        seq: u64,
+        ft: FrameType,
+        time: &mut u128,
+    ) {
+        jb.insert_frame(create_test_frame(seq, ft), *time);
+        *time += 33;
+        jb.find_and_move_continuous_frames(*time);
+    }
+
+    /// #3204: each simulcast layer numbers its frames independently, so after a step-down the
+    /// new layer's keyframe sits far below the last decoded frame. It must start the new stream,
+    /// not be discarded with a keyframe request sent for its replacement.
+    #[test]
+    fn a_keyframe_from_a_lower_sequence_space_is_decoded_not_discarded() {
+        let (mut jb, decoded, requests) = create_counting_jitter_buffer();
+        let mut time = 1000u128;
+        insert_and_poll(&mut jb, 6475, FrameType::KeyFrame, &mut time);
+        for seq in 6476..=6480 {
+            insert_and_poll(&mut jb, seq, FrameType::DeltaFrame, &mut time);
+        }
+        assert_eq!(jb.last_decoded_sequence_number, Some(6480));
+
+        for seq in 3250..=3251 {
+            insert_and_poll(&mut jb, seq, FrameType::DeltaFrame, &mut time);
+        }
+        insert_and_poll(&mut jb, 3252, FrameType::KeyFrame, &mut time);
+        insert_and_poll(&mut jb, 3253, FrameType::DeltaFrame, &mut time);
+
+        assert_eq!(
+            decoded_seqs(&decoded),
+            vec![6475, 6476, 6477, 6478, 6479, 6480, 3252, 3253],
+            "the lower-sequence keyframe must be released and the stream continue from it"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "a keyframe was in hand, so no keyframe request may fire"
+        );
+    }
+
+    /// A REAL publisher restart (sequence reset to 1, keyframe first) decodes from the
+    /// restart keyframe and keeps going.
+    #[test]
+    fn a_publisher_restart_decodes_from_its_first_keyframe() {
+        let (mut jb, decoded, requests) = create_counting_jitter_buffer();
+        let mut time = 1000u128;
+        insert_and_poll(&mut jb, 500, FrameType::KeyFrame, &mut time);
+        insert_and_poll(&mut jb, 501, FrameType::DeltaFrame, &mut time);
+
+        insert_and_poll(&mut jb, 1, FrameType::KeyFrame, &mut time);
+        insert_and_poll(&mut jb, 2, FrameType::DeltaFrame, &mut time);
+        insert_and_poll(&mut jb, 3, FrameType::DeltaFrame, &mut time);
+
+        assert_eq!(decoded_seqs(&decoded), vec![500, 501, 1, 2, 3]);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        let arrival = jb.take_keyframe_arrival().expect("keyframe 1 arrived");
+        assert!(
+            arrival.seq == 1 && arrival.stream_restart,
+            "precondition: seq 1 must have taken the restart path: {arrival:?}"
+        );
+    }
+
+    /// Worker cadence after a layer-switch flush: a new-layer delta every 33ms, a poll every
+    /// 10ms, no keyframe until `keyframe_at` (if any). Returns the request times.
+    fn requests_after_switch_flush(until: u128, keyframe_at: Option<u128>) -> Vec<u128> {
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let now = Arc::new(Mutex::new(0u128));
+        let (f, n) = (fired.clone(), now.clone());
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(Arc::new(Mutex::new(Vec::new())))),
+            Box::new(move |_| f.lock().unwrap().push(*n.lock().unwrap())),
+        );
+        let mut time = 1000u128;
+        insert_and_poll(&mut jb, 6000, FrameType::KeyFrame, &mut time);
+        jb.flush();
+        let start = time;
+        let mut seq = 3000;
+        for t in (start..start + until).step_by(10) {
+            *now.lock().unwrap() = t - start;
+            if (t - start).is_multiple_of(30) {
+                let ft = if keyframe_at.is_some_and(|k| t - start >= k) {
+                    FrameType::KeyFrame
+                } else {
+                    FrameType::DeltaFrame
+                };
+                jb.insert_frame(create_test_frame(seq, ft), t);
+                seq += 1;
+            }
+            jb.find_and_move_continuous_frames(t);
+        }
+        let fired = fired.lock().unwrap().clone();
+        fired
+    }
+
+    /// #3204: a request the relay denied after a switch is retried within one freshness deadline.
+    #[test]
+    fn a_denied_first_request_after_a_switch_is_retried_within_the_freshness_deadline() {
+        let fired = requests_after_switch_flush(6000, None);
+        assert_eq!(
+            fired.first(),
+            Some(&0),
+            "the first new-layer delta requests at once"
+        );
+        let retry = fired.get(1).copied();
+        assert!(
+            retry.is_some_and(|r| r <= MAX_PLAYOUT_AGE_MS as u128 + 100),
+            "no retry within the freshness deadline: {fired:?}"
+        );
+        assert_eq!(fired.len(), 2, "one retry, then the backoff: {fired:?}");
+    }
+
+    #[test]
+    fn an_answered_first_request_after_a_switch_is_not_retried() {
+        assert_eq!(requests_after_switch_flush(5000, Some(300)), vec![0]);
+    }
+
+    /// A publisher restart whose keyframe was lost: the post-restart deltas are rejected as
+    /// old, and the next keyframe (far enough back to read as a restart) recovers the stream.
+    #[test]
+    fn a_publisher_restart_that_loses_its_keyframe_recovers_at_the_next_one() {
+        let (mut jb, decoded, _requests) = create_counting_jitter_buffer();
+        let mut time = 1000u128;
+        insert_and_poll(&mut jb, 500, FrameType::KeyFrame, &mut time);
+        insert_and_poll(&mut jb, 501, FrameType::DeltaFrame, &mut time);
+
+        for seq in 2..=5 {
+            insert_and_poll(&mut jb, seq, FrameType::DeltaFrame, &mut time);
+        }
+        assert_eq!(decoded_seqs(&decoded), vec![500, 501]);
+
+        insert_and_poll(&mut jb, 6, FrameType::KeyFrame, &mut time);
+        insert_and_poll(&mut jb, 7, FrameType::DeltaFrame, &mut time);
+        assert_eq!(decoded_seqs(&decoded), vec![500, 501, 6, 7]);
     }
 
     /// The CONSECUTIVE-OLD-FRAMES flush must also preserve a pending arrival record.

@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Issue 2895: tells the user when the call runs on WebSocket although they
-//! prefer WebTransport.
+//! Issue 2895: which transport the call uses, and whether it is the one the
+//! user prefers.
 
-use crate::components::attendants::action_bar_announce_text;
 use crate::context::TransportPreference;
 use dioxus::prelude::*;
-use gloo_timers::callback::Timeout;
-use std::cell::Cell;
+use gloo_timers::callback::Interval;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-const TOAST_TITLE: &str = "Using WebSocket";
-const TOAST_DETAIL: &str = "WebTransport, your preferred protocol, isn't working well here.";
-pub const FALLBACK_TOAST_MS: u32 = 8_000;
-pub const FALLBACK_NOTE: &str =
-    "This call is using WebSocket because WebTransport isn't working well on this device or network.";
-
-/// The transport the call is using, `None` while not connected.
-#[derive(Clone, Copy)]
-pub struct ActiveTransportCtx(pub Signal<Option<TransportPreference>>);
+pub const ACTIVE_TRANSPORT_POLL_MS: u32 = 1_000;
 
 /// Maps `VideoCallClient::active_transport`'s labels.
 pub fn parse_active_transport(raw: Option<&str>) -> Option<TransportPreference> {
@@ -29,147 +20,63 @@ pub fn parse_active_transport(raw: Option<&str>) -> Option<TransportPreference> 
     }
 }
 
-/// `None` when the active transport is unknown. WebSocket on a deployment
-/// that never offered WebTransport is not a fallback.
 pub fn transport_fallback_active(
     preferred: TransportPreference,
     server_wt_enabled: bool,
     active: Option<TransportPreference>,
 ) -> Option<bool> {
-    active.map(|active| {
-        preferred == TransportPreference::WebTransport
-            && server_wt_enabled
-            && active == TransportPreference::WebSocket
-    })
+    active.map(|active| server_wt_enabled && active != preferred)
 }
 
-/// Returns `(in_fallback, show_toast)`.
-pub fn next_transport_fallback(
-    was_in_fallback: bool,
-    preferred: TransportPreference,
-    server_wt_enabled: bool,
-    active: Option<TransportPreference>,
-) -> (bool, bool) {
-    match transport_fallback_active(preferred, server_wt_enabled, active) {
-        Some(now) => (now, now && !was_in_fallback),
-        None => (was_in_fallback, false),
+/// The Settings › Network note for a call running on `active`.
+pub fn fallback_note(active: TransportPreference) -> &'static str {
+    match active {
+        TransportPreference::WebSocket => {
+            "This call is using WebSocket because WebTransport isn't working well on this device or network."
+        }
+        TransportPreference::WebTransport => {
+            "This call is using WebTransport because WebSocket isn't working well on this device or network."
+        }
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct TransportFallback {
-    pub toast: Signal<Option<u32>>,
-    pub active: Signal<Option<TransportPreference>>,
-}
-
-pub fn use_transport_fallback<R>(
-    call_start_time: Signal<Option<f64>>,
-    connection_error: Signal<Option<String>>,
-    preferred: Signal<TransportPreference>,
-    server_wt_enabled: fn() -> bool,
-    toast_ms: u32,
+/// While `enabled`, reads the transport on every render and every `period_ms`,
+/// re-rendering only when it changes. `None` while disabled.
+pub fn use_polled_active_transport<R>(
+    enabled: bool,
+    period_ms: u32,
     make_reader: impl FnOnce() -> R,
-) -> TransportFallback
+) -> Option<TransportPreference>
 where
     R: Fn() -> Option<&'static str> + 'static,
 {
-    let read_active = use_hook(|| Rc::new(make_reader()));
-    let in_fallback = use_hook(|| Rc::new(Cell::new(false)));
-    let mut toast = use_signal(|| None::<u32>);
-    let mut timer = use_signal(|| None::<Timeout>);
-    let mut active = use_signal(|| None::<TransportPreference>);
+    let read = use_hook(|| Rc::new(make_reader()));
+    let shown = use_hook(|| Rc::new(Cell::new(None::<TransportPreference>)));
+    let ticker = use_hook(|| Rc::new(RefCell::new(None::<Interval>)));
+    let mut changed = use_signal(|| 0u32);
+    let _ = changed();
 
-    use_effect(move || {
-        let started = call_start_time.read().is_some();
-        let connected = started && connection_error.read().is_none();
-        let preferred = preferred();
-        let observed = if connected {
-            parse_active_transport(read_active())
-        } else {
-            None
-        };
-        if *active.peek() != observed {
-            active.set(observed);
-        }
-        if !started {
-            in_fallback.set(false);
-            if toast.peek().is_some() {
-                toast.set(None);
-                timer.set(None);
-            }
-            return;
-        }
-        let (now, show) =
-            next_transport_fallback(in_fallback.get(), preferred, server_wt_enabled(), observed);
-        in_fallback.set(now);
-        if show {
-            let seq = toast.peek().map_or(1, |seq| seq.wrapping_add(1));
-            toast.set(Some(seq));
-            timer.set(Some(Timeout::new(toast_ms, move || {
-                if let Ok(mut slot) = toast.try_write() {
-                    *slot = None;
-                }
-            })));
-        }
-    });
-
-    TransportFallback { toast, active }
-}
-
-#[component]
-pub fn TransportFallbackNotice(toast: Signal<Option<u32>>) -> Element {
-    let current = toast();
-    let status_text = current.map_or_else(String::new, |seq| {
-        action_bar_announce_text(&format!("{TOAST_TITLE}. {TOAST_DETAIL}"), seq)
-    });
-    rsx! {
-        span {
-            class: "visually-hidden",
-            role: "status",
-            "aria-live": "polite",
-            "aria-atomic": "true",
-            "data-testid": "transport-fallback-status",
-            "{status_text}"
-        }
-        if let Some(seq) = current {
-            div {
-                key: "{seq}",
-                class: "peer-toast toast-left",
-                "data-testid": "transport-fallback-toast",
-                span { class: "toast-icon",
-                    svg {
-                        width: "16",
-                        height: "16",
-                        view_box: "0 0 24 24",
-                        fill: "none",
-                        stroke: "currentColor",
-                        stroke_width: "2",
-                        stroke_linecap: "round",
-                        stroke_linejoin: "round",
-                        "aria-hidden": "true",
-                        circle { cx: "12", cy: "12", r: "10" }
-                        line {
-                            x1: "12",
-                            y1: "8",
-                            x2: "12",
-                            y2: "12",
-                        }
-                        line {
-                            x1: "12",
-                            y1: "16",
-                            x2: "12.01",
-                            y2: "16",
-                        }
+    let current = if enabled {
+        parse_active_transport(read())
+    } else {
+        None
+    };
+    shown.set(current);
+    let running = ticker.borrow().is_some();
+    if enabled != running {
+        *ticker.borrow_mut() = enabled.then(|| {
+            let read = read.clone();
+            let shown = shown.clone();
+            Interval::new(period_ms, move || {
+                if parse_active_transport(read()) != shown.get() {
+                    if let Ok(mut seq) = changed.try_write() {
+                        *seq = seq.wrapping_add(1);
                     }
                 }
-                span { class: "toast-text",
-                    span { class: "toast-name", "{TOAST_TITLE}" }
-                    br {}
-                    span { class: "toast-action", "{TOAST_DETAIL}" }
-                }
-            }
-        }
+            })
+        });
     }
+    current
 }
 
 #[cfg(test)]
@@ -177,27 +84,14 @@ mod tests {
     use super::*;
     use TransportPreference::{WebSocket, WebTransport};
 
-    fn run(preferred: TransportPreference, server_wt: bool, steps: &[Option<&str>]) -> Vec<bool> {
-        let mut in_fallback = false;
-        steps
-            .iter()
-            .map(|raw| {
-                let (now, show) = next_transport_fallback(
-                    in_fallback,
-                    preferred,
-                    server_wt,
-                    parse_active_transport(*raw),
-                );
-                in_fallback = now;
-                show
-            })
-            .collect()
-    }
-
     #[test]
-    fn fallback_needs_a_webtransport_preference_an_offered_webtransport_and_websocket() {
+    fn either_preference_can_fall_back_when_webtransport_is_offered() {
         assert_eq!(
             transport_fallback_active(WebTransport, true, Some(WebSocket)),
+            Some(true)
+        );
+        assert_eq!(
+            transport_fallback_active(WebSocket, true, Some(WebTransport)),
             Some(true)
         );
         assert_eq!(
@@ -205,14 +99,20 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            transport_fallback_active(WebTransport, false, Some(WebSocket)),
-            Some(false)
-        );
-        assert_eq!(
             transport_fallback_active(WebSocket, true, Some(WebSocket)),
             Some(false)
         );
+        assert_eq!(
+            transport_fallback_active(WebTransport, false, Some(WebSocket)),
+            Some(false)
+        );
         assert_eq!(transport_fallback_active(WebTransport, true, None), None);
+    }
+
+    #[test]
+    fn the_note_names_the_protocol_in_use() {
+        assert!(fallback_note(WebSocket).starts_with("This call is using WebSocket"));
+        assert!(fallback_note(WebTransport).starts_with("This call is using WebTransport"));
     }
 
     #[test]
@@ -225,56 +125,6 @@ mod tests {
         assert_eq!(parse_active_transport(Some("auto")), None);
         assert_eq!(parse_active_transport(None), None);
     }
-
-    #[test]
-    fn websocket_at_join_toasts_once() {
-        assert_eq!(run(WebTransport, true, &[Some("websocket")]), [true]);
-    }
-
-    #[test]
-    fn a_reconnect_back_onto_websocket_does_not_re_toast() {
-        assert_eq!(
-            run(
-                WebTransport,
-                true,
-                &[Some("websocket"), None, Some("websocket")]
-            ),
-            [true, false, false]
-        );
-    }
-
-    #[test]
-    fn only_an_observed_webtransport_connection_re_arms_the_toast() {
-        assert_eq!(
-            run(
-                WebTransport,
-                true,
-                &[
-                    Some("webtransport"),
-                    Some("websocket"),
-                    Some("webtransport"),
-                    Some("websocket"),
-                ]
-            ),
-            [false, true, false, true]
-        );
-    }
-
-    #[test]
-    fn a_deployment_without_webtransport_never_toasts() {
-        assert_eq!(
-            run(WebTransport, false, &[Some("websocket"), Some("websocket")]),
-            [false, false]
-        );
-    }
-
-    #[test]
-    fn a_websocket_preference_never_toasts() {
-        assert_eq!(
-            run(WebSocket, true, &[Some("websocket"), Some("websocket")]),
-            [false, false]
-        );
-    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -284,55 +134,35 @@ mod dom_tests {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    const SHORT_TOAST_MS: u32 = 250;
+    const SHORT_POLL_MS: u32 = 50;
 
-    fn harness(toast_ms: u32) -> Element {
-        let mut call_start_time = use_signal(|| None::<f64>);
-        let mut connection_error = use_signal(|| None::<String>);
-        let preferred = use_signal(|| TransportPreference::WebTransport);
-        let mut reported = use_signal(|| None::<&'static str>);
-        let fallback = use_transport_fallback(
-            call_start_time,
-            connection_error,
-            preferred,
-            || true,
-            toast_ms,
-            || move || *reported.peek(),
-        );
-        let mut connect = move |raw: Option<&'static str>| {
-            reported.set(raw);
-            connection_error.set(None);
-            let next = call_start_time.peek().unwrap_or(0.0) + 1.0;
-            call_start_time.set(Some(next));
-        };
-        let toast = fallback.toast;
-        let active = fallback.active;
+    thread_local! {
+        static CLIENT_REPORTS: Cell<Option<&'static str>> = const { Cell::new(None) };
+        static CLIENT_READS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn client_reports(raw: Option<&'static str>) {
+        CLIENT_REPORTS.with(|cell| cell.set(raw));
+    }
+
+    fn client_reads() -> u32 {
+        CLIENT_READS.with(Cell::get)
+    }
+
+    #[allow(non_snake_case)]
+    fn PollHarness() -> Element {
+        let mut enabled = use_signal(|| false);
+        let active = use_polled_active_transport(enabled(), SHORT_POLL_MS, || {
+            || {
+                CLIENT_READS.with(|reads| reads.set(reads.get() + 1));
+                CLIENT_REPORTS.with(Cell::get)
+            }
+        });
         rsx! {
-            div {
-                id: "probe",
-                "data-toast": "{toast():?}",
-                "data-active": "{active():?}",
-            }
-            button { id: "ws", onclick: move |_| connect(Some("websocket")) }
-            button { id: "wt", onclick: move |_| connect(Some("webtransport")) }
-            button { id: "unknown", onclick: move |_| connect(None) }
-            button {
-                id: "lost",
-                onclick: move |_| connection_error.set(Some("lost".to_string())),
-            }
-            button { id: "hangup", onclick: move |_| call_start_time.set(None) }
-            TransportFallbackNotice { toast }
+            div { id: "probe", "data-active": "{active:?}" }
+            button { id: "open", onclick: move |_| enabled.set(true) }
+            button { id: "close", onclick: move |_| enabled.set(false) }
         }
-    }
-
-    #[allow(non_snake_case)]
-    fn Harness() -> Element {
-        harness(FALLBACK_TOAST_MS)
-    }
-
-    #[allow(non_snake_case)]
-    fn ShortHarness() -> Element {
-        harness(SHORT_TOAST_MS)
     }
 
     fn launch(app: fn() -> Element) -> web_sys::Element {
@@ -363,107 +193,56 @@ mod dom_tests {
             .unwrap_or_default()
     }
 
-    fn text_of(mount: &web_sys::Element, test_id: &str) -> Option<String> {
-        mount
-            .query_selector(&format!("[data-testid='{test_id}']"))
-            .unwrap()
-            .map(|el| el.text_content().unwrap_or_default())
-    }
-
     async fn settle() {
         TimeoutFuture::new(30).await;
     }
 
-    #[wasm_bindgen_test]
-    async fn the_toast_fires_on_entering_fallback_and_resets_on_hang_up() {
-        let mount = launch(Harness);
-        settle().await;
-        assert_eq!(
-            probe(&mount, "data-toast"),
-            "None",
-            "no toast before joining"
-        );
-
-        click(&mount, "ws");
-        settle().await;
-        assert_eq!(probe(&mount, "data-toast"), "Some(1)", "WebSocket at join");
-        assert_eq!(probe(&mount, "data-active"), "Some(WebSocket)");
-        let toast = text_of(&mount, "transport-fallback-toast").expect("toast rendered");
-        assert!(
-            toast.contains(TOAST_TITLE) && toast.contains(TOAST_DETAIL),
-            "{toast}"
-        );
-        let status = text_of(&mount, "transport-fallback-status").unwrap_or_default();
-        assert!(
-            status.starts_with(&format!("{TOAST_TITLE}. {TOAST_DETAIL}")),
-            "{status}"
-        );
-
-        click(&mount, "unknown");
-        settle().await;
-        click(&mount, "ws");
-        settle().await;
-        assert_eq!(
-            probe(&mount, "data-toast"),
-            "Some(1)",
-            "a reconnect back onto WebSocket must not re-toast"
-        );
-
-        click(&mount, "lost");
-        settle().await;
-        assert_eq!(probe(&mount, "data-active"), "None", "not connected");
-        assert_eq!(probe(&mount, "data-toast"), "Some(1)");
-
-        click(&mount, "wt");
-        settle().await;
-        assert_eq!(probe(&mount, "data-active"), "Some(WebTransport)");
-        click(&mount, "ws");
-        settle().await;
-        assert_eq!(
-            probe(&mount, "data-toast"),
-            "Some(2)",
-            "WebTransport re-arms the toast"
-        );
-
-        click(&mount, "hangup");
-        settle().await;
-        assert_eq!(
-            probe(&mount, "data-toast"),
-            "None",
-            "hang-up clears the toast"
-        );
-        assert_eq!(probe(&mount, "data-active"), "None");
-        assert_eq!(text_of(&mount, "transport-fallback-toast"), None);
-
-        click(&mount, "ws");
-        settle().await;
-        assert_eq!(
-            probe(&mount, "data-toast"),
-            "Some(1)",
-            "a rejoin on WebSocket toasts again"
-        );
-        mount.remove();
+    async fn active_within(mount: &web_sys::Element, expected: &str) -> String {
+        let give_up = js_sys::Date::now() + 2_000.0;
+        while probe(mount, "data-active") != expected && js_sys::Date::now() < give_up {
+            TimeoutFuture::new(10).await;
+        }
+        probe(mount, "data-active")
     }
 
     #[wasm_bindgen_test]
-    async fn the_toast_dismisses_itself_after_its_duration() {
-        let mount = launch(ShortHarness);
-        settle().await;
-        click(&mount, "ws");
-        settle().await;
-        assert_eq!(probe(&mount, "data-toast"), "Some(1)");
-        assert!(text_of(&mount, "transport-fallback-toast").is_some());
+    async fn the_polled_transport_follows_the_client_only_while_enabled() {
+        client_reports(Some("webtransport"));
+        let mount = launch(PollHarness);
+        TimeoutFuture::new(SHORT_POLL_MS * 4).await;
+        let disabled = probe(&mount, "data-active");
+        let disabled_reads = client_reads();
 
-        let give_up = js_sys::Date::now() + 3_000.0;
-        while probe(&mount, "data-toast") != "None" && js_sys::Date::now() < give_up {
-            TimeoutFuture::new(25).await;
-        }
-        assert_eq!(
-            probe(&mount, "data-toast"),
-            "None",
-            "the toast must clear once its duration elapses"
-        );
-        assert_eq!(text_of(&mount, "transport-fallback-toast"), None);
+        click(&mount, "open");
+        settle().await;
+        let on_open = probe(&mount, "data-active");
+
+        client_reports(None);
+        let reconnecting = active_within(&mount, "None").await;
+
+        client_reports(Some("websocket"));
+        let reconnected = active_within(&mount, "Some(WebSocket)").await;
+
+        click(&mount, "close");
+        settle().await;
+        let closed = probe(&mount, "data-active");
+        let reads_at_close = client_reads();
+        TimeoutFuture::new(SHORT_POLL_MS * 4).await;
+        let reads_after_close = client_reads();
         mount.remove();
+
+        assert_eq!(disabled, "None", "a disabled hook reports nothing");
+        assert_eq!(disabled_reads, 0, "a disabled hook never reads the client");
+        assert_eq!(on_open, "Some(WebTransport)");
+        assert_eq!(
+            reconnecting, "None",
+            "a client-internal reconnect must clear the value with no other signal"
+        );
+        assert_eq!(reconnected, "Some(WebSocket)");
+        assert_eq!(closed, "None");
+        assert_eq!(
+            reads_after_close, reads_at_close,
+            "no polling once disabled"
+        );
     }
 }

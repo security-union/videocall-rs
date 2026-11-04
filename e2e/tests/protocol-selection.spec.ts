@@ -535,11 +535,21 @@ test.describe("Protocol selection (transport preference)", () => {
     await setRuntimeConfig(context, {
       webTransportEnabled: "false",
       defaultTransport: "webtransport",
+      transportBadgeEnabled: "false",
     });
 
     await joinMeeting(page, meetingId, "proto-user-9g");
     await openSettingsModal(page);
     await switchToNetworkTab(page);
+
+    const current = page.locator('#settings-panel-network [data-testid="transport-current"]');
+    await expect(current).toHaveAttribute("data-state", "websocket", { timeout: 30_000 });
+    const rowBadge = current.locator(
+      ':scope > .transport-current-reading > [data-testid="transport-current-badge"]',
+    );
+    await expect(rowBadge).toBeVisible();
+    await expect(rowBadge).toContainClass("transport-badge transport-badge--ws");
+    await expect(rowBadge).toHaveText("WS");
 
     const wtRadio = page.locator('[data-testid="transport-radio-webtransport"]');
     const wsRadio = page.locator('[data-testid="transport-radio-websocket"]');

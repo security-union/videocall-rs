@@ -63,11 +63,10 @@ import { createMeeting, transferHost } from "../helpers/meeting-api";
  * toxiproxy proxy, so A must be pinned+routed to WS via
  * `routeDownlinkThroughProxy` (there is no per-client WT/QUIC sever).
  *
- * UNTAGGED (no @bvt) so it does not run in per-PR CI, which has no toxiproxy.
  * Run it against the impair stack:
  *
  *   make e2e-up-impair            # or COMPOSE_PROFILES=impair make e2e-up
- *   cd e2e && npx playwright test host-reconnect-reseed.spec.ts
+ *   cd e2e && npx playwright test host-reconnect-reseed.spec.ts --project=impair
  */
 
 // ---------------------------------------------------------------------------
@@ -192,7 +191,7 @@ test.describe("Host controls re-sync on transport reconnect", () => {
     await waitForServices();
   });
 
-  test("swallowed HOST_REVOKED is healed by the on_connected reseed at reconnect", async ({
+  test("swallowed HOST_REVOKED is healed by the on_connected reseed at reconnect @impair", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);

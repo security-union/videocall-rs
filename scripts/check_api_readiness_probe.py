@@ -40,6 +40,7 @@ WORKFLOWS = (
 )
 SHELL_VAR_STUB = {
     "PG_PASSWORD": "stub",
+    "CAPTIONS_ENABLED": "true",
     "OAUTH_CLIENT_ID": "stub",
     "OAUTH_CLIENT_SECRET": "stub",
     "PR_NUM": "1",

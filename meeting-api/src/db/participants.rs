@@ -86,21 +86,33 @@ pub async fn upsert_host<'e>(
 }
 
 /// Admit a co-host into an active meeting as host, bypassing the waiting room. `Ok(None)` if ineligible.
+/// The `i64` is the meeting's `started_at` in Unix milliseconds, read under the row lock.
 pub async fn admit_as_co_host(
     pool: &PgPool,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
-) -> Result<Option<(ParticipantRow, bool)>, sqlx::Error> {
+) -> Result<Option<(ParticipantRow, bool, i64)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let active: bool = sqlx::query_scalar(
-        "SELECT state IS NOT DISTINCT FROM 'active' FROM meetings WHERE id = $1 FOR UPDATE",
+    let admitted = admit_as_co_host_in(&mut tx, meeting_id, user_id, display_name).await?;
+    tx.commit().await?;
+    Ok(admitted)
+}
+
+/// [`admit_as_co_host`] on the caller's transaction; writes nothing when it returns `None`.
+pub(crate) async fn admit_as_co_host_in(
+    tx: &mut PgConnection,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<Option<(ParticipantRow, bool, i64)>, sqlx::Error> {
+    let (active, started_at): (bool, DateTime<Utc>) = sqlx::query_as(
+        "SELECT state IS NOT DISTINCT FROM 'active', started_at FROM meetings WHERE id = $1 FOR UPDATE",
     )
     .bind(meeting_id)
     .fetch_one(&mut *tx)
     .await?;
     if !active || !crate::db::co_hosts::has_live_entry(&mut *tx, meeting_id, user_id).await? {
-        tx.rollback().await?;
         return Ok(None);
     }
 
@@ -119,15 +131,14 @@ pub async fn admit_as_co_host(
     .await?
     .unwrap_or((false, false));
     if blocked {
-        tx.rollback().await?;
         return Ok(None);
     }
     let row = upsert_host(&mut *tx, meeting_id, user_id, display_name).await?;
-    tx.commit().await?;
-    Ok(Some((row, !was_host)))
+    Ok(Some((row, !was_host, started_at.timestamp_millis())))
 }
 
 /// Atomically join a meeting as an attendee under the current `waiting_room_enabled`. `Ok(None)` if `require_present_host` and none is present.
+/// The `i64` is the meeting's `started_at` in Unix milliseconds, read under the row lock.
 pub async fn join_attendee(
     pool: &PgPool,
     meeting_id: i32,
@@ -136,19 +147,42 @@ pub async fn join_attendee(
     require_present_host: bool,
     is_guest: bool,
     healthy: bool,
-) -> Result<Option<(bool, ParticipantRow, bool)>, sqlx::Error> {
+) -> Result<Option<(bool, ParticipantRow, bool, i64)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let joined = join_attendee_in(
+        &mut tx,
+        meeting_id,
+        user_id,
+        display_name,
+        require_present_host,
+        is_guest,
+        healthy,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(joined)
+}
 
+/// [`join_attendee`] on the caller's transaction; writes nothing when it returns `None`.
+pub(crate) async fn join_attendee_in(
+    tx: &mut PgConnection,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+    require_present_host: bool,
+    is_guest: bool,
+    healthy: bool,
+) -> Result<Option<(bool, ParticipantRow, bool, i64)>, sqlx::Error> {
     // Lock the meeting row to serialize against concurrent waiting room toggles.
-    let (waiting_room_enabled,): (bool,) =
-        sqlx::query_as("SELECT waiting_room_enabled FROM meetings WHERE id = $1 FOR UPDATE")
-            .bind(meeting_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let (waiting_room_enabled, started_at): (bool, DateTime<Utc>) = sqlx::query_as(
+        "SELECT waiting_room_enabled, started_at FROM meetings WHERE id = $1 FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .fetch_one(&mut *tx)
+    .await?;
 
     // Checked in-transaction to close a TOCTOU race.
     if require_present_host && count_present_hosts(&mut *tx, meeting_id, healthy).await? == 0 {
-        tx.rollback().await?;
         return Ok(None);
     }
 
@@ -198,8 +232,12 @@ pub async fn join_attendee(
             .await?
     };
 
-    tx.commit().await?;
-    Ok(Some((!waiting_room_enabled, row, waiting_room_enabled)))
+    Ok(Some((
+        !waiting_room_enabled,
+        row,
+        waiting_room_enabled,
+        started_at.timestamp_millis(),
+    )))
 }
 
 /// Waiting participants (see [`waiting_sql`]) of a meeting, in order of arrival.
@@ -245,6 +283,97 @@ pub async fn get_status<'e>(
         .bind(meeting_id)
         .bind(user_id)
         .fetch_optional(executor)
+        .await
+}
+
+/// Admitted now, or left after being admitted into the instance that started at `meeting_started_at`.
+pub fn in_current_instance(row: &ParticipantRow, meeting_started_at: DateTime<Utc>) -> bool {
+    row.status == "admitted"
+        || (row.status == "left" && row.admitted_at.is_some_and(|a| a >= meeting_started_at))
+}
+
+/// Most room ids [`current_room_ids`] returns.
+pub const MAX_CURRENT_ROOMS: i64 = 32;
+
+/// Room ids of the non-ended, non-deleted meetings `user_id` is [`in_current_instance`] of:
+/// admitted rows first, then the most recently admitted.
+pub async fn current_room_ids(pool: &PgPool, user_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT m.room_id FROM meeting_participants p JOIN meetings m ON m.id = p.meeting_id \
+         WHERE p.user_id = $1 AND m.deleted_at IS NULL AND m.state IS DISTINCT FROM 'ended' \
+           AND (p.status = 'admitted' OR (p.status = 'left' AND p.admitted_at >= m.started_at)) \
+         ORDER BY p.status = 'admitted' DESC, p.admitted_at DESC NULLS LAST \
+         LIMIT $2",
+    )
+    .bind(user_id)
+    .bind(MAX_CURRENT_ROOMS)
+    .fetch_all(pool)
+    .await
+}
+
+/// The non-deleted meeting for a room plus the rows of the requested users in it.
+#[derive(Debug)]
+pub struct RoomParticipants {
+    pub started_at: DateTime<Utc>,
+    pub state: Option<String>,
+    pub rows: Vec<ParticipantRow>,
+}
+
+/// [`RoomParticipants`] for `room_id` and `user_ids` in one statement; `Ok(None)` if the room has no non-deleted meeting.
+pub async fn get_room_participants(
+    pool: &PgPool,
+    room_id: &str,
+    user_ids: &[&str],
+) -> Result<Option<RoomParticipants>, sqlx::Error> {
+    use sqlx::{FromRow, Row};
+    let query = format!(
+        "SELECT m.started_at AS meeting_started_at, m.state AS meeting_state, p.* \
+         FROM meetings m \
+         LEFT JOIN LATERAL unnest($2::text[]) AS wanted(uid) ON TRUE \
+         LEFT JOIN LATERAL ( \
+             SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants \
+             WHERE meeting_id = m.id AND user_id = wanted.uid \
+         ) p ON TRUE \
+         WHERE m.room_id = $1 AND m.deleted_at IS NULL"
+    );
+    let rows = sqlx::query(&query)
+        .bind(room_id)
+        .bind(user_ids)
+        .fetch_all(pool)
+        .await?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let mut participants = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if row.try_get::<Option<i32>, _>("id")?.is_some() {
+            participants.push(ParticipantRow::from_row(row)?);
+        }
+    }
+    Ok(Some(RoomParticipants {
+        started_at: first.try_get("meeting_started_at")?,
+        state: first.try_get("meeting_state")?,
+        rows: participants,
+    }))
+}
+
+/// [`get_status`] holding a share lock on the row for the rest of the
+/// transaction. The caller must have locked the meeting row first, as every
+/// demotion does (transfer, co-host revoke, kick, end); a demotion then
+/// either committed before this read or waits for the caller's transaction.
+pub async fn get_status_for_share(
+    tx: &mut sqlx::PgConnection,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    let query = format!(
+        "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants \
+         WHERE meeting_id = $1 AND user_id = $2 FOR SHARE"
+    );
+    sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(user_id)
+        .fetch_optional(tx)
         .await
 }
 
@@ -643,12 +772,38 @@ pub async fn depart(
     healthy: bool,
 ) -> Result<Option<(ParticipantRow, Option<DepartureEnd>)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let departed = depart_in(&mut tx, meeting_id, user_id, end_when_empty, false, healthy).await?;
+    let departed = depart_in(
+        &mut tx,
+        meeting_id,
+        user_id,
+        end_when_empty,
+        false,
+        healthy,
+        None,
+    )
+    .await?;
     tx.commit().await?;
-    Ok(departed)
+    Ok(departed.map(Departed::immediate))
+}
+
+/// How long a relay-reported last-host departure waits before it ends the
+/// meeting, so a host whose reload re-elects onto the other relay can return.
+pub const HOST_LEFT_END_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(65);
+
+struct Departed {
+    row: ParticipantRow,
+    end: Option<DepartureEnd>,
+    end_deferred: bool,
+}
+
+impl Departed {
+    fn immediate(self) -> (ParticipantRow, Option<DepartureEnd>) {
+        (self.row, self.end)
+    }
 }
 
 /// `keep_live_session`: true only for a lease-expiry guess, so a later heartbeat can restore the row.
+/// `defer_host_end`: schedule a last-host-left end that far out instead of ending now.
 async fn depart_in(
     conn: &mut PgConnection,
     meeting_id: i32,
@@ -656,7 +811,8 @@ async fn depart_in(
     end_when_empty: bool,
     keep_live_session: bool,
     healthy: bool,
-) -> Result<Option<(ParticipantRow, Option<DepartureEnd>)>, sqlx::Error> {
+    defer_host_end: Option<std::time::Duration>,
+) -> Result<Option<Departed>, sqlx::Error> {
     let (state, end_on_host_leave): (Option<String>, bool) =
         sqlx::query_as("SELECT state, end_on_host_leave FROM meetings WHERE id = $1 FOR UPDATE")
             .bind(meeting_id)
@@ -711,6 +867,19 @@ async fn depart_in(
             ended = Some(DepartureEnd::Empty);
         }
     }
+    let mut end_deferred = false;
+    if let (Some(DepartureEnd::LastHostLeft), Some(delay)) = (ended, defer_host_end) {
+        sqlx::query(
+            "UPDATE meetings SET host_left_end_due_at = NOW() + make_interval(secs => $2) \
+             WHERE id = $1",
+        )
+        .bind(meeting_id)
+        .bind(delay.as_secs_f64())
+        .execute(&mut *conn)
+        .await?;
+        ended = None;
+        end_deferred = true;
+    }
     if ended.is_some() {
         crate::db::meetings::end_meeting_in(conn, meeting_id).await?;
     } else if state.as_deref() == Some(crate::db::meetings::STATE_ACTIVE)
@@ -721,11 +890,24 @@ async fn depart_in(
             .execute(&mut *conn)
             .await?;
     }
-    Ok(Some((row, ended)))
+    Ok(Some(Departed {
+        row,
+        end: ended,
+        end_deferred,
+    }))
 }
 
 /// Relay session ids a participant row remembers as left.
 const LEFT_SESSIONS_KEPT: i32 = 8;
+
+/// What [`record_left`] departed.
+#[derive(Debug)]
+pub struct RelayDeparture {
+    pub row: ParticipantRow,
+    /// The last present host left: [`end_host_left_if_due`] ends the meeting
+    /// after [`HOST_LEFT_END_DEBOUNCE`] unless a host is present again.
+    pub end_deferred: bool,
+}
 
 /// Apply a relay's report that `session_id` of `user_id` left. A stale or already-applied report departs nothing.
 pub async fn record_left(
@@ -734,7 +916,7 @@ pub async fn record_left(
     user_id: &str,
     session_id: i64,
     healthy: bool,
-) -> Result<Option<(ParticipantRow, Option<DepartureEnd>)>, sqlx::Error> {
+) -> Result<Option<RelayDeparture>, sqlx::Error> {
     // Cheap unlocked pre-check; re-checked for real under the lock below.
     let maybe_relevant: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM meeting_participants \
@@ -768,12 +950,117 @@ pub async fn record_left(
     .fetch_optional(&mut *tx)
     .await?;
     let departed = if is_live == Some(true) {
-        depart_in(&mut tx, meeting_id, user_id, false, false, healthy).await?
+        depart_in(
+            &mut tx,
+            meeting_id,
+            user_id,
+            false,
+            false,
+            healthy,
+            Some(HOST_LEFT_END_DEBOUNCE),
+        )
+        .await?
     } else {
         None
     };
     tx.commit().await?;
-    Ok(departed)
+    Ok(departed.map(|d| RelayDeparture {
+        row: d.row,
+        end_deferred: d.end_deferred,
+    }))
+}
+
+/// Settle a deferred last-host-left end once due: end the meeting if
+/// `end_on_host_leave` still holds and no host is present. Returns
+/// whether it ended the meeting; a not-yet-due or absent deferral is untouched.
+pub async fn end_host_left_if_due(
+    pool: &PgPool,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let end_on_host_leave: Option<bool> = sqlx::query_scalar(
+        "SELECT end_on_host_leave FROM meetings \
+         WHERE id = $1 AND deleted_at IS NULL AND host_left_end_due_at <= NOW() FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(end_on_host_leave) = end_on_host_leave else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    sqlx::query("UPDATE meetings SET host_left_end_due_at = NULL WHERE id = $1")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+    let end = end_on_host_leave && count_present_hosts(&mut *tx, meeting_id, healthy).await? == 0;
+    if end {
+        crate::db::meetings::end_meeting_in(&mut tx, meeting_id).await?;
+    }
+    tx.commit().await?;
+    Ok(end)
+}
+
+/// The host whose relay-reported departure armed the pending host-left end
+/// confirms leaving: end the meeting now unless a host is present. Only a host
+/// row whose `left_at` is that arming transaction's time qualifies. Returns
+/// that row when it ended the meeting.
+pub async fn end_host_left_now(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    healthy: bool,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let armed_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT host_left_end_due_at - make_interval(secs => $2) FROM meetings \
+         WHERE id = $1 AND deleted_at IS NULL AND end_on_host_leave \
+           AND host_left_end_due_at IS NOT NULL FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .bind(HOST_LEFT_END_DEBOUNCE.as_secs_f64())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let row = match armed_at {
+        Some(armed_at) => {
+            sqlx::query_as::<_, ParticipantRow>(&format!(
+                "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants \
+                 WHERE meeting_id = $1 AND user_id = $2 AND is_host AND left_at >= $3"
+            ))
+            .bind(meeting_id)
+            .bind(user_id)
+            .bind(armed_at)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
+        None => None,
+    };
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    if count_present_hosts(&mut *tx, meeting_id, healthy).await? > 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    crate::db::meetings::end_meeting_in(&mut tx, meeting_id).await?;
+    tx.commit().await?;
+    Ok(Some(row))
+}
+
+/// Up to `limit` meetings whose deferred last-host-left end is due, as `(meeting_id, room_id)`.
+pub async fn host_left_ends_due(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(i32, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, room_id FROM meetings \
+         WHERE host_left_end_due_at <= NOW() AND deleted_at IS NULL ORDER BY host_left_end_due_at LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// What [`record_present`] changed.
@@ -1036,7 +1323,7 @@ pub(crate) fn nats_locally_connected(nats: Option<&async_nats::Client>) -> bool 
 /// Whether the presence-lease pipeline is healthy enough to trust for a
 /// "nobody present" decision: a heartbeat reached the database recently AND
 /// this replica's NATS connection is up. `false` degrades [`present_sql`] to
-/// latch semantics and tells the sweeper to skip its tick.
+/// latch semantics and tells the sweeper to skip its lease sweep.
 pub async fn presence_healthy(
     pool: &PgPool,
     nats: Option<&async_nats::Client>,
@@ -1124,12 +1411,12 @@ pub async fn depart_expired(
     .fetch_one(&mut *tx)
     .await?;
     let departed = if expired {
-        depart_in(&mut tx, meeting_id, user_id, false, true, true).await?
+        depart_in(&mut tx, meeting_id, user_id, false, true, true, None).await?
     } else {
         None
     };
     tx.commit().await?;
-    Ok(departed)
+    Ok(departed.map(Departed::immediate))
 }
 
 /// Leave a meeting (set status to 'left').
@@ -1337,6 +1624,10 @@ impl ParticipantRow {
             allow_guests: false,
             recording_allowed_for_all: false,
             chat_allowed_for_all: true,
+            entry_message_override: Default::default(),
+            entry_sound_override: Default::default(),
+            exit_message_override: Default::default(),
+            exit_sound_override: Default::default(),
         }
     }
 }

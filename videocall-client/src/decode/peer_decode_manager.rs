@@ -22,7 +22,8 @@ use super::layer_chooser::{
 };
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
 use super::pli_budget::{PliBudget, PliBudgetDecision};
-use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
+use super::worker_boot_queue::{BootKind, PeerBootHints, WorkerBootQueue, MAX_BOOT_RETRIES};
+use super::{create_queued_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
     KEYFRAME_BACKOFF_DECAY_MS, KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
     KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SLOW_RETRY_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
@@ -131,8 +132,7 @@ fn emit_keyframe_request(
 /// decoders. Each route captures a cheap clone of the transport `send_packet` callback plus the
 /// owned local user id, the peer's user id, and the peer's relay `session_id` (the per-session
 /// limiter key, #1124), so it can call [`emit_keyframe_request`] for the right peer + stream
-/// without holding `&PeerDecodeManager`. The worker fires the route when its jitter buffer
-/// evicts a stale keyframe-less backlog for that stream.
+/// without holding `&PeerDecodeManager`.
 ///
 /// Issue #1479: each route also captures a clone of the shared per-receiver cross-sender PLI
 /// `budget` and gates the emission through it. The gate sits ABOVE the transport-agnostic
@@ -1236,6 +1236,11 @@ pub struct PeerReceiveDiag {
 /// above the encode ceiling's own budget so no honest publisher is clipped.
 const MAX_REPORTED_SCREEN_KBPS: u32 = 100_000;
 
+/// How long after a share stops, with no screen frame for as long, before its decoder worker is
+/// torn down (#3210). Long enough that stopping to switch windows and resharing keeps the warm
+/// worker.
+const SCREEN_DECODER_IDLE_TEARDOWN_MS: u64 = 30_000;
+
 /// Bounds the peer-stamped source's MAGNITUDE ([`MAX_REPORTED_SCREEN_KBPS`]'s boundary).
 const MAX_REPORTED_SOURCE_DIM: u32 = 16_384;
 
@@ -1280,6 +1285,13 @@ fn enrich_screen_snapshot(
         .screen
         .reported_target_kbps()
         .min(MAX_REPORTED_SCREEN_KBPS);
+}
+
+fn enrich_audio_snapshot(
+    peer: &Peer,
+    snap: &mut crate::decode::layer_chooser::ReceivedLayerSnapshot,
+) {
+    snap.kbps = peer.stamped_audio_kbps().unwrap_or(0);
 }
 
 /// Fill a VIDEO snapshot with what the peer's layer is really ENCODED at, not its ladder
@@ -1399,6 +1411,10 @@ pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
+    /// False while `screen` is the worker-less placeholder (#3210).
+    screen_decoder_live: bool,
+    /// When the peer-monitor tick first saw the share off while the screen decoder was live.
+    screen_off_since_ms: Option<u64>,
     pub session_id: u64,
     /// Cached `session_id.to_string()` to avoid repeated allocations.
     sid_str: String,
@@ -1480,13 +1496,7 @@ pub struct Peer {
     /// When the CURRENT unbroken SCREEN keyframe-less hold began (issue #2328),
     /// or `None` while the screen decoder is not starved.
     ///
-    /// ARMED by the worker's proactive keyframe-request route — the jitter
-    /// buffer fires it when it evicts a stale keyframe-less backlog, i.e. when
-    /// playout is frozen on the last-good frame with no buffered keyframe to
-    /// resume from. That is the only signal available on the main thread that
-    /// means "frozen", and it is transport-agnostic (the worker path is identical
-    /// for WebSocket and WebTransport). NOTE the obvious-looking alternative is a
-    /// trap: `VideoPeerDecoder::is_waiting_for_keyframe()` is hard-coded `false`
+    /// NOTE: `VideoPeerDecoder::is_waiting_for_keyframe()` is hard-coded `false`
     /// on wasm (`videocall_codecs::decoder::wasm`, "the jitter buffer is in the
     /// worker"), so anything keyed off it never executes in production.
     ///
@@ -1568,7 +1578,67 @@ pub struct Peer {
     /// Issue #1878: windowed receive-side audio datagram loss for this peer,
     /// fed in the AUDIO decode arm only while `receiver_on_webtransport`.
     audio_datagram_loss: AudioDatagramLossTracker,
+    stamped_audio_kbps: Option<u32>,
+    /// Simulcast layer of the last frame pushed into the camera decoder.
+    pushed_video_layer: Option<u32>,
+    boot: PeerBoot,
 }
+
+/// Lets `queue`'s expiry ticker retry the timed-out audio boots of the manager inside `owner`, so
+/// a retry does not wait for a packet (#3277).
+pub(crate) fn install_boot_retry_driver<T: 'static>(
+    queue: &WorkerBootQueue,
+    owner: std::rc::Weak<RefCell<T>>,
+    manager: fn(&mut T) -> &mut PeerDecodeManager,
+) {
+    queue.set_retry_driver(Rc::new(move || {
+        let Some(owner) = owner.upgrade() else {
+            return;
+        };
+        let Ok(mut owner) = owner.try_borrow_mut() else {
+            return;
+        };
+        manager(&mut owner).retry_held_audio_boots();
+    }));
+}
+
+/// This peer's workers in the client's boot queue (#3277).
+#[derive(Clone, Default)]
+struct PeerBoot {
+    queue: WorkerBootQueue,
+    hints: Rc<Cell<PeerBootHints>>,
+    /// Timed-out boots retried so far: audio, camera, screen.
+    retries: [u8; 3],
+}
+
+impl PeerBoot {
+    fn new(queue: &WorkerBootQueue) -> Self {
+        Self {
+            queue: queue.clone(),
+            hints: Rc::default(),
+            retries: [0; 3],
+        }
+    }
+
+    fn reserve(
+        &self,
+        session_id: u64,
+        kind: BootKind,
+    ) -> super::worker_boot_queue::BootReservation {
+        self.queue.reserve(session_id, kind, &self.hints)
+    }
+}
+
+/// Each simulcast layer numbers its frames independently, so the worker's jitter buffer
+/// restarts when the frames reaching it switch layer (#3204).
+fn flush_on_layer_change(last_pushed: &mut Option<u32>, layer: u32, decoder: &VideoPeerDecoder) {
+    if last_pushed.replace(layer).is_some_and(|prev| prev != layer) {
+        decoder.flush();
+    }
+}
+
+/// Opus's maximum bitrate; a larger stamped audio bitrate is ignored.
+const MAX_STAMPED_AUDIO_KBPS: u32 = 510;
 
 /// HCL bug #1: window during which a recent media frame suppresses a stale
 /// negative heartbeat. Set to match the publisher's heartbeat cadence
@@ -1877,14 +1947,16 @@ impl Peer {
         vad_threshold: Option<f32>,
         is_guest: bool,
         skip_canvas_paint: bool,
+        boot_queue: &WorkerBootQueue,
     ) -> Result<Self, JsValue> {
         let sid_str = session_id.to_string();
+        let boot = PeerBoot::new(boot_queue);
         let (mut audio, video, screen) = Self::new_decoders(
             &video_canvas_id,
-            &screen_canvas_id,
-            &sid_str,
+            session_id,
             vad_threshold,
             skip_canvas_paint,
+            &boot,
         )?;
 
         audio.set_muted(true);
@@ -1894,6 +1966,8 @@ impl Peer {
             audio,
             video,
             screen,
+            screen_decoder_live: false,
+            screen_off_since_ms: None,
             session_id,
             sid_str,
             user_id,
@@ -1973,15 +2047,18 @@ impl Peer {
             // loss until we confirm the receiver is on WebTransport.
             receiver_on_webtransport: false,
             audio_datagram_loss: AudioDatagramLossTracker::new(),
+            stamped_audio_kbps: None,
+            pushed_video_layer: None,
+            boot,
         })
     }
 
     fn new_decoders(
         video_canvas_id: &str,
-        screen_canvas_id: &str,
-        peer_id: &str,
+        session_id: u64,
         vad_threshold: Option<f32>,
         skip_canvas_paint: bool,
+        boot: &PeerBoot,
     ) -> Result<
         (
             Box<dyn AudioPeerDecoderTrait>,
@@ -1990,16 +2067,22 @@ impl Peer {
         ),
         JsValue,
     > {
-        // Construction order matches the pre-2225 inline version exactly (both
-        // video-like decoders, then audio), so a partial failure drops the same
-        // set of half-built decoders it always did.
-        let video_decoder =
-            Self::new_video_like_decoder(video_canvas_id, MEDIA_TYPE_CAMERA, skip_canvas_paint)?;
-        let screen_decoder =
-            Self::new_video_like_decoder(screen_canvas_id, MEDIA_TYPE_SCREEN, skip_canvas_paint)?;
+        let video_decoder = Self::new_video_like_decoder(
+            video_canvas_id,
+            MEDIA_TYPE_CAMERA,
+            skip_canvas_paint,
+            boot.reserve(session_id, BootKind::Video),
+        );
+        // #3210: the screen decoder's worker (and its wasm memory) is created later, by
+        // `ensure_screen_decoder`.
+        let screen_decoder = VideoPeerDecoder::idle_screen();
 
         Ok((
-            create_audio_peer_decoder(None, peer_id.to_string(), vad_threshold)?,
+            create_queued_audio_peer_decoder(
+                session_id.to_string(),
+                vad_threshold,
+                boot.reserve(session_id, BootKind::Audio),
+            )?,
             video_decoder,
             screen_decoder,
         ))
@@ -2010,8 +2093,7 @@ impl Peer {
     /// Extracted from [`Self::new_decoders`] (issue 2225) so a single stream's
     /// decoder can be rebuilt on its own after a decode error, without dragging
     /// the peer's other two decoders — in particular the NetEQ audio worker —
-    /// along with it. Cold start is unchanged: `new_decoders` calls this twice
-    /// with the same arguments it used to pass inline.
+    /// along with it.
     ///
     /// The decoder is created without a canvas (`set_canvas` may run later, when
     /// the tile mounts) and then opportunistically wired to whatever element
@@ -2022,8 +2104,14 @@ impl Peer {
         canvas_id: &str,
         media_type: &'static str,
         skip_canvas_paint: bool,
-    ) -> Result<VideoPeerDecoder, JsValue> {
-        let decoder = VideoPeerDecoder::new(None, media_type, skip_canvas_paint)?;
+        mut reservation: super::worker_boot_queue::BootReservation,
+    ) -> VideoPeerDecoder {
+        let (decoder, starter) = VideoPeerDecoder::without_canvas_deferred(
+            media_type,
+            skip_canvas_paint,
+            reservation.take_settle_callback(),
+        );
+        reservation.submit(starter);
 
         if let Some(document) = web_sys::window().and_then(|w| w.document()) {
             if let Some(canvas_element) = document.get_element_by_id(canvas_id) {
@@ -2033,7 +2121,7 @@ impl Peer {
             }
         }
 
-        Ok(decoder)
+        decoder
     }
 
     /// Swap in a freshly built audio decoder for this peer, retiring the
@@ -2046,13 +2134,6 @@ impl Peer {
     /// unguarded, one AUDIO decode error blanks the peer's speaking indicator
     /// (tile level forced to 0.0, roster dot darkened, the UI's speaking deadman
     /// cancelled) until the replacement NetEQ worker finishes worklet init.
-    ///
-    /// Issue 2225 narrowed the trigger: a VIDEO or SCREEN decode error no longer
-    /// reaches this function at all (`decoder_reset_scope` routes those to
-    /// `Video`/`Screen`), so the "lossy link, repeated decode errors, blinking
-    /// glow" framing no longer applies. The surviving trigger is a
-    /// decoder-propagated AUDIO failure, which no concrete decoder currently
-    /// produces — see `decoder_reset_scope`'s "Which arms fire today".
     ///
     /// [`AudioPeerDecoderTrait::retire_for_replacement`] makes the outgoing
     /// decoder's `Drop` silent, so the indicator simply carries over: the new
@@ -2087,6 +2168,59 @@ impl Peer {
         self.video = video;
         self.video
             .set_stream_context(from_peer.to_owned(), self.session_id.to_string());
+    }
+
+    /// Swap the worker-less placeholder for a real screen decoder, keeping the canvas and stream
+    /// context the placeholder was given.
+    fn ensure_screen_decoder(&mut self) {
+        if self.screen_decoder_live {
+            return;
+        }
+        let live = Self::new_video_like_decoder(
+            &self.screen_canvas_id,
+            MEDIA_TYPE_SCREEN,
+            self.skip_canvas_paint,
+            self.boot.reserve(self.session_id, BootKind::Screen),
+        );
+        self.install_screen_decoder(live);
+        self.screen_decoder_live = true;
+    }
+
+    /// Return a screen decoder whose share has ended to the placeholder, terminating its worker.
+    fn retire_screen_decoder(&mut self) {
+        if !self.screen_decoder_live {
+            return;
+        }
+        self.install_screen_decoder(VideoPeerDecoder::idle_screen());
+        self.screen_decoder_live = false;
+    }
+
+    fn install_screen_decoder(&mut self, next: VideoPeerDecoder) {
+        if let Some(canvas) = self.screen.get_canvas() {
+            let _ = next.set_canvas(canvas);
+        }
+        if let Some((from_peer, to_peer)) = self.screen.stream_context_pair() {
+            next.set_stream_context(from_peer, to_peer);
+        }
+        // Carried, not left to the self-heal: a late joiner's first screen packet is often a
+        // delta, and the worker's keyframe request for it would otherwise find no route.
+        if let Some(route) = self.screen.take_keyframe_request_route() {
+            next.set_keyframe_request_route(route);
+        }
+        self.screen = next;
+        self.clear_screen_keyframe_starvation();
+    }
+
+    /// True once the share has been off, and no screen frame has arrived, for
+    /// `SCREEN_DECODER_IDLE_TEARDOWN_MS`. The off time is stamped by the first tick that sees it.
+    fn screen_decoder_idle(&mut self, now_ms: u64) -> bool {
+        if !self.screen_decoder_live || self.screen_enabled {
+            self.screen_off_since_ms = None;
+            return false;
+        }
+        let off_since = *self.screen_off_since_ms.get_or_insert(now_ms);
+        now_ms.saturating_sub(off_since) >= SCREEN_DECODER_IDLE_TEARDOWN_MS
+            && now_ms.saturating_sub(self.last_screen_frame_ms) >= SCREEN_DECODER_IDLE_TEARDOWN_MS
     }
 
     /// SCREEN sibling of [`Self::replace_video_decoder`].
@@ -2134,7 +2268,8 @@ impl Peer {
                     &self.video_canvas_id,
                     MEDIA_TYPE_CAMERA,
                     self.skip_canvas_paint,
-                )?;
+                    self.boot.reserve(self.session_id, BootKind::Video),
+                );
                 self.replace_video_decoder(video, from_peer);
             }
             DecoderResetScope::Screen => {
@@ -2143,23 +2278,93 @@ impl Peer {
                     &self.screen_canvas_id,
                     MEDIA_TYPE_SCREEN,
                     self.skip_canvas_paint,
-                )?;
+                    self.boot.reserve(self.session_id, BootKind::Screen),
+                );
                 self.replace_screen_decoder(screen, from_peer);
+                self.screen_decoder_live = true;
             }
             DecoderResetScope::Audio => {
                 debug!(
                     "Rebuilding AUDIO decoder for peer {} with audio muted: {}",
                     self.session_id, !self.audio_enabled
                 );
-                let audio = create_audio_peer_decoder(
-                    None,
+                let audio = create_queued_audio_peer_decoder(
                     self.session_id.to_string(),
                     self.vad_threshold,
+                    self.boot.reserve(self.session_id, BootKind::Audio),
                 )?;
                 self.replace_audio_decoder(audio);
             }
         }
         Ok(())
+    }
+
+    /// Rebuilds, through the boot queue, each of `kinds` whose boot timed out, at most
+    /// [`MAX_BOOT_RETRIES`] times per kind (#3277). Audio is retried only from the queue's hold
+    /// ([`PeerDecodeManager::retry_held_audio_boots`]), which the queue withholds once the peer's
+    /// audio budget is spent.
+    fn retry_timed_out_boots(&mut self, from_peer: &str, kinds: &[BootKind]) {
+        for &kind in kinds {
+            let (index, timed_out) = match kind {
+                BootKind::Audio => (0, self.audio.boot_timed_out()),
+                BootKind::Video => (1, self.video.boot_timed_out()),
+                BootKind::Screen => (2, self.screen.boot_timed_out()),
+            };
+            if !timed_out || self.boot.retries[index] >= MAX_BOOT_RETRIES {
+                continue;
+            }
+            self.boot.retries[index] += 1;
+            let rebuilt = match kind {
+                BootKind::Audio => create_queued_audio_peer_decoder(
+                    self.session_id.to_string(),
+                    self.vad_threshold,
+                    self.boot.reserve(self.session_id, kind),
+                )
+                .map(|audio| self.replace_audio_decoder(audio)),
+                BootKind::Video => {
+                    let video = Self::new_video_like_decoder(
+                        &self.video_canvas_id,
+                        MEDIA_TYPE_CAMERA,
+                        self.skip_canvas_paint,
+                        self.boot.reserve(self.session_id, kind),
+                    );
+                    self.replace_video_decoder(video, from_peer);
+                    Ok(())
+                }
+                BootKind::Screen => {
+                    let screen = Self::new_video_like_decoder(
+                        &self.screen_canvas_id,
+                        MEDIA_TYPE_SCREEN,
+                        self.skip_canvas_paint,
+                        self.boot.reserve(self.session_id, kind),
+                    );
+                    self.replace_screen_decoder(screen, from_peer);
+                    Ok(())
+                }
+            };
+            if let Err(e) = rebuilt {
+                log::error!(
+                    "Peer {}: rebuilding a {kind:?} decoder after a boot timeout failed: {e:?}",
+                    self.session_id
+                );
+            }
+        }
+    }
+
+    /// Publishes this peer's state to the boot queue, which reads it when a slot frees (#3277).
+    fn refresh_boot_hints(&self) {
+        let hints = PeerBootHints {
+            speaking: self.is_speaking,
+            audio_on: self.audio_enabled,
+            visible: self.visible,
+            video_on: self.video_enabled,
+            screen_on: self.screen_enabled,
+        };
+        if self.boot.hints.replace(hints) != hints
+            && self.boot.queue.has_queued_for(self.session_id)
+        {
+            self.boot.queue.schedule_pump();
+        }
     }
 
     /// Select which simulcast layer (issue #989) this receiver decodes for this
@@ -2928,6 +3133,11 @@ impl Peer {
         self.selected_audio_layer
     }
 
+    /// The publisher's last stamped commanded audio bitrate (kbps) while its audio is enabled.
+    pub fn stamped_audio_kbps(&self) -> Option<u32> {
+        self.stamped_audio_kbps.filter(|_| self.audio_enabled)
+    }
+
     /// The audio rung to SHOW for this peer (#2132) — see [`displayed_audio_rung`].
     pub fn displayed_audio_layer(&self, now_ms: u64) -> Option<u32> {
         displayed_audio_rung(
@@ -3219,6 +3429,7 @@ impl Peer {
 
         if audio_off && self.audio_enabled {
             self.audio_enabled = false;
+            self.stamped_audio_kbps = None;
             // Mute and flush the audio decoder the same way the heartbeat
             // audio-off transition does, to prevent the NetEq buffer from
             // emitting expand/hiss packets after the stream is gone.
@@ -3257,6 +3468,9 @@ impl Peer {
             );
         }
 
+        if changed {
+            self.refresh_boot_hints();
+        }
         changed
     }
 
@@ -3587,6 +3801,11 @@ impl Peer {
 
                 self.settle_video_window(local_user_id, media_type, window);
 
+                flush_on_layer_change(
+                    &mut self.pushed_video_layer,
+                    incoming_video_layer,
+                    &self.video,
+                );
                 let video_status = self
                     .video
                     .decode(&packet)
@@ -3635,6 +3854,11 @@ impl Peer {
                 // straggler-drop path so the next heartbeat can detect
                 // recent audio frames and suppress a stale-muted heartbeat.
                 self.last_audio_frame_ms = now;
+
+                let stamped_kbps = packet.audio_metadata.encoder_target_bitrate_kbps;
+                if (1..=MAX_STAMPED_AUDIO_KBPS).contains(&stamped_kbps) {
+                    self.stamped_audio_kbps = Some(stamped_kbps);
+                }
 
                 // Issue #1878: receive-side audio DATAGRAM loss accounting.
                 // Recorded on ARRIVAL — before the mute/straggler gate below —
@@ -3774,6 +3998,7 @@ impl Peer {
                     return Ok((media_type, DecodeStatus::SKIPPED, kf_request));
                 }
 
+                self.ensure_screen_decoder();
                 let screen_status = self
                     .screen
                     .decode(&packet)
@@ -3930,6 +4155,7 @@ impl Peer {
 
                     // Flush audio decoder when audio is turned off to prevent expand packets
                     if audio_turned_off {
+                        self.stamped_audio_kbps = None;
                         // For NetEq audio decoders, we need to flush the buffer to prevent hissing
                         self.audio.flush();
                         debug!(
@@ -3941,10 +4167,9 @@ impl Peer {
                     // Flush screen decoder when screen sharing is turned off
                     if screen_turned_off {
                         self.screen.flush();
-                        // HCL #893 re-share: the screen decoder is reused across
-                        // stop→restart (only flushed, never recreated), so its
-                        // once-per-lifetime first-render ack latch survives. Re-arm
-                        // it here so the NEXT share re-fires
+                        // HCL #893 re-share: a screen decoder reused across
+                        // stop→restart keeps its once-per-lifetime first-render ack
+                        // latch. Re-arm it here so the NEXT share re-fires
                         // PEER_EVENT(screen_decode_started); otherwise every share
                         // after the first in this page session never acks and the
                         // publisher falsely toasts "No peers received the shared
@@ -4217,7 +4442,8 @@ pub struct PeerDecodeManager {
     /// entry is created (via `ensure_peer()`) is still applied once the first
     /// media packet brings the peer online.
     is_guest_cache: HashMap<u64, bool>,
-    /// Roster ids awaiting confirmation from the existing-member replay (#2267).
+    /// Roster ids awaiting confirmation from the existing-member replay or a packet
+    /// decoded after the promote (#2267).
     superseded_candidates: HashSet<u64>,
     /// Whether `superseded_candidates` may be acted on by the next monitor pass.
     superseded_eligible: bool,
@@ -4282,6 +4508,7 @@ pub struct PeerDecodeManager {
     /// benign defense-in-depth shadow of the relay's 32/s cap (see
     /// [`super::pli_budget`]).
     pli_budget: Rc<RefCell<PliBudget>>,
+    boot_queue: WorkerBootQueue,
     /// #1256 Phase 1: per-peer rendered-tile-size hints pushed by the UI. Keyed by
     /// session_id (same key as `connected_peers`). A peer ABSENT from this map (or
     /// `Uncapped`) gets NO size lid — fail-open, so an unknown peer is never capped.
@@ -4338,6 +4565,7 @@ impl PeerDecodeManager {
             screen_decode_retry_tokens: HashMap::new(),
             last_delete_peer_snapshot_ms: 0,
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
+            boot_queue: WorkerBootQueue::default(),
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
             skip_canvas_paint: false,
@@ -4369,6 +4597,7 @@ impl PeerDecodeManager {
             screen_decode_retry_tokens: HashMap::new(),
             last_delete_peer_snapshot_ms: 0,
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
+            boot_queue: WorkerBootQueue::default(),
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
             skip_canvas_paint: false,
@@ -4394,11 +4623,29 @@ impl PeerDecodeManager {
             .insert(session_id, make_zero_loss_top_peer(session_id));
     }
 
-    #[cfg(feature = "testing")]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn insert_peer_for_test(&mut self, session_id: u64, user_id: &str) {
         let (mut peer, _muted) = make_test_peer(session_id);
         peer.user_id = user_id.to_string();
         self.connected_peers.insert(session_id, peer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn end_screen_share_a_hold_ago_for_test(&mut self, session_id: u64, now_ms: u64) {
+        let peer = self.connected_peers.get_mut(&session_id).expect("peer");
+        let ended_at = now_ms - SCREEN_DECODER_IDLE_TEARDOWN_MS;
+        peer.screen_decoder_live = true;
+        peer.screen_enabled = false;
+        peer.screen_off_since_ms = Some(ended_at);
+        peer.last_screen_frame_ms = ended_at;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn screen_decoder_live_for_test(&self, session_id: u64) -> bool {
+        self.connected_peers
+            .get(&session_id)
+            .expect("peer")
+            .screen_decoder_live
     }
 
     #[cfg(feature = "testing")]
@@ -4681,6 +4928,7 @@ impl PeerDecodeManager {
                     peer.screen.clear_canvas();
                 }
                 peer.visible = visible;
+                peer.refresh_boot_hints();
                 if let Some(diagnostics) = &self.diagnostics {
                     diagnostics.set_peer_decode_eligibility(&peer.sid_str, visible);
                 }
@@ -4839,6 +5087,11 @@ impl PeerDecodeManager {
     /// of the relay's existing-member replay (#2267). Staged ids stay INERT until
     /// [`Self::promote_roster_reconcile`]: no packets arrive while the transport is
     /// down, so a pass acting here would reap peers for the outage itself.
+    #[cfg(test)]
+    pub(crate) fn roster_reconcile_pending_for_test(&self) -> bool {
+        !self.superseded_candidates.is_empty()
+    }
+
     pub fn begin_roster_reconcile(&mut self) {
         self.superseded_candidates = self
             .connected_peers
@@ -4859,7 +5112,7 @@ impl PeerDecodeManager {
     }
 
     /// Make the staged ids eligible for the next [`Self::run_peer_monitor`] pass,
-    /// which drops those still unconfirmed AND silent.
+    /// which drops those neither confirmed nor heard from since this promote.
     pub fn promote_roster_reconcile(&mut self) {
         self.superseded_eligible = true;
     }
@@ -4868,6 +5121,28 @@ impl PeerDecodeManager {
     /// which the relay replays per existing member on join AND on reconnect.
     pub fn confirm_peer_present(&mut self, session_id: u64) {
         self.superseded_candidates.remove(&session_id);
+    }
+
+    pub fn tick_decoders(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32> {
+        let desired = self.tick_layer_choosers(now_ms, bounds);
+        self.retire_idle_screen_decoders(now_ms);
+        desired
+    }
+
+    /// Tear down screen decoder workers whose share has ended (#3210). `now_ms` is the same
+    /// `Date::now()` clock `Peer::decode` stamps screen frames with.
+    fn retire_idle_screen_decoders(&mut self, now_ms: u64) {
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                if peer.screen_decoder_idle(now_ms) {
+                    peer.retire_screen_decoder();
+                }
+            }
+        }
     }
 
     pub fn run_peer_monitor(&mut self) -> Vec<String> {
@@ -4879,7 +5154,7 @@ impl PeerDecodeManager {
             HashSet::new()
         };
         let removed = self.connected_peers.remove_if_and_return(|peer| {
-            if superseded.contains(&peer.session_id) && peer.activity_count == 0 {
+            if superseded.contains(&peer.session_id) {
                 return false;
             }
             peer.check_heartbeat()
@@ -5124,16 +5399,10 @@ impl PeerDecodeManager {
         // 300ms-debounced. Every request still hits the relay's
         // per-(receiver, target_session) limiter regardless.
         //
-        // Recovery if this PLI is DROPPED (relay limiter / lost packet): there is NO
-        // client-side retry here — a layer switch only `reanchor_for_layer_switch`s
-        // the sequence tracker (no gap PLI for the new layer's in-order packets), and
-        // the next tick reads `old == current` so it does not re-poke. The decode is
-        // NOT wedged, though: a layer switch does not flush the jitter buffer, so the
-        // prior layer's last-good frame keeps painting (scaled, never blank) and the
-        // codecs jitter buffer fires its OWN keyframe-less recovery PLI at
-        // `MAX_PLAYOUT_AGE_MS` (bounded by #1662). That jitter-buffer path — a
-        // different subsystem — is the actual safety net for a dropped up-switch PLI;
-        // do not remove it on the assumption this loop self-heals.
+        // Recovery if this PLI is DROPPED: the next tick reads `old == current` and
+        // does not re-poke. The safety net is the worker jitter buffer, flushed when
+        // the first new-layer frame is pushed (`flush_on_layer_change`): that delta
+        // fires its stream-open keyframe request, and the canvas keeps the last frame.
         for (user_id, sid, mt) in up_switches {
             self.send_keyframe_request(&user_id, sid, mt);
         }
@@ -5654,7 +5923,7 @@ impl PeerDecodeManager {
         match kind {
             PrefMediaKind::Screen => enrich_screen_snapshot(peer, &mut snap),
             PrefMediaKind::Video => enrich_video_snapshot(peer, &mut snap),
-            PrefMediaKind::Audio => {}
+            PrefMediaKind::Audio => enrich_audio_snapshot(peer, &mut snap),
         }
         Some(snap)
     }
@@ -5734,13 +6003,15 @@ impl PeerDecodeManager {
             });
             let audio = peer.audio_enabled.then(|| {
                 let avail_top = peer.audio_layer_availability.highest_available(now_ms);
-                received_layer_snapshot_with_reason(
+                let mut snap = received_layer_snapshot_with_reason(
                     PrefMediaKind::Audio,
                     peer.selected_audio_layer,
                     avail_top,
                     audio_max,
                     peer.audio_layer_chooser.is_constrained(),
-                )
+                );
+                enrich_audio_snapshot(peer, &mut snap);
+                snap
             });
             // Skip peers with nothing flowing so the list stays compact.
             if video.is_none() && screen.is_none() && audio.is_none() {
@@ -5764,6 +6035,7 @@ impl PeerDecodeManager {
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
+        self.retry_held_audio_boots();
         let packet = Arc::new(response);
         let peer_session_id = packet.session_id;
 
@@ -5797,14 +6069,11 @@ impl PeerDecodeManager {
                 peer.screen
                     .set_stream_context(local_sid_for_context.clone(), peer.sid_str.clone());
                 // Issue #1025: install the proactive keyframe-request route on each video
-                // decoder. The worker fires this (via the jitter buffer) the instant it evicts a
-                // stale keyframe-less backlog for this stream, so we request a fresh keyframe for
-                // THIS peer + media type immediately. Each route is bound to one (peer,
-                // media_type) and emits the identical `KEYFRAME_REQUEST` that the gap-/
-                // visibility-driven paths do, so it flows through the same relay limiter (#979 /
-                // #1011) and cannot storm. Installed only when the transport is wired
-                // (`send_packet` set); `session_id` (not `sid_str`) is the per-session limiter
-                // key (#1124).
+                // decoder. Each route is bound to one (peer, media_type) and emits the identical
+                // `KEYFRAME_REQUEST` that the gap-/visibility-driven paths do, so it flows through
+                // the same relay limiter (#979 / #1011) and cannot storm. Installed only when the
+                // transport is wired (`send_packet` set); `session_id` (not `sid_str`) is the
+                // per-session limiter key (#1124).
                 if let Some(send_packet) = &send_packet_for_route {
                     install_keyframe_request_routes(
                         peer,
@@ -5854,7 +6123,16 @@ impl PeerDecodeManager {
             // AUDIO arm's datagram-loss tracker runs only when this receiver is
             // on WebTransport (audio can ride datagrams only there).
             peer.receiver_on_webtransport = self.receiver_on_webtransport;
-            match peer.decode(&packet, userid) {
+            let decoded = peer.decode(&packet, userid);
+            peer.refresh_boot_hints();
+            peer.retry_timed_out_boots(
+                &local_sid_for_context,
+                &[BootKind::Video, BootKind::Screen],
+            );
+            if self.superseded_eligible && decoded.is_ok() {
+                self.superseded_candidates.remove(&peer_session_id);
+            }
+            match decoded {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_activity();
                     // #2511: the only arm in this match that keeps firing once media stops.
@@ -6164,11 +6442,8 @@ impl PeerDecodeManager {
             self.vad_threshold,
             cached_is_guest,
             self.skip_canvas_paint,
+            &self.boot_queue,
         )?;
-        // Issue #1640: send SetContext to the worker immediately at peer creation
-        // so the publisher session_id (`to_peer`) is populated from the first frame.
-        // `from_peer` = local session_id if known, else empty (backfilled when
-        // `set_local_session_id` is called on SESSION_ASSIGNED).
         let from_peer = self.local_session_id.clone().unwrap_or_default();
         peer.video
             .set_stream_context(from_peer.clone(), sid_str.clone());
@@ -6435,6 +6710,17 @@ impl PeerDecodeManager {
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
+    /// Drops every peer, and so every worker and queued boot, without notifying the UI: the
+    /// client is going away (#3277).
+    pub fn drop_all_peers_for_disconnect(&mut self) {
+        for token in self.screen_decode_retry_tokens.values() {
+            token.set(false);
+        }
+        self.screen_decode_retry_tokens.clear();
+        drop(self.connected_peers.drain_all());
+        self.invalidate_sorted_string_keys();
+    }
+
     /// Collapse a superseded session onto its successor (#2269).
     pub fn adopt_resumed_session(
         &mut self,
@@ -6459,6 +6745,27 @@ impl PeerDecodeManager {
         let had_predecessor = self.connected_peers.contains_key(&previous_session_id);
         self.delete_peer(previous_session_id);
         had_predecessor
+    }
+
+    /// The worker-boot queue this manager's peers boot through (one per client).
+    pub(crate) fn worker_boot_queue(&self) -> WorkerBootQueue {
+        self.boot_queue.clone()
+    }
+
+    /// Retries every timed-out audio boot that holds back camera and screen boots, then lets the
+    /// cameras past (#3277): a peer that is gone or has no retry left ends its hold here.
+    pub(crate) fn retry_held_audio_boots(&mut self) {
+        let held = self.boot_queue.audio_hold_sessions();
+        if held.is_empty() {
+            return;
+        }
+        let from_peer = self.local_session_id.clone().unwrap_or_default();
+        for session_id in held {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                peer.retry_timed_out_boots(&from_peer, &[BootKind::Audio]);
+            }
+            self.boot_queue.end_audio_hold(session_id);
+        }
     }
 
     pub fn ensure_peer(&mut self, session_id: u64, user_id: &str) -> PeerStatus {
@@ -6726,6 +7033,19 @@ impl PeerDecodeManager {
         self.display_name_cache.get(&sid).cloned()
     }
 
+    /// Display name of any connected session belonging to `user_id`.
+    pub fn get_display_name_by_user_id(&self, user_id: &str) -> Option<String> {
+        self.connected_peers.ordered_keys().iter().find_map(|sid| {
+            let peer = self.connected_peers.get(sid)?;
+            if peer.user_id != user_id {
+                return None;
+            }
+            peer.display_name
+                .clone()
+                .or_else(|| self.display_name_cache.get(sid).cloned())
+        })
+    }
+
     /// Get a peer's self-reported device info (#1482) by relay session_id.
     /// THE UI CONTRACT: returns the live peer's `device_info` if the peer exists
     /// and has at least one populated field, else falls back to the cache (info
@@ -6840,6 +7160,11 @@ impl PeerDecodeManager {
         }
         0.0
     }
+
+    pub fn peer_stamped_audio_kbps(&self, key: &str) -> Option<u32> {
+        let sid: u64 = key.parse().ok()?;
+        self.connected_peers.get(&sid)?.stamped_audio_kbps()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6932,6 +7257,8 @@ fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
         audio: Box::new(mock_audio),
         video: VideoPeerDecoder::noop(),
         screen: VideoPeerDecoder::noop(),
+        screen_decoder_live: true,
+        screen_off_since_ms: None,
         session_id,
         sid_str,
         user_id: "test@test.com".into(),
@@ -6988,6 +7315,9 @@ fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
         last_gate_skips_log: Cell::new(None),
         receiver_on_webtransport: false,
         audio_datagram_loss: AudioDatagramLossTracker::new(),
+        stamped_audio_kbps: None,
+        pushed_video_layer: None,
+        boot: PeerBoot::default(),
     };
     (peer, muted_handle)
 }
@@ -7162,6 +7492,115 @@ mod tests {
             "#2251: the receiver must decode the base rung the relay is still \
              forwarding instead of freezing on a rung that stopped"
         );
+    }
+
+    fn layered_video_frame(session_id: u64, layer: u32, seq: u64, key: bool) -> Arc<PacketWrapper> {
+        use videocall_types::protos::media_packet::{VideoCodec, VideoMetadata};
+        Arc::new(PacketWrapper {
+            data: MediaPacket {
+                media_type: MediaType::VIDEO.into(),
+                video_metadata: Some(VideoMetadata {
+                    sequence: seq,
+                    codec: VideoCodec::VP9_PROFILE0_LEVEL10_8BIT.into(),
+                    ..Default::default()
+                })
+                .into(),
+                frame_type: if key { "key" } else { "delta" }.to_string(),
+                data: vec![0; 10],
+                ..Default::default()
+            }
+            .write_to_bytes()
+            .expect("serialize"),
+            user_id: "test@test.com".into(),
+            packet_type: PacketType::MEDIA.into(),
+            session_id,
+            simulcast_layer_id: layer,
+            media_kind: MediaKind::VIDEO.into(),
+            ..Default::default()
+        })
+    }
+
+    /// A visible, video-on peer whose camera decoder is a real jitter buffer.
+    fn jitter_buffer_peer(
+        session_id: u64,
+    ) -> (Peer, crate::decode::peer_decoder::JitterBufferProbe) {
+        let (mut peer, _muted) = make_test_peer(session_id);
+        let (video, probe) = VideoPeerDecoder::backed_by_jitter_buffer();
+        peer.video = video;
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        peer.visible = true;
+        (peer, probe)
+    }
+
+    fn feed(peer: &mut Peer, layer: u32, seqs: std::ops::RangeInclusive<u64>, key_at: Option<u64>) {
+        for seq in seqs {
+            let pkt = layered_video_frame(peer.session_id, layer, seq, key_at == Some(seq));
+            peer.decode(&pkt, "local@test.com").expect("decode");
+        }
+    }
+
+    /// Polls the jitter buffer past its playout delay and returns everything decoded so far.
+    fn drain(probe: &crate::decode::peer_decoder::JitterBufferProbe) -> Vec<u64> {
+        let later = web_time::SystemTime::now()
+            .duration_since(web_time::SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis()
+            + 200;
+        probe.jb.borrow_mut().find_and_move_continuous_frames(later);
+        probe.decoded.lock().expect("decoded").clone()
+    }
+
+    /// #3204: after a step-down from video layer 1 to video layer 0, whose frame numbers are
+    /// far lower, the first video layer 0 delta must request a keyframe and the next video
+    /// layer 0 keyframe must decode — not wait for a scheduled keyframe that is then discarded.
+    #[test]
+    fn a_video_step_down_requests_a_keyframe_and_decodes_the_new_layer() {
+        let (mut peer, probe) = jitter_buffer_peer(3204);
+        peer.set_selected_video_layer(1);
+        feed(&mut peer, 1, 6475..=6480, Some(6475));
+        assert_eq!(drain(&probe), (6475..=6480).collect::<Vec<_>>());
+        assert_eq!(probe.keyframe_requests.get(), 0);
+
+        let lid = crate::decode::layer_chooser::KindLayerBounds {
+            min: None,
+            max: Some(0),
+        };
+        assert_eq!(peer.tick_layer_chooser(now_ms(), lid), 0);
+
+        feed(&mut peer, 1, 6481..=6481, None);
+        feed(&mut peer, 0, 3250..=3250, None);
+        assert_eq!(
+            probe.keyframe_requests.get(),
+            1,
+            "the first video layer 0 delta must request a keyframe at once"
+        );
+        feed(&mut peer, 0, 3251..=3253, Some(3252));
+        assert_eq!(
+            drain(&probe),
+            vec![6475, 6476, 6477, 6478, 6479, 6480, 3252, 3253],
+            "video layer 0 must decode from its keyframe on"
+        );
+        assert_eq!(probe.keyframe_requests.get(), 1);
+        assert_eq!(
+            peer.video.canvas_clears_for_test(),
+            0,
+            "the switch must leave the last frame on the canvas"
+        );
+    }
+
+    /// The guard moving and moving back before any frame of the other layer arrives (the
+    /// #1695 reconcile round trip) leaves the decoding stream untouched.
+    #[test]
+    fn a_guard_round_trip_with_no_frames_between_keeps_decoding() {
+        let (mut peer, probe) = jitter_buffer_peer(3205);
+        feed(&mut peer, 0, 100..=101, Some(100));
+        peer.set_selected_video_layer(1);
+        peer.set_selected_video_layer(0);
+        feed(&mut peer, 0, 102..=102, None);
+
+        assert_eq!(drain(&probe), vec![100, 101, 102]);
+        assert_eq!(probe.keyframe_requests.get(), 0);
     }
 
     /// #2251 wiring. MUTATION: delete the VIDEO-arm call and the guard stays on 2.
@@ -15788,6 +16227,8 @@ mod tests {
                 audio: Box::new(mock_audio),
                 video: VideoPeerDecoder::noop(),
                 screen: VideoPeerDecoder::noop(),
+                screen_decoder_live: true,
+                screen_off_since_ms: None,
                 session_id: sid,
                 sid_str: sid.to_string(),
                 user_id: peer_uids[i].to_string(),
@@ -15844,6 +16285,9 @@ mod tests {
                 last_gate_skips_log: Cell::new(None),
                 receiver_on_webtransport: false,
                 audio_datagram_loss: AudioDatagramLossTracker::new(),
+                stamped_audio_kbps: None,
+                pushed_video_layer: None,
+                boot: PeerBoot::default(),
             };
             manager.connected_peers.insert(sid, peer);
         }
@@ -15918,6 +16362,8 @@ mod tests {
             audio: Box::new(mock_audio),
             video: VideoPeerDecoder::noop(),
             screen: VideoPeerDecoder::noop(),
+            screen_decoder_live: true,
+            screen_off_since_ms: None,
             session_id: 510,
             sid_str: "510".to_string(),
             user_id: "peerX@x.com".to_string(),
@@ -15974,6 +16420,9 @@ mod tests {
             last_gate_skips_log: Cell::new(None),
             receiver_on_webtransport: false,
             audio_datagram_loss: AudioDatagramLossTracker::new(),
+            stamped_audio_kbps: None,
+            pushed_video_layer: None,
+            boot: PeerBoot::default(),
         };
         manager.connected_peers.insert(510, peer);
 
@@ -16008,6 +16457,8 @@ mod tests {
             audio: Box::new(mock_audio),
             video: VideoPeerDecoder::noop(),
             screen: VideoPeerDecoder::noop(),
+            screen_decoder_live: true,
+            screen_off_since_ms: None,
             session_id: 520,
             sid_str: "520".to_string(),
             user_id: "peerY@x.com".to_string(),
@@ -16064,6 +16515,9 @@ mod tests {
             last_gate_skips_log: Cell::new(None),
             receiver_on_webtransport: false,
             audio_datagram_loss: AudioDatagramLossTracker::new(),
+            stamped_audio_kbps: None,
+            pushed_video_layer: None,
+            boot: PeerBoot::default(),
         };
         manager.connected_peers.insert(520, peer);
 
@@ -16255,6 +16709,40 @@ mod tests {
             Some("HostUser".to_string()),
             "should fall back to cache when peer entry has no display_name"
         );
+    }
+
+    #[test]
+    fn display_name_by_user_id_resolves_through_connected_peers() {
+        let mut manager = PeerDecodeManager::new();
+        manager.set_peer_display_name(300, "Cache Only".to_string());
+        manager.insert_peer_for_test(301, "bob@example.com");
+        manager.insert_peer_for_test(302, "hana@example.com");
+        manager.set_peer_display_name(302, "Hana".to_string());
+        manager.insert_peer_for_test(303, "kai@example.com");
+        manager.display_name_cache.insert(303, "Kai".to_string());
+
+        assert_eq!(
+            manager.get_display_name_by_user_id("hana@example.com"),
+            Some("Hana".to_string())
+        );
+        assert_eq!(
+            manager.get_display_name_by_user_id("kai@example.com"),
+            Some("Kai".to_string())
+        );
+        assert_eq!(manager.get_display_name_by_user_id("bob@example.com"), None);
+        assert_eq!(
+            manager.get_display_name_by_user_id("nobody@example.com"),
+            None
+        );
+        // Session 300 has a cached name but no connected peer, so no user id
+        // (nor its session id, nor the empty id) reaches it.
+        for user_id in ["", "300", "Cache Only"] {
+            assert_eq!(
+                manager.get_display_name_by_user_id(user_id),
+                None,
+                "{user_id:?}"
+            );
+        }
     }
 
     /// No peer entry and no cache → should return None.
@@ -16587,7 +17075,7 @@ mod tests {
         assert!(second.is_empty(), "after clear_all the cache is empty");
     }
 
-    /// #2267. 100 = silent but CONFIRMED, 200 = silent + unconfirmed, 300 = active.
+    /// #2267. 100 = silent but CONFIRMED, 200 = silent + unconfirmed, 300 = heard after the promote.
     #[test]
     fn reconnect_reconcile_reaps_only_unconfirmed_and_silent_peers() {
         let mut manager = PeerDecodeManager::new();
@@ -16606,6 +17094,15 @@ mod tests {
         manager.begin_roster_reconcile();
         manager.confirm_peer_present(100);
         manager.promote_roster_reconcile();
+        let _ = manager.decode(
+            packet_wrapper(&reconcile_heartbeat_media(), 300),
+            "test@test.com",
+        );
+        assert_eq!(
+            manager.superseded_candidate_count(),
+            1,
+            "a packet decoded after the promote clears that session's candidacy"
+        );
         let removed = manager.run_peer_monitor();
 
         assert_eq!(
@@ -16620,7 +17117,7 @@ mod tests {
         );
         assert!(
             manager.connected_peers.contains_key(&300),
-            "300 is still delivering media, so a dropped replay packet must not reap it"
+            "300 sent a heartbeat after the promote, so a dropped replay packet must not reap it"
         );
         assert_eq!(
             manager
@@ -16631,6 +17128,72 @@ mod tests {
             1,
             "a surviving silent peer still advances the ordinary 3-strike watchdog"
         );
+    }
+
+    #[test]
+    fn reconnect_reconcile_reaps_an_unconfirmed_peer_whose_traffic_predates_the_stage() {
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(200);
+        let _ = manager.decode(
+            packet_wrapper(&media_of(MediaType::AUDIO), 200),
+            "test@test.com",
+        );
+        assert!(
+            manager.connected_peers.get(&200).unwrap().activity_count > 0,
+            "precondition: 200 was sending up to the transport loss"
+        );
+
+        manager.begin_roster_reconcile();
+        manager.promote_roster_reconcile();
+
+        assert_eq!(
+            manager.run_peer_monitor(),
+            vec!["200".to_string()],
+            "the replay omitted 200 and nothing arrived from it after the stage"
+        );
+    }
+
+    #[test]
+    fn reconnect_reconcile_counts_only_packets_decoded_after_the_promote() {
+        let mut manager = PeerDecodeManager::new();
+        for sid in [200u64, 300, 400] {
+            manager.insert_zero_loss_top_peer_for_test(sid);
+        }
+
+        manager.begin_roster_reconcile();
+        let _ = manager.decode(
+            packet_wrapper(&reconcile_heartbeat_media(), 200),
+            "test@test.com",
+        );
+        manager.promote_roster_reconcile();
+        let _ = manager.decode(
+            packet_wrapper(&reconcile_heartbeat_media(), 300),
+            "test@test.com",
+        );
+        let _ = manager.decode(
+            PacketWrapper {
+                packet_type: PacketType::MEETING.into(),
+                session_id: 400,
+                ..Default::default()
+            },
+            "test@test.com",
+        );
+
+        assert_eq!(
+            manager.run_peer_monitor(),
+            vec!["200".to_string(), "400".to_string()],
+            "200 was heard only before the promote and 400 only by a packet that failed \
+             to decode; 300's heartbeat after the promote is the only proof of life"
+        );
+    }
+
+    fn reconcile_heartbeat_media() -> MediaPacket {
+        MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata::default()).into(),
+            ..Default::default()
+        }
     }
 
     /// #2267: no packets arrive while the transport is down, so a pass between the
@@ -16673,12 +17236,13 @@ mod tests {
 
         manager.begin_roster_reconcile();
         manager.promote_roster_reconcile();
-        assert!(
-            manager.run_peer_monitor().is_empty(),
-            "precondition: 300 is active on the promoted pass, so it survives it"
+        assert_eq!(
+            manager.run_peer_monitor(),
+            vec!["300".to_string()],
+            "precondition: the promoted pass reaps the unconfirmed, unheard 300"
         );
 
-        manager.silence_peer_for_test(300);
+        manager.insert_zero_loss_top_peer_for_test(300);
         manager.promote_roster_reconcile();
         assert!(
             manager.run_peer_monitor().is_empty(),
@@ -18117,13 +18681,6 @@ mod tests {
         );
     }
 
-    /// Plain `#[test]`: `add_peer` call-site — when `local_session_id` is
-    /// already set (SESSION_ASSIGNED arrived before the peer joined), the peer
-    /// worker must immediately receive `from_peer = local_session_id`, not the
-    /// local user's email. This guards the `add_peer` call-site change:
-    /// reverting to `userid.to_string()` makes `from_peer` an email and fails.
-    ///
-    /// Uses direct `connected_peers.insert` (noop decoder, no JS canvas APIs).
     #[test]
     fn add_peer_uses_local_session_id_as_from_peer_when_already_set() {
         let mut mgr = PeerDecodeManager::new();
@@ -19052,4 +19609,650 @@ mod tests {
             );
         }
     }
+
+    fn stamped_audio_media(kbps: u32) -> MediaPacket {
+        use videocall_types::protos::media_packet::AudioMetadata;
+        let mut media = media_of(MediaType::AUDIO);
+        media.audio_metadata = Some(AudioMetadata {
+            encoder_target_bitrate_kbps: kbps,
+            ..Default::default()
+        })
+        .into();
+        media
+    }
+
+    fn manager_with_audio_peer(sid: u64) -> PeerDecodeManager {
+        let mut manager = PeerDecodeManager::new();
+        manager.connected_peers.insert(sid, make_test_peer(sid).0);
+        manager
+    }
+
+    #[test]
+    fn stamped_audio_kbps_holds_the_last_stamp_and_ignores_out_of_range() {
+        let mut manager = manager_with_audio_peer(3170);
+        assert_eq!(manager.peer_stamped_audio_kbps("3170"), None, "fresh peer");
+
+        for (stamp, want) in [(48, 48), (0, 48), (9999, 48), (511, 48), (24, 24), (0, 24)] {
+            let _ = manager.decode(packet_wrapper(&stamped_audio_media(stamp), 3170), "me");
+            assert_eq!(
+                manager.peer_stamped_audio_kbps("3170"),
+                Some(want),
+                "after a packet stamped {stamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_turning_off_clears_the_stamped_audio_kbps() {
+        let (mut peer, _muted) = make_test_peer(3171);
+        let _ = peer.decode(&wrap(&stamped_audio_media(48), 3171), "");
+        assert_eq!(peer.stamped_audio_kbps(), Some(48));
+
+        peer.last_audio_frame_ms = 1;
+        let _ = peer.decode(&heartbeat_packet(3171, false, false, false), "");
+        assert_eq!(peer.stamped_audio_kbps(), None);
+        let _ = peer.decode(&heartbeat_packet(3171, false, true, false), "");
+        assert_eq!(
+            peer.stamped_audio_kbps(),
+            None,
+            "re-enabling with no new stamp shows nothing"
+        );
+    }
+
+    #[test]
+    fn a_stamp_arriving_while_audio_is_off_shows_once_audio_is_on() {
+        let (mut peer, _muted) = make_test_peer(3172);
+        let _ = peer.decode(&heartbeat_packet(3172, false, false, false), "");
+        let _ = peer.decode(&wrap(&stamped_audio_media(24), 3172), "");
+        assert_eq!(peer.stamped_audio_kbps(), None, "audio is off");
+        let _ = peer.decode(&heartbeat_packet(3172, false, true, false), "");
+        assert_eq!(peer.stamped_audio_kbps(), Some(24));
+    }
+
+    #[test]
+    fn host_force_mute_clears_the_stamped_audio_kbps() {
+        let (mut peer, _muted) = make_test_peer(3173);
+        let _ = peer.decode(&wrap(&stamped_audio_media(48), 3173), "");
+        assert_eq!(peer.stamped_audio_kbps(), Some(48));
+        assert!(peer.force_media_off(true, false));
+        peer.audio_enabled = true;
+        assert_eq!(peer.stamped_audio_kbps(), None);
+    }
+
+    #[test]
+    fn host_mute_and_disable_video_reach_the_boot_queue_hints() {
+        let mut manager = PeerDecodeManager::new();
+        for (sid, uid) in [(3175, "one@test.com"), (3176, "two@test.com")] {
+            manager.insert_peer_for_test(sid, uid);
+            let peer = manager.connected_peers.get_mut(&sid).unwrap();
+            (peer.audio_enabled, peer.is_speaking, peer.video_enabled) = (true, true, true);
+            peer.refresh_boot_hints();
+        }
+        let hints =
+            |m: &PeerDecodeManager, sid| m.connected_peers.get(&sid).unwrap().boot.hints.get();
+        let off = |h: PeerBootHints| (h.speaking, h.audio_on, h.video_on);
+
+        manager.force_peer_media_off("one@test.com", true, true);
+        assert_eq!(off(hints(&manager, 3175)), (false, false, false));
+        assert_eq!(off(hints(&manager, 3176)), (true, true, true));
+
+        manager.force_all_peers_media_off_except("host@test.com", true, true);
+        assert_eq!(off(hints(&manager, 3176)), (false, false, false));
+    }
+
+    #[test]
+    fn audio_snapshots_carry_the_stamped_bitrate() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+        let mut manager = manager_with_audio_peer(3174);
+        let _ = manager.decode(packet_wrapper(&stamped_audio_media(48), 3174), "me");
+        let now = now_ms();
+
+        let needle = manager
+            .received_layer_snapshot(PrefMediaKind::Audio, now)
+            .expect("an audio-enabled peer yields a needle snapshot");
+        assert_eq!(needle.kbps, 48);
+        let rows = manager.per_peer_received_snapshots(now, &ReceiveLayerBounds::default());
+        let row = rows
+            .iter()
+            .find(|r| r.session_id == 3174)
+            .and_then(|r| r.audio)
+            .expect("the peer must appear with an audio snapshot");
+        assert_eq!(row.kbps, 48);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    mod lazy_screen_decoder {
+        use super::*;
+        use videocall_types::protos::media_packet::VideoMetadata;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+
+        // Counts `Worker` constructions and `terminate()` calls per script URL.
+        #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function install_worker_counter() {
+  if (globalThis.__workerCounts) return;
+  const W = globalThis.Worker;
+  const counts = { created: {}, terminated: {} };
+  globalThis.__workerCounts = counts;
+  const terminate = W.prototype.terminate;
+  globalThis.Worker = class extends W {
+    constructor(url, opts) {
+      super(url, opts);
+      this.__countKey = String(url);
+      counts.created[this.__countKey] = (counts.created[this.__countKey] || 0) + 1;
+    }
+  };
+  W.prototype.terminate = function () {
+    if (this.__countKey) counts.terminated[this.__countKey] = (counts.terminated[this.__countKey] || 0) + 1;
+    return terminate.call(this);
+  };
 }
+export function point_codecs_worker_at(src) {
+  const link = document.getElementById("codecs-worker");
+  const previous = link.getAttribute("href");
+  link.setAttribute("href", URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  return previous;
+}
+export function restore_codecs_worker(previous) {
+  document.getElementById("codecs-worker").setAttribute("href", previous);
+}
+export function point_neteq_worker_at_a_ready_stub() {
+  const link = document.getElementById("neteq-worker");
+  const previous = link.getAttribute("href");
+  const src = 'self.postMessage({ type: "workerReady", mute_state: true }); self.onmessage = () => {};';
+  link.setAttribute("href", URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  return previous;
+}
+export function restore_neteq_worker(previous) {
+  document.getElementById("neteq-worker").setAttribute("href", previous);
+}
+export function worker_count(kind, url) {
+  return globalThis.__workerCounts[kind][url] || 0;
+}
+export function shift_date_now(ms) {
+  if (!globalThis.__realDateNow) globalThis.__realDateNow = Date.now;
+  const real = globalThis.__realDateNow;
+  Date.now = ms === 0 ? real : () => real() + ms;
+}
+"#)]
+        extern "C" {
+            fn install_worker_counter();
+            fn worker_count(kind: &str, url: &str) -> u32;
+            fn point_codecs_worker_at(src: &str) -> String;
+            fn restore_codecs_worker(previous: String);
+            fn point_neteq_worker_at_a_ready_stub() -> String;
+            fn restore_neteq_worker(previous: String);
+            fn shift_date_now(ms: f64);
+        }
+
+        struct DateNowShift;
+
+        impl DateNowShift {
+            fn by(ms: f64) -> Self {
+                shift_date_now(ms);
+                Self
+            }
+        }
+
+        impl Drop for DateNowShift {
+            fn drop(&mut self) {
+                shift_date_now(0.0);
+            }
+        }
+
+        const SID: u64 = 3210;
+
+        fn codecs_worker_url() -> String {
+            web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id("codecs-worker"))
+                .and_then(|l| l.get_attribute("href"))
+                .expect("codecs-worker link")
+        }
+
+        /// Also stands in a NetEq worker that reports ready, since cameras and screens boot only
+        /// once the NetEq boot has settled (#3277).
+        struct Counts {
+            url: String,
+            created: u32,
+            terminated: u32,
+            neteq_link: Option<String>,
+        }
+
+        impl Drop for Counts {
+            fn drop(&mut self) {
+                if let Some(previous) = self.neteq_link.take() {
+                    restore_neteq_worker(previous);
+                }
+            }
+        }
+
+        impl Counts {
+            fn start() -> Self {
+                ensure_decoder_worker_link_tags();
+                install_worker_counter();
+                let url = codecs_worker_url();
+                Self {
+                    created: worker_count("created", &url),
+                    terminated: worker_count("terminated", &url),
+                    url,
+                    neteq_link: Some(point_neteq_worker_at_a_ready_stub()),
+                }
+            }
+            fn created(&self) -> u32 {
+                worker_count("created", &self.url) - self.created
+            }
+            fn terminated(&self) -> u32 {
+                worker_count("terminated", &self.url) - self.terminated
+            }
+        }
+
+        fn screen_packet_of(seq: u64, frame_type: &str) -> Arc<PacketWrapper> {
+            Arc::new(PacketWrapper {
+                data: MediaPacket {
+                    media_type: MediaType::SCREEN.into(),
+                    video_metadata: Some(VideoMetadata {
+                        sequence: seq,
+                        codec: videocall_types::protos::media_packet::VideoCodec::VP8.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    frame_type: frame_type.to_string(),
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .expect("serialize"),
+                user_id: "sharer@test.com".into(),
+                packet_type: PacketType::MEDIA.into(),
+                session_id: SID,
+                media_kind: MediaKind::SCREEN.into(),
+                ..Default::default()
+            })
+        }
+
+        fn manager_with_peer(visible: bool) -> PeerDecodeManager {
+            let mut manager = PeerDecodeManager::new();
+            manager
+                .add_peer("sharer@test.com", SID, None)
+                .expect("add_peer");
+            manager.connected_peers.get_mut(&SID).expect("peer").visible = visible;
+            manager
+        }
+
+        fn share(manager: &mut PeerDecodeManager, seq: u64) {
+            share_of(manager, seq, "key");
+        }
+
+        fn share_of(manager: &mut PeerDecodeManager, seq: u64, frame_type: &str) {
+            let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+            let _ = peer.decode(&screen_packet_of(seq, frame_type), "local@test.com");
+            peer.refresh_boot_hints();
+        }
+
+        /// Waits for the boot queue to start this peer's workers.
+        async fn boot(manager: &PeerDecodeManager) {
+            use crate::decode::WorkerBootState::{Booting, Queued};
+            for _ in 0..2000 {
+                let peer = manager.connected_peers.get(&SID).expect("peer");
+                let audio = peer.audio.boot_state_for_test();
+                if !matches!(audio, Queued | Booting)
+                    && peer.video.boot_state_for_test() != Queued
+                    && (!peer.screen_decoder_live || peer.screen.boot_state_for_test() != Queued)
+                {
+                    return;
+                }
+                gloo_timers::future::TimeoutFuture::new(5).await;
+            }
+            panic!("boots never started: {}", manager.boot_queue.debug_state());
+        }
+
+        fn live(manager: &PeerDecodeManager) -> bool {
+            manager
+                .connected_peers
+                .get(&SID)
+                .expect("peer")
+                .screen_decoder_live
+        }
+
+        #[wasm_bindgen_test]
+        async fn a_peer_gets_a_screen_decoder_worker_only_on_its_first_screen_packet() {
+            let counts = Counts::start();
+            let mut manager = manager_with_peer(true);
+            boot(&manager).await;
+            assert_eq!(
+                counts.created(),
+                1,
+                "a new peer gets its camera decoder worker only"
+            );
+
+            share(&mut manager, 1);
+            boot(&manager).await;
+            assert_eq!(
+                counts.created(),
+                2,
+                "the first screen packet creates the screen worker"
+            );
+            assert!(live(&manager));
+            share(&mut manager, 2);
+            boot(&manager).await;
+            assert_eq!(counts.created(), 2, "later screen packets reuse it");
+        }
+
+        #[wasm_bindgen_test]
+        async fn a_shares_first_packet_queues_its_screen_worker_behind_a_booting_neteq() {
+            let mut counts = Counts::start();
+            restore_neteq_worker(counts.neteq_link.take().expect("stubbed"));
+            let mut manager = manager_with_peer(true);
+            share(&mut manager, 1);
+            gloo_timers::future::TimeoutFuture::new(100).await;
+
+            assert!(live(&manager));
+            assert_eq!(
+                manager
+                    .connected_peers
+                    .get(&SID)
+                    .expect("peer")
+                    .screen
+                    .boot_state_for_test(),
+                crate::decode::WorkerBootState::Queued
+            );
+            assert_eq!(counts.created(), 0, "{}", manager.boot_queue.debug_state());
+        }
+
+        #[wasm_bindgen_test]
+        async fn an_off_grid_sharer_gets_no_screen_decoder_worker() {
+            let counts = Counts::start();
+            let mut manager = manager_with_peer(false);
+            share(&mut manager, 1);
+            boot(&manager).await;
+            assert_eq!(counts.created(), 1);
+            assert!(!live(&manager));
+        }
+
+        #[wasm_bindgen_test]
+        fn the_screen_decoder_keeps_its_canvas_and_stream_context_across_both_swaps() {
+            let _counts = Counts::start();
+            let mut manager = manager_with_peer(true);
+            let canvas: web_sys::HtmlCanvasElement = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.create_element("canvas").ok())
+                .expect("canvas")
+                .dyn_into()
+                .expect("canvas element");
+            {
+                let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+                peer.screen.set_canvas(canvas.clone()).expect("set canvas");
+                peer.screen
+                    .set_stream_context("local-sid".into(), SID.to_string());
+            }
+            let same = |manager: &PeerDecodeManager| {
+                let peer = manager.connected_peers.get(&SID).expect("peer");
+                (
+                    peer.screen
+                        .get_canvas()
+                        .is_some_and(|c| js_sys::Object::is(&c, &canvas)),
+                    peer.screen.stream_context_pair()
+                        == Some(("local-sid".to_string(), SID.to_string())),
+                )
+            };
+
+            share(&mut manager, 1);
+            assert!(live(&manager));
+            assert_eq!(
+                same(&manager),
+                (true, true),
+                "creating the decoder keeps both"
+            );
+
+            let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+            peer.screen_enabled = false;
+            peer.last_screen_frame_ms = 1;
+            manager.retire_idle_screen_decoders(1);
+            manager.retire_idle_screen_decoders(1 + SCREEN_DECODER_IDLE_TEARDOWN_MS);
+            assert!(!live(&manager));
+            assert_eq!(
+                same(&manager),
+                (true, true),
+                "retiring the decoder keeps both"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        async fn an_ended_share_keeps_its_worker_through_the_hold_then_terminates_it() {
+            let counts = Counts::start();
+            let mut manager = manager_with_peer(true);
+            share(&mut manager, 1);
+            boot(&manager).await;
+            let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+            peer.screen_enabled = false;
+            peer.last_screen_frame_ms = 1_000;
+
+            manager.retire_idle_screen_decoders(1_000);
+            manager.retire_idle_screen_decoders(1_000 + SCREEN_DECODER_IDLE_TEARDOWN_MS - 1);
+            assert!(
+                live(&manager),
+                "a stop-and-reshare inside the hold keeps the warm worker"
+            );
+            assert_eq!(counts.terminated(), 0);
+
+            manager.retire_idle_screen_decoders(1_000 + SCREEN_DECODER_IDLE_TEARDOWN_MS);
+            assert!(!live(&manager));
+            assert_eq!(
+                counts.terminated(),
+                1,
+                "retiring terminates the screen worker"
+            );
+
+            share(&mut manager, 2);
+            boot(&manager).await;
+            assert!(live(&manager));
+            assert_eq!(
+                counts.created(),
+                3,
+                "a reshare after the hold gets a fresh worker"
+            );
+        }
+
+        /// The hold runs from when the share stops, not from its last frame: after a long static
+        /// share, stopping and resharing 10 s later must keep the warm worker.
+        #[wasm_bindgen_test]
+        async fn a_reshare_soon_after_a_long_static_share_keeps_the_worker() {
+            let counts = Counts::start();
+            let mut manager = manager_with_peer(true);
+            share(&mut manager, 1);
+            boot(&manager).await;
+            let set = |manager: &mut PeerDecodeManager, sharing: bool, last_frame: u64| {
+                let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+                peer.screen_enabled = sharing;
+                peer.last_screen_frame_ms = last_frame;
+            };
+            let hold = SCREEN_DECODER_IDLE_TEARDOWN_MS;
+
+            // A static share: on, last frame long ago.
+            set(&mut manager, true, 1_000);
+            let stopped_at = 1_000 + 10 * hold;
+            manager.retire_idle_screen_decoders(stopped_at - 5_000);
+            set(&mut manager, false, 1_000);
+            manager.retire_idle_screen_decoders(stopped_at);
+            manager.retire_idle_screen_decoders(stopped_at + 5_000);
+            assert!(live(&manager), "the share stopped 5 s ago");
+
+            // Reshare 10 s after the stop.
+            share(&mut manager, 2);
+            boot(&manager).await;
+            set(&mut manager, true, stopped_at + 10_000);
+            manager.retire_idle_screen_decoders(stopped_at + 10_000);
+
+            // A second stop much later gets its own full hold.
+            let stopped_again = stopped_at + 10_000 + 10 * hold;
+            set(&mut manager, false, stopped_at + 10_000);
+            manager.retire_idle_screen_decoders(stopped_again);
+            manager.retire_idle_screen_decoders(stopped_again + 5_000);
+            assert!(live(&manager), "the second stop was 5 s ago");
+            assert_eq!(counts.created(), 2, "the reshare reused the worker");
+            assert_eq!(counts.terminated(), 0);
+
+            manager.retire_idle_screen_decoders(stopped_again + hold);
+            assert!(!live(&manager));
+            assert_eq!(counts.terminated(), 1);
+        }
+
+        /// A late joiner's first screen packet is a delta: the worker asks for a keyframe at once,
+        /// and that request must reach the route installed before the decoder existed.
+        #[wasm_bindgen_test]
+        async fn a_delta_first_late_join_sends_exactly_one_recovery_keyframe_request() {
+            let _counts = Counts::start();
+            let previous = point_codecs_worker_at(
+                r#"self.postMessage({ kind: "worker_ready" });
+let asked = false;
+self.onmessage = (e) => {
+  if (!asked && e.data && typeof e.data === "object" && "DecodeFrame" in e.data) {
+    asked = true;
+    self.postMessage({ kind: "request_keyframe", from_peer: null, to_peer: null, head_age_ms: 1200 });
+  }
+};"#,
+            );
+            let mut manager = manager_with_peer(true);
+            let requests = Rc::new(Cell::new(0u32));
+            let seen = requests.clone();
+            manager
+                .connected_peers
+                .get(&SID)
+                .expect("peer")
+                .screen
+                .set_keyframe_request_route(Box::new(move |_| seen.set(seen.get() + 1)));
+
+            share_of(&mut manager, 1, "delta");
+            for _ in 0..50 {
+                if requests.get() > 0 {
+                    break;
+                }
+                gloo_timers::future::TimeoutFuture::new(20).await;
+            }
+            gloo_timers::future::TimeoutFuture::new(100).await;
+            restore_codecs_worker(previous);
+
+            assert!(live(&manager));
+            assert_eq!(requests.get(), 1);
+        }
+
+        #[wasm_bindgen_test]
+        async fn the_decoder_tick_retires_an_ended_share_after_the_hold() {
+            let counts = Counts::start();
+            let mut manager = manager_with_peer(true);
+            share(&mut manager, 1);
+            boot(&manager).await;
+            let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+            peer.screen_enabled = false;
+            peer.last_screen_frame_ms = 1_000;
+            let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
+
+            let _ = manager.tick_decoders(1_000, &bounds);
+            let _ = manager.tick_decoders(1_000 + SCREEN_DECODER_IDLE_TEARDOWN_MS, &bounds);
+            assert!(!live(&manager));
+            assert_eq!(counts.terminated(), 1);
+        }
+
+        #[wasm_bindgen_test]
+        async fn a_screen_frame_after_the_off_stamp_keeps_the_worker() {
+            let counts = Counts::start();
+            let mut manager = manager_with_peer(true);
+            share(&mut manager, 1);
+            boot(&manager).await;
+            let hold = SCREEN_DECODER_IDLE_TEARDOWN_MS;
+            let off_at = js_sys::Date::now() as u64 - hold;
+            let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+            peer.screen_enabled = false;
+            peer.last_screen_frame_ms = 0;
+            manager.retire_idle_screen_decoders(off_at);
+
+            share(&mut manager, 2);
+            manager
+                .connected_peers
+                .get_mut(&SID)
+                .expect("peer")
+                .screen_enabled = false;
+            manager.retire_idle_screen_decoders(off_at + hold);
+            assert!(live(&manager));
+            assert_eq!(counts.terminated(), 0);
+        }
+
+        #[wasm_bindgen_test]
+        async fn a_screen_keyframe_dropped_by_a_slow_worker_boot_is_requested_again() {
+            let _counts = Counts::start();
+            let previous = point_codecs_worker_at(
+                r#"setTimeout(() => {
+  self.onmessage = () => {};
+  self.postMessage({ kind: "worker_ready" });
+}, 200);"#,
+            );
+            let mut manager = manager_with_peer(true);
+            manager.set_local_session_id(8001);
+            let sent: Rc<RefCell<Vec<PacketWrapper>>> = Rc::default();
+            let sink = sent.clone();
+            manager.send_packet = Some(Callback::from(move |p: PacketWrapper| {
+                sink.borrow_mut().push(p)
+            }));
+
+            manager
+                .decode((*screen_packet_of(1, "key")).clone(), "local@test.com")
+                .expect("decode");
+            let shift = DateNowShift::by(
+                videocall_aq::constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS + 100.0,
+            );
+            for _ in 0..50 {
+                if !sent.borrow().is_empty() {
+                    break;
+                }
+                gloo_timers::future::TimeoutFuture::new(20).await;
+            }
+            gloo_timers::future::TimeoutFuture::new(200).await;
+            drop(shift);
+            restore_codecs_worker(previous);
+
+            let sent = sent.borrow();
+            assert_eq!(sent.len(), 1);
+            let request = MediaPacket::parse_from_bytes(&sent[0].data).expect("media packet");
+            assert_eq!(request.media_type, MediaType::KEYFRAME_REQUEST.into());
+            assert_eq!(request.data, b"SCREEN");
+            assert_eq!(request.target_session_id, SID);
+        }
+
+        #[wasm_bindgen_test]
+        fn an_unusable_canvas_fails_the_constructor_before_any_worker_starts() {
+            let counts = Counts::start();
+            let canvas: web_sys::HtmlCanvasElement = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.create_element("canvas").ok())
+                .expect("canvas")
+                .dyn_into()
+                .expect("canvas element");
+            let _offscreen = canvas
+                .transfer_control_to_offscreen()
+                .expect("transfer to offscreen");
+
+            assert!(VideoPeerDecoder::new(Some(canvas), MEDIA_TYPE_SCREEN, false).is_err());
+            assert_eq!(counts.created(), 0);
+        }
+
+        /// Static shared content can go long stretches without a frame; while the share is on,
+        /// the decoder stays however long the gap.
+        #[wasm_bindgen_test]
+        async fn a_share_that_is_still_on_keeps_its_worker_when_frames_pause() {
+            let counts = Counts::start();
+            let mut manager = manager_with_peer(true);
+            share(&mut manager, 1);
+            boot(&manager).await;
+            let peer = manager.connected_peers.get_mut(&SID).expect("peer");
+            peer.screen_enabled = true;
+            peer.last_screen_frame_ms = 1_000;
+
+            manager.retire_idle_screen_decoders(1_000 + 100 * SCREEN_DECODER_IDLE_TEARDOWN_MS);
+            assert!(live(&manager));
+            assert_eq!(counts.terminated(), 0);
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[path = "worker_boot_burst_tests.rs"]
+mod worker_boot_burst_tests;

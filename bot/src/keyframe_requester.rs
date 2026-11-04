@@ -117,7 +117,10 @@ impl KeyframeRequester {
 }
 
 /// Build a serialized KEYFRAME_REQUEST `PacketWrapper`.
-fn build_keyframe_request(self_user_id: &str, target_peer_id: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn build_keyframe_request(
+    self_user_id: &str,
+    target_peer_id: &str,
+) -> anyhow::Result<Vec<u8>> {
     let media_packet = MediaPacket {
         media_type: MediaType::KEYFRAME_REQUEST.into(),
         user_id: target_peer_id.as_bytes().to_vec(),

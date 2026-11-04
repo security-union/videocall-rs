@@ -266,6 +266,7 @@ pub fn generate_room_token(
         display_name,
         end_on_host_leave,
         is_guest,
+        None,
     )
 }
 
@@ -283,6 +284,7 @@ pub fn generate_room_token_at(
     display_name: &str,
     end_on_host_leave: bool,
     is_guest: bool,
+    meeting_started_at_ms: Option<i64>,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
@@ -298,6 +300,7 @@ pub fn generate_room_token_at(
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
         typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
         iat: Some(authorized_at),
+        meeting_started_at_ms,
     };
 
     encode(
@@ -333,6 +336,7 @@ pub fn generate_observer_token(
         room,
         display_name,
         is_guest,
+        None,
     )
 }
 
@@ -345,6 +349,7 @@ pub fn generate_observer_token_at(
     room: &str,
     display_name: &str,
     is_guest: bool,
+    meeting_started_at_ms: Option<i64>,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
@@ -360,6 +365,7 @@ pub fn generate_observer_token_at(
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
         typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
         iat: Some(authorized_at),
+        meeting_started_at_ms,
     };
 
     encode(
@@ -810,13 +816,44 @@ mod tests {
             "X",
             false,
             false,
+            None,
+        )
+        .expect("room");
+        let observer = generate_observer_token_at(
+            TEST_SECRET,
+            authorized_at,
+            "a@b.com",
+            "r",
+            "X",
+            false,
+            None,
+        )
+        .expect("observer");
+        assert_eq!(unverified_claims(&room).iat, Some(authorized_at));
+        assert_eq!(unverified_claims(&observer).iat, Some(authorized_at));
+    }
+
+    #[test]
+    fn the_at_variants_sign_the_meeting_start_they_are_given() {
+        let started = Some(1_707_000_000_123);
+        let room = generate_room_token_at(
+            TEST_SECRET,
+            600,
+            1,
+            "a@b.com",
+            "r",
+            false,
+            "X",
+            false,
+            false,
+            started,
         )
         .expect("room");
         let observer =
-            generate_observer_token_at(TEST_SECRET, authorized_at, "a@b.com", "r", "X", false)
+            generate_observer_token_at(TEST_SECRET, 1, "a@b.com", "r", "X", false, started)
                 .expect("observer");
-        assert_eq!(unverified_claims(&room).iat, Some(authorized_at));
-        assert_eq!(unverified_claims(&observer).iat, Some(authorized_at));
+        assert_eq!(unverified_claims(&room).meeting_started_at_ms, started);
+        assert_eq!(unverified_claims(&observer).meeting_started_at_ms, started);
     }
 
     #[test]

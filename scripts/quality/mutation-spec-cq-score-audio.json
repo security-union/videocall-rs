@@ -1,0 +1,454 @@
+{
+ "_comment": [
+  "Mutations of the scorer's audio stall terms and diagnostics (#2914 PR A), each naming the unit test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-score-audio.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_call_quality_score.py"
+ ],
+ "baseline_tests": 287,
+ "mutations": [
+  {
+   "name": "discards left out of A",
+   "file": "scripts/quality/cq_score.py",
+   "find": "cut = w_cut * increments[M_DISCARDS].get((r, t), {}).get(ts, 0.0) * AUDIO_PACKET_MS / bucket_ms",
+   "replace": "cut = 0.0",
+   "expect_kills": [
+    "test_discarded_packets_add_their_duration_to_that_observers_a_only",
+    "test_the_26_oct_hcl_daily_runs"
+   ]
+  },
+  {
+   "name": "playout silence left out of A",
+   "file": "scripts/quality/cq_score.py",
+   "find": "silent = w_silent * increments[M_UNDERRUN].get((r, t), {}).get(ts, 0.0) / bucket_ms",
+   "replace": "silent = 0.0",
+   "expect_kills": [
+    "test_playout_silence_adds_to_concealment_and_can_turn_g_q3_red"
+   ]
+  },
+  {
+   "name": "a 20 ms packet booked as 10 ms",
+   "file": "scripts/quality/cq_score.py",
+   "find": "AUDIO_PACKET_MS = 20",
+   "replace": "AUDIO_PACKET_MS = 10",
+   "expect_kills": [
+    "test_discarded_packets_add_their_duration_to_that_observers_a_only",
+    "test_the_26_oct_hcl_daily_runs"
+   ]
+  },
+  {
+   "name": "causes mixed before the increase",
+   "file": "scripts/quality/cq_score.py",
+   "find": "by_cause[labels.get(\"cause\", \"\")].append((labels, samples))",
+   "replace": "by_cause[\"\"].append((labels, samples))",
+   "expect_kills": [
+    "test_discard_causes_are_separate_counters_added_after_their_increase"
+   ]
+  },
+  {
+   "name": "never-decoding tiles dilute the freeze share",
+   "file": "scripts/quality/cq_score.py",
+   "find": "live = [k for k in inc if any(v > 0 for t, v in fps_tl.get(k, {}).items() if t >= hs)]",
+   "replace": "live = list(inc)",
+   "expect_kills": [
+    "test_tiles_that_froze_in_one_bucket_count_and_spread_freezes_do_not"
+   ]
+  },
+  {
+   "name": "target at the cap not counted",
+   "file": "scripts/quality/cq_score.py",
+   "find": "if x >= cap) / len(v[M_TARGET])",
+   "replace": "if x > cap) / len(v[M_TARGET])",
+   "expect_kills": [
+    "test_delay_diagnostics_are_reported_and_change_no_gate",
+    "test_the_26_oct_hcl_daily_runs"
+   ]
+  },
+  {
+   "name": "per-receiver diagnostics keep real identities",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "\"correlated_freeze\", \"audio_delay\", \"audio_counter_coverage\", \"by_user\"",
+   "replace": "\"audio_counter_coverage\", \"by_user\"",
+   "expect_kills": [
+    "test_per_receiver_audio_diagnostics_are_pseudonymised"
+   ]
+  },
+  {
+   "name": "the report drops the resolution line",
+   "file": "scripts/quality/cq_report.py",
+   "find": "                \"\", _resolution(result[\"run\"].get(\"scrape_step_s\"))]",
+   "replace": "]",
+   "expect_kills": [
+    "test_the_report_states_the_resolution_and_the_split"
+   ]
+  },
+  {
+   "name": "the discard weight may be lowered",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                 (\"dimensions\", \"discard_weight\"): (1.0, None),\n",
+   "replace": "",
+   "expect_kills": [
+    "test_gate_knobs_can_only_be_made_stricter_than_the_shipped_default"
+   ]
+  },
+  {
+   "name": "diagnostic thresholds unchecked",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            and pairs >= 1 and _is_num(cap) and cap > 0):",
+   "replace": "            and True):",
+   "expect_kills": [
+    "test_diagnostic_thresholds_are_validated"
+   ]
+  },
+  {
+   "name": "discards added to the observed loss",
+   "file": "scripts/quality/cq_score.py",
+   "find": "bad = min(1.0, max(max(conceal, missing) + silent, cut))",
+   "replace": "bad = min(1.0, max(conceal, missing) + silent + cut)",
+   "expect_kills": [
+    "test_discards_count_only_beyond_the_concealment_and_silence_of_their_bucket"
+   ]
+  },
+  {
+   "name": "playout silence maxed instead of added",
+   "file": "scripts/quality/cq_score.py",
+   "find": "bad = min(1.0, max(max(conceal, missing) + silent, cut))",
+   "replace": "bad = min(1.0, max(conceal, missing, silent, cut))",
+   "expect_kills": [
+    "test_playout_silence_is_added_to_concealment_not_maxed"
+   ]
+  },
+  {
+   "name": "no cap of 1 per sample",
+   "file": "scripts/quality/cq_score.py",
+   "find": "bad = min(1.0, max(max(conceal, missing) + silent, cut))",
+   "replace": "bad = max(max(conceal, missing) + silent, cut)",
+   "expect_kills": [
+    "test_playout_silence_is_added_to_concealment_not_maxed"
+   ]
+  },
+  {
+   "name": "coverage counts every talker pair as measured",
+   "file": "scripts/quality/cq_score.py",
+   "find": "terms[AUDIO_TERM_NAMES[name]][0] += (u, t) in increments[name]",
+   "replace": "terms[AUDIO_TERM_NAMES[name]][0] += 1",
+   "expect_kills": [
+    "test_an_absent_counter_is_not_measured_never_zero",
+    "test_one_talker_short_reads_as_partial_coverage"
+   ]
+  },
+  {
+   "name": "the coverage map keeps real identities",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "\"audio_delay\", \"audio_counter_coverage\", \"by_user\"",
+   "replace": "\"audio_delay\", \"by_user\"",
+   "expect_kills": [
+    "test_per_receiver_audio_diagnostics_are_pseudonymised"
+   ]
+  },
+  {
+   "name": "V freeze differenced after merging sessions",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        delta = sum(accrued.values())",
+   "replace": "        delta = counter_delta(sorted(freeze_tl.get((recv, pub), {}).items()), hs)",
+   "expect_kills": [
+    "test_the_handover_scrape_keeps_the_old_sessions_final_increase"
+   ]
+  },
+  {
+   "name": "the handover scrape is cut",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            if ts <= until or upper:\n",
+   "replace": "            if ts < until or upper:\n",
+   "expect_kills": [
+    "test_the_handover_scrape_keeps_the_old_sessions_final_increase"
+   ]
+  },
+  {
+   "name": "a replaced series' later increase is booked",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            if ts <= until or upper:\n",
+   "replace": "            if True:\n",
+   "expect_kills": [
+    "test_a_replaced_sessions_later_increase_is_reported_not_booked"
+   ]
+  },
+  {
+   "name": "coverage taken across cells",
+   "file": "scripts/quality/cq_score.py",
+   "find": "terms = coverage[u].setdefault(cell_of(u, t),",
+   "replace": "terms = coverage[u].setdefault(\"UxU\",",
+   "expect_kills": [
+    "test_coverage_is_scoped_to_the_cell_it_is_shown_in"
+   ]
+  },
+  {
+   "name": "a real meeting gets a mechanism table",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if acc[\"A_terms\"]:\n            vals[\"A_terms\"]",
+   "replace": "        if True:\n            vals[\"A_terms\"]",
+   "expect_kills": [
+    "test_a_real_meeting_shows_no_mechanism_table"
+   ]
+  },
+  {
+   "name": "a re-election that appears mid-session is not counted",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if start < first_ts and birth < first_ts:\n            base = 0.0\n",
+   "replace": "        if False:\n            base = 0.0\n",
+   "expect_kills": [
+    "test_a_failed_reelection_in_an_older_concurrent_tab_is_counted"
+   ]
+  },
+  {
+   "name": "a page-wide re-election count is booked again",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                base = prev if first >= prev else 0.0\n",
+   "replace": "                base = 0.0\n",
+   "expect_kills": [
+    "test_a_page_wide_reelection_count_is_not_booked_again_by_a_new_session"
+   ]
+  },
+  {
+   "name": "tied sessions read as sequential",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            sequential = len(chain) > 1 and all(a[0] < b[0] and a[1] <= b[0] + linger\n",
+   "replace": "            sequential = len(chain) > 1 and all(a[0] <= b[0] and a[1] <= b[0] + linger\n",
+   "expect_kills": [
+    "test_tied_sessions_leave_reelections_unproven"
+   ]
+  },
+  {
+   "name": "pairs iterated in input order",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    for recv, pub in sorted(set(freeze_tl) | set(increments[M_FREEZE]), key=str):",
+   "replace": "    for recv, pub in list(freeze_tl) + [k for k in increments[M_FREEZE] if k not in freeze_tl]:",
+   "expect_kills": [
+    "test_results_do_not_depend_on_series_order"
+   ]
+  },
+  {
+   "name": "staleness pairs iterated in input order",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    for (recv, pub), fps in sorted(fps_tl.items(), key=lambda kv: str(kv[0])):",
+   "replace": "    for (recv, pub), fps in fps_tl.items():",
+   "expect_kills": [
+    "test_results_do_not_depend_on_series_order"
+   ]
+  },
+  {
+   "name": "the lower reading books a rebuild",
+   "file": "scripts/quality/cq_score.py",
+   "find": "low, high = (first if len(prior) < len(others) else max(fit, default=0.0)), 0.0",
+   "replace": "low, high = (first if len(prior) < len(others) else 0.0), 0.0",
+   "expect_kills": [
+    "test_a_reconnect_books_the_lower_reading_and_lists_what_the_upper_adds",
+    "test_v_freeze_continues_on_the_lower_reading_and_a_zero_prior_is_proven"
+   ]
+  },
+  {
+   "name": "an unknown earlier value reads as a proven rebuild",
+   "file": "scripts/quality/cq_score.py",
+   "find": "low, high = (first if len(prior) < len(others) else max(fit, default=0.0)), 0.0",
+   "replace": "low, high = max(fit, default=0.0), 0.0",
+   "expect_kills": [
+    "test_an_unknown_earlier_value_in_the_chain_is_not_a_proven_rebuild"
+   ]
+  },
+  {
+   "name": "an unknown baseline books the whole counter on the lower reading",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            low, high = (0.0, 0.0) if new else (first, 0.0)\n",
+   "replace": "            low, high = 0.0, 0.0\n",
+   "expect_kills": [
+    "test_a_counter_without_a_baseline_books_nothing_until_its_next_sample",
+    "test_a_gate_the_two_readings_disagree_on_is_uncertain_and_blocks_a_pass"
+   ]
+  },
+  {
+   "name": "a zero prior is listed as unproven",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if low:\n            unproven.append(",
+   "replace": "        if low is not None:\n            unproven.append(",
+   "expect_kills": [
+    "test_v_freeze_continues_on_the_lower_reading_and_a_zero_prior_is_proven"
+   ]
+  },
+  {
+   "name": "the upper reading is never scored",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    if not low[\"diagnostics\"][\"counter_lineage_unproven\"]:\n        return low\n",
+   "replace": "    if True:\n        return low\n",
+   "expect_kills": [
+    "test_a_gate_the_two_readings_disagree_on_is_uncertain_and_blocks_a_pass",
+    "test_v_is_uncertain_when_only_the_upper_reading_crosses_red",
+    "test_tied_sessions_leave_reelections_unproven"
+   ]
+  },
+  {
+   "name": "a disagreement between readings is ignored",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if h[\"status\"] != g[\"status\"]:\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_a_gate_the_two_readings_disagree_on_is_uncertain_and_blocks_a_pass",
+    "test_v_is_uncertain_when_only_the_upper_reading_crosses_red",
+    "test_tied_sessions_leave_reelections_unproven"
+   ]
+  },
+  {
+   "name": "an uncertain gate outranks a proven fail",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    if any(g[\"status\"] == \"fail\" for g in quality):\n        return \"FAIL\", blocking\n    if uncertain:\n        return \"INVALID\", uncertain\n",
+   "replace": "    if uncertain:\n        return \"INVALID\", uncertain\n    if any(g[\"status\"] == \"fail\" for g in quality):\n        return \"FAIL\", blocking\n",
+   "expect_kills": [
+    "test_a_proven_fail_stands_beside_uncertain_gates"
+   ]
+  },
+  {
+   "name": "uncertain gates listed as invalid reasons on a FAIL",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        return \"FAIL\", blocking\n",
+   "replace": "        return \"FAIL\", blocking + uncertain\n",
+   "expect_kills": [
+    "test_a_proven_fail_stands_beside_uncertain_gates"
+   ]
+  },
+  {
+   "name": "concurrent re-elections read as new on the lower reading",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                low = max((v for v in held if v <= first), default=0.0) if earlier else first\n",
+   "replace": "                low = 0.0\n",
+   "expect_kills": [
+    "test_a_long_overlap_is_concurrent_not_a_replacement"
+   ]
+  },
+  {
+   "name": "the upper reading continues concurrent re-elections",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                base = 0.0 if upper else low\n",
+   "replace": "                base = low\n",
+   "expect_kills": [
+    "test_tied_sessions_leave_reelections_unproven"
+   ]
+  },
+  {
+   "name": "a long overlap reads as a replacement",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            sequential = len(chain) > 1 and all(a[0] < b[0] and a[1] <= b[0] + linger\n",
+   "replace": "            sequential = len(chain) > 1 and all(a[0] < b[0] and True\n",
+   "expect_kills": [
+    "test_a_long_overlap_is_concurrent_not_a_replacement"
+   ]
+  },
+  {
+   "name": "the report hides uncertain gates",
+   "file": "scripts/quality/cq_report.py",
+   "find": "        if s.get(\"uncertain_gates\"):\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_a_proven_fail_stands_beside_uncertain_gates"
+   ]
+  },
+  {
+   "name": "the lower reading continues the smallest earlier value",
+   "file": "scripts/quality/cq_score.py",
+   "find": "low, high = (first if len(prior) < len(others) else max(fit, default=0.0)), 0.0",
+   "replace": "low, high = (first if len(prior) < len(others) else min(fit, default=0.0)), 0.0",
+   "expect_kills": [
+    "test_two_kept_changes_continue_from_the_largest_earlier_value"
+   ]
+  },
+  {
+   "name": "a concurrent count above the first value is taken as its predecessor",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                low = max((v for v in held if v <= first), default=0.0) if earlier else first\n",
+   "replace": "                low = max(held, default=0.0) if earlier else first\n",
+   "expect_kills": [
+    "test_a_concurrent_tab_count_above_the_first_value_is_not_its_continuation"
+   ]
+  },
+  {
+   "name": "a lone session's first count reads as proven new",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                low = max((v for v in held if v <= first), default=0.0) if earlier else first\n",
+   "replace": "                low = max((v for v in held if v <= first), default=0.0) if earlier else 0.0\n",
+   "expect_kills": [
+    "test_a_count_present_from_a_lone_sessions_first_report_is_unproven"
+   ]
+  },
+  {
+   "name": "the report labels uncertain gates as unmeasured",
+   "file": "scripts/quality/cq_report.py",
+   "find": "            unmeasured = [g for g in s[\"invalid_reasons\"] if g not in s.get(\"uncertain_gates\", [])]\n",
+   "replace": "            unmeasured = s[\"invalid_reasons\"]\n",
+   "expect_kills": [
+    "test_a_gate_the_two_readings_disagree_on_is_uncertain_and_blocks_a_pass"
+   ]
+  },
+  {
+   "name": "a publisher's new session is not provably new",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                [(birth, to_peer, pts, any(births.get(s, (-math.inf,))[0] > start for s in (sid, to_peer)))\n",
+   "replace": "                [(birth, to_peer, pts, False)\n",
+   "expect_kills": [
+    "test_a_publishers_new_session_books_its_counter_from_zero"
+   ]
+  },
+  {
+   "name": "a lane continues across publisher sessions",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        others = [p for b, c, p, _ in lane if c == chain and b <= birth and p is not pts]\n",
+   "replace": "        others = [p for b, c, p, _ in lane if b <= birth and p is not pts]\n",
+   "expect_kills": [
+    "test_a_publishers_new_session_books_its_counter_from_zero"
+   ]
+  },
+  {
+   "name": "a series first sampled at hold start has no baseline",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if first_ts <= start:\n",
+   "replace": "        if first_ts < start:\n",
+   "expect_kills": [
+    "test_a_series_first_sampled_at_hold_start_has_a_known_baseline"
+   ]
+  },
+  {
+   "name": "a bucket at exactly the share is not froze together",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            if len(froze) >= share * len(live):\n",
+   "replace": "            if len(froze) > share * len(live):\n",
+   "expect_kills": [
+    "test_a_bucket_at_exactly_the_share_froze_together"
+   ]
+  },
+  {
+   "name": "a pair's birth ignores the publisher's session",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                birth = max(births.get(s, (pts[0][0],))[0] for s in (sid, to_peer))\n",
+   "replace": "                birth = max(births.get(s, (pts[0][0],))[0] for s in (sid,))\n",
+   "expect_kills": [
+    "test_a_publishers_old_session_increase_after_its_new_session_is_reported_not_booked"
+   ]
+  },
+  {
+   "name": "the resolution text leaves out the cap",
+   "file": "scripts/quality/cq_report.py",
+   "find": "            \"pipeline gap, a declared absence, or a pair missing from a receiver whose per-peer stats are at the cap), \"\n",
+   "replace": "            \"pipeline gap, a declared absence, or a pair from a receiver whose per-peer stats are at the cap), \"\n",
+   "expect_kills": [
+    "test_the_report_states_the_resolution_and_the_split"
+   ]
+  }
+ ]
+}

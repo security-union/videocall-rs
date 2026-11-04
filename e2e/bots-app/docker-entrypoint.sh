@@ -14,10 +14,17 @@
 #   BOT_PASSWORD       login password — REQUIRED for form-login (single mode; from the bot-creds Secret)
 #   BOT_HW_CONCURRENCY navigator.hardwareConcurrency cap → simulcast layer cap (default: 10 → 3 layers; "" omits)
 #   BOT_HW_CONCURRENCY_<N> / BOT_NETEM_PROFILE[_<N>] / BOT_NETEM_IFACE / BOT_MAX_JOIN_STAGGER_SECS  see README
-#   BOT_CAMERA_{ON,OFF}_SECS_{MIN,MAX}  camera duty cycle (#2362); all four unset ⇒ camera always on
+#   BOT_CAMERA_{ON,OFF}_SECS_{MIN,MAX}  camera duty cycle (#2362)
 #   BOT_IDENTITY_MODE  single | ordinal | auto (default: auto — see "Identity resolution" below)
 #   BOT_INDEX          fleet index → clock capture geometry (#2236); ordinal mode OVERWRITES it
 #                      with the pod ordinal. Unset ⇒ flag omitted ⇒ index 0 ⇒ 640x480.
+#   BOT_FLEET_SIZE     talking-clock fleet size N (issue 3072); must equal the replica count
+#   BOT_SPEECH_MODEL / BOT_SPEECH_SEED / BOT_SPEECH_DOMINANT / BOT_SPEECH_OBSERVERS /
+#   BOT_SPEECH_KEEP / BOT_SPEECH_OVERLAP  talking-clock speaking schedule (issue 3090), read by
+#                      `bots-app run` from the env; fleet-wide. See README "Talking clock".
+#   BOT_TRANSPORT / BOT_TRANSPORT_WS_EVERY  ws|wt|auto for every bot / every k-th index on ws, k=1 or k neither dividing nor a multiple of 6 (read by the CLI)
+#   BOT_PERSONAS / BOT_CAMERA / BOT_PERSONA_MIC_ON / BOT_PERSONA_CAMERA_ON  mic and camera follow speech (issue 3091; read by the CLI)
+#   BOT_SIMULCAST_MAX_LAYERS  1-3 overrides __APP_CONFIG.experimentalSimulcastMaxLayers (issue 3246; read by the CLI)
 #   BOT_EMAIL_<N> /    per-ordinal creds for ordinal mode, injected via `envFrom` from the
 #   BOT_PASSWORD_<N>     `bot-accounts` Secret (see k8s/bot-accounts.example.yaml)
 #   BOT_CTL_PORT       control-API port (Increment 3 #2072; UNSET ⇒ control server disabled — see "Control server" below)
@@ -86,6 +93,7 @@ BOT_RUN_DIR="${BOT_RUN_DIR:-/tmp/bots-run}"
 BOT_HW_CONCURRENCY="${BOT_HW_CONCURRENCY-10}"
 BOT_IDENTITY_MODE="${BOT_IDENTITY_MODE:-auto}"
 BOT_INDEX="${BOT_INDEX:-}"
+BOT_FLEET_SIZE="${BOT_FLEET_SIZE:-}"
 BOT_NETEM_PROFILE="${BOT_NETEM_PROFILE:-}"
 BOT_NETEM_IFACE="${BOT_NETEM_IFACE:-eth0}"
 # Mirrors netem.ts's NETEM_IFB_DEV / NETEM_INGRESS_QDISC_MARKER; not operator config.
@@ -195,6 +203,9 @@ if [ "${BOT_IDENTITY_MODE}" = "ordinal" ]; then
   # Same reason for the fleet index: the ordinal wins over a template BOT_INDEX.
   BOT_INDEX="${ORDINAL}"
   BOT_POD_ORDINAL="$((10#${ORDINAL}))"
+  if [ -z "${BOT_FLEET_SIZE}" ]; then
+    say "docker-entrypoint: WARNING — BOT_FLEET_SIZE is unset, so this pod's talking-clock schedule is computed for ordinal + 1 bots and disagrees with other pods'. Set it to the StatefulSet's replica count." 2
+  fi
   # `-`, not `:-`: an explicitly EMPTY value opts this pod out, not the fleet.
   hw_var="BOT_HW_CONCURRENCY_${ORDINAL}"
   BOT_HW_CONCURRENCY="${!hw_var-${BOT_HW_CONCURRENCY}}"
@@ -244,7 +255,8 @@ fi
 # Every operator string this script puts on the launch line or exports to the bot
 # process.
 for raw_var in MEETING_URL BOT_PARTICIPANT TTL BOT_AUTH BOT_RUN_DIR \
-  BOT_HW_CONCURRENCY BOT_INDEX BOT_CTL_PORT BOT_CTL_BIND BOT_CTL_STATE_DIR \
+  BOT_HW_CONCURRENCY BOT_INDEX BOT_FLEET_SIZE BOT_TRANSPORT BOT_TRANSPORT_WS_EVERY BOT_PERSONAS BOT_CAMERA \
+  BOT_CTL_PORT BOT_CTL_BIND BOT_CTL_STATE_DIR \
   BOT_EMAIL BOT_EXTRA_ARGS; do
   case "${!raw_var-}" in
     *$'\r'* | *$'\n'*)
@@ -527,7 +539,7 @@ for camera_var in "${CAMERA_CYCLE_VARS[@]}"; do
 done
 if [ -n "${camera_set}" ]; then
   if [ -n "${camera_unset}" ]; then
-    say "docker-entrypoint: FATAL — camera cycling needs all four of ${CAMERA_CYCLE_VARS[*]}; missing: ${camera_unset% }. Set them all, or none (none = camera on for the whole run)." 2
+    say "docker-entrypoint: FATAL — camera cycling needs all four of ${CAMERA_CYCLE_VARS[*]}; missing: ${camera_unset% }. Set them all, or none." 2
     exit 1
   fi
   for camera_var in "${CAMERA_CYCLE_VARS[@]}"; do
@@ -684,7 +696,7 @@ fi
 
 export BOT_POD_ORDINAL BOT_JOIN_STAGGER_MS BOT_JOIN_STAGGER_INCOMPLETE
 
-say "docker-entrypoint: launching bot — url=${MEETING_URL} participant=${BOT_PARTICIPANT} auth=${BOT_AUTH} ttl=${TTL} identity_mode=${BOT_IDENTITY_MODE} hw_concurrency=${BOT_HW_CONCURRENCY:-<omitted>} credentials=${cred_state} control=[${ctl_state}] netem=[${netem_state}] join_stagger=${stagger_state}${stagger_note} camera_cycle=[${camera_cycle_state}]"
+say "docker-entrypoint: launching bot — url=${MEETING_URL} participant=${BOT_PARTICIPANT} auth=${BOT_AUTH} ttl=${TTL} identity_mode=${BOT_IDENTITY_MODE} hw_concurrency=${BOT_HW_CONCURRENCY:-<omitted>} fleet_size=${BOT_FLEET_SIZE:-<omitted>} transport_ws_every=${BOT_TRANSPORT_WS_EVERY:-<omitted>} personas=${BOT_PERSONAS:-<omitted>} camera=${BOT_CAMERA:-<omitted>} credentials=${cred_state} control=[${ctl_state}] netem=[${netem_state}] join_stagger=${stagger_state}${stagger_note} camera_cycle=[${camera_cycle_state}]"
 
 # Capability cap. `--hardware-concurrency <N>` (added by the parallel frontend
 # task on the `run` command) sets the fake navigator.hardwareConcurrency the bot
@@ -700,6 +712,9 @@ fi
 posture_args=()
 if [ -n "${BOT_INDEX}" ]; then
   posture_args=(--bot-index "${BOT_INDEX}")
+fi
+if [ -n "${BOT_FLEET_SIZE}" ]; then
+  posture_args+=(--fleet-size "${BOT_FLEET_SIZE}")
 fi
 
 # exec the tsx binary DIRECTLY (not `npm run`, which would make npm PID 1 and

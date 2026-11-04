@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Issue 2866: the ordered pin list. Index 0 is the most recently pinned tile,
-//! and a pinned tile is laid out at the front of the grid at its normal size.
+//! and a pinned tile leads the grid behind any enlarged tile, keeping its size.
 
 use crate::components::canvas_generator::{PinnedTile, PinnedTileKind};
+use std::collections::HashMap;
 
 /// CSS `order` of the rank-0 pin; rank `r` sits at `PIN_ORDER_BASE + r`.
 pub const PIN_ORDER_BASE: i32 = -1000;
-/// A pin click this soon after a pin change on ANOTHER tile is dropped.
+/// CSS `order` of the rank-0 enlarged tile, ahead of every pin (issue 3367).
+pub const ENLARGED_ORDER_BASE: i32 = -2000;
+/// A pin or enlarge click this soon after a change on ANOTHER tile is dropped.
 pub const PIN_DOUBLE_ACTIVATION_MS: f64 = 350.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +54,13 @@ pub fn tile_order(rank: Option<usize>, unpinned: i32) -> i32 {
     rank.map_or(unpinned, |r| PIN_ORDER_BASE + r as i32)
 }
 
+pub fn camera_tile_order(enlarged_rank: Option<usize>, pin_rank: Option<usize>) -> i32 {
+    enlarged_rank.map_or_else(
+        || tile_order(pin_rank, 0),
+        |r| ENLARGED_ORDER_BASE + r as i32,
+    )
+}
+
 /// One pin-button click: the double-activation guard, then the toggle. `None`
 /// when the guard drops the click.
 pub fn activate_pin(
@@ -68,12 +78,52 @@ pub fn activate_pin(
     Some(change)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnlargeChange {
+    Enlarged,
+    Restored,
+}
+
+/// One enlarge-button click, behind the pin button's guard. A new enlarge goes
+/// behind the tiles already enlarged, so they do not move.
+pub fn activate_enlarge(
+    list: &mut Vec<PinnedTile>,
+    last: &mut Option<(f64, PinnedTile)>,
+    now_ms: f64,
+    clicked: PinnedTile,
+) -> Option<EnlargeChange> {
+    let recent = last.as_ref().map(|(at, tile)| (*at, tile));
+    if !accept_pin_activation(now_ms, recent, &clicked) {
+        return None;
+    }
+    let change = if unpin(list, &clicked) {
+        EnlargeChange::Restored
+    } else {
+        list.push(clicked.clone());
+        EnlargeChange::Enlarged
+    };
+    *last = Some((now_ms, clicked));
+    Some(change)
+}
+
 /// Never falls back to the user id, which is often an email.
+fn announced_name(name: Option<&str>) -> &str {
+    name.filter(|n| !n.is_empty()).unwrap_or("Participant")
+}
+
 pub fn pin_announcement(name: Option<&str>, change: PinChange) -> String {
-    let who = name.filter(|n| !n.is_empty()).unwrap_or("Participant");
+    let who = announced_name(name);
     match change {
         PinChange::Pinned => format!("{who} pinned"),
         PinChange::Unpinned => format!("{who} unpinned"),
+    }
+}
+
+pub fn enlarge_announcement(name: Option<&str>, change: EnlargeChange) -> String {
+    let who = announced_name(name);
+    match change {
+        EnlargeChange::Enlarged => format!("{who} enlarged"),
+        EnlargeChange::Restored => format!("{who} restored to standard size"),
     }
 }
 
@@ -123,12 +173,133 @@ pub fn camera_pin_sessions(
         .collect()
 }
 
+/// The sessions that lead the grid and their ranks.
+#[derive(Debug, PartialEq)]
+pub struct GridLead {
+    pub sessions: Vec<String>,
+    pub rank: HashMap<String, usize>,
+}
+
+/// Enlarged sessions, then pinned ones, each session once. Both inputs are in
+/// rank order, as `camera_pin_sessions` returns them.
+pub fn grid_lead(enlarged: &[(String, usize)], pinned: &[(String, usize)]) -> GridLead {
+    let behind = enlarged.last().map_or(0, |(_, rank)| rank + 1);
+    let mut lead = GridLead {
+        sessions: enlarged.iter().map(|(s, _)| s.clone()).collect(),
+        rank: enlarged.iter().cloned().collect(),
+    };
+    for (session, rank) in pinned {
+        if !lead.rank.contains_key(session) {
+            lead.sessions.push(session.clone());
+            lead.rank.insert(session.clone(), behind + rank);
+        }
+    }
+    lead
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cam(user: &str) -> PinnedTile {
         PinnedTile::camera(user)
+    }
+
+    fn enlarge(list: &mut Vec<PinnedTile>, user: &str) -> Option<EnlargeChange> {
+        activate_enlarge(list, &mut None, 0.0, cam(user))
+    }
+
+    #[test]
+    fn a_new_enlarge_goes_behind_the_tiles_already_enlarged() {
+        let mut list = Vec::new();
+        assert_eq!(enlarge(&mut list, "a"), Some(EnlargeChange::Enlarged));
+        assert_eq!(enlarge(&mut list, "b"), Some(EnlargeChange::Enlarged));
+        assert_eq!(list, vec![cam("a"), cam("b")], "`a` must not move");
+        assert_eq!(enlarge(&mut list, "a"), Some(EnlargeChange::Restored));
+        assert_eq!(list, vec![cam("b")]);
+    }
+
+    #[test]
+    fn pin_and_enlarge_share_one_double_activation_guard() {
+        let mut last = None;
+        let (mut pins, mut enlarged) = (Vec::new(), Vec::new());
+
+        let first = activate_enlarge(&mut enlarged, &mut last, 1000.0, cam("a"));
+        assert_eq!(first, Some(EnlargeChange::Enlarged));
+        assert_eq!(
+            activate_pin(&mut pins, &mut last, 1100.0, cam("b")),
+            None,
+            "the tile that moved under the second click"
+        );
+        assert!(pins.is_empty());
+        assert_eq!(
+            activate_pin(&mut pins, &mut last, 1200.0, cam("a")),
+            Some(PinChange::Pinned),
+            "the same tile's other control still works"
+        );
+        assert_eq!(
+            activate_enlarge(&mut enlarged, &mut last, 1300.0, cam("b")),
+            None,
+            "and the guard holds the other way round"
+        );
+        assert_eq!(enlarged, vec![cam("a")]);
+        assert_eq!(
+            activate_enlarge(&mut enlarged, &mut last, 1551.0, cam("b")),
+            Some(EnlargeChange::Enlarged),
+            "past the window"
+        );
+    }
+
+    #[test]
+    fn the_enlarge_announcement_never_names_the_user_id() {
+        use EnlargeChange::{Enlarged, Restored};
+        assert_eq!(enlarge_announcement(Some("Ann"), Enlarged), "Ann enlarged");
+        assert_eq!(
+            enlarge_announcement(Some("Ann"), Restored),
+            "Ann restored to standard size"
+        );
+        assert_eq!(enlarge_announcement(None, Enlarged), "Participant enlarged");
+        assert_eq!(
+            enlarge_announcement(Some(""), Restored),
+            "Participant restored to standard size"
+        );
+    }
+
+    #[test]
+    fn every_enlarged_tile_orders_ahead_of_every_pin() {
+        let deepest = crate::constants::CANVAS_LIMIT + 2;
+        assert!(camera_tile_order(Some(deepest), None) < camera_tile_order(None, Some(0)));
+        assert_eq!(
+            camera_tile_order(Some(0), Some(3)),
+            ENLARGED_ORDER_BASE,
+            "enlarged wins over pinned"
+        );
+        assert_eq!(camera_tile_order(None, Some(3)), PIN_ORDER_BASE + 3);
+        assert_eq!(camera_tile_order(None, None), 0);
+    }
+
+    #[test]
+    fn the_grid_lead_is_enlarged_then_pinned_with_no_session_twice() {
+        let s = |id: &str, rank| (id.to_string(), rank);
+        let lead = grid_lead(&[s("7", 0), s("8", 1)], &[s("9", 0), s("7", 1), s("6", 2)]);
+        assert_eq!(lead.sessions, ["7", "8", "9", "6"]);
+        assert_eq!(lead.rank["7"], 0, "an enlarged pin keeps its enlarged rank");
+        assert_eq!(lead.rank["8"], 1);
+        assert_eq!(lead.rank["9"], 2);
+        assert_eq!(lead.rank["6"], 4);
+    }
+
+    #[test]
+    fn without_an_enlarged_tile_the_grid_lead_is_exactly_the_pins() {
+        let pinned = vec![
+            ("7".to_string(), 0),
+            ("8".to_string(), 0),
+            ("9".to_string(), 2),
+        ];
+        let lead = grid_lead(&[], &pinned);
+        assert_eq!(lead.sessions, ["7", "8", "9"]);
+        let ranks: HashMap<String, usize> = pinned.into_iter().collect();
+        assert_eq!(lead.rank, ranks, "two tabs of one user keep tying on rank");
     }
 
     #[test]

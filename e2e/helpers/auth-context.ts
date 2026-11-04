@@ -172,6 +172,18 @@ export async function pinWebSocketTransport(context: BrowserContext): Promise<vo
   await context.addInitScript(PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
 }
 
+// Seeds a preference only; assert the elected transport (the self transport badge) separately.
+export const PIN_WEBTRANSPORT_TRANSPORT_INIT_SCRIPT = `(() => {
+  try {
+    localStorage.setItem("vc_transport_preference", "webtransport");
+    localStorage.setItem("vc_transport_sticky", "true");
+  } catch (_) {}
+})();`;
+
+export async function pinWebTransportTransport(context: BrowserContext): Promise<void> {
+  await context.addInitScript(PIN_WEBTRANSPORT_TRANSPORT_INIT_SCRIPT);
+}
+
 // ---------------------------------------------------------------------------
 // Core helper
 // ---------------------------------------------------------------------------

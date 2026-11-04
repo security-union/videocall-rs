@@ -38,10 +38,7 @@ unsafe impl Send for WasmDecoder {}
 unsafe impl Sync for WasmDecoder {}
 
 pub struct WasmDecoder {
-    worker: Worker,
-    // The closure that handles messages from the worker.
-    // We must store it to keep it alive.
-    _on_message_closure: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    slot: Rc<WorkerSlot>,
     // Store the user's callback
     _on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
     /// Mirrored onto the MAIN thread because the worker→main DiagEvent forward is dropped
@@ -49,6 +46,111 @@ pub struct WasmDecoder {
     freshness_evictions: Rc<Cell<FreshnessEvictionAccum>>,
     gate: Rc<BootGate>,
     context_reemit: ContextReemitRamp,
+}
+
+/// How a deferred worker's boot ended (#3277).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootOutcome {
+    Ready,
+    Failed,
+}
+
+pub type BootSettled = Box<dyn FnOnce(BootOutcome)>;
+
+type InstallHandlers = Box<dyn FnOnce(&Worker) -> WorkerHandlers>;
+
+struct WorkerHandlers {
+    // The closures that handle messages and errors from the worker; stored to keep them alive.
+    _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    _on_error: Closure<dyn FnMut(JsValue)>,
+}
+
+/// The decoder's worker, which a deferred decoder creates only when [`WorkerStarter::start`] runs.
+struct WorkerSlot {
+    url: String,
+    media_type: &'static str,
+    worker: RefCell<Option<Worker>>,
+    handlers: RefCell<Option<WorkerHandlers>>,
+    install: RefCell<Option<InstallHandlers>>,
+    gate: Rc<BootGate>,
+    /// The peer this stream comes from, for the boot-failure log.
+    log_peer: Rc<RefCell<Option<String>>>,
+}
+
+impl WorkerSlot {
+    fn start(&self) -> Result<(), JsValue> {
+        let Some(install) = self.install.borrow_mut().take() else {
+            return Ok(());
+        };
+        let worker = match Worker::new(&self.url) {
+            Ok(worker) => worker,
+            Err(e) => {
+                if self.gate.fail_boot() {
+                    self.gate.settle(BootOutcome::Failed);
+                    log::error!(
+                        "{} decoder worker for peer {} failed to start ({e:?}); this stream cannot be decoded",
+                        self.media_type,
+                        self.log_peer.borrow().as_deref().unwrap_or("unknown")
+                    );
+                }
+                return Err(e);
+            }
+        };
+        self.gate.trim_unstarted();
+        let handlers = install(&worker);
+        worker.set_onmessage(Some(handlers._on_message.as_ref().unchecked_ref()));
+        worker.set_onerror(Some(handlers._on_error.as_ref().unchecked_ref()));
+        *self.handlers.borrow_mut() = Some(handlers);
+        *self.worker.borrow_mut() = Some(worker);
+        Ok(())
+    }
+}
+
+/// Starts a deferred [`WasmDecoder`]'s worker (#3277).
+pub struct WorkerStarter(std::rc::Weak<WorkerSlot>);
+
+impl WorkerStarter {
+    /// `false` once the decoder has been dropped; a failed `Worker::new` is a failed boot.
+    pub fn start(&self) -> bool {
+        match self.0.upgrade() {
+            Some(slot) => {
+                let _ = slot.start();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Terminates a worker that has not reported ready and settles it as a failed boot.
+    pub fn abort(&self) {
+        let Some(slot) = self.0.upgrade() else {
+            return;
+        };
+        if !slot.gate.fail_boot() {
+            return;
+        }
+        if let Some(worker) = slot.worker.borrow().as_ref() {
+            worker.terminate();
+        }
+        slot.gate.timed_out.set(true);
+        slot.gate.settle(BootOutcome::Failed);
+        log::error!(
+            "{} decoder worker for peer {} did not start in time",
+            slot.media_type,
+            slot.log_peer.borrow().as_deref().unwrap_or("unknown")
+        );
+    }
+}
+
+fn worker_url() -> String {
+    window()
+        .expect("no window")
+        .document()
+        .expect("no document")
+        .get_element_by_id("codecs-worker")
+        .expect("worker link tag with id 'codecs-worker' not found")
+        .get_attribute("href")
+        .expect("worker link tag has no href attribute")
 }
 
 impl Decodable for WasmDecoder {
@@ -60,25 +162,10 @@ impl Decodable for WasmDecoder {
         on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
     ) -> Self {
         log::info!("Creating WASM decoder with internal jitter buffer");
-        // Issue #1641: this `Decodable::new` path is not used for real peer rendering (peer
-        // decoders use `new_with_video_frame_callback`, which threads the owner's true media_type).
-        // It still forwards the worker's "video" stats DiagEvent, which health_reporter buckets by
-        // the `media_type` metric — so we must stamp *something*. "VIDEO" (the camera literal,
-        // `MEDIA_TYPE_CAMERA`) is the safe default: there is no real screen-share decoder on this
-        // path, so the camera bucket is correct.
         const DECODABLE_DEFAULT_MEDIA_TYPE: &str = "VIDEO";
         // Camera's `PERIODIC_KEYFRAME_MAX_INTERVAL_MS`, from the non-dependency `videocall-aq`.
         const DECODABLE_DEFAULT_BOOT_REPLAY_TTL_MS: f64 = 5000.0;
-        // Find the worker script URL from the link tag added by Trunk.
-        let worker_url = window()
-            .expect("no window")
-            .document()
-            .expect("no document")
-            .get_element_by_id("codecs-worker")
-            .expect("worker link tag with id 'codecs-worker' not found")
-            .get_attribute("href")
-            .expect("worker link tag has no href attribute");
-
+        let worker_url = worker_url();
         // Create the worker.
         let worker = Worker::new(&worker_url).expect("Failed to create worker");
 
@@ -126,10 +213,10 @@ impl Decodable for WasmDecoder {
                     }
                     Err(_) => {
                         // Issue #1025: this `Decodable::new` path is not used for real peer
-                        // rendering (peer decoders use `new_with_video_frame_callback`), so there
-                        // is no proactive keyframe hook to fire here — but we still recognize the
-                        // worker's RequestKeyframeMessage so it isn't logged as "unexpected". The
-                        // carried `head_age_ms` (#1479) is ignored on this no-render path.
+                        // rendering, so there is no proactive keyframe hook to fire here — but we
+                        // still recognize the worker's RequestKeyframeMessage so it isn't logged
+                        // as "unexpected". The carried `head_age_ms` (#1479) is ignored on this
+                        // no-render path.
                         if !drain_on_worker_ready(&js_val, &ack_worker, &gate_for_closure)
                             && handle_worker_request_keyframe(&js_val).is_none()
                             && !handle_worker_diag_message(
@@ -146,6 +233,14 @@ impl Decodable for WasmDecoder {
         };
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
+        let log_peer = Rc::new(RefCell::new(None));
+        let on_error_closure = boot_failure_handler(
+            worker.clone(),
+            gate.clone(),
+            DECODABLE_DEFAULT_MEDIA_TYPE,
+            log_peer.clone(),
+        );
+        worker.set_onerror(Some(on_error_closure.as_ref().unchecked_ref()));
 
         // Create a dummy callback for the struct field since the real one is in Rc<RefCell<>>
         let dummy_callback = Box::new(|_: DecodedFrame| {
@@ -153,8 +248,18 @@ impl Decodable for WasmDecoder {
         });
 
         WasmDecoder {
-            worker,
-            _on_message_closure: on_message_closure,
+            slot: Rc::new(WorkerSlot {
+                url: worker_url,
+                media_type: DECODABLE_DEFAULT_MEDIA_TYPE,
+                worker: RefCell::new(Some(worker)),
+                handlers: RefCell::new(Some(WorkerHandlers {
+                    _on_message: on_message_closure,
+                    _on_error: on_error_closure,
+                })),
+                install: RefCell::new(None),
+                gate: gate.clone(),
+                log_peer,
+            }),
             _on_decoded_frame: dummy_callback,
             freshness_evictions,
             gate,
@@ -170,12 +275,9 @@ impl Decodable for WasmDecoder {
 impl WasmDecoder {
     /// Create a WasmDecoder with VideoFrame callback for direct canvas rendering.
     ///
-    /// `on_request_keyframe` (issue #1025) is invoked on the main thread whenever the
-    /// worker posts a [`RequestKeyframeMessage`] — i.e. the worker's jitter buffer just
-    /// evicted a stale keyframe-less backlog and wants a fresh keyframe fetched now. The
-    /// owner (e.g. `VideoPeerDecoder`) supplies a closure that issues a `KEYFRAME_REQUEST`
-    /// for this decoder's peer/stream. The closure receives the head-of-line backlog age
-    /// (`head_age_ms`, issue #1479) that tripped the freshness deadline. Pass a no-op
+    /// `on_request_keyframe` (issue #1025): the owner (e.g. `VideoPeerDecoder`) supplies a
+    /// closure that issues a `KEYFRAME_REQUEST` for this decoder's peer/stream. The closure
+    /// receives a backlog age (`head_age_ms`, issue #1479). Pass a no-op
     /// (`Box::new(|_| {})`) when no proactive keyframe path is wired.
     ///
     /// `media_type` (issue #1641) is the owner's stream kind — `"VIDEO"` for a camera decoder
@@ -189,29 +291,104 @@ impl WasmDecoder {
     ///
     /// `boot_replay_ttl_ms` (issue 2572): ONE publisher keyframe interval for the stream's kind.
     pub fn new_with_video_frame_callback(
-        _codec: crate::decoder::VideoCodec,
+        codec: crate::decoder::VideoCodec,
         on_video_frame: Box<dyn Fn(VideoFrame)>,
         on_request_keyframe: Box<dyn Fn(f64)>,
         media_type: &'static str,
         boot_replay_ttl_ms: f64,
     ) -> Self {
+        let decoder = Self::unstarted_with_video_frame_callback(
+            codec,
+            on_video_frame,
+            on_request_keyframe,
+            media_type,
+            boot_replay_ttl_ms,
+            None,
+        );
+        decoder.slot.start().expect("Failed to create worker");
+        decoder
+    }
+
+    /// [`Self::new_with_video_frame_callback`] whose worker is created only when the returned
+    /// [`WorkerStarter`] runs (#3277); `on_boot_settled` runs once the worker is ready or failed.
+    pub fn new_deferred_with_video_frame_callback(
+        codec: crate::decoder::VideoCodec,
+        on_video_frame: Box<dyn Fn(VideoFrame)>,
+        on_request_keyframe: Box<dyn Fn(f64)>,
+        media_type: &'static str,
+        boot_replay_ttl_ms: f64,
+        on_boot_settled: BootSettled,
+    ) -> (Self, WorkerStarter) {
+        let decoder = Self::unstarted_with_video_frame_callback(
+            codec,
+            on_video_frame,
+            on_request_keyframe,
+            media_type,
+            boot_replay_ttl_ms,
+            Some(on_boot_settled),
+        );
+        let starter = WorkerStarter(Rc::downgrade(&decoder.slot));
+        (decoder, starter)
+    }
+
+    fn unstarted_with_video_frame_callback(
+        _codec: crate::decoder::VideoCodec,
+        on_video_frame: Box<dyn Fn(VideoFrame)>,
+        on_request_keyframe: Box<dyn Fn(f64)>,
+        media_type: &'static str,
+        boot_replay_ttl_ms: f64,
+        on_boot_settled: Option<BootSettled>,
+    ) -> Self {
         log::info!("Creating WASM decoder with VideoFrame callback");
-        // Find the worker script URL from the link tag added by Trunk.
-        let worker_url = web_sys::window()
-            .expect("no window")
-            .document()
-            .expect("no document")
-            .get_element_by_id("codecs-worker")
-            .expect("worker link tag with id 'codecs-worker' not found")
-            .get_attribute("href")
-            .expect("worker link tag has no href attribute");
-
-        // Create the worker.
-        let worker = Worker::new(&worker_url).expect("Failed to create worker");
-
         let freshness_evictions = Rc::new(Cell::new(FreshnessEvictionAccum::default()));
         let gate = Rc::new(BootGate::new(boot_replay_ttl_ms));
+        *gate.on_settled.borrow_mut() = on_boot_settled;
+        let log_peer = Rc::new(RefCell::new(None));
+        let (evictions, gate_for_install, log_peer_for_install) =
+            (freshness_evictions.clone(), gate.clone(), log_peer.clone());
+        let install: InstallHandlers = Box::new(move |worker: &Worker| {
+            Self::video_frame_handlers(
+                worker,
+                on_video_frame,
+                on_request_keyframe,
+                media_type,
+                evictions,
+                gate_for_install,
+                log_peer_for_install,
+            )
+        });
 
+        // Create a dummy DecodedFrame callback since we need it for the trait
+        let dummy_callback = Box::new(|_: DecodedFrame| {
+            // This won't be called when using VideoFrame callback
+        });
+
+        WasmDecoder {
+            slot: Rc::new(WorkerSlot {
+                url: worker_url(),
+                media_type,
+                worker: RefCell::new(None),
+                handlers: RefCell::new(None),
+                install: RefCell::new(Some(install)),
+                gate: gate.clone(),
+                log_peer,
+            }),
+            _on_decoded_frame: dummy_callback,
+            freshness_evictions,
+            gate,
+            context_reemit: ContextReemitRamp::default(),
+        }
+    }
+
+    fn video_frame_handlers(
+        worker: &Worker,
+        on_video_frame: Box<dyn Fn(VideoFrame)>,
+        on_request_keyframe: Box<dyn Fn(f64)>,
+        media_type: &'static str,
+        freshness_evictions: Rc<Cell<FreshnessEvictionAccum>>,
+        gate: Rc<BootGate>,
+        log_peer: Rc<RefCell<Option<String>>>,
+    ) -> WorkerHandlers {
         // Create a closure to handle messages from the worker.
         let on_message_closure = {
             let callback = on_video_frame;
@@ -226,7 +403,7 @@ impl WasmDecoder {
             let ack_worker = worker.clone();
             // Issue #1025: proactive keyframe-request callback. Moved into the closure (which is
             // stored on the struct and kept alive for the worker's lifetime) so it survives as
-            // long as the decoder. Invoked when the worker posts a RequestKeyframeMessage.
+            // long as the decoder.
             let request_keyframe = on_request_keyframe;
             let evictions_for_closure = freshness_evictions.clone();
             let gate_for_closure = gate.clone();
@@ -247,36 +424,27 @@ impl WasmDecoder {
                         // keeps the recovery path off the (more frequent) stats path. The carried
                         // `head_age_ms` (#1479) is forwarded to the route so the main thread's PLI
                         // budget can prioritize the stalest stream.
-                        if !drain_on_worker_ready(&js_val, &ack_worker, &gate_for_closure) {
-                            if let Some(head_age_ms) = handle_worker_request_keyframe(&js_val) {
+                        if drain_on_worker_ready(&js_val, &ack_worker, &gate_for_closure) {
+                            if let Some(head_age_ms) = gate_for_closure.dropped_frame_age_ms() {
                                 request_keyframe(head_age_ms);
-                            } else if !handle_worker_diag_message(
-                                &js_val,
-                                media_type,
-                                &evictions_for_closure,
-                            ) {
-                                log::warn!("Received unexpected message from worker: {js_val:?}");
                             }
+                        } else if let Some(head_age_ms) = handle_worker_request_keyframe(&js_val) {
+                            request_keyframe(head_age_ms);
+                        } else if !handle_worker_diag_message(
+                            &js_val,
+                            media_type,
+                            &evictions_for_closure,
+                        ) {
+                            log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
                     }
                 }
             }) as Box<dyn FnMut(_)>)
         };
-
-        worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
-
-        // Create a dummy DecodedFrame callback since we need it for the trait
-        let dummy_callback = Box::new(|_: DecodedFrame| {
-            // This won't be called when using VideoFrame callback
-        });
-
-        WasmDecoder {
-            worker,
-            _on_message_closure: on_message_closure,
-            _on_decoded_frame: dummy_callback,
-            freshness_evictions,
-            gate,
-            context_reemit: ContextReemitRamp::default(),
+        let on_error_closure = boot_failure_handler(worker.clone(), gate, media_type, log_peer);
+        WorkerHandlers {
+            _on_message: on_message_closure,
+            _on_error: on_error_closure,
         }
     }
 
@@ -285,7 +453,29 @@ impl WasmDecoder {
     }
 
     fn send(&self, msg: WorkerMessage) {
-        self.gate.send(&self.worker, msg);
+        match self.slot.worker.borrow().as_ref() {
+            Some(worker) => self.gate.send(worker, msg),
+            None => self.gate.hold_unstarted(msg),
+        }
+    }
+
+    /// True once the worker errored before its ready handshake (#3210).
+    pub fn boot_failed(&self) -> bool {
+        self.gate.failed.get()
+    }
+
+    /// True once [`WorkerStarter::abort`] stopped a boot that did not settle in time (#3277).
+    pub fn boot_timed_out(&self) -> bool {
+        self.gate.timed_out.get()
+    }
+
+    /// False while a deferred decoder waits for its [`WorkerStarter`] (#3277).
+    pub fn worker_started(&self) -> bool {
+        self.slot.worker.borrow().is_some()
+    }
+
+    pub fn boot_pending_messages(&self) -> usize {
+        self.gate.pending.borrow().len()
     }
 
     pub fn worker_handshake_seen(&self) -> bool {
@@ -343,6 +533,7 @@ impl WasmDecoder {
 
     /// Provide diagnostic context to the worker so that metrics include original peer IDs
     pub fn set_context(&self, from_peer: String, to_peer: String) {
+        *self.slot.log_peer.borrow_mut() = Some(to_peer.clone());
         let context = StreamContext { from_peer, to_peer };
         self.context_reemit
             .open_epoch(&context, js_sys::Date::now());
@@ -376,8 +567,11 @@ impl WasmDecoder {
 
 impl Drop for WasmDecoder {
     fn drop(&mut self) {
-        console::log_1(&"Terminating worker".into());
-        self.worker.terminate();
+        if let Some(worker) = self.slot.worker.borrow().as_ref() {
+            console::log_1(&"Terminating worker".into());
+            worker.set_onerror(None);
+            worker.terminate();
+        }
     }
 }
 
@@ -463,10 +657,16 @@ struct BootGate {
     ready: Cell<bool>,
     handshake_seen: Cell<bool>,
     dropped: Cell<bool>,
+    frame_dropped: Cell<bool>,
+    failed: Cell<bool>,
+    timed_out: Cell<bool>,
     pending: RefCell<VecDeque<WorkerMessage>>,
     /// `Date::now()` of the FIRST queued message, or `0.0` while nothing has been queued.
     first_queued_ms: Cell<f64>,
+    /// `first_queued_ms` of the oldest window a not-yet-started worker trimmed a frame from.
+    trimmed_frame_since_ms: Cell<f64>,
     ttl_ms: f64,
+    on_settled: RefCell<Option<BootSettled>>,
 }
 
 impl BootGate {
@@ -475,10 +675,49 @@ impl BootGate {
             ready: Cell::new(false),
             handshake_seen: Cell::new(false),
             dropped: Cell::new(false),
+            frame_dropped: Cell::new(false),
+            failed: Cell::new(false),
+            timed_out: Cell::new(false),
             pending: RefCell::new(VecDeque::new()),
             first_queued_ms: Cell::new(0.0),
+            trimmed_frame_since_ms: Cell::new(0.0),
             ttl_ms,
+            on_settled: RefCell::new(None),
         }
+    }
+
+    fn settle(&self, outcome: BootOutcome) {
+        let on_settled = self.on_settled.borrow_mut().take();
+        if let Some(on_settled) = on_settled {
+            on_settled(outcome);
+        }
+    }
+
+    /// Restarts the window instead of opening the gate: there is no worker to post to yet.
+    fn trim_unstarted(&self) {
+        if self.over_bound() {
+            let mut pending = self.pending.borrow_mut();
+            if pending.iter().any(is_frame) {
+                self.frame_dropped.set(true);
+                if self.trimmed_frame_since_ms.get() == 0.0 {
+                    self.trimmed_frame_since_ms.set(self.first_queued_ms.get());
+                }
+            }
+            pending.clear();
+            self.first_queued_ms.set(0.0);
+            self.dropped.set(true);
+        }
+    }
+
+    fn hold_unstarted(&self, msg: WorkerMessage) {
+        if self.failed.get() {
+            return;
+        }
+        self.trim_unstarted();
+        if self.first_queued_ms.get() == 0.0 {
+            self.first_queued_ms.set(js_sys::Date::now());
+        }
+        self.pending.borrow_mut().push_back(msg);
     }
 
     fn over_bound(&self) -> bool {
@@ -488,17 +727,49 @@ impl BootGate {
     }
 
     fn discard(&self) {
-        self.pending.borrow_mut().clear();
+        let mut pending = self.pending.borrow_mut();
+        if pending.iter().any(is_frame) {
+            self.frame_dropped.set(true);
+        }
+        pending.clear();
         self.dropped.set(true);
         self.ready.set(true);
     }
 
+    fn dropped_frame_age_ms(&self) -> Option<f64> {
+        let trimmed = self.trimmed_frame_since_ms.get();
+        let since = if trimmed == 0.0 {
+            self.first_queued_ms.get()
+        } else {
+            trimmed
+        };
+        self.frame_dropped
+            .get()
+            .then(|| js_sys::Date::now() - since)
+    }
+
+    /// Marks a worker that errored before its handshake as dead; returns false if it had booted.
+    fn fail_boot(&self) -> bool {
+        if self.handshake_seen.get() || self.failed.get() {
+            return false;
+        }
+        self.failed.set(true);
+        self.pending.borrow_mut().clear();
+        true
+    }
+
     fn send(&self, worker: &Worker, msg: WorkerMessage) {
+        if self.failed.get() {
+            return;
+        }
         if !self.ready.get() && self.over_bound() {
             self.discard();
         }
         // `msg` survives the discard above; once queued it can still be dropped by a later one.
         if self.ready.get() {
+            if !self.handshake_seen.get() && is_frame(&msg) {
+                self.frame_dropped.set(true);
+            }
             post_worker_message(worker, &msg);
             return;
         }
@@ -507,6 +778,41 @@ impl BootGate {
         }
         self.pending.borrow_mut().push_back(msg);
     }
+}
+
+fn is_frame(msg: &WorkerMessage) -> bool {
+    matches!(
+        msg,
+        WorkerMessage::DecodeFrame(_) | WorkerMessage::InjectStaleFrame(_)
+    )
+}
+
+fn boot_failure_handler(
+    worker: Worker,
+    gate: Rc<BootGate>,
+    media_type: &'static str,
+    log_peer: Rc<RefCell<Option<String>>>,
+) -> Closure<dyn FnMut(JsValue)> {
+    Closure::wrap(Box::new(move |event: JsValue| {
+        let detail = js_sys::Reflect::get(&event, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "worker error".to_string());
+        if gate.fail_boot() {
+            // A failed boot never recovers; terminating stops its timers and frees what it holds.
+            worker.terminate();
+            gate.settle(BootOutcome::Failed);
+            let peer = log_peer
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            log::error!(
+                "{media_type} decoder worker for peer {peer} failed to start ({detail}); this stream cannot be decoded"
+            );
+        } else {
+            log::warn!("{media_type} decoder worker reported an error: {detail}");
+        }
+    }) as Box<dyn FnMut(JsValue)>)
 }
 
 fn post_worker_message(worker: &Worker, msg: &WorkerMessage) {
@@ -554,6 +860,7 @@ fn drain_on_worker_ready(js_val: &JsValue, worker: &Worker, gate: &BootGate) -> 
         }
     }
     gate.ready.set(true);
+    gate.settle(BootOutcome::Ready);
     true
 }
 

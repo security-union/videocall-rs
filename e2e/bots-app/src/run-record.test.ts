@@ -7,8 +7,18 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { NETEM_PROFILES } from "./control/netem";
 import { DECODE_BUDGET_WAIVER_NOTE } from "./decode-budget";
+import { SKIP_CANVAS_PAINT_WAIVER_NOTE } from "./receiver-caps";
+import { SPEAKING_GLOW_WAIVER_NOTE } from "./speaking-glow";
 import type { BotTask } from "./orchestrator";
 import { SD_SOURCE } from "./posture";
+import { SPEECH_PLAN_DEFAULT } from "./speech-plan";
+import {
+  assignPersonas,
+  createPersonaPlanner,
+  personaFor,
+  resolvePersonaSettings,
+} from "./persona";
+import type { PersonaTally } from "./persona-driver";
 import {
   NODE_NAME_ENV,
   PARTICIPANT_RECORD_DIR,
@@ -689,6 +699,22 @@ describe("diagnostics_packets in the participant record (#2970)", () => {
     ]);
   });
 
+  it.each([
+    ["ENABLED", []],
+    [
+      "DISABLED",
+      ["requested on but the client logged DISABLED (source=url): this bot sends no DIAGNOSTICS"],
+    ],
+  ] as const)("an on request that logs %s", (state, entries) => {
+    const { dir, rec } = recorder();
+    const t = task({ diagPackets: "on" });
+    rec.register(t);
+    rec.diagPacketsObserved(t.botId, { state, source: "url" });
+    const r = readRecord(dir, t.botId) as Rec;
+    expect(r.diagnostics_packets).toEqual({ requested: "on", observed: state, source: "url" });
+    expect(diagEntries(r)).toEqual(entries);
+  });
+
   it("makes a ctl rejoin re-verify", () => {
     const { dir, rec } = recorder();
     const t = task({ diagPackets: "off" });
@@ -786,5 +812,479 @@ describe("decode_budget in the participant record (#2914)", () => {
     const r = readRecord(dir, t.botId) as Rec;
     expect(r.decode_budget.observed).toBe("all");
     expect(entries(r)).toEqual([WAIVED]);
+  });
+});
+
+describe("speaking_glow in the participant record (#2914)", () => {
+  type Rec = {
+    speaking_glow: { requested: string; observed: string | null };
+    unverified: Array<{ field: string; reason: string }>;
+  };
+  const entries = (r: Rec): string[] =>
+    r.unverified.filter((u) => u.field === "speaking_glow").map((u) => u.reason);
+  const PENDING = `${SPEAKING_GLOW_WAIVER_NOTE} requested but vc_appearance_glow_enabled was not read back after the latest join: that join has not happened yet, or the launch failed`;
+  const WAIVED = `${SPEAKING_GLOW_WAIVER_NOTE}: vc_appearance_glow_enabled=false read back after join`;
+
+  function recorder(): { dir: string; rec: ParticipantRecorder } {
+    const dir = runDir();
+    return {
+      dir,
+      rec: new ParticipantRecorder({ runDir: dir, role: null, kernelNetem: "none", pod: POD }),
+    };
+  }
+  const join = (rec: ParticipantRecorder, botId: string, glow: string | null): void =>
+    rec.joined(botId, 1_000, { camera: true, mic: true }, null, null, null, glow);
+
+  it.each([null, "true"])(
+    "records a default bot reading %j as the client's glow, no entry",
+    (readback) => {
+      const { dir, rec } = recorder();
+      rec.register(task());
+      expect(entries(readRecord(dir, task().botId) as Rec)).toEqual([]);
+      join(rec, task().botId, readback);
+      const r = readRecord(dir, task().botId) as Rec;
+      expect(r.speaking_glow).toEqual({ requested: "client", observed: readback });
+      expect(entries(r)).toEqual([]);
+    },
+  );
+
+  it("flags a client bot whose replayed storage turned the glow off", () => {
+    const { dir, rec } = recorder();
+    rec.register(task());
+    join(rec, task().botId, "false");
+    expect(entries(readRecord(dir, task().botId) as Rec)).toEqual([
+      "client requested but vc_appearance_glow_enabled=false was in storage after join (a captured storage state?), so this bot ran with the glow off",
+    ]);
+  });
+
+  it("flags an off bot as pending until join reads the preference back", () => {
+    const { dir, rec } = recorder();
+    const t = task({ speakingGlow: "off" });
+    rec.register(t);
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([PENDING]);
+    rec.finished(t.botId, 9_000, "launch-error");
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([PENDING]);
+  });
+
+  it("records the waiver once join reads it back", () => {
+    const { dir, rec } = recorder();
+    const t = task({ speakingGlow: "off" });
+    rec.register(t);
+    join(rec, t.botId, "false");
+    const r = readRecord(dir, t.botId) as Rec;
+    expect(r.speaking_glow).toEqual({ requested: "off", observed: "false" });
+    expect(entries(r)).toEqual([WAIVED]);
+  });
+
+  it("re-verifies across a ctl rejoin", () => {
+    const { dir, rec } = recorder();
+    const t = task({ speakingGlow: "off" });
+    rec.register(t);
+    join(rec, t.botId, "false");
+    rec.rejoining(t.botId, "dialup");
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([PENDING]);
+    join(rec, t.botId, "false");
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([WAIVED]);
+  });
+});
+
+describe("video_noise in the participant record (issue 3089)", () => {
+  function registered(overrides: Partial<BotTask>): {
+    video_noise: unknown;
+    unverified: Array<{ field: string }>;
+  } {
+    const dir = runDir();
+    new ParticipantRecorder({ runDir: dir, role: null, kernelNetem: "none", pod: POD }).register(
+      task(overrides),
+    );
+    return readRecord(dir, task().botId) as never;
+  }
+
+  it("records the SD default for a clock bot without an entry", () => {
+    const r = registered({ videoMode: "clock" });
+    expect(r.video_noise).toEqual({ requested: null, alpha: 0.1 });
+    expect(r.unverified.map((u) => u.field)).not.toContain("video_noise");
+  });
+
+  it("records nothing for a costume bot, whose picture has no noise layer", () => {
+    const r = registered({ videoMode: "costume", videoNoise: 0.3 });
+    expect(r.video_noise).toBeNull();
+    expect(r.unverified.map((u) => u.field)).not.toContain("video_noise");
+  });
+});
+
+describe("speech in the participant record (issue 3090)", () => {
+  const recorded = (t: BotTask): unknown => {
+    const dir = runDir();
+    new ParticipantRecorder({ runDir: dir, role: null, kernelNetem: "none", pod: POD }).register(t);
+    return (readRecord(dir, t.botId) as { speech: unknown }).speech;
+  };
+  const weighted = { speechPlan: SPEECH_PLAN_DEFAULT };
+
+  it("records a clock bot's plan and its own share of the fleet's talking", () => {
+    const shares = [0, 1, 2, 3, 4, 5, 6, 7].map(
+      (index) =>
+        (
+          recorded(
+            task({ ...weighted, videoMode: "clock", talkingClock: { index, fleetSize: 8 } }),
+          ) as {
+            weight: number;
+          }
+        ).weight,
+    );
+    expect(shares.filter((w) => Math.abs(w - 0.35) < 1e-9)).toHaveLength(1);
+    expect(shares.filter((w) => Math.abs(w - 0.075) < 1e-9)).toHaveLength(6);
+    expect(
+      recorded(task({ ...weighted, videoMode: "clock", talkingClock: { index: 0, fleetSize: 8 } })),
+    ).toEqual({ ...SPEECH_PLAN_DEFAULT, weight: shares[0] });
+  });
+
+  it("records the rotation plan with the bot's 1/N, a lone bot's full share, and null off the clock", () => {
+    const rotation = { speechPlan: { model: "rotation" as const } };
+    expect(
+      recorded(task({ ...rotation, videoMode: "clock", talkingClock: { index: 1, fleetSize: 4 } })),
+    ).toEqual({ model: "rotation", weight: 0.25 });
+    expect(recorded(task({ ...weighted, videoMode: "clock", talkingClock: null }))).toMatchObject({
+      weight: 1,
+    });
+    expect(recorded(task({ ...weighted, videoMode: "costume" }))).toBeNull();
+  });
+
+  it("records the default plan for a launched bot, which carries none", () => {
+    expect(recorded(task({ videoMode: "clock", talkingClock: null }))).toEqual({
+      ...SPEECH_PLAN_DEFAULT,
+      weight: 1,
+    });
+  });
+});
+
+describe("skip_canvas_paint in the participant record (issue 3086)", () => {
+  type Rec = {
+    skip_canvas_paint: { requested: boolean | null; observed: string | null };
+    unverified: Array<{ field: string; reason: string }>;
+  };
+  const entries = (r: Rec): string[] =>
+    r.unverified.filter((u) => u.field === "skip_canvas_paint").map((u) => u.reason);
+  const pending = (observed: string | null): string =>
+    `${SKIP_CANVAS_PAINT_WAIVER_NOTE} requested but __APP_CONFIG.skipCanvasPaint read back ${JSON.stringify(observed)} after the latest join: that join has not happened yet, the launch failed, or the injection did not land`;
+  const WAIVED = `${SKIP_CANVAS_PAINT_WAIVER_NOTE}: skipCanvasPaint="true" read back from __APP_CONFIG after join`;
+
+  function recorder(): { dir: string; rec: ParticipantRecorder } {
+    const dir = runDir();
+    return {
+      dir,
+      rec: new ParticipantRecorder({ runDir: dir, role: null, kernelNetem: "none", pod: POD }),
+    };
+  }
+
+  it.each([
+    [undefined, null, null],
+    [false, false, "false"],
+  ] as const)("records skipCanvasPaint %j without an entry", (asked, requested, readback) => {
+    const { dir, rec } = recorder();
+    const t = task({ skipCanvasPaint: asked });
+    rec.register(t);
+    rec.joined(t.botId, 1_000, { camera: true, mic: true }, null, null, readback);
+    const r = readRecord(dir, t.botId) as Rec;
+    expect(r.skip_canvas_paint).toEqual({ requested, observed: readback });
+    expect(entries(r)).toEqual([]);
+  });
+
+  it("records the waiver once for a false request whose override did not land", () => {
+    const { dir, rec } = recorder();
+    const t = task({ skipCanvasPaint: false });
+    rec.register(t);
+    for (let i = 0; i < 2; i++) {
+      rec.joined(t.botId, 1_000, { camera: true, mic: true }, null, null, "true");
+      rec.rejoining(t.botId, null);
+      const mid = readRecord(dir, t.botId) as Rec;
+      expect(mid.skip_canvas_paint).toEqual({ requested: false, observed: null });
+      expect(entries(mid)).toEqual([]);
+    }
+    rec.joined(t.botId, 1_000, { camera: true, mic: true }, null, null, "true");
+    const r = readRecord(dir, t.botId) as Rec;
+    expect(r.skip_canvas_paint).toEqual({ requested: false, observed: "true" });
+    expect(entries(r)).toEqual([WAIVED]);
+  });
+
+  it("flags a skip-paint bot as pending until join reads the override back", () => {
+    const { dir, rec } = recorder();
+    const t = task({ skipCanvasPaint: true });
+    rec.register(t);
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([pending(null)]);
+    rec.joined(t.botId, 1_000, { camera: true, mic: true }, null, null, "false");
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([pending("false")]);
+  });
+
+  it("records the waiver once join reads it back, and re-verifies across a ctl rejoin", () => {
+    const { dir, rec } = recorder();
+    const t = task({ skipCanvasPaint: true });
+    rec.register(t);
+    rec.joined(t.botId, 1_000, { camera: true, mic: true }, null, null, "true");
+    let r = readRecord(dir, t.botId) as Rec;
+    expect(r.skip_canvas_paint).toEqual({ requested: true, observed: "true" });
+    expect(entries(r)).toEqual([WAIVED]);
+    rec.rejoining(t.botId, "dialup");
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([pending(null)]);
+    rec.joined(t.botId, 1_000, { camera: true, mic: true }, null, null, "true");
+    r = readRecord(dir, t.botId) as Rec;
+    expect(entries(r)).toEqual([WAIVED]);
+  });
+});
+
+describe("simulcast_max_layers in the participant record (#3246)", () => {
+  type Rec = {
+    simulcast_max_layers: { requested: number | null; observed: number | string | null };
+    unverified: Array<{ field: string; reason: string }>;
+  };
+  const entries = (r: Rec): string[] =>
+    r.unverified.filter((u) => u.field === "simulcast_max_layers").map((u) => u.reason);
+  const capped = (n: number): string =>
+    `__APP_CONFIG.experimentalSimulcastMaxLayers=${n} after join caps this bot at ${n} video layer(s); production omits the key, so a real client publishes up to 3`;
+  const pending = (n: number, observed: number | null): string =>
+    `requested ${n} but __APP_CONFIG.experimentalSimulcastMaxLayers=${JSON.stringify(observed)} after the latest join: that join has not happened yet, or the launch failed`;
+  const join = (rec: ParticipantRecorder, id: string, readback: number | null): void =>
+    rec.joined(id, 1_000, { camera: true, mic: true }, null, null, null, null, readback);
+
+  function setup(simulcastMaxLayers?: number): {
+    dir: string;
+    rec: ParticipantRecorder;
+    id: string;
+  } {
+    const dir = runDir();
+    const rec = new ParticipantRecorder({ runDir: dir, role: null, kernelNetem: "none", pod: POD });
+    const t = task({ simulcastMaxLayers });
+    rec.register(t);
+    return { dir, rec, id: t.botId };
+  }
+
+  it("records the deployment's value and flags a ceiling below production's", () => {
+    const { dir, rec, id } = setup();
+    expect(entries(readRecord(dir, id) as Rec)).toEqual([]);
+    join(rec, id, 1);
+    const r = readRecord(dir, id) as Rec;
+    expect(r.simulcast_max_layers).toEqual({ requested: null, observed: 1 });
+    expect(entries(r)).toEqual([capped(1)]);
+  });
+
+  it.each([3, null])("adds no entry for an inherited %j (key at depth, or absent)", (readback) => {
+    const { dir, rec, id } = setup();
+    join(rec, id, readback);
+    const r = readRecord(dir, id) as Rec;
+    expect(r.simulcast_max_layers).toEqual({ requested: null, observed: readback });
+    expect(entries(r)).toEqual([]);
+  });
+
+  it("flags a request as pending until join reads it back, and again across a ctl rejoin", () => {
+    const { dir, rec, id } = setup(3);
+    expect(entries(readRecord(dir, id) as Rec)).toEqual([pending(3, null)]);
+    join(rec, id, 3);
+    let r = readRecord(dir, id) as Rec;
+    expect(r.simulcast_max_layers).toEqual({ requested: 3, observed: 3 });
+    expect(entries(r)).toEqual([]);
+    rec.rejoining(id, "dialup");
+    r = readRecord(dir, id) as Rec;
+    expect(r.simulcast_max_layers.observed).toBeNull();
+    expect(entries(r)).toEqual([pending(3, null)]);
+  });
+
+  it("flags an unrequested bot whose read-back did not complete as unknown, not absent", () => {
+    const { dir, rec, id } = setup();
+    rec.joined(id, 1_000, { camera: true, mic: true }, null, null, null, null, "unread");
+    const r = readRecord(dir, id) as Rec;
+    expect(r.simulcast_max_layers).toEqual({ requested: null, observed: "unread" });
+    expect(entries(r)).toEqual([
+      "the after-join read-back of __APP_CONFIG.experimentalSimulcastMaxLayers timed out or failed, so this bot's video layer ceiling is unknown",
+    ]);
+  });
+
+  it("still flags an honoured request below the ladder depth as a capped bot", () => {
+    const { dir, rec, id } = setup(2);
+    join(rec, id, 2);
+    expect(entries(readRecord(dir, id) as Rec)).toEqual([capped(2)]);
+  });
+});
+
+describe("transport in the participant record (issue 3087)", () => {
+  type Rec = {
+    transport_applied: unknown;
+    transport_observed: string | null;
+    transport_fallbacks: number;
+    unverified: Array<{ field: string; reason: string }>;
+    participant: { transport_intended: string };
+  };
+  const entries = (r: Rec): string[] =>
+    r.unverified.filter((u) => u.field === "transport_intended").map((u) => u.reason);
+  const applied = (preference: string, source = "default", wt_urls = 1) => ({
+    kind: "applied" as const,
+    applied: { preference, source, wt_urls, ws_urls: 1 },
+  });
+  const elected = (active: "websocket" | "webtransport" | "none") => ({
+    kind: "elected" as const,
+    active,
+  });
+
+  function recorder(): { dir: string; rec: ParticipantRecorder } {
+    const dir = runDir();
+    return {
+      dir,
+      rec: new ParticipantRecorder({ runDir: dir, role: null, kernelNetem: "none", pod: POD }),
+    };
+  }
+
+  it("records the intended transport and stays unverified until the applied line", () => {
+    const { dir, rec } = recorder();
+    const t = task({ transport: "websocket" });
+    rec.register(t);
+    let r = readRecord(dir, t.botId) as Rec;
+    expect(r.participant.transport_intended).toBe("websocket");
+    expect(r.transport_applied).toBeNull();
+    expect(entries(r)).toHaveLength(1);
+    rec.transportObserved(t.botId, applied("websocket"));
+    rec.transportObserved(t.botId, elected("websocket"));
+    r = readRecord(dir, t.botId) as Rec;
+    expect(entries(r)).toEqual([]);
+    expect(r.transport_observed).toBe("websocket");
+    expect(r.transport_fallbacks).toBe(0);
+  });
+
+  it("counts webtransport-to-websocket moves across none lines, not repeated lines", () => {
+    const { dir, rec } = recorder();
+    const t = task({ transport: "webtransport" });
+    rec.register(t);
+    rec.transportObserved(t.botId, applied("webtransport"));
+    rec.transportObserved(t.botId, elected("webtransport"));
+    rec.transportObserved(t.botId, elected("websocket"));
+    rec.transportObserved(t.botId, elected("websocket"));
+    rec.rejoining(t.botId, null);
+    const rejoined = readRecord(dir, t.botId) as Rec;
+    expect(rejoined.transport_applied).toBeNull();
+    expect(rejoined.transport_observed).toBeNull();
+    expect(entries(rejoined)).toEqual([
+      expect.stringContaining("no 'Transport preference applied:'"),
+    ]);
+    rec.transportObserved(t.botId, applied("webtransport"));
+    rec.transportObserved(t.botId, elected("websocket"));
+    rec.transportObserved(t.botId, elected("webtransport"));
+    rec.transportObserved(t.botId, elected("none"));
+    rec.transportObserved(t.botId, elected("websocket"));
+    const r = readRecord(dir, t.botId) as Rec;
+    expect(r.transport_fallbacks).toBe(2);
+    expect(r.transport_observed).toBe("websocket");
+  });
+
+  it("does not count a first election that lands on websocket", () => {
+    const { dir, rec } = recorder();
+    const t = task({ transport: "webtransport" });
+    rec.register(t);
+    rec.transportObserved(t.botId, applied("webtransport"));
+    rec.transportObserved(t.botId, elected("none"));
+    rec.transportObserved(t.botId, elected("websocket"));
+    expect((readRecord(dir, t.botId) as Rec).transport_fallbacks).toBe(0);
+  });
+
+  it("treats the first election after a ctl rejoin as a first election", () => {
+    const { dir, rec } = recorder();
+    const t = task({ transport: "webtransport" });
+    rec.register(t);
+    rec.transportObserved(t.botId, applied("webtransport"));
+    rec.transportObserved(t.botId, elected("webtransport"));
+    rec.rejoining(t.botId, null);
+    rec.transportObserved(t.botId, applied("webtransport"));
+    rec.transportObserved(t.botId, elected("websocket"));
+    expect((readRecord(dir, t.botId) as Rec).transport_fallbacks).toBe(0);
+  });
+
+  it("does not count websocket as a fallback when webtransport was never offered", () => {
+    const { dir, rec } = recorder();
+    const t = task({ transport: "webtransport" });
+    rec.register(t);
+    rec.transportObserved(t.botId, applied("webtransport", "default", 0));
+    rec.transportObserved(t.botId, elected("websocket"));
+    const r = readRecord(dir, t.botId) as Rec;
+    expect(r.transport_fallbacks).toBe(0);
+    expect(entries(r)).toEqual([expect.stringContaining("wt_urls=0")]);
+  });
+
+  it("flags a remembered choice on an auto bot without failing it", () => {
+    const { dir, rec } = recorder();
+    const t = task();
+    rec.register(t);
+    expect(entries(readRecord(dir, t.botId) as Rec)).toEqual([]);
+    rec.transportObserved(t.botId, applied("websocket", "sticky"));
+    const r = readRecord(dir, t.botId) as Rec;
+    expect(r.participant.transport_intended).toBe("auto");
+    expect(entries(r)).toEqual([expect.stringContaining("source=sticky")]);
+  });
+});
+
+describe("persona in the participant record (issue 3091)", () => {
+  const room = (n: number, micOn = "0.80,0.65,0.37,0.25,0.11") => {
+    const s = resolvePersonaSettings(true, { BOT_PERSONA_MIC_ON: micOn });
+    if (s.kind !== "ok" || s.value === null) throw new Error("bad settings");
+    return assignPersonas(createPersonaPlanner(SPEECH_PLAN_DEFAULT, n), n, s.value);
+  };
+  const persona = (index: number, r = room(3)) => personaFor(r, { index, fleetSize: r.fleetSize });
+  type Rec = {
+    persona: { mic: string; camera: string; toggles: PersonaTally | null } | null;
+    unverified: Array<{ field: string; reason: string }>;
+  };
+  const tally = (over: Partial<PersonaTally> = {}): PersonaTally => ({
+    ok: 4,
+    failed: 0,
+    already: 0,
+    rendered: 4,
+    unrendered: 0,
+    medianAbsMs: 610,
+    minGapMs: 9_000,
+    ...over,
+  });
+  const setup = (p: ReturnType<typeof persona> | null) => {
+    const dir = runDir();
+    const recorder = new ParticipantRecorder({
+      runDir: dir,
+      role: null,
+      kernelNetem: "none",
+      pod: POD,
+    });
+    const t = task({ videoMode: "clock", speechPlan: SPEECH_PLAN_DEFAULT, persona: p });
+    recorder.register(t);
+    return { recorder, read: () => readRecord(dir, t.botId) as unknown as Rec, botId: t.botId };
+  };
+  const fields = (r: Rec): string[] => r.unverified.map((u) => u.field);
+
+  it("is null without personas", () => {
+    const { read } = setup(null);
+    expect(read().persona).toBeNull();
+    expect(fields(read())).not.toContain("persona.room");
+  });
+
+  it("records the persona, flags the toggled media and a room share below its target", () => {
+    const ptt = setup({ ...persona(0), camera: "with-voice" }).read();
+    expect(ptt.persona).toMatchObject({ mic: "push-to-talk", camera: "with-voice", toggles: null });
+    expect(fields(ptt)).toEqual(
+      expect.arrayContaining(["publishes.mic", "publishes.camera", "persona.room"]),
+    );
+    const open = setup(persona(2, room(3, "0.50,0.65,0.37,0.25,0.11"))).read();
+    expect(open.persona).toMatchObject({ mic: "open", camera: "always" });
+    expect(fields(open)).not.toContain("publishes.mic");
+    expect(fields(open)).not.toContain("publishes.camera");
+    expect(fields(open)).not.toContain("persona.room");
+  });
+
+  it("carries the latest tally and lists failed or unrendered toggles", () => {
+    const { recorder, read, botId } = setup(persona(0));
+    recorder.personaToggled(botId, tally());
+    expect(read().persona?.toggles).toEqual(tally());
+    expect(fields(read())).not.toContain("persona.toggles");
+    recorder.personaToggled(botId, tally({ failed: 1, unrendered: 2 }));
+    const reason = read().unverified.find((u) => u.field === "persona.toggles")?.reason;
+    expect(reason).toContain("1 toggles failed");
+    expect(reason).toContain("2 clicked toggles had no 'Host render:' line");
+    recorder.personaToggled(botId, tally({ unrendered: 1 }));
+    expect(fields(read())).toContain("persona.toggles");
+    recorder.personaToggled(botId, tally());
+    expect(fields(read())).not.toContain("persona.toggles");
+    expect(fields(read())).toContain("persona.room");
   });
 });

@@ -24,6 +24,7 @@ import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+import { expectSelfRecording } from "../helpers/recording-status";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 
@@ -210,17 +211,13 @@ test.describe("Same-account recording icon", () => {
       const alenaRec = alena.getByTestId("record-button");
       await expect(alenaRec).toBeVisible({ timeout: 10_000 });
       await alenaRec.click();
-      await expect(alena.locator(".recording-status-banner .toast-name")).toHaveText(/Recording/, {
-        timeout: 15_000,
-      });
+      await expectSelfRecording(alena);
 
       // Alisa starts recording.
       const alisaRec = alisa.getByTestId("record-button");
       await expect(alisaRec).toBeVisible({ timeout: 10_000 });
       await alisaRec.click();
-      await expect(alisa.locator(".recording-status-banner .toast-name")).toHaveText(/Recording/, {
-        timeout: 15_000,
-      });
+      await expectSelfRecording(alisa);
 
       // ── Viktor joins LATE (same account as Alisa), never records ────────
       await fillAndSubmitJoinForm(viktor, meetingId, "Viktor");

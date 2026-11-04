@@ -1,8 +1,8 @@
 import { test, expect, chromium, Browser, BrowserContext, Locator, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { openPeerList } from "../helpers/controls";
 import {
-  FORCE_POPUP_DETACH_SCRIPT,
   MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT,
   OWN_SHARE_VIEW_KEY,
   RECEIVED_SHARE_VIEW_KEY,
@@ -15,9 +15,9 @@ import {
 } from "../helpers/screen-share-meeting";
 
 /**
- * Issue 2792: shared content opens as a grid tile whose bar offers Enlarge
- * (the split), Pin (front of the grid, issue 2866) and Detach (separate
- * window), and the view chosen for one share is the view the next share opens in.
+ * Issue 2792: a shared-content tile's bar offers Enlarge (the split), Pin
+ * (front of the grid, issue 2866) and Detach (separate window), and the view
+ * chosen for one share is the view the next share opens in.
  *
  * The HOST views a mocked share published by the GUEST. The DOM contract lives
  * in canvas_generator.rs (`ShareTileRoot`, `ScreenShareZoomControls`,
@@ -28,8 +28,14 @@ const DEFAULT_UI_URL = "http://localhost:3001";
 const GRID = "#grid-container";
 const CAMERA_TILE = `${GRID} [id^="peer-video-"][id$="-div"]`;
 const ANNOUNCER = '[data-testid="ss-detach-announce"]';
+const WINDOW_TOAST = '.peer-toasts [data-testid="ss-window-toast"]';
 const SHARER_NAME = "VmSharer";
 const SIZE_TOLERANCE_PX = 4;
+const ENLARGED_DEFAULT_MIN_WIDTH_PX = 720;
+const PHONE = { width: 390, height: 844 };
+const LAPTOP = { width: 1024, height: 768 };
+const TABLET_PORTRAIT = { width: 768, height: 1024 };
+const PHONE_LANDSCAPE = { width: 844, height: 390 };
 
 interface Box {
   x: number;
@@ -42,6 +48,7 @@ interface ShareMeeting {
   viewer: Page;
   sharer: Page;
   close: () => Promise<void>;
+  addSharer: (name: string, prepare?: (ctx: BrowserContext) => Promise<void>) => Promise<Page>;
 }
 
 const receivedTile = (page: Page): Locator => page.locator('[data-testid="received-share-tile"]');
@@ -51,9 +58,18 @@ const control = (tile: Locator, testId: string): Locator =>
   tile.locator(`[data-testid="${testId}"]`);
 const cameraPin = (page: Page): Locator =>
   cameraTile(page).locator('[data-testid="tile-pin-button"]');
+const reattachButton = (popup: Page): Locator =>
+  popup.getByRole("button", { name: "Reattach", exact: true });
 
 const stored = (page: Page, key: string): Promise<string | null> =>
   page.evaluate((k) => window.localStorage.getItem(k), key);
+
+const tileView = (ctx: BrowserContext): Promise<void> => seedShareViewMode(ctx, "tile");
+
+async function gridWidth(page: Page): Promise<number> {
+  const box = await page.locator(GRID).boundingBox();
+  return box ? box.width : Number.NaN;
+}
 
 async function openShareMeeting(
   baseURL: string | undefined,
@@ -91,7 +107,22 @@ async function openShareMeeting(
     const sharer = await joinMeetingAs(sharerCtx, meetingId, SHARER_NAME);
     await admitGuestIfNeeded(viewer, sharer);
     await expect(cameraTile(viewer)).toBeVisible({ timeout: 30_000 });
-    return { viewer, sharer, close };
+    const addSharer: ShareMeeting["addSharer"] = async (name, prepare) => {
+      const browser = await chromium.launch({ args: BROWSER_ARGS });
+      browsers.push(browser);
+      const ctx = await createAuthenticatedContext(
+        browser,
+        `vm-${label}-${name.toLowerCase()}@videocall.rs`,
+        name,
+        uiURL,
+      );
+      await ctx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
+      await prepare?.(ctx);
+      const page = await joinMeetingAs(ctx, meetingId, name);
+      await admitGuestIfNeeded(viewer, page);
+      return page;
+    };
+    return { viewer, sharer, close, addSharer };
   } catch (err) {
     await close();
     throw err;
@@ -210,24 +241,92 @@ async function settledBox(locator: Locator, what: string): Promise<Box> {
   throw new Error(`${what} never settled`);
 }
 
+// Frames the separate window's mirror has presented; null until it plays.
+function mirrorFrames(popup: Page): Promise<number | null> {
+  return popup.evaluate(() => {
+    const v = document.getElementById("ss-detached-video") as HTMLVideoElement | null;
+    if (!v || v.paused || v.readyState < 2 || v.videoWidth === 0) {
+      return null;
+    }
+    return v.getVideoPlaybackQuality().totalVideoFrames;
+  });
+}
+
+async function expectWindowWaiting(popup: Page): Promise<void> {
+  await expect(popup.locator("body")).toHaveAttribute("data-ss-state", "waiting", {
+    timeout: 10_000,
+  });
+  await expect(
+    popup
+      .locator("#ss-detached-waiting")
+      .getByRole("heading", { name: "Shared content will be displayed here" }),
+  ).toBeVisible();
+  for (const id of ["ss-detached-zoom-in", "ss-detached-maximize", "ss-detached-viewport"]) {
+    await expect(popup.locator(`#${id}`)).toHaveCount(1);
+    await expect(popup.locator(`#${id}`)).toBeHidden();
+  }
+  await expect(popup.locator(".ss-detached-name")).toHaveText("Waiting for shared content");
+  await expect(popup).toHaveTitle("Waiting for shared content");
+  const reattach = reattachButton(popup);
+  await expect(reattach).toBeVisible();
+  await expect(reattach).toHaveAttribute("aria-keyshortcuts", "Escape");
+  await expect(reattach).toHaveAccessibleDescription(
+    "New shared content appears here automatically. To view it in the meeting window instead, select Reattach.",
+  );
+}
+
+async function expectWindowLive(popup: Page, name: string): Promise<void> {
+  await expect(popup.locator("body")).toHaveAttribute("data-ss-state", "live", {
+    timeout: 15_000,
+  });
+  await expect(popup.locator("#ss-detached-waiting")).toHaveCount(1);
+  await expect(popup.locator("#ss-detached-waiting")).toBeHidden();
+  await expect(popup.locator("#ss-detached-zoom-in")).toBeVisible();
+  await expect(popup).toHaveTitle("Shared content");
+  await expect(reattachButton(popup)).toHaveAccessibleDescription(
+    "Return shared content to the meeting window",
+  );
+  await expectWindowPlays(popup, name);
+}
+
+async function expectWindowPlays(popup: Page, name: string): Promise<void> {
+  await expect(popup.locator(".ss-detached-name")).toHaveText(name, { timeout: 15_000 });
+  await expect(popup.locator("#ss-detached-video")).toBeVisible();
+  await expect
+    .poll(() => mirrorFrames(popup), {
+      timeout: 15_000,
+      message: `the window never played ${name}'s share`,
+    })
+    .not.toBeNull();
+  const first = await mirrorFrames(popup);
+  expect(first, "the window's mirror stopped playing").not.toBeNull();
+  await expect
+    .poll(async () => (await mirrorFrames(popup)) ?? -1, {
+      timeout: 10_000,
+      message: "the window's mirror is frozen",
+    })
+    .toBeGreaterThan(first!);
+}
+
 test.describe("Issue 2792: shared-content view modes", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
 
-  test("a received share opens as a camera-sized grid tile and the sharer sees its own tile @bvt1", async ({
+  test("a received share with the Tile view stored opens as a camera-sized grid tile and the sharer sees its own tile @bvt1", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);
-    const m = await openShareMeeting(baseURL, "tile", (ctx) =>
-      ctx.addInitScript(() => {
+    const m = await openShareMeeting(baseURL, "tile", async (ctx) => {
+      await tileView(ctx);
+      await ctx.addInitScript(() => {
         try {
           window.localStorage.setItem("vc_self_view_placement", "grid");
         } catch {
           /* no storage on this document */
         }
-      }),
-    );
+      });
+    });
     try {
       const grid = m.viewer.locator(GRID);
       const selfInGrid = m.viewer.locator(`${GRID} > .host[data-self-placement="grid"]`);
@@ -294,11 +393,165 @@ test.describe("Issue 2792: shared-content view modes", () => {
     }
   });
 
+  test("with no view stored a received share opens Enlarged without storing it, and the sharer's own share opens as a grid tile @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const m = await openShareMeeting(baseURL, "default");
+    try {
+      const grid = m.viewer.locator(GRID);
+      expect(
+        await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY),
+        "precondition: no stored view",
+      ).toBeNull();
+      await expect(grid).toBeVisible();
+      expect(await gridWidth(m.viewer), "precondition: a wide meeting area").toBeGreaterThanOrEqual(
+        ENLARGED_DEFAULT_MIN_WIDTH_PX,
+      );
+
+      const tile = await share(m);
+      await expect(tile).toHaveAttribute("data-share-mode", "enlarged", { timeout: 10_000 });
+      await expect(grid).toHaveAttribute("data-share-layout", "enlarged");
+      await expect(grid).toHaveClass(/\bhas-screen-share\b/);
+      await expect(
+        m.viewer.locator(`${GRID} > .ss-left-pane > [data-testid="received-share-tile"]`),
+      ).toBeVisible();
+      await expect(m.viewer.locator(`${GRID} > .ss-left-pane`)).toHaveCSS("display", "flex");
+      await expect(m.viewer.locator(`${GRID} > .screen-share-resize-handle`)).toBeVisible();
+      const sideCam = m.viewer
+        .locator(`${GRID} > .ss-peer-panel [id^="peer-video-"][id$="-div"]`)
+        .first();
+      await expect(sideCam).toBeVisible({ timeout: 10_000 });
+      await expect(sideCam).toHaveClass(/\bsplit-peer-tile\b/);
+      await expect(control(tile, "ss-enlarge")).toHaveAttribute("aria-pressed", "true");
+      await expect(control(tile, "ss-enlarge")).toHaveAttribute("title", "Return to grid");
+      const stage = await settledBox(tile, "enlarged share tile");
+      const side = await settledBox(sideCam, "camera tile in the side panel");
+      expect(stage.width, "the enlarged share is the stage").toBeGreaterThan(side.width * 2);
+      expect(
+        await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY),
+        "the default view is not stored",
+      ).toBeNull();
+
+      const own = ownTile(m.sharer);
+      await expect(own).toBeVisible({ timeout: 15_000 });
+      await expect(own).toHaveAttribute("data-share-mode", "tile");
+      await expect(m.sharer.locator(GRID)).toHaveAttribute("data-share-layout", "tile");
+      await expect(m.sharer.locator(GRID)).not.toHaveClass(/\bhas-screen-share\b/);
+      expect(await stored(m.sharer, OWN_SHARE_VIEW_KEY)).toBeNull();
+
+      await press(tile, "ss-enlarge");
+      await expect(tile).toHaveAttribute("data-share-mode", "tile", { timeout: 10_000 });
+      await expect(grid).toHaveAttribute("data-share-layout", "tile");
+      expect(await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY), "the first choice is stored").toBe(
+        "tile",
+      );
+    } finally {
+      await m.close();
+    }
+  });
+
+  test("with no view stored a received share opens as a grid tile while the meeting area is under 720px wide, portrait or short", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(300_000);
+    const m = await openShareMeeting(baseURL, "narrow");
+    try {
+      const grid = m.viewer.locator(GRID);
+      const peerList = m.viewer.locator("#peer-list-container");
+      const expectMeetingArea = async (wide: boolean, what: string): Promise<void> => {
+        await expect(grid).toBeVisible();
+        const poll = expect.poll(() => gridWidth(m.viewer), { timeout: 10_000, message: what });
+        await (wide
+          ? poll.toBeGreaterThanOrEqual(ENLARGED_DEFAULT_MIN_WIDTH_PX)
+          : poll.toBeLessThan(ENLARGED_DEFAULT_MIN_WIDTH_PX));
+      };
+      const shareArrivesAs = async (mode: "tile" | "enlarged", what: string): Promise<void> => {
+        const tile = await share(m);
+        await expect(tile, what).toHaveAttribute("data-share-mode", mode, { timeout: 10_000 });
+        await expect(grid).toHaveAttribute("data-share-layout", mode);
+        expect(
+          await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY),
+          "the default view is not stored",
+        ).toBeNull();
+      };
+
+      await m.viewer.setViewportSize(PHONE);
+      await expectMeetingArea(false, "precondition: a phone-wide meeting area");
+      await shareArrivesAs("tile", "a phone opens the share as a tile");
+      await expect(grid).not.toHaveClass(/\bhas-screen-share\b/);
+      await expect(control(receivedTile(m.viewer), "ss-enlarge")).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+      await stopShare(m);
+
+      await m.viewer.setViewportSize(TABLET_PORTRAIT);
+      await expectMeetingArea(true, "precondition: a portrait area at least 720px wide");
+      await shareArrivesAs("tile", "a portrait tablet opens the share as a tile");
+      await stopShare(m);
+
+      await m.viewer.setViewportSize(PHONE_LANDSCAPE);
+      await expectMeetingArea(true, "precondition: a landscape phone at least 720px wide");
+      await shareArrivesAs("tile", "a landscape phone opens the share as a tile");
+      await stopShare(m);
+
+      await m.viewer.setViewportSize(LAPTOP);
+      await openPeerList(m.viewer);
+      await expectMeetingArea(false, "precondition: the peer list narrows a 1024px meeting area");
+      await shareArrivesAs("tile", "an open peer list leaves too little room to enlarge");
+      await stopShare(m);
+
+      await peerList.locator("button.close-button").click({ timeout: 10_000 });
+      await expect(peerList).not.toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expectMeetingArea(true, "precondition: the same window with the peer list closed");
+      await shareArrivesAs("enlarged", "the same window without the drawer enlarges");
+    } finally {
+      await m.close();
+    }
+  });
+
+  test("a share arriving Enlarged closes an open density menu and moves focus from the menu or its trigger to the grid", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const m = await openShareMeeting(baseURL, "density");
+    try {
+      const grid = m.viewer.locator(GRID);
+      const menu = m.viewer.locator(".density-popover");
+      const trigger = m.viewer.locator("#density-mode-trigger");
+      await m.viewer.locator(".video-controls-container").hover({ timeout: 10_000 });
+      await trigger.click({ timeout: 10_000 });
+      await expect(menu).toBeVisible({ timeout: 5_000 });
+      await expect
+        .poll(() => focusedControl(m.viewer), { timeout: 5_000 })
+        .toMatch(/^outside:density-opt-/);
+
+      await share(m);
+      await expect(grid).toHaveAttribute("data-share-layout", "enlarged", { timeout: 10_000 });
+      await expect(menu).toHaveCount(0);
+      await expectFocus(m.viewer, "outside:grid-container");
+
+      await stopShare(m);
+      await expect(grid).toHaveAttribute("data-share-layout", "none", { timeout: 10_000 });
+      await expect(trigger).toHaveAttribute("aria-expanded", "false");
+      await expect(menu, "the menu must not reopen when the split ends").toHaveCount(0);
+
+      await m.viewer.locator(".video-controls-container").hover({ timeout: 10_000 });
+      await trigger.focus();
+      await expectFocus(m.viewer, "outside:density-mode-trigger");
+      await share(m);
+      await expectFocus(m.viewer, "outside:grid-container");
+    } finally {
+      await m.close();
+    }
+  });
+
   test("Enlarge opens the split and returns the share to the grid, focus staying on Enlarge @bvt1", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);
-    const m = await openShareMeeting(baseURL, "enlarge");
+    const m = await openShareMeeting(baseURL, "enlarge", tileView);
     try {
       const grid = m.viewer.locator(GRID);
       const tile = await share(m);
@@ -310,6 +563,7 @@ test.describe("Issue 2792: shared-content view modes", () => {
       await expect(grid).toHaveAttribute("data-share-layout", "enlarged");
       await expect(grid).toHaveClass(/\bhas-screen-share\b/);
       await expect(enlarge).toHaveAttribute("aria-pressed", "true");
+      await expect(enlarge).toHaveAttribute("title", "Return to grid");
       await expectFocus(m.viewer, "received:ss-enlarge");
       expect(await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY)).toBe("enlarged");
       const stage = await settledBox(tile, "enlarged share tile");
@@ -321,6 +575,7 @@ test.describe("Issue 2792: shared-content view modes", () => {
       await expect(grid).toHaveAttribute("data-share-layout", "tile");
       await expect(grid).not.toHaveClass(/\bhas-screen-share\b/);
       await expect(enlarge).toHaveAttribute("aria-pressed", "false");
+      await expect(enlarge).toHaveAttribute("title", "Enlarge");
       await expectFocus(m.viewer, "received:ss-enlarge");
       expect(await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY)).toBe("tile");
     } finally {
@@ -332,7 +587,7 @@ test.describe("Issue 2792: shared-content view modes", () => {
     baseURL,
   }) => {
     test.setTimeout(180_000);
-    const m = await openShareMeeting(baseURL, "pin");
+    const m = await openShareMeeting(baseURL, "pin", tileView);
     try {
       const grid = m.viewer.locator(GRID);
       const announce = m.viewer.locator(ANNOUNCER);
@@ -404,7 +659,7 @@ test.describe("Issue 2792: shared-content view modes", () => {
 
   test("camera and share pins coexist, the most recent pin first", async ({ baseURL }) => {
     test.setTimeout(180_000);
-    const m = await openShareMeeting(baseURL, "camerapin");
+    const m = await openShareMeeting(baseURL, "camerapin", tileView);
     try {
       const tile = await share(m);
       const cam = cameraTile(m.viewer);
@@ -449,9 +704,10 @@ test.describe("Issue 2792: shared-content view modes", () => {
     baseURL,
   }) => {
     test.setTimeout(240_000);
-    const m = await openShareMeeting(baseURL, "nodes", (ctx) =>
-      ctx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT),
-    );
+    const m = await openShareMeeting(baseURL, "nodes", async (ctx) => {
+      await tileView(ctx);
+      await ctx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
+    });
     try {
       const grid = m.viewer.locator(GRID);
       const cam = cameraTile(m.viewer);
@@ -497,7 +753,7 @@ test.describe("Issue 2792: shared-content view modes", () => {
 
   test("the chosen view is the view of the next share, per origin", async ({ baseURL }) => {
     test.setTimeout(300_000);
-    const m = await openShareMeeting(baseURL, "sticky");
+    const m = await openShareMeeting(baseURL, "sticky", tileView);
     try {
       let tile = await share(m);
       const own = ownTile(m.sharer);
@@ -544,13 +800,11 @@ test.describe("Issue 2792: shared-content view modes", () => {
     }
   });
 
-  test("Detach returns peers to normal-grid size, reattach focuses Detach, and a share that ends detached offers the window next time", async ({
+  test("Detach returns peers to normal-grid size, reattach focuses Detach, and closing a window left waiting returns the next share to the pre-detach view", async ({
     baseURL,
   }) => {
     test.setTimeout(300_000);
-    const m = await openShareMeeting(baseURL, "detach", (ctx) =>
-      ctx.addInitScript(FORCE_POPUP_DETACH_SCRIPT),
-    );
+    const m = await openShareMeeting(baseURL, "detach", tileView);
     try {
       const grid = m.viewer.locator(GRID);
       const announce = m.viewer.locator(ANNOUNCER);
@@ -562,8 +816,6 @@ test.describe("Issue 2792: shared-content view modes", () => {
       const beside = await settledBox(cam, "camera tile beside the share tile");
       expect(beside.width, "a share cell shrinks the camera tile").toBeLessThan(normal.width - 50);
 
-      // FORCE_POPUP_DETACH_SCRIPT routes Detach to window.open, which headless
-      // Chromium honours, so no window here is a broken Detach, not a blocker.
       const opened = await openDetached(m.viewer, tile, control(tile, "ss-detach"));
       expect(opened, "Detach must open a separate window").not.toBeNull();
       const popup = opened!;
@@ -605,36 +857,39 @@ test.describe("Issue 2792: shared-content view modes", () => {
         .poll(() => stored(m.viewer, RECEIVED_SHARE_VIEW_KEY), { timeout: 5_000 })
         .toBe("detached");
       await stopShare(m);
-      await expect.poll(() => second!.isClosed(), { timeout: 10_000 }).toBe(true);
-      expect(await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY)).toBe("detached");
+      await expectWindowWaiting(second!);
+      await cameraPin(m.viewer).focus();
+      await expectFocus(m.viewer, "outside:tile-pin-button");
+      const secondClosed = second!.waitForEvent("close", { timeout: 10_000 });
+      expect(second!.isClosed(), "the waiting window closed before Escape").toBe(false);
+      // The window closes on keydown, so the keyup of press() finds the page gone.
+      await second!.keyboard.press("Escape").catch((e) => {
+        if (!second!.isClosed()) throw e;
+      });
+      await secondClosed;
+      await expect(announce).toHaveText("Separate window closed", { timeout: 10_000 });
+      await expectFocus(m.viewer, "outside:grid-container");
+      expect(await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY)).toBe("tile");
 
       const next = await share(m);
-      const cta = control(next, "ss-detach-cta");
       await expect(next).toHaveAttribute("data-share-mode", "tile");
-      await expect(cta).toBeVisible({ timeout: 5_000 });
-      await expect(announce).toHaveText(
-        new RegExp(`${SHARER_NAME} started sharing\\. You can open it in a separate window\\.`),
-        { timeout: 5_000 },
-      );
-      const third = await openDetached(m.viewer, next, cta);
-      expect(third, "the one-click route must open the window").not.toBeNull();
-      await expect(next).toHaveAttribute("data-share-mode", "detached", { timeout: 10_000 });
-      await expect(cta).toHaveCount(0, { timeout: 10_000 });
+      await expect(control(next, "ss-detach-cta")).toHaveCount(0);
+      await expect(announce).toHaveText(`${SHARER_NAME} started sharing`, { timeout: 5_000 });
     } finally {
       await m.close();
     }
   });
 
-  test("a stored Detached view offers the window on the tile, then folds into a suggested Detach", async ({
+  test("a stored Detached view offers the window on the tile, folds into a suggested Detach, and opens the window from the next offer", async ({
     baseURL,
   }) => {
-    test.setTimeout(180_000);
+    test.setTimeout(240_000);
     const m = await openShareMeeting(baseURL, "cta", (ctx) => seedShareViewMode(ctx, "detached"));
     try {
       const tile = await share(m);
       const cta = control(tile, "ss-detach-cta");
       const detach = control(tile, "ss-detach");
-      await expect(tile).toHaveAttribute("data-share-mode", "tile");
+      await expect(tile).toHaveAttribute("data-share-mode", "enlarged");
       await expect(cta).toBeVisible({ timeout: 5_000 });
       await expect(cta).toHaveAttribute("aria-label", "Open in separate window");
       await expect(detach).not.toHaveAttribute("data-suggested", "true");
@@ -646,8 +901,265 @@ test.describe("Issue 2792: shared-content view modes", () => {
       // CTA_TIMEOUT_MS is 12 s while the button does not hold focus.
       await expect(cta).toHaveCount(0, { timeout: 20_000 });
       await expect(detach).toHaveAttribute("data-suggested", "true");
-      await expect(tile).toHaveAttribute("data-share-mode", "tile");
+      await expect(tile).toHaveAttribute("data-share-mode", "enlarged");
       expect(await stored(m.viewer, RECEIVED_SHARE_VIEW_KEY)).toBe("detached");
+
+      await stopShare(m);
+      const next = await share(m);
+      const opened = await openDetached(m.viewer, next, control(next, "ss-detach-cta"));
+      expect(opened, "the one-click route must open the window").not.toBeNull();
+      await expect(next).toHaveAttribute("data-share-mode", "detached", { timeout: 10_000 });
+    } finally {
+      await m.close();
+    }
+  });
+});
+
+test.describe("Issue 3173: the received separate window waits between shares", () => {
+  const SECOND_SHARER = "VmSharerTwo";
+  const HOLDER = "VmHolder";
+
+  const openWithWindow = (baseURL: string | undefined, label: string): Promise<ShareMeeting> =>
+    openShareMeeting(baseURL, label, tileView);
+
+  async function detachShare(m: ShareMeeting, holder = m.viewer): Promise<Page> {
+    await share(m);
+    const tile = receivedTile(holder);
+    await expect(tile).toHaveAttribute("data-share-mode", "tile", { timeout: 10_000 });
+    const opened = await openDetached(holder, tile, control(tile, "ss-detach"));
+    expect(opened, "Detach must open a separate window").not.toBeNull();
+    await expect(tile).toHaveAttribute("data-share-mode", "detached", { timeout: 10_000 });
+    await expectWindowPlays(opened!, SHARER_NAME);
+    return opened!;
+  }
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("the window waits when the sharer stops, speaks only in the focused document, plays the next share, and closes on Reattach and when the meeting view is left", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(300_000);
+    const m = await openWithWindow(baseURL, "waits");
+    try {
+      const grid = m.viewer.locator(GRID);
+      const announce = m.viewer.locator(ANNOUNCER);
+      const toast = m.viewer.locator(WINDOW_TOAST);
+      const popup = await detachShare(m);
+      const note = popup.locator("#ss-detached-announce");
+      const pages = m.viewer.context().pages().length;
+
+      await stopShare(m);
+      await expectWindowWaiting(popup);
+      await expect(note).toHaveText(
+        `${SHARER_NAME} stopped sharing. Shared content will be displayed here.`,
+      );
+      await expect(grid).toHaveAttribute("data-share-layout", "none");
+      // Playwright reports every page focused, so the window holds focus here.
+      await expectHeld(
+        m.viewer,
+        async () => (await announce.textContent())?.trim() ?? null,
+        "Shared content opened in a separate window",
+        2_000,
+        "the meeting window must stay silent while the window has focus",
+      );
+
+      await popup.evaluate(() => {
+        document.hasFocus = () => false;
+      });
+      const reshared = await startScreenShare(m.sharer, m.viewer);
+      expect(reshared, "the viewer never received the next share").toBe(true);
+      await expect(toast).toHaveText(`${SHARER_NAME} is sharing in the separate window`);
+      const tile = receivedTile(m.viewer);
+      await expect(tile).toHaveAttribute("data-share-mode", "detached", { timeout: 10_000 });
+      await expect(tile).toHaveAttribute("inert", "true");
+      await expectWindowLive(popup, SHARER_NAME);
+      await expect(announce).toHaveText(
+        `${SHARER_NAME} started sharing. Showing it in the separate window.`,
+        { timeout: 10_000 },
+      );
+      await expect(note).toBeEmpty();
+      expect(m.viewer.context().pages(), "the next share reuses the open window").toHaveLength(
+        pages,
+      );
+
+      await stopShare(m);
+      await expectWindowWaiting(popup);
+      const closed = popup.waitForEvent("close", { timeout: 10_000 });
+      await reattachButton(popup).click({ timeout: 10_000 });
+      await closed;
+      await expect(announce).toHaveText("Separate window closed", { timeout: 10_000 });
+      await expect(grid).toHaveAttribute("data-share-layout", "none");
+
+      const next = await share(m);
+      await expect(next).toHaveAttribute("data-share-mode", "tile");
+      await expect(next).not.toHaveAttribute("inert");
+      expect(m.viewer.context().pages(), "a closed window stays closed").toHaveLength(pages - 1);
+      const last = await openDetached(m.viewer, next, control(next, "ss-detach"));
+      expect(last, "Detach must open again after a waiting window closed").not.toBeNull();
+      await m.viewer.goBack();
+      await expect.poll(() => last!.isClosed(), { timeout: 10_000 }).toBe(true);
+    } finally {
+      await m.close();
+    }
+  });
+
+  test("a window left waiting by a sharer who leaves plays another participant's share", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(300_000);
+    const m = await openWithWindow(baseURL, "handover");
+    try {
+      const second = await m.addSharer(SECOND_SHARER);
+      await expect(m.viewer.locator(CAMERA_TILE)).toHaveCount(2, { timeout: 30_000 });
+      const popup = await detachShare(m);
+      const pages = m.viewer.context().pages().length;
+
+      await m.sharer.close();
+      await expect(receivedTile(m.viewer)).toHaveCount(0, { timeout: 30_000 });
+      await expectWindowWaiting(popup);
+
+      const shared = await startScreenShare(second, m.viewer);
+      expect(shared, "the viewer never received the second participant's share").toBe(true);
+      const toast = m.viewer.locator(WINDOW_TOAST);
+      await expect(toast).toHaveText(`${SECOND_SHARER} is sharing in the separate window`);
+      await expect(receivedTile(m.viewer)).toHaveAttribute("data-share-mode", "detached", {
+        timeout: 10_000,
+      });
+      await expectWindowLive(popup, SECOND_SHARER);
+      await expect(popup.locator("#ss-detached-announce")).toHaveText(
+        `${SECOND_SHARER} started sharing`,
+      );
+      expect(m.viewer.context().pages(), "the second share reuses the open window").toHaveLength(
+        pages,
+      );
+    } finally {
+      await m.close();
+    }
+  });
+
+  test("the window closes when its holder is removed from the meeting", async ({ baseURL }) => {
+    test.setTimeout(300_000);
+    const m = await openWithWindow(baseURL, "kicked");
+    try {
+      const holder = await m.addSharer(HOLDER, tileView);
+      await expect(m.viewer.locator(CAMERA_TILE)).toHaveCount(2, { timeout: 30_000 });
+      const popup = await detachShare(m, holder);
+      const holderTile = m.viewer.locator(".grid-item:has(.tile-mute-btn)", { hasText: HOLDER });
+      await holderTile.hover({ timeout: 15_000 });
+      await holderTile.getByTitle("Host actions").click({ timeout: 10_000 });
+      await holderTile
+        .locator(".tile-context-menu-item", { hasText: "Remove from meeting" })
+        .click({ timeout: 10_000 });
+      await expect(holder.locator(".meeting-ended-overlay")).toBeVisible({ timeout: 20_000 });
+      await expect.poll(() => popup.isClosed(), { timeout: 10_000 }).toBe(true);
+    } finally {
+      await m.close();
+    }
+  });
+
+  test("a share that takes the window leaves the one it replaced as a tile with zoom and Swap, Swap trades places, and the window's share stopping brings the tile back", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(300_000);
+    const m = await openWithWindow(baseURL, "demote");
+    try {
+      const second = await m.addSharer(SECOND_SHARER);
+      await expect(m.viewer.locator(CAMERA_TILE)).toHaveCount(2, { timeout: 30_000 });
+      const popup = await detachShare(m);
+      const demoted = m.viewer.locator(
+        '[data-testid="received-share-tile"][data-share-role="secondary"]',
+      );
+      const expectDemoted = async (name: string): Promise<void> => {
+        await expect(demoted).toHaveCount(1, { timeout: 15_000 });
+        await expect(demoted).toHaveAttribute("aria-label", `Shared content from ${name}`);
+        await expect(demoted).toHaveAttribute("data-share-mode", "tile");
+        await expect(control(demoted, "ss-zoom-in")).toHaveCount(1);
+        await expect(control(demoted, "ss-enlarge")).toHaveCount(0);
+        await expect(control(demoted, "ss-pin")).toHaveCount(0);
+        const swap = control(demoted, "ss-detach");
+        await expect(swap).toHaveAttribute("data-swap", "true");
+        await expect(swap).toHaveAttribute("title", "Swap with the separate window");
+      };
+
+      await startScreenShare(second, m.viewer);
+      await expectDemoted(SHARER_NAME);
+      await expectWindowPlays(popup, SECOND_SHARER);
+
+      await press(demoted, "ss-detach");
+      await expectDemoted(SECOND_SHARER);
+      await expectWindowPlays(popup, SHARER_NAME);
+      await expectFocus(m.viewer, "received:ss-detach");
+
+      await stopScreenShare(second);
+      await expect(demoted).toHaveCount(0, { timeout: 20_000 });
+      await expect(receivedTile(m.viewer)).toHaveAttribute("data-share-mode", "detached");
+      await expectWindowPlays(popup, SHARER_NAME);
+
+      const toast = m.viewer.locator(WINDOW_TOAST);
+      await startScreenShare(second, m.viewer);
+      await expectDemoted(SHARER_NAME);
+      await expect(toast).toHaveText(`${SECOND_SHARER} is sharing in the separate window`);
+      await stopScreenShare(second);
+      await expect(toast).toHaveText(`${SHARER_NAME} is sharing in the separate window`);
+      await expect(demoted).toHaveCount(0, { timeout: 20_000 });
+      await expectWindowPlays(popup, SHARER_NAME);
+    } finally {
+      await m.close();
+    }
+  });
+});
+
+test.describe("Issue 3308: the separate window is a regular window", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("Detach opens a popup window, never Picture-in-Picture, and Reattach closes it @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const m = await openShareMeeting(baseURL, "popup", async (ctx) => {
+      await tileView(ctx);
+      await ctx.addInitScript(() => {
+        if (window.location.href === "about:blank") return;
+        const w = window as unknown as { __pipCalls?: number };
+        Object.defineProperty(window, "documentPictureInPicture", {
+          configurable: true,
+          value: {
+            window: null,
+            requestWindow: () => {
+              w.__pipCalls = (w.__pipCalls ?? 0) + 1;
+              return new Promise(() => {});
+            },
+          },
+        });
+        w.__pipCalls = 0;
+      });
+    });
+    const pipCalls = (): Promise<number | null> =>
+      m.viewer.evaluate(() => (window as unknown as { __pipCalls?: number }).__pipCalls ?? null);
+    try {
+      expect(await pipCalls(), "the counting Picture-in-Picture stub is installed").toBe(0);
+      const tile = await share(m);
+      await expect(tile).toHaveAttribute("data-share-mode", "tile");
+
+      const popup = await openDetached(m.viewer, tile, control(tile, "ss-detach"));
+      expect(popup, "Detach must open a popup window").not.toBeNull();
+      expect(await pipCalls(), "Detach must not request a Picture-in-Picture window").toBe(0);
+      const reattach = popup!.locator("#ss-detached-reattach");
+      await expect(reattach).toBeVisible({ timeout: 10_000 });
+      await expect(popup!.locator("#ss-detached-maximize")).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+      await expect(tile).toHaveAttribute("data-share-mode", "detached", { timeout: 10_000 });
+
+      const closed = popup!.waitForEvent("close", { timeout: 10_000 });
+      await reattach.click({ timeout: 10_000 });
+      await closed;
+      await expect(tile).toHaveAttribute("data-share-mode", "tile", { timeout: 10_000 });
     } finally {
       await m.close();
     }

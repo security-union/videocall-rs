@@ -1440,9 +1440,6 @@ pub const REELECTION_CONSECUTIVE_SAMPLES: u32 = 5;
 /// The winner must be at least this many milliseconds better than the old connection.
 pub const REELECTION_MIN_IMPROVEMENT_MS: f64 = 20.0;
 
-/// If the old active RTT exceeds this value (ms), accept any re-election winner
-/// regardless of whether it is better. The connection is so degraded that any
-/// alternative is worth trying.
 pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
 
 /// Number of *consecutive* implausible-RTT discards on the active connection
@@ -1549,12 +1546,6 @@ pub const RTT_PROBE_ELECTION_INTERVAL_MS: u64 = 200;
 /// ensures the elected transport is chosen on stable data, not a single
 /// potentially anomalous measurement.
 pub const ELECTION_MIN_RTT_SAMPLES: usize = 2;
-
-/// Maximum number of 1-second deadline extensions allowed when the election
-/// timer expires but no connection has accumulated `ELECTION_MIN_RTT_SAMPLES`.
-/// This caps the total additional wait to avoid indefinitely delaying the
-/// election on networks where connections never complete their handshake.
-pub const ELECTION_MAX_EXTENSIONS: u32 = 2;
 
 /// RTT probe interval after server election (milliseconds).
 pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;

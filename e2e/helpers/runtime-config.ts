@@ -3,7 +3,7 @@ import type { BrowserContext, Route } from "@playwright/test";
 // Patches BOTH `config.js` and the `config.local.js` shim served after it; call before the first navigation.
 export async function setRuntimeConfig(
   context: BrowserContext,
-  keys: Record<string, string>,
+  keys: Record<string, string | number>,
 ): Promise<void> {
   const injection = `;window.__APP_CONFIG=Object.assign(window.__APP_CONFIG||{},${JSON.stringify(
     keys,

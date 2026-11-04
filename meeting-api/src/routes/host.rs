@@ -37,13 +37,16 @@ use crate::state::AppState;
 /// Strict host-only authorization. Checks that the user is a participant in the meeting with
 /// "admitted" status and `is_host` flag set. Used by all host-only endpoints in this module.
 async fn require_host(state: &AppState, meeting_id: i32, user_id: &str) -> Result<(), AppError> {
-    let row = db_participants::get_status(&state.db, meeting_id, user_id)
-        .await?
-        .ok_or_else(AppError::not_host)?;
-    if row.status != "admitted" || !row.is_host {
-        return Err(AppError::not_host());
+    let row = db_participants::get_status(&state.db, meeting_id, user_id).await?;
+    ensure_host(row.as_ref())
+}
+
+/// `NOT_HOST` unless `row` is an admitted host.
+pub(crate) fn ensure_host(row: Option<&db_participants::ParticipantRow>) -> Result<(), AppError> {
+    match row {
+        Some(row) if row.status == "admitted" && row.is_host => Ok(()),
+        _ => Err(AppError::not_host()),
     }
-    Ok(())
 }
 
 /// `POST /api/v1/meetings/{meeting_id}/mute`.

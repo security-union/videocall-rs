@@ -88,6 +88,76 @@ pub fn stitch_participant_audio(
     (out, total_samples)
 }
 
+const SAMPLES_PER_PACKET: usize = 960;
+const PACKET_INTERVAL_US: u64 = 20_000;
+/// A wake-up sends at most this many owed packets, the newest; older ones are dropped.
+const MAX_BACKLOG_PACKETS: u64 = 50;
+/// A wake-up owing more than this many packets is logged.
+const STALL_WARN_PACKETS: u64 = 10;
+
+/// The 20 ms packet grid on the shared media clock. Tick `t` is sequence `t - first tick` and
+/// carries the source window starting at `(t * 960) % wrap`, so each window starts where the
+/// previous tick's ended.
+#[derive(Debug)]
+pub struct PacketGrid {
+    next_tick: u64,
+    wrap: usize,
+}
+
+impl PacketGrid {
+    pub fn new(elapsed_us: u64, wrap: usize) -> Self {
+        Self {
+            next_tick: elapsed_us / PACKET_INTERVAL_US,
+            wrap: wrap.max(1),
+        }
+    }
+
+    /// The ticks to send back to back now: every owed tick, up to the newest `MAX_BACKLOG_PACKETS`.
+    pub fn due(&mut self, elapsed_us: u64) -> std::ops::Range<u64> {
+        let end = elapsed_us / PACKET_INTERVAL_US + 1;
+        let start = self.next_tick.max(end.saturating_sub(MAX_BACKLOG_PACKETS));
+        self.next_tick = end;
+        start..end
+    }
+
+    pub fn window_start(&self, tick: u64) -> usize {
+        (tick * SAMPLES_PER_PACKET as u64 % self.wrap as u64) as usize
+    }
+
+    pub fn next_deadline_us(&self) -> u64 {
+        self.next_tick * PACKET_INTERVAL_US
+    }
+}
+
+/// The audio thread's view of the shared media clock.
+trait MediaClock {
+    fn elapsed_us(&self) -> u64;
+    fn sleep_until_us(&mut self, target_us: u64);
+}
+
+struct WallClock(Instant);
+
+impl MediaClock for WallClock {
+    fn elapsed_us(&self) -> u64 {
+        self.0.elapsed().as_micros() as u64
+    }
+
+    fn sleep_until_us(&mut self, target_us: u64) {
+        let deadline = self.0 + Duration::from_micros(target_us);
+        let now = Instant::now();
+        if now < deadline {
+            thread::sleep(deadline - now);
+        }
+    }
+}
+
+/// Copy one packet of `source`, starting at `start` and wrapping at its end.
+pub fn fill_window(source: &[f32], start: usize, out: &mut [f32]) {
+    for (i, sample) in out.iter_mut().enumerate() {
+        *sample = source[(start + i) % source.len()];
+    }
+}
+
 pub struct AudioProducer {
     #[allow(dead_code)]
     user_id: String,
@@ -128,7 +198,7 @@ impl AudioProducer {
                 audio_data,
                 packet_sender,
                 quit_clone,
-                media_start,
+                WallClock(media_start),
                 loop_duration,
                 is_speaking,
                 aq,
@@ -220,7 +290,7 @@ impl AudioProducer {
         audio_data: Vec<f32>,
         packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
-        media_start: Instant,
+        mut clock: impl MediaClock,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
@@ -232,19 +302,18 @@ impl AudioProducer {
             return Ok(());
         }
 
-        // Audio configuration - targeting 50fps (20ms packets)
         let sample_rate = 48000u32;
         let channels = 1u8;
-        let samples_per_packet = (sample_rate as f32 * 0.02) as usize; // 960 samples = 20ms
-        let packet_interval_us: u64 = 20_000; // 20ms in microseconds
-        let loop_duration_us = loop_duration.as_micros() as u64;
-        if loop_duration_us == 0 {
+        let loop_samples =
+            (loop_duration.as_micros() as u64 * sample_rate as u64 / 1_000_000) as usize;
+        if loop_samples == 0 {
             warn!(
                 "Audio producer for {} has zero loop duration, exiting",
                 user_id
             );
             return Ok(());
         }
+        let wrap = loop_samples.min(audio_data.len());
 
         // Create Opus encoder seeded from the AQ controller's current audio tier.
         let mut a = aq.snapshot_audio();
@@ -283,10 +352,11 @@ impl AudioProducer {
             a.dtx,
         );
 
-        // Global monotonic counter -- packet metadata needs strictly increasing
-        // values even when the audio loop wraps.
-        let mut global_sequence: u64 = 0;
         let user_id_bytes = user_id.clone().into_bytes();
+        let mut grid = PacketGrid::new(clock.elapsed_us(), wrap);
+        let first_tick = grid.next_tick;
+        let mut packet_samples = vec![0.0f32; SAMPLES_PER_PACKET];
+        let mut stalls: u64 = 0;
 
         loop {
             if quit.load(Ordering::Relaxed) {
@@ -326,121 +396,85 @@ impl AudioProducer {
                 a = new_a;
             }
 
-            // Position within the loop, derived from shared media clock.
-            // Both audio and video wrap at loop_duration so they never drift apart.
-            // Position is read AFTER any sleep so it reflects the actual send time,
-            // matching the video producer's pattern (encode-then-sleep).
-            let elapsed_us = media_start.elapsed().as_micros() as u64;
-            let position_in_loop_us = elapsed_us % loop_duration_us;
-            let audio_position = (position_in_loop_us as usize * sample_rate as usize / 1_000_000)
-                .min(audio_data.len().saturating_sub(samples_per_packet));
-
-            // Extract 20ms worth of samples from the time-derived position
-            let mut packet_samples = vec![0.0f32; samples_per_packet];
-            for (i, item) in packet_samples.iter_mut().enumerate() {
-                *item = audio_data[(audio_position + i) % audio_data.len()];
-            }
-
-            // DTX: compute RMS per packet, update is_speaking flag
-            let rms = (packet_samples.iter().map(|s| s * s).sum::<f32>()
-                / packet_samples.len() as f32)
-                .sqrt();
-            let speaking_now = next_speaking_state(is_speaking.load(Ordering::Relaxed), rms);
-            is_speaking.store(speaking_now, Ordering::Relaxed);
-
-            // Skip encode/send for near-silence packets (continuous talkers never skip)
-            if skip_silent_frame(rms, continuous) {
-                global_sequence += 1;
-
-                // Still need to sleep to maintain timing
-                let packet_in_loop = position_in_loop_us / packet_interval_us;
-                let next_packet_us = (packet_in_loop + 1) * packet_interval_us;
-                let sleep_target_us = if next_packet_us >= loop_duration_us {
-                    loop_duration_us
-                } else {
-                    next_packet_us
-                };
-                let loop_base_us = elapsed_us - position_in_loop_us;
-                let absolute_target =
-                    media_start + Duration::from_micros(loop_base_us + sleep_target_us);
-                let now = Instant::now();
-                if now < absolute_target {
-                    thread::sleep(absolute_target - now);
+            let owed_from = grid.next_tick;
+            let due = grid.due(clock.elapsed_us());
+            let owed = due.end.saturating_sub(owed_from);
+            if owed > STALL_WARN_PACKETS {
+                stalls += 1;
+                if stalls % 100 == 1 {
+                    warn!(
+                        "[{}] audio: woke {} ticks late; sending {} ticks back to back, dropping {} (stalls: {})",
+                        user_id,
+                        owed - 1,
+                        due.end - due.start,
+                        due.start - owed_from,
+                        stalls
+                    );
                 }
-                continue;
             }
+            for tick in due {
+                fill_window(
+                    &audio_data[..wrap],
+                    grid.window_start(tick),
+                    &mut packet_samples,
+                );
+                let rms = (packet_samples.iter().map(|s| s * s).sum::<f32>()
+                    / packet_samples.len() as f32)
+                    .sqrt();
+                let speaking_now = next_speaking_state(is_speaking.load(Ordering::Relaxed), rms);
+                is_speaking.store(speaking_now, Ordering::Relaxed);
+                if skip_silent_frame(rms, continuous) {
+                    continue;
+                }
 
-            // Encode to Opus
-            let mut encoded = vec![0u8; 4000];
-            match opus_encoder.encode_float(&packet_samples, &mut encoded) {
-                Ok(bytes_written) => {
-                    encoded.truncate(bytes_written);
-
-                    // Create media packet
-                    let media_packet = MediaPacket {
-                        user_id: user_id_bytes.clone(),
-                        media_type: MediaType::AUDIO.into(),
-                        data: encoded,
-                        frame_type: "key".to_string(),
-                        timestamp: get_timestamp_ms(),
-                        audio_metadata: Some(AudioMetadata {
-                            sequence: global_sequence,
-                            ..Default::default()
-                        })
-                        .into(),
-                        ..Default::default()
-                    };
-
-                    // Wrap in packet wrapper
-                    let packet_wrapper = PacketWrapper {
-                        data: media_packet.write_to_bytes()?,
-                        user_id: user_id_bytes.clone(),
-                        packet_type: PacketType::MEDIA.into(),
-                        // Cleartext discriminator so the relay always forwards
-                        // AUDIO regardless of viewport (HCL issue #988). Matches
-                        // the real client (microphone_encoder.rs).
-                        media_kind: MediaKind::AUDIO.into(),
-                        ..Default::default()
-                    };
-
-                    // Send packet — tagged `Audio` so the outbound shim can
-                    // label metrics without re-parsing the wrapper.
-                    let packet_data = packet_wrapper.write_to_bytes()?;
-                    let frame = OutboundFrame::new(MediaTypeLabel::Audio, packet_data);
-                    if let Err(_e) = packet_sender.try_send(frame) {
-                        static AUDIO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
-                        let count = AUDIO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                        transport_drops_counter.fetch_add(1, Ordering::Relaxed);
-                        if count % 100 == 1 {
-                            warn!(
-                                "Dropped audio packets due to full send channel (total: {})",
-                                count,
-                            );
-                        }
+                let mut encoded = vec![0u8; 4000];
+                let bytes_written = match opus_encoder.encode_float(&packet_samples, &mut encoded) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Opus encoding failed for {}: {}", user_id, e);
+                        continue;
                     }
-
-                    global_sequence += 1;
-                }
-                Err(e) => {
-                    error!("Opus encoding failed for {}: {}", user_id, e);
+                };
+                encoded.truncate(bytes_written);
+                let media_packet = MediaPacket {
+                    user_id: user_id_bytes.clone(),
+                    media_type: MediaType::AUDIO.into(),
+                    data: encoded,
+                    frame_type: "key".to_string(),
+                    timestamp: get_timestamp_ms(),
+                    audio_metadata: Some(AudioMetadata {
+                        sequence: tick - first_tick,
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                };
+                let packet_wrapper = PacketWrapper {
+                    data: media_packet.write_to_bytes()?,
+                    user_id: user_id_bytes.clone(),
+                    packet_type: PacketType::MEDIA.into(),
+                    // Cleartext discriminator so the relay always forwards
+                    // AUDIO regardless of viewport (HCL issue #988). Matches
+                    // the real client (microphone_encoder.rs).
+                    media_kind: MediaKind::AUDIO.into(),
+                    ..Default::default()
+                };
+                let packet_data = packet_wrapper.write_to_bytes()?;
+                let frame = OutboundFrame::new(MediaTypeLabel::Audio, packet_data);
+                if let Err(_e) = packet_sender.try_send(frame) {
+                    static AUDIO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+                    let count = AUDIO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    transport_drops_counter.fetch_add(1, Ordering::Relaxed);
+                    if count % 100 == 1 {
+                        warn!(
+                            "Dropped audio packets due to full send channel (total: {})",
+                            count,
+                        );
+                    }
                 }
             }
 
-            // Sleep until next packet deadline (microsecond precision)
-            let packet_in_loop = position_in_loop_us / packet_interval_us;
-            let next_packet_us = (packet_in_loop + 1) * packet_interval_us;
-            let sleep_target_us = if next_packet_us >= loop_duration_us {
-                loop_duration_us
-            } else {
-                next_packet_us
-            };
-            let loop_base_us = elapsed_us - position_in_loop_us;
-            let absolute_target =
-                media_start + Duration::from_micros(loop_base_us + sleep_target_us);
-            let now = Instant::now();
-            if now < absolute_target {
-                thread::sleep(absolute_target - now);
-            }
+            clock.sleep_until_us(grid.next_deadline_us());
         }
 
         Ok(())
@@ -470,9 +504,306 @@ fn get_timestamp_ms() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_speaking_state, skip_silent_frame, stitch_participant_audio, RMS_SPEAKING_ENTER,
-        RMS_SPEAKING_EXIT,
+        fill_window, next_speaking_state, skip_silent_frame, stitch_participant_audio, MediaClock,
+        PacketGrid, WallClock, MAX_BACKLOG_PACKETS, PACKET_INTERVAL_US, RMS_SPEAKING_ENTER,
+        RMS_SPEAKING_EXIT, SAMPLES_PER_PACKET,
     };
+    use protobuf::Message;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use videocall_types::protos::media_packet::MediaPacket;
+    use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    const WRAP: usize = 48 * 3010;
+
+    fn ramp() -> Vec<f32> {
+        (0..WRAP).map(|i| i as f32).collect()
+    }
+
+    #[test]
+    fn every_packet_window_starts_where_the_previous_one_ended_under_late_wakeups() {
+        let source = ramp();
+        let late_us = [
+            0, 7_000, 0, 19_900, 45_000, 0, 3_000, 199_000, 1, 60_000, 0, 9_700,
+        ];
+        let mut grid = PacketGrid::new(1_234_567, WRAP);
+        let mut sent: Vec<(u64, Vec<f32>)> = Vec::new();
+        for wake in 0..600 {
+            let elapsed = grid.next_deadline_us() + late_us[wake % late_us.len()];
+            for tick in grid.due(elapsed) {
+                let mut window = vec![0.0f32; SAMPLES_PER_PACKET];
+                fill_window(&source, grid.window_start(tick), &mut window);
+                sent.push((tick, window));
+            }
+        }
+        assert!(
+            sent.len() > 3 * WRAP / SAMPLES_PER_PACKET,
+            "crosses the loop wrap"
+        );
+        for pair in sent.windows(2) {
+            let ((t0, w0), (t1, w1)) = (&pair[0], &pair[1]);
+            assert_eq!(*t1, t0 + 1, "sequence numbers are contiguous");
+            let expected_next = (w0[SAMPLES_PER_PACKET - 1] as usize + 1) % WRAP;
+            assert_eq!(
+                w1[0] as usize, expected_next,
+                "packet {} starts where packet {} ended",
+                t1, t0
+            );
+            for (a, b) in w1.iter().zip(&w1[1..]) {
+                assert_eq!(
+                    (*a as usize + 1) % WRAP,
+                    *b as usize,
+                    "window is contiguous"
+                );
+            }
+        }
+    }
+
+    const START_US: u64 = 1_234_567;
+    const TONE_HZ: f64 = 250.0;
+
+    struct ScriptedClock {
+        now_us: u64,
+        late_us: Vec<u64>,
+        wakes: usize,
+        quit: Arc<AtomicBool>,
+    }
+
+    impl MediaClock for ScriptedClock {
+        fn elapsed_us(&self) -> u64 {
+            self.now_us
+        }
+
+        fn sleep_until_us(&mut self, target_us: u64) {
+            self.now_us =
+                self.now_us.max(target_us) + self.late_us[self.wakes % self.late_us.len()];
+            self.wakes += 1;
+            if self.wakes == 300 {
+                self.quit.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn tone(len: usize) -> Vec<f32> {
+        let w = 2.0 * std::f64::consts::PI * TONE_HZ / 48_000.0;
+        (0..len)
+            .map(|n| (0.3 * (w * n as f64).sin()) as f32)
+            .collect()
+    }
+
+    /// Runs the real `audio_loop` for 300 wake-ups on a scripted clock and returns each
+    /// sent packet's sequence number and Opus payload.
+    fn run_on_scripted_clock(
+        source: Vec<f32>,
+        loop_duration: Duration,
+        late_us: Vec<u64>,
+        continuous: bool,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let quit = Arc::new(AtomicBool::new(false));
+        let clock = ScriptedClock {
+            now_us: START_US,
+            late_us,
+            wakes: 0,
+            quit: quit.clone(),
+        };
+        let producer_quit = quit.clone();
+        let producer = std::thread::spawn(move || {
+            super::AudioProducer::audio_loop(
+                "tone".into(),
+                source,
+                tx.into(),
+                producer_quit,
+                clock,
+                loop_duration,
+                Arc::new(AtomicBool::new(false)),
+                crate::aq_controller::BotAq::with_default_clock(),
+                Arc::new(AtomicU64::new(0)),
+                continuous,
+            )
+        });
+        let watchdog = Instant::now() + Duration::from_secs(20);
+        while !producer.is_finished() && Instant::now() < watchdog {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let finished = producer.is_finished();
+        quit.store(true, Ordering::Relaxed);
+        producer.join().unwrap().unwrap();
+        assert!(finished, "the producer runs on the injected clock");
+
+        let mut packets = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let wrapper = PacketWrapper::parse_from_bytes(&frame.bytes).unwrap();
+            let media = MediaPacket::parse_from_bytes(&wrapper.data).unwrap();
+            packets.push((media.audio_metadata.sequence, media.data));
+        }
+        packets
+    }
+
+    /// Decodes each packet and returns the tone phase fitted over it.
+    fn decoded_tone_phases(packets: &[(u64, Vec<u8>)]) -> Vec<f64> {
+        let w = 2.0 * std::f64::consts::PI * TONE_HZ / 48_000.0;
+        let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+        let mut pcm = vec![0.0f32; SAMPLES_PER_PACKET];
+        packets
+            .iter()
+            .map(|(_, data)| {
+                assert_eq!(decoder.decode_float(data, &mut pcm, false).unwrap(), 960);
+                let (i, q) = pcm.iter().enumerate().fold((0.0, 0.0), |(i, q), (n, x)| {
+                    let t = w * n as f64;
+                    (i + *x as f64 * t.sin(), q + *x as f64 * t.cos())
+                });
+                q.atan2(i)
+            })
+            .collect()
+    }
+
+    fn degrees_apart(a: f64, b: f64) -> f64 {
+        use std::f64::consts::PI;
+        ((a - b + 3.0 * PI).rem_euclid(2.0 * PI) - PI)
+            .abs()
+            .to_degrees()
+    }
+
+    #[test]
+    fn the_producer_sends_contiguous_source_through_late_wakeups() {
+        let packets = run_on_scripted_clock(
+            tone(4 * 48_000),
+            Duration::from_secs(4),
+            vec![0, 7_000, 0, 3_100, 45_000, 0, 1_500, 13_000, 0, 9_700, 0, 0],
+            false,
+        );
+        let sequences: Vec<u64> = packets.iter().map(|(seq, _)| *seq).collect();
+        assert!(packets.len() > 300, "late wake-ups send the owed packets");
+        assert_eq!(sequences, (0..packets.len() as u64).collect::<Vec<_>>());
+
+        let phases = decoded_tone_phases(&packets);
+        for k in 3..phases.len() {
+            let step = degrees_apart(phases[k], phases[k - 1]);
+            assert!(
+                step < 20.0,
+                "packet {} starts {:.0} degrees of a 192-sample tone away from where packet {} ended",
+                sequences[k],
+                step,
+                sequences[k - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_speaker_spends_one_sequence_number_per_tick_through_silence_and_stalls() {
+        const LOOP_PACKETS: u64 = 100;
+        const TONE_PACKETS: u64 = 50;
+        let mut source = tone(TONE_PACKETS as usize * SAMPLES_PER_PACKET);
+        source.resize(LOOP_PACKETS as usize * SAMPLES_PER_PACKET, 0.0);
+        let mut late_us = vec![0; 300];
+        late_us[50] = 500_000;
+        let packets = run_on_scripted_clock(source, Duration::from_secs(2), late_us, false);
+
+        assert!(
+            packets.len() as u64 > LOOP_PACKETS,
+            "crosses several silent stretches"
+        );
+        let sequences: Vec<u64> = packets.iter().map(|(seq, _)| *seq).collect();
+        let first_tick = START_US / PACKET_INTERVAL_US;
+        let last = *sequences.last().unwrap();
+        let audible: Vec<u64> = (0..=last)
+            .filter(|seq| (first_tick + seq) % LOOP_PACKETS < TONE_PACKETS)
+            .collect();
+        assert!(
+            (51..=76).all(|seq| audible.contains(&seq)),
+            "the 500 ms stall lands in a tone stretch"
+        );
+        assert_eq!(
+            sequences, audible,
+            "every tick's packet carries its own sequence number; skipped silence leaves a gap, a stall does not"
+        );
+    }
+
+    #[test]
+    fn the_source_wraps_at_the_video_loop_not_at_the_end_of_the_audio() {
+        // Production audio is up to 47 samples longer than the loop, which is whole milliseconds.
+        // 4004 ms is whole tone periods but not whole packets, so a window straddles the wrap.
+        let packets = run_on_scripted_clock(
+            tone(4004 * 48 + 47),
+            Duration::from_millis(4004),
+            vec![0],
+            true,
+        );
+        let first_tick = START_US / PACKET_INTERVAL_US;
+        let loop_tick = 4004 * 48 / SAMPLES_PER_PACKET as u64;
+        assert!(
+            packets.first().unwrap().0 + first_tick < loop_tick
+                && packets.last().unwrap().0 + first_tick > loop_tick + 50,
+            "crosses the loop wrap"
+        );
+
+        let phases = decoded_tone_phases(&packets);
+        for (k, phase) in phases.iter().enumerate().skip(4) {
+            assert!(
+                degrees_apart(*phase, phases[3]) < 20.0,
+                "packet {} is {:.0} degrees off the loop's tone phase",
+                packets[k].0,
+                degrees_apart(*phase, phases[3])
+            );
+        }
+    }
+
+    #[test]
+    fn the_wall_clock_sleeps_to_the_deadline_so_slow_steps_do_not_add_up() {
+        let start = Instant::now();
+        let mut clock = WallClock(start);
+        for tick in 1..=10 {
+            std::thread::sleep(Duration::from_millis(15));
+            clock.sleep_until_us(tick * PACKET_INTERVAL_US);
+            assert!(clock.elapsed_us() >= tick * PACKET_INTERVAL_US);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(275),
+            "10 ticks took {:?}; 15 ms of work per 20 ms tick should still finish near 200 ms",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn a_stall_within_the_backlog_bound_sends_every_owed_packet() {
+        let mut grid = PacketGrid::new(0, WRAP);
+        assert_eq!(grid.due(5), 0..1);
+        let stalled = grid.due(PACKET_INTERVAL_US * 26 + 5);
+        assert_eq!(
+            stalled,
+            1..27,
+            "a 500 ms stall owes 26 packets and sends all of them"
+        );
+        assert_eq!(grid.due(grid.next_deadline_us()), 27..28);
+    }
+
+    #[test]
+    fn a_stall_past_the_backlog_sends_only_the_newest_packets() {
+        let mut grid = PacketGrid::new(0, WRAP);
+        assert_eq!(grid.due(5), 0..1);
+        let frozen = grid.due(PACKET_INTERVAL_US * (MAX_BACKLOG_PACKETS + 10) + 5);
+        assert_eq!(
+            frozen,
+            11..MAX_BACKLOG_PACKETS + 11,
+            "60 owed: the oldest 10 are dropped, the newest 50 sent"
+        );
+        assert_eq!(
+            grid.due(grid.next_deadline_us()),
+            MAX_BACKLOG_PACKETS + 11..MAX_BACKLOG_PACKETS + 12
+        );
+    }
+
+    #[test]
+    fn producers_started_at_different_times_send_the_same_window_on_the_same_tick() {
+        let early = PacketGrid::new(0, WRAP);
+        let mut late = PacketGrid::new(5_013_000, WRAP);
+        let tick = late.due(5_013_000).start;
+        assert_eq!(tick, 250);
+        assert_eq!(late.window_start(tick), early.window_start(tick));
+    }
 
     #[test]
     fn continuous_talkers_never_skip_silence() {
@@ -517,18 +848,32 @@ mod tests {
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut frames = 0;
-        while frames < 5 && Instant::now() < deadline {
+        let mut sequences = Vec::new();
+        while sequences.len() < 5 && Instant::now() < deadline {
             match rx.try_recv() {
-                Ok(frame) => frames += usize::from(frame.kind == MediaTypeLabel::Audio),
+                Ok(frame) if frame.kind == MediaTypeLabel::Audio => {
+                    use protobuf::Message;
+                    let wrapper =
+                        videocall_types::protos::packet_wrapper::PacketWrapper::parse_from_bytes(
+                            &frame.bytes,
+                        )
+                        .unwrap();
+                    let media =
+                        videocall_types::protos::media_packet::MediaPacket::parse_from_bytes(
+                            &wrapper.data,
+                        )
+                        .unwrap();
+                    sequences.push(media.audio_metadata.sequence);
+                }
+                Ok(_) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(10)),
             }
         }
         drop(producer);
-        assert!(
-            frames >= 5,
-            "a continuous presenter sends audio; got {} in 5 s",
-            frames
+        assert_eq!(
+            sequences,
+            vec![0, 1, 2, 3, 4],
+            "a continuous presenter sends audio with contiguous sequences"
         );
     }
 

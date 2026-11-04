@@ -352,16 +352,23 @@ pub const fn buffer_absorption_millis(buffer_bytes: usize, bytes_per_sec: usize)
 /// WebTransport session-ID header prepended before quinn's queue accounting.
 pub const WT_DATAGRAM_SESSION_HEADER_BYTES: usize = 1;
 
-/// Bytes one top-tier audio datagram occupies in quinn's queue: the serialized
-/// `PacketWrapper` plus the session header, NOT the bare Opus payload.
+/// Wire bytes of one top-tier audio datagram: the serialized `PacketWrapper`
+/// plus the session header, NOT the bare Opus payload.
 pub const WT_DATAGRAM_AUDIO_WIRE_BYTES: usize = 203;
 
-pub const WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 65_975;
+/// quinn-proto's per-queued-datagram charge on top of the payload (`size_of::<Datagram>()`).
+pub const QUINN_DATAGRAM_ENTRY_OVERHEAD_BYTES: usize = 32;
+
+pub const WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_375;
 
 /// quinn's CONNECTION-level unacked-byte cap, not a per-stream one. Bounds the
 /// backlog a receiver must absorb; its own test pins the resulting ceiling from
 /// both sides. Overridable per cluster via `QUIC_SEND_WINDOW_BYTES`.
 pub const WT_QUIC_SEND_WINDOW_BYTES: u64 = 1_048_576;
+
+/// Bytes the receiver-scoped AUDIO stream may buffer beyond the resolved QUIC send window
+/// (`QUIC_SEND_WINDOW_BYTES`), capped at that window (issue 3116). `WT_AUDIO_SEND_RESERVE_BYTES=0` turns it off.
+pub const WT_AUDIO_SEND_RESERVE_DEFAULT_BYTES: u64 = 262_144;
 
 pub const WT_QUIC_KEEP_ALIVE_DEFAULT_SECS: u64 = 5;
 
@@ -471,12 +478,11 @@ pub const WT_DOWNLINK_LANE_DROP_RELIEF_SUSTAIN: Duration = WT_UNISTREAM_WRITE_DE
 /// Critical control — so the per-publisher size does not apply.
 pub const WT_DOWNLINK_CONTROL_CHANNEL_CAPACITY: usize = 256;
 
-/// Slots of the CONTROL lane's queue that only the never-preempted classes —
-/// `Critical` and `Control` — may use (#2723).
+/// Slots of the CONTROL lane's queue that only `Critical` and `Control` may use
+/// (#2723).
 ///
 /// Without a reserve a lane wedged with media tail-drops the lifecycle packets
-/// #2718 routes onto the reliable stream. The protected set is exactly
-/// `evaluate_dual`'s `Critical | Control` arm.
+/// #2718 routes onto the reliable stream.
 ///
 /// Applied to the control lane ONLY: `DownlinkStreamKey::for_media` never routes
 /// a `Critical` or non-media `Control` frame to a publisher or overflow lane.
@@ -486,7 +492,8 @@ pub const WT_DOWNLINK_CONTROL_RESERVE: usize = 16;
 /// older than `PacketWrapper.media_kind` — whose above-MTU media the relay
 /// cannot attribute — plus any keys past the publisher cap, so it is deeper than
 /// a publisher lane but deliberately not deep enough to trade freshness for
-/// backlog. No reserve: `Critical` and non-media `Control` never key here.
+/// backlog. No reserve: `Critical` and non-media `Control` never key here, so
+/// a caption STATUS tail-drops here like caption text.
 pub const WT_DOWNLINK_OVERFLOW_CHANNEL_CAPACITY: usize = 128;
 
 /// Hand-off queue for the receiver-scoped AUDIO lane (#2724).
@@ -1366,36 +1373,8 @@ pub const PARTICIPANT_REBROADCAST_COALESCE_MS: u64 = 300;
 /// * **Floor:** it must exceed [`PARTICIPANT_REBROADCAST_COALESCE_MS`] (300 ms),
 ///   or it adds nothing the trailing debounce does not already do. 1000 ms is
 ///   3.3× that window.
-/// * **Ceiling:** the deferral stays invisible to users only while it fits
-///   inside the joiner's own RTT election period — a joiner renders no peers
-///   until it elects a connection. That period is 2000 ms
-///   (`SERVER_ELECTION_PERIOD_MS:-2000` in `docker/start-dioxus.sh`, matching the
-///   `server_election_period_ms` default the UI falls back to). Budgeting 300 ms
-///   for the coalescing window plus ~400 ms for two 200 ms+ WAN/NATS legs
-///   (request out, re-announce back) leaves ~1300 ms of headroom; 1000 ms keeps
-///   ~300 ms of slack on top of that on a high-latency link.
-/// * **Adversarial worst case:** a request that lands the instant after its
-///   responder published waits the FULL cooldown, so the end-to-end worst case is
-///   300 ms (window) + 1000 ms (cooldown) + ~400 ms (two WAN/NATS legs) ≈
-///   **1700 ms** — still inside the 2000 ms election period, with ~300 ms of
-///   margin rather than the ~1300 ms the non-adversarial case enjoys.
 /// * **Effect:** a single requester looping requests at 300 ms drives a
 ///   responder at ≤1 re-announce/s instead of ~3.3/s.
-///
-/// ## Operators: this is COUPLED to `SERVER_ELECTION_PERIOD_MS`
-///
-/// Nothing enforces the relationship at build or start time — there is no assert,
-/// no test reading both (the election period is a UI/runtime env var, not a Rust
-/// constant), and no startup warning. The invariant is therefore yours to keep:
-///
-/// > `PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS` ≤ `SERVER_ELECTION_PERIOD_MS` −
-/// > ~700 ms (the 300 ms coalescing window plus ~400 ms of WAN/NATS legs).
-///
-/// At the 2000 ms default that permits up to ~1300 ms and 1000 ms is comfortable.
-/// **If `SERVER_ELECTION_PERIOD_MS` is lowered below ~1700 ms, this constant MUST
-/// be lowered with it**, otherwise a deferred re-announce can land after the
-/// joiner has already elected its connection and the joiner renders a room that
-/// is missing a peer until something else re-announces.
 pub const PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS: u64 = 1000;
 
 /// How many distinct requester SESSIONS a single deduped requester identity may
@@ -1853,7 +1832,7 @@ mod tests {
         );
     }
 
-    /// LOCKSTEP (#2716): the queue must hold exactly
+    /// LOCKSTEP (#2716): the queue must hold
     /// [`RELAY_QUEUE_ABSORPTION_TARGET_MS`] of the fan-out, inverting the
     /// derivation (bytes -> ms) instead of recomputing it. Bracketed on the
     /// E2EE-OFF side too, where the smaller unit buys more milliseconds.
@@ -1866,20 +1845,21 @@ mod tests {
         );
         assert_eq!(pps, 1_300, "26 peers x 1 published audio layer x 50 pkt/s");
 
-        let ms = buffer_absorption_millis(
-            WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES,
-            pps * WT_DATAGRAM_AUDIO_WIRE_BYTES,
-        );
+        let queued = WT_DATAGRAM_AUDIO_WIRE_BYTES + QUINN_DATAGRAM_ENTRY_OVERHEAD_BYTES;
+        let ms = buffer_absorption_millis(WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES, pps * queued);
         assert_eq!(
             ms, RELAY_QUEUE_ABSORPTION_TARGET_MS,
-            "quinn's datagram queue absorbs {ms}ms of the {pps} pkt/s x \
-             {WT_DATAGRAM_AUDIO_WIRE_BYTES}B audio fan-out; target is \
+            "quinn's datagram queue absorbs {ms}ms of the {pps} pkt/s audio \
+             fan-out at {queued}B per queued datagram; target is \
              {RELAY_QUEUE_ABSORPTION_TARGET_MS}ms",
         );
 
         // E2EE off is the live default and its smaller unit buys MORE time;
         // bracket the overshoot against NetEq's 40-120ms jitter target.
-        let cleartext_ms = buffer_absorption_millis(WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES, pps * 188);
+        let cleartext_ms = buffer_absorption_millis(
+            WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES,
+            pps * (188 + QUINN_DATAGRAM_ENTRY_OVERHEAD_BYTES),
+        );
         assert!(
             (RELAY_QUEUE_ABSORPTION_TARGET_MS..=300).contains(&cleartext_ms),
             "with E2EE off the queue absorbs {cleartext_ms}ms, outside the \

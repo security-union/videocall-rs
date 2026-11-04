@@ -19,6 +19,7 @@
 use anyhow::{anyhow, Result};
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_ulong};
+use tracing::info;
 use vpx_sys::*;
 
 macro_rules! vpx {
@@ -48,7 +49,6 @@ pub struct VideoEncoderBuilder {
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub resolution: (u32, u32),
-    #[allow(dead_code)]
     pub cpu_used: u32,
     pub profile: u32,
 }
@@ -112,8 +112,27 @@ impl VideoEncoderBuilder {
             0,
             VPX_ENCODER_ABI_VERSION as i32
         ));
+        let cpu_used = self.cpu_used as c_int;
+        let res = unsafe {
+            vpx_codec_control_(
+                &mut ctx,
+                vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int,
+                cpu_used,
+            )
+        };
+        if res != vpx_codec_err_t::VPX_CODEC_OK {
+            unsafe { vpx_codec_destroy(&mut ctx) };
+            return Err(anyhow!(
+                "VP8E_SET_CPUUSED({}) rejected: {:?}",
+                cpu_used,
+                res
+            ));
+        }
+        info!(
+            "VP9 encoder {}x{} @ {}fps, cpu_used={}",
+            width, height, self.fps, cpu_used
+        );
         unsafe {
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 5);
             vpx_codec_control_(
                 &mut ctx,
                 vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
@@ -132,6 +151,8 @@ impl VideoEncoderBuilder {
             cfg,
             width: self.resolution.0,
             height: self.resolution.1,
+            #[cfg(test)]
+            applied_cpu_used: cpu_used,
         })
     }
 }
@@ -141,9 +162,50 @@ pub struct VideoEncoder {
     cfg: vpx_codec_enc_cfg_t,
     width: u32,
     height: u32,
+    #[cfg(test)]
+    applied_cpu_used: c_int,
+}
+
+#[cfg(test)]
+static DESTROYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        let res = unsafe { vpx_codec_destroy(&mut self.ctx) };
+        #[cfg(test)]
+        if res == vpx_codec_err_t::VPX_CODEC_OK && self.ctx.priv_.is_null() {
+            DESTROYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
+        let _ = res;
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_an_encoder_destroys_its_libvpx_context() {
+        let before = DESTROYED.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3 {
+            let encoder = VideoEncoderBuilder::new(30, 5)
+                .set_resolution(320, 180)
+                .build()
+                .expect("encoder must build");
+            drop(encoder);
+        }
+        let after = DESTROYED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before + 3, "destroyed {} of 3", after - before);
+    }
 }
 
 impl VideoEncoder {
+    #[cfg(test)]
+    pub(crate) fn applied_cpu_used(&self) -> c_int {
+        self.applied_cpu_used
+    }
+
     pub fn update_bitrate_kbps(&mut self, bitrate: u32) -> anyhow::Result<()> {
         self.cfg.rc_target_bitrate = bitrate;
         vpx!(vpx_codec_enc_config_set(&mut self.ctx, &self.cfg));
@@ -238,3 +300,41 @@ impl<'a> Iterator for Frames<'a> {
 
 unsafe impl Send for VideoEncoder {}
 unsafe impl Sync for VideoEncoder {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_clip(cpu_used: u8) -> Vec<Vec<u8>> {
+        let (w, h) = (320usize, 180usize);
+        let mut encoder = VideoEncoderBuilder::new(30, cpu_used)
+            .set_resolution(w as u32, h as u32)
+            .build()
+            .expect("encoder must build");
+        encoder.update_bitrate_kbps(300).expect("bitrate");
+        let mut frame = vec![128u8; w * h * 3 / 2];
+        let mut out = Vec::new();
+        for pts in 0..12i64 {
+            for (i, px) in frame[..w * h].iter_mut().enumerate() {
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                *px = ((x * 3 + y * 5 + pts * 11) % 220 + 16) as u8;
+            }
+            for f in encoder.encode(pts, &frame).expect("encode") {
+                out.push(f.data.to_vec());
+            }
+        }
+        assert!(!out.is_empty(), "encoder produced no frames");
+        out
+    }
+
+    #[test]
+    fn builder_cpu_used_reaches_libvpx() {
+        assert_eq!(
+            encode_clip(8),
+            encode_clip(8),
+            "same config must be deterministic"
+        );
+        assert_ne!(encode_clip(5), encode_clip(8));
+        assert_ne!(encode_clip(7), encode_clip(8));
+    }
+}

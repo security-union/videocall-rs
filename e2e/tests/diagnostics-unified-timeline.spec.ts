@@ -368,7 +368,7 @@ test.describe("Diagnostics — unified timeline chart (issue 173)", () => {
       // the "Per-metric charts" <details>, and still render when expanded
       // (regression guard that they were not deleted). ──
       const perMetricDetails = sidebar.locator("details.diag-disclosure", {
-        has: sidebar.locator("summary", { hasText: "Per-metric charts" }),
+        has: hostPage.locator("summary", { hasText: "Per-metric charts" }),
       });
       await expect(perMetricDetails).toHaveJSProperty("open", false);
 
@@ -417,8 +417,8 @@ test.describe("Diagnostics — unified timeline chart (issue 173)", () => {
       // must close.
       const bufferHelpBtn = sidebar.locator('[data-testid="diag-chart-buffer-help"]');
       await expect(bufferHelpBtn).toBeVisible();
-      await bufferHelpBtn.scrollIntoViewIfNeeded();
-      await bufferHelpBtn.click();
+      await bufferHelpBtn.focus();
+      await hostPage.keyboard.press("Enter");
       await expect(bufferHelpBtn).toHaveAttribute("aria-expanded", "true");
       await expect(hostPage.locator("#diag-chart-buffer-help-popover")).toBeVisible();
       // Single-open: the unified popover closed when the Buffer popover opened.

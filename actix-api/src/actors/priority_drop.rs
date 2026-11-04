@@ -55,9 +55,13 @@
 //! 5. The relay's own **RTT echo** ([`OutboundPriority::ProbeEcho`], #2721)
 //!    sheds with camera VIDEO, so a lane cannot shed media and still answer
 //!    the probe that measures it.
+//! 6. Server-authored **CAPTION** ([`OutboundPriority::Caption`]) sheds at the
+//!    screen threshold (0.90) of channel slot fill; on WebTransport its byte
+//!    dimension is the fullest media byte bucket, so a screen backlog sheds
+//!    captions there (not on WebSocket) while camera video under 0.80 is still
+//!    admitted. A caption STATUS ([`OutboundPriority::CaptionStatus`]) is never
+//!    preemptively dropped.
 //!
-//! The decision is per-session: no global state is introduced, and the
-//! drop policy is identical for the WebTransport and WebSocket transports.
 //! Every queue that can hold video or screen calls [`evaluate_dual`] (#2261,
 //! #2717); WT's datagram lane, which carries neither, calls [`evaluate`].
 //!
@@ -82,9 +86,13 @@
 //! faster. So the preempt-drop here still feeds a per-receiver response — it
 //! just no longer drives the removed sender-keyed CONGESTION path.
 
+use protobuf::rt::WireType;
+use protobuf::CodedInputStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use videocall_types::protos::caption_packet::caption_packet::Kind as CaptionKind;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 /// Channel-fill ratio at which camera VIDEO media packets begin being
 /// dropped to make room for higher-priority screen, audio, and control.
@@ -117,6 +125,10 @@ pub const PRIORITY_DROP_AUDIO_FILL_RATIO: f32 = 0.95;
 /// One binding so [`OutboundPriority::priority_drop_label`] and the
 /// [`evaluate_dual`] arm cannot drift.
 pub const PRIORITY_DROP_RTT_ECHO_REASON: &str = "priority_drop_rtt_echo";
+
+pub const PRIORITY_DROP_CAPTION_REASON: &str = "priority_drop_caption";
+
+pub const CAPTION_DROP_KIND: &str = "caption";
 
 /// Classification of an outbound packet for priority-drop purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,9 +164,77 @@ pub enum OutboundPriority {
     /// latency. Its LOSS is unaffected: it is still admitted against the fullest
     /// MEDIA byte bucket.
     ProbeEcho,
+    /// Server-authored caption text, shed at [`PRIORITY_DROP_SCREEN_FILL_RATIO`].
+    Caption,
+    /// Server-authored caption STATUS_ACTIVE / STATUS_STOPPED. Never preemptively
+    /// dropped; books the caption drop kind on overflow.
+    CaptionStatus,
+}
+
+const CAPTION_KIND_FIELD: u32 = 11;
+
+/// `CaptionPacket.kind` is STATUS_ACTIVE or STATUS_STOPPED; scans the wire
+/// without decoding the message. Malformed input is not a status.
+fn caption_is_status(caption: &[u8]) -> bool {
+    let mut input = CodedInputStream::from_bytes(caption);
+    let mut kind = CaptionKind::KIND_UNSPECIFIED as u64;
+    loop {
+        let tag = match input.read_raw_tag_or_eof() {
+            Ok(Some(tag)) => tag,
+            Ok(None) => break,
+            Err(_) => return false,
+        };
+        let Some(wire_type) = WireType::new(tag & 7).filter(|_| tag >> 3 != 0) else {
+            return false;
+        };
+        let read = if tag >> 3 == CAPTION_KIND_FIELD && wire_type == WireType::Varint {
+            input.read_raw_varint64().map(|v| kind = v)
+        } else {
+            input.skip_field(wire_type)
+        };
+        if read.is_err() {
+            return false;
+        }
+    }
+    kind == CaptionKind::STATUS_ACTIVE as u64 || kind == CaptionKind::STATUS_STOPPED as u64
+}
+
+/// The tier every transport's outbound policy applies to one fanned-out packet:
+/// the sealed-aware class of the OUTER wrapper, refined so a caption STATUS
+/// leaves the caption tier. `media_type` is the inner `MediaPacket.media_type`
+/// when the caller could read it.
+pub(crate) fn outbound_priority(
+    parsed: Option<&PacketWrapper>,
+    media_type: Option<MediaType>,
+) -> OutboundPriority {
+    match parsed {
+        Some(pw) => OutboundPriority::classify_sealed_aware(
+            true,
+            pw.packet_type
+                .enum_value()
+                .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
+            media_type,
+            pw.media_kind
+                .enum_value()
+                .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED),
+        )
+        .refine_caption(&pw.data),
+        // Unparseable outer wrapper → fail-open Control (never a media shed).
+        None => OutboundPriority::Control,
+    }
 }
 
 impl OutboundPriority {
+    /// [`Self::Caption`] becomes [`Self::CaptionStatus`] when `caption` (the
+    /// wrapper's `data`) is a status; every other priority is returned as is.
+    pub fn refine_caption(self, caption: &[u8]) -> Self {
+        if self == OutboundPriority::Caption && caption_is_status(caption) {
+            OutboundPriority::CaptionStatus
+        } else {
+            self
+        }
+    }
+
     /// Map an outer [`PacketType`] plus the inner [`MediaType`] (when
     /// the outer is `MEDIA`) to an [`OutboundPriority`].
     ///
@@ -181,9 +261,6 @@ impl OutboundPriority {
                 // ever reused on that hot path.)
                 _ => OutboundPriority::Control,
             },
-            // Non-media wrappers share their Critical/Control split with
-            // `classify_outer` (single source of truth for the Critical
-            // set).
             other => Self::classify_non_media(other),
         }
     }
@@ -204,9 +281,6 @@ impl OutboundPriority {
     ///   (never preemptively shed something we could not classify).
     /// * `media_kind` `UNSPECIFIED` or any unknown value → `Control`
     ///   (older clients / non-discriminated packets are never shed).
-    /// * any non-`MEDIA` packet type → the SAME Critical/Control split as
-    ///   [`classify`] (so lifecycle/E2EE/CONGESTION packets are never shed
-    ///   at the fan-out hop either).
     ///
     /// Only `MEDIA` packets carrying a concrete VIDEO / AUDIO / SCREEN
     /// `media_kind` map to the droppable [`OutboundPriority::Video`] /
@@ -237,8 +311,6 @@ impl OutboundPriority {
                 // filter, which fails OPEN on UNSPECIFIED media_kind).
                 MediaKind::MEDIA_KIND_UNSPECIFIED => OutboundPriority::Control,
             },
-            // Non-media wrappers: identical Critical/Control split to
-            // `classify` via the shared helper.
             other => Self::classify_non_media(other),
         }
     }
@@ -266,7 +338,7 @@ impl OutboundPriority {
         Self::classify_outer(parsed, packet_type, media_kind)
     }
 
-    /// Critical/Control classification for every NON-`MEDIA` [`PacketType`].
+    /// Classification of every NON-`MEDIA` [`PacketType`].
     ///
     /// Shared by [`classify`] and [`classify_outer`] so the Critical set is
     /// defined in exactly ONE place: a future packet type promoted to (or
@@ -306,6 +378,7 @@ impl OutboundPriority {
             // HOST_MUTE_PARTICIPANT, …). Losing them desyncs the
             // host/participant UI from the server's authoritative state.
             PacketType::MEETING => OutboundPriority::Critical,
+            PacketType::CAPTION => OutboundPriority::Caption,
             // Remaining wrappers: CONNECTION, DIAGNOSTICS, HEALTH,
             // PEER_EVENT, KEYFRAME_REQUEST, PACKET_TYPE_UNKNOWN, … Treated
             // as Control: never preemptively dropped, only fail on actual
@@ -323,9 +396,55 @@ impl OutboundPriority {
             OutboundPriority::Audio => Some("priority_drop_audio"),
             OutboundPriority::Video | OutboundPriority::Screen => Some("priority_drop_video"),
             OutboundPriority::ProbeEcho => Some(PRIORITY_DROP_RTT_ECHO_REASON),
-            OutboundPriority::Critical | OutboundPriority::Control => None,
+            OutboundPriority::Caption => Some(PRIORITY_DROP_CAPTION_REASON),
+            OutboundPriority::Critical
+            | OutboundPriority::Control
+            | OutboundPriority::CaptionStatus => None,
         }
     }
+
+    /// The `kind` a channel-full drop books instead of its payload-derived `drop_kind_label`.
+    pub fn channel_full_kind(self) -> Option<&'static str> {
+        match self {
+            OutboundPriority::Critical => Some("overflow_critical"),
+            OutboundPriority::Caption | OutboundPriority::CaptionStatus => Some(CAPTION_DROP_KIND),
+            OutboundPriority::Control
+            | OutboundPriority::Audio
+            | OutboundPriority::Video
+            | OutboundPriority::Screen
+            | OutboundPriority::ProbeEcho => None,
+        }
+    }
+}
+
+pub(crate) fn drop_kind_label(
+    parsed: bool,
+    is_media: bool,
+    media_type: Option<MediaType>,
+) -> &'static str {
+    if !parsed {
+        return "unknown";
+    }
+    if !is_media {
+        return "control";
+    }
+    match media_type {
+        Some(MediaType::AUDIO) => "audio",
+        Some(MediaType::VIDEO) => "video",
+        Some(MediaType::SCREEN) => "screen",
+        _ => "media",
+    }
+}
+
+pub(crate) fn channel_full_drop_kind(
+    priority: OutboundPriority,
+    parsed: bool,
+    is_media: bool,
+    media_type: Option<MediaType>,
+) -> &'static str {
+    priority
+        .channel_full_kind()
+        .unwrap_or_else(|| drop_kind_label(parsed, is_media, media_type))
 }
 
 /// Outcome of the priority-drop evaluation.
@@ -383,11 +502,9 @@ pub fn evaluate_dual(
     queued_bytes: usize,
     byte_budget: usize,
 ) -> PriorityDropDecision {
-    // Critical and Control never preempt — they admit and let
-    // `try_send` fail naturally on actual overflow.
     if matches!(
         priority,
-        OutboundPriority::Critical | OutboundPriority::Control
+        OutboundPriority::Critical | OutboundPriority::Control | OutboundPriority::CaptionStatus
     ) {
         return PriorityDropDecision::Admit;
     }
@@ -440,7 +557,18 @@ pub fn evaluate_dual(
                 PriorityDropDecision::Admit
             }
         }
-        OutboundPriority::Critical | OutboundPriority::Control => {
+        OutboundPriority::Caption => {
+            if fill_ratio >= PRIORITY_DROP_SCREEN_FILL_RATIO {
+                PriorityDropDecision::Drop {
+                    reason: PRIORITY_DROP_CAPTION_REASON,
+                }
+            } else {
+                PriorityDropDecision::Admit
+            }
+        }
+        OutboundPriority::Critical
+        | OutboundPriority::Control
+        | OutboundPriority::CaptionStatus => {
             // Already handled above; pattern is unreachable but
             // exhaustive matching guards against future variants.
             PriorityDropDecision::Admit
@@ -465,7 +593,9 @@ impl QueueByteMeter {
             OutboundPriority::Audio
             | OutboundPriority::Critical
             | OutboundPriority::Control
-            | OutboundPriority::ProbeEcho => self.other,
+            | OutboundPriority::ProbeEcho
+            | OutboundPriority::Caption
+            | OutboundPriority::CaptionStatus => self.other,
         }
     }
 
@@ -492,7 +622,9 @@ impl QueueByteMeter {
             OutboundPriority::Audio
             | OutboundPriority::Critical
             | OutboundPriority::Control
-            | OutboundPriority::ProbeEcho => &mut self.other,
+            | OutboundPriority::ProbeEcho
+            | OutboundPriority::Caption
+            | OutboundPriority::CaptionStatus => &mut self.other,
         }
     }
 }
@@ -549,7 +681,9 @@ impl SharedQueueByteMeter {
             OutboundPriority::Audio
             | OutboundPriority::Critical
             | OutboundPriority::Control
-            | OutboundPriority::ProbeEcho => &self.other,
+            | OutboundPriority::ProbeEcho
+            | OutboundPriority::Caption
+            | OutboundPriority::CaptionStatus => &self.other,
         }
     }
 }
@@ -562,7 +696,9 @@ pub fn queue_byte_kind_label(priority: OutboundPriority) -> &'static str {
         OutboundPriority::Audio
         | OutboundPriority::Critical
         | OutboundPriority::Control
-        | OutboundPriority::ProbeEcho => "other",
+        | OutboundPriority::ProbeEcho
+        | OutboundPriority::Caption
+        | OutboundPriority::CaptionStatus => "other",
     }
 }
 
@@ -578,8 +714,164 @@ pub const QUEUE_BYTE_KIND_PRIORITIES: &[OutboundPriority] = &[
 ];
 
 #[cfg(test)]
+pub(crate) fn caption_bytes(kind: CaptionKind) -> Vec<u8> {
+    use protobuf::Message;
+    use videocall_types::protos::caption_packet::caption_packet::Translation;
+    use videocall_types::protos::caption_packet::CaptionPacket;
+    let mut caption = CaptionPacket {
+        speaker_session_id: 42,
+        utterance_id: 7,
+        revision: 3,
+        text: "hello world".repeat(20),
+        timestamp_ms: 1_700_000_000_000,
+        started_by: b"host@example.com".to_vec(),
+        ..Default::default()
+    };
+    caption.kind = kind.into();
+    caption.translations.push(Translation {
+        language: "es".to_string(),
+        text: "hola mundo".to_string(),
+        ..Default::default()
+    });
+    caption.write_to_bytes().expect("serialize caption")
+}
+
+/// The outbound CAPTION `PacketWrapper` both transports hand to
+/// [`outbound_priority`], wrapping `caption` (normally [`caption_bytes`]).
+#[cfg(test)]
+pub(crate) fn caption_wrapper(caption: Vec<u8>) -> PacketWrapper {
+    PacketWrapper {
+        packet_type: PacketType::CAPTION.into(),
+        data: caption,
+        ..Default::default()
+    }
+}
+
+/// A MEDIA `PacketWrapper` carrying no inner payload, so only its cleartext
+/// outer `media_kind` can type it — as under E2EE.
+#[cfg(test)]
+pub(crate) fn media_wrapper(media_kind: MediaKind) -> PacketWrapper {
+    PacketWrapper {
+        packet_type: PacketType::MEDIA.into(),
+        media_kind: media_kind.into(),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caption_priority(caption: &[u8]) -> OutboundPriority {
+        outbound_priority(Some(&caption_wrapper(caption.to_vec())), None)
+    }
+
+    #[test]
+    fn outbound_priority_lifts_a_caption_status_out_of_the_caption_tier() {
+        for status in [CaptionKind::STATUS_ACTIVE, CaptionKind::STATUS_STOPPED] {
+            assert_eq!(
+                outbound_priority(Some(&caption_wrapper(caption_bytes(status))), None),
+                OutboundPriority::CaptionStatus,
+                "{status:?}",
+            );
+        }
+        assert_eq!(
+            outbound_priority(
+                Some(&caption_wrapper(caption_bytes(CaptionKind::TEXT))),
+                None
+            ),
+            OutboundPriority::Caption,
+        );
+    }
+
+    #[test]
+    fn outbound_priority_of_an_undecodable_wrapper_fails_open_to_control() {
+        assert_eq!(outbound_priority(None, None), OutboundPriority::Control);
+    }
+
+    /// The shared helper must keep the media tiers both transports classified
+    /// before it existed: the inner `MediaType` when readable, the cleartext
+    /// outer `media_kind` when E2EE sealed it.
+    #[test]
+    fn outbound_priority_keeps_the_sealed_aware_media_tiers() {
+        for (media_kind, expected) in [
+            (MediaKind::VIDEO, OutboundPriority::Video),
+            (MediaKind::AUDIO, OutboundPriority::Audio),
+            (MediaKind::SCREEN, OutboundPriority::Screen),
+        ] {
+            assert_eq!(
+                outbound_priority(Some(&media_wrapper(media_kind)), None),
+                expected,
+                "sealed {media_kind:?}",
+            );
+        }
+        assert_eq!(
+            outbound_priority(
+                Some(&media_wrapper(MediaKind::MEDIA_KIND_UNSPECIFIED)),
+                Some(MediaType::AUDIO)
+            ),
+            OutboundPriority::Audio,
+        );
+        assert_eq!(
+            outbound_priority(
+                Some(&media_wrapper(MediaKind::MEDIA_KIND_UNSPECIFIED)),
+                None
+            ),
+            OutboundPriority::Control,
+        );
+    }
+
+    #[test]
+    fn a_caption_status_survives_the_fill_that_sheds_caption_text() {
+        let text = caption_priority(&caption_bytes(CaptionKind::TEXT));
+        assert_eq!(text, OutboundPriority::Caption);
+        for status in [CaptionKind::STATUS_ACTIVE, CaptionKind::STATUS_STOPPED] {
+            let status = caption_priority(&caption_bytes(status));
+            assert_eq!(status, OutboundPriority::CaptionStatus);
+            for used in [90, 95, 99, 100] {
+                assert_eq!(
+                    evaluate_dual(status, 100 - used, 100, usize::MAX, 1),
+                    PriorityDropDecision::Admit,
+                    "used={used}",
+                );
+                assert_eq!(
+                    evaluate(text, 100 - used, 100),
+                    PriorityDropDecision::Drop {
+                        reason: PRIORITY_DROP_CAPTION_REASON
+                    },
+                    "used={used}",
+                );
+            }
+            assert_eq!(
+                channel_full_drop_kind(status, true, false, None),
+                CAPTION_DROP_KIND
+            );
+            assert_eq!(status.priority_drop_label(), None);
+        }
+    }
+
+    #[test]
+    fn only_a_well_formed_caption_status_leaves_the_caption_tier() {
+        let status = caption_bytes(CaptionKind::STATUS_STOPPED);
+        for caption in [
+            caption_bytes(CaptionKind::KIND_UNSPECIFIED),
+            Vec::new(),
+            status[..status.len() - 1].to_vec(),
+            [&status[..], &[0x80]].concat(),
+            vec![0x00, 0x00, 0x58, 0x03],
+            vec![0x5a, 0x02, 0x08, 0x01],
+            vec![0xff; 4],
+        ] {
+            assert_eq!(caption_priority(&caption), OutboundPriority::Caption);
+        }
+        for other in [
+            OutboundPriority::Control,
+            OutboundPriority::Video,
+            OutboundPriority::Critical,
+        ] {
+            assert_eq!(other.refine_caption(&status), other);
+        }
+    }
 
     // ----- classify() coverage --------------------------------------------
 
@@ -601,6 +893,46 @@ mod tests {
         assert_eq!(
             OutboundPriority::classify(true, PacketType::SESSION_ASSIGNED, None),
             OutboundPriority::Critical,
+        );
+    }
+
+    #[test]
+    fn caption_is_shed_after_camera_video_and_before_audio() {
+        let classified = [
+            OutboundPriority::classify(true, PacketType::CAPTION, None),
+            OutboundPriority::classify_outer(
+                true,
+                PacketType::CAPTION,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+            OutboundPriority::classify_sealed_aware(
+                true,
+                PacketType::CAPTION,
+                None,
+                MediaKind::MEDIA_KIND_UNSPECIFIED,
+            ),
+        ];
+        assert_eq!(classified, [OutboundPriority::Caption; 3]);
+
+        let total = 100;
+        for (used, caption, video) in [
+            (79, true, true),
+            (80, true, false),
+            (89, true, false),
+            (90, false, false),
+            (94, false, false),
+        ] {
+            let free = total - used;
+            let admitted = |p| evaluate(p, free, total) == PriorityDropDecision::Admit;
+            assert_eq!(admitted(OutboundPriority::Caption), caption, "used={used}");
+            assert_eq!(admitted(OutboundPriority::Video), video, "used={used}");
+            assert!(admitted(OutboundPriority::Audio), "used={used}");
+        }
+        assert_eq!(
+            evaluate(OutboundPriority::Caption, 10, total),
+            PriorityDropDecision::Drop {
+                reason: PRIORITY_DROP_CAPTION_REASON
+            },
         );
     }
 
@@ -1771,5 +2103,162 @@ mod tests {
             .map(queue_byte_kind_label)
             .collect();
         assert_eq!(from_emit_set, expected);
+    }
+
+    #[test]
+    fn drop_kind_unknown_when_parse_failed() {
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ false, /*is_media=*/ false, None),
+            "unknown",
+            "parse-fail must map to `unknown` regardless of is_media"
+        );
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ false,
+                /*is_media=*/ true,
+                Some(MediaType::AUDIO),
+            ),
+            "unknown",
+            "parse-fail must override stale is_media + media_type"
+        );
+    }
+
+    #[test]
+    fn drop_kind_media_when_parsed_and_is_media_no_inner_type() {
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ true, None,),
+            "media",
+        );
+    }
+
+    #[test]
+    fn drop_kind_control_when_parsed_and_not_media() {
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ false, None,),
+            "control",
+        );
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ false,
+                Some(MediaType::AUDIO),
+            ),
+            "control",
+            "is_media=false must map to control even with a Some(MediaType)"
+        );
+    }
+
+    #[test]
+    fn drop_kind_audio_when_inner_is_audio() {
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::AUDIO),
+            ),
+            "audio",
+        );
+    }
+
+    #[test]
+    fn drop_kind_video_when_inner_is_video() {
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::VIDEO),
+            ),
+            "video",
+        );
+    }
+
+    #[test]
+    fn drop_kind_screen_when_inner_is_screen() {
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::SCREEN),
+            ),
+            "screen",
+        );
+    }
+
+    #[test]
+    fn drop_kind_falls_back_to_media_for_uncommon_media_types() {
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::HEARTBEAT),
+            ),
+            "media",
+            "HEARTBEAT must fall through to the legacy `media` catch-all"
+        );
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::KEYFRAME_REQUEST),
+            ),
+            "media",
+            "KEYFRAME_REQUEST must fall through to the legacy `media` catch-all"
+        );
+    }
+
+    /// BITES: `if priority == Critical { "overflow_critical" } else { drop_kind_label(..) }`
+    /// books a CAPTION as `control`.
+    #[test]
+    fn channel_full_kind_prefers_the_priority_kind() {
+        let kind = channel_full_drop_kind;
+        assert_eq!(
+            kind(OutboundPriority::Caption, true, false, None),
+            "caption"
+        );
+        assert_eq!(
+            kind(
+                OutboundPriority::Critical,
+                true,
+                true,
+                Some(MediaType::VIDEO)
+            ),
+            "overflow_critical"
+        );
+        assert_eq!(
+            kind(OutboundPriority::Control, true, false, None),
+            "control"
+        );
+        assert_eq!(
+            kind(OutboundPriority::Video, true, true, Some(MediaType::VIDEO)),
+            "video"
+        );
+        assert_eq!(kind(OutboundPriority::Audio, false, true, None), "unknown");
+    }
+
+    #[test]
+    fn drop_kind_label_emits_only_documented_values() {
+        let media_types = [
+            None,
+            Some(MediaType::AUDIO),
+            Some(MediaType::VIDEO),
+            Some(MediaType::SCREEN),
+            Some(MediaType::HEARTBEAT),
+            Some(MediaType::KEYFRAME_REQUEST),
+        ];
+        for parsed in [false, true] {
+            for is_media in [false, true] {
+                for mt in media_types {
+                    let kind = drop_kind_label(parsed, is_media, mt);
+                    assert!(
+                        matches!(
+                            kind,
+                            "audio" | "video" | "screen" | "media" | "control" | "unknown"
+                        ),
+                        "drop_kind_label returned unexpected kind={kind} for \
+                         (parsed={parsed}, is_media={is_media}, media_type={mt:?})"
+                    );
+                }
+            }
+        }
     }
 }

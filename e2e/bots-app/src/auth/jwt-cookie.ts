@@ -6,6 +6,7 @@ export interface JwtCookieAuthOptions {
   email: string;
   displayName: string;
   baseURL: string;
+  notAfterSecs?: number;
 }
 
 export async function applyJwtCookieAuth(
@@ -16,5 +17,6 @@ export async function applyJwtCookieAuth(
     email: opts.email,
     name: opts.displayName,
     baseURL: opts.baseURL,
+    notAfterSecs: opts.notAfterSecs,
   });
 }

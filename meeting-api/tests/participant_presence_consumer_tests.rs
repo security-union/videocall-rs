@@ -25,7 +25,8 @@ use meeting_api::db::meetings as db_meetings;
 use meeting_api::db::participants as db_participants;
 use meeting_api::feed_events::{new_feed_channel, FeedChange, FeedChangeReason};
 use meeting_api::nats_consumers::{
-    apply_participant_presence, spawn_participant_presence_consumer_inner,
+    apply_participant_presence, end_due_host_left_meetings,
+    spawn_participant_presence_consumer_inner,
 };
 use meeting_api::nats_events::{ParticipantPresencePayload, PARTICIPANT_PRESENCE_SUBJECT};
 use serial_test::serial;
@@ -139,6 +140,29 @@ async fn apply(
     )
     .await;
     feed_rx.try_recv().ok()
+}
+
+/// Let the deferred host-left end of `room_id` fall due, then run the
+/// production settle pass. Returns `room_id`'s feed nudge from that pass.
+async fn settle_host_left(pool: &PgPool, room_id: &str) -> Option<FeedChangeReason> {
+    sqlx::query(
+        "UPDATE meetings SET host_left_end_due_at = NOW() - INTERVAL '1 second' \
+         WHERE id = $1 AND host_left_end_due_at IS NOT NULL",
+    )
+    .bind(meeting_pk(pool, room_id).await)
+    .execute(pool)
+    .await
+    .expect("elapse the debounce window");
+    let healthy = db_participants::presence_healthy(pool, None)
+        .await
+        .unwrap_or(false);
+    let (feed_tx, mut feed_rx) = new_feed_channel();
+    end_due_host_left_meetings(pool, None, &feed_tx, healthy)
+        .await
+        .expect("settle pass");
+    std::iter::from_fn(|| feed_rx.try_recv().ok())
+        .find(|c| c.meeting_id == room_id)
+        .map(|c| c.reason)
 }
 
 async fn list_feed(pool: &PgPool, caller: &str) -> APIResponse<ListFeedResponse> {
@@ -358,6 +382,7 @@ async fn left_of_an_old_session_after_a_newer_present_has_no_effect() {
 
     apply(&pool, room_id, host, S2, false).await;
     assert_eq!(status_of(&pool, room_id, host).await.status, "left");
+    settle_host_left(&pool, room_id).await;
     assert_eq!(
         meeting(&pool, room_id).await.state.as_deref(),
         Some("ended"),
@@ -394,12 +419,534 @@ async fn last_present_host_left_ends_the_meeting_only_when_the_last_host_goes() 
         Some("active")
     );
 
-    let nudge = apply(&pool, room_id, host, S1, false).await;
+    apply(&pool, room_id, host, S1, false).await;
+    let nudge = settle_host_left(&pool, room_id).await;
     assert_eq!(
         meeting(&pool, room_id).await.state.as_deref(),
         Some("ended")
     );
-    assert_eq!(nudge.map(|c| c.reason), Some(FeedChangeReason::Ended));
+    assert_eq!(nudge, Some(FeedChangeReason::Ended));
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Last-host LEFT is debounced ─────────────────────────────────────────────
+
+/// Sole host reloads and re-elects onto the other relay: the old relay's LEFT
+/// lands before the new session's PRESENT.
+#[tokio::test]
+#[serial]
+async fn host_left_then_present_on_another_relay_keeps_the_meeting() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-before-present";
+    let host = "phlp-host@example.com";
+    let attendee = "phlp-attendee@example.com";
+    create_meeting_wr_off(&pool, host, room_id).await;
+    join(&pool, room_id, host).await;
+    join(&pool, room_id, attendee).await;
+    apply(&pool, room_id, host, S1, true).await;
+    apply(&pool, room_id, attendee, S2, true).await;
+
+    let nudge = apply(&pool, room_id, host, S1, false).await;
+    assert_eq!(
+        nudge.map(|c| c.reason),
+        Some(FeedChangeReason::ParticipantLeft)
+    );
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active"),
+        "a relay-reported last-host departure must not end the meeting at once"
+    );
+
+    const S3: u64 = 0x8000_0000_0000_0033;
+    apply(&pool, room_id, host, S3, true).await;
+    let nudge = settle_host_left(&pool, room_id).await;
+
+    assert_eq!(nudge, None);
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active")
+    );
+    let row = status_of(&pool, room_id, host).await;
+    assert_eq!(row.status, "admitted");
+    assert!(row.is_host);
+    assert!(row.left_at.is_none());
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn host_left_without_return_ends_the_meeting_once_due() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-no-return";
+    let host = "phln-host@example.com";
+    let attendee = "phln-attendee@example.com";
+    create_meeting_wr_off(&pool, host, room_id).await;
+    join(&pool, room_id, host).await;
+    join(&pool, room_id, attendee).await;
+    apply(&pool, room_id, host, S1, true).await;
+    apply(&pool, room_id, attendee, S2, true).await;
+
+    apply(&pool, room_id, host, S1, false).await;
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active")
+    );
+    let (feed_tx, _feed_rx) = new_feed_channel();
+    end_due_host_left_meetings(&pool, None, &feed_tx, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active"),
+        "nothing ends before the debounce window passes"
+    );
+
+    let nudge = settle_host_left(&pool, room_id).await;
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("ended")
+    );
+    assert_eq!(nudge, Some(FeedChangeReason::Ended));
+    assert_eq!(
+        settle_host_left(&pool, room_id).await,
+        None,
+        "a settled end is not re-announced"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn host_present_before_stale_left_defers_nothing() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-present-before-left";
+    let host = "phpl-host@example.com";
+    create_meeting(&pool, host, room_id, serde_json::json!({})).await;
+    join(&pool, room_id, host).await;
+    apply(&pool, room_id, host, S1, true).await;
+
+    apply(&pool, room_id, host, S2, true).await;
+    assert!(apply(&pool, room_id, host, S1, false).await.is_none());
+
+    assert_eq!(settle_host_left(&pool, room_id).await, None);
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active")
+    );
+    assert_eq!(status_of(&pool, room_id, host).await.status, "admitted");
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+async fn due_in_secs(pool: &PgPool, room_id: &str) -> Option<f64> {
+    sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM host_left_end_due_at - NOW())::FLOAT8 \
+         FROM meetings WHERE room_id = $1",
+    )
+    .bind(room_id)
+    .fetch_one(pool)
+    .await
+    .expect("read host_left_end_due_at")
+}
+
+/// The sole host's relay LEFT leaves the meeting idle with its end pending.
+async fn sole_host_left(pool: &PgPool, room_id: &str, host: &str, extra: serde_json::Value) {
+    create_meeting(pool, host, room_id, extra).await;
+    join(pool, room_id, host).await;
+    apply(pool, room_id, host, S1, true).await;
+    apply(pool, room_id, host, S1, false).await;
+    assert_eq!(meeting(pool, room_id).await.state.as_deref(), Some("idle"));
+}
+
+#[tokio::test]
+#[serial]
+async fn host_left_end_is_due_a_debounce_window_after_the_left() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-due-at";
+    let host = "phld-host@example.com";
+    sole_host_left(&pool, room_id, host, serde_json::json!({})).await;
+
+    let due = due_in_secs(&pool, room_id)
+        .await
+        .expect("an end is pending");
+    assert!(
+        (64.0..=65.5).contains(&due),
+        "the end must be due ~65 s after the LEFT, got {due}"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_host_left_end_is_not_settled_before_it_is_due() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-not-due";
+    let host = "phnd-host@example.com";
+    sole_host_left(&pool, room_id, host, serde_json::json!({})).await;
+    let pk = meeting_pk(&pool, room_id).await;
+
+    assert!(!db_participants::end_host_left_if_due(&pool, pk, true)
+        .await
+        .expect("settle one"));
+
+    assert_eq!(meeting(&pool, room_id).await.state.as_deref(), Some("idle"));
+    assert!(due_in_secs(&pool, room_id).await.is_some());
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn an_attendee_cannot_revive_a_meeting_whose_host_left_end_is_pending() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-attendee-refused";
+    let host = "phar-host@example.com";
+    let attendee = "phar-attendee@example.com";
+    sole_host_left(
+        &pool,
+        room_id,
+        host,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+
+    let status = send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        attendee,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "MEETING_NOT_ACTIVE");
+    assert_eq!(meeting(&pool, room_id).await.state.as_deref(), Some("idle"));
+
+    assert_eq!(
+        settle_host_left(&pool, room_id).await,
+        Some(FeedChangeReason::Ended)
+    );
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("ended")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn the_owner_restarting_drops_the_pending_host_left_end() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-owner-restart";
+    let host = "phor-host@example.com";
+    sole_host_left(&pool, room_id, host, serde_json::json!({})).await;
+
+    join(&pool, room_id, host).await;
+
+    assert_eq!(due_in_secs(&pool, room_id).await, None);
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_co_host_restarting_drops_the_pending_host_left_end() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-cohost-restart";
+    let host = "phcr-host@example.com";
+    let co = "phcr-cohost@example.com";
+    sole_host_left(
+        &pool,
+        room_id,
+        host,
+        serde_json::json!({ "co_hosts": [co], "waiting_room_enabled": false }),
+    )
+    .await;
+
+    join(&pool, room_id, co).await;
+
+    assert_eq!(due_in_secs(&pool, room_id).await, None);
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn turning_end_on_host_leave_off_cancels_the_pending_end() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-option-off";
+    let host = "phoo-host@example.com";
+    sole_host_left(&pool, room_id, host, serde_json::json!({})).await;
+
+    db_meetings::update_meeting_settings(
+        &pool,
+        room_id,
+        None,
+        None,
+        Some(false),
+        None,
+        None,
+        None,
+        Default::default(),
+        &meeting_api::password::PasswordUpdate::Unchanged,
+    )
+    .await
+    .expect("update settings")
+    .expect("meeting exists");
+
+    assert_eq!(settle_host_left(&pool, room_id).await, None);
+    assert_eq!(meeting(&pool, room_id).await.state.as_deref(), Some("idle"));
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn only_the_settle_lock_holder_ends_due_meetings() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-settle-lock";
+    let host = "phsl-host@example.com";
+    sole_host_left(&pool, room_id, host, serde_json::json!({})).await;
+    let mut other_replica = pool.acquire().await.expect("connection");
+    sqlx::query("SELECT pg_advisory_lock(3156001)")
+        .execute(&mut *other_replica)
+        .await
+        .expect("take the settle lock");
+
+    let settled = settle_host_left(&pool, room_id).await;
+    sqlx::query("SELECT pg_advisory_unlock(3156001)")
+        .execute(&mut *other_replica)
+        .await
+        .expect("release the settle lock");
+
+    assert_eq!(settled, None, "a replica without the lock must not settle");
+    assert_eq!(meeting(&pool, room_id).await.state.as_deref(), Some("idle"));
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_deleted_meeting_is_not_ended_by_its_pending_host_left_end() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-deleted";
+    let host = "phdl-host@example.com";
+    sole_host_left(&pool, room_id, host, serde_json::json!({})).await;
+    let pk = meeting_pk(&pool, room_id).await;
+    db_meetings::soft_delete(&pool, room_id, host)
+        .await
+        .expect("soft delete")
+        .expect("meeting deleted");
+    assert_eq!(due_in_secs(&pool, room_id).await, None);
+
+    // A LEFT whose meeting lookup predates the delete still commits a deadline.
+    sqlx::query("UPDATE meetings SET host_left_end_due_at = NOW() WHERE id = $1")
+        .bind(pk)
+        .execute(&pool)
+        .await
+        .expect("elapse the debounce window");
+
+    let (feed_tx, mut feed_rx) = new_feed_channel();
+    end_due_host_left_meetings(&pool, None, &feed_tx, false)
+        .await
+        .expect("settle pass");
+    assert!(
+        std::iter::from_fn(|| feed_rx.try_recv().ok()).all(|c| c.meeting_id != room_id),
+        "the sweep must not announce a deleted meeting"
+    );
+    assert!(!db_participants::host_left_ends_due(&pool, i64::MAX)
+        .await
+        .expect("list due ends")
+        .iter()
+        .any(|(id, _)| *id == pk));
+    assert!(!db_participants::end_host_left_if_due(&pool, pk, false)
+        .await
+        .expect("settle one"));
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn attendee_activation_refuses_a_pending_or_settled_host_left_end() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-locked-activation";
+    let host = "phla-host@example.com";
+    sole_host_left(
+        &pool,
+        room_id,
+        host,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    let pk = meeting_pk(&pool, room_id).await;
+
+    assert!(db_meetings::start_instance_for_attendee(&pool, pk, false)
+        .await
+        .expect("pending")
+        .is_none());
+    assert_eq!(meeting(&pool, room_id).await.state.as_deref(), Some("idle"));
+
+    // The end settles after a joiner read its `idle` snapshot.
+    settle_host_left(&pool, room_id).await;
+    assert!(db_meetings::start_instance_for_attendee(&pool, pk, false)
+        .await
+        .expect("ended")
+        .is_none());
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("ended")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+/// The meeting ends while a joiner's activation is in flight: it must wait
+/// for that end and refuse, not decide from the row as it was.
+#[tokio::test]
+#[serial]
+async fn attendee_activation_waits_for_a_concurrent_end() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-concurrent-end";
+    let host = "phce-host@example.com";
+    sole_host_left(
+        &pool,
+        room_id,
+        host,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    let pk = meeting_pk(&pool, room_id).await;
+    sqlx::query("UPDATE meetings SET host_left_end_due_at = NULL WHERE id = $1")
+        .bind(pk)
+        .execute(&pool)
+        .await
+        .expect("start from an idle meeting with nothing pending");
+
+    let mut ending = pool.begin().await.expect("begin");
+    sqlx::query("SELECT id FROM meetings WHERE id = $1 FOR UPDATE")
+        .bind(pk)
+        .execute(&mut *ending)
+        .await
+        .expect("lock the meeting");
+    db_meetings::end_meeting_in(&mut ending, pk)
+        .await
+        .expect("end, uncommitted");
+
+    let joiner = tokio::spawn({
+        let pool = pool.clone();
+        async move { db_meetings::start_instance_for_attendee(&pool, pk, false).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!joiner.is_finished(), "activation must wait for the lock");
+    ending.commit().await.expect("commit the end");
+
+    let activation = tokio::time::timeout(std::time::Duration::from_secs(10), joiner)
+        .await
+        .expect("activation finishes once the end commits")
+        .expect("join task")
+        .expect("activation query");
+    assert!(activation.is_none(), "got {activation:?}");
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("ended")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn attendee_activation_reopens_a_keep_going_meeting() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-keep-going";
+    let host = "phkg-host@example.com";
+    sole_host_left(
+        &pool,
+        room_id,
+        host,
+        serde_json::json!({ "waiting_room_enabled": false, "end_on_host_leave": false }),
+    )
+    .await;
+    let pk = meeting_pk(&pool, room_id).await;
+    db_meetings::end_meeting(&pool, pk).await.expect("end");
+
+    assert!(db_meetings::start_instance_for_attendee(&pool, pk, false)
+        .await
+        .expect("reopen")
+        .is_some());
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("active")
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_waiting_room_joiner_is_refused_while_the_host_left_end_is_pending() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-left-wr-refused";
+    let host = "phwr-host@example.com";
+    let attendee = "phwr-attendee@example.com";
+    sole_host_left(
+        &pool,
+        room_id,
+        host,
+        serde_json::json!({ "waiting_room_enabled": true }),
+    )
+    .await;
+
+    let status = send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        attendee,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "MEETING_NOT_ACTIVE");
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rest_leave_by_the_last_host_still_ends_immediately() {
+    let pool = get_test_pool().await;
+    let room_id = "pp-host-rest-leave";
+    let host = "phrl-host@example.com";
+    let attendee = "phrl-attendee@example.com";
+    create_meeting_wr_off(&pool, host, room_id).await;
+    join(&pool, room_id, host).await;
+    join(&pool, room_id, attendee).await;
+    apply(&pool, room_id, host, S1, true).await;
+
+    let status = send(
+        &pool,
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/leave"),
+        host,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        meeting(&pool, room_id).await.state.as_deref(),
+        Some("ended")
+    );
 
     cleanup_test_data(&pool, room_id).await;
 }

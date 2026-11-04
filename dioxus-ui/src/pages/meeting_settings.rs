@@ -3,6 +3,9 @@
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
 use crate::auth::{check_session, redirect_to_login};
+use crate::components::announcement_overrides::{
+    use_orphaned_save_refresh, use_override_editor, AnnouncementOverrides,
+};
 use crate::components::co_hosts::CoHostsSection;
 use crate::components::hero_orbs::HeroOrbs;
 use crate::components::invalid_meeting_id::{
@@ -106,6 +109,8 @@ fn MeetingSettingsPageContent(id: String) -> Element {
     let mut allow_guests_toggle = use_signal(|| false);
     let mut recording_allowed_for_all_toggle = use_signal(|| false);
     let mut chat_allowed_for_all_toggle = use_signal(|| true);
+    let announcement_overrides = use_signal(AnnouncementOverrides::default);
+    let announcement_overrides_editor = use_override_editor(announcement_overrides);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
     let mut co_host_refresh = use_signal(|| 0u64);
@@ -130,25 +135,38 @@ fn MeetingSettingsPageContent(id: String) -> Element {
         }
     });
 
-    // Fetch meeting info once auth is confirmed
+    let mut info_refreshes = use_signal(|| 0u64);
+    use_orphaned_save_refresh(&id, move || info_refreshes += 1);
+
+    // Loads the meeting once auth is confirmed; after that, a re-read lands only the overrides.
     {
         let meeting_id = id.clone();
         use_effect(move || {
+            let _ = info_refreshes();
             if !auth_checked() {
                 return;
             }
             let meeting_id = meeting_id.clone();
+            let read = announcement_overrides_editor.start_read();
             spawn(async move {
                 match get_meeting_info(&meeting_id).await {
                     Ok(info) => {
-                        waiting_room_toggle.set(info.waiting_room_enabled);
-                        admitted_can_admit_toggle.set(info.admitted_can_admit);
-                        end_on_host_leave_toggle.set(info.end_on_host_leave);
-                        allow_guests_toggle.set(info.allow_guests);
-                        recording_allowed_for_all_toggle.set(info.recording_allowed_for_all);
-                        chat_allowed_for_all_toggle.set(info.chat_allowed_for_all);
-                        meeting.set(Some(info));
-                        loading.set(false);
+                        announcement_overrides_editor
+                            .land_read(read, AnnouncementOverrides::from_meeting_info(&info));
+                        if meeting.peek().is_none() {
+                            waiting_room_toggle.set(info.waiting_room_enabled);
+                            admitted_can_admit_toggle.set(info.admitted_can_admit);
+                            end_on_host_leave_toggle.set(info.end_on_host_leave);
+                            allow_guests_toggle.set(info.allow_guests);
+                            recording_allowed_for_all_toggle.set(info.recording_allowed_for_all);
+                            chat_allowed_for_all_toggle.set(info.chat_allowed_for_all);
+                            meeting.set(Some(info));
+                            loading.set(false);
+                            error.set(None);
+                        }
+                    }
+                    Err(e) if meeting.peek().is_some() => {
+                        log::warn!("meeting settings refresh failed: {e}");
                     }
                     Err(e) => {
                         loading.set(false);
@@ -336,6 +354,28 @@ fn MeetingSettingsPageContent(id: String) -> Element {
     let meeting_id_guest_link = id.clone();
     let meeting_id_options = id.clone();
     let meeting_id_co_hosts = id.clone();
+    let guest_link_row = allow_guests_toggle().then(|| {
+        let guest_link = window()
+            .and_then(|w| w.location().origin().ok())
+            .map(|origin| format!("{origin}/meeting/{meeting_id_guest_link}/guest"))
+            .unwrap_or_default();
+        rsx! {
+            div { class: "settings-option-row",
+                style: "flex-direction: column; align-items: flex-start; gap: var(--space-1);",
+                span {
+                    class: "settings-option-label",
+                    // @token-exempt: 0.8rem falls between --fs-3 (12px) and --fs-4 (13px)
+                    style: "font-size: 0.8rem; color: var(--text-secondary);",
+                    "Guest join link:"
+                }
+                span {
+                    class: "settings-field-value settings-field-mono settings-guest-link",
+                    style: "user-select: all;",
+                    "{guest_link}"
+                }
+            }
+        }
+    });
 
     let on_join = move |_| {
         navigator.push(Route::Meeting {
@@ -550,33 +590,10 @@ fn MeetingSettingsPageContent(id: String) -> Element {
                     allow_guests_toggle,
                     recording_allowed_for_all_toggle,
                     chat_allowed_for_all_toggle,
+                    announcement_overrides: announcement_overrides_editor,
                     saving,
                     toggle_error,
-                }
-
-                if allow_guests_toggle() {
-                    div { class: "settings-option-row",
-                        style: "flex-direction: column; align-items: flex-start; gap: var(--space-1);",
-                        span {
-                            class: "settings-option-label",
-                            // @token-exempt: 0.8rem falls between --fs-3 (12px) and --fs-4 (13px)
-                            style: "font-size: 0.8rem; color: var(--text-subtle, rgba(255,255,255,0.5));",
-                            "Guest join link:"
-                        }
-                        {
-                            let guest_link = window()
-                                .and_then(|w| w.location().origin().ok())
-                                .map(|origin| format!("{origin}/meeting/{meeting_id_guest_link}/guest"))
-                                .unwrap_or_default();
-                            rsx! {
-                                span {
-                                    class: "settings-field-value settings-field-mono settings-guest-link",
-                                    style: "user-select: all;",
-                                    "{guest_link}"
-                                }
-                            }
-                        }
-                    }
+                    after_allow_guests: guest_link_row,
                 }
             } else {
                 p {

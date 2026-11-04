@@ -66,8 +66,10 @@ For WASM builds, the decoder runs in a Web Worker for better performance. Add th
     data-type="worker"
     data-cargo-features="wasm"
     data-cargo-no-default-features
-    data-loader-shim
-/> 
+/>
+<!-- The crate's own loader (not trunk's data-loader-shim): it re-throws a failed wasm load so it
+     reaches Worker.onerror, which the decoder treats as a failed boot. -->
+<link data-trunk rel="copy-file" href="../videocall-codecs/src/bin/worker_decoder_loader.js" />
 
 <!-- Runtime link for decoder -->
 <link id="codecs-worker" href="/worker_decoder_loader.js" />

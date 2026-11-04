@@ -78,17 +78,15 @@ const CAMERA_TOGGLE = '[data-testid="prejoin-camera-toggle"]';
 const CAMERA_SELECT = '[data-testid="prejoin-camera-select"]';
 const SPEAKER_SELECT = '[data-testid="prejoin-speaker-select"]';
 const PERMISSION_PROMPT = '[data-testid="prejoin-permission-prompt"]';
-const PERMISSION_ALLOW = '[data-testid="prejoin-permission-allow"]';
 const SPEAKER_UNSUPPORTED_NOTE = '[data-testid="prejoin-speaker-unsupported-note"]';
 
 // In-meeting markup (host.rs / device_settings_modal.rs).
 const SELF_VIDEO = "#webcam"; // VIDEO_ELEMENT_ID — local published camera <video>.
-const DEVICE_SETTINGS_BUTTON = ".device-settings-menu-button";
+const OPEN_SETTINGS_BUTTON = '[data-testid="open-settings"]';
 const TAB_VIDEO = "#settings-tab-video";
 const MODAL_VIDEO_TRIGGER = "#modal-video-select"; // glass-select trigger button.
 const MODAL_SPEAKER_TRIGGER = "#modal-speaker-select"; // glass-select trigger button.
-// MicButton is the first primary control, CameraButton is the second (#959).
-const CAMERA_CONTROL = ".video-controls-container .video-control-button";
+const CAMERA_CONTROL = '[data-testid="camera-toggle-button"]';
 
 // localStorage keys (mirror context.rs:602-606).
 const LS_CAMERA_ID = "vc_prejoin_camera_id";
@@ -139,15 +137,7 @@ async function gotoPreJoin(page: Page, meetingId: string) {
   return actionButton;
 }
 
-/**
- * Grant media access from the pre-join prompt. With
- * `--use-fake-ui-for-media-stream` the click auto-grants getUserMedia, the
- * prompt disappears, and the device selects populate.
- */
-async function grantMediaAccess(page: Page) {
-  const allow = page.locator(PERMISSION_ALLOW);
-  await expect(allow).toBeVisible();
-  await allow.click();
+async function waitForMediaAccess(page: Page) {
   await expect(page.locator(PERMISSION_PROMPT)).toBeHidden({ timeout: 15_000 });
   await expect(page.locator(CAMERA_TOGGLE)).toBeVisible({ timeout: 15_000 });
 }
@@ -197,9 +187,10 @@ async function capturedCameraDeviceId(page: Page): Promise<string | null> {
   });
 }
 
-/** Open the in-meeting device settings modal. */
+/** Open the in-meeting device settings modal from the action bar. */
 async function openDeviceSettings(page: Page) {
-  await page.locator(DEVICE_SETTINGS_BUTTON).click();
+  await page.locator(".video-controls-container").hover();
+  await page.locator(OPEN_SETTINGS_BUTTON).click();
   await expect(page.locator("#device-settings-dialog")).toBeVisible({ timeout: 15_000 });
 }
 
@@ -260,7 +251,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
   // ──────────────────────────────────────────────────────────────────────────
   test("lobby-selected camera is the one captured in the meeting @camera", async ({ page }) => {
     const actionButton = await gotoPreJoin(page, `e2e_1295_cam_carry_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     // Three distinct cameras are available under device-count=3. Pick a
     // NON-default one (index 1) so a wrong/default bind is detectable.
@@ -339,7 +330,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
     page,
   }) => {
     const actionButton = await gotoPreJoin(page, `e2e_1295_cam_race_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     const cameras = await lobbyOptions(page, CAMERA_SELECT);
     expect(
@@ -370,8 +361,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
       .poll(async () => capturedCameraDeviceId(page), { timeout: 30_000 })
       .toBe(cameraB.value);
 
-    // In-meeting camera control (CameraButton is the 2nd primary control).
-    const cameraControl = page.locator(CAMERA_CONTROL).nth(1);
+    const cameraControl = page.locator(CAMERA_CONTROL);
     await expect(cameraControl).toHaveClass(/\bactive\b/, { timeout: 15_000 });
 
     // (b) Camera OFF.
@@ -449,7 +439,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
     page,
   }) => {
     const actionButton = await gotoPreJoin(page, `e2e_1295_spk_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     const speakerSelect = page.locator(SPEAKER_SELECT);
     await expect(speakerSelect).toBeVisible();
@@ -521,7 +511,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
   // ──────────────────────────────────────────────────────────────────────────
   test("default camera works when no device is changed in the lobby @camera", async ({ page }) => {
     const actionButton = await gotoPreJoin(page, `e2e_1295_default_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     // Do NOT touch the camera/speaker selectors. Just turn the camera ON with
     // whatever device is selected by default, then join.
@@ -540,7 +530,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
     expect(captured, "default capture must yield a non-empty deviceId").toBeTruthy();
 
     // The in-meeting camera control reflects the enabled/publishing state.
-    const cameraControl = page.locator(CAMERA_CONTROL).nth(1);
+    const cameraControl = page.locator(CAMERA_CONTROL);
     await expect(cameraControl).toHaveClass(/\bactive\b/, { timeout: 15_000 });
     await expect(cameraControl).not.toHaveClass(/\boff\b/);
   });
@@ -655,7 +645,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
     });
 
     const actionButton = await gotoPreJoin(page, `e2e_1295_join_converge_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     // Mirror test 4's join: default devices, camera ON, no selector changes.
     const cameraToggle = page.locator(CAMERA_TOGGLE);
@@ -714,7 +704,7 @@ test.describe("Pre-join device passthrough (#1295)", () => {
     ).toBeTruthy();
 
     // The in-meeting camera control still reflects the enabled/publishing state.
-    const cameraControl = page.locator(CAMERA_CONTROL).nth(1);
+    const cameraControl = page.locator(CAMERA_CONTROL);
     await expect(cameraControl).toHaveClass(/\bactive\b/, { timeout: 15_000 });
     await expect(cameraControl).not.toHaveClass(/\boff\b/);
   });

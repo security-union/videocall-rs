@@ -46,10 +46,27 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+/// The token's meeting start when it carries one, else the relay clock; the
+/// flag says which.
+pub fn meeting_start_time_ms(meeting_started_at_ms: Option<u64>) -> (u64, bool) {
+    match meeting_started_at_ms {
+        Some(ms) => (ms, true),
+        None => (
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            false,
+        ),
+    }
+}
+
 /// Result of starting a session
 #[derive(Debug, Clone)]
 pub struct SessionStartResult {
     pub start_time_ms: u64,
+    /// Whether `start_time_ms` is the token's `meeting_started_at_ms` claim.
+    pub start_time_authoritative: bool,
     pub is_first_participant: bool,
     /// The user_id of the connecting user (host/creator info comes from JWT)
     pub creator_id: String,
@@ -80,20 +97,20 @@ impl SessionManager {
         room_id: &str,
         user_id: &str,
         id: u64,
+        meeting_started_at_ms: Option<u64>,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
         if user_id == SYSTEM_USER_ID {
             return Err(Box::new(SessionError::ReservedUserId));
         }
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let (start_time_ms, start_time_authoritative) =
+            meeting_start_time_ms(meeting_started_at_ms);
 
         info!("Session started for {} in room {}", user_id, room_id);
 
         Ok(SessionStartResult {
-            start_time_ms: now_ms,
+            start_time_ms,
+            start_time_authoritative,
             is_first_participant: true,
             creator_id: user_id.to_string(),
             session_id: id,
@@ -116,12 +133,14 @@ impl SessionManager {
     pub fn build_meeting_started_packet(
         room_id: &str,
         start_time_ms: u64,
+        start_time_authoritative: bool,
         creator_id: &str,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_STARTED.into(),
             room_id: room_id.to_string(),
             start_time_ms,
+            start_time_authoritative,
             creator_id: to_user_id_bytes(creator_id),
             ..Default::default()
         };
@@ -353,6 +372,27 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build the MEETING_INSTANCE_SUPERSEDED notice for a join refused because
+    /// its room token predates the meeting's current instance (#3287).
+    pub fn build_meeting_instance_superseded_packet(
+        room_id: &str,
+        target_user_id: &str,
+    ) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::MEETING_INSTANCE_SUPERSEDED.into(),
+            room_id: room_id.to_string(),
+            target_user_id: to_user_id_bytes(target_user_id),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
@@ -387,19 +427,47 @@ mod tests {
     async fn test_start_session_returns_result() {
         let manager = SessionManager::new();
         let result = manager
-            .start_session("room-1", "alice", 12345)
+            .start_session("room-1", "alice", 12345, None)
             .await
             .unwrap();
         assert!(result.start_time_ms > 0);
+        assert!(!result.start_time_authoritative);
         assert!(result.is_first_participant);
         assert_eq!(result.creator_id, "alice");
         assert_eq!(result.session_id, 12345);
     }
 
     #[tokio::test]
+    async fn start_session_returns_the_token_meeting_start() {
+        let manager = SessionManager::new();
+        let result = manager
+            .start_session("room-1", "alice", 1, Some(1_707_000_000_123))
+            .await
+            .unwrap();
+        assert_eq!(result.start_time_ms, 1_707_000_000_123);
+        assert!(result.start_time_authoritative);
+    }
+
+    #[tokio::test]
+    async fn start_session_without_a_token_start_uses_the_relay_clock() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let result = SessionManager::new()
+            .start_session("room-1", "alice", 1, None)
+            .await
+            .unwrap();
+        assert!(result.start_time_ms >= before);
+        assert!(!result.start_time_authoritative);
+    }
+
+    #[tokio::test]
     async fn test_system_user_id_rejected() {
         let manager = SessionManager::new();
-        let result = manager.start_session("room-1", SYSTEM_USER_ID, 0).await;
+        let result = manager
+            .start_session("room-1", SYSTEM_USER_ID, 0, None)
+            .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -413,13 +481,14 @@ mod tests {
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
         let meeting_started =
-            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice");
+            SessionManager::build_meeting_started_packet("my-room", 1234567890, true, "alice");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_started).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
         assert_eq!(inner.event_type, MeetingEventType::MEETING_STARTED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.start_time_ms, 1234567890);
+        assert!(inner.start_time_authoritative);
         assert_eq!(inner.creator_id, to_user_id_bytes("alice"));
 
         let meeting_ended = SessionManager::build_meeting_ended_packet("my-room", "Host left");

@@ -233,6 +233,7 @@ async fn plant_invalid_id_meeting(pool: &PgPool, room_id: &str) -> i32 {
         true,
         false,
         true,
+        db_meetings::Announcements::default(),
     )
     .await
     .expect("plant meeting");

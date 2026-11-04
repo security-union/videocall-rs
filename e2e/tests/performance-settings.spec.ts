@@ -82,9 +82,8 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   per-chart `diag-chart-{buffer,decode,packets,reorder}-help` "?" icon (the old
  *   section-level `diag-charts-help` was removed).
  *   The drawer title became "Performance & Diagnostics". The Settings modal now
- *   has exactly FIVE tabs (Audio / Video / Network / Appearance / Preferences —
- *   Preferences was added later, in the Action Bar Customization work) and NO
- *   performance affordance at all: the transitional `settings-perf-moved` redirect
+ *   has exactly SIX tabs (Audio / Video / Network / Appearance / Preferences /
+ *   Profile) and NO performance affordance at all: the transitional `settings-perf-moved` redirect
  *   row was REMOVED in the iteration (the drawer is the only home of the
  *   Performance controls; the "performance" deep link still routes to the drawer
  *   via attendants).
@@ -114,8 +113,8 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *                   readouts: perf-vu-recv-{video,audio,screen}-readout (by id)
  *                   format (#1222 quality-letter, {Q}=L/M/H or "1" single-layer):
  *                           `{Q} · {i}/{N} · {w}x{h}` (video/screen),
- *                           `— kbps` (audio: one layer, so no chip and no
- *                           receiver-observable bitrate),
+ *                           `{kbps} kbps` (audio: one layer, so no chip; the
+ *                           publisher's stamped bitrate, `— kbps` unstamped),
  *                           "Not receiving" placeholder when nothing decoded.
  *   Range inputs:   perf-recv-{video,audio,screen}-range-min / -range-max
  *   Auto toggles:   perf-recv-{video,audio,screen}-auto
@@ -311,21 +310,8 @@ async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): 
 
 /** Open the in-meeting device-settings modal via the toolbar gear. */
 async function openSettingsModal(page: Page): Promise<void> {
-  // The controls bar auto-hides after ~1s of mouse inactivity and slides
-  // in/out on a transform transition, so a raw click can hit it mid-animation
-  // ("element is not stable"). Wake it the same way openDrawer does: hover the
-  // container, nudge the pointer to an interior viewport point, and let the
-  // slide-in settle before clicking the gear.
-  await page.locator(".video-controls-container").hover();
-  const vp = page.viewportSize() ?? { width: 800, height: 600 };
-  await page.mouse.move(Math.floor(vp.width / 2), Math.floor(vp.height / 2));
-  await page.waitForTimeout(300);
-
   const gear = page.locator('[data-testid="open-settings"]');
   await expect(gear).toBeVisible({ timeout: 10_000 });
-  // Force-click as a belt-and-suspenders guard: even after the settle the bar
-  // can still report a sub-pixel transform drift on slower runners, which the
-  // actionability "stable" check rejects. The gear's hit target is unaffected.
   await gear.click({ force: true });
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
 }
@@ -1526,11 +1512,11 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
 // second surface to navigate to. The old round-trip cross-nav test is replaced
 // below by (a) a single-surface assertion that the perf panel and the
 // "Simulcast layers" section coexist in ONE open drawer, and (b) a Settings-modal
-// assertion that the modal has exactly FIVE tabs and NO performance affordance.
+// assertion that the modal has exactly SIX tabs and NO performance affordance.
 //
 // #1131 ITERATION: the transitional `settings-perf-moved` redirect row was
 // REMOVED (the product decision reversed the one-release link). The contract is
-// now: the Settings modal has exactly five tabs and offers NO path to Performance
+// now: the Settings modal has exactly six tabs and offers NO path to Performance
 // at all — the drawer is the only home of the Performance controls, opened via the
 // toolbar "Open Diagnostics" button (and the "performance" deep link, which still
 // routes to the drawer via attendants). The old "moved row opens the drawer"
@@ -1618,15 +1604,15 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
   // nothing failed when a 5th tab landed. ~22s against a smoke job that already
   // spends minutes on npm ci + browser install + docker build, in exchange for
   // closing the root cause. Do NOT tag the whole file: it is 5.3 min.
-  test("@bvt1 Settings has exactly FIVE tabs and offers NO performance affordance (#1131 iteration removed the moved row)", async ({
+  test("@bvt1 Settings has exactly SIX tabs and offers NO performance affordance (#1131 iteration removed the moved row)", async ({
     page,
   }) => {
     await joinMeeting(page, "settings_no_perf");
 
-    // ── The Settings modal has exactly FIVE tabs (Performance tab removed) ──
+    // ── The Settings modal has exactly SIX tabs (Performance tab removed) ──
     // MIRRORS RUST: this list is the DOM mirror of `SettingsSection::all()` in
     // `dioxus-ui/src/components/device_settings_modal.rs`, which is itself pinned
-    // by the unit test `tablist_has_five_sections_without_performance` (same
+    // by the unit test `tablist_has_six_sections_with_profile_last_and_without_performance` (same
     // count, same titles, same "no Performance" clause).
     //
     // Do NOT read that pairing as drift-proof: the two halves are NOT gated
@@ -1639,8 +1625,8 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await openSettingsModal(page);
     const modal = page.locator(".device-settings-modal");
     const tabs = modal.getByRole("tab");
-    await expect(tabs).toHaveCount(5);
-    // The five surviving tabs, by accessible name. The nav button renders an
+    await expect(tabs).toHaveCount(6);
+    // The six tabs, by accessible name. The nav button renders an
     // `aria-hidden="true"` icon plus a `.settings-nav-label` span, so the
     // accessible name is `SettingsSection::title()`.
     //
@@ -1656,7 +1642,14 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     //     quietly gut the #1131 contract this test exists to enforce.
     // Verified: bare finds "Video Performance" (count 1) where exact does not
     // (count 0); exact rejects "Preferences (Beta)" where bare accepts it.
-    for (const name of ["Audio", "Video", "Network", "Appearance", "Preferences"] as const) {
+    for (const name of [
+      "Audio",
+      "Video",
+      "Network",
+      "Appearance",
+      "Preferences",
+      "Profile",
+    ] as const) {
       await expect(
         modal.getByRole("tab", { name, exact: true }),
         `${name} tab present`,

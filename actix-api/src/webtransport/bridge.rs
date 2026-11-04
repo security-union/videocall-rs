@@ -70,6 +70,7 @@
 
 use crate::actors::priority_drop::{
     dimension_fill, queue_byte_kind_label, OutboundPriority, SharedQueueByteMeter,
+    CAPTION_DROP_KIND,
 };
 use crate::actors::session_logic::{
     DownlinkDropSink, DownlinkReliefSignal, RELIEF_SOURCE_UNISTREAM_SHED,
@@ -747,7 +748,17 @@ async fn open_downlink_stream(
     class: Option<DownlinkStreamClass>,
     context: &'static str,
 ) -> Option<web_transport_quinn::SendStream> {
-    let mut stream = match session.open_uni().await {
+    // Set before the first byte, or the WebTransport header itself parks on a full window.
+    let reserve = match class {
+        Some(DownlinkStreamClass::Audio) => *super::WT_AUDIO_SEND_RESERVE_BYTES,
+        _ => 0,
+    };
+    let opened = if reserve > 0 {
+        session.open_uni_with_send_reserve(reserve).await
+    } else {
+        session.open_uni().await
+    };
+    let mut stream = match opened {
         Ok(s) => s,
         Err(e) => {
             error!("Error opening downlink UniStream ({context}): {e}");
@@ -1154,10 +1165,13 @@ impl DownlinkStreamMap {
 
     fn dispatch(&mut self, frame: WtOutboundFrame) {
         let key = frame.key;
-        // EXACTLY `evaluate_dual`'s never-preempt set.
         let protected = matches!(
             frame.priority,
             OutboundPriority::Critical | OutboundPriority::Control
+        );
+        let is_caption = matches!(
+            frame.priority,
+            OutboundPriority::Caption | OutboundPriority::CaptionStatus
         );
         let sent_to_overflow;
         let rejected = {
@@ -1182,8 +1196,10 @@ impl DownlinkStreamMap {
             }
         };
         if sent_to_overflow && rejected.is_none() {
-            // Only one of the two is a cap event.
-            let cause = if key == DownlinkStreamKey::Shared {
+            // Only `cap` is a canary.
+            let cause = if is_caption {
+                "caption"
+            } else if key == DownlinkStreamKey::Shared {
                 "unattributed"
             } else {
                 "cap"
@@ -1599,7 +1615,7 @@ fn publisher_session_id(key: DownlinkStreamKey) -> u64 {
     }
 }
 
-fn outbound_drop_kind(priority: OutboundPriority) -> &'static str {
+pub(crate) fn outbound_drop_kind(priority: OutboundPriority) -> &'static str {
     match priority {
         OutboundPriority::Critical => "overflow_critical",
         OutboundPriority::Control => "control",
@@ -1607,12 +1623,13 @@ fn outbound_drop_kind(priority: OutboundPriority) -> &'static str {
         OutboundPriority::Screen => "screen",
         OutboundPriority::Audio => "audio",
         OutboundPriority::ProbeEcho => ECHO_DROP_KIND,
+        OutboundPriority::Caption | OutboundPriority::CaptionStatus => CAPTION_DROP_KIND,
     }
 }
 
 /// Book one shed: the reset counter for either reason, and for `write_timeout`
 /// — the only reason whose frame is DROPPED — the relief stamp plus a drop
-/// counter for `Critical`, `ProbeEcho` and `Control`. The relief stamp is NOT
+/// counter for every class but Audio, Video and Screen. The relief stamp is NOT
 /// gated on the frame's class: `write_timeout` is a LANE state (#2718, #2721).
 fn account_unistream_shed(
     reason: &'static str,
@@ -1637,10 +1654,11 @@ fn account_unistream_shed(
                  UniStream (overflow_critical)"
             );
         }
-        // #2721: same series as the admission shed.
-        OutboundPriority::ProbeEcho => {
+        OutboundPriority::ProbeEcho
+        | OutboundPriority::Caption
+        | OutboundPriority::CaptionStatus => {
             OUTBOUND_CHANNEL_DROPS_TOTAL
-                .with_label_values(&["webtransport", ECHO_DROP_KIND])
+                .with_label_values(&["webtransport", outbound_drop_kind(priority)])
                 .inc();
         }
         OutboundPriority::Control => {
@@ -2619,8 +2637,13 @@ mod writer_shed_tests {
         crate::webtransport::set_path_stat_sample_interval_for_test(Duration::from_millis(50));
         let _interval_guard = PathStatIntervalGuard;
 
+        const PUSHES: u64 = 500;
+        const PAYLOAD: usize = 256;
+
+        // Fits one queued datagram but not two: quinn also charges each entry
+        // the WT session header and a per-entry overhead.
         let mut transport = quinn::TransportConfig::default();
-        transport.datagram_send_buffer_size(1);
+        transport.datagram_send_buffer_size(2 * PAYLOAD);
         let (addr, mut server) = build_test_server_with_transport(Some(Arc::new(transport)));
 
         let server_session_fut = tokio::spawn(async move {
@@ -2634,8 +2657,6 @@ mod writer_shed_tests {
 
         let room = "dgram-overflow-2712";
         let session_id = "overflow-session-1";
-        const PUSHES: u64 = 500;
-        const PAYLOAD: usize = 256;
 
         let (dgram_tx, dgram_rx) = mpsc::channel::<WtOutboundFrame>(PUSHES as usize);
         let (uni_tx, uni_rx) = mpsc::channel::<WtOutboundFrame>(16);
@@ -2750,6 +2771,51 @@ mod writer_shed_tests {
             Ok(Err(e)) => panic!("datagram overflow test failed: {e}"),
             Err(_) => panic!("datagram overflow test timed out after 20s"),
         }
+    }
+
+    /// The datagram-queue cost model in `constants`, checked against quinn.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn quinn_datagram_queue_accounting_matches_the_sizing_model() {
+        use crate::constants::{
+            QUINN_DATAGRAM_ENTRY_OVERHEAD_BYTES, WT_DATAGRAM_AUDIO_WIRE_BYTES,
+            WT_DATAGRAM_SESSION_HEADER_BYTES, WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES,
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.datagram_send_buffer_size(WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES);
+        let (addr, mut server) = build_test_server_with_transport(Some(Arc::new(transport)));
+        let server_session_fut = tokio::spawn(async move {
+            let request = server.accept().await.expect("accept request");
+            request.ok().await.expect("respond ok")
+        });
+        let _client_session = connect_test_client(addr).await;
+        let session = server_session_fut.await.expect("join server session");
+
+        assert_eq!(
+            session.datagram_send_buffer_space(),
+            WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES - QUINN_DATAGRAM_ENTRY_OVERHEAD_BYTES,
+            "an empty queue must read the budget minus quinn's per-entry charge",
+        );
+
+        // No await in the loop, so quinn's driver cannot drain mid-burst.
+        let payload = Bytes::from(vec![
+            0xA5;
+            WT_DATAGRAM_AUDIO_WIRE_BYTES
+                - WT_DATAGRAM_SESSION_HEADER_BYTES
+        ]);
+        for _ in 0..2 * WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES / WT_DATAGRAM_AUDIO_WIRE_BYTES {
+            session
+                .send_datagram(payload.clone())
+                .expect("a top-tier audio datagram must be accepted");
+        }
+        let space = session.datagram_send_buffer_space();
+        assert!(
+            space < WT_DATAGRAM_AUDIO_WIRE_BYTES,
+            "a saturated queue must read less than one {WT_DATAGRAM_AUDIO_WIRE_BYTES}B \
+             datagram free, read {space}",
+        );
     }
 
     fn fallback_total(reason: &str, outcome: &str) -> f64 {
@@ -2922,6 +2988,33 @@ mod writer_shed_tests {
             1.0,
             "a Critical shed must not inflate the probe series",
         );
+    }
+
+    /// `channel_full_kind`, the dispatcher and this writer book a caption
+    /// alike. BITES: leave Caption in the writer's media arm.
+    #[test]
+    #[serial_test::serial]
+    fn a_caption_drop_books_the_caption_kind_at_every_hop() {
+        assert_eq!(
+            OutboundPriority::Caption.channel_full_kind(),
+            Some("caption")
+        );
+        for p in [
+            OutboundPriority::Critical,
+            OutboundPriority::Caption,
+            OutboundPriority::CaptionStatus,
+        ] {
+            assert_eq!(p.channel_full_kind(), Some(outbound_drop_kind(p)), "{p:?}");
+        }
+
+        let (relief, _epoch) = test_relief_signal();
+        for p in [OutboundPriority::Caption, OutboundPriority::CaptionStatus] {
+            let before = outbound_drops("caption");
+            account_unistream_shed("write_error", p, 64, &relief);
+            assert_eq!(outbound_drops("caption") - before, 0.0, "re-sent, not lost");
+            account_unistream_shed("write_timeout", p, 64, &relief);
+            assert_eq!(outbound_drops("caption") - before, 1.0, "{p:?}");
+        }
     }
 
     /// #2721 decision pin. BITES: gate `downlink_relief.stamp` on the frame
@@ -3265,7 +3358,7 @@ mod writer_shed_tests {
 
         // Pin the path MTU so the ceiling cannot climb past the payload.
         let mut transport = quinn::TransportConfig::default();
-        transport.mtu_discovery_config(None);
+        crate::webtransport::QuicMtuMax::Fixed.apply(&mut transport);
         let (addr, mut server) = build_test_server_with_transport(Some(Arc::new(transport)));
 
         let server_session_fut = tokio::spawn(async move {
@@ -3764,12 +3857,12 @@ mod downlink_stream_tests {
         }
     }
 
-    /// A stream whose class matches `wedge` is accepted but NEVER read, which
-    /// parks the relay's write for exactly one key on QUIC flow control.
+    /// A stream whose class is in `wedge` is accepted but NEVER read, which
+    /// parks the relay's write for exactly that key on QUIC flow control.
     async fn collect_stream(
         mut recv: web_transport_quinn::RecvStream,
         out: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
-        wedge: Option<DownlinkStreamClass>,
+        wedge: Arc<[DownlinkStreamClass]>,
     ) {
         let head = match read_frame(&mut recv).await {
             Ok(Some(p)) => p,
@@ -3783,7 +3876,7 @@ mod downlink_stream_tests {
             return;
         };
         let _ = out.send(StreamEvent::Opened(class));
-        if wedge == Some(class) {
+        if wedge.contains(&class) {
             // `received_reset` waits WITHOUT consuming bytes, so credits stay
             // exhausted and this key's write stays parked.
             if let Ok(Some(_code)) = recv.received_reset().await {
@@ -3829,6 +3922,22 @@ mod downlink_stream_tests {
                 .expect("the production-capacity test channel must accept the frame");
         }
 
+        /// Through the PRODUCTION admission check, then the credit site.
+        fn admit(
+            &self,
+            key: DownlinkStreamKey,
+            priority: OutboundPriority,
+            len: usize,
+        ) -> WtAdmission {
+            wt_unistream_admit(
+                &self.uni_tx,
+                &self.meter,
+                priority,
+                Bytes::from(vec![0xCD; len]),
+                key,
+            )
+        }
+
         fn try_offer(
             &self,
             key: DownlinkStreamKey,
@@ -3864,7 +3973,11 @@ mod downlink_stream_tests {
         }
     }
 
-    async fn spin_up(mode: DownlinkStreamMode, wedge: Option<DownlinkStreamClass>) -> Harness {
+    async fn spin_up(
+        mode: DownlinkStreamMode,
+        wedge: impl IntoIterator<Item = DownlinkStreamClass>,
+    ) -> Harness {
+        let wedge: Arc<[DownlinkStreamClass]> = wedge.into_iter().collect();
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (addr, mut server) = build_test_server();
         let server_session_fut = tokio::spawn(async move {
@@ -3877,7 +3990,7 @@ mod downlink_stream_tests {
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Ok(recv) = client_session.accept_uni().await {
-                tokio::spawn(collect_stream(recv, events_tx.clone(), wedge));
+                tokio::spawn(collect_stream(recv, events_tx.clone(), wedge.clone()));
             }
         });
 
@@ -4667,8 +4780,8 @@ mod downlink_stream_tests {
             outbound_drops("control"),
             control_before,
             "media saturation dropped a Control frame — a relayed KEYFRAME_REQUEST \
-             or HEARTBEAT — at the dispatcher; the reserve covers exactly \
-             `evaluate_dual`'s never-preempt set, not Critical alone",
+             or HEARTBEAT — at the dispatcher; the reserve covers Control, \
+             not Critical alone",
         );
     }
 
@@ -4805,6 +4918,65 @@ mod downlink_stream_tests {
             0,
             "a pre-#2723 client's stream must carry no priority hint",
         );
+    }
+
+    /// Over the real loopback session: only the audio stream carries the reserve (issue 3116).
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn only_the_audio_stream_carries_the_send_reserve() {
+        let h = spin_up(DownlinkStreamMode::PerPublisherV1, None).await;
+        let session = h.server_session.clone();
+        let reserve = *crate::webtransport::WT_AUDIO_SEND_RESERVE_BYTES;
+        assert!(reserve > 0, "the reserve must default to on");
+
+        for (class, expected) in [
+            (DownlinkStreamClass::Audio, reserve),
+            (DownlinkStreamClass::Control, 0),
+            (publisher_class(1, PublisherStreamKind::Video), 0),
+            (publisher_class(1, PublisherStreamKind::Screen), 0),
+            (DownlinkStreamClass::Overflow, 0),
+        ] {
+            let s = open_downlink_stream(&session, Some(class), "test")
+                .await
+                .expect("the loopback session must open a stream");
+            let carried = session
+                .stream_send_reserve(s.quic_id())
+                .expect("the stream is open");
+            assert_eq!(
+                carried, expected,
+                "{class:?}: send reserve on the QUIC stream"
+            );
+        }
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn the_audio_stream_opens_through_a_full_send_window() {
+        let h = spin_up(DownlinkStreamMode::PerPublisherV1, None).await;
+        let session = h.server_session.clone();
+        assert!(*crate::webtransport::WT_AUDIO_SEND_RESERVE_BYTES > 0);
+        session.set_send_window(0);
+
+        let audio = tokio::time::timeout(
+            Duration::from_secs(2),
+            open_downlink_stream(&session, Some(DownlinkStreamClass::Audio), "test"),
+        )
+        .await;
+        assert!(
+            matches!(audio, Ok(Some(_))),
+            "the audio open must complete on a full window: {audio:?}"
+        );
+
+        let video = tokio::time::timeout(
+            Duration::from_secs(1),
+            open_downlink_stream(
+                &session,
+                Some(publisher_class(1, PublisherStreamKind::Video)),
+                "test",
+            ),
+        )
+        .await;
+        assert!(video.is_err(), "a video open must still park: {video:?}");
     }
 
     #[test]
@@ -5118,6 +5290,117 @@ mod downlink_stream_tests {
             cap_before,
             "no publisher-key cap was reached, so the canary must stay flat",
         );
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn a_caption_rides_the_overflow_stream_below_audio() {
+        let caption_before = overflow_frames_total("caption");
+        let unattributed_before = overflow_frames_total("unattributed");
+        let mut h = spin_up(DownlinkStreamMode::PerPublisherV1, None).await;
+
+        h.offer(DownlinkStreamKey::Shared, OutboundPriority::Caption, 33);
+        h.offer(
+            DownlinkStreamKey::Shared,
+            OutboundPriority::CaptionStatus,
+            34,
+        );
+
+        let seen = h
+            .collect_until(Duration::from_secs(10), |seen| {
+                seen.iter()
+                    .filter(|e| matches!(e, StreamEvent::Frame(..)))
+                    .count()
+                    == 2
+            })
+            .await;
+        for len in [33, 34] {
+            assert!(
+                seen.contains(&StreamEvent::Frame(DownlinkStreamClass::Overflow, len)),
+                "{seen:?}",
+            );
+        }
+        assert_eq!(overflow_frames_total("caption") - caption_before, 2.0);
+        assert_eq!(overflow_frames_total("unattributed"), unattributed_before);
+        assert!(
+            DownlinkStreamClass::Overflow.send_priority()
+                < DownlinkStreamClass::Audio.send_priority()
+        );
+    }
+
+    /// Camera admission sheds at 0.80, so a camera-only backlog plateaus below
+    /// the caption threshold: captions are admitted, and only the overflow
+    /// lane's tail drop bounds them. BITES: shed Caption at the video ratio;
+    /// book a lane drop of a caption as any other kind.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn a_camera_backlog_admits_captions_and_the_overflow_lane_tail_drops_them() {
+        use crate::actors::priority_drop::{
+            PRIORITY_DROP_SCREEN_FILL_RATIO, PRIORITY_DROP_VIDEO_FILL_RATIO,
+        };
+        const STALLED: u64 = 7790;
+        let video = publisher_class(STALLED, PublisherStreamKind::Video);
+        let mut h = spin_up(
+            DownlinkStreamMode::PerPublisherV1,
+            [video, DownlinkStreamClass::Overflow],
+        )
+        .await;
+        // Exhaust each wedged stream's flow-control window; the overflow one with
+        // unattributed media, which shares that stream with captions.
+        for (key, class) in [
+            (DownlinkStreamKey::Shared, DownlinkStreamClass::Overflow),
+            (video_key(STALLED), video),
+        ] {
+            assert!(matches!(
+                h.admit(key, OutboundPriority::Video, 2 * 1024 * 1024),
+                WtAdmission::Enqueued
+            ));
+            let opened = h
+                .collect_until(Duration::from_secs(10), |seen| {
+                    seen.contains(&StreamEvent::Opened(class))
+                })
+                .await;
+            assert!(opened.contains(&StreamEvent::Opened(class)), "{opened:?}");
+        }
+
+        let budget = wt_unistream_byte_budget_for(OutboundPriority::Video);
+        let mut admitted = 0;
+        while matches!(
+            h.admit(video_key(STALLED), OutboundPriority::Video, budget / 32),
+            WtAdmission::Enqueued
+        ) {
+            admitted += 1;
+            assert!(admitted < WT_DOWNLINK_KEY_CHANNEL_CAPACITY, "never shed");
+        }
+        let fill = h.meter.queued_for(OutboundPriority::Video) as f32 / budget as f32;
+        assert!(
+            (PRIORITY_DROP_VIDEO_FILL_RATIO..PRIORITY_DROP_SCREEN_FILL_RATIO).contains(&fill),
+            "camera plateau {fill}",
+        );
+
+        let caption_before = outbound_drops(CAPTION_DROP_KIND);
+        let other_before = queue_drops_total("other");
+        let excess = 32;
+        for i in 0..WT_DOWNLINK_OVERFLOW_CHANNEL_CAPACITY + excess {
+            assert!(
+                matches!(
+                    h.admit(DownlinkStreamKey::Shared, OutboundPriority::Caption, 64),
+                    WtAdmission::Enqueued
+                ),
+                "caption {i} at camera fill {fill}",
+            );
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while outbound_drops(CAPTION_DROP_KIND) - caption_before < excess as f64
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            outbound_drops(CAPTION_DROP_KIND) - caption_before,
+            excess as f64
+        );
+        assert_eq!(queue_drops_total("other") - other_before, excess as f64);
     }
 
     /// #2745. BITES: delete the `drops.record(...)` call in `dispatch`.

@@ -14,10 +14,31 @@ import cq_score  # noqa: E402
 
 SCHEMA = "scale-scenario/v1"
 PLAN_SCHEMA = "scale-scenario-plan/v1"
-TARGETS = {"local": "local", "ci": "ci-smoke"}
+PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets")
+TARGET_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def profile_targets(profile_dir=PROFILE_DIR):
+    """The shared targets named by `<name>.json` profiles in `profile_dir`."""
+    try:
+        names = os.listdir(profile_dir)
+    except OSError:
+        return []
+    return sorted(n[:-5] for n in names if n.endswith(".json") and TARGET_NAME_RE.fullmatch(n[:-5])
+                  and n[:-5] not in ("local", "ci"))
+
+
+SHARED_TARGETS = frozenset({"hcl-daily", *profile_targets()})
+TARGETS = {"local": "local", "ci": "ci-smoke", "hcl-daily": "hcl-daily",
+           **{t: t for t in sorted(SHARED_TARGETS - {"hcl-daily"})}}
 TOP_KEYS = {"schema", "run", "population", "steps", "events", "scoring"}
-RUN_KEYS = {"id_prefix", "seed", "target", "fidelity_waivers"}
-ROLE_KEYS = {"role", "fleet", "count", "media", "network", "transport", "join_stagger", "receive"}
+RUN_KEYS = {"id_prefix", "seed", "target", "fidelity_waivers", "video_mode", "bot_diagnostics"}
+ON_OFF = ("on", "off")
+BOT_DIAGNOSTICS_DEFAULT = "off"
+VIDEO_MODES = ("ekg", "replay")
+ROLE_KEYS = {"role", "fleet", "count", "media", "network", "transport", "join_stagger", "receive", "decode_budget",
+             "skip_canvas_paint", "diag_packets", "speaking_glow"}
+PROBE_ONLY_KEYS = ("decode_budget", "skip_canvas_paint", "diag_packets", "speaking_glow")
 MEDIA_KEYS = {"camera", "mic", "video_layers"}
 RECEIVE_KEYS = {"pin_video_layer", "viewport_visible_count"}
 STEP_KEYS = {"id", "hold", "headline", "join_window"}
@@ -27,12 +48,25 @@ SCORING_KEYS = {"mode", "relay_path_exemptions", "expect"}
 EXPECT_KEYS = {"verdict", "invalid_gates"}
 CAMERA = {"on": True, "off": False}
 MICS = ("continuous", "muted", "off")
+DECODE_BUDGETS = ("off", "client")
+DECODE_BUDGET_WAIVER = "probe decode budget off (measures delivery, not client behaviour)"
+SKIP_PAINT_WAIVER = ("probe canvas paint skipped: painted fps, paint lag and render freezes are not observed; decoded "
+                     "fps and decoder-output freezes still are")
+DIAG_PACKETS = ("default", "off")
+SPEAKING_GLOWS = ("client", "off")
+SPEAKING_GLOW_WAIVER = ("probe speaking glow off: no tile speaking glow or tile mic-indicator glow, nor the repaints "
+                        "they drive; received video still paints, and nothing scored reads the glow")
+_DIAGNOSTICS_COST = ("nothing scored reads them, but their room-wide fan-out loads the relay and every receiver, so runs "
+                     "that differ in it must not be compared")
+BOT_DIAGNOSTICS_ON_WAIVER = ("Rust bot DIAGNOSTICS packets on (run.bot_diagnostics), as a client from before #3116: "
+                             f"{_DIAGNOSTICS_COST}")
+PROBE_DIAG_PACKETS_OFF_WAIVER = f"probe DIAGNOSTICS packets off (diag_packets): {_DIAGNOSTICS_COST}"
 ACTIONS = ("leave", "mute", "unmute")
 REFUSED_ACTIONS = {
     "camera-on": "G-V13 makes it INVALID in scorer v1",
     "camera-off": "G-V13 makes it INVALID in scorer v1",
     "outage": "G-V13 makes it INVALID in scorer v1",
-    "netem": "probes run with host networking on local and ci targets; netem is cluster only",
+    "netem": "probes run with host networking and the runner has no netem control",
     "rejoin": "a v1 limit: the collector allows one record per user id, and bots-app has no rejoin control",
 }
 ID_PREFIX_RE = re.compile(r"^[a-z0-9]{1,12}$")
@@ -170,7 +204,7 @@ class _Compiler:
             return None
         network = r.get("network", "none")
         if network != "none":
-            self.err(f"{where}.network: {network!r} is refused; local and ci targets cannot shape one participant")
+            self.err(f"{where}.network: {network!r} is refused; the runner cannot shape one participant")
         out = {"role": name, "fleet": fleet, "count": count, "camera": camera, "mic": mic,
                "talker": mic == "continuous"}
         if fleet == "browser":
@@ -190,14 +224,30 @@ class _Compiler:
             self.err(f"{where}.receive: only Rust roles take a receive config")
         if "video_layers" in media:
             self.err(f"{where}.media.video_layers: only Rust roles take video_layers")
-        out.update(transport=transport, join_stagger_s=stagger or 0)
+        budget = r.get("decode_budget", "off")
+        if budget not in DECODE_BUDGETS:
+            self.err(f"{where}.decode_budget: must be off or client")
+        skip = r.get("skip_canvas_paint", False)
+        if not isinstance(skip, bool):
+            self.err(f"{where}.skip_canvas_paint: must be true or false")
+        diag = r.get("diag_packets", "default")
+        if diag not in DIAG_PACKETS:
+            self.err(f"{where}.diag_packets: must be default or off")
+        glow = r.get("speaking_glow", "client")
+        if glow not in SPEAKING_GLOWS:
+            self.err(f"{where}.speaking_glow: must be client or off")
+        out.update(transport=transport, join_stagger_s=stagger or 0, decode_budget=budget, skip_canvas_paint=skip,
+                   diag_packets=diag, speaking_glow=glow)
 
     def _rust(self, r, media, where, out):
         transport = r.get("transport", "websocket")
         if transport != "websocket":
-            self.err(f"{where}.transport: Rust bots run websocket only (webtransport is invalid until R11)")
+            self.err(f"{where}.transport: Rust bots run websocket only (webtransport is invalid until Rust bot work "
+                     "item R11)")
         if "join_stagger" in r:
             self.err(f"{where}.join_stagger: only browser roles are staggered")
+        for k in (k for k in PROBE_ONLY_KEYS if k in r):
+            self.err(f"{where}.{k}: only browser probes take it")
         layers = media.get("video_layers", 3 if out["camera"] else None)
         if out["camera"] and (not _int(layers) or not 1 <= layers <= 3):
             self.err(f"{where}.media.video_layers: must be 1, 2 or 3")
@@ -226,7 +276,8 @@ def _plan_participants(roles, run_id):
             uid = f"{run_id}-{name}" + (f"@{BROWSER_DOMAIN}" if r["fleet"] == "browser" else "")
             parts.append({"user_id": uid, "name": name, "fleet": r["fleet"], "role": r["role"],
                           "observer": r["fleet"] == "browser", "talker": r["talker"],
-                          "publishes": {"camera": r["camera"], "mic": r["mic"] == "continuous", "screen": False}})
+                          "publishes": {"camera": r["camera"], "mic": r["mic"] == "continuous", "screen": False},
+                          **({"decode_budget": r["decode_budget"]} if r["fleet"] == "browser" else {})})
     return parts
 
 
@@ -290,7 +341,9 @@ def _processes(c, roles, parts, leavers):
     for k, p in enumerate(q for q in parts if q["fleet"] == "browser"):
         role = by_name[p["role"]]
         procs.append({"proc_id": f"probe-{k:02d}", "fleet": "browser", "participants": [p["user_id"]],
-                      "probe_index": k, "transport": role["transport"], "join_stagger_s": role["join_stagger_s"]})
+                      "probe_index": k, "transport": role["transport"], "join_stagger_s": role["join_stagger_s"],
+                      "decode_budget": role["decode_budget"], "skip_canvas_paint": role["skip_canvas_paint"],
+                      "diag_packets": role["diag_packets"], "speaking_glow": role["speaking_glow"]})
     rust = {r["role"]: r for r in roles if r["fleet"] == "rust"}
     publishers = [r for r in rust.values() if r["camera"] or r["mic"] != "off"]
     if len({r["video_layers"] for r in publishers if r["camera"]}) > 1:
@@ -321,11 +374,17 @@ def _processes(c, roles, parts, leavers):
     return procs
 
 
-def _scoring(c, scoring):
+def _scoring(c, scoring, target):
     scoring = {"mode": "gate", "relay_path_exemptions": {}, "expect": None, **(scoring or {})}
     c.keys(scoring, SCORING_KEYS, "scoring")
-    if scoring["mode"] != "gate":
-        c.err("scoring.mode: only gate is supported on local and ci targets (report mode is cluster Phase 0)")
+    if target in SHARED_TARGETS and scoring["mode"] != "report":
+        c.err(f"scoring.mode: {target} is a shared stack, so only report is allowed (Phase 0 is report-only)")
+    elif target not in SHARED_TARGETS and scoring["mode"] != "gate":
+        c.err(f"scoring.mode: only gate is supported on target {target}; report mode needs a shared target "
+              f"({', '.join(sorted(SHARED_TARGETS))})")
+    if target in SHARED_TARGETS and scoring["expect"] is not None:
+        c.err("scoring.expect: a shared target is report-only, so runner gate R11 fails every run and no expectation "
+              "can be met")
     ex = scoring["relay_path_exemptions"]
     if not isinstance(ex, dict) or len(ex) > cq_score.MAX_RELAY_EXEMPTIONS or any(
             k not in cq_score.RELAY_PATHS or not isinstance(v, str) or not v.strip() for k, v in ex.items()):
@@ -340,6 +399,26 @@ def _scoring(c, scoring):
                 or len(set(gates)) != len(gates) or (expect["verdict"] == "INVALID") != bool(gates):
             c.err("scoring.expect.invalid_gates: distinct G-V gate ids, non-empty exactly when verdict is INVALID")
     return scoring
+
+
+def viewport_warnings(plan):
+    """Viewport viewers whose peers cannot guarantee that G-V11's layer and viewport filters both act."""
+    procs = {p["proc_id"]: p for p in plan["processes"]}
+    exempt = plan["scoring"].get("relay_path_exemptions") or {}
+    out = []
+    for proc in plan["processes"]:
+        shown = (proc.get("receive") or {}).get("viewport_visible_count")
+        for uid in proc["participants"] if shown else ():
+            peers = [p for p in plan["participants"] if p["user_id"] != uid]
+            cams = [p for p in peers if p["publishes"]["camera"]]
+            layered = [p for p in cams if (procs[p["process"]].get("video_layers") or 0) > 1]
+            if "relay_layer_filtered_total" not in exempt and len(peers) - len(layered) >= shown:
+                out.append(f"{uid}: a viewport of {shown} can fill with the {len(peers) - len(layered)} peers that "
+                           "send no multi-layer video, so relay_layer_filtered_total may not move (G-V11)")
+            if "relay_viewport_filtered_total" not in exempt and shown >= len(cams):
+                out.append(f"{uid}: a viewport of {shown} shows all {len(cams)} camera publishers, so "
+                           "relay_viewport_filtered_total may not move (G-V11)")
+    return out
 
 
 def compile_scenario(doc, *, run_id, scenario_file, scenario_sha256):
@@ -358,12 +437,16 @@ def _compile(doc, run_id, scenario_file, scenario_sha256):
     run = doc["run"]
     if c.keys(run, RUN_KEYS, "run", ("id_prefix", "seed", "target")):
         if run["target"] not in TARGETS:
-            c.err(f"run.target: must be one of {', '.join(TARGETS)} (cluster runs come with PR-8)")
+            c.err(f"run.target: must be one of {', '.join(TARGETS)}")
         if not _int(run["seed"]):
             c.err("run.seed: must be an integer")
         waivers = run.get("fidelity_waivers", [])
         if not isinstance(waivers, list) or not all(isinstance(w, str) and w.strip() for w in waivers):
             c.err("run.fidelity_waivers: must be a list of non-empty strings")
+        if run.get("bot_diagnostics", BOT_DIAGNOSTICS_DEFAULT) not in ON_OFF:
+            c.err("run.bot_diagnostics: must be on or off")
+        if run.get("video_mode", VIDEO_MODES[0]) not in VIDEO_MODES:
+            c.err(f"run.video_mode: must be one of {', '.join(VIDEO_MODES)}")
     if not cq_manifest.RUN_ID_RE.match(run_id or ""):
         c.err(f"run_id {run_id!r}: must match [a-z0-9-]{{1,40}}")
     pop = doc["population"]
@@ -403,22 +486,35 @@ def _compile(doc, run_id, scenario_file, scenario_sha256):
     events = _events(c, doc.get("events") or [], roles, parts, hold_s, step_s)
     leavers = {u for e in events if e["action"] == "leave" for u in e["participants"]}
     processes = _processes(c, roles, parts, leavers)
-    scoring = _scoring(c, doc.get("scoring"))
+    scoring = _scoring(c, doc.get("scoring"), run.get("target"))
+    if run.get("target") in SHARED_TARGETS and all(p["fleet"] != "browser" or p["user_id"] in leavers for p in parts):
+        c.err("population: a shared target needs a browser probe that stays to the end; a 0-probe run is refused")
     if c.errors:
         raise ScenarioError(c.errors)
     owner = {u: q["proc_id"] for q in reversed(processes) for u in q["participants"]}
+    bot_diagnostics = run.get("bot_diagnostics", BOT_DIAGNOSTICS_DEFAULT)
     for p in parts:
         p["steps"] = [step["id"]]
         p["process"] = owner[p["user_id"]]
     return {
         "plan_schema": PLAN_SCHEMA, "run_id": run_id, "meeting_id": f"scale-{run_id}",
         "environment": TARGETS[run["target"]], "target": run["target"], "seed": run["seed"],
-        "fidelity_waivers": list(run.get("fidelity_waivers", [])),
+        "video_mode": run.get("video_mode", VIDEO_MODES[0]), "bot_diagnostics": bot_diagnostics,
+        "fidelity_waivers": _waivers(run.get("fidelity_waivers", []), roles, bot_diagnostics),
         "scenario": {"file": scenario_file, "sha256": scenario_sha256}, "node_aliases": {},
         "steps": [{"step_id": step["id"], "n_target": len(parts) - len(leavers), "headline": True,
                    "hold_s": hold_s, "join_window_s": join_window}],
         "participants": parts, "processes": processes, "events": events, "scoring": scoring,
     }
+
+
+def _waivers(declared, roles, bot_diagnostics):
+    auto = [w for w, on in ((DECODE_BUDGET_WAIVER, any(r.get("decode_budget") == "off" for r in roles)),
+                            (SKIP_PAINT_WAIVER, any(r.get("skip_canvas_paint") for r in roles)),
+                            (SPEAKING_GLOW_WAIVER, any(r.get("speaking_glow") == "off" for r in roles)),
+                            (BOT_DIAGNOSTICS_ON_WAIVER, bot_diagnostics == "on"),
+                            (PROBE_DIAG_PACKETS_OFF_WAIVER, any(r.get("diag_packets") == "off" for r in roles))) if on]
+    return list(declared) + [w for w in auto if w not in declared]
 
 
 def derive_run_id(id_prefix, wall, commit):

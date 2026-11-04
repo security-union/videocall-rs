@@ -56,6 +56,7 @@ function fakeBot(overrides: Record<string, unknown> = {}): unknown {
   return {
     userHangupDetected: new Promise<void>(() => {}),
     crashDetected: new Promise<string>(() => {}),
+    pageReloaded: new Promise(() => {}),
     leaveMeeting: vi.fn(async () => {}),
     shutdown: vi.fn(async () => {}),
     ...overrides,

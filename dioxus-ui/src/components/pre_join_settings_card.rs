@@ -16,6 +16,10 @@
  * conditions.
  */
 
+use crate::components::announcement_overrides::OverrideEditor;
+use crate::components::avatar_settings::{
+    focus_prejoin_avatar_button, AvatarDialog, PrejoinAvatarButton,
+};
 use crate::components::co_hosts::{can_edit_meeting_options, CoHostsSection, MeetingOwnership};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
@@ -47,6 +51,7 @@ pub fn PreJoinSettingsCard(
     /// This user's own join-time host-role snapshot; see [`can_edit_meeting_options`].
     #[props(default)]
     is_host: bool,
+    #[props(default)] is_guest: bool,
     meeting_id: String,
     #[props(default)] owner_user_id: Option<String>,
     #[props(default)] co_host_refresh: Option<Signal<u64>>,
@@ -57,6 +62,7 @@ pub fn PreJoinSettingsCard(
     allow_guests_toggle: Signal<bool>,
     recording_allowed_for_all_toggle: Signal<bool>,
     chat_allowed_for_all_toggle: Signal<bool>,
+    announcement_overrides: OverrideEditor,
     saving: Signal<bool>,
     toggle_error: Signal<Option<String>>,
     connection_error: Signal<Option<String>>,
@@ -92,6 +98,8 @@ pub fn PreJoinSettingsCard(
 ) -> Element {
     let is_owner = ownership.is_owner();
     let can_edit_options = can_edit_meeting_options(ownership, is_host);
+    let mut avatar_dialog_open = use_signal(|| false);
+    let open_avatar_dialog = use_callback(move |_: ()| avatar_dialog_open.set(true));
     rsx! {
         div { class: "settings-card",
             if is_owner {
@@ -129,6 +137,17 @@ pub fn PreJoinSettingsCard(
                 on_microphone_select,
                 on_speaker_select,
                 on_request_permission,
+                can_edit_avatar: !is_guest,
+                on_avatar_click: open_avatar_dialog,
+            }
+
+            if avatar_dialog_open() {
+                AvatarDialog {
+                    on_close: move |_| {
+                        avatar_dialog_open.set(false);
+                        focus_prejoin_avatar_button();
+                    },
+                }
             }
 
             if can_edit_options {
@@ -140,8 +159,10 @@ pub fn PreJoinSettingsCard(
                     allow_guests_toggle,
                     recording_allowed_for_all_toggle,
                     chat_allowed_for_all_toggle,
+                    announcement_overrides,
                     saving,
                     toggle_error,
+                    collapsible: true,
                 }
             }
             if is_owner {
@@ -395,6 +416,8 @@ fn DevicePreview(
     on_microphone_select: EventHandler<DeviceInfo>,
     on_speaker_select: EventHandler<DeviceInfo>,
     on_request_permission: EventHandler<()>,
+    #[props(default)] can_edit_avatar: bool,
+    #[props(default)] on_avatar_click: EventHandler<()>,
 ) -> Element {
     let camera_is_on = camera_on();
     let mic_is_on = mic_on();
@@ -425,7 +448,11 @@ fn DevicePreview(
                     }
                 } else if !camera_is_on {
                     div { class: "prejoin-video-placeholder",
-                        {camera_off_icon()}
+                        if can_edit_avatar {
+                            PrejoinAvatarButton { on_click: on_avatar_click }
+                        } else {
+                            {camera_off_icon()}
+                        }
                         span { class: "prejoin-video-placeholder-text", "Camera is off" }
                     }
                 }

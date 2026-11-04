@@ -191,6 +191,8 @@ fn join(session: u64, room: &str, user: &str, transport: &str) -> JoinRoom {
         transport: transport.to_string(),
         downlink_congested_epoch: never_epoch(),
         token_iat: None,
+        meeting_started_at_ms: None,
+        conn_seq: None,
         closer: None,
     }
 }

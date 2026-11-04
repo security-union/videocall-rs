@@ -5,11 +5,15 @@
 //! These functions are algorithmically non-trivial but have zero WASM / DOM /
 //! Dioxus dependencies, so they can be unit-tested under plain `cargo test`.
 
-use super::decode_budget::{build_decoded_bucket, expand_decoded_for_requested, pin_first_window};
+use super::decode_budget::{
+    build_decoded_bucket, expand_decoded_for_requested, pin_first_window, TileRenderMode,
+};
 use super::density::{DensityMode, MOBILE_WIDTH_BREAKPOINT_PX};
+use super::self_view::{remote_capacity, SelfTileCounts};
 use crate::constants::CANVAS_LIMIT;
 use crate::context::DockPosition;
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 
 /// Tile aspect ratio (width / height) — 3 : 2.
 pub(crate) const TILE_AR: f64 = 3.0 / 2.0;
@@ -21,14 +25,24 @@ pub(crate) fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usiz
     if n == 0 {
         return (1, 1, w);
     }
+    best_layout(1..=n, |cols| n.div_ceil(cols), w, h, gap)
+}
+
+fn best_layout(
+    columns: RangeInclusive<usize>,
+    rows_for: impl Fn(usize) -> usize,
+    w: f64,
+    h: f64,
+    gap: f64,
+) -> (usize, usize, f64) {
     let mut best_cols = 1_usize;
     let mut best_rows = 1_usize;
     let mut best_area = 0.0_f64;
     let mut best_tw = 0.0_f64;
     let ar: f64 = TILE_AR;
 
-    for cols in 1..=n {
-        let rows = n.div_ceil(cols);
+    for cols in columns {
+        let rows = rows_for(cols);
 
         let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
         let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
@@ -54,20 +68,225 @@ pub(crate) fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usiz
     (best_cols, best_rows, best_tw.floor())
 }
 
+/// Rows holding `k` leading 2x2 tiles and `n - k` single cells, densely packed.
+fn enlarged_rows(n: usize, k: usize, cols: usize) -> usize {
+    let bands = k.div_ceil(cols / 2);
+    let free = 2 * bands * cols - 4 * k;
+    2 * bands + (n - k).saturating_sub(free).div_ceil(cols)
+}
+
+/// What the grid's geometry, the enlarged tiles and the size hints all read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TilePlan {
+    pub cols: usize,
+    pub rows: usize,
+    pub tile_w: f64,
+    pub enlarged: usize,
+}
+
+impl TilePlan {
+    pub fn tile_h(&self) -> f64 {
+        self.tile_w / TILE_AR
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TilePlanInput {
+    pub tile_count: usize,
+    pub split_layout: bool,
+    pub full_bleed: bool,
+    pub avail_w: f64,
+    pub avail_h: f64,
+    pub gap: f64,
+    pub vw: f64,
+}
+
+impl TilePlanInput {
+    fn with_enlarged(&self, k: usize) -> Option<TilePlan> {
+        if k == 0 || k > self.tile_count || self.tile_count < 2 {
+            return None;
+        }
+        let n = self.tile_count;
+        let (cols, rows, tile_w) = best_layout(
+            2..=n + k,
+            |cols| enlarged_rows(n, k, cols),
+            self.avail_w,
+            self.avail_h,
+            self.gap,
+        );
+        let floor = DensityMode::Maximum.min_tile_width(self.vw);
+        let standard = compute_layout(n, self.avail_w, self.avail_h, self.gap).2;
+        (cols >= 2 && tile_w >= floor && 2.0 * tile_w + self.gap > standard).then_some(TilePlan {
+            cols,
+            rows,
+            tile_w,
+            enlarged: k,
+        })
+    }
+}
+
+fn plan_tiles(input: TilePlanInput, enlarged_tiles: usize) -> TilePlan {
+    let wanted = if input.split_layout || input.full_bleed {
+        0
+    } else {
+        enlarged_tiles
+    };
+    (1..=wanted)
+        .rev()
+        .find_map(|k| input.with_enlarged(k))
+        .unwrap_or_else(|| {
+            let (cols, rows, tile_w) =
+                compute_layout(input.tile_count, input.avail_w, input.avail_h, input.gap);
+            TilePlan {
+                cols,
+                rows,
+                tile_w,
+                enlarged: 0,
+            }
+        })
+}
+
+const ENLARGE_MIN_TILE_W_FINE_POINTER: f64 = 240.0;
+const ENLARGE_MIN_TILE_W_COARSE_POINTER: f64 = 330.0;
+const ENLARGE_MIN_GAIN: f64 = 1.2;
+
+fn enlarge_offered(input: TilePlanInput, plan: TilePlan, pointer_coarse: bool) -> bool {
+    let min_tile_w = if pointer_coarse {
+        ENLARGE_MIN_TILE_W_COARSE_POINTER
+    } else {
+        ENLARGE_MIN_TILE_W_FINE_POINTER
+    };
+    !input.split_layout
+        && !input.full_bleed
+        && plan.tile_w >= min_tile_w
+        && input
+            .with_enlarged(plan.enlarged + 1)
+            .is_some_and(|next| 2.0 * next.tile_w + input.gap >= ENLARGE_MIN_GAIN * plan.tile_w)
+}
+
+/// The grid's enlarged tiles; empty in the split.
+#[derive(Debug, Default, PartialEq)]
+pub struct EnlargedTiles {
+    /// Painted sessions only.
+    pub rank: HashMap<String, usize>,
+    pub offered: bool,
+}
+
+impl EnlargedTiles {
+    pub(crate) fn painted_sessions(&self) -> HashSet<u64> {
+        self.rank
+            .keys()
+            .filter_map(|id| id.parse::<u64>().ok())
+            .collect()
+    }
+}
+
+/// The grid plan for this render list, and which tiles it paints enlarged.
+pub fn plan_tile_grid(
+    input: TilePlanInput,
+    unified_tiles: &[(String, TileRenderMode)],
+    enlarged_sessions: &[(String, usize)],
+    pointer_coarse: bool,
+) -> (TilePlan, EnlargedTiles) {
+    let requested: HashMap<&str, usize> = enlarged_sessions
+        .iter()
+        .map(|(session, rank)| (session.as_str(), *rank))
+        .collect();
+    let present: Vec<(&String, usize)> = unified_tiles
+        .iter()
+        .filter_map(|(id, _)| requested.get(id.as_str()).map(|rank| (id, *rank)))
+        .collect();
+    let plan = plan_tiles(input, present.len());
+    let enlarged = EnlargedTiles {
+        rank: present
+            .into_iter()
+            .take(plan.enlarged)
+            .map(|(id, rank)| (id.clone(), rank))
+            .collect(),
+        offered: enlarge_offered(input, plan, pointer_coarse),
+    };
+    (plan, enlarged)
+}
+
+/// How many remote tiles the grid places, and how many participants the +N badge
+/// stands in for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridCapacity {
+    pub layout_limit: usize,
+    pub displayed: usize,
+    pub overflow: usize,
+}
+
+impl GridCapacity {
+    pub(crate) fn tile_count(&self, counts: &SelfTileCounts) -> usize {
+        self.displayed
+            + usize::from(self.overflow > 0)
+            + usize::from(counts.self_in_grid)
+            + counts.share_cells
+    }
+}
+
+/// `roster_total` is everyone in the meeting, `total_tiles` the capped population
+/// that can hold a tile. A roster past the cap asks for one more cell, for its badge.
+pub(crate) fn plan_grid_capacity(
+    roster_total: usize,
+    total_tiles: usize,
+    counts: &SelfTileCounts,
+    avail_w: f64,
+    avail_h: f64,
+    gap: f64,
+    min_tile_width: f64,
+) -> GridCapacity {
+    let mut cells = counts.layout_count + usize::from(roster_total > total_tiles);
+    while cells > 1 {
+        let (_cols, _rows, tile_w) = compute_layout(cells, avail_w, avail_h, gap);
+        if tile_w >= min_tile_width {
+            break;
+        }
+        cells -= 1;
+    }
+    let layout_limit = remote_capacity(cells, counts);
+    let (displayed, overflow) = if roster_total > layout_limit.min(total_tiles) {
+        let displayed = layout_limit.saturating_sub(1).max(1);
+        (displayed, roster_total - displayed)
+    } else {
+        (total_tiles, 0)
+    };
+    GridCapacity {
+        layout_limit,
+        displayed,
+        overflow,
+    }
+}
+
 /// `#grid-container`'s flow longhands: a lone tile stretches across 1fr tracks,
-/// 2+ tiles wrap and centre. Every arm emits the same set. (issue 2700)
-pub(crate) fn tile_flow_style(tile_count: usize, cols: usize, rows: usize) -> String {
-    if tile_count == 1 {
+/// 2+ tiles wrap and centre, and enlarged tiles need real tracks to span. Every
+/// arm emits the same set. (issue 2700)
+pub fn tile_flow_style(tile_count: usize, plan: TilePlan) -> String {
+    let (cols, rows) = (plan.cols, plan.rows);
+    if plan.enlarged > 0 {
+        format!(
+            "display: grid; \
+             grid-template-columns: repeat({cols}, {tw:.0}px); grid-template-rows: none; \
+             grid-auto-rows: {th:.0}px; grid-auto-flow: row dense; \
+             justify-content: center; align-content: flex-start; \
+             flex-direction: unset; flex-wrap: unset; align-items: unset;",
+            tw = plan.tile_w,
+            th = plan.tile_h(),
+        )
+    } else if tile_count == 1 {
         format!(
             "display: grid; \
              grid-template-columns: repeat({cols}, 1fr); \
              grid-template-rows: repeat({rows}, 1fr); \
+             grid-auto-rows: auto; grid-auto-flow: row; \
              justify-content: stretch; align-content: stretch; \
              flex-direction: unset; flex-wrap: unset; align-items: unset;"
         )
     } else {
         "display: flex; \
          grid-template-columns: none; grid-template-rows: none; \
+         grid-auto-rows: auto; grid-auto-flow: row; \
          justify-content: center; align-content: flex-start; \
          flex-direction: row; flex-wrap: wrap; align-items: flex-start;"
             .to_string()
@@ -78,7 +297,19 @@ pub(crate) fn tile_flow_style(tile_count: usize, cols: usize, rows: usize) -> St
 pub(crate) fn screen_share_flow_style() -> &'static str {
     "display: flex; flex-direction: row; flex-wrap: nowrap; align-items: stretch; \
      justify-content: flex-start; align-content: stretch; \
-     grid-template-columns: none; grid-template-rows: none;"
+     grid-template-columns: none; grid-template-rows: none; \
+     grid-auto-rows: auto; grid-auto-flow: row;"
+}
+
+/// The tile size custom properties, standard and enlarged.
+pub fn tile_size_vars(tile_w: f64, tile_h: f64, gap: f64) -> String {
+    let (tw, th) = (tile_w.round(), tile_h.round());
+    format!(
+        "--tile-w: {tw:.0}px; --tile-h: {th:.0}px; \
+         --tile-2x-w: {:.0}px; --tile-2x-h: {:.0}px;",
+        2.0 * tw + gap,
+        2.0 * th + gap,
+    )
 }
 
 /// `--tile-w` / `--tile-h` for the screen-share split: the largest 3:2 tile in
@@ -90,6 +321,87 @@ pub(crate) fn screen_share_stage_tile_size(avail_w: f64, avail_h: f64) -> (f64, 
     let tw = (avail_h * TILE_AR).min(avail_w).max(0.0);
     let th = tw / TILE_AR;
     (tw, th)
+}
+
+pub(crate) const SPLIT_GAP: f64 = 10.0;
+const SPLIT_HANDLE_W: f64 = 6.0;
+const SPLIT_PANEL_PAD: f64 = 14.0;
+const SPLIT_PANEL_MIN_COL: f64 = 160.0;
+const SPLIT_PANEL_SLACK: f64 = 15.0;
+const SPLIT_PANEL_SHAVE: f64 = 0.004;
+
+/// The split's peer panel: `#grid-container`'s content-box width, the stage's
+/// share of it, the panel's height and its number of tiles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SplitPanel {
+    pub(crate) content_w: f64,
+    pub(crate) ratio: f64,
+    pub(crate) height: f64,
+    pub(crate) tiles: usize,
+}
+
+/// The panel in a `#grid-container` `grid_w` px wide and `vh` px tall, padded by
+/// [`screen_share_padding`]'s `pads`, holding `cameras` and `shares` share tiles.
+pub(crate) fn split_panel(
+    grid_w: f64,
+    vh: f64,
+    (top, right, bottom, left): (f64, f64, f64, f64),
+    ratio: f64,
+    cameras: usize,
+    shares: usize,
+) -> SplitPanel {
+    SplitPanel {
+        content_w: grid_w - left - right,
+        ratio,
+        height: vh - top - bottom,
+        tiles: cameras + shares,
+    }
+}
+
+/// CSS height of a camera tile in `.ss-peer-panel`, rounded up to the widest
+/// tile its `auto-fill` grid can paint, with a scrollbar when it overflows.
+pub(crate) fn split_peer_tile_height(panel: SplitPanel) -> f64 {
+    let flex_w = panel.content_w - SPLIT_HANDLE_W - 2.0 * SPLIT_GAP;
+    let panel_w = flex_w * (1.0 - panel.ratio - SPLIT_PANEL_SHAVE) / (1.0 - SPLIT_PANEL_SHAVE);
+    let inner = (panel_w - 2.0 * SPLIT_PANEL_PAD).max(0.0);
+    let tile = |slack: f64| {
+        let cols = ((inner - slack + SPLIT_GAP) / (SPLIT_PANEL_MIN_COL + SPLIT_GAP))
+            .floor()
+            .max(1.0);
+        ((inner - SPLIT_GAP * (cols - 1.0)) / cols / TILE_AR, cols)
+    };
+    let (h, cols) = tile(0.0);
+    let rows = (panel.tiles as f64 / cols).ceil();
+    let content_h = rows * (h + SPLIT_GAP) - SPLIT_GAP + 2.0 * SPLIT_PANEL_PAD;
+    if content_h > panel.height {
+        tile(SPLIT_PANEL_SLACK).0
+    } else {
+        h
+    }
+}
+
+/// Device-pixel height of a decoded camera tile, the receive-side video layer lid.
+pub(crate) fn decoded_tile_device_px_h(
+    split_layout: bool,
+    panel: SplitPanel,
+    plan: TilePlan,
+    tile_count: usize,
+    avail_h: f64,
+    dpr: f64,
+) -> u32 {
+    let css_h = if split_layout {
+        split_peer_tile_height(panel)
+    } else if tile_count == 1 {
+        // The lone tile is full-bleed (`.participants-1 .grid-item.full-bleed`).
+        avail_h
+    } else {
+        plan.tile_h()
+    };
+    (css_h * dpr).round() as u32
+}
+
+pub(crate) fn enlarged_tile_device_px_h(plan: TilePlan, gap: f64, dpr: f64) -> u32 {
+    ((2.0 * plan.tile_h() + gap) * dpr).round() as u32
 }
 
 /// Freshness (ms) an overflow speaker must beat to displace a VISIBLE speaker in
@@ -119,9 +431,9 @@ fn recent_speech(
 
 /// Rank the roster BEFORE the `CANVAS_LIMIT` cut and return the capped
 /// `(session_id, camera_on)` list `attendants.rs` feeds to
-/// `partition_camera_tiles` (issue #2273). Pinned peers rank first, by pin rank
-/// (issue 2866). Returns the input order untouched when `capped_real` covers the
-/// whole roster.
+/// `partition_camera_tiles` (issue #2273). Enlarged then pinned peers rank first,
+/// by `pin_rank` (issues 3367, 2866). Returns the input order untouched when
+/// `capped_real` covers the whole roster.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_display_candidates(
     display_peers: &[String],
@@ -292,7 +604,7 @@ pub(crate) struct SpeakerInputs<'a> {
 }
 
 pub(crate) struct CameraWindowInput<'a> {
-    /// Camera-pinned session_ids in rank order.
+    /// Leading session_ids in rank order: enlarged then pinned, or pinned for the split panel.
     pub pins: &'a [String],
     /// Join-sorted.
     pub camera_on: Vec<String>,
@@ -510,8 +822,6 @@ pub(crate) fn grid_padding(dock: DockPosition, vw: f64) -> (f64, f64, f64, f64, 
     (gap, top, right, bottom + MEETING_FOOTER_RESERVE, left)
 }
 
-const DRAWER_SHRINK_FLOORS: [f64; 2] = [DRAWER_MIN_WIDTH, DRAWER_MIN_WIDTH];
-
 const DRAWER_DRAG_QUANTUM: f64 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -672,7 +982,7 @@ pub(crate) fn drawers_to_close_on_open(
 
 pub(crate) fn resize_notice(close: DrawersToClose, customize_ended: bool) -> Option<&'static str> {
     if customize_ended {
-        return Some("Customize ended to fit the window; layout saved");
+        return Some("Button editing ended to fit the window; layout saved");
     }
     match (close.peer_list, close.diagnostics, close.chat) {
         (false, false, false) => None,
@@ -700,6 +1010,7 @@ pub(crate) struct DrawerState {
     pub(crate) diagnostics_open: bool,
     pub(crate) right_w: f64,
     pub(crate) chat_open: bool,
+    pub(crate) chat_w: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -713,14 +1024,15 @@ pub(crate) struct DrawerReserves {
 }
 
 /// Zero below [`DRAWER_REFLOW_MIN_VW`]; over [`max_total_reserve`] the drawers
-/// shrink diagnostics then the peer list, and the floors win over the cap.
+/// shrink diagnostics, then the peer list, then chat, and the floors win over
+/// the cap.
 pub(crate) fn drawer_reserves(state: DrawerState) -> DrawerReserves {
     // Negated, not `vw < MIN`: a NaN viewport must not reach the grid branch.
     let reflows = state.vw >= DRAWER_REFLOW_MIN_VW;
     if !reflows {
         return DrawerReserves {
             left_render_w: state.left_w,
-            chat_render_w: CHAT_DRAWER_WIDTH,
+            chat_render_w: state.chat_w,
             diag_render_w: state.right_w,
             chat_right_offset: 0.0,
             left_reserve: 0.0,
@@ -728,26 +1040,24 @@ pub(crate) fn drawer_reserves(state: DrawerState) -> DrawerReserves {
         };
     }
 
-    let open = [state.diagnostics_open, state.peer_list_open];
-    let mut w = [state.right_w, state.left_w];
-    let chat_render_w = CHAT_DRAWER_WIDTH;
-    // Below its breakpoint chat paints 360 wide but reserves nothing.
-    let chat_occupies = if state.chat_open && !chat_is_sheet(state.vw) {
-        chat_render_w
-    } else {
-        0.0
-    };
+    let chat_reserves = state.chat_open && !chat_is_sheet(state.vw);
+    let open = [state.diagnostics_open, state.peer_list_open, chat_reserves];
+    let floors = [
+        DRAWER_MIN_WIDTH,
+        DRAWER_MIN_WIDTH,
+        state.chat_w.min(CHAT_DRAWER_WIDTH),
+    ];
+    let mut w = [state.right_w, state.left_w, state.chat_w];
     let budget = max_total_reserve(state.vw);
-    let occupied = |w: &[f64; 2]| -> f64 {
-        chat_occupies
-            + w.iter()
-                .zip(open.iter())
-                .filter(|(_, is_open)| **is_open)
-                .map(|(width, _)| *width)
-                .sum::<f64>()
+    let occupied = |w: &[f64; 3]| -> f64 {
+        w.iter()
+            .zip(open.iter())
+            .filter(|(_, is_open)| **is_open)
+            .map(|(width, _)| *width)
+            .sum::<f64>()
     };
 
-    for (i, &floor) in DRAWER_SHRINK_FLOORS.iter().enumerate() {
+    for (i, &floor) in floors.iter().enumerate() {
         let over = occupied(&w) - budget;
         if over <= 0.0 {
             break;
@@ -757,7 +1067,8 @@ pub(crate) fn drawer_reserves(state: DrawerState) -> DrawerReserves {
         }
     }
 
-    let [diag_render_w, left_render_w] = w;
+    let [diag_render_w, left_render_w, chat_render_w] = w;
+    let chat_occupies = if chat_reserves { chat_render_w } else { 0.0 };
     let diag_reserve = if state.diagnostics_open {
         diag_render_w
     } else {
@@ -787,7 +1098,7 @@ pub(crate) fn drawer_reserves(state: DrawerState) -> DrawerReserves {
 pub(crate) fn drawer_max_for_side(state: DrawerState, side: DrawerSide) -> f64 {
     let others = if state.vw >= DRAWER_REFLOW_MIN_VW {
         let chat = if state.chat_open && !chat_is_sheet(state.vw) {
-            CHAT_DRAWER_WIDTH
+            drawer_reserves(state).chat_render_w
         } else {
             0.0
         };
@@ -875,9 +1186,18 @@ mod tests {
         assert_eq!((c_open, tw_open), (2, 423.0));
     }
 
+    fn plain(cols: usize, rows: usize) -> TilePlan {
+        TilePlan {
+            cols,
+            rows,
+            tile_w: 300.0,
+            enlarged: 0,
+        }
+    }
+
     #[test]
     fn tile_flow_wraps_and_centres_for_two_or_more_tiles() {
-        let s = tile_flow_style(4, 2, 2);
+        let s = tile_flow_style(4, plain(2, 2));
         assert!(s.contains("display: flex;"), "{s}");
         assert!(s.contains("flex-wrap: wrap;"), "{s}");
         assert!(s.contains("justify-content: center;"), "{s}");
@@ -888,7 +1208,7 @@ mod tests {
 
     #[test]
     fn tile_flow_stretches_a_lone_tile_across_one_fr_tracks() {
-        let s = tile_flow_style(1, 1, 1);
+        let s = tile_flow_style(1, plain(1, 1));
         assert!(s.contains("display: grid;"), "{s}");
         assert!(s.contains("grid-template-columns: repeat(1, 1fr);"), "{s}");
         assert!(s.contains("justify-content: stretch;"), "{s}");
@@ -910,11 +1230,498 @@ mod tests {
             v.sort_unstable();
             v
         }
-        let lone = tile_flow_style(1, 2, 2);
-        let wrap = tile_flow_style(4, 2, 2);
-        assert_eq!(names(&lone).len(), 8, "{lone}");
+        let lone = tile_flow_style(1, plain(2, 2));
+        let wrap = tile_flow_style(4, plain(2, 2));
+        let enlarged = tile_flow_style(
+            4,
+            TilePlan {
+                enlarged: 1,
+                ..plain(3, 2)
+            },
+        );
+        assert_eq!(names(&lone).len(), 10, "{lone}");
         assert_eq!(names(&lone), names(&wrap));
+        assert_eq!(names(&lone), names(&enlarged));
         assert_eq!(names(&lone), names(screen_share_flow_style()));
+    }
+
+    #[test]
+    fn only_a_painted_enlarged_tile_gives_the_grid_real_tracks() {
+        let s = tile_flow_style(
+            4,
+            TilePlan {
+                cols: 4,
+                rows: 2,
+                tile_w: 298.0,
+                enlarged: 1,
+            },
+        );
+        for want in [
+            "display: grid;",
+            "grid-template-columns: repeat(4, 298px);",
+            "grid-auto-rows: 199px;",
+            "grid-auto-flow: row dense;",
+            "justify-content: center;",
+            "align-content: flex-start;",
+        ] {
+            assert!(s.contains(want), "{want} missing from {s}");
+        }
+        assert!(tile_flow_style(4, plain(2, 2)).contains("grid-auto-flow: row;"));
+    }
+
+    #[test]
+    fn the_2x_vars_span_two_painted_cells_and_a_gap() {
+        assert_eq!(
+            tile_size_vars(298.0, 298.0 / TILE_AR, 16.0),
+            "--tile-w: 298px; --tile-h: 199px; --tile-2x-w: 612px; --tile-2x-h: 414px;"
+        );
+    }
+
+    fn input(tile_count: usize) -> TilePlanInput {
+        TilePlanInput {
+            tile_count,
+            split_layout: false,
+            full_bleed: false,
+            avail_w: 1240.0,
+            avail_h: 548.0,
+            gap: 16.0,
+            vw: 1280.0,
+        }
+    }
+
+    /// CSS `grid-auto-flow: row dense`: every item takes the first area it fits.
+    fn dense_packed_rows(n: usize, k: usize, cols: usize) -> usize {
+        let mut taken: HashSet<(usize, usize)> = HashSet::new();
+        let mut rows = 0;
+        for span in std::iter::repeat_n(2, k).chain(std::iter::repeat_n(1, n - k)) {
+            let (row, col) = (0..)
+                .flat_map(|row| (0..=cols - span).map(move |col| (row, col)))
+                .find(|&(row, col)| {
+                    (row..row + span).all(|r| (col..col + span).all(|c| !taken.contains(&(r, c))))
+                })
+                .expect("the grid has unbounded rows");
+            for r in row..row + span {
+                for c in col..col + span {
+                    taken.insert((r, c));
+                }
+            }
+            rows = rows.max(row + span);
+        }
+        rows
+    }
+
+    #[test]
+    fn enlarged_rows_matches_a_dense_packing_simulation() {
+        for n in 1..=24 {
+            for k in 1..=n {
+                for cols in 2..=n + k {
+                    assert_eq!(
+                        enlarged_rows(n, k, cols),
+                        dense_packed_rows(n, k, cols),
+                        "n={n} k={k} cols={cols}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_always_fits_the_meeting_area() {
+        for (w, h, gap, vw) in [
+            (1240.0, 548.0, 16.0, 1280.0),
+            (760.0, 548.0, 16.0, 800.0),
+            (1880.0, 908.0, 16.0, 1920.0),
+            (359.0, 547.0, 8.0, 375.0),
+            (651.0, 263.0, 8.0, 667.0),
+        ] {
+            for n in 2..=24 {
+                for wanted in 1..=n {
+                    let p = plan_tiles(
+                        TilePlanInput {
+                            avail_w: w,
+                            avail_h: h,
+                            gap,
+                            vw,
+                            ..input(n)
+                        },
+                        wanted,
+                    );
+                    let (cols, rows) = (p.cols as f64, p.rows as f64);
+                    assert!(
+                        cols * p.tile_w + (cols - 1.0) * gap <= w,
+                        "too wide: {p:?} in {w}x{h} n={n}"
+                    );
+                    assert!(
+                        rows * p.tile_h() + (rows - 1.0) * gap <= h + 0.001,
+                        "too tall: {p:?} in {w}x{h} n={n}"
+                    );
+                    if p.enlarged > 0 {
+                        assert_eq!(p.rows, dense_packed_rows(n, p.enlarged, p.cols));
+                        assert!(p.cols >= 2);
+                        assert!(p.tile_w >= DensityMode::Maximum.min_tile_width(vw));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_nothing_enlarged_the_plan_is_exactly_compute_layout() {
+        for n in 0..=30 {
+            for (w, h, gap) in [(1240.0, 548.0, 16.0), (359.0, 547.0, 8.0), (0.0, 0.0, 8.0)] {
+                let p = plan_tiles(
+                    TilePlanInput {
+                        avail_w: w,
+                        avail_h: h,
+                        gap,
+                        ..input(n)
+                    },
+                    0,
+                );
+                assert_eq!((p.cols, p.rows, p.tile_w), compute_layout(n, w, h, gap));
+                assert_eq!(p.enlarged, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn one_enlarged_tile_of_two_takes_three_columns() {
+        let p = plan_tiles(input(2), 1);
+        assert_eq!((p.cols, p.rows, p.tile_w, p.enlarged), (3, 2, 399.0, 1));
+    }
+
+    #[test]
+    fn the_width_floor_drops_enlarged_tiles_from_the_back() {
+        let area = TilePlanInput {
+            avail_w: 420.0,
+            avail_h: 700.0,
+            ..input(6)
+        };
+        let floor = DensityMode::Maximum.min_tile_width(area.vw);
+        let all_four = best_layout(
+            2..=10,
+            |cols| enlarged_rows(6, 4, cols),
+            area.avail_w,
+            area.avail_h,
+            area.gap,
+        );
+        assert!(
+            all_four.2 < floor,
+            "premise: 4 miss the floor: {all_four:?}"
+        );
+        let p = plan_tiles(area, 4);
+        assert_eq!(p.enlarged, 3, "{p:?}");
+        assert!(p.tile_w >= floor, "{p:?}");
+    }
+
+    #[test]
+    fn no_room_for_two_columns_enlarges_nothing() {
+        let p = plan_tiles(
+            TilePlanInput {
+                avail_w: 200.0,
+                avail_h: 900.0,
+                ..input(3)
+            },
+            1,
+        );
+        assert_eq!(p.enlarged, 0, "{p:?}");
+    }
+
+    #[test]
+    fn the_split_and_a_full_bleed_tile_enlarge_nothing() {
+        let split = TilePlanInput {
+            split_layout: true,
+            ..input(4)
+        };
+        let bleed = TilePlanInput {
+            full_bleed: true,
+            ..input(2)
+        };
+        assert_eq!(plan_tiles(input(4), 1).enlarged, 1, "premise");
+        assert_eq!(plan_tiles(split, 1).enlarged, 0);
+        assert_eq!(plan_tiles(bleed, 1).enlarged, 0);
+        assert_eq!(
+            plan_tiles(input(1), 1).enlarged,
+            0,
+            "a lone tile has no second column to span"
+        );
+    }
+
+    #[test]
+    fn the_split_and_full_bleed_withdraw_the_offer() {
+        let two = input(2);
+        assert!(enlarge_offered(two, plan_tiles(two, 0), false));
+        assert!(enlarge_offered(two, plan_tiles(two, 0), true));
+        for off in [
+            TilePlanInput {
+                split_layout: true,
+                ..two
+            },
+            TilePlanInput {
+                full_bleed: true,
+                ..two
+            },
+        ] {
+            assert!(!enlarge_offered(off, plan_tiles(off, 0), false), "{off:?}");
+        }
+    }
+
+    fn portrait_phone() -> TilePlanInput {
+        TilePlanInput {
+            avail_w: 359.0,
+            avail_h: 547.0,
+            gap: 8.0,
+            vw: 375.0,
+            ..input(2)
+        }
+    }
+
+    #[test]
+    fn a_portrait_phone_is_not_offered_enlarge() {
+        let phone = portrait_phone();
+        let plan = plan_tiles(phone, 0);
+        assert!(plan.tile_w >= ENLARGE_MIN_TILE_W_COARSE_POINTER, "{plan:?}");
+        assert!(
+            !enlarge_offered(phone, plan, true),
+            "2x a 175px tile does not beat the {} px tile it replaces",
+            plan.tile_w
+        );
+    }
+
+    #[test]
+    fn a_painted_tile_must_be_bigger_than_a_standard_tile_with_nothing_enlarged() {
+        let phone = portrait_phone();
+        assert_eq!(plan_tiles(phone, 0).tile_w, 359.0, "premise");
+        assert_eq!(
+            best_layout(2..=3, |c| enlarged_rows(2, 1, c), 359.0, 547.0, 8.0).2,
+            175.0
+        );
+        assert_eq!(
+            plan_tiles(phone, 1).enlarged,
+            0,
+            "358 px at 2x is not an enlargement of 359 px"
+        );
+    }
+
+    #[test]
+    fn offering_needs_a_1_2x_gain_but_keeping_needs_only_a_bigger_tile() {
+        for (avail_w, avail_h, vw, standard_w, enlarged_w, offered) in [
+            (1326.0, 478.0, 1366.0, 655.0, 708.0, false),
+            (1496.0, 558.0, 1536.0, 740.0, 828.0, false),
+            (1240.0, 548.0, 1280.0, 612.0, 814.0, true),
+            (1880.0, 768.0, 1920.0, 932.0, 1144.0, true),
+            (1880.0, 797.0, 1920.0, 932.0, 1186.0, true),
+        ] {
+            let area = TilePlanInput {
+                avail_w,
+                avail_h,
+                vw,
+                ..input(2)
+            };
+            let standard = plan_tiles(area, 0);
+            let kept = plan_tiles(area, 1);
+            assert_eq!(standard.tile_w, standard_w, "{area:?}");
+            assert_eq!(2.0 * kept.tile_w + area.gap, enlarged_w, "{area:?}");
+            assert_eq!(kept.enlarged, 1, "{area:?}: any bigger tile stays painted");
+            assert_eq!(enlarge_offered(area, standard, false), offered, "{area:?}");
+        }
+    }
+
+    #[test]
+    fn with_two_remotes_the_second_tile_is_not_offered() {
+        let two = input(2);
+        let painted = plan_tiles(two, 1);
+        assert_eq!(painted.enlarged, 1, "premise");
+        assert!(!enlarge_offered(two, painted, false));
+        assert!(!enlarge_offered(two, painted, true));
+    }
+
+    #[test]
+    fn an_offer_always_paints_one_more_tile_at_a_worthwhile_size() {
+        let mut offered = 0;
+        for (w, h, gap, vw) in [
+            (1240.0, 548.0, 16.0, 1280.0),
+            (1326.0, 478.0, 16.0, 1366.0),
+            (760.0, 548.0, 16.0, 800.0),
+            (1880.0, 908.0, 16.0, 1920.0),
+            (396.0, 719.0, 8.0, 412.0),
+            (359.0, 547.0, 8.0, 375.0),
+            (651.0, 263.0, 8.0, 667.0),
+            (700.0, 330.0, 16.0, 740.0),
+        ] {
+            for n in 2..=24 {
+                for k in 0..n {
+                    let area = TilePlanInput {
+                        avail_w: w,
+                        avail_h: h,
+                        gap,
+                        vw,
+                        ..input(n)
+                    };
+                    let plan = plan_tiles(area, k);
+                    if !enlarge_offered(area, plan, false) {
+                        continue;
+                    }
+                    offered += 1;
+                    let next = plan_tiles(area, plan.enlarged + 1);
+                    assert_eq!(next.enlarged, plan.enlarged + 1, "{w}x{h} n={n} k={k}");
+                    assert!(
+                        2.0 * next.tile_w + gap >= 1.2 * plan.tile_w,
+                        "{w}x{h} n={n} k={k}: {next:?} over {plan:?}"
+                    );
+                }
+            }
+        }
+        assert!(offered > 0, "premise: something must be offered");
+    }
+
+    #[test]
+    fn the_offer_needs_a_240_px_tile_on_a_fine_pointer_and_330_px_on_a_coarse_one() {
+        let area = TilePlanInput {
+            avail_w: 1000.0,
+            avail_h: 540.0,
+            ..input(4)
+        };
+        let at = |tile_w: f64| TilePlan {
+            tile_w,
+            ..plan_tiles(area, 0)
+        };
+        assert!(enlarge_offered(area, at(240.0), false));
+        assert!(!enlarge_offered(area, at(239.0), false));
+        assert!(enlarge_offered(area, at(330.0), true));
+        assert!(!enlarge_offered(area, at(329.0), true));
+    }
+
+    #[test]
+    fn the_offer_needs_a_gain_of_at_least_1_2x() {
+        let area = TilePlanInput {
+            avail_w: 1096.0,
+            avail_h: 400.0,
+            ..input(4)
+        };
+        let next = plan_tiles(area, 1);
+        assert_eq!(2.0 * next.tile_w + area.gap, 540.0, "premise");
+        let at = |tile_w: f64| TilePlan {
+            tile_w,
+            ..plan_tiles(area, 0)
+        };
+        assert!(enlarge_offered(area, at(450.0), false), "exactly 1.2x");
+        assert!(!enlarge_offered(area, at(451.0), false), "just under 1.2x");
+    }
+
+    #[test]
+    fn only_numeric_painted_tiles_have_a_session_to_lid() {
+        let enlarged = EnlargedTiles {
+            rank: HashMap::from([
+                ("7".to_string(), 0),
+                ("mock-1".to_string(), 1),
+                ("12".to_string(), 2),
+            ]),
+            offered: false,
+        };
+        assert_eq!(enlarged.painted_sessions(), HashSet::from([7, 12]));
+        assert!(EnlargedTiles::default().painted_sessions().is_empty());
+    }
+
+    #[test]
+    fn a_tile_the_plan_could_not_paint_is_never_offered() {
+        let mut unpainted = 0;
+        for n in 2..=24 {
+            for wanted in 1..=n {
+                let area = TilePlanInput {
+                    avail_w: 620.0,
+                    avail_h: 400.0,
+                    vw: 660.0,
+                    ..input(n)
+                };
+                let plan = plan_tiles(area, wanted);
+                if plan.enlarged < wanted {
+                    unpainted += 1;
+                    assert!(!enlarge_offered(area, plan, false), "n={n} {plan:?}");
+                }
+            }
+        }
+        assert!(unpainted > 0, "premise: the floor must bind somewhere");
+    }
+
+    #[test]
+    fn the_render_order_of_enlarged_tiles_picks_who_is_painted() {
+        let tiles: Vec<(String, TileRenderMode)> = ["8", "7", "9", "6", "4", "3"]
+            .map(|id| (id.to_string(), TileRenderMode::Decoded))
+            .to_vec();
+        let requested = |sessions: &[(&str, usize)]| -> Vec<(String, usize)> {
+            sessions.iter().map(|(s, r)| (s.to_string(), *r)).collect()
+        };
+        let floor_at_two = TilePlanInput {
+            avail_w: 700.0,
+            avail_h: 330.0,
+            vw: 740.0,
+            ..input(6)
+        };
+        assert_eq!(plan_tiles(floor_at_two, 3).enlarged, 2, "premise");
+
+        let (plan, enlarged) = plan_tile_grid(
+            floor_at_two,
+            &tiles,
+            &requested(&[("9", 2), ("8", 0), ("7", 1), ("5", 3)]),
+            false,
+        );
+        assert_eq!(
+            plan.enlarged, 2,
+            "a peer who left the render list is not counted"
+        );
+        assert_eq!(
+            enlarged.rank,
+            HashMap::from([("8".to_string(), 0), ("7".to_string(), 1)]),
+            "only the painted tiles get an enlarged `order`"
+        );
+        assert!(
+            !enlarged.offered,
+            "the tile it could not paint gets no control"
+        );
+
+        let (plan, enlarged) = plan_tile_grid(input(6), &tiles, &requested(&[("7", 0)]), false);
+        assert_eq!(plan.enlarged, 1);
+        assert_eq!(enlarged.rank, HashMap::from([("7".to_string(), 0)]));
+        assert!(enlarged.offered, "a second tile still fits");
+    }
+
+    #[test]
+    fn the_grid_plan_enlarges_nothing_in_the_split_or_at_full_bleed() {
+        let tiles = vec![
+            ("7".to_string(), TileRenderMode::Decoded),
+            ("8".to_string(), TileRenderMode::Decoded),
+        ];
+        let requested = [("7".to_string(), 0)];
+        let (plan, enlarged) = plan_tile_grid(input(2), &tiles, &requested, false);
+        assert_eq!(plan.enlarged, 1, "premise");
+        assert!(!enlarged.rank.is_empty(), "premise");
+        for off in [
+            TilePlanInput {
+                split_layout: true,
+                ..input(2)
+            },
+            TilePlanInput {
+                full_bleed: true,
+                ..input(2)
+            },
+        ] {
+            let (plan, enlarged) = plan_tile_grid(off, &tiles, &requested, false);
+            assert_eq!(plan.enlarged, 0, "{off:?}");
+            assert_eq!(enlarged, EnlargedTiles::default(), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_enlarged_lid_is_two_painted_cells_and_a_gap() {
+        let plan = TilePlan {
+            cols: 4,
+            rows: 2,
+            tile_w: 300.0,
+            enlarged: 1,
+        };
+        assert_eq!(enlarged_tile_device_px_h(plan, 16.0, 1.0), 416);
+        assert_eq!(enlarged_tile_device_px_h(plan, 16.0, 2.0), 832);
     }
 
     // -- screen_share_stage_tile_size ---------------------------------
@@ -1803,6 +2610,7 @@ mod tests {
             diagnostics_open,
             right_w: 560.0,
             chat_open,
+            chat_w: CHAT_DRAWER_WIDTH,
         }
     }
 
@@ -1863,6 +2671,7 @@ mod tests {
             diagnostics_open: true,
             right_w: 560.0,
             chat_open: true,
+            chat_w: CHAT_DRAWER_WIDTH,
         };
         let r = drawer_reserves(mobile);
         close_to(r.left_reserve, 0.0, "mobile left reserve");
@@ -1879,6 +2688,7 @@ mod tests {
             diagnostics_open: true,
             right_w: 560.0,
             chat_open: false,
+            chat_w: CHAT_DRAWER_WIDTH,
         };
         let r = drawer_reserves(state);
         close_to(r.diag_render_w, 520.0, "diagnostics absorbs the overflow");
@@ -1916,6 +2726,112 @@ mod tests {
             drawer_max_for_side(desktop_state(true, true, true), DrawerSide::Left),
             300.0,
             "peer-list cap with diagnostics + chat open",
+        );
+    }
+
+    fn with_chat_w(state: DrawerState, chat_w: f64) -> DrawerState {
+        DrawerState { chat_w, ..state }
+    }
+
+    #[test]
+    fn a_wide_chat_shrinks_last_and_never_below_its_default() {
+        let alone = drawer_reserves(with_chat_w(desktop_state(false, false, true), 720.0));
+        close_to(alone.chat_render_w, 720.0, "chat alone keeps its width");
+        close_to(alone.right_reserve, 720.0, "chat alone reserves its width");
+
+        let beside_diag = drawer_reserves(with_chat_w(desktop_state(false, true, true), 720.0));
+        close_to(
+            beside_diag.diag_render_w,
+            300.0,
+            "diagnostics shrinks first",
+        );
+        close_to(
+            beside_diag.chat_render_w,
+            468.0,
+            "then chat absorbs the rest",
+        );
+        close_to(beside_diag.chat_right_offset, 300.0, "chat sits inboard");
+        close_to(
+            beside_diag.right_reserve,
+            768.0,
+            "the stack fills the budget",
+        );
+
+        let beside_both = drawer_reserves(with_chat_w(desktop_state(true, true, true), 720.0));
+        close_to(beside_both.left_render_w, 300.0, "peer list at its floor");
+        close_to(beside_both.diag_render_w, 300.0, "diagnostics at its floor");
+        close_to(
+            beside_both.chat_render_w,
+            360.0,
+            "chat stops at its default",
+        );
+
+        let narrow = drawer_reserves(with_chat_w(desktop_state(true, true, true), 300.0));
+        close_to(
+            narrow.chat_render_w,
+            300.0,
+            "a narrowed chat is never widened",
+        );
+        close_to(
+            narrow.right_reserve,
+            600.0,
+            "and reserves only what it paints",
+        );
+    }
+
+    #[test]
+    fn chat_render_width_ignores_the_other_drawers_preferred_widths() {
+        let mut vw = CHAT_OVERLAY_MIN_VW;
+        while vw <= 1920.0 {
+            for chat_w in [DRAWER_MIN_WIDTH, CHAT_DRAWER_WIDTH, 500.0, DRAWER_MAX_ABS] {
+                for (p, d) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let others = f64::from(u8::from(p) + u8::from(d)) * DRAWER_MIN_WIDTH;
+                    let want = chat_w.min((max_total_reserve(vw) - others).max(CHAT_DRAWER_WIDTH));
+                    for side_w in [DRAWER_MIN_WIDTH, 560.0, DRAWER_MAX_ABS] {
+                        let state = DrawerState {
+                            vw,
+                            peer_list_open: p,
+                            left_w: side_w,
+                            diagnostics_open: d,
+                            right_w: side_w,
+                            chat_open: true,
+                            chat_w,
+                        };
+                        close_to(
+                            drawer_reserves(state).chat_render_w,
+                            want,
+                            &format!("{state:?}"),
+                        );
+                    }
+                }
+            }
+            vw += 7.0;
+        }
+    }
+
+    #[test]
+    fn the_left_and_right_caps_subtract_the_live_chat_width() {
+        let wide = |p: bool, d: bool| DrawerState {
+            vw: 1600.0,
+            ..with_chat_w(desktop_state(p, d, true), 400.0)
+        };
+        close_to(
+            drawer_max_for_side(wide(false, true), DrawerSide::Right),
+            560.0,
+            "960 budget less a 400 chat",
+        );
+        close_to(
+            drawer_max_for_side(wide(true, false), DrawerSide::Left),
+            560.0,
+            "960 budget less a 400 chat",
+        );
+        close_to(
+            drawer_max_for_side(
+                with_chat_w(desktop_state(false, true, true), 300.0),
+                DrawerSide::Right,
+            ),
+            468.0,
+            "768 budget less a 300 chat",
         );
     }
 
@@ -2067,6 +2983,12 @@ mod tests {
             "the {:.2}px block no longer makes chat a full-width sheet",
             CHAT_OVERLAY_MIN_VW - 0.02
         );
+        let sheet_flat = sheet.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            sheet_flat
+                .contains("#chat-sidebar .drawer-resize-handle { display: none !important; }"),
+            "the chat resize handle stays grabbable over the full-width sheet"
+        );
     }
 
     #[test]
@@ -2153,70 +3075,73 @@ mod tests {
             DrawerKind::Diagnostics,
             DrawerKind::Chat,
         ];
-        let mut vw = DRAWER_REFLOW_MIN_VW;
-        while vw <= 1600.0 {
-            for i in 0..8usize {
-                let (p0, d0, c0) = flags(i);
-                let mut cases = vec![(drawers_to_close_on_resize(vw, p0, d0, c0), p0, d0, c0)];
-                for kind in kinds {
-                    let (p, d, c) = (
-                        p0 || kind == DrawerKind::PeerList,
-                        d0 || kind == DrawerKind::Diagnostics,
-                        c0 || kind == DrawerKind::Chat,
-                    );
-                    cases.push((drawers_to_close_on_open(vw, kind, p0, d0, c0), p, d, c));
-                }
-                for (close, p, d, c) in cases {
-                    let state = DrawerState {
-                        vw,
-                        peer_list_open: p && !close.peer_list,
-                        left_w: DRAWER_MAX_ABS,
-                        diagnostics_open: d && !close.diagnostics,
-                        right_w: DRAWER_MAX_ABS,
-                        chat_open: c && !close.chat,
-                    };
-                    let r = drawer_reserves(state);
-                    // Tile AREA: a 40px band is all padding and holds no tile.
-                    let area = vw - r.left_reserve - r.right_reserve - GRID_SIDE_PADDING;
-                    let reserving = usize::from(state.peer_list_open)
-                        + usize::from(state.diagnostics_open)
-                        + usize::from(state.chat_open && !chat_is_sheet(vw));
-                    let floor = if reserving >= 2 { MIN_TILE_AREA } else { 1.0 };
-                    assert!(
-                        area >= floor,
-                        "vw {vw}: {state:?} left {area}px of tile area against a \
+        for chat_w in [DRAWER_MIN_WIDTH, CHAT_DRAWER_WIDTH, DRAWER_MAX_ABS] {
+            let mut vw = DRAWER_REFLOW_MIN_VW;
+            while vw <= 1600.0 {
+                for i in 0..8usize {
+                    let (p0, d0, c0) = flags(i);
+                    let mut cases = vec![(drawers_to_close_on_resize(vw, p0, d0, c0), p0, d0, c0)];
+                    for kind in kinds {
+                        let (p, d, c) = (
+                            p0 || kind == DrawerKind::PeerList,
+                            d0 || kind == DrawerKind::Diagnostics,
+                            c0 || kind == DrawerKind::Chat,
+                        );
+                        cases.push((drawers_to_close_on_open(vw, kind, p0, d0, c0), p, d, c));
+                    }
+                    for (close, p, d, c) in cases {
+                        let state = DrawerState {
+                            vw,
+                            peer_list_open: p && !close.peer_list,
+                            left_w: DRAWER_MAX_ABS,
+                            diagnostics_open: d && !close.diagnostics,
+                            right_w: DRAWER_MAX_ABS,
+                            chat_open: c && !close.chat,
+                            chat_w,
+                        };
+                        let r = drawer_reserves(state);
+                        // Tile AREA: a 40px band is all padding and holds no tile.
+                        let area = vw - r.left_reserve - r.right_reserve - GRID_SIDE_PADDING;
+                        let reserving = usize::from(state.peer_list_open)
+                            + usize::from(state.diagnostics_open)
+                            + usize::from(state.chat_open && !chat_is_sheet(vw));
+                        let floor = if reserving >= 2 { MIN_TILE_AREA } else { 1.0 };
+                        assert!(
+                            area >= floor,
+                            "vw {vw}: {state:?} left {area}px of tile area against a \
                          {floor}px floor (reserves {} + {})",
-                        r.left_reserve,
-                        r.right_reserve
-                    );
+                            r.left_reserve,
+                            r.right_reserve
+                        );
 
-                    let rects = open_drawer_rects(state, r);
-                    for &(name, l, right) in &rects {
-                        assert!(
-                            l >= 0.0 && right <= vw,
-                            "vw {vw}: {name} paints at [{l}, {right}], outside the \
+                        let rects = open_drawer_rects(state, r);
+                        for &(name, l, right) in &rects {
+                            assert!(
+                                l >= 0.0 && right <= vw,
+                                "vw {vw}: {name} paints at [{l}, {right}], outside the \
                              viewport ({state:?})"
-                        );
-                    }
-                    for (a, b) in rects
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(i, a)| rects[i + 1..].iter().map(move |b| (a, b)))
-                    {
-                        assert!(
-                            a.2 <= b.1 || b.2 <= a.1,
-                            "vw {vw}: {} [{}, {}] overlaps {} [{}, {}] ({state:?})",
-                            a.0,
-                            a.1,
-                            a.2,
-                            b.0,
-                            b.1,
-                            b.2
-                        );
+                            );
+                        }
+                        for (a, b) in rects
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, a)| rects[i + 1..].iter().map(move |b| (a, b)))
+                        {
+                            assert!(
+                                a.2 <= b.1 || b.2 <= a.1,
+                                "vw {vw}: {} [{}, {}] overlaps {} [{}, {}] ({state:?})",
+                                a.0,
+                                a.1,
+                                a.2,
+                                b.0,
+                                b.1,
+                                b.2
+                            );
+                        }
                     }
                 }
+                vw += 1.0;
             }
-            vw += 1.0;
         }
     }
 
@@ -2232,6 +3157,7 @@ mod tests {
                 diagnostics_open: false,
                 right_w: 560.0,
                 chat_open: true,
+                chat_w: CHAT_DRAWER_WIDTH,
             })
         };
         close_to(chat_at(600.0).right_reserve, 0.0, "600 chat overlays");
@@ -2255,6 +3181,7 @@ mod tests {
             diagnostics_open: true,
             right_w: 560.0,
             chat_open: true,
+            chat_w: CHAT_DRAWER_WIDTH,
         };
         let r = drawer_reserves(sheet_over_diagnostics);
         assert!(
@@ -2331,6 +3258,7 @@ mod tests {
             diagnostics_open: true,
             right_w: 560.0,
             chat_open: true,
+            chat_w: CHAT_DRAWER_WIDTH,
         });
         let band = action_bar_band_width(1280.0, reserves);
         close_to(band, 512.0, "band");
@@ -2538,7 +3466,7 @@ mod tests {
         );
         assert_eq!(
             resize_notice(DrawersToClose::default(), true),
-            Some("Customize ended to fit the window; layout saved")
+            Some("Button editing ended to fit the window; layout saved")
         );
         assert_eq!(resize_notice(DrawersToClose::default(), false), None);
         assert_eq!(
@@ -2581,5 +3509,517 @@ mod tests {
         close_to(quantise_reserve(333.0, false), 333.0, "at rest is exact");
         close_to(quantise_reserve(320.0, true), 320.0, "320 is on the step");
         close_to(quantise_reserve(360.0, true), 360.0, "360 is on the step");
+    }
+
+    #[test]
+    fn split_panel_camera_tiles_are_lidded_to_their_painted_size() {
+        use crate::components::decode_budget::screen_decode_sets;
+        use videocall_client::{size_cap_layer, PrefMediaKind, TileHint};
+        let split = SplitPanel {
+            content_w: 1248.0,
+            ratio: 0.667,
+            height: 560.0,
+            tiles: 2,
+        };
+        let plan = plan_tiles(
+            TilePlanInput {
+                avail_h: 560.0,
+                ..input(9)
+            },
+            0,
+        );
+        let lid = |dpr| decoded_tile_device_px_h(true, split, plan, 9, 560.0, dpr);
+        assert_eq!((lid(1.0), lid(2.0)), (122, 244), "a ~183x122 thumbnail");
+        assert_eq!(
+            decoded_tile_device_px_h(false, split, plan, 9, 560.0, 1.0),
+            176,
+            "the grid ignores the panel"
+        );
+        let (_, hinted) = screen_decode_sets(&[7, 8].into_iter().collect(), None, &[]);
+        let hints = hinted.tile_hints(&[7, 8], lid(2.0), &HashSet::new(), 0);
+        assert_eq!(
+            hints[&7],
+            TileHint::Capped { device_px_h: 244 },
+            "the sharer too"
+        );
+        let layer = |h| size_cap_layer(h, 2, 3, PrefMediaKind::Video);
+        assert_eq!((layer(lid(1.0)), layer(lid(2.0))), (0, 1));
+        assert_eq!(
+            size_cap_layer(244, 2, 3, PrefMediaKind::Screen),
+            2,
+            "never lids a screen"
+        );
+    }
+
+    #[test]
+    fn the_panel_lid_allows_for_a_scrollbar_only_when_its_tiles_overflow() {
+        use crate::components::share_view::panel_share_tiles;
+        let pads = screen_share_padding(0.0, false, 1180.0);
+        let lid = |cameras, shares| {
+            split_peer_tile_height(split_panel(1180.0, 700.0, pads, 0.667, cameras, shares))
+        };
+        let stage_only = panel_share_tiles((false, false), &[]);
+        close_to(
+            lid(8, stage_only),
+            110.9,
+            "8 cameras fit two columns: no scrollbar",
+        );
+        close_to(
+            lid(8, panel_share_tiles((false, true), &[])),
+            228.4,
+            "the own share's tile overflows the panel",
+        );
+        close_to(
+            lid(8, panel_share_tiles((false, false), &[false, true])),
+            228.4,
+            "so does a displaced share's tile",
+        );
+        assert_eq!(panel_share_tiles((true, true), &[true, false, true]), 4);
+        close_to(
+            lid(10, stage_only),
+            228.4,
+            "10 overflow once the padding is subtracted",
+        );
+        close_to(lid(24, stage_only), 228.4, "24 overflow");
+    }
+}
+
+#[cfg(test)]
+mod grid_capacity_tests {
+    use super::*;
+    use crate::components::density::DENSITY_MODES;
+    use crate::components::self_view::self_tile_counts;
+    use crate::context::SelfViewPlacement;
+
+    const GAP: f64 = 8.0;
+    const DESKTOP: (f64, f64) = (1920.0, 1000.0);
+    const LAPTOP: (f64, f64) = (1366.0, 640.0);
+    const FITS_30_CELLS: (f64, f64) = (800.0, 450.0);
+    const FITS_31_CELLS: (f64, f64) = (3960.0, 100.0);
+    const PHONE: (f64, f64) = (375.0, 600.0);
+    const ONE_CELL: (f64, f64) = (100.0, 100.0);
+    const VIEWPORTS: [(f64, f64); 6] = [
+        DESKTOP,
+        LAPTOP,
+        FITS_30_CELLS,
+        FITS_31_CELLS,
+        PHONE,
+        ONE_CELL,
+    ];
+
+    #[derive(Clone, Copy, Debug)]
+    struct Call {
+        real: usize,
+        mocks: usize,
+        self_in_grid: bool,
+        share_cells: usize,
+        viewport: (f64, f64),
+    }
+
+    impl Call {
+        fn real_only(real: usize, self_in_grid: bool, viewport: (f64, f64)) -> Self {
+            Self {
+                real,
+                mocks: 0,
+                self_in_grid,
+                share_cells: 0,
+                viewport,
+            }
+        }
+
+        fn total_tiles(self) -> usize {
+            self.real.min(CANVAS_LIMIT) + self.mocks
+        }
+
+        fn plan_in(self, mode: DensityMode) -> GridCapacity {
+            let (w, h) = self.viewport;
+            plan_grid_capacity(
+                self.real + self.mocks,
+                self.total_tiles(),
+                &self_tile_counts(
+                    self.real.min(CANVAS_LIMIT),
+                    self.mocks,
+                    SelfViewPlacement::Grid,
+                    self.self_in_grid,
+                    false,
+                    self.share_cells,
+                ),
+                w,
+                h,
+                GAP,
+                mode.min_tile_width(w),
+            )
+        }
+
+        fn plan(self) -> GridCapacity {
+            self.plan_in(DensityMode::Maximum)
+        }
+    }
+
+    fn fits(cells: usize, (w, h): (f64, f64)) -> bool {
+        compute_layout(cells, w, h, GAP).2 >= DensityMode::Maximum.min_tile_width(w)
+    }
+
+    fn capacity(layout_limit: usize, displayed: usize, overflow: usize) -> GridCapacity {
+        GridCapacity {
+            layout_limit,
+            displayed,
+            overflow,
+        }
+    }
+
+    #[test]
+    fn past_the_cap_thirty_tiles_show_beside_the_badge() {
+        for real in [31, 40, 100] {
+            for self_in_grid in [true, false] {
+                for viewport in [DESKTOP, LAPTOP] {
+                    assert_eq!(
+                        Call::real_only(real, self_in_grid, viewport).plan(),
+                        capacity(31, 30, real - 30),
+                        "real={real} self_in_grid={self_in_grid} viewport={viewport:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_share_cell_keeps_thirty_tiles_beside_the_badge() {
+        let call = Call {
+            share_cells: 1,
+            ..Call::real_only(40, true, DESKTOP)
+        };
+        assert_eq!(call.plan(), capacity(31, 30, 10));
+    }
+
+    #[test]
+    fn the_badge_takes_a_tiles_cell_when_no_extra_cell_fits() {
+        assert!(fits(30, FITS_30_CELLS) && !fits(31, FITS_30_CELLS));
+        assert!(fits(31, FITS_31_CELLS) && !fits(32, FITS_31_CELLS));
+        for real in [31, 40, 100] {
+            let expected = capacity(30, 29, real - 29);
+            assert_eq!(Call::real_only(real, false, FITS_30_CELLS).plan(), expected);
+            assert_eq!(Call::real_only(real, true, FITS_31_CELLS).plan(), expected);
+        }
+    }
+
+    #[test]
+    fn a_small_viewport_counts_the_whole_roster_in_the_badge() {
+        assert!(fits(24, PHONE) && !fits(25, PHONE));
+        for real in [30, 31, 40, 100] {
+            assert_eq!(
+                Call::real_only(real, true, PHONE).plan(),
+                capacity(23, 22, real - 22)
+            );
+        }
+    }
+
+    #[test]
+    fn at_the_cap_with_room_every_peer_has_a_tile_and_no_badge_shows() {
+        for self_in_grid in [true, false] {
+            assert_eq!(
+                Call::real_only(30, self_in_grid, DESKTOP).plan(),
+                capacity(30, 30, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn at_or_below_the_cap_the_badge_shows_only_when_the_tiles_do_not_fit() {
+        assert_eq!(
+            Call::real_only(20, true, LAPTOP).plan_in(DensityMode::Dense),
+            capacity(14, 13, 7)
+        );
+        assert_eq!(
+            Call::real_only(30, true, DESKTOP).plan_in(DensityMode::Auto),
+            capacity(29, 28, 2)
+        );
+        assert_eq!(
+            Call::real_only(30, false, DESKTOP).plan_in(DensityMode::Auto),
+            capacity(30, 30, 0)
+        );
+    }
+
+    #[test]
+    fn a_viewport_that_fits_one_cell_still_shows_one_tile() {
+        assert!(!fits(2, ONE_CELL));
+        for self_in_grid in [true, false] {
+            assert_eq!(
+                Call::real_only(3, self_in_grid, ONE_CELL).plan(),
+                capacity(1, 1, 2)
+            );
+        }
+    }
+
+    #[test]
+    fn displayed_and_overflow_sum_to_the_roster() {
+        for real in (0..=35).chain([40, 100]) {
+            for mocks in [0, 3] {
+                for self_in_grid in [true, false] {
+                    for share_cells in [0, 1] {
+                        for viewport in VIEWPORTS {
+                            for mode in DENSITY_MODES {
+                                let call = Call {
+                                    real,
+                                    mocks,
+                                    self_in_grid,
+                                    share_cells,
+                                    viewport,
+                                };
+                                let plan = call.plan_in(mode);
+                                let roster_total = real + mocks;
+                                let context = format!("{call:?} {mode:?} {plan:?}");
+                                assert_eq!(
+                                    plan.displayed + plan.overflow,
+                                    roster_total,
+                                    "{context}"
+                                );
+                                assert!(plan.displayed <= call.total_tiles(), "{context}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_render_body_takes_its_counts_from_the_plan() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        for wired in [
+            "lettotal_tiles=capped_real+mock_count;",
+            "letroster_total=num_display_peers+mock_count;",
+            "plan_grid_capacity(roster_total,total_tiles,&self_counts,avail_w,avail_h,gap,\
+             effective_mode.min_tile_width(vw),)",
+            "letdecoded_limit=grid_capacity.layout_limit.min(budget_cap.max(MIN_CAP));",
+            "letdisplayed_tile_count=grid_capacity.displayed;",
+            "letoverflow_count=grid_capacity.overflow;",
+            "displayed:displayed_tile_count,",
+            "lettile_count=grid_capacity.tile_count(&self_counts);",
+        ] {
+            assert_eq!(flat.matches(wired).count(), 1, "{wired}");
+        }
+    }
+
+    #[test]
+    fn the_tile_count_is_the_tiles_the_badge_the_self_and_the_share_cells() {
+        let corner = self_tile_counts(3, 0, SelfViewPlacement::Corner, true, false, 0);
+        let grid_and_shares = self_tile_counts(30, 0, SelfViewPlacement::Grid, true, false, 2);
+        assert_eq!(capacity(3, 3, 0).tile_count(&corner), 3);
+        assert_eq!(capacity(31, 30, 10).tile_count(&corner), 31);
+        assert_eq!(capacity(31, 30, 10).tile_count(&grid_and_shares), 34);
+    }
+
+    fn sessions(count: usize) -> Vec<String> {
+        (1..=count).map(|id| id.to_string()).collect()
+    }
+
+    fn camera_window(pins: &[String], tiles: &[String], capacity: GridCapacity) -> CameraWindow {
+        plan_camera_window(
+            CameraWindowInput {
+                pins,
+                camera_on: tiles.to_vec(),
+                camera_off: Vec::new(),
+                displayed: capacity.displayed,
+                budget: capacity.layout_limit,
+                device_ceiling: None,
+                requested: &HashSet::new(),
+            },
+            &SpeakerInputs {
+                speech_map: &HashMap::new(),
+                join_map: &HashMap::new(),
+                now_ms: 0.0,
+                active_ms: 0.0,
+            },
+        )
+    }
+
+    /// The render's path from the roster to the grid plan, with the last capped
+    /// session enlarged.
+    fn enlarged_grid(
+        roster_total: usize,
+        placement: SelfViewPlacement,
+        (w, h): (f64, f64),
+        gap: f64,
+    ) -> (GridCapacity, usize, TilePlan, EnlargedTiles) {
+        let total_tiles = roster_total.min(CANVAS_LIMIT);
+        let counts = self_tile_counts(total_tiles, 0, placement, true, false, 0);
+        let capacity = plan_grid_capacity(
+            roster_total,
+            total_tiles,
+            &counts,
+            w,
+            h,
+            gap,
+            DensityMode::Maximum.min_tile_width(w),
+        );
+        let tiles = sessions(total_tiles);
+        let enlarged = tiles[total_tiles - 1].clone();
+        let lead = [enlarged.clone()];
+        let plain = camera_window(&[], &tiles, capacity);
+        let window = camera_window(&lead, &tiles, capacity);
+        assert_eq!(window.on_cells, plain.on_cells, "the window keeps its size");
+        assert_eq!(window.decoded, plain.decoded);
+        assert_eq!(
+            window.tiles[0], enlarged,
+            "the enlarged tile is in the window"
+        );
+        let unified: Vec<(String, TileRenderMode)> = window
+            .tiles
+            .iter()
+            .take(window.on_cells)
+            .map(|id| (id.clone(), TileRenderMode::Decoded))
+            .collect();
+        let tile_count = capacity.tile_count(&counts);
+        let (plan, enlarged_tiles) = plan_tile_grid(
+            TilePlanInput {
+                tile_count,
+                split_layout: false,
+                full_bleed: false,
+                avail_w: w,
+                avail_h: h,
+                gap,
+                vw: w,
+            },
+            &unified,
+            &[(enlarged, 0)],
+            false,
+        );
+        (capacity, tile_count, plan, enlarged_tiles)
+    }
+
+    #[test]
+    fn a_past_cap_roster_keeps_its_window_and_badge_beside_an_enlarged_tile() {
+        use SelfViewPlacement::{Corner, Grid};
+        for (placement, viewport, expected, cells, layout) in [
+            (Corner, DESKTOP, capacity(31, 30, 10), 31, (7, 5, 267.0, 1)),
+            (Grid, DESKTOP, capacity(31, 30, 10), 32, (7, 5, 267.0, 1)),
+            (Corner, LAPTOP, capacity(31, 30, 10), 31, (7, 5, 182.0, 1)),
+            (Grid, LAPTOP, capacity(31, 30, 10), 32, (7, 5, 182.0, 1)),
+            (
+                Corner,
+                FITS_30_CELLS,
+                capacity(30, 29, 11),
+                30,
+                (6, 5, 125.0, 0),
+            ),
+            (
+                Grid,
+                FITS_30_CELLS,
+                capacity(29, 28, 12),
+                30,
+                (6, 5, 125.0, 0),
+            ),
+        ] {
+            let context = format!("{placement:?} {viewport:?}");
+            let (planned, tile_count, plan, enlarged) = enlarged_grid(40, placement, viewport, GAP);
+            assert_eq!(planned, expected, "{context}");
+            assert_eq!(tile_count, cells, "{context}");
+            assert_eq!(
+                (plan.cols, plan.rows, plan.tile_w, plan.enlarged),
+                layout,
+                "{context}"
+            );
+            assert_eq!(enlarged.rank.len(), plan.enlarged, "{context}");
+            let (w, h) = viewport;
+            let rows = plan.rows as f64;
+            assert!(
+                rows * plan.tile_h() + (rows - 1.0) * GAP <= h,
+                "{context}: too tall"
+            );
+            if plan.enlarged > 0 {
+                assert!(2.0 * plan.tile_w + GAP <= w, "{context}: too wide");
+                assert_eq!(
+                    plan.rows,
+                    enlarged_rows(tile_count, 1, plan.cols),
+                    "{context}: the badge has its cell"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_past_cap_badge_cell_can_push_an_enlarged_plan_under_the_floor() {
+        const DESKTOP_GAP: f64 = 16.0;
+        const WIDE_AND_SHORT: (f64, f64) = (1600.0, 320.0);
+
+        let (at_cap, cells, plan, enlarged) =
+            enlarged_grid(30, SelfViewPlacement::Corner, WIDE_AND_SHORT, DESKTOP_GAP);
+        assert_eq!(at_cap, capacity(30, 30, 0), "premise: no badge");
+        assert_eq!(cells, 30);
+        assert_eq!((plan.cols, plan.tile_w, plan.enlarged), (11, 130.0, 1));
+        assert_eq!(enlarged.rank.len(), 1);
+
+        let (past_cap, cells, plan, enlarged) =
+            enlarged_grid(40, SelfViewPlacement::Corner, WIDE_AND_SHORT, DESKTOP_GAP);
+        assert_eq!(past_cap, capacity(31, 30, 10), "premise: the badge's cell");
+        assert_eq!(cells, 31);
+        assert_eq!(
+            (plan.cols, plan.tile_w, plan.enlarged),
+            (11, 130.0, 0),
+            "one more cell makes the enlarged plan 118 px wide, under the 120 px floor"
+        );
+        assert_eq!(enlarged, EnlargedTiles::default());
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod split_panel_dom_tests {
+    use super::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn painted_tile_h(width: f64, ratio: f64, tiles: usize) -> f64 {
+        let doc = gloo_utils::document();
+        let frame = doc.create_element("iframe").unwrap();
+        let size = format!("width: {width}px; height: 600px; border: 0;");
+        frame.set_attribute("style", &size).unwrap();
+        doc.body().unwrap().append_child(&frame).unwrap();
+        let page: web_sys::Document = js_sys::Reflect::get(&frame, &"contentDocument".into())
+            .unwrap()
+            .unchecked_into();
+        let style = page.create_element("style").unwrap();
+        style.set_text_content(Some(&format!(
+            "*, ::before, ::after {{ box-sizing: border-box; }}{}",
+            include_str!("../../static/style.css")
+        )));
+        page.head().unwrap().append_child(&style).unwrap();
+        let pct = ratio * 100.0;
+        page.body().unwrap().set_inner_html(&format!(
+            "<div id='grid-container' class='has-screen-share' style='position: absolute; \
+             inset: 0; gap: {SPLIT_GAP}px; padding: 16px; box-sizing: border-box; {}'>\
+             <div class='ss-left-pane' style='--ss-ratio: {pct:.2}%;'></div>\
+             <div class='screen-share-resize-handle'></div>\
+             <div class='ss-peer-panel' style='--ss-ratio: {pct:.2}%;'>{}</div></div>",
+            screen_share_flow_style(),
+            "<div class='tile-slot'><div class='split-peer-tile'></div></div>".repeat(tiles),
+        ));
+        let tile = page.query_selector(".split-peer-tile").unwrap().unwrap();
+        let h = tile.get_bounding_client_rect().height();
+        frame.remove();
+        h
+    }
+
+    #[wasm_bindgen_test]
+    fn the_split_lid_covers_the_painted_panel_tile() {
+        for width in [800.0, 1024.0, 1160.0, 1180.0, 1200.0, 1280.0, 1920.0] {
+            for ratio in [0.3, 0.667, 0.85] {
+                for tiles in [2, 24] {
+                    let painted = painted_tile_h(width, ratio, tiles);
+                    let lid = split_peer_tile_height(SplitPanel {
+                        content_w: width - 32.0,
+                        ratio,
+                        height: 600.0 - 32.0,
+                        tiles,
+                    });
+                    let at = format!("{width}px at {ratio} with {tiles} tiles");
+                    assert!(painted > 0.0, "premise: {at}");
+                    assert!(lid >= painted - 0.5, "{at}: lid {lid:.1} < {painted:.1}");
+                    if tiles == 2 {
+                        assert!(lid <= painted * 1.04, "{at}: lid {lid:.1} >> {painted:.1}");
+                    }
+                }
+            }
+        }
     }
 }

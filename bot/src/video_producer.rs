@@ -16,6 +16,8 @@
  * conditions.
  */
 
+pub mod replay;
+
 use crate::aq_controller::BotAq;
 use crate::costume_renderer::CostumeRenderer;
 use crate::ekg_renderer::EkgRenderer;
@@ -28,11 +30,20 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+/// libvpx `VP8E_SET_CPUUSED` for every bot publisher encoder.
+const VP9_CPU_USED: u8 = 8;
+
+fn publisher_encoder(fps: u32, width: u32, height: u32) -> anyhow::Result<VideoEncoder> {
+    VideoEncoderBuilder::new(fps, VP9_CPU_USED)
+        .set_resolution(width, height)
+        .build()
+}
 
 pub struct VideoProducer {
     #[allow(dead_code)]
@@ -69,6 +80,7 @@ impl VideoProducer {
         encoder_frames_ok: Arc<AtomicU64>,
         transport_drops_counter: Arc<AtomicU64>,
         simulcast_layers: u32,
+        keyframe_gate: ForcedKeyframeGate,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -91,6 +103,7 @@ impl VideoProducer {
                 encoder_frames_ok,
                 transport_drops_counter,
                 simulcast_layers,
+                keyframe_gate,
             ) {
                 error!("Video producer error: {}", e);
             }
@@ -120,6 +133,7 @@ impl VideoProducer {
         encoder_frames_ok: Arc<AtomicU64>,
         transport_drops_counter: Arc<AtomicU64>,
         simulcast_layers: u32,
+        keyframe_gate: ForcedKeyframeGate,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -140,6 +154,7 @@ impl VideoProducer {
                 encoder_frames_ok,
                 transport_drops_counter,
                 simulcast_layers,
+                keyframe_gate,
             ) {
                 error!("Costume video producer error: {}", e);
             }
@@ -169,6 +184,7 @@ impl VideoProducer {
         encoder_frames_ok: Arc<AtomicU64>,
         transport_drops_counter: Arc<AtomicU64>,
         simulcast_layers: u32,
+        keyframe_gate: ForcedKeyframeGate,
     ) -> anyhow::Result<()> {
         // N>=2: run the multi-layer simulcast producer (fixed-geometry layers).
         // N==1 (or any clamped-down value) falls through to the legacy
@@ -206,6 +222,7 @@ impl VideoProducer {
                                 encoder_frames_ok,
                                 transport_drops_counter,
                                 layers,
+                                keyframe_gate,
                                 native_w,
                                 native_h,
                             );
@@ -255,9 +272,7 @@ impl VideoProducer {
         // reporter can include it in HealthPacket.encoder_output_fps.
         encoder_output_fps.store(framerate, Ordering::Relaxed);
 
-        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
-            .set_resolution(width, height)
-            .build()?;
+        let mut video_encoder = publisher_encoder(framerate, width, height)?;
         video_encoder.update_bitrate_kbps(v.bitrate_kbps)?;
 
         let loop_duration_us = loop_duration.as_micros() as u64;
@@ -269,6 +284,7 @@ impl VideoProducer {
             return Ok(());
         }
         let mut prev_frame_index: Option<usize> = None;
+        let mut keyframe_gate = keyframe_gate;
         let mut global_sequence: u64 = 0;
 
         // Pre-allocate reusable buffers to avoid per-frame heap allocation.
@@ -319,10 +335,7 @@ impl VideoProducer {
                     frame_interval_us = 1_000_000 / framerate as u64;
 
                     // Rebuild encoder at new dimensions.
-                    match VideoEncoderBuilder::new(framerate, 5)
-                        .set_resolution(width, height)
-                        .build()
-                    {
+                    match publisher_encoder(framerate, width, height) {
                         Ok(mut enc) => {
                             let _ = enc.update_bitrate_kbps(new_v.bitrate_kbps);
                             video_encoder = enc;
@@ -365,7 +378,8 @@ impl VideoProducer {
                 None => true,
             };
             let periodic_keyframe = global_sequence.is_multiple_of(frames_per_keyframe as u64);
-            let force_keyframe = at_loop_wrap || periodic_keyframe;
+            let force_keyframe =
+                keyframe_gate.requested(elapsed_us) || at_loop_wrap || periodic_keyframe;
             prev_frame_index = Some(frame_in_loop);
 
             if global_sequence.is_multiple_of(framerate as u64 * 5) {
@@ -394,7 +408,7 @@ impl VideoProducer {
 
             // Encode to VP9
             let frames_result = if force_keyframe {
-                info!("Forcing keyframe for {} (seq={})", user_id, global_sequence);
+                debug!("Forcing keyframe for {} (seq={})", user_id, global_sequence);
                 video_encoder.encode_keyframe(global_sequence as i64, &i420_buf)
             } else {
                 video_encoder.encode(global_sequence as i64, &i420_buf)
@@ -427,6 +441,9 @@ impl VideoProducer {
                 }
             };
 
+            if force_keyframe {
+                keyframe_gate.on_keyframe(elapsed_us);
+            }
             for frame in frames {
                 let sent = build_and_send_layer(
                     &packet_sender,
@@ -495,6 +512,7 @@ impl VideoProducer {
         encoder_frames_ok: Arc<AtomicU64>,
         transport_drops_counter: Arc<AtomicU64>,
         simulcast_layers: u32,
+        keyframe_gate: ForcedKeyframeGate,
     ) -> anyhow::Result<()> {
         // N>=2: run the multi-layer simulcast producer (fixed-geometry layers).
         // N==1 (or any clamped-down value) falls through to the legacy
@@ -522,6 +540,7 @@ impl VideoProducer {
                         encoder_frames_ok,
                         transport_drops_counter,
                         layers,
+                        keyframe_gate,
                     );
                 }
                 Err(e) => {
@@ -574,9 +593,7 @@ impl VideoProducer {
         // reporter can include it in HealthPacket.encoder_output_fps.
         encoder_output_fps.store(framerate, Ordering::Relaxed);
 
-        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
-            .set_resolution(enc_w, enc_h)
-            .build()?;
+        let mut video_encoder = publisher_encoder(framerate, enc_w, enc_h)?;
         video_encoder.update_bitrate_kbps(v.bitrate_kbps)?;
 
         let loop_duration_us = loop_duration.as_micros() as u64;
@@ -588,6 +605,7 @@ impl VideoProducer {
             return Ok(());
         }
         let mut prev_frame_index: Option<usize> = None;
+        let mut keyframe_gate = keyframe_gate;
         let mut global_sequence: u64 = 0;
         let user_id_bytes = user_id.clone().into_bytes();
 
@@ -630,10 +648,7 @@ impl VideoProducer {
                         user_id, enc_w, enc_h, framerate, target_w, target_h, fps,
                     );
 
-                    match VideoEncoderBuilder::new(fps, 5)
-                        .set_resolution(target_w, target_h)
-                        .build()
-                    {
+                    match publisher_encoder(fps, target_w, target_h) {
                         Ok(mut enc) => {
                             let _ = enc.update_bitrate_kbps(new_v.bitrate_kbps);
                             video_encoder = enc;
@@ -684,7 +699,8 @@ impl VideoProducer {
                 None => true,
             };
             let periodic_keyframe = global_sequence.is_multiple_of(frames_per_keyframe as u64);
-            let force_keyframe = at_loop_wrap || periodic_keyframe;
+            let force_keyframe =
+                keyframe_gate.requested(elapsed_us) || at_loop_wrap || periodic_keyframe;
             prev_frame_index = Some(frame_in_loop);
 
             if global_sequence.is_multiple_of(framerate as u64 * 5) {
@@ -725,7 +741,7 @@ impl VideoProducer {
 
             // Encode to VP9
             let frames_result = if force_keyframe {
-                info!(
+                debug!(
                     "Forcing keyframe for {} (costume seq={})",
                     user_id, global_sequence
                 );
@@ -761,6 +777,9 @@ impl VideoProducer {
                 }
             };
 
+            if force_keyframe {
+                keyframe_gate.on_keyframe(elapsed_us);
+            }
             for frame in frames {
                 let sent = build_and_send_layer(
                     &packet_sender,
@@ -837,9 +856,7 @@ impl VideoProducer {
             let framerate = tier.target_fps.max(1);
             let frames_per_keyframe = tier.keyframe_interval_frames.max(1);
 
-            let mut encoder = VideoEncoderBuilder::new(framerate, 5)
-                .set_resolution(enc_w, enc_h)
-                .build()?;
+            let mut encoder = publisher_encoder(framerate, enc_w, enc_h)?;
             encoder.update_bitrate_kbps(tier.ideal_bitrate_kbps)?;
 
             let needs_scale = enc_w < native_w || enc_h < native_h;
@@ -893,7 +910,7 @@ impl VideoProducer {
         rms_fps: u32,
         packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
-        media_start: Instant,
+        mut media_start: impl Pacer,
         loop_duration: Duration,
         aq: Arc<BotAq>,
         encoder_output_fps: Arc<AtomicU32>,
@@ -901,6 +918,7 @@ impl VideoProducer {
         encoder_frames_ok: Arc<AtomicU64>,
         transport_drops_counter: Arc<AtomicU64>,
         mut layers: Vec<SimulcastLayer>,
+        keyframe_gate: ForcedKeyframeGate,
         native_w: u32,
         native_h: u32,
     ) -> anyhow::Result<()> {
@@ -945,6 +963,7 @@ impl VideoProducer {
         let user_id_bytes = user_id.clone().into_bytes();
 
         let mut prev_frame_index: Option<usize> = None;
+        let mut keyframe_gate = keyframe_gate;
         let mut render_count: u64 = 0;
 
         // Per-layer AQ state (issue #1083 V21). `active` is how many top-down
@@ -988,7 +1007,7 @@ impl VideoProducer {
                     &user_id,
                 );
             }
-            let elapsed_us = media_start.elapsed().as_micros() as u64;
+            let elapsed_us = media_start.elapsed_us();
             let position_in_loop_us = elapsed_us % loop_duration_us;
             let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
 
@@ -998,6 +1017,10 @@ impl VideoProducer {
                 None => true,
             };
             prev_frame_index = Some(frame_in_loop);
+            let key_all = keyframe_gate.requested(elapsed_us) || at_loop_wrap;
+            if key_all {
+                keyframe_gate.on_keyframe(elapsed_us);
+            }
 
             // Render the EKG frame ONCE at native resolution; all layers encode
             // a downscaled copy of the same source.
@@ -1021,7 +1044,7 @@ impl VideoProducer {
                 // forces a keyframe on its next DUE encode (clears the latch),
                 // instead of serving deltas across the source-loop discontinuity
                 // until its next periodic keyframe (~5s for L0).
-                layer.kf.latch_wrap(at_loop_wrap);
+                layer.kf.latch_wrap(key_all);
 
                 // Top-down shed (issue #1083 V21): skip any layer at/above the
                 // AQ's active count entirely — no encode, no send. The base layer
@@ -1141,6 +1164,9 @@ impl VideoProducer {
                 // Post-encode: advance sequence and clear the wrap latch iff a
                 // keyframe was observed (Finding 2). Same method the unit test
                 // drives.
+                if saw_key {
+                    keyframe_gate.on_layer_keyframe(layer.layer_id, active, elapsed_us);
+                }
                 layer.kf.on_encoded(saw_key);
             }
 
@@ -1168,12 +1194,7 @@ impl VideoProducer {
                 next_frame_us
             };
             let loop_base_us = elapsed_us - position_in_loop_us;
-            let absolute_target =
-                media_start + Duration::from_micros(loop_base_us + sleep_target_us);
-            let now = Instant::now();
-            if now < absolute_target {
-                thread::sleep(absolute_target - now);
-            }
+            media_start.sleep_until_us(loop_base_us + sleep_target_us);
         }
 
         Ok(())
@@ -1191,7 +1212,7 @@ impl VideoProducer {
         renderer: CostumeRenderer,
         packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
-        media_start: Instant,
+        mut media_start: impl Pacer,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
@@ -1200,6 +1221,7 @@ impl VideoProducer {
         encoder_frames_ok: Arc<AtomicU64>,
         transport_drops_counter: Arc<AtomicU64>,
         mut layers: Vec<SimulcastLayer>,
+        keyframe_gate: ForcedKeyframeGate,
     ) -> anyhow::Result<()> {
         let loop_duration_us = loop_duration.as_micros() as u64;
         if loop_duration_us == 0 {
@@ -1237,6 +1259,7 @@ impl VideoProducer {
 
         let user_id_bytes = user_id.clone().into_bytes();
         let mut prev_frame_index: Option<usize> = None;
+        let mut keyframe_gate = keyframe_gate;
         let mut render_count: u64 = 0;
 
         // Per-layer AQ state (issue #1083 V21) — see ekg_video_loop_simulcast for
@@ -1273,7 +1296,7 @@ impl VideoProducer {
                     &user_id,
                 );
             }
-            let elapsed_us = media_start.elapsed().as_micros() as u64;
+            let elapsed_us = media_start.elapsed_us();
             let position_in_loop_us = elapsed_us % loop_duration_us;
             let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
 
@@ -1282,6 +1305,10 @@ impl VideoProducer {
                 None => true,
             };
             prev_frame_index = Some(frame_in_loop);
+            let key_all = keyframe_gate.requested(elapsed_us) || at_loop_wrap;
+            if key_all {
+                keyframe_gate.on_keyframe(elapsed_us);
+            }
 
             // Read the native-resolution I420 source frame ONCE.
             let speaking = is_speaking.load(Ordering::Relaxed);
@@ -1292,7 +1319,7 @@ impl VideoProducer {
                 // ekg_video_loop_simulcast. Record the wrap for EVERY layer
                 // BEFORE the shed / not-yet-due `continue`s so a layer that
                 // skips this tick still keyframes on its next due encode.
-                layer.kf.latch_wrap(at_loop_wrap);
+                layer.kf.latch_wrap(key_all);
 
                 // Top-down shed (issue #1083 V21) — see ekg_video_loop_simulcast.
                 // Skip any layer at/above the AQ active count; base layer always
@@ -1395,6 +1422,9 @@ impl VideoProducer {
                     }
                 }
 
+                if saw_key {
+                    keyframe_gate.on_layer_keyframe(layer.layer_id, active, elapsed_us);
+                }
                 layer.kf.on_encoded(saw_key);
             }
 
@@ -1421,12 +1451,7 @@ impl VideoProducer {
                 next_frame_us
             };
             let loop_base_us = elapsed_us - position_in_loop_us;
-            let absolute_target =
-                media_start + Duration::from_micros(loop_base_us + sleep_target_us);
-            let now = Instant::now();
-            if now < absolute_target {
-                thread::sleep(absolute_target - now);
-            }
+            media_start.sleep_until_us(loop_base_us + sleep_target_us);
         }
 
         Ok(())
@@ -1446,32 +1471,44 @@ impl Drop for VideoProducer {
     }
 }
 
+const RGB_FIX_SHIFT: u32 = 20;
+const RGB_FIX_ROUND: i32 = 1 << (RGB_FIX_SHIFT - 1);
+
+const Y_COEF: [i32; 3] = [269_484, 528_482, 102_760];
+const U_COEF: [i32; 3] = [-155_189, -305_136, 460_325];
+const V_COEF: [i32; 3] = [460_325, -385_876, -74_449];
+
+#[inline(always)]
+fn rgb_fix(px: &[u8], c: [i32; 3], offset: i32) -> u8 {
+    let sum = c[0] * px[0] as i32 + c[1] * px[1] as i32 + c[2] * px[2] as i32;
+    ((sum + (offset << RGB_FIX_SHIFT) + RGB_FIX_ROUND) >> RGB_FIX_SHIFT) as u8
+}
+
 fn rgb_to_i420_into(image: &ImageBuffer<Rgb<u8>, Vec<u8>>, i420_data: &mut [u8]) {
     let width = image.width() as usize;
     let height = image.height() as usize;
     debug_assert_eq!(i420_data.len(), width * height * 3 / 2);
+    if width == 0 || height == 0 {
+        return;
+    }
 
     let rgb = image.as_raw();
     let (y_plane, uv_planes) = i420_data.split_at_mut(width * height);
     let (u_plane, v_plane) = uv_planes.split_at_mut(width * height / 4);
+    let chroma_w = width / 2;
 
-    for y in 0..height {
-        for x in 0..width {
-            let rgb_index = (y * width + x) * 3;
-            let r = rgb[rgb_index] as f32;
-            let g = rgb[rgb_index + 1] as f32;
-            let b = rgb[rgb_index + 2] as f32;
-
-            let y_value = (0.257 * r + 0.504 * g + 0.098 * b + 16.0).round() as u8;
-            let u_value = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).round() as u8;
-            let v_value = (0.439 * r - 0.368 * g - 0.071 * b + 128.0).round() as u8;
-
-            y_plane[y * width + x] = y_value;
-
-            if y % 2 == 0 && x % 2 == 0 {
-                let uv_index = (y / 2) * (width / 2) + (x / 2);
-                u_plane[uv_index] = u_value;
-                v_plane[uv_index] = v_value;
+    let rows = rgb
+        .chunks_exact(width * 3)
+        .zip(y_plane.chunks_exact_mut(width));
+    for (row, (rgb_row, y_row)) in rows.enumerate() {
+        for (px, y_out) in rgb_row.chunks_exact(3).zip(y_row.iter_mut()) {
+            *y_out = rgb_fix(px, Y_COEF, 16);
+        }
+        if row % 2 == 0 {
+            let base = (row / 2) * chroma_w;
+            for (i, px) in rgb_row.chunks_exact(3).step_by(2).enumerate() {
+                u_plane[base + i] = rgb_fix(px, U_COEF, 128);
+                v_plane[base + i] = rgb_fix(px, V_COEF, 128);
             }
         }
     }
@@ -1540,6 +1577,26 @@ fn build_and_send_layer(
     let packet_data = packet_wrapper.write_to_bytes()?;
     let out_frame = OutboundFrame::new(MediaTypeLabel::Video, packet_data);
     Ok(packet_sender.try_send(out_frame).is_ok())
+}
+
+/// The simulcast loops' clock: time since media start, and a wait for a later time.
+trait Pacer {
+    fn elapsed_us(&self) -> u64;
+    fn sleep_until_us(&mut self, target_us: u64);
+}
+
+impl Pacer for Instant {
+    fn elapsed_us(&self) -> u64 {
+        self.elapsed().as_micros() as u64
+    }
+
+    fn sleep_until_us(&mut self, target_us: u64) {
+        let target = *self + Duration::from_micros(target_us);
+        let now = Instant::now();
+        if now < target {
+            thread::sleep(target - now);
+        }
+    }
 }
 
 /// Per-layer loop-wrap keyframe latch (issue #1123 item 1), pure so it is
@@ -1653,6 +1710,69 @@ impl LayerKeyframeState {
             self.pending_keyframe = false;
         }
         self.sequence += 1;
+    }
+}
+
+/// Answers camera KEYFRAME_REQUESTs as the browser camera encoder does. A
+/// request stays pending until every active video layer has keyed since it
+/// (periodic keyframes count) or it forces a keyframe on every video layer,
+/// which it does only once the publisher's cooldown (replay's `RequestCooldown`)
+/// has passed since the last keyframe on any video layer.
+pub struct ForcedKeyframeGate {
+    requests: Option<Arc<AtomicU64>>,
+    uplink: Option<replay::UplinkProbe>,
+    cooldown: replay::RequestCooldown,
+    seen: u64,
+    pending: bool,
+    keyed_layers: u64,
+    last_key_us: Option<u64>,
+}
+
+impl ForcedKeyframeGate {
+    /// `requests` counts camera KEYFRAME_REQUESTs for this bot (`None` ignores
+    /// them); `uplink` widens the cooldown on a congested WebSocket uplink.
+    pub fn new(requests: Option<Arc<AtomicU64>>, uplink: Option<replay::UplinkProbe>) -> Self {
+        let seen = requests.as_ref().map_or(0, |r| r.load(Ordering::Relaxed));
+        Self {
+            requests,
+            cooldown: replay::RequestCooldown::new(uplink.as_ref()),
+            uplink,
+            seen,
+            pending: false,
+            keyed_layers: 0,
+            last_key_us: None,
+        }
+    }
+
+    fn requested(&mut self, elapsed_us: u64) -> bool {
+        if let Some(requests) = &self.requests {
+            let n = requests.load(Ordering::Relaxed);
+            if n != self.seen {
+                self.seen = n;
+                self.pending = true;
+                self.keyed_layers = 0;
+            }
+        }
+        let cooldown_us = self.cooldown.cooldown_us(self.uplink.as_ref(), elapsed_us);
+        self.pending
+            && self
+                .last_key_us
+                .is_none_or(|last| elapsed_us.saturating_sub(last) >= cooldown_us)
+    }
+
+    /// A keyframe on every video layer.
+    fn on_keyframe(&mut self, elapsed_us: u64) {
+        self.pending = false;
+        self.last_key_us = Some(elapsed_us);
+    }
+
+    /// A keyframe on one video layer, `active` layers being sent.
+    fn on_layer_keyframe(&mut self, layer: u32, active: usize, elapsed_us: u64) {
+        self.last_key_us = Some(elapsed_us);
+        self.keyed_layers |= 1 << layer;
+        if (0..active).all(|l| self.keyed_layers & (1 << l) != 0) {
+            self.pending = false;
+        }
     }
 }
 
@@ -1803,6 +1923,543 @@ mod tests {
     use videocall_types::protos::media_packet::{MediaPacket, VideoCodec};
     use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
     use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    struct SentFrame {
+        at: Instant,
+        layer: u32,
+        key: bool,
+        sent_ms: f64,
+        seq: u64,
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<OutboundFrame>, sent: &mut Vec<SentFrame>) {
+        while let Ok(frame) = rx.try_recv() {
+            let wrapper = PacketWrapper::parse_from_bytes(&frame.bytes).unwrap();
+            let media = MediaPacket::parse_from_bytes(&wrapper.data).unwrap();
+            sent.push(SentFrame {
+                at: Instant::now(),
+                layer: wrapper.simulcast_layer_id,
+                key: media.frame_type == "key",
+                sent_ms: media.timestamp,
+                seq: media.video_metadata.sequence,
+            });
+        }
+    }
+
+    fn wait_for(
+        rx: &mut tokio::sync::mpsc::Receiver<OutboundFrame>,
+        sent: &mut Vec<SentFrame>,
+        done: impl Fn(&[SentFrame]) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(sent) && Instant::now() < deadline {
+            drain(rx, sent);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(done(sent), "the live publisher kept sending video");
+    }
+
+    enum Source {
+        Ekg,
+        Costume,
+    }
+
+    fn start_live_publisher(
+        source: Source,
+        simulcast_layers: u32,
+        tx: OutboundFrameSender,
+        requests: Arc<AtomicU64>,
+    ) -> VideoProducer {
+        let aq = BotAq::with_default_clock();
+        let v = aq.snapshot_video();
+        let counters = || Arc::new(AtomicU64::new(0));
+        match source {
+            Source::Ekg => VideoProducer::from_ekg(
+                "kf".into(),
+                EkgRenderer::new([0, 200, 255], v.max_width, v.max_height),
+                vec![0.0; 1000],
+                0.01,
+                v.target_fps.max(1),
+                tx,
+                Instant::now(),
+                Duration::from_secs(60),
+                aq,
+                Arc::new(AtomicU32::new(0)),
+                counters(),
+                counters(),
+                counters(),
+                simulcast_layers,
+                ForcedKeyframeGate::new(Some(requests), None),
+            ),
+            Source::Costume => VideoProducer::from_costume(
+                "kf".into(),
+                costume_renderer(),
+                tx,
+                Instant::now(),
+                Duration::from_secs(60),
+                Arc::new(AtomicBool::new(false)),
+                aq,
+                Arc::new(AtomicU32::new(0)),
+                counters(),
+                counters(),
+                counters(),
+                simulcast_layers,
+                ForcedKeyframeGate::new(Some(requests), None),
+            ),
+        }
+        .unwrap()
+    }
+
+    fn costume_renderer() -> CostumeRenderer {
+        static DIRS: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bot-kf-costume-{}-{}",
+            std::process::id(),
+            DIRS.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let frame = vec![128u8; 1280 * 720 * 3 / 2];
+        std::fs::write(dir.join("idle.i420"), &frame).unwrap();
+        std::fs::write(dir.join("talking.i420"), &frame).unwrap();
+        let renderer = CostumeRenderer::load(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        renderer
+    }
+
+    /// A live publisher sends delta frames until a KEYFRAME_REQUEST arrives,
+    /// then one keyframe on every video layer, at most one delta frame after
+    /// the request, then deltas again.
+    fn live_publisher_answers_a_keyframe_request(source: Source, simulcast_layers: u32) {
+        let requests = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let mut producer =
+            start_live_publisher(source, simulcast_layers, tx.into(), Arc::clone(&requests));
+        let per_layer =
+            |sent: &[SentFrame], layer: u32| sent.iter().filter(|f| f.layer == layer).count();
+        let layers: Vec<u32> = (0..simulcast_layers).collect();
+
+        let mut sent = Vec::new();
+        wait_for(&mut rx, &mut sent, |s| {
+            s.first()
+                .is_some_and(|f| f.at.elapsed() > Duration::from_millis(600))
+                && layers.iter().all(|&l| per_layer(s, l) >= 4)
+        });
+        for &l in &layers {
+            let keys: Vec<bool> = sent
+                .iter()
+                .filter(|f| f.layer == l)
+                .map(|f| f.key)
+                .collect();
+            assert!(keys[0], "video layer {} starts on a keyframe", l);
+            assert!(
+                keys[1..].iter().all(|k| !k),
+                "with no request, video layer {} sends deltas: {:?}",
+                l,
+                keys
+            );
+        }
+
+        let before = sent.len();
+        requests.fetch_add(1, Ordering::Relaxed);
+        let requested_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        wait_for(&mut rx, &mut sent, |s| {
+            layers.iter().all(|&l| {
+                s[before..]
+                    .iter()
+                    .filter(|f| f.layer == l && f.sent_ms > requested_ms)
+                    .count()
+                    >= 4
+            })
+        });
+        producer.stop();
+        for &l in &layers {
+            let after: Vec<&SentFrame> = sent[before..].iter().filter(|f| f.layer == l).collect();
+            assert!(
+                after.iter().filter(|f| f.key).count() == 1,
+                "one request, one keyframe on video layer {}: {:?}",
+                l,
+                after.iter().map(|f| f.key).collect::<Vec<_>>()
+            );
+            let deltas_after_request = after
+                .iter()
+                .take_while(|f| !f.key)
+                .filter(|f| f.sent_ms > requested_ms)
+                .count();
+            assert!(
+                deltas_after_request <= 1,
+                "video layer {} answers the request on its next frame, not after {} more delta frames",
+                l,
+                deltas_after_request
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_stream_ekg_publisher_answers_a_keyframe_request() {
+        live_publisher_answers_a_keyframe_request(Source::Ekg, 1);
+    }
+
+    #[test]
+    fn a_simulcast_ekg_publisher_answers_a_keyframe_request_on_every_layer() {
+        live_publisher_answers_a_keyframe_request(Source::Ekg, 2);
+    }
+
+    #[test]
+    fn a_single_stream_costume_publisher_answers_a_keyframe_request() {
+        live_publisher_answers_a_keyframe_request(Source::Costume, 1);
+    }
+
+    #[test]
+    fn a_simulcast_costume_publisher_answers_a_keyframe_request_on_every_layer() {
+        live_publisher_answers_a_keyframe_request(Source::Costume, 2);
+    }
+
+    /// Runs a two-layer simulcast loop one render tick at a time, each tick at
+    /// the time the loop asked to sleep until.
+    struct SteppedPublisher {
+        parked: std::sync::mpsc::Receiver<u64>,
+        resume: Option<std::sync::mpsc::Sender<u64>>,
+        next_tick_us: Option<u64>,
+        rx: tokio::sync::mpsc::Receiver<OutboundFrame>,
+        quit: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    struct SteppedClock {
+        now_us: u64,
+        parked: std::sync::mpsc::Sender<u64>,
+        resume: std::sync::mpsc::Receiver<u64>,
+    }
+
+    impl Pacer for SteppedClock {
+        fn elapsed_us(&self) -> u64 {
+            self.now_us
+        }
+
+        fn sleep_until_us(&mut self, target_us: u64) {
+            if self.parked.send(target_us).is_ok() {
+                if let Ok(now_us) = self.resume.recv() {
+                    self.now_us = now_us;
+                }
+            }
+        }
+    }
+
+    impl SteppedPublisher {
+        fn start(source: Source, requests: Arc<AtomicU64>) -> Self {
+            let (parked_tx, parked) = std::sync::mpsc::channel();
+            let (resume, resume_rx) = std::sync::mpsc::channel();
+            let clock = SteppedClock {
+                now_us: 0,
+                parked: parked_tx,
+                resume: resume_rx,
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(4096);
+            let tx: OutboundFrameSender = tx.into();
+            let quit = Arc::new(AtomicBool::new(false));
+            let q = Arc::clone(&quit);
+            let aq = BotAq::with_default_clock();
+            let gate = ForcedKeyframeGate::new(Some(requests), None);
+            let counters = || Arc::new(AtomicU64::new(0));
+            let handle = thread::spawn(move || {
+                let result = match source {
+                    Source::Ekg => {
+                        let top = &videocall_aq::constants::simulcast_layers(2)[1];
+                        let (w, h) = (top.max_width & !1, top.max_height & !1);
+                        VideoProducer::ekg_video_loop_simulcast(
+                            "kf".into(),
+                            EkgRenderer::new([0, 200, 255], w, h),
+                            vec![0.0; 1000],
+                            0.01,
+                            top.target_fps,
+                            tx,
+                            q,
+                            clock,
+                            Duration::from_secs(60),
+                            aq,
+                            Arc::new(AtomicU32::new(0)),
+                            counters(),
+                            counters(),
+                            counters(),
+                            VideoProducer::build_simulcast_layers(2, w, h).unwrap(),
+                            gate,
+                            w,
+                            h,
+                        )
+                    }
+                    Source::Costume => {
+                        let renderer = costume_renderer();
+                        let layers = VideoProducer::build_simulcast_layers(
+                            2,
+                            renderer.width(),
+                            renderer.height(),
+                        )
+                        .unwrap();
+                        VideoProducer::costume_video_loop_simulcast(
+                            "kf".into(),
+                            renderer,
+                            tx,
+                            q,
+                            clock,
+                            Duration::from_secs(60),
+                            Arc::new(AtomicBool::new(false)),
+                            aq,
+                            Arc::new(AtomicU32::new(0)),
+                            counters(),
+                            counters(),
+                            counters(),
+                            layers,
+                            gate,
+                        )
+                    }
+                };
+                result.unwrap();
+            });
+            Self {
+                parked,
+                resume: Some(resume),
+                next_tick_us: None,
+                rx,
+                quit,
+                handle: Some(handle),
+            }
+        }
+
+        /// Runs the loop's next render tick and returns the frames it sent.
+        fn tick(&mut self) -> Vec<SentFrame> {
+            if let (Some(at), Some(resume)) = (self.next_tick_us, &self.resume) {
+                resume.send(at).unwrap();
+            }
+            self.next_tick_us = Some(self.parked.recv().expect("the simulcast loop stopped"));
+            let mut sent = Vec::new();
+            drain(&mut self.rx, &mut sent);
+            sent
+        }
+    }
+
+    impl Drop for SteppedPublisher {
+        fn drop(&mut self) {
+            self.quit.store(true, Ordering::Relaxed);
+            self.resume = None;
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// A request that lands after video layer 1 answered the previous one, but
+    /// before video layer 0 sent its latched keyframe, keys video layer 1 again.
+    fn a_request_is_not_answered_by_video_layer_0_alone(source: Source) {
+        let requests = Arc::new(AtomicU64::new(0));
+        let mut publisher = SteppedPublisher::start(source, Arc::clone(&requests));
+        let top = &videocall_aq::constants::simulcast_layers(2)[1];
+        let cooldown_ticks = replay::KEYFRAME_REQUEST_COOLDOWN_US
+            .div_ceil(1_000_000 / top.target_fps as u64) as usize;
+        let sent = |s: &[SentFrame], layer: u32| s.iter().any(|f| f.layer == layer);
+        let keyed = |s: &[SentFrame], layer: u32| s.iter().any(|f| f.layer == layer && f.key);
+
+        let mut ticks = 1;
+        while !(sent(&publisher.tick(), 0) && ticks > cooldown_ticks) {
+            ticks += 1;
+            assert!(ticks < 10 * cooldown_ticks, "video layer 0 stopped sending");
+        }
+        requests.fetch_add(1, Ordering::Relaxed);
+        let first = publisher.tick();
+        assert!(
+            keyed(&first, 1) && !sent(&first, 0),
+            "the first request keyed video layer 1 on a tick without video layer 0"
+        );
+
+        requests.fetch_add(1, Ordering::Relaxed);
+        let mut frames = publisher.tick();
+        let mut ticks = 1;
+        while !sent(&frames, 0) {
+            assert!(
+                !keyed(&frames, 1),
+                "video layer 1 keyed inside the cooldown"
+            );
+            ticks += 1;
+            assert!(ticks <= cooldown_ticks, "video layer 0 stopped sending");
+            frames = publisher.tick();
+        }
+        assert!(
+            keyed(&frames, 0) && !keyed(&frames, 1),
+            "video layer 0 sent its latched keyframe alone"
+        );
+
+        let after: Vec<SentFrame> = (0..=cooldown_ticks)
+            .flat_map(|_| publisher.tick())
+            .collect();
+        let top_gop = top.keyframe_interval_frames as u64;
+        assert!(
+            after
+                .iter()
+                .any(|f| f.layer == 1 && f.key && !f.seq.is_multiple_of(top_gop)),
+            "the second request keyed video layer 1, not only video layer 0"
+        );
+    }
+
+    #[test]
+    fn a_simulcast_ekg_request_is_not_answered_by_video_layer_0_alone() {
+        a_request_is_not_answered_by_video_layer_0_alone(Source::Ekg);
+    }
+
+    #[test]
+    fn a_simulcast_costume_request_is_not_answered_by_video_layer_0_alone() {
+        a_request_is_not_answered_by_video_layer_0_alone(Source::Costume);
+    }
+
+    /// A request that lands just after a periodic keyframe on video layer 0
+    /// waits out the cooldown from that keyframe, then is answered.
+    fn a_request_after_a_periodic_keyframe_waits_for_the_cooldown(
+        source: Source,
+        simulcast_layers: u32,
+    ) {
+        let requests = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let mut producer =
+            start_live_publisher(source, simulcast_layers, tx.into(), Arc::clone(&requests));
+        let base_keys = |s: &[SentFrame]| s.iter().filter(|f| f.layer == 0 && f.key).count();
+        let mut sent = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while base_keys(&sent) < 2 && Instant::now() < deadline {
+            drain(&mut rx, &mut sent);
+            thread::sleep(Duration::from_micros(200));
+        }
+        requests.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(base_keys(&sent), 2, "a periodic keyframe on video layer 0");
+        let periodic_ms = sent
+            .iter()
+            .filter(|f| f.layer == 0 && f.key)
+            .nth(1)
+            .unwrap()
+            .sent_ms;
+        let before = sent.len();
+        wait_for(&mut rx, &mut sent, |s| {
+            s[before..].iter().any(|f| f.layer == 0 && f.key)
+        });
+        producer.stop();
+        let key = sent[before..]
+            .iter()
+            .find(|f| f.layer == 0 && f.key)
+            .unwrap();
+        let cooldown_ms = replay::KEYFRAME_REQUEST_COOLDOWN_US as f64 / 1000.0;
+        let gap_ms = key.sent_ms - periodic_ms;
+        assert!(
+            gap_ms >= cooldown_ms - 60.0,
+            "the request keyed video layer 0 {} ms after its periodic keyframe",
+            gap_ms
+        );
+        assert!(
+            gap_ms <= 1500.0,
+            "the pending request was answered, not left for the next periodic keyframe ({} ms)",
+            gap_ms
+        );
+    }
+
+    #[test]
+    fn a_single_stream_ekg_request_after_a_periodic_keyframe_waits_for_the_cooldown() {
+        a_request_after_a_periodic_keyframe_waits_for_the_cooldown(Source::Ekg, 1);
+    }
+
+    #[test]
+    fn a_simulcast_ekg_request_after_a_periodic_keyframe_waits_for_the_cooldown() {
+        a_request_after_a_periodic_keyframe_waits_for_the_cooldown(Source::Ekg, 2);
+    }
+
+    #[test]
+    fn a_simulcast_costume_request_after_a_periodic_keyframe_waits_for_the_cooldown() {
+        a_request_after_a_periodic_keyframe_waits_for_the_cooldown(Source::Costume, 2);
+    }
+
+    #[test]
+    fn a_congested_websocket_uplink_holds_a_request_for_the_longer_cooldown() {
+        let requests = Arc::new(AtomicU64::new(0));
+        let wait = Arc::new(AtomicU64::new(0));
+        let w = Arc::clone(&wait);
+        let uplink = replay::UplinkProbe {
+            websocket: true,
+            wait_us: Box::new(move || w.load(Ordering::Relaxed)),
+        };
+        let mut gate = ForcedKeyframeGate::new(Some(Arc::clone(&requests)), Some(uplink));
+        gate.on_keyframe(0);
+        requests.fetch_add(1, Ordering::Relaxed);
+        let congested = replay::CONGESTED_KEYFRAME_REQUEST_COOLDOWN_US;
+        let tick = 40_000;
+        let mut t = 0;
+        while t + tick < congested {
+            t += tick;
+            wait.fetch_add(1_000, Ordering::Relaxed);
+            assert!(!gate.requested(t), "held at {} us on a congested uplink", t);
+        }
+        wait.fetch_add(1_000, Ordering::Relaxed);
+        assert!(
+            gate.requested(congested),
+            "answered once the congested cooldown passed"
+        );
+    }
+
+    #[test]
+    fn a_pending_request_clears_once_every_active_video_layer_has_keyed() {
+        let requests = Arc::new(AtomicU64::new(0));
+        let cooldown = replay::KEYFRAME_REQUEST_COOLDOWN_US;
+        let mut gate = ForcedKeyframeGate::new(Some(Arc::clone(&requests)), None);
+        gate.on_keyframe(0);
+        requests.fetch_add(1, Ordering::Relaxed);
+        assert!(!gate.requested(1_000));
+        gate.on_layer_keyframe(0, 2, 2_000);
+        assert!(
+            gate.requested(2_000 + cooldown),
+            "video layer 1 has not keyed since the request"
+        );
+
+        let mut gate = ForcedKeyframeGate::new(Some(Arc::clone(&requests)), None);
+        gate.on_keyframe(0);
+        requests.fetch_add(1, Ordering::Relaxed);
+        assert!(!gate.requested(1_000));
+        gate.on_layer_keyframe(1, 2, 2_000);
+        gate.on_layer_keyframe(0, 2, 3_000);
+        assert!(
+            !gate.requested(3_000 + cooldown),
+            "periodic keyframes on both active video layers answered the request"
+        );
+
+        let mut gate = ForcedKeyframeGate::new(Some(Arc::clone(&requests)), None);
+        gate.on_layer_keyframe(1, 2, 0);
+        requests.fetch_add(1, Ordering::Relaxed);
+        assert!(!gate.requested(1_000));
+        gate.on_layer_keyframe(0, 2, 2_000);
+        assert!(
+            gate.requested(2_000 + cooldown),
+            "a keyframe on video layer 1 from before the request does not count"
+        );
+
+        let mut gate = ForcedKeyframeGate::new(Some(Arc::clone(&requests)), None);
+        gate.on_keyframe(0);
+        requests.fetch_add(1, Ordering::Relaxed);
+        assert!(!gate.requested(1_000));
+        gate.on_layer_keyframe(0, 1, 2_000);
+        assert!(
+            !gate.requested(2_000 + cooldown),
+            "with one active video layer, its keyframe answers the request"
+        );
+    }
+
+    #[test]
+    fn a_request_inside_the_cooldown_waits_and_is_not_lost() {
+        let requests = Arc::new(AtomicU64::new(0));
+        let mut gate = ForcedKeyframeGate::new(Some(Arc::clone(&requests)), None);
+        assert!(!gate.requested(0));
+        gate.on_keyframe(0);
+        requests.fetch_add(3, Ordering::Relaxed);
+        assert!(!gate.requested(replay::KEYFRAME_REQUEST_COOLDOWN_US - 1));
+        assert!(gate.requested(replay::KEYFRAME_REQUEST_COOLDOWN_US));
+        gate.on_keyframe(replay::KEYFRAME_REQUEST_COOLDOWN_US);
+        assert!(!gate.requested(10 * replay::KEYFRAME_REQUEST_COOLDOWN_US));
+    }
 
     /// Send one frame through `build_and_send_layer` and return the parsed
     /// outer wrapper. Uses a synchronous `try_send`/`try_recv` pair (the helper
@@ -2245,6 +2902,135 @@ mod tests {
                 ekg_rms_index_for_render_frame(f, 30, 30),
                 f,
                 "equal fps must map the index 1:1"
+            );
+        }
+    }
+
+    fn rgb_to_i420_f32_reference(image: &ImageBuffer<Rgb<u8>, Vec<u8>>, i420_data: &mut [u8]) {
+        let width = image.width() as usize;
+        let height = image.height() as usize;
+        let rgb = image.as_raw();
+        let (y_plane, uv_planes) = i420_data.split_at_mut(width * height);
+        let (u_plane, v_plane) = uv_planes.split_at_mut(width * height / 4);
+        for y in 0..height {
+            for x in 0..width {
+                let rgb_index = (y * width + x) * 3;
+                let r = rgb[rgb_index] as f32;
+                let g = rgb[rgb_index + 1] as f32;
+                let b = rgb[rgb_index + 2] as f32;
+                let y_value = (0.257 * r + 0.504 * g + 0.098 * b + 16.0).round() as u8;
+                let u_value = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).round() as u8;
+                let v_value = (0.439 * r - 0.368 * g - 0.071 * b + 128.0).round() as u8;
+                y_plane[y * width + x] = y_value;
+                if y % 2 == 0 && x % 2 == 0 {
+                    let uv_index = (y / 2) * (width / 2) + (x / 2);
+                    u_plane[uv_index] = u_value;
+                    v_plane[uv_index] = v_value;
+                }
+            }
+        }
+    }
+
+    /// Asserts every byte is within 1 of the f32 reference; returns the
+    /// per-plane (Y, U, V) count of bytes that differ at all.
+    fn diff_against_reference(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> [usize; 3] {
+        let (w, h) = (image.width() as usize, image.height() as usize);
+        let len = w * h * 3 / 2;
+        let mut got = vec![0u8; len];
+        let mut want = vec![0u8; len];
+        rgb_to_i420_into(image, &mut got);
+        rgb_to_i420_f32_reference(image, &mut want);
+        let mut mismatches = [0usize; 3];
+        for (i, (g, r)) in got.iter().zip(&want).enumerate() {
+            let plane = if i < w * h {
+                0
+            } else if i < w * h + w * h / 4 {
+                1
+            } else {
+                2
+            };
+            let d = (*g as i32 - *r as i32).abs();
+            assert!(
+                d <= 1,
+                "{}x{} plane {} byte {}: got {}, reference {}",
+                w,
+                h,
+                plane,
+                i,
+                g,
+                r
+            );
+            mismatches[plane] += usize::from(d != 0);
+        }
+        mismatches
+    }
+
+    #[test]
+    fn integer_rgb_to_i420_matches_f32_reference_for_every_rgb_value() {
+        const PER_STRIP: u32 = 4096;
+        let mut mismatches = [0usize; 3];
+        for strip in 0..(1u32 << 24) / PER_STRIP {
+            let image = ImageBuffer::from_fn(PER_STRIP * 2, 2, |x, _| {
+                let c = strip * PER_STRIP + x / 2;
+                Rgb([(c >> 16) as u8, (c >> 8) as u8, c as u8])
+            });
+            for (m, d) in mismatches.iter_mut().zip(diff_against_reference(&image)) {
+                *m += d;
+            }
+        }
+        let colours = 1usize << 24;
+        assert!(
+            mismatches[0] < colours * 4 / 500,
+            "Y differs on {} of {} samples",
+            mismatches[0],
+            colours * 4
+        );
+        for m in &mismatches[1..] {
+            assert!(
+                *m < colours / 500,
+                "chroma differs on {} of {} samples",
+                m,
+                colours
+            );
+        }
+    }
+
+    #[test]
+    fn integer_rgb_to_i420_matches_f32_reference_across_dimensions() {
+        let mut state: u32 = 0x2914;
+        for (w, h) in [
+            (2, 2),
+            (4, 2),
+            (6, 4),
+            (8, 6),
+            (5, 4),
+            (7, 6),
+            (320, 180),
+            (641, 360),
+            (1280, 720),
+        ] {
+            let image = ImageBuffer::from_fn(w, h, |_, _| {
+                let mut next = || {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                };
+                Rgb([next(), next(), next()])
+            });
+            diff_against_reference(&image);
+        }
+    }
+
+    #[test]
+    fn simulcast_layer_encoders_apply_cpu_used_8() {
+        let layers =
+            VideoProducer::build_simulcast_layers(3, 1280, 720).expect("layers must build");
+        assert_eq!(layers.len(), 3);
+        for layer in &layers {
+            assert_eq!(
+                layer.encoder.applied_cpu_used(),
+                8,
+                "layer {}",
+                layer.layer_id
             );
         }
     }

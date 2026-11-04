@@ -1,8 +1,16 @@
 import { test, expect, Browser, BrowserContext, Page, chromium } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
+import { setTransportBadgeFlag } from "../helpers/transport-badge-config";
 import { waitForServices } from "../helpers/wait-for-services";
-import { createMeeting, joinMeeting, endMeeting, fetchMeetingState } from "../helpers/meeting-api";
+import {
+  createMeeting,
+  joinMeeting,
+  endMeeting,
+  fetchAdmittedUserIds,
+  fetchMeetingState,
+} from "../helpers/meeting-api";
 
 /**
  * E2E coverage for the presence-driven meeting idle/active state machine
@@ -72,6 +80,9 @@ import { createMeeting, joinMeeting, endMeeting, fetchMeetingState } from "../he
 // Generous timeout for the empty→idle transition: transport teardown followed
 // by a NATS round-trip and a DB write, observed by polling the feed.
 const IDLE_TRANSITION_TIMEOUT = 30_000;
+// Without a close frame the WebTransport relay notices a closed page only at the QUIC
+// idle timeout (30 s), then waits RECONNECT_GRACE_PERIOD (3 s) before the departure.
+const DEPARTURE_APPLIED_TIMEOUT = 45_000;
 // Join→active is faster (a synchronous activate() on admit) but still async to
 // the observer; keep a comfortable margin for connection setup under load.
 const ACTIVE_TRANSITION_TIMEOUT = 30_000;
@@ -122,7 +133,16 @@ async function createPresenceContext(
   await ctx.addInitScript((displayName: string) => {
     localStorage.setItem("vc_display_name", displayName);
   }, name);
+  await setTransportBadgeFlag(ctx, "true");
+  await enableDiagnosticsTileIndicators(ctx);
   return ctx;
+}
+
+async function expectElected(page: Page): Promise<void> {
+  await expect(
+    page.locator('.transport-badge[aria-label^="Your connection transport: "]'),
+    "the client must elect a transport before leaving, or the relay never reports the departure",
+  ).toHaveCount(1, { timeout: 30_000 });
 }
 
 async function enterMeetingRoom(page: Page, meetingId: string): Promise<void> {
@@ -248,6 +268,7 @@ test.describe("Meeting idle/active presence-driven state transitions", () => {
     // The core new behaviour. Requires a REAL room connection (UI → actix-api
     // transport) to drive presence to one and back to zero — a REST-only join
     // would never trigger the empty→idle path and would be false confidence.
+    test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const email = `presence-cycle-${Date.now()}@videocall.rs`;
     const name = "PresenceCycleUser";
@@ -271,6 +292,8 @@ test.describe("Meeting idle/active presence-driven state transitions", () => {
           timeout: ACTIVE_TRANSITION_TIMEOUT,
         })
         .toBe("active");
+      await expectElected(page);
+      await expect.poll(() => fetchAdmittedUserIds(email, name, meetingId)).toContain(email);
 
       // ── 2) Everyone leaves → idle ─────────────────────────────────────────
       // Close the page + context: the transport drops, actix-api sees the room
@@ -279,6 +302,13 @@ test.describe("Meeting idle/active presence-driven state transitions", () => {
       await page.close();
       await ctx.close();
 
+      await expect
+        .poll(() => fetchAdmittedUserIds(email, name, meetingId), {
+          timeout: DEPARTURE_APPLIED_TIMEOUT,
+          intervals: [500],
+          message: "meeting-api must apply the relay's departure for the last participant",
+        })
+        .not.toContain(email);
       await expect
         .poll(() => fetchMeetingState(email, name, meetingId), {
           timeout: IDLE_TRANSITION_TIMEOUT,

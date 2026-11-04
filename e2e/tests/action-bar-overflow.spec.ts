@@ -1,4 +1,4 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -199,6 +199,186 @@ test.describe("Action bar overflow menu", () => {
     await expect(page.locator(".action-bar-overflow-popover")).not.toBeVisible({ timeout: 3_000 });
   });
 
+  async function openFromOverflow(page: Page, label: string, surface: string) {
+    await page.setViewportSize({ width: 400, height: 720 });
+    await hoverActionBar(page);
+
+    const trigger = page.locator("#overflow-menu-trigger");
+    await trigger.click();
+    const item = page
+      .locator(".action-bar-overflow-popover > button.overflow-item")
+      .filter({ hasText: new RegExp(`^${label}$`) });
+    await expect(item).toHaveCount(1);
+    await item.click();
+    await expect(page.locator(surface)).toBeVisible();
+    return trigger;
+  }
+
+  async function openDiagnosticsFromOverflow(page: Page) {
+    const trigger = await openFromOverflow(page, "Diagnostics", "#diagnostics-sidebar.visible");
+    return { trigger, drawer: page.locator("#diagnostics-sidebar") };
+  }
+
+  async function expectKeysStillWork(page: Page, trigger: Locator) {
+    await expect(trigger).toBeFocused();
+    await page.keyboard.press("Enter");
+    const menu = page.locator(".action-bar-overflow-popover");
+    await expect(menu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+  }
+
+  for (const { id, label, surface, inside } of [
+    {
+      id: "density",
+      label: "Density mode",
+      surface: ".density-popover",
+      inside: '.density-popover [role="menuitemradio"]',
+    },
+    {
+      id: "reactions",
+      label: "Reactions",
+      surface: '[data-testid="reactions-palette"]',
+      inside: '[data-testid="reactions-close"]',
+    },
+    {
+      id: "meeting_timer",
+      label: "Meeting timer",
+      surface: '[data-testid="meeting-timer-popover"]',
+      inside: '[data-testid="meeting-timer-popover"] button',
+    },
+  ]) {
+    test(`Escape closing ${label} opened from the overflow returns focus to the overflow trigger`, async ({
+      page,
+    }) => {
+      await joinMeeting(page, `close_${id}`);
+      const trigger = await openFromOverflow(page, label, surface);
+      await page.locator(inside).first().focus();
+      await expect(page.locator(`${surface} :focus`)).toHaveCount(1);
+
+      await page.keyboard.press("Escape");
+      await expect(page.locator(surface)).toHaveCount(0);
+      await expect(trigger).toBeVisible();
+      await expect(trigger).toBeFocused();
+    });
+  }
+
+  test("closing Diagnostics with its close button leaves the overflow trigger focused and keys working", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "diagnostics_close_button");
+    const { trigger, drawer } = await openDiagnosticsFromOverflow(page);
+
+    await drawer.locator('.sidebar-header > button.close-button[aria-label="Close panel"]').click();
+    await expect(drawer).not.toHaveClass(/\bvisible\b/);
+    await expectKeysStillWork(page, trigger);
+  });
+
+  test("clicking a Density option leaves the overflow trigger focused and keys working", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "density_option_click");
+    const trigger = await openFromOverflow(page, "Density mode", ".density-popover");
+    const option = page
+      .locator('.density-popover [role="menuitemradio"][aria-checked="false"]')
+      .first();
+    await expect(option).toBeVisible();
+
+    await option.click();
+    await expect(page.locator(".density-popover")).toHaveCount(0);
+    await expectKeysStillWork(page, trigger);
+  });
+
+  test("Settings opened from the overflow leaves focus off the overflow trigger and Enter does not toggle the menu behind it", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "settings_focus");
+    const dialog = page.locator("#device-settings-dialog");
+    const trigger = await openFromOverflow(page, "Settings", "#device-settings-dialog");
+    await page.waitForTimeout(300);
+    await expect.soft(trigger).not.toBeFocused();
+
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    await expect(dialog).toBeVisible();
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator(".action-bar-overflow-popover")).toHaveCount(0);
+  });
+
+  async function openDiagnosticsFromBarAt1280(page: Page, label: string) {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await joinMeeting(page, label);
+    await hoverActionBar(page);
+    const diagnostics = page.locator("#diagnostics-trigger");
+    const more = page.locator("#overflow-menu-trigger");
+    await expect(more).toBeHidden();
+    await diagnostics.click();
+    const drawer = page.locator("#diagnostics-sidebar");
+    await expect(drawer).toHaveClass(/\bvisible\b/);
+    await expect(diagnostics).toBeHidden();
+    await expect(more).toBeVisible();
+    return { diagnostics, more, drawer };
+  }
+
+  test("closing Diagnostics with its close button at 1280, where the open drawer overflows its trigger, returns focus to that trigger", async ({
+    page,
+  }) => {
+    const { diagnostics, more, drawer } = await openDiagnosticsFromBarAt1280(
+      page,
+      "diagnostics_close_1280",
+    );
+
+    await drawer.locator('.sidebar-header > button.close-button[aria-label="Close panel"]').click();
+    await expect(drawer).not.toHaveClass(/\bvisible\b/);
+    await expect(diagnostics).toBeFocused();
+    await expect(more).toBeHidden();
+  });
+
+  test("Escape from inside Diagnostics at 1280, where the open drawer overflows its trigger, returns focus to that trigger", async ({
+    page,
+  }) => {
+    const { diagnostics, more, drawer } = await openDiagnosticsFromBarAt1280(
+      page,
+      "diagnostics_escape_1280",
+    );
+    const inDrawer = drawer.locator("button").first();
+    await inDrawer.focus();
+    await expect(inDrawer).toBeFocused();
+
+    await page.keyboard.press("Escape");
+    await expect(drawer).not.toHaveClass(/\bvisible\b/);
+    await expect(diagnostics).toBeFocused();
+    await expect(more).toBeHidden();
+  });
+
+  test("Escape closes Diagnostics clicked open from the overflow and focus stays on the overflow trigger @bvt1", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "diagnostics_escape");
+    const { trigger, drawer } = await openDiagnosticsFromOverflow(page);
+    await expect.soft(trigger).toBeFocused();
+
+    await page.keyboard.press("Escape");
+    await expect(drawer).not.toHaveClass(/\bvisible\b/);
+    await expect(trigger).toBeFocused();
+  });
+
+  test("Escape from inside Diagnostics opened from the overflow returns focus to the overflow trigger", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "diagnostics_escape_inside");
+    const { trigger, drawer } = await openDiagnosticsFromOverflow(page);
+    const inDrawer = drawer.locator("button").first();
+    await expect(inDrawer).toBeVisible();
+    await inDrawer.focus();
+    await expect(inDrawer).toBeFocused();
+
+    await page.keyboard.press("Escape");
+    await expect(drawer).not.toHaveClass(/\bvisible\b/);
+    await expect(trigger).toBeFocused();
+  });
+
   // -- Resizing wider hides the overflow trigger ---------------------------
 
   test("resizing viewport wider hides the overflow trigger and restores buttons @bvt1", async ({
@@ -253,9 +433,6 @@ test.describe("Action bar overflow menu", () => {
   test("widening the window never hides more action-bar buttons @bvt1", async ({ page }) => {
     await joinMeeting(page, "widen_monotonic");
 
-    // Count secondary slot wrappers currently visible (not tucked into the
-    // overflow menu). Hover keeps the bar expanded so only overflow — not the
-    // collapse animation — governs visibility.
     async function visibleSecondaryCount(): Promise<number> {
       const wrappers = page.locator(".action-bar-slot-wrapper.slot-secondary");
       const total = await wrappers.count();

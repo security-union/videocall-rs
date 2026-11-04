@@ -11,11 +11,11 @@
  * at your option.
  */
 
-//! Co-host management: list, grant, and revoke co-hosts.
+//! Co-host management: list, suggest, grant, and revoke co-hosts.
 
 use videocall_meeting_types::{
     requests::{GrantCoHostRequest, RevokeCoHostRequest},
-    responses::ListCoHostsResponse,
+    responses::{ListCoHostSuggestionsResponse, ListCoHostsResponse},
 };
 
 use crate::error::ApiError;
@@ -24,6 +24,15 @@ use crate::{parse_api_response, MeetingApiClient};
 impl MeetingApiClient {
     pub async fn list_co_hosts(&self, meeting_id: &str) -> Result<ListCoHostsResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/co-hosts");
+        let response = self.get(&path).send().await?;
+        parse_api_response(response).await
+    }
+
+    pub async fn list_co_host_suggestions(
+        &self,
+        meeting_id: &str,
+    ) -> Result<ListCoHostSuggestionsResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/co-hosts/suggestions");
         let response = self.get(&path).send().await?;
         parse_api_response(response).await
     }

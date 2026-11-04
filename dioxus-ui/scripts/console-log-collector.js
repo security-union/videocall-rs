@@ -179,11 +179,15 @@
   // State
   // ---------------------------------------------------------------------------
   var BUFFER_CAP = 10000;
-  var BUFFER_BYTE_BUDGET = 768 * 1024; // 768 KB — flush before hitting the 1 MB server limit
+  var UPLOAD_TRIGGER_BYTES = 48 * 1024;
+  // Chromium rejects a keepalive request once the document's in-flight
+  // keepalive bodies would exceed 64 KiB (UTF-8 bytes, headers excluded).
+  var KEEPALIVE_QUOTA_BYTES = 64 * 1024;
+  var META_RESERVE_BYTES = 512;
   var UPLOAD_INTERVAL_MS = 30000;
 
   var buffer = [];
-  var bufferBytes = 0; // running byte count of buffer contents
+  var bufferBytes = 0; // UTF-8 size of the upload payload the buffer would produce
   var meetingId = null;
   var userId = null;
   var displayName = null;
@@ -198,6 +202,7 @@
   var uploadInFlight = false;
   var nextSeq = 0;
   var nextChunkSeq = 1;
+  var keepaliveBytesInFlight = 0;
 
   // ---------------------------------------------------------------------------
   // PII / secret scrubbing (best-effort, pattern-based)
@@ -254,6 +259,16 @@
     return scrub(parts.join(" "));
   }
 
+  // Exact for JSON.stringify output, which never contains a lone surrogate.
+  function utf8Length(str) {
+    var n = str.length;
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c >= 0x80) n += (c >= 0x800 && (c < 0xd800 || c > 0xdfff)) ? 2 : 1;
+    }
+    return n;
+  }
+
   function pushEntry(level, args) {
     var entry = JSON.stringify({
       seq: nextSeq++,
@@ -262,14 +277,14 @@
       msg: stringify(args),
     });
     buffer.push(entry);
-    bufferBytes += entry.length + 1; // +1 for the newline in the upload payload
+    bufferBytes += utf8Length(entry) + 1;
 
     // Evict oldest entries if over line cap
     if (buffer.length > BUFFER_CAP) {
       var removed = buffer.splice(0, buffer.length - BUFFER_CAP);
       var removedCount = removed.length;
       for (var i = 0; i < removed.length; i++) {
-        bufferBytes -= removed[i].length + 1;
+        bufferBytes -= utf8Length(removed[i]) + 1;
       }
       var warnEntry = JSON.stringify({
         seq: nextSeq++,
@@ -278,13 +293,11 @@
         msg: "CONSOLE_LOG_COLLECTOR: evicted " + removedCount + " oldest entries (buffer cap=" + BUFFER_CAP + ")"
       });
       buffer.push(warnEntry);
-      bufferBytes += warnEntry.length + 1;
+      bufferBytes += utf8Length(warnEntry) + 1;
     }
 
-    // Auto-flush when byte budget is exceeded to prevent 413s from the
-    // server's 1 MB DefaultBodyLimit, especially with Debug-level logging.
-    if (bufferBytes >= BUFFER_BYTE_BUDGET && meetingId && userId && sessionTimestampMs) {
-      doUpload(false);
+    if (bufferBytes >= UPLOAD_TRIGGER_BYTES && meetingId && userId && sessionTimestampMs) {
+      doUpload();
     }
   }
 
@@ -375,7 +388,7 @@
       msg: msg,
     });
     buffer.push(entry);
-    bufferBytes += entry.length + 1;
+    bufferBytes += utf8Length(entry) + 1;
 
     // Expose static metadata as window globals for the WASM health reporter (TELEM-7).
     updateClientMetadata();
@@ -393,21 +406,11 @@
     return base + "/api/v1/meetings/" + encodeURIComponent(meetingId) + "/console-logs";
   }
 
-  function doUpload(useKeepalive) {
-    if (buffer.length === 0) return;
-    if (uploadInFlight && !useKeepalive) return;
-    var url = buildUrl();
-    if (!url || !userId || !sessionTimestampMs) return;
-
-    var payload = buffer.join("\n") + "\n";
-    var entryCount = buffer.length;
-    buffer = [];
-    bufferBytes = 0;
-
+  function uploadHeaders(chunkSeq) {
     var headers = {
       "Content-Type": "text/plain",
       "X-Session-Timestamp": String(sessionTimestampMs),
-      "X-Chunk-Seq": String(nextChunkSeq),
+      "X-Chunk-Seq": String(chunkSeq),
     };
     // Authenticate via the room_token. The console-logs route validates this
     // room_token (a meeting-api-signed JWT) as the sole credential on BOTH
@@ -418,49 +421,147 @@
     if (authToken) {
       headers["Authorization"] = "Bearer " + authToken;
     }
+    return headers;
+  }
 
-    var opts = {
-      method: "POST",
-      credentials: "include",
-      headers: headers,
-      body: payload,
-    };
+  function reportFailure(what, entryCount, err) {
+    // Use originals.error (unwrapped) to avoid recursion — this bypasses the collector.
+    var msg = "CONSOLE_LOG_COLLECTOR: " + what + ", " + entryCount + " entries dropped";
+    if (err === undefined) {
+      originals.error.call(console, msg);
+    } else {
+      originals.error.call(console, msg + ":", err);
+    }
+  }
+
+  function seqOf(entry) {
+    try {
+      return JSON.parse(entry).seq;
+    } catch (_) {
+      return "?";
+    }
+  }
+
+  function postChunk(url, lines, bytes, keepalive, done) {
+    var payload = lines.join("\n") + "\n";
     // Increment BEFORE fetch so even failed requests advance the counter,
     // preventing filename collisions on retry.
-    nextChunkSeq++;
-    if (useKeepalive) {
-      opts.keepalive = true;
-    }
-
-    uploadInFlight = true;
-    fetch(url, opts)
-      .then(function (resp) {
-        uploadInFlight = false;
-        if (resp.ok || resp.status === 409) {
-          // 2xx: saved. 409: chunk already exists (prior upload succeeded).
-          return;
-        }
-        // Use originals.error (unwrapped) to avoid recursion — this bypasses the collector.
-        originals.error.call(console,
-          "CONSOLE_LOG_COLLECTOR: upload failed (" + resp.status + "), " + entryCount + " entries dropped"
-        );
+    var chunkSeq = nextChunkSeq++;
+    var what = keepalive ? "keepalive upload" : "upload";
+    if (keepalive) keepaliveBytesInFlight += bytes;
+    var settle = function () {
+      if (keepalive) keepaliveBytesInFlight -= bytes;
+      if (done) done();
+    };
+    try {
+      fetch(url, {
+        method: "POST",
+        credentials: "include",
+        keepalive: keepalive,
+        headers: uploadHeaders(chunkSeq),
+        body: payload,
       })
-      .catch(function (err) {
-        uploadInFlight = false;
-        // Use originals.error (unwrapped) to avoid recursion — this bypasses the collector.
-        originals.error.call(console,
-          "CONSOLE_LOG_COLLECTOR: upload network error, " + entryCount + " entries dropped:", err
-        );
+        .then(function (resp) {
+          return resp.text().then(function () {
+            // 409: chunk already exists (prior upload succeeded).
+            if (!resp.ok && resp.status !== 409) {
+              reportFailure(what + " failed (" + resp.status + ")", lines.length);
+            }
+          });
+        })
+        .catch(function (err) {
+          reportFailure(what + " network error", lines.length, err);
+        })
+        .then(settle);
+    } catch (_) {
+      settle();
+      if (keepalive) sendBeacon(url, payload, chunkSeq);
+    }
+  }
+
+  function sendBeacon(url, payload, chunkSeq) {
+    // Cannot carry the Bearer header, so the route 401s it. Identifiers go in
+    // the body rather than the query to keep them out of access logs.
+    try {
+      var meta = JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "meta",
+        msg: "user_id=" + userId + "; session_ts=" + sessionTimestampMs + "; chunk_seq=" + chunkSeq,
       });
+      var blob = new Blob([meta + "\n" + payload], { type: "text/plain" });
+      navigator.sendBeacon(url, blob);
+    } catch (__) {}
+  }
+
+  function freeKeepaliveBytes() {
+    return KEEPALIVE_QUOTA_BYTES - keepaliveBytesInFlight - META_RESERVE_BYTES;
+  }
+
+  // Uses keepalive when the payload fits, so an upload in flight at unload is
+  // not cancelled with the page.
+  function doUpload() {
+    if (buffer.length === 0) return;
+    if (uploadInFlight) return;
+    var url = buildUrl();
+    if (!url || !userId || !sessionTimestampMs) return;
+
+    var lines = buffer;
+    var bytes = bufferBytes;
+    buffer = [];
+    bufferBytes = 0;
+    uploadInFlight = true;
+    postChunk(url, lines, bytes, bytes <= freeKeepaliveBytes(), function () {
+      uploadInFlight = false;
+    });
+  }
+
+  // Sends the oldest entries that fit the free keepalive quota and leaves the
+  // rest buffered. On final unload it sends the newest instead and replaces
+  // the older ones with one `meta` line.
+  function sendKeepalive(isFinal) {
+    if (buffer.length === 0) return;
+    var url = buildUrl();
+    if (!url || !userId || !sessionTimestampMs) return;
+
+    var budget = freeKeepaliveBytes();
+    var bytes = 0;
+    var n = 0;
+    while (n < buffer.length) {
+      var entry = buffer[isFinal ? buffer.length - 1 - n : n];
+      var size = utf8Length(entry) + 1;
+      if (bytes + size > budget) break;
+      bytes += size;
+      n++;
+    }
+    var lines;
+    if (!isFinal) {
+      if (n === 0) return;
+      lines = buffer.splice(0, n);
+      bufferBytes -= bytes;
+    } else {
+      var dropped = buffer.length - n;
+      lines = buffer.slice(dropped);
+      if (dropped > 0) {
+        var meta = JSON.stringify({
+          seq: nextSeq++,
+          ts: new Date().toISOString(),
+          level: "meta",
+          msg: "CONSOLE_LOG_COLLECTOR: keepalive quota exceeded at page close, dropped " + dropped
+            + " oldest entries (seq " + seqOf(buffer[0]) + ".." + seqOf(buffer[dropped - 1])
+            + ", " + (bufferBytes - bytes) + " bytes)",
+        });
+        lines.unshift(meta);
+        bytes += utf8Length(meta) + 1;
+      }
+      buffer = [];
+      bufferBytes = 0;
+    }
+    postChunk(url, lines, bytes, true);
   }
 
   function startTimer() {
     if (uploadTimer) return;
     uploadTimer = setInterval(doUpload, UPLOAD_INTERVAL_MS);
-  }
-
-  function flushNow() {
-    doUpload(true);
   }
 
   // ---------------------------------------------------------------------------
@@ -487,73 +588,16 @@
   // beforeunload on swipe-away or backgrounding.
   // ---------------------------------------------------------------------------
 
-  var pageCloseFlushed = false;
-
-  function onPageClose() {
-    if (pageCloseFlushed) return;
-    if (buffer.length === 0) return;
-    var url = buildUrl();
-    if (!url || !userId || !sessionTimestampMs) return;
-    pageCloseFlushed = true;
-
-    var payload = buffer.join("\n") + "\n";
-
-    // Prefer fetch with keepalive — supports custom headers and survives
-    // page navigation in all modern browsers.
-    var closeChunkSeq = nextChunkSeq;
-    nextChunkSeq++;
-    try {
-      var closeHeaders = {
-        "Content-Type": "text/plain",
-        "X-Session-Timestamp": String(sessionTimestampMs),
-        "X-Chunk-Seq": String(closeChunkSeq),
-      };
-      // keepalive fetch supports custom headers, so the close-path upload is
-      // fully authenticated via the room_token (same contract as doUpload).
-      if (authToken) {
-        closeHeaders["Authorization"] = "Bearer " + authToken;
-      }
-      fetch(url, {
-        method: "POST",
-        credentials: "include",
-        keepalive: true,
-        headers: closeHeaders,
-        body: payload,
-      });
-    } catch (_) {
-      // fetch+keepalive not available — fall back to sendBeacon.
-      // NOTE: sendBeacon CANNOT set request headers, so it cannot carry the
-      // `Authorization: Bearer` token. The route requires that token on every
-      // deployment, so this beacon path will 401 — it is best-effort only,
-      // reached solely when keepalive fetch is unavailable (rare on modern
-      // browsers).
-      // Embed user_id and session_ts in the body as a metadata header line
-      // instead of query params to avoid leaking identifiers to access logs.
-      try {
-        var meta = JSON.stringify({
-          ts: new Date().toISOString(),
-          level: "meta",
-          msg: "user_id=" + userId + "; session_ts=" + sessionTimestampMs + "; chunk_seq=" + closeChunkSeq,
-        });
-        var beaconPayload = meta + "\n" + payload;
-        var blob = new Blob([beaconPayload], { type: "text/plain" });
-        navigator.sendBeacon(url, blob);
-      } catch (__) {
-        // Best-effort — nothing more we can do on tab close.
-      }
-    }
+  function onUnload() {
+    sendKeepalive(true);
   }
-
-  window.addEventListener("beforeunload", onPageClose);
-  window.addEventListener("pagehide", onPageClose);
+  window.addEventListener("beforeunload", onUnload);
+  window.addEventListener("pagehide", onUnload);
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "hidden") {
-      onPageClose();
+      sendKeepalive(false);
     } else if (document.visibilityState === "visible") {
-      // Reset so a subsequent hide/unload can flush logs accumulated while
-      // the tab was re-activated.
-      pageCloseFlushed = false;
-      doUpload(false);
+      doUpload();
     }
   });
 
@@ -589,9 +633,9 @@
       authToken = token || null;
     },
 
-    /** Called by WASM on hangup — immediate upload of buffered entries. */
+    /** Called by WASM on hangup — uploads what fits the keepalive quota; the rest stays buffered. */
     flush: function () {
-      flushNow();
+      sendKeepalive(false);
     },
   };
 })();

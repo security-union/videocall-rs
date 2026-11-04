@@ -24,7 +24,7 @@ import cq_prom  # noqa: E402
 import cq_report  # noqa: E402
 import cq_score  # noqa: E402
 from cq_score import (  # noqa: E402
-    M_CAN_LISTEN, M_EXPAND, M_FPS, M_FREEZE, M_HEALTH, M_PPS, M_REELECT, M_RTT, M_SENT, M_STALE)
+    M_CAN_LISTEN, M_DISCARDS, M_EXPAND, M_FPS, M_FREEZE, M_HEALTH, M_PPS, M_REELECT, M_RTT, M_SENT, M_STALE, M_UNDERRUN)
 
 HS, HE, JOIN, STEP = 1000.0, 1600.0, 940.0, 15
 BOT_HEALTH_INTERVAL_S = 5
@@ -134,7 +134,8 @@ class World:
             seen.append((url, query, dict(headers)))
             if query.startswith("count by (from_peer)"):
                 return json.dumps(self.reporters_payload(query)).encode()
-            payload = self.payload(query.removeprefix("min_over_time(").split("{", 1)[0])
+            payload = self.payload("_cfs" if "container_cpu_cfs_periods_total" in query
+                                   else query.removeprefix("min_over_time(").split("{", 1)[0])
             if query.startswith("min_over_time("):
                 payload = self.payload(M_PPS)
             for label, raw in re.findall(r'(\w+)="((?:[^"\\]|\\.)*)"', query):
@@ -160,6 +161,8 @@ def healthy_world(observers, talkers, rust_extra=0, audio_expand=0.0, fps=30.0, 
         for t in talkers:
             w.pair(M_PPS, o, sess(t), 50)
             w.pair(M_EXPAND, o, sess(t), audio_expand)
+            w.pair(M_DISCARDS, o, sess(t), 0)
+            w.pair(M_UNDERRUN, o, sess(t), 0)
         for u in observers + talkers:
             if u != o:
                 w.pair(M_FPS, o, sess(u), fps)
@@ -234,6 +237,13 @@ class ManifestValidatorTest(unittest.TestCase):
         errs = self.errors_for(bad)
         self.assertIn("unknown step_id 'nope'", errs)
         self.assertIn("unsupported major version", errs)
+
+    def test_recorded_transport_fields_are_checked(self):
+        def bad(m):
+            m["participants"][0].update(transport_observed="quic", transport_fallbacks=-1)
+        errs = self.errors_for(bad)
+        self.assertIn("transport_observed: must be one of", errs)
+        self.assertIn("transport_fallbacks: must be a non-negative integer", errs)
 
     def test_enum_checked(self):
         def bad(m):
@@ -536,6 +546,9 @@ class BlockerRegressionTest(unittest.TestCase):
         m, w = self.run_world()
         s2 = sess("o02", 2)
         mid = HS + 20 * STEP
+        for x in w.series[M_SENT]:
+            if x["metric"]["session_id"] == sess("o02"):
+                x["values"] = [v for v in x["values"] if v[0] <= mid + STEP]
         w.presence("o02", s2, mid, HE)
         w.add(M_REELECT, {"session_id": s2, "result": "proceeded"}, 1, lo=mid)
         r = score(m, w)
@@ -801,6 +814,49 @@ class TeamDecisionTest(unittest.TestCase):
             with open(os.path.join(tmp, "report.md"), encoding="utf-8") as fh:
                 return rc, err, read_json(os.path.join(tmp, "result.json")), fh.read()
 
+    def test_t8_short_identities_in_structured_fields_are_pseudonymised(self):
+        users = ["Li", "bob@example.com"]
+        w = healthy_world(users, [], audio_expand=0.0)
+        w.pair(M_PPS, users[0], sess(users[1]), 50)
+        w.add(M_RTT, {"peer_id": "Li", "session_id": sess("Li"), "server_type": "webtransport"}, 40, hi=HS)
+        w.add(M_RTT, {"peer_id": "Li", "session_id": "777", "server_type": "websocket"}, 40, lo=HS + STEP)
+        w.add(cq_score.M_PEER_INFO, {"peer_id": "Li", "session_id": "777"}, 1)
+        w.add("videocall_relay_connection_rtt_ms", {"room": "scale-t1", "session_id": sess("Li")}, 280)
+        for lst in w.series.values():
+            for x in lst:
+                for k, v in list(x["metric"].items()):
+                    if v == sess("Li"):
+                        x["metric"][k] = "42"
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, _ = main_with_stderr(["--meeting", "scale-t1", "--window", f"{HS},{HE}", "--prom-url",
+                                      "http://prom.invalid", "--out-dir", tmp], transport=w.transport([]), environ={})
+            self.assertEqual(rc, 0)
+            result = read_json(os.path.join(tmp, "result.json"))
+            with open(os.path.join(tmp, "report.md"), encoding="utf-8") as fh:
+                report = fh.read()
+        step = result["steps"][0]
+        self.assertTrue(result["run"]["pseudonymised"])
+        self.assertTrue(step["transport_timeline"] and step["server_diagnostics"]["quic"]["by_user"])
+        blob = json.dumps(result)
+        self.assertIn(" <- ", step["diagnostics"]["max_staleness_pair"])
+        self.assertTrue([f for f in step["flags"] if "transport switched" in f])
+        for raw in ('"Li"', '"42"', '"Li <- ', ' <- Li"', '"Li: '):
+            self.assertNotIn(raw, blob)
+        for raw in ("| Li ", "| 42 "):
+            self.assertNotIn(raw, report)
+
+    def test_t8_a_session_seen_only_as_a_publisher_is_pseudonymised(self):
+        m, w, _ = self.world()
+        ghost = "88888"
+        for value in (50, 40):
+            w.pair(M_PPS, "o00", ghost, value)
+        data = w.data()
+        r = cq_score.score_step(m, m["steps"][0], data, cq_score.load_config())
+        self.assertIn(ghost, r["diagnostics"]["unknown_publisher_sessions"])
+        self.assertIn(ghost, gate(r, "G-Q8", "quality_gates")["detail"])
+        out = cq_privacy.pseudonymise(r, cq_privacy.identities_to_hide(m, {"s1": data}, real=False), b"salt")
+        self.assertNotIn(ghost, json.dumps(out))
+
     def test_t7_g_v1_counts_session_level_bot_health_at_5_s(self):
         obs = [f"o{i:02d}" for i in range(10)]
         viewers = [f"v{i}" for i in range(4)]
@@ -843,7 +899,8 @@ class TeamDecisionTest(unittest.TestCase):
         data = w.data()
         r = cq_score.score_step(m, m["steps"][0], data, cq_score.load_config())
         hidden = cq_privacy.identities_to_hide(m, {"s1": data}, real=False)
-        self.assertEqual(hidden, {"intruder@example.com"})
+        sessions = {lb[k] for series in data.values() for lb, _ in series for k in ("session_id", "to_peer") if lb.get(k)}
+        self.assertEqual(hidden, {"intruder@example.com"} | sessions)
         out = cq_privacy.pseudonymise(r, hidden, b"salt")
         detail = gate(out, "G-V8")["detail"]
         self.assertNotIn("intruder@example.com", detail)
@@ -1428,7 +1485,6 @@ class Review2963Test(unittest.TestCase):
             verdict = os.path.join(tmp, "v.json")
             with open(verdict, "w") as fh:
                 json.dump([1], fh)
-            m = cq_manifest.load_manifest(EXAMPLE)
             rc, err = main_with_stderr(["--manifest", EXAMPLE, "--prom-url", "http://prom.invalid",
                                         "--generator-verdict", verdict], transport=World().transport([]), environ={})
         self.assertEqual(rc, cli.EXIT_ERROR, err)
@@ -2137,7 +2193,7 @@ class GateKnobAndSeriesClassTest(unittest.TestCase):
         cfg = cq_score.load_config()
         stricter_is_lower = {"k_red_fail", "split_rate_red", "expand_ops_full_scale", "drop_gap_s", "rejoin_grace_s",
                              "health_reports_max_ratio", "per_talker_A_red"}
-        stricter_is_higher = {"health_reports_min_ratio", "n_min_observers"}
+        stricter_is_higher = {"health_reports_min_ratio", "n_min_observers", "discard_weight", "playout_underrun_weight"}
         fixed = {"scrape_step_s", "browser_health_interval_s", "nominal_talker_pps", "join_deadline_s"}
         self.assertEqual({k for _, k in cq_score.CONFIG_BOUNDS}, stricter_is_lower | stricter_is_higher | fixed)
         for (group, key), (lo, hi) in cq_score.CONFIG_BOUNDS.items():
@@ -2688,6 +2744,1034 @@ class ConfigAndQueryTest(unittest.TestCase):
         pair = [q for name, q, _, _ in queries if name in cq_score.PAIR_METRICS]
         self.assertEqual(len(pair), len(cq_score.PAIR_METRICS))
         self.assertTrue(all('from_peer=~"probe-000@bots-app\\\\.local"' in q for q in pair))
+
+
+
+AUDIO_FIXTURES = os.path.join(HERE, "testdata", "audio_stalls_20261026")
+
+
+def fixture_step(run, cfg=None):
+    with open(os.path.join(AUDIO_FIXTURES, f"{run}.json"), encoding="utf-8") as fh:
+        doc = json.load(fh)
+    w = World()
+    for name, payload in doc["payloads"].items():
+        w.series[name] = payload["data"]["result"]
+    for u, sid in {**doc["observers"], **doc["bots"]}.items():
+        w.add(M_SENT, {"peer_id": u, "session_id": sid}, 50, *doc["hold"])
+    parts = [dict(part(u), publishes={"camera": False, "mic": False, "screen": False}) for u in doc["observers"]]
+    parts += [dict(part(b, "rust", False, b in doc["talkers"]),
+                   publishes={"camera": True, "mic": b in doc["talkers"], "screen": False}) for b in doc["bots"]]
+    m = manifest(parts)
+    m["steps"][0]["hold_end"] = doc["hold"][1]
+    return cq_score.score_step(m, m["steps"][0], w.data(), cfg or cq_score.load_config())
+
+
+def report_of(r):
+    return cq_report.render_markdown({"run": {"meeting_id": "m", "mode": "run", "bands_version": "b", "commit": "c",
+                                              "scrape_step_s": 15}, "verdict": r["verdict"], "headline_step": "s1",
+                                      "steps": [r]})
+
+
+def a_of(r, user):
+    return r["cells"]["UxU"]["participants"][user]["A"]
+
+
+class AudioStallTest(unittest.TestCase):
+    OBS = [f"o{i:02d}" for i in range(10)]
+
+    def world(self):
+        m = manifest([part(o) for o in self.OBS] + [part("t1", "rust", False, True)])
+        return m, healthy_world(self.OBS, ["t1"])
+
+    def bump(self, w, name, recv, at, amount, cause=None):
+        for s in w.series[name]:
+            if s["metric"]["from_peer"] == recv and (cause is None or s["metric"].get("cause") == cause):
+                s["values"] = [[ts, str(float(v) + (amount if ts >= at else 0))] for ts, v in s["values"]]
+
+    def test_discarded_packets_add_their_duration_to_that_observers_a_only(self):
+        m, w = self.world()
+        before = score(m, w)
+        self.bump(w, M_DISCARDS, "o01", HS + 10 * STEP, 40)
+        after = score(m, w)
+        self.assertAlmostEqual(a_of(after, "o01") - a_of(before, "o01"), 40 * 20 / 15000 / 41)
+        self.assertEqual([a_of(after, o) for o in self.OBS if o != "o01"],
+                         [a_of(before, o) for o in self.OBS if o != "o01"])
+        self.assertAlmostEqual(after["cells"]["UxU"]["participants"]["o01"]["A_terms"]["discarded"],
+                               40 * 20 / 15000 / 41)
+
+    def test_playout_silence_adds_to_concealment_and_can_turn_g_q3_red(self):
+        m, w = self.world()
+        self.bump(w, M_UNDERRUN, "o02", HS + 10 * STEP, 1500)
+        r = score(m, w)
+        self.assertAlmostEqual(a_of(r, "o02"), 0.1 / 41)
+        self.assertEqual(gate(r, "G-Q3", "quality_gates")["status"], "pass")
+        for o in self.OBS[:3]:
+            for k in range(3):
+                self.bump(w, M_UNDERRUN, o, HS + (11 + k) * STEP, 15000)
+        self.assertEqual(gate(score(m, w), "G-Q3", "quality_gates")["status"], "fail")
+
+    def test_playout_silence_is_added_to_concealment_not_maxed_and_capped_at_one(self):
+        m = manifest([part(o) for o in self.OBS] + [part("t1", "rust", False, True)])
+        w = healthy_world(self.OBS, ["t1"], audio_expand=10)
+        self.bump(w, M_UNDERRUN, "o01", HS + 10 * STEP, 1500)
+        self.bump(w, M_UNDERRUN, "o02", HS + 10 * STEP, 15000)
+        r = score(m, w)
+        self.assertAlmostEqual(a_of(r, "o01"), (40 * 0.1 + 0.2) / 41)
+        self.assertAlmostEqual(a_of(r, "o02"), (40 * 0.1 + 1.0) / 41)
+
+    def test_discards_count_only_beyond_the_concealment_and_silence_of_their_bucket(self):
+        m = manifest([part(o) for o in self.OBS] + [part("t1", "rust", False, True)])
+        w = healthy_world(self.OBS, ["t1"], audio_expand=10)
+        self.bump(w, M_DISCARDS, "o01", HS + 10 * STEP, 60)
+        self.bump(w, M_DISCARDS, "o02", HS + 10 * STEP, 150)
+        self.bump(w, M_UNDERRUN, "o03", HS + 10 * STEP, 1500)
+        self.bump(w, M_DISCARDS, "o03", HS + 10 * STEP, 150)
+        r = score(m, w)
+        self.assertAlmostEqual(a_of(r, "o01"), 41 * 0.1 / 41)
+        self.assertAlmostEqual(a_of(r, "o02"), (40 * 0.1 + 0.2) / 41)
+        self.assertAlmostEqual(a_of(r, "o03"), (40 * 0.1 + 0.2) / 41)
+
+    def test_an_absent_counter_is_not_measured_never_zero(self):
+        m, w = self.world()
+        base = score(m, w)
+        w.series[M_UNDERRUN] = [s for s in w.series[M_UNDERRUN] if s["metric"]["from_peer"] != "o03"]
+        r = score(m, w)
+        self.assertEqual(r["diagnostics"]["audio_counter_coverage"]["o03"],
+                         {"UxU": {"discarded audio": [1, 1], "playout silence": [0, 1]}})
+        self.assertIn("dimension A: playout silence measured for 9 of 10 observer-talker pairs; A leaves it out where "
+                      "it is missing", r["notices"])
+        self.assertIn("| o03 | 0 | 0 | 0 | 0 | not measured | 0 |", report_of(r))
+        self.assertEqual(a_of(r, "o03"), a_of(base, "o03"))
+        self.assertEqual(gate(r, "G-Q8", "quality_gates")["status"], "pass")
+
+    def test_one_talker_short_reads_as_partial_coverage(self):
+        m = manifest([part(o) for o in self.OBS] + [part("t1", "rust", False, True), part("t2", "rust", False, True)])
+        w = healthy_world(self.OBS, ["t1", "t2"])
+        w.series[M_DISCARDS] = [x for x in w.series[M_DISCARDS]
+                                if (x["metric"]["from_peer"], x["metric"]["to_peer"]) != ("o05", sess("t2"))]
+        r = score(m, w)
+        self.assertEqual(r["diagnostics"]["audio_counter_coverage"]["o05"]["UxU"]["discarded audio"], [1, 2])
+        self.assertIn("dimension A: discarded audio measured for 19 of 20 observer-talker pairs; A leaves it out where "
+                      "it is missing", r["notices"])
+        self.assertIn("| o05 | 0 | 0 | 0 | 0 (1/2 talkers) | 0 | 0 |", report_of(r))
+
+    def test_coverage_is_scoped_to_the_cell_it_is_shown_in(self):
+        m = manifest([part(o) for o in self.OBS] + [part("t1", "rust", False, True),
+                                                     part("t2", "rust", False, True, shaped=True)])
+        w = healthy_world(self.OBS, ["t1", "t2"])
+        w.series[M_DISCARDS] = [x for x in w.series[M_DISCARDS] if x["metric"]["to_peer"] != sess("t2")]
+        r = score(m, w)
+        self.assertEqual(r["diagnostics"]["audio_counter_coverage"]["o05"]["UxS"]["discarded audio"], [0, 1])
+        text = report_of(r)
+        shaped, unshaped = text.split("**UxS**")[1].split("**UxU**")
+        self.assertIn("| o05 | 0 | 0 | 0 | 0 | 0 | 0 |", unshaped)
+        self.assertIn("| o05 | 0 | 0 | 0 | not measured | 0 | 0 |", shaped)
+
+    def test_a_real_meeting_shows_no_mechanism_table(self):
+        m, w = self.world()
+        r = score(m, w, mode="real")
+        self.assertFalse([p for c in r["cells"].values() for p in c["participants"].values() if "A_terms" in p])
+        self.assertNotIn("Dimension A by mechanism", report_of(r))
+
+    def test_a_reconnect_books_the_lower_reading_and_lists_what_the_upper_adds(self):
+        for second, booked, unproven in ((15, 15, [f"o04 <- t1: {M_DISCARDS} continuation or rebuild (10)"]),
+                                         (3, 13, []), (0, 10, [])):
+            with self.subTest(second=second):
+                m, w = self.world()
+                self.bump(w, M_DISCARDS, "o04", HS + 5 * STEP, 10)
+                w.new_session("o04", HS + 20 * STEP)
+                for x in w.series[M_DISCARDS]:
+                    if x["metric"]["session_id"] == sess("o04", 2):
+                        x["values"] = [[ts, str(second)] for ts, _ in x["values"]]
+                r = score(m, w)
+                self.assertAlmostEqual(r["cells"]["UxU"]["participants"]["o04"]["A_terms"]["discarded"],
+                                       booked * 20 / 15000 / 41)
+                self.assertEqual(r["diagnostics"]["counter_lineage_unproven"], unproven)
+                self.assertEqual(r["uncertain_gates"], [])
+
+    def baseline_world(self, before, who=("o04",)):
+        m, w = self.world()
+        for x in w.series[M_DISCARDS]:
+            if x["metric"]["from_peer"] in who:
+                x["values"] = [[ts, str(before if ts < HS + 10 * STEP else before + 30)] for ts, _ in x["values"]
+                               if ts > HS]
+        return m, w
+
+    def test_two_kept_changes_continue_from_the_largest_earlier_value(self):
+        m, w = self.world()
+        self.bump(w, M_DISCARDS, "o04", HS + 5 * STEP, 10)
+        w.new_session("o04", HS + 15 * STEP, n=2)
+        w.new_session("o04", HS + 25 * STEP, n=3, prev=2)
+        for x in w.series[M_DISCARDS]:
+            if x["metric"]["session_id"] in (sess("o04", 2), sess("o04", 3)):
+                x["values"] = [[ts, "20"] for ts, _ in x["values"]]
+        r = score(m, w)
+        self.assertAlmostEqual(r["cells"]["UxU"]["participants"]["o04"]["A_terms"]["discarded"], 20 * 20 / 15000 / 41)
+
+    def test_a_counter_without_a_baseline_books_nothing_until_its_next_sample(self):
+        m, w = self.baseline_world(100)
+        r = score(m, w)
+        self.assertAlmostEqual(r["cells"]["UxU"]["participants"]["o04"]["A_terms"]["discarded"], 30 * 20 / 15000 / 41)
+        self.assertEqual(r["diagnostics"]["counter_lineage_unproven"], [f"o04 <- t1: {M_DISCARDS} baseline (100)"])
+        self.assertEqual((r["verdict"], r["uncertain_gates"]), ("PASS", []))
+
+    def test_a_gate_the_two_readings_disagree_on_is_uncertain_and_blocks_a_pass(self):
+        m, w = self.baseline_world(3000, ("o03", "o04"))
+        m["steps"][0]["hold_end"] = HS + 12 * STEP
+        for x in w.series[M_HEALTH]:
+            x["values"] = [v for v in x["values"] if v[0] <= HS + 12 * STEP]
+        r = score(m, w)
+        self.assertEqual((gate(r, "G-Q3", "quality_gates")["status"], r["uncertain_gates"]), ("uncertain", ["G-Q3"]))
+        self.assertEqual((r["verdict"], r["invalid_reasons"]), ("INVALID", ["G-Q3"]))
+        self.assertNotIn("Blocking unmeasured gates", report_of(r))
+
+    def test_a_fail_under_both_readings_stands(self):
+        m, w = self.world()
+        for o in ("o00", "o01", "o02"):
+            self.bump(w, M_UNDERRUN, o, HS + 5 * STEP, 20)
+            w.new_session(o, HS + 20 * STEP)
+            for x in w.series[M_UNDERRUN]:
+                if x["metric"]["session_id"] == sess(o, 2):
+                    x["values"] = [[ts, str(20 + 15000 * min(3, max(0, (ts - HS) // STEP - 19)))]
+                                   for ts, _ in x["values"]]
+        r = score(m, w)
+        self.assertEqual((gate(r, "G-Q3", "quality_gates")["status"], r["verdict"]), ("fail", "FAIL"))
+        self.assertEqual(r["invalid_reasons"], [])
+
+    def test_discard_causes_are_separate_counters_added_after_their_increase(self):
+        m, w = self.world()
+        for s in list(w.series[M_DISCARDS]):
+            s["metric"]["cause"] = "smart_flush"
+            w.series[M_DISCARDS].append({"metric": dict(s["metric"], cause="resync_to_live"),
+                                         "values": [[ts, "0"] for ts, _ in s["values"]][::2]})
+        self.bump(w, M_DISCARDS, "o05", HS + 10 * STEP, 10, "resync_to_live")
+        r = score(m, w)
+        self.assertEqual(gate(r, "G-Q8", "quality_gates")["status"], "pass")
+        self.assertAlmostEqual(r["cells"]["UxU"]["participants"]["o05"]["A_terms"]["discarded"], 10 * 20 / 15000 / 41)
+
+    def test_tiles_that_froze_in_one_bucket_count_and_spread_freezes_do_not(self):
+        def freezes(starts):
+            m = manifest([part("o1")] + [part(p, "rust", False) for p in ("p1", "p2", "p3", "p4")])
+            w = World()
+            for u in ("o1", "p1", "p2", "p3", "p4"):
+                w.presence(u)
+            for p, start in zip(("p1", "p2", "p3"), starts):
+                w.pair(M_FPS, "o1", sess(p), 25)
+                w.pair(M_FREEZE, "o1", sess(p), lambda t, start=start: 2.0 * (t >= start))
+            w.pair(M_FPS, "o1", sess("p4"), 0)
+            w.pair(M_FREEZE, "o1", sess("p4"), lambda t: t - HS)
+            return score(m, w)["diagnostics"]["correlated_freeze"]["o1"]
+        cf = freezes([HS + 10 * STEP] * 3)
+        self.assertEqual((cf["buckets_froze_together"], cf["freeze_s_in_those_buckets"]), ([HS + 10 * STEP], 6.0))
+        cf = freezes([HS + k * STEP for k in (20, 21, 22)])
+        self.assertEqual((cf["buckets_froze_together"], cf["max_share_frozen"]), ([], 1 / 3))
+
+    def test_delay_diagnostics_are_reported_and_change_no_gate(self):
+        m, w = self.world()
+        base = score(m, w)
+        for o in self.OBS:
+            w.pair(cq_score.M_BUFFER, o, sess("t1"), lambda t: 800 if t > HS + 20 * STEP else 100)
+            w.pair(cq_score.M_TARGET, o, sess("t1"), lambda t: 300 if t > HS + 20 * STEP else 120)
+            w.pair(cq_score.M_ACCEL, o, sess("t1"), 4)
+        r = score(m, w)
+        self.assertEqual(r["diagnostics"]["audio_delay"]["o00"],
+                         {"buffer_ms_p95": 800, "target_delay_at_cap_share": 20 / 41, "accelerate_ops_per_sec_mean": 4.0})
+        self.assertEqual((r["verdict"], r["validity"], r["quality_gates"]),
+                         (base["verdict"], base["validity"], base["quality_gates"]))
+
+    def test_the_report_states_the_resolution_and_the_split(self):
+        m, w = self.world()
+        self.bump(w, M_DISCARDS, "o01", HS + 10 * STEP, 40)
+        r = score(m, w)
+        text = cq_report.render_markdown({"run": {"meeting_id": "m", "mode": "run", "bands_version": "b", "commit": "c",
+                                                  "scrape_step_s": 15}, "verdict": r["verdict"],
+                                          "headline_step": "s1", "steps": [r]})
+        self.assertIn("1 s NetEQ windows read once per 15 s scrape, so dimension A sees 1 s in 15", text)
+        self.assertIn("a pair missing from a receiver whose per-peer stats are at the cap", text)
+        self.assertIn("| o01 | 0.001301 | 0 | 0 | 0.001301 | 0 | 0 |", text)
+        self.assertIn("### Video tiles that froze together", text)
+        self.assertIn("### Audio jitter-buffer delay", text)
+
+    def test_per_receiver_audio_diagnostics_are_pseudonymised(self):
+        human = "someone@example.com"
+        m = manifest([part(human), part("t1", "rust", False, True)])
+        w = healthy_world([human], ["t1"])
+        w.pair(cq_score.M_BUFFER, human, sess("t1"), 100)
+        w.series[M_UNDERRUN] = []
+        hidden = cq_privacy.pseudonymise(score(m, w), {human}, b"salt")
+        self.assertNotIn(human, json.dumps(hidden["diagnostics"]))
+
+    def test_diagnostic_thresholds_are_validated(self):
+        for key, bad in (("correlated_freeze_share", 0), ("correlated_freeze_share", 1.5),
+                         ("correlated_freeze_min_pairs", 0), ("correlated_freeze_min_pairs", 2.5),
+                         ("target_delay_cap_ms", 0), ("target_delay_cap_ms", True)):
+            cfg = cq_score.load_config()
+            cfg["diagnostics"][key]["value"] = bad
+            with self.subTest(key=key, bad=bad), self.assertRaises(cq_score.ConfigError):
+                cq_score.validate_config(cfg)
+
+    def test_the_26_oct_hcl_daily_runs(self):
+        want = {"20261026T1200Z": (0.3012, 0.1117), "20261026T1212Z": (0.0042, 0.0508),
+                "20261026T1217Z": (0.0423, 0.0178), "20261026T1221Z": (0.2778, 0.3622)}
+        for run, (tab, probe) in want.items():
+            with self.subTest(run=run):
+                r = fixture_step(run)
+                self.assertAlmostEqual(a_of(r, "human-tab"), tab, places=4)
+                self.assertAlmostEqual(a_of(r, "probe"), probe, places=4)
+                self.assertEqual({u: c["UxU"]["playout silence"][0]
+                                  for u, c in r["diagnostics"]["audio_counter_coverage"].items()},
+                                 {"human-tab": 0, "probe": 0})
+        small = fixture_step("20261026T1212Z")
+        self.assertEqual(gate(small, "G-Q3", "quality_gates")["status"], "pass")
+        self.assertEqual(small["cells"]["UxU"]["participants"]["probe"]["A_terms"]["discarded"], 0)
+        self.assertEqual(small["diagnostics"]["correlated_freeze"]["human-tab"]["buckets_froze_together"], [1015.0])
+        self.assertEqual(small["diagnostics"]["audio_delay"]["probe"]["target_delay_at_cap_share"], 1.0)
+
+
+
+class CounterSessionTest(unittest.TestCase):
+    def freeze_world(self, pubs=("p1",)):
+        m = manifest([part("o1")] + [part(p, "rust", False) for p in pubs])
+        w = World()
+        for u in ("o1",) + tuple(pubs):
+            w.presence(u)
+        for p in pubs:
+            w.pair(M_FPS, "o1", sess(p), 25)
+        return m, w
+
+    def handover(self, w, pubs, at, value, old=None):
+        """The receiver moves to a new session at `at`; its decoders report `value(pub)` there."""
+        w.presence("o1", sess("o1", 2), at, HE)
+        for p in pubs:
+            if old:
+                for x in w.series[M_FREEZE]:
+                    if x["metric"]["to_peer"] == sess(p):
+                        x["values"] = [[t, str(old(t))] for t, _ in x["values"] if t <= at]
+            w.pair(M_FREEZE, "o1", sess(p), value(p), recv_session=sess("o1", 2), lo=at)
+
+    def test_v_freeze_continues_on_the_lower_reading_and_a_zero_prior_is_proven(self):
+        for before, second, booked, unproven in ((4.0, 6.0, 6.0, [f"o1 <- p1: {M_FREEZE} continuation or rebuild (4)"]),
+                                                 (4.0, 1.0, 5.0, []), (0.0, 1.0, 1.0, [])):
+            with self.subTest(before=before, second=second):
+                m, w = self.freeze_world()
+                w.pair(M_FREEZE, "o1", sess("p1"), lambda t, b=before: b * (t >= HS + 5 * STEP))
+                self.handover(w, ("p1",), HS + 20 * STEP, lambda p, v=second: v)
+                r = score(m, w)
+                self.assertEqual(r["diagnostics"]["max_freeze_seconds_pair"], booked)
+                self.assertEqual(r["diagnostics"]["counter_lineage_unproven"], unproven)
+
+    def test_v_is_uncertain_when_only_the_upper_reading_crosses_red(self):
+        m, w = self.freeze_world()
+        w.pair(M_FREEZE, "o1", sess("p1"), lambda t: 30.0 * (t >= HS))
+        self.handover(w, ("p1",), HS + 20 * STEP, lambda p: 30.0)
+        r = score(m, w)
+        self.assertEqual(r["uncertain_gates"], ["G-Q4"])
+
+    def test_an_unknown_earlier_value_in_the_chain_is_not_a_proven_rebuild(self):
+        m, w = self.freeze_world()
+        at = HS + 20 * STEP
+        for n, lo, value in ((2, at, 5.0), (3, at + 2 * STEP, 7.0)):
+            w.presence("o1", sess("o1", n), lo=at)
+            w.pair(M_FREEZE, "o1", sess("p1"), value, recv_session=sess("o1", n), lo=lo)
+        self.assertEqual(score(m, w)["diagnostics"]["counter_lineage_unproven"],
+                         [f"o1 <- p1: {M_FREEZE} continuation or rebuild (5)"] * 2)
+
+    def test_the_handover_scrape_keeps_the_old_sessions_final_increase(self):
+        m, w = self.freeze_world()
+        at = HS + 20 * STEP
+        w.pair(M_FREEZE, "o1", sess("p1"), lambda t: 6.0 * (t >= at))
+        self.handover(w, ("p1",), at, lambda p: 0.0)
+        r = score(m, w)
+        self.assertEqual(r["diagnostics"]["max_freeze_seconds_pair"], 6.0)
+        self.assertEqual(r["diagnostics"]["counter_lineage_unproven"], [])
+
+    def test_a_replaced_sessions_later_increase_is_reported_not_booked(self):
+        m, w = self.freeze_world()
+        w.pair(M_FREEZE, "o1", sess("p1"), lambda t: 4.0 * (t >= HS + 5 * STEP) + 9.0 * (t >= HS + 25 * STEP))
+        w.presence("o1", sess("o1", 2), HS + 20 * STEP, HE)
+        w.pair(M_FREEZE, "o1", sess("p1"), 0.0, recv_session=sess("o1", 2), lo=HS + 20 * STEP)
+        r = score(m, w)
+        self.assertEqual(r["diagnostics"]["max_freeze_seconds_pair"], 4.0)
+        self.assertEqual(r["diagnostics"]["counter_lineage_unproven"],
+                         [f"o1 <- p1: {M_FREEZE} after a later session started (9)"])
+
+    def publisher_rejoins(self, old_after):
+        """p1 rejoins at `at`; o1's decoder for p1's new session reports 3 s, the old one 2 s then `old_after`."""
+        m, w = self.freeze_world()
+        at = HS + 20 * STEP
+        w.series[M_SENT] = [x for x in w.series[M_SENT] if x["metric"]["peer_id"] != "p1"]
+        w.presence("p1", hi=at)
+        w.presence("p1", sess("p1", 2), at, HE)
+        w.pair(M_FREEZE, "o1", sess("p1"), lambda t: 2.0 * (t >= HS + 5 * STEP) + old_after * (t > at + STEP))
+        w.pair(M_FREEZE, "o1", sess("p1", 2), 3.0, lo=at + STEP)
+        return score(m, w)["diagnostics"]
+
+    def test_a_publishers_new_session_books_its_counter_from_zero(self):
+        d = self.publisher_rejoins(0.0)
+        self.assertEqual((d["max_freeze_seconds_pair"], d["counter_lineage_unproven"]), (5.0, []))
+
+    def test_a_publishers_old_session_increase_after_its_new_session_is_reported_not_booked(self):
+        d = self.publisher_rejoins(4.0)
+        self.assertEqual((d["max_freeze_seconds_pair"], d["counter_lineage_unproven"]),
+                         (5.0, [f"o1 <- p1: {M_FREEZE} after a later session started (4)"]))
+
+    def test_a_series_first_sampled_at_hold_start_has_a_known_baseline(self):
+        m, w = self.freeze_world()
+        w.pair(M_FREEZE, "o1", sess("p1"), lambda t: 4.0 + 2.0 * (t >= HS + 5 * STEP))
+        d = score(m, w)["diagnostics"]
+        self.assertEqual((d["max_freeze_seconds_pair"], d["counter_lineage_unproven"]), (2.0, []))
+
+    def test_a_bucket_at_exactly_the_share_froze_together(self):
+        pubs = ("p1", "p2", "p3", "p4", "p5")
+        m, w = self.freeze_world(pubs)
+        for p in pubs[:4]:
+            w.pair(M_FREEZE, "o1", sess(p), lambda t: 1.0 * (t >= HS + 5 * STEP))
+        w.pair(M_FREEZE, "o1", sess("p5"), 0.0)
+        cf = score(m, w)["diagnostics"]["correlated_freeze"]["o1"]
+        self.assertEqual(cf["buckets_froze_together"], [HS + 5 * STEP])
+
+    def test_retained_freeze_totals_make_no_tiles_froze_together_bucket(self):
+        pubs = ("p1", "p2", "p3")
+        for value, together in ((lambda p: 2.0, []), (lambda p: 0.5, [HS + 20 * STEP])):
+            with self.subTest(together=together):
+                m, w = self.freeze_world(pubs)
+                for p in pubs:
+                    w.pair(M_FREEZE, "o1", sess(p), lambda t: 2.0 * (t >= HS + 5 * STEP))
+                self.handover(w, pubs, HS + 20 * STEP, value)
+                cf = score(m, w)["diagnostics"]["correlated_freeze"]["o1"]
+                self.assertEqual(cf["buckets_froze_together"], [HS + 5 * STEP] + together)
+
+    def reelect_world(self, before, first_after, then=None):
+        m = manifest([part("o1"), part("t1", "rust", False, True)])
+        w = World()
+        mid = HS + 20 * STEP
+        w.presence("o1", sess("o1", 1), JOIN, mid)
+        w.presence("o1", sess("o1", 2), mid + STEP, HE)
+        w.presence("t1")
+        w.add(M_REELECT, {"session_id": sess("o1", 1), "result": "proceeded"}, before, JOIN, mid)
+        w.add(M_REELECT, {"session_id": sess("o1", 2), "result": "proceeded"},
+              lambda t: first_after if then is None or t < HE - 10 * STEP else then, mid + STEP)
+        return score(m, w)["stability"]["o1"]
+
+    def test_a_page_wide_reelection_count_is_not_booked_again_by_a_new_session(self):
+        st = self.reelect_world(1, 1)
+        self.assertEqual((st["migrations"], st["unplanned_reconnects"]), (0, 1))
+        self.assertGreater(st["S"], 0)
+
+    def test_reelections_after_the_session_change_still_count(self):
+        self.assertEqual(self.reelect_world(1, 1, then=2)["migrations"], 1)
+        self.assertEqual(self.reelect_world(3, 1)["migrations"], 1)
+
+
+    def test_a_failed_reelection_in_an_older_concurrent_tab_is_counted(self):
+        m, w = Review2963Test().base()
+        newer = sess("o04", 2)
+        w.presence("o04", newer, lo=HS - 30)
+        w.add(M_REELECT, {"session_id": newer, "result": "failed"}, 1, lo=HS - 30)
+        w.add(M_REELECT, {"session_id": sess("o04"), "result": "failed"}, 1, lo=HS + 10 * STEP)
+        r = score(m, w)
+        self.assertEqual((r["stability"]["o04"]["reelection_failed"], r["verdict"]), (1, "FAIL"))
+
+    def tied(self, result, loud=()):
+        m, w = Review2963Test().base()
+        for x in w.series[M_EXPAND]:
+            if x["metric"]["from_peer"] in loud:
+                x["values"] = [[ts, "100"] for ts, _ in x["values"]]
+        at = HS + 20 * STEP
+        for x in w.series[M_SENT]:
+            if x["metric"]["session_id"] == sess("o04"):
+                x["values"] = [v for v in x["values"] if v[0] <= at]
+        for n, hi in ((2, at + STEP), (3, HE)):
+            w.presence("o04", sess("o04", n), lo=at, hi=hi)
+            w.add(M_REELECT, {"session_id": sess("o04", n), "result": result}, 1, lo=at, hi=hi)
+        return score(m, w)
+
+    def test_tied_sessions_leave_reelections_unproven(self):
+        r = self.tied("proceeded")
+        self.assertEqual(r["stability"]["o04"]["migrations"], 0)
+        self.assertEqual(gate(r, "G-Q9", "quality_gates")["status"], "uncertain")
+        self.assertNotEqual(r["verdict"], "PASS")
+        self.assertEqual(gate(self.tied("failed"), "G-Q2", "quality_gates")["status"], "uncertain")
+
+    def test_a_proven_fail_stands_beside_uncertain_gates(self):
+        r = self.tied("proceeded", loud=("o00", "o01"))
+        self.assertEqual(gate(r, "G-Q3", "quality_gates")["status"], "fail")
+        self.assertEqual((r["verdict"], r["invalid_reasons"]), ("FAIL", []))
+        self.assertIn("G-Q9", r["uncertain_gates"])
+        self.assertIn("Uncertain gates", report_of(r))
+
+    def test_a_long_overlap_is_concurrent_not_a_replacement(self):
+        m, w = Review2963Test().base()
+        mid = HS + 20 * STEP
+        w.add(M_REELECT, {"session_id": sess("o04"), "result": "proceeded"}, 1, lo=JOIN)
+        w.presence("o04", sess("o04", 2), lo=mid)
+        w.add(M_REELECT, {"session_id": sess("o04", 2), "result": "proceeded"}, 1, lo=mid)
+        self.assertIn("o04: re-election proceeded not provably from this hold (1)",
+                      score(m, w)["diagnostics"]["counter_lineage_unproven"])
+
+    def test_a_concurrent_tab_count_above_the_first_value_is_not_its_continuation(self):
+        m, w = Review2963Test().base()
+        mid = HS + 20 * STEP
+        w.add(M_REELECT, {"session_id": sess("o04"), "result": "proceeded"}, 3, lo=JOIN)
+        w.presence("o04", sess("o04", 2), lo=mid)
+        w.add(M_REELECT, {"session_id": sess("o04", 2), "result": "proceeded"}, 1, lo=mid)
+        self.assertEqual(score(m, w)["diagnostics"]["counter_lineage_unproven"], [])
+
+    def test_a_count_present_from_a_lone_sessions_first_report_is_unproven(self):
+        m, w = Review2963Test().base()
+        mid = HS + 20 * STEP
+        w.series[M_SENT] = [x for x in w.series[M_SENT] if x["metric"]["peer_id"] != "o04"]
+        w.presence("o04", sess("o04", 2), lo=mid)
+        w.add(M_REELECT, {"session_id": sess("o04", 2), "result": "proceeded"}, 1, lo=mid)
+        self.assertIn("o04: re-election proceeded not provably from this hold (1)",
+                      score(m, w)["diagnostics"]["counter_lineage_unproven"])
+
+    def test_results_do_not_depend_on_series_order(self):
+        import random
+
+        def storm():
+            m, w = Review2963Test().base()
+            at, later = HS + 20 * STEP, HS + 30 * STEP
+            w.new_session("o04", at, n=2)
+            w.new_session("o04", later, n=3, prev=2)
+            w.presence("o04", sess("o04", 1), lo=at, hi=at + 15)
+            for n, (lo, hi, count) in {0: (JOIN, at + 15, 1), 1: (at, at + 15, 2), 2: (at, later + 15, 3),
+                                       3: (later, HE, 3)}.items():
+                w.add(M_REELECT, {"session_id": sess("o04", n), "result": "proceeded"}, count, lo=lo, hi=hi)
+            for x in w.series[M_DISCARDS] + w.series[M_FREEZE]:
+                if x["metric"]["session_id"] == sess("o04", 3):
+                    x["values"] = [[ts, "7"] for ts, _ in x["values"]]
+            for x in w.series[M_FREEZE]:
+                if x["metric"]["from_peer"] in ("o00", "o01"):
+                    x["values"] = [[ts, str(3.0 * (ts >= later))] for ts, _ in x["values"]]
+            return m, w
+        m, w = storm()
+        want = json.dumps(score(m, w), sort_keys=True)
+        rng = random.Random(3101)
+        for _ in range(6):
+            m, w = storm()
+            for lst in w.series.values():
+                rng.shuffle(lst)
+            self.assertEqual(json.dumps(score(m, w), sort_keys=True), want)
+
+
+FIXTURES = os.path.join(HERE, "testdata", "relay_evidence_20261026")
+DAILY_PODS = 'namespace="videocall",pod=~"videocall-websocket-.*|videocall-webtransport-.*|nats-[0-9]+"'
+ESC, DROPS, SESSIONS = ("relay_downlink_shed_escalations_total", "relay_session_drops_total",
+                        "relay_active_sessions_per_room")
+
+
+class RelayEvidenceTest(unittest.TestCase):
+    def fetched(self, w, cfg=None, users=("o1",), fail=(), recorded=None, exact=False, whole=False):
+        m = manifest([dict(part(u), **(recorded or {}).get(u, {})) for u in users] + [part("t1", "rust", False, True)])
+        cfg = cfg or cq_score.load_config()
+        fake = w.transport([])
+
+        def transport(url, body, headers):
+            query = urllib.parse.parse_qs(body.decode())["query"][0]
+            if any(f == query if exact else f in query for f in fail):
+                raise urllib.error.HTTPError(url, 400, "bad", {}, None)
+            return fake(url, body, headers)
+        client = cq_prom.PromClient("http://prom.invalid", transport=transport)
+        data = cq_score.fetch_step_data(client, m, m["steps"][0], cfg, set(users))
+        if whole:
+            return cq_score.score_run(m, {"s1": data}, cfg)
+        return cq_score.score_step(m, m["steps"][0], data, cfg)
+
+    def world(self, transports=("webtransport",), users=("o1",)):
+        w = healthy_world(list(users), ["t1"])
+        for t in transports:
+            w.add(SESSIONS, {"room": "scale-t1", "transport": t}, 1)
+        return w
+
+    def fixture(self, run, whole=False):
+        with open(os.path.join(FIXTURES, f"{run}.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        w = self.world((), doc["users"])
+        for name, payload in doc["payloads"].items():
+            w.series[name] = payload["data"]["result"]
+        for user, sessions in doc["users"].items():
+            for sid in sessions:
+                w.add(cq_score.M_PEER_INFO, {"peer_id": user, "session_id": sid}, 1)
+        recorded = {u: dict(r) for u, r in doc.get("bots_app_records", {}).items()}
+        return self.fetched(w, self.cfg(DAILY_PODS), tuple(doc["users"]), recorded=recorded, whole=whole)
+
+    def cfg(self, pods):
+        cfg = cq_score.load_config()
+        cfg["server_diagnostics"]["throttle_pod_selector"]["value"] = pods
+        return cfg
+
+    def test_stage_one_escalations_are_reported_beside_stage_two(self):
+        w = self.world()
+        w.add(ESC, {"transport": "webtransport", "stage": "one"}, lambda t: 3 * (t > HS + 10 * STEP))
+        w.add(ESC, {"transport": "webtransport", "stage": "two"}, 0)
+        r = self.fetched(w)
+        self.assertEqual(r["server_diagnostics"]["shed_escalations"],
+                         {"status": "measured", "by": {"webtransport/one": 3.0, "webtransport/two": 0.0}})
+        report = cq_report.render_markdown({"run": {"meeting_id": "m", "mode": "run", "bands_version": "b",
+                                                    "commit": "c"}, "verdict": "PASS", "headline_step": "s1",
+                                            "steps": [r]})
+        self.assertIn("webtransport/one 3, webtransport/two 0", report)
+        self.assertEqual(cq_report._fmt(37503.0), "37503")
+
+    def test_an_absent_counter_reads_zero_only_where_the_relay_exports_it_for_this_room(self):
+        w = self.world(("webtransport", "websocket"))
+        w.add(ESC, {"transport": "webtransport", "stage": "one"}, 0)
+        w.add("videocall_outbound_channel_drops_total", {"transport": "websocket", "kind": "video"}, 0)
+        sd = self.fetched(w)["server_diagnostics"]
+        self.assertEqual(sd["shed_escalations"]["by"], {"webtransport/one": 0.0, "webtransport/two": 0.0})
+        self.assertEqual(sd["outbound_channel_drops"]["by"], {"websocket/audio": 0.0, "websocket/video": 0.0})
+        self.assertIn("no series on webtransport", sd["outbound_channel_drops"]["detail"])
+        self.assertEqual(sd["stream_resets"]["status"], "not collected")
+        self.assertIn("never incremented, or not exported", sd["stream_resets"]["detail"])
+        sd = self.fetched(self.world(("websocket",)))["server_diagnostics"]
+        self.assertEqual(sd["shed_escalations"]["status"], "not collected")
+        for status in [self.fetched(self.world(()))["server_diagnostics"][k]["status"]
+                       for k in ("shed_escalations", "stream_resets", "session_drops", "quic", "cpu_throttling")]:
+            self.assertEqual(status, "not collected")
+
+    def test_a_failed_room_query_makes_its_dependants_read_query_failed(self):
+        w = self.world(("webtransport",))
+        w.add(ESC, {"transport": "webtransport", "stage": "one"}, 0)
+        sd = self.fetched(w, fail=("relay_active_sessions_per_room",))["server_diagnostics"]
+        self.assertEqual((sd["room_transports"], sd["stream_resets"]["status"]), ("query failed", "query failed"))
+        self.assertEqual(sd["shed_escalations"]["by"], {"webtransport/one": 0.0})
+        self.assertIn("relay_active_sessions_per_room query failed", sd["shed_escalations"]["detail"])
+
+    def test_wt_session_closes_carry_only_reason_keys(self):
+        w = self.world()
+        w.add("relay_wt_session_closes_total", {"transport": "webtransport", "reason": "idle"},
+              lambda t: 3 * (t > HS + 10 * STEP))
+        r = self.fetched(w)
+        self.assertEqual(r["server_diagnostics"]["wt_session_closes"]["by"], {"webtransport/idle": 3.0})
+        report = cq_report.render_markdown({"run": {"meeting_id": "m", "mode": "run", "bands_version": "b",
+                                                    "commit": "c"}, "verdict": "PASS", "headline_step": "s1",
+                                            "steps": [r]})
+        self.assertNotIn("webtransport 0", report)
+
+    def test_a_room_session_gauge_stuck_at_zero_does_not_put_its_transport_in_the_room(self):
+        w = self.world(("webtransport",))
+        w.add(SESSIONS, {"room": "scale-t1", "transport": "websocket"}, 0)
+        w.add("videocall_outbound_channel_drops_total", {"transport": "websocket", "kind": "video"}, 0)
+        sd = self.fetched(w)["server_diagnostics"]
+        self.assertEqual(sd["room_transports"], ["webtransport"])
+        self.assertNotIn("websocket/audio", sd["outbound_channel_drops"]["by"])
+
+    def test_a_failed_rtt_query_names_no_transport_and_splits_no_cell(self):
+        m = manifest([part("o1"), part("t1", "rust", False, True)])
+        w = healthy_world(["o1"], ["t1"])
+        w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1"), "server_type": "webtransport"}, 40)
+
+        def transport(url, body, headers):
+            if urllib.parse.parse_qs(body.decode())["query"][0].startswith(M_RTT):
+                raise urllib.error.HTTPError(url, 400, "bad", {}, None)
+            return w.transport([])(url, body, headers)
+        cfg = cq_score.load_config()
+        data = cq_score.fetch_step_data(cq_prom.PromClient("http://prom.invalid", transport=transport), m,
+                                        m["steps"][0], cfg, {"o1"})
+        r = cq_score.score_step(m, m["steps"][0], data, cfg, split_transport=True)
+        self.assertEqual(r["transport"]["o1"], "query failed")
+        self.assertEqual(set(r["cells"]), {"UxU"})
+        self.assertEqual(r["cells"]["UxU"]["transport_mix"], "query failed")
+        self.assertIn("--split-transport: no per-transport cells, the RTT query failed", r["flags"])
+
+    def test_a_failed_layer_query_keeps_the_decoded_fps(self):
+        r = self.fetched(self.world(), fail=(cq_score.M_ACTIVE_LAYERS,))
+        self.assertEqual(r["layer_mix"]["publisher_active_video_layers_p50"], "query failed")
+        self.assertEqual(r["layer_mix"]["decoded_fps_p50"], self.fetched(self.world())["layer_mix"]["decoded_fps_p50"])
+        self.assertIsNotNone(r["layer_mix"]["decoded_fps_p50"])
+
+    def test_every_diagnostic_query_failure_reads_query_failed_and_changes_no_gate(self):
+        m = manifest([part("o1"), part("t1", "rust", False, True)])
+        cfg = self.cfg('pod=~"relay-.*"')
+        queries = {name: q for name, q, _, _ in cq_score.step_queries(m, m["steps"][0], cfg, {"o1"})
+                   if name in cq_score.DIAGNOSTIC_SERIES}
+        self.assertTrue({cq_score.M_RTT, cq_score.M_ACTIVE_LAYERS, "_room_sessions", "_cfs"} <= set(queries))
+        clean = self.fetched(self.world(), cfg)
+        for name, query in sorted(queries.items()):
+            with self.subTest(name=name):
+                r = self.fetched(self.world(), cfg, fail=(query,), exact=True)
+                self.assertEqual((r["verdict"], r["validity"], r["quality_gates"]),
+                                 (clean["verdict"], clean["validity"], clean["quality_gates"]))
+                self.assertIn('"query failed"', json.dumps(r))
+                self.assertIn("query failed", report_of(r))
+
+    def test_a_failed_diagnostic_query_reads_query_failed_and_scoring_goes_on(self):
+        cfg = self.cfg('pod=~"relay-.*"')
+        r = self.fetched(self.world(), cfg,
+                         fail=("relay_downlink_shed_escalations_total", "container_cpu_cfs", "path_lost_packets"))
+        sd = r["server_diagnostics"]
+        self.assertEqual([sd[k]["status"] for k in ("shed_escalations", "cpu_throttling", "quic")],
+                         ["query failed"] * 3)
+        clean = self.fetched(self.world(), cfg)
+        self.assertEqual((r["verdict"], r["quality_gates"]), (clean["verdict"], clean["quality_gates"]))
+        with self.assertRaises(cq_prom.PromError):
+            self.fetched(self.world(), fail=(M_PPS,))
+
+    def test_audio_drops_are_split_by_kind_transport_and_receiver(self):
+        w = self.world(("webtransport", "websocket"), ("o1", "o2"))
+        for user, kind, n in (("o1", "audio", 40), ("o1", "priority_drop_video", 7), ("o2", "audio", 2)):
+            w.add(DROPS, {"room": "scale-t1", "transport": "webtransport", "session_id": sess(user), "kind": kind},
+                  lambda t, n=n: n * (t > HS))
+        w.add("videocall_outbound_channel_drops_total", {"transport": "webtransport", "kind": "audio"},
+              lambda t: 9 * (t > HS))
+        sd = self.fetched(w, users=("o1", "o2"))["server_diagnostics"]
+        self.assertEqual(sd["session_drops"]["by"], {"webtransport/audio": 42.0, "webtransport/priority_drop_video": 7.0})
+        self.assertIn("no series on websocket", sd["session_drops"]["detail"])
+        self.assertEqual(sd["session_drops"]["by_user"], {"o1": {"audio": 40.0, "priority_drop_video": 7.0},
+                                                          "o2": {"audio": 2.0}})
+        self.assertEqual(sd["outbound_channel_drops"]["by"], {"webtransport/audio": 9.0})
+
+    def test_a_quic_gauge_without_a_series_is_unknown_not_zero(self):
+        w = self.world()
+        labels = {"room": "scale-t1", "session_id": "s-a"}
+        w.add("videocall_relay_connection_path_sent_packets", labels, lambda t: 9000 + 600 * (t > HS))
+        w.add("videocall_relay_connection_rtt_ms", labels, 280)
+        q = self.fetched(w)["server_diagnostics"]["quic"]
+        self.assertEqual((q["lost"], q["loss_fraction"], q["congestion_events"], q["loss_sessions"]),
+                         (None, None, None, [0, 1]))
+        self.assertEqual(q["by_user"]["?"][0]["sent"], 600.0)
+
+    def test_a_quic_session_first_seen_after_the_hold_start_books_no_unknown_baseline(self):
+        w = self.world()
+        w.presence("o1", "s-c")
+        labels = {"room": "scale-t1", "session_id": "s-c"}
+        w.add("videocall_relay_connection_path_lost_packets", labels, lambda t: 500 + 3 * (t > HS + 10 * STEP),
+              lo=HS + 5 * STEP)
+        w.add("videocall_relay_connection_path_sent_packets", labels, lambda t: 9000 + 100 * (t > HS + 10 * STEP),
+              lo=HS + 5 * STEP)
+        q = self.fetched(w)["server_diagnostics"]["quic"]
+        self.assertEqual((q["lost"], q["sent"], q["loss_fraction"], q["loss_sessions"]), (None, None, None, [0, 1]))
+
+    def test_quic_loss_uses_each_sessions_own_increase_when_a_session_ends_mid_hold(self):
+        w = self.world()
+        mid = HS + 20 * STEP
+        for sid, hi, lost, sent, rtt in (("s-a", mid, 100, 1000, 280), ("s-b", HE, 1, 1000, 40)):
+            labels = {"room": "scale-t1", "session_id": sid}
+            w.add("videocall_relay_connection_path_lost_packets", labels, lambda t, k=lost: 500 + k * (t > HS), hi=hi)
+            w.add("videocall_relay_connection_path_sent_packets", labels, lambda t, k=sent: 9000 + k * (t > HS), hi=hi)
+            w.add("videocall_relay_connection_rtt_ms", labels, rtt, hi=hi)
+        w.add(cq_score.M_PEER_INFO, {"peer_id": "o1", "session_id": "s-a"}, 1)
+        q = self.fetched(w)["server_diagnostics"]["quic"]
+        self.assertEqual((q["lost"], q["sent"]), (101.0, 2000.0))
+        self.assertAlmostEqual(q["loss_fraction"], 101 / 2000)
+        self.assertEqual(q["by_user"]["o1"], [dict(q["by_user"]["o1"][0], session_id="s-a", loss_fraction=0.1)])
+        self.assertEqual((q["rtt_ms_median"], q["by_user"]["?"][0]["rtt_ms_median"]), (160.0, 40.0))
+
+    def quic(self, sessions, born=()):
+        w = self.world()
+        for sid in born:
+            w.presence("o1", sid, lo=HS + STEP)
+        for sid, (lost, sent, lo) in sessions.items():
+            labels = {"room": "scale-t1", "session_id": sid}
+            for name, value in (("lost_packets", lost), ("sent_packets", sent)):
+                if value is not None:
+                    w.add(f"videocall_relay_connection_path_{name}", labels, value, lo=lo)
+        return self.fetched(w)["server_diagnostics"]["quic"]
+
+    def test_quic_sessions_with_unknown_or_zero_counts(self):
+        q = self.quic({"s-a": (lambda t: 7 * (t > HS), None, HS), "s-b": (lambda t: 3 * (t > HS), lambda t: 200 * (t > HS), HS)})
+        self.assertEqual((q["lost"], q["sent"], q["loss_sessions"]), (3.0, 200.0, [1, 2]))
+        q = self.quic({"s-a": (lambda t: 20 * (t > HS), 0, HS), "s-b": (0, lambda t: 100 * (t > HS), HS)})
+        self.assertAlmostEqual(q["loss_fraction"], 20 / 100)
+        q = self.quic({"s-c": (lambda t: 5 + 2 * (t > HS + 5 * STEP), lambda t: 100 + 50 * (t > HS + 5 * STEP),
+                               HS + STEP)}, born=("s-c",))
+        self.assertEqual((q["lost"], q["sent"]), (7.0, 150.0))
+
+    def test_cpu_throttling_is_not_collected_without_a_selector_and_scoped_by_it(self):
+        w = self.world()
+        w.add("_cfs", {"pod": "relay-wt-1"}, 0.0)
+        w.add("_cfs", {"pod": "grafana-1"}, 0.4)
+        seen = []
+        fake = w.transport(seen)
+        m = manifest([part("o1"), part("t1", "rust", False, True)])
+        cfg = cq_score.load_config()
+        cq_score.fetch_step_data(cq_prom.PromClient("http://p.invalid", transport=fake), m, m["steps"][0], cfg, {"o1"})
+        self.assertFalse([q for _, q, _ in seen if "cfs" in q])
+        self.assertEqual(self.fetched(w)["server_diagnostics"]["cpu_throttling"],
+                         {"status": "not collected", "detail": "no relay and NATS pod selector for this target"})
+        cpu = self.fetched(w, self.cfg('namespace="vc",pod=~"relay-.*"'))["server_diagnostics"]["cpu_throttling"]
+        self.assertEqual((cpu["status"], list(cpu["by_pod"]), cpu["max"]), ("measured", ["relay-wt-1"], 0.0))
+        cq_score.fetch_step_data(cq_prom.PromClient("http://p.invalid", transport=fake), m, m["steps"][0],
+                                 self.cfg('namespace="vc",pod=~"relay-.*"'), {"o1"})
+        self.assertIn('rate(container_cpu_cfs_throttled_periods_total{namespace="vc",pod=~"relay-.*"}[1m])',
+                      next(q for _, q, _ in seen if "cfs" in q))
+
+    def test_the_throttle_selector_must_be_matchers_or_null(self):
+        for bad in ("", "  ", 'up{job="x"}', 3):
+            with self.subTest(bad=bad), self.assertRaises(cq_score.ConfigError):
+                cq_score.validate_config(self.cfg(bad))
+
+    def test_a_counter_series_with_no_finite_sample_is_not_a_measured_zero(self):
+        w = self.world()
+        w.add(ESC, {"transport": "webtransport", "stage": "one"}, "NaN")
+        self.assertEqual(self.fetched(w)["server_diagnostics"]["shed_escalations"]["status"], "not collected")
+
+    def test_no_session_id_survives_pseudonymisation(self):
+        m = manifest([part("o1"), part("t1", "rust", False, True)])
+        w = self.world()
+        sid = sess("o1")
+        w.add(DROPS, {"room": "scale-t1", "transport": "webtransport", "session_id": sid, "kind": "audio"}, 1)
+        w.add("videocall_relay_connection_rtt_ms", {"room": "scale-t1", "session_id": sid}, 280)
+        w.add(M_RTT, {"peer_id": "o1", "session_id": sid, "server_type": "webtransport"}, 40)
+        w.add(cq_score.M_PEER_INFO, {"peer_id": "o1", "session_id": "999123"}, 1)
+        cfg = cq_score.load_config()
+        data = cq_score.fetch_step_data(cq_prom.PromClient("http://p.invalid", transport=w.transport([])), m,
+                                        m["steps"][0], cfg, {"o1"})
+        r = cq_score.score_step(m, m["steps"][0], data, cfg)
+        self.assertIn(sid, json.dumps(r))
+        out = cq_privacy.pseudonymise(r, cq_privacy.identities_to_hide(m, {"s1": data}, False), b"salt")
+        report = cq_report.render_markdown({"run": {"meeting_id": "m", "mode": "run", "bands_version": "b",
+                                                    "commit": "c"}, "verdict": "PASS", "headline_step": "s1",
+                                            "steps": [out]})
+        for raw in (sid, sess("t1"), "999123"):
+            self.assertNotIn(raw, json.dumps(out) + report)
+
+    def test_per_user_relay_evidence_is_pseudonymised(self):
+        human = "someone@example.com"
+        w = self.world(users=(human,))
+        w.add(DROPS, {"room": "scale-t1", "transport": "webtransport", "session_id": sess(human), "kind": "audio"}, 1)
+        sd = self.fetched(w, users=(human,))["server_diagnostics"]
+        self.assertIn(human, sd["session_drops"]["by_user"])
+        hidden = cq_privacy.pseudonymise({"server_diagnostics": sd}, {human}, b"salt")
+        self.assertNotIn(human, json.dumps(hidden))
+
+    def test_the_26_oct_hcl_daily_runs(self):
+        want = {"20261026T1200Z": (7.0, 171.0, 2411.0, 728 / 37503, 0.0, 270.0),
+                "20261026T1212Z": (0.0, 0.0, 0.0, 43 / 27127, 0.0, 13.0),
+                "20261026T1217Z": (0.0, 0.0, 0.0, 11 / 21906, 0.0034, 8.0),
+                "20261026T1221Z": (4.0, 95.0, 911.0, 865 / 31256, 0.0, 377.0)}
+        for run, (stage_one, resets, audio_drops, loss, cfs, congestion) in want.items():
+            with self.subTest(run=run):
+                sd = self.fixture(run)["server_diagnostics"]
+                self.assertEqual(sd["shed_escalations"]["by"]["webtransport/one"], stage_one)
+                self.assertEqual(sd["shed_escalations"]["by"]["webtransport/two"], 0.0)
+                self.assertEqual(sd["stream_resets"]["by"]["webtransport/write_timeout"], resets)
+                if audio_drops:
+                    self.assertEqual(sd["session_drops"]["by"]["webtransport/audio"], audio_drops)
+                else:
+                    self.assertEqual(sd["session_drops"]["status"], "not collected")
+                self.assertAlmostEqual(sd["quic"]["loss_fraction"], loss)
+                self.assertEqual(sd["quic"]["congestion_events"], congestion)
+                self.assertAlmostEqual(sd["cpu_throttling"]["max"], cfs, places=4)
+                self.assertEqual(sorted(sd["cpu_throttling"]["by_pod"])[0], "nats-0")
+
+
+
+class TransportTimelineTest(unittest.TestCase):
+    def test_a_switch_mid_run_is_recorded_not_collapsed_to_the_majority(self):
+        human = "someone@example.com"
+        m = manifest([part(human), part("t1", "rust", False, True)])
+        w = healthy_world([human], ["t1"])
+        mid = HS + 30 * STEP
+        w.add(M_RTT, {"peer_id": human, "session_id": sess(human), "server_type": "webtransport"}, 40, JOIN, mid)
+        w.add(M_RTT, {"peer_id": human, "session_id": sess(human, 2), "server_type": "websocket"}, 40, mid + STEP, HE)
+        w.add(cq_score.M_PEER_INFO, {"peer_id": human, "session_id": sess(human, 2)}, 1)
+        r = score(m, w)
+        tl = r["transport_timeline"][human]
+        self.assertEqual([(x["server_type"], x["from"], x["to"]) for x in tl["sessions"]],
+                         [("webtransport", JOIN, mid), ("websocket", mid + STEP, HE)])
+        self.assertEqual((tl["switches"], tl["switches_in_hold"]), (1, 1))
+        self.assertEqual(r["transport"][human], "webtransport")
+        self.assertIn(f"{human}: transport switched webtransport -> websocket (switches 1, in the hold 1)", r["flags"])
+        report = cq_report.render_markdown({"run": {"meeting_id": "m", "mode": "run", "bands_version": "b",
+                                                    "commit": "c"}, "verdict": "PASS", "headline_step": "s1",
+                                            "steps": [r]})
+        self.assertIn("webtransport → websocket (switches 1, in the hold 1)", report)
+        hidden = cq_privacy.pseudonymise(r, {human}, b"salt")
+        self.assertNotIn(human, json.dumps(hidden["transport_timeline"]))
+
+    def test_the_majority_transport_counts_the_hold_only(self):
+        m = manifest([part("o1"), part("t1", "rust", False, True)])
+        w = healthy_world(["o1"], ["t1"])
+        w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1", 1), "server_type": "webtransport"}, 40,
+              HS - 60 * STEP, HS - STEP)
+        w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1"), "server_type": "websocket"}, 40)
+        w.add(cq_score.M_PEER_INFO, {"peer_id": "o1", "session_id": sess("o1", 1)}, 1)
+        r = score(m, w)
+        self.assertEqual(r["transport"]["o1"], "websocket")
+        self.assertEqual((r["transport_timeline"]["o1"]["switches"], r["transport_timeline"]["o1"]["switches_in_hold"]),
+                         (1, 0))
+
+    def test_transport_is_fetched_from_the_join_so_a_pre_hold_switch_is_seen(self):
+        m = cq_manifest.load_manifest(EXAMPLE)
+        step = m["steps"][0]
+        start = next(s for name, _, s, _ in cq_score.step_queries(m, step, cq_score.load_config(), None) if name == M_RTT)
+        self.assertLessEqual(start, step["join_start"])
+
+    def test_a_fallback_the_health_reports_miss_is_reconciled_from_the_bots_app_record(self):
+        r = RelayEvidenceTest().fixture("20261026T1200Z", whole=True)
+        self.assertEqual(r["steps"][0]["transport_timeline"]["probe"]["switches"], 0)
+        self.assertEqual(r["transport_fallbacks"]["probe"], {"preferred": "webtransport", "observed": "websocket",
+                                                             "fallbacks": 1, "fallbacks_in_health_reports": 0})
+        self.assertIn("transport: 1 participant(s) whose bots-app record counts fallbacks from the preferred transport "
+                      "that their health reports in the scored windows do not show", r["notices"])
+
+    def two_steps(self, preferred, fallbacks, path, user="o1", fail_first=False):
+        mid = HS + 20 * STEP
+        p = dict(part(user), transport_preferred=preferred, transport_fallbacks=fallbacks,
+                 transport_observed=path[-1] if path[-1] != "unknown" else "websocket")
+        m = manifest([p, part("t1", "rust", False, True)])
+        for x in m["participants"]:
+            x["steps"] = ["s1", "s2"]
+        m["steps"] = [dict(m["steps"][0], hold_end=mid, headline=True),
+                      dict(m["steps"][0], step_id="s2", join_start=mid, hold_start=mid + STEP, headline=False)]
+        w = healthy_world([user], ["t1"])
+        for i, st in enumerate(path):
+            lo = JOIN if not i else mid + 5 * STEP * i
+            hi = HE if i == len(path) - 1 else mid + 5 * STEP * (i + 1) - STEP
+            w.add(M_RTT, {"peer_id": user, "session_id": sess(user, i), "server_type": st}, 40, lo, hi)
+            w.add(cq_score.M_PEER_INFO, {"peer_id": user, "session_id": sess(user, i)}, 1, lo, hi)
+        data = w.data()
+        first = dict(data, **{M_RTT: cq_score.FailedQuery()}) if fail_first else data
+        return cq_score.score_run(m, {"s1": first, "s2": data}, cq_score.load_config())
+
+    def test_fallbacks_are_reconciled_over_the_run_in_the_preferred_direction(self):
+        r = self.two_steps("webtransport", 1, ["webtransport", "websocket"])
+        self.assertEqual(r["steps"][0]["transport_timeline"]["o1"]["switches"], 0)
+        self.assertEqual(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"], 1)
+        self.assertFalse([n for n in r["notices"] if n.startswith("transport:")])
+        r = self.two_steps("webtransport", 1, ["websocket", "webtransport"])
+        self.assertEqual(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"], 0)
+        self.assertTrue([n for n in r["notices"] if n.startswith("transport:")])
+        r = self.two_steps("websocket", 1, ["websocket", "webtransport"])
+        self.assertEqual(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"], 1)
+        r = self.two_steps("webtransport", 1, ["webtransport", "unknown"])
+        self.assertEqual(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"], 0)
+
+    def sessions_run(self, spans, preferred="webtransport", fallbacks=1):
+        p = dict(part("o1"), transport_preferred=preferred, transport_observed=spans[-1][2], transport_fallbacks=fallbacks)
+        m = manifest([p, part("t1", "rust", False, True)])
+        w = healthy_world(["o1"], ["t1"])
+        for n, (lo, hi, st) in enumerate(spans, 1):
+            w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1", n), "server_type": st}, 40, lo, hi)
+            w.add(cq_score.M_PEER_INFO, {"peer_id": "o1", "session_id": sess("o1", n)}, 1)
+        r = cq_score.score_run(m, {"s1": w.data()}, cq_score.load_config())
+        tl = r["steps"][0]["transport_timeline"]["o1"]
+        return tl["switches"], tl["switches_unproven"], r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"]
+
+    def test_a_successor_of_tied_sessions_is_unproven_whatever_the_transport_names(self):
+        for a, b in (("webtransport", "websocket"), ("websocket", "webtransport")):
+            with self.subTest(successor=a):
+                self.assertEqual(self.sessions_run([(JOIN, JOIN + 15, a), (JOIN, JOIN + 15, b), (JOIN + 30, HE, a)]),
+                                 (0, 3, None))
+
+    def test_a_session_beside_a_long_lived_tab_is_not_a_switch(self):
+        self.assertEqual(self.sessions_run([(JOIN, HE, "webtransport"), (JOIN + 15, JOIN + 30, "webtransport"),
+                                            (HS, HE, "websocket")]), (0, 1, None))
+
+    def test_later_reconnects_after_a_tie_add_nothing_and_the_path_names_no_order(self):
+        spans = [(JOIN, JOIN + 15, "webtransport"), (JOIN, JOIN + 15, "websocket")]
+        spans += [(JOIN + 30 * k, JOIN + 30 * k + 15, "webtransport") for k in range(1, 7)]
+        self.assertEqual(self.sessions_run(spans)[:2], (0, 3))
+        self.assertEqual(self.sessions_run([(JOIN, JOIN + 15, "websocket"), (JOIN, JOIN + 15, "webtransport"),
+                                            (JOIN + 30, JOIN + 75, "webtransport"), (JOIN + 90, HE, "websocket")])[:2],
+                         (0, 4))
+        for a, b in (("webtransport", "websocket"), ("websocket", "webtransport")):
+            p = dict(part("o1"), transport_preferred="webtransport", transport_observed=a, transport_fallbacks=0)
+            m = manifest([p, part("t1", "rust", False, True)])
+            w = healthy_world(["o1"], ["t1"])
+            for n, (lo, hi, st) in enumerate([(JOIN, JOIN + 15, a), (JOIN, JOIN + 15, b), (JOIN + 30, HE, a)], 1):
+                w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1", n), "server_type": st}, 40, lo, hi)
+                w.add(cq_score.M_PEER_INFO, {"peer_id": "o1", "session_id": sess("o1", n)}, 1)
+            tl = score(m, w)["transport_timeline"]["o1"]
+            self.assertEqual(tl["path"], f"websocket+webtransport -> {a}")
+
+    def test_every_session_beside_a_live_session_on_another_transport_is_unproven(self):
+        self.assertEqual(self.sessions_run([(JOIN, HE, "websocket"), (JOIN, JOIN + 15, "webtransport"),
+                                            (JOIN + 30, JOIN + 45, "webtransport"), (JOIN + 60, HE, "webtransport")]),
+                         (0, 4, None))
+
+    def test_a_record_without_rtt_history_or_preference_leaves_fallbacks_unknown(self):
+        for preferred, rtt in (("webtransport", False), (None, True)):
+            with self.subTest(preferred=preferred):
+                p = dict(part("o1"), transport_preferred=preferred, transport_observed="websocket",
+                         transport_fallbacks=1)
+                w = healthy_world(["o1"], ["t1"])
+                if rtt:
+                    for n, (lo, hi, st) in enumerate([(JOIN, JOIN + 15, "webtransport"), (JOIN + 30, HE, "websocket")], 1):
+                        w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1", n), "server_type": st}, 40, lo, hi)
+                        w.add(cq_score.M_PEER_INFO, {"peer_id": "o1", "session_id": sess("o1", n)}, 1)
+                r = cq_score.score_run(manifest([p, part("t1", "rust", False, True)]), {"s1": w.data()},
+                                       cq_score.load_config())
+                self.assertIsNone(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"])
+                self.assertFalse([n for n in r["notices"] if n.startswith("transport:")])
+
+    def test_a_chain_of_four_sessions_counts_each_switch(self):
+        self.assertEqual(self.sessions_run([(JOIN, JOIN + 15, "webtransport"), (JOIN + 30, JOIN + 45, "websocket"),
+                                            (JOIN + 60, JOIN + 75, "webtransport"), (JOIN + 90, HE, "websocket")]),
+                         (3, 0, 2))
+
+    def test_a_failed_rtt_query_in_one_step_leaves_the_run_unknown(self):
+        r = self.two_steps("webtransport", 1, ["webtransport"], fail_first=True)
+        self.assertEqual(r["steps"][1]["transport_timeline"]["o1"]["status"], "measured")
+        self.assertIsNone(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"])
+        self.assertFalse([n for n in r["notices"] if n.startswith("transport:")])
+
+    def test_a_failed_rtt_query_leaves_fallbacks_unknown_and_quiet(self):
+        recorded = {"o1": {"transport_preferred": "webtransport", "transport_observed": "websocket",
+                           "transport_fallbacks": 1}}
+        r = RelayEvidenceTest().fetched(healthy_world(["o1"], ["t1"]), recorded=recorded, whole=True,
+                                        fail=(f'{M_RTT}{{meeting_id="scale-t1"}}',), exact=True)
+        self.assertIsNone(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"])
+        self.assertFalse([n for n in r["notices"] if n.startswith("transport:")])
+
+    def test_a_quick_reconnect_within_the_linger_is_a_switch(self):
+        self.assertEqual(self.sessions_run([(JOIN, HS + 15 * STEP, "webtransport"),
+                                            (HS + 13 * STEP, HS + 25 * STEP, "websocket"),
+                                            (HS + 24 * STEP, HE, "websocket")]), (1, 0, 1))
+
+    def test_two_concurrent_tabs_are_not_a_switch_and_leave_fallbacks_unknown(self):
+        p = dict(part("o1"), transport_preferred="webtransport", transport_observed="websocket", transport_fallbacks=1)
+        m = manifest([p, part("t1", "rust", False, True)])
+        w = healthy_world(["o1"], ["t1"])
+        for n, st in ((1, "webtransport"), (2, "websocket")):
+            w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1", n), "server_type": st}, 40, JOIN + 15 * n)
+            w.add(cq_score.M_PEER_INFO, {"peer_id": "o1", "session_id": sess("o1", n)}, 1)
+        r = cq_score.score_run(m, {"s1": w.data()}, cq_score.load_config())
+        tl = r["steps"][0]["transport_timeline"]["o1"]
+        self.assertEqual((tl["switches"], tl["switches_unproven"]), (0, 1))
+        self.assertIsNone(r["transport_fallbacks"]["o1"]["fallbacks_in_health_reports"])
+        self.assertIn("o1: 1 session(s) started alongside a session on another transport; their transport changes "
+                      "are not counted as switches", r["steps"][0]["flags"])
+        self.assertIn("(1 started alongside another transport)", cq_report.render_markdown(r))
+        self.assertFalse([n for n in r["notices"] if n.startswith("transport:")])
+
+    def test_the_run_level_reconciliation_is_pseudonymised(self):
+        human = "someone@example.com"
+        r = self.two_steps("webtransport", 1, ["webtransport", "websocket"], human)
+        self.assertIn(human, r["transport_fallbacks"])
+        self.assertNotIn(human, json.dumps(cq_privacy.pseudonymise(r, {human}, b"salt")["transport_fallbacks"]))
+
+    def test_a_non_observer_browser_gets_its_timeline_and_pre_hold_rtt_picks_no_transport(self):
+        m = manifest([part("o1"), part("b1", observer=False, talker=True)])
+        w = healthy_world(["o1"], ["b1"])
+        w.add(M_RTT, {"peer_id": "b1", "session_id": sess("b1"), "server_type": "websocket"}, 40)
+        w.add(M_RTT, {"peer_id": "o1", "session_id": sess("o1"), "server_type": "webtransport"}, 40, JOIN, HS - STEP)
+        client = cq_prom.PromClient("http://prom.invalid", transport=w.transport([]))
+        r = cq_score.score_step(m, m["steps"][0], cq_score.fetch_step_data(client, m, m["steps"][0],
+                                                                           cq_score.load_config(), {"o1"}),
+                                cq_score.load_config())
+        self.assertEqual([x["server_type"] for x in r["transport_timeline"]["b1"]["sessions"]], ["websocket"])
+        self.assertEqual(r["transport"]["o1"], "unknown")
+
+    def test_the_record_is_shown_without_any_rtt_history(self):
+        text = cq_report._transport_text("unknown", {"status": "measured", "sessions": [], "switches": 0,
+                                                     "switches_in_hold": 0,
+                                                     "recorded": {"preferred": "webtransport", "observed": "websocket",
+                                                                  "fallbacks": 1}})
+        self.assertEqual(text, "unknown; bots-app record: preferred webtransport, last websocket, 1 fallbacks")
+
+    def test_the_26_oct_tab_switches(self):
+        want = {"20261026T1212Z": (["websocket", "webtransport", "webtransport", "webtransport"], 0, 0, 3),
+                "20261026T1217Z": (["webtransport", "websocket"], 1, 0, 0),
+                "20261026T1221Z": (["websocket", "webtransport"], 1, 0, 0)}
+        for run, (path, switches, in_hold, unproven) in want.items():
+            with self.subTest(run=run):
+                tl = RelayEvidenceTest().fixture(run)["transport_timeline"]["human-tab"]
+                self.assertEqual([x["server_type"] for x in tl["sessions"]], path)
+                self.assertEqual((tl["switches"], tl["switches_in_hold"], tl["switches_unproven"]),
+                                 (switches, in_hold, unproven))
 
 
 if __name__ == "__main__":

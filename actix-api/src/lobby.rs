@@ -32,9 +32,11 @@ use actix_web::web::Bytes;
 use actix_web::{get, web, Error, HttpRequest, HttpResponse};
 use actix_web_actors::ws::{handshake, WebsocketContext};
 use tracing::{debug, error};
+use videocall_meeting_types::token::RoomAccessTokenClaims;
 use videocall_types::validation::is_valid_meeting_id;
 use videocall_types::FeatureFlags;
 
+use crate::actors::session_logic::parse_conn_seq;
 use crate::actors::transports::ws_chat_session::WsChatSession;
 use crate::constants::{MAX_FRAME_SIZE, VALID_USER_ID_PATTERN};
 use crate::models::AppState;
@@ -65,6 +67,15 @@ pub struct LobbyTokenQuery {
     /// the same tab/meeting join. The server uses it to correlate reconnections
     /// and silently evict stale sessions.
     pub instance_id: Option<String>,
+    /// Raw `?conn_seq=`; read through [`LobbyTokenQuery::parsed_conn_seq`].
+    pub conn_seq: Option<String>,
+}
+
+impl LobbyTokenQuery {
+    /// The parsed `?conn_seq=`, `None` when absent or malformed.
+    pub fn parsed_conn_seq(&self) -> Option<u64> {
+        parse_conn_seq(self.conn_seq.as_deref())
+    }
 }
 
 /// Query parameters for the deprecated path-based lobby endpoint.
@@ -119,6 +130,17 @@ pub async fn ws_connect_authenticated(
         }
     };
 
+    let actor = authenticated_ws_session(&state, claims, query.into_inner());
+    let codec = Codec::new().max_size(MAX_FRAME_SIZE);
+    start_with_codec(actor, &req, stream, codec)
+}
+
+/// Build the session actor for a validated room token and its connect query.
+fn authenticated_ws_session(
+    state: &AppState,
+    claims: RoomAccessTokenClaims,
+    query: LobbyTokenQuery,
+) -> WsChatSession {
     let user_id = claims.sub;
     let room = claims.room;
     let observer = claims.observer;
@@ -126,31 +148,30 @@ pub async fn ws_connect_authenticated(
     let is_host = claims.is_host;
     let is_guest = claims.is_guest;
     let token_iat = claims.iat;
+    let meeting_started_at_ms = claims
+        .meeting_started_at_ms
+        .and_then(|ms| u64::try_from(ms).ok());
 
     debug!(
         "socket connected (token-based) for user_id={user_id}, room={room}, display_name={display_name}, is_guest={is_guest}, observer={observer}, is_host={is_host}"
     );
-    let chat = state.chat.clone();
-    let nats_client = state.nats_client.clone();
-    let tracker_sender = state.tracker_sender.clone();
-    let session_manager = state.session_manager.clone();
-    let instance_id = query.into_inner().instance_id;
-    let actor = WsChatSession::new(
-        chat,
+    let conn_seq = query.parsed_conn_seq();
+    WsChatSession::new(
+        state.chat.clone(),
         room,
         user_id,
         display_name,
         is_guest,
-        nats_client,
-        tracker_sender,
-        session_manager,
+        state.nats_client.clone(),
+        state.tracker_sender.clone(),
+        state.session_manager.clone(),
         observer,
-        instance_id,
+        query.instance_id,
         is_host,
     )
-    .with_token_iat(token_iat);
-    let codec = Codec::new().max_size(MAX_FRAME_SIZE);
-    start_with_codec(actor, &req, stream, codec)
+    .with_token_iat(token_iat)
+    .with_conn_seq(conn_seq)
+    .with_meeting_started_at_ms(meeting_started_at_ms)
 }
 
 /// **DEPRECATED**: Use `GET /lobby?token=<JWT>` instead.
@@ -209,7 +230,7 @@ pub async fn ws_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::deprecated_path_identity;
+    use super::{deprecated_path_identity, web, LobbyTokenQuery};
 
     #[test]
     fn deprecated_path_accepts_valid_meeting_ids_unchanged() {
@@ -249,5 +270,93 @@ mod tests {
                 "{user_id:?}"
             );
         }
+    }
+
+    fn lobby_query(query: &str) -> LobbyTokenQuery {
+        web::Query::<LobbyTokenQuery>::from_query(query)
+            .expect("lobby query should deserialise")
+            .into_inner()
+    }
+
+    #[test]
+    fn lobby_query_reads_conn_seq() {
+        assert_eq!(
+            lobby_query("token=t&instance_id=i&conn_seq=42").parsed_conn_seq(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn lobby_query_without_conn_seq_is_none() {
+        assert_eq!(lobby_query("token=t&instance_id=i").parsed_conn_seq(), None);
+    }
+
+    #[test]
+    fn lobby_query_with_malformed_conn_seq_still_connects_with_none() {
+        for raw in ["abc", "-1", "", "1.5", "18446744073709551616"] {
+            let query = lobby_query(&format!("token=t&conn_seq={raw}"));
+            assert_eq!(query.parsed_conn_seq(), None, "{raw:?}");
+            assert_eq!(query.token, "t");
+        }
+    }
+
+    struct ForceCloseSink3285;
+    impl actix::Actor for ForceCloseSink3285 {
+        type Context = actix::Context<Self>;
+    }
+    impl actix::Handler<crate::messages::session::ForceClose> for ForceCloseSink3285 {
+        type Result = ();
+        fn handle(&mut self, _msg: crate::messages::session::ForceClose, _ctx: &mut Self::Context) {
+        }
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn authenticated_ws_session_carries_conn_seq_into_join_room_3285() {
+        use crate::actors::chat_server::ChatServer;
+        use crate::models::AppState;
+        use crate::session_manager::SessionManager;
+        use actix::Actor;
+
+        const SECRET: &str = "test-secret-3285-lobby";
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let (tracker_sender, _tracker_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState {
+            chat: ChatServer::new(nats_client.clone()).await.start(),
+            nats_client,
+            tracker_sender,
+            session_manager: SessionManager::new(),
+        };
+        let token = meeting_api::token::generate_room_token_at(
+            SECRET,
+            3_600,
+            chrono::Utc::now().timestamp(),
+            "ws@example.com",
+            "room-3285",
+            false,
+            "WS",
+            false,
+            false,
+            Some(1_707_000_000_123),
+        )
+        .expect("should generate a room token");
+        let claims = crate::token_validator::decode_room_token(SECRET, &token)
+            .expect("generated token should decode");
+
+        let actor = super::authenticated_ws_session(
+            &state,
+            claims,
+            lobby_query(&format!(
+                "token={token}&instance_id=iid-3285-ws&conn_seq=42"
+            )),
+        );
+        let join = actor.join_room_message_for_test(ForceCloseSink3285.start().recipient());
+
+        assert_eq!(join.conn_seq, Some(42));
+        assert_eq!(join.meeting_started_at_ms, Some(1_707_000_000_123));
+        assert_eq!(join.instance_id.as_deref(), Some("iid-3285-ws"));
     }
 }

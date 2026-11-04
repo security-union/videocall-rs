@@ -1,0 +1,120 @@
+{
+ "_comment": [
+  "Mutations of the probe cost command (#2914), each naming the test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-probe-cost.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_probe_cost.py"
+ ],
+ "baseline_tests": 6,
+ "mutations": [
+  {
+   "name": "ticks are not converted by CLK_TCK",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "        out.append(used / (clk * (t2 - t1)))",
+   "replace": "        out.append(used / (t2 - t1))",
+   "expect_kills": [
+    "test_cores_are_clock_ticks_over_clk_tck_and_seconds_for_chrome_and_node_only"
+   ]
+  },
+  {
+   "name": "the interval length is ignored",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "        out.append(used / (clk * (t2 - t1)))",
+   "replace": "        out.append(used / clk)",
+   "expect_kills": [
+    "test_cores_are_clock_ticks_over_clk_tck_and_seconds_for_chrome_and_node_only"
+   ]
+  },
+  {
+   "name": "the Rust bots count as probe processes",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "PROBE_COMM = re.compile(rf\"chrom.*|node|tsx|{cq_local.PROBE_NODE_COMM}\")",
+   "replace": "PROBE_COMM = re.compile(rf\"chrom.*|node|tsx|bot|{cq_local.PROBE_NODE_COMM}\")",
+   "expect_kills": [
+    "test_cores_are_clock_ticks_over_clk_tck_and_seconds_for_chrome_and_node_only"
+   ]
+  },
+  {
+   "name": "samples outside the hold count",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "    times = sorted(t for t in ticks if start <= t <= end)",
+   "replace": "    times = sorted(ticks)",
+   "expect_kills": [
+    "test_cores_are_clock_ticks_over_clk_tck_and_seconds_for_chrome_and_node_only"
+   ]
+  },
+  {
+   "name": "a restarted process counts negative",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "        used = sum(max(0, ticks[t2][pid] - ticks[t1][pid])",
+   "replace": "        used = sum((ticks[t2][pid] - ticks[t1][pid])",
+   "expect_kills": [
+    "test_a_process_seen_in_only_one_sample_or_restarted_adds_nothing"
+   ]
+  },
+  {
+   "name": "stime is ignored",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "ticks[int(f[1])][f[2]] = int(f[4]) + int(f[5])",
+   "replace": "ticks[int(f[1])][f[2]] = int(f[4])",
+   "expect_kills": [
+    "test_cores_are_clock_ticks_over_clk_tck_and_seconds_for_chrome_and_node_only"
+   ]
+  },
+  {
+   "name": "no meta row is accepted",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "    if clk is None or clk <= 0:",
+   "replace": "    if False:",
+   "expect_kills": [
+    "test_missing_hold_samples_or_clock_ticks_exit_3"
+   ]
+  },
+  {
+   "name": "a CLK_TCK of 0 is accepted",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "    if clk is None or clk <= 0:",
+   "replace": "    if clk is None or clk < 0:",
+   "expect_kills": [
+    "test_missing_hold_samples_or_clock_ticks_exit_3"
+   ]
+  },
+  {
+   "name": "the peak shared out over the probes is not divided",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "per = f\"; the peak over {n} probes, {max(cores) / n:.2f} cores each\"",
+   "replace": "per = f\"; the peak over {n} probes, {max(cores):.2f} cores each\"",
+   "expect_kills": [
+    "test_several_probes_also_give_the_peak_shared_out_over_them"
+   ]
+  },
+  {
+   "name": "the probe's Node process is not counted",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "PROBE_COMM = re.compile(rf\"chrom.*|node|tsx|{cq_local.PROBE_NODE_COMM}\")",
+   "replace": "PROBE_COMM = re.compile(rf\"chrom.*|node|tsx\")",
+   "expect_kills": [
+    "test_the_probes_node_process_found_by_its_command_line_counts"
+   ]
+  },
+  {
+   "name": "samples with no process in common count as zero",
+   "file": "scripts/quality/cq_probe_cost.py",
+   "find": "        if not both:\n            continue\n",
+   "replace": "",
+   "expect_kills": [
+    "test_samples_with_no_process_in_common_are_an_error_not_zero"
+   ]
+  }
+ ]
+}

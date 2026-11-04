@@ -775,7 +775,6 @@ test.describe("Drawers reflow the tile grid (#2701 / #2272)", () => {
         uiURL,
       );
       await guestCtx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
-      // The split panes under test are opt-in since #2792.
       await seedShareViewMode(hostCtx, "enlarged");
       const meetingId = `e2e_reflow_ss_${Date.now()}`;
 

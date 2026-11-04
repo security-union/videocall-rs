@@ -41,6 +41,9 @@ pub struct RuntimeConfig {
     #[serde(rename = "transportBadgeEnabled")]
     #[serde(default)]
     pub transport_badge_enabled: String,
+    #[serde(rename = "captionsEnabled")]
+    #[serde(default)]
+    pub captions_enabled: String,
     /// Issue #1480: whether client/server build info may display github info
     /// (git commit SHA + branch) in the About modal and diagnostics build-info
     /// table. FAIL-CLOSED: absent / empty / falsey -> false (github info hidden),
@@ -130,6 +133,14 @@ pub struct RuntimeConfig {
     pub search_api_base_url: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
+    /// Absent: `serverElectionPeriodMs`.
+    #[serde(rename = "webTransportConnectTimeoutMs")]
+    #[serde(default)]
+    pub web_transport_connect_timeout_ms: Option<u64>,
+    /// Absent: `serverElectionPeriodMs`.
+    #[serde(rename = "webSocketConnectTimeoutMs")]
+    #[serde(default)]
+    pub web_socket_connect_timeout_ms: Option<u64>,
     #[serde(rename = "vadThreshold", default = "default_vad_threshold")]
     pub vad_threshold: f32,
     #[serde(rename = "consoleLogUploadEnabled")]
@@ -253,7 +264,7 @@ pub struct RuntimeConfig {
     #[serde(rename = "defaultTransport")]
     #[serde(default)]
     pub default_transport: Option<String>,
-    /// Whether this client sends `DiagnosticsPacket`s. Absent means enabled;
+    /// Whether this client sends `DiagnosticsPacket`s. Absent means disabled;
     /// a falsy value cannot be re-enabled by `?diag_packets=`.
     #[serde(rename = "diagnosticsPacketsEnabled")]
     #[serde(default)]
@@ -447,7 +458,7 @@ impl std::fmt::Display for DiagnosticsPacketsSource {
     }
 }
 
-fn parse_diagnostics_packets_switch(raw: &str) -> Option<bool> {
+fn parse_config_switch(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "0" | "false" | "off" | "no" => Some(false),
         "1" | "true" | "on" | "yes" => Some(true),
@@ -457,22 +468,22 @@ fn parse_diagnostics_packets_switch(raw: &str) -> Option<bool> {
 
 /// Config is a ceiling: a falsy `diagnosticsPacketsEnabled` disables and the
 /// URL param is ignored; otherwise the URL param, then the config, then
-/// enabled. An empty or unrecognised value falls through to the next source.
+/// disabled. An empty or unrecognised value falls through to the next source.
 pub fn resolve_diagnostics_packets(
     url_param: Option<&str>,
     config: Option<&str>,
 ) -> (bool, DiagnosticsPacketsSource) {
-    let config = config.and_then(parse_diagnostics_packets_switch);
+    let config = config.and_then(parse_config_switch);
     if config == Some(false) {
         return (false, DiagnosticsPacketsSource::Config);
     }
-    if let Some(enabled) = url_param.and_then(parse_diagnostics_packets_switch) {
+    if let Some(enabled) = url_param.and_then(parse_config_switch) {
         return (enabled, DiagnosticsPacketsSource::Url);
     }
     if config == Some(true) {
         return (true, DiagnosticsPacketsSource::Config);
     }
-    (true, DiagnosticsPacketsSource::Default)
+    (false, DiagnosticsPacketsSource::Default)
 }
 
 thread_local! {
@@ -847,6 +858,10 @@ pub fn transport_badge_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.transport_badge_enabled.as_str())))
 }
 
+pub fn captions_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.captions_enabled.as_str())))
+}
+
 /// Pure core of [`show_build_git_info`], split out so it is host-unit-testable
 /// (the accessor calls `app_config()` -> `window()`, which is wasm-only). Issue #1480.
 fn git_info_visible(flag: &str) -> bool {
@@ -886,8 +901,30 @@ pub fn mock_peers_enabled() -> bool {
 pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {
     app_config().map(|c| split_users(Some(&c.users_allowed_to_stream)))
 }
-pub fn server_election_period_ms() -> Result<u64, String> {
-    app_config().map(|c| c.server_election_period_ms)
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const MIN_CONNECT_TIMEOUT_MS: u64 = 500;
+const MAX_CONNECT_TIMEOUT_MS: u64 = 30_000;
+
+impl RuntimeConfig {
+    /// `(webtransport, websocket)` connect timeouts.
+    pub fn connect_timeouts_ms(&self) -> (u64, u64) {
+        let clamp = |ms: Option<u64>| {
+            ms.unwrap_or(self.server_election_period_ms)
+                .clamp(MIN_CONNECT_TIMEOUT_MS, MAX_CONNECT_TIMEOUT_MS)
+        };
+        (
+            clamp(self.web_transport_connect_timeout_ms),
+            clamp(self.web_socket_connect_timeout_ms),
+        )
+    }
+}
+
+/// `(webtransport, websocket)` connect timeouts for an election.
+pub fn connect_timeouts_ms() -> (u64, u64) {
+    app_config().map_or(
+        (DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS),
+        |c| c.connect_timeouts_ms(),
+    )
 }
 
 pub fn oauth_provider() -> Option<String> {
@@ -1061,10 +1098,10 @@ mod diagnostics_packets_tests {
     use super::{resolve_diagnostics_packets, DiagnosticsPacketsSource as Src};
 
     #[test]
-    fn defaults_to_enabled_when_no_source_is_set() {
+    fn defaults_to_disabled_when_no_source_is_set() {
         assert_eq!(
             resolve_diagnostics_packets(None, None),
-            (true, Src::Default)
+            (false, Src::Default)
         );
     }
 
@@ -1177,7 +1214,7 @@ mod diagnostics_packets_tests {
             );
             assert_eq!(
                 resolve_diagnostics_packets(Some(junk), Some(junk)),
-                (true, Src::Default),
+                (false, Src::Default),
                 "url/config={junk:?} must fall through to the default"
             );
         }
@@ -1208,6 +1245,39 @@ mod runtime_config_tests {
         );
     }
 
+    #[test]
+    fn per_protocol_connect_timeouts_override_the_election_period() {
+        let config: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "apiBaseUrl": "http://test:8080",
+            "wsUrl": "ws://test:8080",
+            "webTransportHost": "https://test:4433",
+            "oauthEnabled": "false",
+            "e2eeEnabled": "false",
+            "webTransportEnabled": "true",
+            "usersAllowedToStream": "",
+            "serverElectionPeriodMs": 2000,
+            "webTransportConnectTimeoutMs": 5000,
+            "webSocketConnectTimeoutMs": 4000
+        }))
+        .expect("config with per-protocol timeouts must parse");
+        assert_eq!(config.connect_timeouts_ms(), (5000, 4000));
+
+        let extreme: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "apiBaseUrl": "http://test:8080",
+            "wsUrl": "ws://test:8080",
+            "webTransportHost": "https://test:4433",
+            "oauthEnabled": "false",
+            "e2eeEnabled": "false",
+            "webTransportEnabled": "true",
+            "usersAllowedToStream": "",
+            "serverElectionPeriodMs": 2000,
+            "webTransportConnectTimeoutMs": 0,
+            "webSocketConnectTimeoutMs": u64::MAX
+        }))
+        .expect("config must parse");
+        assert_eq!(extreme.connect_timeouts_ms(), (500, 30_000));
+    }
+
     /// Issue #1193: bitrate targets are owned by the centralized AQ tables, so
     /// runtime configuration no longer requires the legacy audio/video/screen
     /// bitrate keys. Restoring any old required field makes this parse fail.
@@ -1226,6 +1296,7 @@ mod runtime_config_tests {
         .expect("config without legacy bitrate keys must parse");
 
         assert_eq!(config.server_election_period_ms, 2000);
+        assert_eq!(config.connect_timeouts_ms(), (2000, 2000));
         assert_eq!(config.max_received_layer, None);
         assert_eq!(config.skip_canvas_paint, "");
         assert_eq!(config.diagnostics_packets_enabled, None);

@@ -20,7 +20,7 @@
     "-p",
     "test_mutation_check.py"
   ],
-  "baseline_tests": 34,
+  "baseline_tests": 88,
   "mutations": [
     {
       "name": "classify always returns KILLED (the worst possible bug)",
@@ -76,6 +76,605 @@
       "replace": "    if False:\n        sys.exit(\"INVALID SPEC:",
       "expect_kills": [
         "test_typod_mutation_key_is_rejected"
+      ]
+    },
+    {
+      "name": "timeout: suite not started in its own session",
+      "file": "scripts/mutation-check.py",
+      "find": "env=env, start_new_session=True)",
+      "replace": "env=env, start_new_session=False)",
+      "expect_kills": [
+        "test_a_timed_out_suite_leaves_no_grandchild_running",
+        "test_an_interrupted_suite_leaves_no_grandchild_running",
+        "test_a_finished_suite_leaves_no_grandchild_running"
+      ]
+    },
+    {
+      "name": "timeout: only the direct child is killed",
+      "file": "scripts/mutation-check.py",
+      "find": "                    os.killpg(proc.pid, signal.SIGKILL)",
+      "replace": "                    proc.kill()",
+      "expect_kills": [
+        "test_a_timed_out_suite_leaves_no_grandchild_running",
+        "test_an_interrupted_suite_leaves_no_grandchild_running",
+        "test_a_finished_suite_leaves_no_grandchild_running"
+      ]
+    },
+    {
+      "name": "Ctrl-C leaves the suite's group running",
+      "file": "scripts/mutation-check.py",
+      "find": "            finally:\n                try:\n                    os.killpg",
+      "replace": "            except subprocess.TimeoutExpired:\n                pass\n            if True:\n                try:\n                    os.killpg",
+      "expect_kills": [
+        "test_an_interrupted_suite_leaves_no_grandchild_running",
+        "test_a_signal_between_popen_and_the_try_still_kills_the_group"
+      ]
+    },
+    {
+      "name": "spec key timeout_s rejected",
+      "file": "scripts/mutation-check.py",
+      "find": "\"node\", \"timeout_s\", \"baseline_tests\"",
+      "replace": "\"node\", \"baseline_tests\"",
+      "expect_kills": [
+        "test_a_spec_may_set_timeout_s"
+      ]
+    },
+    {
+      "name": "--only: unmatched filter silently ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "    if unmatched:\n        sys.exit(",
+      "replace": "    if False:\n        sys.exit(",
+      "expect_kills": [
+        "test_a_filter_matching_nothing_is_an_error"
+      ]
+    },
+    {
+      "name": "--only: only the first filter applied",
+      "file": "scripts/mutation-check.py",
+      "find": "    for f in only:\n",
+      "replace": "    for f in only[:1]:\n",
+      "expect_kills": [
+        "test_repeated_only_runs_the_union",
+        "test_repeated_only_on_the_cli_lists_the_union"
+      ]
+    },
+    {
+      "name": "--only: CLI flag not repeatable",
+      "file": "scripts/mutation-check.py",
+      "find": "r.add_argument(\"--only\", action=\"append\", default=[],",
+      "replace": "r.add_argument(\"--only\", default=[],",
+      "expect_kills": [
+        "test_repeated_only_on_the_cli_lists_the_union"
+      ]
+    },
+    {
+      "name": "no filter no longer means the full run",
+      "file": "scripts/mutation-check.py",
+      "find": "    if not only and changed_since is None:\n        return",
+      "replace": "    if False:\n        return",
+      "expect_kills": [
+        "test_no_filter_selects_every_mutation"
+      ]
+    },
+    {
+      "name": "(a) new spec entry not selected",
+      "file": "scripts/mutation-check.py",
+      "find": "        if not prior:\n",
+      "replace": "        if False:\n",
+      "expect_kills": [
+        "test_a_new_and_an_edited_spec_entry_are_selected"
+      ]
+    },
+    {
+      "name": "(a) edited spec entry not selected",
+      "file": "scripts/mutation-check.py",
+      "find": "        elif m not in prior:\n",
+      "replace": "        elif False:\n",
+      "expect_kills": [
+        "test_a_new_and_an_edited_spec_entry_are_selected"
+      ]
+    },
+    {
+      "name": "(b) no Python function widening",
+      "file": "scripts/mutation-check.py",
+      "find": "        enclosing = [d for d in defs or [] if d[1] <= ln <= d[2]]",
+      "replace": "        enclosing = []",
+      "expect_kills": [
+        "test_a_python_change_widens_to_the_whole_enclosing_function",
+        "test_a_change_in_a_nested_def_widens"
+      ]
+    },
+    {
+      "name": "(b) innermost def instead of outermost",
+      "file": "scripts/mutation-check.py",
+      "find": "min(enclosing, key=lambda d: d[1])",
+      "replace": "max(enclosing, key=lambda d: d[1])",
+      "expect_kills": [
+        "test_a_change_in_a_nested_def_widens_to_the_outermost"
+      ]
+    },
+    {
+      "name": "(b) no context margin",
+      "file": "scripts/mutation-check.py",
+      "find": "CONTEXT_MARGIN = 3",
+      "replace": "CONTEXT_MARGIN = 0",
+      "expect_kills": [
+        "test_a_non_python_change_selects_anchors_within_the_margin_only"
+      ]
+    },
+    {
+      "name": "(b) overlap test always true",
+      "file": "scripts/mutation-check.py",
+      "find": "                if lo <= span[1] and span[0] <= hi:",
+      "replace": "                if True:",
+      "expect_kills": [
+        "test_a_python_change_widens_to_the_whole_enclosing_function",
+        "test_a_non_python_change_selects_anchors_within_the_margin_only"
+      ]
+    },
+    {
+      "name": "(b) pure deletion ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "if n else (max(start, 1), start + 1))",
+      "replace": "if n else ())",
+      "expect_kills": [
+        "test_a_pure_deletion_counts_as_a_change_beside_it"
+      ]
+    },
+    {
+      "name": "(b) anchor count mismatch not selected",
+      "file": "scripts/mutation-check.py",
+      "find": "        if found != want:\n            why.append",
+      "replace": "        if False:\n            why.append",
+      "expect_kills": [
+        "test_a_vanished_anchor_is_selected",
+        "test_a_newly_duplicated_anchor_is_selected"
+      ]
+    },
+    {
+      "name": "(c) changed test files ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "    test_files = [p for p in changed if p.endswith(exts)]",
+      "replace": "    test_files = []",
+      "expect_kills": [
+        "test_an_edited_named_test_selects_its_mutations",
+        "test_a_deleted_named_test_selects_its_mutations"
+      ]
+    },
+    {
+      "name": "(c) cargo name not reduced to its fn segment",
+      "file": "scripts/mutation-check.py",
+      "find": "        seg = needle.rsplit(\"::\", 1)[-1]",
+      "replace": "        seg = needle",
+      "expect_kills": [
+        "test_cargo_maps_the_last_path_segment_to_the_fn_body"
+      ]
+    },
+    {
+      "name": "(c) vitest name not reduced to its title",
+      "file": "scripts/mutation-check.py",
+      "find": "        seg = needle.rsplit(\" > \", 1)[-1]",
+      "replace": "        seg = needle",
+      "expect_kills": [
+        "test_vitest_maps_the_last_title_segment_to_the_call_body"
+      ]
+    },
+    {
+      "name": "(c) block end off by one",
+      "file": "scripts/mutation-check.py",
+      "find": "                    return i + 1\n",
+      "replace": "                    return i\n",
+      "expect_kills": [
+        "test_cargo_maps_the_last_path_segment_to_the_fn_body",
+        "test_vitest_maps_the_last_title_segment_to_the_call_body"
+      ]
+    },
+    {
+      "name": "unresolvable rev not refused",
+      "file": "scripts/mutation-check.py",
+      "find": "    if out.returncode != 0:\n        sys.exit(f\"ERROR: --changed-since",
+      "replace": "    if False:\n        sys.exit(f\"ERROR: --changed-since",
+      "expect_kills": [
+        "test_an_unresolvable_rev_is_an_error"
+      ]
+    },
+    {
+      "name": "spec missing at rev not refused",
+      "file": "scripts/mutation-check.py",
+      "find": "    if blob.returncode != 0:\n        sys.exit(f\"ERROR: cannot read the spec",
+      "replace": "    if False:\n        sys.exit(f\"ERROR: cannot read the spec",
+      "expect_kills": [
+        "test_a_spec_missing_at_the_rev_is_an_error"
+      ]
+    },
+    {
+      "name": "--list runs the suite",
+      "file": "scripts/mutation-check.py",
+      "find": "        if args.list:\n",
+      "replace": "        if False:\n",
+      "expect_kills": [
+        "test_list_prints_names_reasons_and_count_and_runs_nothing"
+      ]
+    },
+    {
+      "name": "empty targeted set runs the baseline",
+      "file": "scripts/mutation-check.py",
+      "find": "    if not muts:\n        print(",
+      "replace": "    if False:\n        print(",
+      "expect_kills": [
+        "test_an_empty_targeted_set_runs_nothing_and_passes"
+      ]
+    },
+    {
+      "name": "group kill skipped unless timed out",
+      "file": "scripts/mutation-check.py",
+      "find": "            finally:\n                try:\n                    os.killpg",
+      "replace": "            except subprocess.TimeoutExpired:\n                pass\n            if timed_out:\n                try:\n                    os.killpg",
+      "expect_kills": [
+        "test_an_interrupted_suite_leaves_no_grandchild_running",
+        "test_a_finished_suite_leaves_no_grandchild_running"
+      ]
+    },
+    {
+      "name": "fail-safe: changed run command not selecting everything",
+      "file": "scripts/mutation-check.py",
+      "find": "        if old_spec.get(key) != spec.get(key):\n",
+      "replace": "        if False:\n",
+      "expect_kills": [
+        "test_a_changed_run_command_selects_every_entry"
+      ]
+    },
+    {
+      "name": "fail-safe: unparseable Python not selecting everything",
+      "file": "scripts/mutation-check.py",
+      "find": "            if text is not None and python_defs(text) is None:\n                return everything",
+      "replace": "            if False:\n                return everything",
+      "expect_kills": [
+        "test_a_python_file_that_does_not_parse_selects_every_entry"
+      ]
+    },
+    {
+      "name": "file names read from the patch instead of -z",
+      "file": "scripts/mutation-check.py",
+      "find": "    names = git(\"diff\", \"-z\", \"--name-only\"",
+      "replace": "    names = git(\"diff\", \"--name-only\"",
+      "expect_kills": [
+        "test_quoted_and_non_ascii_file_names_are_read"
+      ]
+    },
+    {
+      "name": "(b) deletion neighbours ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "changed_regions(p, read(p), changed[p].near)",
+      "replace": "changed_regions(p, read(p), changed[p].new)",
+      "expect_kills": [
+        "test_a_pure_deletion_counts_as_a_change_beside_it"
+      ]
+    },
+    {
+      "name": "(c) old definitions at REV ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "(then[p], changed[p].old, f\"changed or removed",
+      "replace": "(then[p], set(), f\"changed or removed",
+      "expect_kills": [
+        "test_a_deleted_named_test_selects_its_mutations"
+      ]
+    },
+    {
+      "name": "(c) deletion neighbours leak into test matching",
+      "file": "scripts/mutation-check.py",
+      "find": "(read(p), changed[p].new, f\"changed at {p}\")",
+      "replace": "(read(p), changed[p].near, f\"changed at {p}\")",
+      "expect_kills": [
+        "test_a_deleted_named_test_selects_its_mutations"
+      ]
+    },
+    {
+      "name": "(c) old text never read",
+      "file": "scripts/mutation-check.py",
+      "find": "    return blob.stdout if blob.returncode == 0 else None",
+      "replace": "    return None",
+      "expect_kills": [
+        "test_a_deleted_named_test_selects_its_mutations"
+      ]
+    },
+    {
+      "name": "(c) braces in strings counted",
+      "file": "scripts/mutation-check.py",
+      "find": "            elif ch in quotes:\n                quote = ch\n",
+      "replace": "            elif False:\n                quote = ch\n",
+      "expect_kills": [
+        "test_a_brace_inside_a_string_does_not_end_the_span"
+      ]
+    },
+    {
+      "name": "(c) braces after // counted",
+      "file": "scripts/mutation-check.py",
+      "find": "            elif line.startswith(\"//\", j):\n                break\n",
+      "replace": "            elif False:\n                break\n",
+      "expect_kills": [
+        "test_a_brace_inside_a_string_does_not_end_the_span"
+      ]
+    },
+    {
+      "name": "(c) cargo attributes above the fn ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "                while runner == \"cargo\" and lo > 1 and (not lines[lo - 2].strip()\n                                                        or lines[lo - 2].strip().startswith((\"#[\", \"//\"))):",
+      "replace": "                while False:",
+      "expect_kills": [
+        "test_removing_a_test_attribute_with_the_body_unchanged_selects_it",
+        "test_cargo_maps_the_last_path_segment_to_the_fn_body",
+        "test_removing_a_test_attribute_above_a_blank_line_selects_it"
+      ]
+    },
+    {
+      "name": "(c) enclosing class header ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "                    spans.extend([(start, child.end_lineno)] + headers)",
+      "replace": "                    spans.append((start, child.end_lineno))",
+      "expect_kills": [
+        "test_a_skip_decorator_on_the_enclosing_class_selects_it"
+      ]
+    },
+    {
+      "name": "(c) decorators outside the test span",
+      "file": "scripts/mutation-check.py",
+      "find": "                start = min([child.lineno] + [d.lineno for d in child.decorator_list])",
+      "replace": "                start = child.lineno",
+      "expect_kills": [
+        "test_a_skip_decorator_on_a_named_test_selects_it",
+        "test_a_skip_decorator_on_the_enclosing_class_selects_it"
+      ]
+    },
+    {
+      "name": "fail-safe: baseline_tests fall not selecting everything",
+      "file": "scripts/mutation-check.py",
+      "find": "    if isinstance(was, int) and isinstance(now_count, int) and now_count < was:",
+      "replace": "    if False:",
+      "expect_kills": [
+        "test_a_fall_in_baseline_tests_selects_every_entry"
+      ]
+    },
+    {
+      "name": "fail-safe: baseline_tests rise selecting everything",
+      "file": "scripts/mutation-check.py",
+      "find": "and now_count < was:",
+      "replace": "and now_count != was:",
+      "expect_kills": [
+        "test_a_rise_in_baseline_tests_selects_nothing_extra"
+      ]
+    },
+    {
+      "name": "(c) blank line stops the attribute walk",
+      "file": "scripts/mutation-check.py",
+      "find": "(not lines[lo - 2].strip()\n                                                        or lines",
+      "replace": "(False\n                                                        or lines",
+      "expect_kills": [
+        "test_removing_a_test_attribute_above_a_blank_line_selects_it"
+      ]
+    },
+    {
+      "name": "signals: no SIGTERM/SIGHUP handlers",
+      "file": "scripts/mutation-check.py",
+      "find": "    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):",
+      "replace": "    for sig in ():",
+      "expect_kills": [
+        "test_sigterm_kills_the_suite_and_restores_the_file",
+        "test_sighup_kills_the_suite_and_restores_the_file",
+        "test_gnu_timeout_kills_the_suite_and_restores_the_file",
+        "test_sigint_kills_the_suite_and_restores_the_file"
+      ]
+    },
+    {
+      "name": "signals: SIGHUP not handled",
+      "file": "scripts/mutation-check.py",
+      "find": "    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):",
+      "replace": "    for sig in (signal.SIGTERM, signal.SIGINT):",
+      "expect_kills": [
+        "test_sighup_kills_the_suite_and_restores_the_file"
+      ]
+    },
+    {
+      "name": "suite output on a pipe a grandchild can hold",
+      "file": "scripts/mutation-check.py",
+      "find": "stdout=fout, stderr=ferr,",
+      "replace": "stdout=subprocess.PIPE, stderr=ferr,",
+      "expect_kills": [
+        "test_a_grandchild_holding_stdout_does_not_hold_a_finished_suite"
+      ]
+    },
+    {
+      "name": "fail-safe: runner change ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "    for key in (\"runner\", \"cwd\", \"command\", \"node\"):",
+      "replace": "    for key in (\"cwd\", \"command\", \"node\"):",
+      "expect_kills": [
+        "test_each_run_key_change_selects_every_entry"
+      ]
+    },
+    {
+      "name": "fail-safe: cwd change ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "    for key in (\"runner\", \"cwd\", \"command\", \"node\"):",
+      "replace": "    for key in (\"runner\", \"command\", \"node\"):",
+      "expect_kills": [
+        "test_each_run_key_change_selects_every_entry"
+      ]
+    },
+    {
+      "name": "fail-safe: node change ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "    for key in (\"runner\", \"cwd\", \"command\", \"node\"):",
+      "replace": "    for key in (\"runner\", \"cwd\", \"command\"):",
+      "expect_kills": [
+        "test_each_run_key_change_selects_every_entry"
+      ]
+    },
+    {
+      "name": "fail-safe: unparseable at REV ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "(read(p), \"now\"), (then[p], f\"at {sha[:8]}\")",
+      "replace": "(read(p), \"now\"), (None, f\"at {sha[:8]}\")",
+      "expect_kills": [
+        "test_a_python_file_that_did_not_parse_at_rev_selects_every_entry"
+      ]
+    },
+    {
+      "name": "(c) cargo // lines above the fn ignored",
+      "file": "scripts/mutation-check.py",
+      "find": "or lines[lo - 2].strip().startswith((\"#[\", \"//\"))):",
+      "replace": "or lines[lo - 2].strip().startswith((\"#[\",))):",
+      "expect_kills": [
+        "test_cargo_span_reaches_comment_lines_above_the_fn"
+      ]
+    },
+    {
+      "name": "(c) vitest modifiers not matched",
+      "file": "scripts/mutation-check.py",
+      "find": "(?:it|test|describe)(?:\\.\\w+)*\\(",
+      "replace": "(?:it|test|describe)\\(",
+      "expect_kills": [
+        "test_vitest_modifiers_on_the_title_line_still_match"
+      ]
+    },
+    {
+      "name": "(b) multi-line anchor reduced to its first line",
+      "file": "scripts/mutation-check.py",
+      "find": "    return start, start + find.rstrip(\"\\n\").count(\"\\n\")",
+      "replace": "    return start, start",
+      "expect_kills": [
+        "test_a_multi_line_anchor_spans_all_its_lines"
+      ]
+    },
+    {
+      "name": "(b) overlap boundary on the lo side",
+      "file": "scripts/mutation-check.py",
+      "find": "                if lo <= span[1] and span[0] <= hi:",
+      "replace": "                if lo < span[1] and span[0] <= hi:",
+      "expect_kills": [
+        "test_a_change_exactly_the_margin_after_the_anchor_selects_it"
+      ]
+    },
+    {
+      "name": "(b) production def span ignores decorators",
+      "file": "scripts/mutation-check.py",
+      "find": "    return [(n.name, min([n.lineno] + [d.lineno for d in n.decorator_list]), n.end_lineno)",
+      "replace": "    return [(n.name, n.lineno, n.end_lineno)",
+      "expect_kills": [
+        "test_a_changed_decorator_widens_to_the_decorated_def"
+      ]
+    },
+    {
+      "name": "(c) class header ends at the class line",
+      "file": "scripts/mutation-check.py",
+      "find": "(start, max(child.lineno, child.body[0].lineno - 1))",
+      "replace": "(start, child.lineno)",
+      "expect_kills": [
+        "test_unittest_span_covers_a_multi_line_class_header"
+      ]
+    },
+    {
+      "name": "(c) bodiless fn gets no margin",
+      "file": "scripts/mutation-check.py",
+      "find": "    return start + CONTEXT_MARGIN\n",
+      "replace": "    return start\n",
+      "expect_kills": [
+        "test_cargo_fn_without_a_body_gets_the_margin"
+      ]
+    },
+    {
+      "name": "signals: SIGINT not handled",
+      "file": "scripts/mutation-check.py",
+      "find": "    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):",
+      "replace": "    for sig in (signal.SIGTERM, signal.SIGHUP):",
+      "expect_kills": [
+        "test_sigint_kills_the_suite_and_restores_the_file"
+      ]
+    },
+    {
+      "name": "signals: a signal during cleanup raises instead of waiting",
+      "file": "scripts/mutation-check.py",
+      "find": "    if _DEFER:\n        _PENDING.append(signum)",
+      "replace": "    if False:\n        _PENDING.append(signum)",
+      "expect_kills": [
+        "test_a_signal_between_popen_and_the_try_still_kills_the_group",
+        "test_a_second_signal_during_the_group_kill_does_not_abort_it",
+        "test_a_signal_during_the_restore_does_not_leave_the_mutation"
+      ]
+    },
+    {
+      "name": "signals: Popen outside the deferred region",
+      "file": "scripts/mutation-check.py",
+      "find": "        with deferred_signals(), tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:",
+      "replace": "        with tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:",
+      "expect_kills": [
+        "test_a_signal_between_popen_and_the_try_still_kills_the_group"
+      ]
+    },
+    {
+      "name": "signals: wait loop never checks a pending signal",
+      "file": "scripts/mutation-check.py",
+      "find": "                    check_signal()\n                    try:\n                        proc.wait(",
+      "replace": "                    try:\n                        proc.wait(",
+      "expect_kills": [
+        "test_a_signal_between_popen_and_the_try_still_kills_the_group"
+      ]
+    },
+    {
+      "name": "signals: restore outside the deferred region",
+      "file": "scripts/mutation-check.py",
+      "find": "    with deferred_signals():\n        return _cmd_run(",
+      "replace": "    if True:\n        return _cmd_run(",
+      "expect_kills": [
+        "test_a_signal_during_the_restore_does_not_leave_the_mutation"
+      ]
+    },
+    {
+      "name": "signals: next mutation starts after a signal",
+      "file": "scripts/mutation-check.py",
+      "find": "    for m in muts:\n        check_signal()\n",
+      "replace": "    for m in muts:\n",
+      "expect_kills": [
+        "test_a_signal_during_the_restore_does_not_leave_the_mutation"
+      ]
+    },
+    {
+      "name": "signals: pending signal exits 0",
+      "file": "scripts/mutation-check.py",
+      "find": "        raise SystemExit(128 + _PENDING[0])",
+      "replace": "        raise SystemExit(0)",
+      "expect_kills": [
+        "test_sigterm_kills_the_suite_and_restores_the_file",
+        "test_sighup_kills_the_suite_and_restores_the_file",
+        "test_gnu_timeout_kills_the_suite_and_restores_the_file",
+        "test_a_signal_between_popen_and_the_try_still_kills_the_group"
+      ]
+    },
+    {
+      "name": "signals: the last signal wins",
+      "file": "scripts/mutation-check.py",
+      "find": "        raise SystemExit(128 + _PENDING[0])",
+      "replace": "        raise SystemExit(128 + _PENDING[-1])",
+      "expect_kills": [
+        "test_two_pending_signals_exit_with_the_first"
+      ]
+    },
+    {
+      "name": "signals: immediate exit is 0",
+      "file": "scripts/mutation-check.py",
+      "find": "    else:\n        raise SystemExit(128 + signum)",
+      "replace": "    else:\n        raise SystemExit(0)",
+      "expect_kills": [
+        "test_with_nothing_to_clean_up_a_signal_exits_at_once"
+      ]
+    },
+    {
+      "name": "suite stderr discarded",
+      "file": "scripts/mutation-check.py",
+      "find": "out = (fout.read() + ferr.read())",
+      "replace": "out = (fout.read())",
+      "expect_kills": [
+        "test_suite_stderr_reaches_the_error_and_verbose_output"
       ]
     }
   ]

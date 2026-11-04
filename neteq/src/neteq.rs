@@ -28,7 +28,7 @@ use crate::expand::ExpandFactory;
 use crate::expand::{Expand, ExpandPhase};
 use crate::packet::AudioPacket;
 use crate::statistics::{
-    LifetimeStatistics, NetworkStatistics, StatisticsCalculator, TimeStretchOperation,
+    FlushCause, LifetimeStatistics, NetworkStatistics, StatisticsCalculator, TimeStretchOperation,
 };
 use crate::time_stretch::{TimeStretchFactory, TimeStretcher};
 use crate::{NetEqError, Result};
@@ -414,6 +414,10 @@ impl NetEq {
 
     /// Get 10ms of audio data
     pub fn get_audio(&mut self) -> Result<AudioFrame> {
+        self.get_audio_at(Instant::now())
+    }
+
+    fn get_audio_at(&mut self, statistics_now: Instant) -> Result<AudioFrame> {
         // Ensure packet-rate snapshot rolls even when no packets arrive
         // This prevents stale non-zero values when the peer stops sending
         self.maybe_roll_packet_rate();
@@ -490,7 +494,11 @@ impl NetEq {
         }
 
         // Record decode operation for per-second tracking
-        self.statistics.record_decode_operation(operation);
+        self.statistics.record_decode_operation(
+            operation,
+            frame.samples_per_channel as u64,
+            statistics_now,
+        );
 
         // === Log buffer status after producing frame ===
         let post_buffer_ms = self.current_buffer_size_ms();
@@ -802,6 +810,7 @@ impl NetEq {
         let _ = self.packet_buffer.partial_flush(
             keep_ms,
             self.config.sample_rate,
+            FlushCause::ResyncToLive,
             &mut self.statistics,
         );
 
@@ -970,8 +979,9 @@ impl NetEq {
             // Track time-stretching for buffer level filtering (matches WebRTC pattern)
             // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
             // extended_frame has more samples than we need, representing available data
-            let samples_removed = used_input_samples as i32 - output.samples.len() as i32;
-            self.timestretch_added_samples -= samples_removed / self.config.channels as i32;
+            let samples_removed = (used_input_samples as i32 - output.samples.len() as i32)
+                / self.config.channels as i32;
+            self.timestretch_added_samples -= samples_removed;
 
             // Update statistics
             self.statistics
@@ -1029,8 +1039,9 @@ impl NetEq {
             // Track time-stretching for buffer level filtering (matches WebRTC pattern)
             // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
             // For preemptive expand, we had normal frame samples available
-            let samples_added = output.samples.len() as i32 - used_input_samples as i32;
-            self.timestretch_added_samples += samples_added / self.config.channels as i32;
+            let samples_added = (output.samples.len() as i32 - used_input_samples as i32)
+                / self.config.channels as i32;
+            self.timestretch_added_samples += samples_added;
 
             // Update statistics
             self.statistics.time_stretch_operation(
@@ -1655,6 +1666,111 @@ mod tests {
             "the stall residue ({max_after_settling}ms) must stay BELOW peer_tile's \
              {CONSUMER_FLOOR_MS}ms liveness floor, or a stalled stream reads as live \
              and issue 2174's glow is suppressed for a talking peer"
+        );
+    }
+
+    fn pcm_neteq(channels: u8, config: NetEqConfig) -> NetEq {
+        let mut neteq = NetEq::new(NetEqConfig {
+            sample_rate: 48_000,
+            channels,
+            ..config
+        })
+        .unwrap();
+        neteq.register_decoder(
+            96,
+            Box::new(TestPcmDecoder {
+                sample_rate: 48_000,
+                channels,
+                samples: 960 * channels as usize,
+            }),
+        );
+        neteq
+    }
+
+    fn pcm_20ms_packet(seq: u16, channels: u8) -> AudioPacket {
+        let header = RtpHeader::new(seq, u32::from(seq) * 960, 12345, 96, false);
+        AudioPacket::new(header, vec![0; 4], 48_000, channels, 20)
+    }
+
+    #[test]
+    fn expand_rate_recovers_when_audio_starts_after_an_empty_buffer() {
+        let mut neteq = pcm_neteq(
+            1,
+            NetEqConfig {
+                delay_config: DelayConfig {
+                    resample_interval_ms: None,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let frame = Duration::from_millis(10);
+        let mut now = Instant::now() + Duration::from_secs(10);
+        neteq.get_audio_at(now).unwrap();
+
+        for _ in 0..120 {
+            now += frame;
+            neteq.get_audio_at(now).unwrap();
+        }
+        let empty_expand_rate = neteq.get_statistics().network.expand_rate;
+        assert!(
+            empty_expand_rate >= crate::statistics::q14::from_float(0.9),
+            "an empty buffer conceals every output audio frame, got {empty_expand_rate}"
+        );
+
+        for seq in 0..125_u16 {
+            neteq.insert_packet(pcm_20ms_packet(seq, 1)).unwrap();
+            for _ in 0..2 {
+                now += frame;
+                neteq.get_audio_at(now).unwrap();
+            }
+        }
+        let playing_expand_rate = neteq.get_statistics().network.expand_rate;
+        assert!(
+            playing_expand_rate < crate::statistics::q14::from_float(0.05),
+            "expand_rate must reflect the audio now playing, got {playing_expand_rate}"
+        );
+    }
+
+    #[test]
+    fn stereo_time_stretch_rates_count_samples_per_channel() {
+        let mut neteq = pcm_neteq(2, NetEqConfig::default());
+        let now = Instant::now() + Duration::from_secs(10);
+        neteq.get_audio_at(now).unwrap();
+        for seq in 0..20_u16 {
+            neteq.insert_packet(pcm_20ms_packet(seq, 2)).unwrap();
+        }
+
+        neteq.timestretch_added_samples = 0;
+        neteq
+            .decode_accelerate(&mut AudioFrame::new(48_000, 2, 480), true)
+            .unwrap();
+        let removed_per_channel = -neteq.timestretch_added_samples;
+        neteq.timestretch_added_samples = 0;
+        neteq
+            .decode_preemptive_expand(&mut AudioFrame::new(48_000, 2, 480))
+            .unwrap();
+        let added_per_channel = neteq.timestretch_added_samples;
+        assert!(
+            removed_per_channel > 0 && added_per_channel > 0,
+            "the fixture must accelerate ({removed_per_channel}) and preemptively expand ({added_per_channel})"
+        );
+
+        let output_per_channel = 10 * 480;
+        neteq.statistics.record_decode_operation(
+            Operation::Normal,
+            output_per_channel,
+            now + Duration::from_millis(1_500),
+        );
+        let network = &neteq.get_statistics().network;
+        let rate = |samples: i32| {
+            crate::statistics::q14::from_float(samples as f64 / output_per_channel as f64)
+        };
+        assert_eq!(
+            (network.accelerate_rate, network.preemptive_rate),
+            (rate(removed_per_channel), rate(added_per_channel)),
+            "stereo accelerate/preemptive rates must count samples per channel, \
+             like the buffer-level filter's timestretch_added_samples"
         );
     }
 
@@ -3095,5 +3211,52 @@ mod tests {
                 neteq.filtered_buffer_level_ms()
             );
         }
+    }
+
+    #[test]
+    fn resync_to_live_counts_discarded_packets() {
+        let config = NetEqConfig {
+            max_delay_ms: 300,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        insert_audio(&mut neteq, 1200);
+        reset_filtered_level(&mut neteq);
+        let before = neteq.packet_buffer.len() as u64;
+
+        let target = neteq.delay_manager.target_delay_ms();
+        assert_eq!(
+            neteq.maybe_resync_to_live(target),
+            Some(Operation::ExpandStart)
+        );
+        let removed = before - neteq.packet_buffer.len() as u64;
+        assert!(removed > 0);
+
+        let lifetime = neteq.get_statistics().lifetime;
+        assert_eq!(lifetime.resync_discarded_packets, removed);
+        assert_eq!(lifetime.smart_flush_discarded_packets, 0);
+        assert_eq!(lifetime.overflow_discarded_packets, 0);
+    }
+
+    #[test]
+    fn smart_flush_counts_discarded_packets() {
+        let config = NetEqConfig {
+            max_delay_ms: 300,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        let mut insert_audio = make_insert_audio!();
+
+        insert_audio(&mut neteq, 1600);
+        let removed = 160 - neteq.packet_buffer.len() as u64;
+        assert!(removed > 0);
+
+        let lifetime = neteq.get_statistics().lifetime;
+        assert_eq!(lifetime.smart_flush_discarded_packets, removed);
+        assert_eq!(lifetime.resync_discarded_packets, 0);
+        assert_eq!(lifetime.overflow_discarded_packets, 0);
     }
 }

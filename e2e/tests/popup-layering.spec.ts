@@ -291,7 +291,7 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
   });
 
-  // The dock wrapper houses Customize and Reset as well as the position picker,
+  // The dock wrapper houses Edit Buttons and Reset Buttons as well as the position picker,
   // and nothing represents it in the overflow popover, so shedding it on any
   // overflow would remove those three controls outright. It must stay visible
   // while it fits, which at 1280 it does in every drawer state.

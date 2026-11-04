@@ -5,7 +5,7 @@
  * a second sharer-side spec reuses one implementation rather than forking a copy.
  */
 
-import { Page, BrowserContext, expect } from "@playwright/test";
+import { Page, BrowserContext, Locator, expect } from "@playwright/test";
 import { wakeControls } from "./controls";
 
 export interface MeetingMember {
@@ -124,37 +124,8 @@ export async function admitGuestIfNeeded(hostPage: Page, guestPage: Page): Promi
   }
 }
 
-/**
- * Force the detach `window.open` fallback path in headless Chromium by
- * shadowing `documentPictureInPicture` with an own-property getter that returns
- * `undefined`. The Rust side reads it via `Reflect::get` and treats
- * undefined/null as "PiP unsupported" (`screen_share_detach.rs`
- * `document_pip_supported()`), so `open()` takes `open_popup` → `window.open`.
- *
- * Why: Document Picture-in-Picture's `requestWindow` is unreliable headless
- * (it may reject with no compositor), whereas `window.open` is a real, reliably
- * -working production path (Firefox / Safari / older Chromium users hit it) that
- * Playwright's headless Chromium honors and surfaces as a new context page.
- * Forcing this path makes the detached-window contract deterministic so the
- * mirror / zoom / reattach flow is actually exercised. The detach tests still
- * tolerate the revert branch (skip) if a given environment blocks the popup.
- */
-export const FORCE_POPUP_DETACH_SCRIPT = `
-  (() => {
-    try {
-      Object.defineProperty(window, 'documentPictureInPicture', {
-        configurable: true,
-        get() { return undefined; },
-      });
-    } catch (e) {
-      /* non-configurable here; the detach test tolerates either window path */
-    }
-  })();
-`;
-
 // Issue 2792: the view a new share opens in is read from these keys when the
-// share starts (share_view.rs `ShareOrigin::pref_key`). The default is "tile";
-// the pre-2792 split layout is "enlarged".
+// share starts (share_view.rs `ShareOrigin::pref_key`).
 export type ShareViewMode = "tile" | "enlarged" | "pinned" | "detached";
 export const RECEIVED_SHARE_VIEW_KEY = "vc_share_view_mode";
 export const OWN_SHARE_VIEW_KEY = "vc_own_share_view_mode";
@@ -168,6 +139,7 @@ export async function seedShareViewMode(
 ): Promise<void> {
   await target.addInitScript(
     ([k, v]) => {
+      if (window.location.href === "about:blank") return;
       try {
         window.localStorage.setItem(k, v);
       } catch {
@@ -184,10 +156,26 @@ export function shareButton(page: Page) {
   });
 }
 
-export function stopShareButton(page: Page) {
-  return page.locator("button.video-control-button", {
-    has: page.locator(".tooltip", { hasText: /Stop.*Shar/ }),
-  });
+// While a share is live the button opens a menu instead of stopping it.
+export function shareMenuTrigger(page: Page) {
+  return page.locator('#screen-share-trigger[data-state="active"]');
+}
+
+// Returns the menu as is when it is already open: clicking the trigger would close it.
+export async function openShareMenu(sharerPage: Page): Promise<Locator> {
+  const open = sharerPage.locator('[data-testid="screen-share-menu"]');
+  if (await open.isVisible()) {
+    return open;
+  }
+  await wakeControls(sharerPage);
+  await sharerPage.waitForTimeout(300);
+  await sharerPage.locator(".video-controls-container").hover();
+  const trigger = shareMenuTrigger(sharerPage);
+  await expect(trigger).toBeVisible({ timeout: 10_000 });
+  await trigger.click();
+  const menu = sharerPage.locator('[data-testid="screen-share-menu"]');
+  await expect(menu).toBeVisible({ timeout: 5_000 });
+  return menu;
 }
 
 // True once the VIEWER renders the received share tile, confirming encoded
@@ -211,10 +199,9 @@ export async function startScreenShare(sharerPage: Page, viewerPage: Page): Prom
 }
 
 export async function stopScreenShare(sharerPage: Page): Promise<void> {
-  await wakeControls(sharerPage);
-  await sharerPage.waitForTimeout(300);
-  await sharerPage.locator(".video-controls-container").hover();
-  const button = stopShareButton(sharerPage);
-  await expect(button).toBeVisible({ timeout: 10_000 });
-  await button.click();
+  const menu = await openShareMenu(sharerPage);
+  await menu.locator('[data-testid="screen-share-menu-stop"]').click();
+  await expect(sharerPage.locator("#screen-share-trigger")).toHaveAttribute("data-state", "idle", {
+    timeout: 10_000,
+  });
 }

@@ -439,6 +439,10 @@ mod tests {
             allow_guests: false,
             recording_allowed_for_all: false,
             chat_allowed_for_all: true,
+            entry_message_override: Default::default(),
+            entry_sound_override: Default::default(),
+            exit_message_override: Default::default(),
+            exit_sound_override: Default::default(),
         }
     }
 

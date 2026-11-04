@@ -37,6 +37,7 @@
 //! ```
 
 pub mod auth;
+pub mod avatars;
 pub mod co_hosts;
 pub mod error;
 pub mod host;
@@ -208,6 +209,21 @@ pub(crate) async fn parse_api_response<T: serde::de::DeserializeOwned + serde::S
         404 => {
             let text = response.text().await.unwrap_or_default();
             Err(ApiError::NotFound(text))
+        }
+        409 => {
+            let text = response.text().await.unwrap_or_default();
+            let mismatch = serde_json::from_str::<
+                videocall_meeting_types::APIResponse<videocall_meeting_types::APIError>,
+            >(&text)
+            .is_ok_and(|body| body.result.code == "AVATAR_IDENTITY_MISMATCH");
+            if mismatch {
+                Err(ApiError::IdentityMismatch)
+            } else {
+                Err(ApiError::ServerError {
+                    status: 409,
+                    body: text,
+                })
+            }
         }
         400 => {
             let text = response.text().await.unwrap_or_default();

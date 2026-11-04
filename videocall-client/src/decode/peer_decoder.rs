@@ -78,9 +78,9 @@ struct CanvasRenderer {
 /// worker-message closure and `VideoPeerDecoder` share it; `RefCell<Option<..>>` because the
 /// route is installed after construction (and may be `None` before the transport is wired).
 ///
-/// The route closure receives the head-of-line backlog age (`head_age_ms`, issue #1479) that
-/// tripped the freshness deadline, so the manager's per-receiver cross-sender PLI budget can
-/// prioritize the stalest stream when its global cap is reached.
+/// The route closure receives the head-of-line backlog age (`head_age_ms`, issue #1479), so the
+/// manager's per-receiver cross-sender PLI budget can prioritize the stalest stream when its
+/// global cap is reached.
 type KeyframeRequestRoute = Rc<RefCell<Option<Box<dyn Fn(f64)>>>>;
 
 /// Shared handle to the `requestAnimationFrame` paint closure (issue #1783). `Rc` so the
@@ -95,12 +95,44 @@ type RafPaintClosure = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
 /// struct field and the local both under clippy's `type_complexity` threshold.
 type SampleTimerClosure = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
 
+thread_local! {
+    static MIRRORED_CANVAS: RefCell<Option<HtmlCanvasElement>> = const { RefCell::new(None) };
+}
+
+/// Register the canvas a separate window mirrors, or clear it with `None`. While the
+/// document is hidden, the decoder whose canvas this is paints each decoded frame
+/// directly.
+pub fn set_mirrored_canvas(canvas: Option<&HtmlCanvasElement>) {
+    MIRRORED_CANVAS.with(|m| *m.borrow_mut() = canvas.cloned());
+}
+
+/// Whether `canvas` is the one registered with [`set_mirrored_canvas`].
+pub fn is_mirrored_canvas(canvas: &HtmlCanvasElement) -> bool {
+    MIRRORED_CANVAS.with(|m| m.borrow().as_ref() == Some(canvas))
+}
+
+fn paints_while_hidden(
+    canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
+    document: Option<&web_sys::Document>,
+) -> bool {
+    MIRRORED_CANVAS.with(|m| {
+        let mirrored = m.borrow();
+        let Some(mirrored) = mirrored.as_ref() else {
+            return false;
+        };
+        document.is_some_and(|d| d.hidden())
+            && canvas_renderer
+                .borrow()
+                .as_ref()
+                .is_some_and(|r| &r.canvas == mirrored)
+    })
+}
+
 /// Issue #1784: diagnostics subsystem + metric for per-peer PAINTED fps — the rate
-/// of frames actually drawn to the canvas at the rAF paint site, as opposed to the
+/// of frames actually drawn to the canvas, as opposed to the
 /// decode-call `video` / `fps_received` bucket (`diagnostics_manager.rs`) that counts
 /// packets the instant they are dispatched into the decode pipeline, before the jitter
-/// buffer drops/holds/skips and before #1783 coalesces a burst of late frames to a
-/// single draw. (Since #2190 that bucket excludes packets the simulcast rung guard
+/// buffer drops/holds/skips. (Since #2190 that bucket excludes packets the simulcast rung guard
 /// SKIPPED, so it is a decode-call count, not an arrival count — but it still counts
 /// dispatches, not draws.) The media-metrics overlay's "↓ fps" reads THIS.
 ///
@@ -121,12 +153,11 @@ const PAINTED_FPS_SAMPLE_INTERVAL_MS: i32 = 1000;
 /// Pure, host-testable 1-second painted-fps meter (issue #1784).
 ///
 /// Counts frames ACTUALLY PAINTED to the canvas — `record_paint` is called at the
-/// rAF paint site in [`VideoPeerDecoder`], right where `render_to_canvas_cached`
+/// paint site in [`VideoPeerDecoder`], right where `render_to_canvas_cached`
 /// reports it drew — and `sample` rolls the count into an fps value on the ~1 Hz
 /// tick that emits the [`SUBSYSTEM_VIDEO_PAINTED`] event. This is deliberately
 /// distinct from the decode-call `FpsTracker` (`fps_received`, an arrival count until
-/// #2190): a burst of late frames that #1783 coalesces to a single draw counts as ONE
-/// paint here, so the value never exceeds the source frame rate.
+/// #2190).
 ///
 /// A window with zero paints (a stopped or hidden tile — no `record_paint` calls)
 /// samples to exactly `0.0`, so the overlay's snap-down reverts the readout to the
@@ -335,9 +366,7 @@ pub struct VideoPeerDecoder {
     /// HCL #893 companion latch: the "have we ever fired the first-render ack
     /// for THIS decoder" guard that `mark_first_render` checks so the
     /// `PEER_EVENT(screen_decode_started)` ack is emitted at most once per real
-    /// render burst. The screen `VideoPeerDecoder` is created once per peer and
-    /// only `flush()`ed (not recreated) when a share stops, so this latch
-    /// survives a stop→restart of screen sharing. `rearm_first_render_ack()`
+    /// render burst. `rearm_first_render_ack()`
     /// clears it on the screen-turned-off edge so the NEXT share re-arms and
     /// re-acks — without that reset every share after the first (within a
     /// receiver's page session) never acks, and the publisher falsely reports
@@ -368,13 +397,11 @@ pub struct VideoPeerDecoder {
     skip_canvas_paint: Rc<Cell<bool>>,
     /// #2511: `Date::now()` of the last frame the worker handed to main; `0.0` = none yet.
     last_output_ms: Rc<Cell<f64>>,
-    /// Issue #1025: proactive keyframe-request route. The underlying `WasmDecoder`'s
-    /// worker-message closure (captured in [`Self::new`]) holds a clone of this `Rc` and,
-    /// when the worker posts a `RequestKeyframeMessage`, invokes the inner closure if set.
-    /// The owner (`PeerDecodeManager`) installs the closure via
-    /// [`Self::set_keyframe_request_route`] once it has the transport send-packet callback,
-    /// the local user id, and this peer's identity. `None` (the initial state, and after a
-    /// disconnect that clears the route) makes the proactive path a safe no-op.
+    /// Issue #1025: proactive keyframe-request route. The owner (`PeerDecodeManager`) installs
+    /// the closure via [`Self::set_keyframe_request_route`] once it has the transport
+    /// send-packet callback, the local user id, and this peer's identity. `None` (the initial
+    /// state, and after a disconnect that clears the route) makes the proactive path a safe
+    /// no-op.
     ///
     /// Shared on the single render thread; `RefCell` because the closure is installed after
     /// construction. The boxed closure issues a `KEYFRAME_REQUEST` for this decoder's
@@ -383,10 +410,7 @@ pub struct VideoPeerDecoder {
     keyframe_request_route: KeyframeRequestRoute,
     /// Issue #1783 realtime-first playout: latest-wins presentation mailbox. The `on_video_frame`
     /// callback (which drains every decoded frame from the worker→main queue) `offer`s each frame
-    /// here instead of painting it synchronously; a `requestAnimationFrame`-scheduled paint then
-    /// `take`s the newest and draws it. A burst of late frames thus collapses to a single draw (an
-    /// instant jump to live) rather than a fast-forward replay. Steady state (≤1 frame pending per
-    /// frame interval) is unchanged: the one held frame is presented untouched.
+    /// here; a paint then `take`s the newest and draws it.
     ///
     /// Shared (`Rc`) with the paint closure and the offer closure captured in [`Self::new`]; kept
     /// on `self` so `clear_canvas` and `Drop` can close any still-held frame (freeing GPU memory the
@@ -395,7 +419,7 @@ pub struct VideoPeerDecoder {
     latest_frame: Rc<RefCell<LatestFrameMailbox<web_sys::VideoFrame>>>,
     /// Issue #1783: whether a `requestAnimationFrame` paint is currently pending. Prevents
     /// scheduling more than one rAF at a time — the single scheduled paint always presents whatever
-    /// is newest when it fires, so a burst of offers coalesces to one draw.
+    /// is newest when it fires.
     ///
     /// Read only in the wasm-gated `Drop` (its writers are the closures in `new`, which hold their
     /// own `Rc` clones), so on the host build it is held-but-not-read; the `allow(dead_code)` is
@@ -421,6 +445,8 @@ pub struct VideoPeerDecoder {
     /// [`Self::new`]; `None` on the host build (and in `noop()`).
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     _painted_fps_interval_closure: SampleTimerClosure,
+    #[cfg(test)]
+    canvas_clears: Cell<u32>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -432,6 +458,9 @@ trait VideoFrameDecoder {
     /// Deliberately WITHOUT a default body (#2524): a defaulted `(0, 0)` let deleting the
     /// `WasmVideoFrameDecoder` override publish a constant 0 with a green suite.
     fn freshness_eviction_counts(&self) -> (u64, u64);
+    fn boot_timed_out(&self) -> bool {
+        false
+    }
     #[cfg(test)]
     fn set_freshness_eviction_counts_for_test(&self, _total: u64, _keyframeless: u64) {}
     /// Only the host-test stand-in records this; a worker-backed decoder cannot read back what
@@ -445,6 +474,24 @@ trait VideoFrameDecoder {
     #[cfg(test)]
     fn boot_replay_ttl_ms(&self) -> f64 {
         unimplemented!("only a worker-backed decoder carries a boot gate")
+    }
+    #[cfg(test)]
+    fn boot_state(&self) -> crate::decode::WorkerBootState {
+        unimplemented!("only a worker-backed decoder boots")
+    }
+}
+
+/// Holds no worker and drops everything; stands in until a real decoder is needed (#3210).
+struct IdleDecoder;
+
+impl VideoFrameDecoder for IdleDecoder {
+    fn push_frame(&self, _: FrameBuffer, _: Option<&StreamContext>) {}
+    fn is_waiting_for_keyframe(&self) -> bool {
+        false
+    }
+    fn flush(&self) {}
+    fn freshness_eviction_counts(&self) -> (u64, u64) {
+        (0, 0)
     }
 }
 
@@ -477,6 +524,63 @@ impl VideoFrameDecoder for NoopDecoder {
     }
 }
 
+/// Host-test stand-in for the decode worker: a real `JitterBuffer` fed the way
+/// `worker_decoder.rs` feeds it (`insert_frame` per pushed frame, `flush` on `Flush`).
+#[cfg(test)]
+pub(crate) struct JitterBufferProbe {
+    pub(crate) jb: Rc<RefCell<videocall_codecs::jitter_buffer::JitterBuffer<DecodedFrame>>>,
+    pub(crate) decoded: Arc<std::sync::Mutex<Vec<u64>>>,
+    pub(crate) keyframe_requests: Rc<Cell<u32>>,
+}
+
+#[cfg(test)]
+use videocall_codecs::decoder::DecodedFrame;
+
+#[cfg(test)]
+struct RecordingDecodable {
+    decoded: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+#[cfg(test)]
+impl videocall_codecs::decoder::Decodable for RecordingDecodable {
+    type Frame = DecodedFrame;
+    fn new(
+        _codec: videocall_codecs::decoder::VideoCodec,
+        _on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+    ) -> Self {
+        unreachable!("built directly by VideoPeerDecoder::backed_by_jitter_buffer")
+    }
+    fn decode(&self, frame: FrameBuffer) {
+        self.decoded
+            .lock()
+            .expect("decoded log")
+            .push(frame.sequence_number());
+    }
+}
+
+#[cfg(test)]
+struct JitterBufferDecoder {
+    jb: Rc<RefCell<videocall_codecs::jitter_buffer::JitterBuffer<DecodedFrame>>>,
+}
+
+#[cfg(test)]
+impl VideoFrameDecoder for JitterBufferDecoder {
+    fn push_frame(&self, frame: FrameBuffer, _: Option<&StreamContext>) {
+        self.jb
+            .borrow_mut()
+            .insert_frame(frame.frame, frame.arrival_time_ms);
+    }
+    fn is_waiting_for_keyframe(&self) -> bool {
+        self.jb.borrow().is_waiting_for_keyframe()
+    }
+    fn flush(&self) {
+        self.jb.borrow_mut().flush();
+    }
+    fn freshness_eviction_counts(&self) -> (u64, u64) {
+        self.jb.borrow().freshness_eviction_counts()
+    }
+}
+
 struct WasmVideoFrameDecoder {
     decoder: WasmDecoder,
 }
@@ -502,9 +606,27 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
         self.decoder.freshness_eviction_counts()
     }
 
+    fn boot_timed_out(&self) -> bool {
+        self.decoder.boot_timed_out()
+    }
+
     #[cfg(test)]
     fn boot_replay_ttl_ms(&self) -> f64 {
         self.decoder.boot_replay_ttl_ms()
+    }
+
+    #[cfg(test)]
+    fn boot_state(&self) -> crate::decode::WorkerBootState {
+        use crate::decode::WorkerBootState;
+        if self.decoder.boot_failed() {
+            WorkerBootState::Failed
+        } else if self.decoder.worker_handshake_seen() {
+            WorkerBootState::Ready
+        } else if self.decoder.worker_started() {
+            WorkerBootState::Booting
+        } else {
+            WorkerBootState::Queued
+        }
     }
 }
 
@@ -596,9 +718,18 @@ impl VideoPeerDecoder {
         self.decoder.freshness_eviction_counts()
     }
 
+    pub(crate) fn boot_timed_out(&self) -> bool {
+        self.decoder.boot_timed_out()
+    }
+
     #[cfg(test)]
     pub(crate) fn boot_replay_ttl_ms_for_test(&self) -> f64 {
         self.decoder.boot_replay_ttl_ms()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn boot_state_for_test(&self) -> crate::decode::WorkerBootState {
+        self.decoder.boot_state()
     }
 
     #[cfg(test)]
@@ -627,24 +758,57 @@ impl VideoPeerDecoder {
         media_type: &'static str,
         skip_canvas_paint: bool,
     ) -> Result<Self, JsValue> {
+        let renderer = match canvas {
+            Some(canvas) => {
+                let context = canvas
+                    .get_context("2d")?
+                    .ok_or_else(|| JsValue::from_str("Failed to get 2d context"))?
+                    .dyn_into::<CanvasRenderingContext2d>()?;
+                Some(CanvasRenderer {
+                    canvas,
+                    context,
+                    last_width: 0,
+                    last_height: 0,
+                    from_peer: None,
+                    to_peer: None,
+                })
+            }
+            None => None,
+        };
+        let decoder = Self::without_canvas(media_type, skip_canvas_paint);
+        *decoder.canvas_renderer.borrow_mut() = renderer;
+        Ok(decoder)
+    }
+
+    pub(crate) fn without_canvas(media_type: &'static str, skip_canvas_paint: bool) -> Self {
+        Self::build(media_type, skip_canvas_paint, None).0
+    }
+
+    /// Like [`Self::without_canvas`], but the worker boots only when the returned starter runs
+    /// (#3277).
+    pub(crate) fn without_canvas_deferred(
+        media_type: &'static str,
+        skip_canvas_paint: bool,
+        on_boot_settled: videocall_codecs::decoder::BootSettled,
+    ) -> (Self, crate::decode::worker_boot_queue::BootHandle) {
+        let (decoder, starter) = Self::build(media_type, skip_canvas_paint, Some(on_boot_settled));
+        let starter = Rc::new(starter.expect("a deferred build returns its starter"));
+        let aborter = starter.clone();
+        (
+            decoder,
+            crate::decode::worker_boot_queue::BootHandle {
+                start: Box::new(move || starter.start()),
+                abort: Box::new(move || aborter.abort()),
+            },
+        )
+    }
+
+    fn build(
+        media_type: &'static str,
+        skip_canvas_paint: bool,
+        on_boot_settled: Option<videocall_codecs::decoder::BootSettled>,
+    ) -> (Self, Option<videocall_codecs::decoder::WorkerStarter>) {
         let canvas_renderer = Rc::new(RefCell::new(None));
-
-        // Initialize canvas if provided
-        if let Some(canvas) = canvas {
-            let context = canvas
-                .get_context("2d")?
-                .ok_or_else(|| JsValue::from_str("Failed to get 2d context"))?
-                .dyn_into::<CanvasRenderingContext2d>()?;
-
-            *canvas_renderer.borrow_mut() = Some(CanvasRenderer {
-                canvas,
-                context,
-                last_width: 0,
-                last_height: 0,
-                from_peer: None,
-                to_peer: None,
-            });
-        }
 
         // HCL #893: shared flag the async render callback uses to tell the
         // next synchronous `decode()` call that a frame has actually
@@ -677,22 +841,18 @@ impl VideoPeerDecoder {
         // `mark_first_render_*` tests for the pinned semantics).
         let first_render_fired = Rc::new(RefCell::new(false));
 
-        // The rAF paint: present the single newest held frame, at most one draw per animation
-        // frame. Held in an `Rc<RefCell<Option<Closure>>>` so the offer closure can schedule it and
-        // so it stays alive for the decoder's lifetime.
+        // The rAF paint closure, held in an `Rc<RefCell<Option<Closure>>>` so the offer closure
+        // can schedule it and so it stays alive for the decoder's lifetime.
         let raf_paint_closure: RafPaintClosure = Rc::new(RefCell::new(None));
-        {
+        let present_newest: Rc<dyn Fn()> = {
             let mailbox = latest_frame.clone();
             let canvas_ref = canvas_renderer.clone();
             let paint_flag = paint_enabled.clone();
             let skip_flag = skip_canvas_paint.clone();
             let first_render_flag = first_render_pending_ack.clone();
             let first_render_fired = first_render_fired.clone();
-            let raf_scheduled_for_paint = raf_scheduled.clone();
             let paint_meter_for_paint = paint_meter.clone();
-            *raf_paint_closure.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-                // This rAF has fired; allow the next offer to schedule the following paint.
-                raf_scheduled_for_paint.set(false);
+            Rc::new(move || {
                 // Present the newest frame; older frames of the burst were already closed at offer
                 // time. `take` releases the mailbox borrow before we render (render never touches
                 // the mailbox, but keep the borrow window minimal).
@@ -717,6 +877,15 @@ impl VideoPeerDecoder {
                     }
                 }
             })
+        };
+        {
+            let raf_scheduled_for_paint = raf_scheduled.clone();
+            let present = present_newest.clone();
+            *raf_paint_closure.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+                // This rAF has fired; allow the next offer to schedule the following paint.
+                raf_scheduled_for_paint.set(false);
+                present();
+            })
                 as Box<dyn FnMut()>));
         }
 
@@ -735,6 +904,8 @@ impl VideoPeerDecoder {
         // scheduled frame — mirrors `render_fps::RenderFpsObserver::start`. `None` (no window) makes
         // rAF scheduling a no-op, exactly as before.
         let window_for_offer = web_sys::window();
+        let document_for_offer = window_for_offer.as_ref().and_then(|w| w.document());
+        let canvas_for_offer = canvas_renderer.clone();
         let last_output_ms = Rc::new(Cell::new(0.0f64));
         let last_output_for_offer = last_output_ms.clone();
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
@@ -758,7 +929,7 @@ impl VideoPeerDecoder {
                 stale.close();
             }
             // Ensure a single rAF paint is pending. It will present whatever is newest when it
-            // fires, so a burst arriving across several message tasks coalesces to one draw.
+            // fires.
             if !raf_scheduled_for_offer.get() {
                 if let Some(win) = window_for_offer.as_ref() {
                     if let Some(cb) = raf_paint_for_offer.borrow().as_ref() {
@@ -769,12 +940,14 @@ impl VideoPeerDecoder {
                     }
                 }
             }
+            if paints_while_hidden(&canvas_for_offer, document_for_offer.as_ref()) {
+                present_newest();
+            }
         };
 
-        // Issue #1025: shared slot for the proactive keyframe-request route. The closure
-        // handed to the decoder reads this slot when the worker signals a keyframe-less
-        // eviction; the manager installs the real route later via
-        // `set_keyframe_request_route`. While `None` the proactive path is a no-op.
+        // Issue #1025: shared slot for the proactive keyframe-request route. The manager
+        // installs the real route later via `set_keyframe_request_route`. While `None` the
+        // proactive path is a no-op.
         let keyframe_request_route: KeyframeRequestRoute = Rc::new(RefCell::new(None));
         let route_for_decoder = keyframe_request_route.clone();
         let on_request_keyframe = move |head_age_ms: f64| {
@@ -783,17 +956,34 @@ impl VideoPeerDecoder {
             }
         };
 
-        let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
-            videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
-            Box::new(on_video_frame),
-            Box::new(on_request_keyframe),
-            // Issue #1641: thread this decoder's stream kind (MEDIA_TYPE_CAMERA / MEDIA_TYPE_SCREEN)
-            // into the worker→main re-broadcast so its "video" playout-stats DiagEvent is bucketed
-            // into the correct camera-vs-screen slot by health_reporter. The worker cannot supply
-            // this (it only knows peer IDs), so the kind is stamped on the main thread here.
-            media_type,
-            boot_replay_ttl_ms(media_type),
-        );
+        // Issue #1641: thread this decoder's stream kind (MEDIA_TYPE_CAMERA / MEDIA_TYPE_SCREEN)
+        // into the worker→main re-broadcast so its "video" playout-stats DiagEvent is bucketed
+        // into the correct camera-vs-screen slot by health_reporter. The worker cannot supply
+        // this (it only knows peer IDs), so the kind is stamped on the main thread here.
+        let (wasm_decoder, starter) = match on_boot_settled {
+            Some(on_boot_settled) => {
+                let (decoder, starter) =
+                    videocall_codecs::decoder::WasmDecoder::new_deferred_with_video_frame_callback(
+                        videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
+                        Box::new(on_video_frame),
+                        Box::new(on_request_keyframe),
+                        media_type,
+                        boot_replay_ttl_ms(media_type),
+                        on_boot_settled,
+                    );
+                (decoder, Some(starter))
+            }
+            None => (
+                videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
+                    videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
+                    Box::new(on_video_frame),
+                    Box::new(on_request_keyframe),
+                    media_type,
+                    boot_replay_ttl_ms(media_type),
+                ),
+                None,
+            ),
+        };
 
         let decoder = Box::new(WasmVideoFrameDecoder {
             decoder: wasm_decoder,
@@ -849,7 +1039,7 @@ impl VideoPeerDecoder {
             *painted_fps_interval_closure.borrow_mut() = Some(closure);
         }
 
-        Ok(Self {
+        let decoder = Self {
             decoder,
             canvas_renderer,
             media_type,
@@ -868,7 +1058,10 @@ impl VideoPeerDecoder {
             _raf_paint_closure: raf_paint_closure,
             painted_fps_interval_id,
             _painted_fps_interval_closure: painted_fps_interval_closure,
-        })
+            #[cfg(test)]
+            canvas_clears: Cell::new(0),
+        };
+        (decoder, starter)
     }
 
     pub fn last_output_ms(&self) -> f64 {
@@ -1121,6 +1314,8 @@ impl VideoPeerDecoder {
         // dropped instead of repainting the tile we are about to wipe. The next
         // `decode()` (only reached while visible) re-enables painting.
         self.paint_enabled.set(false);
+        #[cfg(test)]
+        self.canvas_clears.set(self.canvas_clears.get() + 1);
         // Issue #1783 compose with #1183: drop any frame still held for presentation. The tile is
         // leaving the active set, so a held frame must never be painted — not even by a rAF that
         // fires after a subsequent `decode()` re-enables `paint_enabled`. The rAF re-check of
@@ -1146,6 +1341,8 @@ impl VideoPeerDecoder {
     /// stopped, rather than a decode-budget visibility transition.
     pub fn force_clear_canvas(&self) {
         self.paint_enabled.set(false);
+        #[cfg(test)]
+        self.canvas_clears.set(self.canvas_clears.get() + 1);
         // Issue #1783 compose with #1746: drop any frame still held for
         // presentation so a pending rAF cannot repaint the tile after we wipe it
         // (mirror of the drain in `clear_canvas`). Unlike `clear_canvas`, this
@@ -1182,14 +1379,13 @@ impl VideoPeerDecoder {
     /// the NEXT screen share from this peer re-fires
     /// `PEER_EVENT(screen_decode_started)`.
     ///
-    /// The screen `VideoPeerDecoder` is created once per peer and only
-    /// `flush()`ed (jitter buffer cleared) — never recreated — when a share
-    /// stops. `first_render_fired` therefore stays `true` across a stop→restart,
-    /// so `mark_first_render` no-ops on the second share's first render and the
-    /// synchronous `decode()` never returns `first_frame: true` again. Without
-    /// this reset, `peer_decode_manager` never publishes the decode-started ack
-    /// for the second (and every subsequent) share of a receiver's page
-    /// session, and the publisher's visibility timer falsely fires
+    /// A screen `VideoPeerDecoder` reused across a share stop→restart keeps
+    /// `first_render_fired == true`, so `mark_first_render` no-ops on the
+    /// second share's first render and the synchronous `decode()` never returns
+    /// `first_frame: true` again. Without this reset, `peer_decode_manager`
+    /// never publishes the decode-started ack for the second (and every
+    /// subsequent) share of a receiver's page session, and the publisher's
+    /// visibility timer falsely fires
     /// "No peers received the shared content within 10 seconds" even though the
     /// receiver is decoding and painting the share.
     ///
@@ -1204,8 +1400,6 @@ impl VideoPeerDecoder {
 
     /// Install the proactive keyframe-request route (issue #1025).
     ///
-    /// `route` is invoked on the main thread when the worker signals that it evicted a stale
-    /// keyframe-less backlog for this decoder's stream (no buffered keyframe to resume from).
     /// The `PeerDecodeManager` supplies a closure that emits a `KEYFRAME_REQUEST` for this
     /// decoder's peer + media type — it is already bound to one (peer, stream), so the worker
     /// message carries no identity. Installing it here (rather than at construction) lets the
@@ -1213,9 +1407,9 @@ impl VideoPeerDecoder {
     /// peer's identity are all known. Replaces any previously-installed route; pass-through to
     /// the shared slot the decoder closure reads.
     ///
-    /// The `route` receives the head-of-line backlog age (`head_age_ms`, issue #1479) that tripped
-    /// the freshness deadline; the manager's route closure feeds it to the per-receiver
-    /// cross-sender PLI budget as the staleness-priority key.
+    /// The `route` receives the head-of-line backlog age (`head_age_ms`, issue #1479); the
+    /// manager's route closure feeds it to the per-receiver cross-sender PLI budget as the
+    /// staleness-priority key.
     pub fn set_keyframe_request_route(&self, route: Box<dyn Fn(f64)>) {
         *self.keyframe_request_route.borrow_mut() = Some(route);
     }
@@ -1228,6 +1422,10 @@ impl VideoPeerDecoder {
     /// [`PeerDecodeManager::clear_send_packet_callback`].
     pub fn clear_keyframe_request_route(&self) {
         *self.keyframe_request_route.borrow_mut() = None;
+    }
+
+    pub(crate) fn take_keyframe_request_route(&self) -> Option<Box<dyn Fn(f64)>> {
+        self.keyframe_request_route.borrow_mut().take()
     }
 
     /// Test/observability helper: whether a keyframe-request route is currently
@@ -1252,13 +1450,29 @@ impl VideoPeerDecoder {
         }
     }
 
+    /// A screen-decoder slot with no worker, used while the peer has no live screen decoder (#3210).
+    pub(crate) fn idle_screen() -> Self {
+        Self::worker_less(Box::new(IdleDecoder), MEDIA_TYPE_SCREEN)
+    }
+
+    pub(crate) fn stream_context_pair(&self) -> Option<(String, String)> {
+        self.stream_context
+            .borrow()
+            .as_ref()
+            .map(|c| (c.from_peer.clone(), c.to_peer.clone()))
+    }
+
     /// No-op decoder for unit tests — avoids requiring WebCodecs / worker link tags.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn noop() -> Self {
+        Self::worker_less(Box::new(NoopDecoder::default()), MEDIA_TYPE_CAMERA)
+    }
+
+    fn worker_less(decoder: Box<dyn VideoFrameDecoder>, media_type: &'static str) -> Self {
         Self {
-            decoder: Box::new(NoopDecoder::default()),
+            decoder,
             canvas_renderer: Rc::new(RefCell::new(None)),
-            media_type: MEDIA_TYPE_CAMERA,
+            media_type,
             last_source_dims: RefCell::new((0, 0)),
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: Rc::new(RefCell::new(None)),
@@ -1274,7 +1488,39 @@ impl VideoPeerDecoder {
             _raf_paint_closure: Rc::new(RefCell::new(None)),
             painted_fps_interval_id: Rc::new(Cell::new(0)),
             _painted_fps_interval_closure: Rc::new(RefCell::new(None)),
+            #[cfg(test)]
+            canvas_clears: Cell::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canvas_clears_for_test(&self) -> u32 {
+        self.canvas_clears.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backed_by_jitter_buffer() -> (Self, JitterBufferProbe) {
+        let decoded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let keyframe_requests = Rc::new(Cell::new(0u32));
+        let requests = keyframe_requests.clone();
+        let jb = Rc::new(RefCell::new(
+            videocall_codecs::jitter_buffer::JitterBuffer::with_keyframe_request(
+                Box::new(RecordingDecodable {
+                    decoded: decoded.clone(),
+                }),
+                Box::new(move |_head_age_ms| requests.set(requests.get() + 1)),
+            ),
+        ));
+        let mut decoder = Self::noop();
+        decoder.decoder = Box::new(JitterBufferDecoder { jb: jb.clone() });
+        (
+            decoder,
+            JitterBufferProbe {
+                jb,
+                decoded,
+                keyframe_requests,
+            },
+        )
     }
 
     /// Test accessor for the #1183 late-frame paint gate. The async paint
@@ -1984,11 +2230,11 @@ mod tests {
         );
     }
 
-    /// HCL #893 re-share regression: the screen `VideoPeerDecoder` is reused
-    /// (only `flush()`ed, never recreated) across a share stop→restart, so the
-    /// `first_render_fired` latch survives. `rearm_first_render` (invoked by
-    /// `rearm_first_render_ack` on the screen-turned-off edge) must reset that
-    /// latch so the SECOND share's first render re-acks the publisher.
+    /// HCL #893 re-share regression: when the screen `VideoPeerDecoder` is reused
+    /// across a share stop→restart, the `first_render_fired` latch survives.
+    /// `rearm_first_render` (invoked by `rearm_first_render_ack` on the
+    /// screen-turned-off edge) must reset that latch so the SECOND share's
+    /// first render re-acks the publisher.
     ///
     /// Mutation sensitivity: reverting `rearm_first_render` to a no-op (or
     /// dropping the screen-off `rearm_first_render_ack()` call it backs) leaves
@@ -2769,6 +3015,7 @@ mod worker_boot_replay_tests {
     use super::tests::minimal_video_packet;
     use super::*;
     use videocall_codecs::decoder::WasmDecoder;
+    use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -2965,6 +3212,45 @@ if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {inst
             0,
             "an over-age backlog must be dropped, not flushed (issue 2572)"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_boot_discard_requests_one_keyframe_only_when_it_dropped_a_frame() {
+        let previous = install_worker_script(&boots_after(1000).script());
+        let counting = |requests: &Rc<Cell<u64>>| {
+            let requests = requests.clone();
+            WasmDecoder::new_with_video_frame_callback(
+                videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
+                Box::new(|_frame| {}),
+                Box::new(move |_head_age_ms| requests.set(requests.get() + 1)),
+                MEDIA_TYPE_SCREEN,
+                300.0,
+            )
+        };
+        let requests: [Rc<Cell<u64>>; 3] = Default::default();
+        let [context_only, with_frame, frame_after_expiry] =
+            [0, 1, 2].map(|i| counting(&requests[i]));
+        context_only.set_context("local".into(), "peer".into());
+        with_frame.push_frame(delta_frame(1), None);
+        frame_after_expiry.set_context("local".into(), "peer".into());
+        restore_worker_link(previous);
+        sleep(400).await;
+        frame_after_expiry.push_frame(delta_frame(1), None);
+
+        let decoders = [&context_only, &with_frame, &frame_after_expiry];
+        poll_counts(
+            || {
+                let seen = decoders
+                    .iter()
+                    .filter(|d| d.worker_handshake_seen())
+                    .count();
+                (seen as u64, 0)
+            },
+            |(seen, _)| seen == 3,
+        )
+        .await;
+        assert!(decoders.iter().all(|d| d.boot_queue_dropped()));
+        assert_eq!(requests.map(|r| r.get()), [0, 1, 1]);
     }
 
     /// The fallback when a bound is exceeded is the UN-GATED behaviour, not silence: a worker that
@@ -3214,5 +3500,408 @@ if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {inst
             contexts, 1,
             "an owned gate re-ramps; a shared gate is mid-throttle and sends 0"
         );
+    }
+
+    /// #3210: unlike a worker that is merely slow to hand over, one that errors before its
+    /// handshake is dead, so nothing is posted to it after the TTL either.
+    #[wasm_bindgen_test]
+    async fn a_worker_that_errors_before_handing_over_is_not_sent_to_after_the_ttl() {
+        let script = format!(
+            "{}\nsetTimeout(() => {{ throw new Error(\"simulated wasm load failure\"); }}, 0);",
+            FakeWorker {
+                install_delay_ms: 0,
+                post_ready: false,
+                require_ascending: false,
+            }
+            .script()
+        );
+        let previous = install_worker_script(&script);
+        let decoder = decoder_with_ttl(300.0);
+        decoder.push_frame(delta_frame(1), None);
+        restore_worker_link(previous);
+
+        sleep(500).await;
+        decoder.push_frame(delta_frame(2), None);
+        sleep(500).await;
+
+        assert!(
+            decoder.boot_failed(),
+            "the worker's error must reach Worker.onerror"
+        );
+        assert!(
+            !decoder.boot_queue_dropped(),
+            "frame 2 must stop at the failed gate, not reach the TTL discard-and-post fallback"
+        );
+        assert_eq!(
+            decoder.freshness_eviction_counts().0,
+            0,
+            "a worker that failed to start must not be sent frames"
+        );
+    }
+
+    /// An error AFTER the handshake is a runtime fault in a live worker, not a failed boot: the
+    /// stream must keep flowing.
+    #[wasm_bindgen_test]
+    async fn a_worker_that_errors_after_handing_over_is_still_sent_to() {
+        let script = format!(
+            "{}\nsetTimeout(() => {{ throw new Error(\"runtime fault after boot\"); }}, 50);",
+            boots_after(0).script()
+        );
+        let previous = install_worker_script(&script);
+        let decoder = decoder_with_ttl(300.0);
+        restore_worker_link(previous);
+
+        sleep(300).await;
+        decoder.push_frame(delta_frame(1), None);
+        let (frames, _) = poll_counts(|| decoder.freshness_eviction_counts(), |(f, _)| f > 0).await;
+
+        assert!(decoder.worker_handshake_seen());
+        assert!(!decoder.boot_failed());
+        assert_eq!(
+            frames, 1,
+            "a worker that booted must still be sent frames after an error"
+        );
+    }
+
+    /// A worker that failed to start is terminated, so its timers stop. The stub
+    /// keeps reporting a growing count until it is terminated.
+    #[wasm_bindgen_test]
+    async fn a_worker_that_fails_to_start_is_terminated() {
+        let script = r#"
+let ticks = 0;
+setInterval(() => {
+  ticks += 1;
+  self.postMessage({
+    kind: "video_stats", from_peer: "boot-local", to_peer: "boot-peer",
+    frames_buffered: 0, playout_latency_ms: 0.0, playout_stage1_span_ms: 0.0,
+    playout_paint_lag_ms: 0.0, playout_skip_to_live_total: 0,
+    content_staleness_ms: 0.0, keyframe_arrivals_total: 0,
+    freshness_evictions_total: ticks, freshness_evictions_keyframeless_total: 0
+  });
+}, 10);
+setTimeout(() => { throw new Error("simulated wasm load failure"); }, 0);
+"#;
+        let previous = install_worker_script(script);
+        let decoder = decoder_with_ttl(300.0);
+        restore_worker_link(previous);
+
+        for _ in 0..POLL_ATTEMPTS {
+            if decoder.boot_failed() {
+                break;
+            }
+            sleep(POLL_INTERVAL_MS).await;
+        }
+        sleep(50).await;
+        let at_failure = decoder.freshness_eviction_counts().0;
+        sleep(300).await;
+
+        assert!(decoder.boot_failed());
+        assert_eq!(
+            decoder.freshness_eviction_counts().0,
+            at_failure,
+            "a failed worker must stop posting: terminate it"
+        );
+    }
+
+    const SHIPPED_DECODER_LOADER: &str =
+        include_str!("../../../videocall-codecs/src/bin/worker_decoder_loader.js");
+
+    /// The shipped loader must turn a rejected `wasm_bindgen()` into a `Worker.onerror`; trunk's
+    /// shim leaves it an unhandled rejection, which never reaches the main thread (#2988, #3210).
+    #[wasm_bindgen_test]
+    async fn the_shipped_decoder_loader_reports_a_wasm_load_failure() {
+        let origin = web_sys::window()
+            .expect("browser test needs a window")
+            .location()
+            .origin()
+            .expect("page origin");
+        let script = format!(
+            "self.importScripts = () => {{ self.wasm_bindgen = (p) => \
+             fetch(new URL(p, \"{origin}/missing-3210/\")).then(WebAssembly.instantiateStreaming); }};\n\
+             {SHIPPED_DECODER_LOADER}"
+        );
+        let previous = install_worker_script(&script);
+        let decoder = decoder_with_ttl(300.0);
+        restore_worker_link(previous);
+
+        for _ in 0..POLL_ATTEMPTS {
+            if decoder.boot_failed() {
+                break;
+            }
+            sleep(POLL_INTERVAL_MS).await;
+        }
+        assert!(decoder.boot_failed());
+    }
+
+    type Outcome = Rc<Cell<Option<videocall_codecs::decoder::BootOutcome>>>;
+
+    /// The production deferred constructor (#3277); `outcome` records the boot-settled callback.
+    fn deferred_decoder_with_ttl(
+        ttl_ms: f64,
+        outcome: &Outcome,
+    ) -> (WasmDecoder, videocall_codecs::decoder::WorkerStarter) {
+        let outcome = outcome.clone();
+        WasmDecoder::new_deferred_with_video_frame_callback(
+            videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
+            Box::new(|_frame| {}),
+            Box::new(|_head_age_ms| {}),
+            MEDIA_TYPE_CAMERA,
+            ttl_ms,
+            Box::new(move |settled| outcome.set(Some(settled))),
+        )
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_decoder_waiting_for_its_boot_slot_holds_one_bounded_window_and_replays_it() {
+        let previous = install_worker_script(&boots_after(0).script());
+        let outcome = Outcome::default();
+        let (decoder, starter) = deferred_decoder_with_ttl(60_000.0, &outcome);
+        restore_worker_link(previous);
+        let cap = decoder.boot_replay_max_messages() as u64;
+        let pushed = 2 * cap + cap / 2;
+        for seq in 1..=pushed {
+            decoder.push_frame(delta_frame(seq), None);
+        }
+        assert!(!decoder.worker_started());
+        assert_eq!(
+            decoder.boot_pending_messages() as u64,
+            pushed % cap,
+            "the backlog restarts at the cap instead of growing"
+        );
+
+        assert!(starter.start());
+        let (frames, _) = poll_counts(|| decoder.freshness_eviction_counts(), |(f, _)| f > 0).await;
+        assert_eq!(
+            frames,
+            pushed % cap,
+            "the held window is replayed at the handshake"
+        );
+        assert_eq!(
+            outcome.get(),
+            Some(videocall_codecs::decoder::BootOutcome::Ready)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_held_window_older_than_the_ttl_restarts_before_the_worker_exists() {
+        let previous = install_worker_script(&boots_after(0).script());
+        let outcome = Outcome::default();
+        let (decoder, starter) = deferred_decoder_with_ttl(100.0, &outcome);
+        restore_worker_link(previous);
+        decoder.push_frame(delta_frame(1), None);
+        sleep(150).await;
+        decoder.push_frame(delta_frame(2), None);
+
+        assert_eq!(decoder.boot_pending_messages(), 1);
+        assert!(decoder.boot_queue_dropped());
+        assert!(starter.start());
+        let (frames, _) = poll_counts(|| decoder.freshness_eviction_counts(), |(f, _)| f > 0).await;
+        assert_eq!(frames, 1, "only the frame inside the TTL is replayed");
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_frame_trimmed_before_the_worker_exists_requests_a_keyframe_with_its_age() {
+        let previous = install_worker_script(&boots_after(0).script());
+        let ages: Rc<RefCell<Vec<f64>>> = Rc::default();
+        let seen = ages.clone();
+        let (decoder, starter) = WasmDecoder::new_deferred_with_video_frame_callback(
+            videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
+            Box::new(|_frame| {}),
+            Box::new(move |head_age_ms| seen.borrow_mut().push(head_age_ms)),
+            MEDIA_TYPE_SCREEN,
+            100.0,
+            Box::new(|_| {}),
+        );
+        restore_worker_link(previous);
+        decoder.push_frame(delta_frame(1), None);
+        sleep(150).await;
+
+        assert!(starter.start());
+        assert!(decoder.boot_queue_dropped());
+        for _ in 0..POLL_ATTEMPTS {
+            if decoder.worker_handshake_seen() {
+                break;
+            }
+            sleep(POLL_INTERVAL_MS).await;
+        }
+        let ages = ages.borrow();
+        assert_eq!(ages.len(), 1, "{ages:?}");
+        assert!((150.0..60_000.0).contains(&ages[0]), "{ages:?}");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_worker_that_cannot_be_constructed_settles_as_a_failed_boot() {
+        // `new Worker()` throws synchronously on a URL that cannot be parsed.
+        let previous = install_worker_script("");
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("codecs-worker"))
+            .expect("the worker <link> is installed")
+            .set_attribute("href", "http://[")
+            .expect("set href");
+        let outcome = Outcome::default();
+        let (decoder, starter) = deferred_decoder_with_ttl(60_000.0, &outcome);
+        restore_worker_link(previous);
+
+        assert!(starter.start());
+        assert!(decoder.boot_failed());
+        assert!(!decoder.worker_started());
+        assert_eq!(
+            outcome.get(),
+            Some(videocall_codecs::decoder::BootOutcome::Failed)
+        );
+        decoder.push_frame(delta_frame(1), None);
+        assert_eq!(
+            decoder.boot_pending_messages(),
+            0,
+            "nothing is held for a failed boot"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_starter_whose_decoder_is_gone_starts_nothing() {
+        let previous = install_worker_script(&boots_after(0).script());
+        let outcome = Outcome::default();
+        let (decoder, starter) = deferred_decoder_with_ttl(60_000.0, &outcome);
+        restore_worker_link(previous);
+        drop(decoder);
+
+        assert!(!starter.start());
+        assert_eq!(outcome.get(), None);
+    }
+
+    #[wasm_bindgen(inline_js = r#"
+let original = null;
+let made = [];
+export function record_new_workers() {
+  const Base = globalThis.Worker;
+  original = Base;
+  made = [];
+  globalThis.Worker = class extends Base {
+    constructor(...args) { super(...args); this.terminated = false; made.push(this); }
+    terminate() { this.terminated = true; return super.terminate(); }
+  };
+}
+export function stop_recording_workers() {
+  if (original) globalThis.Worker = original;
+  original = null;
+  return made;
+}
+"#)]
+    extern "C" {
+        fn record_new_workers();
+        fn stop_recording_workers() -> js_sys::Array;
+    }
+
+    #[wasm_bindgen_test]
+    fn dropping_a_wasm_decoder_terminates_its_worker_and_detaches_its_error_handler() {
+        let previous = install_worker_script(&boots_after(0).script());
+        record_new_workers();
+        let decoder = decoder_with_ttl(300.0);
+        let made = stop_recording_workers();
+        restore_worker_link(previous);
+
+        assert_eq!(made.length(), 1, "the decoder starts exactly one worker");
+        let worker: web_sys::Worker = made.get(0).unchecked_into();
+        let terminated = || {
+            js_sys::Reflect::get(&worker, &JsValue::from_str("terminated"))
+                .ok()
+                .and_then(|v| v.as_bool())
+        };
+        assert_eq!(terminated(), Some(false));
+        assert!(worker.onerror().is_some());
+
+        drop(decoder);
+
+        assert_eq!(terminated(), Some(true), "Drop must terminate the worker");
+        assert!(
+            worker.onerror().is_none(),
+            "Drop must detach the error handler before the closure field is freed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hidden_mirror_paint_tests {
+    use super::freshness_skip_wiring_tests::{install_worker_script, restore_worker_link};
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    const FRAME_WORKER: &str = "self.onmessage = () => {};\n\
+        const c = new OffscreenCanvas(8, 6);\n\
+        c.getContext('2d').fillRect(0, 0, 8, 6);\n\
+        const f = new VideoFrame(c, { timestamp: 0 });\n\
+        self.postMessage(f, [f]);\n";
+
+    fn eval(src: &str) {
+        js_sys::Function::new_no_args(src)
+            .call0(&JsValue::NULL)
+            .expect("eval");
+    }
+
+    fn stub_page(hidden: bool) {
+        eval(&format!(
+            "window.__realRaf = window.__realRaf || window.requestAnimationFrame; \
+             window.requestAnimationFrame = () => 1; \
+             Object.defineProperty(document, 'hidden', {{ configurable: true, get: () => {hidden} }});"
+        ));
+    }
+
+    fn restore_page() {
+        eval("window.requestAnimationFrame = window.__realRaf; delete document.hidden;");
+    }
+
+    fn new_canvas() -> HtmlCanvasElement {
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.create_element("canvas").ok())
+            .expect("canvas")
+            .unchecked_into()
+    }
+
+    /// The decoder after one worker frame reached it on a page whose
+    /// `requestAnimationFrame` never fires.
+    async fn decode_one_frame(hidden: bool, mirrored: bool) -> VideoPeerDecoder {
+        let canvas = new_canvas();
+        let other = new_canvas();
+        stub_page(hidden);
+        set_mirrored_canvas(Some(if mirrored { &canvas } else { &other }));
+        let previous = install_worker_script(FRAME_WORKER);
+        let decoder = VideoPeerDecoder::new(Some(canvas), MEDIA_TYPE_SCREEN, false)
+            .expect("real decoder must construct once the worker <link> is installed");
+        restore_worker_link(previous);
+        for _ in 0..100 {
+            if decoder.last_output_ms() > 0.0 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        gloo_timers::future::TimeoutFuture::new(100).await;
+        restore_page();
+        set_mirrored_canvas(None);
+        decoder
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_hidden_page_still_paints_the_mirrored_canvas() {
+        let decoder = decode_one_frame(true, true).await;
+        assert!(decoder.last_output_ms() > 0.0, "premise: the frame arrived");
+        assert_eq!(decoder.renderer_dims_for_test(), Some((8, 6)));
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_hidden_page_does_not_paint_an_unmirrored_canvas() {
+        let decoder = decode_one_frame(true, false).await;
+        assert!(decoder.last_output_ms() > 0.0, "premise: the frame arrived");
+        assert_eq!(decoder.renderer_dims_for_test(), Some((0, 0)));
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_visible_page_leaves_the_mirrored_canvas_to_animation_frames() {
+        let decoder = decode_one_frame(false, true).await;
+        assert!(decoder.last_output_ms() > 0.0, "premise: the frame arrived");
+        assert_eq!(decoder.renderer_dims_for_test(), Some((0, 0)));
     }
 }

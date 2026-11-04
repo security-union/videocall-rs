@@ -152,6 +152,8 @@ async fn join_as(
             transport: "websocket".to_string(),
             downlink_congested_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             token_iat,
+            meeting_started_at_ms: None,
+            conn_seq: None,
             closer: Some(probe.recipient()),
         })
         .await

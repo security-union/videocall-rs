@@ -245,7 +245,7 @@ describe("POST /launch/multi", () => {
     expect(surface.launchSpecs[0].ttl).toBe(300_000);
   });
 
-  it("carries diagPackets to every spawned bot and refuses on (#2970)", async () => {
+  it("carries diagPackets to every spawned bot and refuses junk (#2970)", async () => {
     const body = {
       mode: "first-n",
       count: 2,
@@ -253,19 +253,21 @@ describe("POST /launch/multi", () => {
       ttl: "5m",
     };
     const auth = { authorization: `Bearer ${token}` };
-    const on = await fetchJson(handle.port, "/launch/multi", {
+    const bad = await fetchJson(handle.port, "/launch/multi", {
       method: "POST",
       headers: auth,
-      body: { ...body, diagPackets: "on" },
+      body: { ...body, diagPackets: "maybe" },
     });
-    expect(on.status).toBe(400);
+    expect(bad.status).toBe(400);
     expect(surface.launchSpecs).toHaveLength(0);
-    await fetchJson(handle.port, "/launch/multi", {
-      method: "POST",
-      headers: auth,
-      body: { ...body, diagPackets: "off" },
-    });
-    expect(surface.launchSpecs.map((s) => s.diagPackets)).toEqual(["off", "off"]);
+    for (const diagPackets of ["on", "off"]) {
+      await fetchJson(handle.port, "/launch/multi", {
+        method: "POST",
+        headers: auth,
+        body: { ...body, diagPackets },
+      });
+    }
+    expect(surface.launchSpecs.map((s) => s.diagPackets)).toEqual(["on", "on", "off", "off"]);
   });
 
   it("random mode is reproducible given a seed", async () => {

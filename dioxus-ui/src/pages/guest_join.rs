@@ -4,7 +4,9 @@
 //! without signing in with an OAuth provider. The guest only needs
 //! to provide a display name.
 
+use crate::components::announcement_overrides::AnnouncementOverrides;
 use crate::components::attendants::AttendantsComponent;
+use crate::components::avatar::AvatarCacheProvider;
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::hero_orbs::HeroOrbs;
 use crate::components::invalid_meeting_id::{
@@ -21,8 +23,8 @@ use crate::constants::{
 use crate::context::{
     load_transport_preference_with_source, resolve_transport_config,
     save_display_name_owner_to_storage, save_display_name_to_storage, validate_display_name,
-    DisplayNameCtx, TransportPreference, TransportPreferenceCtx, DISPLAY_NAME_MAX_LEN,
-    GUEST_DISPLAY_NAME_OWNER,
+    DisplayNameCtx, MeetingRejoinCtx, TransportPreference, TransportPreferenceCtx,
+    DISPLAY_NAME_MAX_LEN, GUEST_DISPLAY_NAME_OWNER,
 };
 use crate::meeting_api::{join_meeting_as_guest, JoinMeetingResponse};
 use crate::theme::color as theme_color;
@@ -60,6 +62,7 @@ enum GuestStatus {
         allow_guests: bool,
         recording_allowed_for_all: bool,
         chat_allowed_for_all: bool,
+        announcement_overrides: AnnouncementOverrides,
     },
     Rejected,
     InvalidMeetingId(String),
@@ -94,6 +97,7 @@ fn guest_status_from_join_response(
                     allow_guests: response.allow_guests,
                     recording_allowed_for_all: response.recording_allowed_for_all,
                     chat_allowed_for_all: response.chat_allowed_for_all,
+                    announcement_overrides: AnnouncementOverrides::from_status(response),
                 }
             } else {
                 GuestStatus::Error("Admitted but no room token".to_string())
@@ -142,6 +146,7 @@ fn handle_admitted(
 ) {
     let determined_host = response.host_display_name.clone();
     let determined_host_uid = response.host_user_id.clone();
+    let announcement_overrides = AnnouncementOverrides::from_status(&response);
     let token = response.room_token.unwrap_or_default();
     let status_observer_token = resolve_status_observer_token(
         response.observer_token,
@@ -163,6 +168,7 @@ fn handle_admitted(
         allow_guests: response.allow_guests,
         recording_allowed_for_all: response.recording_allowed_for_all,
         chat_allowed_for_all: response.chat_allowed_for_all,
+        announcement_overrides,
     });
 }
 
@@ -202,7 +208,6 @@ fn start_observer_connection(
         .collect();
 
     let (effective_wt_enabled, websocket_urls, webtransport_urls) = resolve_transport_config(
-        transport_pref,
         webtransport_enabled().unwrap_or(false),
         websocket_urls,
         webtransport_urls,
@@ -221,6 +226,8 @@ fn start_observer_connection(
         websocket_urls.len()
     );
 
+    let (webtransport_connect_timeout_ms, websocket_connect_timeout_ms) =
+        crate::constants::connect_timeouts_ms();
     let opts = VideoCallClientOptions {
         user_id,
         display_name: display_name.clone(),
@@ -230,6 +237,10 @@ fn start_observer_connection(
         webtransport_urls,
         enable_e2ee: false,
         enable_webtransport: effective_wt_enabled,
+        prefer_webtransport: transport_pref == TransportPreference::WebTransport,
+        on_election_progress: None,
+        start_in_fallback: crate::context::load_transport_fallback(transport_pref),
+        on_fallback_memory: Some(crate::context::fallback_memory_callback(transport_pref)),
         max_received_layer: crate::constants::max_received_layer(),
         skip_canvas_paint: crate::constants::skip_canvas_paint(),
         // Issue #1884: guest lobby OBSERVER client — no in-call reaction overlay,
@@ -242,6 +253,7 @@ fn start_observer_connection(
         // callback would be unreachable code, not a missing feature.
         // There is deliberately no timer in the waiting room.
         on_meeting_timer: None,
+        on_caption: None,
         on_connected: VcCallback::from(move |_| {
             log::info!("Guest observer connection established (waiting for meeting)");
         }),
@@ -260,7 +272,8 @@ fn start_observer_connection(
         enable_health_reporting: false,
         health_reporting_interval_ms: None,
         on_encoder_settings_update: None,
-        rtt_testing_period_ms: 3000,
+        webtransport_connect_timeout_ms,
+        websocket_connect_timeout_ms,
         rtt_probe_interval_ms: None,
         on_meeting_info: None,
         on_meeting_ended: None,
@@ -343,6 +356,7 @@ fn start_observer_connection(
         on_host_mute: None,
         on_host_disable_video: None,
         on_participant_kicked: None,
+        on_instance_superseded: None,
         on_host_granted: None,
         on_host_revoked: None,
         on_peer_event: None,
@@ -352,6 +366,7 @@ fn start_observer_connection(
         on_peer_left: None,
         on_peer_joined: None,
         on_display_name_changed: None,
+        on_avatar_changed: None,
         decode_media: false,
         // Guest observer client: short-lived, recovery is via meeting
         // activation push, not re-election. No post-rebase retry.
@@ -548,6 +563,15 @@ fn GuestJoinPageContent(id: String) -> Element {
         }
     };
 
+    {
+        let mut on_join = on_join_guest.clone();
+        let rejoin = use_callback(move |_: ()| {
+            came_from_waiting_room.set(false);
+            on_join(None);
+        });
+        use_context_provider(|| MeetingRejoinCtx(rejoin));
+    }
+
     // Handle waiting room admission
     let on_admitted = {
         let meeting_id = id.clone();
@@ -611,7 +635,11 @@ fn GuestJoinPageContent(id: String) -> Element {
     rsx! {
         match &current_guest_status {
             // Admitted — show the meeting
-            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests, recording_allowed_for_all, chat_allowed_for_all } => rsx! {
+            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests, recording_allowed_for_all, chat_allowed_for_all, announcement_overrides } => rsx! {
+                AvatarCacheProvider {
+                    meeting_id: id.clone(),
+                    room_token: room_token.clone(),
+                    is_guest: true,
                 AttendantsComponent {
                     display_name: display_name_for_render.clone(),
                     id: id.clone(),
@@ -629,6 +657,8 @@ fn GuestJoinPageContent(id: String) -> Element {
                     allow_guests: *allow_guests,
                     recording_allowed_for_all: *recording_allowed_for_all,
                     chat_allowed_for_all: *chat_allowed_for_all,
+                    announcement_overrides: *announcement_overrides,
+                }
                 }
             },
 
@@ -907,6 +937,10 @@ mod tests {
             allow_guests: true,
             recording_allowed_for_all: false,
             chat_allowed_for_all: true,
+            entry_message_override: Default::default(),
+            entry_sound_override: Default::default(),
+            exit_message_override: Default::default(),
+            exit_sound_override: Default::default(),
         }
     }
 

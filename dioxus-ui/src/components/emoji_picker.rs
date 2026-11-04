@@ -440,6 +440,12 @@ pub fn should_autofocus_search_field(pointer_coarse: bool, width_px: f64, height
         && height_px >= AUTOFOCUS_MIN_VIEWPORT_HEIGHT_PX
 }
 
+pub(crate) fn primary_pointer_is_coarse() -> bool {
+    web_sys::window()
+        .and_then(|win| win.match_media("(pointer: coarse)").ok().flatten())
+        .is_some_and(|mql| mql.matches())
+}
+
 /// Read the three inputs [`should_autofocus_search_field`] needs out of the DOM.
 fn should_autofocus_search() -> bool {
     let Some(win) = web_sys::window() else {
@@ -451,11 +457,7 @@ fn should_autofocus_search() -> bool {
     // any viewport heuristic. An unreadable `matchMedia` degrades to `false`
     // ("assume a fine pointer") because the size thresholds below still catch
     // every phone-shaped viewport on their own.
-    let pointer_coarse = win
-        .match_media("(pointer: coarse)")
-        .ok()
-        .flatten()
-        .is_some_and(|mql| mql.matches());
+    let pointer_coarse = primary_pointer_is_coarse();
     // Defaults are deliberately generous: an unreadable dimension must not
     // silently suppress the autofocus on a desktop, where it is the whole point.
     let width = win

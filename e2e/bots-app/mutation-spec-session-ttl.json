@@ -1,0 +1,472 @@
+{
+  "_comment": [
+    "Mutations of the bots-app run deadline and JWT-mode session cookie expiry (#2914), each naming the vitest case that must catch it:",
+    "  scripts/mutation-check.py run e2e/bots-app/mutation-spec-session-ttl.json"
+  ],
+  "runner": "vitest",
+  "cwd": "e2e",
+  "command": [
+    "npx",
+    "vitest",
+    "run",
+    "bots-app/src/auth/jwt-cookie.test.ts",
+    "bots-app/src/bot.test.ts",
+    "bots-app/src/orchestrator.join.test.ts",
+    "bots-app/src/cli.test.ts",
+    "bots-app/src/orchestrator.test.ts",
+    "bots-app/src/orchestrator.ssh-deadline.test.ts"
+  ],
+  "baseline_tests": 345,
+  "mutations": [
+    {
+      "name": "the session cookie ignores the deadline",
+      "file": "e2e/helpers/auth.ts",
+      "find": "exp: notAfterSecs === undefined ? now + ttlSecs : Math.min(now + ttlSecs, notAfterSecs),",
+      "replace": "exp: now + ttlSecs,",
+      "expect_kills": ["expires the session cookie by the deadline"]
+    },
+    {
+      "name": "a session cookie is minted after the deadline",
+      "file": "e2e/helpers/auth.ts",
+      "find": "  if (notAfterSecs !== undefined && notAfterSecs <= now) {",
+      "replace": "  if (false) {",
+      "expect_kills": ["refuses to mint once the deadline has passed"]
+    },
+    {
+      "name": "injectSessionCookie drops the deadline",
+      "file": "e2e/helpers/auth.ts",
+      "find": "generateSessionToken(email, name, undefined, opts.notAfterSecs)",
+      "replace": "generateSessionToken(email, name)",
+      "expect_kills": ["expires the session cookie by the deadline"]
+    },
+    {
+      "name": "applyJwtCookieAuth drops the deadline",
+      "file": "e2e/bots-app/src/auth/jwt-cookie.ts",
+      "find": "    notAfterSecs: opts.notAfterSecs,\n",
+      "replace": "",
+      "expect_kills": ["expires the session cookie by the deadline"]
+    },
+    {
+      "name": "launchBot rounds the deadline up",
+      "file": "e2e/bots-app/src/bot.ts",
+      "find": "Math.floor(opts.sessionNotAfterMs / 1000)",
+      "replace": "Math.ceil(opts.sessionNotAfterMs / 1000)",
+      "expect_kills": ["mints the session cookie to expire by the given deadline"]
+    },
+    {
+      "name": "a launch goes ahead past the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "if (runDeadlineMs != null && runDeadlineMs - launchAt < MIN_LAUNCH_MS) {",
+      "replace": "if (false) {",
+      "expect_kills": ["does not launch once the run deadline is too close"]
+    },
+    {
+      "name": "the TTL runs past the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    const ttlCtl = createRearmableTtl(runDeadlineMs);",
+      "replace": "    const ttlCtl = createRearmableTtl(null);",
+      "expect_kills": [
+        "ends a bot, and bounds its session cookie, by the run deadline",
+        "caps a ctl TTL extension at the run deadline"
+      ]
+    },
+    {
+      "name": "the session cookie ignores the run deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      runDeadlineMs ?? Infinity,",
+      "replace": "      Infinity,",
+      "expect_kills": ["ends a bot, and bounds its session cookie, by the run deadline"]
+    },
+    {
+      "name": "the session cookie ignores a shorter TTL",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      ttl === \"infinite\" ? Infinity : launchAt + ttl,",
+      "replace": "      Infinity,",
+      "expect_kills": ["bounds the session cookie by a TTL shorter than the run"]
+    },
+    {
+      "name": "capTtl ignores the deadline for a finite TTL",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "  return ttl === \"infinite\" ? left : Math.min(ttl, left);",
+      "replace": "  return ttl === \"infinite\" ? left : ttl;",
+      "expect_kills": ["caps an infinite or longer TTL"]
+    },
+    {
+      "name": "--deadline read as milliseconds",
+      "file": "e2e/bots-app/src/cli.ts",
+      "find": "      runDeadlineMs = Number(opts.deadline) * 1000;",
+      "replace": "      runDeadlineMs = Number(opts.deadline);",
+      "expect_kills": ["puts --deadline on every task in epoch ms"]
+    },
+    {
+      "name": "a malformed --deadline accepted",
+      "file": "e2e/bots-app/src/cli.ts",
+      "find": "      if (!/^\\d+$/.test(opts.deadline)) {",
+      "replace": "      if (false) {",
+      "expect_kills": ["puts --deadline on every task in epoch ms"]
+    },
+    {
+      "name": "the launch is not raced against the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "? await launchByDeadline(launching, launchBy, launchAbort)",
+      "replace": "? await launching",
+      "expect_kills": ["aborts a launch that outlasts the deadline"]
+    },
+    {
+      "name": "a leave is awaited past the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    const pastDeadline = deps.deadlineFired() || ttlEnd === \"deadline\";",
+      "replace": "    const pastDeadline = false;",
+      "expect_kills": ["closes the browser at the deadline without waiting for a leave"]
+    },
+    {
+      "name": "control launches lose the run deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      newTask.runDeadlineMs = runDeadlineMs;\n",
+      "replace": "",
+      "expect_kills": [
+        "gives control launches the run deadline and closes the control server at it"
+      ]
+    },
+    {
+      "name": "the run does not shut down at its deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "            requestShutdown(\"the run deadline\");\n",
+      "replace": "",
+      "expect_kills": [
+        "gives control launches the run deadline and closes the control server at it"
+      ]
+    },
+    {
+      "name": "a control launch is accepted after the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    launchOne: async (spec: LaunchSpec) => {\n      if (pastRunDeadline()) throw new Error(\"the run's deadline has passed\");\n",
+      "replace": "    launchOne: async (spec: LaunchSpec) => {\n",
+      "expect_kills": ["refuses a control launch while the run is closing after its deadline"]
+    },
+    {
+      "name": "the CLI drops the run-level deadline",
+      "file": "e2e/bots-app/src/cli.ts",
+      "find": "        tasks,\n        runDeadlineMs,\n",
+      "replace": "        tasks,\n",
+      "expect_kills": ["puts --deadline on every task in epoch ms"]
+    },
+    {
+      "name": "a duplicate is accepted after the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      if (src.host.kind === \"ssh\") throw new NotSupportedRemoteError(\"duplicate\");\n      if (pastRunDeadline()) throw new Error(\"the run's deadline has passed\");\n",
+      "replace": "      if (src.host.kind === \"ssh\") throw new NotSupportedRemoteError(\"duplicate\");\n",
+      "expect_kills": ["refuses a control launch while the run is closing after its deadline"]
+    },
+    {
+      "name": "no deadline watchdog on a launched bot",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    if (runDeadlineMs != null) armDeadlineWatchdog(bot, runDeadlineMs);\n",
+      "replace": "",
+      "expect_kills": ["closes the browser and returns at the deadline when teardown after"]
+    },
+    {
+      "name": "the run waits for teardowns stalled past the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      hardStop,\n    ]);",
+      "replace": "    ]);",
+      "expect_kills": ["closes the browser and returns at the deadline when teardown after"]
+    },
+    {
+      "name": "the watchdog fires at once",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "setTimeout(close, Math.max(0, deadlineMs - Date.now()) + FORCE_CLOSE_MS)",
+      "replace": "setTimeout(close, 0)",
+      "expect_kills": ["closes the browser at the deadline without waiting for a leave"]
+    },
+    {
+      "name": "the watchdog fires without the grace",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "setTimeout(close, Math.max(0, deadlineMs - Date.now()) + FORCE_CLOSE_MS)",
+      "replace": "setTimeout(close, Math.max(0, deadlineMs - Date.now()))",
+      "expect_kills": ["closes the browser at the deadline without waiting for a leave"]
+    },
+    {
+      "name": "the hard stop returns before closing the control server",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "          `${inFlight.size} bot(s) still tearing down past the run deadline`,\n        ),\n      );\n      break;",
+      "replace": "          `${inFlight.size} bot(s) still tearing down past the run deadline`,\n        ),\n      );\n      return;",
+      "expect_kills": ["closes the browser and returns at the deadline when teardown after"]
+    },
+    {
+      "name": "the watchdog's close is reported as a crash",
+      "file": "e2e/bots-app/src/bot.ts",
+      "find": "  const abandonBrowser = (): Promise<void> => {\n    intentionalCloseStarted = true;\n",
+      "replace": "  const abandonBrowser = (): Promise<void> => {\n",
+      "expect_kills": [
+        "closes the browser at once without reporting a crash",
+        "does not report the browser close of an aborted launch as a crash"
+      ]
+    },
+    {
+      "name": "a launch aborted before it starts goes on",
+      "file": "e2e/bots-app/src/bot.ts",
+      "find": "  if (isAborted()) throw new LaunchAbortedError();\n  const close:",
+      "replace": "  const close:",
+      "expect_kills": ["rejects an already-aborted launch without starting Chromium"]
+    },
+    {
+      "name": "the SSH launch command drops --deadline",
+      "file": "e2e/bots-app/src/control/ssh-hosts.ts",
+      "find": "  if (spec.deadlineSecs != null) {\n    cmd.push(\"--deadline\", String(spec.deadlineSecs));\n  }\n",
+      "replace": "",
+      "expect_kills": [
+        "forwards clock video mode and the run deadline through the production SSH spawn path"
+      ]
+    },
+    {
+      "name": "buildSshCommand loses the deadline",
+      "file": "e2e/bots-app/src/control/ssh-launcher.ts",
+      "find": "    deadlineSecs: spec.deadlineSecs ?? null,\n",
+      "replace": "    deadlineSecs: null,\n",
+      "expect_kills": [
+        "forwards clock video mode and the run deadline through the production SSH spawn path"
+      ]
+    },
+    {
+      "name": "registerSshTask spawns without the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    deadlineSecs: deps.runDeadlineMs == null ? null : Math.floor(deps.runDeadlineMs / 1000),\n",
+      "replace": "    deadlineSecs: null,\n",
+      "expect_kills": [
+        "forwards clock video mode and the run deadline through the production SSH spawn path",
+        "passes the run deadline to the remote bot"
+      ]
+    },
+    {
+      "name": "a control SSH launch is not given the run deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "          remoteResource: opts.remoteResource,\n          runDeadlineMs,\n",
+      "replace": "          remoteResource: opts.remoteResource,\n",
+      "expect_kills": ["passes the run deadline to the remote bot"]
+    },
+    {
+      "name": "forceClose waits for a hung shutdown",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    new Promise<void>((res) => {\n      timer = setTimeout(res, FORCE_CLOSE_MS);\n    }),\n",
+      "replace": "",
+      "expect_kills": ["ends a bot whose browser close hangs within FORCE_CLOSE_MS of the deadline"]
+    },
+    {
+      "name": "a --deadline past the timer range is accepted",
+      "file": "e2e/bots-app/src/cli.ts",
+      "find": "      if (runDeadlineMs - Date.now() > MAX_TIMER_MS - RUN_END_AFTER_DEADLINE_MS) {",
+      "replace": "      if (false) {",
+      "expect_kills": [
+        "refuses a --deadline too far away for a timer, such as epoch ms",
+        "leaves the run's timers past the deadline inside the timer range"
+      ]
+    },
+    {
+      "name": "the --deadline range ignores the run's timers past the deadline",
+      "file": "e2e/bots-app/src/cli.ts",
+      "find": "      if (runDeadlineMs - Date.now() > MAX_TIMER_MS - RUN_END_AFTER_DEADLINE_MS) {",
+      "replace": "      if (runDeadlineMs - Date.now() > MAX_TIMER_MS) {",
+      "expect_kills": ["leaves the run's timers past the deadline inside the timer range"]
+    },
+    {
+      "name": "the deadline path keys on the clock, so a deadline timer firing early takes the leave path",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    const pastDeadline = deps.deadlineFired() || ttlEnd === \"deadline\";",
+      "replace": "    const pastDeadline = runDeadlineMs != null && Date.now() >= runDeadlineMs;",
+      "expect_kills": ["skips the leave when the deadline's timer fires a little early"]
+    },
+    {
+      "name": "a clock tolerance skips the leave of a TTL ending just before the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    const pastDeadline = deps.deadlineFired() || ttlEnd === \"deadline\";",
+      "replace": "    const pastDeadline = runDeadlineMs != null && Date.now() >= runDeadlineMs - 100;",
+      "expect_kills": ["leaves gracefully when the TTL ends just before the deadline"]
+    },
+    {
+      "name": "every TTL end counts as the deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    const end: TtlEnd = left !== null && (ttl === \"infinite\" || ttl >= left) ? \"deadline\" : \"ttl\";",
+      "replace": "    const end: TtlEnd = left !== null ? \"deadline\" : \"ttl\";",
+      "expect_kills": ["leaves gracefully when the TTL ends just before the deadline"]
+    },
+    {
+      "name": "a TTL capped at the deadline counts as a plain TTL end",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      resolveDone(end);",
+      "replace": "      resolveDone(\"ttl\");",
+      "expect_kills": ["skips the leave when the deadline's timer fires a little early"]
+    },
+    {
+      "name": "the run deadline timer sets no flag",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "            deadlineFired = true;\n",
+      "replace": "",
+      "expect_kills": [
+        "skips the leave when the run's deadline timer ends the bot before its TTL does"
+      ]
+    },
+    {
+      "name": "a ctl TTL extension leaves the running timer alone",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "timer !== undefined ? timer.rearm(newTtl) : capTtl(newTtl, entry.task.runDeadlineMs);",
+      "replace": "capTtl(newTtl, entry.task.runDeadlineMs);",
+      "expect_kills": ["rearms the running TTL timer on a ctl TTL extension"]
+    },
+    {
+      "name": "the first abort's cause is ignored",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      const cause: unknown = launchAbort.signal.aborted ? launchAbort.signal.reason : unaborted;",
+      "replace": "      const cause: unknown = unaborted;",
+      "expect_kills": [
+        "records a launch the run's deadline timer aborts as a TTL expiry",
+        "records a SIGTERM abort as a shutdown when"
+      ]
+    },
+    {
+      "name": "a shutdown that came first is recorded as the deadline that ended the wait",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      if (cause === SHUTDOWN_ABORT) {",
+      "replace": "      if (false) {",
+      "expect_kills": [
+        "records a SIGTERM abort as a shutdown when",
+        "on SIGTERM, and finishes the bot as a shutdown"
+      ]
+    },
+    {
+      "name": "a run-deadline abort is recorded by the launch's own deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      if (cause === RUN_DEADLINE_ABORT || launchBy === runDeadlineMs) {",
+      "replace": "      if (launchBy === runDeadlineMs) {",
+      "expect_kills": [
+        "records a launch the run's deadline timer aborts as a TTL expiry, run deadline before a later join deadline"
+      ]
+    },
+    {
+      "name": "a launch cut off by the run deadline ends as a launch error",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      if (cause === RUN_DEADLINE_ABORT || launchBy === runDeadlineMs) {",
+      "replace": "      if (cause === RUN_DEADLINE_ABORT) {",
+      "expect_kills": [
+        "gives up a launch at the run deadline when it comes before the join deadline",
+        "does not count a launch the run's deadline overtook"
+      ]
+    },
+    {
+      "name": "a join deadline before the run deadline is recorded as the run's",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      if (cause === RUN_DEADLINE_ABORT || launchBy === runDeadlineMs) {",
+      "replace": "      if (cause === RUN_DEADLINE_ABORT || runDeadlineMs != null) {",
+      "expect_kills": ["cancels a launch still joining at its join deadline, with that reason"]
+    },
+    {
+      "name": "an unaborted LaunchAbortedError is taken for a deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      if (err instanceof LaunchAbortedError) return endBeforeJoin(SHUTDOWN_ABORT);",
+      "replace": "      if (err instanceof LaunchAbortedError) return endBeforeJoin(LAUNCH_DEADLINE_ABORT);",
+      "expect_kills": ["does not count an aborted launch"]
+    },
+    {
+      "name": "a launch that finished past its deadline is taken for a shutdown",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    if (bot === null) return endBeforeJoin(LAUNCH_DEADLINE_ABORT);",
+      "replace": "    if (bot === null) return endBeforeJoin(SHUTDOWN_ABORT);",
+      "expect_kills": [
+        "closes a launch that finishes past its join deadline before the deadline's timer fires"
+      ]
+    },
+    {
+      "name": "the run deadline's abort is taken for a shutdown",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      launchAbort.abort(deps.deadlineFired() ? RUN_DEADLINE_ABORT : SHUTDOWN_ABORT),",
+      "replace": "      launchAbort.abort(SHUTDOWN_ABORT),",
+      "expect_kills": ["records a launch the run's deadline timer aborts as a TTL expiry"]
+    },
+    {
+      "name": "every shutdown abort is taken for the run deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      launchAbort.abort(deps.deadlineFired() ? RUN_DEADLINE_ABORT : SHUTDOWN_ABORT),",
+      "replace": "      launchAbort.abort(RUN_DEADLINE_ABORT),",
+      "expect_kills": [
+        "on SIGTERM, and finishes the bot as a shutdown",
+        "records a SIGTERM abort as a shutdown when"
+      ]
+    },
+    {
+      "name": "a launch ignores its join deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    const launchBy = Math.min(runDeadlineMs ?? Infinity, joinDeadlineMs ?? Infinity);",
+      "replace": "    const launchBy = runDeadlineMs ?? Infinity;",
+      "expect_kills": ["cancels a launch still joining at its join deadline, with that reason"]
+    },
+    {
+      "name": "a join deadline's give-up names the run's deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "      const err = new Error(\"the join deadline passed during the launch\");",
+      "replace": "      const err = new Error(\"the run's deadline passed during the launch\");",
+      "expect_kills": ["cancels a launch still joining at its join deadline, with that reason"]
+    },
+    {
+      "name": "a ctl rejoin keeps the first join's deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    entry.task.joinDeadlineMs = null;\n",
+      "replace": "",
+      "expect_kills": ["launches a ctl rejoin after the first join's deadline has passed"]
+    },
+    {
+      "name": "--join-deadline does not reach the tasks",
+      "file": "e2e/bots-app/src/cli.ts",
+      "find": "        runDeadlineMs,\n        joinDeadlineMs,\n",
+      "replace": "        runDeadlineMs,\n",
+      "expect_kills": [
+        "puts --join-deadline on every task in epoch ms, and refuses a malformed or distant one"
+      ]
+    },
+    {
+      "name": "a distant --join-deadline is accepted",
+      "file": "e2e/bots-app/src/cli.ts",
+      "find": "      if (joinDeadlineMs - Date.now() > MAX_TIMER_MS) {",
+      "replace": "      if (false) {",
+      "expect_kills": [
+        "puts --join-deadline on every task in epoch ms, and refuses a malformed or distant one"
+      ]
+    },
+    {
+      "name": "an expired launch is not cancelled",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "        ? await launchByDeadline(launching, launchBy, launchAbort)",
+      "replace": "        ? await launchByDeadline(launching, launchBy, new AbortController())",
+      "expect_kills": [
+        "cancels a launch still joining at its join deadline, with that reason",
+        "aborts a launch that outlasts the deadline"
+      ]
+    },
+    {
+      "name": "a launch that finishes past its deadline is accepted",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    if (winner !== null && Date.now() >= deadlineMs) {",
+      "replace": "    if (false) {",
+      "expect_kills": [
+        "closes a launch that finishes past its join deadline before the deadline's timer fires"
+      ]
+    },
+    {
+      "name": "no watchdog on a launch that finishes past its deadline",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    if (winner !== null && Date.now() >= deadlineMs) {\n      armDeadlineWatchdog(winner, deadlineMs);\n",
+      "replace": "    if (winner !== null && Date.now() >= deadlineMs) {\n",
+      "expect_kills": [
+        "closes a launch that finishes past its join deadline before the deadline's timer fires"
+      ]
+    },
+    {
+      "name": "a launch is bounded by its join deadline when it has one",
+      "file": "e2e/bots-app/src/orchestrator.ts",
+      "find": "    const launchBy = Math.min(runDeadlineMs ?? Infinity, joinDeadlineMs ?? Infinity);",
+      "replace": "    const launchBy = joinDeadlineMs ?? runDeadlineMs ?? Infinity;",
+      "expect_kills": [
+        "gives up a launch at the run deadline when it comes before the join deadline"
+      ]
+    }
+  ]
+}

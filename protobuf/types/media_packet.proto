@@ -42,6 +42,8 @@ message AudioMetadata {
   uint32 audio_number_of_frames = 3;
   float audio_sample_rate = 4;
   uint64 sequence = 5;
+  // Publisher's commanded Opus bitrate; 0 = not stamped on this packet.
+  uint32 encoder_target_bitrate_kbps = 6;
 }
 
 message VideoMetadata {

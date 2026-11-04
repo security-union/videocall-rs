@@ -1,0 +1,125 @@
+{
+  "_comment": [
+    "Mutation receipts for #3206 (relay delivers a keyframe request only to its target):",
+    "  scripts/mutation-check.py run actix-api/mutation-spec-3206.json"
+  ],
+  "runner": "cargo",
+  "cwd": ".",
+  "command": [
+    "cargo",
+    "test",
+    "--no-fail-fast",
+    "-p",
+    "videocall-api",
+    "--lib",
+    "--",
+    "keyframe_target_tests",
+    "keyframe_request_target",
+    "forget_room_metrics"
+  ],
+  "baseline_tests": 9,
+  "mutations": [
+    {
+      "name": "the forwarder no longer filters keyframe requests",
+      "file": "actix-api/src/actors/chat_server.rs",
+      "find": "        if parsed.is_some_and(|pw| keyframe_request_for_other_user(pw, &receiver_user_id)) {\n            RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL\n                .with_label_values(&[&room])\n                .inc();\n            return Ok(());\n        }\n",
+      "replace": "",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_keyframe_request_reaches_only_its_target",
+        "a_reconnected_target_still_receives_a_request_naming_its_old_session",
+        "each_dropped_copy_is_counted"
+      ]
+    },
+    {
+      "name": "the filter keeps only copies for OTHER users",
+      "file": "actix-api/src/actors/chat_server.rs",
+      "find": "keyframe_request_target(&pw.data).is_some_and(|t| t != receiver_user_id.as_bytes())",
+      "replace": "keyframe_request_target(&pw.data).is_some_and(|t| t == receiver_user_id.as_bytes())",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_keyframe_request_reaches_only_its_target",
+        "a_reconnected_target_still_receives_a_request_naming_its_old_session",
+        "each_dropped_copy_is_counted"
+      ]
+    },
+    {
+      "name": "tagged media is scanned too",
+      "file": "actix-api/src/actors/chat_server.rs",
+      "find": "        && pw.media_kind.enum_value() == Ok(MediaKind::MEDIA_KIND_UNSPECIFIED)\n",
+      "replace": "",
+      "occurrences": 1,
+      "expect_kills": [
+        "other_packet_kinds_are_unaffected"
+      ]
+    },
+    {
+      "name": "a dropped copy is not counted",
+      "file": "actix-api/src/actors/chat_server.rs",
+      "find": "            RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL\n                .with_label_values(&[&room])\n                .inc();\n",
+      "replace": "",
+      "occurrences": 1,
+      "expect_kills": [
+        "each_dropped_copy_is_counted"
+      ]
+    },
+    {
+      "name": "an empty target counts as a target",
+      "file": "actix-api/src/actors/packet_handler.rs",
+      "find": "    Some(&inner[start..end]).filter(|target| !target.is_empty())\n",
+      "replace": "    Some(&inner[start..end])\n",
+      "occurrences": 1,
+      "expect_kills": [
+        "keyframe_request_target_is_none_without_a_readable_target",
+        "a_request_without_a_readable_target_is_delivered_as_today"
+      ]
+    },
+    {
+      "name": "any media type with a user_id is treated as a keyframe request",
+      "file": "actix-api/src/actors/packet_handler.rs",
+      "find": "    if media_type != MediaType::KEYFRAME_REQUEST.value() {\n        return None;\n    }\n",
+      "replace": "",
+      "occurrences": 1,
+      "expect_kills": [
+        "keyframe_request_target_is_none_without_a_readable_target",
+        "other_packet_kinds_are_unaffected"
+      ]
+    },
+    {
+      "name": "the target is read from the wrong field",
+      "file": "actix-api/src/actors/packet_handler.rs",
+      "find": "    const FIELD_USER_ID: u32 = 2;\n\n    let mut is = CodedInputStream::from_bytes(inner);\n    let mut media_type: i32 = 0;",
+      "replace": "    const FIELD_USER_ID: u32 = 3;\n\n    let mut is = CodedInputStream::from_bytes(inner);\n    let mut media_type: i32 = 0;",
+      "occurrences": 1,
+      "expect_kills": [
+        "keyframe_request_target_reads_the_named_target",
+        "keyframe_request_target_does_not_depend_on_field_order",
+        "keyframe_request_target_is_none_without_a_readable_target",
+        "a_keyframe_request_reaches_only_its_target",
+        "a_reconnected_target_still_receives_a_request_naming_its_old_session",
+        "a_request_without_a_readable_target_is_delivered_as_today",
+        "each_dropped_copy_is_counted"
+      ]
+    },
+    {
+      "name": "an undecodable request still yields a target",
+      "file": "actix-api/src/actors/packet_handler.rs",
+      "find": "                user_id_range = Some(length_delimited_range(&mut is, inner)?);\n            }\n            (_, wt) => is.skip_field(wt).ok()?,\n        }\n    }\n\n    if media_type != MediaType::KEYFRAME_REQUEST",
+      "replace": "                user_id_range = Some(length_delimited_range(&mut is, inner)?);\n            }\n            (_, wt) => {\n                if is.skip_field(wt).is_err() {\n                    break;\n                }\n            }\n        }\n    }\n\n    if media_type != MediaType::KEYFRAME_REQUEST",
+      "occurrences": 1,
+      "expect_kills": [
+        "keyframe_request_target_is_none_without_a_readable_target"
+      ]
+    },
+    {
+      "name": "the room sweep forgets the filtered counter",
+      "file": "actix-api/src/metrics.rs",
+      "find": "    let _ = RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL.remove_label_values(&[room]);\n",
+      "replace": "",
+      "occurrences": 1,
+      "expect_kills": [
+        "forget_room_metrics_removes_every_room_series"
+      ]
+    }
+  ]
+}

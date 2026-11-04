@@ -278,6 +278,98 @@ impl APIError {
             engineering_error: None,
         }
     }
+
+    /// The request body is larger than `max` bytes.
+    pub fn payload_too_large(max: usize) -> Self {
+        Self {
+            code: "PAYLOAD_TOO_LARGE".to_string(),
+            message: format!("Request body exceeds maximum size of {max} bytes"),
+            engineering_error: None,
+        }
+    }
+
+    /// The request `Content-Type` (or the uploaded file's real type) is not accepted.
+    pub fn unsupported_media_type() -> Self {
+        Self {
+            code: "UNSUPPORTED_MEDIA_TYPE".to_string(),
+            message: "Use a PNG, JPEG or WebP image.".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// The image could not be used as an avatar; `message` is a fixed server string.
+    pub fn invalid_image(message: &str) -> Self {
+        Self {
+            code: "INVALID_IMAGE".to_string(),
+            message: message.to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// No avatar is visible to the caller for the requested user.
+    pub fn avatar_not_found() -> Self {
+        Self {
+            code: "AVATAR_NOT_FOUND".to_string(),
+            message: "No avatar found".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// The Gravatar field is neither a Gravatar e-mail nor a Gravatar avatar link.
+    pub fn invalid_gravatar() -> Self {
+        Self {
+            code: "INVALID_GRAVATAR".to_string(),
+            message: "Enter your Gravatar email or a link like https://gravatar.com/avatar/…"
+                .to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// Gravatar has no image for the given e-mail or link.
+    pub fn gravatar_not_found() -> Self {
+        Self {
+            code: "GRAVATAR_NOT_FOUND".to_string(),
+            message: "No Gravatar image found for that email or link".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// Gravatar could not be reached or answered unexpectedly.
+    pub fn gravatar_unavailable() -> Self {
+        Self {
+            code: "GRAVATAR_UNAVAILABLE".to_string(),
+            message: "Gravatar is unavailable right now. Please try again.".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// The server is at its bounded capacity for this work. Transient.
+    pub fn service_busy() -> Self {
+        Self {
+            code: "SERVICE_BUSY".to_string(),
+            message: "The server is busy. Please try again.".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// `RATE_LIMIT_EXCEEDED` with avatar-specific copy.
+    pub fn avatar_rate_limit_exceeded() -> Self {
+        Self {
+            code: "RATE_LIMIT_EXCEEDED".to_string(),
+            message: "Too many avatar requests. Please wait before trying again.".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// The signed-in user is not the user the avatar write was meant for.
+    pub fn avatar_identity_mismatch() -> Self {
+        Self {
+            code: "AVATAR_IDENTITY_MISMATCH".to_string(),
+            message: "The signed-in account is not the account this change was made for; nothing was changed."
+                .to_string(),
+            engineering_error: None,
+        }
+    }
 }
 
 impl std::fmt::Display for APIError {

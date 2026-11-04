@@ -921,6 +921,57 @@ fn pack_redundant_audio(primary: &[u8], redundant: &PreviousAudioFrame) -> Vec<u
     buf
 }
 
+const AUDIO_BITRATE_RESTAMP_INTERVAL_MS: f64 = 1000.0;
+
+/// Picks which audio packets carry `AudioMetadata.encoder_target_bitrate_kbps`.
+#[derive(Default)]
+struct AudioBitrateStamper {
+    last_stamp: Option<(u32, f64)>,
+}
+
+impl AudioBitrateStamper {
+    /// `commanded_kbps` when this packet is stamped, else `0`.
+    fn next(&mut self, commanded_kbps: u32, now_ms: f64) -> u32 {
+        if let Some((kbps, at_ms)) = self.last_stamp {
+            let elapsed_ms = now_ms - at_ms;
+            if kbps == commanded_kbps
+                && (0.0..AUDIO_BITRATE_RESTAMP_INTERVAL_MS).contains(&elapsed_ms)
+            {
+                return 0;
+            }
+        }
+        self.last_stamp = Some((commanded_kbps, now_ms));
+        commanded_kbps
+    }
+}
+
+/// Sends `ReconfigOpus` to every layer's codec and records a commanded bitrate.
+fn apply_opus_reconfig(
+    codecs: &[AudioWorkletCodec],
+    commanded_kbps: &AtomicU32,
+    fec: bool,
+    packet_loss_perc: u32,
+    bit_rate: Option<u32>,
+) {
+    for codec in codecs {
+        let _ = codec.send_message(&CodecMessages::<EncoderInitOptions>::ReconfigOpus {
+            fec,
+            packet_loss_perc,
+            bit_rate,
+        });
+    }
+    if let Some(bps) = bit_rate {
+        commanded_kbps.store(bps / 1000, Ordering::Relaxed);
+    }
+}
+
+fn wall_clock_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as f64
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
@@ -929,12 +980,9 @@ pub fn transform_audio_chunk(
     aes: Rc<Aes128State>,
     previous_frame: Option<&PreviousAudioFrame>,
     simulcast_layer_id: u32,
+    encoder_target_bitrate_kbps: u32,
+    now_ms: f64,
 ) -> PacketWrapper {
-    let now_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as f64;
-
     let primary_data = chunk.to_vec();
 
     // Determine whether to include redundancy.
@@ -955,6 +1003,7 @@ pub fn transform_audio_chunk(
         audio_metadata: Some(AudioMetadata {
             sequence,
             audio_format,
+            encoder_target_bitrate_kbps,
             ..Default::default()
         })
         .into(),
@@ -1802,12 +1851,23 @@ impl MicrophoneEncoder {
         // emitted packet; each layer owns its own seq counter + RED previous-
         // frame buffer so a receiver decoding ONE audio layer sees a dense
         // sequence. The captured values are cloned per handler so the handlers
-        // can coexist. For N=1 only the base (layer 0) handler is built —
-        // byte-identical to the legacy path.
+        // can coexist. For N=1 only the base (layer 0) handler is built.
+        let commanded_base_kbps = Rc::new(AtomicU32::new(0));
         let make_audio_handler = |layer_id: u32| -> Box<dyn FnMut(MessageEvent)> {
             log::info!(
                 "Starting Microphone audio encoder (layer {layer_id}) with AnalyserNode VAD"
             );
+            let commanded_kbps = if layer_id == 0 {
+                commanded_base_kbps.clone()
+            } else {
+                Rc::new(AtomicU32::new(
+                    AUDIO_SIMULCAST_LAYER_KBPS
+                        .get(layer_id as usize)
+                        .copied()
+                        .unwrap_or(0),
+                ))
+            };
+            let mut bitrate_stamper = AudioBitrateStamper::default();
             let mut sequence_number: u64 = 0;
             let client_for_send = client.clone();
             let user_id = user_id.clone();
@@ -1895,6 +1955,7 @@ impl MicrophoneEncoder {
                         congestion_layer_ceiling.load(Ordering::Relaxed),
                     ) {
                         previous_frame = None;
+                        bitrate_stamper = AudioBitrateStamper::default();
                         return;
                     }
 
@@ -1911,6 +1972,7 @@ impl MicrophoneEncoder {
                         None
                     };
 
+                    let now_ms = wall_clock_ms();
                     let packet: PacketWrapper = transform_audio_chunk(
                         &data,
                         &user_id,
@@ -1918,6 +1980,8 @@ impl MicrophoneEncoder {
                         aes.clone(),
                         red_ref,
                         layer_id,
+                        bitrate_stamper.next(commanded_kbps.load(Ordering::Relaxed), now_ms),
+                        now_ms,
                     );
                     // Phase 2 of WT freeze fix: route audio on its dedicated
                     // persistent QUIC stream so it can never be HOL-blocked by
@@ -1976,6 +2040,7 @@ impl MicrophoneEncoder {
         let fec_reconfig_tier_index = self.shared_audio_tier_index.clone();
         let fec_reconfig_codecs: Vec<AudioWorkletCodec> = self.codecs.clone();
         let fec_reconfig_holder = self.fec_reconfig_interval.clone();
+        let fec_commanded_base_kbps = commanded_base_kbps.clone();
         // Single-layer congestion BITRATE-floor state (issue #1398). The bitrate
         // mechanism is gated to single-layer mode (`n_audio_layers == 1`): only
         // then does a single Opus stream with no upper layer to shed need a live
@@ -2305,6 +2370,7 @@ impl MicrophoneEncoder {
             } else {
                 initial_tier.bitrate_kbps * 1000
             };
+            commanded_base_kbps.store(base_bitrate_bps / 1000, Ordering::Relaxed);
             let _ = base_codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
                     encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
@@ -2922,15 +2988,13 @@ impl MicrophoneEncoder {
                     // longer-instantiated codec is a safe no-op: send_message
                     // returns Err (no port) and the worklet's `reconfigOpus`
                     // case is inside its `if(this.encoder)` guard.
-                    for codec in &fec_codecs {
-                        let _ = codec.send_message(
-                            &CodecMessages::<EncoderInitOptions>::ReconfigOpus {
-                                fec,
-                                packet_loss_perc,
-                                bit_rate,
-                            },
-                        );
-                    }
+                    apply_opus_reconfig(
+                        &fec_codecs,
+                        &fec_commanded_base_kbps,
+                        fec,
+                        packet_loss_perc,
+                        bit_rate,
+                    );
                     fec_last_sent.set(Some((fec, packet_loss_perc, bit_rate)));
                     log::info!(
                         "MicrophoneEncoder: live Opus reconfig applied (tier {idx} '{}'): fec={fec}, packet_loss_perc={packet_loss_perc}, bit_rate={bit_rate:?}",
@@ -3016,8 +3080,8 @@ mod layer_count_tests {
         audio_congestion_recover, audio_congestion_tick, audio_detector_gate_open,
         audio_detector_should_reseed, audio_fec_reconfig_change, audio_layer_is_published,
         audio_reconfig_change, audio_uplink_step_down_decision, clamp_audio_layer_count,
-        current_audio_uplink_counter_values, effective_audio_bitrate, AudioUplinkAxisInput,
-        AUDIO_SIMULCAST_LAYER_KBPS, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
+        current_audio_uplink_counter_values, effective_audio_bitrate, AudioBitrateStamper,
+        AudioUplinkAxisInput, AUDIO_SIMULCAST_LAYER_KBPS, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
     use crate::adaptive_quality_constants::{
         AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS, AUDIO_QUALITY_TIERS,
@@ -4404,6 +4468,47 @@ mod layer_count_tests {
         // window after a reconnect cashes a spurious cut.
         assert!(audio_detector_should_reseed(true, true, true));
     }
+
+    fn stamps_at(stamper: &mut AudioBitrateStamper, kbps: u32, times_ms: &[f64]) -> Vec<u32> {
+        times_ms.iter().map(|&t| stamper.next(kbps, t)).collect()
+    }
+
+    #[test]
+    fn bitrate_stamper_restamps_dtx_sparse_packets_once_a_second_has_passed() {
+        let mut s = AudioBitrateStamper::default();
+        let times: Vec<f64> = (0..7).map(|i| f64::from(i * 400)).collect();
+        assert_eq!(stamps_at(&mut s, 48, &times), [48, 0, 0, 48, 0, 0, 48]);
+    }
+
+    #[test]
+    fn bitrate_stamper_restamps_at_the_interval_not_before() {
+        let mut s = AudioBitrateStamper::default();
+        assert_eq!(stamps_at(&mut s, 48, &[0.0, 999.0, 1000.0]), [48, 0, 48]);
+    }
+
+    #[test]
+    fn bitrate_stamper_stamps_dense_packets_once_a_second() {
+        let mut s = AudioBitrateStamper::default();
+        let stamped_at: Vec<f64> = (0..150)
+            .map(|i| f64::from(i * 20))
+            .filter(|&t| s.next(48, t) != 0)
+            .collect();
+        assert_eq!(stamped_at, [0.0, 1000.0, 2000.0]);
+    }
+
+    #[test]
+    fn bitrate_stamper_stamps_the_first_packet_and_every_change() {
+        let mut s = AudioBitrateStamper::default();
+        assert_eq!(stamps_at(&mut s, 48, &[5_000.0, 5_020.0]), [48, 0]);
+        assert_eq!(stamps_at(&mut s, 24, &[5_040.0, 5_060.0]), [24, 0]);
+    }
+
+    #[test]
+    fn bitrate_stamper_stamps_and_rebases_on_a_backward_clock_step() {
+        let mut s = AudioBitrateStamper::default();
+        let times = [5_000.0, 4_000.0, 4_500.0, 5_000.0];
+        assert_eq!(stamps_at(&mut s, 48, &times), [48, 48, 0, 48]);
+    }
 }
 
 #[cfg(test)]
@@ -4427,7 +4532,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn audio_chunk_layer_zero_is_wire_absent() {
         let aes = Rc::new(Aes128State::new(false));
-        let with_zero = transform_audio_chunk(&make_audio_data(), "alice", 0, aes.clone(), None, 0);
+        let with_zero =
+            transform_audio_chunk(&make_audio_data(), "alice", 0, aes.clone(), None, 0, 0, 0.0);
         let parsed = PacketWrapper::parse_from_bytes(&with_zero.write_to_bytes().unwrap()).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 0);
         assert_eq!(
@@ -4443,7 +4549,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn audio_chunk_layer_one_round_trips() {
         let aes = Rc::new(Aes128State::new(false));
-        let with_one = transform_audio_chunk(&make_audio_data(), "alice", 0, aes, None, 1);
+        let with_one = transform_audio_chunk(&make_audio_data(), "alice", 0, aes, None, 1, 0, 0.0);
         let parsed = PacketWrapper::parse_from_bytes(&with_one.write_to_bytes().unwrap()).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 1);
         assert_eq!(parsed.media_kind.enum_value(), Ok(MediaKind::AUDIO));
@@ -4454,10 +4560,28 @@ mod tests {
     #[wasm_bindgen_test]
     fn audio_chunk_layer_two_round_trips() {
         let aes = Rc::new(Aes128State::new(false));
-        let with_two = transform_audio_chunk(&make_audio_data(), "alice", 0, aes, None, 2);
+        let with_two = transform_audio_chunk(&make_audio_data(), "alice", 0, aes, None, 2, 0, 0.0);
         let parsed = PacketWrapper::parse_from_bytes(&with_two.write_to_bytes().unwrap()).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 2);
         assert_eq!(parsed.media_kind.enum_value(), Ok(MediaKind::AUDIO));
+    }
+
+    #[wasm_bindgen_test]
+    fn audio_chunk_carries_the_stamped_bitrate() {
+        let aes = Rc::new(Aes128State::new(false));
+        let wrapper = transform_audio_chunk(&make_audio_data(), "alice", 0, aes, None, 0, 48, 0.0);
+        let media = MediaPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(media.audio_metadata.encoder_target_bitrate_kbps, 48);
+    }
+
+    #[wasm_bindgen_test]
+    fn opus_reconfig_records_a_commanded_bitrate_and_keeps_it_without_one() {
+        let codecs = [AudioWorkletCodec::default()];
+        let commanded = AtomicU32::new(48);
+        apply_opus_reconfig(&codecs, &commanded, false, 0, Some(24_000));
+        assert_eq!(commanded.load(Ordering::Relaxed), 24);
+        apply_opus_reconfig(&codecs, &commanded, true, 10, None);
+        assert_eq!(commanded.load(Ordering::Relaxed), 24);
     }
 
     #[wasm_bindgen_test]

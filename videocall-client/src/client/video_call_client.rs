@@ -18,7 +18,7 @@
 
 use super::super::connection::{
     ConnectionController, ConnectionLostReason, ConnectionManagerOptions, ConnectionState,
-    MediaStreamKey, SessionIdHistory,
+    ElectionProgress, MediaStreamKey, SessionIdHistory, StreamQueueDepth,
 };
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use super::layer_preference_sender::LayerPreferenceSender;
@@ -28,7 +28,10 @@ use crate::crypto::rsa::RsaWrapper;
 use crate::decode::layer_chooser::{
     PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
 };
-use crate::decode::peer_decode_manager::{PeerDecodeError, PeerDeviceInfo, PeerReceiveDiag};
+use crate::decode::peer_decode_manager::{
+    install_boot_retry_driver, PeerDecodeError, PeerDeviceInfo, PeerReceiveDiag,
+};
+use crate::decode::worker_boot_queue::WorkerBootQueue;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
@@ -39,6 +42,7 @@ use gloo_timers::callback::{Interval, Timeout};
 use videocall_diagnostics::MetricValue;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
+use crate::client::captions::{caption_update_from_wrapper, CaptionUpdate};
 use log::{debug, error, info, trace, warn};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
@@ -250,6 +254,9 @@ pub type RaiseHandCallback = Callback<(u64, bool, u64, String)>;
 /// would otherwise resurrect a timer the host already stopped.
 pub type MeetingTimerCallback = Callback<MeetingTimerState>;
 
+/// Callback payload for an inbound server-authored `CAPTION`.
+pub type CaptionCallback = Callback<CaptionUpdate>;
+
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
 /// initialise the client.  Pass an instance of this struct to
@@ -258,6 +265,15 @@ pub type MeetingTimerCallback = Callback<MeetingTimerState>;
 pub struct VideoCallClientOptions {
     pub enable_e2ee: bool,
     pub enable_webtransport: bool,
+    /// The user's network preference; the other protocol is the fallback.
+    pub prefer_webtransport: bool,
+    /// Join-election progress, for a connection-status UI.
+    pub on_election_progress: Option<Callback<ElectionProgress>>,
+    /// This tab already fell back: a join starts in the fallback phase and
+    /// still dials the preferred protocol.
+    pub start_in_fallback: bool,
+    /// The tab's fallback memory changed.
+    pub on_fallback_memory: Option<Callback<bool>>,
     /// Operator ceiling for received camera and screen simulcast layers.
     /// `Some(0)` means base only; `None` leaves receive selection uncapped.
     pub max_received_layer: Option<u32>,
@@ -291,7 +307,8 @@ pub struct VideoCallClientOptions {
     pub enable_health_reporting: bool,
     pub health_reporting_interval_ms: Option<u64>,
     pub on_encoder_settings_update: Option<Callback<String>>,
-    pub rtt_testing_period_ms: u64,
+    pub webtransport_connect_timeout_ms: u64,
+    pub websocket_connect_timeout_ms: u64,
     pub rtt_probe_interval_ms: Option<u64>,
     pub on_meeting_info: Option<Callback<f64>>,
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -335,6 +352,10 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the host removes this client from the meeting.
     pub on_participant_kicked: Option<Callback<()>>,
 
+    /// Callback triggered when the relay refuses this client's join because its
+    /// room token belongs to an earlier instance of the meeting.
+    pub on_instance_superseded: Option<Callback<()>>,
+
     /// Callback triggered when a participant is granted host.
     pub on_host_granted: Option<Callback<String>>,
 
@@ -372,6 +393,10 @@ pub struct VideoCallClientOptions {
     /// authenticated user (same `user_id`, different `session_id`) does not
     /// overwrite its own self-name when another tab renames. See HCL #828.
     pub on_display_name_changed: Option<Callback<(String, String, u64)>>,
+
+    /// Callback triggered when a participant changes their avatar. Emits that
+    /// participant's `user_id`.
+    pub on_avatar_changed: Option<Callback<String>>,
 
     /// Callback triggered when a remote participant joins the meeting.
     /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_JOINED
@@ -446,6 +471,10 @@ pub struct VideoCallClientOptions {
     /// Fires for peers only, and only after the relay's host gate has accepted the
     /// sender — a non-host's packet never reaches any client.
     pub on_meeting_timer: Option<MeetingTimerCallback>,
+
+    /// Server-authored caption text or room status.
+    /// Revision ordering is the consumer's job.
+    pub on_caption: Option<CaptionCallback>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -541,6 +570,7 @@ struct InnerOptions {
     on_host_mute: Option<Callback<()>>,
     on_host_disable_video: Option<Callback<()>>,
     on_participant_kicked: Option<Callback<()>>,
+    on_instance_superseded: Option<Callback<()>>,
     on_host_granted: Option<Callback<String>>,
     on_host_revoked: Option<Callback<String>>,
     on_peer_event: Option<Callback<(String, String, String)>>,
@@ -549,7 +579,9 @@ struct InnerOptions {
     on_reaction: Option<ReactionCallback>,
     on_raise_hand: Option<RaiseHandCallback>,
     on_meeting_timer: Option<MeetingTimerCallback>,
+    on_caption: Option<CaptionCallback>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
+    on_avatar_changed: Option<Callback<String>>,
     decode_media: bool,
 }
 
@@ -580,6 +612,8 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// The emitted meeting start and whether it was authoritative.
+    emitted_meeting_start: Option<(u64, bool)>,
     /// Issue #1700: the `own_session_id` the reconnect handler last snapped the
     /// decode guards to `highest_available` against. The inline reconnect reconcile
     /// snaps guards UP to highest_available ONLY when this differs from the current
@@ -760,11 +794,15 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
+    /// The peers' worker-boot queue, reachable while `Inner` is borrowed (#3277).
+    worker_boot_queue: WorkerBootQueue,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    connection_epoch: Rc<ConnectionEpoch>,
     /// Last values read through a SUCCESSFUL borrow of `connection_controller`;
     /// a one-tick `try_borrow` conflict is not "cannot report" (issue #2343).
     last_send_queue_depth: Rc<Cell<Option<u64>>>,
     last_active_transport: Rc<Cell<Option<&'static str>>>,
+    last_screen_queue_depth: Rc<Cell<Option<StreamQueueDepth>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     /// Send-side state machine for the viewport control packet (HCL issue
@@ -788,6 +826,10 @@ pub struct VideoCallClient {
     /// `viewport_debounce_timer`. Dropping the `VideoCallClient` drops this slot,
     /// which drops the `Interval`, which cancels the underlying browser timer.
     early_seed_timer: Rc<RefCell<Option<Interval>>>,
+    /// Outlives every rebuilt `ConnectionController`.
+    fallback_memory: Rc<Cell<bool>>,
+    /// Outlives every rebuilt `ConnectionController`.
+    conn_seq: Rc<Cell<u64>>,
     /// Forced-keyframe cooldown reset for the CAMERA encoder (issue #1311,
     /// hardened in #1352). A clone of `CameraEncoder::keyframe_cooldown_reset`,
     /// wired in by the host after the encoder is built.
@@ -1208,6 +1250,17 @@ fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
     });
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
+thread_local! {
+    static SCREEN_ENABLED_CALLS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Every `set_screen_enabled` argument since the last call.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn take_screen_enabled_calls_for_test() -> Vec<bool> {
+    SCREEN_ENABLED_CALLS.with(|c| c.take())
+}
+
 #[cfg(test)]
 mod layer_switch_freshness_window_tests {
     use super::{freshness_skip_within_switch_window, POST_SWITCH_WINDOW_MS};
@@ -1431,6 +1484,100 @@ fn handle_reconnecting_roster_stage(inner: &Weak<RefCell<Inner>>) {
             inner.peer_decode_manager.begin_roster_reconcile();
         }
     }
+}
+
+/// Client-owned, so it outlives every `ConnectionController` it numbers (#3277).
+#[derive(Default)]
+struct ConnectionEpoch {
+    /// Bumped each time a controller is created; a retired controller's states are ignored.
+    controller: Cell<u64>,
+    /// Bumped on every state the current controller reports.
+    state: Cell<u64>,
+}
+
+/// Records `state` on `Inner` and, on `Failed`, terminates every peer's workers so stale wasm
+/// instances do not hold memory during the reconnect. When `Inner` is borrowed this retries once
+/// on a microtask; the state is then recorded only if no newer one arrived, but a `Failed` still
+/// clears the peers of the failed connection. Nothing from a retired controller is applied (#3277).
+fn apply_connection_state(
+    inner: &Weak<RefCell<Inner>>,
+    state: &ConnectionState,
+    epoch: &Rc<ConnectionEpoch>,
+    controller: u64,
+) {
+    if epoch.controller.get() != controller {
+        debug!("Ignoring {state:?} from a retired connection controller");
+        return;
+    }
+    let current = epoch.state.get().wrapping_add(1);
+    epoch.state.set(current);
+    if record_connection_state(inner, state, true) {
+        return;
+    }
+    warn!("Connection state {state:?} not recorded: client state is borrowed; retrying");
+    let (inner, state, epoch) = (inner.clone(), state.clone(), epoch.clone());
+    wasm_bindgen_futures::spawn_local(async move {
+        if epoch.controller.get() != controller {
+            return;
+        }
+        if !record_connection_state(&inner, &state, epoch.state.get() == current) {
+            error!("Connection state {state:?} still not recorded; peers of the failed connection are kept");
+        }
+    });
+}
+
+/// `callback`, silenced once a controller newer than `controller` has been created.
+fn for_current_controller<T: 'static>(
+    epoch: &Rc<ConnectionEpoch>,
+    controller: u64,
+    callback: Callback<T>,
+) -> Callback<T> {
+    let epoch = epoch.clone();
+    Callback::from(move |value: T| {
+        if epoch.controller.get() == controller {
+            callback.emit(value);
+        }
+    })
+}
+
+/// The `Inner` half of [`VideoCallClient::disconnect`].
+fn release_inner_for_disconnect(inner: &mut Inner) {
+    inner.connection_state = ConnectionState::Failed {
+        error: "Disconnected".to_string(),
+        last_known_server: None,
+    };
+    inner.emitted_meeting_start = None;
+    // 1. peer_decode_manager → callback → VideoCallClient → Rc<Inner>
+    inner.peer_decode_manager.clear_send_packet_callback();
+    inner.peer_decode_manager.drop_all_peers_for_disconnect();
+
+    // 2. health_reporter spawn_local future → cloned send_callback → ...
+    if let Some(hr) = inner.health_reporter.as_ref() {
+        if let Ok(mut reporter) = hr.try_borrow_mut() {
+            reporter.shutdown();
+        }
+    }
+}
+
+/// `false` only when `Inner` is alive but borrowed.
+fn record_connection_state(
+    inner: &Weak<RefCell<Inner>>,
+    state: &ConnectionState,
+    is_latest: bool,
+) -> bool {
+    let Some(inner) = inner.upgrade() else {
+        return true;
+    };
+    let Ok(mut inner) = inner.try_borrow_mut() else {
+        return false;
+    };
+    if is_latest {
+        inner.connection_state = state.clone();
+    }
+    if matches!(state, ConnectionState::Failed { .. }) {
+        inner.peer_decode_manager.clear_all_peers();
+    }
+    true
 }
 
 fn handle_connected_reconnect_resets(
@@ -1754,6 +1901,7 @@ impl VideoCallClient {
     /// afterwards to begin the RTT election and connect to a server.
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
+        let fallback_memory = Rc::new(Cell::new(options.start_in_fallback));
 
         let diagnostics = if options.enable_diagnostics {
             let mut diagnostics = DiagnosticManager::new(options.user_id.clone());
@@ -1852,11 +2000,17 @@ impl VideoCallClient {
         }
 
         let room_host_user_ids: Rc<RefCell<HashSet<String>>> = Rc::default();
+        let mut peer_decode_manager =
+            Self::create_peer_decoder_manager(&options, diagnostics.clone());
+        peer_decode_manager.share_room_host_user_ids(room_host_user_ids.clone());
+        let worker_boot_queue = peer_decode_manager.worker_boot_queue();
         let client = Self {
             options: options.clone(),
+            worker_boot_queue,
             room_host_user_ids: room_host_user_ids.clone(),
             last_send_queue_depth: Rc::new(Cell::new(None)),
             last_active_transport: Rc::new(Cell::new(None)),
+            last_screen_queue_depth: Rc::new(Cell::new(None)),
             inner: Rc::new(RefCell::new(Inner {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
@@ -1873,15 +2027,18 @@ impl VideoCallClient {
                     on_host_mute: options.on_host_mute.clone(),
                     on_host_disable_video: options.on_host_disable_video.clone(),
                     on_participant_kicked: options.on_participant_kicked.clone(),
+                    on_instance_superseded: options.on_instance_superseded.clone(),
                     on_host_granted: options.on_host_granted.clone(),
                     on_host_revoked: options.on_host_revoked.clone(),
                     on_peer_event: options.on_peer_event.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
+                    on_avatar_changed: options.on_avatar_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
                     on_reaction: options.on_reaction.clone(),
                     on_raise_hand: options.on_raise_hand.clone(),
                     on_meeting_timer: options.on_meeting_timer.clone(),
+                    on_caption: options.on_caption.clone(),
                     decode_media: options.decode_media,
                 },
                 connection_controller: connection_controller.clone(),
@@ -1890,16 +2047,12 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
+                emitted_meeting_start: None,
                 last_reconnect_reconciled_session: None,
                 own_session_ids: Rc::new(RefCell::new(SessionIdHistory::default())),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
-                peer_decode_manager: {
-                    let mut manager =
-                        Self::create_peer_decoder_manager(&options, diagnostics.clone());
-                    manager.share_room_host_user_ids(room_host_user_ids);
-                    manager
-                },
+                peer_decode_manager,
                 layer_preference_sender: LayerPreferenceSender::new(),
                 receive_layer_bounds: {
                     // #2068 cap. FREEZE-SAFETY rests on a cross-repo relay invariant
@@ -1944,10 +2097,13 @@ impl VideoCallClient {
             })),
             connection_controller,
             aes,
+            connection_epoch: Rc::default(),
             _diagnostics: diagnostics.clone(),
             viewport_sender: Rc::new(RefCell::new(ViewportSender::new())),
             viewport_debounce_timer: Rc::new(RefCell::new(None)),
             early_seed_timer: Rc::new(RefCell::new(None)),
+            fallback_memory,
+            conn_seq: Rc::new(Cell::new(0)),
             // Issue #1311 / #1352: None until the host wires in
             // `CameraEncoder::keyframe_cooldown_reset`; the reconnect reset
             // no-ops while None. Held outside `Inner` so the `Connected` arm can
@@ -1963,6 +2119,11 @@ impl VideoCallClient {
             // without taking the (possibly contended) Inner borrow.
             audio_detector_reconnect_reseed: audio_detector_reconnect_reseed.clone(),
         };
+        install_boot_retry_driver(
+            &client.worker_boot_queue,
+            Rc::downgrade(&client.inner),
+            |inner: &mut Inner| &mut inner.peer_decode_manager,
+        );
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
         // send KEYFRAME_REQUEST packets back through the connection.
@@ -2011,59 +2172,19 @@ impl VideoCallClient {
         client
     }
 
-    pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
-        // Idempotency guard: if a ConnectionController already exists we need
-        // to decide whether to skip (actively connecting/connected) or tear
-        // down a stale controller (failed state) before reconnecting.
-        if let Ok(cc) = self.connection_controller.try_borrow() {
-            if let Some(controller) = cc.as_ref() {
-                let state = controller.get_connection_state();
-                match state {
-                    // Election running, connection active, or manager is
-                    // already handling its own reconnection — skip.
-                    ConnectionState::Testing { .. }
-                    | ConnectionState::Connected { .. }
-                    | ConnectionState::Reconnecting { .. } => {
-                        info!(
-                            "connect() called but ConnectionController is in {state:?} state — skipping duplicate connection"
-                        );
-                        return Ok(());
-                    }
-                    // Connection permanently failed — tear down the stale
-                    // controller and create a fresh one below. We only
-                    // recycle the transport layer here; the callbacks
-                    // captured in `Inner` (PLI, diagnostics, health
-                    // reporting) must keep working across the reconnect.
-                    ConnectionState::Failed { .. } => {
-                        drop(cc);
-                        info!("connect() called with failed ConnectionController — disconnecting before reconnect");
-                        let _ = self.disconnect_controller_only();
-                    }
-                }
-            }
-        }
+    /// Options for a new controller; every earlier controller's state callback is retired.
+    fn next_controller_options(&self) -> ConnectionManagerOptions {
+        self.connection_epoch
+            .controller
+            .set(self.connection_epoch.controller.get().wrapping_add(1));
+        self.connection_manager_options()
+    }
 
-        let websocket_count = self.options.websocket_urls.len();
-        let webtransport_count = if self.options.enable_webtransport {
-            self.options.webtransport_urls.len()
-        } else {
-            0
-        };
-        let total_servers = websocket_count + webtransport_count;
-
-        info!(
-            "Starting RTT testing for {total_servers} servers (WebSocket: {websocket_count}, WebTransport: {webtransport_count})"
-        );
-
-        if total_servers == 0 {
-            return Err(anyhow!("No servers provided for RTT testing"));
-        }
-
-        let election_period_ms = self.options.rtt_testing_period_ms;
-
-        info!("RTT testing period: {election_period_ms}ms");
-
-        let manager_options = ConnectionManagerOptions {
+    fn connection_manager_options(&self) -> ConnectionManagerOptions {
+        // Every callback handed to this controller goes quiet once a newer controller exists.
+        let epoch = self.connection_epoch.clone();
+        let controller = epoch.controller.get();
+        ConnectionManagerOptions {
             websocket_urls: self.options.websocket_urls.clone(),
             webtransport_urls: if self.options.enable_webtransport {
                 self.options.webtransport_urls.clone()
@@ -2071,7 +2192,7 @@ impl VideoCallClient {
                 Vec::new()
             },
             userid: self.options.user_id.clone(),
-            on_inbound_media: {
+            on_inbound_media: for_current_controller(&epoch, controller, {
                 let inner = Rc::downgrade(&self.inner);
                 // Issue #1179, Part B: the early-seed timer is armed the first
                 // time a peer is Added. Capture the slot here so the per-packet
@@ -2100,8 +2221,8 @@ impl VideoCallClient {
                         }
                     }
                 })
-            },
-            on_state_changed: {
+            }),
+            on_state_changed: for_current_controller(&epoch, controller, {
                 let on_connected = self.options.on_connected.clone();
                 let on_connection_lost = self.options.on_connection_lost.clone();
                 let inner = Rc::downgrade(&self.inner);
@@ -2138,19 +2259,9 @@ impl VideoCallClient {
                 // session (reconnects reuse the same manager). See `dedup_on_connected`.
                 let last_connected_identity: Rc<RefCell<Option<String>>> =
                     Rc::new(RefCell::new(None));
+                let epoch = epoch.clone();
                 Callback::from(move |state: ConnectionState| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.connection_state = state.clone();
-
-                            // On connection failure, immediately terminate all
-                            // decoder workers so stale WASM instances don't
-                            // accumulate memory during reconnection.
-                            if matches!(state, ConnectionState::Failed { .. }) {
-                                inner.peer_decode_manager.clear_all_peers();
-                            }
-                        }
-                    }
+                    apply_connection_state(&inner, &state, &epoch, controller);
                     info!("Connection state changed: {state:?} in video call client");
 
                     // Emit `on_connected` once per genuine connect (see
@@ -2237,8 +2348,8 @@ impl VideoCallClient {
                         _ => {}
                     }
                 })
-            },
-            peer_monitor: {
+            }),
+            peer_monitor: for_current_controller(&epoch, controller, {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |_| {
                     if let Some(inner) = Weak::upgrade(&inner) {
@@ -2273,9 +2384,8 @@ impl VideoCallClient {
                                 // so snapshot it to avoid an aliasing borrow with
                                 // `&mut peer_decode_manager`.
                                 let bounds = inner.receive_layer_bounds;
-                                let desired = inner
-                                    .peer_decode_manager
-                                    .tick_layer_choosers(now_ms, &bounds);
+                                let desired =
+                                    inner.peer_decode_manager.tick_decoders(now_ms, &bounds);
                                 // #1561: snapshot the per-(peer,kind) desired layer
                                 // map into the health reporter for the next packet.
                                 if let Some(hr) = &inner.health_reporter {
@@ -2299,8 +2409,22 @@ impl VideoCallClient {
                         }
                     }
                 })
-            },
-            election_period_ms,
+            }),
+            webtransport_connect_timeout_ms: self.options.webtransport_connect_timeout_ms,
+            websocket_connect_timeout_ms: self.options.websocket_connect_timeout_ms,
+            prefer_webtransport: self.options.prefer_webtransport,
+            on_election_progress: self
+                .options
+                .on_election_progress
+                .clone()
+                .map(|cb| for_current_controller(&epoch, controller, cb)),
+            fallback_memory: self.fallback_memory.clone(),
+            conn_seq: self.conn_seq.clone(),
+            on_fallback_memory: self
+                .options
+                .on_fallback_memory
+                .clone()
+                .map(|cb| for_current_controller(&epoch, controller, cb)),
             instance_id: generate_instance_id(),
             reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
             allow_post_rebase_retry: self.options.allow_post_rebase_retry,
@@ -2315,7 +2439,58 @@ impl VideoCallClient {
             // reconnect into the new manager's self-filter.
             own_session_ids: self.inner.borrow().own_session_ids.clone(),
             adopt_wt_spare_worker: self.options.decode_media,
+        }
+    }
+
+    pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
+        // Idempotency guard: if a ConnectionController already exists we need
+        // to decide whether to skip (actively connecting/connected) or tear
+        // down a stale controller (failed state) before reconnecting.
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                let state = controller.get_connection_state();
+                match state {
+                    // Election running, connection active, or manager is
+                    // already handling its own reconnection — skip.
+                    ConnectionState::Testing { .. }
+                    | ConnectionState::Connected { .. }
+                    | ConnectionState::Reconnecting { .. } => {
+                        info!(
+                            "connect() called but ConnectionController is in {state:?} state — skipping duplicate connection"
+                        );
+                        return Ok(());
+                    }
+                    // Connection permanently failed — tear down the stale
+                    // controller and create a fresh one below. We only
+                    // recycle the transport layer here; the callbacks
+                    // captured in `Inner` (PLI, diagnostics, health
+                    // reporting) must keep working across the reconnect.
+                    ConnectionState::Failed { .. } => {
+                        drop(cc);
+                        info!("connect() called with failed ConnectionController — disconnecting before reconnect");
+                        let _ = self.disconnect_controller_only();
+                    }
+                }
+            }
+        }
+
+        let websocket_count = self.options.websocket_urls.len();
+        let webtransport_count = if self.options.enable_webtransport {
+            self.options.webtransport_urls.len()
+        } else {
+            0
         };
+        let total_servers = websocket_count + webtransport_count;
+
+        info!(
+            "Starting RTT testing for {total_servers} servers (WebSocket: {websocket_count}, WebTransport: {webtransport_count})"
+        );
+
+        if total_servers == 0 {
+            return Err(anyhow!("No servers provided for RTT testing"));
+        }
+
+        let manager_options = self.next_controller_options();
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
@@ -2536,21 +2711,26 @@ impl VideoCallClient {
         }
     }
 
-    /// Both screen-uplink sensors under ONE borrow, so the pair cannot tear.
-    pub(crate) fn uplink_sensors(&self) -> (Option<&'static str>, Option<u64>) {
+    /// The screen stream's queued bytes on the active connection, tagged by the
+    /// transport that holds them. Feeds the screen uplink governor.
+    pub(crate) fn screen_uplink_sensor(&self) -> Option<StreamQueueDepth> {
         let read = self.connection_controller.try_borrow().ok().map(|cc| {
-            let controller = cc.as_ref();
-            (
-                controller
-                    .and_then(|c| c.active_transport())
-                    .map(Self::transport_label),
-                controller.and_then(|c| c.get_send_queue_depth()),
-            )
+            cc.as_ref()
+                .and_then(|c| c.stream_send_queue_depth(MediaStreamKey::Screen))
         });
-        (
-            Self::resolve_cached_sensor(read.map(|(t, _)| t), &self.last_active_transport),
-            Self::resolve_cached_sensor(read.map(|(_, d)| d), &self.last_send_queue_depth),
-        )
+        Self::resolve_cached_sensor(read, &self.last_screen_queue_depth)
+    }
+
+    /// [`Self::screen_uplink_sensor`] as the screen send gate reads it.
+    pub(crate) fn screen_send_queue_depth(&self) -> Option<StreamQueueDepth> {
+        #[cfg(feature = "netsim")]
+        {
+            crate::connection::screen_queue_depth_with_netsim_override(self.screen_uplink_sensor())
+        }
+        #[cfg(not(feature = "netsim"))]
+        {
+            self.screen_uplink_sensor()
+        }
     }
 
     /// This client's active-connection WebSocket send-queue depth
@@ -2639,19 +2819,26 @@ impl VideoCallClient {
     /// only need to recycle the transport layer should use
     /// `disconnect_controller_only`.
     pub fn disconnect(&self) -> anyhow::Result<()> {
+        self.worker_boot_queue.close();
         self.disconnect_controller_only()?;
 
-        // Break the `Rc` cycles inside `Inner`.
+        // Break the `Rc` cycles inside `Inner`. A caller inside inbound dispatch (the kick
+        // callback) runs while `Inner` is borrowed; the release then runs once that borrow ends.
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            // 1. peer_decode_manager → callback → VideoCallClient → Rc<Inner>
-            inner.peer_decode_manager.clear_send_packet_callback();
-
-            // 2. health_reporter spawn_local future → cloned send_callback → ...
-            if let Some(hr) = inner.health_reporter.as_ref() {
-                if let Ok(mut reporter) = hr.try_borrow_mut() {
-                    reporter.shutdown();
-                }
-            }
+            release_inner_for_disconnect(&mut inner);
+        } else {
+            warn!("disconnect: client state is borrowed; releasing peers once it is free");
+            let inner = Rc::downgrade(&self.inner);
+            wasm_bindgen_futures::spawn_local(async move {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let Ok(mut inner) = inner.try_borrow_mut() else {
+                    error!("disconnect: client state still borrowed; peers were not released");
+                    return;
+                };
+                release_inner_for_disconnect(&mut inner);
+            });
         }
 
         // 3. DiagnosticWorker future → packet_handler → VideoCallClient → ...
@@ -2938,6 +3125,11 @@ impl VideoCallClient {
             return inner.peer_decode_manager.is_peer_speaking(key);
         }
         false
+    }
+
+    pub fn peer_stamped_audio_kbps(&self, key: &str) -> Option<u32> {
+        let inner = self.inner.try_borrow().ok()?;
+        inner.peer_decode_manager.peer_stamped_audio_kbps(key)
     }
 
     /// The peer's last known audio level.
@@ -4207,6 +4399,8 @@ impl VideoCallClient {
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
+        #[cfg(all(test, target_arch = "wasm32"))]
+        SCREEN_ENABLED_CALLS.with(|c| c.borrow_mut().push(enabled));
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if let Some(controller) = cc.as_ref() {
                 if let Err(e) = controller.set_screen_enabled(enabled) {
@@ -4885,8 +5079,31 @@ impl Inner {
                                 String::from_utf8_lossy(&meeting_packet.creator_id),
                             );
 
-                            if let Some(callback) = &self.options.on_meeting_info {
-                                callback.emit(meeting_packet.start_time_ms as f64);
+                            let start_time_ms = meeting_packet.start_time_ms;
+                            let authoritative = meeting_packet.start_time_authoritative;
+                            let emit = match self.emitted_meeting_start {
+                                _ if start_time_ms == 0 => false,
+                                None => true,
+                                Some((emitted, true)) if authoritative => start_time_ms > emitted,
+                                Some((emitted, false)) if authoritative => start_time_ms != emitted,
+                                Some((_, true)) => false,
+                                Some((emitted, false)) => start_time_ms < emitted,
+                            };
+                            if emit {
+                                self.emitted_meeting_start = Some((start_time_ms, authoritative));
+                                if let Some(callback) = &self.options.on_meeting_info {
+                                    callback.emit(start_time_ms as f64);
+                                }
+                            } else {
+                                info!(
+                                    "Ignoring MEETING_STARTED start_time={}ms authoritative={} (already emitted {:?})",
+                                    start_time_ms, authoritative, self.emitted_meeting_start,
+                                );
+                                if authoritative
+                                    && matches!(self.emitted_meeting_start, Some((e, _)) if e == start_time_ms)
+                                {
+                                    self.emitted_meeting_start = Some((start_time_ms, true));
+                                }
                             }
                         }
                         Ok(MeetingEventType::MEETING_ENDED) => {
@@ -4894,6 +5111,7 @@ impl Inner {
                                 "Received MEETING_ENDED: room={}, message={}",
                                 meeting_packet.room_id, meeting_packet.message
                             );
+                            self.emitted_meeting_start = None;
                             if let Some(callback) = &self.options.on_meeting_ended {
                                 let end_time_ms = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
@@ -5268,6 +5486,24 @@ impl Inner {
                                 }
                             }
                         }
+                        Ok(MeetingEventType::MEETING_INSTANCE_SUPERSEDED) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_targeted_at_self =
+                                target.as_slice() == self.options.user_id.as_bytes();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            info!(
+                                "Received MEETING_INSTANCE_SUPERSEDED: room={}, target=\"{}\", is_targeted_at_self={}",
+                                meeting_packet.room_id, target_str, is_targeted_at_self
+                            );
+                            if is_targeted_at_self
+                                && !self
+                                    .is_duplicate_host_action("instance_superseded", &target_str)
+                            {
+                                if let Some(cb) = &self.options.on_instance_superseded {
+                                    cb.emit(());
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::HOST_GRANTED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -5363,6 +5599,15 @@ impl Inner {
                             debug!("Ignoring server-internal PARTICIPANT_LIST_REQUEST");
                         }
                         Ok(MeetingEventType::RECORDING_STATE) => {}
+                        Ok(MeetingEventType::PARTICIPANT_AVATAR_CHANGED) => {
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            if !target_str.is_empty() {
+                                if let Some(cb) = &self.options.on_avatar_changed {
+                                    cb.emit(target_str);
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                             error!(
                                 "Received meeting packet with unknown event type: room={}",
@@ -5795,6 +6040,26 @@ impl Inner {
                     }
                 }
             }
+            Ok(PacketType::CAPTION) => {
+                if let Some(cb) = &self.options.on_caption {
+                    let update = caption_update_from_wrapper(
+                        &response,
+                        |sid| {
+                            self.peer_decode_manager
+                                .get_peer_display_name(&sid.to_string())
+                        },
+                        |uid| self.peer_decode_manager.get_display_name_by_user_id(uid),
+                        |sid| {
+                            self.own_session_id == Some(sid)
+                                || self.own_session_ids.borrow().contains(sid)
+                        },
+                        &self.options.user_id,
+                    );
+                    if let Some(update) = update {
+                        cb.emit(update);
+                    }
+                }
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",
@@ -5802,7 +6067,7 @@ impl Inner {
                 );
             }
             Err(e) => {
-                error!("Failed to parse packet type: {e}");
+                debug!("Ignoring packet of a newer type: {e}");
             }
         }
         if let PeerStatus::Added(peer_session_id) = peer_status {
@@ -5934,7 +6199,12 @@ impl VideoCallClient {
             enable_health_reporting: false,
             health_reporting_interval_ms: None,
             on_encoder_settings_update: None,
-            rtt_testing_period_ms: 2000,
+            webtransport_connect_timeout_ms: 2000,
+            websocket_connect_timeout_ms: 2000,
+            prefer_webtransport: true,
+            on_election_progress: None,
+            start_in_fallback: false,
+            on_fallback_memory: None,
             rtt_probe_interval_ms: None,
             on_meeting_info: None,
             on_meeting_ended: None,
@@ -5949,15 +6219,18 @@ impl VideoCallClient {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_instance_superseded: None,
             on_host_granted: None,
             on_host_revoked: None,
             on_peer_event: None,
             on_peer_left: None,
             on_display_name_changed: None,
+            on_avatar_changed: None,
             on_peer_joined: None,
             on_reaction: None,
             on_raise_hand: None,
             on_meeting_timer: None,
+            on_caption: None,
             decode_media: true,
             is_guest: false,
             allow_post_rebase_retry: true,
@@ -5978,6 +6251,16 @@ impl VideoCallClient {
         f()
     }
 
+    /// Test-only: elect the running controller's connection, so that
+    /// [`is_connected`](Self::is_connected) returns `true` without a server.
+    pub fn mark_connected_for_test(&self) {
+        self.connection_controller
+            .borrow()
+            .as_ref()
+            .expect("connect() ran first")
+            .mark_elected_for_test();
+    }
+
     /// Test-only: add a connected peer with no-op decoders.
     pub fn insert_peer_for_test(&self, session_id: u64, user_id: &str) {
         self.inner
@@ -5993,6 +6276,37 @@ impl VideoCallClient {
             .peer_decode_manager
             .set_peer_media_for_test(session_id, video, screen);
     }
+
+    /// Test-only: decode one AUDIO packet stamped with `encoder_target_bitrate_kbps`
+    /// from `session_id` through the production peer decode path.
+    pub fn decode_audio_packet_for_test(&self, session_id: u64, encoder_target_bitrate_kbps: u32) {
+        use protobuf::Message;
+        use videocall_types::protos::media_packet::{
+            media_packet::MediaType, AudioMetadata, MediaPacket,
+        };
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+        let media = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            data: vec![0u8; 10],
+            audio_metadata: Some(AudioMetadata {
+                encoder_target_bitrate_kbps,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let packet = PacketWrapper {
+            data: media.write_to_bytes().expect("serialize MediaPacket"),
+            packet_type: PacketType::MEDIA.into(),
+            session_id,
+            ..Default::default()
+        };
+        let _ = self
+            .inner
+            .borrow_mut()
+            .peer_decode_manager
+            .decode(packet, "test-local");
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -6006,12 +6320,402 @@ pub(crate) mod disconnect_tests {
     //! `diagnostics.packet_handler`, and `health_reporter`'s
     //! `start_health_reporting` future. These tests pin the contract of
     //! `disconnect()`: it must be idempotent, safe on a never-connected
-    //! client, and break those cycles synchronously.
+    //! client, and break those cycles (once any borrow of the client state ends).
     use super::*;
     use videocall_types::Callback as VcCallback;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    /// The retry runs as a spawned task; give it a few event-loop turns.
+    async fn until_peers_cleared(client: &VideoCallClient) {
+        for _ in 0..50 {
+            if client
+                .inner
+                .borrow()
+                .peer_decode_manager
+                .sorted_keys()
+                .is_empty()
+            {
+                return;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+    }
+
+    fn failed() -> ConnectionState {
+        ConnectionState::Failed {
+            error: "test".to_string(),
+            last_known_server: None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_failed_state_reported_while_inner_is_borrowed_still_clears_the_peers() {
+        let client = VideoCallClient::new(build_test_options());
+        client
+            .inner
+            .borrow_mut()
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(7);
+        let epoch = client.connection_epoch.clone();
+        {
+            let held = client.inner.borrow();
+            apply_connection_state(&Rc::downgrade(&client.inner), &failed(), &epoch, 0);
+            assert_eq!(held.peer_decode_manager.sorted_keys().len(), 1);
+        }
+        until_peers_cleared(&client).await;
+
+        {
+            let inner = client.inner.borrow();
+            assert!(inner.peer_decode_manager.sorted_keys().is_empty());
+            assert!(matches!(
+                inner.connection_state,
+                ConnectionState::Failed { .. }
+            ));
+        }
+        client.disconnect().expect("disconnect must succeed");
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_deferred_failed_clears_the_peers_but_does_not_overwrite_a_newer_state() {
+        let client = VideoCallClient::new(build_test_options());
+        client
+            .inner
+            .borrow_mut()
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(7);
+        let epoch = client.connection_epoch.clone();
+        let inner = Rc::downgrade(&client.inner);
+        {
+            let _held = client.inner.borrow();
+            apply_connection_state(&inner, &failed(), &epoch, 0);
+        }
+        let reconnecting = ConnectionState::Reconnecting {
+            server_url: "wss://relay".to_string(),
+            attempt: 1,
+        };
+        apply_connection_state(&inner, &reconnecting, &epoch, 0);
+        until_peers_cleared(&client).await;
+
+        {
+            let inner = client.inner.borrow();
+            assert!(inner.peer_decode_manager.sorted_keys().is_empty());
+            assert!(matches!(
+                inner.connection_state,
+                ConnectionState::Reconnecting { .. }
+            ));
+        }
+        client.disconnect().expect("disconnect must succeed");
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_retired_controllers_deferred_failed_leaves_its_replacement_alone() {
+        let client = VideoCallClient::new(build_test_options());
+        let epoch = client.connection_epoch.clone();
+        let inner = Rc::downgrade(&client.inner);
+        epoch.controller.set(1);
+        {
+            let _held = client.inner.borrow();
+            apply_connection_state(&inner, &failed(), &epoch, 1);
+        }
+        epoch.controller.set(2);
+        let connected = ConnectionState::Connected {
+            server_url: "wss://relay".to_string(),
+            rtt: 10.0,
+            is_webtransport: false,
+            connection_id: "replacement".to_string(),
+        };
+        apply_connection_state(&inner, &connected, &epoch, 2);
+        client
+            .inner
+            .borrow_mut()
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(9);
+        for _ in 0..10 {
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+
+        {
+            let inner = client.inner.borrow();
+            assert!(matches!(
+                inner.connection_state,
+                ConnectionState::Connected { .. }
+            ));
+            assert_eq!(inner.peer_decode_manager.sorted_keys().len(), 1);
+        }
+        apply_connection_state(&Rc::downgrade(&client.inner), &failed(), &epoch, 1);
+        assert_eq!(
+            client
+                .inner
+                .borrow()
+                .peer_decode_manager
+                .sorted_keys()
+                .len(),
+            1,
+            "a retired controller's own Failed is ignored too"
+        );
+        client.disconnect().expect("disconnect must succeed");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_replaced_controllers_callbacks_are_all_ignored() {
+        let connected_calls = Rc::new(Cell::new(0));
+        let lost_calls = Rc::new(Cell::new(0));
+        let (c, l) = (connected_calls.clone(), lost_calls.clone());
+        let client = VideoCallClient::new(VideoCallClientOptions {
+            on_connected: VcCallback::from(move |_| c.set(c.get() + 1)),
+            on_connection_lost: VcCallback::from(move |_| l.set(l.get() + 1)),
+            ..build_test_options()
+        });
+        client
+            .inner
+            .borrow_mut()
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(9);
+        client
+            .viewport_sender
+            .borrow_mut()
+            .record(&HashSet::from([9]));
+        let retired = client.next_controller_options();
+        let _current = client.next_controller_options();
+
+        retired.on_state_changed.emit(failed());
+        retired.on_state_changed.emit(ConnectionState::Connected {
+            server_url: "wss://relay".to_string(),
+            rtt: 10.0,
+            is_webtransport: false,
+            connection_id: "retired".to_string(),
+        });
+        retired
+            .on_state_changed
+            .emit(ConnectionState::Reconnecting {
+                server_url: "wss://relay".to_string(),
+                attempt: 1,
+            });
+        retired.on_inbound_media.emit(PacketWrapper {
+            session_id: 77,
+            user_id: "late@test.com".into(),
+            ..Default::default()
+        });
+
+        assert_eq!((connected_calls.get(), lost_calls.get()), (0, 0));
+        let inner = client.inner.borrow();
+        assert_eq!(inner.peer_decode_manager.sorted_keys(), &vec![9]);
+        assert!(!inner
+            .peer_decode_manager
+            .roster_reconcile_pending_for_test());
+        assert!(
+            !matches!(inner.connection_state, ConnectionState::Connected { .. }),
+            "{:?}",
+            inner.connection_state
+        );
+        drop(inner);
+        assert_eq!(
+            client.viewport_sender.borrow_mut().take_if_changed(),
+            Some(vec![9]),
+            "the viewport was not re-sent for the retired controller"
+        );
+        client.disconnect().expect("disconnect must succeed");
+    }
+
+    #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function install_idle_worker_links() {
+  for (const id of ["codecs-worker", "neteq-worker"]) {
+    if (document.getElementById(id)) continue;
+    const link = document.createElement("link");
+    link.id = id;
+    link.setAttribute("href", URL.createObjectURL(new Blob(["self.onmessage = () => {};"], { type: "text/javascript" })));
+    document.head.appendChild(link);
+  }
+}
+export function count_new_workers() {
+  const Original = globalThis.Worker;
+  let created = 0;
+  globalThis.Worker = class extends Original {
+    constructor(...args) { super(...args); created += 1; }
+  };
+  return () => { globalThis.Worker = Original; return created; };
+}
+"#)]
+    extern "C" {
+        fn install_idle_worker_links();
+        fn count_new_workers() -> js_sys::Function;
+    }
+
+    #[wasm_bindgen_test]
+    async fn disconnect_drops_peers_and_starts_no_queued_boot() {
+        install_idle_worker_links();
+        let client = VideoCallClient::new(build_test_options());
+        for sid in 9001..=9010 {
+            client
+                .inner
+                .borrow_mut()
+                .peer_decode_manager
+                .ensure_peer(sid, "peer@test.com");
+        }
+        client.disconnect().expect("disconnect must succeed");
+        let created = count_new_workers();
+        gloo_timers::future::TimeoutFuture::new(100).await;
+        let created = created.call0(&JsValue::NULL).expect("count").as_f64();
+
+        assert_eq!(
+            created,
+            Some(0.0),
+            "no queued boot started after disconnect"
+        );
+        assert!(client
+            .inner
+            .borrow()
+            .peer_decode_manager
+            .sorted_keys()
+            .is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_disconnect_from_the_kick_callback_drops_peers_and_starts_no_queued_boot() {
+        install_idle_worker_links();
+        let holder: Rc<RefCell<Option<VideoCallClient>>> = Rc::default();
+        let for_kick = holder.clone();
+        let kicks = Rc::new(Cell::new(0));
+        let on_kick = kicks.clone();
+        let client = VideoCallClient::new(VideoCallClientOptions {
+            on_participant_kicked: Some(VcCallback::from(move |_| {
+                on_kick.set(on_kick.get() + 1);
+                if let Some(client) = for_kick.borrow().as_ref() {
+                    client.disconnect().expect("disconnect must succeed");
+                }
+            })),
+            ..build_test_options()
+        });
+        *holder.borrow_mut() = Some(client.clone());
+        for sid in 9201..=9210 {
+            client
+                .inner
+                .borrow_mut()
+                .peer_decode_manager
+                .ensure_peer(sid, "peer@test.com");
+        }
+        let kick = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_KICKED.into(),
+            target_user_id: client.options.user_id.as_bytes().to_vec(),
+            room_id: "test-meeting".into(),
+            ..Default::default()
+        };
+        let created = count_new_workers();
+        client
+            .next_controller_options()
+            .on_inbound_media
+            .emit(PacketWrapper {
+                packet_type: PacketType::MEETING.into(),
+                data: kick.write_to_bytes().expect("kick encodes"),
+                ..Default::default()
+            });
+        gloo_timers::future::TimeoutFuture::new(100).await;
+        let created = created.call0(&JsValue::NULL).expect("count").as_f64();
+        holder.borrow_mut().take();
+
+        assert_eq!(kicks.get(), 1);
+        assert_eq!(created, Some(0.0), "no queued boot started after the kick");
+        assert!(client
+            .inner
+            .borrow()
+            .peer_decode_manager
+            .sorted_keys()
+            .is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn the_client_lets_its_boot_queue_drive_audio_retries() {
+        let client = VideoCallClient::new(build_test_options());
+        client.worker_boot_queue.hold_audio_for_test(77);
+        client.worker_boot_queue.drive_retries_for_test();
+        assert!(client.worker_boot_queue.audio_hold_sessions().is_empty());
+        client.disconnect().expect("disconnect must succeed");
+    }
+
+    #[wasm_bindgen_test]
+    fn connect_creates_a_controller_under_a_new_epoch() {
+        let mut client = VideoCallClient::new(VideoCallClientOptions {
+            websocket_urls: vec!["ws://127.0.0.1:9/lobby".to_string()],
+            ..build_test_options()
+        });
+        let before = client.connection_epoch.controller.get();
+        client.connect().expect("connect builds a controller");
+        assert_eq!(client.connection_epoch.controller.get(), before + 1);
+        client.disconnect().expect("disconnect must succeed");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_replaced_controllers_peer_monitor_removes_no_peer() {
+        let client = VideoCallClient::new(build_test_options());
+        client
+            .inner
+            .borrow_mut()
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(9);
+        let retired = client.next_controller_options().peer_monitor;
+        let current = client.next_controller_options().peer_monitor;
+        let peers = || {
+            client
+                .inner
+                .borrow()
+                .peer_decode_manager
+                .sorted_keys()
+                .len()
+        };
+
+        for _ in 0..4 {
+            retired.emit(());
+        }
+        assert_eq!(peers(), 1, "a retired monitor never times a peer out");
+        for _ in 0..4 {
+            current.emit(());
+        }
+        assert_eq!(peers(), 0, "the current monitor still does");
+        client.disconnect().expect("disconnect must succeed");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_replaced_controllers_election_and_fallback_callbacks_are_silent() {
+        let progress = Rc::new(Cell::new(0));
+        let fallback = Rc::new(Cell::new(0));
+        let (p, f) = (progress.clone(), fallback.clone());
+        let client = VideoCallClient::new(VideoCallClientOptions {
+            on_election_progress: Some(VcCallback::from(move |_| p.set(p.get() + 1))),
+            on_fallback_memory: Some(VcCallback::from(move |_| f.set(f.get() + 1))),
+            ..build_test_options()
+        });
+        let retired = client.next_controller_options();
+        let current = client.next_controller_options();
+        let connected = || ElectionProgress::Connected {
+            webtransport: false,
+        };
+
+        retired
+            .on_election_progress
+            .as_ref()
+            .expect("wired")
+            .emit(connected());
+        retired
+            .on_fallback_memory
+            .as_ref()
+            .expect("wired")
+            .emit(true);
+        assert_eq!((progress.get(), fallback.get()), (0, 0));
+        current
+            .on_election_progress
+            .as_ref()
+            .expect("wired")
+            .emit(connected());
+        current
+            .on_fallback_memory
+            .as_ref()
+            .expect("wired")
+            .emit(true);
+        assert_eq!((progress.get(), fallback.get()), (1, 1));
+        client.disconnect().expect("disconnect must succeed");
+    }
 
     pub(crate) fn build_test_options() -> VideoCallClientOptions {
         VideoCallClientOptions {
@@ -6044,7 +6748,12 @@ pub(crate) mod disconnect_tests {
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
             on_encoder_settings_update: None,
-            rtt_testing_period_ms: 2000,
+            webtransport_connect_timeout_ms: 2000,
+            websocket_connect_timeout_ms: 2000,
+            prefer_webtransport: true,
+            on_election_progress: None,
+            start_in_fallback: false,
+            on_fallback_memory: None,
             rtt_probe_interval_ms: None,
             on_meeting_info: None,
             on_meeting_ended: None,
@@ -6061,16 +6770,41 @@ pub(crate) mod disconnect_tests {
             on_reaction: None,
             on_raise_hand: None,
             on_meeting_timer: None,
+            on_caption: None,
             on_display_name_changed: None,
+            on_avatar_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_instance_superseded: None,
             on_host_granted: None,
             on_host_revoked: None,
             on_peer_event: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn the_peer_monitor_tick_retires_a_screen_decoder_whose_share_ended_a_hold_ago() {
+        let client = VideoCallClient::new(build_test_options());
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .insert_peer_for_test(3210, "sharer@test.com");
+            inner
+                .peer_decode_manager
+                .end_screen_share_a_hold_ago_for_test(3210, js_sys::Date::now() as u64);
+        }
+
+        client.connection_manager_options().peer_monitor.emit(());
+
+        assert!(!client
+            .inner
+            .borrow()
+            .peer_decode_manager
+            .screen_decoder_live_for_test(3210));
     }
 
     #[wasm_bindgen_test]
@@ -6272,7 +7006,12 @@ mod dedup_tests {
             enable_health_reporting: false,
             health_reporting_interval_ms: None,
             on_encoder_settings_update: None,
-            rtt_testing_period_ms: 2000,
+            webtransport_connect_timeout_ms: 2000,
+            websocket_connect_timeout_ms: 2000,
+            prefer_webtransport: true,
+            on_election_progress: None,
+            start_in_fallback: false,
+            on_fallback_memory: None,
             rtt_probe_interval_ms: None,
             on_meeting_info: None,
             on_meeting_ended: None,
@@ -6289,10 +7028,13 @@ mod dedup_tests {
             on_reaction: None,
             on_raise_hand: None,
             on_meeting_timer: None,
+            on_caption: None,
             on_display_name_changed: None,
+            on_avatar_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_instance_superseded: None,
             on_host_granted: None,
             on_host_revoked: None,
             on_peer_event: None,
@@ -6469,6 +7211,49 @@ mod dedup_tests {
         );
     }
 
+    /// Deliver a MEETING_INSTANCE_SUPERSEDED for `target` to a client whose
+    /// user is "dedup_test_user"; returns how many times `on_instance_superseded` fired.
+    fn superseded_callbacks_for(target: &[u8], deliveries: usize) -> usize {
+        use protobuf::Message;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let fired = Rc::new(std::cell::Cell::new(0usize));
+        let sink = fired.clone();
+        client.inner.borrow_mut().options.on_instance_superseded =
+            Some(Callback::from(move |_: ()| sink.set(sink.get() + 1)));
+        for _ in 0..deliveries {
+            let meeting_packet = MeetingPacket {
+                event_type: MeetingEventType::MEETING_INSTANCE_SUPERSEDED.into(),
+                room_id: "test-meeting".to_string(),
+                target_user_id: target.to_vec(),
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEETING.into(),
+                data: meeting_packet.write_to_bytes().unwrap(),
+                ..Default::default()
+            };
+            let _ = client.inner.borrow_mut().on_inbound_media(wrapper);
+        }
+        fired.get()
+    }
+
+    #[wasm_bindgen_test]
+    fn instance_superseded_fires_the_callback_only_for_the_targeted_user() {
+        assert_eq!(superseded_callbacks_for(b"dedup_test_user", 1), 1);
+        assert_eq!(superseded_callbacks_for(b"someone-else", 1), 0);
+        assert_eq!(superseded_callbacks_for(b"", 1), 0);
+        assert_eq!(superseded_callbacks_for(b"dedup_test_use", 1), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn instance_superseded_repeated_within_the_dedup_window_fires_once() {
+        assert_eq!(superseded_callbacks_for(b"dedup_test_user", 3), 1);
+    }
+
     /// HOST_MUTE_PARTICIPANT dedup is user-scoped on purpose: a host muting
     /// `antonio@hcl` legitimately mutes ALL of his sessions, and both
     /// transports must collapse to one local effect. This guards against
@@ -6579,6 +7364,96 @@ mod dedup_tests {
              Regression guard for HCL #828."
         );
     }
+
+    #[wasm_bindgen_test]
+    fn caption_packets_dispatch_to_on_caption_without_creating_a_peer() {
+        use crate::client::captions::{CaptionStatus, CaptionUpdate};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use videocall_types::protos::caption_packet::{caption_packet::Kind, CaptionPacket};
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let received: Rc<RefCell<Vec<CaptionUpdate>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = received.clone();
+        let mut opts = build_dedup_test_options();
+        opts.on_caption = Some(VcCallback::from(move |u: CaptionUpdate| {
+            sink.borrow_mut().push(u);
+        }));
+        let client = VideoCallClient::new(opts);
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner.own_session_id = Some(7);
+            // A session this client held before a re-election.
+            inner.own_session_ids.borrow_mut().record(9);
+            let peers = &mut inner.peer_decode_manager;
+            peers.insert_peer_for_test(4242, "maria@example.com");
+            peers.set_peer_display_name(4242, "Maria".to_string());
+            peers.insert_peer_for_test(5150, "host@example.com");
+            peers.set_peer_display_name(5150, "Hana".to_string());
+        }
+        let wrap = |caption: CaptionPacket| PacketWrapper {
+            packet_type: PacketType::CAPTION.into(),
+            user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+            session_id: 0,
+            data: caption.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let text = |speaker_session_id: u64| CaptionPacket {
+            speaker_session_id,
+            speaker_user_id: b"someone@example.com".to_vec(),
+            text: "ciao a tutti".to_string(),
+            kind: Kind::TEXT.into(),
+            ..Default::default()
+        };
+        let active = |started_by: &[u8]| CaptionPacket {
+            kind: Kind::STATUS_ACTIVE.into(),
+            started_by: started_by.to_vec(),
+            ..Default::default()
+        };
+        for caption in [
+            text(4242),
+            text(7),
+            text(9),
+            active(b"host@example.com"),
+            active(b"dedup_test_user"),
+        ] {
+            let status = client.inner.borrow_mut().on_inbound_media(wrap(caption));
+            assert!(matches!(status, PeerStatus::NoChange));
+        }
+
+        let got = received.borrow();
+        assert_eq!(got.len(), 5);
+        let speakers: Vec<(String, bool)> = got[..3]
+            .iter()
+            .map(|u| match u {
+                CaptionUpdate::Text(e) => (e.speaker_name.clone(), e.is_local),
+                other => panic!("expected text, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            speakers,
+            [
+                ("Maria".to_string(), false),
+                ("someone@example.com".to_string(), true),
+                ("someone@example.com".to_string(), true),
+            ],
+            "the current session and a previous one of ours are both local"
+        );
+        assert_eq!(
+            got[3],
+            CaptionUpdate::Status(CaptionStatus {
+                active: true,
+                started_by_user_id: "host@example.com".to_string(),
+                started_by_name: "Hana".to_string(),
+                started_by_local: false,
+            })
+        );
+        assert!(matches!(
+            &got[4],
+            CaptionUpdate::Status(s) if s.started_by_local
+        ));
+    }
 }
 
 /// Host-target regression tests for the issue-#1352 hardening of the
@@ -6618,13 +7493,18 @@ mod cooldown_reset_hardening_tests {
     }
 
     /// #2343: a contended controller cell is not evidence the transport cannot
-    /// report. A `None` transport — or a `None` depth on WS — reaches
-    /// `screen_uplink_sample` as `Unobservable` and resets the governor's dwell.
+    /// report. A `None` screen depth reaches `screen_uplink_sample` as
+    /// `Unobservable` and resets the governor's dwell.
     #[test]
     fn uplink_sensors_survive_a_transient_borrow_conflict() {
+        use crate::connection::StreamQueueDepth;
+
         let client = build_test_client_with(None, true);
         client.last_send_queue_depth.set(Some(64_000));
         client.last_active_transport.set(Some("websocket"));
+        client
+            .last_screen_queue_depth
+            .set(Some(StreamQueueDepth::WebTransport(311_000)));
 
         let held = client.connection_controller.borrow_mut();
         assert_eq!(
@@ -6638,9 +7518,9 @@ mod cooldown_reset_hardening_tests {
             "a contended cell must yield the last-known transport"
         );
         assert_eq!(
-            client.uplink_sensors(),
-            (Some("websocket"), Some(64_000)),
-            "the single-borrow pair must agree with the individual accessors"
+            client.screen_uplink_sensor(),
+            Some(StreamQueueDepth::WebTransport(311_000)),
+            "a contended cell must yield the last-known screen depth"
         );
         drop(held);
 
@@ -6648,31 +7528,76 @@ mod cooldown_reset_hardening_tests {
         let no_controller = "no elected controller: the seeded value must not survive";
         assert_eq!(client.send_queue_depth(), None, "{no_controller}");
         assert_eq!(client.active_transport(), None, "{no_controller}");
+        assert_eq!(client.screen_uplink_sensor(), None, "{no_controller}");
         assert_eq!(client.last_send_queue_depth.get(), None, "{no_controller}");
         assert_eq!(client.last_active_transport.get(), None, "{no_controller}");
+        assert_eq!(
+            client.last_screen_queue_depth.get(),
+            None,
+            "{no_controller}"
+        );
     }
 
     #[cfg(feature = "netsim")]
     #[test]
     fn netsim_ws_buffered_override_replaces_send_queue_depth_only() {
         use crate::connection::set_ws_buffered_override_for_netsim;
+        use crate::connection::StreamQueueDepth;
 
         let client = build_test_client_with(None, true);
         client.last_send_queue_depth.set(Some(64_000));
-        client.last_active_transport.set(Some("websocket"));
+        client
+            .last_screen_queue_depth
+            .set(Some(StreamQueueDepth::WebSocket(64_000)));
         let held = client.connection_controller.borrow_mut();
 
         set_ws_buffered_override_for_netsim(Some(200_000));
         assert_eq!(client.send_queue_depth(), Some(200_000));
         assert_eq!(
-            client.uplink_sensors(),
-            (Some("websocket"), Some(64_000)),
-            "the screen uplink sensor pair must keep the real read"
+            client.screen_send_queue_depth(),
+            Some(StreamQueueDepth::WebSocket(200_000)),
+            "the screen gate reads the override"
+        );
+        assert_eq!(
+            client.screen_uplink_sensor(),
+            Some(StreamQueueDepth::WebSocket(64_000)),
+            "the screen uplink governor must keep the real read"
         );
         assert_eq!(client.last_send_queue_depth.get(), Some(64_000));
 
         set_ws_buffered_override_for_netsim(None);
         assert_eq!(client.send_queue_depth(), Some(64_000));
+        drop(held);
+    }
+
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn netsim_wt_screen_queue_override_reaches_the_screen_gate_only() {
+        use crate::connection::set_wt_screen_queue_override_for_netsim;
+        use crate::connection::StreamQueueDepth;
+
+        let client = build_test_client_with(None, true);
+        client
+            .last_screen_queue_depth
+            .set(Some(StreamQueueDepth::WebTransport(0)));
+        let held = client.connection_controller.borrow_mut();
+
+        set_wt_screen_queue_override_for_netsim(Some(400_000));
+        assert_eq!(
+            client.screen_send_queue_depth(),
+            Some(StreamQueueDepth::WebTransport(400_000))
+        );
+        assert_eq!(
+            client.screen_uplink_sensor(),
+            Some(StreamQueueDepth::WebTransport(0)),
+            "the screen uplink governor must keep the real read"
+        );
+
+        set_wt_screen_queue_override_for_netsim(None);
+        assert_eq!(
+            client.screen_send_queue_depth(),
+            Some(StreamQueueDepth::WebTransport(0))
+        );
         drop(held);
     }
 
@@ -6764,6 +7689,24 @@ mod cooldown_reset_hardening_tests {
         build_test_client_with(None, false)
     }
 
+    #[test]
+    fn every_manager_a_client_builds_shares_the_tabs_fallback_memory() {
+        let client = build_test_client();
+        client
+            .connection_manager_options()
+            .fallback_memory
+            .set(true);
+        assert!(client.connection_manager_options().fallback_memory.get());
+    }
+
+    #[test]
+    fn every_controller_a_client_builds_shares_the_tabs_conn_seq() {
+        let client = build_test_client();
+        let retired = client.next_controller_options();
+        let current = client.next_controller_options();
+        assert!(Rc::ptr_eq(&retired.conn_seq, &current.conn_seq));
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn only_a_decoding_client_lets_its_manager_adopt_the_wt_spare_worker() {
@@ -6809,7 +7752,12 @@ mod cooldown_reset_hardening_tests {
             enable_health_reporting: false,
             health_reporting_interval_ms: None,
             on_encoder_settings_update: None,
-            rtt_testing_period_ms: 2000,
+            webtransport_connect_timeout_ms: 2000,
+            websocket_connect_timeout_ms: 2000,
+            prefer_webtransport: true,
+            on_election_progress: None,
+            start_in_fallback: false,
+            on_fallback_memory: None,
             rtt_probe_interval_ms: None,
             on_meeting_info: None,
             on_meeting_ended: None,
@@ -6826,10 +7774,13 @@ mod cooldown_reset_hardening_tests {
             on_reaction: None,
             on_raise_hand: None,
             on_meeting_timer: None,
+            on_caption: None,
             on_display_name_changed: None,
+            on_avatar_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_instance_superseded: None,
             on_host_granted: None,
             on_host_revoked: None,
             on_peer_event: None,
@@ -7745,7 +8696,7 @@ mod cooldown_reset_hardening_tests {
 
     /// #2267 in PRODUCTION ORDER. The relay dispatches its replay at `JoinRoom`,
     /// mid-election, so it lands ~2s BEFORE `Connected`; staging first inverts that.
-    /// 700 is replayed, 800 is not, and BOTH are silent.
+    /// 700 is replayed and silent; 800 is not replayed and still counts its pre-loss packets.
     #[test]
     fn roster_reconcile_in_production_order_spares_the_replayed_peer() {
         use protobuf::Message;
@@ -7762,8 +8713,8 @@ mod cooldown_reset_hardening_tests {
                 inner
                     .peer_decode_manager
                     .insert_zero_loss_top_peer_for_test(sid);
-                inner.peer_decode_manager.silence_peer_for_test(sid);
             }
+            inner.peer_decode_manager.silence_peer_for_test(700);
             inner.own_session_id = Some(99);
             inner.last_reconnect_reconciled_session = Some(99);
         }
@@ -7935,6 +8886,194 @@ mod cooldown_reset_hardening_tests {
              again → returns true (and the size-lid PLI would be justified)"
         );
     }
+
+    #[test]
+    fn meeting_started_emits_only_the_earliest_start_time_until_meeting_ended() {
+        use protobuf::Message;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+
+        let client = build_test_client();
+        let emitted: EmittedStarts = Rc::default();
+        let sink = emitted.clone();
+        client.inner.borrow_mut().options.on_meeting_info =
+            Some(Callback::from(move |t: f64| sink.borrow_mut().push(t)));
+        let deliver_as = |event_type: MeetingEventType, start_time_ms: u64, authoritative: bool| {
+            let meeting_packet = MeetingPacket {
+                event_type: event_type.into(),
+                room_id: "test-meeting".to_string(),
+                start_time_ms,
+                start_time_authoritative: authoritative,
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEETING.into(),
+                data: meeting_packet.write_to_bytes().unwrap(),
+                ..Default::default()
+            };
+            let _ = client.inner.borrow_mut().on_inbound_media(wrapper);
+        };
+        let deliver = |event_type, start_time_ms| deliver_as(event_type, start_time_ms, false);
+        const T: u64 = 1_760_000_000_000;
+
+        deliver(MeetingEventType::MEETING_STARTED, T);
+        deliver(MeetingEventType::MEETING_STARTED, T + 5_000);
+        deliver(MeetingEventType::MEETING_STARTED, T);
+        deliver(MeetingEventType::MEETING_STARTED, 0);
+        assert_eq!(*emitted.borrow(), vec![T as f64]);
+
+        deliver(MeetingEventType::MEETING_STARTED, T - 1_000);
+        assert_eq!(*emitted.borrow(), vec![T as f64, (T - 1_000) as f64]);
+
+        deliver(MeetingEventType::MEETING_ENDED, 0);
+        deliver(MeetingEventType::MEETING_STARTED, T + 60_000);
+        assert_eq!(
+            *emitted.borrow(),
+            vec![T as f64, (T - 1_000) as f64, (T + 60_000) as f64]
+        );
+
+        client.disconnect().unwrap();
+        deliver(MeetingEventType::MEETING_STARTED, T + 60_000);
+        assert_eq!(emitted.borrow().len(), 4);
+    }
+
+    type EmittedStarts = Rc<RefCell<Vec<f64>>>;
+
+    fn meeting_started_sink() -> (VideoCallClient, EmittedStarts, impl Fn(u64, bool)) {
+        use protobuf::Message;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+
+        let client = build_test_client();
+        let emitted: EmittedStarts = Rc::default();
+        let sink = emitted.clone();
+        client.inner.borrow_mut().options.on_meeting_info =
+            Some(Callback::from(move |t: f64| sink.borrow_mut().push(t)));
+        let inner = client.inner.clone();
+        let deliver = move |start_time_ms: u64, authoritative: bool| {
+            let meeting_packet = MeetingPacket {
+                event_type: MeetingEventType::MEETING_STARTED.into(),
+                room_id: "test-meeting".to_string(),
+                start_time_ms,
+                start_time_authoritative: authoritative,
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEETING.into(),
+                data: meeting_packet.write_to_bytes().unwrap(),
+                ..Default::default()
+            };
+            let _ = inner.borrow_mut().on_inbound_media(wrapper);
+        };
+        (client, emitted, deliver)
+    }
+
+    #[test]
+    fn an_authoritative_meeting_start_replaces_a_relay_clock_one_and_only_moves_forward() {
+        let (_client, emitted, deliver) = meeting_started_sink();
+        const T: u64 = 1_760_000_000_000;
+
+        deliver(T, false);
+        deliver(T + 5_000, true);
+        deliver(T + 5_000, true);
+        deliver(T + 90_000, true);
+        deliver(T + 1_000, true);
+        assert_eq!(
+            *emitted.borrow(),
+            vec![T as f64, (T + 5_000) as f64, (T + 90_000) as f64]
+        );
+    }
+
+    #[test]
+    fn an_earlier_authoritative_start_replaces_a_relay_clock_one() {
+        let (_client, emitted, deliver) = meeting_started_sink();
+        const T: u64 = 1_760_000_000_000;
+
+        deliver(T, false);
+        deliver(T - 30_000, true);
+        assert_eq!(*emitted.borrow(), vec![T as f64, (T - 30_000) as f64]);
+    }
+
+    #[test]
+    fn a_stale_earlier_authoritative_start_is_ignored_after_a_later_one() {
+        let (_client, emitted, deliver) = meeting_started_sink();
+        const T: u64 = 1_760_000_000_000;
+
+        deliver(T + 90_000, true);
+        deliver(T, true);
+        deliver(T + 50_000, true);
+        assert_eq!(*emitted.borrow(), vec![(T + 90_000) as f64]);
+    }
+
+    #[test]
+    fn a_relay_clock_meeting_start_cannot_override_an_authoritative_one() {
+        let (_client, emitted, deliver) = meeting_started_sink();
+        const T: u64 = 1_760_000_000_000;
+
+        deliver(T, true);
+        deliver(T - 30_000, false);
+        deliver(T + 30_000, false);
+        assert_eq!(*emitted.borrow(), vec![T as f64]);
+    }
+
+    #[test]
+    fn an_authoritative_repeat_of_the_emitted_start_locks_out_relay_clock_values() {
+        let (_client, emitted, deliver) = meeting_started_sink();
+        const T: u64 = 1_760_000_000_000;
+
+        deliver(T, false);
+        deliver(T, true);
+        deliver(T - 30_000, false);
+        assert_eq!(*emitted.borrow(), vec![T as f64]);
+    }
+
+    #[test]
+    fn every_avatar_change_emits_its_user_and_an_unnamed_one_is_dropped() {
+        use protobuf::Message;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+        use videocall_types::SYSTEM_USER_ID;
+
+        let client = build_test_client();
+        let emitted: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = emitted.clone();
+        client.inner.borrow_mut().options.on_avatar_changed =
+            Some(Callback::from(move |user_id: String| {
+                sink.borrow_mut().push(user_id)
+            }));
+        let deliver = |target_user_id: &[u8]| {
+            let meeting_packet = MeetingPacket {
+                event_type: MeetingEventType::PARTICIPANT_AVATAR_CHANGED.into(),
+                room_id: "test-meeting".to_string(),
+                target_user_id: target_user_id.to_vec(),
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEETING.into(),
+                user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+                data: meeting_packet.write_to_bytes().unwrap(),
+                ..Default::default()
+            };
+            let _ = client.inner.borrow_mut().on_inbound_media(wrapper);
+        };
+
+        deliver(b"ann@example.com");
+        assert_eq!(*emitted.borrow(), ["ann@example.com"]);
+        deliver(b"");
+        deliver(b"ann@example.com");
+        deliver(b"bo\xffb@example.com");
+        assert_eq!(
+            *emitted.borrow(),
+            [
+                "ann@example.com",
+                "ann@example.com",
+                "bo\u{FFFD}b@example.com"
+            ]
+        );
+    }
 }
 
 /// A peer must NOT be created for: system messages, the unstamped `session_id
@@ -8003,6 +9142,9 @@ fn suppresses_peer_creation_for_packet(response: &PacketWrapper, decode_media: b
     // very first heartbeat would mint a spurious empty tile for the host and the
     // heartbeat would keep it alive.
     if response.packet_type == PacketType::MEETING_TIMER.into() {
+        return true;
+    }
+    if response.packet_type == PacketType::CAPTION.into() {
         return true;
     }
     let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
@@ -8216,6 +9358,12 @@ mod self_peer_suppression_tests {
             "a MEETING_TIMER must never create a peer tile — it is room-global state \
              rendered as one shared countdown, not a participant"
         );
+    }
+
+    #[test]
+    fn wiring_caption_packet_is_suppressed_even_with_a_peer_identity() {
+        let p = packet(PacketType::CAPTION, 42, b"alice@example.com");
+        assert!(suppresses_peer_creation_for_packet(&p, true));
     }
 
     /// Observer mode (`decode_media == false`) suppresses even a normal MEDIA

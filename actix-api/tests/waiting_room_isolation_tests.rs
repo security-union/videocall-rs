@@ -258,6 +258,20 @@ fn make_media_packet(sender_user_id: &str) -> Vec<u8> {
     make_media_packet_typed(sender_user_id, MediaType::AUDIO)
 }
 
+async fn send_heartbeat(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    user_id: &str,
+) {
+    ws.send(Message::Binary(make_media_packet_typed(
+        user_id,
+        MediaType::HEARTBEAT,
+    )))
+    .await
+    .expect("heartbeat send should succeed");
+}
+
 /// Build a non-MEDIA PacketWrapper of the given type, ready to send over the wire.
 fn make_packet_of_type(sender_user_id: &str, packet_type: PacketType) -> Vec<u8> {
     let mut wrapper = PacketWrapper::new();
@@ -327,6 +341,7 @@ async fn test_admitted_session_receives_media_normally() {
     let mut ws_b = connect_with_token(port, &token_b).await;
     let _session_b = wait_for_session_assigned(&mut ws_b).await;
     wait_for_meeting_started(&mut ws_b).await;
+    send_heartbeat(&mut ws_b, "bob@test.com").await;
 
     // Give the server a moment to fully register both sessions in the room
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -380,6 +395,7 @@ async fn test_observer_does_not_receive_media_from_admitted_peer() {
     let token_observer = make_observer_token("observer@test.com", room, "Observer");
     let mut ws_observer = connect_with_token(port, &token_observer).await;
     let _session_observer = wait_for_session_assigned(&mut ws_observer).await;
+    send_heartbeat(&mut ws_observer, "observer@test.com").await;
 
     // Observers may or may not receive MEETING_STARTED depending on timing;
     // the important thing is SESSION_ASSIGNED was received (connection is alive).
@@ -433,6 +449,7 @@ async fn test_observer_cannot_publish_media() {
     let mut ws_admitted = connect_with_token(port, &token_admitted).await;
     let _session_admitted = wait_for_session_assigned(&mut ws_admitted).await;
     wait_for_meeting_started(&mut ws_admitted).await;
+    send_heartbeat(&mut ws_admitted, "bob@test.com").await;
 
     // Connect an observer session
     let token_observer = make_observer_token("observer@test.com", room, "Observer");
@@ -511,6 +528,7 @@ async fn test_observer_spoofed_user_id_still_dropped() {
     let mut ws_a = connect_with_token(port, &token_a).await;
     let _sid_a = wait_for_session_assigned(&mut ws_a).await;
     wait_for_meeting_started(&mut ws_a).await;
+    send_heartbeat(&mut ws_a, "alice@test.com").await;
 
     // Connect observer
     let token_obs = make_observer_token("observer@test.com", room, "Observer");
@@ -563,6 +581,7 @@ async fn test_observer_spoofed_session_id_still_dropped() {
     let mut ws_b = connect_with_token(port, &token_b).await;
     let _sid_b = wait_for_session_assigned(&mut ws_b).await;
     wait_for_meeting_started(&mut ws_b).await;
+    send_heartbeat(&mut ws_b, "bob@test.com").await;
 
     let token_obs = make_observer_token("observer@test.com", room, "Observer");
     let mut ws_obs = connect_with_token(port, &token_obs).await;
@@ -622,6 +641,7 @@ async fn test_observer_unparseable_packet_dropped() {
     let mut ws_a = connect_with_token(port, &token_a).await;
     let _sid_a = wait_for_session_assigned(&mut ws_a).await;
     wait_for_meeting_started(&mut ws_a).await;
+    send_heartbeat(&mut ws_a, "alice@test.com").await;
 
     let token_obs = make_observer_token("observer@test.com", room, "Observer");
     let mut ws_obs = connect_with_token(port, &token_obs).await;
@@ -681,6 +701,7 @@ async fn test_observer_blocked_for_all_media_types() {
     let token_obs = make_observer_token("observer@test.com", room, "Observer");
     let mut ws_obs = connect_with_token(port, &token_obs).await;
     let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    send_heartbeat(&mut ws_obs, "observer@test.com").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Send MEDIA packets with every non-AUDIO MediaType variant
@@ -733,6 +754,7 @@ async fn test_observer_blocked_for_non_media_packet_types() {
     let token_obs = make_observer_token("observer@test.com", room, "Observer");
     let mut ws_obs = connect_with_token(port, &token_obs).await;
     let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    send_heartbeat(&mut ws_obs, "observer@test.com").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Send every sensitive non-MEDIA packet type from the admitted peer

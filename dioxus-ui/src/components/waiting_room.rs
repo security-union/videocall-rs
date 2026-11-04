@@ -9,7 +9,7 @@
 //! backed by polling that never stops: every 5s while that socket is down,
 //! every 15s while it is up.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::components::presence_keepalive::PresenceKeepalive;
@@ -117,8 +117,10 @@ pub fn WaitingRoom(
 
     // Create an observer WebSocket client to receive push notifications
     // when the host admits or rejects this participant.
-    let mut observer_client = use_signal(|| None::<VideoCallClient>);
+    let observer_client: Rc<RefCell<Option<VideoCallClient>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
     {
+        let observer_client = observer_client.clone();
         let observer_token = observer_token.clone();
         let meeting_id = meeting_id.clone();
         let user_id = user_id.clone();
@@ -128,7 +130,6 @@ pub fn WaitingRoom(
         use_effect(move || {
             if observer_token.is_empty() {
                 log::warn!("WaitingRoom: no observer token, push notifications unavailable; polling fallback will activate");
-                observer_client.set(None);
                 observer_connected.set(false);
                 return;
             }
@@ -149,12 +150,7 @@ pub fn WaitingRoom(
             let server_wt_enabled = webtransport_enabled().unwrap_or(false);
             let applied_pref = (transport_pref_ctx.0)();
             let (effective_wt_enabled, websocket_urls, webtransport_urls) =
-                resolve_transport_config(
-                    applied_pref,
-                    server_wt_enabled,
-                    websocket_urls,
-                    webtransport_urls,
-                );
+                resolve_transport_config(server_wt_enabled, websocket_urls, webtransport_urls);
 
             // Issue #1745 PR2 (observability only): record the applied
             // preference + its provenance for the waiting-room OBSERVER client,
@@ -176,6 +172,8 @@ pub fn WaitingRoom(
             let resolved_on_push = resolved.clone();
             let resolved_on_push_reject = resolved.clone();
 
+            let (webtransport_connect_timeout_ms, websocket_connect_timeout_ms) =
+                crate::constants::connect_timeouts_ms();
             let opts = VideoCallClientOptions {
                 user_id: user_id.clone(),
                 display_name: display_name.clone(),
@@ -185,6 +183,11 @@ pub fn WaitingRoom(
                 webtransport_urls,
                 enable_e2ee: false,
                 enable_webtransport: effective_wt_enabled,
+                prefer_webtransport: applied_pref
+                    == crate::context::TransportPreference::WebTransport,
+                on_election_progress: None,
+                start_in_fallback: crate::context::load_transport_fallback(applied_pref),
+                on_fallback_memory: Some(crate::context::fallback_memory_callback(applied_pref)),
                 max_received_layer: crate::constants::max_received_layer(),
                 skip_canvas_paint: crate::constants::skip_canvas_paint(),
                 // Issue #1884: waiting-room OBSERVER client — no in-call reaction
@@ -197,6 +200,7 @@ pub fn WaitingRoom(
                 // callback would be unreachable code, not a missing feature.
                 // There is deliberately no timer in the waiting room.
                 on_meeting_timer: None,
+                on_caption: None,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting room)");
                     obs_conn_on_connect.set(true);
@@ -259,7 +263,8 @@ pub fn WaitingRoom(
                 enable_health_reporting: false,
                 health_reporting_interval_ms: None,
                 on_encoder_settings_update: None,
-                rtt_testing_period_ms: 3000,
+                webtransport_connect_timeout_ms,
+                websocket_connect_timeout_ms,
                 rtt_probe_interval_ms: None,
                 on_meeting_info: None,
                 on_meeting_ended: None,
@@ -310,6 +315,7 @@ pub fn WaitingRoom(
                 on_host_mute: None,
                 on_host_disable_video: None,
                 on_participant_kicked: None,
+                on_instance_superseded: None,
                 on_host_granted: None,
                 on_host_revoked: None,
                 on_peer_event: None,
@@ -319,6 +325,7 @@ pub fn WaitingRoom(
                 on_peer_left: None,
                 on_peer_joined: None,
                 on_display_name_changed: None,
+                on_avatar_changed: None,
                 // Observer-only client: never decode or play back media.
                 // Participants in the waiting room must not hear audio from
                 // the active call.
@@ -343,11 +350,10 @@ pub fn WaitingRoom(
             if let Err(e) = client.connect() {
                 log::error!("Failed to connect observer client for waiting room: {e}");
                 error.set(Some(format!("Failed to connect for push updates: {e}")));
-                observer_client.set(None);
                 observer_connected.set(false);
                 return;
             }
-            observer_client.set(Some(client));
+            *observer_client.borrow_mut() = Some(client);
         });
     }
 
@@ -459,8 +465,10 @@ pub fn WaitingRoom(
                                 }
                             }
                             "rejected" => {
-                                log::info!("Polling fallback: participant rejected");
-                                on_rejected.call(());
+                                if !resolved_interval.replace(true) {
+                                    log::info!("Polling fallback: participant rejected");
+                                    on_rejected.call(());
+                                }
                             }
                             _ if stranded_by_waiting_room_off(&status) => {
                                 if !resolved_interval.replace(true) {
@@ -492,6 +500,34 @@ pub fn WaitingRoom(
 
             // Store the interval ID so use_drop can clear it on unmount.
             poll_interval_id.set(interval_id);
+        });
+    }
+
+    // Leaving without an admit or reject takes this user off the waiting list.
+    {
+        let resolved = resolved.clone();
+        let meeting_id = meeting_id.clone();
+        let observer_token = observer_token.clone();
+        use_drop(move || {
+            if let Some(client) = observer_client.borrow_mut().take() {
+                let _ = client.disconnect();
+            }
+            if resolved.replace(true) {
+                return;
+            }
+            let token = latest_token
+                .try_peek()
+                .map(|t| t.clone())
+                .unwrap_or(observer_token);
+            wasm_bindgen_futures::spawn_local(async move {
+                if is_guest {
+                    let leave = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &token);
+                    crate::meeting_api::leave_within_deadline(&meeting_id, leave).await;
+                } else {
+                    let leave = crate::meeting_api::leave_meeting(&meeting_id);
+                    crate::meeting_api::leave_within_deadline(&meeting_id, leave).await;
+                }
+            });
         });
     }
 

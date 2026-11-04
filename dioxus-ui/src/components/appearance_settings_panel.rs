@@ -7,6 +7,7 @@ use crate::components::attendants::action_bar_announce_text;
 use crate::components::canvas_generator::{glow_tail_seconds, speak_style};
 use crate::components::color_picker::HsvColorPicker;
 use crate::components::peer_tile::glow_deadman_ms;
+use crate::components::recent_actions::SettingsTarget;
 use crate::context::{
     apply_theme_to_dom, default_glow_palette, load_glow_palette_from_storage,
     save_glow_palette_to_storage, AppearanceSettings, AppearanceSettingsCtx, CustomThemeCtx,
@@ -525,6 +526,7 @@ pub fn AppearanceSettingsPanel() -> Element {
 
                 // ── Section 1: Theme ─────────────────────────────────────────────
                 section { class: "appearance-section",
+                    "data-recent-action": SettingsTarget::Theme.slug(),
                     div { class: "appearance-section-header",
                         div { class: "settings-panel-title",
                             svg {
@@ -826,6 +828,7 @@ pub fn AppearanceSettingsPanel() -> Element {
 
                 // ── Section 2: Speaker Highlight ─────────────────────────────────
                 section { class: "appearance-section",
+                    "data-recent-action": SettingsTarget::SpeakerHighlight.slug(),
                     div { class: "appearance-section-header",
                         div { class: "settings-panel-title",
                             svg {
@@ -1005,14 +1008,6 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                 input_error.set(false);
                                                 focus_color_panel_fallback_deferred();
                                             },
-                                            onkeydown: move |evt: KeyboardEvent| {
-                                                if evt.key() == Key::Escape {
-                                                    show_picker.set(false);
-                                                    color_input.set(String::new());
-                                                    input_error.set(false);
-                                                    focus_color_panel_fallback_deferred();
-                                                }
-                                            },
                                             div {
                                                 class: "custom-color-popover custom-color-modal",
                                                 role: "dialog",
@@ -1035,6 +1030,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                 onmousedown: move |evt: Event<MouseData>| evt.stop_propagation(),
                                                 onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
                                                 onkeydown: move |evt: KeyboardEvent| {
+                                                    evt.stop_propagation();
                                                     match evt.key() {
                                                         Key::Escape => {
                                                             show_picker.set(false);

@@ -418,23 +418,28 @@ describe("control server: SSH host registry endpoints", () => {
       expect(body.remoteCommand).toContain("--video-mode 'clock'");
     });
 
-    it("previews the --diag-packets off the launch would pass (#2970)", async () => {
-      await seed("preview-diag");
-      const res = await fetchJson(handle.port, "/hosts/preview-diag/preview-launch", {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}` },
-        body: {
-          meetingURL: "https://example.com/meeting/X",
-          participant: "alice",
-          ttl: "5m",
-          headless: true,
-          network: "none",
-          authBackend: "jwt",
-          diagPackets: "off",
-        },
-      });
-      expect((res.body as { remoteCommand: string }).remoteCommand).toContain("--diag-packets off");
-    });
+    it.each(["off", "on"])(
+      "previews the --diag-packets %s the launch would pass (#2970)",
+      async (v) => {
+        await seed(`preview-diag-${v}`);
+        const res = await fetchJson(handle.port, `/hosts/preview-diag-${v}/preview-launch`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}` },
+          body: {
+            meetingURL: "https://example.com/meeting/X",
+            participant: "alice",
+            ttl: "5m",
+            headless: true,
+            network: "none",
+            authBackend: "jwt",
+            diagPackets: v,
+          },
+        });
+        expect((res.body as { remoteCommand: string }).remoteCommand).toContain(
+          `--diag-packets ${v}`,
+        );
+      },
+    );
 
     it("returns 404 when the host is not registered", async () => {
       const res = await fetchJson(handle.port, "/hosts/ghost/preview-launch", {

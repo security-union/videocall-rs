@@ -115,8 +115,7 @@ jwt_secret: "your-base64-secret"   # or set JWT_SECRET in the environment
 token_ttl_secs: 86400
 ```
 
-> WebTransport receive works: the workspace pins `web-transport-quinn` 0.11.9, and
-> `VALIDATION.md` V20/V22 record WT runs on both send and receive.
+> WebTransport receive works: the workspace pins `web-transport-quinn` 0.11.9.
 
 ### 4. Build & Run
 
@@ -198,7 +197,7 @@ Every 10 seconds each bot logs a stats line:
 - **Video**: VP9 Profile 0, one packet per frame, `simulcast_layers` (default 3) independent encodes from the browser ladder (`SIMULCAST_VIDEO_LAYERS`): video layer 0 at 7 fps, video layer 1 at 15 fps, video layer 2 at 30 fps, 52 video packets/s per camera publisher. Costume frames are pre-recorded I420; EKG frames are rendered on the fly
 - **Heartbeat**: 5s keepalive plus one on every speaking change (browser cadence; `--control-timing legacy` = 1s)
 - **Health**: session-level HealthPacket every 5s (browser cadence; `--health-interval-ms` overrides): identity, transport, probe RTT (unshaped bots only), packet rates, drops, keyframe requests, AQ and encoder telemetry. No `peer_stats` and no quality scores: the bot does not decode, so per-pair receive values would be invented (#2919). The message rate per session matches a browser; the packet is smaller, because a browser's carries up to 128 `peer_stats` entries
-- **Diagnostics**: one DiagnosticsPacket per tracked (peer, media) every 500ms, zeros included, for at most `--diag-video-trackers` video streams (default 12, the tiles a default desktop browser shows; 30 is the browser maximum) plus every audio stream, until the peer leaves: relay `PARTICIPANT_LEFT`, or 15s with no packet from it (both the browser's rules)
+- **Diagnostics**: off by default, as the browser since #3116. With `--diagnostics on`, one DiagnosticsPacket per tracked (peer, media) every 500ms, zeros included, for at most `--diag-video-trackers` video streams (default 12, the tiles a default desktop browser shows; 30 is the browser maximum) plus every audio stream, until the peer leaves: relay `PARTICIPANT_LEFT`, or 15s with no packet from it (both the browser's rules)
 - **LAYER_HINT**: a publisher caps its camera video layers to the relay's self-targeted hint (the highest video layer any receiver wants), as the browser does; hints for another session and AUDIO/SCREEN entries are ignored
 - **Presenters**: `--talkers N` (default 2, counted over the run-wide roster) broadcasters send every 20ms audio frame, silence included, instead of skipping near-silent frames
 - **Split runs**: `--roster-offset K` makes this process run run-wide roster positions K.., so several hosts share one population (roles, talker count, `bot-NNN` names and the WS/WT split are run-wide). Every host must pass the same `--run-size` (total participants; required with `--roster-offset`) so `--cameras` spreads evenly over the hosts. Audio publishers are manifest participants, so they all run on the host with offset 0: size that host for them. Without these flags every process is its own run. Example, 170 Rust bots on 3 hosts:
@@ -253,7 +252,10 @@ On the remote machine:
 | `server_url` | legacy | — | Legacy: single server URL |
 | `meeting_id` | yes | — | Room to join |
 | `conversation_dir` | no | `"conversation"` | Path to manifest + line WAVs |
-| `video_mode` | no | `"ekg"` | `"costume"` (recorded clips) or `"ekg"` (waveform) |
+| `video_mode` | no | `"ekg"` | `"costume"` (recorded clips), `"ekg"` (waveform), or `"replay"`: the EKG is encoded once per process at startup (before any bot joins) and every publisher replays it with its own sequence numbers, timestamps and keyframe phase. Needs 2 or 3 simulcast layers. CLI `--video-mode`, env `BOT_VIDEO_MODE` |
+| `replay_loop_secs` | no | `20` | Length of each replay variant (silent and speaking), rounded up to whole 5 s GOPs, at most 40. Every replay publisher in a process shows the EKG colour of the process's first camera. CLI `--replay-loop-secs` |
+| `replay_seed` | no | random | Seeds every replay publisher's keyframe phase and tick offset, so a run can be repeated. CLI `--replay-seed` |
+| `replay_answer_keyframe_requests` | no | `true` | Replay keys every active video layer when a KEYFRAME_REQUEST targets the bot, after a 250 ms cooldown per publisher (2000 ms on WebSocket while the netsim uplink is saturated), and on every AQ tier change (including every change in the active video layer count), without the cooldown unless that congested 2000 ms window is on. `false` does neither. Live (EKG and costume) publishers always answer requests, with the same cooldown, restarted by every keyframe. CLI `--replay-answer-keyframe-requests`, env `BOT_REPLAY_ANSWER_KEYFRAME_REQUESTS` |
 | `broadcasters` | no | `0` | First N manifest participants send A/V (0 = all manifest participants; generated ones never send audio) |
 | `warmup_secs` | no | `15` | Seconds of silence before conversation starts |
 | `jwt_secret` | yes\*\* | — | HMAC secret for JWT auth. Falls back to `JWT_SECRET` |
@@ -289,7 +291,7 @@ CLI arguments:
 | `--talkers <N>` | Run-wide presenters, default 2 (or `BOT_TALKERS`) |
 | `--cameras <N>` | Run-wide camera-on, mic-muted participants, default 0 (or `BOT_CAMERAS`) |
 | `--broadcasters <N>` | Manifest participants with mic and camera on, default all (or `BOT_BROADCASTERS`) |
-| `--diagnostics <on\|off>` | `off` sends no DIAGNOSTICS at all (no reporter task), default `on` (or `BOT_DIAGNOSTICS`). Pairs with the browser client switch (#2906) for a diagnostics-off arm |
+| `--diagnostics <on\|off>` | Default `off`: no DIAGNOSTICS at all (no reporter task), as a browser since #3116. `on` sends them as a client from before #3116 did, for an old-client arm (or `BOT_DIAGNOSTICS`; YAML `diagnostics: true`) |
 | `--diag-video-trackers <N>` | Most video streams a bot sends DIAGNOSTICS for, default 12 (or `BOT_DIAG_VIDEO_TRACKERS`) |
 | `--run-size <N>` | Participants in the whole run across hosts; cameras spread over it (or `BOT_RUN_SIZE`) |
 | `--roster-offset <K>` | First run-wide roster position, default 0 (or `BOT_ROSTER_OFFSET`) |
@@ -316,6 +318,12 @@ using the field names of the call-quality run manifest
 (`talker` / `speaker` / `viewer`), `observer`, `talker`, `publishes`, `network`
 (`profile`, `shaped`, `direction`, `shaper`, `params`), `transport_intended`,
 optional `placement`, and the actual `join_ts` / `leave_ts` (UTC epoch seconds).
+`video_source` is the camera's effective source (`ekg-live`, `costume-live`,
+`ekg-replay`; `null` with the camera off). Replay cameras also carry
+`replay_answer_keyframe_requests`, `replay_forced_keyframes` (keyframes per video
+layer sent only because a KEYFRAME_REQUEST asked for one) and
+`replay_tier_change_keyframes` (sent only because of an AQ tier change, which
+includes every active video layer count change). A forced keyframe also rewrites the file, at most once per second.
 A scenario runner merges it into the full manifest.
 
 Between the initial and final writes, the file is rewritten atomically after
@@ -350,7 +358,7 @@ main.rs
   └── Per participant:
         ├── transport.rs → websocket_client.rs / webtransport_client.rs
         ├── health_reporter.rs  (tokio task, HealthPackets every 5s by default)
-        ├── diagnostics_reporter.rs (DiagnosticsPackets every 500ms by default)
+        ├── diagnostics_reporter.rs (DiagnosticsPackets every 500ms with --diagnostics on)
         ├── heartbeat producer  (5s keepalive + on speaking change, VAD is_speaking)
         ├── inbound_stats.rs    (per-sender RX quality diagnostics)
         └── [broadcasters only]:
@@ -399,7 +407,7 @@ Because the bot skips decode, jitter buffering, and rendering, its jitter and ga
 - **Impaired bots and control packets.** The in-process netsim drops control packets as well as media. An impaired bot that loses its one `SESSION_ASSIGNED` ignores every LAYER_HINT for the rest of the run, and one that loses a restore hint keeps a stale video layer cap. A browser behind kernel `tc` would get them retransmitted. Phase 0 runs `--no-impair`.
 - **No VIEWPORT by default.** Without `viewport_visible_count` the relay forwards video from every publisher, so relay video egress is not what browsers, which send VIEWPORT, would cause.
 - **Audio through silence is an upper bound.** Presenters send every 20 ms frame (50 audio packets/s). The browser's Opus encoder has DTX on (`microphone_encoder.rs`), and whether its silent frames reach the wire at the same rate is not verified.
-- **Inbound DIAGNOSTICS cost.** DIAGNOSTICS fan out to the whole room. A 200-bot process can receive on the order of 1.35 M DIAGNOSTICS packets/s (derived, PR #2958 review); measure bot-host CPU before N=200, or compare with `--diagnostics off`.
+- **Inbound DIAGNOSTICS cost.** DIAGNOSTICS fan out to the whole room. With `--diagnostics on` on every bot, a 200-bot process can receive on the order of 1.35 M DIAGNOSTICS packets/s (derived, PR #2958 review); measure bot-host CPU before an N=200 old-client arm.
 - **Video rate needs a release build and CPU headroom.** One thread renders and encodes every video layer of a publisher, and a video layer that misses its deadline skips the frame. `BOT_WIRE_SECS=12 cargo test -p bot --test wire_media -- --nocapture` measured video layers 0/1/2 at 7/15/30 frames/s (52 video packets/s) in a `--release` build, but 7/15/15–19 (37–41 video packets/s) in a debug build. Video layer 2 is the first to fall short, so check it on a loaded bot host.
 - **No WebSocket liveness check.** The bot answers relay pings but sends none of its own, so a silent network partition on WS is only noticed when TCP gives up. WT relies on QUIC's idle timeout.
 - **One session per client.** A client whose relay connection closes is recorded with `outcome: "dropped: <reason>"` (a bot-side error: `failed: <reason>`; aborted after the stop grace: `aborted`) and does not reconnect; the process exits non-zero.

@@ -26,10 +26,8 @@ LABEL org.opencontainers.image.ref.name=${GIT_BRANCH}
 
 RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
 
-COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
 # Copy all binary executables from actix-api
 COPY --from=build /app/binaries/* /usr/bin/
-COPY --from=build /app/dbmate /app/dbmate
 
 STOPSIGNAL SIGINT
 

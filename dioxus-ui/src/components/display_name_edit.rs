@@ -3,11 +3,15 @@
 //! Display-name rename, shared by the peer-list modal and the self tile's
 //! inline editor (issue 2794).
 
-use crate::context::{save_display_name_to_storage, validate_display_name, DISPLAY_NAME_MAX_LEN};
+use crate::components::co_hosts::local_host_role;
+use crate::context::{
+    save_display_name_to_storage, validate_display_name, HostSetCtx, DISPLAY_NAME_MAX_LEN,
+};
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
 const SELF_TILE_NAME_ERROR_ID: &str = "self-tile-name-error";
+pub(crate) const SELF_TILE_NAME_CLASS: &str = "self-tile-name";
 const RENAME_SUCCESS_ANNOUNCEMENT: &str = "Display name updated";
 
 /// Trim, reject empty, then apply the shared display-name rules.
@@ -92,8 +96,13 @@ pub fn SelfTileName(
     display_name: String,
     meeting_id: String,
     session_id: Option<u64>,
+    local_user_id: String,
+    owner_user_id: Option<String>,
     on_renamed: EventHandler<String>,
 ) -> Element {
+    let host_set = try_use_context::<HostSetCtx>();
+    let role = local_host_role(host_set.as_ref(), owner_user_id.as_deref(), &local_user_id)
+        .map(|role| role.label());
     let mut editing = use_signal(|| false);
     let mut draft = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
@@ -156,7 +165,7 @@ pub fn SelfTileName(
 
     let has_error = error().is_some();
     rsx! {
-        h4 { class: "floating-name self-tile-name", dir: "auto",
+        h4 { class: "floating-name {SELF_TILE_NAME_CLASS}", dir: "auto",
             if editing() {
                 input {
                     r#type: "text",
@@ -252,7 +261,16 @@ pub fn SelfTileName(
                     }
                 }
             }
-            span { class: "self-indicator", "You" }
+            span { class: "self-indicator", dir: "ltr",
+                "You"
+                if let Some(role) = role {
+                    span { class: "self-indicator-role",
+                        " "
+                        span { "aria-hidden": "true", "·" }
+                        " {role}"
+                    }
+                }
+            }
         }
         if let Some(msg) = error() {
             div {

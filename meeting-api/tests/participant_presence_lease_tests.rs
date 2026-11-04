@@ -797,9 +797,14 @@ async fn admitting_into_a_meeting_nobody_is_in_starts_the_new_instance_first() {
         .expect("the attendee was waiting");
 
     assert_eq!(admitted.status, "admitted");
+    let started_at_ms = meeting(&pool, room).await.started_at.timestamp_millis();
     assert_eq!(
         activation,
-        db_meetings::Activation::NewInstance { demoted: vec![] }
+        db_meetings::Activation::NewInstance {
+            demoted: vec![],
+            captions_generation: 0,
+            started_at_ms,
+        }
     );
     assert!(entries(&pool, room).await.is_empty());
     assert_eq!(row(&pool, room, CO).await.status, "waiting");
@@ -2253,5 +2258,96 @@ async fn the_migration_relists_a_waiting_row_the_old_upsert_left_a_stale_presenc
 
     assert_eq!(waiting_list(&pool, room).await, [ATTENDEE]);
     assert_eq!(presence_seen_at_of(&pool, room, OWNER).await, owner_seen);
+    cleanup_test_data(&pool, room).await;
+}
+
+/// The process that deferred a last-host-left end died before settling it:
+/// any replica's sweep tick ends it once due, even while the heartbeat
+/// pipeline is unhealthy.
+#[tokio::test]
+#[serial]
+async fn the_sweep_tick_settles_an_orphaned_host_left_end() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping orphaned host-left end NATS test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room = "lease-orphaned-host-left-end";
+    create(
+        &pool,
+        room,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    transport(&pool, room, OWNER, S1, true).await;
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    transport(&pool, room, OWNER, S1, false).await;
+    assert_eq!(meeting(&pool, room).await.state.as_deref(), Some("active"));
+
+    sqlx::query("UPDATE meetings SET host_left_end_due_at = NOW() WHERE room_id = $1")
+        .bind(room)
+        .execute(&pool)
+        .await
+        .expect("elapse the host-left debounce");
+    stale_watermark(&pool).await;
+    let (feed_tx, _feed_rx) = new_feed_channel();
+    sweep_tick_for_test(&pool, &nats, &feed_tx).await;
+
+    assert_eq!(meeting(&pool, room).await.state.as_deref(), Some("ended"));
+
+    fresh_watermark(&pool).await;
+    cleanup_test_data(&pool, room).await;
+}
+
+/// While the heartbeat pipeline is unhealthy, the sweep tick settles with
+/// latch presence: a host row that is admitted with a lapsed lease still
+/// counts as present, so the meeting is not ended.
+#[tokio::test]
+#[serial]
+async fn an_unhealthy_sweep_tick_counts_a_latched_host_as_present() {
+    let Some(nats) = maybe_nats().await else {
+        eprintln!("NATS_URL not set — skipping latched host-left end NATS test");
+        return;
+    };
+    let pool = get_test_pool().await;
+    let room = "lease-latched-host-left-end";
+    create(
+        &pool,
+        room,
+        serde_json::json!({ "waiting_room_enabled": false }),
+    )
+    .await;
+    join(&pool, room, OWNER).await;
+    join(&pool, room, ATTENDEE).await;
+    transport(&pool, room, OWNER, S1, true).await;
+    transport(&pool, room, ATTENDEE, S2, true).await;
+    transport(&pool, room, OWNER, S1, false).await;
+
+    let pk = meeting(&pool, room).await.id;
+    sqlx::query(
+        "UPDATE meeting_participants SET status = 'admitted', left_at = NULL, \
+         live_session_id = $3, presence_seen_at = NOW() - INTERVAL '999 seconds' \
+         WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(pk)
+    .bind(OWNER)
+    .bind(S3 as i64)
+    .execute(&pool)
+    .await
+    .expect("forge a latched host with a lapsed lease");
+    sqlx::query("UPDATE meetings SET host_left_end_due_at = NOW() WHERE id = $1")
+        .bind(pk)
+        .execute(&pool)
+        .await
+        .expect("elapse the host-left debounce");
+    stale_watermark(&pool).await;
+    let (feed_tx, _feed_rx) = new_feed_channel();
+    sweep_tick_for_test(&pool, &nats, &feed_tx).await;
+
+    assert_eq!(meeting(&pool, room).await.state.as_deref(), Some("active"));
+
+    fresh_watermark(&pool).await;
     cleanup_test_data(&pool, room).await;
 }

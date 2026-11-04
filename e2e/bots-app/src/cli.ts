@@ -14,6 +14,7 @@ import {
 } from "./auth/storage-state";
 import { FORM_LOGIN_ACTION_TIMEOUT_MS, FORM_LOGIN_TIMEOUT_MS } from "./auth/form-login";
 import { captureSsoStateInteractive } from "./auth/sso-capture";
+import { browserEnvWithoutSecrets } from "./browser-env";
 import { writeFileSync } from "node:fs";
 
 import { registerConductCommand } from "./control/conduct";
@@ -23,6 +24,8 @@ import { defaultTokenFilePath, generateToken, writeTokenFile } from "./control/a
 import { NETEM_IFACE_DEFAULT } from "./control/netem";
 import { isLoopbackBindAddress } from "./control/server";
 import { prepareParticipantCostume } from "./costumes";
+import { MAX_TIMER_MS } from "./dashboard";
+import { registerReportCommand } from "./delivery/command";
 import { firstNParticipantNames, loadManifest, type Manifest } from "./manifest";
 import {
   emitMeetingConfigYaml,
@@ -30,7 +33,12 @@ import {
   loadMeetingConfig,
   NETSIM_PRESETS,
 } from "./meeting-config";
-import { runBotsToCompletion, type BotTask, type RunOptions } from "./orchestrator";
+import {
+  RUN_END_AFTER_DEADLINE_MS,
+  runBotsToCompletion,
+  type BotTask,
+  type RunOptions,
+} from "./orchestrator";
 import { type VideoMode } from "./bot";
 import { CAMERA_CYCLE_ENV, resolveCameraCycle } from "./camera-cycle";
 import {
@@ -38,17 +46,50 @@ import {
   DECODE_BUDGET_WAIVER_NOTE,
   resolveDecodeBudget,
 } from "./decode-budget";
+import {
+  resolveSpeakingGlow,
+  SPEAKING_GLOW_DEFAULT,
+  SPEAKING_GLOW_ENV,
+  SPEAKING_GLOW_WAIVER_NOTE,
+} from "./speaking-glow";
 import { resolveHardwareConcurrency } from "./hw-concurrency";
 import { botsAppLine, taggedLine } from "./log-line";
-import { resolveBaseBotIndex, sourceGeometryForIndex } from "./posture";
+import {
+  resolveBaseBotIndex,
+  resolveFleetSize,
+  resolveTransportWsEvery,
+  sourceGeometryForIndex,
+  strideHdSkew,
+  transportForIndex,
+  websocketIndices,
+} from "./posture";
 import { JOIN_MEDIA_ON, type JoinMediaState } from "./meeting-join";
 import {
   DIAG_PACKETS_ENV,
   resolveDiagPackets,
   resolveMaxReceivedLayer,
   resolveSkipCanvasPaint,
+  SKIP_CANVAS_PAINT_ENV,
 } from "./receiver-caps";
 import { ParticipantRecorder, readPodContext, resolveJoinMedia, resolveRole } from "./run-record";
+import {
+  type SimulcastMaxLayersObserved,
+  resolveSimulcastMaxLayers,
+  SIMULCAST_LADDER_DEPTH,
+  SIMULCAST_MAX_LAYERS_CONFIG_KEY,
+  SIMULCAST_MAX_LAYERS_ENV,
+} from "./simulcast-layers";
+import { resolveSpeechPlan } from "./speech-plan";
+import {
+  assignPersonas,
+  createPersonaPlanner,
+  PERSONA_ENV,
+  personaFor,
+  personaRoomLine,
+  personaShortfalls,
+  resolvePersonaSettings,
+} from "./persona";
+import { resolveTransport, TRANSPORT_ENV, TRANSPORT_WS_EVERY_ENV } from "./transport";
 import { ArrivalTracker } from "./resource/arrival";
 import { FpsTracker } from "./resource/fps";
 import { RemoteResourceManager, ResourceCaptureSession } from "./resource/session";
@@ -64,6 +105,7 @@ import { registerResourceVerdictCommand } from "./resource/window-verdict";
 const REMOTE_SAMPLER_MAX_SECONDS = 6 * 3600;
 import { prepareParticipantAudio } from "./stitcher";
 import { parseDuration, Ttl } from "./ttl";
+import { HD_VIDEO_NOISE, resolveVideoNoise, SD_VIDEO_NOISE, VIDEO_NOISE_ENV } from "./video-noise";
 
 const program = new Command();
 
@@ -109,6 +151,14 @@ program
     "--ttl <duration>",
     'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits. Shared across all bots in --users mode.',
     "5m",
+  )
+  .option(
+    "--deadline <epoch-seconds>",
+    "Absolute end of the run: no bot launches or rejoins after it, its TTL never runs past it, and its JWT session cookie expires by it.",
+  )
+  .option(
+    "--join-deadline <epoch-seconds>",
+    "Absolute time the bot must be in the meeting by: its launch (browser, navigation, join attempts) gives up then.",
   )
   .option(
     "--manifest <path>",
@@ -177,8 +227,16 @@ program
     "Skip per-tile canvas paint via window.__APP_CONFIG.skipCanvasPaint (env: BOT_SKIP_CANVAS_PAINT; CLI flag wins). true = decode-and-drop (saves paint/GPU only — decode still runs; use --max-received-layer to cut decode CPU) (issue #2069). Same launch-time injection + PR #2078 dependency as --max-received-layer. When unset the deployment's value is inherited.",
   )
   .option(
-    "--diag-packets <off|default>",
-    "off stops each bot's own DIAGNOSTICS sends by injecting window.__APP_CONFIG.diagnosticsPacketsEnabled=\"0\" (env: BOT_DIAG_PACKETS; CLI flag wins). A real client sends DIAGNOSTICS, so off is a fidelity trade: use it only where every participant in the scenario has them off (Phase 0 arm 3). It still receives other clients' DIAGNOSTICS. Requires a deployed client with #2970; each bot records the client's own report in <assets-dir>/participants/<bot-id>.json (diagnostics_packets). Applies to the bots this command starts and their /duplicate copies; a control-API launch carries its own diagPackets field. When unset (or default) the deployment's setting applies.",
+    "--simulcast-max-layers <N>",
+    `Inject window.__APP_CONFIG.${SIMULCAST_MAX_LAYERS_CONFIG_KEY}=N (1-${SIMULCAST_LADDER_DEPTH}) over the deployment's value (env: ${SIMULCAST_MAX_LAYERS_ENV}; CLI flag wins), then read it back after join and fail the bot if it did not land. Production omits the key, so the client uses ${SIMULCAST_LADDER_DEPTH}; the e2e dioxus-ui config.js pins 1, so a local run publishes at most 1 video layer unless N is 2 or ${SIMULCAST_LADDER_DEPTH}. N sets a ceiling: a bot publishes up to min(N, its device ceiling) camera video layers, starting at 1 and growing or shedding at runtime under adaptive quality, and the device ceiling follows --hardware-concurrency (10+ allows ${SIMULCAST_LADDER_DEPTH} video layers). Unset injects nothing. Recorded in <assets-dir>/participants/<bot-id>.json (simulcast_max_layers). Applies to the bots this command starts and their /duplicate copies, not to /launch, profile or SSH launches.`,
+  )
+  .option(
+    "--video-noise <alpha>",
+    `Alpha (0-1) of the per-frame noise drawn under the clock-mode picture, giving the camera encoder detail to spend its bitrate on (env: ${VIDEO_NOISE_ENV}; CLI flag wins; issue 3089). Unset ⇒ ${SD_VIDEO_NOISE} for a 640x480 source, ${HD_VIDEO_NOISE} for 1280x720. 0 draws none, which under-represents a real camera's upload. A set value replaces the per-geometry default and is listed in each participant record's unverified. Applies to the bots this command starts and their /duplicate copies; /launch and profile bots take the geometry default.`,
+  )
+  .option(
+    "--diag-packets <on|off|default>",
+    "on/off forces each bot's own DIAGNOSTICS sends by injecting window.__APP_CONFIG.diagnosticsPacketsEnabled=\"1\"/\"0\" over the deployment's value (env: BOT_DIAG_PACKETS; CLI flag wins). Unset (or default) injects nothing, so a bot sends what a real client on that deployment sends; on or off is a fidelity trade unless every participant in the scenario matches it. It still receives other clients' DIAGNOSTICS. Requires a deployed client with #2970; each bot records the client's own report in <assets-dir>/participants/<bot-id>.json (diagnostics_packets). Applies to the bots this command starts and their /duplicate copies; a control-API launch carries its own diagPackets field.",
   )
   .option(
     "--decode-budget <client|off>",
@@ -186,16 +244,32 @@ program
     DECODE_BUDGET_DEFAULT,
   )
   .option(
+    "--speaking-glow <client|off>",
+    `off seeds localStorage vc_appearance_glow_enabled="false" before any page script runs (env: ${SPEAKING_GLOW_ENV}; CLI flag wins), so the client draws no tile speaking glow or tile mic-indicator glow and makes none of the repaints they drive; the participant-list mic loses only the glow colour (its speaking drop-shadow stays), and received video still paints. It then reads it back after join and fails the bot if it did not stick. A FIDELITY WAIVER: a real client draws the glow by default. Nothing scored reads it. Recorded in <assets-dir>/participants/<bot-id>.json (speaking_glow, plus an unverified entry). Applies to the bots this command starts and their /duplicate copies, not to /launch, profile or SSH launches. client injects nothing.`,
+  )
+  .option(
+    "--transport <ws|wt|auto>",
+    `Transport for every bot this command starts (env: ${TRANSPORT_ENV}; CLI flag wins). ws injects window.__APP_CONFIG.defaultTransport="websocket" (WebSocket first, WebTransport only as its fallback); wt injects "webtransport" (the normal election: WebTransport with WebSocket fallback). Either one also clears a remembered choice (localStorage vc_transport_sticky / vc_transport_preference, sessionStorage vc_transport_session) before any page script runs, and fails the bot if the client's applied line shows another value or a source other than its default; no such line within 10 s only warns and is listed as unverified. Unset or auto injects nothing. For a fleet mix, ${TRANSPORT_WS_EVERY_ENV}=k (env only, beaten by this flag or ${TRANSPORT_ENV}) puts every k-th fleet index on ws, with index 7 among them (k=4: 3, 7, 11, …), and the rest on wt; a k above 1 that divides 6 or is a multiple of 6 is refused, since it confounds transport with 1280x720 capture. Recorded in <assets-dir>/participants/<bot-id>.json (transport_intended, transport_applied, transport_observed, transport_fallbacks). Applies to the bots this command starts and their /duplicate copies, not to /launch, profile or SSH launches.`,
+  )
+  .option(
     "--bot-index <N>",
     "Fleet index of this process's FIRST bot (env: BOT_INDEX; CLI flag wins). Clock-mode capture geometry is a pure function of the index: every 6th index (1, 7, 13, 19, …) captures 1280x720, the rest 640x480, seeding the observed publisher mix (issue #2236, following #2171). Further bots in this process take the following indices. A K8s pod passes its StatefulSet ordinal (the entrypoint does this in ordinal identity mode). Unset ⇒ 0 ⇒ 640x480.",
   )
   .option(
+    "--fleet-size <N>",
+    "Number of clock bots sharing the talking-clock schedule (env: BOT_FLEET_SIZE; CLI flag wins). Clock-mode bots speak the UTC time in 10 s blocks; BOT_SPEECH_MODEL picks who speaks each block (README: Talking clock). Unset ⇒ this process's highest index + 1, which is right when one process runs the whole meeting. A K8s pod runs one bot, so the StatefulSet sets it to its replica count.",
+  )
+  .option(
     "--join-camera-off",
-    "Leave the camera off after joining instead of turning it on (env: BOT_JOIN_CAMERA_OFF). If the product joins with the camera on, the bot clicks it off and reads the control back. A camera-off bot publishes no camera, which is less load than a camera-on participant; use it only where the scenario's participant really has the camera off (#2914). Recorded in <assets-dir>/participants/<bot-id>.json. Refused together with the camera duty cycle. Applies to the bots this command starts and to their control-API `/duplicate` copies, not to bots launched with `/launch`.",
+    "Leave the camera off after joining instead of turning it on (env: BOT_JOIN_CAMERA_OFF). If the product joins with the camera on, the bot clicks it off and reads the control back. A camera-off bot publishes no camera, which is less load than a camera-on participant; use it only where the scenario's participant really has the camera off (#2914). Recorded in <assets-dir>/participants/<bot-id>.json. Refused together with the camera duty cycle. The camera control must still match the selectors in src/control-buttons.ts (live-bar slot wrapper, camera-toggle-button testid, state aria-label; see the README), or every bot fails its launch. Applies to the bots this command starts and to their control-API `/duplicate` copies, not to bots launched with `/launch`.",
   )
   .option(
     "--join-mic-muted",
-    "Leave the mic muted after joining instead of unmuting it (env: BOT_JOIN_MIC_MUTED). If the product joins with the mic on, the bot clicks it off and reads the control back; the record carries the observed state and flags a mismatch. Recorded like --join-camera-off.",
+    "Leave the mic muted after joining instead of unmuting it (env: BOT_JOIN_MIC_MUTED). If the product joins with the mic on, the bot clicks it off and reads the control back; a mic that will not read muted fails the launch. The mic control must still match the selectors in src/control-buttons.ts (live-bar slot wrapper, mic-toggle-button testid, state aria-label; see the README), or every bot fails its launch. Recorded like --join-camera-off.",
+  )
+  .option(
+    "--personas",
+    `Clock mode: each bot's mic and camera follow the speaking schedule by persona (env: ${PERSONA_ENV.personas}=on; issue 3091), clicking the real buttons. Refused with --join-camera-off, --join-mic-muted and the camera duty cycle. README: Personas.`,
   )
   .option(
     "--role <name>",
@@ -282,6 +356,34 @@ program
     } catch (e) {
       console.error(botsAppLine((e as Error).message));
       process.exit(2);
+    }
+
+    let runDeadlineMs: number | null = null;
+    if (opts.deadline !== undefined) {
+      if (!/^\d+$/.test(opts.deadline)) {
+        console.error(botsAppLine(`--deadline must be epoch seconds, got "${opts.deadline}"`));
+        process.exit(2);
+      }
+      runDeadlineMs = Number(opts.deadline) * 1000;
+      if (runDeadlineMs - Date.now() > MAX_TIMER_MS - RUN_END_AFTER_DEADLINE_MS) {
+        console.error(botsAppLine(`--deadline ${opts.deadline} is over 24 days away`));
+        process.exit(2);
+      }
+    }
+
+    let joinDeadlineMs: number | null = null;
+    if (opts.joinDeadline !== undefined) {
+      if (!/^\d+$/.test(opts.joinDeadline)) {
+        console.error(
+          botsAppLine(`--join-deadline must be epoch seconds, got "${opts.joinDeadline}"`),
+        );
+        process.exit(2);
+      }
+      joinDeadlineMs = Number(opts.joinDeadline) * 1000;
+      if (joinDeadlineMs - Date.now() > MAX_TIMER_MS) {
+        console.error(botsAppLine(`--join-deadline ${opts.joinDeadline} is over 24 days away`));
+        process.exit(2);
+      }
     }
 
     let manifest: Manifest | null = null;
@@ -403,19 +505,33 @@ program
     }
     const maxReceivedLayer = mrlResult.value;
     const scpResult = resolveSkipCanvasPaint(
-      opts.skipCanvasPaint ?? process.env.BOT_SKIP_CANVAS_PAINT,
+      opts.skipCanvasPaint ?? process.env[SKIP_CANVAS_PAINT_ENV],
     );
     if (scpResult.kind === "invalid") {
       console.error(botsAppLine(scpResult.message));
       process.exit(2);
     }
     const skipCanvasPaint = scpResult.value;
+    const simulcastResult = resolveSimulcastMaxLayers(
+      opts.simulcastMaxLayers ?? process.env[SIMULCAST_MAX_LAYERS_ENV],
+    );
+    if (simulcastResult.kind === "invalid") {
+      console.error(botsAppLine(simulcastResult.message));
+      process.exit(2);
+    }
+    const simulcastMaxLayers = simulcastResult.value ?? null;
     const diagResult = resolveDiagPackets(opts.diagPackets ?? process.env[DIAG_PACKETS_ENV]);
     if (diagResult.kind === "invalid") {
       console.error(botsAppLine(diagResult.message));
       process.exit(2);
     }
     const diagPackets = diagResult.value ?? null;
+    const videoNoiseResult = resolveVideoNoise(opts.videoNoise ?? process.env[VIDEO_NOISE_ENV]);
+    if (videoNoiseResult.kind === "invalid") {
+      console.error(botsAppLine(videoNoiseResult.message));
+      process.exit(2);
+    }
+    const videoNoise = videoNoiseResult.kind === "ok" ? (videoNoiseResult.value ?? null) : null;
     const decodeBudgetResult = resolveDecodeBudget(opts.decodeBudget);
     if (decodeBudgetResult.kind === "invalid") {
       console.error(botsAppLine(decodeBudgetResult.message));
@@ -423,6 +539,16 @@ program
     }
     const decodeBudget = decodeBudgetResult.kind === "ok" ? decodeBudgetResult.value : "client";
     if (decodeBudget === "off") console.log(botsAppLine(DECODE_BUDGET_WAIVER_NOTE));
+    const speakingGlowResult = resolveSpeakingGlow(
+      opts.speakingGlow ?? process.env[SPEAKING_GLOW_ENV],
+    );
+    if (speakingGlowResult.kind === "invalid") {
+      console.error(botsAppLine(speakingGlowResult.message));
+      process.exit(2);
+    }
+    const speakingGlow =
+      speakingGlowResult.kind === "ok" ? speakingGlowResult.value : SPEAKING_GLOW_DEFAULT;
+    if (speakingGlow === "off") console.log(botsAppLine(SPEAKING_GLOW_WAIVER_NOTE));
 
     // #2362: env-only (the fleet sets it via the StatefulSet).
     const cameraCycleResult = resolveCameraCycle({
@@ -476,6 +602,74 @@ program
       process.exit(2);
     }
     const baseIndex = indexResult.value;
+    const fleetSizeResult = resolveFleetSize(
+      opts.fleetSize,
+      process.env.BOT_FLEET_SIZE,
+      baseIndex + participants.length,
+    );
+    if (fleetSizeResult.kind === "invalid") {
+      console.error(botsAppLine(fleetSizeResult.message));
+      process.exit(2);
+    }
+    const fleetSize = fleetSizeResult.value;
+    const speechResult = resolveSpeechPlan(process.env);
+    if (speechResult.kind === "invalid") {
+      console.error(botsAppLine(speechResult.message));
+      process.exit(2);
+    }
+    const speechPlan = speechResult.value;
+    const personaResult = resolvePersonaSettings(opts.personas, process.env);
+    const personaSettings = personaResult.kind === "ok" ? personaResult.value : null;
+    const personaConflict =
+      personaResult.kind === "invalid"
+        ? personaResult.message
+        : personaSettings === null
+          ? null
+          : cameraCycle !== null
+            ? "personas cannot be combined with the camera duty cycle (BOT_CAMERA_*_SECS_*)"
+            : !joinMedia.camera || !joinMedia.mic
+              ? "personas cannot be combined with --join-camera-off / --join-mic-muted"
+              : baseIndex + participants.length > fleetSize
+                ? `personas need every index inside the fleet size ${fleetSize}`
+                : null;
+    if (personaConflict !== null) {
+      console.error(botsAppLine(personaConflict));
+      process.exit(2);
+    }
+    const room =
+      personaSettings === null
+        ? null
+        : assignPersonas(createPersonaPlanner(speechPlan, fleetSize), fleetSize, personaSettings);
+    if (room !== null) {
+      console.log(botsAppLine(personaRoomLine(room)));
+      for (const gap of personaShortfalls(room)) console.error(botsAppLine(`WARNING: ${gap}`));
+    }
+    const rawTransport = opts.transport ?? process.env[TRANSPORT_ENV];
+    const transportResult = resolveTransport(rawTransport);
+    const wsEveryResult = resolveTransportWsEvery(process.env[TRANSPORT_WS_EVERY_ENV]);
+    for (const r of [transportResult, wsEveryResult]) {
+      if (r.kind === "invalid") {
+        console.error(botsAppLine(r.message));
+        process.exit(2);
+      }
+    }
+    const explicitTransport =
+      transportResult.kind === "ok" && rawTransport?.trim() ? transportResult.value : null;
+    const wsEvery = wsEveryResult.kind === "ok" ? wsEveryResult.value : null;
+    if (wsEvery !== null && explicitTransport !== null) {
+      console.log(
+        botsAppLine(
+          `${TRANSPORT_WS_EVERY_ENV}=${wsEvery} ignored: --transport / ${TRANSPORT_ENV} sets every bot to ${explicitTransport}`,
+        ),
+      );
+    } else if (wsEvery !== null) {
+      const ws = websocketIndices(wsEvery, fleetSize);
+      const line = `transport mix: ${TRANSPORT_WS_EVERY_ENV}=${wsEvery} over fleet size ${fleetSize} puts websocket on index ${ws.length > 0 ? ws.join(",") : "none"}, webtransport on the rest`;
+      if (ws.length === 0) console.error(botsAppLine(`WARNING: ${line}`));
+      else console.log(botsAppLine(line));
+      const skew = strideHdSkew(wsEvery, fleetSize);
+      if (skew !== null && ws.length > 0) console.error(botsAppLine(`WARNING: ${skew}`));
+    }
 
     const tasks: BotTask[] = participants.map((participant, offset) => {
       const displayName =
@@ -516,6 +710,8 @@ program
       // before the config was loaded.
       const network = configEntry?.network ?? configNetwork ?? opts.network ?? undefined;
       const videoMode = configEntry?.videoMode ?? configVideoMode ?? (opts.videoMode as VideoMode);
+      const slot = { index: baseIndex + offset, fleetSize };
+      const persona = room !== null && videoMode === "clock" ? personaFor(room, slot) : null;
       return {
         botId: generateBotId(),
         meetingURL: meetingUrl,
@@ -530,19 +726,36 @@ program
         manifestDir,
         runDir: opts.assetsDir,
         ttl: botTtl,
+        runDeadlineMs,
+        joinDeadlineMs,
         network,
         hardwareConcurrency,
         maxReceivedLayer,
         skipCanvasPaint,
+        simulcastMaxLayers,
+        videoNoise,
         diagPackets,
         decodeBudget,
+        speakingGlow,
         formLoginTimeoutMs,
         formLoginActionTimeoutMs,
         sourceGeometry: sourceGeometryForIndex(baseIndex + offset),
+        talkingClock: slot,
+        speechPlan,
         cameraCycle,
-        joinMedia,
+        persona,
+        joinMedia: persona
+          ? { camera: persona.camera === "always", mic: persona.mic === "open" }
+          : joinMedia,
+        transport:
+          explicitTransport ??
+          (wsEvery !== null ? transportForIndex(baseIndex + offset, wsEvery) : "auto"),
       };
     });
+    if (room !== null && tasks.some((t) => t.persona == null)) {
+      console.error(botsAppLine("personas need --video-mode clock for every bot"));
+      process.exit(2);
+    }
 
     // Parse --ctl-port. The flag is opt-in: omitting it preserves the
     // pre-Phase 4 byte-for-byte behavior. Accepts a literal integer or
@@ -587,6 +800,9 @@ program
       media?: JoinMediaState,
       sessionUserId?: string | null,
       decodeBudgetReadback?: string | null,
+      skipCanvasPaintReadback?: string | null,
+      speakingGlowReadback?: string | null,
+      simulcastMaxLayersReadback?: SimulcastMaxLayersObserved,
     ): void => {
       arrivals.record(botId, joinedAt);
       recorder.joined(
@@ -595,6 +811,9 @@ program
         media ?? null,
         sessionUserId ?? null,
         decodeBudgetReadback ?? null,
+        skipCanvasPaintReadback ?? null,
+        speakingGlowReadback ?? null,
+        simulcastMaxLayersReadback ?? null,
       );
     };
     const onRegister = (task: BotTask): void => recorder.register(task);
@@ -675,9 +894,12 @@ program
     try {
       await runBotsToCompletion({
         tasks,
+        runDeadlineMs,
         control,
         onEncoderFps,
         onDiagPackets: (botId, obs) => recorder.diagPacketsObserved(botId, obs),
+        onTransport: (botId, event) => recorder.transportObserved(botId, event),
+        onPersona: (botId, tally) => recorder.personaToggled(botId, tally),
         onJoin,
         onRegister,
         onRejoin: (botId, network) => recorder.rejoining(botId, network),
@@ -706,6 +928,8 @@ interface RunCommandOptions {
   headless: boolean;
   videoMode: string;
   ttl: string;
+  deadline?: string;
+  joinDeadline?: string;
   manifest: string;
   assetsDir: string;
   auth?: string;
@@ -720,13 +944,19 @@ interface RunCommandOptions {
   hardwareConcurrency?: string;
   maxReceivedLayer?: string;
   skipCanvasPaint?: string;
+  simulcastMaxLayers?: string;
   diagPackets?: string;
   decodeBudget?: string;
+  speakingGlow?: string;
+  transport?: string;
   botIndex?: string;
+  fleetSize?: string;
+  videoNoise?: string;
   loginTimeout?: string;
   loginActionTimeout?: string;
   joinCameraOff?: boolean;
   joinMicMuted?: boolean;
+  personas?: boolean;
   role?: string;
 }
 
@@ -780,6 +1010,7 @@ program
 
     const browser = await chromium.launch({
       headless: false,
+      env: browserEnvWithoutSecrets(),
       // Match the opt-out its siblings already carry (`bot.ts`,
       // `auth/sso-capture.ts`, added by #2142 for #2089). This subcommand is
       // standalone — it never shares a process with the orchestrator or a bot
@@ -1131,6 +1362,7 @@ registerCtlCommands(program, join(repoRoot(), "e2e/bots-app/run"));
 registerConductCommand(program);
 
 registerResourceVerdictCommand(program);
+registerReportCommand(program);
 
 // Phase 5: the dashboard subcommand. Spins up a small Node HTTP
 // sidecar that proxies the browser-facing UI to a phase-4

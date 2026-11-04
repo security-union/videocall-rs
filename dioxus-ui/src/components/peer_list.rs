@@ -16,16 +16,17 @@
  * conditions.
  */
 
+use crate::components::attendants::try_set;
 use crate::components::co_hosts::{
-    host_role, kick_failure_text, owner_holds_host, peer_holds_host, peer_host_menu,
-    post_co_host_notice, CoHostNoticeCtx, CoHostRequest, CoHostTarget, HostRole, MeetingOwnership,
+    host_role, local_host_role, owner_holds_host, peer_holds_host, peer_host_menu,
+    post_host_action_failure, shared_name, CoHostNoticeCtx, CoHostRequest, CoHostTarget,
+    HostAction, HostRole, MeetingOwnership,
 };
 use crate::components::peer_list_item::PeerListItem;
 use crate::components::peer_tile::{
     audio_path_is_live, corroborated_speaking, expire_stale_claim, glow_deadman_ms,
     record_fast_path_verdict, records_live_audio, FastPathVerdict, LiveStamp, NowMs,
 };
-use crate::constants::meeting_api_client;
 use crate::context::{HostSetCtx, RaisedHandsCtx, RecordingSetCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
@@ -35,6 +36,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use videocall_diagnostics::{recv_loop_action, subscribe, DiagEvent, MetricValue, RecvLoopAction};
+
+use crate::components::peer_list_item::RosterMenuTracker;
+use crate::components::peer_list_sort::{
+    join_time_of, load_sort_pref, save_sort_pref, sort_roster, KeyboardModality, NameKeyCache,
+    RosterOrderMemo, RosterRole, RosterSort, RosterSortKey,
+};
+use dioxus::web::WebEventExt;
+use std::collections::HashSet;
 
 /// How long a roster speaking dot survives with no further evidence (issue
 /// 2660). The tile's glow-deadman rule, from the same `const fn`: two
@@ -58,7 +67,7 @@ fn stamp_roster_speaking(stamps: &RefCell<HashMap<String, f64>>, peer: &str, now
 /// with no mounted tile is covered. Not signals: they steer a write that already
 /// happens, so touching them must not re-render the roster.
 #[derive(Default)]
-pub(crate) struct RosterLiveness {
+pub struct RosterLiveness {
     verdicts: RefCell<HashMap<String, Cell<FastPathVerdict>>>,
     last_live_at: RefCell<HashMap<String, f64>>,
 }
@@ -207,6 +216,7 @@ pub fn PeerList(
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] local_user_display_name: String,
     #[props(default)] on_edit_self_name: EventHandler<()>,
+    #[props(default)] peer_join_time: ReadSignal<HashMap<String, f64>>,
 ) -> Element {
     let mut search_query = use_signal(String::new);
     let mut show_incall_menu = use_signal(|| false);
@@ -329,8 +339,11 @@ pub fn PeerList(
     let role_of = |is_host: bool, uid: &str| {
         host_role(is_host, uid, owner_user_id.as_deref(), owner_has_role)
     };
-    let self_is_co_host =
-        role_of(is_current_user_host, &current_user_id_val) == Some(HostRole::CoHost);
+    let self_is_co_host = local_host_role(
+        host_set.as_ref(),
+        owner_user_id.as_deref(),
+        &current_user_id_val,
+    ) == Some(HostRole::CoHost);
     let co_host_notice = try_use_context::<CoHostNoticeCtx>();
     // Per-recorder indicator. Unlike `is_host_uid` (per-account role, keyed by
     // user_id), recording is a per-SESSION action, so this keys on `session_id`.
@@ -361,6 +374,63 @@ pub fn PeerList(
             .as_ref()
             .and_then(|rh| rh.queue_slot(session_id))
     };
+
+    // Issue 3123: sort the filtered rows (never the self row), holding the
+    // shown order while a row menu is open or keyboard focus is in the list.
+    let mut roster_sort = use_signal(load_sort_pref);
+    let mut release_tick = use_signal(|| 0u32);
+    let open_menu_rows = use_signal(HashSet::<String>::new);
+    let roster_list = use_hook(|| Rc::new(RefCell::new(None::<web_sys::Element>)));
+    let bump = move || release_tick.try_write().map(|mut tick| *tick += 1);
+    let modality = use_hook(|| Rc::new(KeyboardModality::listen(roster_list.clone(), bump)));
+    let name_keys = use_hook(|| Rc::new(RefCell::new(NameKeyCache::default())));
+    let roster_order = use_hook(|| Rc::new(RefCell::new(RosterOrderMemo::default())));
+    let roster_mode = roster_sort();
+    let mut keyed_peers: Vec<(RosterSortKey, PeerListEntry)> = {
+        let join_times = peer_join_time.read();
+        let mut name_keys = name_keys.borrow_mut();
+        name_keys.prune(peers.iter().map(|peer| peer.session_id.as_str()));
+        filtered_peers
+            .into_iter()
+            .map(|peer| {
+                let sid = peer.session_id.as_str();
+                let name = client_ctx
+                    .get_peer_display_name(sid)
+                    .unwrap_or_else(|| peer.user_id.clone());
+                let is_guest = client_ctx.get_peer_is_guest(sid).unwrap_or(false);
+                let key = RosterSortKey {
+                    joined_at: join_time_of(&join_times, sid),
+                    role: RosterRole::of(
+                        role_of(is_host_uid(&peer.user_id), &peer.user_id),
+                        is_guest,
+                    ),
+                    session_id: peer.session_id.clone(),
+                    name: name_keys.key(sid, &name),
+                    hand_position: hand_slot_of(sid).map(|(position, _)| position),
+                    muted: !resolve_roster_media_flag(audio_states.get(sid).copied(), || {
+                        client_ctx.is_audio_enabled_for_peer(sid)
+                    }),
+                    camera_on: resolve_roster_media_flag(video_states.get(sid).copied(), || {
+                        client_ctx.is_video_enabled_for_peer(sid)
+                    }),
+                };
+                (key, peer)
+            })
+            .collect()
+    };
+    sort_roster(roster_mode, &mut keyed_peers, |(key, _)| key);
+    let present = |sid: &str| keyed_peers.iter().any(|(key, _)| key.session_id == sid);
+    let menu_open = open_menu_rows.read().iter().any(|sid| present(sid));
+    release_tick.read();
+    let frozen = menu_open || modality.focus_within(present);
+    let sorted_peers: Vec<PeerListEntry> = roster_order
+        .borrow_mut()
+        .arrange(roster_mode, frozen, keyed_peers, |(key, _)| {
+            key.session_id.as_str()
+        })
+        .into_iter()
+        .map(|(_, peer)| peer)
+        .collect();
 
     rsx! {
         div {
@@ -408,6 +478,29 @@ pub fn PeerList(
                 div { class: "attendants-section",
                     div { class: "in-call-header",
                         h3 { "In call" }
+                        div { class: "peer-list-sort-group",
+                            label { r#for: "peer-list-sort", class: "peer-list-sort-label", "Sort" }
+                            select {
+                                id: "peer-list-sort",
+                                class: "peer-list-sort",
+                                "data-testid": "peer-list-sort",
+                                aria_label: "Sort participants",
+                                onchange: move |e: Event<FormData>| {
+                                    if let Some(mode) = RosterSort::from_value(&e.value()) {
+                                        roster_sort.set(mode);
+                                        save_sort_pref(mode);
+                                    }
+                                },
+                                for mode in RosterSort::ALL {
+                                    option {
+                                        key: "{mode.value()}",
+                                        value: mode.value(),
+                                        selected: mode == roster_mode,
+                                        "{mode.label()}"
+                                    }
+                                }
+                            }
+                        }
                         if is_current_user_host {
                             {
                                 let room_id_for_mute = room_id.clone();
@@ -451,16 +544,12 @@ pub fn PeerList(
                                                         is_muting_all.set(true);
                                                         show_incall_menu.set(false);
                                                         let meeting_id = room_id_for_mute.clone();
-                                                        spawn(async move {
-                                                            match meeting_api_client() {
-                                                                Ok(client) => {
-                                                                    if let Err(e) = client.mute_all(&meeting_id).await {
-                                                                        log::warn!("mute_all failed: {e}");
-                                                                    }
-                                                                }
-                                                                Err(e) => log::warn!("meeting_api_client error: {e}"),
+                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                            if let Err(e) = crate::meeting_api::mute_all(&meeting_id).await {
+                                                                log::warn!("mute_all failed: {e}");
+                                                                post_host_action_failure(co_host_notice, HostAction::MuteAll, &e);
                                                             }
-                                                            is_muting_all.set(false);
+                                                            try_set(is_muting_all, false);
                                                         });
                                                     },
                                                     svg {
@@ -489,16 +578,12 @@ pub fn PeerList(
                                                         is_disabling_video_all.set(true);
                                                         show_incall_menu.set(false);
                                                         let meeting_id = room_id_for_disable_video_all.clone();
-                                                        spawn(async move {
-                                                            match meeting_api_client() {
-                                                                Ok(client) => {
-                                                                    if let Err(e) = client.disable_video_all(&meeting_id).await {
-                                                                        log::warn!("disable_video_all failed: {e}");
-                                                                    }
-                                                                }
-                                                                Err(e) => log::warn!("meeting_api_client error: {e}"),
+                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                            if let Err(e) = crate::meeting_api::disable_video_all(&meeting_id).await {
+                                                                log::warn!("disable_video_all failed: {e}");
+                                                                post_host_action_failure(co_host_notice, HostAction::DisableVideoAll, &e);
                                                             }
-                                                            is_disabling_video_all.set(false);
+                                                            try_set(is_disabling_video_all, false);
                                                         });
                                                     },
                                                     svg {
@@ -525,11 +610,20 @@ pub fn PeerList(
                     }
                     div { class: "peer-list",
                         ul {
+                            onmounted: move |e: MountedEvent| {
+                                *roster_list.borrow_mut() = e.try_as_web_event();
+                            },
+                            onfocusout: move |e: FocusEvent| {
+                                let next = e.as_web_event().related_target();
+                                if frozen && modality.focus_leaves(next) {
+                                    release_tick += 1;
+                                }
+                            },
                             // show self as the first item with actual username
                             li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_co_host: self_is_co_host, is_recording: is_recording_session(&current_session_id), is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, hand_slot: hand_slot_of(&current_session_id), on_edit_name: on_edit_self_name } }
 
-                            for peer in filtered_peers.iter() {
-                                {
+                            for peer in sorted_peers.iter() {
+                                li { key: "{peer.session_id}", "data-sid": "{peer.session_id}", {
                                     // Each entry is one session — look up per-session
                                     // state (display name, guest flag, audio/video/
                                     // speaking) by session_id. Multiple entries may
@@ -540,6 +634,8 @@ pub fn PeerList(
                                     let peer_display_name = client_ctx
                                         .get_peer_display_name(sid)
                                         .unwrap_or_else(|| user_id.clone());
+                                    let name_for_handlers = std::cell::OnceCell::<Rc<str>>::new();
+                                    let handler_name = || shared_name(&name_for_handlers, &peer_display_name);
                                     let peer_is_guest = client_ctx
                                         .get_peer_is_guest(sid)
                                         .unwrap_or(false);
@@ -586,29 +682,24 @@ pub fn PeerList(
                                     let on_mute = if host_menu.mute_and_disable_video && !muted {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
+                                        let peer_name = handler_name();
                                         Some(EventHandler::new(move |_| {
                                             let meeting_id = meeting_id.clone();
                                             let peer_user_id = peer_user_id.clone();
-                                            spawn(async move {
-                                                match meeting_api_client() {
-                                                    Ok(client) => {
-                                                        if let Err(e) = client
-                                                            .mute_participant(
-                                                                &meeting_id,
-                                                                &peer_user_id,
-                                                            )
-                                                            .await
-                                                        {
-                                                            log::warn!(
-                                                                "mute_participant failed: {e}"
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::warn!(
-                                                            "meeting_api_client error: {e}"
-                                                        );
-                                                    }
+                                            let peer_name = peer_name.clone();
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                if let Err(e) = crate::meeting_api::mute_participant(
+                                                    &meeting_id,
+                                                    &peer_user_id,
+                                                )
+                                                .await
+                                                {
+                                                    log::warn!("mute_participant failed: {e}");
+                                                    post_host_action_failure(
+                                                        co_host_notice,
+                                                        HostAction::Mute(&peer_name),
+                                                        &e,
+                                                    );
                                                 }
                                             });
                                         }))
@@ -619,29 +710,27 @@ pub fn PeerList(
                                     let on_disable_video = if host_menu.mute_and_disable_video && !video_disabled {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
+                                        let peer_name = handler_name();
                                         Some(EventHandler::new(move |_| {
                                             let meeting_id = meeting_id.clone();
                                             let peer_user_id = peer_user_id.clone();
-                                            spawn(async move {
-                                                match meeting_api_client() {
-                                                    Ok(client) => {
-                                                        if let Err(e) = client
-                                                            .disable_video_participant(
-                                                                &meeting_id,
-                                                                &peer_user_id,
-                                                            )
-                                                            .await
-                                                        {
-                                                            log::warn!(
-                                                                "disable_video_participant failed: {e}"
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::warn!(
-                                                            "meeting_api_client error: {e}"
-                                                        );
-                                                    }
+                                            let peer_name = peer_name.clone();
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                if let Err(e) =
+                                                    crate::meeting_api::disable_video_participant(
+                                                        &meeting_id,
+                                                        &peer_user_id,
+                                                    )
+                                                    .await
+                                                {
+                                                    log::warn!(
+                                                        "disable_video_participant failed: {e}"
+                                                    );
+                                                    post_host_action_failure(
+                                                        co_host_notice,
+                                                        HostAction::DisableVideo(&peer_name),
+                                                        &e,
+                                                    );
                                                 }
                                             });
                                         }))
@@ -651,38 +740,24 @@ pub fn PeerList(
                                     let on_kick = if host_menu.kick {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
-                                        let peer_name = peer_display_name.clone();
+                                        let peer_name = handler_name();
                                         Some(EventHandler::new(move |_| {
                                             let meeting_id = meeting_id.clone();
                                             let peer_user_id = peer_user_id.clone();
                                             let peer_name = peer_name.clone();
-                                            spawn(async move {
-                                                match meeting_api_client() {
-                                                    Ok(client) => {
-                                                        if let Err(e) = client
-                                                            .kick_participant(
-                                                                &meeting_id,
-                                                                &peer_user_id,
-                                                            )
-                                                            .await
-                                                        {
-                                                            log::warn!(
-                                                                "kick_participant failed: {e}"
-                                                            );
-                                                            if let Some(ctx) = co_host_notice {
-                                                                post_co_host_notice(
-                                                                    ctx,
-                                                                    kick_failure_text(&peer_name, &e),
-                                                                    true,
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::warn!(
-                                                            "meeting_api_client error: {e}"
-                                                        );
-                                                    }
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                if let Err(e) = crate::meeting_api::kick_participant(
+                                                    &meeting_id,
+                                                    &peer_user_id,
+                                                )
+                                                .await
+                                                {
+                                                    log::warn!("kick_participant failed: {e}");
+                                                    post_host_action_failure(
+                                                        co_host_notice,
+                                                        HostAction::Kick(&peer_name),
+                                                        &e,
+                                                    );
                                                 }
                                             });
                                         }))
@@ -692,17 +767,19 @@ pub fn PeerList(
                                     let on_transfer_host = if host_menu.transfer {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
+                                        let peer_name = handler_name();
                                         Some(EventHandler::new(move |_| {
                                             let meeting_id = meeting_id.clone();
                                             let peer_user_id = peer_user_id.clone();
-                                            spawn(async move {
-                                                match meeting_api_client() {
-                                                    Ok(client) => {
-                                                        if let Err(e) = client.transfer_host(&meeting_id, &peer_user_id).await {
-                                                            log::warn!("transfer_host failed: {e}");
-                                                        }
-                                                    }
-                                                    Err(e) => log::warn!("meeting_api_client error: {e}"),
+                                            let peer_name = peer_name.clone();
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                if let Err(e) = crate::meeting_api::transfer_host(&meeting_id, &peer_user_id).await {
+                                                    log::warn!("transfer_host failed: {e}");
+                                                    post_host_action_failure(
+                                                        co_host_notice,
+                                                        HostAction::TransferHost(&peer_name),
+                                                        &e,
+                                                    );
                                                 }
                                             });
                                         }))
@@ -717,11 +794,8 @@ pub fn PeerList(
                                     });
                                     let is_peer_co_host =
                                         role_of(is_peer_host, &user_id) == Some(HostRole::CoHost);
-                                    let row_key = peer.session_id.clone();
                                     let tooltip_user_id = user_id.clone();
                                     rsx! {
-                                        li {
-                                            key: "{row_key}",
                                             PeerListItem {
                                                 name: peer_display_name,
                                                 tooltip: tooltip_user_id,
@@ -738,10 +812,13 @@ pub fn PeerList(
                                                 on_disable_video: on_disable_video,
                                                 on_kick: on_kick,
                                                 on_transfer_host: on_transfer_host,
+                                                menu_tracker: RosterMenuTracker {
+                                                    open_rows: open_menu_rows,
+                                                    row: peer.session_id.clone(),
+                                                },
                                             }
-                                        }
                                     }
-                                }
+                                } }
                             }
                         }
                     }

@@ -18,7 +18,7 @@
 //! the bot knows, under the schema's field names; the scenario runner merges
 //! them into the full manifest and adds run-level fields and step membership.
 
-use crate::config::Role;
+use crate::config::{Role, VideoMode};
 use crate::netsim::NetworkProfile;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -65,6 +65,10 @@ pub struct ParticipantRecord {
     pub observer: bool,
     pub talker: bool,
     pub publishes: Publishes,
+    pub video_source: Option<&'static str>,
+    pub replay_answer_keyframe_requests: Option<bool>,
+    pub replay_forced_keyframes: Option<Vec<u64>>,
+    pub replay_tier_change_keyframes: Option<Vec<u64>>,
     pub network: NetworkRecord,
     pub transport_intended: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,6 +114,16 @@ pub fn role_for(role: Role) -> &'static str {
         Role::Presenter => "talker",
         Role::Speaker => "speaker",
         Role::Camera | Role::Viewer => "viewer",
+    }
+}
+
+/// The video source a camera publisher actually runs: costume mode without a
+/// costume directory falls back to the live EKG.
+pub fn video_source(mode: &VideoMode, has_costume_dir: bool) -> &'static str {
+    match mode {
+        VideoMode::Replay => "ekg-replay",
+        VideoMode::Costume if has_costume_dir => "costume-live",
+        VideoMode::Costume | VideoMode::Ekg => "ekg-live",
     }
 }
 
@@ -183,6 +197,13 @@ impl ParticipantRegistry {
         inner.media_started_at.get_or_insert(ts);
         drop(inner);
         self.changed.notify_one();
+    }
+
+    pub fn set_replay_forced_keyframes(&self, user_id: &str, by_request: &[u64], by_tier: &[u64]) {
+        self.update(user_id, |p| {
+            p.replay_forced_keyframes = Some(by_request.to_vec());
+            p.replay_tier_change_keyframes = Some(by_tier.to_vec());
+        });
     }
 
     pub fn set_instance_id(&self, user_id: &str, instance_id: &str) {
@@ -363,6 +384,10 @@ mod tests {
                 mic: true,
                 screen: false,
             },
+            video_source: Some(video_source(&VideoMode::Ekg, false)),
+            replay_answer_keyframe_requests: None,
+            replay_forced_keyframes: None,
+            replay_tier_change_keyframes: None,
             network: network_record("lossy_mobile", profile),
             transport_intended: "webtransport",
             placement: None,
@@ -371,6 +396,17 @@ mod tests {
             instance_id: None,
             outcome: None,
         }
+    }
+
+    #[test]
+    fn video_source_names_the_effective_source() {
+        assert_eq!(video_source(&VideoMode::Replay, false), "ekg-replay");
+        assert_eq!(video_source(&VideoMode::Replay, true), "ekg-replay");
+        assert_eq!(video_source(&VideoMode::Ekg, false), "ekg-live");
+        assert_eq!(video_source(&VideoMode::Costume, true), "costume-live");
+        assert_eq!(video_source(&VideoMode::Costume, false), "ekg-live");
+        let json = serde_json::to_value(record("a", &NetworkProfile::passthrough())).unwrap();
+        assert_eq!(json["video_source"], "ekg-live");
     }
 
     #[test]

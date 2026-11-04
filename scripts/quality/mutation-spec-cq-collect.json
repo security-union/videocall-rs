@@ -15,7 +15,7 @@
     "-p",
     "test_cq_collect.py"
   ],
-  "baseline_tests": 88,
+  "baseline_tests": 102,
   "mutations": [
     {
       "name": "missing record dropped silently",
@@ -196,6 +196,24 @@
       "replace": "False",
       "expect_kills": [
         "test_an_unverified_publishes_field_is_an_error"
+      ]
+    },
+    {
+      "name": "unverified transport_intended ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "(\"transport_intended\", \"stagger_ms\")",
+      "replace": "(\"stagger_ms\",)",
+      "expect_kills": [
+        "test_an_unverified_transport_intended_is_an_error"
+      ]
+    },
+    {
+      "name": "unverified stagger_ms ignored",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "(\"transport_intended\", \"stagger_ms\")",
+      "replace": "(\"transport_intended\",)",
+      "expect_kills": [
+        "test_an_unverified_stagger_ms_is_an_error"
       ]
     },
     {
@@ -855,8 +873,8 @@
     {
       "name": "ci not reserved",
       "file": "scripts/quality/cq_collect.py",
-      "find": "RESERVED_NODES = (\"local\", \"ci\")",
-      "replace": "RESERVED_NODES = (\"local\",)",
+      "find": "RESERVED_NODES = (\"local\", \"ci\", \"load-a\")",
+      "replace": "RESERVED_NODES = (\"local\", \"load-a\")",
       "expect_kills": [
         "test_reserved_node_names_need_no_alias"
       ]
@@ -932,6 +950,33 @@
       "replace": "if False:",
       "expect_kills": [
         "test_a_missing_out_dir_exits_3_and_is_not_created"
+      ]
+    },
+    {
+      "name": "the collector drops the recorded transport",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "    if rec.transport is not None:\n        out.update(_transport_seen(uid, rec, errors))\n",
+      "replace": "",
+      "expect_kills": [
+        "test_the_recorded_transport_and_fallbacks_reach_the_manifest"
+      ]
+    },
+    {
+      "name": "the collector accepts a negative fallback count",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "fallbacks, int) or fallbacks < 0:",
+      "replace": "fallbacks, int):",
+      "expect_kills": [
+        "test_a_malformed_fallback_count_is_an_error"
+      ]
+    },
+    {
+      "name": "the collector drops the preference",
+      "file": "scripts/quality/cq_collect.py",
+      "find": "\"transport_fallbacks\": fallbacks, \"transport_preferred\": preferred}",
+      "replace": "\"transport_fallbacks\": fallbacks}",
+      "expect_kills": [
+        "test_the_recorded_transport_and_fallbacks_reach_the_manifest"
       ]
     }
   ]

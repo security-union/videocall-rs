@@ -57,7 +57,8 @@
 # | RTT degradation threshold reached           | reelection_times | videocall-client/src/connection/connection_manager.rs |
 # | Discarding implausible RTT                  | implausible    | videocall-client/src/connection/connection_manager.rs |
 # | Successfully left meeting                   | left_clean     | dioxus-ui/src/components/attendants.rs                 |
-# | Connection lost / No valid connections      | connection_lost | videocall-client                                       |
+# | Connection lost / No valid connections      | connection_lost (cleared by a later recovery; ignores "after intentional disconnect") | videocall-client |
+# | Election decision: ... outcome=elected|preserved_old|aborted_kept_old | connection_recovered | videocall-client/src/connection/connection_manager.rs |
 # | datagram dropped                            | datagram_drops | videocall-client (WT transport)                        |
 # | handshake failed / Opening handshake failed | handshake_failures | videocall-client (WT transport)                     |
 # | Speaking changed: false -> true             | speaking_transitions (open-mic energy, NOT speech)    | videocall-client mic/VAD        |
@@ -67,6 +68,7 @@
 # | ProtectiveMode: EMERGENCY cap N->M          | tile collapse       | dioxus-ui/src/components/attendants.rs               |
 # | ProtectiveMode: EXITED                      | recovery            | dioxus-ui/src/components/attendants.rs               |
 # | ProtectiveMode: audio-driven pressured latch | feeds max audio_buffer_ms only | dioxus-ui/src/components/attendants.rs    |
+# | NetEq audio decoder initialized for peer X / Worker ready for peer X / Queueing message for peer X (worker not ready) | never-started audio workers (#3071) | videocall-client/src/decode/neteq_audio_decoder.rs |
 #
 # | KEYFRAME_REQUEST                            | keyframe_req_count  | videocall-client/src/decode/peer_decode_manager.rs     |
 # | CameraEncoder: forcing keyframe             | pli_received_count  | videocall-client/src/encode/camera_encoder.rs          |
@@ -232,7 +234,7 @@ TMPDIR_WORK=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_WORK"' EXIT
 
 # Grep pattern covering all "interesting" log messages (key-event lines only)
-KEY_EVENTS_GREP='DIOXUS-UI: Creating VideoCallClient|Elected connection |Baseline RTT for re-election|SESSION_ASSIGNED|RTT degradation threshold|Discarding implausible RTT|Successfully left meeting|Connection lost|No valid connections|datagram dropped|handshake failed|Opening handshake failed'
+KEY_EVENTS_GREP='DIOXUS-UI: Creating VideoCallClient|Elected connection |Baseline RTT for re-election|SESSION_ASSIGNED|RTT degradation threshold|Discarding implausible RTT|Successfully left meeting|Connection lost|No valid connections|datagram dropped|handshake failed|Opening handshake failed|Election decision:'
 
 # Separate pattern for error-level lines
 ERROR_GREP='"level":"error"'
@@ -275,7 +277,8 @@ for key in "${ALL_KEYS[@]}"; do
     grep -E "$KEY_EVENTS_GREP" | \
     jq -sc '
       reduce .[] as $r (
-        {dn:null, tid:null, rtt:null, sid:null, rtimes:[], left:null, clost:null, drops:0, hfail:0};
+        {dn:null, tid:null, rtt:null, sid:null, rtimes:[], left:null, clost:null, crec:null, lost_at:null, rec_at:null, n:0, drops:0, hfail:0};
+        .n += 1 |
         if ($r.msg | startswith("DIOXUS-UI: Creating VideoCallClient")) then
           .dn = ($r.msg | capture("for (?<n>[^)]+) in ") | .n)
         elif ($r.msg | startswith("Elected connection ")) then
@@ -294,8 +297,11 @@ for key in "${ALL_KEYS[@]}"; do
           .rtimes += [$r.ts]
         elif ($r.msg | startswith("Successfully left meeting")) then
           .left = $r.ts
+        elif ($r.msg | test("after intentional disconnect")) then .
         elif ($r.msg | test("Connection lost|No valid connections")) then
-          .clost = $r.ts
+          .clost = ([.clost, $r.ts] | max) | .lost_at = ([.lost_at, [$r.ts, .n]] | max)
+        elif ($r.msg | test("^Election decision:.*outcome=(elected|preserved_old|aborted_kept_old)")) and ($r.msg | test("active=none") | not) then
+          .crec = ([.crec, $r.ts] | max) | .rec_at = ([.rec_at, [$r.ts, .n]] | max)
         elif ($r.msg | test("datagram dropped")) then
           .drops += 1
         elif ($r.msg | test("handshake failed|Opening handshake failed")) then
@@ -536,6 +542,7 @@ for key in "${ALL_KEYS[@]}"; do
       reelection_count: (.rtimes | length),
       left_clean: (.left // null),
       connection_lost: (.clost // null),
+      connection_recovered: (if .lost_at != null and .rec_at != null and .rec_at > .lost_at then .crec else null end),
       datagram_drops: .drops,
       handshake_failures: .hfail,
       implausible_rtt_discards: $implausible,
@@ -757,6 +764,10 @@ if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
     "handshake failed"
     "Speaking changed: false -> true"
     "audio health (buffer:"
+    "NetEq audio decoder initialized for peer"
+    "Worker ready for peer"
+    "Queueing message for peer"
+    "Election decision:"
     "KEYFRAME_REQUEST"
     "CameraEncoder: forcing keyframe"
     "stepped DOWN"
@@ -879,7 +890,7 @@ for s in "${session_jsons[@]}"; do
   buf_n_nonzero=$(echo "$s" | jq -r '.audio_buffer.n_nonzero // 0')
   buf_median_nz=$(echo "$s" | jq -r '.audio_buffer.median_nonzero_ms // "—"')
   left=$(echo "$s" | jq -r '.left_clean // ""')
-  clost=$(echo "$s" | jq -r '.connection_lost // ""')
+  clost=$(echo "$s" | jq -r 'if .connection_recovered then "" else (.connection_lost // "") end')
   if [[ -n "$left" && "$left" != "null" ]]; then end_status="clean"
   elif [[ -n "$clost" && "$clost" != "null" ]]; then end_status="**LOST**"
   else end_status="?"; fi
@@ -1018,7 +1029,7 @@ for s in "${session_jsons[@]}"; do
   email=$(echo "$s" | jq -r '.email')
   start=$(echo "$s" | jq -r '.start_human')
   times=$(echo "$s" | jq -r '.reelection_times | join(", ")')
-  lost=$(echo "$s" | jq -r '.connection_lost // "none"')
+  lost=$(echo "$s" | jq -r '(.connection_lost // "none") + (if .connection_recovered then " (recovered " + .connection_recovered + ")" else "" end)')
   echo "**${name} (${email}) session @${start}:** ${reelect} trigger(s)"
   echo "- Times: ${times}"
   echo "- Connection lost at: ${lost}"
@@ -1230,7 +1241,7 @@ freeze_tsv="$TMPDIR_WORK/freshness_skip.tsv"
 while read -r who; do
   [[ -z "$who" ]] && continue
   zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
-    | jq -rc 'select(.msg? != null) | select(.msg | contains("freshness_skip")) | [.ts, .msg] | @tsv' 2>/dev/null \
+    | jq -Rrc 'fromjson? | select(.msg? != null) | select(.msg | contains("freshness_skip")) | [.ts, .msg] | @tsv' 2>/dev/null \
     | $AWK -F'\t' -v who="$who" '
         { msg = $2
           if (match(msg, /freshness_skip [0-9]*->([0-9]+)/, m)) pub = m[1]; else pub = "-"
@@ -1289,7 +1300,7 @@ kf_tsv="$TMPDIR_WORK/keyframe_arrival.tsv"
 while read -r who; do
   [[ -z "$who" ]] && continue
   zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
-    | jq -rc 'select(.msg? != null) | select(.msg | contains("keyframe_arrival")) | [.ts, .msg] | @tsv' 2>/dev/null \
+    | jq -Rrc 'fromjson? | select(.msg? != null) | select(.msg | contains("keyframe_arrival")) | [.ts, .msg] | @tsv' 2>/dev/null \
     | $AWK -F'\t' -v who="$who" '
         { if (match($2, /keyframe_arrival [0-9]*->([0-9]+)/, m)) pub = m[1]; else pub = "-"
           print $1 "\t" who "\t" pub }' 2>/dev/null
@@ -1325,7 +1336,7 @@ lg_tsv="$TMPDIR_WORK/layer_gate.tsv"
 while read -r who; do
   [[ -z "$who" ]] && continue
   zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
-    | jq -rc 'select(.msg? != null) | select(.msg | contains("LAYER_GATE_SKIPS")) | .msg' 2>/dev/null \
+    | jq -Rrc 'fromjson? | select(.msg? != null) | select(.msg | contains("LAYER_GATE_SKIPS")) | .msg' 2>/dev/null \
     | $AWK -v who="$who" '
         # The emitter omits any field whose count is 0, so absent means 0 here.
         { sid = ""
@@ -1365,7 +1376,7 @@ pm_found=0
 while read -r who; do
   [[ -z "$who" ]] && continue
   zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
-    | jq -rc 'select(.msg? != null) | select(.msg | contains("ProtectiveMode")) | [.ts, .msg] | @tsv' 2>/dev/null \
+    | jq -Rrc 'fromjson? | select(.msg? != null) | select(.msg | contains("ProtectiveMode")) | [.ts, .msg] | @tsv' 2>/dev/null \
     | $AWK -F'\t' -v who="$who" '
         BEGIN { ent=0; ext=0; emg=0; worst=""; maxbuf=-1; fps=-1; lt=-1; fpsn=0; ltn=0; first="" }
         { msg = $2
@@ -1403,6 +1414,66 @@ fi
 echo ""
 echo "_An empty section means no client sacrificed video for audio — NOT that audio was healthy. Concealment can be elevated without ProtectiveMode firing (measured 2026-08-31: a receiver at 15.2% mean concealment logged zero ProtectiveMode events, while a receiver graded A peaked at 1040ms buffer). Read this alongside \`videocall_audio_concealment_pct\`, never instead of it._"
 echo ""
+echo "### Audio Workers That Never Started (#3071)"
+echo ""
+echo "_A NetEq worker that logs \`NetEq audio decoder initialized for peer\` but never \`Worker ready\` drops that participant's audio for this listener until the peer is re-added or its decoder rebuilt (\`Dead until\`) or the log ends (or the peer left), with no error line and no \`videocall_neteq_*\` series for the pair. Queued counts above ~50 mean the participant was unmuted while the worker was dead (~50 audio packets/s)._"
+echo ""
+echo "| Listener (log session) | Participant not heard | Worker created | Dead until | Messages queued, never played |"
+echo "|------------------------|-----------------------|----------------|------------|-------------------------------|"
+
+declare -A NR_SID_NAME
+for s in "${session_jsons[@]}"; do
+  nr_sid=$(echo "$s" | jq -r '.session_id')
+  [[ -z "$nr_sid" || "$nr_sid" == "null" ]] && continue
+  NR_SID_NAME["$nr_sid"]=$(echo "$s" | jq -r '.display_name')
+done
+
+while read -r who; do
+  [[ -z "$who" ]] && continue
+  for f in "$LOG_DIR/${who}"_*.log.gz; do zcat "$f" 2>/dev/null || true; done \
+    | jq -Rrc 'fromjson? | select(.msg? != null)
+        | select(.msg | test("NetEq audio decoder initialized for peer|Worker ready for peer|Queueing message for peer [0-9]+ \\(worker not ready\\)|PARTICIPANT_JOINED.*display_name="))
+        | [(.seq // "" | tostring), .ts, .msg] | @tsv' 2>/dev/null \
+    | $AWK -F'\t' -v who="$who" '
+        # Chunks can repeat lines (00001 is re-shipped inside 00002): count each seq once.
+        seen[$1 SUBSEP $2 SUBSEP $3]++ { next }
+        # Re-adding a peer or rebuilding its audio decoder creates a new worker, so each creation starts a new instance.
+        match($3, /NetEq audio decoder initialized for peer ([0-9]+)/, m) {
+          p = m[1]; if (p in made && !(p in ready)) dead[++nd] = p SUBSEP made[p] SUBSEP $2 SUBSEP queued[p] + 0
+          made[p] = $2; delete ready[p]; queued[p] = 0; next }
+        match($3, /Worker ready for peer ([0-9]+)/, m)                       { ready[m[1]] = 1; next }
+        match($3, /Queueing message for peer ([0-9]+)/, m)                   { queued[m[1]]++; next }
+        match($3, /display_name=([^,]*), session=([0-9]+)/, m)                { name[m[2]] = m[1] }
+        END { for (p in made) if (!(p in ready)) dead[++nd] = p SUBSEP made[p] SUBSEP "end of log" SUBSEP queued[p] + 0
+              for (i = 1; i <= nd; i++) { split(dead[i], d, SUBSEP)
+                printf "%s\t%s\t%s\t%s\t%d\t%s\n", who, d[1], d[2], d[3], d[4], name[d[1]] } }' 2>/dev/null
+done < <(find "$LOG_DIR" -maxdepth 1 -name '*.log.gz' -exec basename {} \; \
+         | sed 's/_[0-9]*\.log\.gz$//' | sort -u) \
+  | sort -t$'\t' -k5,5nr > "$TMPDIR_WORK/neteq_never_ready.tsv"
+
+nr_lost=0
+if [[ -s "$TMPDIR_WORK/neteq_never_ready.tsv" ]]; then
+  while IFS=$'\t' read -r who peer made until queued joined_name; do
+    pname="${joined_name:-${NR_SID_NAME[$peer]:-?}}"
+    flag=""
+    if [[ "$queued" -gt 50 ]]; then flag=" ⚠"; nr_lost=$((nr_lost + 1)); fi
+    [[ "$until" != "end of log" ]] && until="${until:11:8}"
+    echo "| ${who} | ${pname} (\`${peer}\`) | ${made:11:8} | ${until} | ${queued}${flag} |"
+  done < "$TMPDIR_WORK/neteq_never_ready.tsv"
+  echo ""
+  [[ "$nr_lost" -gt 0 ]] && echo "⚠ **${nr_lost} never-started worker(s) dropped a participant's audio.**"
+else
+  echo "| _none_ | | | | |"
+  nr_phrase_seen=0
+  for f in "$LOG_DIR"/*.log.gz; do
+    if zcat "$f" 2>/dev/null | grep -qF -- "NetEq audio decoder initialized for peer"; then nr_phrase_seen=1; break; fi
+  done
+  if [[ ${#ALL_KEYS[@]} -gt 1 && "$nr_phrase_seen" -eq 0 ]]; then
+    echo ""
+    echo "⚠ **No \`NetEq audio decoder initialized for peer\` line in a ${#ALL_KEYS[@]}-session corpus.** The emitter's wording has probably changed; this section is NOT a clean result."
+  fi
+fi
+echo ""
 echo "### Peer ID → Email Map (for Prometheus)"
 echo ""
 echo "| Session ID (uint64) | Email | Display Name |"
@@ -1419,6 +1490,7 @@ echo ""
 echo "### Prometheus Copy-Paste"
 echo ""
 echo "\`\`\`bash"
+echo "# hcl-daily needs basic auth: set PROM_USER and PROM_PASSWORD first."
 echo "PROM=https://prometheus.videocall.fnxlabs.com"
 echo "# meeting_id is the ROOM NAME, not the date. Guessed from the parent dir —"
 echo "# override if the local path does not mirror /console-logs/<room>/<date>/."
@@ -1431,7 +1503,7 @@ echo "# scraped when the last participant leaves, so an instant query at END is 
 echo "# even for a counter. Read a counter's first vs last sample over the range."
 echo ""
 echo "# Enumerate exactly what this meeting exported (catches renamed metrics):"
-echo "curl -sk \"\$PROM/api/v1/series\" \\"
+echo "curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/series\" \\"
 echo "  --data-urlencode \"match[]={meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" | jq -r '.data[].__name__' | sort -u"
 echo ""
@@ -1439,7 +1511,7 @@ echo "# Freeze ground truth (counters — compare first vs last sample):"
 echo "for q in videocall_video_freeze_episodes_total videocall_video_freeze_seconds_total \\"
 echo "         videocall_video_max_decode_gap_ms videocall_video_max_content_staleness_ms \\"
 echo "         videocall_video_freshness_evictions_keyframeless_total; do"
-echo "  curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "  curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/query_range\" \\"
 echo "    --data-urlencode \"query=\$q{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "    --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=30s\""
 echo "done"
@@ -1449,18 +1521,18 @@ echo "# Both 0 while freeze_episodes > 0 means the frames ARRIVED and could not 
 echo "# decoded — look at the decoder/worker path, not the transport."
 echo "for q in videocall_video_seq_loss_per_sec videocall_video_seq_max_gap_frames \\"
 echo "         videocall_websocket_drops videocall_client_send_queue_bytes; do"
-echo "  curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "  curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/query_range\" \\"
 echo "    --data-urlencode \"query=\$q{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "    --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=30s\""
 echo "done"
 echo ""
 echo "# Call quality scores:"
-echo "curl -s \"\$PROM/api/v1/query_range\" \\"
+echo "curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=videocall_call_quality_score{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=15s\""
 echo ""
 echo "# Audio concealment:"
-echo "curl -s \"\$PROM/api/v1/query_range\" \\"
+echo "curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=videocall_audio_concealment_pct{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=15s\""
 echo ""
@@ -1468,16 +1540,16 @@ echo "# Relay WS fragment reassembly. ⚠ These carry NO room or meeting label a
 echo "# process-lifetime totals for the whole relay pod, so the value is NOT"
 echo "# attributable to this meeting — read it as a rate over the meeting window and"
 echo "# check the pod's uptime and restart count before drawing any conclusion."
-echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=increase(relay_ws_fragmented_inbound_total[5m])\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=1m\""
-echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=increase(relay_ws_fragment_discarded_total[5m])\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=1m\""
 echo ""
 echo "# Relay mailbox-overflow drops (issue #1057) — room label is the meeting NAME:"
 echo "# Any nonzero increase here = the freeze-causing actor-mailbox overflow."
-echo "curl -s \"\$PROM/api/v1/query_range\" \\"
+echo "curl -s -u \"\$PROM_USER:\$PROM_PASSWORD\" \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=increase(relay_packet_drops_total{room=\\\"<ROOM_NAME>\\\",drop_reason=\\\"mailbox_full\\\"}[1m])\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=30s\""
 echo "\`\`\`"

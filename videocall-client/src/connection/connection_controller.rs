@@ -20,7 +20,7 @@ use super::connection_manager::{
     monotonic_now_ms, ConnectionManager, ConnectionManagerOptions, ConnectionState,
     CPU_OVERLOADED_DURATION_MS, CPU_OVERLOAD_DRIFT_THRESHOLD_MS,
 };
-use super::webmedia::MediaStreamKey;
+use super::webmedia::{MediaStreamKey, StreamQueueDepth};
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
@@ -172,47 +172,7 @@ impl ConnectionController {
                             debug!("Failed to send 1Hz RTT probe post-election: {e}");
                         }
 
-                        // Check whether the active connection's RTT has degraded
-                        // enough to warrant a quality re-election.
-                        //
-                        // We call `request_reelection` instead of
-                        // `start_reelection` directly so that, when a
-                        // refresh callback is configured (Phase 3 /
-                        // AUTH-2), the manager refreshes the room token
-                        // before spawning candidates. This prevents
-                        // post-TTL re-elections from cascade-failing with
-                        // all candidates rejected by the relay. See
-                        // discussion #562.
-                        if mgr.check_rtt_degradation() {
-                            if let Err(e) = mgr.request_reelection() {
-                                log::error!("Failed to start re-election: {e}");
-                            }
-                        }
-
-                        // Issue 2029: evaluate the WebTransport→WebSocket
-                        // audio-datagram-loss fallback on this SAME 1 Hz tick,
-                        // but INDEPENDENTLY of `check_rtt_degradation` above.
-                        // That watchdog is suppressed by `cpu_overloaded` /
-                        // recent inbound — the exact conditions a constrained
-                        // receiver's uniform datagram loss creates — so the
-                        // fallback must not sit behind the same gate. The
-                        // detector latches WebSocket-only (at most once per
-                        // session); we then re-elect through the unified
-                        // full-election path, which now excludes every WT
-                        // candidate because the latch is set.
-                        if mgr.check_audio_datagram_fallback(monotonic_now_ms()) {
-                            info!(
-                                "[WT_AUDIO_FALLBACK] session switched to \
-                                 WebSocket-only after sustained uniform \
-                                 audio-datagram loss"
-                            );
-                            if let Err(e) = mgr.reset_and_start_election() {
-                                log::error!(
-                                    "[WT_AUDIO_FALLBACK] re-election after \
-                                     WebSocket fallback failed: {e}"
-                                );
-                            }
-                        }
+                        mgr.run_connected_watchdogs(monotonic_now_ms());
                     }
                 } else {
                     warn!("1Hz diagnostics timer: skipped — ConnectionManager already borrowed");
@@ -466,6 +426,14 @@ impl ConnectionController {
         }
     }
 
+    /// Forwards to [`ConnectionManager::stream_send_queue_depth`] (#3077).
+    pub fn stream_send_queue_depth(&self, stream_key: MediaStreamKey) -> Option<StreamQueueDepth> {
+        self.manager
+            .try_borrow()
+            .ok()?
+            .stream_send_queue_depth(stream_key)
+    }
+
     /// Forwards to [`ConnectionManager::uplink_queue_depth_bytes`] (#2722).
     pub fn uplink_queue_depth_bytes(&self) -> Option<u64> {
         if let Ok(mgr) = self.manager.try_borrow() {
@@ -477,9 +445,14 @@ impl ConnectionController {
 
     /// The value one health tick reports as `send_queue_bytes` (#2722). MUST be
     /// the transport-agnostic depth: [`Self::get_send_queue_depth`] is WS-only
-    /// for the #1921 screen gate and leaves WT sessions empty.
+    /// and leaves WT sessions empty.
     pub fn health_send_queue_bytes(&self) -> Option<u64> {
         self.uplink_queue_depth_bytes()
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn mark_elected_for_test(&self) {
+        self.manager.borrow_mut().mark_elected_for_test();
     }
 
     #[cfg(test)]
@@ -611,7 +584,13 @@ mod tests {
             on_inbound_media: Callback::from(|_| {}),
             on_state_changed: state_capture.callback(),
             peer_monitor: Callback::from(|_| {}),
-            election_period_ms: 1000,
+            webtransport_connect_timeout_ms: 1000,
+            websocket_connect_timeout_ms: 1000,
+            prefer_webtransport: true,
+            on_election_progress: None,
+            fallback_memory: Rc::new(std::cell::Cell::new(false)),
+            on_fallback_memory: None,
+            conn_seq: Rc::new(std::cell::Cell::new(0)),
             instance_id: "test-instance-id".to_string(),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             allow_post_rebase_retry: true,
@@ -676,7 +655,7 @@ mod uplink_depth_tests {
         assert_eq!(
             cc.get_send_queue_depth(),
             None,
-            "the WS-only accessor the #1921 screen gate reads must stay empty on WT"
+            "the WS-only accessor the camera gate reads must stay empty on WT"
         );
         assert_eq!(
             cc.health_send_queue_bytes(),
@@ -696,6 +675,34 @@ mod uplink_depth_tests {
     fn health_send_queue_bytes_is_empty_with_no_elected_connection() {
         let cc = ConnectionController::from_manager_for_test(ConnectionManager::new_for_test());
         assert_eq!(cc.health_send_queue_bytes(), None);
+    }
+
+    #[test]
+    fn the_screen_stream_depth_on_webtransport_is_the_sessions_own_stream() {
+        let mut mgr = ConnectionManager::new_for_test();
+        let wt = super::super::connection::Connection::new_for_test_with_uplink(true, None);
+        wt.set_wt_stream_depth_for_test(311_000);
+        mgr.insert_active_connection_for_test("active", wt);
+        let cc = ConnectionController::from_manager_for_test(mgr);
+        assert_eq!(
+            cc.stream_send_queue_depth(MediaStreamKey::Screen),
+            Some(StreamQueueDepth::WebTransport(311_000))
+        );
+    }
+
+    #[test]
+    fn the_screen_stream_depth_on_websocket_is_the_shared_socket() {
+        let cc = controller_over(false, Some(48_000));
+        assert_eq!(
+            cc.stream_send_queue_depth(MediaStreamKey::Screen),
+            Some(StreamQueueDepth::WebSocket(48_000))
+        );
+    }
+
+    #[test]
+    fn the_screen_stream_depth_is_empty_with_no_elected_connection() {
+        let cc = ConnectionController::from_manager_for_test(ConnectionManager::new_for_test());
+        assert_eq!(cc.stream_send_queue_depth(MediaStreamKey::Screen), None);
     }
 }
 

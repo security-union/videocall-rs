@@ -303,8 +303,7 @@ pub fn DecodeBudgetBanner(
     pressured: bool,
     /// Number of off-budget avatar tiles (`avatar_tile_count`).
     avatar_count: usize,
-    /// The uncapped natural tile count (`total_tiles ∩ CANVAS_LIMIT` is applied
-    /// downstream by `decode_budget::effective_cap`). Issue #1466: "Show all
+    /// The natural tile count (`total_tiles`). Issue #1466: "Show all
     /// videos" now sets the override to `All` (which tracks the live natural
     /// count itself, so this prop is no longer the source of the target). It is
     /// retained because it carries meaningful context for the action button's

@@ -96,6 +96,8 @@ export async function createMeeting(
   return json.result.meeting_id;
 }
 
+export type AnnouncementOverride = "participant" | "on" | "off";
+
 /** Settings accepted by `PATCH /api/v1/meetings/{id}` (`UpdateMeetingRequest`). */
 export interface MeetingSettingsPatch {
   waiting_room_enabled?: boolean;
@@ -104,6 +106,10 @@ export interface MeetingSettingsPatch {
   allow_guests?: boolean;
   recording_allowed_for_all?: boolean;
   chat_allowed_for_all?: boolean;
+  entry_message_override?: AnnouncementOverride;
+  entry_sound_override?: AnnouncementOverride;
+  exit_message_override?: AnnouncementOverride;
+  exit_sound_override?: AnnouncementOverride;
 }
 
 /**
@@ -150,7 +156,7 @@ export async function joinMeeting(
   name: string,
   meetingId: string,
   displayName?: string,
-): Promise<{ status: string }> {
+): Promise<{ status: string; roomToken?: string }> {
   const body: Record<string, unknown> = {};
   if (displayName !== undefined) body.display_name = displayName;
 
@@ -166,8 +172,8 @@ export async function joinMeeting(
     const txt = await res.text();
     throw new Error(`POST /api/v1/meetings/${meetingId}/join failed (${res.status}): ${txt}`);
   }
-  const json = (await res.json()) as { result: { status: string } };
-  return { status: json.result.status };
+  const json = (await res.json()) as { result: { status: string; room_token?: string } };
+  return { status: json.result.status, roomToken: json.result.room_token };
 }
 
 /**
@@ -189,6 +195,21 @@ export async function endMeeting(
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`POST /api/v1/meetings/${meetingId}/end failed (${res.status}): ${txt}`);
+  }
+}
+
+/** Leave a meeting as the calling user via `POST /api/v1/meetings/{id}/leave` (row becomes `left`). */
+export async function leaveMeeting(email: string, name: string, meetingId: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}/leave`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: authCookie(email, name),
+    },
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`POST /api/v1/meetings/${meetingId}/leave failed (${res.status}): ${txt}`);
   }
 }
 
@@ -290,6 +311,26 @@ export async function fetchMeetingState(
   };
   const row = json.result.meetings.find((m) => m.meeting_id === meetingId);
   return row ? row.state : null;
+}
+
+/** User ids of the admitted rows from `GET /api/v1/meetings/{id}/participants`. */
+export async function fetchAdmittedUserIds(
+  email: string,
+  name: string,
+  meetingId: string,
+): Promise<string[]> {
+  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}/participants`, {
+    method: "GET",
+    headers: { Cookie: authCookie(email, name) },
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(
+      `GET /api/v1/meetings/${meetingId}/participants failed (${res.status}): ${txt}`,
+    );
+  }
+  const json = (await res.json()) as { result: Array<{ user_id: string }> };
+  return json.result.map((p) => p.user_id);
 }
 
 /**

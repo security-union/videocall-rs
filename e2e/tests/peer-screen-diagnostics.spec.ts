@@ -188,8 +188,6 @@ test.describe("Peer screen-share diagnostics", () => {
         // Mock getDisplayMedia on both sides so the guest's share button does
         // not open a real system picker.
         await ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
-        // The viewer stays on the split layout this spec was written against;
-        // a share opens as a grid tile by default since #2792.
         await seedShareViewMode(ctx, "enlarged");
         members.push({
           page: null as unknown as Page,

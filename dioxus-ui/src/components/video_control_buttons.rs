@@ -13,6 +13,8 @@
 
 //! Reusable video control button components with SVG icons.
 
+use crate::components::action_bar_layout::ActionBarSlot;
+use crate::components::captions::{captions_button_hint, CaptionsButtonState};
 use crate::components::icons::meeting_timer::MeetingTimerIcon;
 use crate::components::icons::raised_hand::RaisedHandIcon;
 use dioxus::prelude::*;
@@ -232,35 +234,104 @@ pub fn CameraButton(
 // Screen Share Button
 // =============================================================================
 
+/// What the screen-share control is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareButtonState {
+    #[default]
+    Idle,
+    /// The browser picker for a new share is open.
+    Requesting,
+    Active,
+    /// The picker for a replacement is open; the current share continues.
+    Replacing,
+}
+
+pub const SCREEN_SHARE_TRIGGER_ID: &str = "screen-share-trigger";
+pub const SCREEN_SHARE_MENU_ID: &str = "screen-share-menu";
+const SCREEN_SHARE_MENU_HEADING_ID: &str = "screen-share-menu-heading";
+const SCREEN_SHARE_MENU_ITEMS: [&str; 2] = ["screen-share-menu-replace", "screen-share-menu-stop"];
+
+/// The share menu's heading for the captured surface (`displaySurface`).
+pub fn share_menu_heading(surface: Option<&str>) -> &'static str {
+    match surface {
+        Some("monitor") => "You're sharing your entire screen",
+        Some("window") => "You're sharing a window",
+        Some("browser") => "You're sharing a tab",
+        _ => "You're sharing content",
+    }
+}
+
+const SHARE_REPLACING_DESC: &str =
+    "Pick what to share in the browser dialog. Your current share continues until you choose.";
+const SHARE_REQUESTING_DESC: &str = "Choose what to share in the browser dialog";
+
 #[component]
 pub fn ScreenShareButton(
     active: bool,
     disabled: bool,
     #[props(default)] describedby: Option<&'static str>,
+    #[props(default)] id: String,
+    #[props(default)] menu_open: bool,
+    /// A replacement is being picked: focusable, but inert.
+    #[props(default)]
+    busy: bool,
+    #[props(default)] onkeydown: Option<EventHandler<KeyboardEvent>>,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
-    let class = match (active, disabled) {
+    let class = match (active, disabled || busy) {
         (true, true) => "video-control-button active disabled",
         (true, false) => "video-control-button active",
         (false, true) => "video-control-button disabled",
         (false, false) => "video-control-button",
     };
-    let tooltip_title = if active {
-        "Screen share — Stop Screen Share"
+    let has_menu = active && !busy;
+    let desc_id = (!id.is_empty() && active).then(|| format!("{id}-desc"));
+    let describedby = match (describedby, desc_id.as_deref()) {
+        (Some(hint), Some(desc)) => Some(format!("{hint} {desc}")),
+        (hint, desc) => hint.map(str::to_string).or(desc.map(str::to_string)),
+    };
+    let (state, tooltip_title, tooltip_desc) = if busy {
+        (
+            "replacing",
+            "Screen share — Choosing new content",
+            SHARE_REPLACING_DESC,
+        )
+    } else if active {
+        (
+            "active",
+            "Screen share — Sharing options",
+            "Share something else or stop sharing.",
+        )
     } else {
-        "Screen share — Share Screen"
+        (
+            if disabled { "requesting" } else { "idle" },
+            "Screen share — Share Screen",
+            "Show a window or your entire screen to everyone in the call.",
+        )
     };
 
     rsx! {
         button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
             class,
             "data-testid": "screen-share-button",
+            "data-state": state,
             "aria-label": tooltip_title,
             "aria-describedby": describedby,
+            "aria-haspopup": has_menu.then_some("menu"),
+            "aria-expanded": has_menu.then_some(if menu_open { "true" } else { "false" }),
+            "aria-controls": (has_menu && menu_open).then_some(SCREEN_SHARE_MENU_ID),
+            "aria-disabled": busy.then_some("true"),
+            "aria-busy": busy.then_some("true"),
             disabled,
             onclick: move |evt| {
                 if !disabled {
                     onclick.call(evt);
+                }
+            },
+            onkeydown: move |evt| {
+                if let Some(handler) = onkeydown {
+                    handler.call(evt);
                 }
             },
             svg {
@@ -275,17 +346,339 @@ pub fn ScreenShareButton(
                 line { x1: "8", y1: "21", x2: "16", y2: "21" }
                 line { x1: "12", y1: "17", x2: "12", y2: "21" }
             }
-            if active {
-                span { class: "tooltip",
-                    span { class: "tooltip-title", "{tooltip_title}" }
-                    span { class: "tooltip-desc", "Stop sharing your screen with everyone in the call." }
+            span { class: "tooltip",
+                span { class: "tooltip-title", "{tooltip_title}" }
+                span { id: desc_id, class: "tooltip-desc", "{tooltip_desc}" }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn ShareSwapIcon() -> Element {
+    rsx! {
+        svg {
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            polyline { points: "17 1 21 5 17 9" }
+            path { d: "M3 11V9a4 4 0 0 1 4-4h14" }
+            polyline { points: "7 23 3 19 7 15" }
+            path { d: "M21 13v2a4 4 0 0 1-4 4H3" }
+        }
+    }
+}
+
+#[component]
+pub fn ShareStopIcon() -> Element {
+    rsx! {
+        svg {
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            rect { x: "2", y: "3", width: "20", height: "14", rx: "2", ry: "2" }
+            line { x1: "8", y1: "21", x2: "16", y2: "21" }
+            line { x1: "12", y1: "17", x2: "12", y2: "21" }
+            line { x1: "2", y1: "2", x2: "22", y2: "22" }
+        }
+    }
+}
+
+fn focus_share_item(item: usize) {
+    crate::components::canvas_generator::focus_element_by_id(SCREEN_SHARE_MENU_ITEMS[item]);
+}
+
+/// Close the menu and put focus back on its trigger.
+fn close_share_menu(mut open: Signal<bool>) {
+    open.set(false);
+    crate::components::canvas_generator::focus_element_by_id(SCREEN_SHARE_TRIGGER_ID);
+}
+
+/// The menu a live share's button opens: share something else, or stop.
+#[component]
+pub fn ScreenShareMenu(
+    heading: &'static str,
+    open: Signal<bool>,
+    highlight: Signal<usize>,
+    on_replace: EventHandler<MouseEvent>,
+    on_stop: EventHandler<MouseEvent>,
+) -> Element {
+    use_effect(move || focus_share_item(*highlight.peek()));
+    let mut highlight_to = move |item: usize| {
+        highlight.set(item);
+        focus_share_item(item);
+    };
+    let last = SCREEN_SHARE_MENU_ITEMS.len() - 1;
+    let tabindex = move |item: usize| if highlight() == item { "0" } else { "-1" };
+    rsx! {
+        div {
+            class: "screen-share-menu",
+            "data-testid": "screen-share-menu-popover",
+            onclick: move |e: MouseEvent| e.stop_propagation(),
+            onfocusout: move |e: FocusEvent| {
+                use dioxus::web::WebEventExt;
+                use wasm_bindgen::JsCast;
+                let to = e.as_web_event().related_target();
+                let to = to.and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+                let leaves = to.is_some_and(|t| {
+                    t.id() != SCREEN_SHARE_TRIGGER_ID
+                        && t.closest(".screen-share-menu").ok().flatten().is_none()
+                });
+                if leaves {
+                    open.set(false);
                 }
-            } else {
-                span { class: "tooltip",
-                    span { class: "tooltip-title", "{tooltip_title}" }
-                    span { class: "tooltip-desc", "Show a window or your entire screen to everyone in the call." }
+            },
+            div {
+                id: SCREEN_SHARE_MENU_HEADING_ID,
+                class: "screen-share-menu__heading",
+                "aria-hidden": "true",
+                "{heading}"
+            }
+            div {
+                id: SCREEN_SHARE_MENU_ID,
+                role: "menu",
+                "aria-labelledby": SCREEN_SHARE_MENU_HEADING_ID,
+                "data-testid": "screen-share-menu",
+                onkeydown: move |evt: KeyboardEvent| {
+                    let current = highlight();
+                    let next = match evt.key() {
+                        Key::ArrowDown => Some(if current >= last { 0 } else { current + 1 }),
+                        Key::ArrowUp => Some(if current == 0 { last } else { current - 1 }),
+                        Key::Home => Some(0),
+                        Key::End => Some(last),
+                        Key::Escape | Key::Tab => {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            close_share_menu(open);
+                            None
+                        }
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        evt.stop_propagation();
+                        evt.prevent_default();
+                        highlight_to(next);
+                    }
+                },
+                button {
+                    id: SCREEN_SHARE_MENU_ITEMS[0],
+                    r#type: "button",
+                    role: "menuitem",
+                    class: "screen-share-menu__item",
+                    tabindex: tabindex(0),
+                    "data-testid": "screen-share-menu-replace",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        close_share_menu(open);
+                        on_replace.call(e);
+                    },
+                    ShareSwapIcon {}
+                    span { "Share something else" }
+                }
+                div { class: "screen-share-menu__sep", role: "separator" }
+                button {
+                    id: SCREEN_SHARE_MENU_ITEMS[1],
+                    r#type: "button",
+                    role: "menuitem",
+                    class: "screen-share-menu__item screen-share-menu__item--stop",
+                    tabindex: tabindex(1),
+                    "data-testid": "screen-share-menu-stop",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        close_share_menu(open);
+                        on_stop.call(e);
+                    },
+                    ShareStopIcon {}
+                    span { "Stop sharing" }
                 }
             }
+        }
+    }
+}
+
+/// A menu's screen-share entry: one item that starts a share,
+/// or, while one is live, the menu's two choices in a group.
+#[component]
+pub fn OverflowShareItems(
+    state: ShareButtonState,
+    icon: Element,
+    on_done: EventHandler<()>,
+    on_start: EventHandler<()>,
+    on_replace: EventHandler<()>,
+    on_stop: EventHandler<()>,
+    #[props(default)] item_role: Option<&'static str>,
+    #[props(default = Some("overflow-menu-trigger"))] focus_on_done: Option<&'static str>,
+) -> Element {
+    let done = move || {
+        on_done.call(());
+        if let Some(id) = focus_on_done {
+            crate::components::canvas_generator::focus_element_by_id(id);
+        }
+    };
+    let recent_action = crate::components::recent_actions::slot_attr(ActionBarSlot::ScreenShare);
+    let busy = state == ShareButtonState::Replacing;
+    let why_busy = busy.then_some(SHARE_REPLACING_DESC);
+    if !matches!(
+        state,
+        ShareButtonState::Active | ShareButtonState::Replacing
+    ) {
+        let requesting = state == ShareButtonState::Requesting;
+        return rsx! {
+            button {
+                class: "overflow-item overflow-share-item",
+                role: item_role,
+                "data-recent-action": recent_action,
+                "data-testid": "overflow-share-start",
+                "aria-disabled": requesting.then_some("true"),
+                "aria-busy": requesting.then_some("true"),
+                "aria-description": requesting.then_some(SHARE_REQUESTING_DESC),
+                onclick: move |_| {
+                    if !requesting {
+                        done();
+                        on_start.call(());
+                    }
+                },
+                {icon}
+                span { "Screen share" }
+            }
+        };
+    }
+    let item = move |action: EventHandler<()>| {
+        move |_: MouseEvent| {
+            if !busy {
+                done();
+                action.call(());
+            }
+        }
+    };
+    rsx! {
+        div { class: "overflow-share-group", role: "group", "aria-label": "Screen share",
+            button {
+                class: "overflow-item overflow-share-item",
+                role: item_role,
+                "data-recent-action": recent_action.clone(),
+                "data-testid": "overflow-share-replace",
+                "aria-disabled": busy.then_some("true"),
+                "aria-busy": busy.then_some("true"),
+                "aria-description": why_busy,
+                onclick: item(on_replace),
+                ShareSwapIcon {}
+                span { "Share something else" }
+            }
+            button {
+                class: "overflow-item overflow-share-item overflow-item--stop",
+                role: item_role,
+                "data-recent-action": recent_action,
+                "data-testid": "overflow-share-stop",
+                "aria-disabled": busy.then_some("true"),
+                "aria-busy": busy.then_some("true"),
+                "aria-description": why_busy,
+                onclick: item(on_stop),
+                ShareStopIcon {}
+                span { "Stop sharing" }
+            }
+        }
+    }
+}
+
+/// The action-bar screen-share button: starts a share, or while one is live
+/// opens [`ScreenShareMenu`]. `locked` (customize mode, overflowed) keeps it
+/// from opening.
+#[component]
+pub fn ScreenShareControl(
+    state: ShareButtonState,
+    heading: &'static str,
+    open: Signal<bool>,
+    #[props(default)] locked: bool,
+    #[props(default)] live_lock: Option<Signal<bool>>,
+    #[props(default)] describedby: Option<&'static str>,
+    on_start: EventHandler<MouseEvent>,
+    on_open: EventHandler<()>,
+    on_replace: EventHandler<MouseEvent>,
+    on_stop: EventHandler<MouseEvent>,
+) -> Element {
+    let mut highlight = use_signal(|| 0usize);
+    let usable = state == ShareButtonState::Active && !locked;
+    let refocus = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    if !usable && *open.peek() {
+        refocus.set(crate::components::share_actions::focus_in_share_menu());
+    }
+    use_effect(use_reactive!(|usable| {
+        if !usable && *open.peek() {
+            open.set(false);
+            if refocus.replace(false) {
+                crate::components::share_actions::focus_share_control();
+            }
+        }
+    }));
+    let menu_open = open() && usable;
+    let mut show = move |item: usize| {
+        highlight.set(item);
+        if *open.peek() {
+            focus_share_item(item);
+        } else {
+            on_open.call(());
+            open.set(true);
+        }
+    };
+    let last = SCREEN_SHARE_MENU_ITEMS.len() - 1;
+    rsx! {
+        ScreenShareButton {
+            id: SCREEN_SHARE_TRIGGER_ID.to_string(),
+            active: matches!(state, ShareButtonState::Active | ShareButtonState::Replacing),
+            disabled: state == ShareButtonState::Requesting,
+            busy: state == ShareButtonState::Replacing,
+            menu_open,
+            describedby,
+            onkeydown: move |evt: KeyboardEvent| {
+                if !usable {
+                    return;
+                }
+                match evt.key() {
+                    Key::ArrowDown => {
+                        evt.prevent_default();
+                        show(0);
+                    }
+                    Key::ArrowUp => {
+                        evt.prevent_default();
+                        show(last);
+                    }
+                    Key::Escape if menu_open => {
+                        evt.stop_propagation();
+                        evt.prevent_default();
+                        open.set(false);
+                    }
+                    _ => {}
+                }
+            },
+            onclick: move |evt: MouseEvent| {
+                if locked || live_lock.is_some_and(|live| live()) {
+                    return;
+                }
+                match state {
+                    ShareButtonState::Idle => on_start.call(evt),
+                    ShareButtonState::Active => {
+                        evt.stop_propagation();
+                        if menu_open {
+                            open.set(false);
+                        } else {
+                            show(0);
+                        }
+                    }
+                    ShareButtonState::Requesting | ShareButtonState::Replacing => {}
+                }
+            },
+        }
+        if menu_open {
+            ScreenShareMenu { heading, open, highlight, on_replace, on_stop }
         }
     }
 }
@@ -432,6 +825,54 @@ pub fn DiagnosticsButton(
     }
 }
 
+/// Lucide `history`.
+#[component]
+pub fn RecentActionsIcon() -> Element {
+    rsx! {
+        svg {
+            "aria-hidden": "true",
+            xmlns: "http://www.w3.org/2000/svg",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }
+            path { d: "M3 3v5h5" }
+            path { d: "M12 7v5l4 2" }
+        }
+    }
+}
+
+#[component]
+pub fn RecentActionsButton(
+    open: bool,
+    #[props(default)] id: String,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+    #[props(default)] onkeydown: EventHandler<KeyboardEvent>,
+) -> Element {
+    rsx! {
+        button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
+            class: if open { "video-control-button active" } else { "video-control-button" },
+            r#type: "button",
+            "aria-label": "Recent actions",
+            "aria-describedby": describedby,
+            "aria-haspopup": "menu",
+            "aria-expanded": if open { "true" } else { "false" },
+            onclick: move |evt| onclick.call(evt),
+            onkeydown: move |evt| onkeydown.call(evt),
+            RecentActionsIcon {}
+            span { class: "tooltip",
+                span { class: "tooltip-title", "Recent actions" }
+                span { class: "tooltip-desc", "Jump back to features and settings you used recently." }
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Reactions Button (issue #1884)
 // =============================================================================
@@ -566,6 +1007,69 @@ pub fn RaiseHandButton(
                         "Let everyone know you want to speak — they see it even if your tile is off-screen."
                     }
                 }
+            }
+        }
+    }
+}
+
+/// "CC" glyph shared by the action-bar button and the overflow menu item.
+#[component]
+pub fn CaptionsIcon() -> Element {
+    rsx! {
+        svg {
+            "aria-hidden": "true",
+            xmlns: "http://www.w3.org/2000/svg",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            rect { x: "2", y: "5", width: "20", height: "14", rx: "3" }
+            path { d: "M10.5 10.2a2.2 2.2 0 1 0 0 3.6" }
+            path { d: "M17 10.2a2.2 2.2 0 1 0 0 3.6" }
+        }
+    }
+}
+
+/// The CC control. A host's button turns room transcription on and off; a
+/// participant's only shows or hides the overlay, and is `aria-disabled` while
+/// the room is not captioned. Same stable-noun + `aria-pressed` contract as
+/// [`RaiseHandButton`].
+#[component]
+pub fn CaptionsButton(
+    state: CaptionsButtonState,
+    #[props(default)] id: String,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    let class = match (state.pressed, state.disabled) {
+        (_, true) => "video-control-button captions-button captions-button--unavailable",
+        (true, false) => "video-control-button active captions-button",
+        (false, false) => "video-control-button captions-button",
+    };
+    const NAME: &str = "Captions";
+    let hint_id = format!("{id}-captions-hint");
+    let described = describedby.map_or_else(|| hint_id.clone(), |d| format!("{d} {hint_id}"));
+    rsx! {
+        button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
+            class,
+            r#type: "button",
+            "data-testid": "captions-button",
+            "data-captions-on": if state.pressed { "true" } else { "false" },
+            "data-captions-pending": if state.pending { "true" } else { "false" },
+            "data-captions-role": state.role.as_str(),
+            "aria-label": NAME,
+            "aria-describedby": described,
+            "aria-pressed": if state.pressed { "true" } else { "false" },
+            "aria-disabled": if state.disabled { Some("true") } else { None },
+            "aria-busy": if state.pending { Some("true") } else { None },
+            onclick: move |evt| onclick.call(evt),
+            CaptionsIcon {}
+            span { class: "tooltip",
+                span { class: "tooltip-title", {NAME} }
+                span { id: hint_id, class: "tooltip-desc", {captions_button_hint(state)} }
             }
         }
     }
@@ -901,6 +1405,49 @@ impl RecordButtonState {
             RecordButtonState::Activating | RecordButtonState::Stopping | RecordButtonState::Saving
         )
     }
+
+    pub fn menu_label(&self) -> &'static str {
+        match self {
+            RecordButtonState::Idle => ActionBarSlot::Recording.display_name(),
+            RecordButtonState::Activating => "Starting recording\u{2026}",
+            RecordButtonState::Recording => "Stop recording",
+            RecordButtonState::Stopping => "Stopping recording\u{2026}",
+            RecordButtonState::Saving => "Saving recording\u{2026}",
+        }
+    }
+}
+
+/// How a menu item for a slot reads, and whether it can be activated, right now.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SlotItem {
+    pub label: &'static str,
+    pub disabled: bool,
+    pub busy: bool,
+}
+
+pub fn slot_item(
+    slot: ActionBarSlot,
+    record_state: &RecordButtonState,
+    captions: Option<CaptionsButtonState>,
+) -> SlotItem {
+    let plain = SlotItem {
+        label: slot.display_name(),
+        disabled: false,
+        busy: false,
+    };
+    match (slot, captions) {
+        (ActionBarSlot::Recording, _) => SlotItem {
+            label: record_state.menu_label(),
+            disabled: record_state.is_busy(),
+            busy: record_state.is_busy(),
+        },
+        (ActionBarSlot::Captions, Some(state)) => SlotItem {
+            disabled: state.disabled,
+            busy: state.pending,
+            ..plain
+        },
+        _ => plain,
+    }
 }
 
 #[component]
@@ -984,6 +1531,73 @@ pub fn js_state_to_record_button_state(s: &str) -> RecordButtonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_recording_is_labelled_as_what_activating_it_does() {
+        let item = |state: RecordButtonState| slot_item(ActionBarSlot::Recording, &state, None);
+        let (idle, running) = (
+            item(RecordButtonState::Idle),
+            item(RecordButtonState::Recording),
+        );
+        assert_eq!((idle.label, idle.disabled), ("Record", false));
+        assert_eq!((running.label, running.disabled), ("Stop recording", false));
+        for busy in [
+            RecordButtonState::Activating,
+            RecordButtonState::Stopping,
+            RecordButtonState::Saving,
+        ] {
+            let shown = item(busy.clone());
+            assert!(shown.disabled && shown.busy, "{busy:?}");
+            assert_ne!(shown.label, "Stop recording", "{busy:?}");
+        }
+    }
+
+    #[test]
+    fn a_captions_item_reports_its_state_and_other_items_never_do() {
+        let idle = RecordButtonState::Idle;
+        let captions = CaptionsButtonState {
+            role: crate::components::captions::CaptionsRole::Viewer,
+            pressed: false,
+            disabled: true,
+            pending: true,
+        };
+        let item = slot_item(ActionBarSlot::Captions, &idle, Some(captions));
+        assert!(item.disabled && item.busy);
+        let peers = slot_item(ActionBarSlot::PeerList, &idle, Some(captions));
+        assert!(!peers.disabled && !peers.busy);
+        assert_eq!(peers.label, ActionBarSlot::PeerList.display_name());
+    }
+
+    #[test]
+    fn a_hosts_pending_captions_item_is_busy_and_can_still_be_pressed() {
+        let captions = CaptionsButtonState {
+            role: crate::components::captions::CaptionsRole::Host,
+            pressed: false,
+            disabled: false,
+            pending: true,
+        };
+        let item = slot_item(
+            ActionBarSlot::Captions,
+            &RecordButtonState::Idle,
+            Some(captions),
+        );
+        assert!(!item.disabled);
+        assert!(item.busy);
+    }
+
+    #[test]
+    fn the_share_menu_heading_names_the_captured_surface() {
+        assert_eq!(
+            share_menu_heading(Some("monitor")),
+            "You're sharing your entire screen"
+        );
+        assert_eq!(
+            share_menu_heading(Some("window")),
+            "You're sharing a window"
+        );
+        assert_eq!(share_menu_heading(Some("browser")), "You're sharing a tab");
+        assert_eq!(share_menu_heading(None), "You're sharing content");
+    }
 
     // ── is_busy ────────────────────────────────────────────────────────────
     // `is_busy()` governs whether the RecordButton is disabled mid-transition —

@@ -1,0 +1,70 @@
+{
+  "_comment": [
+    "Mutation receipts for #3204 in the receive path:",
+    "  scripts/mutation-check.py run videocall-client/mutation-spec-3204.json"
+  ],
+  "runner": "cargo",
+  "cwd": ".",
+  "command": [
+    "cargo",
+    "test",
+    "--no-fail-fast",
+    "-p",
+    "videocall-client",
+    "--lib"
+  ],
+  "baseline_tests": 1329,
+  "mutations": [
+    {
+      "name": "the VIDEO push no longer flushes on a layer change",
+      "file": "videocall-client/src/decode/peer_decode_manager.rs",
+      "find": "                flush_on_layer_change(\n                    &mut self.pushed_video_layer,\n                    incoming_video_layer,\n                    &self.video,\n                );\n",
+      "replace": "",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_video_step_down_requests_a_keyframe_and_decodes_the_new_layer"
+      ]
+    },
+    {
+      "name": "every push flushes, same layer or not",
+      "file": "videocall-client/src/decode/peer_decode_manager.rs",
+      "find": "last_pushed.replace(layer).is_some_and(|prev| prev != layer)",
+      "replace": "last_pushed.replace(layer).is_some()",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_guard_round_trip_with_no_frames_between_keeps_decoding",
+        "a_video_step_down_requests_a_keyframe_and_decodes_the_new_layer"
+      ]
+    },
+    {
+      "name": "the pushed layer is never recorded",
+      "file": "videocall-client/src/decode/peer_decode_manager.rs",
+      "find": "last_pushed.replace(layer).is_some_and(|prev| prev != layer)",
+      "replace": "last_pushed.is_some_and(|prev| prev != layer)",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_video_step_down_requests_a_keyframe_and_decodes_the_new_layer"
+      ]
+    },
+    {
+      "name": "the switch flush also force-clears the canvas",
+      "file": "videocall-client/src/decode/peer_decode_manager.rs",
+      "find": "        decoder.flush();\n",
+      "replace": "        decoder.flush();\n        decoder.force_clear_canvas();\n",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_video_step_down_requests_a_keyframe_and_decodes_the_new_layer"
+      ]
+    },
+    {
+      "name": "the switch flush also clears the canvas",
+      "file": "videocall-client/src/decode/peer_decode_manager.rs",
+      "find": "        decoder.flush();\n",
+      "replace": "        decoder.flush();\n        decoder.clear_canvas();\n",
+      "occurrences": 1,
+      "expect_kills": [
+        "a_video_step_down_requests_a_keyframe_and_decodes_the_new_layer"
+      ]
+    }
+  ]
+}

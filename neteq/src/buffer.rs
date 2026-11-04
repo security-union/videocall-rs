@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use web_time::Duration;
 
-use crate::statistics::StatisticsCalculator;
+use crate::statistics::{FlushCause, StatisticsCalculator};
 use crate::{AudioPacket, Result};
 
 /// Configuration for smart flushing behavior
@@ -121,6 +121,7 @@ impl PacketBuffer {
         &mut self,
         target_level_ms: u32,
         _sample_rate: u32,
+        cause: FlushCause,
         stats: &mut StatisticsCalculator,
     ) -> Result<BufferReturnCode> {
         if self.buffer.is_empty() {
@@ -145,6 +146,7 @@ impl PacketBuffer {
         // Remove older packets
         let remove_count = self.buffer.len().saturating_sub(keep_count);
         if remove_count > 0 {
+            stats.packets_flushed(cause, remove_count as u64);
             for _ in 0..remove_count {
                 if let Some(packet) = self.buffer.pop_front() {
                     stats.packet_discarded(packet.is_older_than(self.max_packet_age));
@@ -170,16 +172,27 @@ impl PacketBuffer {
 
         // Check if we need to trigger smart flushing
         if self.should_smart_flush(target_level_ms) {
-            self.partial_flush(target_level_ms, packet.sample_rate, stats)?;
+            self.partial_flush(
+                target_level_ms,
+                packet.sample_rate,
+                FlushCause::SmartFlush,
+                stats,
+            )?;
         }
 
         // Check if buffer is full
         if self.buffer.len() >= self.max_packets {
             // Try partial flush first
-            self.partial_flush(target_level_ms, packet.sample_rate, stats)?;
+            self.partial_flush(
+                target_level_ms,
+                packet.sample_rate,
+                FlushCause::Overflow,
+                stats,
+            )?;
 
             // If still full, flush completely
             if self.buffer.len() >= self.max_packets {
+                stats.packets_flushed(FlushCause::Overflow, self.buffer.len() as u64);
                 self.flush(stats);
                 log::warn!("Buffer overflow: performed full flush");
                 stats.buffer_flush();
@@ -485,6 +498,25 @@ mod tests {
 
         // Buffer should not exceed max capacity
         assert!(buffer.len() <= 2);
+        let lifetime = stats.lifetime_statistics();
+        assert_eq!(lifetime.overflow_discarded_packets, 2);
+        assert_eq!(lifetime.smart_flush_discarded_packets, 0);
+    }
+
+    #[test]
+    fn overflow_partial_flush_counts_as_overflow() {
+        let mut buffer = PacketBuffer::new(3);
+        let mut stats = StatisticsCalculator::new();
+        for (seq, ts) in [(1, 1000), (2, 1320), (3, 1640), (4, 1960)] {
+            buffer
+                .insert_packet(create_test_packet(seq, ts, 20), &mut stats, 20)
+                .unwrap();
+        }
+
+        assert_eq!(buffer.len(), 2);
+        let lifetime = stats.lifetime_statistics();
+        assert_eq!(lifetime.overflow_discarded_packets, 2);
+        assert_eq!(lifetime.smart_flush_discarded_packets, 0);
     }
 
     #[test]

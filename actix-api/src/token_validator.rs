@@ -359,6 +359,7 @@ mod tests {
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
             iat: Some(now),
+            meeting_started_at_ms: None,
         };
         jsonwebtoken::encode(
             &Header::default(),
@@ -426,6 +427,7 @@ mod tests {
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
             iat: Some(now),
+            meeting_started_at_ms: None,
         };
         let token = jsonwebtoken::encode(
             &Header::default(),
@@ -896,6 +898,7 @@ mod tests {
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: typ.map(str::to_string),
             iat: Some(now),
+            meeting_started_at_ms: None,
         };
         jsonwebtoken::encode(
             &Header::default(),

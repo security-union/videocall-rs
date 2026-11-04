@@ -167,6 +167,43 @@ impl MeetingApiClient {
         parse_status_only(response).await
     }
 
+    /// Sends `POST /api/v1/meetings/{meeting_id}/captions` with
+    /// `{"enabled", "renew"}` and the room token as bearer: enable
+    /// (`renew = false`), renew (`renew = true`) or revoke (`enabled = false`)
+    /// the meeting's live-captions lease.
+    ///
+    /// `renew = true` without `enabled = true` is contradictory and returns
+    /// [`ApiError::Config`] unsent.
+    pub async fn set_captions(
+        &self,
+        meeting_id: &str,
+        enabled: bool,
+        renew: bool,
+    ) -> Result<(), ApiError> {
+        let response = self
+            .captions_request(meeting_id, enabled, renew)?
+            .send()
+            .await?;
+        parse_status_only(response).await
+    }
+
+    fn captions_request(
+        &self,
+        meeting_id: &str,
+        enabled: bool,
+        renew: bool,
+    ) -> Result<reqwest::RequestBuilder, ApiError> {
+        if renew && !enabled {
+            return Err(ApiError::Config(
+                "set_captions: renew requires enabled".to_string(),
+            ));
+        }
+        let path = format!("/api/v1/meetings/{meeting_id}/captions");
+        Ok(self
+            .post(&path)
+            .json(&serde_json::json!({ "enabled": enabled, "renew": renew })))
+    }
+
     /// Update your display name during an active meeting.
     ///
     /// Calls `PUT /api/v1/meetings/{meeting_id}/display-name`.
@@ -204,5 +241,58 @@ impl MeetingApiClient {
         let path = format!("/api/v1/meetings/{meeting_id}/participants");
         let response = self.get(&path).send().await?;
         parse_api_response(response).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AuthMode, MeetingApiClient};
+
+    fn captions_body(enabled: bool, renew: bool) -> (reqwest::Request, serde_json::Value) {
+        let client = MeetingApiClient::new("http://api.test/", AuthMode::Bearer("tok".into()));
+        let request = client
+            .captions_request("standup", enabled, renew)
+            .unwrap()
+            .build()
+            .unwrap();
+        let body = request.body().and_then(|b| b.as_bytes()).unwrap();
+        let json = serde_json::from_slice(body).unwrap();
+        (request, json)
+    }
+
+    #[test]
+    fn captions_request_posts_enabled_and_renew_to_the_meeting() {
+        let (request, body) = captions_body(true, false);
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().as_str(),
+            "http://api.test/api/v1/meetings/standup/captions"
+        );
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer tok"
+        );
+        assert_eq!(body, serde_json::json!({"enabled": true, "renew": false}));
+    }
+
+    #[test]
+    fn captions_request_carries_renewal_and_revoke() {
+        assert_eq!(
+            captions_body(true, true).1,
+            serde_json::json!({"enabled": true, "renew": true})
+        );
+        assert_eq!(
+            captions_body(false, false).1,
+            serde_json::json!({"enabled": false, "renew": false})
+        );
+    }
+
+    #[test]
+    fn captions_request_rejects_renewing_a_revoke() {
+        let client = MeetingApiClient::new("http://api.test/", AuthMode::Bearer("tok".into()));
+        assert!(matches!(
+            client.captions_request("standup", false, true),
+            Err(crate::ApiError::Config(_))
+        ));
     }
 }

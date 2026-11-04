@@ -28,7 +28,9 @@
 #
 # Usage:
 #   resource-sampler.sh --out <csv> [--interval <sec>] [--proc-grep <regex>] \
-#       [--watch-pid <pid>] [--label <run-id>]
+#       [--cmdline-grep <regex> --cmdline-name <name>] [--watch-pid <pid>] [--label <run-id>]
+#
+# --cmdline-grep also samples processes whose command line matches, under the comm <name>.
 
 set -u
 
@@ -39,6 +41,8 @@ INTERVAL=5
 # `node`/`tsx` covers a locally-launched orchestrator/bot. The watched run
 # process is always included regardless (see the sample loop).
 PROC_GREP='chrome|chromium|node|tsx'
+CMDLINE_GREP=""
+CMDLINE_NAME="cmdline-match"
 WATCH_PID=""
 MAX_SECONDS=0
 LABEL=""
@@ -48,6 +52,8 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --proc-grep) PROC_GREP="$2"; shift 2 ;;
+    --cmdline-grep) CMDLINE_GREP="$2"; shift 2 ;;
+    --cmdline-name) CMDLINE_NAME="$2"; shift 2 ;;
     --watch-pid) WATCH_PID="$2"; shift 2 ;;
     --max-seconds) MAX_SECONDS="$2"; shift 2 ;;
     --label) LABEL="$2"; shift 2 ;;
@@ -65,6 +71,17 @@ fi
 # short lines on Linux).
 emit() {
   printf '%s\n' "$1" >>"$OUT"
+}
+
+# Splits stdin's NUL-separated argv into `args`; ends on any read failure, as one leaves `arg` unchanged.
+cmdline_args() {
+  args=()
+  arg=""
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+    arg=""
+  done
+  if [ -n "$arg" ]; then args+=("$arg"); fi
 }
 
 CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
@@ -138,12 +155,16 @@ sample_once() {
   # the orchestrator's own CPU is still captured. Only MATCHED PIDs then pay
   # the two /proc reads below.
   local count=0
-  local pid comm utime stime rss statfile
+  local pid comm utime stime rss statfile args arg
   for piddir in /proc/[0-9]*/; do
     pid="${piddir#/proc/}"
     pid="${pid%/}"
     read -r comm <"/proc/${pid}/comm" 2>/dev/null || continue
-    if [[ $comm =~ $PROC_GREP ]] || [ "$pid" = "$WATCH_PID" ]; then
+    if [ -n "$CMDLINE_GREP" ] && cmdline_args 2>/dev/null <"/proc/${pid}/cmdline" &&
+      [[ "${args[*]-}" =~ $CMDLINE_GREP ]]; then
+      comm="$CMDLINE_NAME"
+    fi
+    if [[ $comm =~ $PROC_GREP ]] || [ "$comm" = "$CMDLINE_NAME" ] || [ "$pid" = "$WATCH_PID" ]; then
       statfile="/proc/${pid}/stat"
       # /proc/pid/stat: comm (field 2) may contain spaces/parens, so split on
       # the LAST ")" and index utime (field 14) / stime (field 15) from the

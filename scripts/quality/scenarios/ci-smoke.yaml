@@ -1,0 +1,18 @@
+# The CI smoke shape: 2 probes and 5 Rust bots. A golden INVALID: G-V7 needs 10 observers and the scorer's
+# bounds refuse fewer, so a PASS here means G-V7 is broken. PR-7 freezes the failing gate set from its first
+# green dispatch. The viewer's viewport holds more peers than there are non-publishers and fewer than there are
+# publishers, so G-V11's layer and viewport filters both act whatever the session ids.
+schema: scale-scenario/v1
+run: {id_prefix: cqci, seed: 1, target: ci, bot_diagnostics: off, fidelity_waivers: []}
+population:
+  - {role: probes, fleet: browser, count: 2, media: {camera: off, mic: muted}, join_stagger: 4s, decode_budget: off}
+  - {role: talker, fleet: rust, count: 1, media: {camera: on, mic: continuous, video_layers: 3}}
+  - {role: cameras, fleet: rust, count: 3, media: {camera: on, mic: muted, video_layers: 3}}
+  - {role: viewers, fleet: rust, count: 1, media: {camera: off, mic: off},
+     receive: {pin_video_layer: 0, viewport_visible_count: 3}}
+steps: [{id: smoke, hold: 5m, join_window: 2m, headline: true}]
+events: []
+scoring:
+  mode: gate
+  relay_path_exemptions: {}
+  expect: {verdict: INVALID, invalid_gates: [G-V7]}

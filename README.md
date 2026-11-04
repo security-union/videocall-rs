@@ -518,7 +518,7 @@ browser via `wasm-bindgen-test`:
 ```bash
 # Run UI component tests natively (requires Chrome + chromedriver)
 cd dioxus-ui
-CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
+CHROMEDRIVER=$(which chromedriver) ../scripts/wasm-browser-test cargo test --target wasm32-unknown-unknown
 ```
 
 CI runs these tests automatically via `.github/workflows/wasm-test.yaml`.
@@ -547,7 +547,7 @@ cleans up its own data. The infrastructure is defined in
 | Service | Purpose |
 |---------|---------|
 | `postgres:12` | Database for meetings and sessions |
-| `nats:2.10-alpine` | Message broker with JetStream |
+| `nats:2.14.8` | Message broker with JetStream |
 | `rust-tests` | Test runner (runs `dbmate` migrations, then `cargo test`) |
 
 ```bash

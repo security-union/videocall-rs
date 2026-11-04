@@ -69,6 +69,7 @@ async fn non_owner_patch_chat_setting_is_rejected_and_db_unchanged() {
         false,
         false,
         true,
+        db_meetings::Announcements::default(),
     )
     .await
     .expect("create_with_options must succeed");
@@ -149,6 +150,7 @@ async fn chat_allowed_for_all_round_trips_through_db() {
         false,
         false,
         false,
+        db_meetings::Announcements::default(),
     )
     .await
     .expect("create_with_options must succeed");
@@ -171,6 +173,7 @@ async fn chat_allowed_for_all_round_trips_through_db() {
         None,
         None,
         Some(true),
+        db_meetings::Announcements::default(),
         &PasswordUpdate::Unchanged,
     )
     .await
@@ -200,6 +203,7 @@ async fn chat_allowed_for_all_round_trips_through_db() {
         None,
         None,
         None,
+        db_meetings::Announcements::default(),
         &PasswordUpdate::Unchanged,
     )
     .await
@@ -221,6 +225,7 @@ async fn chat_allowed_for_all_round_trips_through_db() {
         None,
         None,
         Some(false),
+        db_meetings::Announcements::default(),
         &PasswordUpdate::Unchanged,
     )
     .await

@@ -1,0 +1,18 @@
+# One probe and six Rust bots on this machine. INVALID by construction: G-V7 needs 10 observers, and one probe
+# has no other observer to see it (G-V6). It proves the runner end to end, including a Rust leave (D11).
+# Each viewer's viewport holds more peers than there are non-publishers and fewer than there are publishers, so
+# G-V11's layer and viewport filters both act whatever the session ids.
+schema: scale-scenario/v1
+run: {id_prefix: cqlocal, seed: 1, target: local, bot_diagnostics: off, fidelity_waivers: []}
+population:
+  - {role: probe, fleet: browser, count: 1, media: {camera: off, mic: muted}, decode_budget: off}
+  - {role: talkers, fleet: rust, count: 2, media: {camera: on, mic: continuous, video_layers: 3}}
+  - {role: cameras, fleet: rust, count: 2, media: {camera: on, mic: muted, video_layers: 3}}
+  - {role: viewers, fleet: rust, count: 2, media: {camera: off, mic: off},
+     receive: {pin_video_layer: 0, viewport_visible_count: 3}}
+steps: [{id: smoke, hold: 3m, headline: true}]
+events: [{at: hold+90s, select: {role: viewers, count: 1}, action: leave}]
+scoring:
+  mode: gate
+  relay_path_exemptions: {}
+  expect: {verdict: INVALID, invalid_gates: [G-V6, G-V7]}

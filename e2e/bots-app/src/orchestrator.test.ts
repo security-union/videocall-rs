@@ -270,7 +270,7 @@ lines:
 });
 
 describe("orchestrator.registerSshTask", () => {
-  it("forwards clock video mode through the production SSH spawn path", async () => {
+  it("forwards clock video mode and the run deadline through the production SSH spawn path", async () => {
     const host: SshHost = {
       label: "clock-host",
       host: "clock-host.intra",
@@ -336,6 +336,27 @@ describe("orchestrator.registerSshTask", () => {
     });
     expect(buildSshCommand(captured!.host, captured!).remoteCommand).toContain(
       "--diag-packets off",
+    );
+
+    await registerSshTask({ ...spec, diagPackets: "on" }, host, {
+      registry,
+      inFlight,
+      inFlightWaiters: [],
+      spawnRemoteBot: fakeSpawnRemoteBot,
+    });
+    expect(buildSshCommand(captured!.host, captured!).remoteCommand).toContain("--diag-packets on");
+    expect(buildSshCommand(captured!.host, captured!).remoteCommand).not.toContain("--deadline");
+
+    const late = await registerSshTask(spec, host, {
+      registry,
+      inFlight,
+      inFlightWaiters: [],
+      spawnRemoteBot: fakeSpawnRemoteBot,
+      runDeadlineMs: 1_791_000_835_999,
+    });
+    expect(registry.get(late)?.task.runDeadlineMs).toBe(1_791_000_835_999);
+    expect(buildSshCommand(captured!.host, captured!).remoteCommand).toContain(
+      "--deadline 1791000835",
     );
   });
 });

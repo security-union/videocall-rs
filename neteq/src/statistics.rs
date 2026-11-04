@@ -277,6 +277,19 @@ pub struct LifetimeStatistics {
     /// decoder, or a libopus PLC failure (issue 620).
     #[serde(default)]
     pub plc_invocations_fallback_noise: u64,
+    #[serde(default)]
+    pub smart_flush_discarded_packets: u64,
+    #[serde(default)]
+    pub resync_discarded_packets: u64,
+    #[serde(default)]
+    pub overflow_discarded_packets: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushCause {
+    SmartFlush,
+    ResyncToLive,
+    Overflow,
 }
 
 /// Operations and internal state metrics
@@ -316,10 +329,10 @@ pub struct StatisticsCalculator {
     start_time: Instant,
     waiting_times: Vec<i32>,
     _last_update: Instant,
-    /// Total output samples for rate calculations
-    total_output_samples: u64,
-    /// Total expanded samples for rate calculations
-    total_expanded_samples: u64,
+    window_output_samples: u64,
+    window_expanded_samples: u64,
+    window_accelerate_samples: u64,
+    window_preemptive_samples: u64,
     /// Operation counters for rolling window tracking
     operation_counts: [u32; OPERATION_VARIANT_COUNT],
     /// Last time operation rates were calculated
@@ -345,8 +358,10 @@ impl StatisticsCalculator {
             start_time: now,
             waiting_times: Vec::new(),
             _last_update: now,
-            total_output_samples: 0,
-            total_expanded_samples: 0,
+            window_output_samples: 0,
+            window_expanded_samples: 0,
+            window_accelerate_samples: 0,
+            window_preemptive_samples: 0,
             operation_counts: [0; OPERATION_VARIANT_COUNT],
             last_operation_update: now,
             operation_window_duration: Duration::from_secs(1),
@@ -405,46 +420,31 @@ impl StatisticsCalculator {
 
     /// Record time-stretching operation
     pub fn time_stretch_operation(&mut self, operation: TimeStretchOperation, samples: u64) {
-        // Track total output samples for rate calculations
-        self.total_output_samples += samples;
-
         match operation {
             TimeStretchOperation::Accelerate => {
                 self.lifetime_stats.removed_samples_for_acceleration += samples;
                 self.operation_stats.accelerate_samples += samples;
-                // Calculate cumulative accelerate rate: (removed_samples / total_output_samples) in Q14
-                if self.total_output_samples > 0 {
-                    let ratio = self.lifetime_stats.removed_samples_for_acceleration as f64
-                        / self.total_output_samples as f64;
-                    self.network_stats.accelerate_rate = q14::from_float(ratio);
-                }
+                self.window_accelerate_samples += samples;
             }
             TimeStretchOperation::PreemptiveExpand => {
                 self.lifetime_stats.inserted_samples_for_deceleration += samples;
                 self.operation_stats.preemptive_samples += samples;
-                // Calculate cumulative preemptive rate: (inserted_samples / total_output_samples) in Q14
-                if self.total_output_samples > 0 {
-                    let ratio = self.lifetime_stats.inserted_samples_for_deceleration as f64
-                        / self.total_output_samples as f64;
-                    self.network_stats.preemptive_rate = q14::from_float(ratio);
-                }
+                self.window_preemptive_samples += samples;
             }
             TimeStretchOperation::Expand => {
-                self.total_expanded_samples += samples;
-                // Calculate cumulative expand rate: (expanded_samples / total_output_samples) in Q14
-                if self.total_output_samples > 0 {
-                    let ratio =
-                        self.total_expanded_samples as f64 / self.total_output_samples as f64;
-                    self.network_stats.expand_rate = q14::from_float(ratio);
-                }
+                self.window_expanded_samples += samples;
             }
         }
     }
 
-    /// Record a decode operation for per-second tracking
-    pub fn record_decode_operation(&mut self, operation: Operation) {
-        let now = Instant::now();
-
+    /// Record one output audio frame of `output_samples` samples per channel
+    /// produced by `operation` at `now`.
+    pub fn record_decode_operation(
+        &mut self,
+        operation: Operation,
+        output_samples: u64,
+        now: Instant,
+    ) {
         // Convert operation to array index
         let index = match operation {
             Operation::Normal => 0,
@@ -463,11 +463,32 @@ impl StatisticsCalculator {
 
         // Increment counter
         self.operation_counts[index] += 1;
+        self.window_output_samples += output_samples;
 
         // Update operation counters per second if window has elapsed
         if now.duration_since(self.last_operation_update) >= self.operation_window_duration {
             self.update_operation_rates(now);
         }
+    }
+
+    fn update_time_stretch_rates(&mut self, elapsed: Duration) {
+        if elapsed >= self.operation_window_duration * 2 {
+            self.network_stats.expand_rate = 0;
+            self.network_stats.accelerate_rate = 0;
+            self.network_stats.preemptive_rate = 0;
+        } else if self.window_output_samples > 0 {
+            let output = self.window_output_samples as f64;
+            self.network_stats.expand_rate =
+                q14::from_float(self.window_expanded_samples as f64 / output);
+            self.network_stats.accelerate_rate =
+                q14::from_float(self.window_accelerate_samples as f64 / output);
+            self.network_stats.preemptive_rate =
+                q14::from_float(self.window_preemptive_samples as f64 / output);
+        }
+        self.window_output_samples = 0;
+        self.window_expanded_samples = 0;
+        self.window_accelerate_samples = 0;
+        self.window_preemptive_samples = 0;
     }
 
     /// Update operation rates (operations per second)
@@ -506,6 +527,8 @@ impl StatisticsCalculator {
             self.network_stats.operation_counters.undefined_per_sec =
                 self.operation_counts[11] as f32 / elapsed_secs;
 
+            self.update_time_stretch_rates(elapsed);
+
             // Reset counters for next window
             self.operation_counts.fill(0);
             self.last_operation_update = now;
@@ -516,6 +539,15 @@ impl StatisticsCalculator {
     pub fn buffer_flush(&mut self) {
         self.lifetime_stats.buffer_flushes += 1;
         self.operation_stats.packet_buffer_flushes += 1;
+    }
+
+    pub fn packets_flushed(&mut self, cause: FlushCause, count: u64) {
+        let counter = match cause {
+            FlushCause::SmartFlush => &mut self.lifetime_stats.smart_flush_discarded_packets,
+            FlushCause::ResyncToLive => &mut self.lifetime_stats.resync_discarded_packets,
+            FlushCause::Overflow => &mut self.lifetime_stats.overflow_discarded_packets,
+        };
+        *counter = counter.saturating_add(count);
     }
 
     /// Record discarded packet
@@ -661,82 +693,181 @@ mod tests {
         assert_eq!(stats.median_waiting_time_ms, 20); // Middle value when sorted
     }
 
-    #[test]
-    fn test_expand_rate_calculation_fix() {
-        let mut stats = StatisticsCalculator::new();
+    const FRAME_SAMPLES: u64 = 480;
 
-        // Simulate normal operation: 10 frames of normal audio (160 samples each)
-        for _ in 0..10 {
-            stats.time_stretch_operation(TimeStretchOperation::Accelerate, 160);
-            // Not expand, just to track output
+    fn output_frame(
+        calc: &mut StatisticsCalculator,
+        operation: Operation,
+        stretch: Option<(TimeStretchOperation, u64)>,
+        now: Instant,
+    ) {
+        if let Some((kind, samples)) = stretch {
+            calc.time_stretch_operation(kind, samples);
         }
+        calc.record_decode_operation(operation, FRAME_SAMPLES, now);
+    }
 
-        // Reset accelerate stats to focus on expand rate
-        stats.network_stats.accelerate_rate = 0;
-        stats.lifetime_stats.removed_samples_for_acceleration = 0;
+    fn run_window(
+        calc: &mut StatisticsCalculator,
+        start: Instant,
+        frames: &[(Operation, Option<(TimeStretchOperation, u64)>)],
+    ) -> Instant {
+        let mut now = start;
+        for &(operation, stretch) in frames {
+            now += Duration::from_millis(10);
+            output_frame(calc, operation, stretch, now);
+        }
+        now
+    }
 
-        // Simulate 2 expand operations (160 samples each)
-        stats.time_stretch_operation(TimeStretchOperation::Expand, 160);
-        stats.time_stretch_operation(TimeStretchOperation::Expand, 160);
+    fn normal_frames(n: usize) -> Vec<(Operation, Option<(TimeStretchOperation, u64)>)> {
+        vec![(Operation::Normal, None); n]
+    }
 
-        // Total: 1600 + 320 = 1920 output samples
-        // Expanded: 320 samples
-        // Expected rate: (320 / 1920) * 16384 = 2730.67 ≈ 2731 (Q14)
-        // Expected UI display: 2731 / 16.384 = 166.7‰
-
-        let expected_q14 = ((320.0 / 1920.0) * 16384.0) as u16;
-        assert_eq!(stats.network_stats.expand_rate, expected_q14);
-
-        // The UI should now show ~166.7‰ instead of 7864.0
-        let ui_display_rate = stats.network_stats.expand_rate as f32 / 16.384;
-        assert!(
-            (ui_display_rate - 166.7).abs() < 1.0,
-            "Expected ~166.7‰, got {ui_display_rate:.1}‰"
-        );
-
-        println!("✅ Expand rate calculation fix verified:");
-        println!("   Q14 value: {}", stats.network_stats.expand_rate);
-        println!("   UI display: {ui_display_rate:.1}‰ (was showing 7864.0)");
+    fn expand_frames(n: usize) -> Vec<(Operation, Option<(TimeStretchOperation, u64)>)> {
+        vec![
+            (
+                Operation::Expand,
+                Some((TimeStretchOperation::Expand, FRAME_SAMPLES))
+            );
+            n
+        ]
     }
 
     #[test]
-    fn test_expand_rate_no_longer_spikes_to_7864() {
-        let mut stats = StatisticsCalculator::new();
+    fn expand_rate_recovers_after_early_expands_once_normal_audio_plays() {
+        let mut calc = StatisticsCalculator::new();
+        let start = calc.last_operation_update;
 
-        // Simulate the scenario: peer starts talking → buffer empty → expansion
-        // This used to cause expand_rate = 7864.0
+        let now = run_window(&mut calc, start, &expand_frames(100));
+        assert_eq!(calc.network_statistics().expand_rate, q14::from_float(1.0));
 
-        // First, some normal operation
-        for _ in 0..5 {
-            stats.time_stretch_operation(TimeStretchOperation::Accelerate, 160);
-        }
-
-        // Reset to focus on expansion
-        stats.network_stats.accelerate_rate = 0;
-        stats.lifetime_stats.removed_samples_for_acceleration = 0;
-
-        // Expansion happens (this used to set expand_rate = 7864.0)
-        stats.time_stretch_operation(TimeStretchOperation::Expand, 480); // 30ms at 16kHz
-
-        // With the fix, the rate should be reasonable
-        let ui_rate = stats.network_stats.expand_rate as f32 / 16.384;
-
-        // Should be much less than the old broken value of 7864.0
-        assert!(
-            ui_rate < 1000.0,
-            "Expand rate still too high: {ui_rate:.1}‰ (was 7864.0)"
+        let mut frames = expand_frames(1);
+        frames.extend(normal_frames(99));
+        let now = run_window(&mut calc, now, &frames);
+        assert_eq!(
+            calc.network_statistics().expand_rate,
+            q14::from_float(0.01),
+            "one expanded audio frame in 100 output audio frames"
         );
 
-        // Should be approximately: (480 / (800 + 480)) * 1000 = 375‰
-        let expected_rate = (480.0 / 1280.0) * 1000.0; // ≈ 375‰
-        assert!(
-            (ui_rate - expected_rate).abs() < 50.0,
-            "Expected ~{expected_rate:.1}‰, got {ui_rate:.1}‰"
+        run_window(&mut calc, now, &normal_frames(100));
+        assert_eq!(calc.network_statistics().expand_rate, 0);
+    }
+
+    #[test]
+    fn expand_rate_stays_high_under_sustained_expand() {
+        let mut calc = StatisticsCalculator::new();
+        let start = calc.last_operation_update;
+
+        let mut frames = normal_frames(10);
+        frames.extend(expand_frames(90));
+        let now = run_window(&mut calc, start, &frames);
+        assert_eq!(calc.network_statistics().expand_rate, q14::from_float(0.9));
+
+        run_window(&mut calc, now, &expand_frames(100));
+        assert_eq!(calc.network_statistics().expand_rate, q14::from_float(1.0));
+    }
+
+    #[test]
+    fn accelerate_rate_is_relative_to_all_output_and_decays() {
+        let mut calc = StatisticsCalculator::new();
+        let start = calc.last_operation_update;
+
+        let mut frames = vec![
+            (
+                Operation::Accelerate,
+                Some((TimeStretchOperation::Accelerate, FRAME_SAMPLES))
+            );
+            10
+        ];
+        frames.extend(normal_frames(90));
+        let now = run_window(&mut calc, start, &frames);
+        assert_eq!(
+            calc.network_statistics().accelerate_rate,
+            q14::from_float(0.1)
         );
 
-        println!("🚀 Bug fix verified: expand rate no longer spikes to 7864.0");
-        println!("   Old broken value: 7864.0‰");
-        println!("   New correct value: {ui_rate:.1}‰");
+        run_window(&mut calc, now, &normal_frames(100));
+        assert_eq!(calc.network_statistics().accelerate_rate, 0);
+    }
+
+    #[test]
+    fn preemptive_rate_is_relative_to_all_output_and_decays() {
+        let mut calc = StatisticsCalculator::new();
+        let start = calc.last_operation_update;
+
+        let mut frames = vec![
+            (
+                Operation::PreemptiveExpand,
+                Some((TimeStretchOperation::PreemptiveExpand, FRAME_SAMPLES))
+            );
+            20
+        ];
+        frames.extend(normal_frames(80));
+        let now = run_window(&mut calc, start, &frames);
+        assert_eq!(
+            calc.network_statistics().preemptive_rate,
+            q14::from_float(0.2)
+        );
+
+        run_window(&mut calc, now, &normal_frames(100));
+        assert_eq!(calc.network_statistics().preemptive_rate, 0);
+    }
+
+    fn mixed_frames(n: usize) -> Vec<(Operation, Option<(TimeStretchOperation, u64)>)> {
+        let mut frames = expand_frames(3 * n);
+        frames.extend(vec![
+            (
+                Operation::Accelerate,
+                Some((TimeStretchOperation::Accelerate, FRAME_SAMPLES))
+            );
+            n
+        ]);
+        frames.extend(vec![
+            (
+                Operation::PreemptiveExpand,
+                Some((TimeStretchOperation::PreemptiveExpand, FRAME_SAMPLES))
+            );
+            n
+        ]);
+        frames
+    }
+
+    #[test]
+    fn rates_are_not_published_from_a_window_split_by_an_output_gap() {
+        let mut calc = StatisticsCalculator::new();
+        let start = calc.last_operation_update;
+
+        let now = run_window(&mut calc, start, &mixed_frames(20));
+        let stats = calc.network_statistics();
+        assert_eq!(stats.expand_rate, q14::from_float(0.6));
+        assert_eq!(stats.accelerate_rate, q14::from_float(0.2));
+        assert_eq!(stats.preemptive_rate, q14::from_float(0.2));
+
+        let now = run_window(&mut calc, now, &mixed_frames(10));
+        let after_gap = now + Duration::from_secs(3);
+        output_frame(
+            &mut calc,
+            Operation::Expand,
+            Some((TimeStretchOperation::Expand, FRAME_SAMPLES)),
+            after_gap,
+        );
+        let stats = calc.network_statistics();
+        assert_eq!(
+            (
+                stats.expand_rate,
+                stats.accelerate_rate,
+                stats.preemptive_rate
+            ),
+            (0, 0, 0),
+            "a window spanning a 3s output gap must not be published"
+        );
+
+        let mut frames = expand_frames(5);
+        frames.extend(normal_frames(95));
+        run_window(&mut calc, after_gap, &frames);
+        assert_eq!(calc.network_statistics().expand_rate, q14::from_float(0.05));
     }
 
     #[test]

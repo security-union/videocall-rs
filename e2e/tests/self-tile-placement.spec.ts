@@ -7,6 +7,7 @@ import {
   MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT,
   RECEIVED_SHARE_VIEW_KEY,
   startScreenShare,
+  stopScreenShare,
 } from "../helpers/screen-share-meeting";
 import { enterTwoUserMeeting } from "../helpers/two-user-meeting";
 import { waitForVisibleState } from "../helpers/visible-state";
@@ -29,6 +30,8 @@ const SHOW_ICON = `button.video-control-button[data-testid="${SHOW_BTN}"]`;
 const TOAST = '.peer-toast.self-view-hidden-toast[role="status"]';
 const TOAST_CLOSE = 'button.toast-close-btn[data-testid="self-view-toast-close"]';
 const SCOPE_TEXT = "Only affects your view — others still see you.";
+/** The self pill of a user who started the meeting: its owner, who holds the host role. */
+const OWNER_SELF_PILL = "You · Host";
 /** The action bar. `position: fixed` at the viewport bottom, so its box is comparable. */
 const DOCK = ".video-controls-container";
 
@@ -363,7 +366,7 @@ test.describe("Self-view placement (issue 66)", () => {
 
       const chip = nav.locator("h4.floating-name.self-tile-name");
       await expect(chip).toHaveCount(1);
-      await expect(chip.locator("span.self-indicator")).toHaveText("You");
+      await expect(chip.locator("span.self-indicator")).toHaveText(OWNER_SELF_PILL);
       await expect(chip.locator("span.floating-name-text")).toHaveText(/\S/);
       await expect(chip.locator("span.floating-name-text")).not.toContainText("(You)");
 
@@ -669,12 +672,7 @@ test.describe("Self-view placement (issue 66)", () => {
       await expect(nav.locator(`[data-testid="${PLACEMENT_BTN}"]`)).toHaveCount(0);
       await expect(nav.locator(`[data-testid="${HIDE_BTN}"]`)).toHaveCount(1);
 
-      const stopButton = hostPage.locator("button.video-control-button", {
-        has: hostPage.locator(".tooltip", { hasText: "Stop Screen Share" }),
-      });
-      await hostPage.locator(".video-controls-container").hover();
-      await expect(stopButton).toBeVisible({ timeout: 15_000 });
-      await stopButton.click();
+      await stopScreenShare(hostPage);
 
       await expect(nav).toHaveAttribute("data-self-placement", "grid", { timeout: 30_000 });
     } finally {
@@ -996,7 +994,9 @@ async function expectSelfNameShown(page: Page, name: string): Promise<void> {
   await expect(button).toHaveAttribute("type", "button");
   await expect(button).toHaveAttribute("aria-label", `Edit display name, ${name}`);
   await expect(button.locator(":scope > span.floating-name-text")).toHaveText(name);
-  await expect(selfNameChip(page).locator(":scope > span.self-indicator")).toHaveText("You");
+  await expect(selfNameChip(page).locator(":scope > span.self-indicator")).toHaveText(
+    OWNER_SELF_PILL,
+  );
 }
 
 /** Click the name and prove the editor opened focused, prefilled and fully selected. */

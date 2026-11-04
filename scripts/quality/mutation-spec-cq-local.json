@@ -1,0 +1,1234 @@
+{
+ "_comment": [
+  "Mutations of the local adapters (#2914 PR-5), each naming the test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-local.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_cq_local.py"
+ ],
+ "baseline_tests": 68,
+ "mutations": [
+  {
+   "name": "probes and bots without --init",
+   "file": "scripts/quality/cq_local.py",
+   "find": "[c.docker, \"run\", \"-d\", \"--init\", *c.run_flags(), \"--stop-timeout\"",
+   "replace": "[c.docker, \"run\", \"-d\", *c.run_flags(), \"--stop-timeout\"",
+   "expect_kills": [
+    "test_probes_run_tsx_under_init_with_their_own_port_token_and_waiver",
+    "test_rust_processes_run_the_bot_image_with_records_ids_and_roster_flags"
+   ]
+  },
+  {
+   "name": "probe stop timeout shortened",
+   "file": "scripts/quality/cq_local.py",
+   "find": "PROBE_STOP_S = 30",
+   "replace": "PROBE_STOP_S = 10",
+   "expect_kills": [
+    "test_probes_run_tsx_under_init_with_their_own_port_token_and_waiver",
+    "test_rust_stops_first_in_one_parallel_stop_then_the_probes"
+   ]
+  },
+  {
+   "name": "probes run through npx",
+   "file": "scripts/quality/cq_local.py",
+   "find": "TSX = \"node_modules/.bin/tsx\"",
+   "replace": "TSX = \"npx\"",
+   "expect_kills": [
+    "test_probes_run_tsx_under_init_with_their_own_port_token_and_waiver"
+   ]
+  },
+  {
+   "name": "control token on the command line",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"--ipc\", \"host\", \"-e\", \"BOT_CTL_TOKEN\",",
+   "replace": "\"--ipc\", \"host\", \"-e\", f\"BOT_CTL_TOKEN={token}\",",
+   "expect_kills": [
+    "test_probes_run_tsx_under_init_with_their_own_port_token_and_waiver"
+   ]
+  },
+  {
+   "name": "one control port for every probe",
+   "file": "scripts/quality/cq_local.py",
+   "find": "port = CTL_PORT_BASE + proc[\"probe_index\"]",
+   "replace": "port = CTL_PORT_BASE",
+   "expect_kills": [
+    "test_probes_run_tsx_under_init_with_their_own_port_token_and_waiver"
+   ]
+  },
+  {
+   "name": "children share the runner's session",
+   "file": "scripts/quality/cq_local.py",
+   "find": "start_new_session=True, env=env or self.env()",
+   "replace": "start_new_session=False, env=env or self.env()",
+   "expect_kills": [
+    "test_probes_run_tsx_under_init_with_their_own_port_token_and_waiver",
+    "test_rust_stops_first_in_one_parallel_stop_then_the_probes"
+   ]
+  },
+  {
+   "name": "leftover containers ignored",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if not runs:\n            return []",
+   "replace": "        if True:\n            return []",
+   "expect_kills": [
+    "test_containers_left_by_another_run_are_refused"
+   ]
+  },
+  {
+   "name": "exit time is the reap time",
+   "file": "scripts/quality/cq_local.py",
+   "find": "return Exit(pid, docker_time(state.get(\"FinishedAt\")), state.get(\"ExitCode\"))",
+   "replace": "return Exit(pid, time.time(), state.get(\"ExitCode\"))",
+   "expect_kills": [
+    "test_exit_times_come_from_finished_at_not_the_reap"
+   ]
+  },
+  {
+   "name": "each process stopped on its own",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            group = [p for p in self.launched if self.procs[p][\"fleet\"] == proc[\"fleet\"]\n                     and p not in self.reported and p not in self.stopping]",
+   "replace": "            group = [pid]",
+   "expect_kills": [
+    "test_rust_stops_first_in_one_parallel_stop_then_the_probes"
+   ]
+  },
+  {
+   "name": "a Rust leave is a SIGKILL",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"kill\", \"--signal\", \"SIGTERM\"",
+   "replace": "\"kill\", \"--signal\", \"SIGKILL\"",
+   "expect_kills": [
+    "test_a_rust_leave_is_a_sigterm_to_its_own_process_only"
+   ]
+  },
+  {
+   "name": "a Rust leave of a shared process allowed",
+   "file": "scripts/quality/cq_local.py",
+   "find": "if action != \"leave\" or set(self.procs[pid][\"participants\"]) - set(event[\"participants\"]):",
+   "replace": "if action != \"leave\":",
+   "expect_kills": [
+    "test_a_rust_leave_is_a_sigterm_to_its_own_process_only"
+   ]
+  },
+  {
+   "name": "joined without a Prometheus report",
+   "file": "scripts/quality/cq_local.py",
+   "find": "if self._in_meeting(pid) and self._prom_reports(uid):",
+   "replace": "if self._in_meeting(pid):",
+   "expect_kills": [
+    "test_a_probe_counts_as_joined_only_once_it_reports_to_prometheus"
+   ]
+  },
+  {
+   "name": "joined without /healthz inMeeting",
+   "file": "scripts/quality/cq_local.py",
+   "find": "if self._in_meeting(pid) and self._prom_reports(uid):",
+   "replace": "if self._prom_reports(uid):",
+   "expect_kills": [
+    "test_a_probe_out_of_the_meeting_is_not_joined"
+   ]
+  },
+  {
+   "name": "a crashed probe still counts as joined",
+   "file": "scripts/quality/cq_local.py",
+   "find": "if rec is None or rec[\"participant\"].get(\"join_ts\") is None or rec.get(\"outcome\") is not None:",
+   "replace": "if rec is None or rec[\"participant\"].get(\"join_ts\") is None:",
+   "expect_kills": [
+    "test_a_probe_counts_as_joined_only_once_it_reports_to_prometheus"
+   ]
+  },
+  {
+   "name": "a down target counts as ready",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            if t.get(\"health\") != \"up\":",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_ready_only_when_every_target_is_up_from_the_targets_api"
+   ]
+  },
+  {
+   "name": "a missing job counts as ready",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if not ts:\n            problems.append",
+   "replace": "        if False:\n            problems.append",
+   "expect_kills": [
+    "test_ready_only_when_every_target_is_up_from_the_targets_api"
+   ]
+  },
+  {
+   "name": "any scrape interval accepted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            if t.get(\"scrapeInterval\") != interval:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_ready_only_when_every_target_is_up_from_the_targets_api"
+   ]
+  },
+  {
+   "name": "readiness from an instant query",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        doc = c.prom_json(\"/api/v1/targets\")\n        problems += targets_problems(doc)",
+   "replace": "        doc = c.prom_json(\"/api/v1/query\", query=\"up\")\n        problems += targets_problems(doc)",
+   "expect_kills": [
+    "test_ready_only_when_every_target_is_up_from_the_targets_api"
+   ]
+  },
+  {
+   "name": "a netem qdisc ignored",
+   "file": "scripts/quality/cq_local.py",
+   "find": "q.get(\"kind\") == \"netem\"]",
+   "replace": "q.get(\"kind\") == \"no-such-kind\"]",
+   "expect_kills": [
+    "test_a_shaped_probe_link_is_refused"
+   ]
+  },
+  {
+   "name": "a shaped link stamped unshaped",
+   "file": "scripts/quality/cq_local.py",
+   "find": "c.netem_applied = None if link else \"none\"",
+   "replace": "c.netem_applied = \"none\"",
+   "expect_kills": [
+    "test_a_shaped_probe_link_is_refused"
+   ]
+  },
+  {
+   "name": "an unverified link stamped unshaped",
+   "file": "scripts/quality/cq_local.py",
+   "find": "BOT_NETEM_APPLIED={c.netem_applied or 'unknown'}",
+   "replace": "BOT_NETEM_APPLIED={c.netem_applied or 'none'}",
+   "expect_kills": [
+    "test_an_unverified_link_is_never_stamped_unshaped"
+   ]
+  },
+  {
+   "name": "room tokens kept in saved logs",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    text = TOKEN_RE.sub(r\"\\1<redacted>\", text)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_logs_are_saved_redacted_and_containers_removed"
+   ]
+  },
+  {
+   "name": "checkout path kept in adapter text",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(self.root, \"$CHECKOUT\")",
+   "replace": "(self.root + \"/nowhere\", \"$CHECKOUT\")",
+   "expect_kills": [
+    "test_logs_are_saved_redacted_and_containers_removed",
+    "test_adapter_errors_name_no_host_path"
+   ]
+  },
+  {
+   "name": "containers left after collect",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            c.sh([c.docker, \"rm\", \"-f\", *ids], DOCKER_S)\n",
+   "replace": "            pass\n",
+   "expect_kills": [
+    "test_logs_are_saved_redacted_and_containers_removed"
+   ]
+  },
+  {
+   "name": "cameras first instead of the bot's spread",
+   "file": "scripts/quality/cq_local.py",
+   "find": "return cameras >= muted or (m + 1) * cameras // muted > m * cameras // muted",
+   "replace": "return m < cameras",
+   "expect_kills": [
+    "test_cameras_sit_where_the_rust_bot_spreads_them"
+   ]
+  },
+  {
+   "name": "talkers count only the process's own",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"--talkers\", str(broadcasters),",
+   "replace": "\"--talkers\", str(len(talkers)),",
+   "expect_kills": [
+    "test_a_leaving_talker_is_a_presenter_in_its_own_process"
+   ]
+  },
+  {
+   "name": "a camera-off talker accepted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if any(not p[\"publishes\"][\"camera\"] for p in talkers):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_rosters_the_bot_cannot_honour_are_refused"
+   ]
+  },
+  {
+   "name": "--broadcasters 0 accepted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if broadcasters == 0:",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_rosters_the_bot_cannot_honour_are_refused"
+   ]
+  },
+  {
+   "name": "poll gives up on the first docker error",
+   "file": "scripts/quality/cq_local.py",
+   "find": "POLL_TRIES = 3",
+   "replace": "POLL_TRIES = 1",
+   "expect_kills": [
+    "test_poll_retries_a_transient_docker_error"
+   ]
+  },
+  {
+   "name": "two samplers allowed",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if n != 1:\n            raise AdapterError(f\"expected exactly one",
+   "replace": "        if n < 1:\n            raise AdapterError(f\"expected exactly one",
+   "expect_kills": [
+    "test_exactly_one_host_sampler_writes_the_csv"
+   ]
+  },
+  {
+   "name": "verdict without its host",
+   "file": "scripts/quality/cq_local.py",
+   "find": "return [dict(verdict, host=c.node)]",
+   "replace": "return [verdict]",
+   "expect_kills": [
+    "test_generator_verdict_is_judged_for_exactly_the_hold_and_names_its_host"
+   ]
+  },
+  {
+   "name": "a failed resource-verdict accepted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if p.returncode not in (0, 1):",
+   "replace": "        if False:",
+   "expect_kills": [
+    "test_generator_verdict_is_judged_for_exactly_the_hold_and_names_its_host"
+   ]
+  },
+  {
+   "name": "alt ports without the overlay",
+   "file": "scripts/quality/cq_local.py",
+   "find": "+ ([COMPOSE_ALT] if self.mode == \"alt\" else [])",
+   "replace": "+ []",
+   "expect_kills": [
+    "test_busy_default_ports_pick_the_alt_overlay_and_busy_alt_ports_refuse"
+   ]
+  },
+  {
+   "name": "busy ports ignored",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            if not problems and not shared:\n",
+   "replace": "            if not shared:\n",
+   "expect_kills": [
+    "test_busy_default_ports_pick_the_alt_overlay_and_busy_alt_ports_refuse"
+   ]
+  },
+  {
+   "name": "gate ignores load1",
+   "file": "scripts/quality/cq_local.py",
+   "find": "ok = not busy and not hot and load1 < GATE_LOAD1",
+   "replace": "ok = not busy and not hot",
+   "expect_kills": [
+    "test_quiet_host_gate"
+   ]
+  },
+  {
+   "name": "unmute sends a mute",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"unmute\": (f\"/bots/{bot}/mute\", {\"mic\": False}, (200,))",
+   "replace": "\"unmute\": (f\"/bots/{bot}/mute\", {\"mic\": True}, (200,))",
+   "expect_kills": [
+    "test_mute_and_unmute_go_through_the_probe_control_api"
+   ]
+  },
+  {
+   "name": "a refused control call confirmed",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            if status not in want:",
+   "replace": "            if False:",
+   "expect_kills": [
+    "test_mute_and_unmute_go_through_the_probe_control_api"
+   ]
+  },
+  {
+   "name": "collect swallows an interrupt",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            except Exception as exc:  # noqa: BLE001 - every step runs; an interrupt still escapes\n",
+   "replace": "            except BaseException as exc:  # noqa: B036\n",
+   "expect_kills": [
+    "test_an_interrupt_is_never_swallowed"
+   ]
+  },
+  {
+   "name": "sampler files kept raw",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            self.ctx.scrub_file(rel)",
+   "replace": "            pass",
+   "expect_kills": [
+    "test_exactly_one_host_sampler_writes_the_csv"
+   ]
+  },
+  {
+   "name": "local-smoke viewport shows every publisher",
+   "file": "scripts/quality/scenarios/local-smoke.yaml",
+   "find": "receive: {pin_video_layer: 0, viewport_visible_count: 3}",
+   "replace": "receive: {pin_video_layer: 0, viewport_visible_count: 4}",
+   "expect_kills": [
+    "test_every_viewport_shows_a_publisher_and_hides_one"
+   ]
+  },
+  {
+   "name": "ci-smoke viewport shows only non-publishers",
+   "file": "scripts/quality/scenarios/ci-smoke.yaml",
+   "find": "receive: {pin_video_layer: 0, viewport_visible_count: 3}",
+   "replace": "receive: {pin_video_layer: 0, viewport_visible_count: 2}",
+   "expect_kills": [
+    "test_every_viewport_shows_a_publisher_and_hides_one"
+   ]
+  },
+  {
+   "name": "local-smoke cameras become talkers",
+   "file": "scripts/quality/scenarios/local-smoke.yaml",
+   "find": "{role: cameras, fleet: rust, count: 2, media: {camera: on, mic: muted, video_layers: 3}}",
+   "replace": "{role: cameras, fleet: rust, count: 2, media: {camera: on, mic: continuous, video_layers: 3}}",
+   "expect_kills": [
+    "test_the_scenarios_compile_to_their_documented_shapes"
+   ]
+  },
+  {
+   "name": "local-smoke hold lengthened",
+   "file": "scripts/quality/scenarios/local-smoke.yaml",
+   "find": "steps: [{id: smoke, hold: 3m, headline: true}]",
+   "replace": "steps: [{id: smoke, hold: 4m, headline: true}]",
+   "expect_kills": [
+    "test_the_scenarios_compile_to_their_documented_shapes"
+   ]
+  },
+  {
+   "name": "local-smoke leave moved earlier",
+   "file": "scripts/quality/scenarios/local-smoke.yaml",
+   "find": "at: hold+90s",
+   "replace": "at: hold+60s",
+   "expect_kills": [
+    "test_the_scenarios_compile_to_their_documented_shapes"
+   ]
+  },
+  {
+   "name": "local-smoke leave by a talker",
+   "file": "scripts/quality/scenarios/local-smoke.yaml",
+   "find": "select: {role: viewers, count: 1}",
+   "replace": "select: {role: talkers, count: 1}",
+   "expect_kills": [
+    "test_the_scenarios_compile_to_their_documented_shapes"
+   ]
+  },
+  {
+   "name": "ci-smoke cameras become talkers",
+   "file": "scripts/quality/scenarios/ci-smoke.yaml",
+   "find": "{role: cameras, fleet: rust, count: 3, media: {camera: on, mic: muted, video_layers: 3}}",
+   "replace": "{role: cameras, fleet: rust, count: 3, media: {camera: on, mic: continuous, video_layers: 3}}",
+   "expect_kills": [
+    "test_the_scenarios_compile_to_their_documented_shapes"
+   ]
+  },
+  {
+   "name": "ci-smoke hold shortened",
+   "file": "scripts/quality/scenarios/ci-smoke.yaml",
+   "find": "hold: 5m",
+   "replace": "hold: 4m",
+   "expect_kills": [
+    "test_the_scenarios_compile_to_their_documented_shapes"
+   ]
+  },
+  {
+   "name": "a later probe does not wait for the owner",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        self._await_owner(proc[\"proc_id\"])\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_later_probe_waits_until_the_owner_is_in_the_meeting"
+   ]
+  },
+  {
+   "name": "the owner counts as in the meeting at once",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        while not self._in_meeting(owner):",
+   "replace": "        while False:",
+   "expect_kills": [
+    "test_a_later_probe_waits_until_the_owner_is_in_the_meeting"
+   ]
+  },
+  {
+   "name": "dumped files left unscrubbed",
+   "file": "scripts/quality/cq_local.py",
+   "find": "json.dump(self.scrub_obj(obj), fh, indent=1)",
+   "replace": "json.dump(obj, fh, indent=1)",
+   "expect_kills": [
+    "test_containers_json_records_state_and_image_and_names_no_host_path"
+   ]
+  },
+  {
+   "name": "targets keep lastError",
+   "file": "scripts/quality/cq_local.py",
+   "find": "keep = (\"health\", \"lastScrape\",",
+   "replace": "keep = (\"health\", \"lastError\", \"lastScrape\",",
+   "expect_kills": [
+    "test_targets_json_keeps_no_host_url"
+   ]
+  },
+  {
+   "name": "containers.json keyed by the slashed name",
+   "file": "scripts/quality/cq_local.py",
+   "find": "names = {n.lstrip(\"/\"): (proc, image) for",
+   "replace": "names = {n: (proc, image) for",
+   "expect_kills": [
+    "test_containers_json_records_state_and_image_and_names_no_host_path"
+   ]
+  },
+  {
+   "name": "containers.json without the image",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"FinishedAt\", \"Error\")}, Image=image)",
+   "replace": "\"FinishedAt\", \"Error\")})",
+   "expect_kills": [
+    "test_containers_json_records_state_and_image_and_names_no_host_path"
+   ]
+  },
+  {
+   "name": "--stack up adopts a running project",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            if c.stack_mode == \"up\" and ours:\n",
+   "replace": "            if False:\n",
+   "expect_kills": [
+    "test_up_never_adopts_or_runs_beside_an_e2e_stack_of_this_checkout",
+    "test_up_never_adopts_a_stopped_project"
+   ]
+  },
+  {
+   "name": "a project from another checkout counts as mine",
+   "file": "scripts/quality/cq_local.py",
+   "find": "mine = any(r[2] == \"running\" for r in ours) and all(self._here(r[1]) for r in ours)",
+   "replace": "mine = any(r[2] == \"running\" for r in ours)",
+   "expect_kills": [
+    "test_a_stack_from_another_checkout_is_never_mine"
+   ]
+  },
+  {
+   "name": "--stack reuse takes a project that is not mine",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            elif c.stack_mode == \"reuse\" and not mine:\n",
+   "replace": "            elif False:\n",
+   "expect_kills": [
+    "test_a_stack_from_another_checkout_is_never_mine"
+   ]
+  },
+  {
+   "name": "up adopts a project started after preflight",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if self._project_running(c.project, stopped=True):\n            raise",
+   "replace": "        if False:\n            raise",
+   "expect_kills": [
+    "test_a_stack_that_appears_before_up_is_neither_adopted_nor_taken_down"
+   ]
+  },
+  {
+   "name": "down takes down a stack it did not start",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if not self.owned:\n            return\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_stack_that_appears_before_up_is_neither_adopted_nor_taken_down",
+    "test_reuse_starts_nothing_waits_briefly_and_never_takes_the_stack_down"
+   ]
+  },
+  {
+   "name": "anonymous volumes left at down",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            c.sh(c.compose(\"rm\", \"-s\", \"-f\", \"-v\"), DOWN_S, env=c.compose_env())\n",
+   "replace": "            pass\n",
+   "expect_kills": [
+    "test_compose_up_and_down_argv_and_pinned_env"
+   ]
+  },
+  {
+   "name": "compose rm keeps anonymous volumes",
+   "file": "scripts/quality/cq_local.py",
+   "find": "c.compose(\"rm\", \"-s\", \"-f\", \"-v\")",
+   "replace": "c.compose(\"rm\", \"-s\", \"-f\")",
+   "expect_kills": [
+    "test_compose_up_and_down_argv_and_pinned_env"
+   ]
+  },
+  {
+   "name": "compose env not pinned",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"1\" if self.settings.release else \"0\", **PINNED_ENV)",
+   "replace": "\"1\" if self.settings.release else \"0\")",
+   "expect_kills": [
+    "test_compose_up_and_down_argv_and_pinned_env"
+   ]
+  },
+  {
+   "name": "reuse waits the full up budget",
+   "file": "scripts/quality/cq_local.py",
+   "find": "self._wait_ready(READY_S if mode == \"up\" else READY_REUSE_S)",
+   "replace": "self._wait_ready(READY_S)",
+   "expect_kills": [
+    "test_reuse_starts_nothing_waits_briefly_and_never_takes_the_stack_down"
+   ]
+  },
+  {
+   "name": "release_build from the settings",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"release_build\": {frozenset({\"1\"}): True, frozenset({\"0\"}): False}.get(frozenset(release)),",
+   "replace": "\"release_build\": c.settings.release,",
+   "expect_kills": [
+    "test_compose_json_reads_the_stack_env_and_logs_start_at_up"
+   ]
+  },
+  {
+   "name": "service logs from the container's start",
+   "file": "scripts/quality/cq_local.py",
+   "find": "since = [] if self.since is None else",
+   "replace": "since = [] if True else",
+   "expect_kills": [
+    "test_compose_json_reads_the_stack_env_and_logs_start_at_up"
+   ]
+  },
+  {
+   "name": "docker OS not recorded",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"docker_os\": info.stdout.strip() if info.returncode == 0 else None",
+   "replace": "\"docker_os\": None",
+   "expect_kills": [
+    "test_compose_json_reads_the_stack_env_and_logs_start_at_up"
+   ]
+  },
+  {
+   "name": "a dirty build under the clean tag",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    return BOT_IMAGE.format((commit or \"unknown\")[:12]) + (\"-dirty\" if dirty else \"\")",
+   "replace": "    return BOT_IMAGE.format((commit or \"unknown\")[:12])",
+   "expect_kills": [
+    "test_a_dirty_tree_always_builds_under_a_dirty_tag"
+   ]
+  },
+  {
+   "name": "a dirty build labelled clean",
+   "file": "scripts/quality/cq_local.py",
+   "find": "tree = \"dirty\" if c.dirty else \"clean\"",
+   "replace": "tree = \"clean\"",
+   "expect_kills": [
+    "test_a_dirty_tree_always_builds_under_a_dirty_tag"
+   ]
+  },
+  {
+   "name": "an image reused on its revision alone",
+   "file": "scripts/quality/cq_local.py",
+   "find": "p.stdout.strip() != f\"{c.commit}\\tclean\"",
+   "replace": "p.stdout.strip().split(\"\\t\")[0] != c.commit",
+   "expect_kills": [
+    "test_a_clean_tree_reuses_only_a_clean_image_of_its_commit"
+   ]
+  },
+  {
+   "name": "a dirty tree read as clean",
+   "file": "scripts/quality/cq_local.py",
+   "find": "                       DOCKER_S).stdout.strip() != \"\"",
+   "replace": "                       DOCKER_S).stdout.strip() == \"never\"",
+   "expect_kills": [
+    "test_a_dirty_tree_always_builds_under_a_dirty_tag"
+   ]
+  },
+  {
+   "name": "the current bot image pruned",
+   "file": "scripts/quality/cq_local.py",
+   "find": "if t.startswith(BOT_IMAGE.format(\"\")) and t != c.bot_image\n",
+   "replace": "if t.startswith(BOT_IMAGE.format(\"\"))\n",
+   "expect_kills": [
+    "test_cq_tags_older_than_a_day_are_pruned_and_the_current_one_kept"
+   ]
+  },
+  {
+   "name": "non-cq bot tags pruned",
+   "file": "scripts/quality/cq_local.py",
+   "find": "                      if t.startswith(BOT_IMAGE.format(\"\")) and t != c.bot_image\n",
+   "replace": "                      if t != c.bot_image\n",
+   "expect_kills": [
+    "test_cq_tags_older_than_a_day_are_pruned_and_the_current_one_kept"
+   ]
+  },
+  {
+   "name": "dangling bot images kept",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        c.sh([c.docker, \"image\", \"prune\", \"-f\", \"--filter\", f\"label={TREE_LABEL}\"], DOCKER_S, check=False)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_cq_tags_older_than_a_day_are_pruned_and_the_current_one_kept"
+   ]
+  },
+  {
+   "name": "collect stops at a step's TimeoutExpired",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            except Exception as exc:  # noqa: BLE001 - every step runs; an interrupt still escapes\n",
+   "replace": "            except (AdapterError, OSError, ValueError) as exc:\n",
+   "expect_kills": [
+    "test_a_step_that_fails_in_collect_never_skips_the_others"
+   ]
+  },
+  {
+   "name": "containers removed only when saving succeeded",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        try:\n            self._save_container_files(ids)\n        finally:\n",
+   "replace": "        try:\n            self._save_container_files(ids)\n        except BaseException:\n            raise\n        else:\n",
+   "expect_kills": [
+    "test_a_failed_log_save_still_saves_the_others_and_removes_the_containers"
+   ]
+  },
+  {
+   "name": "one failed log save skips the rest",
+   "file": "scripts/quality/cq_local.py",
+   "find": "                problems.append(f\"{proc} log: {describe(exc)}\")\n",
+   "replace": "                raise\n",
+   "expect_kills": [
+    "test_a_failed_log_save_still_saves_the_others_and_removes_the_containers"
+   ]
+  },
+  {
+   "name": "JWTs kept",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    return JWT_RE.sub(\"<jwt>\", text)",
+   "replace": "    return text",
+   "expect_kills": [
+    "test_logs_are_saved_redacted_and_containers_removed"
+   ]
+  },
+  {
+   "name": "the home folder kept",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(os.path.expanduser(\"~\"), \"~\")",
+   "replace": "(None, \"~\")",
+   "expect_kills": [
+    "test_the_home_folder_is_scrubbed_to_a_tilde"
+   ]
+  },
+  {
+   "name": "UI and meeting-api status ignored",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            if status != 200:\n                problems.append(f\"{name} answered {status}\")",
+   "replace": "            if False:\n                problems.append(f\"{name} answered {status}\")",
+   "expect_kills": [
+    "test_the_ui_and_meeting_api_must_answer_200"
+   ]
+  },
+  {
+   "name": "UI readiness on another path",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(\"UI\", f\"http://localhost:{ports['ui']}/\")",
+   "replace": "(\"UI\", f\"http://localhost:{ports['ui']}/version\")",
+   "expect_kills": [
+    "test_the_ui_and_meeting_api_must_answer_200"
+   ]
+  },
+  {
+   "name": "meeting-api readiness on another path",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(\"meeting-api\", f\"http://localhost:{ports['api']}/version\")",
+   "replace": "(\"meeting-api\", f\"http://localhost:{ports['api']}/\")",
+   "expect_kills": [
+    "test_the_ui_and_meeting_api_must_answer_200"
+   ]
+  },
+  {
+   "name": "stale-label ps without -a",
+   "file": "scripts/quality/cq_local.py",
+   "find": "[c.docker, \"ps\", \"-a\", \"--filter\", f\"label={LABEL}\", \"--format\"",
+   "replace": "[c.docker, \"ps\", \"--filter\", f\"label={LABEL}\", \"--format\"",
+   "expect_kills": [
+    "test_containers_left_by_another_run_are_refused"
+   ]
+  },
+  {
+   "name": "inspect swallows a daemon error",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if p.returncode != 0 and not out and \"no such\" not in p.stderr.lower():\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_inspect_raises_on_a_daemon_error_but_not_on_a_missing_container"
+   ]
+  },
+  {
+   "name": "inspect raises on a missing container",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if p.returncode != 0 and not out and \"no such\" not in p.stderr.lower():\n",
+   "replace": "        if p.returncode != 0 and not out:\n",
+   "expect_kills": [
+    "test_inspect_raises_on_a_daemon_error_but_not_on_a_missing_container"
+   ]
+  },
+  {
+   "name": "a container still running after stop accepted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if st.get(\"Running\"):\n            raise AdapterError(f\"{pid} is still running after docker stop\")",
+   "replace": "        if False:\n            raise AdapterError(f\"{pid} is still running after docker stop\")",
+   "expect_kills": [
+    "test_a_container_still_running_after_docker_stop_is_an_error"
+   ]
+  },
+  {
+   "name": "a project of another checkout accepted",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if dirs and {os.path.realpath(d) for d in dirs} != {want}:\n",
+   "replace": "        if False:\n",
+   "expect_kills": [
+    "test_stopped_containers_of_another_checkout_are_refused"
+   ]
+  },
+  {
+   "name": "the stamps fallback unlabelled",
+   "file": "scripts/quality/cq_local.py",
+   "find": "[c.docker, \"run\", \"--rm\", \"--label\", f\"{LABEL}={c.run_id}\", \"--user\", \"0\"",
+   "replace": "[c.docker, \"run\", \"--rm\", \"--user\", \"0\"",
+   "expect_kills": [
+    "test_every_container_carries_the_run_label"
+   ]
+  },
+  {
+   "name": "every camera counts for the layer filter",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "layered = [p for p in cams if (procs[p[\"process\"]].get(\"video_layers\") or 0) > 1]",
+   "replace": "layered = cams",
+   "expect_kills": [
+    "test_a_viewport_that_cannot_exercise_both_filters_is_warned_about"
+   ]
+  },
+  {
+   "name": "a layer-filter exemption ignored",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "if \"relay_layer_filtered_total\" not in exempt and len(peers)",
+   "replace": "if len(peers)",
+   "expect_kills": [
+    "test_a_viewport_that_cannot_exercise_both_filters_is_warned_about"
+   ]
+  },
+  {
+   "name": "a viewport showing every camera not warned",
+   "file": "scripts/quality/cq_scenario.py",
+   "find": "if \"relay_viewport_filtered_total\" not in exempt and shown >= len(cams):",
+   "replace": "if False:",
+   "expect_kills": [
+    "test_a_viewport_that_cannot_exercise_both_filters_is_warned_about"
+   ]
+  },
+  {
+   "name": "compile warnings not printed",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "    for warning in cq_scenario.viewport_warnings(plan):\n",
+   "replace": "    for warning in []:\n",
+   "expect_kills": [
+    "test_the_cli_warns_at_compile_and_passes_the_stack_mode_to_the_adapters"
+   ]
+  },
+  {
+   "name": "the stack mode not passed to the adapters",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "run_id, root)\n        stack, fleet = factory(plan, run_dir, args.stack)",
+   "replace": "run_id, root)\n        stack, fleet = factory(plan, run_dir)",
+   "expect_kills": [
+    "test_the_cli_warns_at_compile_and_passes_the_stack_mode_to_the_adapters"
+   ]
+  },
+  {
+   "name": "up beside an e2e stack of this checkout",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            if project in E2E_PROJECTS:\n",
+   "replace": "            if False:\n",
+   "expect_kills": [
+    "test_up_never_adopts_or_runs_beside_an_e2e_stack_of_this_checkout"
+   ]
+  },
+  {
+   "name": "up beside a dev stack of this checkout without a release build",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            elif not c.settings.release:\n",
+   "replace": "            elif False:\n",
+   "expect_kills": [
+    "test_beside_a_dev_stack_of_this_checkout_up_needs_a_release_build"
+   ]
+  },
+  {
+   "name": "a release build still refused beside a dev stack",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            elif not c.settings.release:\n",
+   "replace": "            else:\n",
+   "expect_kills": [
+    "test_beside_a_dev_stack_of_this_checkout_up_needs_a_release_build"
+   ]
+  },
+  {
+   "name": "same-checkout stacks not checked",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        shared = self._shared_here(rows) if c.stack_mode == \"up\" else []\n",
+   "replace": "        shared = []\n",
+   "expect_kills": [
+    "test_up_never_adopts_or_runs_beside_an_e2e_stack_of_this_checkout",
+    "test_beside_a_dev_stack_of_this_checkout_up_needs_a_release_build"
+   ]
+  },
+  {
+   "name": "a stopped same-checkout stack counts as sharing",
+   "file": "scripts/quality/cq_local.py",
+   "find": "{r[0] for r in rows if r[2] not in (\"exited\", \"dead\") and self._here(r[1])}",
+   "replace": "{r[0] for r in rows if self._here(r[1])}",
+   "expect_kills": [
+    "test_up_never_adopts_a_stopped_project"
+   ]
+  },
+  {
+   "name": "stopped containers hidden from preflight",
+   "file": "scripts/quality/cq_local.py",
+   "find": "[c.docker, \"ps\", \"-a\", \"--format\", '{{.Label \"com.docker.compose.project\"}}\\t'",
+   "replace": "[c.docker, \"ps\", \"--format\", '{{.Label \"com.docker.compose.project\"}}\\t'",
+   "expect_kills": [
+    "test_up_never_adopts_a_stopped_project"
+   ]
+  },
+  {
+   "name": "a paused, restarting or created same-checkout stack ignored",
+   "file": "scripts/quality/cq_local.py",
+   "find": "r[2] not in (\"exited\", \"dead\") and self._here(r[1])",
+   "replace": "r[2] == \"running\" and self._here(r[1])",
+   "expect_kills": [
+    "test_up_refuses_beside_a_paused_restarting_or_created_stack_of_this_checkout"
+   ]
+  },
+  {
+   "name": "a dead same-checkout stack counts as sharing",
+   "file": "scripts/quality/cq_local.py",
+   "find": "r[2] not in (\"exited\", \"dead\")",
+   "replace": "r[2] not in (\"exited\",)",
+   "expect_kills": [
+    "test_up_refuses_beside_a_paused_restarting_or_created_stack_of_this_checkout"
+   ]
+  },
+  {
+   "name": "a stopped project counts as mine for reuse",
+   "file": "scripts/quality/cq_local.py",
+   "find": "mine = any(r[2] == \"running\" for r in ours) and",
+   "replace": "mine = bool(ours) and",
+   "expect_kills": [
+    "test_up_never_adopts_a_stopped_project"
+   ]
+  },
+  {
+   "name": "the reuse hint for a stack that is not mine",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(\"pass --stack reuse or remove it\" if mine else \"remove it\")",
+   "replace": "\"pass --stack reuse or remove it\"",
+   "expect_kills": [
+    "test_up_never_adopts_a_stopped_project"
+   ]
+  },
+  {
+   "name": "up rechecks running containers only",
+   "file": "scripts/quality/cq_local.py",
+   "find": "self._project_running(c.project, stopped=True)",
+   "replace": "self._project_running(c.project)",
+   "expect_kills": [
+    "test_a_stack_that_appears_before_up_is_neither_adopted_nor_taken_down"
+   ]
+  },
+  {
+   "name": "up writes the dev cert before its recheck",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            self._refuse_new_stacks()\n            c.sh([\"bash\", \"scripts/regen-dev-cert.sh\"], CERT_S)\n",
+   "replace": "            c.sh([\"bash\", \"scripts/regen-dev-cert.sh\"], CERT_S)\n",
+   "expect_kills": [
+    "test_up_writes_nothing_shared_beside_a_stack_that_appeared_after_preflight"
+   ]
+  },
+  {
+   "name": "up does not recheck after the cert step",
+   "file": "scripts/quality/cq_local.py",
+   "find": "CERT_S)\n            self._refuse_new_stacks()\n",
+   "replace": "CERT_S)\n",
+   "expect_kills": [
+    "test_up_writes_nothing_shared_beside_a_stack_that_appeared_after_preflight"
+   ]
+  },
+  {
+   "name": "up clears the stamps before its recheck",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            self._refuse_new_stacks()\n            self._clear_stamps()\n",
+   "replace": "            self._clear_stamps()\n            self._refuse_new_stacks()\n",
+   "expect_kills": [
+    "test_up_writes_nothing_shared_beside_a_stack_that_appeared_after_preflight"
+   ]
+  },
+  {
+   "name": "up rechecks only its own project",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        shared = self._shared_here(self._containers())\n        if shared:\n",
+   "replace": "        shared = []\n        if shared:\n",
+   "expect_kills": [
+    "test_up_writes_nothing_shared_beside_a_stack_that_appeared_after_preflight"
+   ]
+  },
+  {
+   "name": "up owns the stack before its recheck",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if mode == \"up\":\n            self._refuse_new_stacks()\n",
+   "replace": "        if mode == \"up\":\n            self.owned = True\n            self._refuse_new_stacks()\n",
+   "expect_kills": [
+    "test_up_writes_nothing_shared_beside_a_stack_that_appeared_after_preflight"
+   ]
+  },
+  {
+   "name": "reuse takes a stopped project",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        elif not self._project_running(c.project):\n",
+   "replace": "        elif not self._project_running(c.project, stopped=True):\n",
+   "expect_kills": [
+    "test_reuse_refuses_a_stopped_project"
+   ]
+  },
+  {
+   "name": "a fresh cq tag pruned",
+   "file": "scripts/quality/cq_local.py",
+   "find": "                      and time.time() - image_created(created) > PRUNE_AGE_S})",
+   "replace": "})",
+   "expect_kills": [
+    "test_cq_tags_older_than_a_day_are_pruned_and_the_current_one_kept"
+   ]
+  },
+  {
+   "name": "CreatedAt read in local time",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"%Y-%m-%d %H:%M:%S %z\").timestamp()",
+   "replace": "\"%Y-%m-%d %H:%M:%S %z\").replace(tzinfo=None).timestamp()",
+   "expect_kills": [
+    "test_cq_tags_older_than_a_day_are_pruned_and_the_current_one_kept"
+   ]
+  },
+  {
+   "name": "images without the bot tag",
+   "file": "scripts/quality/cq_local.py",
+   "find": "rust_bot=f\"{bot} ({c.bot_image})\")",
+   "replace": "rust_bot=bot)",
+   "expect_kills": [
+    "test_images_name_the_bot_tag_so_a_dirty_build_shows"
+   ]
+  },
+  {
+   "name": "serve mode read from the env alone",
+   "file": "scripts/quality/cq_local.py",
+   "find": "return \"static\" if ui_env.get(\"VIDEOCALL_RELEASE_BUILD\") == \"1\" else",
+   "replace": "return",
+   "expect_kills": [
+    "test_compose_json_reads_the_stack_env_and_logs_start_at_up"
+   ]
+  },
+  {
+   "name": "host substitution before redaction (#3108 item 1)",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        text = redact(text, self.secrets())\n        subs = [",
+   "replace": "        subs = [",
+   "expect_kills": [
+    "test_redaction_runs_before_host_substitution_so_a_host_name_cannot_split_a_token"
+   ]
+  },
+  {
+   "name": "JSON token form missed (#3108 item 2)",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(?:=|%3D|\\\"\\s*:\\s*\\\"))",
+   "replace": "(?:=|%3D))",
+   "expect_kills": [
+    "test_token_patterns_cover_json_url_encoded_and_any_case_bearer"
+   ]
+  },
+  {
+   "name": "URL-encoded token form missed (#3108 item 2)",
+   "file": "scripts/quality/cq_local.py",
+   "find": "(?:=|%3D|\\\"\\s*:\\s*\\\"))",
+   "replace": "(?:=|\\\"\\s*:\\s*\\\"))",
+   "expect_kills": [
+    "test_token_patterns_cover_json_url_encoded_and_any_case_bearer"
+   ]
+  },
+  {
+   "name": "lower-case bearer missed (#3108 item 2)",
+   "file": "scripts/quality/cq_local.py",
+   "find": "BEARER_RE = re.compile(r\"(Bearer\\s+)[A-Za-z0-9._~+/=-]+\", re.IGNORECASE)",
+   "replace": "BEARER_RE = re.compile(r\"(Bearer\\s+)[A-Za-z0-9._~+/=-]+\")",
+   "expect_kills": [
+    "test_token_patterns_cover_json_url_encoded_and_any_case_bearer"
+   ]
+  },
+  {
+   "name": "the skip-paint flag is dropped",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    return ([\"--skip-canvas-paint\", \"true\"] if proc.get(\"skip_canvas_paint\") else []) + (",
+   "replace": "    return [] + (",
+   "expect_kills": [
+    "test_a_probe_skips_paint_and_diag_packets_only_when_its_plan_says_so"
+   ]
+  },
+  {
+   "name": "the diag-packets flag is dropped",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        [\"--diag-packets\", \"off\"] if proc.get(\"diag_packets\") == \"off\" else []) + (",
+   "replace": "        []) + (",
+   "expect_kills": [
+    "test_a_probe_skips_paint_and_diag_packets_only_when_its_plan_says_so"
+   ]
+  },
+  {
+   "name": "local probes get no posture flags",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        argv += probe_flags(proc)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_probe_skips_paint_and_diag_packets_only_when_its_plan_says_so"
+   ]
+  },
+  {
+   "name": "the Rust diagnostics flag is dropped",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    return [\"--diagnostics\", plan[\"bot_diagnostics\"]]",
+   "replace": "    return []",
+   "expect_kills": [
+    "test_rust_bots_are_told_the_plans_diagnostics_value_either_way"
+   ]
+  },
+  {
+   "name": "an on plan is left to the bot's default",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    return [\"--diagnostics\", plan[\"bot_diagnostics\"]]",
+   "replace": "    return [\"--diagnostics\", \"off\"] if plan.get(\"bot_diagnostics\") == \"off\" else []",
+   "expect_kills": [
+    "test_rust_bots_are_told_the_plans_diagnostics_value_either_way"
+   ]
+  },
+  {
+   "name": "the plan's diagnostics value is ignored",
+   "file": "scripts/quality/cq_local.py",
+   "find": "    return [\"--diagnostics\", plan[\"bot_diagnostics\"]]",
+   "replace": "    return [\"--diagnostics\", \"off\"]",
+   "expect_kills": [
+    "test_rust_bots_are_told_the_plans_diagnostics_value_either_way"
+   ]
+  },
+  {
+   "name": "local Rust bots get no diagnostics flag",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"--deadline\", str(self._deadline()), *rust_flags(c.plan),",
+   "replace": "\"--deadline\", str(self._deadline()),",
+   "expect_kills": [
+    "test_rust_bots_are_told_the_plans_diagnostics_value_either_way"
+   ]
+  },
+  {
+   "name": "the speaking-glow flag is dropped",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        [\"--speaking-glow\", \"off\"] if proc.get(\"speaking_glow\") == \"off\" else [])",
+   "replace": "        [])",
+   "expect_kills": [
+    "test_a_probe_skips_paint_and_diag_packets_only_when_its_plan_says_so"
+   ]
+  },
+  {
+   "name": "local Rust bots log at plain info",
+   "file": "scripts/quality/cq_local.py",
+   "find": "            \"-e\", f\"RUST_LOG={RUST_LOG}\", \"-w\", \"/rust\",",
+   "replace": "            \"-e\", \"RUST_LOG=info\", \"-w\", \"/rust\",",
+   "expect_kills": [
+    "test_rust_bots_log_like_the_remote_runner"
+   ]
+  },
+  {
+   "name": "local probes get no --deadline",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"--deadline\", str(self._deadline()), \"--manifest\", \"\",\n            \"--assets-dir\", \"/out\",",
+   "replace": "\"--manifest\", \"\",\n            \"--assets-dir\", \"/out\",",
+   "expect_kills": [
+    "test_every_bot_and_probe_gets_one_deadline_a_ttl_after_the_first_launch"
+   ]
+  },
+  {
+   "name": "local Rust bots get no --deadline",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"--duration\", f\"{self._ttl_s()}s\", \"--deadline\", str(self._deadline()), *rust_flags(c.plan),",
+   "replace": "\"--duration\", f\"{self._ttl_s()}s\", *rust_flags(c.plan),",
+   "expect_kills": [
+    "test_every_bot_and_probe_gets_one_deadline_a_ttl_after_the_first_launch"
+   ]
+  },
+  {
+   "name": "each local launch gets its own deadline",
+   "file": "scripts/quality/cq_local.py",
+   "find": "        if self.run_end is None:\n            self.run_end = int(time.time()) + self._ttl_s()\n        return self.run_end\n",
+   "replace": "        return int(time.time()) + self._ttl_s()\n",
+   "expect_kills": [
+    "test_every_bot_and_probe_gets_one_deadline_a_ttl_after_the_first_launch"
+   ]
+  },
+  {
+   "name": "the sampler is not told the probe's command line",
+   "file": "scripts/quality/cq_local.py",
+   "find": "\"--cmdline-grep\", PROBE_NODE_CMDLINE, \"--cmdline-name\", PROBE_NODE_COMM,\n                 ",
+   "replace": "",
+   "expect_kills": [
+    "test_the_host_sampler_names_a_probes_node_process_by_its_command_line"
+   ]
+  },
+  {
+   "name": "podman's command line counts as the probe",
+   "file": "scripts/quality/cq_local.py",
+   "find": "PROBE_NODE_CMDLINE = r\"^(/[^ ]*/)?node( --(import|require)[= ][^ ]+)* bots-app/src/cli\\.ts run( |$)\"",
+   "replace": "PROBE_NODE_CMDLINE = r\"(/[^ ]*/)?node( --(import|require)[= ][^ ]+)* bots-app/src/cli\\.ts run( |$)\"",
+   "expect_kills": [
+    "test_the_host_sampler_names_a_probes_node_process_by_its_command_line"
+   ]
+  },
+  {
+   "name": "any node tool running cli.ts counts as the probe",
+   "file": "scripts/quality/cq_local.py",
+   "find": "PROBE_NODE_CMDLINE = r\"^(/[^ ]*/)?node( --(import|require)[= ][^ ]+)* bots-app/src/cli\\.ts run( |$)\"",
+   "replace": "PROBE_NODE_CMDLINE = r\"^(/[^ ]*/)?node .*bots-app/src/cli\\.ts run( |$)\"",
+   "expect_kills": [
+    "test_the_host_sampler_names_a_probes_node_process_by_its_command_line"
+   ]
+  },
+  {
+   "name": "the probe's run subcommand is not checked",
+   "file": "scripts/quality/cq_local.py",
+   "find": "PROBE_NODE_CMDLINE = r\"^(/[^ ]*/)?node( --(import|require)[= ][^ ]+)* bots-app/src/cli\\.ts run( |$)\"",
+   "replace": "PROBE_NODE_CMDLINE = r\"^(/[^ ]*/)?node( --(import|require)[= ][^ ]+)* bots-app/src/cli\\.ts\"",
+   "expect_kills": [
+    "test_the_host_sampler_names_a_probes_node_process_by_its_command_line"
+   ]
+  },
+  {
+   "name": "the sampler matches the probe's argv[0] only",
+   "file": "e2e/bots-app/scripts/resource-sampler.sh",
+   "find": "[[ \"${args[*]-}\" =~ $CMDLINE_GREP ]]",
+   "replace": "[[ \"${args[0]-}\" =~ $CMDLINE_GREP ]]",
+   "expect_kills": [
+    "test_the_host_sampler_names_a_probes_node_process_by_its_command_line"
+   ]
+  },
+  {
+   "name": "the sampler's cmdline reader loops on a stale argument after a read error",
+   "file": "e2e/bots-app/scripts/resource-sampler.sh",
+   "find": "  while IFS= read -r -d '' arg; do\n    args+=(\"$arg\")\n    arg=\"\"\n  done\n",
+   "replace": "  while IFS= read -r -d '' arg || [ -n \"$arg\" ]; do\n    args+=(\"$arg\")\n  done\n",
+   "expect_kills": [
+    "test_the_samplers_cmdline_reader_ends_on_a_read_error_without_repeating_an_argument"
+   ]
+  }
+ ]
+}

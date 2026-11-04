@@ -15,7 +15,7 @@ import { BUDGET } from "../helpers/rust-mirrored-constants";
  * build too, so the injected FPS is MILD (Down fires, recovery cannot) and DENSE,
  * and the witness below must have NO preceding `dir=growth`.
  *
- * Needs MOCK_PEERS_ENABLED + `make e2e-up-impair`, so UNTAGGED. WebSocket only.
+ * Needs MOCK_PEERS_ENABLED + `make e2e-up-impair`. WebSocket only.
  */
 
 const USER_EMAIL = "budget-rearm@videocall.rs";
@@ -49,7 +49,7 @@ test.describe("Decode-budget cascade re-arm on fast reconnect (#2271)", () => {
     await waitForServices();
   });
 
-  test("a reconnect that never emits Failed re-arms the cascade", async ({ baseURL }) => {
+  test("a reconnect that never emits Failed re-arms the cascade @impair", async ({ baseURL }) => {
     test.setTimeout(300_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_budget_rearm_${Date.now()}`;

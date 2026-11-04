@@ -20,6 +20,16 @@ export async function installMediaSocketRecorder(context: BrowserContext): Promi
   await context.addInitScript(RECORDER_INIT_SCRIPT);
 }
 
+/** URLs of the page's open `/lobby` sockets, in creation order. */
+export async function liveMediaSocketUrls(page: Page): Promise<string[]> {
+  return page.evaluate((key) => {
+    const sockets = (window as unknown as Record<string, WebSocket[] | undefined>)[key] ?? [];
+    return sockets
+      .filter((ws) => ws.readyState === 1 && ws.url.includes("/lobby"))
+      .map((ws) => ws.url);
+  }, RECORDER_KEY);
+}
+
 export interface SeverResult {
   recorded: number;
   severed: number;

@@ -70,8 +70,9 @@
             data-type="worker"
             data-cargo-features="wasm"
             data-cargo-no-default-features
-            data-loader-shim
         />
+        <!-- Own loader (not trunk's shim) so a wasm load failure reaches Worker.onerror (#3210). -->
+        <link data-trunk rel="copy-file" href="../videocall-codecs/src/bin/worker_decoder_loader.js" />
         <!-- Runtime link so the wasm decoder can find the built worker URL -->
         <link id="codecs-worker" href="/worker_decoder_loader.js" />
         <!-- NetEq worker -->
@@ -83,8 +84,8 @@
         data-type="worker"
         data-cargo-features="web"
         data-cargo-no-default-features
-        data-loader-shim
         />
+        <link data-trunk rel="copy-file" href="../neteq/src/bin/neteq_worker_loader.js" />
         <link id="neteq-worker" href="/neteq_worker_loader.js" />
 
         <!-- WebTransport session worker (#2728): owns the QUIC session so a

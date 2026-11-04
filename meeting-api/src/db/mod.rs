@@ -13,6 +13,7 @@
 
 //! Database query modules.
 
+pub mod avatars;
 pub mod co_hosts;
 pub mod meetings;
 pub mod oauth;

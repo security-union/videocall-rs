@@ -4,28 +4,28 @@ import {
   createAuthenticatedContext,
   pinWebSocketTransport,
 } from "../helpers/auth-context";
+import { ELECTION_STARVED_GRACE_MS } from "../helpers/rust-mirrored-constants";
+import { setRuntimeConfig } from "../helpers/runtime-config";
 
 /**
  * The relay echoes an RTT probe back byte-identical (`ws_chat_session.rs`
  * writes back the bytes it was handed, with no relay-side stamping), and
  * WebSocket has no datagram concept so the probe travels as one binary frame.
- * Untagged on purpose: this drives a ~10s famine and is not smoke-test material,
+ * WebTransport is switched off so the starved WebSocket candidate is the only
+ * one; with it on, a WebSocket-preferred join falls back to WebTransport.
+ * Untagged on purpose: this drives a ~15s famine and is not smoke-test material,
  * so it runs under `--project=dioxus` only, never in the per-PR `@bvt` sweep.
  */
 
 const UI_URL = "http://localhost:3001";
 
-const RETRY_LINE = /retrying the scan in \d+ms \(retry (\d)\/3\)/;
-// The TERMINAL give-up: `error!("Election failed: …")` also fires on every retried
-// round. Pinned by `only_the_terminal_round_emits_an_election_decision`.
 const TERMINAL_FAILURE_LINE = /Election decision:.*outcome=failed/;
-const ELECTION_START_LINE = /Starting connection election for/;
-const LIVE_BUT_STARVED_LINE = /Election candidate:.*is_connected=true rtt_samples=0/;
+const ELECTION_START_LINE = /Starting connection election: preferred=ws preferred_timeout_ms=(\d+)/;
+const LIVE_BUT_STARVED_LINE = /Election candidate:.*status=connected rtt_samples=0/;
 
-// Above the un-fixed ceiling (base + every extension), below the fixed one (+3 retry rounds).
-const MIN_MS_BEFORE_GIVING_UP = 6_000;
+const MARGIN_MS = 1_000;
 
-test("election with no RTT samples keeps testing instead of failing the join", async () => {
+test("a WebSocket-only election with no RTT samples waits out its deadline and grace, then fails", async () => {
   test.setTimeout(120_000);
 
   const browser = await chromium.launch({ args: BROWSER_ARGS });
@@ -36,6 +36,7 @@ test("election with no RTT samples keeps testing instead of failing the join", a
     UI_URL,
   );
   // The RTT famine below intercepts ws://localhost:8080 only.
+  await setRuntimeConfig(context, { webTransportEnabled: "false" });
   await pinWebSocketTransport(context);
   const page = await context.newPage();
 
@@ -62,11 +63,14 @@ test("election with no RTT samples keeps testing instead of failing the join", a
 
     const log: Array<{ at: number; text: string }> = [];
     let electionStartedAt = 0;
+    let preferredTimeoutMs = 0;
     page.on("console", (msg) => {
       const text = msg.text();
       const at = Date.now();
-      if (!electionStartedAt && ELECTION_START_LINE.test(text)) {
+      const start = text.match(ELECTION_START_LINE);
+      if (!electionStartedAt && start) {
         electionStartedAt = at;
+        preferredTimeoutMs = Number(start[1]);
       }
       log.push({ at, text });
     });
@@ -110,24 +114,19 @@ test("election with no RTT samples keeps testing instead of failing the join", a
       "the election must have seen a CONNECTED candidate with zero RTT samples",
     ).not.toHaveLength(0);
 
-    const retryRounds = texts
-      .map((t) => t.match(RETRY_LINE))
-      .filter((m): m is RegExpMatchArray => m !== null)
-      .map((m) => m[1]);
-    expect(
-      retryRounds.slice(0, 3),
-      "a measurement-less election with a live candidate must be retried 3x",
-    ).toEqual(["1", "2", "3"]);
-
     const firstFailure = log.find((l) => TERMINAL_FAILURE_LINE.test(l.text));
     expect(
       firstFailure,
       "the famine is permanent, so the election must eventually fail",
     ).toBeTruthy();
-    expect(
-      firstFailure!.at - electionStartedAt,
-      "the client must keep testing for the full retry budget before giving up",
-    ).toBeGreaterThanOrEqual(MIN_MS_BEFORE_GIVING_UP);
+    expect(firstFailure!.text).toContain("preferred=ws phase=preferred");
+    expect(firstFailure!.text).toContain("transport_pick=none");
+    const graceEndMs = preferredTimeoutMs + ELECTION_STARVED_GRACE_MS;
+    const waitedMs = firstFailure!.at - electionStartedAt;
+    expect(waitedMs, "a starved candidate is waited for through the grace").toBeGreaterThanOrEqual(
+      graceEndMs - 250,
+    );
+    expect(waitedMs, "and not beyond it").toBeLessThan(graceEndMs + MARGIN_MS);
 
     await expect(grid).toBeVisible();
     await expect(page.locator(".connection-led").first()).toHaveClass(/connecting/);

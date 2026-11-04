@@ -1,0 +1,22 @@
+# Bot-vs-browser fidelity room (#3246 W0): every Rust role beside browsers of the same class, one meeting.
+schema: scale-scenario/v1
+run: {id_prefix: fid, seed: 1, target: local, video_mode: replay, bot_diagnostics: off, fidelity_waivers: []}
+fidelity:
+  browser_simulcast_max_layers: 3
+  browser_hardware_concurrency: 10
+  browser_source: {bcam: 1280x720}
+  settle: 30s
+  browser_min_video_fps: [5.7, 10.7, 18.6]
+population:
+  - {role: talkers, fleet: rust, count: 2, media: {camera: on, mic: continuous, video_layers: 3}}
+  - {role: cameras, fleet: rust, count: 2, media: {camera: on, mic: muted, video_layers: 3}}
+  - {role: viewers, fleet: rust, count: 1, media: {camera: off, mic: off}, receive: {pin_video_layer: 0}}
+  - {role: vpviewers, fleet: rust, count: 1, media: {camera: off, mic: off}, receive: {viewport_visible_count: 4}}
+  - {role: btalk, fleet: browser, count: 2, media: {camera: on, mic: continuous}, transport: websocket,
+     join_stagger: 4s, decode_budget: client}
+  - {role: bcam, fleet: browser, count: 1, media: {camera: on, mic: muted}, transport: websocket, join_stagger: 4s,
+     decode_budget: client}
+  - {role: probe, fleet: browser, count: 1, media: {camera: off, mic: muted}, transport: websocket, join_stagger: 4s,
+     decode_budget: client, skip_canvas_paint: true, diag_packets: off, speaking_glow: off}
+steps: [{id: hold, hold: 6m, headline: true, join_window: 2m}]
+events: []

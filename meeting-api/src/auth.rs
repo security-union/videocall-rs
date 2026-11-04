@@ -428,9 +428,14 @@ mod tests {
             kick_rate_limiter: std::sync::Arc::new(
                 crate::rate_limit::KeyedRateLimiter::for_host_kicks(),
             ),
+            captions_rate_limiter: std::sync::Arc::new(
+                crate::rate_limit::KeyedRateLimiter::for_captions(),
+            ),
             recording: Default::default(),
+            avatars: Default::default(),
             search: None,
             display_name_rate_limit_disabled: false,
+            captions_enabled: false,
             dev_user: None,
             password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
             presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -953,9 +958,14 @@ mod tests {
             kick_rate_limiter: std::sync::Arc::new(
                 crate::rate_limit::KeyedRateLimiter::for_host_kicks(),
             ),
+            captions_rate_limiter: std::sync::Arc::new(
+                crate::rate_limit::KeyedRateLimiter::for_captions(),
+            ),
             recording: Default::default(),
+            avatars: Default::default(),
             search: None,
             display_name_rate_limit_disabled: false,
+            captions_enabled: false,
             dev_user: None,
             password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
             presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1377,6 +1387,7 @@ mod tests {
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: typ.map(str::to_string),
             iat: Some(now),
+            meeting_started_at_ms: None,
         };
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),

@@ -18,7 +18,7 @@
  *
  * Why API-level (not a browser flow):
  *   The browser collector uploads console logs on a background timer / on
- *   page-close via `sendBeacon`. Asserting those opportunistic background
+ *   page-close via keepalive `fetch`. Asserting those opportunistic background
  *   uploads from a real page is inherently racy. The auth/authz contract this
  *   change introduced lives entirely at the HTTP boundary, so a direct request
  *   against the endpoint is both deterministic and a tighter fit for the

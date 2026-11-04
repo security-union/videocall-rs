@@ -3078,4 +3078,64 @@ test.describe("Device settings modal", () => {
       .poll(() => ring("Cyan highlight"), { timeout: 5_000 })
       .toMatchObject({ opacity: "0.6" });
   });
+
+  test("arrow keys on a colour swatch and a glass select stay on their tab, and the tablist still switches", async ({
+    page,
+  }) => {
+    await openAppearanceTab(page, `e2e_settings_arrows_${Date.now()}`, "settings-arrows-user");
+    const appearanceTab = page.getByTestId("settings-nav-appearance");
+    const swatch = page
+      .locator("#color-swatches-container .color-swatch:not(.add-color-btn)")
+      .first();
+    await expect(swatch).toBeVisible({ timeout: 5_000 });
+    await swatch.focus();
+    for (const key of ["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp"]) {
+      await page.keyboard.press(key);
+    }
+    await page.waitForTimeout(300);
+    await expect(appearanceTab).toHaveAttribute("aria-selected", "true");
+    await expect(swatch).toBeFocused();
+
+    const audioTab = page.getByTestId("settings-nav-audio");
+    await audioTab.click();
+    await expect(audioTab).toHaveAttribute("aria-selected", "true");
+    const select = page.locator("#settings-panel-audio .glass-select > button#modal-audio-select");
+    await expect(select).toBeVisible({ timeout: 5_000 });
+    await select.focus();
+    for (const key of ["ArrowRight", "ArrowLeft"]) {
+      await page.keyboard.press(key);
+    }
+    await page.waitForTimeout(300);
+    await expect(audioTab).toHaveAttribute("aria-selected", "true");
+    await expect(select).toBeFocused();
+
+    await audioTab.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByTestId("settings-nav-video")).toHaveAttribute("aria-selected", "true");
+    await expect(audioTab).toHaveAttribute("aria-selected", "false");
+
+    await page.locator("#settings-panel-video > .settings-section-description").click();
+    await expect(page.locator("#device-settings-dialog")).toBeFocused();
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByTestId("settings-nav-network")).toHaveAttribute("aria-selected", "true");
+  });
+
+  test("under forced colors the active theme button keeps its outline after a mouse click", async ({
+    page,
+  }) => {
+    await openAppearanceTab(page, `e2e_theme_forced_colors_${Date.now()}`, "theme-forced-user");
+    await page.emulateMedia({ forcedColors: "active" });
+    expect(await page.evaluate(() => matchMedia("(forced-colors: active)").matches)).toBe(true);
+
+    const light = page.locator('button.theme-icon-button[title="Light"]');
+    await expect(light).toBeVisible({ timeout: 5_000 });
+    await light.click();
+    await expect(light).toHaveClass(/\btheme-icon-button--active\b/);
+    await expect(light).toBeFocused();
+    expect(
+      await light.evaluate((el) => el.matches(":focus-visible")),
+      "premise: a mouse click does not match :focus-visible",
+    ).toBe(false);
+    await expect(light).toHaveCSS("outline-style", "solid");
+  });
 });

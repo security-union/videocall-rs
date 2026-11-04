@@ -25,6 +25,12 @@ pub struct CoHostRow {
     pub display_name: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+pub struct SuggestionRow {
+    pub user_id: String,
+    pub display_name: Option<String>,
+}
+
 /// Outcome of [`grant`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum GrantOutcome {
@@ -130,6 +136,84 @@ pub async fn list(
         present = crate::db::participants::present_sql("p", healthy)
     ))
     .bind(meeting_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Co-host candidates for `owner`, most recent first: the co-hosts and hosts of meetings they own, and the owners of
+/// meetings they were admitted to. Excludes `owner`, guests, and `meeting_id`'s existing entries. Display names come
+/// only from those same meetings: an admitted participant's name, or an owner's `host_display_name` as a fallback.
+pub async fn suggestions(
+    pool: &PgPool,
+    owner: &str,
+    meeting_id: i32,
+    limit: i64,
+) -> Result<Vec<SuggestionRow>, sqlx::Error> {
+    sqlx::query_as::<_, SuggestionRow>(
+        r#"
+        WITH owned AS (
+            SELECT id FROM meetings WHERE creator_id = $1 AND deleted_at IS NULL
+        ),
+        joined AS (
+            SELECT m.id, m.creator_id, m.host_display_name, p.updated_at
+            FROM meeting_participants p
+            JOIN meetings m ON m.id = p.meeting_id
+            WHERE p.user_id = $1 AND p.admitted_at IS NOT NULL AND NOT p.is_guest
+              AND m.deleted_at IS NULL
+        ),
+        candidates AS (
+            SELECT c.user_id, c.updated_at AS seen_at, NULL::text AS fallback_name, FALSE AS real_case
+            FROM meeting_co_hosts c
+            JOIN owned o ON o.id = c.meeting_id
+            UNION ALL
+            SELECT p.user_id, p.updated_at, NULL, TRUE
+            FROM meeting_participants p
+            JOIN owned o ON o.id = p.meeting_id
+            WHERE p.is_host AND NOT p.is_guest
+            UNION ALL
+            SELECT j.creator_id, j.updated_at, j.host_display_name, TRUE
+            FROM joined j
+            WHERE j.creator_id IS NOT NULL
+        ),
+        top AS (
+            SELECT LOWER(user_id) AS key,
+                   MAX(seen_at) AS last_seen,
+                   (ARRAY_AGG(user_id ORDER BY seen_at DESC, user_id)
+                        FILTER (WHERE real_case))[1] AS real_id,
+                   (ARRAY_AGG(fallback_name ORDER BY seen_at DESC, user_id)
+                        FILTER (WHERE TRIM(fallback_name) <> ''))[1] AS fallback_name
+            FROM candidates
+            WHERE LOWER(user_id) <> LOWER($1)
+              AND NOT starts_with(LOWER(user_id), $2)
+              AND NOT EXISTS (SELECT 1 FROM meeting_co_hosts c
+                              WHERE c.meeting_id = $3 AND c.user_id = LOWER(candidates.user_id))
+            GROUP BY LOWER(user_id)
+            ORDER BY last_seen DESC, key
+            LIMIT $4
+        ),
+        known AS (
+            SELECT LOWER(p.user_id) AS key,
+                   (ARRAY_AGG(p.user_id ORDER BY p.updated_at DESC, p.id DESC))[1] AS user_id,
+                   (ARRAY_AGG(p.display_name ORDER BY p.updated_at DESC, p.id DESC)
+                        FILTER (WHERE TRIM(p.display_name) <> ''))[1] AS display_name
+            FROM (SELECT id FROM owned UNION SELECT id FROM joined) r
+            JOIN meeting_participants p ON p.meeting_id = r.id
+            WHERE NOT p.is_guest AND p.admitted_at IS NOT NULL
+              AND LOWER(p.user_id) IN (SELECT key FROM top)
+            GROUP BY LOWER(p.user_id)
+        )
+        SELECT COALESCE(k.user_id, t.real_id, t.key) AS user_id,
+               COALESCE(k.display_name, t.fallback_name) AS display_name
+        FROM top t
+        LEFT JOIN known k ON k.key = t.key
+        ORDER BY t.last_seen DESC, t.key
+        "#,
+    )
+    .persistent(false)
+    .bind(owner)
+    .bind(videocall_meeting_types::GUEST_USER_ID_PREFIX.to_lowercase())
+    .bind(meeting_id)
+    .bind(limit)
     .fetch_all(pool)
     .await
 }

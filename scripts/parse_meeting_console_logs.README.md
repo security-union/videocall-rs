@@ -78,7 +78,7 @@ Also prints sections for: **Error Census**, **Re-election Events**, **Implausibl
 | Speak | Count of `Speaking changed: false -> true` (VAD) | **Open-mic energy, not speech** — an RMS threshold on the raw mic stream, so it fires on breathing and background noise. Never read it as who was talking. Packet rate does not separate them either: a silent open mic transmits at the same ~50 pkt/s (#2278). For mute state use `videocall_self_audio_enabled`, written unconditionally from the sender's own report. |
 | Buf med | Median of non-zero NetEQ audio buffer depth, ms | 100–300ms = healthy; < 50ms = underrun risk (audible clicks); > 500ms = network jitter; zero-only samples filtered out (they represent peers not sending) |
 | Errors | `level:error` log line count | categorize before alarming — one broken encoder can emit thousands of identical errors. **This is a per-session count, so it HIDES any defect shared by several people — read the Error Census instead** (below). |
-| End | `clean` if user left via UI, `LOST` if `Connection lost` event, `?` if neither | — |
+| End | `clean` if user left via UI, `LOST` if a `Connection lost` / `No valid connections` line has no later recovering `Election decision` (intentional disconnects ignored), `?` otherwise | — |
 | Cores | `navigator.hardwareConcurrency` from preamble | **< 6 ⚠** or **Intel Mac (macOS ≤ 15) with ≤ 8 cores ⚠** — see discussion #562 |
 | Platform | OS + version from preamble | macOS 14 / 15 (pre-Apple-Silicon) often indicate old hardware |
 | Concurrent | Count of overlapping sessions for same email (including 15s post-end NetEQ zombie window) | **> 1 ⚠** = duplicate NetEQ + AudioWorkletNode instances mixing into `master_gain` → audio crackling. See NETEQ-1 in discussion #562. |
@@ -136,6 +136,15 @@ dropped — they are continuations, not defects.
     `⚠ N session(s) had a truncated or corrupt .log.gz`. **Detection needs `zgrep`
     to exit ≥ 2 or print a gzip diagnostic; where it reports neither, this loss is
     undetected.**
+
+## Audio Workers That Never Started
+
+Lists every NetEq worker that logged `NetEq audio decoder initialized for peer` but never
+`Worker ready for peer` (#3071). That participant is silent for that listener until the
+peer is re-added or its decoder rebuilt (`Dead until`), leaves, or the log ends, with no error line and no
+`videocall_neteq_*` series for the pair. Re-adding a peer or rebuilding its audio
+decoder creates a new worker, so each dead instance is its own row. A queue above ~50 (⚠) means the participant was unmuted
+while the worker was dead. Lines re-shipped in a later chunk are counted once.
 
 ## When to use `--verify`
 

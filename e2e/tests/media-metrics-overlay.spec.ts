@@ -36,8 +36,8 @@ import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
  * video (mock peers are video-OFF placeholders that never decode). Cameras AND
  * mics both default OFF, so `vc_prejoin_camera_on` and `vc_prejoin_mic_on` are
  * seeded to `"true"` for both users — camera-on drives the RECEIVED-video
- * metrics, and mic-on makes the peer's audio field visible for the #2279
- * assertion that it renders the em-dash ("· —k").
+ * metrics, and mic-on makes the publisher stamp its Opus bitrate so the peer's
+ * audio field renders a number ("· 48k"), not the em-dash (#3170).
  * Untagged (no @bvt): runs in the dioxus full suite, not per-PR CI.
  */
 
@@ -317,14 +317,19 @@ test.describe("Per-tile media-metrics overlay (issue 1768)", () => {
         })
         .toMatch(/·\s*\d+fps\s*·/);
 
-      // Issue #2279: the RECEIVED-audio field is the trailing "· —k" segment.
-      // Pre-#2279 this read `· 12k`/`· 48k`, so the assertion is discriminating;
-      // the fps segment above proves the overlay is otherwise live.
+      let peerText = "";
       await expect
-        .poll(async () => (await peerOverlay.first().textContent()) ?? "", {
-          timeout: 30_000,
-        })
-        .toMatch(/·\s*—k\s*$/);
+        .poll(
+          async () => {
+            peerText = (await peerOverlay.first().textContent()) ?? "";
+            return peerText;
+          },
+          { timeout: 30_000 },
+        )
+        .toMatch(/·\s*\d+k\s*$/);
+      const peerAudioKbps = Number(/·\s*(\d+)k\s*$/.exec(peerText)![1]);
+      expect(peerAudioKbps, `peer overlay: "${peerText}"`).toBeGreaterThanOrEqual(1);
+      expect(peerAudioKbps, `peer overlay: "${peerText}"`).toBeLessThanOrEqual(510);
 
       // RELOAD PERSISTENCE — guards the `load_bool` read-back the spec would
       // otherwise leave unverified. After a reload the "true" preference must be

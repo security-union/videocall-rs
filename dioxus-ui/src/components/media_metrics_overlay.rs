@@ -5,9 +5,7 @@
 //! When the diagnostics "Show diagnostics on tiles" checkbox is on, each tile
 //! renders a small, passive readout anchored at its bottom edge:
 //!   * a REMOTE peer tile shows what THIS client is RECEIVING from that peer —
-//!     decoded video resolution and received video fps. Its audio field is always
-//!     the em-dash: a single-layer publisher's bitrate is set by its own AQ tier,
-//!     which no receiver observes;
+//!     decoded video resolution and received video fps;
 //!   * the LOCAL user's OWN tile shows what it is SENDING — the live encode
 //!     resolution / target fps and the audio send bitrate.
 //!
@@ -96,8 +94,8 @@ pub struct MediaMetricsOverlay {
     /// Video frames per second — received (remote) or target (self). `None` →
     /// em-dash.
     pub fps: Option<f64>,
-    /// Audio bitrate (kbps): the live send bitrate on the self tile, always `None`
-    /// (em-dash) on a remote peer's. `None` → em-dash.
+    /// Audio bitrate (kbps): the live send bitrate on the self tile, the publisher's
+    /// stamped bitrate on a remote peer's. `None` → em-dash.
     pub audio_kbps: Option<u32>,
 }
 
@@ -230,15 +228,9 @@ pub fn overlay_painted_fps_sample(metrics: &[Metric], peer_id: &str) -> Option<f
     fps
 }
 
-/// Received-audio kbps for a REMOTE peer's overlay: always `0.0`, which the
-/// overlay's `> 0.0` gate renders as the em-dash "—k".
-///
-/// Nothing a receiver observes determines a publisher's audio bitrate — the rate
-/// comes from the publisher's own AQ audio tier, not from the layer id being
-/// decoded — so this takes no arguments. The SELF tile's `audio_kbps` is the only
-/// honest audio figure.
-pub fn overlay_audio_kbps() -> f64 {
-    0.0
+/// A REMOTE peer's stamped audio kbps for the overlay; `None` becomes `0.0`, the em-dash.
+pub fn overlay_audio_kbps(stamped_kbps: Option<u32>) -> f64 {
+    stamped_kbps.map_or(0.0, f64::from)
 }
 
 /// The overlay's `audio_kbps` field from the per-tile signal: a real number, or
@@ -638,25 +630,17 @@ mod tests {
     }
 
     #[test]
-    fn overlay_audio_kbps_em_dashes_every_remote_peer() {
-        // The nominals come from the production ladder, so this fails the moment a
-        // layer->bitrate mapping is reintroduced here.
-        let kbps = overlay_audio_kbps();
-        assert_eq!(kbps, 0.0);
-        for rung in 0..3u32 {
-            let nominal = videocall_client::decode::layer_chooser::audio_layer_kbps(rung).unwrap();
-            assert_ne!(kbps, f64::from(nominal), "reads as rung {rung}'s nominal");
-        }
-        let line = format_media_metrics_line(
-            false,
-            Some((1280, 720)),
-            Some(30.0),
-            overlay_audio_kbps_display(kbps),
-        );
-        assert!(
-            line.ends_with("\u{2014}k"),
-            "a remote peer's audio field must render the em-dash: {line}"
-        );
+    fn overlay_audio_kbps_renders_a_stamped_bitrate_and_em_dashes_none() {
+        let line = |stamped: Option<u32>| {
+            format_media_metrics_line(
+                false,
+                Some((1280, 720)),
+                Some(30.0),
+                overlay_audio_kbps_display(overlay_audio_kbps(stamped)),
+            )
+        };
+        assert!(line(Some(8)).ends_with(" 8k"), "{}", line(Some(8)));
+        assert!(line(None).ends_with("\u{2014}k"), "{}", line(None));
     }
 
     #[test]

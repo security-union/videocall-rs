@@ -15,7 +15,9 @@ use wasm_bindgen_test::*;
 
 use dioxus::prelude::*;
 use dioxus_ui::components::changelog::reset_changelog_cache_for_test;
-use dioxus_ui::components::meeting_footer::{MeetingFooter, MeetingInfoDialog};
+use dioxus_ui::components::meeting_footer::{
+    element_is_shown, focus_was_dropped, MeetingFooter, MeetingInfoDialog,
+};
 use dioxus_ui::components::meeting_format::format_datetime_zoned;
 use dioxus_ui::context::MeetingTime;
 
@@ -29,6 +31,10 @@ const BACKDROP: &str = "[data-testid='meeting-info-dialog-backdrop']";
 const CLOSE: &str = "[data-testid='meeting-info-dialog-close']";
 const COPY: &str = "[data-testid='meeting-info-copy-link']";
 const OPEN_STATE: &str = "[data-testid='open-state']";
+const PARTICIPANTS_ID: &str = "meeting-footer-participants-trigger";
+const PARTICIPANTS: &str = "#meeting-footer-participants-trigger";
+const PEER_LIST_TOGGLES: &str = "[data-testid='peer-list-toggles']";
+const HELP: &str = "[data-testid='meeting-footer-help']";
 
 fn provide_meeting_time() {
     let meeting_time = use_signal(MeetingTime::default);
@@ -39,13 +45,22 @@ fn provide_meeting_time() {
 fn Meeting(initially_open: bool, is_active: bool, show_git: bool) -> Element {
     provide_meeting_time();
     let open = use_signal(|| initially_open);
+    let mut peer_list_open = use_signal(|| false);
+    let mut toggles = use_signal(|| 0u32);
+    let on_toggle_participants = use_callback(move |_: ()| {
+        toggles += 1;
+        peer_list_open.toggle();
+    });
     rsx! {
         span { "data-testid": "open-state", "{open}" }
+        span { "data-testid": "peer-list-toggles", "{toggles}" }
         MeetingFooter {
             open,
             meeting_id: MEETING_ID.to_string(),
             participant_count: 3,
             is_active,
+            participants_open: peer_list_open(),
+            on_toggle_participants,
         }
         MeetingInfoDialog {
             open,
@@ -223,14 +238,217 @@ async fn trigger_label_is_static_and_the_ticking_line_is_hidden_from_assistive_t
         Some("dialog")
     );
     assert_eq!(
-        html(&mount, ".meeting-footer-trigger > .meeting-footer-content")
-            .get_attribute("aria-hidden")
-            .as_deref(),
-        Some("true")
+        html(&mount, TRIGGER).text_content().as_deref(),
+        Some(""),
+        "the trigger is named by its static label alone"
     );
+    let unhidden_text = js_sys::Function::new_with_args(
+        "root, skip",
+        "const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT); const out = []; \
+         for (let n = w.nextNode(); n; n = w.nextNode()) { \
+           const el = n.parentElement; \
+           if (!n.textContent.trim() || el.closest('[aria-hidden=\"true\"]') || el.closest(skip)) continue; \
+           out.push(n.textContent); } \
+         return out.join('|');",
+    );
+    let leaked = unhidden_text
+        .call2(
+            &JsValue::NULL,
+            &find(&mount, ".meeting-footer-content").unwrap(),
+            &JsValue::from_str(PARTICIPANTS),
+        )
+        .unwrap()
+        .as_string()
+        .unwrap();
+    assert_eq!(
+        leaked, "",
+        "every part of the line outside the participants button must be aria-hidden"
+    );
+    assert!(find(&mount, "[data-testid='meeting-footer-timer']")
+        .unwrap()
+        .closest("[aria-hidden='true']")
+        .unwrap()
+        .is_some());
     assert!(find(&mount, ".meeting-footer [aria-live]").is_none());
 
     cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn the_participants_button_sits_beside_the_trigger_and_nothing_focusable_is_aria_hidden() {
+    let mount = fresh_mount();
+    render_into(&mount, live_closed);
+    yield_now().await;
+
+    let trigger = find(&mount, TRIGGER).unwrap();
+    let participants = find(&mount, PARTICIPANTS).expect("the count is its own button");
+    assert_eq!(participants.tag_name(), "BUTTON");
+    let node: &web_sys::Node = &participants;
+    assert!(
+        !trigger.contains(Some(node)),
+        "a button nested in the trigger would bubble its click into Meeting info"
+    );
+    assert!(participants
+        .closest("[aria-hidden='true']")
+        .unwrap()
+        .is_none());
+    assert!(
+        find(
+            &mount,
+            ".meeting-footer [aria-hidden='true'] :is(button, a[href], input, select, textarea, [tabindex])"
+        )
+        .is_none(),
+        "no focusable element may sit in an aria-hidden subtree"
+    );
+    assert_eq!(
+        participants.get_attribute("data-testid").as_deref(),
+        Some("meeting-footer-participants")
+    );
+    for part in [
+        ".meeting-footer-count-compact",
+        ".meeting-footer-count-text",
+    ] {
+        assert!(
+            participants.query_selector(part).unwrap().is_some(),
+            "{part}"
+        );
+    }
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn the_participants_button_names_the_count_and_reports_the_peer_list_it_controls() {
+    let mount = fresh_mount();
+    render_into(&mount, live_closed);
+    yield_now().await;
+
+    let participants = html(&mount, PARTICIPANTS);
+    let attr = |name: &str| participants.get_attribute(name);
+    assert_eq!(attr("type").as_deref(), Some("button"));
+    assert_eq!(attr("aria-label").as_deref(), Some("3 participants"));
+    assert_eq!(
+        attr("aria-controls").as_deref(),
+        Some("peer-list-container")
+    );
+    assert_eq!(attr("aria-expanded").as_deref(), Some("false"));
+
+    participants.click();
+    yield_now().await;
+    assert_eq!(attr("aria-expanded").as_deref(), Some("true"));
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn clicking_the_participant_count_toggles_the_peer_list_and_leaves_meeting_info_closed() {
+    let mount = fresh_mount();
+    render_into(&mount, live_closed);
+    yield_now().await;
+
+    html(&mount, PARTICIPANTS).click();
+    yield_now().await;
+    assert_eq!(text(&mount, PEER_LIST_TOGGLES), "1");
+    assert_eq!(text(&mount, OPEN_STATE), "false");
+    assert!(find(&mount, DIALOG).is_none());
+
+    html(&mount, PARTICIPANTS).click();
+    yield_now().await;
+    assert_eq!(text(&mount, PEER_LIST_TOGGLES), "2");
+    assert_eq!(text(&mount, OPEN_STATE), "false");
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn clicking_the_meeting_info_trigger_opens_the_dialog_without_toggling_the_peer_list() {
+    let mount = fresh_mount();
+    render_into(&mount, live_closed);
+    yield_now().await;
+
+    html(&mount, TRIGGER).click();
+    assert!(wait_for_selector(&mount, DIALOG, 1_000).await);
+    yield_now().await;
+
+    assert_eq!(text(&mount, OPEN_STATE), "true");
+    assert_eq!(text(&mount, PEER_LIST_TOGGLES), "0");
+    assert_eq!(
+        html(&mount, PARTICIPANTS)
+            .get_attribute("aria-expanded")
+            .as_deref(),
+        Some("false")
+    );
+
+    cleanup(&mount);
+}
+
+fn hit_at_center(mount: &web_sys::Element, selector: &str) -> web_sys::Element {
+    let rect = html(mount, selector).get_bounding_client_rect();
+    gloo_utils::document()
+        .element_from_point(
+            ((rect.left() + rect.right()) / 2.0) as f32,
+            ((rect.top() + rect.bottom()) / 2.0) as f32,
+        )
+        .unwrap_or_else(|| panic!("nothing is hit at the centre of {selector}"))
+}
+
+#[wasm_bindgen_test]
+async fn a_press_on_the_count_reaches_the_participants_button_and_any_other_press_reaches_meeting_info(
+) {
+    let mount = fresh_mount();
+    install_stylesheets("");
+    render_into(&mount, live_closed);
+    yield_now().await;
+
+    let footer_w = html(&mount, "footer.meeting-footer")
+        .get_bounding_client_rect()
+        .width();
+    assert!(
+        footer_w >= 560.0,
+        "premise: a footer wide enough ({footer_w}px) to show the count text"
+    );
+    for selector in [
+        ".meeting-footer-status-label",
+        "[data-testid='meeting-footer-timer']",
+        "[data-testid='meeting-footer-meeting-id']",
+        "[data-testid='meeting-footer-version']",
+        ".meeting-footer-affordance",
+    ] {
+        let hit = hit_at_center(&mount, selector);
+        assert_eq!(
+            hit.id(),
+            "meeting-footer-trigger",
+            "a press on {selector} must land on the Meeting info trigger, got <{}>",
+            hit.tag_name()
+        );
+    }
+    let hit = hit_at_center(&mount, ".meeting-footer-count-text");
+    assert!(
+        hit.closest(PARTICIPANTS).unwrap().is_some(),
+        "a press on the count must land on the participants button, got <{} id={:?}>",
+        hit.tag_name(),
+        hit.id()
+    );
+    let count = html(&mount, ".meeting-footer-count-text").get_bounding_client_rect();
+    let footer = html(&mount, "footer.meeting-footer").get_bounding_client_rect();
+    for y in [footer.top() + 2.0, footer.bottom() - 2.0] {
+        let near_miss = gloo_utils::document()
+            .element_from_point(((count.left() + count.right()) / 2.0) as f32, y as f32)
+            .unwrap();
+        assert!(
+            near_miss.closest(PARTICIPANTS).unwrap().is_some(),
+            "a press above or below the count (y={y}) must still reach the participants button"
+        );
+    }
+
+    hit.dyn_ref::<web_sys::HtmlElement>()
+        .expect("the hit is an HTML element")
+        .click();
+    yield_now().await;
+    assert_eq!(text(&mount, PEER_LIST_TOGGLES), "1");
+    assert_eq!(text(&mount, OPEN_STATE), "false");
+
+    remove_marked_nodes();
 }
 
 #[wasm_bindgen_test]
@@ -1099,6 +1317,93 @@ async fn builds_without_changes_are_skipped_and_not_counted() {
     cleanup(&mount);
 }
 
+const CHANGELOG_GROUP: &str = "[data-testid='changelog-group']";
+const NEWEST_SECTION: &str = "[data-testid='changelog-build']:has(#meeting-info-changelog-build-0)";
+const OLDER_SECTION: &str = "[data-testid='changelog-build']:has(#meeting-info-changelog-build-1)";
+
+/// Build 2 lists curated lines out of display order, with a repeat and an
+/// uncategorized line; build 1 lists only a raw PR title.
+fn kinds_fixture() -> String {
+    r#"{"builds":[
+      {"built":"2026-09-02T12:00:00Z","version":"1.1.2","commit":"00000002","changes":[
+        "bug-fix: No echo after a rejoin (#3003)",
+        "Meeting-api: tidy logs (#3004)",
+        "UX: Clearer mute button (#3001)",
+        "Perf: Faster joins",
+        "UX: Clearer mute button (#3005)"]},
+      {"built":"2026-09-01T12:00:00Z","version":"1.1.1","commit":"00000001","changes":[
+        "Pinning moves a tile to the front of the grid (#2872)"]}]}"#
+        .to_string()
+}
+
+fn all_attr(mount: &web_sys::Element, selector: &str, name: &str) -> Vec<String> {
+    let nodes = mount.query_selector_all(selector).unwrap();
+    (0..nodes.length())
+        .filter_map(|i| nodes.item(i))
+        .filter_map(|n| n.dyn_into::<web_sys::Element>().ok())
+        .filter_map(|el| el.get_attribute(name))
+        .collect()
+}
+
+#[wasm_bindgen_test]
+async fn curated_lines_are_grouped_under_kind_pills_without_their_prefix_or_pr_number() {
+    let mount = fresh_mount();
+    install_stylesheets("");
+    stub_changelog(&kinds_fixture(), "application/json");
+    render_into(&mount, live_open);
+    yield_now().await;
+    open_whats_new(&mount).await;
+
+    let groups = format!("{NEWEST_SECTION} > {CHANGELOG_GROUP}");
+    assert_eq!(
+        all_attr(&mount, &groups, "data-kind"),
+        ["ux", "performance", "fixes", "miscellaneous"]
+    );
+    assert_eq!(
+        all_text(
+            &mount,
+            &format!("{groups} > h6[data-testid='changelog-kind']")
+        ),
+        ["UX", "Performance", "Fixes", "Miscellaneous"]
+    );
+    assert_eq!(
+        all_text(
+            &mount,
+            &format!("{groups} > ul.changelog-changes > li[data-testid='changelog-change']")
+        ),
+        [
+            "Clearer mute button",
+            "Faster joins",
+            "No echo after a rejoin",
+            "Meeting-api: tidy logs"
+        ]
+    );
+
+    let ux = find(&mount, &format!("{groups} > h6.changelog-kind--ux")).unwrap();
+    let fixes = find(&mount, &format!("{groups} > h6.changelog-kind--fixes")).unwrap();
+    assert_eq!(computed(&ux, "border-top-left-radius"), "9999px");
+    assert_ne!(
+        computed(&ux, "background-color"),
+        computed(&fixes, "background-color"),
+        "each kind's pill has its own colour"
+    );
+
+    assert_eq!(
+        count(&mount, &format!("{OLDER_SECTION} {CHANGELOG_GROUP}")),
+        0
+    );
+    assert_eq!(
+        all_text(
+            &mount,
+            &format!("{OLDER_SECTION} > ul.changelog-changes > li[data-testid='changelog-change']")
+        ),
+        ["Pinning moves a tile to the front of the grid"],
+        "a build with no curated line keeps one plain list"
+    );
+
+    remove_marked_nodes();
+}
+
 const COPY_STATUS: &str = "#meeting-info-dialog [role='status']";
 
 fn stub_clipboard(stub: &str) {
@@ -1227,6 +1532,8 @@ fn FooterInATallMainContainer() -> Element {
                     meeting_id: MEETING_ID.to_string(),
                     participant_count: 3,
                     is_active: true,
+                    participants_open: false,
+                    on_toggle_participants: |_| {},
                 }
             }
         }
@@ -1395,12 +1702,14 @@ fn HourLongMeetingInANarrowFooter() -> Element {
     use_context_provider(|| meeting_time);
     let open = use_signal(|| false);
     rsx! {
-        div { style: "--drawer-left-reserve: 0px; --drawer-right-reserve: calc(100% - 240px);",
+        div { style: "--drawer-left-reserve: 0px; --drawer-right-reserve: calc(100% - 180px);",
             MeetingFooter {
                 open,
                 meeting_id: MEETING_ID.to_string(),
                 participant_count: 12,
                 is_active: true,
+                participants_open: false,
+                on_toggle_participants: |_| {},
             }
         }
     }
@@ -1412,8 +1721,17 @@ fn hour_long_meeting_in_a_narrow_footer() -> Element {
 
 #[wasm_bindgen_test]
 async fn an_hour_long_meeting_line_is_clipped_in_a_narrow_footer_not_painted_over_the_version() {
+    assert_a_narrow_footer_clips_the_hour_long_line("").await;
+}
+
+#[wasm_bindgen_test]
+async fn in_a_wide_font_an_hour_long_meeting_line_is_clipped_in_a_narrow_footer() {
+    assert_a_narrow_footer_clips_the_hour_long_line(WIDE_FONT).await;
+}
+
+async fn assert_a_narrow_footer_clips_the_hour_long_line(font_css: &str) {
     let mount = fresh_mount();
-    install_stylesheets("");
+    install_stylesheets(font_css);
     render_into(&mount, hour_long_meeting_in_a_narrow_footer);
     yield_now().await;
     for _ in 0..50 {
@@ -1431,8 +1749,8 @@ async fn an_hour_long_meeting_line_is_clipped_in_a_narrow_footer_not_painted_ove
         .get_bounding_client_rect()
         .width();
     assert!(
-        (footer_w - 240.0).abs() < 1.0,
-        "premise: a 240px footer, got {footer_w}"
+        (footer_w - 180.0).abs() < 1.0,
+        "premise: a 180px footer, got {footer_w}"
     );
     let viewport_w = f64::from(
         gloo_utils::document()
@@ -1469,12 +1787,630 @@ async fn an_hour_long_meeting_line_is_clipped_in_a_narrow_footer_not_painted_ove
         "the meeting group must clip what does not fit instead of painting it over \
          the version group, got overflow-x: {overflow_x}"
     );
-    let room = html(&mount, "[data-testid='meeting-footer-meeting-id']");
-    assert_eq!(computed(&room, "text-overflow"), "ellipsis");
+    let app_text = html(&mount, ".meeting-footer-app-text")
+        .get_bounding_client_rect()
+        .width();
     assert!(
-        room.client_width() > 0,
-        "the meeting ID keeps its ellipsis slot"
+        app_text < 1.0,
+        "the meeting line is clipped while {app_text}px of app info still shows"
     );
 
     remove_marked_nodes();
+}
+
+const LONG_MEETING_ID: &str =
+    "quarterly-planning-review-for-the-platform-infrastructure-and-developer-experience-teams";
+
+#[component]
+fn FooterWithALongMeetingId() -> Element {
+    provide_meeting_time();
+    let open = use_signal(|| false);
+    rsx! {
+        div { "data-testid": "footer-width",
+            MeetingFooter {
+                open,
+                meeting_id: LONG_MEETING_ID.to_string(),
+                participant_count: 3,
+                is_active: true,
+                participants_open: false,
+                on_toggle_participants: |_| {},
+            }
+        }
+    }
+}
+
+fn footer_with_a_long_meeting_id() -> Element {
+    rsx! { FooterWithALongMeetingId {} }
+}
+
+fn px(el: &web_sys::Element, property: &str) -> f64 {
+    computed(el, property)
+        .trim_end_matches("px")
+        .parse()
+        .unwrap_or_else(|_| panic!("{property} is not a px length"))
+}
+
+fn ring_right(el: &web_sys::Element) -> f64 {
+    let right = el.get_bounding_client_rect().right();
+    if computed(el, "outline-style") == "none" {
+        right
+    } else {
+        right + px(el, "outline-width") + px(el, "outline-offset")
+    }
+}
+
+fn set_footer_width(mount: &web_sys::Element, width: f64) -> web_sys::DomRect {
+    html(mount, "[data-testid='footer-width']")
+        .style()
+        .set_property("--drawer-right-reserve", &format!("calc(100% - {width}px)"))
+        .unwrap();
+    let footer = html(mount, "footer.meeting-footer").get_bounding_client_rect();
+    assert!(
+        (footer.width() - width).abs() < 1.0,
+        "premise: a {width}px footer, got {}",
+        footer.width()
+    );
+    footer
+}
+
+#[wasm_bindgen_test]
+async fn the_participants_trigger_reads_as_shown_only_outside_tier_s() {
+    let mount = fresh_mount();
+    assert!(!element_is_shown(PARTICIPANTS_ID), "premise: no footer yet");
+    install_stylesheets("");
+    render_into(&mount, footer_with_a_long_meeting_id);
+    yield_now().await;
+
+    for (width, shown) in [(340.0, false), (620.0, true), (340.0, false)] {
+        set_footer_width(&mount, width);
+        assert_eq!(element_is_shown(PARTICIPANTS_ID), shown, "at {width}px");
+    }
+
+    remove_marked_nodes();
+}
+
+#[wasm_bindgen_test]
+async fn focus_reads_as_dropped_on_body_or_on_a_participants_trigger_hidden_by_tier_s() {
+    let mount = fresh_mount();
+    install_stylesheets("");
+    render_into(&mount, footer_with_a_long_meeting_id);
+    yield_now().await;
+
+    set_footer_width(&mount, 620.0);
+    html(&mount, PARTICIPANTS).focus().unwrap();
+    assert!(active_is(&mount, PARTICIPANTS), "premise");
+    assert!(!focus_was_dropped());
+
+    set_footer_width(&mount, 340.0);
+    assert!(focus_was_dropped());
+
+    html(&mount, TRIGGER).focus().unwrap();
+    assert!(active_is(&mount, TRIGGER), "premise");
+    assert!(
+        !focus_was_dropped(),
+        "focus that moved elsewhere was not dropped"
+    );
+    html(&mount, TRIGGER).blur().unwrap();
+    assert!(focus_was_dropped(), "focus on <body> is dropped");
+
+    remove_marked_nodes();
+}
+
+#[wasm_bindgen_test]
+async fn the_help_link_opens_the_help_page_in_a_new_tab_outside_the_hidden_group() {
+    let mount = fresh_mount();
+    render_into(&mount, live_closed);
+    yield_now().await;
+
+    let help = find(&mount, HELP).expect("the footer links to the help page");
+    let attr = |name: &str| help.get_attribute(name).unwrap_or_default();
+    assert_eq!(help.tag_name(), "A");
+    assert_eq!(attr("href"), "/help?from=call");
+    assert_eq!(
+        html(&mount, TRIGGER).get_attribute("title").as_deref(),
+        Some("Meeting info")
+    );
+    assert_eq!(attr("title"), "Help and FAQ (opens in a new tab)");
+    assert_eq!(
+        attr("target"),
+        "_blank",
+        "navigating the meeting tab away would leave the call"
+    );
+    assert!(
+        attr("rel").split_whitespace().any(|r| r == "noopener"),
+        "{}",
+        attr("rel")
+    );
+    assert_eq!(attr("aria-label"), "Help and FAQ (opens in a new tab)");
+    assert!(help.closest("[aria-hidden='true']").unwrap().is_none());
+    let node: &web_sys::Node = &help;
+    assert!(find(&mount, "footer.meeting-footer")
+        .unwrap()
+        .contains(Some(node)));
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn a_press_on_the_help_icon_reaches_the_link_at_every_width_and_leaves_meeting_info_closed() {
+    let mount = fresh_mount();
+    install_stylesheets("");
+    render_into(&mount, live_closed);
+    yield_now().await;
+    js_sys::eval(
+        "window.__helpClicks = []; window.__helpGuard = function (e) { \
+           var a = e.target.closest && e.target.closest('[data-testid=\"meeting-footer-help\"]'); \
+           if (a) { e.preventDefault(); window.__helpClicks.push(a.getAttribute('href')); } }; \
+         window.addEventListener('click', window.__helpGuard, true);",
+    )
+    .unwrap();
+
+    for width in [240.0, 300.0, 450.0, 620.0, 770.0] {
+        mount
+            .dyn_ref::<web_sys::HtmlElement>()
+            .unwrap()
+            .style()
+            .set_property("--drawer-right-reserve", &format!("calc(100% - {width}px)"))
+            .unwrap();
+        let footer = html(&mount, "footer.meeting-footer").get_bounding_client_rect();
+        assert!(
+            (footer.width() - width).abs() < 1.0,
+            "premise: a {width}px footer"
+        );
+        let help = html(&mount, HELP);
+        let rect = help.get_bounding_client_rect();
+        assert!(
+            rect.width() >= 24.0 && rect.height() >= 24.0,
+            "at {width}px the help target is {}x{}",
+            rect.width(),
+            rect.height()
+        );
+        assert!(
+            rect.left() >= footer.left() && rect.right() <= footer.right() + 0.5,
+            "at {width}px the help link sits outside the footer"
+        );
+        let hit = hit_at_center(&mount, HELP);
+        assert!(
+            hit.closest(HELP).unwrap().is_some(),
+            "at {width}px a press on the help icon lands on <{} id={:?}>",
+            hit.tag_name(),
+            hit.id()
+        );
+        assert_eq!(
+            hit_at_center(&mount, ".meeting-footer-affordance").id(),
+            "meeting-footer-trigger",
+            "at {width}px the help link must not cover the Meeting info affordance"
+        );
+        assert_eq!(
+            computed(&html(&mount, ".meeting-footer-help-label"), "display"),
+            "none",
+            "at {width}px the help link stays icon-only"
+        );
+    }
+
+    mouse(&hit_at_center(&mount, HELP), "click");
+    yield_now().await;
+    let clicks = js_sys::eval(
+        "window.removeEventListener('click', window.__helpGuard, true); \
+         JSON.stringify(window.__helpClicks)",
+    )
+    .unwrap()
+    .as_string()
+    .unwrap();
+    assert_eq!(clicks, r#"["/help?from=call"]"#);
+    assert_eq!(
+        text(&mount, OPEN_STATE),
+        "false",
+        "the help link must not open Meeting info"
+    );
+    assert!(find(&mount, DIALOG).is_none());
+    assert_eq!(text(&mount, PEER_LIST_TOGGLES), "0");
+
+    mount
+        .dyn_ref::<web_sys::HtmlElement>()
+        .unwrap()
+        .style()
+        .set_property("--drawer-right-reserve", "calc(100% - 900px)")
+        .unwrap();
+    assert_ne!(
+        computed(&html(&mount, ".meeting-footer-help-label"), "display"),
+        "none",
+        "from the 900px tier the help link shows its Help label"
+    );
+
+    remove_marked_nodes();
+}
+
+#[wasm_bindgen_test]
+async fn the_participants_button_follows_every_width_tier_and_its_focus_ring_is_never_clipped() {
+    let mount = fresh_mount();
+    install_stylesheets("");
+    render_into(&mount, footer_with_a_long_meeting_id);
+    yield_now().await;
+
+    let participants = html(&mount, PARTICIPANTS);
+    let pill = html(&mount, ".meeting-footer-participants-pill");
+    for width in [300.0, 450.0, 620.0, 770.0] {
+        let footer = set_footer_width(&mount, width);
+        if width < 400.0 {
+            assert_eq!(computed(&participants, "display"), "none");
+            participants.focus().unwrap();
+            assert!(
+                !active_is(&mount, PARTICIPANTS),
+                "the hidden count must not be a tab stop"
+            );
+            continue;
+        }
+        let room = html(&mount, "[data-testid='meeting-footer-meeting-id']");
+        assert!(
+            room.scroll_width() > room.client_width(),
+            "premise: the meeting ID is ellipsized at {width}px"
+        );
+        participants.focus().unwrap();
+        assert!(
+            participants.matches(":focus-visible").unwrap()
+                && computed(&pill, "outline-style") != "none",
+            "premise: the focus ring shows"
+        );
+        let group = html(&mount, ".meeting-footer-group--meeting").get_bounding_client_rect();
+        for ring in [ring_right(&participants), ring_right(&pill)] {
+            assert!(
+                ring <= group.right() + 0.5,
+                "at {width}px the ring ends at {ring}px, past the meeting group's clip edge at {}px",
+                group.right()
+            );
+        }
+        let button = participants.get_bounding_client_rect();
+        assert!(button.top() >= footer.top() && button.bottom() <= footer.bottom());
+        assert!(
+            button.height() >= footer.height() - 1.5,
+            "at {width}px the count's hit area is {}px of a {}px footer",
+            button.height(),
+            footer.height()
+        );
+        assert!((pill.get_bounding_client_rect().height() - 24.0).abs() < 0.5);
+        participants.blur().unwrap();
+    }
+
+    remove_marked_nodes();
+}
+
+#[component]
+fn FooterForTheMeetingId(minutes: u32, participants: usize) -> Element {
+    let meeting_time = use_signal(|| MeetingTime {
+        call_start_time: None,
+        meeting_start_time: Some(js_sys::Date::now() - f64::from(minutes) * 60_000.0),
+    });
+    use_context_provider(|| meeting_time);
+    let open = use_signal(|| false);
+    rsx! {
+        div { "data-testid": "footer-width",
+            MeetingFooter {
+                open,
+                meeting_id: MEETING_ID.to_string(),
+                participant_count: participants,
+                is_active: true,
+                participants_open: false,
+                on_toggle_participants: |_| {},
+            }
+        }
+    }
+}
+
+fn footer_with_a_five_minute_meeting() -> Element {
+    rsx! { FooterForTheMeetingId { minutes: 5, participants: 3 } }
+}
+
+fn footer_with_an_hour_long_meeting() -> Element {
+    rsx! { FooterForTheMeetingId { minutes: 62, participants: 12 } }
+}
+
+const WIDE_FONT: &str = ".meeting-footer { font-family: Verdana, \"DejaVu Sans\", sans-serif; }";
+
+#[derive(Clone, Copy, Debug)]
+enum IdFloor {
+    Full,
+    EightChOrFull,
+}
+
+const ID_FLOORS: [(f64, IdFloor); 5] = [
+    (320.0, IdFloor::Full),
+    (400.0, IdFloor::EightChOrFull),
+    (560.0, IdFloor::EightChOrFull),
+    (600.0, IdFloor::EightChOrFull),
+    (768.0, IdFloor::Full),
+];
+
+fn ch_px(room: &web_sys::Element, chars: usize) -> f64 {
+    let doc = gloo_utils::document();
+    let probe = doc.create_element("span").unwrap();
+    probe
+        .set_attribute("style", "position: absolute; visibility: hidden;")
+        .unwrap();
+    probe.set_text_content(Some(&"0".repeat(chars)));
+    room.append_child(&probe).unwrap();
+    let width = probe.get_bounding_client_rect().width();
+    probe.remove();
+    width
+}
+
+async fn assert_the_meeting_id_keeps_its_room(
+    root: fn() -> Element,
+    timer_colons: usize,
+    font_css: &str,
+) {
+    let mount = fresh_mount();
+    install_stylesheets(font_css);
+    render_into(&mount, root);
+    yield_now().await;
+    let timer_ready = wait_until(|| {
+        text(&mount, "[data-testid='meeting-footer-timer']")
+            .matches(':')
+            .count()
+            == timer_colons
+    })
+    .await;
+    assert!(timer_ready, "premise: the timer shows its full length");
+    assert!(
+        find(&mount, HELP).is_some(),
+        "premise: the help link is in the footer"
+    );
+
+    for (width, floor) in ID_FLOORS {
+        set_footer_width(&mount, width);
+        let room = html(&mount, "[data-testid='meeting-footer-meeting-id']");
+        let group = html(&mount, ".meeting-footer-group--meeting");
+        let (visible, full) = visible_meeting_id_px(&room, &group);
+        let floor = match floor {
+            IdFloor::Full => full - 0.5,
+            IdFloor::EightChOrFull => ch_px(&room, 8).min(full - 0.5),
+        };
+        let app_text = html(&mount, ".meeting-footer-app-text")
+            .get_bounding_client_rect()
+            .width();
+        assert_eq!(computed(&room, "text-overflow"), "ellipsis", "at {width}px");
+        assert_ne!(
+            computed(&room, "overflow-x"),
+            "visible",
+            "at {width}px a truncated ID would spill past its box instead of ending in an ellipsis"
+        );
+        assert!(
+            room.get_bounding_client_rect().right()
+                <= group.get_bounding_client_rect().right() + 0.5,
+            "at {width}px the meeting ID is hard-clipped instead of ending in an ellipsis"
+        );
+        if visible < full - 0.5 {
+            assert!(
+                room.scroll_width() > room.client_width(),
+                "at {width}px the ID is cut short by something other than its own ellipsis"
+            );
+            assert!(
+                app_text < 1.0,
+                "at {width}px the ID gave up width ({visible} of {full}px) while {app_text}px of app info still shows"
+            );
+        }
+        assert!(
+            visible >= floor,
+            "at {width}px only {visible}px of the {full}px meeting ID shows (floor {floor})"
+        );
+    }
+
+    remove_marked_nodes();
+}
+
+fn visible_meeting_id_px(room: &web_sys::Element, group: &web_sys::Element) -> (f64, f64) {
+    let measure = js_sys::Function::new_with_args(
+        "room, group",
+        "const text = [...room.childNodes].find((n) => n.nodeType === Node.TEXT_NODE); \
+         const range = document.createRange(); range.selectNodeContents(text); \
+         const t = range.getBoundingClientRect(); const r = room.getBoundingClientRect(); \
+         const visible = Math.min(t.right, r.left + room.clientWidth, group.getBoundingClientRect().right) - t.left; \
+         return [visible, t.width];",
+    );
+    let out: js_sys::Array = measure
+        .call2(&JsValue::NULL, room, group)
+        .unwrap()
+        .unchecked_into();
+    (out.get(0).as_f64().unwrap(), out.get(1).as_f64().unwrap())
+}
+
+#[wasm_bindgen_test]
+async fn beside_the_help_link_a_short_meetings_id_keeps_its_room() {
+    assert_the_meeting_id_keeps_its_room(footer_with_a_five_minute_meeting, 1, "").await;
+}
+
+#[wasm_bindgen_test]
+async fn beside_the_help_link_an_hour_long_meetings_id_keeps_its_room() {
+    assert_the_meeting_id_keeps_its_room(footer_with_an_hour_long_meeting, 2, "").await;
+}
+
+#[wasm_bindgen_test]
+async fn in_a_wide_font_a_short_meetings_id_keeps_its_room() {
+    assert_the_meeting_id_keeps_its_room(footer_with_a_five_minute_meeting, 1, WIDE_FONT).await;
+}
+
+#[wasm_bindgen_test]
+async fn in_a_wide_font_an_hour_long_meetings_id_keeps_its_room() {
+    assert_the_meeting_id_keeps_its_room(footer_with_an_hour_long_meeting, 2, WIDE_FONT).await;
+}
+
+const APP_INFO_WIDTHS: [f64; 9] = [
+    180.0, 240.0, 320.0, 400.0, 560.0, 600.0, 768.0, 840.0, 1024.0,
+];
+const APP_INFO_FITS: [f64; 2] = [768.0, 1024.0];
+
+async fn assert_app_info_shows_whole_units_beside_the_help_link(font_css: &str) {
+    let fixtures: [(fn() -> Element, usize); 2] = [
+        (footer_with_a_five_minute_meeting, 1),
+        (footer_with_an_hour_long_meeting, 2),
+    ];
+    for (root, timer_colons) in fixtures {
+        let mount = fresh_mount();
+        install_stylesheets(font_css);
+        render_into(&mount, root);
+        yield_now().await;
+        let timer_ready = wait_until(|| {
+            text(&mount, "[data-testid='meeting-footer-timer']")
+                .matches(':')
+                .count()
+                == timer_colons
+        })
+        .await;
+        assert!(timer_ready, "premise: the timer shows its full length");
+
+        for width in APP_INFO_WIDTHS {
+            set_footer_width(&mount, width);
+            let text_box = html(&mount, ".meeting-footer-app-text");
+            for axis in ["overflow-x", "overflow-y"] {
+                assert_ne!(
+                    computed(&text_box, axis),
+                    "visible",
+                    "at {width}px app info that does not fit would paint past its box"
+                );
+            }
+            let b = text_box.get_bounding_client_rect();
+            let fits = APP_INFO_FITS.contains(&width);
+            if width >= 1024.0 {
+                assert_ne!(
+                    computed(&html(&mount, ".meeting-footer-app-built"), "display"),
+                    "none",
+                    "premise: at {width}px the build date is displayed"
+                );
+            }
+            let units = text_box.children();
+            for i in 0..units.length() {
+                let unit = units.item(i).unwrap();
+                if computed(&unit, "display") == "none" {
+                    continue;
+                }
+                let r = unit.get_bounding_client_rect();
+                let inside = r.left() >= b.left() - 0.5
+                    && r.right() <= b.right() + 0.5
+                    && r.top() >= b.top() - 0.5
+                    && r.bottom() <= b.bottom() + 0.5;
+                let overlap_x = r.right().min(b.right()) - r.left().max(b.left());
+                let overlap_y = r.bottom().min(b.bottom()) - r.top().max(b.top());
+                assert!(
+                    inside || overlap_x <= 0.5 || overlap_y <= 0.5,
+                    "at {width}px app info shows part of {:?}",
+                    unit.text_content().unwrap_or_default()
+                );
+                if fits {
+                    assert!(
+                        inside && r.width() > 0.5 && r.height() > 0.5,
+                        "at {width}px app info hides {:?} though it fits",
+                        unit.text_content().unwrap_or_default()
+                    );
+                }
+            }
+
+            let icon = html(&mount, ".meeting-footer-affordance").get_bounding_client_rect();
+            let help = html(&mount, HELP).get_bounding_client_rect();
+            assert!(
+                icon.width() >= 13.5 && help.width() >= 14.0,
+                "at {width}px the info icon ({}px) or the help link ({}px) is squeezed",
+                icon.width(),
+                help.width()
+            );
+            assert!(
+                icon.right() <= help.left() + 0.5,
+                "at {width}px the info icon ({}..{}px) runs into the help link at {}px",
+                icon.left(),
+                icon.right(),
+                help.left()
+            );
+        }
+
+        remove_marked_nodes();
+    }
+}
+
+#[wasm_bindgen_test]
+async fn app_info_shows_whole_units_beside_the_help_link() {
+    assert_app_info_shows_whole_units_beside_the_help_link("").await;
+}
+
+#[wasm_bindgen_test]
+async fn in_a_wide_font_app_info_shows_whole_units_beside_the_help_link() {
+    assert_app_info_shows_whole_units_beside_the_help_link(WIDE_FONT).await;
+}
+
+#[component]
+fn FooterWithASeventyCharacterMeetingId() -> Element {
+    provide_meeting_time();
+    let open = use_signal(|| false);
+    rsx! {
+        div { "data-testid": "footer-width",
+            MeetingFooter {
+                open,
+                meeting_id: LONG_MEETING_ID[..70].to_string(),
+                participant_count: 3,
+                is_active: true,
+                participants_open: false,
+                on_toggle_participants: |_| {},
+            }
+        }
+    }
+}
+
+fn footer_with_a_seventy_character_meeting_id() -> Element {
+    rsx! { FooterWithASeventyCharacterMeetingId {} }
+}
+
+async fn assert_the_app_name_never_shows_without_its_version(font_css: &str) {
+    let mount = fresh_mount();
+    install_stylesheets(font_css);
+    render_into(&mount, footer_with_a_seventy_character_meeting_id);
+    yield_now().await;
+
+    let mut version_hidden = false;
+    let mut version_shown = false;
+    let mut seen = String::new();
+    for step in 0..=110 {
+        let width = 840.0 + 4.0 * f64::from(step);
+        set_footer_width(&mount, width);
+        let text_box = html(&mount, ".meeting-footer-app-text");
+        let b = text_box.get_bounding_client_rect();
+        let shown = |selector: &str| {
+            let el = html(&mount, selector);
+            let mut item: web_sys::Element = el.clone().into();
+            while let Some(parent) = item.parent_element() {
+                if parent.is_same_node(Some(&text_box)) {
+                    break;
+                }
+                item = parent;
+            }
+            let r = el.get_bounding_client_rect();
+            computed(&el, "display") != "none"
+                && r.width() > 0.5
+                && r.left() >= b.left() - 0.5
+                && r.right() <= b.right() + 0.5
+                && (item.get_bounding_client_rect().top() - b.top()).abs() < 0.5
+        };
+        let name = shown(".meeting-footer-app-name");
+        let version = shown("[data-testid='meeting-footer-version']");
+        assert!(
+            !name || version,
+            "at {width}px the app name shows without its version"
+        );
+        version_hidden |= !version;
+        version_shown |= version;
+        seen.push_str(&format!("{width}:{} ", u8::from(version)));
+    }
+
+    remove_marked_nodes();
+    assert!(
+        version_hidden && version_shown,
+        "premise: the sweep crosses the width where app info comes back, saw {seen}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn beside_a_long_meeting_id_the_app_name_never_shows_without_its_version() {
+    assert_the_app_name_never_shows_without_its_version("").await;
+}
+
+#[wasm_bindgen_test]
+async fn in_a_wide_font_the_app_name_never_shows_without_its_version() {
+    assert_the_app_name_never_shows_without_its_version(WIDE_FONT).await;
 }

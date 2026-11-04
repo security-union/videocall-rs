@@ -16,6 +16,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::{PgConnection, PgPool};
+use videocall_meeting_types::AnnouncementOverride;
 
 use crate::password::PasswordUpdate;
 
@@ -68,6 +69,36 @@ pub struct MeetingRow {
     /// UI-visibility gate on the send affordance, not a server-side
     /// access-control enforcement.
     pub chat_allowed_for_all: bool,
+    #[sqlx(try_from = "String")]
+    pub entry_message_override: AnnouncementOverride,
+    #[sqlx(try_from = "String")]
+    pub entry_sound_override: AnnouncementOverride,
+    #[sqlx(try_from = "String")]
+    pub exit_message_override: AnnouncementOverride,
+    #[sqlx(try_from = "String")]
+    pub exit_sound_override: AnnouncementOverride,
+}
+
+impl MeetingRow {
+    /// `started_at` in Unix milliseconds, or `None` unless the meeting is active.
+    pub fn active_started_at_ms(&self) -> Option<i64> {
+        (self.state.as_deref() == Some(STATE_ACTIVE)).then(|| self.started_at.timestamp_millis())
+    }
+
+    /// `started_at` in Unix milliseconds in any state: the latest instance's
+    /// start, kept through `idle` and `ended`.
+    pub fn instance_started_at_ms(&self) -> i64 {
+        self.started_at.timestamp_millis()
+    }
+}
+
+/// One value per join/leave announcement override column.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Announcements<T> {
+    pub entry_message: T,
+    pub entry_sound: T,
+    pub exit_message: T,
+    pub exit_sound: T,
 }
 
 /// Create a new meeting. Uses INSERT ... ON CONFLICT to handle the partial unique index.
@@ -90,6 +121,7 @@ pub async fn create(
         false,
         false,
         true,
+        Announcements::default(),
     )
     .await
 }
@@ -108,14 +140,18 @@ pub async fn create_with_options<'e>(
     allow_guests: bool,
     recording_allowed_for_all: bool,
     chat_allowed_for_all: bool,
+    announcements: Announcements<AnnouncementOverride>,
 ) -> Result<MeetingRow, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all)
-        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all,
+                              entry_message_override, entry_sound_override, exit_message_override, exit_sound_override, captions_generation)
+        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                (SELECT COALESCE(MAX(captions_generation + captions_on::int), 0) FROM meetings WHERE room_id = $1))
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all,
+                  entry_message_override, entry_sound_override, exit_message_override, exit_sound_override
         "#,
     )
     .bind(room_id)
@@ -128,6 +164,10 @@ pub async fn create_with_options<'e>(
     .bind(allow_guests)
     .bind(recording_allowed_for_all)
     .bind(chat_allowed_for_all)
+    .bind(announcements.entry_message.as_str())
+    .bind(announcements.entry_sound.as_str())
+    .bind(announcements.exit_message.as_str())
+    .bind(announcements.exit_sound.as_str())
     .fetch_one(executor)
     .await
 }
@@ -141,7 +181,8 @@ pub async fn get_by_room_id(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all
+               waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all,
+               entry_message_override, entry_sound_override, exit_message_override, exit_sound_override
         FROM meetings
         WHERE room_id = $1 AND deleted_at IS NULL
         "#,
@@ -166,7 +207,8 @@ pub async fn list_by_owner(
         r#"
         SELECT DISTINCT m.id, m.room_id, m.started_at, m.ended_at, m.created_at, m.updated_at,
                m.deleted_at, m.creator_id, m.password_hash, m.state, m.attendees, m.host_display_name,
-               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests, m.recording_allowed_for_all, m.chat_allowed_for_all
+               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests, m.recording_allowed_for_all, m.chat_allowed_for_all,
+               m.entry_message_override, m.entry_sound_override, m.exit_message_override, m.exit_sound_override
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $1
         WHERE m.deleted_at IS NULL
@@ -237,7 +279,8 @@ pub async fn search_by_owner(
         r#"
         SELECT DISTINCT m.id, m.room_id, m.started_at, m.ended_at, m.created_at, m.updated_at,
                m.deleted_at, m.creator_id, m.password_hash, m.state, m.attendees, m.host_display_name,
-               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests, m.recording_allowed_for_all, m.chat_allowed_for_all
+               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests, m.recording_allowed_for_all, m.chat_allowed_for_all,
+               m.entry_message_override, m.entry_sound_override, m.exit_message_override, m.exit_sound_override
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $2
         WHERE m.deleted_at IS NULL
@@ -366,6 +409,14 @@ pub struct FeedMeetingRow {
     pub allow_guests: bool,
     pub recording_allowed_for_all: bool,
     pub chat_allowed_for_all: bool,
+    #[sqlx(try_from = "String")]
+    pub entry_message_override: AnnouncementOverride,
+    #[sqlx(try_from = "String")]
+    pub entry_sound_override: AnnouncementOverride,
+    #[sqlx(try_from = "String")]
+    pub exit_message_override: AnnouncementOverride,
+    #[sqlx(try_from = "String")]
+    pub exit_sound_override: AnnouncementOverride,
     pub waiting_room_enabled: bool,
     pub end_on_host_leave: bool,
     pub admitted_can_admit: bool,
@@ -411,6 +462,10 @@ pub async fn list_feed_for_user(
                m.allow_guests,
                m.recording_allowed_for_all,
                m.chat_allowed_for_all,
+               m.entry_message_override,
+               m.entry_sound_override,
+               m.exit_message_override,
+               m.exit_sound_override,
                m.waiting_room_enabled,
                m.end_on_host_leave,
                m.admitted_can_admit,
@@ -469,17 +524,31 @@ pub async fn soft_delete(
     sqlx::query_as::<_, MeetingRow>(
         r#"
         UPDATE meetings
-        SET deleted_at = NOW()
+        SET deleted_at = NOW(), host_left_end_due_at = NULL
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all,
+                  entry_message_override, entry_sound_override, exit_message_override, exit_sound_override
         "#,
     )
     .bind(room_id)
     .bind(creator_id)
     .fetch_optional(pool)
     .await
+}
+
+/// [`MeetingRow::instance_started_at_ms`] read fresh; `None` for a missing meeting.
+pub async fn instance_started_at_ms<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+) -> Result<Option<i64>, sqlx::Error> {
+    let started_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT started_at FROM meetings WHERE id = $1")
+            .bind(meeting_id)
+            .fetch_optional(executor)
+            .await?;
+    Ok(started_at.map(|t| t.timestamp_millis()))
 }
 
 /// Activate a meeting (set state to 'active').
@@ -518,7 +587,7 @@ pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Err
 pub async fn end_meeting_in(conn: &mut PgConnection, meeting_id: i32) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE meetings \
-         SET state = 'ended', ended_at = COALESCE(ended_at, NOW()) \
+         SET state = 'ended', ended_at = COALESCE(ended_at, NOW()), host_left_end_due_at = NULL \
          WHERE id = $1 AND state <> 'ended'",
     )
     .bind(meeting_id)
@@ -529,6 +598,116 @@ pub async fn end_meeting_in(conn: &mut PgConnection, meeting_id: i32) -> Result<
     crate::db::co_hosts::clear_instance_only_entries(conn, meeting_id).await
 }
 
+/// Whether an `end_on_host_leave` meeting is waiting out a deferred last-host-left end.
+pub async fn host_left_end_pending(pool: &PgPool, meeting_id: i32) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM meetings WHERE id = $1 AND end_on_host_leave \
+         AND host_left_end_due_at IS NOT NULL)",
+    )
+    .bind(meeting_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Locks the meeting row for the rest of the transaction, as every path that
+/// changes hosts does first (transfer, co-host revoke, kick, end), so a
+/// captions change and a demotion serialise instead of deadlocking. `None`
+/// when the meeting does not exist or is deleted.
+pub async fn lock_for_captions(
+    tx: &mut sqlx::PgConnection,
+    meeting_id: i32,
+) -> Result<Option<()>, sqlx::Error> {
+    sqlx::query_scalar::<_, i32>(
+        "SELECT id FROM meetings WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .fetch_optional(tx)
+    .await
+    .map(|row| row.map(|_| ()))
+}
+
+/// Turn captions on for an active meeting. Returns the generation, bumped only if they were off; `None` unless active.
+pub async fn enable_captions<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE meetings \
+         SET captions_on = TRUE, \
+             captions_generation = captions_generation + CASE WHEN captions_on THEN 0 ELSE 1 END \
+         WHERE id = $1 AND deleted_at IS NULL AND state = 'active' \
+         RETURNING captions_generation",
+    )
+    .bind(meeting_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// The generation of an active meeting whose captions are on, else `None`.
+pub async fn captions_generation_if_on<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT captions_generation FROM meetings \
+         WHERE id = $1 AND captions_on AND deleted_at IS NULL AND state = 'active'",
+    )
+    .bind(meeting_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Turn captions off and bump the generation; returns the new generation, `None` for a deleted meeting.
+pub async fn revoke_captions<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    meeting_id: i32,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE meetings \
+         SET captions_on = FALSE, captions_generation = captions_generation + 1 \
+         WHERE id = $1 AND deleted_at IS NULL RETURNING captions_generation",
+    )
+    .bind(meeting_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Turn captions off and bump the generation of an idle, ended or deleted meeting whose captions are still on: `(room_id, generation)`, else `None`.
+pub async fn revoke_captions_if_inactive(
+    pool: &PgPool,
+    meeting_id: i32,
+) -> Result<Option<(String, i64)>, sqlx::Error> {
+    sqlx::query_as(
+        "UPDATE meetings \
+         SET captions_on = FALSE, captions_generation = captions_generation + 1 \
+         WHERE id = $1 AND captions_on AND (state IN ('idle', 'ended') OR deleted_at IS NOT NULL) \
+         RETURNING room_id, captions_generation",
+    )
+    .bind(meeting_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// [`revoke_captions_if_inactive`] for up to `limit` meetings: `(room_id, generation)` of each.
+pub async fn revoke_stale_captions(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    sqlx::query_as(
+        "WITH stale AS ( \
+             SELECT id FROM meetings \
+             WHERE captions_on AND (state IN ('idle', 'ended') OR deleted_at IS NOT NULL) \
+             LIMIT $1 FOR UPDATE SKIP LOCKED) \
+         UPDATE meetings m \
+         SET captions_on = FALSE, captions_generation = m.captions_generation + 1 \
+         FROM stale WHERE m.id = stale.id \
+         RETURNING m.room_id, m.captions_generation",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// How [`start_instance`] left a meeting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Activation {
@@ -536,8 +715,13 @@ pub enum Activation {
     Unchanged,
     /// Idle with someone present: set active, still the same instance.
     Resumed,
-    /// Ended, or nobody present: a new instance started, demoting these non-owner hosts.
-    NewInstance { demoted: Vec<String> },
+    /// Ended, or nobody present: a new instance started, demoting these non-owner hosts,
+    /// with captions off at this generation.
+    NewInstance {
+        demoted: Vec<String>,
+        captions_generation: i64,
+        started_at_ms: i64,
+    },
 }
 
 impl Activation {
@@ -549,8 +733,26 @@ impl Activation {
     /// The non-owner hosts a new instance demoted.
     pub fn demoted(&self) -> &[String] {
         match self {
-            Activation::NewInstance { demoted } => demoted,
+            Activation::NewInstance { demoted, .. } => demoted,
             _ => &[],
+        }
+    }
+
+    pub fn captions_generation(&self) -> Option<i64> {
+        match self {
+            Activation::NewInstance {
+                captions_generation,
+                ..
+            } => Some(*captions_generation),
+            _ => None,
+        }
+    }
+
+    /// The new instance's `started_at` in Unix milliseconds.
+    pub fn new_instance_started_at_ms(&self) -> Option<i64> {
+        match self {
+            Activation::NewInstance { started_at_ms, .. } => Some(*started_at_ms),
+            _ => None,
         }
     }
 }
@@ -593,13 +795,27 @@ pub(crate) async fn start_instance_in(
     .execute(&mut *conn)
     .await?;
     crate::db::co_hosts::reset_for_new_instance(&mut *conn, meeting_id).await?;
-    sqlx::query(
-        "UPDATE meetings SET state = 'active', started_at = NOW(), ended_at = NULL WHERE id = $1",
+    let started_at: DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE meetings SET state = 'active', started_at = NOW(), ended_at = NULL, \
+         host_left_end_due_at = NULL WHERE id = $1 RETURNING started_at",
     )
     .bind(meeting_id)
-    .execute(&mut *conn)
+    .fetch_one(&mut *conn)
     .await?;
-    Ok(Activation::NewInstance { demoted })
+    let captions_generation = sqlx::query_scalar(
+        "UPDATE meetings \
+         SET captions_on = FALSE, \
+             captions_generation = captions_generation + CASE WHEN captions_on THEN 1 ELSE 0 END \
+         WHERE id = $1 RETURNING captions_generation",
+    )
+    .bind(meeting_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(Activation::NewInstance {
+        demoted,
+        captions_generation,
+        started_at_ms: started_at.timestamp_millis(),
+    })
 }
 
 /// Activate a meeting (see [`start_instance_in`]).
@@ -612,6 +828,111 @@ pub async fn start_instance(
     let activation = start_instance_in(&mut tx, meeting_id, healthy).await?;
     tx.commit().await?;
     Ok(activation)
+}
+
+/// [`start_instance`] for a joiner without host authority: `None`, changing
+/// nothing, when `end_on_host_leave` holds and the meeting is ended or its
+/// host-left end is pending.
+pub async fn start_instance_for_attendee(
+    pool: &PgPool,
+    meeting_id: i32,
+    healthy: bool,
+) -> Result<Option<Activation>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if host_ended_in(&mut tx, meeting_id).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let activation = start_instance_in(&mut tx, meeting_id, healthy).await?;
+    tx.commit().await?;
+    Ok(Some(activation))
+}
+
+async fn host_ended_in(conn: &mut PgConnection, meeting_id: i32) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT end_on_host_leave AND (state = 'ended' OR host_left_end_due_at IS NOT NULL) \
+         FROM meetings WHERE id = $1 FOR UPDATE",
+    )
+    .bind(meeting_id)
+    .fetch_one(conn)
+    .await
+}
+
+#[derive(Debug)]
+pub enum InstanceEntry {
+    CoHost {
+        row: crate::db::participants::ParticipantRow,
+        promoted: bool,
+    },
+    Attendee {
+        auto_admitted: bool,
+        row: crate::db::participants::ParticipantRow,
+        waiting_room_enabled: bool,
+    },
+}
+
+#[derive(Debug)]
+pub struct InstanceJoin {
+    pub activation: Activation,
+    /// The meeting's `started_at` once activated, read under the row lock.
+    pub started_at_ms: i64,
+    pub entry: InstanceEntry,
+}
+
+/// Activate the meeting and add the joiner in one transaction, so a concurrent
+/// joiner finds them present instead of starting another instance.
+pub async fn start_instance_and_join(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+    is_guest: bool,
+    is_live_co_host: bool,
+    healthy: bool,
+) -> Result<Option<InstanceJoin>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !is_live_co_host && host_ended_in(&mut tx, meeting_id).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let activation = start_instance_in(&mut tx, meeting_id, healthy).await?;
+    let started_at_ms = instance_started_at_ms(&mut *tx, meeting_id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    let co_host = if is_guest {
+        None
+    } else {
+        crate::db::participants::admit_as_co_host_in(&mut tx, meeting_id, user_id, display_name)
+            .await?
+    };
+    let entry = match co_host {
+        Some((row, promoted, _)) => InstanceEntry::CoHost { row, promoted },
+        None => {
+            let (auto_admitted, row, waiting_room_enabled, _) =
+                crate::db::participants::join_attendee_in(
+                    &mut tx,
+                    meeting_id,
+                    user_id,
+                    display_name,
+                    false,
+                    is_guest,
+                    healthy,
+                )
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
+            InstanceEntry::Attendee {
+                auto_admitted,
+                row,
+                waiting_room_enabled,
+            }
+        }
+    };
+    tx.commit().await?;
+    Ok(Some(InstanceJoin {
+        activation,
+        started_at_ms,
+        entry,
+    }))
 }
 
 /// Admit the creator, activating the meeting. Their first join of the
@@ -715,8 +1036,8 @@ pub struct SettingsUpdate {
     pub auto_admitted_user_ids: Vec<String>,
 }
 
-/// The `($9, $10)` pair the password `CASE` in [`update_meeting_settings`]
-/// consumes: `(clear it, the hash to write)`.
+/// The pair the password `CASE` in [`update_meeting_settings`] consumes:
+/// `(clear it, the hash to write)`.
 fn password_binds(update: &PasswordUpdate) -> (bool, Option<&str>) {
     match update {
         PasswordUpdate::Unchanged => (false, None),
@@ -736,6 +1057,7 @@ pub async fn update_meeting_settings(
     allow_guests: Option<bool>,
     recording_allowed_for_all: Option<bool>,
     chat_allowed_for_all: Option<bool>,
+    announcements: Announcements<Option<AnnouncementOverride>>,
     password: &PasswordUpdate,
 ) -> Result<Option<SettingsUpdate>, sqlx::Error> {
     let (clear_password, new_password_hash) = password_binds(password);
@@ -751,11 +1073,16 @@ pub async fn update_meeting_settings(
             allow_guests = COALESCE($5, allow_guests),
             recording_allowed_for_all = COALESCE($6, recording_allowed_for_all),
             chat_allowed_for_all = COALESCE($7, chat_allowed_for_all),
-            password_hash = CASE WHEN $8 THEN NULL ELSE COALESCE($9, password_hash) END
+            entry_message_override = COALESCE($8, entry_message_override),
+            entry_sound_override = COALESCE($9, entry_sound_override),
+            exit_message_override = COALESCE($10, exit_message_override),
+            exit_sound_override = COALESCE($11, exit_sound_override),
+            password_hash = CASE WHEN $12 THEN NULL ELSE COALESCE($13, password_hash) END
         WHERE room_id = $1 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all, chat_allowed_for_all,
+                  entry_message_override, entry_sound_override, exit_message_override, exit_sound_override
         "#,
     )
     .bind(room_id)
@@ -765,6 +1092,10 @@ pub async fn update_meeting_settings(
     .bind(allow_guests)
     .bind(recording_allowed_for_all)
     .bind(chat_allowed_for_all)
+    .bind(announcements.entry_message.map(AnnouncementOverride::as_str))
+    .bind(announcements.entry_sound.map(AnnouncementOverride::as_str))
+    .bind(announcements.exit_message.map(AnnouncementOverride::as_str))
+    .bind(announcements.exit_sound.map(AnnouncementOverride::as_str))
     .bind(clear_password)
     .bind(new_password_hash)
     .fetch_optional(&mut *tx)

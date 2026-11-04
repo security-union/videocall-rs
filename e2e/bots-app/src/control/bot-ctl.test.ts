@@ -41,6 +41,7 @@ case "$args" in
   exit "\${FAKE_COMMITTED_ENV_RC:-0}"
   ;;
 *"get statefulset"*)
+  echo "STS_GET=$args" >>"$ENV_LOG"
   if [ -n "\${FAKE_STS_FAIL:-}" ]; then
     echo "Unable to connect to the server: i/o timeout" >&2
     exit 1
@@ -491,6 +492,7 @@ interface ManifestContainer {
 
 /** COMMITTED_ENV's row format is this template's output; a template change must update both. */
 const ENV_TEMPLATE = String.raw`{{range .spec.template.spec.containers}}{{$c := .name}}{{range .env}}container {{$c}} env {{.name}}{{"\n"}}{{end}}{{range .envFrom}}container {{$c}} envFrom {{with .configMapRef}}configMap {{.name}}{{end}}{{with .secretRef}}secret {{.name}}{{end}} prefix={{with .prefix}}{{.}}{{end}}{{"\n"}}{{end}}{{end}}`;
+const STS_TEMPLATE = String.raw`{{.spec.replicas}} {{.status.replicas}} {{.status.updateRevision}} {{.metadata.generation}} {{.status.observedGeneration}} {{range .spec.template.spec.containers}}{{range .env}}{{if eq .name "BOT_FLEET_SIZE"}}{{if .valueFrom}}valueFrom{{else}}={{or .value ""}}{{end}}{{end}}{{end}}{{end}}{{"\n"}}{{if .spec.template.spec.initContainers}}initContainers{{"\n"}}{{end}}{{range .spec.template.spec.containers}}{{range $k, $v := .resources.limits}}limits.{{$k}} {{$v}}{{"\n"}}{{end}}{{range $k, $v := .resources.requests}}requests.{{$k}} {{$v}}{{"\n"}}{{end}}{{end}}`;
 
 /** The committed manifest's env in ENV_TEMPLATE's row format. */
 const COMMITTED_ENV = (
@@ -539,14 +541,16 @@ function preflight(
     used?: Record<string, string>;
     pods?: string[];
     replicas?: number;
+    fleetSize?: string;
     fake?: Record<string, string>;
   } = {},
 ): RunResult {
   const pods = opts.pods ?? [];
   const replicas = opts.replicas ?? pods.length;
+  const fleetSize = opts.fleetSize ?? `=${n}`;
   return runBotCtl(["preflight", n], {
     fake: {
-      FAKE_STS: `${replicas} ${replicas} videocall-bots-new 4 4\n${LIVE_TEMPLATE}`,
+      FAKE_STS: `${replicas} ${replicas} videocall-bots-new 4 4 ${fleetSize}\n${LIVE_TEMPLATE}`,
       FAKE_QUOTA: quotaTemplate(opts.used),
       FAKE_FLEET_PODS: pods.map((p) => `${p}\n`).join(""),
       FAKE_LIVE_ENV: COMMITTED_ENV,
@@ -678,26 +682,76 @@ describe("k8s/bot-ctl preflight — quota admission", () => {
 });
 
 describe("k8s/bot-ctl preflight — drift and rollout", () => {
-  it("diffs the committed StatefulSet with only replicas set to the live value", () => {
+  it("diffs the committed StatefulSet with only replicas and BOT_FLEET_SIZE set to the live values", () => {
     const committed = /^ {2}replicas: (\d+)$/m.exec(STS_YAML)?.[1];
-    const res = preflight("1");
-    expect(res.status).toBe(0);
+    const res = preflight("1", { fleetSize: "=7" });
     const sent = res.diffed.STS.split("\n");
     const orig = STS_YAML.split("\n");
     expect(sent).toHaveLength(orig.length);
     const changed = sent.filter((l, i) => l !== orig[i]);
-    expect(changed).toEqual(committed === "0" ? [] : ["  replicas: 0"]);
+    expect(changed).toEqual([
+      ...(committed === "0" ? [] : ["  replicas: 0"]),
+      '              value: "7"',
+    ]);
+    expect(sent[sent.indexOf('              value: "7"') - 1]).toBe(
+      "            - name: BOT_FLEET_SIZE",
+    );
     expect(res.diffed.NS).toContain("kind: ResourceQuota");
     expect(res.env.filter((l) => l.startsWith("DIFF_ARGS="))).toEqual([
       "DIFF_ARGS=diff -n bot-load -f -",
       "DIFF_ARGS=diff -n bot-load -f -",
     ]);
     expect(res.stdout).toContain(
-      `✓ statefulset/videocall-bots (replicas ignored: live 0, committed ${committed}) matches k8s/statefulset.yaml`,
+      `✓ statefulset/videocall-bots (replicas ignored: live 0, committed ${committed}; BOT_FLEET_SIZE ignored: live 7) matches k8s/statefulset.yaml`,
     );
     expect(res.stdout).toContain(
       "✓ statefulset/videocall-bots pod template env and envFrom names match k8s/statefulset.yaml",
     );
+  });
+
+  it("does not claim a non-numeric live BOT_FLEET_SIZE was ignored", () => {
+    const committedFleet = /- name: BOT_FLEET_SIZE\n +value: "(\d+)"/.exec(STS_YAML)?.[1];
+    expect(committedFleet).toBeDefined();
+    const res = preflight("0", { fleetSize: "=abc" });
+    expect(res.diffed.STS).toContain(
+      `            - name: BOT_FLEET_SIZE\n              value: "${committedFleet}"`,
+    );
+    const out = res.stdout + res.stderr;
+    expect(out).toContain("BOT_FLEET_SIZE compared: live abc is not a number");
+    expect(out).not.toContain("BOT_FLEET_SIZE ignored");
+  });
+
+  it("names a valueFrom BOT_FLEET_SIZE as such", () => {
+    const res = preflight("4", { fleetSize: "valueFrom" });
+    const out = res.stdout + res.stderr;
+    expect(out).toContain("BOT_FLEET_SIZE compared: live set by valueFrom is not a number");
+    expect(out).toContain("BOT_FLEET_SIZE is set by valueFrom, not 4");
+  });
+
+  it("does not mistake a literal BOT_FLEET_SIZE of valueFrom for a valueFrom reference", () => {
+    const res = preflight("4", { fleetSize: "=valueFrom" });
+    const out = res.stdout + res.stderr;
+    expect(out).toContain("BOT_FLEET_SIZE compared: live valueFrom is not a number");
+    expect(out).not.toContain("set by valueFrom");
+  });
+
+  it("keeps two BOT_FLEET_SIZE entries apart instead of reading them as one number", () => {
+    const out = (({ stdout, stderr }) => stdout + stderr)(preflight("4", { fleetSize: "=3=4" }));
+    expect(out).toContain("BOT_FLEET_SIZE compared: live 3=4 is not a number");
+  });
+
+  it("reports an empty live BOT_FLEET_SIZE as unset, not valueFrom", () => {
+    const res = preflight("4", { fleetSize: "=" });
+    const out = res.stdout + res.stderr;
+    expect(out).toContain("BOT_FLEET_SIZE compared: live unset is not a number");
+    expect(out).toContain("BOT_FLEET_SIZE is unset, not 4");
+    expect(out).not.toContain("valueFrom");
+  });
+
+  it("sends the StatefulSet go-template the tests model", () => {
+    const res = preflight("4");
+    const sent = res.env.find((l) => l.startsWith("STS_GET="))?.split("go-template=")[1];
+    expect(sent).toBe(STS_TEMPLATE);
   });
 
   it("fails on env the live template has and the manifest lacks, though kubectl diff is clean", () => {
@@ -814,5 +868,38 @@ describe("k8s/bot-ctl preflight — drift and rollout", () => {
     expect(res.stderr).toContain(
       "found 1 pod(s) labelled app.kubernetes.io/instance=videocall-bots but the StatefulSet reports 3",
     );
+  });
+});
+
+describe("k8s/bot-ctl preflight — talking-clock BOT_FLEET_SIZE (issue 3072)", () => {
+  const SET_ENV = "kubectl -n bot-load set env statefulset/videocall-bots BOT_FLEET_SIZE=10";
+
+  it("fails a scale whose replica count BOT_FLEET_SIZE does not match, printing the set-env fix", () => {
+    for (const [fleetSize, shown] of [
+      ["=3", "3"],
+      ["", "unset"],
+    ]) {
+      const res = preflight("10", { fleetSize });
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toContain(`✗ BOT_FLEET_SIZE is ${shown}, not 10:`);
+      expect(res.stderr).toContain(SET_ENV);
+    }
+  });
+
+  it("passes when BOT_FLEET_SIZE equals the target, and prints set env before the scale", () => {
+    const res = preflight("10");
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("✓ BOT_FLEET_SIZE is 10, the target replica count");
+    const hint = res.stdout.slice(res.stdout.indexOf("preflight: all checks passed"));
+    expect(hint.indexOf(SET_ENV)).toBeGreaterThan(-1);
+    expect(hint.indexOf(SET_ENV)).toBeLessThan(
+      hint.indexOf("scale statefulset/videocall-bots --replicas=10"),
+    );
+  });
+
+  it("does not hold a scale to zero to the rotation size", () => {
+    const res = preflight("0", { fleetSize: "=3" });
+    expect(res.status).toBe(0);
+    expect(res.stdout).not.toContain("set env");
   });
 });

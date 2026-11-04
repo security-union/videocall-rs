@@ -5310,7 +5310,7 @@
       },
       "id": 104,
       "title": "Relay Outbound Datagram Send Failures /sec — FLEET-WIDE (issue 2030)",
-      "description": "Server-side view of WebTransport outbound datagrams quinn REFUSED (issue 2030): send_datagram returned Err in spawn_datagram_writer, broken down by failure reason. A refusal is not automatically a lost packet. Since #2716 reason=too_large and reason=unsupported are counted here AND diverted to the reliable uni stream, so they mark the datagram lane refusing the packet, not the packet vanishing — pair them with videocall_relay_datagram_unistream_fallbacks_total to see whether that lane carried it (outcome=unistream) or was full (outcome=dropped). reason=connection_lost is benign teardown churn and IS loss; reason=disabled and reason=webtransport are loss too. A sustained too_large / unsupported / disabled is an actionable MTU or datagram-config bug either way. FLEET-WIDE — relay_outbound_bridge_datagram_send_failures_total carries only 'transport' (always webtransport) and 'reason' labels (no room/meeting), so this is NOT filtered by $meeting. Server-side sibling of the receiver-side Audio Datagram Loss panel above — this signal survives a wedged client. Does NOT count datagrams quinn accepts (returns Ok) and then silently evicts when its bounded send buffer (datagram_send_buffer_size) overflows — quinn pops the oldest queued datagram and still returns Ok, so this call site can't see it (pacing/cwnd only set the drain rate). That class needs a quinn-level hook, out of scope for issue 2030.",
+      "description": "Server-side view of WebTransport outbound datagrams quinn REFUSED (issue 2030): send_datagram returned Err in spawn_datagram_writer, broken down by failure reason. A refusal is not automatically a lost packet. Since #2716 reason=too_large and reason=unsupported are counted here AND diverted to the reliable uni stream, so they mark the datagram lane refusing the packet, not the packet vanishing — pair them with videocall_relay_datagram_unistream_fallbacks_total to see whether that lane carried it (outcome=unistream) or was full (outcome=dropped). reason=connection_lost is benign teardown churn and IS loss; reason=disabled and reason=webtransport are loss too. A sustained too_large / unsupported / disabled is an actionable MTU or datagram-config bug either way. FLEET-WIDE — relay_outbound_bridge_datagram_send_failures_total carries only 'transport' (always webtransport) and 'reason' labels (no room/meeting), so this is NOT filtered by $meeting. Server-side sibling of the receiver-side Audio Datagram Loss panel above — this signal survives a wedged client. Does NOT count datagrams quinn accepts (returns Ok) and then silently evicts when its bounded send buffer (datagram_send_buffer_size) overflows — quinn pops the oldest queued datagrams and still returns Ok, so this call site can't see it (pacing/cwnd only set the drain rate). That class needs a quinn-level hook, out of scope for issue 2030.",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -6390,7 +6390,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Rate of MAX_DATA and MAX_STREAM_DATA frames the relay RECEIVED on live WebTransport connections -- flow-control credit each peer granted. Read it as the INVERSE of a stall: a healthy receiver grants credit continuously as it drains, so a line that FLATTENS while the relay still has data queued identifies that receiver as the wedge, not relay CPU. MAX_STREAM_DATA is the per-stream window the persistent unistream writer parks on (#1638); MAX_DATA is the connection-level one. Both gauges are cumulative, so they are charted with rate(). Corroborate a flat line with videocall_relay_connection_path_cwnd_bytes and the outbound queue depth. This panel previously charted frame_tx_data_blocked / frame_tx_stream_data_blocked, which read zero forever: quinn-proto 0.11.13 decodes those frames but has no TX construction site for them (#2716).",
+      "description": "Rate of MAX_DATA and MAX_STREAM_DATA frames the relay RECEIVED on live WebTransport connections -- flow-control credit each peer granted. Read it as the INVERSE of a stall: a healthy receiver grants credit continuously as it drains, so a line that FLATTENS while the relay still has data queued identifies that receiver as the wedge, not relay CPU. MAX_STREAM_DATA is the per-stream window the persistent unistream writer parks on (#1638); MAX_DATA is the connection-level one. Both gauges are cumulative, so they are charted with rate(). Corroborate a flat line with videocall_relay_connection_path_cwnd_bytes and the outbound queue depth.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -6650,7 +6650,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Two cumulative gauges charted as rates. send_datagram calls counts datagrams quinn ACCEPTED into its bounded outgoing queue (returned Ok); frame_tx.datagram counts datagram frames that actually left the relay. The two tracking together is healthy. Calls running above frames is the silent-drop condition -- quinn evicts the OLDEST queued datagram on overflow and still returns Ok, so the send-failures counter never sees it. The gap itself is the next panel.",
+      "description": "Two cumulative gauges charted as rates. send_datagram calls counts datagrams quinn ACCEPTED into its bounded outgoing queue (returned Ok); frame_tx.datagram counts datagram frames that actually left the relay. The two tracking together is healthy. Calls running above frames is the silent-drop condition -- quinn evicts the OLDEST queued datagrams to make room and still returns Ok, so the send-failures counter never sees it. The gap itself is the next panel.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -6717,7 +6717,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "How far the silent-drop level (send_datagram calls minus datagram frames transmitted, clamped at 0) CLIMBED over the last 5 minutes. That level is a backlog, not a monotonic counter -- it falls again when the queue drains -- so this uses delta() rather than increase(), which would apply counter-reset correction to every legitimate dip. Part of any standing value is simply queued-not-yet-sent, bounded by the relay's configured datagram_send_buffer_size -- 65,975 bytes since #2742, about 325 top-tier audio datagrams at 203 wire bytes each, overridable by QUIC_DATAGRAM_SEND_BUFFER_BYTES -- so a standing level near a thousand is mostly real eviction, not transient queue. Only a sustained positive delta is real silent loss. Pair it with the send-buffer-space panel: space pinned at 0 while this climbs identifies queue overflow as the mechanism.",
+      "description": "How far the silent-drop level (send_datagram calls minus datagram frames transmitted, clamped at 0) CLIMBED over the last 5 minutes. That level is a backlog, not a monotonic counter -- it falls again when the queue drains -- so this uses delta() rather than increase(), which would apply counter-reset correction to every legitimate dip. Part of any standing value is simply queued-not-yet-sent, bounded by the relay's configured datagram_send_buffer_size -- WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES, overridable by QUIC_DATAGRAM_SEND_BUFFER_BYTES -- so a standing level near a thousand is mostly real eviction, not transient queue. Only a sustained positive delta is real silent loss. Pair it with the send-buffer-space panel: space held below the next datagram's bytes while this climbs identifies queue overflow as the mechanism.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -6778,7 +6778,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Bytes still free in quinn's outgoing datagram queue for each live WebTransport connection, an instantaneous level. Zero means the queue has reached its budget: quinn evicts only while the queued total EXCEEDS datagram_send_buffer_size, so zero is the point at which the next send_datagram MAY start evicting, not proof that one already did. Sustained zero together with a climbing silent-drop delta is the overflow signature.",
+      "description": "Bytes still free in quinn's outgoing datagram queue for each live WebTransport connection, an instantaneous level. Free space below the next datagram's bytes means a send at that moment evicts the oldest; a saturated queue reads in that range, not necessarily 0, and a low reading is not proof that one already did. Sustained sub-datagram space together with a climbing silent-drop delta is the overflow signature.",
       "fieldConfig": {
         "defaults": {
           "custom": {

@@ -34,7 +34,7 @@ RUN v=$(grep '^version' dioxus-ui/Cargo.toml | head -1) && v="${v#*\"}" && v="${
     > dioxus-ui/dist/version.json
 
 # ---------------------------------------------------------------------------
-FROM nginx:1.21.5-alpine
+FROM nginx:1.30.6-alpine3.24-slim
 
 ARG GIT_SHA=unknown
 ARG GIT_BRANCH=unknown

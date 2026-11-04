@@ -217,8 +217,7 @@ async function setupTwoUserMeeting(
     guestName,
     uiURL,
   );
-  // The share tests here read the split layout, which a received share opens
-  // in only by preference since #2792.
+  // The share tests here read the split layout.
   await seedShareViewMode(guestCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();

@@ -56,6 +56,8 @@ pub enum MintError {
     /// Neither a token nor a signing secret was configured, and the caller did
     /// not opt in to the deprecated unauthenticated path.
     NoCredential,
+    /// The deadline the token had to expire by has already passed.
+    PastDeadline,
 }
 
 impl fmt::Display for MintError {
@@ -69,6 +71,7 @@ impl fmt::Display for MintError {
                  to join with `?token=`, or explicitly opt in to the deprecated unauthenticated \
                  `/lobby/{{user_id}}/{{room}}` path"
             ),
+            MintError::PastDeadline => write!(f, "the token's deadline has already passed"),
         }
     }
 }
@@ -78,7 +81,7 @@ impl std::error::Error for MintError {
         match self {
             MintError::Clock(e) => Some(e),
             MintError::Encode(e) => Some(e),
-            MintError::NoCredential => None,
+            MintError::NoCredential | MintError::PastDeadline => None,
         }
     }
 }
@@ -90,11 +93,45 @@ pub fn mint_room_token(
     room: &str,
     ttl_secs: u64,
 ) -> Result<String, MintError> {
-    let now = SystemTime::now()
+    let now = now_secs()?;
+    sign_room_token(jwt_secret, user_id, room, now, now.saturating_add(ttl_secs))
+}
+
+/// [`mint_room_token`], expiring by `not_after` (epoch seconds) at the latest; refused once it has passed.
+pub fn mint_room_token_until(
+    jwt_secret: &str,
+    user_id: &str,
+    room: &str,
+    ttl_secs: u64,
+    not_after: u64,
+) -> Result<String, MintError> {
+    let now = now_secs()?;
+    if now >= not_after {
+        return Err(MintError::PastDeadline);
+    }
+    sign_room_token(
+        jwt_secret,
+        user_id,
+        room,
+        now,
+        now.saturating_add(ttl_secs).min(not_after),
+    )
+}
+
+fn now_secs() -> Result<u64, MintError> {
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(MintError::Clock)?
-        .as_secs();
+        .as_secs())
+}
 
+fn sign_room_token(
+    jwt_secret: &str,
+    user_id: &str,
+    room: &str,
+    now: u64,
+    exp: u64,
+) -> Result<String, MintError> {
     let claims = RoomAccessTokenClaims {
         sub: user_id.to_string(),
         room: room.to_string(),
@@ -104,10 +141,11 @@ pub fn mint_room_token(
         display_name: user_id.to_string(),
         observer: false,
         end_on_host_leave: true,
-        exp: (now + ttl_secs) as i64,
+        exp: i64::try_from(exp).unwrap_or(i64::MAX),
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
         typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
         iat: Some(now as i64),
+        meeting_started_at_ms: None,
     };
 
     // The relay treats the secret as raw UTF-8 bytes (not base64-decoded).
@@ -243,6 +281,28 @@ mod tests {
         let exp = decode_claims(&token, b"secret").exp;
         assert!(exp >= before + 120);
         assert!(exp <= after + 120);
+    }
+
+    #[test]
+    fn mint_room_token_saturates_a_huge_ttl_instead_of_going_negative() {
+        let token = mint_room_token("secret", "bot-1", "room-123", u64::MAX).unwrap();
+        assert_eq!(decode_claims(&token, b"secret").exp, i64::MAX);
+    }
+
+    #[test]
+    fn mint_room_token_until_caps_the_expiry_at_the_deadline_and_refuses_after_it() {
+        let now = now_secs().unwrap();
+        let token = mint_room_token_until("secret", "bot-1", "room-123", 3600, now + 5).unwrap();
+        assert!(decode_claims(&token, b"secret").exp <= (now + 5) as i64);
+        let token = mint_room_token_until("secret", "bot-1", "room-123", 2, now + 3600).unwrap();
+        assert!(decode_claims(&token, b"secret").exp <= (now + 3) as i64);
+        assert!(matches!(
+            mint_room_token_until("secret", "bot-1", "room-123", 60, now),
+            Err(MintError::PastDeadline)
+        ));
+        let token =
+            mint_room_token_until("secret", "bot-1", "room-123", u64::MAX, now + 100).unwrap();
+        assert!(decode_claims(&token, b"secret").exp <= (now + 100) as i64);
     }
 
     #[test]

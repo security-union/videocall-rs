@@ -229,7 +229,6 @@ async function setupTwoUserMeeting(
     await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
     await guestCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
   }
-  // The split layout under test is opt-in since #2792.
   await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();

@@ -87,6 +87,10 @@ pub struct RoomAccessTokenClaims {
     /// participant's token whose `iat` does not postdate the kick (#2934).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iat: Option<i64>,
+
+    /// Unix milliseconds of the meeting instance's `started_at` (#3237).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_started_at_ms: Option<i64>,
 }
 
 impl RoomAccessTokenClaims {
@@ -188,11 +192,13 @@ mod tests {
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
             typ: None,
             iat: None,
+            meeting_started_at_ms: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
         assert!(!json.contains("typ"));
         assert!(!json.contains("iat"));
+        assert!(!json.contains("meeting_started_at_ms"));
     }
 
     #[test]
@@ -209,5 +215,22 @@ mod tests {
         let back: RoomAccessTokenClaims =
             serde_json::from_str(&serde_json::to_string(&with_iat).unwrap()).unwrap();
         assert_eq!(back.iat, Some(1_707_000_000));
+    }
+
+    #[test]
+    fn meeting_started_at_ms_round_trips_and_absent_is_none() {
+        let legacy = r#"{"sub":"a","room":"r","room_join":true,"is_host":false,
+            "display_name":"A","exp":1707004800,"iss":"videocall-meeting-backend"}"#;
+        let claims: RoomAccessTokenClaims = serde_json::from_str(legacy).expect("legacy");
+        assert_eq!(claims.meeting_started_at_ms, None);
+
+        let with_start = RoomAccessTokenClaims {
+            meeting_started_at_ms: Some(1_707_000_000_123),
+            ..claims
+        };
+        let json = serde_json::to_string(&with_start).unwrap();
+        assert!(json.contains(r#""meeting_started_at_ms":1707000000123"#));
+        let back: RoomAccessTokenClaims = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.meeting_started_at_ms, Some(1_707_000_000_123));
     }
 }

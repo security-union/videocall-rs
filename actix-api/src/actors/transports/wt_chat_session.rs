@@ -23,10 +23,11 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
+use crate::actors::priority_drop::channel_full_drop_kind;
 use crate::actors::priority_drop::{
     dimension_fill, evaluate as evaluate_priority_drop,
-    evaluate_dual as evaluate_priority_drop_dual, OutboundPriority, PriorityDropDecision,
-    SharedQueueByteMeter,
+    evaluate_dual as evaluate_priority_drop_dual, outbound_priority, OutboundPriority,
+    PriorityDropDecision, SharedQueueByteMeter,
 };
 use crate::actors::session_logic::{
     DownlinkDropSink, DownlinkReliefSignal, InboundAction, SessionLogic,
@@ -52,8 +53,7 @@ use actix::{
 use bytes::Bytes;
 use protobuf::Enum as ProtobufEnum;
 use protobuf::Message as ProtobufMessage;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -141,7 +141,8 @@ pub enum DownlinkStreamKey {
     /// Every audio frame, both E2EE modes: one receiver-scoped stream, NOT one per
     /// publisher (#2724, contract A1).
     Audio,
-    /// Bulk media the relay cannot attribute: it rides the SHARED overflow stream.
+    /// The SHARED overflow stream: bulk media the relay cannot attribute, and
+    /// every caption.
     Shared,
 }
 
@@ -239,7 +240,9 @@ pub(crate) fn wt_unistream_byte_budget_for(priority: OutboundPriority) -> usize 
         OutboundPriority::Audio
         | OutboundPriority::Critical
         | OutboundPriority::Control
-        | OutboundPriority::ProbeEcho => 0,
+        | OutboundPriority::ProbeEcho
+        | OutboundPriority::Caption
+        | OutboundPriority::CaptionStatus => 0,
     }
 }
 
@@ -258,7 +261,10 @@ pub(crate) fn wt_unistream_decision(
     free_capacity: usize,
     queued: &SharedQueueByteMeter,
 ) -> PriorityDropDecision {
-    let (queued_bytes, budget) = if priority == OutboundPriority::ProbeEcho {
+    let (queued_bytes, budget) = if matches!(
+        priority,
+        OutboundPriority::ProbeEcho | OutboundPriority::Caption
+    ) {
         fullest_media_byte_dimension(queued)
     } else {
         let budget = wt_unistream_byte_budget_for(priority);
@@ -345,28 +351,37 @@ pub(crate) fn wt_route_and_admit(
     data: Vec<u8>,
     is_media: bool,
     is_audio: bool,
-    parsed: bool,
-    packet_type: PacketType,
+    parsed: Option<&PacketWrapper>,
     media_type: Option<MediaType>,
-    media_kind: MediaKind,
     publisher_session_id: u64,
     audio_lane: AudioDownlinkLane,
     escalation: &DownlinkShedEscalation,
 ) -> WtAdmission {
-    let priority =
-        OutboundPriority::classify_sealed_aware(parsed, packet_type, media_type, media_kind);
+    let priority = outbound_priority(parsed, media_type);
+    // Cleartext even under E2EE, so a sealed frame still keys to its
+    // publisher's lane.
+    let media_kind = parsed
+        .and_then(|pw| pw.media_kind.enum_value().ok())
+        .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED);
     // #2726 stage 1, decayed and never latched.
     if priority == OutboundPriority::Video && escalation.camera_video_is_shed() {
         return WtAdmission::EscalationShed;
     }
-    let key = DownlinkStreamKey::for_media(
-        is_media,
-        is_audio,
-        publisher_session_id,
-        media_kind,
-        data.len(),
-        audio_lane,
-    );
+    let key = if matches!(
+        priority,
+        OutboundPriority::Caption | OutboundPriority::CaptionStatus
+    ) {
+        DownlinkStreamKey::Shared
+    } else {
+        DownlinkStreamKey::for_media(
+            is_media,
+            is_audio,
+            publisher_session_id,
+            media_kind,
+            data.len(),
+            audio_lane,
+        )
+    };
     match build_outbound(data, is_media, is_audio, priority, audio_lane) {
         WtOutbound::UniStream(bytes) => {
             wt_unistream_admit(unistream_tx, unistream_bytes, priority, bytes, key)
@@ -586,9 +601,9 @@ pub struct WtChatSession {
     /// Track if ActivateConnection has been sent
     activated: bool,
 
-    /// Set when a host kick closes this session (#2934), so the connection
-    /// closes with [`videocall_types::wt_close::WT_CLOSE_CODE_REMOVED_BY_HOST`].
-    removed_by_host: Arc<AtomicBool>,
+    /// Why the relay force-closed this session, so the connection closes
+    /// with that reason's code.
+    forced_close: Arc<OnceLock<ForceClose>>,
 }
 
 /// Pure outbound-routing decision used by [`WtChatSession::send_auto`].
@@ -601,6 +616,7 @@ pub struct WtChatSession {
 /// 0. [`OutboundPriority::Critical`] → reliable unidirectional stream,
 ///    whatever the size (#2718). `classify_sealed_aware` never returns
 ///    `Critical` for a `MEDIA` packet, so this moves non-media control only.
+///    [`OutboundPriority::Caption`] likewise never takes a datagram.
 /// 1. Non-media, fits MTU → datagram (control / heartbeats / RTT).
 /// 2. Media + audio + fits MTU → datagram, but ONLY while `audio_lane` is the
 ///    legacy [`AudioDownlinkLane::Datagram`] (#2724). Under the default the
@@ -614,7 +630,10 @@ fn build_outbound(
     priority: OutboundPriority,
     audio_lane: AudioDownlinkLane,
 ) -> WtOutbound {
-    if priority == OutboundPriority::Critical {
+    if matches!(
+        priority,
+        OutboundPriority::Critical | OutboundPriority::Caption | OutboundPriority::CaptionStatus
+    ) {
         return WtOutbound::UniStream(data.into());
     }
     let fits_datagram = data.len() <= DATAGRAM_MAX_SIZE;
@@ -638,49 +657,6 @@ pub(crate) fn book_escalation_shed() {
     RELAY_DOWNLINK_SHED_TOTAL
         .with_label_values(&["webtransport"])
         .inc();
-}
-
-/// Classify a dropped outbound packet for the
-/// `videocall_outbound_channel_drops_total{kind=...}` label.
-///
-/// Mirrors the WS site (`ws_chat_session::Handler<Message>`):
-/// * `parsed=false` → `"unknown"` — the upstream `PacketWrapper` parse
-///   failed, so we cannot trust `is_media`. Emit the same fallback the
-///   WS path uses so alerts tuned on `kind` behave consistently across
-///   transports (issue #610).
-/// * `parsed=true && !is_media` → `"control"`.
-/// * `parsed=true && is_media && media_type == Some(AUDIO)`  → `"audio"`.
-/// * `parsed=true && is_media && media_type == Some(VIDEO)`  → `"video"`.
-/// * `parsed=true && is_media && media_type == Some(SCREEN)` → `"screen"`.
-/// * `parsed=true && is_media && media_type` is anything else (HEARTBEAT,
-///   KEYFRAME_REQUEST, encrypted/unparseable inner) → `"media"`. This is
-///   the legacy catch-all so existing alerts that pivot on `kind="media"`
-///   still see a series.
-///
-/// Extracted as a free function so the mapping can be unit-tested
-/// without spinning up a real `WtChatSession`.
-///
-/// `pub(crate)` so the metric-taxonomy coverage guard
-/// (`metrics::tests::relay_drop_kinds_covers_all_emitted_drop_labels`) can
-/// enumerate this emit site's output directly (issue #1186). Kept in lock-step
-/// with the `ws_chat_session` copy — that test asserts both copies agree.
-pub(crate) fn drop_kind_label(
-    parsed: bool,
-    is_media: bool,
-    media_type: Option<MediaType>,
-) -> &'static str {
-    if !parsed {
-        return "unknown";
-    }
-    if !is_media {
-        return "control";
-    }
-    match media_type {
-        Some(MediaType::AUDIO) => "audio",
-        Some(MediaType::VIDEO) => "video",
-        Some(MediaType::SCREEN) => "screen",
-        _ => "media",
-    }
 }
 
 impl WtChatSession {
@@ -727,20 +703,38 @@ impl WtChatSession {
             audio_lane,
             escalation,
             activated: false,
-            removed_by_host: Arc::new(AtomicBool::new(false)),
+            forced_close: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Whether a host kick closed this session. Read BEFORE `start()`, like
-    /// [`Self::session_id`].
-    pub fn removed_by_host(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.removed_by_host)
+    /// Read BEFORE `start()`, like [`Self::session_id`].
+    pub fn forced_close(&self) -> Arc<OnceLock<ForceClose>> {
+        Arc::clone(&self.forced_close)
     }
 
     /// Carry the room token's `iat` claim into `JoinRoom` (#2934).
     pub fn with_token_iat(mut self, token_iat: Option<i64>) -> Self {
         self.logic.token_iat = token_iat;
         self
+    }
+
+    pub fn with_meeting_started_at_ms(mut self, meeting_started_at_ms: Option<u64>) -> Self {
+        self.logic.meeting_started_at_ms = meeting_started_at_ms;
+        self
+    }
+
+    /// Carry the client's `?conn_seq=` into `JoinRoom`.
+    pub fn with_conn_seq(mut self, conn_seq: Option<u64>) -> Self {
+        self.logic.conn_seq = conn_seq;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn join_room_message_for_test(
+        &self,
+        closer: actix::Recipient<crate::messages::session::ForceClose>,
+    ) -> crate::messages::server::JoinRoom {
+        self.logic.create_join_room_message(closer)
     }
 
     /// The canonical per-session id for this connection (`SessionLogic::id`).
@@ -840,29 +834,18 @@ impl WtChatSession {
     /// from an already-parsed `PacketWrapper` / `MediaPacket`, avoiding a
     /// redundant protobuf parse on every outbound packet.
     ///
-    /// `parsed` is a tri-state signal: `true` if the upstream
-    /// `PacketWrapper` parsed successfully (so `is_media` is trustworthy),
-    /// `false` if the parse failed and `is_media` is the safe-default
-    /// fallback (`false`). This is used only for the drop-counter `kind`
-    /// label so it matches the WS site's `unknown` fallback — routing
-    /// continues to honour the same safe default it always has.
-    ///
-    /// `media_type` is the inner `MediaPacket.media_type` when it could be
-    /// extracted (the inner parse succeeded). It is used solely to refine
-    /// the drop-counter `kind` label into `audio`/`video`/`screen` — the
-    /// 2026-05-08 production storm dropped 25,081 packets to one slow
-    /// receiver and the metric had no way to tell audio from video. This
-    /// hint does NOT influence routing.
-    #[allow(clippy::too_many_arguments)]
+    /// `parsed` is the already-decoded outer wrapper (`None` when it failed to
+    /// decode) and `media_type` the inner `MediaPacket.media_type` when it was
+    /// readable. [`outbound_priority`] classifies the shed tier from both, and
+    /// [`build_outbound`] reads that tier; `parsed.is_some()` and `media_type`
+    /// also refine the drop-counter `kind` into `audio`/`video`/`screen`.
     fn send_auto(
         &self,
         data: Vec<u8>,
         is_media: bool,
         is_audio: bool,
-        parsed: bool,
-        packet_type: PacketType,
+        parsed: Option<&PacketWrapper>,
         media_type: Option<MediaType>,
-        media_kind: MediaKind,
         publisher_session_id: u64,
     ) -> WtSendResult {
         let admission = wt_route_and_admit(
@@ -873,9 +856,7 @@ impl WtChatSession {
             is_media,
             is_audio,
             parsed,
-            packet_type,
             media_type,
-            media_kind,
             publisher_session_id,
             self.audio_lane,
             &self.escalation,
@@ -935,38 +916,11 @@ impl WtChatSession {
                 // in the log line below. Increment both the room-tagged
                 // RELAY_PACKET_DROPS_TOTAL (for per-room investigation) and
                 // the protocol-wide OUTBOUND_CHANNEL_DROPS_TOTAL (for
-                // alerting). `kind` is derived from the already-parsed
-                // `is_media` hint plus the inner `MediaType` — we explicitly
-                // avoid an extra protobuf parse on the drop hot path.
-                //
-                // Issue #610: when the upstream parse failed (`parsed=false`)
-                // we cannot trust `is_media`, so emit `kind="unknown"` to
-                // match the WS site's fallback. Without this, malformed
-                // wire-bytes would silently inflate WT's `control` series
-                // while WS would distinguish them as `unknown`, breaking
-                // alerts tuned on the same label across transports.
-                //
-                // 2026-05-08 audio-quality follow-up: when the inner
-                // `MediaType` is known, the label is refined into
-                // `audio`/`video`/`screen` so operators can attribute a
-                // congestion storm to the specific media stream. Anything
-                // else (HEARTBEAT, KEYFRAME_REQUEST, encrypted inner)
-                // continues to use the legacy `media` catch-all.
-                //
-                // 2026-05-11 priority-drop policy (discussion #699): if
-                // the priority is Critical (SESSION_ASSIGNED,
-                // CONGESTION, RSA_PUB_KEY, MEETING) and try_send still
-                // fails, emit `kind="overflow_critical"` so the
-                // exceptional case of a lifecycle packet dropped is
-                // alertable independently of normal media drops.
+                // alerting).
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                     .inc();
-                let kind = if priority == OutboundPriority::Critical {
-                    "overflow_critical"
-                } else {
-                    drop_kind_label(parsed, is_media, media_type)
-                };
+                let kind = channel_full_drop_kind(priority, parsed.is_some(), is_media, media_type);
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["webtransport", kind])
                     .inc();
@@ -1129,20 +1083,23 @@ impl Actor for WtChatSession {
         let room = self.logic.room.clone();
         let user_id = self.logic.user_id.clone();
         let session_id = self.logic.id;
+        let meeting_started_at_ms = self.logic.meeting_started_at_ms;
 
         ctx.wait(
             async move {
                 session_manager
-                    .start_session(&room, &user_id, session_id)
+                    .start_session(&room, &user_id, session_id, meeting_started_at_ms)
                     .await
             }
             .into_actor(self)
             .map(|result, act, ctx| match result {
                 Ok(result) => {
                     act.send(act.logic.build_session_assigned());
-                    let bytes = act
-                        .logic
-                        .build_meeting_started(result.start_time_ms, &result.creator_id);
+                    let bytes = act.logic.build_meeting_started(
+                        result.start_time_ms,
+                        result.start_time_authoritative,
+                        &result.creator_id,
+                    );
                     act.send(bytes);
                 }
                 Err(e) => {
@@ -1222,10 +1179,6 @@ impl Handler<Message> for WtChatSession {
         // user_id, and packet_type. This avoids a redundant parse in send_auto
         // and ensures congestion tracking targets the correct (sender) session.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
-        // Whether the outer `PacketWrapper` parsed at all. Threaded into
-        // `send_auto` so the drop-counter `kind` label can fall back to
-        // "unknown" on parse failure (issue #610) — matching the WS site.
-        let parse_succeeded = parsed.is_some();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
         let sender_user_id = parsed
             .as_ref()
@@ -1265,20 +1218,12 @@ impl Handler<Message> for WtChatSession {
             None
         };
         let is_audio = matches!(inner_media_type, Some(MediaType::AUDIO));
-        // Cleartext even under E2EE, so it keeps the byte bound alive (#2717).
-        let media_kind = parsed
-            .as_ref()
-            .and_then(|pw| pw.media_kind.enum_value().ok())
-            .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED);
-
         match self.send_auto(
             bytes,
             is_media,
             is_audio,
-            parse_succeeded,
-            packet_type,
+            parsed.as_ref(),
             inner_media_type,
-            media_kind,
             sender_session_id,
         ) {
             WtSendResult::Sent => self.logic.observe_outbound_delivery(&msg),
@@ -1377,12 +1322,14 @@ impl Handler<StopSession> for WtChatSession {
 impl Handler<ForceClose> for WtChatSession {
     type Result = ();
 
-    fn handle(&mut self, _msg: ForceClose, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: ForceClose, ctx: &mut Self::Context) -> Self::Result {
         info!(
-            "Closing WebTransport session {} in room {}: removed by host",
-            self.logic.id, self.logic.room
+            "Closing WebTransport session {} in room {}: {}",
+            self.logic.id,
+            self.logic.room,
+            msg.description()
         );
-        self.removed_by_host.store(true, Ordering::Release);
+        let _ = self.forced_close.set(msg);
         ctx.run_later(KICK_CLOSE_FLUSH_DELAY, |_act, ctx| ctx.stop());
     }
 }
@@ -1434,12 +1381,15 @@ impl WtChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actors::priority_drop::PRIORITY_DROP_RTT_ECHO_REASON;
+    use crate::actors::priority_drop::{
+        caption_bytes, caption_wrapper, media_wrapper, PRIORITY_DROP_RTT_ECHO_REASON,
+    };
     use crate::constants::{
         resolve_wt_mailbox_capacity, INBOUND_MAILBOX_HEADROOM_FACTOR,
         WT_DOWNLINK_AUDIO_CHANNEL_CAPACITY, WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
     };
     use protobuf::Enum as ProtobufEnum;
+    use videocall_types::protos::caption_packet::caption_packet::Kind as CaptionKind;
 
     // -----------------------------------------------------------------------
     // Issue #1057 (+ PR #1060 review) + #1144 headroom + #1062 shared binding:
@@ -1878,172 +1828,6 @@ mod tests {
                 "{packet_type:?} ({priority:?}) is not Critical and fits the MTU, \
                  so it must stay on the low-latency datagram lane; got {out:?}",
             );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Issue #610: WT outbound-drop label parity with WS
-    //
-    // The WS site emits `kind="unknown"` when the upstream PacketWrapper
-    // parse fails. WT used to hard-code `kind="control"` for the same
-    // path because it lost the parse-success signal before reaching the
-    // drop counter. These tests lock in the new tri-state mapping so a
-    // future revert to the old `if is_media { "media" } else { "control" }`
-    // branch fails CI.
-    //
-    // 2026-05-08 audio-quality follow-up: extended the helper to refine
-    // the `media` bucket into `audio`/`video`/`screen` based on the
-    // inner `MediaPacket.media_type`. Tests in the next block lock in
-    // that mapping.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn drop_kind_unknown_when_parse_failed() {
-        // Issue #610: when the outer PacketWrapper parse failed upstream,
-        // we cannot trust `is_media`, so the counter must record this
-        // drop as `kind="unknown"` to match the WS site.
-        assert_eq!(
-            drop_kind_label(/*parsed=*/ false, /*is_media=*/ false, None),
-            "unknown",
-            "parse-fail must map to `unknown` regardless of is_media"
-        );
-        // Even if a stale `is_media=true` and a stale `media_type` somehow
-        // propagate, parse-fail wins — we never want to attribute a
-        // malformed packet to a media kind we did not actually classify.
-        assert_eq!(
-            drop_kind_label(
-                /*parsed=*/ false,
-                /*is_media=*/ true,
-                Some(MediaType::AUDIO),
-            ),
-            "unknown",
-            "parse-fail must override stale is_media + media_type"
-        );
-    }
-
-    #[test]
-    fn drop_kind_media_when_parsed_and_is_media_no_inner_type() {
-        // Backwards-compat: when the inner MediaPacket couldn't be
-        // classified (encrypted payload, parse failure, future MediaType
-        // not in our enum), fall back to the legacy `media` bucket so
-        // existing alerts pivoting on `kind="media"` still see a series.
-        assert_eq!(
-            drop_kind_label(/*parsed=*/ true, /*is_media=*/ true, None,),
-            "media",
-        );
-    }
-
-    #[test]
-    fn drop_kind_control_when_parsed_and_not_media() {
-        // media_type is meaningful only for media packets. Even if a
-        // caller incorrectly threads a `Some(...)` while `is_media=false`,
-        // the label MUST stay `control` — `is_media` is the gate.
-        assert_eq!(
-            drop_kind_label(/*parsed=*/ true, /*is_media=*/ false, None,),
-            "control",
-        );
-        assert_eq!(
-            drop_kind_label(
-                /*parsed=*/ true,
-                /*is_media=*/ false,
-                Some(MediaType::AUDIO),
-            ),
-            "control",
-            "is_media=false must map to control even with a Some(MediaType)"
-        );
-    }
-
-    #[test]
-    fn drop_kind_audio_when_inner_is_audio() {
-        assert_eq!(
-            drop_kind_label(
-                /*parsed=*/ true,
-                /*is_media=*/ true,
-                Some(MediaType::AUDIO),
-            ),
-            "audio",
-        );
-    }
-
-    #[test]
-    fn drop_kind_video_when_inner_is_video() {
-        assert_eq!(
-            drop_kind_label(
-                /*parsed=*/ true,
-                /*is_media=*/ true,
-                Some(MediaType::VIDEO),
-            ),
-            "video",
-        );
-    }
-
-    #[test]
-    fn drop_kind_screen_when_inner_is_screen() {
-        assert_eq!(
-            drop_kind_label(
-                /*parsed=*/ true,
-                /*is_media=*/ true,
-                Some(MediaType::SCREEN),
-            ),
-            "screen",
-        );
-    }
-
-    #[test]
-    fn drop_kind_falls_back_to_media_for_uncommon_media_types() {
-        // HEARTBEAT and KEYFRAME_REQUEST are MEDIA packet types that
-        // are NOT audio/video/screen. They should stay in the legacy
-        // `media` bucket so we don't pollute the new fine-grained
-        // labels with bookkeeping traffic.
-        assert_eq!(
-            drop_kind_label(
-                /*parsed=*/ true,
-                /*is_media=*/ true,
-                Some(MediaType::HEARTBEAT),
-            ),
-            "media",
-            "HEARTBEAT must fall through to the legacy `media` catch-all"
-        );
-        assert_eq!(
-            drop_kind_label(
-                /*parsed=*/ true,
-                /*is_media=*/ true,
-                Some(MediaType::KEYFRAME_REQUEST),
-            ),
-            "media",
-            "KEYFRAME_REQUEST must fall through to the legacy `media` catch-all"
-        );
-    }
-
-    #[test]
-    fn drop_kind_label_emits_only_documented_values() {
-        // Guard against typos / future drift: the only kinds this mapping
-        // ever returns are the six documented in metrics.rs
-        // (`audio`, `video`, `screen`, `media`, `control`, `unknown`). The
-        // seventh documented value, `rtt`, is emitted by the inbound-echo
-        // path, not by this helper.
-        let media_types = [
-            None,
-            Some(MediaType::AUDIO),
-            Some(MediaType::VIDEO),
-            Some(MediaType::SCREEN),
-            Some(MediaType::HEARTBEAT),
-            Some(MediaType::KEYFRAME_REQUEST),
-        ];
-        for parsed in [false, true] {
-            for is_media in [false, true] {
-                for mt in media_types {
-                    let kind = drop_kind_label(parsed, is_media, mt);
-                    assert!(
-                        matches!(
-                            kind,
-                            "audio" | "video" | "screen" | "media" | "control" | "unknown"
-                        ),
-                        "drop_kind_label returned unexpected kind={kind} for \
-                         (parsed={parsed}, is_media={is_media}, media_type={mt:?})"
-                    );
-                }
-            }
         }
     }
 
@@ -2909,10 +2693,8 @@ mod tests {
             vec![0u8; 4_096],
             true,
             media_type == MediaType::AUDIO,
-            true,
-            PacketType::MEDIA,
+            Some(&media_wrapper(media_kind)),
             Some(media_type),
-            media_kind,
             7,
             AudioDownlinkLane::Reliable,
             escalation,
@@ -2982,6 +2764,153 @@ mod tests {
         ));
     }
 
+    /// A CAPTION never takes the datagram lane or the control stream.
+    #[tokio::test]
+    async fn a_caption_rides_the_shared_stream_never_a_datagram() {
+        let (uni_tx, mut uni_rx) = mpsc::channel::<WtOutboundFrame>(wt_outbound_channel_capacity());
+        let (dgram_tx, mut dgram_rx) =
+            mpsc::channel::<WtOutboundFrame>(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let queued = SharedQueueByteMeter::default();
+        for len in [120, DATAGRAM_MAX_SIZE + 1] {
+            let admitted = wt_route_and_admit(
+                &uni_tx,
+                &dgram_tx,
+                &queued,
+                vec![0u8; len],
+                false,
+                false,
+                Some(&caption_wrapper(caption_bytes(CaptionKind::TEXT))),
+                None,
+                0,
+                AudioDownlinkLane::Reliable,
+                &DownlinkShedEscalation::new(),
+            );
+            assert!(matches!(admitted, WtAdmission::Enqueued), "len={len}");
+            let frame = uni_rx.try_recv().expect("caption on the unistream lane");
+            assert_eq!(frame.priority, OutboundPriority::Caption, "len={len}");
+            assert_eq!(frame.key, DownlinkStreamKey::Shared, "len={len}");
+        }
+        assert!(dgram_rx.try_recv().is_err());
+    }
+
+    /// Admitted media reaches the caption threshold only as a screen backlog, or
+    /// as one camera keyframe admitted below 0.80 that lands past 0.90; a
+    /// camera-only backlog stops near 0.80 and captions pass. BITES: judge
+    /// Caption on its own zero byte budget; shed it at the video or audio ratio.
+    #[test]
+    fn a_caption_sheds_only_once_admitted_media_passes_the_screen_threshold() {
+        use crate::actors::priority_drop::{
+            PRIORITY_DROP_AUDIO_FILL_RATIO, PRIORITY_DROP_CAPTION_REASON,
+            PRIORITY_DROP_SCREEN_FILL_RATIO,
+        };
+        fn offer(
+            tx: &mpsc::Sender<WtOutboundFrame>,
+            meter: &SharedQueueByteMeter,
+            priority: OutboundPriority,
+            len: usize,
+        ) -> Option<&'static str> {
+            let bytes = Bytes::from(vec![0u8; len]);
+            match wt_unistream_admit(tx, meter, priority, bytes, DownlinkStreamKey::Shared) {
+                WtAdmission::Enqueued => None,
+                WtAdmission::PriorityDropped { reason, .. } => Some(reason),
+                _ => panic!("{priority:?} was neither admitted nor priority-dropped"),
+            }
+        }
+        let video = wt_unistream_byte_budget_for(OutboundPriority::Video);
+        let screen = wt_unistream_byte_budget_for(OutboundPriority::Screen);
+        let fill =
+            |meter: &SharedQueueByteMeter, p, budget| meter.queued_for(p) as f32 / budget as f32;
+
+        let (tx, _rx) = mpsc::channel(wt_outbound_channel_capacity());
+        let meter = SharedQueueByteMeter::default();
+        while offer(&tx, &meter, OutboundPriority::Screen, screen / 25).is_none() {}
+        assert!(fill(&meter, OutboundPriority::Screen, screen) < PRIORITY_DROP_AUDIO_FILL_RATIO);
+        assert_eq!(
+            offer(&tx, &meter, OutboundPriority::Caption, 64),
+            Some(PRIORITY_DROP_CAPTION_REASON)
+        );
+        assert_eq!(offer(&tx, &meter, OutboundPriority::Audio, 64), None);
+
+        let (tx, _rx) = mpsc::channel(wt_outbound_channel_capacity());
+        let meter = SharedQueueByteMeter::default();
+        while meter.queued_for(OutboundPriority::Video) + video / 32 < video * 80 / 100 {
+            assert_eq!(
+                offer(&tx, &meter, OutboundPriority::Video, video / 32),
+                None
+            );
+        }
+        assert_eq!(
+            offer(&tx, &meter, OutboundPriority::Video, video * 15 / 100),
+            None
+        );
+        let keyframe_fill = fill(&meter, OutboundPriority::Video, video);
+        assert!(
+            (PRIORITY_DROP_SCREEN_FILL_RATIO..PRIORITY_DROP_AUDIO_FILL_RATIO)
+                .contains(&keyframe_fill),
+            "{keyframe_fill}"
+        );
+        assert_eq!(
+            offer(&tx, &meter, OutboundPriority::Caption, 64),
+            Some(PRIORITY_DROP_CAPTION_REASON)
+        );
+        assert_eq!(offer(&tx, &meter, OutboundPriority::Audio, 64), None);
+
+        let (tx, _rx) = mpsc::channel(wt_outbound_channel_capacity());
+        let meter = SharedQueueByteMeter::default();
+        while offer(&tx, &meter, OutboundPriority::Video, video / 32).is_none() {}
+        assert!(fill(&meter, OutboundPriority::Video, video) < PRIORITY_DROP_SCREEN_FILL_RATIO);
+        assert_eq!(offer(&tx, &meter, OutboundPriority::Caption, 64), None);
+    }
+
+    #[test]
+    fn a_screen_backlog_sheds_caption_text_but_routes_caption_status_to_the_shared_stream() {
+        use crate::actors::priority_drop::PRIORITY_DROP_CAPTION_REASON;
+        let (uni_tx, mut uni_rx) = mpsc::channel(wt_outbound_channel_capacity());
+        let (dgram_tx, _dgram_rx) = mpsc::channel(WT_DATAGRAM_CHANNEL_CAPACITY);
+        let meter = SharedQueueByteMeter::default();
+        let screen = wt_unistream_byte_budget_for(OutboundPriority::Screen);
+        while matches!(
+            wt_unistream_admit(
+                &uni_tx,
+                &meter,
+                OutboundPriority::Screen,
+                Bytes::from(vec![0u8; screen / 25]),
+                DownlinkStreamKey::Shared,
+            ),
+            WtAdmission::Enqueued
+        ) {}
+        while uni_rx.try_recv().is_ok() {}
+        let route = |kind| {
+            let caption = caption_bytes(kind);
+            wt_route_and_admit(
+                &uni_tx,
+                &dgram_tx,
+                &meter,
+                vec![0u8; caption.len() + 8],
+                false,
+                false,
+                Some(&caption_wrapper(caption)),
+                None,
+                0,
+                AudioDownlinkLane::Reliable,
+                &DownlinkShedEscalation::new(),
+            )
+        };
+        assert!(matches!(
+            route(CaptionKind::TEXT),
+            WtAdmission::PriorityDropped {
+                reason: PRIORITY_DROP_CAPTION_REASON,
+                ..
+            }
+        ));
+        for kind in [CaptionKind::STATUS_ACTIVE, CaptionKind::STATUS_STOPPED] {
+            assert!(matches!(route(kind), WtAdmission::Enqueued), "{kind:?}");
+            let frame = uni_rx.try_recv().expect("status on the unistream lane");
+            assert_eq!(frame.priority, OutboundPriority::CaptionStatus);
+            assert_eq!(frame.key, DownlinkStreamKey::Shared);
+        }
+    }
+
     /// The real classify-route-enqueue path must charge the lane. Everything
     /// `send_auto` does except the drop metrics; it needs NATS to call directly.
     #[tokio::test]
@@ -2998,10 +2927,8 @@ mod tests {
             vec![0u8; 4_096],
             true,
             false,
-            true,
-            PacketType::MEDIA,
+            Some(&media_wrapper(MediaKind::VIDEO)),
             Some(MediaType::VIDEO),
-            MediaKind::VIDEO,
             7,
             AudioDownlinkLane::Reliable,
             &DownlinkShedEscalation::new(),
@@ -3020,10 +2947,8 @@ mod tests {
             vec![0u8; 200],
             true,
             true,
-            true,
-            PacketType::MEDIA,
+            Some(&media_wrapper(MediaKind::AUDIO)),
             Some(MediaType::AUDIO),
-            MediaKind::AUDIO,
             7,
             AudioDownlinkLane::Datagram,
             &DownlinkShedEscalation::new(),
@@ -3045,10 +2970,8 @@ mod tests {
             vec![0u8; 200],
             true,
             true,
-            true,
-            PacketType::MEDIA,
+            Some(&media_wrapper(MediaKind::AUDIO)),
             Some(MediaType::AUDIO),
-            MediaKind::AUDIO,
             7,
             AudioDownlinkLane::Reliable,
             &DownlinkShedEscalation::new(),
@@ -3075,10 +2998,8 @@ mod tests {
             vec![0u8; 1_000],
             true,
             false,
-            true,
-            PacketType::MEDIA,
+            Some(&media_wrapper(MediaKind::VIDEO)),
             None,
-            MediaKind::VIDEO,
             7,
             AudioDownlinkLane::Reliable,
             &DownlinkShedEscalation::new(),
@@ -3399,10 +3320,8 @@ mod tests {
             vec![0u8; 4_096],
             true,
             false,
-            true,
-            PacketType::MEDIA,
+            Some(&media_wrapper(MediaKind::VIDEO)),
             Some(MediaType::VIDEO),
-            MediaKind::VIDEO,
             909,
             AudioDownlinkLane::Reliable,
             &DownlinkShedEscalation::new(),
@@ -3433,5 +3352,50 @@ mod tests {
 
         meter.on_dequeue(OutboundPriority::Video, 1);
         assert_eq!(meter.queued_for(OutboundPriority::Video), 0);
+    }
+
+    struct ForceCloseSink3285;
+    impl Actor for ForceCloseSink3285 {
+        type Context = actix::Context<Self>;
+    }
+    impl Handler<ForceClose> for ForceCloseSink3285 {
+        type Result = ();
+        fn handle(&mut self, _msg: ForceClose, _ctx: &mut Self::Context) {}
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn with_conn_seq_reaches_join_room_3285() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let (unistream_tx, _unistream_rx) = mpsc::channel::<WtOutboundFrame>(8);
+        let (datagram_tx, _datagram_rx) = mpsc::channel::<WtOutboundFrame>(8);
+        let (tracker_sender, _tracker_rx) = mpsc::unbounded_channel();
+        let actor = WtChatSession::new(
+            chat_server,
+            "room-3285".to_string(),
+            "wt@example.com".to_string(),
+            "WT".to_string(),
+            false,
+            unistream_tx,
+            datagram_tx,
+            Arc::new(SharedQueueByteMeter::default()),
+            nats_client,
+            tracker_sender,
+            SessionManager::new(),
+            false,
+            Some("iid-3285-wt".to_string()),
+            false,
+            AudioDownlinkLane::Reliable,
+            DownlinkShedEscalation::new(),
+        )
+        .with_conn_seq(Some(9));
+
+        let join = actor.join_room_message_for_test(ForceCloseSink3285.start().recipient());
+
+        assert_eq!(join.conn_seq, Some(9));
     }
 }

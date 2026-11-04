@@ -167,6 +167,7 @@
    * to the in-memory _chunks accumulation path.
    */
   var _writer = null;
+  var _saveTarget = null;
   /**
    * Promise chain that serialises incremental _writer.write() calls so
    * ondataavailable never races itself (the handler is synchronous but the
@@ -2820,13 +2821,17 @@
     // intentionally empty — recording continues uninterrupted when tab hides
   }
 
-  /** Trigger a browser download for a Blob with the given file extension. */
-  function triggerDownload(blob, ext) {
+  function defaultRecordingName(ext) {
+    var ts = new Date().toISOString().replace(/[:.]/g, "-");
+    return "meeting-recording-" + ts + "." + ext;
+  }
+
+  /** Trigger a browser download for a Blob under the given file name. */
+  function triggerDownload(blob, name) {
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
-    var ts = new Date().toISOString().replace(/[:.]/g, "-");
     a.href = url;
-    a.download = "meeting-recording-" + ts + "." + ext;
+    a.download = name;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -2889,6 +2894,7 @@
       _onStateChange = onStateChange;
       _chunks = [];
       _writer = null;
+      _saveTarget = null;
       _writeChain = Promise.resolve();
       // Reset the in-memory fallback ceiling + counters for this recording.
       // window.__VC_RECORDING_MAX_FALLBACK_BYTES__ is a TEST-ONLY override
@@ -3060,12 +3066,12 @@
       _fileHandle = null;
       _writer = null;
       _writeChain = Promise.resolve();
+      var defaultName = defaultRecordingName(fileExtension(_mimeType));
       if (typeof window.showSaveFilePicker === "function") {
         var ext = fileExtension(_mimeType);
-        var ts = new Date().toISOString().replace(/[:.]/g, "-");
         try {
           var handle = await window.showSaveFilePicker({
-            suggestedName: "meeting-recording-" + ts + "." + ext,
+            suggestedName: defaultName,
             types: [
               {
                 description: "Video file",
@@ -3108,6 +3114,10 @@
           _fileHandle = null;
         }
       }
+      _saveTarget =
+        _fileHandle && _writer
+          ? { name: _fileHandle.name, mode: "file" }
+          : { name: defaultName, mode: "download" };
 
       // ── STAGE 2: Composite video canvas ───────────────────────────────────
       _offCanvas = document.createElement("canvas");
@@ -3264,9 +3274,8 @@
         stopRafLoop();
         setState("saving");
 
-        var ext = fileExtension(_mimeType);
-
         // Capture volatile state before the async save operation.
+        var saveName = _saveTarget.name;
         var capturedKey = _e2eeKey;
         var capturedHandle = _fileHandle;
         var capturedWriter = _writer;
@@ -3319,7 +3328,7 @@
          * chosen at recording start, or auto-download if unavailable.
          * Also transitions the state to "saved".
          */
-        function persistBlob(blobToSave, saveExt) {
+        function persistBlob(blobToSave) {
           if (capturedHandle) {
             capturedHandle
               .createWritable()
@@ -3333,10 +3342,10 @@
                   "[recording] FileSystemWritableFileStream failed, falling back to download:",
                   e,
                 );
-                triggerDownload(blobToSave, saveExt);
+                triggerDownload(blobToSave, saveName);
               });
           } else {
-            triggerDownload(blobToSave, saveExt);
+            triggerDownload(blobToSave, saveName);
           }
           setState("saved");
           setTimeout(function () {
@@ -3398,7 +3407,7 @@
                 );
                 enc = null; // drop the ciphertext ArrayBuffer reference
               }
-              persistBlob(new Blob(plainParts, { type: _mimeType }), ext);
+              persistBlob(new Blob(plainParts, { type: _mimeType }));
             } catch (err) {
               console.error("[recording] E2EE chunk decryption failed:", err);
               setState("idle");
@@ -3406,7 +3415,7 @@
           })();
         } else {
           // In-memory raw fallback (no file handle, no E2EE).
-          persistBlob(new Blob(capturedChunks, { type: _mimeType }), ext);
+          persistBlob(new Blob(capturedChunks, { type: _mimeType }));
         }
       };
 
@@ -3442,6 +3451,13 @@
     /** Return the current recording state string. */
     getState: function () {
       return _state;
+    },
+
+    /** `{name, mode: "file"|"download"}` of the current recording, or null. */
+    saveTarget: function () {
+      return _saveTarget
+        ? { name: _saveTarget.name, mode: _saveTarget.mode }
+        : null;
     },
 
     /**

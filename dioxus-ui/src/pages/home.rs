@@ -841,6 +841,13 @@ pub fn Home() -> Element {
                         "{env!(\"CARGO_PKG_VERSION\")}"
                         "{about_built_suffix}"
                     }
+                    span { class: "about-footer-sep", "aria-hidden": "true", "\u{00b7}" }
+                    Link {
+                        to: Route::Help {},
+                        class: "about-footer-link",
+                        "data-testid": "home-help-link",
+                        "Help & FAQ"
+                    }
                 }
 
                 div { class: "grid grid-cols-1 md:grid-cols-2 gap-8", style: "margin-top:1em",

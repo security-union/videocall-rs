@@ -12,6 +12,7 @@ CLOCK_SYNC = ("chrony", "ntp", "none", "unknown")
 DIRECTIONS = ("none", "egress", "ingress", "both")
 SHAPERS = ("none", "netem", "netsim", "region")
 TRANSPORTS = ("auto", "websocket", "webtransport")
+OBSERVED_TRANSPORTS = (None, "none", "websocket", "webtransport")
 EVENT_ACTIONS = ("netem", "leave", "rejoin", "outage", "mute", "unmute", "camera-off", "camera-on")
 RUN_ID_RE = re.compile(r"^[a-z0-9-]{1,40}$")
 
@@ -233,6 +234,11 @@ def _validate_participants(c, m, step_ids):
             if "params" in net and not isinstance(net["params"], dict):
                 c.err(f"{p}.network.params", "must be an object")
         c.typed(pt, "transport_intended", p, "str", choices=TRANSPORTS)
+        c.typed(pt, "transport_observed", p, "str", required=False, nullable=True, choices=OBSERVED_TRANSPORTS[1:])
+        c.typed(pt, "transport_preferred", p, "str", required=False, nullable=True)
+        fallbacks = c.typed(pt, "transport_fallbacks", p, "num", required=False)
+        if fallbacks is not None and (int(fallbacks) != fallbacks or fallbacks < 0):
+            c.err(f"{p}.transport_fallbacks", "must be a non-negative integer")
         placement = pt.get("placement")
         if placement is not None:
             if not isinstance(placement, dict):

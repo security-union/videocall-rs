@@ -182,7 +182,9 @@ that is not arriving skips every packet and **freezes on its last-good frame** (
 *"NOTHING decodable and the tile FREEZES on its last-good frame; it does NOT fall back"*). For camera
 video the freeze is bounded on the client: once no layer at or above the selected one has arrived
 within `LAYER_AVAILABILITY_WINDOW_MS` (4 s), the next lower-layer packet collapses the guard onto the
-highest layer still arriving (`collapse_video_guard_to_available`, `peer_decode_manager.rs`, #2251). The relay
+highest layer still arriving (`collapse_video_guard_to_available`, `peer_decode_manager.rs`, #2251). Each
+layer numbers its frames independently, so the first frame of a newly selected camera video layer restarts the decode
+worker's jitter buffer (`flush_on_layer_change`); if that frame is a delta, it requests a keyframe (#3204). The relay
 does not validate availability — the `AVAILABILITY NOT VALIDATED` note sits on the forwarding path in
 `chat_server.rs`, next to the predicate quoted under Rule 3.
 

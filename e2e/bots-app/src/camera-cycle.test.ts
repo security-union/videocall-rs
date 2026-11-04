@@ -24,7 +24,7 @@ import { ACTION_BAR_SELECTOR, cameraButtonSelector } from "./control-buttons";
 const FULL = { onMin: "5", onMax: "15", offMin: "20", offMax: "60" };
 
 describe("resolveCameraCycle", () => {
-  it("returns undefined when all four are unset — the camera-always-on default", () => {
+  it("returns undefined when all four are unset", () => {
     for (const raw of [{}, { onMin: "", onMax: "  ", offMin: undefined, offMax: "" }]) {
       const r = resolveCameraCycle(raw);
       expect(r).toEqual({ kind: "ok", value: undefined });
@@ -43,8 +43,6 @@ describe("resolveCameraCycle", () => {
     expect(r.kind).toBe("ok");
   });
 
-  // The failure the issue's "unset ⇒ unchanged" default makes dangerous: three
-  // set + one missing must NOT collapse to always-on.
   it.each([
     ["onMax", CAMERA_CYCLE_ENV.onMax],
     ["offMin", CAMERA_CYCLE_ENV.offMin],
@@ -189,7 +187,7 @@ describe("formatCameraCycleReceipt", () => {
   });
 
   // The receipt-must-not-lie case: a bot whose toggles all failed spent the run
-  // camera-on, and must not be indistinguishable from camera-always-on.
+  // camera-on.
   it("reports DEGRADED when any toggle failed, even with confirmed ones", () => {
     const allFailed = formatCameraCycleReceipt(CFG, {
       confirmed: 0,

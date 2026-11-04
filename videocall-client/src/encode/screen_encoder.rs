@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::connection::MediaStreamKey;
+use crate::connection::{MediaStreamKey, StreamQueueDepth};
 use gloo_timers::future::sleep;
 use gloo_utils::window;
 use js_sys::Array;
@@ -492,7 +492,7 @@ fn apply_screen_track_resolution_constraint(
 
     match track.apply_constraints_with_constraints(&constraints) {
         Ok(promise) => {
-            let track = track.clone();
+            let track = Clone::clone(track);
             wasm_bindgen_futures::spawn_local(async move {
                 match JsFuture::from(promise).await {
                     Ok(_) => {
@@ -817,55 +817,29 @@ fn record_screen_restart(reason: RestartReason) {
     );
 }
 
-// ── Screen-share WebSocket send-side freshness gate (issue #1921) ─────────────
-//
-// On a WebSocket publisher ALL media shares one ordered TCP stream — unlike
-// WebTransport, where screen rides its own reliable QUIC unistream
-// (`MediaStreamKey::Screen`). A large screen keyframe (30–150 KB) then queues
-// head-of-line behind whatever screen DELTAS are already backed up in the
-// socket, so a receiver's PLI→keyframe turnaround was observed at 30–120 s on
-// WS vs 1–2 s on WT, with macroblock corruption and staleness up to 27 s that
-// survived the entire #1903 receiver-side fix set.
-//
-// The gate below shortens that queue at the source. When the browser's WS
-// `bufferedAmount` shows the stream is genuinely backed up, screen DELTAS are
-// dropped (they would arrive seconds stale regardless) while KEYFRAMES are
-// ALWAYS sent. Because the sequence number still advances on a drop, the
-// receiver's jitter buffer sees a gap — its `find_next_frame_to_decode` only
-// releases sequence-CONTIGUOUS frames — so it holds the deltas behind the gap
-// and skips to the next keyframe. The receiver FREEZES on the last good frame
-// until that next keyframe: ~1.8 s+ when a PLI is served (the receiver's
-// freshness deadline + relay/keyframe RTT) and up to the ~3–5 s periodic/floor
-// keyframe cadence otherwise — bounded, and strictly better than the up-to-27 s
-// staleness and macroblock corruption it replaces (a dropped delta would
-// otherwise decode against a wrong reference).
-//
-// Scope is SCREEN only. Camera deltas are small and continuous — dropping them
-// would stutter the primary video for little queue relief, and shortening the
-// screen backlog already speeds every keyframe (camera included) sharing the
-// pipe. AUDIO and CONTROL never reach this gate. On WebTransport the depth
-// accessor returns `None` (no shared queue), so that path never drops. The
-// decision reads the sender's own pre-encryption frame type and media kind, so
-// it is E2EE-safe: no encrypted payload is inspected.
-
 /// Cumulative screen DELTAS dropped by the WS send-side freshness gate (#1921),
 /// since page load. Mirrors the sibling screen-encoder observability counters;
-/// WebTransport publishers (depth `None`) never increment it.
+/// WebTransport drops are counted in [`SCREEN_WT_GATE_DROPS`] instead.
 static SCREEN_WS_STALE_DELTA_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Wall-clock (epoch ms) of the last throttled freshness-drop log line, and the
 /// cumulative drop total captured at that line — shared by BOTH screen output
 /// handlers (base + per-simulcast-layer) so the aggregated `info!` is emitted at
-/// most once per [`SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS`] no matter how many
+/// most once per [`SCREEN_GATE_DROP_LOG_THROTTLE_MS`] no matter how many
 /// handlers or frames are dropping. wasm is single-threaded, so plain
 /// load/store on these atomics needs no CAS.
 static SCREEN_WS_STALE_DROP_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
 static SCREEN_WS_STALE_DROP_LOG_LAST_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Screen frames (deltas and keyframes) the WT send gate dropped (#3077).
+static SCREEN_WT_GATE_DROPS: AtomicU64 = AtomicU64::new(0);
+static SCREEN_WT_DROP_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static SCREEN_WT_DROP_LOG_LAST_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Minimum spacing between aggregated freshness-drop `info!` lines. ≥1s so a
 /// congested share logs a once-per-second summary (dropped-count in the window)
 /// for e2e assertion + field triage, without spamming the console per frame.
-const SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS: u64 = 1000;
+const SCREEN_GATE_DROP_LOG_THROTTLE_MS: u64 = 1000;
 
 /// Cumulative count of stale screen DELTAS dropped at the WS send-side freshness
 /// gate (issue #1921). See [`screen_ws_send_decision`].
@@ -878,25 +852,172 @@ pub(crate) fn set_screen_ws_stale_delta_drops_for_test(n: u64) {
     SCREEN_WS_STALE_DELTA_DROPS.store(n, Ordering::Relaxed);
 }
 
-/// Record one #1921 freshness-gate drop: bump the cumulative counter and, at most
-/// once per [`SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS`], emit an aggregated `info!`
-/// summarizing how many deltas were gated since the last line plus the live
-/// backlog/threshold. Shared by both screen output handlers (one throttle for
-/// all). wasm-only (reads `js_sys::Date::now()`); the pure send DECISION stays in
-/// [`screen_ws_send_decision`].
-fn record_screen_ws_stale_drop(buffered_bytes: u64, threshold_bytes: u64) {
-    let total = SCREEN_WS_STALE_DELTA_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-    let now_ms = js_sys::Date::now() as u64;
-    let last_ms = SCREEN_WS_STALE_DROP_LOG_LAST_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(last_ms) >= SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS {
-        SCREEN_WS_STALE_DROP_LOG_LAST_MS.store(now_ms, Ordering::Relaxed);
-        let prev_total = SCREEN_WS_STALE_DROP_LOG_LAST_TOTAL.swap(total, Ordering::Relaxed);
-        let dropped_in_window = total.saturating_sub(prev_total);
-        log::info!(
-            "ScreenEncoder: dropping stale screen delta(s) under WS backpressure (issue #1921) — \
-             dropped={dropped_in_window} in last window, buffered={buffered_bytes}, \
-             threshold={threshold_bytes}"
-        );
+#[cfg(test)]
+thread_local! {
+    static FAILING_CONFIGURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Fail the next `n` base-encoder configures.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn fail_configures_for_test(n: u32) {
+    FAILING_CONFIGURES.with(|f| f.set(n));
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn configures_left_to_fail_for_test() -> u32 {
+    FAILING_CONFIGURES.with(|f| f.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static BACKOFF_DIVISOR: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    static FORCED_RESTART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RETAINED_AT_EMIT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Divide every restart backoff by `divisor`.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn shorten_restart_backoff_for_test(divisor: u64) {
+    BACKOFF_DIVISOR.with(|d| d.set(divisor.max(1)));
+}
+
+/// Restart the running share's encoder at the encode loop's next pass.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn force_restart_for_test(on: bool) {
+    FORCED_RESTART.with(|f| f.set(on));
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn restart_forced_for_test() -> bool {
+    FORCED_RESTART.with(|f| f.get())
+}
+
+/// Whether a frame was retained when the last `Started` or `Replaced` was emitted.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn frame_retained_at_emit_for_test() -> Option<bool> {
+    RETAINED_AT_EMIT.with(|r| r.take())
+}
+
+#[cfg(test)]
+fn injected_configure_failure() -> Result<(), JsValue> {
+    FAILING_CONFIGURES.with(|f| match f.get() {
+        0 => Ok(()),
+        n => {
+            f.set(n - 1);
+            Err(JsValue::from_str("injected configure failure"))
+        }
+    })
+}
+
+/// Cumulative screen frames the WT send gate dropped (#3077).
+pub fn screen_wt_gate_drops() -> u64 {
+    SCREEN_WT_GATE_DROPS.load(Ordering::Relaxed)
+}
+
+/// Drops since the last aggregated log line, when one is due at `now_ms`.
+fn screen_gate_drops_to_log(
+    total: u64,
+    now_ms: u64,
+    last_ms: &AtomicU64,
+    last_total: &AtomicU64,
+) -> Option<u64> {
+    if now_ms.saturating_sub(last_ms.load(Ordering::Relaxed)) < SCREEN_GATE_DROP_LOG_THROTTLE_MS {
+        return None;
+    }
+    last_ms.store(now_ms, Ordering::Relaxed);
+    Some(total.saturating_sub(last_total.swap(total, Ordering::Relaxed)))
+}
+
+/// What the send gate did with one screen chunk, by the transport it billed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenGateAction {
+    Send,
+    WsDeltaDrop,
+    WtDeltaDrop,
+    WtKeyframeDrop,
+}
+
+fn screen_gate_action(depth: Option<StreamQueueDepth>, send: ScreenSend) -> ScreenGateAction {
+    match (send, depth) {
+        (ScreenSend::Send, _) => ScreenGateAction::Send,
+        (ScreenSend::DropKeyframe, _) => ScreenGateAction::WtKeyframeDrop,
+        (ScreenSend::DropDelta, Some(StreamQueueDepth::WebTransport(_))) => {
+            ScreenGateAction::WtDeltaDrop
+        }
+        (ScreenSend::DropDelta, _) => ScreenGateAction::WsDeltaDrop,
+    }
+}
+
+fn screen_gate_drop_counter(action: ScreenGateAction) -> Option<&'static AtomicU64> {
+    match action {
+        ScreenGateAction::Send => None,
+        ScreenGateAction::WsDeltaDrop => Some(&SCREEN_WS_STALE_DELTA_DROPS),
+        ScreenGateAction::WtDeltaDrop | ScreenGateAction::WtKeyframeDrop => {
+            Some(&SCREEN_WT_GATE_DROPS)
+        }
+    }
+}
+
+/// Bump the action's counter and log it: the delta lines at most once per
+/// [`SCREEN_GATE_DROP_LOG_THROTTLE_MS`] with the count since the last line,
+/// every keyframe drop on its own.
+fn record_screen_gate_drop(
+    action: ScreenGateAction,
+    counter: Option<&AtomicU64>,
+    queued: u64,
+    gate: ScreenGate,
+    debt: KeyframeDebt,
+    now_ms: fn() -> f64,
+) {
+    let Some(counter) = counter else {
+        return;
+    };
+    let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let threshold = gate.delta_bytes();
+    match action {
+        ScreenGateAction::WsDeltaDrop => {
+            if let Some(dropped) = screen_gate_drops_to_log(
+                total,
+                now_ms() as u64,
+                &SCREEN_WS_STALE_DROP_LOG_LAST_MS,
+                &SCREEN_WS_STALE_DROP_LOG_LAST_TOTAL,
+            ) {
+                log::info!(
+                    "ScreenEncoder: dropping stale screen delta(s) under WS backpressure (issue #1921) — \
+                     dropped={dropped} in last window, buffered={queued}, threshold={threshold}"
+                );
+            }
+        }
+        ScreenGateAction::WtDeltaDrop => {
+            if let Some(dropped) = screen_gate_drops_to_log(
+                total,
+                now_ms() as u64,
+                &SCREEN_WT_DROP_LOG_LAST_MS,
+                &SCREEN_WT_DROP_LOG_LAST_TOTAL,
+            ) {
+                log::info!(
+                    "ScreenEncoder: dropping screen delta(s) on the WT screen stream (issue #3077) — \
+                     dropped={dropped} in last window, queued={queued}, threshold={threshold}, \
+                     debt={}",
+                    debt.label()
+                );
+            }
+        }
+        ScreenGateAction::WtKeyframeDrop => {
+            let ceiling = match gate {
+                ScreenGate::WebTransport {
+                    keyframe_ceiling_bytes,
+                    ..
+                } => keyframe_ceiling_bytes,
+                ScreenGate::WebSocket { .. } => 0,
+            };
+            log::info!(
+                "ScreenEncoder: dropping a screen keyframe over the WT queue ceiling (issue #3077) — \
+                 queued={queued}, ceiling={ceiling}; a fresh keyframe is owed"
+            );
+        }
+        ScreenGateAction::Send => {}
     }
 }
 
@@ -917,12 +1038,14 @@ const SCREEN_WS_MIN_THRESHOLD_BYTES: u64 = 16_384;
 /// screen bitrate in kbps. Pure so it is host-testable. The result is floored at
 /// [`SCREEN_WS_MIN_THRESHOLD_BYTES`].
 fn screen_ws_freshness_threshold_bytes(target_bitrate_kbps: u32) -> u64 {
+    screen_queue_bytes_for(target_bitrate_kbps, SCREEN_WS_FRESHNESS_DELAY_MS)
+        .max(SCREEN_WS_MIN_THRESHOLD_BYTES)
+}
+
+/// Bytes of `kbps` video in `delay_ms`.
+fn screen_queue_bytes_for(kbps: u32, delay_ms: u64) -> u64 {
     // bytes = kbps * 1000 / 8 * delay_ms / 1000  ==  kbps * 125 * delay_ms / 1000
-    let bytes = (target_bitrate_kbps as u64)
-        .saturating_mul(125)
-        .saturating_mul(SCREEN_WS_FRESHNESS_DELAY_MS)
-        / 1000;
-    bytes.max(SCREEN_WS_MIN_THRESHOLD_BYTES)
+    (kbps as u64).saturating_mul(125).saturating_mul(delay_ms) / 1000
 }
 
 const _: () = assert!(
@@ -967,21 +1090,32 @@ fn screen_ws_gate_threshold_bytes(baseline: ScreenBaselineKbps) -> u64 {
     screen_ws_freshness_threshold_bytes(baseline.kbps())
 }
 
-/// Pick the sample from the ACTIVE transport, never from the `Option`-ness of
-/// the depth.
+/// The governor's sample for the transport holding the screen queue, with each
+/// transport's own gate-drop counter. A WT depth is rescaled by
+/// [`screen_wt_bytes_on_ws_scale`].
 fn screen_uplink_sample(
-    active_transport: Option<&str>,
-    ws_buffered: Option<u64>,
-    gate_drops: u64,
-    stream_events: u64,
+    depth: Option<StreamQueueDepth>,
+    ws_gate_drops: u64,
+    wt_gate_drops: u64,
+    wt_delay_ms: u64,
 ) -> ScreenUplinkSample {
-    match (active_transport, ws_buffered) {
-        (Some("webtransport"), _) => ScreenUplinkSample::StreamEvents {
-            events: stream_events,
+    match depth {
+        Some(StreamQueueDepth::WebSocket(bytes)) => ScreenUplinkSample::Buffered {
+            bytes,
+            gate_drops: ws_gate_drops,
         },
-        (Some("websocket"), Some(bytes)) => ScreenUplinkSample::Buffered { bytes, gate_drops },
-        _ => ScreenUplinkSample::Unobservable,
+        Some(StreamQueueDepth::WebTransport(bytes)) => ScreenUplinkSample::Buffered {
+            bytes: screen_wt_bytes_on_ws_scale(bytes, wt_delay_ms),
+            gate_drops: wt_gate_drops,
+        },
+        None => ScreenUplinkSample::Unobservable,
     }
+}
+
+/// A WT screen-stream depth in the bytes that would put the same fraction of
+/// the WS gate threshold on the governor as it is of the WT gate threshold.
+fn screen_wt_bytes_on_ws_scale(bytes: u64, wt_delay_ms: u64) -> u64 {
+    bytes.saturating_mul(SCREEN_WS_FRESHNESS_DELAY_MS) / wt_delay_ms.max(1)
 }
 
 /// Reconstruct the live baseline from the atomics the geometry publisher writes.
@@ -1007,10 +1141,9 @@ enum ScreenWsSend {
     DropStaleDelta,
 }
 
-/// Send-side freshness decision for one screen frame on a WebSocket publisher.
+/// Send-side freshness decision for one screen frame (#1921).
 ///
-/// * `buffered_amount` — the WS `bufferedAmount`. `None` ⇒ always
-///   [`ScreenWsSend::Send`].
+/// * `buffered_amount` — bytes queued ahead of the frame.
 /// * `is_keyframe` — keyframes are ALWAYS sent; the decode chain and the #1908
 ///   keyframe floor depend on them arriving.
 /// * `threshold_bytes` — from [`screen_ws_freshness_threshold_bytes`].
@@ -1020,19 +1153,250 @@ enum ScreenWsSend {
 /// and needs no reset on reconnect — a fresh socket starts at
 /// `bufferedAmount == 0`, below any threshold.
 fn screen_ws_send_decision(
-    buffered_amount: Option<u64>,
+    buffered_amount: u64,
     is_keyframe: bool,
     threshold_bytes: u64,
 ) -> ScreenWsSend {
-    match buffered_amount {
-        None => ScreenWsSend::Send,
-        // Keyframes are never dropped — the receiver resumes on them.
-        Some(_) if is_keyframe => ScreenWsSend::Send,
-        // Backed-up socket: drop this stale delta so keyframes queue less.
-        Some(buffered) if buffered > threshold_bytes => ScreenWsSend::DropStaleDelta,
-        // Queue is shallow enough that the delta will arrive fresh.
-        Some(_) => ScreenWsSend::Send,
+    if !is_keyframe && buffered_amount > threshold_bytes {
+        ScreenWsSend::DropStaleDelta
+    } else {
+        ScreenWsSend::Send
     }
+}
+
+/// Floor, in ms of baseline screen video, of the WT screen-stream queue above
+/// which a screen DELTA is dropped (#3077).
+const SCREEN_WT_FRESHNESS_DELAY_MS: u64 = 1_000;
+/// The WT delta threshold rises to this multiple of the uplink RTT baseline.
+const SCREEN_WT_RTT_MULTIPLIER: f64 = 2.0;
+/// Cap on the WT delta threshold, in ms.
+const SCREEN_WT_FRESHNESS_DELAY_MAX_MS: u64 = 1_500;
+/// The WT queue, in ms of baseline screen video, above which even a screen
+/// keyframe is dropped: one screen keyframe period.
+const SCREEN_WT_KEYFRAME_CEILING_MS: u64 = SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS as u64;
+
+const _: () = assert!(SCREEN_WS_FRESHNESS_DELAY_MS <= SCREEN_WT_FRESHNESS_DELAY_MS);
+const _: () = assert!(SCREEN_WT_FRESHNESS_DELAY_MS <= SCREEN_WT_FRESHNESS_DELAY_MAX_MS);
+const _: () = assert!(SCREEN_WT_FRESHNESS_DELAY_MAX_MS < SCREEN_WT_KEYFRAME_CEILING_MS);
+
+/// The WT delta threshold in ms: `clamp(2 × rtt_baseline_ms, 1000, 1500)`.
+fn screen_wt_gate_delay_ms(rtt_baseline_ms: f64) -> u64 {
+    let rtt_term = SCREEN_WT_RTT_MULTIPLIER * rtt_baseline_ms;
+    if rtt_term.is_finite() && rtt_term > SCREEN_WT_FRESHNESS_DELAY_MS as f64 {
+        (rtt_term as u64).min(SCREEN_WT_FRESHNESS_DELAY_MAX_MS)
+    } else {
+        SCREEN_WT_FRESHNESS_DELAY_MS
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenGate {
+    WebSocket {
+        delta_bytes: u64,
+    },
+    WebTransport {
+        delta_bytes: u64,
+        keyframe_ceiling_bytes: u64,
+    },
+}
+
+impl ScreenGate {
+    fn delta_bytes(self) -> u64 {
+        match self {
+            ScreenGate::WebSocket { delta_bytes }
+            | ScreenGate::WebTransport { delta_bytes, .. } => delta_bytes,
+        }
+    }
+}
+
+/// The queued bytes ahead of the next screen frame and the gate for the
+/// transport holding them.
+fn screen_gate_for(
+    depth: Option<StreamQueueDepth>,
+    baseline: ScreenBaselineKbps,
+    rtt_baseline_ms: f64,
+) -> (Option<u64>, ScreenGate) {
+    let ws_gate = ScreenGate::WebSocket {
+        delta_bytes: screen_ws_gate_threshold_bytes(baseline),
+    };
+    match depth {
+        Some(StreamQueueDepth::WebTransport(queued)) => (
+            Some(queued),
+            ScreenGate::WebTransport {
+                delta_bytes: screen_queue_bytes_for(
+                    baseline.kbps(),
+                    screen_wt_gate_delay_ms(rtt_baseline_ms),
+                ),
+                keyframe_ceiling_bytes: screen_queue_bytes_for(
+                    baseline.kbps(),
+                    SCREEN_WT_KEYFRAME_CEILING_MS,
+                ),
+            },
+        ),
+        Some(StreamQueueDepth::WebSocket(queued)) => (Some(queued), ws_gate),
+        None => (None, ws_gate),
+    }
+}
+
+/// Why receivers cannot decode the next WT screen delta: the gate dropped a
+/// delta (`GopBroken`) or a keyframe (`Owed`, then `Requested`) since the last
+/// keyframe it sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum KeyframeDebt {
+    #[default]
+    Clear,
+    GopBroken,
+    Owed,
+    Requested,
+}
+
+impl KeyframeDebt {
+    fn label(self) -> &'static str {
+        match self {
+            KeyframeDebt::Clear => "clear",
+            KeyframeDebt::GopBroken => "gop_broken",
+            KeyframeDebt::Owed => "owed",
+            KeyframeDebt::Requested => "requested",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenSend {
+    Send,
+    DropDelta,
+    DropKeyframe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenGateStep {
+    send: ScreenSend,
+    debt: KeyframeDebt,
+    request_keyframe: bool,
+}
+
+/// One screen frame through the send gate (#1921, #3077).
+///
+/// WebSocket keeps the #1921 rule and carries no debt. On WebTransport a
+/// keyframe over the ceiling is dropped and owed, and a delta over the
+/// threshold is dropped and breaks the GOP; either way every later delta is
+/// dropped until a keyframe is sent. An owed keyframe is requested by the
+/// first delta seen at or under the threshold. With no depth, frames pass.
+fn screen_send_decision(
+    queued: Option<u64>,
+    is_keyframe: bool,
+    gate: ScreenGate,
+    debt: KeyframeDebt,
+) -> ScreenGateStep {
+    use KeyframeDebt::{Clear, GopBroken, Owed, Requested};
+    let step = |send, debt, request_keyframe| ScreenGateStep {
+        send,
+        debt,
+        request_keyframe,
+    };
+    let Some(queued) = queued else {
+        return step(
+            ScreenSend::Send,
+            if is_keyframe { Clear } else { debt },
+            false,
+        );
+    };
+    match gate {
+        ScreenGate::WebSocket { delta_bytes } => {
+            match screen_ws_send_decision(queued, is_keyframe, delta_bytes) {
+                ScreenWsSend::Send => step(ScreenSend::Send, Clear, false),
+                ScreenWsSend::DropStaleDelta => step(ScreenSend::DropDelta, Clear, false),
+            }
+        }
+        ScreenGate::WebTransport {
+            delta_bytes,
+            keyframe_ceiling_bytes,
+        } => match (is_keyframe, debt) {
+            (true, _) if queued > keyframe_ceiling_bytes => {
+                step(ScreenSend::DropKeyframe, Owed, false)
+            }
+            (true, _) => step(ScreenSend::Send, Clear, false),
+            (false, Owed) if queued <= delta_bytes => step(ScreenSend::DropDelta, Requested, true),
+            (false, GopBroken | Owed | Requested) => step(ScreenSend::DropDelta, debt, false),
+            (false, Clear) if queued > delta_bytes => step(ScreenSend::DropDelta, GopBroken, false),
+            (false, Clear) => step(ScreenSend::Send, Clear, false),
+        },
+    }
+}
+
+/// Runs [`screen_send_decision`] for one encoded chunk with its counters and
+/// logs.
+fn gate_screen_chunk(
+    depth: Option<StreamQueueDepth>,
+    is_keyframe: bool,
+    baseline: ScreenBaselineKbps,
+    debt: &Cell<KeyframeDebt>,
+    owed_keyframe: &Cell<bool>,
+    now_ms: fn() -> f64,
+) -> ScreenGateAction {
+    let (queued, gate) = screen_gate_for(
+        depth,
+        baseline,
+        videocall_transport::webtransport::uplink_rtt_baseline_ms(),
+    );
+    let step = screen_send_decision(queued, is_keyframe, gate, debt.get());
+    debt.set(step.debt);
+    let queued = queued.unwrap_or(0);
+    if step.request_keyframe {
+        owed_keyframe.set(true);
+        log::info!(
+            "ScreenEncoder: WT screen queue drained (queued={queued}, threshold={}) — \
+             requesting the owed keyframe (issue #3077)",
+            gate.delta_bytes()
+        );
+    }
+    let action = screen_gate_action(depth, step.send);
+    record_screen_gate_drop(
+        action,
+        screen_gate_drop_counter(action),
+        queued,
+        gate,
+        step.debt,
+        now_ms,
+    );
+    action
+}
+
+/// The frame arm's ungated keyframe input: the periodic GOP, the stall-resume
+/// latch, and a keyframe the WT gate owes, consumed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameArmKeyframe {
+    forced: bool,
+    owed: bool,
+}
+
+fn screen_frame_arm_keyframe(
+    periodic_due: bool,
+    stall_resume: bool,
+    owed_keyframe: &Cell<bool>,
+) -> FrameArmKeyframe {
+    let owed = owed_keyframe.replace(false);
+    FrameArmKeyframe {
+        forced: periodic_due || stall_resume || owed,
+        owed,
+    }
+}
+
+/// Whether the static timer arm must re-encode the retained frame to pay a WT
+/// gate debt: one is outstanding, the WT queue has drained to the delta
+/// threshold, and `floor_ms` has passed since the last keyframe.
+fn screen_static_owed_keyframe_due(
+    debt: KeyframeDebt,
+    queued: Option<u64>,
+    gate: ScreenGate,
+    now_ms: f64,
+    last_keyframe_ms: Option<f64>,
+    floor_ms: f64,
+) -> bool {
+    debt != KeyframeDebt::Clear
+        && matches!(gate, ScreenGate::WebTransport { .. })
+        && queued.is_some_and(|queued| queued <= gate.delta_bytes())
+        && last_keyframe_ms.is_none_or(|last| now_ms - last >= floor_ms)
 }
 
 /// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
@@ -1515,6 +1879,46 @@ fn close_retained_frame(retained: &mut Option<VideoFrame>) {
     if let Some(frame) = retained.take() {
         frame.close();
     }
+}
+
+/// The read in flight on a capture reader. Dropping it closes the frame that
+/// read may still deliver; left open, that frame pins a capture buffer until GC.
+struct OutstandingRead(js_sys::Promise);
+
+impl OutstandingRead {
+    fn new(reader: &ReadableStreamDefaultReader) -> Self {
+        Self(reader.read())
+    }
+
+    fn rearm(&mut self, reader: &ReadableStreamDefaultReader) {
+        self.0 = reader.read();
+    }
+
+    fn future(&self) -> std::pin::Pin<Box<JsFuture>> {
+        Box::pin(JsFuture::from(Clone::clone(&self.0)))
+    }
+}
+
+impl Drop for OutstandingRead {
+    fn drop(&mut self) {
+        let read = JsFuture::from(Clone::clone(&self.0));
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(frame) = read
+                .await
+                .and_then(|r| Reflect::get(&r, &JsValue::from_str("value")))
+                .and_then(|v| v.dyn_into::<VideoFrame>())
+            {
+                frame.close();
+            }
+        });
+    }
+}
+
+/// A new capture replaces the old one: no recovery keyframe may re-send the
+/// old capture's content.
+fn forget_retained_frame(retained: &mut Option<VideoFrame>, retained_ms: &mut Option<f64>) {
+    close_retained_frame(retained);
+    *retained_ms = None;
 }
 
 /// Settle window (ms) the source-dimension reconfigure gate (issue #1922) waits for the raw capture
@@ -2004,6 +2408,9 @@ pub enum ScreenShareEvent {
     Cancelled,
     /// Screen share ended normally (user clicked browser's "Stop sharing" or stream ended)
     Stopped,
+    /// [`ScreenEncoder::replace_stream`]'s capture is now the one being encoded,
+    /// in the same share.
+    Replaced(MediaStream),
     /// Screen share failed due to an error (shows error dialog)
     Failed(String),
 }
@@ -2026,6 +2433,9 @@ pub struct ScreenEncoder {
     /// Only used by the screen encoder -- this is screen-specific state, not generic encoder state.
     /// I do not like this but so far it is reliable.
     screen_stream: Rc<RefCell<Option<MediaStream>>>,
+    /// A capture handed to [`Self::replace_stream`] that the encode loop has not
+    /// swapped in yet.
+    pending_replacement: Rc<RefCell<Option<MediaStream>>>,
     /// Tier-controlled max width for screen share.
     tier_max_width: Rc<AtomicU32>,
     /// Tier-controlled max height for screen share.
@@ -2272,6 +2682,7 @@ impl ScreenEncoder {
             on_encoder_settings_update: Some(on_encoder_settings_update),
             on_state_change: Some(on_state_change),
             screen_stream: Rc::new(RefCell::new(None)),
+            pending_replacement: Rc::new(RefCell::new(None)),
             tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
@@ -3148,6 +3559,24 @@ impl ScreenEncoder {
         self.on_state_change.is_some()
     }
 
+    /// Swap the running share's capture for `stream`: the encode loop rebuilds
+    /// its encoder on it, keeps every sequence counter, emits
+    /// [`ScreenShareEvent::Replaced`] (`Started` if the share never started)
+    /// and stops the old capture. Returns
+    /// `false`, and stops `stream`, while the share holds no capture: before
+    /// start/start_with_stream gives it a capture, after it stops, or while a
+    /// restart awaits its new capture.
+    pub fn replace_stream(&mut self, stream: MediaStream) -> bool {
+        if !self.state.is_enabled() || self.screen_stream.borrow().is_none() {
+            stop_media_stream_tracks(&stream);
+            return false;
+        }
+        if let Some(stale) = self.pending_replacement.borrow_mut().replace(stream) {
+            stop_media_stream_tracks(&stale);
+        }
+        true
+    }
+
     /// Stops encoding and MediaStream after it has been started.
     ///
     /// This is the authoritative cleanup path when the UI triggers a stop.
@@ -3180,6 +3609,9 @@ impl ScreenEncoder {
         if let Some(track) = self.active_video_track.borrow_mut().take() {
             log::info!("stop: stopping original capture track to dismiss browser indicator");
             track.stop();
+        }
+        if let Some(pending) = self.pending_replacement.borrow_mut().take() {
+            stop_media_stream_tracks(&pending);
         }
 
         // Synchronously stop all tracks from the stored (cloned) stream.
@@ -3351,6 +3783,10 @@ impl ScreenEncoder {
         // Sender encoder backpressure (issue #1108, Phase B): forwarded into the
         // shared encode loop, which WRITES the max active-layer queue depth.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        let pending_replacement = self.pending_replacement.clone();
+        if let Some(stale) = pending_replacement.borrow_mut().take() {
+            stop_media_stream_tracks(&stale);
+        }
 
         wasm_bindgen_futures::spawn_local(async move {
             let screen_to_share = stream;
@@ -3386,6 +3822,7 @@ impl ScreenEncoder {
                 shared_active_layer_count,
                 shared_layer_bitrates_bps,
                 shared_encoder_queue_depth,
+                pending_replacement,
                 // The UI acquired this stream in its own click handler, so the
                 // encoder cannot know whether the #1973 ceiling was requested or
                 // dropped. Treat it as unknown (issue #2179 review): the cost of
@@ -3458,6 +3895,10 @@ impl ScreenEncoder {
         // Sender encoder backpressure (issue #1108, Phase B): forwarded into the
         // shared encode loop, which WRITES the max active-layer queue depth.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        let pending_replacement = self.pending_replacement.clone();
+        if let Some(stale) = pending_replacement.borrow_mut().take() {
+            stop_media_stream_tracks(&stale);
+        }
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -3541,6 +3982,7 @@ impl ScreenEncoder {
                 shared_active_layer_count,
                 shared_layer_bitrates_bps,
                 shared_encoder_queue_depth,
+                pending_replacement,
                 capture_ceiling_dropped,
                 tier_targets,
             )
@@ -3557,9 +3999,7 @@ impl ScreenEncoder {
     ///
     /// Contains a `'restart` loop that handles encoder auto-recovery with
     /// exponential backoff when the encoder encounters fatal errors (e.g.,
-    /// "closed codec", "InvalidStateError"). On restart, the media stream
-    /// is re-acquired via `getDisplayMedia` since the original stream may
-    /// have been torn down by the browser.
+    /// "closed codec", "InvalidStateError").
     #[allow(clippy::too_many_arguments)]
     async fn run_screen_encoding(
         screen_to_share: MediaStream,
@@ -3610,6 +4050,7 @@ impl ScreenEncoder {
         // the screen AQ control loop. Stored-only on the controller side in
         // Stage 1 (no behavior change).
         shared_encoder_queue_depth: Rc<AtomicU32>,
+        pending_replacement: Rc<RefCell<Option<MediaStream>>>,
         // Issue #2179 review: `true` when the capture was acquired WITHOUT the
         // resolution ceiling — either because `getDisplayMedia` rejected the
         // ceiling (the OverconstrainedError fallback) or because the stream was
@@ -3658,6 +4099,11 @@ impl ScreenEncoder {
                         track.stop();
                     }
                 }
+            }
+            let held = screen_stream.borrow().as_ref().map(Clone::clone);
+            let pending = pending_replacement.borrow_mut().take();
+            for stream in held.iter().chain(pending.iter()) {
+                stop_media_stream_tracks(stream);
             }
             // Reset enabled flag
             enabled.store(false, Ordering::Release);
@@ -3745,10 +4191,11 @@ impl ScreenEncoder {
         // #1841). Declared OUTSIDE `'restart` so it is in scope for the final cleanup
         // (which closes it on user-stop / unrecoverable exit) AND — post-#1903 — so it
         // SURVIVES an encoder `'restart`: a static share that restarts (fatal encode
-        // error / closed codec / stream replace) has no fresh frame to re-seed it, so
+        // error / closed codec) has no fresh frame to re-seed it, so
         // closing it on restart (as the pre-#1903 code did) left the static-share
         // keyframe path — both the #1841 on-demand PLI re-encode AND the #1903 floor —
-        // with nothing to encode and thus permanently disarmed. Set only inside the
+        // with nothing to encode and thus permanently disarmed. A new capture (a swap or
+        // a restart pick) never inherits it: see `forget_retained_frame`. Set only inside the
         // `'encode` loop, right after a successful encode, and holds EXACTLY ONE open
         // frame at a time (close-prior-on-replace, so it never leaks along the encode
         // path). The `'restart`-internal give-up `return;` paths bypass the final
@@ -3771,6 +4218,9 @@ impl ScreenEncoder {
         // permanently disarming the floor on a static share. Carried across each restart
         // by `ScreenFloorAccount::carry_across_restart` (a no-op by design).
         let mut floor_account = ScreenFloorAccount::idle();
+        // Raised by the send gate once a dropped keyframe can be replaced (#3077).
+        let owed_keyframe: Rc<Cell<bool>> = Rc::default();
+        let keyframe_debt: Rc<Cell<KeyframeDebt>> = Rc::default();
         // One-time INFO latch: `true` once the retained-frame path has served a
         // keyframe request, so the first engagement of the #1841 static path is a
         // single clear signal in field logs rather than a per-emit stream.
@@ -3816,6 +4266,8 @@ impl ScreenEncoder {
             let encode_w_for_handler = encode_width_out.clone();
             let encode_h_for_handler = encode_height_out.clone();
             let tier_idx_for_handler = shared_screen_tier_index.clone();
+            let owed_keyframe = owed_keyframe.clone();
+            let keyframe_debt = keyframe_debt.clone();
 
             Box::new(move |chunk: JsValue| {
                 let now = window()
@@ -3849,46 +4301,38 @@ impl ScreenEncoder {
                 let source_height_now = source_height_for_handler.load(Ordering::Relaxed);
                 // Issue #903: stamped on the wire for the receiver's Cause line.
                 let target_bitrate_now = target_bitrate_for_handler.load(Ordering::Relaxed);
-                // Issue #1921: WS send-side freshness gate. Read the frame type
-                // BEFORE `chunk` is moved into `transform_screen_chunk`. On a
-                // backed-up WebSocket socket a stale screen DELTA is dropped
-                // (keyframes are always sent) so keyframes stop queuing
-                // head-of-line behind stale deltas on the single shared TCP
-                // stream. A `None` depth — WebTransport, or no elected
-                // connection — always sends, so it never drops. The
-                // sequence number still advances on a drop, so the receiver's
-                // jitter buffer sees a gap and freezes to the next keyframe
-                // instead of decoding a wrong-reference delta into corruption.
+                // Read the frame type BEFORE `chunk` is moved into
+                // `transform_screen_chunk`.
                 let is_keyframe = matches!(chunk.type_(), web_sys::EncodedVideoChunkType::Key);
-                let ws_threshold = screen_ws_gate_threshold_bytes(screen_baseline_from_published(
+                let baseline = screen_baseline_from_published(
                     &encode_w_for_handler,
                     &encode_h_for_handler,
                     &tier_idx_for_handler,
-                ));
-                let ws_buffered = client.send_queue_depth();
-                match screen_ws_send_decision(ws_buffered, is_keyframe, ws_threshold) {
-                    ScreenWsSend::Send => {
-                        let packet: PacketWrapper = transform_screen_chunk(
-                            chunk,
-                            sequence_number,
-                            buffer.as_mut_slice(),
-                            &userid,
-                            aes.clone(),
-                            source_width_now,
-                            source_height_now,
-                            target_bitrate_now,
-                            0,
-                        );
-                        // Phase 2 of WT freeze fix: route screen-share video on
-                        // its own persistent QUIC stream, isolated from the
-                        // camera and audio streams.
-                        client.send_media_packet(packet, MediaStreamKey::Screen);
-                    }
-                    ScreenWsSend::DropStaleDelta => {
-                        // `ws_buffered` is `Some` here (a `None` depth decides
-                        // Send), so `unwrap_or(0)` reports the real backlog.
-                        record_screen_ws_stale_drop(ws_buffered.unwrap_or(0), ws_threshold);
-                    }
+                );
+                if gate_screen_chunk(
+                    client.screen_send_queue_depth(),
+                    is_keyframe,
+                    baseline,
+                    &keyframe_debt,
+                    &owed_keyframe,
+                    js_sys::Date::now,
+                ) == ScreenGateAction::Send
+                {
+                    let packet: PacketWrapper = transform_screen_chunk(
+                        chunk,
+                        sequence_number,
+                        buffer.as_mut_slice(),
+                        &userid,
+                        aes.clone(),
+                        source_width_now,
+                        source_height_now,
+                        target_bitrate_now,
+                        0,
+                    );
+                    // Phase 2 of WT freeze fix: route screen-share video on
+                    // its own persistent QUIC stream, isolated from the
+                    // camera and audio streams.
+                    client.send_media_packet(packet, MediaStreamKey::Screen);
                 }
                 // Advance the sequence number whether the frame was sent or
                 // dropped: the gap lets the receiver detect the loss (its jitter
@@ -3910,11 +4354,33 @@ impl ScreenEncoder {
         );
 
         let mut uplink_governor = ScreenUplinkGovernor::new();
+        // Set by a capture swap for the one iteration that installs it.
+        let mut swap_iteration = false;
+        let mut emit_replaced = false;
+        let mut share_started = false;
 
         'restart: loop {
+            let swapped = std::mem::take(&mut swap_iteration);
+            if emit_replaced && !swapped {
+                if let Some(track) = current_track.take() {
+                    track.set_onended(None);
+                }
+                if let Some(ref stream) = current_stream {
+                    cleanup_on_error(
+                        stream,
+                        &enabled,
+                        &on_state_change,
+                        "Could not switch to the new shared content".to_string(),
+                    );
+                }
+                close_retained_frame(&mut last_encoded_frame);
+                return;
+            }
             // --- Backoff + max-restart guard (skip on first iteration) ---
-            if restart_count > 0 {
+            if restart_count > 0 && !swapped {
                 let delay_ms = 500u64.saturating_mul(restart_count.min(4) as u64);
+                #[cfg(test)]
+                let delay_ms = delay_ms / BACKOFF_DIVISOR.with(|d| d.get());
                 log::warn!(
                     "ScreenEncoder: restarting encoder (attempt {restart_count}/{MAX_RESTARTS}), \
                      backoff {delay_ms}ms"
@@ -3942,9 +4408,7 @@ impl ScreenEncoder {
                 }
             }
 
-            // --- Media acquisition (first iteration uses the passed-in stream,
-            //     restarts re-acquire via getDisplayMedia) ---
-            if should_reacquire_screen_capture(media_acquired, restart_count) {
+            if !swapped && should_reacquire_screen_capture(media_acquired, restart_count) {
                 if let Some(track) = current_track.take() {
                     track.set_onended(None);
                     track.stop();
@@ -3952,7 +4416,9 @@ impl ScreenEncoder {
                 if let Some(stream) = current_stream.take() {
                     stop_media_stream_tracks(&stream);
                 }
-                screen_stream.borrow_mut().take();
+                if let Some(held) = screen_stream.borrow_mut().take() {
+                    stop_media_stream_tracks(&held);
+                }
                 active_video_track.borrow_mut().take();
                 _onended_handler = None;
 
@@ -3961,7 +4427,13 @@ impl ScreenEncoder {
                 // reintroduce native-resolution frames on exactly the recovery
                 // path. The helper retries once without the ceiling on
                 // OverconstrainedError.
-                let acquired_stream: MediaStream =
+                let picked = pending_replacement.borrow_mut().take();
+                let acquired_stream: MediaStream = if let Some(picked) = picked {
+                    forget_retained_frame(&mut last_encoded_frame, &mut last_encoded_frame_ms);
+                    capture_ceiling_dropped = true;
+                    emit_replaced = true;
+                    picked
+                } else {
                     match acquire_screen_capture_stream(&media_devices).await {
                         Ok((stream, ceiling_dropped)) => {
                             capture_ceiling_dropped = ceiling_dropped;
@@ -3993,8 +4465,13 @@ impl ScreenEncoder {
                             close_retained_frame(&mut last_encoded_frame);
                             return;
                         }
-                    };
+                    }
+                };
 
+                if !enabled.load(Ordering::Acquire) {
+                    stop_media_stream_tracks(&acquired_stream);
+                    break 'restart;
+                }
                 log::info!("Screen to share: {acquired_stream:?}");
 
                 // Signal camera encoder ASAP after capture is confirmed so it begins
@@ -4025,7 +4502,9 @@ impl ScreenEncoder {
                 );
 
                 // Store the original track so stop() can stop it synchronously
-                active_video_track.borrow_mut().replace(track.clone());
+                active_video_track
+                    .borrow_mut()
+                    .replace(Clone::clone(&track));
 
                 // Set up onended handler to detect when user clicks browser's "Stop sharing" button
                 _onended_handler = {
@@ -4113,7 +4592,9 @@ impl ScreenEncoder {
                 );
 
                 // Store the original track so stop() can stop it synchronously
-                active_video_track.borrow_mut().replace(track.clone());
+                active_video_track
+                    .borrow_mut()
+                    .replace(Clone::clone(&track));
 
                 // Set up onended handler
                 _onended_handler = {
@@ -4211,7 +4692,10 @@ impl ScreenEncoder {
                 &screen_encoder_config,
                 active_screen_tier_fps(shared_screen_tier_index.load(Ordering::Relaxed)),
             );
-            if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
+            let configured = screen_encoder.configure(&screen_encoder_config);
+            #[cfg(test)]
+            let configured = configured.and_then(|()| injected_configure_failure());
+            if let Err(e) = configured {
                 SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                 let msg = format!("Error configuring screen encoder: {e:?}");
                 error!("ScreenEncoder: {msg} (restart {restart_count})");
@@ -4296,6 +4780,8 @@ impl ScreenEncoder {
                     let encode_w_for_layer = encode_width_out.clone();
                     let encode_h_for_layer = encode_height_out.clone();
                     let tier_idx_for_layer = shared_screen_tier_index.clone();
+                    let owed_keyframe = owed_keyframe.clone();
+                    let keyframe_debt = Cell::new(KeyframeDebt::Clear);
                     (
                         Box::new(move |chunk: JsValue| {
                             let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -4306,44 +4792,37 @@ impl ScreenEncoder {
                             if buffer.len() < byte_length {
                                 buffer.resize(byte_length, 0);
                             }
-                            // Issue #1921: same WS send-side freshness gate as
-                            // the base layer. Read frame type before `chunk` is
-                            // moved; drop stale deltas on a backed-up WS socket
-                            // (keyframes always sent), advancing `local_seq`
-                            // either way so the receiver detects the gap.
+                            // Same send gate as screen layer 0; `local_seq`
+                            // advances either way so the receiver detects the gap.
                             let target_bitrate_now = target_bitrate.load(Ordering::Relaxed);
                             let is_keyframe =
                                 matches!(chunk.type_(), web_sys::EncodedVideoChunkType::Key);
-                            let ws_threshold =
-                                screen_ws_gate_threshold_bytes(screen_baseline_from_published(
-                                    &encode_w_for_layer,
-                                    &encode_h_for_layer,
-                                    &tier_idx_for_layer,
-                                ));
-                            let ws_buffered = client.send_queue_depth();
-                            match screen_ws_send_decision(ws_buffered, is_keyframe, ws_threshold) {
-                                ScreenWsSend::Send => {
-                                    let packet: PacketWrapper = transform_screen_chunk(
-                                        chunk,
-                                        local_seq,
-                                        buffer.as_mut_slice(),
-                                        &userid,
-                                        aes.clone(),
-                                        source_w.load(Ordering::Relaxed),
-                                        source_h.load(Ordering::Relaxed),
-                                        target_bitrate_now,
-                                        layer_id,
-                                    );
-                                    client.send_media_packet(packet, MediaStreamKey::Screen);
-                                }
-                                ScreenWsSend::DropStaleDelta => {
-                                    // Shared throttle with the base handler; `ws_buffered`
-                                    // is `Some` on the drop path.
-                                    record_screen_ws_stale_drop(
-                                        ws_buffered.unwrap_or(0),
-                                        ws_threshold,
-                                    );
-                                }
+                            let baseline = screen_baseline_from_published(
+                                &encode_w_for_layer,
+                                &encode_h_for_layer,
+                                &tier_idx_for_layer,
+                            );
+                            if gate_screen_chunk(
+                                client.screen_send_queue_depth(),
+                                is_keyframe,
+                                baseline,
+                                &keyframe_debt,
+                                &owed_keyframe,
+                                js_sys::Date::now,
+                            ) == ScreenGateAction::Send
+                            {
+                                let packet: PacketWrapper = transform_screen_chunk(
+                                    chunk,
+                                    local_seq,
+                                    buffer.as_mut_slice(),
+                                    &userid,
+                                    aes.clone(),
+                                    source_w.load(Ordering::Relaxed),
+                                    source_h.load(Ordering::Relaxed),
+                                    target_bitrate_now,
+                                    layer_id,
+                                );
+                                client.send_media_packet(packet, MediaStreamKey::Screen);
                             }
                             local_seq += 1;
                             seq_out_inner.set(local_seq);
@@ -4460,18 +4939,26 @@ impl ScreenEncoder {
                 }
             };
 
-            // Emit Started on every successful acquisition so the preview can
-            // bind to the fresh stream after a restart.
-            if restart_count == 0 {
-                client_for_state.set_screen_enabled(true);
+            #[cfg(test)]
+            RETAINED_AT_EMIT.with(|r| r.set(Some(last_encoded_frame.is_some())));
+            if std::mem::take(&mut emit_replaced) && share_started {
+                if let Some(ref callback) = on_state_change {
+                    callback.emit(ScreenShareEvent::Replaced(Clone::clone(stream_ref)));
+                }
             } else {
-                log::info!(
-                    "ScreenEncoder: encoder restarted successfully (attempt {restart_count})"
-                );
+                if !share_started {
+                    client_for_state.set_screen_enabled(true);
+                }
+                if restart_count > 0 {
+                    log::info!(
+                        "ScreenEncoder: encoder restarted successfully (attempt {restart_count})"
+                    );
+                }
+                if let Some(ref callback) = on_state_change {
+                    callback.emit(ScreenShareEvent::Started(Clone::clone(stream_ref)));
+                }
             }
-            if let Some(ref callback) = on_state_change {
-                callback.emit(ScreenShareEvent::Started(Clone::clone(stream_ref)));
-            }
+            share_started = true;
 
             let screen_reader = match screen_processor
                 .readable()
@@ -4499,7 +4986,8 @@ impl ScreenEncoder {
             // exactly one read is ever in flight — issuing a second `read()` on the
             // same `ReadableStreamDefaultReader` while one is pending is an error.
             // Re-armed in the loop the moment a frame (or read error) resolves.
-            let mut read_fut = Box::pin(JsFuture::from(screen_reader.read()));
+            let mut outstanding_read = OutstandingRead::new(&screen_reader);
+            let mut read_fut = outstanding_read.future();
 
             let mut screen_frame_counter: u32 = 0;
             // Wall-clock (`performance.now()`, ms) of the last keyframe this screen
@@ -4640,6 +5128,7 @@ impl ScreenEncoder {
             // restarting races the shared EncoderState with the user's next share
             // (stop-then-share-again defect). See `post_encode_exit_action`.
             let mut stream_ended = false;
+            let mut swap_to: Option<MediaStream> = None;
 
             'encode: loop {
                 // discussion 1960 (issue 2): sender-side tick-starvation heartbeat. This runs EVERY
@@ -4681,9 +5170,17 @@ impl ScreenEncoder {
                     // Break to final cleanup — not a restart.
                     break 'restart;
                 }
+                let replacement = pending_replacement.borrow_mut().take();
+                if replacement.is_some() {
+                    swap_to = replacement;
+                    break 'encode;
+                }
 
                 // --- Guard: skip reconfigure if encoder is already closed ---
-                if screen_encoder.state() == CodecState::Closed {
+                let codec_closed = screen_encoder.state() == CodecState::Closed;
+                #[cfg(test)]
+                let codec_closed = codec_closed || FORCED_RESTART.with(|f| f.replace(false));
+                if codec_closed {
                     log::warn!("ScreenEncoder: encoder found in closed state, triggering restart");
                     record_screen_restart(RestartReason::ClosedCodec);
                     fatal_encode_exit = true;
@@ -4701,17 +5198,12 @@ impl ScreenEncoder {
                     );
                 }
 
-                let screen_key = MediaStreamKey::Screen.as_u8();
-                let (active_transport, ws_buffered) = client.uplink_sensors();
                 let sample = screen_uplink_sample(
-                    active_transport,
-                    ws_buffered,
+                    client.screen_uplink_sensor(),
                     screen_ws_stale_delta_drops(),
-                    videocall_transport::webtransport::unistream_drop_count_for_stream(screen_key)
-                        .saturating_add(
-                        videocall_transport::webtransport::unistream_ready_stall_count_for_stream(
-                            screen_key,
-                        ),
+                    screen_wt_gate_drops(),
+                    screen_wt_gate_delay_ms(
+                        videocall_transport::webtransport::uplink_rtt_baseline_ms(),
                     ),
                 );
                 let governed = uplink_governor.observe(js_sys::Date::now(), sample, baseline);
@@ -5014,7 +5506,8 @@ impl ScreenEncoder {
                         // A real track frame (or a read error) resolved first. Re-arm
                         // the read IMMEDIATELY so exactly one read is ever outstanding
                         // on this reader; the resolved result is processed below.
-                        read_fut = Box::pin(JsFuture::from(screen_reader.read()));
+                        outstanding_read.rearm(&screen_reader);
+                        read_fut = outstanding_read.future();
                         read_result
                     }
                     futures::future::Either::Right((_elapsed, pending_read)) => {
@@ -5026,7 +5519,7 @@ impl ScreenEncoder {
 
                         // Re-encode the retained frame as a keyframe when EITHER a receiver's
                         // KEYFRAME_REQUEST is pending (on-demand, issue #1841) OR the static-share
-                        // wall-clock FLOOR is due (issue #1903).
+                        // wall-clock FLOOR is due (issue #1903) OR a WT gate debt can be paid (#3077).
                         //
                         // The floor is the insurance path the pre-#1903 "on-demand only" gate lacked:
                         // a paused capture never runs the real-frame arm, so the periodic GOP keyframe
@@ -5047,6 +5540,19 @@ impl ScreenEncoder {
                             .now();
                         let floor_due =
                             floor_account.floor_due(now, SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS);
+                        let (owed_queued, owed_gate) = screen_gate_for(
+                            client.screen_send_queue_depth(),
+                            baseline,
+                            videocall_transport::webtransport::uplink_rtt_baseline_ms(),
+                        );
+                        let owed_due = screen_static_owed_keyframe_due(
+                            keyframe_debt.get(),
+                            owed_queued,
+                            owed_gate,
+                            now,
+                            floor_account.clock_ms,
+                            SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                        );
                         // #1903 live-instrumentation: one throttled DEBUG line of the floor's decision
                         // inputs on EVERY static tick — logged BEFORE the emit gate (and independent of
                         // budget / retained-frame presence) so an e2e/field pass can see exactly WHY a
@@ -5253,7 +5759,7 @@ impl ScreenEncoder {
                         // The settled-resize apply above already emitted a room-wide keyframe this tick,
                         // so skip the PLI/floor re-encode (mutually exclusive) — the settle keyframe
                         // satisfies any pending PLI and stamps the floor cadence.
-                        if !settle_emitted && (pli_pending || floor_due) {
+                        if !settle_emitted && (pli_pending || floor_due || owed_due) {
                             if let Some(retained) = last_encoded_frame.as_ref() {
                                 // Consume the #1311 cooldown-reset edge ONLY when actually
                                 // servicing a PLI. On a static share the real-frame arm never
@@ -5279,7 +5785,7 @@ impl ScreenEncoder {
                                 let decision = keyframe_tick_decision(KeyframeTickInput {
                                     now_ms: now,
                                     pli_pending,
-                                    is_periodic: floor_due,
+                                    is_periodic: floor_due || owed_due,
                                     cooldown_reset,
                                     last_keyframe_emit_ms,
                                     cooldown_ms: ENCODER_PLI_COOLDOWN_MS,
@@ -5367,6 +5873,14 @@ impl ScreenEncoder {
                                         floor_account.on_floor_emitted(now);
                                     } else {
                                         floor_account.on_keyframe_emitted(now);
+                                    }
+                                    if owed_due {
+                                        owed_keyframe.set(false);
+                                        log::info!(
+                                            "ScreenEncoder: static share — re-encoding the retained frame as the keyframe owed since a WT queue drop (queued={}, threshold={}) (issue #3077)",
+                                            owed_queued.unwrap_or(0),
+                                            owed_gate.delta_bytes()
+                                        );
                                     }
                                     if !served_synthetic_once {
                                         served_synthetic_once = true;
@@ -5594,16 +6108,26 @@ impl ScreenEncoder {
                         // the clock by TYPE, so handing it `last_keyframe_emit_ms` will not compile)
                         // precisely so a host test can pin this decision — see that fn's doc for what
                         // that guard does and does not cover.
-                        let is_periodic_keyframe = screen_periodic_keyframe_due(
-                            screen_frame_counter,
-                            local_keyframe_interval,
-                            now,
-                            &full_fanout_keyframe,
-                            SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
-                        ) || stall_resume_keyframe;
+                        let frame_keyframe = screen_frame_arm_keyframe(
+                            screen_periodic_keyframe_due(
+                                screen_frame_counter,
+                                local_keyframe_interval,
+                                now,
+                                &full_fanout_keyframe,
+                                SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                            ),
+                            stall_resume_keyframe,
+                            &owed_keyframe,
+                        );
+                        let is_periodic_keyframe = frame_keyframe.forced;
                         if stall_resume_keyframe {
                             log::info!(
                                 "[SCREEN_ENCODER] stall: forcing a fresh capture-path keyframe on the first frame after a tick-starvation resume (discussion 1960)"
+                            );
+                        }
+                        if frame_keyframe.owed {
+                            log::info!(
+                                "ScreenEncoder: emitting the keyframe owed since a WT queue-ceiling drop (issue #3077)"
                             );
                         }
                         // Resolve the keyframe decision via the shared single source of
@@ -5946,6 +6470,33 @@ impl ScreenEncoder {
             // 'restart iteration rebuilds them.
             drop(extra_layers);
 
+            if let Some(next) = swap_to.take() {
+                if let Some(track) = current_track.take() {
+                    track.set_onended(None);
+                }
+                if let Some(stream) = current_stream.take() {
+                    stop_media_stream_tracks(&stream);
+                }
+                _onended_handler = None;
+                active_video_track.borrow_mut().take();
+                if let Some(held) = screen_stream.borrow_mut().replace(next.clone()) {
+                    stop_media_stream_tracks(&held);
+                }
+                forget_retained_frame(&mut last_encoded_frame, &mut last_encoded_frame_ms);
+                let (src_w, src_h) = screen_stream_source_dims(&next);
+                tier_targets.capture_width.store(src_w, Ordering::Relaxed);
+                tier_targets.capture_height.store(src_h, Ordering::Relaxed);
+                encode_width_out.store(0, Ordering::Relaxed);
+                encode_height_out.store(0, Ordering::Relaxed);
+                apply_initial_tier_to(&tier_targets);
+                capture_ceiling_dropped = true;
+                current_stream = Some(next);
+                swap_iteration = true;
+                emit_replaced = true;
+                log::info!("ScreenEncoder: swapped in a new capture for the running share");
+                continue 'restart;
+            }
+
             // A track end short-circuits straight to clean shutdown: it can never
             // be auto-recovered without a user gesture, and re-entering the
             // restart loop would race the shared EncoderState (enabled flag +
@@ -5986,6 +6537,9 @@ impl ScreenEncoder {
 
         // Clear the active track reference so stop() doesn't try to stop it again.
         active_video_track.borrow_mut().take();
+        if let Some(pending) = pending_replacement.borrow_mut().take() {
+            stop_media_stream_tracks(&pending);
+        }
 
         // Clear the onended handler before dropping the closure to avoid dangling reference
         if let Some(ref track) = current_track {
@@ -6031,6 +6585,7 @@ mod tests {
     use super::clear_screen_sharing_flags;
     use super::floor_budget_after_emit;
     use super::floor_budget_replenished;
+    use super::gate_screen_chunk;
     use super::is_fatal_encoder_error_message;
     use super::keyframe_tick_decision;
     use super::periodic_keyframe_due;
@@ -6038,6 +6593,7 @@ mod tests {
     use super::publish_screen_effective_bitrate;
     use super::publish_screen_encode_geometry;
     use super::publish_screen_floor_signal;
+    use super::record_screen_gate_drop;
     use super::record_screen_restart;
     use super::retained_stale_warn_due;
     use super::screen_baseline_from_published;
@@ -6048,7 +6604,14 @@ mod tests {
     use super::screen_encoder_restarts_configure;
     use super::screen_encoder_restarts_memory;
     use super::screen_encoder_restarts_other;
+    use super::screen_frame_arm_keyframe;
+    use super::screen_gate_action;
+    use super::screen_gate_drop_counter;
+    use super::screen_gate_drops_to_log;
+    use super::screen_gate_for;
     use super::screen_periodic_keyframe_due;
+    use super::screen_send_decision;
+    use super::screen_static_owed_keyframe_due;
     use super::screen_step_log_decision;
     use super::screen_track_constraint_for_tier;
     use super::screen_uplink_sample;
@@ -6056,6 +6619,7 @@ mod tests {
     use super::screen_ws_gate_threshold_bytes;
     use super::screen_ws_send_decision;
     use super::screen_ws_stale_drop_step_down_decision;
+    use super::screen_wt_gate_delay_ms;
     use super::seed_screen_floor_signal;
     use super::should_attempt_screen_reconfigure;
     use super::should_reacquire_screen_capture;
@@ -6066,13 +6630,18 @@ mod tests {
     use super::wt_saturation_step_down_decision;
     use super::DimensionSettle;
     use super::EncoderStallMonitor;
+    use super::FrameArmKeyframe;
     use super::FullFanoutKeyframeClock;
+    use super::KeyframeDebt;
     use super::KeyframeTickInput;
     use super::PostEncodeExit;
     use super::RestartReason;
     use super::ScreenEffectiveBitrate;
     use super::ScreenEncoder;
     use super::ScreenFloorAccount;
+    use super::ScreenGate;
+    use super::ScreenGateAction;
+    use super::ScreenSend;
     use super::ScreenWsSend;
     use super::SourceDims;
     use super::SCREEN_DIM_SETTLE_MS;
@@ -6084,6 +6653,8 @@ mod tests {
     use super::SCREEN_STATIC_REENCODE_POLL_MS;
     use super::SCREEN_WS_FRESHNESS_DELAY_MS;
     use super::SCREEN_WS_MIN_THRESHOLD_BYTES;
+    use super::SCREEN_WS_STALE_DELTA_DROPS;
+    use super::SCREEN_WT_GATE_DROPS;
     use super::SHED_TEARDOWN_DWELL_MS;
     use crate::adaptive_quality_constants::ENCODER_PLI_COOLDOWN_MS;
     use crate::adaptive_quality_constants::SCREEN_MIN_BITRATE_KBPS;
@@ -6094,9 +6665,11 @@ mod tests {
         WS_SELF_CONGESTION_WINDOW_MS, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
         WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
     };
+    use crate::connection::StreamQueueDepth;
     use crate::encode::encoder_state::ForcedKeyframeCause;
     use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
-    use std::sync::atomic::AtomicU32;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
     use videocall_aq::screen_bitrate::{
         screen_effective_bitrate_kbps, ScreenPressureStep, ScreenUplinkGovernor,
         ScreenUplinkSample, SCREEN_BACKOFF_MAX_STEP, SCREEN_BACKOFF_PROBE_INTERVAL_MS,
@@ -6449,7 +7022,7 @@ mod tests {
     fn screen_ws_keyframe_always_sent_even_when_backlog_huge() {
         // buffered 10 MB, threshold a mere 100 B, but it's a keyframe.
         assert_eq!(
-            screen_ws_send_decision(Some(10_000_000), true, 100),
+            screen_ws_send_decision(10_000_000, true, 100),
             ScreenWsSend::Send
         );
     }
@@ -6459,7 +7032,7 @@ mod tests {
     #[test]
     fn screen_ws_delta_dropped_when_backlog_over_threshold() {
         assert_eq!(
-            screen_ws_send_decision(Some(200_000), false, 125_000),
+            screen_ws_send_decision(200_000, false, 125_000),
             ScreenWsSend::DropStaleDelta
         );
     }
@@ -6470,30 +7043,36 @@ mod tests {
     #[test]
     fn screen_ws_delta_threshold_boundary_is_strict_greater_than() {
         assert_eq!(
-            screen_ws_send_decision(Some(125_000), false, 125_000),
+            screen_ws_send_decision(125_000, false, 125_000),
             ScreenWsSend::Send,
             "at exactly the threshold the delta must still be sent"
         );
         assert_eq!(
-            screen_ws_send_decision(Some(125_001), false, 125_000),
+            screen_ws_send_decision(125_001, false, 125_000),
             ScreenWsSend::DropStaleDelta,
             "one byte over the threshold must drop"
         );
         assert_eq!(
-            screen_ws_send_decision(Some(124_999), false, 125_000),
+            screen_ws_send_decision(124_999, false, 125_000),
             ScreenWsSend::Send,
             "below the threshold must send"
         );
     }
 
-    /// On WebTransport (or before election) the depth is `None` — screen has its
-    /// own QUIC unistream, so nothing is ever dropped here even for a delta with
-    /// a threshold of 1. Mutating the `None ⇒ Send` arm would fail this and is
-    /// the guard that keeps the WT path byte-for-byte unchanged.
+    /// Before election there is no depth: every delta passes and leaves the
+    /// debt as it was.
     #[test]
-    fn screen_ws_none_depth_never_drops() {
-        assert_eq!(screen_ws_send_decision(None, false, 1), ScreenWsSend::Send);
-        assert_eq!(screen_ws_send_decision(None, true, 1), ScreenWsSend::Send);
+    fn with_no_depth_reading_a_delta_passes_and_keeps_the_debt() {
+        for gate in [wt_gate_1080p(0.0), ws_gate_1080p()] {
+            for debt in ALL_DEBTS {
+                let delta = screen_send_decision(None, false, gate, debt);
+                assert_eq!(
+                    (delta.send, delta.debt, delta.request_keyframe),
+                    (ScreenSend::Send, debt, false),
+                    "{gate:?} {debt:?}"
+                );
+            }
+        }
     }
 
     /// The threshold is 500 ms of the current screen target bitrate. Exact
@@ -6505,6 +7084,567 @@ mod tests {
         assert_eq!(screen_ws_freshness_threshold_bytes(2500), 156_250);
         // 2000 kbps → 250 KB/s → 500 ms = 125_000 bytes.
         assert_eq!(screen_ws_freshness_threshold_bytes(2000), 125_000);
+    }
+
+    // ── Issue #3077: WT screen send gate ────────────────────────────────────
+
+    const NO_CLOCK: fn() -> f64 = || 0.0;
+
+    fn wt_gate_1080p(rtt_ms: f64) -> ScreenGate {
+        screen_gate_for(
+            Some(StreamQueueDepth::WebTransport(0)),
+            ScreenBaselineKbps::for_geometry(1920, 1080, 10),
+            rtt_ms,
+        )
+        .1
+    }
+
+    fn ws_gate_1080p() -> ScreenGate {
+        screen_gate_for(
+            Some(StreamQueueDepth::WebSocket(0)),
+            ScreenBaselineKbps::for_geometry(1920, 1080, 10),
+            0.0,
+        )
+        .1
+    }
+
+    fn wt_ceiling(gate: ScreenGate) -> u64 {
+        match gate {
+            ScreenGate::WebTransport {
+                keyframe_ceiling_bytes,
+                ..
+            } => keyframe_ceiling_bytes,
+            ScreenGate::WebSocket { .. } => panic!("not a WT gate"),
+        }
+    }
+
+    #[test]
+    fn the_wt_gate_delay_is_twice_the_rtt_between_one_and_one_and_a_half_seconds() {
+        assert_eq!(screen_wt_gate_delay_ms(0.0), 1_000);
+        assert_eq!(screen_wt_gate_delay_ms(250.0), 1_000);
+        assert_eq!(screen_wt_gate_delay_ms(550.0), 1_100);
+        assert_eq!(screen_wt_gate_delay_ms(700.0), 1_400);
+        assert_eq!(screen_wt_gate_delay_ms(2_000.0), 1_500);
+        assert_eq!(screen_wt_gate_delay_ms(f64::NAN), 1_000);
+        assert_eq!(screen_wt_gate_delay_ms(-5.0), 1_000);
+    }
+
+    /// 1080p at 10 fps budgets 2488 kbps = 311_000 B/s of screen video.
+    #[test]
+    fn the_wt_gate_has_its_own_thresholds_and_a_keyframe_ceiling() {
+        let wt = |delta_bytes| ScreenGate::WebTransport {
+            delta_bytes,
+            keyframe_ceiling_bytes: 933_000,
+        };
+        assert_eq!(wt_gate_1080p(400.0), wt(311_000));
+        assert_eq!(wt_gate_1080p(550.0), wt(342_100));
+        assert_eq!(wt_gate_1080p(2_000.0), wt(466_500));
+
+        let baseline = ScreenBaselineKbps::for_geometry(1920, 1080, 10);
+        assert_eq!(
+            screen_gate_for(Some(StreamQueueDepth::WebSocket(7)), baseline, 550.0),
+            (
+                Some(7),
+                ScreenGate::WebSocket {
+                    delta_bytes: screen_ws_gate_threshold_bytes(baseline),
+                }
+            ),
+            "WS keeps the #1921 threshold and no keyframe ceiling"
+        );
+        assert_eq!(
+            screen_gate_for(Some(StreamQueueDepth::WebTransport(9)), baseline, 0.0).0,
+            Some(9)
+        );
+        assert_eq!(screen_gate_for(None, baseline, 0.0).0, None);
+    }
+
+    #[test]
+    fn a_wt_delta_over_the_threshold_breaks_the_gop_and_one_at_it_is_sent() {
+        let gate = wt_gate_1080p(0.0);
+        let over = screen_send_decision(Some(311_001), false, gate, KeyframeDebt::Clear);
+        assert_eq!(
+            (over.send, over.debt, over.request_keyframe),
+            (ScreenSend::DropDelta, KeyframeDebt::GopBroken, false)
+        );
+        let at = screen_send_decision(Some(311_000), false, gate, KeyframeDebt::Clear);
+        assert_eq!((at.send, at.debt), (ScreenSend::Send, KeyframeDebt::Clear));
+    }
+
+    #[test]
+    fn a_broken_gop_drops_every_delta_until_a_keyframe_is_sent_without_requesting_one() {
+        let gate = wt_gate_1080p(0.0);
+        let drained = screen_send_decision(Some(0), false, gate, KeyframeDebt::GopBroken);
+        assert_eq!(
+            (drained.send, drained.debt, drained.request_keyframe),
+            (ScreenSend::DropDelta, KeyframeDebt::GopBroken, false),
+            "a delta after a dropped delta is undecodable even on an empty queue"
+        );
+        let keyframe = screen_send_decision(Some(0), true, gate, KeyframeDebt::GopBroken);
+        assert_eq!(
+            (keyframe.send, keyframe.debt),
+            (ScreenSend::Send, KeyframeDebt::Clear)
+        );
+        let after = screen_send_decision(Some(0), false, gate, KeyframeDebt::Clear);
+        assert_eq!(after.send, ScreenSend::Send);
+    }
+
+    #[test]
+    fn a_wt_keyframe_over_the_ceiling_is_dropped_and_owed() {
+        let gate = wt_gate_1080p(0.0);
+        let over = screen_send_decision(Some(933_001), true, gate, KeyframeDebt::Clear);
+        assert_eq!(
+            (over.send, over.debt, over.request_keyframe),
+            (ScreenSend::DropKeyframe, KeyframeDebt::Owed, false)
+        );
+        let at = screen_send_decision(Some(933_000), true, gate, KeyframeDebt::Clear);
+        assert_eq!((at.send, at.debt), (ScreenSend::Send, KeyframeDebt::Clear));
+    }
+
+    #[test]
+    fn an_owed_keyframe_holds_deltas_until_the_queue_drains_then_is_requested_once() {
+        let gate = wt_gate_1080p(0.0);
+        let backed_up = screen_send_decision(Some(311_001), false, gate, KeyframeDebt::Owed);
+        assert_eq!(
+            (backed_up.send, backed_up.debt, backed_up.request_keyframe),
+            (ScreenSend::DropDelta, KeyframeDebt::Owed, false)
+        );
+        let drained = screen_send_decision(Some(311_000), false, gate, KeyframeDebt::Owed);
+        assert_eq!(
+            (drained.send, drained.debt, drained.request_keyframe),
+            (ScreenSend::DropDelta, KeyframeDebt::Requested, true),
+            "a queue at exactly the threshold has drained"
+        );
+        let waiting = screen_send_decision(Some(0), false, gate, KeyframeDebt::Requested);
+        assert_eq!(
+            (waiting.send, waiting.debt, waiting.request_keyframe),
+            (ScreenSend::DropDelta, KeyframeDebt::Requested, false),
+            "requested once, not once per frame"
+        );
+        let keyframe = screen_send_decision(Some(0), true, gate, KeyframeDebt::Requested);
+        assert_eq!(
+            (keyframe.send, keyframe.debt),
+            (ScreenSend::Send, KeyframeDebt::Clear)
+        );
+    }
+
+    const ALL_DEBTS: [KeyframeDebt; 4] = [
+        KeyframeDebt::Clear,
+        KeyframeDebt::GopBroken,
+        KeyframeDebt::Owed,
+        KeyframeDebt::Requested,
+    ];
+
+    /// The debt cannot wedge: any keyframe that fits clears it, whatever state
+    /// it is in, and so does one sent with no queue to read.
+    #[test]
+    fn any_keyframe_that_fits_clears_the_debt() {
+        let gate = wt_gate_1080p(0.0);
+        for debt in ALL_DEBTS {
+            for queued in [Some(0), Some(933_000), None] {
+                let step = screen_send_decision(queued, true, gate, debt);
+                assert_eq!(
+                    (step.send, step.debt),
+                    (ScreenSend::Send, KeyframeDebt::Clear),
+                    "{debt:?} at {queued:?}"
+                );
+            }
+        }
+    }
+
+    /// A WT debt carried over a fallback to WebSocket is dropped on the first
+    /// WS frame, so WS keeps the #1921 rule exactly.
+    #[test]
+    fn websocket_carries_no_keyframe_debt() {
+        let baseline = ScreenBaselineKbps::for_geometry(1920, 1080, 10);
+        let threshold = screen_ws_gate_threshold_bytes(baseline);
+        let ws = |queued| screen_gate_for(Some(StreamQueueDepth::WebSocket(queued)), baseline, 0.0);
+        for debt in ALL_DEBTS {
+            let (queued, gate) = ws(threshold);
+            let step = screen_send_decision(queued, false, gate, debt);
+            assert_eq!(
+                (step.send, step.debt, step.request_keyframe),
+                (ScreenSend::Send, KeyframeDebt::Clear, false),
+                "{debt:?}"
+            );
+            let (queued, gate) = ws(threshold + 1);
+            let step = screen_send_decision(queued, false, gate, debt);
+            assert_eq!(
+                (step.send, step.debt),
+                (ScreenSend::DropDelta, KeyframeDebt::Clear),
+                "{debt:?}"
+            );
+            let (queued, gate) = ws(10_000_000);
+            let step = screen_send_decision(queued, true, gate, debt);
+            assert_eq!(
+                (step.send, step.debt),
+                (ScreenSend::Send, KeyframeDebt::Clear),
+                "{debt:?}"
+            );
+        }
+    }
+
+    struct SimulatedShare {
+        peak: u64,
+        keyframes_sent: u32,
+        longest_keyframe_gap_frames: u64,
+        undecodable_deltas_sent: u32,
+    }
+
+    /// A 10 fps share with a 3 s GOP whose frames go through the WT gate onto
+    /// a link that drains `drain_per_frame` bytes per frame.
+    fn simulate_wt_share(gate: ScreenGate, keyframe: u64, drain_per_frame: u64) -> SimulatedShare {
+        const DELTA: u64 = 30_000;
+        let mut out = SimulatedShare {
+            peak: 0,
+            keyframes_sent: 0,
+            longest_keyframe_gap_frames: 0,
+            undecodable_deltas_sent: 0,
+        };
+        let mut queued = 0_u64;
+        let mut debt = KeyframeDebt::Clear;
+        let mut force_next = false;
+        let mut decodable = true;
+        let mut last_keyframe_sent = 0_u64;
+        for frame in 0..6_000_u64 {
+            let is_keyframe = frame % 30 == 0 || std::mem::take(&mut force_next);
+            let step = screen_send_decision(Some(queued), is_keyframe, gate, debt);
+            debt = step.debt;
+            force_next |= step.request_keyframe;
+            match (step.send, is_keyframe) {
+                (ScreenSend::Send, true) => {
+                    queued += keyframe;
+                    decodable = true;
+                    out.keyframes_sent += 1;
+                    out.longest_keyframe_gap_frames = out
+                        .longest_keyframe_gap_frames
+                        .max(frame - last_keyframe_sent);
+                    last_keyframe_sent = frame;
+                }
+                (ScreenSend::Send, false) => {
+                    queued += DELTA;
+                    out.undecodable_deltas_sent += u32::from(!decodable);
+                }
+                _ => decodable = false,
+            }
+            out.peak = out.peak.max(queued);
+            queued = queued.saturating_sub(drain_per_frame);
+        }
+        out
+    }
+
+    const ONE_MBPS_PER_FRAME: u64 = 12_500;
+
+    /// A 1080p high-motion share on a 1 Mbps uplink stays under the ceiling plus
+    /// one keyframe — including when its keyframes alone outrun the link — and
+    /// never spends the uplink on a delta receivers cannot decode.
+    #[test]
+    fn a_sustained_wt_deficit_keeps_the_screen_queue_bounded() {
+        let gate = wt_gate_1080p(400.0);
+        let ceiling = wt_ceiling(gate);
+        for keyframe in [300_000, 600_000] {
+            let share = simulate_wt_share(gate, keyframe, ONE_MBPS_PER_FRAME);
+            assert!(
+                share.peak <= ceiling + keyframe,
+                "{keyframe}B keyframes: peak queue {} exceeds ceiling {ceiling} plus one",
+                share.peak
+            );
+            assert!(
+                share.keyframes_sent >= 50,
+                "{keyframe}B keyframes: only {} got out in 10 minutes",
+                share.keyframes_sent
+            );
+            assert_eq!(
+                share.undecodable_deltas_sent, 0,
+                "{keyframe}B keyframes: deltas after a drop were still sent"
+            );
+        }
+    }
+
+    /// A keyframe larger than the ceiling degrades the share to a slideshow;
+    /// keyframes must keep getting through.
+    #[test]
+    fn a_keyframe_larger_than_the_ceiling_still_gets_through() {
+        let gate = wt_gate_1080p(400.0);
+        let keyframe = 1_500_000;
+        assert!(keyframe > wt_ceiling(gate));
+        let share = simulate_wt_share(gate, keyframe, ONE_MBPS_PER_FRAME);
+        assert!(
+            share.keyframes_sent >= 30,
+            "only {} keyframes got out in 10 minutes",
+            share.keyframes_sent
+        );
+        assert!(
+            share.longest_keyframe_gap_frames <= 160,
+            "{} frames between keyframes",
+            share.longest_keyframe_gap_frames
+        );
+    }
+
+    #[test]
+    fn the_gate_drop_log_is_throttled_to_one_line_per_second_with_the_window_count() {
+        let last_ms = AtomicU64::new(0);
+        let last_total = AtomicU64::new(0);
+        assert_eq!(
+            screen_gate_drops_to_log(3, 1_000, &last_ms, &last_total),
+            Some(3)
+        );
+        assert_eq!(
+            screen_gate_drops_to_log(5, 1_999, &last_ms, &last_total),
+            None
+        );
+        assert_eq!(
+            screen_gate_drops_to_log(9, 2_000, &last_ms, &last_total),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn each_recorded_gate_drop_increments_the_counter_it_is_billed_to() {
+        let gate = wt_gate_1080p(0.0);
+        let counter = AtomicU64::new(0);
+        for (action, expected) in [
+            (ScreenGateAction::WtDeltaDrop, 1),
+            (ScreenGateAction::WtKeyframeDrop, 2),
+            (ScreenGateAction::WsDeltaDrop, 3),
+        ] {
+            record_screen_gate_drop(
+                action,
+                Some(&counter),
+                0,
+                gate,
+                KeyframeDebt::GopBroken,
+                NO_CLOCK,
+            );
+            assert_eq!(counter.load(Ordering::Relaxed), expected, "{action:?}");
+        }
+        record_screen_gate_drop(
+            ScreenGateAction::Send,
+            None,
+            0,
+            gate,
+            KeyframeDebt::Clear,
+            NO_CLOCK,
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn each_gate_drop_is_billed_to_its_own_transports_counter() {
+        let wt_counter = screen_gate_drop_counter(ScreenGateAction::WtDeltaDrop).unwrap();
+        assert!(std::ptr::eq(wt_counter, &SCREEN_WT_GATE_DROPS));
+        let wt_keyframe = screen_gate_drop_counter(ScreenGateAction::WtKeyframeDrop).unwrap();
+        assert!(std::ptr::eq(wt_keyframe, &SCREEN_WT_GATE_DROPS));
+        let ws_counter = screen_gate_drop_counter(ScreenGateAction::WsDeltaDrop).unwrap();
+        assert!(std::ptr::eq(ws_counter, &SCREEN_WS_STALE_DELTA_DROPS));
+        assert!(screen_gate_drop_counter(ScreenGateAction::Send).is_none());
+
+        let wt = Some(StreamQueueDepth::WebTransport(0));
+        let ws = Some(StreamQueueDepth::WebSocket(0));
+        assert_eq!(
+            screen_gate_action(wt, ScreenSend::DropDelta),
+            ScreenGateAction::WtDeltaDrop
+        );
+        assert_eq!(
+            screen_gate_action(ws, ScreenSend::DropDelta),
+            ScreenGateAction::WsDeltaDrop
+        );
+        assert_eq!(
+            screen_gate_action(wt, ScreenSend::DropKeyframe),
+            ScreenGateAction::WtKeyframeDrop
+        );
+        assert_eq!(
+            screen_gate_action(None, ScreenSend::Send),
+            ScreenGateAction::Send
+        );
+    }
+
+    #[test]
+    fn the_wt_gate_latches_a_dropped_delta_until_a_keyframe_is_sent() {
+        let baseline = ScreenBaselineKbps::for_geometry(1920, 1080, 10);
+        let owed = Cell::new(false);
+        let debt = Cell::new(KeyframeDebt::Clear);
+        let wt = StreamQueueDepth::WebTransport;
+        let gate = |queued, is_keyframe| {
+            gate_screen_chunk(
+                Some(wt(queued)),
+                is_keyframe,
+                baseline,
+                &debt,
+                &owed,
+                NO_CLOCK,
+            )
+        };
+        assert_eq!(gate(10_000_000, false), ScreenGateAction::WtDeltaDrop);
+        assert_eq!(debt.get(), KeyframeDebt::GopBroken);
+        assert_eq!(gate(0, false), ScreenGateAction::WtDeltaDrop);
+        assert_eq!(gate(0, true), ScreenGateAction::Send);
+        assert_eq!(gate(0, false), ScreenGateAction::Send);
+        assert_eq!(debt.get(), KeyframeDebt::Clear);
+        assert!(!owed.get(), "a dropped delta waits for the next keyframe");
+    }
+
+    #[test]
+    fn the_wt_gate_raises_the_owed_keyframe_once_a_dropped_keyframe_can_be_replaced() {
+        let baseline = ScreenBaselineKbps::for_geometry(1920, 1080, 10);
+        let owed = Cell::new(false);
+        let debt = Cell::new(KeyframeDebt::Clear);
+        let wt = StreamQueueDepth::WebTransport;
+        let gate = |queued, is_keyframe| {
+            gate_screen_chunk(
+                Some(wt(queued)),
+                is_keyframe,
+                baseline,
+                &debt,
+                &owed,
+                NO_CLOCK,
+            )
+        };
+        assert_eq!(gate(10_000_000, true), ScreenGateAction::WtKeyframeDrop);
+        assert_eq!(debt.get(), KeyframeDebt::Owed);
+        assert!(!owed.get());
+
+        assert_eq!(gate(0, false), ScreenGateAction::WtDeltaDrop);
+        assert!(
+            owed.get(),
+            "the encode loop must be told to emit the keyframe"
+        );
+        assert_eq!(debt.get(), KeyframeDebt::Requested);
+
+        assert_eq!(gate(0, true), ScreenGateAction::Send);
+        assert_eq!(debt.get(), KeyframeDebt::Clear);
+    }
+
+    #[test]
+    fn the_static_arm_pays_a_debt_once_the_wt_queue_drained_and_a_floor_period_passed() {
+        let wt = wt_gate_1080p(0.0);
+        let due = |debt, queued, gate, now_ms, last_ms| {
+            screen_static_owed_keyframe_due(
+                debt,
+                queued,
+                gate,
+                now_ms,
+                last_ms,
+                SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+            )
+        };
+        for debt in [
+            KeyframeDebt::GopBroken,
+            KeyframeDebt::Owed,
+            KeyframeDebt::Requested,
+        ] {
+            assert!(due(debt, Some(311_000), wt, 3_000.0, Some(0.0)), "{debt:?}");
+            assert!(
+                due(debt, Some(0), wt, 0.0, None),
+                "{debt:?}: no keyframe yet"
+            );
+            assert!(
+                !due(debt, Some(311_001), wt, 3_000.0, Some(0.0)),
+                "{debt:?}: still backed up"
+            );
+            assert!(
+                !due(debt, Some(0), wt, 2_999.0, Some(0.0)),
+                "{debt:?}: within a floor period"
+            );
+            assert!(
+                !due(debt, None, wt, 3_000.0, Some(0.0)),
+                "{debt:?}: no reading"
+            );
+            assert!(
+                !due(debt, Some(0), ws_gate_1080p(), 3_000.0, Some(0.0)),
+                "{debt:?}: WS carries no debt"
+            );
+        }
+        assert!(!due(KeyframeDebt::Clear, Some(0), wt, 3_000.0, Some(0.0)));
+    }
+
+    /// A static share whose keyframes exceed the WT ceiling on a 500 kbps
+    /// link: every floor keyframe is dropped while the queue drains, and the
+    /// debt is still paid once it has drained, with no content change.
+    #[test]
+    fn a_static_share_pays_a_dropped_keyframe_once_the_queue_drains() {
+        const KEYFRAME: u64 = 1_500_000;
+        const DRAIN_PER_TICK: u64 = 9_375;
+        let floor = SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+        let gate = wt_gate_1080p(0.0);
+        let mut account = ScreenFloorAccount::idle();
+        account.on_captured_frame();
+        account.on_keyframe_emitted(0.0);
+        let mut queued = 2_400_000_u64;
+        let mut debt = KeyframeDebt::Clear;
+        let mut floor_emits = 0_u32;
+        let mut sent_at = Vec::new();
+        let mut t = 0.0;
+        while t <= 60_000.0 {
+            let floor_due = account.floor_due(t, floor);
+            let owed_due = screen_static_owed_keyframe_due(
+                debt,
+                Some(queued),
+                gate,
+                t,
+                account.clock_ms,
+                floor,
+            );
+            if floor_due || owed_due {
+                let step = screen_send_decision(Some(queued), true, gate, debt);
+                debt = step.debt;
+                assert!(
+                    !owed_due || step.send == ScreenSend::Send,
+                    "an owed emit must fit the gate at {t} ms"
+                );
+                if step.send == ScreenSend::Send {
+                    queued += KEYFRAME;
+                    sent_at.push(t);
+                }
+                if floor_due {
+                    account.on_floor_emitted(t);
+                    floor_emits += 1;
+                } else {
+                    account.on_keyframe_emitted(t);
+                }
+            }
+            queued = queued.saturating_sub(DRAIN_PER_TICK);
+            t += 150.0;
+        }
+        assert_eq!(floor_emits, SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET);
+        assert_eq!(
+            debt,
+            KeyframeDebt::Clear,
+            "the dropped keyframe was never paid"
+        );
+        assert_eq!(sent_at.len(), 1, "one keyframe pays the debt: {sent_at:?}");
+    }
+
+    #[test]
+    fn the_frame_arm_consumes_an_owed_keyframe_exactly_once() {
+        let owed = Cell::new(true);
+        assert_eq!(
+            screen_frame_arm_keyframe(false, false, &owed),
+            FrameArmKeyframe {
+                forced: true,
+                owed: true
+            }
+        );
+        assert_eq!(
+            screen_frame_arm_keyframe(false, false, &owed),
+            FrameArmKeyframe {
+                forced: false,
+                owed: false
+            },
+            "a paid debt must not force every later frame"
+        );
+
+        owed.set(true);
+        assert_eq!(
+            screen_frame_arm_keyframe(true, false, &owed),
+            FrameArmKeyframe {
+                forced: true,
+                owed: true
+            },
+            "a periodic keyframe pays the debt too"
+        );
+        assert!(!owed.get());
+        assert!(screen_frame_arm_keyframe(false, true, &owed).forced);
+        assert!(!screen_frame_arm_keyframe(false, false, &owed).forced);
     }
 
     /// A low tier's raw 500 ms figure falls below the floor and is clamped, so
@@ -7129,7 +8269,12 @@ mod tests {
             enable_health_reporting: false,
             health_reporting_interval_ms: None,
             on_encoder_settings_update: None,
-            rtt_testing_period_ms: 2000,
+            webtransport_connect_timeout_ms: 2000,
+            websocket_connect_timeout_ms: 2000,
+            prefer_webtransport: true,
+            on_election_progress: None,
+            start_in_fallback: false,
+            on_fallback_memory: None,
             rtt_probe_interval_ms: None,
             on_meeting_info: None,
             on_meeting_ended: None,
@@ -7146,10 +8291,13 @@ mod tests {
             on_reaction: None,
             on_raise_hand: None,
             on_meeting_timer: None,
+            on_caption: None,
             on_display_name_changed: None,
+            on_avatar_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_instance_superseded: None,
             on_host_granted: None,
             on_host_revoked: None,
             on_peer_event: None,
@@ -7628,29 +8776,83 @@ mod tests {
     }
 
     #[test]
-    fn the_governor_sample_is_selected_by_transport_not_by_a_missing_depth() {
+    fn the_governor_sample_reads_the_screen_queue_of_the_transport_holding_it() {
         assert_eq!(
-            screen_uplink_sample(Some("webtransport"), None, 9, 4),
-            ScreenUplinkSample::StreamEvents { events: 4 }
+            screen_uplink_sample(Some(StreamQueueDepth::WebTransport(140_000)), 9, 4, 1_000),
+            ScreenUplinkSample::Buffered {
+                bytes: 70_000,
+                gate_drops: 4
+            },
+            "WT: the screen stream's depth on the WS gate's scale, with the WT gate drops"
         );
         assert_eq!(
-            screen_uplink_sample(Some("websocket"), Some(70_000), 9, 4),
+            screen_uplink_sample(Some(StreamQueueDepth::WebTransport(130_000)), 9, 4, 1_300),
+            ScreenUplinkSample::Buffered {
+                bytes: 50_000,
+                gate_drops: 4
+            },
+            "the scale follows the RTT-raised WT delay"
+        );
+        assert_eq!(
+            screen_uplink_sample(Some(StreamQueueDepth::WebSocket(70_000)), 9, 4, 1_000),
             ScreenUplinkSample::Buffered {
                 bytes: 70_000,
                 gate_drops: 9
             }
         );
-        for unreportable in [
-            screen_uplink_sample(Some("websocket"), None, 9, 4),
-            screen_uplink_sample(None, None, 9, 4),
-            screen_uplink_sample(None, Some(70_000), 9, 4),
-        ] {
-            assert_eq!(
-                unreportable,
-                ScreenUplinkSample::Unobservable,
-                "a depth this client cannot read is not a quiet WebTransport stream"
+        assert_eq!(
+            screen_uplink_sample(None, 9, 4, 1_000),
+            ScreenUplinkSample::Unobservable,
+            "a depth this client cannot read is not a quiet queue"
+        );
+    }
+
+    /// #3077: a WT screen queue held at its gate threshold must walk the
+    /// bitrate down.
+    #[test]
+    fn a_wt_screen_queue_held_at_its_gate_threshold_steps_the_governor_down() {
+        let baseline = ScreenBaselineKbps::for_geometry(1920, 1080, 10);
+        for rtt_ms in [400.0, 650.0] {
+            let delay_ms = screen_wt_gate_delay_ms(rtt_ms);
+            let (_, gate) =
+                screen_gate_for(Some(StreamQueueDepth::WebTransport(0)), baseline, rtt_ms);
+            let mut g = ScreenUplinkGovernor::new();
+            let mut t = 0.0;
+            while t <= 3_000.0 {
+                g.observe(
+                    t,
+                    screen_uplink_sample(
+                        Some(StreamQueueDepth::WebTransport(gate.delta_bytes())),
+                        0,
+                        0,
+                        delay_ms,
+                    ),
+                    baseline,
+                );
+                t += 150.0;
+            }
+            assert!(
+                g.step().raw() >= 1,
+                "RTT {rtt_ms}: a WT queue at its gate threshold is pressure, got step {}",
+                g.step().raw()
             );
         }
+    }
+
+    /// The same bytes are a deeper backlog on WS than on WT, whose gate
+    /// tolerates more; the governor must see each against its own gate.
+    #[test]
+    fn a_wt_queue_below_its_pressure_point_is_not_pressure_where_ws_would_be() {
+        let baseline = ScreenBaselineKbps::for_geometry(1920, 1080, 10);
+        let bytes = 150_000;
+        let ws = screen_uplink_sample(Some(StreamQueueDepth::WebSocket(bytes)), 0, 0, 1_000);
+        let wt = screen_uplink_sample(Some(StreamQueueDepth::WebTransport(bytes)), 0, 0, 1_000);
+        let queued_ms = |sample| match sample {
+            ScreenUplinkSample::Buffered { bytes, .. } => queued_ms_for(bytes, baseline),
+            other => panic!("expected a buffered sample, got {other:?}"),
+        };
+        assert!(queued_ms(ws) >= SCREEN_UPLINK_PRESSURE_MS);
+        assert!(queued_ms(wt) < SCREEN_UPLINK_PRESSURE_MS);
     }
 
     #[test]
@@ -8498,7 +9700,41 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[cfg(target_arch = "wasm32")]
+    fn media_devices() -> web_sys::MediaDevices {
+        window().navigator().media_devices().unwrap()
+    }
+
+    /// The picker answers with a fake camera after `delay_ms`, so no test
+    /// depends on the browser granting desktop capture without a gesture.
+    #[cfg(target_arch = "wasm32")]
+    fn stub_display_media(delay_ms: u32) {
+        let picker = js_sys::Function::new_no_args(&format!(
+            "return new Promise((ok) => setTimeout(() => \
+             ok(navigator.mediaDevices.getUserMedia({{ video: true }}) \
+             .then((s) => (window.__picked = s, s))), {delay_ms}));"
+        ));
+        Reflect::set(
+            &media_devices(),
+            &JsValue::from_str("getDisplayMedia"),
+            &picker,
+        )
+        .unwrap();
+    }
+
+    /// Every seam at its baseline: no forced failure or restart, the restart
+    /// backoff divided by 10, and no stub picker or `__picked` stream left over.
+    #[cfg(target_arch = "wasm32")]
+    fn reset_test_seams() {
+        fail_configures_for_test(0);
+        shorten_restart_backoff_for_test(10);
+        force_restart_for_test(false);
+        let _ = Reflect::delete_property(&media_devices(), &JsValue::from_str("getDisplayMedia"));
+        let _ = Reflect::delete_property(&window(), &JsValue::from_str("__picked"));
+    }
+
+    #[cfg(target_arch = "wasm32")]
     fn test_screen_encoder() -> ScreenEncoder {
+        reset_test_seams();
         let client = crate::VideoCallClient::new(
             crate::client::video_call_client::disconnect_tests::build_test_options(),
         );
@@ -8549,6 +9785,689 @@ mod wasm_tests {
             track.ready_state(),
             web_sys::MediaStreamTrackState::Ended,
             "a refused start_with_stream must stop the stream it was handed"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn first_video_track(stream: &MediaStream) -> web_sys::MediaStreamTrack {
+        stream
+            .get_video_tracks()
+            .get(0)
+            .unchecked_into::<web_sys::MediaStreamTrack>()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn replace_stream_refuses_and_releases_a_capture_when_no_share_runs() {
+        let stream = fake_capture_stream().await;
+        let track = first_video_track(&stream);
+        let mut enc = test_screen_encoder();
+
+        assert!(!enc.replace_stream(stream));
+
+        assert_eq!(track.ready_state(), web_sys::MediaStreamTrackState::Ended);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn replace_stream_refuses_a_capture_while_enabled_before_any_share() {
+        let stream = fake_capture_stream().await;
+        let track = first_video_track(&stream);
+        let mut enc = test_screen_encoder();
+        enc.set_enabled(true);
+
+        assert!(!enc.replace_stream(stream));
+
+        assert_eq!(track.ready_state(), web_sys::MediaStreamTrackState::Ended);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn wait_for_event(events: &Rc<RefCell<Vec<&'static str>>>, name: &str) {
+        for _ in 0..1_000 {
+            if events.borrow().contains(&name) {
+                return;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+        panic!("no {name} event; saw {:?}", events.borrow());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn recording_screen_encoder() -> (ScreenEncoder, Rc<RefCell<Vec<&'static str>>>) {
+        reset_test_seams();
+        let events: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let sink = events.clone();
+        let enc = ScreenEncoder::new(
+            crate::VideoCallClient::new(
+                crate::client::video_call_client::disconnect_tests::build_test_options(),
+            ),
+            2500,
+            Callback::noop(),
+            Callback::from(move |event: ScreenShareEvent| {
+                sink.borrow_mut().push(match event {
+                    ScreenShareEvent::Started(_) => "started",
+                    ScreenShareEvent::Replaced(_) => "replaced",
+                    ScreenShareEvent::Stopped => "stopped",
+                    ScreenShareEvent::Cancelled => "cancelled",
+                    ScreenShareEvent::Failed(_) => "failed",
+                });
+            }),
+            Rc::new(AtomicBool::new(false)),
+            1,
+        );
+        (enc, events)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn started_share() -> (
+        ScreenEncoder,
+        Rc<RefCell<Vec<&'static str>>>,
+        web_sys::MediaStreamTrack,
+    ) {
+        let (mut enc, events) = recording_screen_encoder();
+        enc.set_enabled(true);
+        let first = fake_capture_stream().await;
+        let first_track = first_video_track(&first);
+        enc.start_with_stream(first);
+        wait_for_event(&events, "started").await;
+        (enc, events, first_track)
+    }
+
+    /// Whether `stop()` stops `track` itself, not a copy of it.
+    #[cfg(target_arch = "wasm32")]
+    fn stops_on_stop(enc: &ScreenEncoder, track: &web_sys::MediaStreamTrack) -> bool {
+        enc.active_video_track
+            .borrow()
+            .as_ref()
+            .is_some_and(|t| js_sys::Object::is(t, track))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn held_track(enc: &ScreenEncoder) -> web_sys::MediaStreamTrack {
+        first_video_track(
+            &enc.screen_stream()
+                .borrow()
+                .clone()
+                .expect("the share holds its capture"),
+        )
+    }
+
+    /// Issue 3173: "Share something else" swaps the capture inside one share.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_replaced_capture_continues_the_share_and_releases_the_old_one() {
+        let (mut enc, events, first_track) = started_share().await;
+        let first_held = held_track(&enc);
+
+        let next = fake_capture_stream().await;
+        let next_track = first_video_track(&next);
+        wait_for_an_encoded_frame().await;
+        frame_retained_at_emit_for_test();
+        assert!(enc.replace_stream(Clone::clone(&next)));
+        wait_for_event(&events, "replaced").await;
+        assert_eq!(frame_retained_at_emit_for_test(), Some(false));
+
+        for (track, what) in [(&first_track, "captured"), (&first_held, "held")] {
+            assert_eq!(
+                track.ready_state(),
+                web_sys::MediaStreamTrackState::Ended,
+                "the old {what} track is released, or the old content stays captured"
+            );
+        }
+        assert_eq!(
+            next_track.ready_state(),
+            web_sys::MediaStreamTrackState::Live
+        );
+        assert!(
+            stops_on_stop(&enc, &next_track),
+            "no live copy is left behind"
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec!["started", "replaced"],
+            "no stop in between"
+        );
+        assert!(enc.is_enabled_for_test(), "the share is still running");
+        assert_eq!(
+            held_track(&enc).ready_state(),
+            web_sys::MediaStreamTrackState::Live
+        );
+
+        enc.stop();
+        for _ in 0..1_000 {
+            if next_track.ready_state() == web_sys::MediaStreamTrackState::Ended {
+                return;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+        panic!("stopping the share must release the replacement capture");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_superseded_and_a_stopped_replacement_are_both_released() {
+        let (mut enc, _events, _first) = started_share().await;
+        let a = fake_capture_stream().await;
+        let b = fake_capture_stream().await;
+        let (a_track, b_track) = (first_video_track(&a), first_video_track(&b));
+
+        assert!(enc.replace_stream(a));
+        assert!(enc.replace_stream(b));
+        assert_eq!(a_track.ready_state(), web_sys::MediaStreamTrackState::Ended);
+        assert_eq!(b_track.ready_state(), web_sys::MediaStreamTrackState::Live);
+
+        enc.stop();
+        assert_eq!(b_track.ready_state(), web_sys::MediaStreamTrackState::Ended);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_replacement_whose_encoder_cannot_be_configured_ends_the_share() {
+        let (mut enc, events, _first) = started_share().await;
+        let next = fake_capture_stream().await;
+        let next_track = first_video_track(&next);
+        fail_configures_for_test(1);
+
+        assert!(enc.replace_stream(Clone::clone(&next)));
+        wait_for_event(&events, "failed").await;
+
+        assert_eq!(*events.borrow(), vec!["started", "failed"]);
+        for (track, what) in [(&next_track, "captured"), (&held_track(&enc), "held")] {
+            assert_eq!(
+                track.ready_state(),
+                web_sys::MediaStreamTrackState::Ended,
+                "the {what} replacement track"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_pick_made_during_a_restart_backoff_is_shared_without_a_new_prompt() {
+        let (mut enc, events) = recording_screen_encoder();
+        let refuse = js_sys::Function::new_no_args(
+            "return Promise.reject(new DOMException('refused', 'NotAllowedError'));",
+        );
+        Reflect::set(
+            &media_devices(),
+            &JsValue::from_str("getDisplayMedia"),
+            &refuse,
+        )
+        .unwrap();
+        enc.set_enabled(true);
+        let first = fake_capture_stream().await;
+        let first_track = first_video_track(&first);
+        let picked = fake_capture_stream().await;
+        let picked_track = first_video_track(&picked);
+        fail_configures_for_test(1);
+        enc.start_with_stream(first);
+        for _ in 0..2_500 {
+            if configures_left_to_fail_for_test() == 0 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(1).await;
+        }
+        assert!(
+            enc.replace_stream(picked),
+            "premise: accepted in the backoff"
+        );
+
+        wait_for_event(&events, "started").await;
+
+        assert_eq!(
+            *events.borrow(),
+            vec!["started"],
+            "a share that never started starts with the pick"
+        );
+        assert_eq!(
+            first_track.ready_state(),
+            web_sys::MediaStreamTrackState::Ended
+        );
+        assert_eq!(
+            picked_track.ready_state(),
+            web_sys::MediaStreamTrackState::Live
+        );
+        enc.stop();
+        reset_test_seams();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_share_whose_first_configure_fails_announces_itself_once_it_recovers() {
+        use crate::client::video_call_client::take_screen_enabled_calls_for_test;
+        for pick in [true, false] {
+            let (mut enc, events) = recording_screen_encoder();
+            if pick {
+                let refuse = js_sys::Function::new_no_args(
+                    "return Promise.reject(new DOMException('refused', 'NotAllowedError'));",
+                );
+                Reflect::set(
+                    &media_devices(),
+                    &JsValue::from_str("getDisplayMedia"),
+                    &refuse,
+                )
+                .unwrap();
+            } else {
+                stub_display_media(0);
+            }
+            enc.set_enabled(true);
+            let first = fake_capture_stream().await;
+            let picked = fake_capture_stream().await;
+            fail_configures_for_test(1);
+            take_screen_enabled_calls_for_test();
+            enc.start_with_stream(first);
+            if pick {
+                for _ in 0..2_500 {
+                    if configures_left_to_fail_for_test() == 0 {
+                        break;
+                    }
+                    gloo_timers::future::TimeoutFuture::new(1).await;
+                }
+                assert!(
+                    enc.replace_stream(picked),
+                    "premise: accepted in the backoff"
+                );
+            } else {
+                first_video_track(&picked).stop();
+            }
+            wait_for_event(&events, "started").await;
+
+            let calls = take_screen_enabled_calls_for_test();
+            enc.stop();
+            assert_eq!(
+                calls,
+                vec![true],
+                "pick={pick}: announced once, as it starts"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn wait_for_an_encoded_frame() {
+        let encoded = screen_encoder_frames_submitted_ok();
+        for _ in 0..200 {
+            if screen_encoder_frames_submitted_ok() > encoded {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+        }
+        assert!(
+            screen_encoder_frames_submitted_ok() > encoded,
+            "premise: frames encoded"
+        );
+    }
+
+    /// Runs the share until it encodes, then restarts it mid-share.
+    #[cfg(target_arch = "wasm32")]
+    async fn restart_mid_share() {
+        wait_for_an_encoded_frame().await;
+        force_restart_for_test(true);
+        for _ in 0..1_000 {
+            if !restart_forced_for_test() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+        assert!(!restart_forced_for_test(), "premise: the restart ran");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_pick_installed_by_a_restart_never_resends_the_old_content() {
+        let (mut enc, events, first_track) = started_share().await;
+        let picked = fake_capture_stream().await;
+        let picked_track = first_video_track(&picked);
+        frame_retained_at_emit_for_test();
+        restart_mid_share().await;
+        assert!(
+            enc.replace_stream(picked),
+            "premise: accepted in the backoff"
+        );
+
+        wait_for_event(&events, "replaced").await;
+
+        assert_eq!(frame_retained_at_emit_for_test(), Some(false));
+        assert!(stops_on_stop(&enc, &picked_track));
+        assert_eq!(
+            first_track.ready_state(),
+            web_sys::MediaStreamTrackState::Ended
+        );
+        enc.stop();
+        assert_eq!(
+            picked_track.ready_state(),
+            web_sys::MediaStreamTrackState::Ended
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn wait_for_events(events: &Rc<RefCell<Vec<&'static str>>>, count: usize) {
+        for _ in 0..1_000 {
+            if events.borrow().len() >= count {
+                return;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+        panic!("saw only {:?}", events.borrow());
+    }
+
+    /// Issue #1903: the static-share keyframe floor needs the frame after a restart.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_plain_restart_carries_the_static_share_frame() {
+        let (mut enc, events, _first) = started_share().await;
+        stub_display_media(0);
+        frame_retained_at_emit_for_test();
+        restart_mid_share().await;
+
+        wait_for_events(&events, 2).await;
+
+        assert_eq!(*events.borrow(), vec!["started", "started"]);
+        assert_eq!(frame_retained_at_emit_for_test(), Some(true));
+        enc.stop();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_stop_while_a_restart_is_picking_releases_what_it_picks() {
+        let (mut enc, events, _first) = started_share().await;
+        stub_display_media(400);
+        restart_mid_share().await;
+        for _ in 0..1_000 {
+            if enc.screen_stream().borrow().is_none() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+        assert!(
+            enc.screen_stream().borrow().is_none(),
+            "premise: the re-acquire waits"
+        );
+        enc.stop();
+
+        let mut picked = JsValue::UNDEFINED;
+        for _ in 0..100 {
+            picked = Reflect::get(&window(), &JsValue::from_str("__picked")).unwrap();
+            if !picked.is_undefined() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+        }
+        assert!(
+            !picked.is_undefined(),
+            "premise: the stub answered the pick"
+        );
+        gloo_timers::future::TimeoutFuture::new(200).await;
+
+        let held = enc.screen_stream().borrow().clone();
+        let live = held.map(|s| {
+            s.get_tracks().iter().any(|t| {
+                t.unchecked_into::<web_sys::MediaStreamTrack>()
+                    .ready_state()
+                    == web_sys::MediaStreamTrackState::Live
+            })
+        });
+        assert_ne!(live, Some(true), "no live copy of the late capture");
+        let picked: MediaStream = picked.unchecked_into();
+        assert_eq!(
+            first_video_track(&picked).ready_state(),
+            web_sys::MediaStreamTrackState::Ended
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec!["started"],
+            "a stopped share stays stopped"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_pick_after_an_encoder_reacquire_is_bounded_to_the_tier() {
+        let (mut enc, events, _first) = started_share().await;
+        stub_display_media(0);
+        restart_mid_share().await;
+        for _ in 0..1_000 {
+            if events.borrow().len() > 1 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+        assert_eq!(
+            *events.borrow(),
+            vec!["started", "started"],
+            "premise: re-acquired"
+        );
+        let picked = fake_capture_stream().await;
+        let track = first_video_track(&picked);
+        js_sys::Function::new_with_args(
+            "t",
+            "t.getSettings = () => ({ width: 3840, height: 2160 }); window.__bounded = 0; \
+             t.applyConstraints = () => { window.__bounded += 1; return Promise.resolve(); };",
+        )
+        .call1(&JsValue::NULL, &track)
+        .unwrap();
+        restart_mid_share().await;
+        assert!(
+            enc.replace_stream(picked),
+            "premise: accepted in the backoff"
+        );
+
+        wait_for_event(&events, "replaced").await;
+        let mut bounded = JsValue::UNDEFINED;
+        for _ in 0..200 {
+            bounded = Reflect::get(&window(), &JsValue::from_str("__bounded")).unwrap();
+            if bounded.as_f64().unwrap_or(0.0) >= 1.0 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+        }
+        assert!(
+            bounded.as_f64().unwrap_or(0.0) >= 1.0,
+            "a pick's size is unknown"
+        );
+        enc.stop();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_direct_swap_to_an_oversized_pick_is_bounded_to_the_tier() {
+        let (mut enc, events, _first) = started_share().await;
+        stub_display_media(0);
+        restart_mid_share().await;
+        wait_for_events(&events, 2).await;
+        assert_eq!(
+            *events.borrow(),
+            vec!["started", "started"],
+            "premise: re-acquired with the ceiling applied"
+        );
+        wait_for_an_encoded_frame().await;
+        let picked = fake_capture_stream().await;
+        js_sys::Function::new_with_args(
+            "t",
+            "t.getSettings = () => ({ width: 3840, height: 2160 }); window.__bounded = 0; \
+             t.applyConstraints = () => { window.__bounded += 1; return Promise.resolve(); };",
+        )
+        .call1(&JsValue::NULL, &first_video_track(&picked))
+        .unwrap();
+        assert!(
+            enc.replace_stream(picked),
+            "premise: swapped while encoding"
+        );
+
+        wait_for_event(&events, "replaced").await;
+        let mut bounded = 0.0;
+        for _ in 0..200 {
+            bounded = Reflect::get(&window(), &JsValue::from_str("__bounded"))
+                .unwrap()
+                .as_f64()
+                .unwrap_or(0.0);
+            if bounded >= 1.0 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+        }
+        enc.stop();
+
+        assert!(
+            bounded >= 1.0,
+            "an oversized pick swapped in mid-share is never bounded"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_restart_closes_the_frame_its_abandoned_read_delivers() {
+        let (mut enc, _events, _first) = started_share().await;
+        stub_display_media(0);
+        shorten_restart_backoff_for_test(1);
+        let proto = Reflect::get(
+            &js_sys::global(),
+            &JsValue::from_str("ReadableStreamDefaultReader"),
+        )
+        .and_then(|ctor| Reflect::get(&ctor, &JsValue::from_str("prototype")))
+        .unwrap();
+        let read_key = JsValue::from_str("read");
+        let original = Reflect::get(&proto, &read_key).unwrap();
+        let reads = Array::new();
+        let spy = js_sys::Function::new_with_args(
+            "original, reads",
+            "return function () { const p = original.call(this); reads.push([this, p]); return p; };",
+        )
+        .call2(&JsValue::NULL, &original, &reads)
+        .unwrap();
+        Reflect::set(&proto, &read_key, &spy).unwrap();
+        restart_mid_share().await;
+        Reflect::set(&proto, &read_key, &original).unwrap();
+
+        let reader = Reflect::get(&reads.get(0), &JsValue::from(0)).unwrap();
+        let abandoned = reads
+            .iter()
+            .rev()
+            .find(|r| js_sys::Object::is(&Reflect::get(r, &JsValue::from(0)).unwrap(), &reader))
+            .map(|r| Reflect::get(&r, &JsValue::from(1)).unwrap())
+            .unwrap();
+        let result = JsFuture::from(abandoned.unchecked_into::<js_sys::Promise>())
+            .await
+            .unwrap();
+        let frame = Reflect::get(&result, &JsValue::from_str("value"))
+            .unwrap()
+            .dyn_into::<VideoFrame>()
+            .expect("premise: the old capture delivered a frame to the abandoned read");
+        gloo_timers::future::TimeoutFuture::new(20).await;
+        let open = frame.coded_width() > 0;
+        frame.close();
+        enc.stop();
+
+        assert!(!open, "the abandoned read's frame pins a capture buffer");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_pick_made_in_the_last_restart_backoff_is_released_when_the_share_gives_up() {
+        let (mut enc, events) = recording_screen_encoder();
+        stub_display_media(0);
+        enc.set_enabled(true);
+        let first = fake_capture_stream().await;
+        let picked = fake_capture_stream().await;
+        let picked_track = first_video_track(&picked);
+        fail_configures_for_test(5);
+        enc.start_with_stream(first);
+        for _ in 0..1_000 {
+            if configures_left_to_fail_for_test() == 0 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+        assert_eq!(configures_left_to_fail_for_test(), 0, "premise: all failed");
+        assert!(
+            enc.replace_stream(picked),
+            "premise: accepted in the backoff"
+        );
+
+        wait_for_event(&events, "failed").await;
+
+        assert_eq!(*events.borrow(), vec!["failed"]);
+        assert_eq!(
+            picked_track.ready_state(),
+            web_sys::MediaStreamTrackState::Ended
+        );
+        enc.stop();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn a_restart_that_reacquires_releases_the_held_capture() {
+        let (mut enc, events) = recording_screen_encoder();
+        stub_display_media(0);
+        enc.set_enabled(true);
+        let first = fake_capture_stream().await;
+        fail_configures_for_test(1);
+        enc.start_with_stream(first);
+        gloo_timers::future::TimeoutFuture::new(0).await;
+        let held = held_track(&enc);
+
+        for _ in 0..1_000 {
+            if !events.borrow().is_empty() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(10).await;
+        }
+
+        assert!(!events.borrow().is_empty(), "premise: the restart ran");
+        assert_eq!(held.ready_state(), web_sys::MediaStreamTrackState::Ended);
+        enc.stop();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn an_applied_screen_constraint_leaves_no_live_copy_of_the_capture_track() {
+        let stream = fake_capture_stream().await;
+        let track = stream
+            .get_video_tracks()
+            .get(0)
+            .unchecked_into::<MediaStreamTrack>();
+        let proto = Reflect::get(&js_sys::global(), &JsValue::from_str("MediaStreamTrack"))
+            .and_then(|ctor| Reflect::get(&ctor, &JsValue::from_str("prototype")))
+            .expect("MediaStreamTrack.prototype");
+        let clone_key = JsValue::from_str("clone");
+        let original = Reflect::get(&proto, &clone_key).expect("MediaStreamTrack.prototype.clone");
+        let copies = Array::new();
+        let spy = js_sys::Function::new_with_args(
+            "original, copies",
+            "return function () { const c = original.call(this); copies.push(c); return c; };",
+        )
+        .call2(&JsValue::NULL, &original, &copies)
+        .expect("build the clone spy");
+        Reflect::set(&proto, &clone_key, &spy).expect("install the clone spy");
+
+        let applied = Rc::new(Cell::new((0, 0)));
+        apply_screen_track_resolution_constraint(
+            &track,
+            320,
+            240,
+            applied.clone(),
+            SourceDims::new(),
+            Rc::new(Cell::new(None)),
+        );
+        for _ in 0..100 {
+            if applied.get() != (0, 0) {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        track.stop();
+        Reflect::set(&proto, &clone_key, &original)
+            .expect("restore MediaStreamTrack.prototype.clone");
+        let copies: Vec<MediaStreamTrack> = copies.iter().map(|c| c.unchecked_into()).collect();
+        let live = copies
+            .iter()
+            .filter(|c| c.ready_state() == web_sys::MediaStreamTrackState::Live)
+            .count();
+        copies.iter().for_each(MediaStreamTrack::stop);
+
+        assert_eq!(applied.get(), (320, 240), "premise: the constraint applied");
+        assert_eq!(
+            live, 0,
+            "applyConstraints left {live} live copy of the capture track after the share stopped"
         );
     }
 

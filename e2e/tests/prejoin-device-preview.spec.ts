@@ -39,7 +39,6 @@ const MIC_SELECT = '[data-testid="prejoin-mic-select"]';
 const SPEAKER_SELECT = '[data-testid="prejoin-speaker-select"]';
 const MIC_METER = '[data-testid="prejoin-mic-meter"]';
 const PERMISSION_PROMPT = '[data-testid="prejoin-permission-prompt"]';
-const PERMISSION_ALLOW = '[data-testid="prejoin-permission-allow"]';
 const SPEAKER_UNSUPPORTED_NOTE = '[data-testid="prejoin-speaker-unsupported-note"]';
 
 // localStorage keys (mirror context.rs).
@@ -64,33 +63,8 @@ async function gotoPreJoin(page: Page, meetingId: string) {
   return actionButton;
 }
 
-/**
- * Reach the granted state on the pre-join screen and return once it is
- * reflected in the DOM.
- *
- * Since issue 1134 the pre-join screen AUTO-requests getUserMedia once on mount,
- * and with `--use-fake-ui-for-media-stream` that request auto-grants — so the
- * granted state (toggles + selects) typically appears WITHOUT any click and the
- * permission prompt / Allow button clear on their own. This helper is therefore
- * written to be path-agnostic: if the manual "Allow camera & mic" fallback
- * button is still on screen (the auto-request hasn't resolved yet, or the
- * browser blocked it), we click it; otherwise we just wait for the granted
- * state the auto-request produced. Either way it returns once the toggles render.
- */
-async function grantMediaAccess(page: Page) {
-  const allow = page.locator(PERMISSION_ALLOW);
-  // Click the manual fallback only if it is actually still present — the 1134
-  // auto-request may have already granted and removed it. A short visibility
-  // probe avoids racing the auto-grant: we don't hard-require the button.
-  if (await allow.isVisible().catch(() => false)) {
-    await allow.click().catch(() => {
-      // The auto-grant may have detached the button between the probe and the
-      // click; that is fine — the granted-state wait below is the real gate.
-    });
-  }
-  // Prompt goes away once getUserMedia resolves and labels are populated.
+async function waitForMediaAccess(page: Page) {
   await expect(page.locator(PERMISSION_PROMPT)).toBeHidden({ timeout: 15_000 });
-  // Toggles only render in the granted state.
   await expect(page.locator(CAMERA_TOGGLE)).toBeVisible({ timeout: 15_000 });
   await expect(page.locator(MIC_TOGGLE)).toBeVisible();
 }
@@ -141,7 +115,7 @@ test.describe("Pre-join device preview (#959)", () => {
     // assertion runs and would flake. The dedicated auto-show / no-auto-join
     // coverage lives in prejoin-auto-show-devices.spec.ts (issue 1134); this
     // test just confirms the granted-state UI is correct once reached.
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     // After granting: prompt gone, selects present and labeled.
     await expect(page.locator(PERMISSION_PROMPT)).toBeHidden();
@@ -165,7 +139,7 @@ test.describe("Pre-join device preview (#959)", () => {
 
   test("camera toggle starts and stops the live preview video", async ({ page }) => {
     await gotoPreJoin(page, `e2e_prejoin_camera_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     const cameraToggle = page.locator(CAMERA_TOGGLE);
     const video = page.locator(CAMERA_VIDEO);
@@ -229,7 +203,7 @@ test.describe("Pre-join device preview (#959)", () => {
 
   test("mic toggle drives the input-level meter aria state", async ({ page }) => {
     await gotoPreJoin(page, `e2e_prejoin_mic_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     const micToggle = page.locator(MIC_TOGGLE);
     const meter = page.locator(MIC_METER);
@@ -270,7 +244,7 @@ test.describe("Pre-join device preview (#959)", () => {
     page,
   }) => {
     await gotoPreJoin(page, `e2e_prejoin_selectors_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     const cameraSelect = page.locator(CAMERA_SELECT);
     const micSelect = page.locator(MIC_SELECT);
@@ -322,7 +296,7 @@ test.describe("Pre-join device preview (#959)", () => {
 
   test("speaker output: either selectable or shows the unsupported note", async ({ page }) => {
     await gotoPreJoin(page, `e2e_prejoin_speaker_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     const speakerSelect = page.locator(SPEAKER_SELECT);
     await expect(speakerSelect).toBeVisible();
@@ -349,7 +323,7 @@ test.describe("Pre-join device preview (#959)", () => {
 
   test("camera/mic on-off and device selection persist across reload", async ({ page }) => {
     await gotoPreJoin(page, `e2e_prejoin_persist_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     const cameraToggle = page.locator(CAMERA_TOGGLE);
     const micToggle = page.locator(MIC_TOGGLE);
@@ -388,7 +362,7 @@ test.describe("Pre-join device preview (#959)", () => {
     await page.getByRole("button", { name: /Start Meeting|Join Meeting/ }).waitFor({
       timeout: 30_000,
     });
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     // Restored on-off state. (Independent of device ids, so deterministic here.)
     await expect(page.locator(CAMERA_TOGGLE)).toHaveAttribute("aria-pressed", "true");
@@ -419,7 +393,7 @@ test.describe("Pre-join device preview (#959)", () => {
 
   test("camera ON in pre-join carries into the meeting", async ({ page }) => {
     const actionButton = await gotoPreJoin(page, `e2e_prejoin_carry_${Date.now()}`);
-    await grantMediaAccess(page);
+    await waitForMediaAccess(page);
 
     // Toggle camera ON in pre-join and confirm a live preview track acquired.
     const cameraToggle = page.locator(CAMERA_TOGGLE);
@@ -438,10 +412,8 @@ test.describe("Pre-join device preview (#959)", () => {
 
     // Regression lock (#959): the pre-join camera ON choice carries into the
     // meeting. The in-meeting CameraButton reflects publishing state via its
-    // class — `active` when video_enabled is true, `off` when not. Find the
-    // camera control (the second of the two primary controls; mic is first)
-    // and assert it is in the active/enabled state rather than `off`.
-    const cameraControl = page.locator(".video-controls-container .video-control-button").nth(1);
+    // class — `active` when video_enabled is true, `off` when not.
+    const cameraControl = page.getByTestId("camera-toggle-button");
     await expect(cameraControl).toBeVisible({ timeout: 15_000 });
     await expect(cameraControl).toHaveClass(/\bactive\b/, { timeout: 15_000 });
     await expect(cameraControl).not.toHaveClass(/\boff\b/);

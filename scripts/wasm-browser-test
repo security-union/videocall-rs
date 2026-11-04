@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""wasm-browser-test — run a wasm-bindgen browser test command; kill the Chrome it orphans.
+
+  scripts/wasm-browser-test cargo test -p videocall-ui --target wasm32-unknown-unknown --test <name>
+
+When a test never reports a result (it hangs, or panics where the harness misses it),
+wasm-bindgen-test-runner times out, SIGKILLs chromedriver without closing its Chrome, then blocks
+until that Chrome exits. This runs the command in its own session and kills that session's
+chromedriver-launched Chrome once its driver is gone, during the run and after it, and deletes its
+throwaway profile. Exits with the command's status.
+"""
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+POLL_SECS = 2.0
+GRACE_SECS = 5.0
+PROFILE = re.compile(r"--user-data-dir=(\S*org\.chromium\.Chromium\.[\w.]+)")
+BINARY = re.compile(r"^(?:.*/)?(?:Google Chrome(?: for Testing)?|Chromium|chrome|chromium|chrome-headless-shell)$")
+DRIVER = re.compile(r"^(?:.*/)?chromedriver$")
+AUTOMATION = ("--enable-automation", "--remote-debugging-port", "--remote-debugging-pipe", "--headless")
+
+_ps_warned = False
+
+
+def processes():
+    global _ps_warned
+    try:
+        out = subprocess.run(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,command="],
+                             capture_output=True, text=True, errors="replace", check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        if not _ps_warned:
+            print(f"wasm-browser-test: cannot list processes, orphans NOT reaped: {e}", file=sys.stderr)
+            _ps_warned = True
+        return {}
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    return procs
+
+
+def orphaned_browsers(procs):
+    """{pid: profile dir} of chromedriver-launched Chrome main processes whose parent is not chromedriver."""
+    found = {}
+    for pid, (ppid, cmd) in procs.items():
+        m = PROFILE.search(cmd)
+        if (not m or "--type=" in cmd or not BINARY.match(cmd.split(" --", 1)[0])
+                or not any(flag in cmd for flag in AUTOMATION)):
+            continue
+        if not DRIVER.match(procs.get(ppid, (0, ""))[1].split(" --", 1)[0]):
+            found[pid] = m.group(1)
+    return found
+
+
+def in_session(pid, sid):
+    try:
+        return os.getsid(pid) == sid
+    except OSError:
+        return False
+
+
+def reap(killed, sid):
+    procs = processes()
+    now = time.monotonic()
+    for pid, profile in orphaned_browsers(procs).items():
+        sent = killed.get(profile)
+        if sent is None:
+            sig = signal.SIGTERM
+        elif now - sent >= GRACE_SECS:
+            sig = signal.SIGKILL
+        else:
+            continue
+        if not in_session(pid, sid):
+            continue
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            continue
+        killed.setdefault(profile, now)
+    return procs
+
+
+def finish(killed, sid):
+    deadline = time.monotonic() + GRACE_SECS + POLL_SECS
+    while True:
+        cmds = [cmd for _, cmd in reap(killed, sid).values()]
+        profiles = set(killed)
+        busy = {p for p in profiles if any(p in cmd for cmd in cmds)}
+        if not busy or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    for profile in profiles - busy:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    try:
+        child = subprocess.Popen(argv, start_new_session=True)
+    except OSError as e:
+        print(f"wasm-browser-test: {e}", file=sys.stderr)
+        return 127
+
+    def forward(signum, _frame):
+        try:
+            os.killpg(child.pid, signum)
+        except OSError:
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, forward)
+    killed = {}
+    try:
+        while True:
+            try:
+                rc = child.wait(timeout=POLL_SECS)
+                break
+            except subprocess.TimeoutExpired:
+                reap(killed, child.pid)
+    finally:
+        finish(killed, child.pid)
+        if killed:
+            print(f"wasm-browser-test: killed {len(killed)} orphaned Chrome(s)", file=sys.stderr)
+    return 128 - rc if rc < 0 else rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

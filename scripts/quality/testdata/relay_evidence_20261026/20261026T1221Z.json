@@ -1,0 +1,1183 @@
+{
+"_source": "runs/audio-scale/20261026T1221Z-daily-no-fix/relay-evidence/*.json (hcl-daily, kit queries at a 5 s step), resampled to 15 s inside the hold and rebased so hold_start = 1000; labels other than transport/stage/reason/kind/session_id/pod dropped, the human's id replaced. relay_active_sessions_per_room is DERIVED from the clients' server_type (the kit did not save it).",
+"bots_app_records": {
+"probe": {
+"transport_fallbacks": 0,
+"transport_observed": "webtransport",
+"transport_preferred": "webtransport"
+}
+},
+"hold": [
+1000.0,
+1060.0
+],
+"payloads": {
+"_cfs": {
+"data": {
+"result": [
+{
+"metric": {
+"pod": "client-metrics-api-7c697f6ccd-rrgcd"
+},
+"values": [
+[
+1000.0,
+"0.03372171131434293"
+],
+[
+1015.0,
+"0.041204571117600064"
+],
+[
+1030.0,
+"0.025958635100065734"
+],
+[
+1045.0,
+"0.01863421871274485"
+],
+[
+1060.0,
+"0.022539004640850232"
+]
+]
+},
+{
+"metric": {
+"pod": "grafana-7fbdf4cc6b-68qkj"
+},
+"values": [
+[
+1000.0,
+"0.3473684210526316"
+],
+[
+1015.0,
+"0.3684210526315789"
+],
+[
+1030.0,
+"0.3220338983050848"
+],
+[
+1045.0,
+"0.3636363636363636"
+],
+[
+1060.0,
+"0.37894736842105264"
+]
+]
+},
+{
+"metric": {
+"pod": "nats-0"
+},
+"values": [
+[
+1000.0,
+"0"
+],
+[
+1015.0,
+"0"
+],
+[
+1030.0,
+"0"
+],
+[
+1045.0,
+"0"
+],
+[
+1060.0,
+"0"
+]
+]
+},
+{
+"metric": {
+"pod": "postgres-postgresql-0"
+},
+"values": [
+[
+1000.0,
+"0.06474600373945062"
+],
+[
+1015.0,
+"0.11887863314524416"
+],
+[
+1030.0,
+"0.12484243621267709"
+],
+[
+1045.0,
+"0.15839389401838472"
+],
+[
+1060.0,
+"0.1343415086487147"
+]
+]
+},
+{
+"metric": {
+"pod": "server-metrics-api-7b44878787-zhvdq"
+},
+"values": [
+[
+1000.0,
+"0"
+],
+[
+1015.0,
+"0"
+],
+[
+1030.0,
+"0"
+],
+[
+1045.0,
+"0"
+],
+[
+1060.0,
+"0"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-api-b9c4f9bd8-dtcxs"
+},
+"values": [
+[
+1000.0,
+"0"
+],
+[
+1015.0,
+"0"
+],
+[
+1030.0,
+"0"
+],
+[
+1045.0,
+"0"
+],
+[
+1060.0,
+"0"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-dioxus-ui-58547b4f6d-jfth5"
+},
+"values": [
+[
+1000.0,
+"0"
+],
+[
+1015.0,
+"0"
+],
+[
+1030.0,
+"0"
+],
+[
+1045.0,
+"0"
+],
+[
+1060.0,
+"0"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-websocket-dcbd558f8-s5bzg"
+},
+"values": [
+[
+1000.0,
+"0"
+],
+[
+1015.0,
+"0"
+],
+[
+1030.0,
+"0"
+],
+[
+1045.0,
+"0"
+],
+[
+1060.0,
+"0"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs"
+},
+"values": [
+[
+1000.0,
+"0"
+],
+[
+1015.0,
+"0"
+],
+[
+1030.0,
+"0"
+],
+[
+1045.0,
+"0"
+],
+[
+1060.0,
+"0"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"relay_active_sessions_per_room": {
+"data": {
+"result": [
+{
+"metric": {
+"room": "scale-t1",
+"transport": "websocket"
+},
+"values": [
+[
+1000.0,
+"34"
+],
+[
+1015.0,
+"34"
+],
+[
+1030.0,
+"34"
+],
+[
+1045.0,
+"34"
+],
+[
+1060.0,
+"34"
+]
+]
+},
+{
+"metric": {
+"room": "scale-t1",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"2"
+],
+[
+1015.0,
+"2"
+],
+[
+1030.0,
+"2"
+],
+[
+1045.0,
+"2"
+],
+[
+1060.0,
+"2"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"relay_downlink_shed_escalations_total": {
+"data": {
+"result": [
+{
+"metric": {
+"stage": "one",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"16"
+],
+[
+1015.0,
+"16"
+],
+[
+1030.0,
+"18"
+],
+[
+1045.0,
+"18"
+],
+[
+1060.0,
+"20"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"relay_downlink_stream_queue_drops_total": {
+"data": {
+"result": [
+{
+"metric": {
+"kind": "other",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"7605"
+],
+[
+1015.0,
+"7605"
+],
+[
+1030.0,
+"7802"
+],
+[
+1045.0,
+"7802"
+],
+[
+1060.0,
+"8516"
+]
+]
+},
+{
+"metric": {
+"kind": "video",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"2563"
+],
+[
+1015.0,
+"2651"
+],
+[
+1030.0,
+"2952"
+],
+[
+1045.0,
+"2975"
+],
+[
+1060.0,
+"3401"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"relay_outbound_bridge_stream_resets_total": {
+"data": {
+"result": [
+{
+"metric": {
+"reason": "lane_abort",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"81"
+],
+[
+1015.0,
+"81"
+],
+[
+1030.0,
+"81"
+],
+[
+1045.0,
+"81"
+],
+[
+1060.0,
+"81"
+]
+]
+},
+{
+"metric": {
+"reason": "write_timeout",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"434"
+],
+[
+1015.0,
+"439"
+],
+[
+1030.0,
+"477"
+],
+[
+1045.0,
+"477"
+],
+[
+1060.0,
+"529"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"relay_session_drops_total": {
+"data": {
+"result": [
+{
+"metric": {
+"kind": "audio",
+"room": "scale-t1",
+"session_id": "7000",
+"transport": "webtransport"
+},
+"values": [
+[
+1060.0,
+"444"
+]
+]
+},
+{
+"metric": {
+"kind": "audio",
+"room": "scale-t1",
+"session_id": "7001",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"604"
+],
+[
+1015.0,
+"604"
+],
+[
+1030.0,
+"801"
+],
+[
+1045.0,
+"801"
+],
+[
+1060.0,
+"1071"
+]
+]
+},
+{
+"metric": {
+"kind": "priority_drop_video",
+"room": "scale-t1",
+"session_id": "7000",
+"transport": "webtransport"
+},
+"values": [
+[
+1030.0,
+"56"
+],
+[
+1045.0,
+"56"
+],
+[
+1060.0,
+"56"
+]
+]
+},
+{
+"metric": {
+"kind": "priority_drop_video",
+"room": "scale-t1",
+"session_id": "7001",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"207"
+],
+[
+1015.0,
+"207"
+],
+[
+1030.0,
+"383"
+],
+[
+1045.0,
+"383"
+],
+[
+1060.0,
+"1096"
+]
+]
+},
+{
+"metric": {
+"kind": "video",
+"room": "scale-t1",
+"session_id": "7000",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"264"
+],
+[
+1015.0,
+"352"
+],
+[
+1030.0,
+"533"
+],
+[
+1045.0,
+"556"
+],
+[
+1060.0,
+"828"
+]
+]
+},
+{
+"metric": {
+"kind": "video",
+"room": "scale-t1",
+"session_id": "7001",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"119"
+],
+[
+1015.0,
+"119"
+],
+[
+1030.0,
+"239"
+],
+[
+1045.0,
+"239"
+],
+[
+1060.0,
+"393"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"videocall_client_active_server_rtt_ms": {
+"data": {
+"result": [
+{
+"metric": {
+"peer_id": "probe",
+"server_type": "webtransport",
+"session_id": "7000"
+},
+"values": [
+[
+970.0,
+"271.6600488185883"
+],
+[
+985.0,
+"290.9700488269329"
+],
+[
+1000.0,
+"303.5600488215685"
+],
+[
+1015.0,
+"281.1500488191843"
+],
+[
+1030.0,
+"312.85004882514477"
+],
+[
+1045.0,
+"287.1100488215685"
+],
+[
+1060.0,
+"375.550048828125"
+]
+]
+},
+{
+"metric": {
+"peer_id": "human-tab",
+"server_type": "websocket",
+"session_id": "7002"
+},
+"values": [
+[
+925.0,
+"276.68000000119207"
+],
+[
+940.0,
+"276.68000000119207"
+]
+]
+},
+{
+"metric": {
+"peer_id": "human-tab",
+"server_type": "webtransport",
+"session_id": "7001"
+},
+"values": [
+[
+955.0,
+"273.44009766578677"
+],
+[
+970.0,
+"281.09009765982626"
+],
+[
+985.0,
+"321.5200976669788"
+],
+[
+1000.0,
+"301.39009764790535"
+],
+[
+1015.0,
+"287.3600976586342"
+],
+[
+1030.0,
+"322.7200976610184"
+],
+[
+1045.0,
+"282.6800976455212"
+],
+[
+1060.0,
+"391.70009765625"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"videocall_outbound_channel_drops_total": {
+"data": {
+"result": [
+{
+"metric": {
+"kind": "audio",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"7605"
+],
+[
+1015.0,
+"7605"
+],
+[
+1030.0,
+"7802"
+],
+[
+1045.0,
+"7802"
+],
+[
+1060.0,
+"8516"
+]
+]
+},
+{
+"metric": {
+"kind": "control",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"2"
+],
+[
+1015.0,
+"2"
+],
+[
+1030.0,
+"2"
+],
+[
+1045.0,
+"2"
+],
+[
+1060.0,
+"2"
+]
+]
+},
+{
+"metric": {
+"kind": "priority_drop_video",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"5865"
+],
+[
+1015.0,
+"5865"
+],
+[
+1030.0,
+"6097"
+],
+[
+1045.0,
+"6097"
+],
+[
+1060.0,
+"6810"
+]
+]
+},
+{
+"metric": {
+"kind": "rtt",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"6"
+],
+[
+1015.0,
+"6"
+],
+[
+1030.0,
+"6"
+],
+[
+1045.0,
+"6"
+],
+[
+1060.0,
+"6"
+]
+]
+},
+{
+"metric": {
+"kind": "video",
+"transport": "webtransport"
+},
+"values": [
+[
+1000.0,
+"2563"
+],
+[
+1015.0,
+"2651"
+],
+[
+1030.0,
+"2952"
+],
+[
+1045.0,
+"2975"
+],
+[
+1060.0,
+"3401"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"videocall_relay_connection_path_congestion_events": {
+"data": {
+"result": [
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7000"
+},
+"values": [
+[
+1000.0,
+"24"
+],
+[
+1015.0,
+"105"
+],
+[
+1030.0,
+"176"
+],
+[
+1045.0,
+"192"
+],
+[
+1060.0,
+"213"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7001"
+},
+"values": [
+[
+1000.0,
+"25"
+],
+[
+1015.0,
+"113"
+],
+[
+1030.0,
+"140"
+],
+[
+1045.0,
+"205"
+],
+[
+1060.0,
+"213"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"videocall_relay_connection_path_lost_packets": {
+"data": {
+"result": [
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7000"
+},
+"values": [
+[
+1000.0,
+"58"
+],
+[
+1015.0,
+"201"
+],
+[
+1030.0,
+"341"
+],
+[
+1045.0,
+"364"
+],
+[
+1060.0,
+"509"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7001"
+},
+"values": [
+[
+1000.0,
+"55"
+],
+[
+1015.0,
+"231"
+],
+[
+1030.0,
+"280"
+],
+[
+1045.0,
+"433"
+],
+[
+1060.0,
+"469"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"videocall_relay_connection_path_sent_packets": {
+"data": {
+"result": [
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7000"
+},
+"values": [
+[
+1000.0,
+"8174"
+],
+[
+1015.0,
+"13040"
+],
+[
+1030.0,
+"16439"
+],
+[
+1045.0,
+"21253"
+],
+[
+1060.0,
+"23587"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7001"
+},
+"values": [
+[
+1000.0,
+"8391"
+],
+[
+1015.0,
+"13233"
+],
+[
+1030.0,
+"16082"
+],
+[
+1045.0,
+"21267"
+],
+[
+1060.0,
+"24234"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+},
+"videocall_relay_connection_rtt_ms": {
+"data": {
+"result": [
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7000"
+},
+"values": [
+[
+1000.0,
+"266.78119"
+],
+[
+1015.0,
+"274.512248"
+],
+[
+1030.0,
+"271.256034"
+],
+[
+1045.0,
+"287.111711"
+],
+[
+1060.0,
+"282.961525"
+]
+]
+},
+{
+"metric": {
+"pod": "videocall-webtransport-6977fd997d-pqljs",
+"room": "scale-t1",
+"session_id": "7001"
+},
+"values": [
+[
+1000.0,
+"273.036857"
+],
+[
+1015.0,
+"282.51220900000004"
+],
+[
+1030.0,
+"274.224725"
+],
+[
+1045.0,
+"326.396188"
+],
+[
+1060.0,
+"286.341955"
+]
+]
+}
+],
+"resultType": "matrix"
+},
+"status": "success"
+}
+},
+"users": {
+"human-tab": {
+"7001": "webtransport",
+"7002": "websocket"
+},
+"probe": {
+"7000": "webtransport"
+}
+}
+}

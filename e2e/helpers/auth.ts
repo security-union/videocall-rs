@@ -4,13 +4,21 @@ import { BrowserContext } from "@playwright/test";
 const JWT_SECRET = process.env.JWT_SECRET || "dev-jwt-secret-change-me";
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 
-export function generateSessionToken(email: string, name: string, ttlSecs: number = 3600): string {
+export function generateSessionToken(
+  email: string,
+  name: string,
+  ttlSecs: number = 3600,
+  notAfterSecs?: number,
+): string {
   const now = Math.floor(Date.now() / 1000);
+  if (notAfterSecs !== undefined && notAfterSecs <= now) {
+    throw new Error(`the session's deadline ${notAfterSecs} has passed (now ${now})`);
+  }
   return jwt.sign(
     {
       sub: email,
       name: name,
-      exp: now + ttlSecs,
+      exp: notAfterSecs === undefined ? now + ttlSecs : Math.min(now + ttlSecs, notAfterSecs),
       iat: now,
       iss: "videocall-meeting-backend",
       // Must match `SessionTokenClaims::TOKEN_TYPE` in meeting-api/src/token.rs.
@@ -25,6 +33,8 @@ interface SessionCookieOptions {
   email?: string;
   name?: string;
   baseURL?: string;
+  /** Epoch seconds the session token must expire by; `generateSessionToken`'s default lifetime when unset. */
+  notAfterSecs?: number;
 }
 
 /**
@@ -92,7 +102,7 @@ export async function injectSessionCookie(
   const name = opts.name || "E2ETestUser";
   const resolvedURL = opts.baseURL || "http://localhost:80";
 
-  const token = generateSessionToken(email, name);
+  const token = generateSessionToken(email, name, undefined, opts.notAfterSecs);
   const url = new URL(resolvedURL);
 
   // Evict any pre-existing session cookie of the same name BEFORE injecting

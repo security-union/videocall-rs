@@ -1041,7 +1041,7 @@ pub(crate) fn compute_popup_position(
 }
 
 /// Read an `Element`'s viewport-coordinate rect into our pure-data [`Rect`].
-fn element_rect(el: &web_sys::Element) -> Rect {
+pub(crate) fn element_rect(el: &web_sys::Element) -> Rect {
     let r = el.get_bounding_client_rect();
     Rect {
         left: r.left(),

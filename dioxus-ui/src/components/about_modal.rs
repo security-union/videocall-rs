@@ -24,6 +24,7 @@
 
 use crate::components::changelog::WhatsNew;
 use crate::components::meeting_footer::trap_tab_in_dialog;
+use crate::routing::Route;
 use dioxus::prelude::*;
 use serde::Deserialize;
 use wasm_bindgen::JsCast;
@@ -248,6 +249,31 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
                     }
                 }
 
+                p { class: "about-modal-help",
+                    Link {
+                        to: Route::Help {},
+                        class: "about-modal-help-link",
+                        "data-testid": "about-help-link",
+                        svg {
+                            "aria-hidden": "true",
+                            xmlns: "http://www.w3.org/2000/svg",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            circle { cx: "12", cy: "12", r: "10" }
+                            path { d: "M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" }
+                            line { x1: "12", y1: "17", x2: "12.01", y2: "17" }
+                        }
+                        "Help & FAQ"
+                    }
+                    span { class: "about-modal-help-desc",
+                        " \u{2014} how to use the app and answers to common questions"
+                    }
+                }
+
                 section {
                     class: "about-modal-section",
                     "aria-labelledby": "about-client-heading",
@@ -333,10 +359,23 @@ mod dom_tests {
     use gloo_timers::future::TimeoutFuture;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[allow(non_snake_case)]
-    fn OpenAbout() -> Element {
+    #[derive(Clone, Routable, PartialEq, Debug)]
+    #[rustfmt::skip]
+    enum OpenAboutRoute {
+        #[route("/:..segments")]
+        OpenAboutAt { segments: Vec<String> },
+    }
+
+    #[component]
+    fn OpenAboutAt(segments: Vec<String>) -> Element {
+        let _ = segments;
         let open = use_signal(|| true);
         rsx! { AboutModal { open } }
+    }
+
+    #[allow(non_snake_case)]
+    fn OpenAbout() -> Element {
+        rsx! { Router::<OpenAboutRoute> {} }
     }
 
     async fn wait_for(mount: &web_sys::Element, selector: &str) -> Option<web_sys::Element> {
@@ -481,13 +520,26 @@ mod dom_tests {
         );
     }
 
-    #[allow(non_snake_case)]
-    fn AboutWithTrigger() -> Element {
+    #[derive(Clone, Routable, PartialEq, Debug)]
+    #[rustfmt::skip]
+    enum TriggerRoute {
+        #[route("/:..segments")]
+        AboutWithTriggerAt { segments: Vec<String> },
+    }
+
+    #[component]
+    fn AboutWithTriggerAt(segments: Vec<String>) -> Element {
+        let _ = segments;
         let mut open = use_signal(|| true);
         rsx! {
             button { id: ABOUT_TRIGGER_ID, onclick: move |_| open.set(true), "About" }
             AboutModal { open }
         }
+    }
+
+    #[allow(non_snake_case)]
+    fn AboutWithTrigger() -> Element {
+        rsx! { Router::<TriggerRoute> {} }
     }
 
     fn mount_about_with_trigger() -> web_sys::Element {
@@ -618,5 +670,100 @@ mod dom_tests {
             "Shift+Tab on Close wraps to the last button"
         );
         assert!(card_tab_enters, "Tab on the card moves to the first button");
+    }
+
+    const TABBABLE: &str = "a[href], button:not([disabled]), input:not([disabled]), \
+         select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+
+    /// One Tab press as the browser runs it: the dialog's handler sees the
+    /// keydown first, and only an unprevented press moves focus to the
+    /// neighbouring tabbable element. Returns false when focus would leave `card`.
+    fn press_tab(card: &web_sys::Element, shift: bool) -> bool {
+        let doc = gloo_utils::document();
+        let active = doc.active_element().unwrap();
+        let unprevented = js_sys::Function::new_with_args(
+            "el, shift",
+            "return el.dispatchEvent(new KeyboardEvent('keydown', \
+             { key: 'Tab', shiftKey: shift, bubbles: true, cancelable: true }));",
+        )
+        .call2(&wasm_bindgen::JsValue::NULL, &active, &shift.into())
+        .unwrap()
+        .as_bool()
+        .unwrap();
+        if !unprevented {
+            return true;
+        }
+        let nodes = card.query_selector_all(TABBABLE).unwrap();
+        let stops: Vec<web_sys::HtmlElement> = (0..nodes.length())
+            .filter_map(|i| nodes.item(i))
+            .filter_map(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+            .collect();
+        let at = stops.iter().position(|el| el.is_same_node(Some(&active)));
+        let next = match (at, shift) {
+            (Some(i), false) => stops.get(i + 1),
+            (Some(i), true) => i.checked_sub(1).and_then(|i| stops.get(i)),
+            (None, _) => None,
+        };
+        next.is_some_and(|el| el.focus().is_ok())
+    }
+
+    #[wasm_bindgen_test]
+    async fn tab_from_close_reaches_the_help_link_and_the_trap_still_wraps() {
+        let mount = mount_about_with_trigger();
+        let card = wait_for(&mount, "[data-testid='about-modal-dialog']")
+            .await
+            .unwrap();
+        let link = wait_for(&mount, "[data-testid='about-help-link']")
+            .await
+            .expect("About links to the help page");
+        let close = card
+            .query_selector("[data-testid='about-modal-close']")
+            .unwrap()
+            .unwrap();
+        let name_of = |el: &web_sys::Element| {
+            el.get_attribute("data-testid")
+                .unwrap_or_else(|| el.tag_name())
+        };
+
+        close
+            .unchecked_ref::<web_sys::HtmlElement>()
+            .focus()
+            .unwrap();
+        let mut stops = Vec::new();
+        for _ in 0..6 {
+            if !press_tab(&card, false) {
+                stops.push("<left the dialog>".to_string());
+                break;
+            }
+            let active = gloo_utils::document().active_element().unwrap();
+            stops.push(name_of(&active));
+            if active.is_same_node(Some(&close)) {
+                break;
+            }
+        }
+        link.unchecked_ref::<web_sys::HtmlElement>()
+            .focus()
+            .unwrap();
+        press_tab(&card, true);
+        let shift_tab_from_link = gloo_utils::document()
+            .active_element()
+            .map(|el| name_of(&el));
+        let href = link.get_attribute("href");
+        let tag = link.tag_name();
+        mount.remove();
+
+        assert_eq!(tag, "A");
+        assert_eq!(href.as_deref(), Some("/help"));
+        assert_eq!(
+            stops.first().map(String::as_str),
+            Some("about-help-link"),
+            "Tab from Close must land on Help & FAQ, got {stops:?}"
+        );
+        assert_eq!(
+            stops.last().map(String::as_str),
+            Some("about-modal-close"),
+            "Tab keeps cycling inside the dialog, got {stops:?}"
+        );
+        assert_eq!(shift_tab_from_link.as_deref(), Some("about-modal-close"));
     }
 }

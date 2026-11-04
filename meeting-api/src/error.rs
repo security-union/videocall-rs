@@ -83,6 +83,18 @@ impl AppError {
         )
     }
 
+    /// Bare `404 NOT_FOUND` for a feature that is switched off.
+    pub fn feature_not_found() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            APIError {
+                code: "NOT_FOUND".to_string(),
+                message: "Not found".to_string(),
+                engineering_error: None,
+            },
+        )
+    }
+
     pub fn not_host() -> Self {
         Self::new(StatusCode::FORBIDDEN, APIError::not_host())
     }
@@ -200,6 +212,79 @@ impl AppError {
             StatusCode::SERVICE_UNAVAILABLE,
             APIError::password_hasher_overloaded(),
         )
+    }
+
+    /// `413` — the body is larger than `max` bytes.
+    pub fn payload_too_large(max: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            APIError::payload_too_large(max),
+        )
+    }
+
+    /// `415` — the media type is not accepted.
+    pub fn unsupported_media_type() -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            APIError::unsupported_media_type(),
+        )
+    }
+
+    /// `422` — the image cannot be used as an avatar.
+    pub fn invalid_image(message: &str) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            APIError::invalid_image(message),
+        )
+    }
+
+    /// `404` — no avatar the caller may see.
+    pub fn avatar_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, APIError::avatar_not_found())
+    }
+
+    /// `400` — not a Gravatar e-mail or avatar link.
+    pub fn invalid_gravatar() -> Self {
+        Self::new(StatusCode::BAD_REQUEST, APIError::invalid_gravatar())
+    }
+
+    /// `422` — Gravatar has no image for the input.
+    pub fn gravatar_not_found() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            APIError::gravatar_not_found(),
+        )
+    }
+
+    /// `502` — Gravatar failed or answered unexpectedly.
+    pub fn gravatar_unavailable() -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, APIError::gravatar_unavailable())
+    }
+
+    /// `504` — Gravatar did not answer in time.
+    pub fn gravatar_timeout() -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            APIError::gravatar_unavailable(),
+        )
+    }
+
+    /// `503` — bounded capacity reached; transient.
+    pub fn service_busy() -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, APIError::service_busy())
+    }
+
+    /// `429` — the per-user avatar budget is spent.
+    pub fn avatar_rate_limited() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            APIError::avatar_rate_limit_exceeded(),
+        )
+    }
+
+    /// `409` — the signed-in user is not the `expected_user_id` of the write.
+    pub fn avatar_identity_mismatch() -> Self {
+        Self::new(StatusCode::CONFLICT, APIError::avatar_identity_mismatch())
     }
 }
 

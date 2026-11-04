@@ -76,6 +76,8 @@ class Guard(unittest.TestCase):
     def test_a_config_constant_change_fails(self):
         for group, key, value, dim in (
                 ("dimensions", "expand_ops_full_scale", 80, "A"),
+                ("dimensions", "discard_weight", 2, "A"),
+                ("dimensions", "playout_underrun_weight", 2, "A"),
                 ("dimensions", "near_frozen_fps", 6, "Q")):
             with self.subTest(key=key):
                 self.assert_flags(f"{dim} hold query differs", config={group: {key: {"value": value}}})
@@ -93,14 +95,23 @@ class Guard(unittest.TestCase):
                 ("talker join dropped", ' * on (to_peer) group_left () max by (to_peer) (label_replace(', ' + 0 * (',
                  "A hold query differs"),
                 ("can_listen == 0", "== 1) or on", "== 0) or on", "A hold query differs"),
-                ("V offset changed", "[5m] offset 15s", "[5m] offset 30s", "offset 30s != scrape_step_s 15s"),
-                ("V offset dropped", "[5m] offset 15s", "[5m]", "V hold query differs"),
-                ("V reset branch keeps the name", '\\"$obs\\"} * 1)', '\\"$obs\\"})', "V hold query differs"),
+                ("V offset changed", "[$__range] offset 15s", "[$__range] offset 30s", "offset 30s != scrape_step_s 15s"),
+                ("V offset dropped", "[$__range] offset 15s", "[$__range]", "V hold query differs"),
+                ("own previous sample within 5 min", "[$__range] offset 15s", "[5m] offset 15s", "A hold query differs"),
+                ("V reset branch keeps the name", '\\"$obs\\"} * 1 and (', '\\"$obs\\"} and (', "V hold query differs"),
+                ("first sample of any session", "offset 15s)) and on (session_id) topk by (peer_id)",
+                 "offset 15s)) or on (session_id) topk by (peer_id)", "V hold query differs"),
+                ("chain looks back 5 min", "[$__range]) * 1 or", "[5m]) * 1 or", "A hold query differs"),
+                ("chain not scoped to the hold", "[$__range] @ end()) or", "[$__range]) or", "A hold query differs"),
                 ("V oldest session wins", "topk by (peer_id)", "bottomk by (peer_id)",
                  "V hold query differs"),
                 ("Q fps >= 0", "> bool 0) * (", ">= bool 0) * (", "Q hold query differs"),
                 ("Q near-frozen 6", "< bool 5)", "< bool 6)", "Q hold query differs"),
                 ("A nominal 45", "} / 50,", "} / 45,", "A hold query differs"),
+                ("A discarded packet 10 ms", " * 20 / 15000", " * 10 / 15000", "A hold query differs"),
+                ("A discards added, not maxed", "clamp_max(max by (session_id", "clamp_max(sum by (session_id",
+                 "A hold query differs"),
+                ("A not capped at 1", ", 1) and on (session_id", ", 2) and on (session_id", "A hold query differs"),
                 ("S failed re-elections", 'result=\\"proceeded\\"', 'result=\\"failed\\"', "S hold query differs"),
                 ("S new sessions only", " unless on (session_id) ", " and on (session_id) ", "S hold query differs"),
                 ("k strict", ">= bool 0.1\\n", "> bool 0.1\\n", "Q k query differs"),

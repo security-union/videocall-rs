@@ -156,7 +156,11 @@ async function waitForGlow(
  * Hover target is an unclassed `div` marked only by inline `cursor: crosshair` —
  * the weakest selector here; a `data-testid` in `signal_quality.rs` is the fix.
  */
-async function readAudioBufferMs(hostPage: Page, tile: Locator): Promise<number> {
+async function readAudioBufferMs(
+  hostPage: Page,
+  tile: Locator,
+  atLeastMs: number,
+): Promise<{ bufferMs: number; tooltip: string }> {
   const signalButton = tile.locator("button.signal-indicator").first();
   await expect(signalButton).toBeVisible({ timeout: 15_000 });
   await signalButton.click();
@@ -171,47 +175,59 @@ async function readAudioBufferMs(hostPage: Page, tile: Locator): Promise<number>
       "yet, or the overlay this reader hovers has changed shape",
   ).toBeVisible({ timeout: 30_000 });
 
-  let text = "";
-  await expect
-    .poll(
-      async () => {
-        await chartOverlay.hover();
-        // `evaluate`, not a locator: the tooltip is lazily created and
-        // `textContent()` rejects on a missing element, which a poll propagates.
-        text = await hostPage.evaluate(
-          () => document.getElementById("signal-chart-tooltip-global")?.textContent ?? "",
-        );
-        return /Audio: buf \d+ms/.test(text);
-      },
-      {
-        timeout: 20_000,
-        message:
-          "the signal-chart tooltip never rendered an `Audio: buf {N}ms` line — without it " +
-          "there is no evidence audio is arriving, and a dark tile proves nothing",
-      },
-    )
-    .toBe(true);
-
-  const match = /Audio: buf (\d+)ms/.exec(text);
-  if (!match) {
-    throw new Error(`tooltip matched the probe but not the capture — text was: ${text}`);
+  // Audio reaches the newest sample only after the NetEq boots, its 1 Hz stats
+  // tick and the tile's once-a-second sample, so re-read until it clears the floor.
+  let bufferMs: number | null = null;
+  let tooltip = "";
+  const deadline = Date.now() + 20_000;
+  for (let attempt = 0; ; attempt += 1) {
+    // Only the overlay's right edge is the newest sample; alternating x forces a real move.
+    const timeout = Math.max(1_000, deadline - Date.now());
+    const box = await chartOverlay.boundingBox({ timeout });
+    await chartOverlay.hover(
+      box
+        ? {
+            position: { x: Math.max(0, box.width - 1 - (attempt % 2)), y: box.height / 2 },
+            timeout,
+          }
+        : { timeout },
+    );
+    // `evaluate`, not a locator: the tooltip is lazily created.
+    const text = await hostPage.evaluate(
+      () => document.getElementById("signal-chart-tooltip-global")?.textContent ?? "",
+    );
+    const match = /Audio: buf (\d+)ms/.exec(text);
+    if (match) {
+      bufferMs = Number(match[1]);
+      tooltip = text;
+    }
+    if ((bufferMs !== null && bufferMs >= atLeastMs) || Date.now() >= deadline) {
+      break;
+    }
+    await hostPage.waitForTimeout(500);
   }
-  const bufferMs = Number(match[1]);
+  if (bufferMs === null) {
+    throw new Error(
+      "the signal-chart tooltip never rendered an `Audio: buf {N}ms` line — without it " +
+        "there is no evidence audio is arriving, and a dark tile proves nothing",
+    );
+  }
 
   await popup.locator("button.popup-close").click();
   await expect(popup, "the signal popup did not close").toBeHidden({ timeout: 10_000 });
 
-  return bufferMs;
+  return { bufferMs, tooltip };
 }
 
 async function assertAudioIsArriving(hostPage: Page, tile: Locator, when: string): Promise<number> {
-  const bufferMs = await readAudioBufferMs(hostPage, tile);
+  const { bufferMs, tooltip } = await readAudioBufferMs(hostPage, tile, LIVE_BUFFER_FLOOR_MS);
   expect(
     bufferMs,
     `${when}: the peer's decoded-audio buffer read ${bufferMs}ms, under the ` +
       `${LIVE_BUFFER_FLOOR_MS}ms floor \`records_live_audio\` gates on. The liveness gate is ` +
       `therefore NOT held open, the veto under test would not fire, and a dark tile would mean ` +
-      `"we cannot hear this peer" — the issue-2174 case — rather than the issue-2660 one`,
+      `"we cannot hear this peer" — the issue-2174 case — rather than the issue-2660 one. ` +
+      `Last tooltip: "${tooltip}"`,
   ).toBeGreaterThanOrEqual(LIVE_BUFFER_FLOOR_MS);
   return bufferMs;
 }

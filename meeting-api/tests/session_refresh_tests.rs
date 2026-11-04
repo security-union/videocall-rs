@@ -55,9 +55,14 @@ fn test_state() -> AppState {
         kick_rate_limiter: std::sync::Arc::new(
             meeting_api::rate_limit::KeyedRateLimiter::for_host_kicks(),
         ),
+        captions_rate_limiter: std::sync::Arc::new(
+            meeting_api::rate_limit::KeyedRateLimiter::for_captions(),
+        ),
         recording: Default::default(),
+        avatars: Default::default(),
         search: None,
         display_name_rate_limit_disabled: false,
+        captions_enabled: false,
         dev_user: None,
         password_gate: std::sync::Arc::new(meeting_api::password::MeetingPasswordGate::new()),
         presence_watermark_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),

@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +28,8 @@ DASHBOARD_GLOBS = (
 PRUNED_DIRS = {".git", ".claude", "target", "node_modules", "dist"}
 QUERY_KEYS = {"expr", "query", "definition"}
 HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
+# Queried before the PR that registers them merges; a registered entry fails the guard until removed.
+PENDING: dict[str, str] = {}
 
 TOKEN = re.compile(r"(?<![A-Za-z0-9_:$])((?:videocall|relay|meeting)_[A-Za-z0-9_]+)")
 STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
@@ -42,6 +45,21 @@ EXPR_LINE = re.compile(r"^(\s*)(?:-\s+)?expr:\s*(.*)$")
 
 
 def rust_files(root):
+    """Tracked .rs files in a git checkout, so files another job left in a reused workspace do not count."""
+    try:
+        inside = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+                                capture_output=True).returncode == 0
+    except OSError:
+        inside = False
+    if inside:
+        git = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "*.rs"], capture_output=True)
+        if git.returncode != 0:
+            raise RuntimeError(f"git ls-files failed in {root}: {git.stderr.decode().strip()}")
+        for rel in filter(None, git.stdout.decode().split("\0")):
+            path = root / rel
+            if not PRUNED_DIRS & set(Path(rel).parts) and path.is_file():
+                yield path
+        return
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in PRUNED_DIRS]
         for name in filenames:
@@ -167,7 +185,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     root = args.root.resolve()
 
-    names, labels = registered(root)
+    try:
+        names, labels = registered(root)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not names:
         print(f"error: no registered metric under {root}", file=sys.stderr)
         return 2
@@ -182,11 +204,18 @@ def main(argv=None):
         print(f"error: no alert rule or dashboard file under {root}", file=sys.stderr)
         return 2
 
+    stale = sorted(PENDING.keys() & names)
+    for token in stale:
+        print(f"{token} is registered now: remove it from PENDING")
+    pending = sorted({t for _, t in dead if t in PENDING})
+    dead = [(p, t) for p, t in dead if t not in PENDING]
     for path, token in dead:
         print(f"{path}: {token} is not registered")
-    if dead:
+    if dead or stale:
         return 1
-    print(f"OK: {scanned} files, every referenced metric is registered")
+    for token in pending:
+        print(f"pending: {token} is registered by {PENDING[token]}")
+    print(f"OK: {scanned} files, every referenced metric is registered{' or pending' if pending else ''}")
     return 0
 
 

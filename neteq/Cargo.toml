@@ -25,6 +25,7 @@ js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "DedicatedWorkerGlobalScope", 
     "MessageEvent", 
+    "MessagePort",
     "console",
     "AudioDecoder",
     "AudioDecoderConfig",
@@ -78,6 +79,7 @@ native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http"
 [dev-dependencies]
 env_logger = "0.10"
 hound = "3.5"
+miniz_oxide = "0.8"
 
 [[example]]
 name = "basic_usage"

@@ -14,8 +14,7 @@
 # target namespace). Keep REGISTRY/IMAGE_NAME in lockstep with k8s/bot-pod.yaml.
 #
 # ── Remote builder ──────────────────────────────────────────────────────────
-# The qsk8s CI agents build via `podman --remote` over SSH to the shared
-# builder jenkins@10.190.112.123 (socket /run/user/1003/podman/podman.sock).
+# CI agents build via `podman --remote` over SSH on the shared builder.
 # Set PODMAN_REMOTE=1 to use it (requires the builder SSH key + a system
 # connection). Otherwise a local `docker`/`podman` build is used.
 

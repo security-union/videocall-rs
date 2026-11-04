@@ -40,6 +40,10 @@ message MeetingPacket {
     PARTICIPANT_SESSION_RESUMED = 17;
     // Server-authored recording registry snapshot
     RECORDING_STATE = 19;
+    // Participant changed their avatar; `target_user_id` names them
+    PARTICIPANT_AVATAR_CHANGED = 20;
+    // Join refused: the room token predates the meeting's current instance
+    MEETING_INSTANCE_SUPERSEDED = 21;
   }
 
   MeetingEventType event_type = 1;
@@ -84,6 +88,9 @@ message MeetingPacket {
   // RECORDING_STATE: meetings.created_at in microseconds.
   uint64 recording_epoch = 14;
   RecordingState recording_state = 15;
+  // MEETING_STARTED: start_time_ms came from the room token's
+  // meeting_started_at_ms claim rather than the relay clock.
+  bool start_time_authoritative = 16;
 }
 
 message RecordingState {

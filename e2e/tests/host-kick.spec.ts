@@ -12,6 +12,7 @@ import {
 import { createMeeting } from "../helpers/meeting-api";
 import { waitForServices } from "../helpers/wait-for-services";
 import { openPeerList } from "../helpers/controls";
+import { clickMeetingInfoTriggerAt } from "../helpers/meeting-footer";
 
 async function enableMicAndAwaitCapture(page: Page): Promise<void> {
   await page.mouse.move(400, 400);
@@ -650,8 +651,7 @@ test.describe("Host kick controls", () => {
       const peerList = guestPage.locator(PEER_LIST);
       await openPeerList(guestPage);
 
-      await expect(guestPage.locator(FOOTER_TRIGGER)).toBeVisible({ timeout: 15_000 });
-      await guestPage.locator(FOOTER_TRIGGER).click({ timeout: 10_000 });
+      await clickMeetingInfoTriggerAt(guestPage);
       const infoDialog = guestPage.locator(MEETING_INFO_DIALOG);
       await expect(infoDialog).toBeVisible({ timeout: 5_000 });
       await expect(infoDialog, "the dialog holds focus before the meeting ends").toBeFocused({

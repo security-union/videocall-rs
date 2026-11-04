@@ -12,10 +12,12 @@ use std::cell::Cell;
 
 use dioxus::prelude::*;
 use dioxus_ui::components::appearance_settings_panel::AppearanceSettingsPanel;
+use dioxus_ui::components::device_settings_modal::DeviceSettingsModal;
 use dioxus_ui::context::{
     AppearanceSettings, AppearanceSettingsCtx, GlowColor, LocalAudioLevelCtx, LocalSpeakingCtx,
     Theme, ThemePreferenceCtx,
 };
+use dioxus_ui::util::color_math::parse_hex;
 use support::{cleanup, create_mount_point, render_into, yield_now};
 use videocall_diagnostics::{global_sender, metric, DiagEvent};
 use wasm_bindgen::JsCast;
@@ -31,18 +33,49 @@ const PAST_DELETE_GUARD_MS: i32 = 450;
 
 thread_local! {
     static SEED: Cell<AppearanceSettings> = Cell::new(AppearanceSettings::default());
+    static SETTINGS_CLOSES: Cell<u32> = const { Cell::new(0) };
 }
 
-#[allow(non_snake_case)]
-fn Panel() -> Element {
+fn provide_panel_contexts() -> (Signal<f32>, Signal<bool>) {
     let theme = use_signal(|| Theme::Dark);
     use_context_provider(|| ThemePreferenceCtx(theme));
     let appearance = use_signal(|| SEED.with(Cell::get));
     use_context_provider(|| AppearanceSettingsCtx(appearance));
-    let mut level = use_signal(|| 0.0f32);
-    let mut speaking = use_signal(|| false);
+    let level = use_signal(|| 0.0f32);
+    let speaking = use_signal(|| false);
     use_context_provider(|| LocalAudioLevelCtx(level));
     use_context_provider(|| LocalSpeakingCtx(speaking));
+    (level, speaking)
+}
+
+#[allow(non_snake_case)]
+fn SettingsModal() -> Element {
+    provide_panel_contexts();
+    let mut visible = use_signal(|| true);
+    rsx! {
+        DeviceSettingsModal {
+            microphones: Vec::<web_sys::MediaDeviceInfo>::new(),
+            cameras: Vec::<web_sys::MediaDeviceInfo>::new(),
+            speakers: Vec::<web_sys::MediaDeviceInfo>::new(),
+            selected_microphone_id: None::<String>,
+            selected_camera_id: None::<String>,
+            selected_speaker_id: None::<String>,
+            on_microphone_select: move |_| {},
+            on_camera_select: move |_| {},
+            on_speaker_select: move |_| {},
+            visible: visible(),
+            initial_section: Some("appearance".to_string()),
+            on_close: move |_| {
+                SETTINGS_CLOSES.with(|c| c.set(c.get() + 1));
+                visible.set(false);
+            },
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn Panel() -> Element {
+    let (mut level, mut speaking) = provide_panel_contexts();
     rsx! {
         AppearanceSettingsPanel {}
         button {
@@ -146,10 +179,10 @@ async fn wait_for_caption(root: &web_sys::Element, want: &str, timeout_ms: i32) 
     false
 }
 
-fn key_down(target: &web_sys::HtmlElement, key: &str, repeat: bool) {
+fn key_down(target: &web_sys::HtmlElement, key: &str, repeat: bool) -> bool {
     js_sys::Function::new_with_args(
         "el, key, repeat",
-        "el.dispatchEvent(new KeyboardEvent('keydown', {key, repeat, bubbles: true, cancelable: true}));",
+        "return !el.dispatchEvent(new KeyboardEvent('keydown', {key, repeat, bubbles: true, cancelable: true}));",
     )
     .call3(
         &wasm_bindgen::JsValue::NULL,
@@ -157,7 +190,9 @@ fn key_down(target: &web_sys::HtmlElement, key: &str, repeat: bool) {
         &key.into(),
         &repeat.into(),
     )
-    .unwrap();
+    .unwrap()
+    .as_bool()
+    .unwrap()
 }
 
 fn focused_label() -> Option<String> {
@@ -664,6 +699,11 @@ async fn a_hidden_delete_badge_takes_no_clicks() {
 
 async fn add_color(root: &web_sys::Element, hex: &str) {
     click(root, "#add-custom-color-btn").await;
+    type_hex(root, hex).await;
+    click(root, ".custom-color-add-btn").await;
+}
+
+async fn type_hex(root: &web_sys::Element, hex: &str) {
     let input: web_sys::HtmlInputElement = one(root, "[aria-label='Hex color value']")
         .dyn_into()
         .unwrap();
@@ -675,7 +715,6 @@ async fn add_color(root: &web_sys::Element, hex: &str) {
     .call1(&wasm_bindgen::JsValue::NULL, &input)
     .unwrap();
     yield_now().await;
-    click(root, ".custom-color-add-btn").await;
 }
 
 fn announcement(root: &web_sys::Element) -> String {
@@ -733,6 +772,153 @@ async fn two_deliberate_delete_presses_delete_two_swatches() {
 
     cleanup(&mount);
     reset_storage();
+}
+
+async fn mount_settings_modal() -> web_sys::Element {
+    reset_storage();
+    SEED.with(|s| s.set(AppearanceSettings::default()));
+    SETTINGS_CLOSES.with(|c| c.set(0));
+    let mount = create_mount_point();
+    render_into(&mount, SettingsModal);
+    yield_now().await;
+    mount
+}
+
+#[wasm_bindgen_test]
+async fn escape_in_the_custom_color_dialog_leaves_the_settings_modal_open() {
+    let mount = mount_settings_modal().await;
+
+    click(&mount, "#add-custom-color-btn").await;
+    key_down(&one(&mount, ".custom-color-modal"), "Escape", false);
+    yield_now().await;
+    sleep_ms(120).await;
+
+    assert!(mount
+        .query_selector(".custom-color-modal-overlay")
+        .unwrap()
+        .is_none());
+    assert_eq!(SETTINGS_CLOSES.with(Cell::get), 0, "Escape closed Settings");
+    one(&mount, ".device-settings-modal #settings-panel-appearance");
+    assert_eq!(
+        gloo_utils::document().active_element().map(|el| el.id()),
+        Some("add-custom-color-btn".to_string())
+    );
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn arrow_keys_in_the_custom_color_dialog_keep_the_appearance_tab() {
+    let mount = mount_settings_modal().await;
+
+    click(&mount, "#add-custom-color-btn").await;
+    let typed = GlowColor::Plum.to_hex();
+    type_hex(&mount, &typed).await;
+    for (source, key) in [
+        ("#color-picker-hex-input", "ArrowRight"),
+        ("#color-picker-hex-input", "ArrowLeft"),
+        (".color-picker-hue-track", "ArrowRight"),
+        (".color-picker-hue-track", "ArrowLeft"),
+    ] {
+        let prevented = key_down(&one(&mount, source), key, false);
+        yield_now().await;
+        assert!(!prevented, "{key} on {source} lost its default action");
+        one(&mount, "#settings-panel-appearance .custom-color-modal");
+        let input: web_sys::HtmlInputElement =
+            one(&mount, "#color-picker-hex-input").dyn_into().unwrap();
+        assert_eq!(input.value(), typed, "{key} on {source}");
+    }
+    assert_eq!(SETTINGS_CLOSES.with(Cell::get), 0);
+
+    cleanup(&mount);
+}
+
+fn stub_clipboard() {
+    js_sys::Function::new_no_args(
+        "window.__copiedText = null;
+         Object.defineProperty(navigator, 'clipboard', {
+             configurable: true,
+             value: { writeText: (text) => { window.__copiedText = text; return Promise.resolve(); } },
+         });",
+    )
+    .call0(&wasm_bindgen::JsValue::NULL)
+    .unwrap();
+}
+
+fn restore_clipboard() {
+    js_sys::Function::new_no_args("delete navigator.clipboard; delete window.__copiedText;")
+        .call0(&wasm_bindgen::JsValue::NULL)
+        .unwrap();
+}
+
+fn copy_status(root: &web_sys::Element) -> String {
+    all(root, ".custom-color-popover [aria-live='polite']")[1]
+        .text_content()
+        .unwrap_or_default()
+}
+
+fn shown_in_picker(root: &web_sys::Element) -> String {
+    one(root, ".custom-color-popover .color-picker-preview-swatch")
+        .style()
+        .get_property_value("background-color")
+        .unwrap()
+}
+
+async fn copy_from_picker(root: &web_sys::Element) -> (String, String) {
+    js_sys::Reflect::set(
+        &web_sys::window().unwrap(),
+        &"__copiedText".into(),
+        &wasm_bindgen::JsValue::NULL,
+    )
+    .unwrap();
+    click(root, ".custom-color-popover .color-picker-copy-btn").await;
+    let copied = js_sys::Reflect::get(&web_sys::window().unwrap(), &"__copiedText".into())
+        .unwrap()
+        .as_string()
+        .expect("Copy wrote nothing to the clipboard");
+    let want = format!("Copied {copied}");
+    let mut waited = 0;
+    while copy_status(root) != want && waited < 1000 {
+        sleep_ms(50).await;
+        waited += 50;
+    }
+    (copied, copy_status(root))
+}
+
+#[wasm_bindgen_test]
+async fn copy_writes_and_announces_the_color_the_picker_shows() {
+    reset_storage();
+    stub_clipboard();
+    let mount = mount_panel(AppearanceSettings {
+        glow_color: GlowColor::Cyan,
+        ..AppearanceSettings::default()
+    })
+    .await;
+
+    click(&mount, "#add-custom-color-btn").await;
+    let shown = shown_in_picker(&mount);
+    assert!(shown.contains(&channels(GlowColor::Cyan)), "{shown}");
+    let (copied, status) = copy_from_picker(&mount).await;
+    assert_eq!(
+        parse_hex(&copied),
+        Some(GlowColor::Cyan.to_rgb()),
+        "{copied:?}"
+    );
+    assert_eq!(status, format!("Copied {copied}"));
+
+    type_hex(&mount, &GlowColor::Plum.to_hex()).await;
+    let shown = shown_in_picker(&mount);
+    assert!(shown.contains(&channels(GlowColor::Plum)), "{shown}");
+    let (copied, status) = copy_from_picker(&mount).await;
+    assert_eq!(
+        parse_hex(&copied),
+        Some(GlowColor::Plum.to_rgb()),
+        "{copied:?}"
+    );
+    assert_eq!(status, format!("Copied {copied}"));
+
+    cleanup(&mount);
+    restore_clipboard();
 }
 
 #[wasm_bindgen_test]

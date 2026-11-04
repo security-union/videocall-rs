@@ -102,6 +102,14 @@ impl PublisherInboundFrameGapTracker {
 /// a real epoch even in the first millisecond of process life.
 pub const DOWNLINK_EPOCH_NEVER: u64 = 0;
 
+/// Connect-URL query parameter carrying `JoinRoom::conn_seq`.
+pub const CONN_SEQ_QUERY_PARAM: &str = "conn_seq";
+
+/// Parse a raw `?conn_seq=` value; anything that is not a `u64` is `None`.
+pub fn parse_conn_seq(raw: Option<&str>) -> Option<u64> {
+    raw?.parse().ok()
+}
+
 /// Current monotonic epoch (millis since the process-global `PROCESS_START`
 /// origin, offset by `+1`) for stamping the shared receiver-downlink congestion
 /// signal. The `+1` keeps every real epoch strictly greater than the
@@ -297,13 +305,17 @@ pub enum ConnectionState {
     Testing,
     /// Connection is active and should broadcast to NATS
     Active,
-    /// The participant was kicked (#2934); the transport is closing and the
-    /// session may neither publish nor be re-activated.
+    /// The participant was kicked (#2934), or its join was refused; the
+    /// transport is closing and the session may neither publish nor be
+    /// re-activated.
     Revoked,
 }
 
 /// `JoinRoom` error for a room token revoked by a host kick.
 pub const JOIN_REFUSED_KICKED: &str = "removed from the meeting by the host";
+
+/// `JoinRoom` error for a room token minted for an earlier meeting instance (#3287).
+pub const JOIN_REFUSED_STALE_INSTANCE: &str = "room token is for an earlier meeting instance";
 
 /// Result of handling an inbound packet
 #[derive(Debug)]
@@ -616,6 +628,9 @@ pub struct SessionLogic {
     pub is_host: bool,
     /// The room token's `iat` claim, compared against host kicks (#2934).
     pub token_iat: Option<i64>,
+    pub meeting_started_at_ms: Option<u64>,
+    /// Client-supplied `?conn_seq=`, forwarded on `JoinRoom`.
+    pub conn_seq: Option<u64>,
     /// Tracks this receiver's outbound packet drops per sender; feeds the
     /// #979 keyframe-relax path (no longer a CONGESTION emit, see #1219).
     pub congestion_tracker: Arc<Mutex<CongestionTracker>>,
@@ -699,6 +714,8 @@ impl SessionLogic {
             transport: transport.to_string(),
             is_host,
             token_iat: None,
+            meeting_started_at_ms: None,
+            conn_seq: None,
             congestion_tracker: Arc::new(Mutex::new(CongestionTracker::new())),
             keyframe_limiter: KeyframeRequestLimiter::new(),
             reaction_limiter: ReactionRateLimiter::new(),
@@ -759,8 +776,18 @@ impl SessionLogic {
     }
 
     /// Build MEETING_STARTED packet
-    pub fn build_meeting_started(&self, start_time_ms: u64, creator_id: &str) -> Vec<u8> {
-        SessionManager::build_meeting_started_packet(&self.room, start_time_ms, creator_id)
+    pub fn build_meeting_started(
+        &self,
+        start_time_ms: u64,
+        start_time_authoritative: bool,
+        creator_id: &str,
+    ) -> Vec<u8> {
+        SessionManager::build_meeting_started_packet(
+            &self.room,
+            start_time_ms,
+            start_time_authoritative,
+            creator_id,
+        )
     }
 
     /// Build SESSION_ASSIGNED packet for this session
@@ -840,6 +867,8 @@ impl SessionLogic {
             // shedding; this actor writes it from `on_outbound_drop`.
             downlink_congested_epoch: Arc::clone(&self.downlink_congested_epoch),
             token_iat: self.token_iat,
+            meeting_started_at_ms: self.meeting_started_at_ms,
+            conn_seq: self.conn_seq,
             closer: Some(closer),
         }
     }
@@ -908,7 +937,7 @@ impl SessionLogic {
                 );
                 false
             }
-            Ok(Err(e)) if e == JOIN_REFUSED_KICKED => {
+            Ok(Err(e)) if e == JOIN_REFUSED_KICKED || e == JOIN_REFUSED_STALE_INSTANCE => {
                 info!(
                     "Join refused for session {} in room {}: {}",
                     self.id, self.room, e

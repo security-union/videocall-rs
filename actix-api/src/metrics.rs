@@ -78,12 +78,9 @@ pub async fn metrics_responder() -> impl Responder {
 
 /// Every `drop_reason`/`kind` label ever passed to a relay drop counter.
 ///
-/// This is the UNION of:
-/// - `relay_packet_drops_total{drop_reason}` (`mailbox_full`, `channel_full`,
-///   `lane_dead`, `priority_drop_video`, `priority_drop_audio`), and
-/// - `relay_session_drops_total{kind}` / `videocall_outbound_channel_drops_total{kind}`
-///   (`audio`, `video`, `screen`, `media`, `control`, `rtt`, `unknown`,
-///   `priority_drop_video`, `priority_drop_audio`, `overflow_critical`).
+/// This is the union of every `drop_reason` of `relay_packet_drops_total` and
+/// every `kind` of `relay_session_drops_total` /
+/// `videocall_outbound_channel_drops_total`; the const below is the list.
 ///
 /// Iterating the full union for either counter's GC is leak-proof: removing a
 /// `(…, kind)` tuple that was never created is a benign `Err` (issue #1090),
@@ -98,6 +95,7 @@ pub const RELAY_DROP_KINDS: &[&str] = &[
     "priority_drop_video",
     "priority_drop_audio",
     "priority_drop_rtt_echo",
+    "priority_drop_caption",
     // outbound/session drop kinds (drop_kind_label + overflow_critical)
     "audio",
     "video",
@@ -105,6 +103,7 @@ pub const RELAY_DROP_KINDS: &[&str] = &[
     "media",
     "control",
     "rtt",
+    "caption",
     "unknown",
     "overflow_critical",
 ];
@@ -208,6 +207,7 @@ pub fn forget_room_metrics(room: &str) {
     // relay_downlink_congestion_filtered_total{room} (#1219 Half 2) — same
     // room-keyed unicast-filter sibling; swept alongside its CONGESTION cousin.
     let _ = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
+    let _ = RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL.remove_label_values(&[room]);
 
     // relay_room_bytes_total{room, direction}.
     for direction in ["inbound", "outbound"] {
@@ -506,6 +506,33 @@ lazy_static! {
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create audio_playout_latency_ms metric");
+
+    /// Cumulative 20 ms audio packets NetEQ removed unplayed, per receiver→source pair.
+    /// Counts only `smart_flush` and `resync_to_live` discards (`cause`). ABSENT, not 0, from a
+    /// client that does not report the field.
+    pub static ref AUDIO_PACKETS_DISCARDED_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_audio_packets_discarded_total",
+        "Cumulative 20 ms audio packets the receiver's NetEQ removed from its buffer without playing them; counts only smart_flush and resync_to_live discards (cause); absent for clients that do not report it",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "cause"]
+    )
+    .expect("Failed to create audio_packets_discarded_total metric");
+
+    /// Cumulative ms of silence the receiver's AudioWorklet played while the source's audio was
+    /// flowing, per receiver→source pair. ABSENT, not 0, from a client that does not report it.
+    pub static ref AUDIO_PLAYOUT_UNDERRUN_MS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_audio_playout_underrun_ms_total",
+        "Cumulative ms the receiver's AudioWorklet output silence while this source's audio was flowing (delivery gaps NetEQ does not count); absent for clients that do not report it",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create audio_playout_underrun_ms_total metric");
+
+    /// Count of the silent runs behind `AUDIO_PLAYOUT_UNDERRUN_MS_TOTAL`.
+    pub static ref AUDIO_PLAYOUT_UNDERRUN_EVENTS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_audio_playout_underrun_events_total",
+        "Cumulative count of silent runs in the receiver's AudioWorklet output while this source's audio was flowing; absent for clients that do not report it",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create audio_playout_underrun_events_total metric");
 
     /// NetEQ packets waiting for decode
     pub static ref NETEQ_PACKETS_AWAITING_DECODE: GaugeVec = register_gauge_vec!(
@@ -1960,9 +1987,8 @@ lazy_static! {
     /// `drop_reason` values:
     /// - `mailbox_full`: a fan-out `try_send` into a receiver's actor mailbox
     ///   failed (the #1057 room-wide-freeze signature). Emitted at the inbound
-    ///   fan-out hop (`chat_server.rs` `handle_msg`) for Critical/Control
-    ///   packets, packets the relay could not classify (unparseable wrapper /
-    ///   UNSPECIFIED `media_kind`), and `Closed`-mailbox drops.
+    ///   fan-out hop (`chat_server.rs` `handle_msg`) for every priority with no
+    ///   `priority_drop_label()` and on a `Closed` mailbox.
     /// - `channel_full`: a `try_send` into the policy-aware outbound channel
     ///   failed (emitted at the per-transport `Handler<Message>` hop).
     /// - `priority_drop_video` / `priority_drop_audio`: a droppable MEDIA frame
@@ -1975,6 +2001,8 @@ lazy_static! {
     ///   WHICH kind was sacrificed so a fan-out burst reads as "video shed"
     ///   rather than undifferentiated `mailbox_full`). Classified off the OUTER
     ///   cleartext `media_kind` (E2EE-safe), never the inner MediaType.
+    /// - `priority_drop_caption`: a server-authored caption TEXT was the kind
+    ///   sacrificed, at either hop.
     /// The label set mirrors the OUTBOUND taxonomy on
     /// [`OUTBOUND_CHANNEL_DROPS_TOTAL`] so one dashboard query spans both hops.
     pub static ref RELAY_PACKET_DROPS_TOTAL: CounterVec = register_counter_vec!(
@@ -2526,6 +2554,30 @@ lazy_static! {
     )
     .expect("Failed to create videocall_relay_kick_enforcements_total metric");
 
+    /// Non-observer joins whose room token carried no `meeting_started_at_ms`,
+    /// so its instance went unchecked (#3287).
+    pub static ref RELAY_JOIN_INSTANCE_UNCHECKED_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_relay_join_instance_unchecked_total",
+        "Non-observer joins admitted without a meeting_started_at_ms claim to check (#3287)",
+        &["transport"]
+    )
+    .expect("Failed to create videocall_relay_join_instance_unchecked_total metric");
+
+    /// Joins refused because the room token predates the room's latest known instance (#3287).
+    pub static ref RELAY_JOIN_STALE_INSTANCE_REFUSED_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_relay_join_stale_instance_refused_total",
+        "Joins refused for a room token minted for an earlier meeting instance (#3287)",
+        &["transport"]
+    )
+    .expect("Failed to create videocall_relay_join_stale_instance_refused_total metric");
+
+    /// Instance-registry rooms evicted to stay within its cap (#3287).
+    pub static ref RELAY_INSTANCE_REGISTRY_EVICTIONS_TOTAL: Counter = register_counter!(
+        "videocall_relay_instance_registry_evictions_total",
+        "Meeting-instance registry rooms evicted by the global cap (#3287)"
+    )
+    .expect("Failed to create videocall_relay_instance_registry_evictions_total metric");
+
     /// Room tokens accepted despite carrying no `typ` claim (#2411).
     pub static ref LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL: Counter = register_counter!(
         "videocall_legacy_token_type_accepted_total",
@@ -2577,9 +2629,7 @@ lazy_static! {
     /// This is the counter Grafana joins against to NAME the slow receiver in a
     /// room ("session 12345 is shedding video") instead of only "a session in
     /// this room is slow". `kind` is the subset of [`RELAY_DROP_KINDS`] the
-    /// transport actors pass to `record_session_drop`
-    /// (`audio|video|screen|media|control|rtt|unknown|priority_drop_video|
-    /// priority_drop_audio|overflow_critical`).
+    /// transport actors pass to `record_session_drop`.
     pub static ref RELAY_SESSION_DROPS_TOTAL: CounterVec = register_counter_vec!(
         "relay_session_drops_total",
         "Per-session outbound-channel drops attributable to a specific receiver session (GC'd on session close). Names the slow receiver for the meeting-investigation dashboard",
@@ -2602,9 +2652,9 @@ lazy_static! {
     ///
     /// NOTE (#1145): the DROP itself is no longer attributed indiscriminately.
     /// The room-tagged `relay_packet_drops_total{drop_reason}` now records
-    /// WHICH KIND was sacrificed on a `Full` mailbox (`priority_drop_video` /
-    /// `priority_drop_audio` for droppable media, `mailbox_full` for
-    /// Critical/Control/unclassifiable). THIS aggregate counter, by contrast,
+    /// WHICH KIND was sacrificed on a `Full` mailbox (the priority's drop
+    /// label when it has one, `mailbox_full` otherwise). THIS aggregate
+    /// counter, by contrast,
     /// still increments on EVERY inbound-mailbox drop regardless of kind, so
     /// the fleet-wide freeze signature (`rate()` summed over transport) is
     /// unchanged by that per-room attribution split.
@@ -2771,7 +2821,6 @@ lazy_static! {
     .expect("Failed to create relay_downlink_stream_idle_reaps_total metric");
 
     /// Frames written to a receiver's shared OVERFLOW stream, by CAUSE (#2723).
-    /// The two are very different and only one is a canary.
     ///
     /// `cause="unattributed"`: media the relay cannot attribute to a
     /// (publisher, kind), because the publisher predates
@@ -2780,10 +2829,10 @@ lazy_static! {
     /// `cause="cap"`: the receiver's publisher-key map was full. THIS is the
     /// canary, and its expected magnitude is zero.
     ///
-    /// CARDINALITY BOUND: 2 series (`webtransport` x {unattributed, cap}).
+    /// `cause="caption"`: a live caption.
     pub static ref RELAY_DOWNLINK_STREAM_OVERFLOW_FRAMES_TOTAL: CounterVec = register_counter_vec!(
         "relay_downlink_stream_overflow_frames_total",
-        "Frames written to the shared overflow downlink stream, by transport and cause: unattributed = media with no usable media_kind (expected high during the field-6 rollout), cap = the per-receiver publisher-stream cap was reached (expected zero) (#2723)",
+        "Frames written to the shared overflow downlink stream, by transport and cause: unattributed = media with no usable media_kind (expected high during the field-6 rollout), cap = the per-receiver publisher-stream cap was reached (expected zero), caption = live caption packets (#2723)",
         &["transport", "cause"]
     )
     .expect("Failed to create relay_downlink_stream_overflow_frames_total metric");
@@ -2825,8 +2874,7 @@ lazy_static! {
     /// by transport and `reason` (issue 2030).
     ///
     /// THIS COUNTS ERRORS, NOT OVERFLOW DROPS: quinn's `Datagrams::send(_, drop =
-    /// true)` pops the OLDEST queued datagram and returns `Ok` on overflow
-    /// (quinn-proto-0.11.13 `connection/datagrams.rs`).
+    /// true)` pops the OLDEST queued datagrams to make room and returns `Ok`.
     ///
     /// Fills the last quadrant of the bridge-drop counter family: inbound
     /// datagram/unistream drops are `relay_inbound_bridge_drops_total`; outbound
@@ -2847,7 +2895,7 @@ lazy_static! {
     /// `Ok`) and then silently evicts from its bounded outgoing datagram queue.
     /// That queue is sized by quinn's `datagram_send_buffer_size`; when a new
     /// datagram would overflow it, quinn pops and drops the OLDEST queued
-    /// datagram and STILL returns `Ok` from `send_datagram` (pacing / the
+    /// datagrams and STILL returns `Ok` from `send_datagram` (pacing / the
     /// congestion window only govern how fast that queue drains, so a slow
     /// drain is what lets it fill and overflow). This call site therefore
     /// cannot observe those send-buffer-overflow evictions;
@@ -2876,7 +2924,7 @@ lazy_static! {
     /// above). Safe for indefinite retention; no cleanup required.
     pub static ref RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL: CounterVec = register_counter_vec!(
         "relay_outbound_bridge_datagram_send_failures_total",
-        "Outbound relay->client WebTransport datagram send ERRORS at the bridge writer — send_datagram returned Err — by transport and reason (too_large|connection_lost|unsupported|disabled|webtransport). Since #2716 reason=too_large and reason=unsupported are still counted here but the packet is NOT lost: the writer diverts it to the reliable uni stream and records the outcome on videocall_relay_datagram_unistream_fallbacks_total. The other reasons are still losses. NOT overflow drops: quinn's outgoing-datagram queue evicts the OLDEST entry and still returns Ok, so those are invisible here; use videocall_relay_connection_datagram_silent_drops instead (issue 2030, corrected by #2712)",
+        "Outbound relay->client WebTransport datagram send ERRORS at the bridge writer — send_datagram returned Err — by transport and reason (too_large|connection_lost|unsupported|disabled|webtransport). Since #2716 reason=too_large and reason=unsupported are still counted here but the packet is NOT lost: the writer diverts it to the reliable uni stream and records the outcome on videocall_relay_datagram_unistream_fallbacks_total. The other reasons are still losses. NOT overflow drops: quinn's outgoing-datagram queue evicts the OLDEST entries and still returns Ok, so those are invisible here; use videocall_relay_connection_datagram_silent_drops instead (issue 2030, corrected by #2712)",
         &["transport", "reason"]
     )
     .expect("Failed to create relay_outbound_bridge_datagram_send_failures_total metric");
@@ -2884,9 +2932,7 @@ lazy_static! {
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///
     /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
-    /// `kind` is one of `audio`|`video`|`screen`|`media`|`control`|`rtt`|`unknown`|
-    /// `priority_drop_video`|`priority_drop_audio`|`overflow_critical`.
-    /// ~20 series total.
+    /// `kind` is one of [`RELAY_DROP_KINDS`]. ~30 series total.
     ///
     /// CARDINALITY TRADE-OFF: We deliberately do NOT include `session_id` as a
     /// label — session IDs are unbounded and would explode storage. The existing
@@ -2894,8 +2940,7 @@ lazy_static! {
     /// new counter is the protocol-wide aggregate that backs alerting (rate()
     /// over 5m). Use `relay_packet_drops_total` for per-room investigation.
     ///
-    /// `kind` values (set in `wt_chat_session::drop_kind_label` and the
-    /// matching helper in `ws_chat_session`):
+    /// `kind` values (one of [`RELAY_DROP_KINDS`]):
     /// - `audio`: MEDIA packet whose inner `MediaPacket.media_type == AUDIO`,
     ///   dropped on a real channel-full event (NOT the new priority policy —
     ///   audio at >=95% goes to `priority_drop_audio` instead).
@@ -2911,7 +2956,7 @@ lazy_static! {
     /// - `control`: any non-media outbound (heartbeats, session-assigned, etc.)
     ///   dropped on a real channel-full event (rare: control should never
     ///   be preempted by the priority policy — see `overflow_critical`).
-    /// - `rtt`: RTT echo path that drops on a full datagram queue
+    /// - `rtt`: an RTT echo dropped at WT lane admission or shed by the bridge
     /// - `unknown`: caller could not classify (parse failure / unparsed paths)
     /// - `priority_drop_video`: MEDIA video or screen frame *preemptively*
     ///   dropped at the enqueue site because the per-session outbound
@@ -2931,6 +2976,8 @@ lazy_static! {
     ///   indicates the channel is so saturated that even the highest-
     ///   priority lifecycle packets cannot be admitted. Page on this.
     ///   Added 2026-05-11 (discussion #699).
+    /// - `caption`: a server-authored CAPTION lost to a full channel or lane.
+    /// - `priority_drop_caption`: a CAPTION shed by the priority policy.
     ///
     /// BACKWARDS-COMPAT NOTE FOR DASHBOARDS: queries grouped on `kind="media"`
     /// will only see the catch-all bucket after this change; audio/video/screen
@@ -3076,6 +3123,15 @@ lazy_static! {
     )
     .expect("Failed to create relay_downlink_congestion_filtered_total metric");
 
+    /// KEYFRAME_REQUEST copies the per-session forwarder dropped because they
+    /// target another participant (#3206).
+    pub static ref RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_keyframe_request_filtered_total",
+        "KEYFRAME_REQUEST copies dropped because they target another participant (#3206)",
+        &["room"]
+    )
+    .expect("Failed to create relay_keyframe_request_filtered_total metric");
+
     // ===== RELAY-MEASURED PER-CONNECTION QUIC PATH HEALTH (#1637, epic #1636) =====
     //
     // LEAD SIGNAL SET for distinguishing the two incident mechanisms epic #1636 is
@@ -3089,20 +3145,17 @@ lazy_static! {
     //         (just late/lossy), so the ACK-gated estimators move. Shared network.
     //
     //   (ii)  FULL COLLAPSE (mechanism C, the 14:07:00 synchronized-SESSION-DROPPED
-    //         shape): the downlink stops returning ACKs entirely. `rtt`,
-    //         `lost_packets`, `congestion_events` FREEZE FLAT — they update ONLY on
-    //         ACK receipt (`RttEstimator::update`/`detect_lost_packets`/`process_ecn`,
-    //         all reached only from `on_ack_received` in quinn-proto 0.11.13
-    //         connection/mod.rs:1522/1530/…). BUT the relay keeps TRANSMITTING into
-    //         the void (egress + runtime are fine), so `sent_packets` KEEPS CLIMBING
-    //         (incremented on every packet built — `PacketBuilder::finish`,
-    //         packet_builder.rs:217 — independent of ACKs). So: rtt/loss/congestion
-    //         flat + `sent_packets` climbing ⇒ C-collapse, NOT B. This case is the
-    //         whole reason `sent_packets` exists; without it a full collapse is
-    //         INDISTINGUISHABLE from mechanism B and from a healthy idle link.
+    //         shape): the downlink stops returning ACKs entirely. BUT the relay
+    //         keeps TRANSMITTING into the void (egress + runtime are fine), so
+    //         `sent_packets` KEEPS CLIMBING (incremented on packets built —
+    //         `PacketBuilder::finish_and_track` — independent of ACKs). So:
+    //         rtt/loss/congestion flat + `sent_packets` climbing ⇒ C-collapse,
+    //         NOT B. This case is the whole reason `sent_packets` exists; without
+    //         it a full collapse is INDISTINGUISHABLE from mechanism B and from a
+    //         healthy idle link.
     //
-    //   (iii) THREAD-STARVATION (mechanism B / Gun #2, #1639): the relay's single
-    //         runtime thread is wedged, so it cannot run the SEND path either —
+    //   (iii) THREAD-STARVATION (mechanism B / Gun #2, #1639): the relay's
+    //         runtime is wedged, so it cannot run the SEND path either —
     //         `sent_packets` ALSO goes flat — AND `videocall_relay_scheduler_lag_ms`
     //         spikes. EVERYTHING (rtt, loss, congestion, sent_packets) flat + a
     //         scheduler-lag spike ⇒ B.
@@ -3120,11 +3173,7 @@ lazy_static! {
     // NOTE — there is NO "last-ACK age" field in quinn (quinn-proto 0.11
     // `connection/stats.rs` exposes `PathStats { rtt, lost_packets, lost_bytes,
     // congestion_events, sent_packets, cwnd, current_mtu, .. }` and
-    // `Connection::rtt()`, but no direct ack-age accessor). The issue's "last-ACK
-    // age" intent is served HERE by the (rtt+loss+congestion) freeze contrasted
-    // against `sent_packets` still climbing — together they answer "is this path
-    // still being serviced, and are WE still sending?" without fabricating a field
-    // quinn does not expose.
+    // `Connection::rtt()`, but no direct ack-age accessor).
 
     /// Relay-measured smoothed RTT for a live WebTransport connection, in ms
     /// (#1637). Read from `quinn` `ConnectionStats.path.rtt` (identical to
@@ -3143,12 +3192,11 @@ lazy_static! {
     ///
     /// CAVEAT — `initial_rtt` floor: a path that has NOT YET had an ACK sampled
     /// returns the `initial_rtt` CONSTANT, not a real measurement. quinn-proto 0.11
-    /// defaults that to 333ms (`config/transport.rs:373`; the relay does not
-    /// override it), because `RttEstimator::get()` is `smoothed.unwrap_or(latest)`
-    /// and `latest` starts at `initial_rtt` (`connection/paths.rs:307`,`:299`). So
-    /// a flat ~333ms reading can mean "no ACK sampled yet" (e.g. a path reset)
-    /// rather than a healthy 333ms link — do not misread it as a real RTT. The
-    /// sampler deliberately SKIPS the first tick on a brand-new connection (see
+    /// defaults that to 333ms (the relay does not override it), because
+    /// `RttEstimator::get()` is `smoothed.unwrap_or(latest)` and `latest` starts at
+    /// `initial_rtt`. So a flat ~333ms reading can mean "no ACK sampled yet"
+    /// (e.g. a path reset) rather than a healthy 333ms link — do not misread it
+    /// as a real RTT. The sampler deliberately SKIPS the first tick on a brand-new connection (see
     /// `sample_connection_path_stats`) to avoid emitting this floor at t=0, but a
     /// mid-life path reset can still surface it.
     ///
@@ -3217,18 +3265,17 @@ lazy_static! {
     /// snapshot as the three gauges above.
     ///
     /// THE B-vs-C DISAMBIGUATOR (this is why the gauge exists). Unlike `rtt` /
-    /// `lost_packets` / `congestion_events` — which update ONLY on ACK receipt and
-    /// therefore FREEZE FLAT the instant a downlink fully collapses — `sent_packets`
-    /// is incremented on the EGRESS path, on every packet the relay builds
-    /// (quinn-proto `PacketBuilder::finish`, packet_builder.rs:217), independent of
-    /// whether any ACK ever comes back. So:
+    /// `lost_packets` / `congestion_events`, `sent_packets` is incremented on the
+    /// EGRESS path, on packets the relay builds (quinn-proto
+    /// `PacketBuilder::finish_and_track`), independent of whether any ACK ever
+    /// comes back. So:
     ///   * `sent_packets` CLIMBING while rtt/loss/congestion are FLAT ⇒ the relay is
     ///     still transmitting but getting nothing back: a downlink/NIC COLLAPSE
     ///     (mechanism C), NOT a relay stall. Without this gauge that collapse is
     ///     indistinguishable from mechanism B and from a healthy idle link.
     ///   * `sent_packets` ALSO FLAT (plus a `videocall_relay_scheduler_lag_ms`
-    ///     spike) ⇒ the relay's single runtime thread is wedged and cannot even run
-    ///     the send path: mechanism B (thread-starvation / Gun #2, #1639).
+    ///     spike) ⇒ the relay's runtime is wedged and cannot even run the send
+    ///     path: mechanism B (thread-starvation / Gun #2, #1639).
     ///
     /// Cumulative-in-a-gauge, same convention/GC/`rate()`-query guidance as the
     /// loss/congestion gauges above. Note it counts BUILT packets across all
@@ -3239,24 +3286,22 @@ lazy_static! {
     /// [`forget_connection_path_stats`].
     pub static ref RELAY_CONNECTION_PATH_SENT_PACKETS: GaugeVec = register_gauge_vec!(
         "videocall_relay_connection_path_sent_packets",
-        "Relay-measured cumulative packets SENT (quinn ConnectionStats.path.sent_packets, egress-counted, NOT ACK-gated) on a live WebTransport connection. Climbing while rtt/loss freeze flat => downlink collapse (mechanism C); flat + scheduler_lag spike => relay thread-starvation (mechanism B). Cumulative-in-a-gauge; chart with rate()/increase() (#1637)",
+        "Relay-measured cumulative packets SENT (quinn ConnectionStats.path.sent_packets, egress-counted, NOT ACK-gated) on a live WebTransport connection. Flat + scheduler_lag spike => relay thread-starvation (mechanism B). Cumulative-in-a-gauge; chart with rate()/increase() (#1637)",
         &["room", "session_id"]
     )
     .expect("Failed to create videocall_relay_connection_path_sent_packets metric");
 
 
-    /// Replaces #2712's structurally-zero `frame_tx_data_blocked` (#2716).
     pub static ref RELAY_CONNECTION_FRAME_RX_MAX_DATA: GaugeVec = register_gauge_vec!(
         "videocall_relay_connection_frame_rx_max_data",
-        "Relay-measured cumulative MAX_DATA frames RECEIVED (quinn ConnectionStats.frame_rx.max_data) on a live WebTransport connection: connection-level flow-control credit the peer granted the relay. Read it as the INVERSE of a stall — a receiver that stops granting credit while the relay still has data queued is the wedge. Pair with videocall_relay_connection_path_cwnd_bytes and the outbound queue depth. Replaces frame_tx_data_blocked, which quinn-proto 0.11.13 never increments (it has no TX construction site for DATA_BLOCKED). Cumulative-in-a-gauge; chart with rate()/increase() (#2712, corrected by #2716)",
+        "Relay-measured cumulative MAX_DATA frames RECEIVED (quinn ConnectionStats.frame_rx.max_data) on a live WebTransport connection: connection-level flow-control credit the peer granted the relay. Read it as the INVERSE of a stall — a receiver that stops granting credit while the relay still has data queued is the wedge. Pair with videocall_relay_connection_path_cwnd_bytes and the outbound queue depth. Cumulative-in-a-gauge; chart with rate()/increase() (#2712, corrected by #2716)",
         &["room", "session_id"]
     )
     .expect("Failed to create videocall_relay_connection_frame_rx_max_data metric");
 
-    /// Per-stream counterpart; replaces `frame_tx_stream_data_blocked` (#2716).
     pub static ref RELAY_CONNECTION_FRAME_RX_MAX_STREAM_DATA: GaugeVec = register_gauge_vec!(
         "videocall_relay_connection_frame_rx_max_stream_data",
-        "Relay-measured cumulative MAX_STREAM_DATA frames RECEIVED (quinn ConnectionStats.frame_rx.max_stream_data) on a live WebTransport connection: per-stream flow-control credit the peer granted. This is the window the persistent unistream writer parks on (#1638), so a flat line here while that writer is parked identifies the receiver as the stall. Replaces frame_tx_stream_data_blocked, which quinn-proto 0.11.13 never increments. Cumulative-in-a-gauge; chart with rate()/increase() (#2712, corrected by #2716)",
+        "Relay-measured cumulative MAX_STREAM_DATA frames RECEIVED (quinn ConnectionStats.frame_rx.max_stream_data) on a live WebTransport connection: per-stream flow-control credit the peer granted. This is the window the persistent unistream writer parks on (#1638), so a flat line here while that writer is parked identifies the receiver as the stall. Cumulative-in-a-gauge; chart with rate()/increase() (#2712, corrected by #2716)",
         &["room", "session_id"]
     )
     .expect("Failed to create videocall_relay_connection_frame_rx_max_stream_data metric");
@@ -3298,14 +3343,14 @@ lazy_static! {
 
     pub static ref RELAY_CONNECTION_DATAGRAM_SILENT_DROPS: GaugeVec = register_gauge_vec!(
         "videocall_relay_connection_datagram_silent_drops",
-        "Relay->client datagrams enqueued but never transmitted on a live WebTransport connection: datagram_send_calls - frame_tx.datagram, clamped at 0. quinn's outgoing-datagram queue pops the OLDEST entry on overflow and still returns Ok, so the send-failures counter cannot see these; this can. Part of the value is queued-not-yet-sent, bounded by datagram_send_buffer_size, which #2742 set to WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES = 65975 (about 325 sub-MTU datagrams) — so read only a value CLIMBING across 5s ticks as real silent loss, and anything past ~325 as eviction (#2712, bound corrected by #2742)",
+        "Relay->client datagrams enqueued but never transmitted on a live WebTransport connection: datagram_send_calls - frame_tx.datagram, clamped at 0. quinn's outgoing-datagram queue evicts its OLDEST entries to make room for a new one and still returns Ok, so the send-failures counter cannot see these; this can. Part of the value is queued-not-yet-sent, bounded by datagram_send_buffer_size (WT_QUIC_DATAGRAM_SEND_BUFFER_BYTES) — so read only a value CLIMBING across 5s ticks as real silent loss (#2712, bound corrected by #2742)",
         &["room", "session_id"]
     )
     .expect("Failed to create videocall_relay_connection_datagram_silent_drops metric");
 
     pub static ref RELAY_CONNECTION_DATAGRAM_SEND_BUFFER_SPACE_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_relay_connection_datagram_send_buffer_space_bytes",
-        "Bytes free in quinn's outgoing datagram queue (quinn::Connection::datagram_send_buffer_space) for a live WebTransport connection. INSTANTANEOUS level, not cumulative. Zero means the queue has reached its budget: quinn evicts only while the queued total EXCEEDS datagram_send_buffer_size, so zero is the threshold at which the next send_datagram may start evicting, not proof one already did. Sustained zero + climbing datagram_silent_drops identifies queue overflow as the drop mechanism (#2712)",
+        "Bytes free in quinn's outgoing datagram queue (quinn::Connection::datagram_send_buffer_space) for a live WebTransport connection. INSTANTANEOUS level, not cumulative. Free space below the next datagram's bytes means a send at that moment evicts the oldest; a saturated queue reads in that range, not necessarily 0, and a low reading is not proof one already did. Sustained sub-datagram space + climbing datagram_silent_drops identifies queue overflow as the drop mechanism (#2712)",
         &["room", "session_id"]
     )
     .expect("Failed to create videocall_relay_connection_datagram_send_buffer_space_bytes metric");
@@ -3794,6 +3839,7 @@ pub fn register_nats_statistics(client: &async_nats::Client) -> prometheus::Resu
 /// probe — both relays.
 fn init_relay_common_series() {
     lazy_static::initialize(&LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL);
+    lazy_static::initialize(&RELAY_INSTANCE_REGISTRY_EVICTIONS_TOTAL);
     lazy_static::initialize(&RELAY_NATS_PUBLISH_LATENCY_MS);
     init_nats_event_series();
     lazy_static::initialize(&RELAY_SCHEDULER_LAG_MS);
@@ -4346,13 +4392,13 @@ mod tests {
     /// they are functions, so a NEW emitted kind is caught — not just deletions
     /// from the const (issue #1186):
     ///
-    ///   * `drop_kind_label` (ws + wt transports): ENUMERATED over its full input
+    ///   * `drop_kind_label` (shared by the ws + wt transports): ENUMERATED over its full input
     ///     domain — `parsed ∈ {false, true}` × `is_media ∈ {false, true}` ×
     ///     `media_type ∈ {None} ∪ MediaType::VALUES`. `MediaType::VALUES` is the
     ///     protobuf-generated variant list, so adding a `MediaType` variant that
-    ///     maps to a new label surfaces here automatically. Both transport copies
-    ///     are enumerated and asserted equal, so drift between them is also caught.
-    ///   * `OutboundPriority::priority_drop_label`: ENUMERATED over every
+    ///     maps to a new label surfaces here automatically.
+    ///   * `OutboundPriority::{priority_drop_label, channel_full_kind}` and
+    ///     `bridge::outbound_drop_kind`: ENUMERATED over every
     ///     `OutboundPriority` variant. The local `all_priorities` list is pinned
     ///     to an exhaustive `match` below, so adding a variant fails to COMPILE
     ///     until the witness is updated.
@@ -4366,8 +4412,8 @@ mod tests {
     /// `RELAY_DROP_KINDS` also fails it.
     #[test]
     fn relay_drop_kinds_covers_all_emitted_drop_labels() {
-        use crate::actors::priority_drop::OutboundPriority;
-        use crate::actors::transports::{ws_chat_session, wt_chat_session};
+        use crate::actors::priority_drop::{drop_kind_label, OutboundPriority};
+        use crate::webtransport::bridge::outbound_drop_kind;
         use protobuf::Enum; // brings `MediaType::VALUES` (trait const) into scope
         use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -4382,22 +4428,11 @@ mod tests {
         for &parsed in &[false, true] {
             for &is_media in &[false, true] {
                 for &mt in &media_types {
-                    let ws_label = ws_chat_session::drop_kind_label(parsed, is_media, mt);
-                    let wt_label = wt_chat_session::drop_kind_label(parsed, is_media, mt);
-                    // The two transport copies MUST stay in lock-step — a drift
-                    // would silently double the taxonomy the GC must cover.
-                    assert_eq!(
-                        ws_label, wt_label,
-                        "ws/wt drop_kind_label disagree for (parsed={parsed}, \
-                         is_media={is_media}, media_type={mt:?}); the copies must \
-                         stay in lock-step (#1186)"
-                    );
-                    emitted.insert(ws_label);
+                    emitted.insert(drop_kind_label(parsed, is_media, mt));
                 }
             }
         }
 
-        // ---- Tier 1b: enumerate the real `priority_drop_label` emit fn. ----
         // `all_priorities` is pinned to an exhaustive match so a new variant
         // breaks compilation until this list (and the witness) are updated.
         let all_priorities = [
@@ -4407,6 +4442,8 @@ mod tests {
             OutboundPriority::Video,
             OutboundPriority::Screen,
             OutboundPriority::ProbeEcho,
+            OutboundPriority::Caption,
+            OutboundPriority::CaptionStatus,
         ];
         for p in all_priorities {
             // Compile-time exhaustiveness guard: adding an OutboundPriority
@@ -4418,11 +4455,13 @@ mod tests {
                 | OutboundPriority::Audio
                 | OutboundPriority::Video
                 | OutboundPriority::Screen
-                | OutboundPriority::ProbeEcho => {}
+                | OutboundPriority::ProbeEcho
+                | OutboundPriority::Caption
+                | OutboundPriority::CaptionStatus => {}
             }
-            if let Some(label) = p.priority_drop_label() {
-                emitted.insert(label);
-            }
+            emitted.extend(p.priority_drop_label());
+            emitted.extend(p.channel_full_kind());
+            emitted.insert(outbound_drop_kind(p));
         }
 
         // Every label produced by the emit FUNCTIONS must be covered.
@@ -4554,6 +4593,9 @@ mod tests {
         RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
             .with_label_values(&[room])
             .inc();
+        RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
         RELAY_ROOM_BYTES_TOTAL
             .with_label_values(&[room, "outbound"])
             .inc();
@@ -4628,8 +4670,23 @@ mod tests {
             "nonvideo-guard seed must be observable before removal (non-vacuous)"
         );
 
+        assert_eq!(
+            RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            1.0
+        );
+
         // Drain the room.
         forget_room_metrics(room);
+
+        assert_eq!(
+            RELAY_KEYFRAME_REQUEST_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0,
+            "relay_keyframe_request_filtered_total{{room}} must be swept by forget_room_metrics"
+        );
 
         // Every room-labeled series must now be gone. A removed series reads
         // back at the type default on a fresh handle.

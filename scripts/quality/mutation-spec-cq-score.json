@@ -1,0 +1,589 @@
+{
+ "_comment": [
+  "Mutations of the scorer's relay evidence (#2914 PR B), each naming the unit test that must catch it:",
+  "  scripts/mutation-check.py run scripts/quality/mutation-spec-cq-score.json"
+ ],
+ "runner": "unittest",
+ "cwd": ".",
+ "command": [
+  "python3",
+  "-m",
+  "unittest",
+  "discover",
+  "-s",
+  "scripts/quality",
+  "-p",
+  "test_call_quality_score.py"
+ ],
+ "baseline_tests": 248,
+ "mutations": [
+  {
+   "name": "escalations queried at stage two only (the original defect)",
+   "file": "scripts/quality/cq_score.py",
+   "find": "\"shed_escalations\": (\"relay_downlink_shed_escalations_total\", [], \"stage\"",
+   "replace": "\"shed_escalations\": (\"relay_downlink_shed_escalations_total\", [(\"stage\", \"=\", \"two\")], \"stage\"",
+   "expect_kills": [
+    "test_stage_one_escalations_are_reported_beside_stage_two",
+    "test_the_26_oct_hcl_daily_runs"
+   ]
+  },
+  {
+   "name": "an absent counter is not zero-filled",
+   "file": "scripts/quality/cq_score.py",
+   "find": "by.setdefault(f\"{t}/{v}\", 0.0)",
+   "replace": "by.get(t)",
+   "expect_kills": [
+    "test_an_absent_counter_reads_zero_only_where_the_relay_exports_it_for_this_room"
+   ]
+  },
+  {
+   "name": "a failed diagnostic query reads as empty",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            out[name] = FailedQuery()",
+   "replace": "            out[name] = []",
+   "expect_kills": [
+    "test_a_failed_diagnostic_query_reads_query_failed_and_scoring_goes_on"
+   ]
+  },
+  {
+   "name": "a failed scoring query is swallowed too",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            if name not in DIAGNOSTIC_SERIES:\n                raise\n",
+   "replace": "            if name not in DIAGNOSTIC_SERIES:\n                pass\n",
+   "expect_kills": [
+    "test_a_failed_diagnostic_query_reads_query_failed_and_scoring_goes_on"
+   ]
+  },
+  {
+   "name": "QUIC gauges summed from zero, not from the hold start",
+   "file": "scripts/quality/cq_score.py",
+   "find": "per[sid][field].append(_series_total(samples, start, births.get(sid, (-math.inf,))[0] > start))",
+   "replace": "per[sid][field].append(_series_total(samples, 0, True))",
+   "expect_kills": [
+    "test_quic_loss_uses_each_sessions_own_increase_when_a_session_ends_mid_hold",
+    "test_the_26_oct_hcl_daily_runs"
+   ]
+  },
+  {
+   "name": "QUIC loss fraction over lost plus sent",
+   "file": "scripts/quality/cq_score.py",
+   "find": "\"loss_fraction\": lost / sent if sent else None, \"loss_sessions\"",
+   "replace": "\"loss_fraction\": lost / (sent + lost) if sent else None, \"loss_sessions\"",
+   "expect_kills": [
+    "test_quic_loss_uses_each_sessions_own_increase_when_a_session_ends_mid_hold",
+    "test_the_26_oct_hcl_daily_runs"
+   ]
+  },
+  {
+   "name": "CFS read without a selector",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    if not pods:\n        return {\"status\": NOT_COLLECTED, \"detail\": \"no relay and NATS pod selector",
+   "replace": "    if False:\n        return {\"status\": NOT_COLLECTED, \"detail\": \"no relay and NATS pod selector",
+   "expect_kills": [
+    "test_cpu_throttling_is_not_collected_without_a_selector_and_scoped_by_it"
+   ]
+  },
+  {
+   "name": "CFS queried without a selector",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    if pods:\n        q.append((\"_cfs\"",
+   "replace": "    if True:\n        q.append((\"_cfs\"",
+   "expect_kills": [
+    "test_cpu_throttling_is_not_collected_without_a_selector_and_scoped_by_it"
+   ]
+  },
+  {
+   "name": "session drops not attributed to their receiver",
+   "file": "scripts/quality/cq_score.py",
+   "find": "by_user[sess2user.get(labels.get(\"session_id\"), \"?\")][labels.get(\"kind\", \"?\")]",
+   "replace": "by_user[\"?\"][labels.get(\"kind\", \"?\")]",
+   "expect_kills": [
+    "test_audio_drops_are_split_by_kind_transport_and_receiver",
+    "test_per_user_relay_evidence_is_pseudonymised"
+   ]
+  },
+  {
+   "name": "per-user relay evidence keeps real identities",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "\"by_user\", \"transport_timeline\", \"transport_fallbacks\")",
+   "replace": "\"transport_timeline\", \"transport_fallbacks\")",
+   "expect_kills": [
+    "test_per_user_relay_evidence_is_pseudonymised"
+   ]
+  },
+  {
+   "name": "a full PromQL expression accepted as the throttle selector",
+   "file": "scripts/quality/cq_score.py",
+   "find": "set(pods) & set(\"{}\\n\")",
+   "replace": "set(pods) & set(\"\\n\")",
+   "expect_kills": [
+    "test_the_throttle_selector_must_be_matchers_or_null"
+   ]
+  },
+  {
+   "name": "the report drops the escalation row",
+   "file": "scripts/quality/cq_report.py",
+   "find": "    \"shed_escalations\": \"Shed escalations (stage one: camera video shed; two: session closed)\",\n",
+   "replace": "",
+   "expect_kills": [
+    "test_stage_one_escalations_are_reported_beside_stage_two"
+   ]
+  },
+  {
+   "name": "pre-hold switches counted in the hold",
+   "file": "scripts/quality/cq_score.py",
+   "find": "\"switches_in_hold\": sum(1 for _, _, at in moves if hs < at),",
+   "replace": "\"switches_in_hold\": len(moves),",
+   "expect_kills": [
+    "test_the_26_oct_tab_switches"
+   ]
+  },
+  {
+   "name": "transport fetched over the hold only",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        (M_RTT, selector(M_RTT, meet), *wide),",
+   "replace": "        (M_RTT, selector(M_RTT, meet), *hold),",
+   "expect_kills": [
+    "test_transport_is_fetched_from_the_join_so_a_pre_hold_switch_is_seen"
+   ]
+  },
+  {
+   "name": "a recorded fallback the health reports miss is not noticed",
+   "file": "scripts/quality/cq_score.py",
+   "find": "if f[\"fallbacks_in_health_reports\"] is not None and f[\"fallbacks\"] > f[\"fallbacks_in_health_reports\"])",
+   "replace": "if f[\"fallbacks_in_health_reports\"] is not None and f[\"fallbacks\"] > f[\"fallbacks_in_health_reports\"] + 1)",
+   "expect_kills": [
+    "test_a_fallback_the_health_reports_miss_is_reconciled_from_the_bots_app_record"
+   ]
+  },
+  {
+   "name": "a switch is not flagged",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if tl[\"switches\"]:\n            flags.append(",
+   "replace": "        if False:\n            flags.append(",
+   "expect_kills": [
+    "test_a_switch_mid_run_is_recorded_not_collapsed_to_the_majority"
+   ]
+  },
+  {
+   "name": "the transport timeline keeps real identities",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "\"by_user\", \"transport_timeline\", \"transport_fallbacks\")",
+   "replace": "\"by_user\", \"transport_fallbacks\")",
+   "expect_kills": [
+    "test_a_switch_mid_run_is_recorded_not_collapsed_to_the_majority"
+   ]
+  },
+  {
+   "name": "the report shows the majority transport only",
+   "file": "scripts/quality/cq_report.py",
+   "find": "    elif tl.get(\"sessions\"):\n",
+   "replace": "    elif False:\n",
+   "expect_kills": [
+    "test_a_switch_mid_run_is_recorded_not_collapsed_to_the_majority"
+   ]
+  },
+  {
+   "name": "the manifest accepts a negative fallback count",
+   "file": "scripts/quality/cq_manifest.py",
+   "find": "if fallbacks is not None and (int(fallbacks) != fallbacks or fallbacks < 0):",
+   "replace": "if fallbacks is not None and int(fallbacks) != fallbacks:",
+   "expect_kills": [
+    "test_recorded_transport_fields_are_checked"
+   ]
+  },
+  {
+   "name": "the majority transport counts the joining period too",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        n = sum(1 for t, _ in samples if t >= hs)",
+   "replace": "        n = len(samples)",
+   "expect_kills": [
+    "test_the_majority_transport_counts_the_hold_only"
+   ]
+  },
+  {
+   "name": "only server queries are failure-tolerant",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            if name not in DIAGNOSTIC_SERIES:\n                raise\n",
+   "replace": "            if name not in SERVER_QUERIES:\n                raise\n",
+   "expect_kills": [
+    "test_every_diagnostic_query_failure_reads_query_failed_and_changes_no_gate"
+   ]
+  },
+  {
+   "name": "a failed room query reads not collected",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        return {\"status\": FAILED if room_failed else NOT_COLLECTED, \"detail\": detail or \"no series\"}",
+   "replace": "        return {\"status\": NOT_COLLECTED, \"detail\": detail or \"no series\"}",
+   "expect_kills": [
+    "test_a_failed_room_query_makes_its_dependants_read_query_failed"
+   ]
+  },
+  {
+   "name": "zero-filled without evidence the relay exports it",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    for t in set(transports) & exported:",
+   "replace": "    for t in transports:",
+   "expect_kills": [
+    "test_an_absent_counter_reads_zero_only_where_the_relay_exports_it_for_this_room"
+   ]
+  },
+  {
+   "name": "any switch counts as a fallback",
+   "file": "scripts/quality/cq_score.py",
+   "find": "if a == pref and b in (\"webtransport\", \"websocket\")))",
+   "replace": "if b in (\"webtransport\", \"websocket\")))",
+   "expect_kills": [
+    "test_fallbacks_are_reconciled_over_the_run_in_the_preferred_direction"
+   ]
+  },
+  {
+   "name": "RTT fetched for observers only",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        (M_RTT, selector(M_RTT, meet), *wide),",
+   "replace": "        (M_RTT, selector(M_RTT, meet + ([(\"peer_id\", \"=~\", any_of_regex(observers))] if observers else [])), *wide),",
+   "expect_kills": [
+    "test_a_non_observer_browser_gets_its_timeline_and_pre_hold_rtt_picks_no_transport"
+   ]
+  },
+  {
+   "name": "a transport with no hold samples is a candidate",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if labels.get(\"session_id\") in sessions and n:",
+   "replace": "        if labels.get(\"session_id\") in sessions:",
+   "expect_kills": [
+    "test_a_non_observer_browser_gets_its_timeline_and_pre_hold_rtt_picks_no_transport"
+   ]
+  },
+  {
+   "name": "the record is hidden without RTT history",
+   "file": "scripts/quality/cq_report.py",
+   "find": "    rec = tl.get(\"recorded\")\n    if rec:",
+   "replace": "    rec = tl.get(\"recorded\") if path else None\n    if rec:",
+   "expect_kills": [
+    "test_the_record_is_shown_without_any_rtt_history"
+   ]
+  },
+  {
+   "name": "the run-level reconciliation keeps real identities",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "\"by_user\", \"transport_timeline\", \"transport_fallbacks\")",
+   "replace": "\"by_user\", \"transport_timeline\")",
+   "expect_kills": [
+    "test_the_run_level_reconciliation_is_pseudonymised"
+   ]
+  },
+  {
+   "name": "session ids stay in the result",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "    return ((seen | {p[\"user_id\"] for p in parts if p[\"fleet\"] == \"human\"}) - bots) | sessions",
+   "replace": "    return (seen | {p[\"user_id\"] for p in parts if p[\"fleet\"] == \"human\"}) - bots",
+   "expect_kills": [
+    "test_no_session_id_survives_pseudonymisation"
+   ]
+  },
+  {
+   "name": "session_id fields are not pseudonymised",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "\"rust_bot_reporters\", \"session_id\", \"unknown_publisher_sessions\")",
+   "replace": "\"rust_bot_reporters\", \"unknown_publisher_sessions\")",
+   "expect_kills": [
+    "test_no_session_id_survives_pseudonymisation"
+   ]
+  },
+  {
+   "name": "an absent QUIC gauge reads 0 in its row",
+   "file": "scripts/quality/cq_score.py",
+   "find": "row = {k: (None if not v or None in v else sum(v)) for k, v in st.items() if k != \"rtt\"}",
+   "replace": "row = {k: (0.0 if not v else None if None in v else sum(v)) for k, v in st.items() if k != \"rtt\"}",
+   "expect_kills": [
+    "test_quic_sessions_with_unknown_or_zero_counts",
+    "test_a_quic_gauge_without_a_series_is_unknown_not_zero"
+   ]
+  },
+  {
+   "name": "a session born in the hold drops its first count",
+   "file": "scripts/quality/cq_score.py",
+   "find": "per[sid][field].append(_series_total(samples, start, births.get(sid, (-math.inf,))[0] > start))",
+   "replace": "per[sid][field].append(_series_total(samples, start, False))",
+   "expect_kills": [
+    "test_quic_sessions_with_unknown_or_zero_counts"
+   ]
+  },
+  {
+   "name": "an unknown QUIC baseline reads as a measured count",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    if not samples or (samples[0][0] > start and not born_after):\n",
+   "replace": "    if not samples:\n",
+   "expect_kills": [
+    "test_a_quic_session_first_seen_after_the_hold_start_books_no_unknown_baseline"
+   ]
+  },
+  {
+   "name": "a session that sent nothing is left out of the loss",
+   "file": "scripts/quality/cq_score.py",
+   "find": "both = [st for st in rows if st[\"lost\"] is not None and st[\"sent\"] is not None]",
+   "replace": "both = [st for st in rows if st[\"lost\"] is not None and st[\"sent\"]]",
+   "expect_kills": [
+    "test_quic_sessions_with_unknown_or_zero_counts"
+   ]
+  },
+  {
+   "name": "a series with no finite sample counts as measured",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    series = [(labels, samples) for labels, samples in series if samples]\n",
+   "replace": "",
+   "expect_kills": [
+    "test_a_counter_series_with_no_finite_sample_is_not_a_measured_zero"
+   ]
+  },
+  {
+   "name": "a move to an unknown transport counts as a fallback",
+   "file": "scripts/quality/cq_score.py",
+   "find": "if a == pref and b in (\"webtransport\", \"websocket\")))",
+   "replace": "if a == pref))",
+   "expect_kills": [
+    "test_fallbacks_are_reconciled_over_the_run_in_the_preferred_direction"
+   ]
+  },
+  {
+   "name": "short structured identities stay raw",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "        return words(\" <- \".join(exact.get(p, p) for p in text.split(\" <- \")))",
+   "replace": "        return words(text)",
+   "expect_kills": [
+    "test_t8_short_identities_in_structured_fields_are_pseudonymised"
+   ]
+  },
+  {
+   "name": "unknown publisher sessions are not scrubbed",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "\"rust_bot_reporters\", \"session_id\", \"unknown_publisher_sessions\")",
+   "replace": "\"rust_bot_reporters\", \"session_id\")",
+   "expect_kills": [
+    "test_t8_a_session_seen_only_as_a_publisher_is_pseudonymised"
+   ]
+  },
+  {
+   "name": "to_peer sessions are not discovered",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "SESSION_LABELS = (\"session_id\", \"to_peer\")",
+   "replace": "SESSION_LABELS = (\"session_id\",)",
+   "expect_kills": [
+    "test_t8_a_session_seen_only_as_a_publisher_is_pseudonymised"
+   ]
+  },
+  {
+   "name": "concurrent sessions still reconcile fallbacks",
+   "file": "scripts/quality/cq_score.py",
+   "find": "seen = (None if failed or concurrent or not rows or pref",
+   "replace": "seen = (None if failed or not rows or pref",
+   "expect_kills": [
+    "test_two_concurrent_tabs_are_not_a_switch_and_leave_fallbacks_unknown",
+    "test_a_session_beside_a_long_lived_tab_is_not_a_switch"
+   ]
+  },
+  {
+   "name": "a tie reads as sequential",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    return a[0] < b[0] and a[1] <= b[0] + linger\n",
+   "replace": "    return a[0] <= b[0] and a[1] <= b[0] + linger\n",
+   "expect_kills": [
+    "test_the_26_oct_tab_switches",
+    "test_a_successor_of_tied_sessions_is_unproven_whatever_the_transport_names"
+   ]
+  },
+  {
+   "name": "a move between same-transport sessions counts as a switch",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            if earlier[-1][2] != b[2]:\n",
+   "replace": "            if True:\n",
+   "expect_kills": [
+    "test_a_quick_reconnect_within_the_linger_is_a_switch"
+   ]
+  },
+  {
+   "name": "a change after a non-sequential history counts as a switch",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if all(_sequential(x, y, linger) for x, y in zip(chain, chain[1:])):\n",
+   "replace": "        if True:\n",
+   "expect_kills": [
+    "test_a_successor_of_tied_sessions_is_unproven_whatever_the_transport_names",
+    "test_a_session_beside_a_long_lived_tab_is_not_a_switch"
+   ]
+  },
+  {
+   "name": "the timeline ignores the metrics linger",
+   "file": "scripts/quality/cq_score.py",
+   "find": "                                           METRICS_SESSION_TIMEOUT_S + step_s) for u in in_step}",
+   "replace": "                                           0) for u in in_step}",
+   "expect_kills": [
+    "test_a_quick_reconnect_within_the_linger_is_a_switch"
+   ]
+  },
+  {
+   "name": "reconciliation ignores the metrics linger",
+   "file": "scripts/quality/cq_score.py",
+   "find": "fallbacks = _fallback_reconciliation(steps, METRICS_SESSION_TIMEOUT_S + cv(cfg, \"sampling\", \"scrape_step_s\"))",
+   "replace": "fallbacks = _fallback_reconciliation(steps, 0)",
+   "expect_kills": [
+    "test_a_quick_reconnect_within_the_linger_is_a_switch"
+   ]
+  },
+  {
+   "name": "concurrent-session changes are not flagged",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        if tl.get(\"switches_unproven\"):\n            flags.append(",
+   "replace": "        if False:\n            flags.append(",
+   "expect_kills": [
+    "test_two_concurrent_tabs_are_not_a_switch_and_leave_fallbacks_unknown"
+   ]
+  },
+  {
+   "name": "the report hides concurrent-session changes",
+   "file": "scripts/quality/cq_report.py",
+   "find": "        text += (f\" ({tl['switches_unproven']} started alongside another transport)\"\n                 if tl.get(\"switches_unproven\") else \"\")\n",
+   "replace": "",
+   "expect_kills": [
+    "test_two_concurrent_tabs_are_not_a_switch_and_leave_fallbacks_unknown"
+   ]
+  },
+  {
+   "name": "reconciliation ignores a failed RTT query",
+   "file": "scripts/quality/cq_score.py",
+   "find": "seen = (None if failed or concurrent or not rows or pref",
+   "replace": "seen = (None if concurrent or not rows or pref",
+   "expect_kills": [
+    "test_a_failed_rtt_query_in_one_step_leaves_the_run_unknown"
+   ]
+  },
+  {
+   "name": "a switch is measured against the first session",
+   "file": "scripts/quality/cq_score.py",
+   "find": "            if earlier[-1][2] != b[2]:\n                moves.append((earlier[-1][2], b[2], b[0]))\n",
+   "replace": "            if earlier[0][2] != b[2]:\n                moves.append((earlier[0][2], b[2], b[0]))\n",
+   "expect_kills": [
+    "test_a_chain_of_four_sessions_counts_each_switch"
+   ]
+  },
+  {
+   "name": "every later session after a tie counts as alongside",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        elif any(r[2] != b[2] and (not _sequential(r, b, linger) or r[0] == earlier[-1][0]) for r in earlier):\n",
+   "replace": "        elif any(r[2] != b[2] for r in earlier):\n",
+   "expect_kills": [
+    "test_later_reconnects_after_a_tie_add_nothing_and_the_path_names_no_order",
+    "test_the_26_oct_tab_switches"
+   ]
+  },
+  {
+   "name": "the path shows tied sessions in name order",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    path = [\"+\".join(sorted(g)) for _, g in sorted(groups.items())]\n",
+   "replace": "    path = [sorted(g)[0] for _, g in sorted(groups.items())]\n",
+   "expect_kills": [
+    "test_later_reconnects_after_a_tie_add_nothing_and_the_path_names_no_order"
+   ]
+  },
+  {
+   "name": "a short id leading a flag stays raw",
+   "file": "scripts/quality/cq_privacy.py",
+   "find": "        text = exact[head] + sep + rest if sep and head in exact else text\n",
+   "replace": "",
+   "expect_kills": [
+    "test_t8_short_identities_in_structured_fields_are_pseudonymised"
+   ]
+  },
+  {
+   "name": "a change after a tie is counted nowhere",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        elif any(r[2] != b[2] and (not _sequential(r, b, linger) or r[0] == earlier[-1][0]) for r in earlier):\n",
+   "replace": "        elif any(r[2] != b[2] and not _sequential(r, b, linger) for r in earlier):\n",
+   "expect_kills": [
+    "test_later_reconnects_after_a_tie_add_nothing_and_the_path_names_no_order",
+    "test_the_26_oct_tab_switches"
+   ]
+  },
+  {
+   "name": "a bare transport key beside the reason keys",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        for v in always:\n            by.setdefault(f\"{t}/{v}\", 0.0)\n",
+   "replace": "        for v in always or (None,):\n            by.setdefault(t if v is None else f\"{t}/{v}\", 0.0)\n",
+   "expect_kills": [
+    "test_wt_session_closes_carry_only_reason_keys"
+   ]
+  },
+  {
+   "name": "a failed RTT query reads as an unknown transport",
+   "file": "scripts/quality/cq_score.py",
+   "find": "        return FAILED\n    counts = defaultdict(int)\n",
+   "replace": "        pass\n    counts = defaultdict(int)\n",
+   "expect_kills": [
+    "test_a_failed_rtt_query_names_no_transport_and_splits_no_cell"
+   ]
+  },
+  {
+   "name": "a failed RTT query enters the transport mix",
+   "file": "scripts/quality/cq_score.py",
+   "find": "FAILED if rtt_failed else _count(transport.get(u",
+   "replace": "_count(transport.get(u",
+   "expect_kills": [
+    "test_a_failed_rtt_query_names_no_transport_and_splits_no_cell"
+   ]
+  },
+  {
+   "name": "a failed RTT query still splits cells by transport",
+   "file": "scripts/quality/cq_score.py",
+   "find": "    if split_transport and rtt_failed:\n",
+   "replace": "    if False:\n",
+   "expect_kills": [
+    "test_a_failed_rtt_query_names_no_transport_and_splits_no_cell"
+   ]
+  },
+  {
+   "name": "no RTT history reconciles to zero fallbacks",
+   "file": "scripts/quality/cq_score.py",
+   "find": "or concurrent or not rows or pref",
+   "replace": "or concurrent or pref",
+   "expect_kills": [
+    "test_a_record_without_rtt_history_or_preference_leaves_fallbacks_unknown"
+   ]
+  },
+  {
+   "name": "a record with no preference reconciles",
+   "file": "scripts/quality/cq_score.py",
+   "find": "or not rows or pref not in (\"webtransport\", \"websocket\") else",
+   "replace": "or not rows else",
+   "expect_kills": [
+    "test_a_record_without_rtt_history_or_preference_leaves_fallbacks_unknown"
+   ]
+  },
+  {
+   "name": "a room gauge stuck at zero puts its transport in the room",
+   "file": "scripts/quality/cq_score.py",
+   "find": "if labels.get(\"transport\") and any(v > 0 for _, v in smp)}",
+   "replace": "if labels.get(\"transport\")}",
+   "expect_kills": [
+    "test_a_room_session_gauge_stuck_at_zero_does_not_put_its_transport_in_the_room"
+   ]
+  },
+  {
+   "name": "a failed layer query drops the decoded fps",
+   "file": "scripts/quality/cq_score.py",
+   "find": "return {\"decoded_fps_p50\": percentile(fps, 50),",
+   "replace": "return {\"decoded_fps_p50\": None if layers == FAILED else percentile(fps, 50),",
+   "expect_kills": [
+    "test_a_failed_layer_query_keeps_the_decoded_fps"
+   ]
+  },
+  {
+   "name": "a session beside a live tab on another transport is not unproven",
+   "file": "scripts/quality/cq_score.py",
+   "find": "(not _sequential(r, b, linger) or r[0] == earlier[-1][0])",
+   "replace": "(r[0] == earlier[-1][0])",
+   "expect_kills": [
+    "test_every_session_beside_a_live_session_on_another_transport_is_unproven"
+   ]
+  }
+ ]
+}

@@ -15,7 +15,7 @@
   "-p",
   "test_scenario_run_integration.py"
  ],
- "baseline_tests": 42,
+ "baseline_tests": 43,
  "mutations": [
   {
    "name": "stopped stamped at reap time",
@@ -177,8 +177,8 @@
   {
    "name": "join budget 5 s longer",
    "file": "scripts/quality/cq_runner.py",
-   "find": "        deadline = start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S",
-   "replace": "        deadline = start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S + 5",
+   "find": "                          start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S, \"join budget ran out\")",
+   "replace": "                          start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S + 5, \"join budget ran out\")",
    "expect_kills": [
     "test_a_late_join_beyond_the_budget_aborts_with_a_partial_manifest"
    ]

@@ -19,10 +19,13 @@ window.__APP_CONFIG = ({
   e2eeEnabled: "false",
   webTransportEnabled: "true",
   transportBadgeEnabled: "true",
+  captionsEnabled: "false",
   showBuildGitInfo: "true",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
+  webTransportConnectTimeoutMs: 5000,
+  webSocketConnectTimeoutMs: 5000,
   oauthProvider: "",
   vadThreshold: 0.02,
   oauthAuthUrl: "",
@@ -37,6 +40,7 @@ window.__APP_CONFIG = ({
   consoleLogUploadEnabled: "false",
   // Independent opt-out for health-packet hardware/network/battery telemetry.
   hardwareMetricsEnabled: "true",
+  audioDirectPcm: "true",
   mockPeersEnabled: "false",
   // WASM logger max level. Valid values (case-insensitive): "trace", "debug",
   // "info", "warn", "error" (also "off"). Operators can change this WITHOUT a

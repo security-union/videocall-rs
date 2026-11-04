@@ -1,7 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { COSTUME_HEIGHT, COSTUME_WIDTH, y4mMatchesTargetGeometry } from "./costumes";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 
@@ -10,6 +9,7 @@ import { performFormLogin, resolveFormLoginCredentials } from "./auth/form-login
 import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
 import { ensureAssetsPrimed, type PrimeProgress } from "./auto-prime";
+import { browserEnvWithoutSecrets } from "./browser-env";
 import {
   type CameraCycleConfig,
   type CameraCycleRunner,
@@ -27,9 +27,37 @@ import {
   isClientDecodeBudget,
 } from "./decode-budget";
 import { isDevServerNoise } from "./dev-noise";
+import {
+  isLoadFailure,
+  joinedDocumentIdentity,
+  PAGE_RELOADED,
+  type PageReload,
+  PageReloadedError,
+  STAMP_TIMEOUT_MS,
+  type StampResult,
+  StampTimeoutError,
+  watchPageReload,
+} from "./page-reload";
 import { taggedLine } from "./log-line";
 import { type Manifest } from "./manifest";
 import { captureGeometryToken, type SourceGeometry } from "./posture";
+import { effectiveVideoNoise, videoNoiseLine } from "./video-noise";
+import {
+  buildClockInitScript,
+  parseTalkingClockLine,
+  resolveClockVoice,
+  SOLO_CLOCK_SLOT,
+  talkingClockLine,
+  type TalkingClockSlot,
+} from "./clock-init";
+import { SPEECH_PLAN_DEFAULT, type SpeechPlan } from "./speech-plan";
+import { type BotPersona, createPersonaPlanner, mutedListeners, personaTargets } from "./persona";
+import {
+  type PersonaDriver,
+  personaReceipt,
+  type PersonaTally,
+  startPersonaDriver,
+} from "./persona-driver";
 import {
   buildReceiverConfigInitScript,
   buildReceiverConfigOverrides,
@@ -37,9 +65,36 @@ import {
 } from "./receiver-caps";
 import { coerceEncoderFps } from "./resource/fps";
 import {
+  SIMULCAST_MAX_LAYERS_CONFIG_KEY,
+  SIMULCAST_READBACK_TIMEOUT_MS,
+  SIMULCAST_READBACK_UNREAD,
+  type SimulcastMaxLayersObserved,
+  SimulcastMaxLayersNotAppliedError,
+  SimulcastMaxLayersReadbackTimeoutError,
+  simulcastMaxLayersReadback as readSimulcastMaxLayers,
+} from "./simulcast-layers";
+import {
+  BROWSER_STEP_TIME_LIMIT_MS,
+  PAGE_CALL_TIME_LIMIT_MS,
+  TimeLimitExceededError,
+  withTimeLimit,
+} from "./time-limit";
+import {
+  buildTransportInitScript,
+  isPinned,
+  parseTransportLine,
+  type TransportApplied,
+  type TransportEvent,
+  type TransportIntent,
+  transportMismatch,
+  TransportNotAppliedError,
+} from "./transport";
+import {
+  GRID_SELECTOR,
   isSessionUserIdResponse,
   JOIN_MEDIA_ON,
   type JoinMedia,
+  JoinMediaNotAppliedError,
   type JoinMediaState,
   joinMeetingAndEnableMedia,
   JoinRejectedError,
@@ -47,9 +102,14 @@ import {
   sessionUserIdFromBody,
   WaitingRoomError,
 } from "./meeting-join";
-
-const CLOCK_SOURCE_PATH = fileURLToPath(new URL("./clock-source.js", import.meta.url));
-const CLOCK_SOURCE_SCRIPT = `${readFileSync(CLOCK_SOURCE_PATH, "utf8")}\n//# sourceURL=${CLOCK_SOURCE_PATH}`;
+import {
+  buildSpeakingGlowInitScript,
+  type SpeakingGlow,
+  SPEAKING_GLOW_OFF_VALUE,
+  SPEAKING_GLOW_STORAGE_KEY,
+  SpeakingGlowNotAppliedError,
+  speakingGlowVerdict,
+} from "./speaking-glow";
 
 const CHROME_ARGS = [
   "--ignore-certificate-errors",
@@ -57,24 +117,6 @@ const CHROME_ARGS = [
   "--use-fake-ui-for-media-stream",
   "--disable-dev-shm-usage",
 ];
-
-/**
- * Fleet-credential env-var names, matched for removal before the browser is
- * launched. In the K8s fleet (#2035) the StatefulSet injects the WHOLE
- * `bot-accounts` Secret into every pod via `envFrom` — so `process.env` holds
- * EVERY ordinal's `BOT_EMAIL_<N>`/`BOT_PASSWORD_<N>` (plus the single-mode
- * `BOT_EMAIL`/`BOT_PASSWORD`), plus the fleet-wide `BOT_CTL_TOKEN` (#2072) — the
- * control-API bearer token, a STRICTLY higher-value secret than any single bot
- * account since it drives `/netem` and `/leave` on every pod. Only the
- * orchestrator (this Node process) needs any of these; the Chromium subprocess —
- * which renders untrusted page JS and is the highest-risk component for a
- * sandbox escape — needs NONE of them. Stripping them from the browser's
- * environment is defense-in-depth against a renderer→browser escape reading the
- * fleet's credentials out of the process environment. (Page JavaScript cannot
- * read OS env, so this is not a live hole — but the browser process holding zero
- * fleet secrets is strictly better than it holding all of them.)
- */
-const FLEET_CRED_ENV_RE = /^BOT_(EMAIL|PASSWORD|CTL_TOKEN)(_\d+)?$/;
 
 /**
  * The bot's rendered receive posture — an explicit 1080p desktop (#2235).
@@ -93,22 +135,6 @@ export const BOT_RECEIVE_POSTURE = {
 } as const satisfies NonNullable<Parameters<Browser["newContext"]>[0]>;
 
 /**
- * `process.env` with every fleet-credential variable removed, as a string-only
- * record suitable for Playwright's `chromium.launch({ env })` (which REPLACES
- * the browser env rather than merging). Non-credential vars (PATH, DISPLAY, …)
- * are preserved so the browser launches normally.
- */
-export function browserEnvWithoutFleetCreds(
-  source: NodeJS.ProcessEnv = process.env,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(source)) {
-    if (v !== undefined && !FLEET_CRED_ENV_RE.test(k)) out[k] = v;
-  }
-  return out;
-}
-
-/**
  * Delay (ms) between encoder-fps polls of `window.__videocall_encoder_fps`
  * (#2062). The client republishes the value on its ~5s health tick. The global
  * is a PERSISTED LEVEL, not an event, so any interval observes each published
@@ -122,6 +148,29 @@ export function browserEnvWithoutFleetCreds(
  * so polls can never pile up in flight.
  */
 export const ENCODER_FPS_POLL_MS = 2000;
+
+/** Bounds on each failed-launch teardown step, so a stalled renderer cannot hold the launch open. */
+export const HANG_UP_BUDGET_MS = 5_000;
+export const CLOSE_STEP_BUDGET_MS = 5_000;
+
+/** The launch was aborted (shutdown or run deadline) before the bot was handed back. */
+export class LaunchAbortedError extends Error {
+  constructor() {
+    super("launch aborted by shutdown or the run deadline; browser closed");
+    this.name = "LaunchAbortedError";
+  }
+}
+
+async function within(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    work.catch(() => {}),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
+    }),
+  ]);
+  clearTimeout(timer);
+}
 
 /** Per-action budget for one camera toggle (hover, click, post-condition). */
 export const CAMERA_TOGGLE_TIMEOUT_MS = 5000;
@@ -173,6 +222,10 @@ export interface DiagPacketsObservation {
 /** dioxus-ui `attendants.rs` logs this once per meeting mount (#2970). */
 export const DIAG_PACKETS_LINE =
   /diagnostics packets: (ENABLED|DISABLED) \(source=(url|config|default)\)/;
+
+export function diagPacketsExpected(requested: DiagPackets): DiagPacketsObservation["state"] {
+  return requested === "on" ? "ENABLED" : "DISABLED";
+}
 
 export function parseDiagPacketsLine(text: string): DiagPacketsObservation | null {
   const m = DIAG_PACKETS_LINE.exec(text);
@@ -226,6 +279,8 @@ export interface BotRunOptions {
    * first navigation if one is in the way).
    */
   ssoStateFile?: string | null;
+  /** Epoch ms the JWT-mode session cookie must expire by. */
+  sessionNotAfterMs?: number | null;
   /**
    * When provided alongside `runDir`, the bot looks up the prep'd fake
    * camera (y4m) + fake mic (WAV) for this participant and passes them
@@ -338,23 +393,44 @@ export interface BotRunOptions {
    * {@link maxReceivedLayer}.
    */
   skipCanvasPaint?: boolean | null;
+  /** Injects `__APP_CONFIG.experimentalSimulcastMaxLayers` and fails the launch unless it reads back. */
+  simulcastMaxLayers?: number | null;
   /** `"off"` stops this bot's own DIAGNOSTICS sends (#2970); a fidelity trade. */
   diagPackets?: DiagPackets | null;
   /** Receives each `diagnostics packets:` console line the client prints. */
   onDiagPackets?: ((obs: DiagPacketsObservation) => void) | null;
   /** `"off"` seeds `vc_decode_budget_override=all` and fails the launch unless it reads back; a fidelity waiver. */
   decodeBudget?: DecodeBudget | null;
+  /** `"off"` seeds `vc_appearance_glow_enabled=false` and fails the launch unless it reads back; a fidelity waiver. */
+  speakingGlow?: SpeakingGlow | null;
   /** Override `FORM_LOGIN_TIMEOUT_MS`; the login runs over startup shaping (#2354). */
   formLoginTimeoutMs?: number | null;
   /** Override `FORM_LOGIN_ACTION_TIMEOUT_MS` for the per-step fill/click actions. */
   formLoginActionTimeoutMs?: number | null;
   /** Clock-mode capture geometry (#2236). */
   sourceGeometry: SourceGeometry;
-  /** Opt-in duty cycle (#2362); unset = camera on the whole run. Set = less publish. */
+  /** Clock-mode background noise alpha (issue 3089); unset = the geometry's default. */
+  videoNoise?: number | null;
+  /** Clock-mode index in a talking-clock fleet (issue 3072); unset = index 0 of 1, i.e. speaks every turn. */
+  talkingClock?: TalkingClockSlot | null;
+  speechPlan?: SpeechPlan | null;
+  /** Opt-in duty cycle (#2362). Set = less publish. */
   cameraCycle?: CameraCycleConfig | null;
+  /** Clock mode, issue 3091: mic and camera follow `speechPlan`. */
+  persona?: BotPersona | null;
+  onPersona?: ((tally: PersonaTally) => void) | null;
   /** Opt-in camera-off / mic-muted join (#2914); unset = both turned on after joining. */
   joinMedia?: JoinMedia | null;
+  /** Aborting closes the browser and rejects the launch with `LaunchAbortedError`. */
+  signal?: AbortSignal | null;
+  /** Pinned: injects `defaultTransport`, clears remembered choices, fails on a mismatching applied line. Unset = `auto`. */
+  transport?: TransportIntent | null;
+  /** Receives each `Transport preference applied:` / `Election decision:` line the client prints. */
+  onTransport?: ((event: TransportEvent) => void) | null;
 }
+
+/** How long after join a pinned bot waits for its first `Transport preference applied:` line. */
+export const TRANSPORT_APPLIED_WAIT_MS = 10_000;
 
 /**
  * Reason the orchestrator should record for a finished bot task. Used by
@@ -381,6 +457,7 @@ export interface BotRunOptions {
  *                         host gone, etc.).
  *   - `launch-error`    : everything else that prevented the join from
  *                         completing (timeout, browser crash, ...).
+ *   - `page-reloaded`   : the meeting page loaded a new document after join.
  */
 export type BotExitReason =
   | { kind: "ttl-expired" }
@@ -389,7 +466,8 @@ export type BotExitReason =
   | { kind: "waiting-room"; variant: "waiting-room" | "waiting-for-host"; detail: string }
   | { kind: "meeting-rejected"; reason: "rejected" | "error"; detail: string }
   | { kind: "launch-error"; cause: unknown }
-  | { kind: "browser-crash"; detail: string };
+  | { kind: "browser-crash"; detail: string }
+  | { kind: "page-reloaded"; detail: string };
 
 export interface BotHandle {
   browser: Browser;
@@ -403,6 +481,8 @@ export interface BotHandle {
    */
   leaveMeeting: () => Promise<void>;
   shutdown: () => Promise<void>;
+  /** Close the browser at once, as a deliberate close rather than a crash, whatever `shutdown` is doing. */
+  closeBrowserNow: () => Promise<void>;
   /**
    * Resolves when the user manually leaves the meeting via the browser
    * (top-frame URL transitions away from `/meeting/…`). The orchestrator
@@ -414,12 +494,20 @@ export interface BotHandle {
   userHangupDetected: Promise<void>;
   /** Resolves with a description when the browser or page dies without our asking. */
   crashDetected: Promise<string>;
+  /** Resolves when the meeting page loads a new document after join, which leaves the meeting. */
+  pageReloaded: Promise<PageReload>;
   /** Media state the join step left behind. */
   joinMedia: JoinMediaState;
   /** The `user_id` the meeting-api handed this session, once a participant-status response named it. */
   sessionUserId: () => string | null;
   /** `vc_decode_budget_override` read back after join (only for `off` or a replayed storage state); `null` otherwise. */
   decodeBudgetReadback: string | null;
+  /** `vc_appearance_glow_enabled` read back after join (only for `off` or a replayed storage state); `null` otherwise. */
+  speakingGlowReadback: string | null;
+  /** `__APP_CONFIG.skipCanvasPaint` read back after join; `null` when not injected or unreadable. */
+  skipCanvasPaintReadback: string | null;
+  /** `__APP_CONFIG.experimentalSimulcastMaxLayers` read back after join; `null` when absent, `"unread"` when the read timed out or threw. */
+  simulcastMaxLayersReadback: SimulcastMaxLayersObserved;
 }
 
 /**
@@ -460,7 +548,62 @@ export async function clickHangUp(
   }
 }
 
+/** Aborting `opts.signal` before the launch resolves closes the browser and rejects with `LaunchAbortedError`; any other failure after Chromium starts closes it before rejecting. */
 export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
+  const signal = opts.signal ?? null;
+  const isAborted = (): boolean => signal?.aborted === true;
+  if (isAborted()) throw new LaunchAbortedError();
+  const close: { fn: (() => Promise<void>) | null; abandon: (() => Promise<void>) | null } = {
+    fn: null,
+    abandon: null,
+  };
+  let rejectAborted!: (e: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAborted = reject;
+  });
+  aborted.catch(() => {});
+  const onAbort = (): void => {
+    void close.fn?.();
+    rejectAborted(new LaunchAbortedError());
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const body = launchInBrowser(opts, {
+    registerClose: (fn, abandon) => {
+      close.fn = fn;
+      close.abandon = abandon;
+      if (isAborted()) void fn();
+    },
+    aborted: isAborted,
+  });
+  body.catch(() => {});
+  let handle: BotHandle;
+  try {
+    handle = await Promise.race([body, aborted]);
+  } catch (e) {
+    if (!isAborted()) await close.abandon?.();
+    if (!isAborted()) throw e;
+    await within(
+      Promise.allSettled([body, close.fn?.() ?? Promise.resolve()]),
+      2 * CLOSE_STEP_BUDGET_MS,
+    );
+    throw new LaunchAbortedError();
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+  if (isAborted()) {
+    await within(handle.shutdown(), 2 * CLOSE_STEP_BUDGET_MS);
+    throw new LaunchAbortedError();
+  }
+  return handle;
+}
+
+async function launchInBrowser(
+  opts: BotRunOptions,
+  launch: {
+    registerClose: (close: () => Promise<void>, abandon: () => Promise<void>) => void;
+    aborted: () => boolean;
+  },
+): Promise<BotHandle> {
   const label = logLabel(opts);
   const at = (msg: string): string => taggedLine(label, msg);
   const videoMode = opts.videoMode ?? "costume";
@@ -582,10 +725,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const browser = await chromium.launch({
     headless: opts.headless,
     args: launchArgs,
-    // Strip the fleet's BOT_EMAIL_*/BOT_PASSWORD_* from the browser subprocess's
-    // environment (see browserEnvWithoutFleetCreds) — the renderer/browser is the
-    // highest-risk process and never needs the credentials the orchestrator used.
-    env: browserEnvWithoutFleetCreds(),
+    env: browserEnvWithoutSecrets(),
     // Do not let Playwright preempt the bots-app's process lifecycle policy
     // (#2089). Playwright defaults these to `true` (`browserType.js`
     // `_launchProcess`), installing signal handlers that call
@@ -623,18 +763,19 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   //
   // Playwright ALSO emits `disconnected` during a perfectly normal
   // `browser.close()`, so the listener must know whether WE asked. Every
-  // intentional teardown in this function — `shutdown()` and each early-exit
-  // path (missing form-login creds, form-login failure, manual hang-up,
-  // waiting-room / join-rejected) — therefore goes through
-  // `closeBrowserIntentionally()`, which raises the flag FIRST. Setting it only
-  // in `shutdown()` is not enough: the early exits would each log a false crash
-  // on a graceful hang-up, which is exactly the spurious error line #2089 exists
-  // to remove.
+  // intentional close goes through `abandonBrowser()`, which raises the flag
+  // first. Setting it only in `shutdown()` is not enough: the early exits would
+  // each log a false crash on a graceful hang-up, which is exactly the spurious
+  // error line #2089 exists to remove.
   let intentionalCloseStarted = false;
   let browserDiedUnexpectedly = false;
+  let crashSeen: string | null = null;
   let resolveCrash!: (detail: string) => void;
   const crashDetected = new Promise<string>((resolve) => {
-    resolveCrash = resolve;
+    resolveCrash = (detail) => {
+      crashSeen ??= detail;
+      resolve(detail);
+    };
   });
   browser.on("disconnected", () => {
     if (!intentionalCloseStarted) {
@@ -643,23 +784,42 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       console.error(at(`browser disconnected unexpectedly (crash or external kill)`));
     }
   });
-  /**
-   * Tear down context + browser as a DELIBERATE act, swallowing errors. Use this
-   * for every early-exit teardown; `shutdown()` does the same sequencing with its
-   * own error-reporting closes.
-   *
-   * The flag is raised immediately before `browser.close()` and NOT before
-   * `context.close()`. Closing a CONTEXT does not disconnect the browser, so a
-   * `disconnected` arriving during the context close can only be a real crash or
-   * an external kill — raising the flag earlier would blind the listener across
-   * exactly the window where a crash is most likely, and demote the resulting
-   * close error to `debug`.
-   */
-  const closeBrowserIntentionally = async (): Promise<void> => {
-    await context.close().catch(() => {});
+  const closeStep = (what: "context" | "browser", close: () => Promise<void>): Promise<void> =>
+    withTimeLimit(`${what}.close`, CLOSE_STEP_BUDGET_MS, close).catch((e: unknown) => {
+      if (isBenignTeardownError(e, browserDiedUnexpectedly)) {
+        console.debug(at(`${what} was already closed during teardown:`), e);
+      } else {
+        console.error(at(`${what}.close failed:`), e);
+      }
+    });
+  let browserClosing: Promise<void> | null = null;
+  // Every close disarms the reload watch first, so the close is never read as a reload.
+  let disarmReloadWatch = (): void => {};
+  const abandonBrowser = (): Promise<void> => {
+    disarmReloadWatch();
     intentionalCloseStarted = true;
-    await browser.close().catch(() => {});
+    browserClosing ??= closeStep("browser", () => browser.close());
+    return browserClosing;
   };
+  /**
+   * The one teardown every path shares: each step bounded, run once. The flag is
+   * raised before `browser.close()`, not `context.close()`, so a `disconnected`
+   * during the context close still reads as a crash.
+   */
+  let createdContext: BrowserContext | null = null;
+  let tearingDown: Promise<void> | null = null;
+  const closeBrowserIntentionally = (): Promise<void> => {
+    disarmReloadWatch();
+    const context = createdContext;
+    tearingDown ??= (async () => {
+      if (context !== null) await closeStep("context", () => context.close());
+      await abandonBrowser();
+    })();
+    return tearingDown;
+  };
+  launch.registerClose(closeBrowserIntentionally, abandonBrowser);
+  const setupStep = <T>(what: string, step: () => Promise<T>): Promise<T> =>
+    withTimeLimit(what, BROWSER_STEP_TIME_LIMIT_MS, step);
   let initialStorageState: string | undefined;
   let ssoStateLoaded = false;
   if (opts.authBackend === "storage-state" && opts.storageStateFile) {
@@ -673,18 +833,25 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     initialStorageState = opts.ssoStateFile;
     ssoStateLoaded = true;
   }
-  const context = await browser.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: initialStorageState,
-    ...BOT_RECEIVE_POSTURE,
-  });
+  const context = await setupStep("browser.newContext", () =>
+    browser.newContext({
+      ignoreHTTPSErrors: true,
+      storageState: initialStorageState,
+      ...BOT_RECEIVE_POSTURE,
+    }),
+  );
+  createdContext = context;
   if (opts.authBackend === "jwt") {
     const email = participantEmail(opts.participant);
-    await applyJwtCookieAuth(context, {
-      email,
-      displayName: opts.displayName,
-      baseURL,
-    });
+    await setupStep("session cookie injection", () =>
+      applyJwtCookieAuth(context, {
+        email,
+        displayName: opts.displayName,
+        baseURL,
+        notAfterSecs:
+          opts.sessionNotAfterMs == null ? undefined : Math.floor(opts.sessionNotAfterMs / 1000),
+      }),
+    );
     if (ssoStateLoaded) {
       console.log(
         at(
@@ -717,7 +884,18 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     console.log(at(`auth: guest (no session cookie injected)`));
   }
 
-  const page = await context.newPage();
+  const page = await setupStep("context.newPage", () => context.newPage());
+  const addInitScript = (source: string): Promise<void> =>
+    setupStep("page.addInitScript", () => page.addInitScript(source));
+  const hangUpWithinBudget = (): Promise<void> =>
+    within(
+      clickHangUp(
+        page,
+        (m, e) => console.error(at(m), e),
+        (m) => console.warn(at(m)),
+      ),
+      HANG_UP_BUDGET_MS,
+    );
   page.on("crash", () => {
     console.error(at("page crashed"));
     resolveCrash("page crashed");
@@ -740,7 +918,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // runtime config reassignment. Unset / `<= 0` ⇒ inject nothing (real value).
   if (opts.hardwareConcurrency != null && opts.hardwareConcurrency > 0) {
     const cores = Math.floor(opts.hardwareConcurrency);
-    await page.addInitScript(
+    await addInitScript(
       `Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${cores}, configurable: true });`,
     );
     console.log(at(`navigator.hardwareConcurrency spoofed → ${cores} (issue #2035)`));
@@ -757,30 +935,57 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     maxReceivedLayer: opts.maxReceivedLayer ?? undefined,
     skipCanvasPaint: opts.skipCanvasPaint ?? undefined,
     diagPackets: opts.diagPackets ?? undefined,
+    defaultTransport: isPinned(opts.transport) ? opts.transport : undefined,
+    simulcastMaxLayers: opts.simulcastMaxLayers ?? undefined,
   });
+  if (isPinned(opts.transport)) {
+    await addInitScript(buildTransportInitScript(originalUrl.origin));
+  }
   if (receiverOverrides !== null) {
-    await page.addInitScript(buildReceiverConfigInitScript(receiverOverrides, originalUrl.origin));
+    await addInitScript(buildReceiverConfigInitScript(receiverOverrides, originalUrl.origin));
     console.log(
       at(`__APP_CONFIG overrides → ${JSON.stringify(receiverOverrides)} (#2068/#2069/#2970)`),
     );
   }
 
   if (opts.decodeBudget === "off") {
-    await page.addInitScript(buildDecodeBudgetInitScript(originalUrl.origin));
+    await addInitScript(buildDecodeBudgetInitScript(originalUrl.origin));
     console.log(
       at(`decode budget off: seeding ${DECODE_BUDGET_STORAGE_KEY}=${DECODE_BUDGET_OFF_VALUE}`),
     );
   }
 
+  if (opts.speakingGlow === "off") {
+    await addInitScript(buildSpeakingGlowInitScript(originalUrl.origin));
+    console.log(
+      at(`speaking glow off: seeding ${SPEAKING_GLOW_STORAGE_KEY}=${SPEAKING_GLOW_OFF_VALUE}`),
+    );
+  }
+
   if (videoMode === "clock") {
+    const slot = opts.talkingClock ?? SOLO_CLOCK_SLOT;
+    const speechPlan = opts.speechPlan ?? SPEECH_PLAN_DEFAULT;
+    const voice = resolveClockVoice(opts.participant, slot.index);
+    const videoNoise = effectiveVideoNoise(opts);
     // ONE registration: clock-source.js reads these globals at module scope.
-    await page.addInitScript(
-      `globalThis.__CLOCK_PARTICIPANT = ${JSON.stringify(opts.displayName)};\n` +
-        `globalThis.__CLOCK_WIDTH = ${opts.sourceGeometry.width};\n` +
-        `globalThis.__CLOCK_HEIGHT = ${opts.sourceGeometry.height};\n` +
-        CLOCK_SOURCE_SCRIPT,
+    await addInitScript(
+      buildClockInitScript({
+        displayName: opts.displayName,
+        sourceGeometry: opts.sourceGeometry,
+        videoNoise,
+        slot,
+        voice,
+        speechPlan,
+        mutedListeners: opts.persona ? mutedListeners(opts.persona.room) : [],
+      }),
     );
     console.log(at(`fake camera: synchronized wall clock`));
+    console.log(at(videoNoiseLine(opts)));
+    console.log(at(talkingClockLine(slot, voice, speechPlan)));
+    if (opts.persona) {
+      const { mic, camera, index, room } = opts.persona;
+      console.log(at(`persona: mic=${mic} camera=${camera} (index ${index} of ${room.fleetSize})`));
+    }
   }
 
   // Dioxus 0.7's `trunk serve` workflow injects noisy diagnostics on
@@ -806,16 +1011,39 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
     console.error(at(`console.error: ${text}`));
   });
+  let personaDriver: PersonaDriver | null = null;
+  page.on("console", (msg) => personaDriver?.onConsole(msg.text()));
+  page.on("console", (msg) => {
+    const status = parseTalkingClockLine(msg.text());
+    if (status !== null) console.log(at(`talking clock: ${status}`));
+  });
   page.on("console", (msg) => {
     const obs = parseDiagPacketsLine(msg.text());
     if (obs === null) return;
     console.log(at(`diagnostics packets: ${obs.state} (source=${obs.source})`));
-    if (opts.diagPackets === "off" && obs.state === "ENABLED") {
+    if (opts.diagPackets && obs.state !== diagPacketsExpected(opts.diagPackets)) {
       console.error(
-        at(`--diag-packets off requested but the client logged ENABLED (source=${obs.source})`),
+        at(
+          `--diag-packets ${opts.diagPackets} requested but the client logged ${obs.state} (source=${obs.source})`,
+        ),
       );
     }
     opts.onDiagPackets?.(obs);
+  });
+  let lastApplied: TransportApplied | null = null;
+  let notifyApplied: (() => void) | null = null;
+  page.on("console", (msg) => {
+    const event = parseTransportLine(msg.text());
+    if (event === null) return;
+    if (event.kind === "applied") {
+      const a = event.applied;
+      lastApplied = a;
+      console.log(
+        at(`transport applied: pref=${a.preference} source=${a.source} wt_urls=${a.wt_urls}`),
+      );
+      notifyApplied?.();
+    }
+    opts.onTransport?.(event);
   });
 
   let sessionUserId: string | null = null;
@@ -891,6 +1119,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   let userHangupFired = false;
   page.on("framenavigated", (frame) => {
     if (frame.parentFrame() !== null) return; // top frame only
+    if (isLoadFailure(frame.url())) return;
     let pathname: string;
     try {
       pathname = new URL(frame.url()).pathname;
@@ -904,19 +1133,57 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
   });
 
+  const reloadWatch = watchPageReload(page, meetingPathPrefix, {
+    identity: () => page.mainFrame().evaluate(() => performance.timeOrigin),
+    joinedIdentity: () => page.mainFrame().evaluate(joinedDocumentIdentity, GRID_SELECTOR),
+  });
+  disarmReloadWatch = reloadWatch.disarm;
+  const stampOrThrow = async (): Promise<StampResult> => {
+    const result = await reloadWatch.stamp();
+    if (result === "timed-out") throw new StampTimeoutError(STAMP_TIMEOUT_MS);
+    const reload = reloadWatch.seen();
+    if (reload !== null) throw new PageReloadedError(reload);
+    return result;
+  };
+  const raceReload = <T>(work: Promise<T>): Promise<T> =>
+    Promise.race([
+      work,
+      reloadWatch.detected.then((r): never => {
+        throw new PageReloadedError(r);
+      }),
+    ]);
+  const failIfReloaded = async (): Promise<void> => {
+    const reload = reloadWatch.seen();
+    if (reload === null) return;
+    await closeBrowserIntentionally();
+    throw new PageReloadedError(reload);
+  };
   let joinMedia: JoinMediaState;
+  let stamp: StampResult;
   try {
     // Pass the composite label (participant or participant@idshort)
     // through to the join helper so its log lines match the rest of
     // the bot's prefix.
-    joinMedia = await joinMeetingAndEnableMedia({
+    const joining = joinMeetingAndEnableMedia({
       page,
       participant: label,
       displayName: opts.displayName,
       meetingId,
+      onInMeeting: async () => void (await stampOrThrow()),
       media: opts.joinMedia ?? JOIN_MEDIA_ON,
+      signal: opts.signal ?? undefined,
     });
-  } catch (e) {
+    joining.catch(() => {});
+    // A reload ends the wait on the rename and media steps after the stamp, whatever they are awaiting.
+    joinMedia = await raceReload(joining);
+    stamp = await stampOrThrow();
+  } catch (caught) {
+    if (launch.aborted()) throw new LaunchAbortedError();
+    const seenReload = reloadWatch.seen();
+    const e =
+      caught instanceof MeetingNavigatedAwayError && seenReload !== null
+        ? new PageReloadedError(seenReload)
+        : caught;
     if (e instanceof MeetingNavigatedAwayError) {
       // Make sure the orchestrator-facing signal fires even if for some
       // reason the `framenavigated` handler ran after the join helper's
@@ -933,6 +1200,13 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       // typed sentinel and can branch on it.
       throw e;
     }
+    if (e instanceof StampTimeoutError || e instanceof PageReloadedError) {
+      const crashed = crashSeen as string | null;
+      const failure = crashed === null ? e : new Error(`${crashed} during the launch`);
+      console.error(at(failure.message));
+      await closeBrowserIntentionally();
+      throw failure;
+    }
     if (e instanceof WaitingRoomError || e instanceof JoinRejectedError) {
       // The meeting page reached a terminal-but-non-grid state. The
       // browser context is still alive but there's nothing for the bot
@@ -942,7 +1216,77 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       await closeBrowserIntentionally();
       throw e;
     }
+    if (e instanceof JoinMediaNotAppliedError) {
+      console.error(at(e.message));
+      await hangUpWithinBudget();
+      await closeBrowserIntentionally();
+    }
     throw e;
+  }
+
+  if (stamp === "unreadable") {
+    console.error(
+      at(
+        `WARNING: could not read the meeting document's identity after join: a page reload will not be detected for this bot`,
+      ),
+    );
+  }
+  const pageReloaded = reloadWatch.detected.then((r) => {
+    console.error(
+      at(
+        `meeting page replaced its document at ${new Date(r.atMs).toISOString()} after join (${r.url}): the bot is no longer in the meeting; failing it as ${PAGE_RELOADED}`,
+      ),
+    );
+    return r;
+  });
+  let simulcastMaxLayersReadback: SimulcastMaxLayersObserved = SIMULCAST_READBACK_UNREAD;
+  let readbackStalled = false;
+  try {
+    const raw = await raceReload(
+      withTimeLimit("simulcast read-back", SIMULCAST_READBACK_TIMEOUT_MS, () =>
+        page.evaluate(
+          (key) =>
+            (globalThis as unknown as { __APP_CONFIG?: Record<string, unknown> }).__APP_CONFIG?.[
+              key
+            ],
+          SIMULCAST_MAX_LAYERS_CONFIG_KEY,
+        ),
+      ),
+    );
+    simulcastMaxLayersReadback = readSimulcastMaxLayers(raw);
+  } catch (e) {
+    if (e instanceof TimeLimitExceededError) readbackStalled = true;
+    else console.error(at(`simulcast max layers readback failed:`), e);
+  }
+  await failIfReloaded();
+  const requestedLayers = opts.simulcastMaxLayers ?? null;
+  if (readbackStalled && requestedLayers === null) {
+    console.error(
+      at(
+        `WARNING: ${SIMULCAST_MAX_LAYERS_CONFIG_KEY} read-back did not settle within ${SIMULCAST_READBACK_TIMEOUT_MS}ms; recorded as unread`,
+      ),
+    );
+  } else if (readbackStalled) {
+    const err = new SimulcastMaxLayersReadbackTimeoutError(SIMULCAST_READBACK_TIMEOUT_MS);
+    console.error(at(err.message));
+    await abandonBrowser();
+    throw err;
+  } else if (requestedLayers !== null && simulcastMaxLayersReadback !== requestedLayers) {
+    const err = new SimulcastMaxLayersNotAppliedError(requestedLayers, simulcastMaxLayersReadback);
+    console.error(at(err.message));
+    await clickHangUp(
+      page,
+      (m, e) => console.error(at(m), e),
+      (m) => console.warn(at(m)),
+    );
+    await closeBrowserIntentionally();
+    throw err;
+  } else if (requestedLayers !== null) {
+    console.log(
+      at(
+        `simulcast max layers verified: ${SIMULCAST_MAX_LAYERS_CONFIG_KEY}=${simulcastMaxLayersReadback}`,
+      ),
+    );
   }
 
   // Issues #2068/#2069: assert the receiver-cap overrides actually landed in
@@ -953,25 +1297,34 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // loudly rather than let a silently-uncapped bot skew the load test. This
   // proves the override is PRESENT in __APP_CONFIG; whether the deployed client
   // HONORS it depends on it carrying videocall-client PR #2078.
-  if (receiverOverrides !== null) {
+  let skipCanvasPaintReadback: string | null = null;
+  const receiverCaps = Object.fromEntries(
+    Object.entries(receiverOverrides ?? {}).filter(([k]) => k !== SIMULCAST_MAX_LAYERS_CONFIG_KEY),
+  );
+  if (Object.keys(receiverCaps).length > 0) {
     try {
-      const applied = await page.evaluate((keys) => {
-        const cfg = (globalThis as unknown as { __APP_CONFIG?: Record<string, unknown> })
-          .__APP_CONFIG;
-        const out: Record<string, unknown> = {};
-        for (const k of keys) out[k] = cfg?.[k];
-        return out;
-      }, Object.keys(receiverOverrides));
-      const mismatched = Object.keys(receiverOverrides).filter(
-        (k) => applied[k] !== receiverOverrides[k],
+      const applied = await raceReload(
+        withTimeLimit("receiver-caps read-back", PAGE_CALL_TIME_LIMIT_MS, () =>
+          page.evaluate((keys) => {
+            const cfg = (globalThis as unknown as { __APP_CONFIG?: Record<string, unknown> })
+              .__APP_CONFIG;
+            const out: Record<string, unknown> = {};
+            for (const k of keys) out[k] = cfg?.[k];
+            return out;
+          }, Object.keys(receiverCaps)),
+        ),
       );
+      if (typeof applied.skipCanvasPaint === "string") {
+        skipCanvasPaintReadback = applied.skipCanvasPaint;
+      }
+      const mismatched = Object.keys(receiverCaps).filter((k) => applied[k] !== receiverCaps[k]);
       if (mismatched.length === 0) {
         console.log(at(`receiver caps verified in __APP_CONFIG: ${JSON.stringify(applied)}`));
       } else {
         console.error(
           at(
             `WARNING: receiver caps did NOT land in __APP_CONFIG (expected ${JSON.stringify(
-              receiverOverrides,
+              receiverCaps,
             )}, got ${JSON.stringify(applied)}); the bot may not be capped (issues #2068/#2069)`,
           ),
         );
@@ -985,23 +1338,21 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   let decodeBudgetReadback: string | null = null;
   if (opts.decodeBudget === "off" || initialStorageState !== undefined) {
     try {
-      decodeBudgetReadback = await page.evaluate(
-        (key) => localStorage.getItem(key),
-        DECODE_BUDGET_STORAGE_KEY,
+      decodeBudgetReadback = await raceReload(
+        withTimeLimit("decode-budget read-back", PAGE_CALL_TIME_LIMIT_MS, () =>
+          page.evaluate((key) => localStorage.getItem(key), DECODE_BUDGET_STORAGE_KEY),
+        ),
       );
     } catch (e) {
       console.error(at(`decode-budget readback failed:`), e);
     }
   }
+  await failIfReloaded();
   if (opts.decodeBudget === "off") {
     if (decodeBudgetReadback !== DECODE_BUDGET_OFF_VALUE) {
       const err = new DecodeBudgetNotAppliedError(decodeBudgetReadback);
       console.error(at(err.message));
-      await clickHangUp(
-        page,
-        (m, e) => console.error(at(m), e),
-        (m) => console.warn(at(m)),
-      );
+      await hangUpWithinBudget();
       await closeBrowserIntentionally();
       throw err;
     }
@@ -1014,6 +1365,68 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
         `WARNING: decode budget client requested but ${DECODE_BUDGET_STORAGE_KEY}=${decodeBudgetReadback} is in storage (a captured storage state?): this bot runs under that override`,
       ),
     );
+  }
+
+  let speakingGlowReadback: string | null = null;
+  if (opts.speakingGlow === "off" || initialStorageState !== undefined) {
+    try {
+      speakingGlowReadback = await raceReload(
+        withTimeLimit("speaking-glow read-back", PAGE_CALL_TIME_LIMIT_MS, () =>
+          page.evaluate((key) => localStorage.getItem(key), SPEAKING_GLOW_STORAGE_KEY),
+        ),
+      );
+    } catch (e) {
+      console.error(at(`speaking-glow readback failed:`), e);
+    }
+  }
+  await failIfReloaded();
+  const glowVerdict = speakingGlowVerdict(opts.speakingGlow ?? "client", speakingGlowReadback);
+  if (glowVerdict === "not-applied") {
+    const err = new SpeakingGlowNotAppliedError(speakingGlowReadback);
+    console.error(at(err.message));
+    await hangUpWithinBudget();
+    await closeBrowserIntentionally();
+    throw err;
+  } else if (glowVerdict === "inherited-off") {
+    console.error(
+      at(
+        `WARNING: speaking glow client requested but ${SPEAKING_GLOW_STORAGE_KEY}=${speakingGlowReadback} is in storage (a captured storage state?): this bot runs with the glow off`,
+      ),
+    );
+  } else if (opts.speakingGlow === "off") {
+    console.log(
+      at(`speaking glow off verified: ${SPEAKING_GLOW_STORAGE_KEY}=${speakingGlowReadback}`),
+    );
+  }
+
+  if (isPinned(opts.transport)) {
+    if (lastApplied === null) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, TRANSPORT_APPLIED_WAIT_MS);
+        notifyApplied = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        void reloadWatch.detected.then(() => notifyApplied?.());
+      });
+      notifyApplied = null;
+    }
+    await failIfReloaded();
+    const applied = lastApplied as TransportApplied | null;
+    const reason = applied === null ? null : transportMismatch(opts.transport, applied);
+    if (applied === null) {
+      console.error(
+        at(
+          `WARNING: --transport ${opts.transport} requested but no 'Transport preference applied:' line within ${TRANSPORT_APPLIED_WAIT_MS}ms of joining: the applied transport is unverified`,
+        ),
+      );
+    } else if (reason !== null) {
+      const err = new TransportNotAppliedError(opts.transport, reason);
+      console.error(at(err.message));
+      await hangUpWithinBudget();
+      await closeBrowserIntentionally();
+      throw err;
+    }
   }
 
   // Best-effort: log the suppression summary once, after a successful
@@ -1097,12 +1510,39 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     });
   }
 
-  const leaveMeeting = async (): Promise<void> => {
-    await clickHangUp(
-      page,
-      (m, e) => console.error(at(m), e),
-      (m) => console.warn(at(m)),
+  const persona = videoMode === "clock" ? (opts.persona ?? null) : null;
+  if (persona !== null) {
+    const planner = createPersonaPlanner(
+      opts.speechPlan ?? SPEECH_PLAN_DEFAULT,
+      persona.room.fleetSize,
     );
+    personaDriver = startPersonaDriver({
+      page,
+      targets: (t) => personaTargets(planner, persona, t),
+      joined: { mic: joinMedia.mic, camera: joinMedia.camera },
+      log: (m) => console.log(at(m)),
+      error: (m) => console.error(at(m)),
+      onTally: (tally) => opts.onPersona?.(tally),
+    });
+  }
+
+  let personaStopped = false;
+  const stopPersona = (): void => {
+    if (personaDriver === null || persona === null || personaStopped) return;
+    personaStopped = true;
+    const receipt = personaReceipt(
+      `mic=${persona.mic} camera=${persona.camera}`,
+      personaDriver.stop(),
+    );
+    if (receipt.degraded) console.error(at(receipt.line));
+    else console.log(at(receipt.line));
+  };
+
+  // Before hang-up: a tick during it would find no control and fail.
+  const leaveMeeting = async (): Promise<void> => {
+    reloadWatch.disarm();
+    stopPersona();
+    await hangUpWithinBudget();
   };
 
   const shutdown = async (): Promise<void> => {
@@ -1114,35 +1554,27 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       clearTimeout(fpsPollTimer);
       fpsPollTimer = undefined;
     }
+    stopPersona();
     if (cameraCycleRunner !== null) {
       const receipt = cameraCycleRunner.stop();
+      cameraCycleRunner = null;
       if (receipt.banner === CAMERA_CYCLE_DEGRADED_BANNER) console.error(at(receipt.line));
       else console.log(at(receipt.line));
     }
-    try {
-      await context.close();
-    } catch (e) {
-      if (isBenignTeardownError(e, browserDiedUnexpectedly)) {
-        console.debug(at(`context was already closed during teardown:`), e);
-      } else {
-        console.error(at(`context.close failed:`), e);
-      }
-    }
-    // Raised HERE, not before `context.close()` above: closing a context does not
-    // disconnect the browser, so a `disconnected` during the context close is a
-    // genuine crash and must stay visible. Playwright DOES emit `disconnected` for
-    // this `browser.close()`, which is what the flag suppresses.
-    intentionalCloseStarted = true;
-    try {
-      await browser.close();
-    } catch (e) {
-      if (isBenignTeardownError(e, browserDiedUnexpectedly)) {
-        console.debug(at(`browser was already closed during teardown:`), e);
-      } else {
-        console.error(at(`browser.close failed:`), e);
-      }
-    }
+    await closeBrowserIntentionally();
   };
+
+  const closeBrowserNow = abandonBrowser;
+
+  if (launch.aborted()) {
+    await within(shutdown(), 2 * CLOSE_STEP_BUDGET_MS);
+    throw new LaunchAbortedError();
+  }
+  const reloadedDuringLaunch = reloadWatch.seen();
+  if (reloadedDuringLaunch !== null) {
+    await shutdown();
+    throw new PageReloadedError(reloadedDuringLaunch);
+  }
 
   return {
     browser,
@@ -1150,11 +1582,16 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     page,
     leaveMeeting,
     shutdown,
+    closeBrowserNow,
     userHangupDetected,
     crashDetected,
+    pageReloaded,
     joinMedia,
     sessionUserId: () => sessionUserId,
     decodeBudgetReadback,
+    skipCanvasPaintReadback,
+    speakingGlowReadback,
+    simulcastMaxLayersReadback,
   };
 }
 

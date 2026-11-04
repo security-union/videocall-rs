@@ -15,7 +15,7 @@
   "-p",
   "test_scenario_run.py"
  ],
- "baseline_tests": 140,
+ "baseline_tests": 153,
  "mutations": [
   {
    "name": "stopped stamped at reap time",
@@ -406,8 +406,8 @@
   {
    "name": "join budget without the extra",
    "file": "scripts/quality/cq_runner.py",
-   "find": "        deadline = start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S",
-   "replace": "        deadline = start[\"mono\"] + self.step[\"join_window_s\"]",
+   "find": "                          start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S, \"join budget ran out\")",
+   "replace": "                          start[\"mono\"] + self.step[\"join_window_s\"], \"join budget ran out\")",
    "expect_kills": [
     "test_r2_a_participant_that_never_joins_aborts_at_the_join_budget"
    ]
@@ -428,7 +428,7 @@
    "find": "[m + MEDIA_SETTLE_S for m in media])",
    "replace": "[m for m in media])",
    "expect_kills": [
-    "test_hold_and_teardown_respect_the_settle_rules_over_random_timings"
+    "test_with_no_probe_the_hold_waits_for_rust_media_to_settle"
    ]
   },
   {
@@ -489,7 +489,7 @@
   {
    "name": "run folder inside the repo",
    "file": "scripts/quality/cq_runner.py",
-   "find": "    if os.path.commonpath([out, root]) == root:",
+   "find": "    if os.path.commonpath([out, os.path.realpath(repo_root)]) == os.path.realpath(repo_root):",
    "replace": "    if False:",
    "expect_kills": [
     "test_an_out_dir_inside_the_repo_is_refused"
@@ -1008,8 +1008,8 @@
   {
    "name": "tool child shares the runner's process group",
    "file": "scripts/quality/cq_runner.py",
-   "find": "check=False,\n                               start_new_session=True)",
-   "replace": "check=False,\n                               start_new_session=False)",
+   "find": "check=False,\n                               start_new_session=True, env=child_env())",
+   "replace": "check=False,\n                               start_new_session=False, env=child_env())",
    "expect_kills": [
     "test_a_terminal_signal_to_the_process_group_never_reaches_a_tool",
     "test_every_child_the_runner_starts_gets_its_own_session_and_a_timeout"
@@ -1018,8 +1018,8 @@
   {
    "name": "git child shares the runner's process group",
    "file": "scripts/quality/cq_runner.py",
-   "find": "timeout=TOOL_TIMEOUT_S, start_new_session=True)",
-   "replace": "timeout=TOOL_TIMEOUT_S, start_new_session=False)",
+   "find": "timeout=TOOL_TIMEOUT_S, start_new_session=True, env=child_env())",
+   "replace": "timeout=TOOL_TIMEOUT_S, start_new_session=False, env=child_env())",
    "expect_kills": [
     "test_every_child_the_runner_starts_gets_its_own_session_and_a_timeout"
    ]
@@ -1090,8 +1090,8 @@
   {
    "name": "git timeout dropped",
    "file": "scripts/quality/cq_runner.py",
-   "find": "timeout=TOOL_TIMEOUT_S, start_new_session=True)",
-   "replace": "start_new_session=True)",
+   "find": "timeout=TOOL_TIMEOUT_S, start_new_session=True, env=child_env())",
+   "replace": "start_new_session=True, env=child_env())",
    "expect_kills": [
     "test_every_child_the_runner_starts_gets_its_own_session_and_a_timeout"
    ]
@@ -1392,6 +1392,178 @@
    "replace": "latency_waived = cq_score.latency_metric(cfg) is None",
    "expect_kills": [
     "test_g_q5_may_be_unmeasured_only_while_latency_is_waived"
+   ]
+  },
+  {
+   "name": "probes do not wait for Rust media",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        self._await_joins({u for p in rust for u in p[\"participants\"]}, start[\"mono\"] + RUST_READY_S,",
+   "replace": "        self._await_joins(set(), start[\"mono\"] + RUST_READY_S,",
+   "expect_kills": [
+    "test_rust_launches_first_and_probes_follow_staggered_once_rust_media_started",
+    "test_rust_media_that_never_starts_aborts_at_the_rust_bound_before_any_probe_launch"
+   ]
+  },
+  {
+   "name": "the Rust media wait runs to the join budget",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "start[\"mono\"] + RUST_READY_S,",
+   "replace": "start[\"mono\"] + self.step[\"join_window_s\"] + JOIN_BUDGET_EXTRA_S,",
+   "expect_kills": [
+    "test_rust_media_that_never_starts_aborts_at_the_rust_bound_before_any_probe_launch"
+   ]
+  },
+  {
+   "name": "readiness seen after the deadline accepted",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            if not missing and now.mono <= deadline:",
+   "replace": "            if not missing:",
+   "expect_kills": [
+    "test_rust_media_seen_only_after_the_rust_bound_aborts_even_when_launches_used_it_up"
+   ]
+  },
+  {
+   "name": "preflight-only goes on to the run",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "    if args.preflight_only:\n        return _preflight_only(args, plan, raw, root, env, factory, tree, clock, tools)\n",
+   "replace": "",
+   "expect_kills": [
+    "test_preflight_only_runs_the_preflight_and_launches_nothing"
+   ]
+  },
+  {
+   "name": "preflight-only skips the runner's own checks",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._preflight()\n        except (Refused, AdapterError) as exc:\n            return getattr",
+   "replace": "            problems = self.stack.preflight(self.plan)\n            if problems:\n                self.preflight_problems = list(problems)\n                raise Refused(\"stack preflight\")\n        except (Refused, AdapterError) as exc:\n            return getattr",
+   "expect_kills": [
+    "test_preflight_only_makes_the_runners_own_checks"
+   ]
+  },
+  {
+   "name": "preflight-only launches a process",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            self._preflight()\n        except (Refused, AdapterError) as exc:\n            return getattr",
+   "replace": "            self._preflight()\n            self.fleet.launch(self.plan[\"processes\"][0])\n        except (Refused, AdapterError) as exc:\n            return getattr",
+   "expect_kills": [
+    "test_preflight_only_runs_the_preflight_and_launches_nothing"
+   ]
+  },
+  {
+   "name": "preflight-only writes the run folder",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "        with tempfile.TemporaryDirectory(prefix=\"cq-preflight-\") as run_dir:",
+   "replace": "        for run_dir in [cq_runner.prepare_run_dir(args.out_dir or default_out_dir(env), plan[\"run_id\"], root)]:",
+   "expect_kills": [
+    "test_preflight_only_runs_the_preflight_and_launches_nothing"
+   ]
+  },
+  {
+   "name": "preflight problems not listed one by one",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            return getattr(self, \"preflight_problems\", None) or [_describe(exc)]",
+   "replace": "            return [_describe(exc)]",
+   "expect_kills": [
+    "test_preflight_only_lists_every_problem_and_exits_3"
+   ]
+  },
+  {
+   "name": "preflight-only passes despite problems",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "    if problems:\n        print(f\"{plan['run_id']}: preflight refused",
+   "replace": "    if False:\n        print(f\"{plan['run_id']}: preflight refused",
+   "expect_kills": [
+    "test_preflight_only_lists_every_problem_and_exits_3"
+   ]
+  },
+  {
+   "name": "preflight-only skips the out-dir check",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "        _check_writable(cq_runner.check_out_dir(args.out_dir or default_out_dir(env), root))\n",
+   "replace": "        _check_writable(os.path.realpath(args.out_dir or default_out_dir(env)))\n",
+   "expect_kills": [
+    "test_preflight_only_makes_the_runners_own_checks"
+   ]
+  },
+  {
+   "name": "preflight-only skips the out-dir write check",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "        _check_writable(cq_runner.check_out_dir(args.out_dir or default_out_dir(env), root))",
+   "replace": "        cq_runner.check_out_dir(args.out_dir or default_out_dir(env), root)",
+   "expect_kills": [
+    "test_preflight_only_refuses_an_out_dir_the_run_could_not_create"
+   ]
+  },
+  {
+   "name": "the preflight's probe folder is left behind",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "        os.rmdir(tempfile.mkdtemp(prefix=\".cq-preflight-\", dir=base))",
+   "replace": "        tempfile.mkdtemp(prefix=\".cq-preflight-\", dir=base)",
+   "expect_kills": [
+    "test_preflight_only_leaves_the_out_dirs_parent_as_it_found_it"
+   ]
+  },
+  {
+   "name": "the writable check climbs one missing level only",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "    while not os.path.lexists(base):",
+   "replace": "    if not os.path.lexists(base):",
+   "expect_kills": [
+    "test_preflight_only_accepts_an_out_dir_two_levels_below_the_nearest_folder"
+   ]
+  },
+  {
+   "name": "preflight-only ignores --allow-dirty",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "                                        allow_dirty=args.allow_dirty).preflight_only()",
+   "replace": "                                        allow_dirty=False).preflight_only()",
+   "expect_kills": [
+    "test_preflight_only_takes_allow_dirty_as_the_run_does"
+   ]
+  },
+  {
+   "name": "preflight-only catches only Refused",
+   "file": "scripts/quality/scenario_run.py",
+   "find": "    except (cq_runner.Refused, cq_runner.AdapterError) as exc:\n        problems = [str(exc)]",
+   "replace": "    except cq_runner.Refused as exc:\n        problems = [str(exc)]",
+   "expect_kills": [
+    "test_preflight_only_lists_a_refusal_from_the_real_shared_target_factory"
+   ]
+  },
+  {
+   "name": "the forced config drops the throttle selector",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "            \"server_diagnostics\": {\"throttle_pod_selector\": {\"value\": throttle_pod_selector}}}",
+   "replace": "            }",
+   "expect_kills": [
+    "test_the_forced_config_is_strict_and_loads"
+   ]
+  },
+  {
+   "name": "the runner does not pass the stack's throttle selector",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "                                                       self.stack.throttle_pod_selector()))",
+   "replace": "                                                       None))",
+   "expect_kills": [
+    "test_the_forced_config_is_strict_and_loads"
+   ]
+  },
+  {
+   "name": "uncertain gates are reported as unmeasured",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if listed := [g for g in step.get(\"invalid_reasons\", []) if (g in uncertain) == unsure]:\n",
+   "replace": "        if listed := [g for g in step.get(\"invalid_reasons\", []) if not unsure]:\n",
+   "expect_kills": [
+    "test_uncertain_gates_are_not_reported_as_unmeasured"
+   ]
+  },
+  {
+   "name": "unmeasured gates are reported as uncertain",
+   "file": "scripts/quality/cq_runner.py",
+   "find": "        if listed := [g for g in step.get(\"invalid_reasons\", []) if (g in uncertain) == unsure]:\n",
+   "replace": "        if listed := [g for g in step.get(\"invalid_reasons\", []) if unsure]:\n",
+   "expect_kills": [
+    "test_unmeasured_gates_are_not_reported_as_uncertain"
    ]
   }
  ]

@@ -24,12 +24,13 @@ use super::task::Task;
 use super::url_log::strip_query_for_log;
 #[cfg(feature = "netsim")]
 use super::webmedia::InboundLane;
-use super::webmedia::MediaStreamKey;
 #[cfg(feature = "netsim")]
 use super::webmedia::ReceivedAtMs;
+use super::webmedia::{MediaStreamKey, StreamQueueDepth};
 use super::ConnectOptions;
 use crate::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
+use crate::diagnostics::heartbeat::HeartbeatTimer;
 use gloo::timers::callback::{Interval, Timeout};
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
@@ -69,8 +70,8 @@ const PEER_MONITOR_TICK_INTERVAL_MS: u32 = {
 /// reliable (Control stream), so a single resend suffices.
 pub(crate) const STATE_CHANGE_RESEND_DELAY_MS: u32 = 600;
 
-#[derive(Clone, Copy, Debug)]
-enum Status {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Status {
     Connecting,
     Connected,
     Closed,
@@ -79,7 +80,7 @@ enum Status {
 #[derive(Debug)]
 pub struct Connection {
     task: Rc<Task>,
-    heartbeat: Option<Interval>,
+    heartbeat: Option<HeartbeatTimer>,
     heartbeat_monitor: Option<Interval>,
     status: Rc<Cell<Status>>,
     aes: Rc<Aes128State>,
@@ -89,7 +90,7 @@ pub struct Connection {
     is_speaking: Rc<AtomicBool>,
     session_id: Rc<RefCell<Option<u64>>>,
     /// Not wrapped in `Rc` because it is only accessed via `&self` methods,
-    /// unlike `session_id` which is shared with the heartbeat `Interval` closure.
+    /// unlike `session_id` which is shared with the heartbeat timer closure.
     userid: RefCell<Option<String>>,
     /// Pending one-shot resend of a state-change heartbeat (see
     /// `schedule_state_resend`). Held so it can be cancelled if the
@@ -237,8 +238,17 @@ impl Connection {
         matches!(self.status.get(), Status::Connected)
     }
 
+    pub(crate) fn status(&self) -> Status {
+        self.status.get()
+    }
+
     pub fn start_heartbeat(&mut self, userid: String) {
+        self.start_heartbeat_with_period(userid, HEARTBEAT_KEEPALIVE_INTERVAL_MS);
+    }
+
+    fn start_heartbeat_with_period(&mut self, userid: String, period_ms: u32) {
         *self.userid.borrow_mut() = Some(userid.clone());
+        self.send_immediate_heartbeat();
         let task = Rc::clone(&self.task);
         let status = Rc::clone(&self.status);
         let aes = Rc::clone(&self.aes);
@@ -249,7 +259,7 @@ impl Connection {
         let session_id = Rc::clone(&self.session_id);
         let transport_type = self.transport_type;
 
-        self.heartbeat = Some(Interval::new(HEARTBEAT_KEEPALIVE_INTERVAL_MS, move || {
+        let on_tick = move || {
             if let Some(packet_wrapper) = build_heartbeat_packet(
                 &userid,
                 &video_enabled,
@@ -267,13 +277,17 @@ impl Connection {
                     task.send_packet_datagram(packet_wrapper);
                 }
             }
-        }));
+        };
+        // Worker-driven: the relay reaps a WebTransport session after 30 s without inbound data.
+        self.heartbeat = Some(HeartbeatTimer::start(
+            "keepalive heartbeat",
+            period_ms,
+            on_tick,
+        ));
     }
 
     fn stop_heartbeat(&mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.cancel();
-        }
+        self.heartbeat = None;
         if let Some(heartbeat_monitor) = self.heartbeat_monitor.take() {
             heartbeat_monitor.cancel();
         }
@@ -476,9 +490,18 @@ impl Connection {
         self.task.get_send_queue_depth()
     }
 
+    pub fn stream_send_queue_depth(&self, stream_key: MediaStreamKey) -> Option<StreamQueueDepth> {
+        self.task.stream_send_queue_depth(stream_key)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_send_queue_depth_for_test(&self, bytes: u64) {
         self.task.set_send_queue_depth_for_test(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wt_stream_depth_for_test(&self, bytes: u64) {
+        self.task.set_wt_stream_depth_for_test(bytes);
     }
 
     /// Forwards to [`Task::uplink_queue_depth_bytes`] (#2722).
@@ -562,12 +585,26 @@ impl Connection {
         conn
     }
 
+    pub(crate) fn new_for_test_connecting(webtransport: bool) -> Self {
+        let conn = Self::new_for_test_with_transport(webtransport);
+        conn.status.set(Status::Connecting);
+        conn
+    }
+
     pub(crate) fn state_resend_is_pending(&self) -> bool {
         self.state_resend.borrow().is_some()
     }
 
     pub(crate) fn stop_heartbeat_for_test(&mut self) {
         self.stop_heartbeat();
+    }
+
+    pub(crate) fn heartbeat_debug_for_test(&self) -> Option<String> {
+        self.heartbeat.as_ref().map(|h| format!("{h:?}"))
+    }
+
+    pub(crate) fn start_heartbeat_with_period_for_test(&mut self, period_ms: u32) {
+        self.start_heartbeat_with_period("test-user".to_string(), period_ms);
     }
 }
 
@@ -753,6 +790,58 @@ mod tests {
 
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
+    fn keepalive_heartbeat_runs_on_the_worker_timer_and_stops_on_teardown() {
+        let mut conn = Connection::new_for_test_with_transport(true);
+        conn.start_heartbeat("test-user".to_string());
+        let backend = conn.heartbeat_debug_for_test().expect("heartbeat started");
+        assert!(backend.contains("\"Worker\""), "got {backend}");
+        assert!(
+            backend.contains(&format!("period_ms: {HEARTBEAT_KEEPALIVE_INTERVAL_MS}")),
+            "got {backend}"
+        );
+        conn.stop_heartbeat_for_test();
+        assert_eq!(conn.heartbeat_debug_for_test(), None);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn keepalive_ticks_send_heartbeat_datagrams_at_the_posted_period() {
+        let mut conn = Connection::new_for_test_with_transport(true);
+        conn.task.clear_last_send_for_test();
+        conn.start_heartbeat_with_period_for_test(50);
+        assert_eq!(
+            conn.take_sends_for_test(),
+            vec![(StubSendKind::Reliable, MediaStreamKey::Control)],
+            "expected one immediate reliable heartbeat"
+        );
+        let mut first = Vec::new();
+        for _ in 0..40 {
+            gloo_timers::future::TimeoutFuture::new(50).await;
+            first = conn.take_sends_for_test();
+            if !first.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            first.first(),
+            Some(&(StubSendKind::Datagram, MediaStreamKey::Control)),
+            "no heartbeat datagram within 2 s: {first:?}"
+        );
+        // A 500 ms period (the Worker's fallback when periodMs is lost) sends none here.
+        gloo_timers::future::TimeoutFuture::new(300).await;
+        let window = conn.take_sends_for_test();
+        conn.stop_heartbeat_for_test();
+        assert!(
+            window.len() >= 2
+                && window
+                    .iter()
+                    .all(|s| *s == (StubSendKind::Datagram, MediaStreamKey::Control)),
+            "got {window:?}"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
     fn immediate_heartbeat_uses_control_stream_not_datagram() {
         let conn = Connection::new_for_test();
         conn.task.clear_last_send_for_test();
@@ -777,5 +866,31 @@ mod tests {
             conn.task.take_last_send_for_test().is_none(),
             "periodic keepalive datagram path must not run without start_heartbeat"
         );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn start_heartbeat_sends_one_reliable_heartbeat_immediately() {
+        let mut conn = Connection::new_for_test_without_userid();
+        conn.task.clear_last_send_for_test();
+
+        conn.start_heartbeat("test-user".to_string());
+
+        assert_eq!(
+            conn.task.take_sends_for_test(),
+            vec![(StubSendKind::Reliable, MediaStreamKey::Control)],
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn start_heartbeat_sends_nothing_immediately_when_not_connected() {
+        let mut conn = Connection::new_for_test_without_userid();
+        conn.status.set(Status::Connecting);
+        conn.task.clear_last_send_for_test();
+
+        conn.start_heartbeat("test-user".to_string());
+
+        assert!(conn.task.take_sends_for_test().is_empty());
     }
 }

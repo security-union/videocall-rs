@@ -13,7 +13,11 @@ use crate::context::ScreenZoomState;
 
 /// Detach / zoom key of the local user's own share tile.
 pub const OWN_SHARE_KEY: &str = "__own_share__";
+/// Key of the one detached window that shows received shares.
+pub const RECEIVED_WINDOW_KEY: &str = "__received_share_window__";
 pub const CTA_TIMEOUT_MS: u32 = 12_000;
+pub const ENLARGED_DEFAULT_MIN_WIDTH_PX: f64 = 720.0;
+pub const ENLARGED_DEFAULT_MIN_HEIGHT_PX: f64 = 540.0;
 pub const CTA_HINT: &str = "You can open it in a separate window.";
 pub const DETACH_FAILED: &str =
     "Could not open a separate window. Allow pop-ups for this site and try again.";
@@ -39,12 +43,13 @@ impl ShareViewMode {
         }
     }
 
-    pub fn parse(stored: Option<&str>) -> Self {
-        match stored {
-            Some("enlarged") => ShareViewMode::Enlarged,
-            Some("pinned") => ShareViewMode::Pinned,
-            Some("detached") => ShareViewMode::Detached,
-            _ => ShareViewMode::Tile,
+    pub fn parse(stored: Option<&str>) -> Option<Self> {
+        match stored? {
+            "tile" => Some(ShareViewMode::Tile),
+            "enlarged" => Some(ShareViewMode::Enlarged),
+            "pinned" => Some(ShareViewMode::Pinned),
+            "detached" => Some(ShareViewMode::Detached),
+            _ => None,
         }
     }
 }
@@ -83,6 +88,22 @@ impl ShareOrigin {
             ShareOrigin::Own => ShareOrigin::Received,
         }
     }
+
+    /// The mode a share opens in while no choice is stored, for a meeting area
+    /// `width` CSS px wide in a window `height` CSS px tall.
+    pub fn default_mode(self, (width, height): (f64, f64)) -> ShareViewMode {
+        let wide = width >= ENLARGED_DEFAULT_MIN_WIDTH_PX
+            && width > height
+            && height >= ENLARGED_DEFAULT_MIN_HEIGHT_PX;
+        match self {
+            ShareOrigin::Received if wide => ShareViewMode::Enlarged,
+            _ => ShareViewMode::Tile,
+        }
+    }
+
+    pub fn stored_mode(self, stored: Option<&str>, meeting: (f64, f64)) -> ShareViewMode {
+        ShareViewMode::parse(stored).unwrap_or(self.default_mode(meeting))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -116,6 +137,8 @@ pub struct ShareSlot {
     pub pre_detach: Option<ShareViewMode>,
     pub cta: CtaState,
     pub guard: bool,
+    /// The presenter set `guard` with Hide or Show preview.
+    pub guard_chosen: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -137,6 +160,76 @@ impl ShareSlots {
             ShareOrigin::Received => &mut self.received,
             ShareOrigin::Own => &mut self.own,
         }
+    }
+}
+
+impl ShareOrigin {
+    pub fn window_key(self) -> &'static str {
+        match self {
+            ShareOrigin::Received => RECEIVED_WINDOW_KEY,
+            ShareOrigin::Own => OWN_SHARE_KEY,
+        }
+    }
+}
+
+/// The received shares on screen. `primary` holds the received slot, on the
+/// stage or, while `window` is open, in the received window; `demoted` are the
+/// other live shares shown as tiles.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReceivedStage {
+    pub primary: Option<String>,
+    pub demoted: Vec<String>,
+    pub window: bool,
+    pub primary_target: Option<ShareTarget>,
+    pub toast: Option<(u32, String)>,
+    pub toast_seq: u32,
+    seen: Vec<String>,
+}
+
+impl ReceivedStage {
+    /// The stage once the received sharers are `sharers`, oldest first.
+    pub fn follow(&self, sharers: &[String]) -> Self {
+        let live = |k: &String| sharers.contains(k);
+        let mut next = Self {
+            primary: self.primary.clone().filter(live),
+            demoted: self.demoted.iter().filter(|k| live(k)).cloned().collect(),
+            seen: sharers.to_vec(),
+            ..self.clone()
+        };
+        if let Some(newest) = sharers.iter().rfind(|k| !self.seen.contains(k)) {
+            next.primary = Some(newest.clone());
+        }
+        if next.primary.is_none() {
+            next.primary = sharers.last().cloned();
+            next.demoted.retain(|k| Some(k) != next.primary.as_ref());
+        }
+        if self.window {
+            for key in sharers {
+                if Some(key) != next.primary.as_ref() && !next.demoted.contains(key) {
+                    next.demoted.push(key.clone());
+                }
+            }
+        }
+        next
+    }
+
+    /// A demoted share takes the received slot; the share holding it takes
+    /// the demoted share's place. False when `key` is no longer demoted.
+    pub fn take_slot(&mut self, key: &str) -> bool {
+        let Some(at) = self.demoted.iter().position(|k| k == key) else {
+            return false;
+        };
+        self.demoted.remove(at);
+        if let Some(shown) = self.primary.replace(key.to_string()) {
+            self.demoted.insert(at, shown);
+        }
+        true
+    }
+
+    /// The share the received window shows.
+    pub fn bound_target(&self) -> Option<ShareTarget> {
+        let key = self.primary.as_ref().filter(|_| self.window)?;
+        self.primary_target.clone().filter(|t| &t.key == key)
     }
 }
 
@@ -273,6 +366,17 @@ fn land(s: &ShareSnapshot, t: &mut ShareTransition) -> ShareViewMode {
     }
 }
 
+/// The view a received share opens in after the user closes a waiting window.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub fn closed_waiting_pref(slot: ShareSlot) -> ShareViewMode {
+    let s = ShareSnapshot {
+        base: slot.base,
+        pre_detach: slot.pre_detach,
+        ..ShareSnapshot::default()
+    };
+    land(&s, &mut ShareTransition::default())
+}
+
 pub fn next_share_view(s: ShareSnapshot, action: ShareAction) -> ShareTransition {
     use ShareViewMode as M;
     let mode = effective_mode(s.detached, s.pinned, s.base);
@@ -357,9 +461,11 @@ pub struct ArrivalPlan {
 }
 
 /// Section 6: the stored pref applied to a new share. A popup needs transient
-/// user activation, so a Detached pref opens directly only from a click.
+/// user activation, so a Detached pref opens directly only from a click, and
+/// otherwise opens in `fallback`.
 pub fn arrival_plan(
     pref: ShareViewMode,
+    fallback: ShareViewMode,
     detach_supported: bool,
     user_activation: bool,
 ) -> ArrivalPlan {
@@ -372,8 +478,12 @@ pub fn arrival_plan(
         }
         ShareViewMode::Pinned => plan.pin = true,
         ShareViewMode::Detached if detach_supported && user_activation => plan.detach_now = true,
-        ShareViewMode::Detached if detach_supported => plan.cta = CtaState::Shown,
-        ShareViewMode::Detached => {}
+        ShareViewMode::Detached => {
+            plan = arrival_plan(fallback, ShareViewMode::Tile, false, false);
+            if detach_supported {
+                plan.cta = CtaState::Shown;
+            }
+        }
     }
     plan
 }
@@ -382,7 +492,7 @@ pub fn own_arrival_plan(pref: ShareViewMode, detach_supported: bool, guard: bool
     if guard {
         ArrivalPlan::default()
     } else {
-        arrival_plan(pref, detach_supported, false)
+        arrival_plan(pref, ShareViewMode::Tile, detach_supported, false)
     }
 }
 
@@ -399,6 +509,7 @@ pub fn show_preview_plan(
 ) -> ArrivalPlan {
     arrival_plan(
         pref,
+        ShareViewMode::Tile,
         detach_supported,
         !mirror_guard_default(display_surface),
     )
@@ -425,6 +536,7 @@ pub fn share_in_panel(split_layout: bool, mode: ShareViewMode, was_in_panel: boo
 pub struct PanelPlacement {
     received: Option<String>,
     own: bool,
+    demoted: Vec<String>,
 }
 
 impl PanelPlacement {
@@ -445,6 +557,27 @@ impl PanelPlacement {
         self.own = own_in;
         (received_in, own_in)
     }
+
+    /// Which demoted tiles render in the panel; each keeps its own seat.
+    pub fn place_demoted(&mut self, split_layout: bool, keys: &[String]) -> Vec<bool> {
+        let placed: Vec<bool> = keys
+            .iter()
+            .map(|k| share_in_panel(split_layout, ShareViewMode::Tile, self.demoted.contains(k)))
+            .collect();
+        self.demoted = keys
+            .iter()
+            .zip(&placed)
+            .filter(|(_, in_panel)| **in_panel)
+            .map(|(k, _)| k.clone())
+            .collect();
+        placed
+    }
+}
+
+/// The share tiles in the split's peer panel: the received and own shares
+/// placed there, and the demoted tiles placed there.
+pub fn panel_share_tiles((received, own): (bool, bool), demoted: &[bool]) -> usize {
+    usize::from(received) + usize::from(own) + demoted.iter().filter(|p| **p).count()
 }
 
 /// The share tile's region name; the pinned badge is decorative.
@@ -508,6 +641,65 @@ pub fn switch_announcement(
     }
 }
 
+/// What a change of the share in the received window announces in the
+/// meeting. `prev` carries whether the previous share is still sharing.
+pub fn window_switch_announcement(
+    prev: Option<(&str, bool)>,
+    next: Option<&str>,
+) -> Option<String> {
+    match (prev, next) {
+        (Some((gone, false)), Some(shown)) => Some(format!(
+            "{gone} stopped sharing. Showing {shown}'s shared content in the separate window."
+        )),
+        (Some((moved, true)), Some(started)) => Some(format!(
+            "{started} started sharing in the separate window. {moved}'s shared content moved \
+             to the meeting."
+        )),
+        (None, Some(started)) => Some(format!(
+            "{started} started sharing. Showing it in the separate window."
+        )),
+        (Some((gone, false)), None) => Some(format!(
+            "{gone} stopped sharing. The separate window stays open for the next share."
+        )),
+        _ => None,
+    }
+}
+
+/// The same change, spoken inside the separate window.
+pub fn window_note(prev: Option<(&str, bool)>, next: Option<&str>) -> Option<String> {
+    match (prev, next) {
+        (Some((gone, false)), Some(shown)) => Some(format!(
+            "{gone} stopped sharing. Now showing {shown}'s shared content."
+        )),
+        (Some((_, true)), Some(shown)) => Some(format!("Now showing {shown}'s shared content")),
+        (None, Some(started)) => Some(format!("{started} started sharing")),
+        (Some((gone, false)), None) => Some(format!(
+            "{gone} stopped sharing. Shared content will be displayed here."
+        )),
+        _ => None,
+    }
+}
+
+pub fn swap_announcement(shown: &str, moved: Option<&str>) -> String {
+    match moved {
+        Some(moved) => format!(
+            "Showing {shown}'s shared content in the separate window. {moved}'s shared content \
+             moved to the meeting."
+        ),
+        None => format!("Showing {shown}'s shared content in the separate window."),
+    }
+}
+
+/// An open from a displaced tile while no window was open.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn tile_opened_announcement(shown: &str, stays: Option<&str>) -> String {
+    let opened = swap_announcement(shown, None);
+    match stays {
+        Some(stays) => format!("{opened} {stays}'s shared content stays in the meeting."),
+        None => opened,
+    }
+}
+
 /// Whether a share pin points at a share tile that is no longer rendered.
 /// `received_sharer` is `Some(None)` while a received share is on screen but
 /// its sharer's user id could not be read this render: the pin is held.
@@ -536,11 +728,15 @@ pub fn share_dom_id(key: &str, part: &str) -> String {
     }
 }
 
-pub fn load_share_view_pref(origin: ShareOrigin) -> ShareViewMode {
+pub fn load_share_view_pref(origin: ShareOrigin, meeting: (f64, f64)) -> ShareViewMode {
     let stored = web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|s| s.get_item(origin.pref_key()).ok().flatten());
-    ShareViewMode::parse(stored.as_deref())
+    origin.stored_mode(stored.as_deref(), meeting)
+}
+
+pub fn load_own_share_view_pref() -> ShareViewMode {
+    load_share_view_pref(ShareOrigin::Own, (0.0, 0.0))
 }
 
 pub fn save_share_view_pref(origin: ShareOrigin, mode: ShareViewMode) {
@@ -566,6 +762,7 @@ pub struct ShareViewCtx {
     pub detached: Signal<Option<String>>,
     pub announce: Signal<(String, u32)>,
     pub own_stream: Signal<Option<web_sys::MediaStream>>,
+    pub stage: Signal<ReceivedStage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -583,6 +780,7 @@ pub struct ShareTileView {
     pub cta: CtaState,
     pub guard: bool,
     pub pin_rank: Option<usize>,
+    pub demoted: bool,
 }
 
 impl ShareTileView {
@@ -624,43 +822,24 @@ pub enum TeardownCause {
     User,
     System,
     Displaced,
+    #[cfg(target_arch = "wasm32")]
+    Failed,
 }
 
 thread_local! {
     static TEARDOWN_CAUSE: std::cell::Cell<TeardownCause> =
         const { std::cell::Cell::new(TeardownCause::User) };
-    /// A system teardown that cancelled a still-pending open; its reattach
-    /// callback fires later, outside `teardown_with_cause`.
-    static PENDING_CANCEL: std::cell::RefCell<Option<(String, TeardownCause)>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(target_arch = "wasm32")]
-fn take_teardown_cause(key: &str) -> TeardownCause {
-    let now = TEARDOWN_CAUSE.with(|c| c.replace(TeardownCause::User));
-    let pending = PENDING_CANCEL.with(|p| {
-        let mut p = p.borrow_mut();
-        if p.as_ref().is_some_and(|(k, _)| k == key) {
-            p.take().map(|(_, cause)| cause)
-        } else {
-            None
-        }
-    });
-    pending.unwrap_or(now)
+fn take_teardown_cause() -> TeardownCause {
+    TEARDOWN_CAUSE.with(|c| c.replace(TeardownCause::User))
 }
 
-/// Close `key`'s detached window, or cancel its pending open, for a reason
-/// other than the user's.
 pub fn teardown_with_cause(key: &str, cause: TeardownCause) {
     TEARDOWN_CAUSE.with(|c| c.set(cause));
     #[cfg(target_arch = "wasm32")]
-    {
-        use crate::components::screen_share_detach as ssd;
-        if cause != TeardownCause::User && ssd::is_pending(key) {
-            PENDING_CANCEL.with(|p| *p.borrow_mut() = Some((key.to_string(), cause)));
-        }
-        ssd::teardown(key);
-    }
+    crate::components::screen_share_detach::teardown(key);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = key;
     TEARDOWN_CAUSE.with(|c| c.set(TeardownCause::User));
@@ -677,11 +856,15 @@ fn snapshot(ctx: ShareViewCtx, target: &ShareTarget) -> ShareSnapshot {
         .try_peek()
         .map(|d| d.clone())
         .unwrap_or_default();
+    let other_window = match target.origin {
+        ShareOrigin::Own => ctx.stage.try_peek().is_ok_and(|s| s.window),
+        ShareOrigin::Received => detached.as_deref() == Some(OWN_SHARE_KEY),
+    };
     ShareSnapshot {
         base: slot.base,
         pinned: ctx.pins.try_peek().is_ok_and(|p| p.contains(&target.pin)),
         detached: detached.as_deref() == Some(target.key.as_str()),
-        other_detached: detached.is_some() && detached.as_deref() != Some(target.key.as_str()),
+        other_detached: other_window,
         pre_detach: slot.pre_detach,
     }
 }
@@ -735,6 +918,17 @@ pub fn dispatch(ctx: ShareViewCtx, target: &ShareTarget, action: ShareAction) {
     {
         return;
     }
+    let demoted = target.origin == ShareOrigin::Received
+        && ctx
+            .stage
+            .try_peek()
+            .is_ok_and(|s| s.demoted.contains(&target.key));
+    if demoted {
+        if action == ShareAction::Detach {
+            detach_demoted(ctx, target);
+        }
+        return;
+    }
     let before = snapshot(ctx, target);
     let t = next_share_view(before, action);
     apply(ctx, target, t);
@@ -742,45 +936,185 @@ pub fn dispatch(ctx: ShareViewCtx, target: &ShareTarget, action: ShareAction) {
         DetachOp::Keep => {}
         DetachOp::Close => {
             #[cfg(target_arch = "wasm32")]
-            crate::components::screen_share_detach::reattach(&target.key);
+            crate::components::screen_share_detach::reattach(target.origin.window_key());
         }
         DetachOp::Open => {
             if t.reattach_other {
-                if let Some(other) = ctx.detached.peek().clone() {
-                    teardown_with_cause(&other, TeardownCause::Displaced);
-                }
+                teardown_with_cause(target.origin.other().window_key(), TeardownCause::Displaced);
             }
-            open_detached(ctx, target);
+            open_detached(ctx, target, false);
         }
     }
 }
 
+/// The received window closes when the meeting ends or its view unmounts.
+pub fn use_received_window_lifetime(meeting_over: impl Fn() -> bool + 'static) {
+    use_effect(move || {
+        if meeting_over() {
+            teardown_with_cause(RECEIVED_WINDOW_KEY, TeardownCause::System);
+        }
+    });
+    use_drop(|| teardown_with_cause(RECEIVED_WINDOW_KEY, TeardownCause::System));
+}
+
+/// Detach on a demoted tile: it takes the received slot into the window, and
+/// the share it displaces becomes a demoted tile.
+fn detach_demoted(ctx: ShareViewCtx, target: &ShareTarget) {
+    let (window, moved) = {
+        let s = ctx.stage.peek();
+        (s.window, s.bound_target().map(|t| t.name))
+    };
+    if window {
+        if take_demoted_slot(ctx, target) {
+            announce(ctx, swap_announcement(&target.name, moved.as_deref()));
+        }
+        return;
+    }
+    if ctx.detached.peek().as_deref() == Some(OWN_SHARE_KEY) {
+        teardown_with_cause(OWN_SHARE_KEY, TeardownCause::Displaced);
+    }
+    open_detached(ctx, target, true);
+}
+
+fn take_demoted_slot(ctx: ShareViewCtx, target: &ShareTarget) -> bool {
+    let mut stage = ctx.stage;
+    let Ok(mut s) = stage.try_write() else {
+        return false;
+    };
+    if !s.take_slot(&target.key) {
+        return false;
+    }
+    s.primary_target = Some(target.clone());
+    s.toast = None;
+    true
+}
+
+/// `parts` spoken as one announcement.
+fn join_announcements(parts: &[String]) -> Option<String> {
+    let (last, rest) = parts.split_last()?;
+    let mut text = String::new();
+    for part in rest {
+        text.push_str(part.trim_end_matches('.'));
+        text.push_str(". ");
+    }
+    text.push_str(last);
+    Some(text)
+}
+
+/// Whether the focused received window, not the meeting, speaks a change.
+fn speaks_in_window(window: bool) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        window && crate::components::screen_share_detach::received_window_focused()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = window;
+        false
+    }
+}
+
+fn bind_window(ctx: ShareViewCtx, target: Option<&ShareTarget>) {
+    let key = target.map(|t| t.key.clone());
+    let mut detached = ctx.detached;
+    if detached.try_peek().is_ok_and(|d| *d != key) {
+        if let Ok(mut d) = detached.try_write() {
+            *d = key;
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    crate::components::screen_share_detach::show(
+        target.map(|t| (t.key.as_str(), t.name.as_str())),
+        None,
+    );
+}
+
 #[cfg(target_arch = "wasm32")]
-fn open_detached(ctx: ShareViewCtx, target: &ShareTarget) {
+fn received_window_closed(ctx: ShareViewCtx, cause: TeardownCause, opened: bool) {
+    let mut stage = ctx.stage;
+    let bound = stage.try_peek().ok().and_then(|s| s.bound_target());
+    if let Ok(mut s) = stage.try_write() {
+        s.window = false;
+        s.toast = None;
+    }
+    crate::components::screen_share_detach::show(None, None);
+    let mut detached = ctx.detached;
+    if let Ok(mut d) = detached.try_write() {
+        if d.as_deref() != Some(OWN_SHARE_KEY) {
+            *d = None;
+        }
+    }
+    match (cause, bound) {
+        (TeardownCause::Displaced, Some(t)) => settle(ctx, &t, ShareAction::Displaced),
+        (TeardownCause::User, Some(t)) => settle(ctx, &t, ShareAction::Reattach { opened }),
+        (TeardownCause::Failed, Some(t)) => {
+            settle(ctx, &t, ShareAction::Reattach { opened: false })
+        }
+        (TeardownCause::User, None) if opened => {
+            let slot = ctx.slots.try_peek().map(|s| s.received).unwrap_or_default();
+            save_share_view_pref(ShareOrigin::Received, closed_waiting_pref(slot));
+            announce(ctx, "Separate window closed".to_string());
+            focus_first(&[]);
+        }
+        (TeardownCause::User, None) => announce(ctx, DETACH_FAILED.to_string()),
+        _ => {}
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn open_detached(ctx: ShareViewCtx, target: &ShareTarget, demoted: bool) {
     use crate::components::screen_share_detach as ssd;
     use std::cell::Cell;
     use std::rc::Rc;
 
     let mut detached = ctx.detached;
     detached.set(Some(target.key.clone()));
+    if target.origin == ShareOrigin::Received {
+        let mut stage = ctx.stage;
+        stage.with_mut(|s| s.window = true);
+    }
     let opened = Rc::new(Cell::new(false));
     let on_opened: Box<dyn FnOnce()> = {
         let opened = opened.clone();
         let origin = target.origin;
+        let target = target.clone();
         Box::new(move || {
             opened.set(true);
+            let mut message = detach_announcement(origin, true);
+            if demoted {
+                let shown = ctx
+                    .stage
+                    .try_peek()
+                    .ok()
+                    .and_then(|s| s.primary_target.clone());
+                if take_demoted_slot(ctx, &target) {
+                    let mut slots = ctx.slots;
+                    if let Ok(mut s) = slots.try_write() {
+                        s.received = ShareSlot {
+                            pre_detach: Some(ShareViewMode::Tile),
+                            ..ShareSlot::default()
+                        };
+                    };
+                    let stays = shown.as_ref().map(|t| t.name.as_str());
+                    message = tile_opened_announcement(&target.name, stays);
+                }
+            }
             save_share_view_pref(origin, ShareViewMode::Detached);
             let mut slots = ctx.slots;
             if let Ok(mut s) = slots.try_write() {
                 s.get_mut(origin).cta = CtaState::Hidden;
             }
-            announce(ctx, detach_announcement(origin, true));
+            announce(ctx, message);
         })
     };
     let on_reattach: Box<dyn Fn()> = {
         let target = target.clone();
         Box::new(move || {
-            let cause = take_teardown_cause(&target.key);
+            let cause = take_teardown_cause();
+            if target.origin == ShareOrigin::Received {
+                received_window_closed(ctx, cause, opened.get());
+                return;
+            }
             let mut detached = ctx.detached;
             if let Ok(mut d) = detached.try_write() {
                 if d.as_deref() == Some(target.key.as_str()) {
@@ -788,7 +1122,7 @@ fn open_detached(ctx: ShareViewCtx, target: &ShareTarget) {
                 }
             }
             match cause {
-                TeardownCause::System => {}
+                TeardownCause::System | TeardownCause::Failed => {}
                 TeardownCause::Displaced => settle(ctx, &target, ShareAction::Displaced),
                 TeardownCause::User => settle(
                     ctx,
@@ -801,7 +1135,13 @@ fn open_detached(ctx: ShareViewCtx, target: &ShareTarget) {
         })
     };
     match target.origin {
-        ShareOrigin::Received => ssd::open(&target.key, &target.name, on_opened, on_reattach),
+        ShareOrigin::Received => ssd::open(
+            RECEIVED_WINDOW_KEY,
+            &target.key,
+            &target.name,
+            on_opened,
+            on_reattach,
+        ),
         ShareOrigin::Own => match ctx.own_stream.peek().clone() {
             Some(stream) => ssd::open_stream(&target.key, stream, on_opened, on_reattach),
             None => on_reattach(),
@@ -810,7 +1150,7 @@ fn open_detached(ctx: ShareViewCtx, target: &ShareTarget) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn open_detached(_ctx: ShareViewCtx, _target: &ShareTarget) {}
+fn open_detached(_ctx: ShareViewCtx, _target: &ShareTarget, _demoted: bool) {}
 
 /// Apply an arrival plan to a share that just started.
 pub fn begin_share(ctx: ShareViewCtx, target: &ShareTarget, plan: ArrivalPlan, guard: bool) {
@@ -821,6 +1161,7 @@ pub fn begin_share(ctx: ShareViewCtx, target: &ShareTarget, plan: ArrivalPlan, g
             pre_detach: None,
             cta: plan.cta,
             guard,
+            guard_chosen: false,
         };
     });
     if plan.demote_other {
@@ -831,10 +1172,53 @@ pub fn begin_share(ctx: ShareViewCtx, target: &ShareTarget, plan: ArrivalPlan, g
     }
 }
 
+/// The share tiles laid out in the meeting: received, own, then one tile per
+/// demoted share.
+pub fn shown_share_tiles(
+    received: Option<(ShareBase, ShareViewMode)>,
+    own: Option<(ShareBase, ShareViewMode)>,
+    demoted: usize,
+) -> Vec<(ShareBase, ShareViewMode)> {
+    let demoted = std::iter::repeat_n((ShareBase::Tile, ShareViewMode::Tile), demoted);
+    received.into_iter().chain(own).chain(demoted).collect()
+}
+
+/// The demoted tiles placed (`in_panel`) or not in the split's panel.
+pub fn demoted_views(
+    targets: &[ShareTarget],
+    placed: &[bool],
+    in_panel: bool,
+) -> Vec<ShareTileView> {
+    targets
+        .iter()
+        .zip(placed)
+        .filter(|(_, placed)| **placed == in_panel)
+        .map(|(target, _)| ShareTileView {
+            target: target.clone(),
+            mode: ShareViewMode::Tile,
+            cta: CtaState::Hidden,
+            guard: false,
+            pin_rank: None,
+            demoted: true,
+        })
+        .collect()
+}
+
+/// Follow the received sharers, oldest first, and return the stage to render.
+pub fn follow_stage(ctx: ShareViewCtx, sharers: &[String]) -> ReceivedStage {
+    let mut stage = ctx.stage;
+    let next = stage.peek().follow(sharers);
+    if *stage.peek() != next {
+        stage.set(next.clone());
+    }
+    next
+}
+
 /// The shares seen on the previous render.
 #[derive(Default)]
 pub struct ShareTracker {
     received: Option<ShareTarget>,
+    demoted: Vec<ShareTarget>,
     own_live: bool,
     /// The received slot left by an arrival whose pin waits for the sharer's
     /// user id; the pin applies only if the slot is unchanged.
@@ -862,29 +1246,71 @@ pub fn track_shares(
     tracker: &mut ShareTracker,
     ctx: ShareViewCtx,
     received: Option<&ShareTarget>,
+    demoted: &[ShareTarget],
     received_user_known: bool,
     still_sharing: &dyn Fn(&str) -> bool,
     own: Option<(&ShareTarget, &web_sys::MediaStream)>,
     detach_supported: bool,
+    meeting: (f64, f64),
     mut zoom: Signal<HashMap<String, ScreenZoomState>>,
     mut actual: Signal<Option<String>>,
 ) {
+    let window = ctx.stage.try_peek().is_ok_and(|s| s.window);
+    let in_window = speaks_in_window(window);
+    let bound_elsewhere = window
+        && ctx
+            .stage
+            .try_peek()
+            .is_ok_and(|s| s.primary_target.as_ref().map(|t| &t.key) != received.map(|t| &t.key));
+    let target_changed = tracker.received.as_ref() != received || bound_elsewhere;
+    let mut said = Vec::new();
+    let mut notes = Vec::new();
+    let gone: Vec<ShareTarget> = tracker
+        .demoted
+        .iter()
+        .filter(|d| {
+            !demoted.iter().any(|t| t.key == d.key)
+                && received.is_none_or(|t| t.key != d.key)
+                && !still_sharing(&d.key)
+        })
+        .cloned()
+        .collect();
+    for d in &gone {
+        let text = format!("{} stopped sharing", d.name);
+        if in_window {
+            notes.push(text);
+        } else {
+            said.push(text);
+        }
+        zoom.with_mut(|m| m.remove(&d.key));
+    }
     let prev_key = tracker.received.as_ref().map(|t| t.key.clone());
     if prev_key.as_deref() != received.map(|t| t.key.as_str()) {
         let prev = tracker.received.take();
         if let Some(prev) = prev.as_ref() {
-            settle(ctx, prev, ShareAction::Ended);
+            if !window {
+                settle(ctx, prev, ShareAction::Ended);
+            }
             zoom.with_mut(|m| m.remove(&prev.key));
             if actual.peek().as_deref() == Some(prev.key.as_str()) {
                 actual.set(None);
             }
             let mut slots = ctx.slots;
-            slots.with_mut(|s| s.received = ShareSlot::default());
+            if window {
+                slots.with_mut(|s| s.received.cta = CtaState::Hidden);
+            } else {
+                slots.with_mut(|s| s.received = ShareSlot::default());
+            }
         }
         let mut cta = false;
         tracker.pin_on_resolve = None;
-        if let Some(t) = received {
-            let mut plan = arrival_plan(load_share_view_pref(t.origin), detach_supported, false);
+        if let Some(t) = received.filter(|_| !window) {
+            let mut plan = arrival_plan(
+                load_share_view_pref(t.origin, meeting),
+                t.origin.default_mode(meeting),
+                detach_supported,
+                false,
+            );
             let defer_pin = plan.pin && !received_user_known;
             plan.pin &= received_user_known;
             begin_share(ctx, t, plan, false);
@@ -893,16 +1319,50 @@ pub fn track_shares(
             }
             cta = plan.cta == CtaState::Shown;
         }
-        let message = switch_announcement(
-            prev.as_ref()
-                .map(|p| (p.name.as_str(), still_sharing(&p.key))),
-            received.map(|t| t.name.as_str()),
-            cta,
-        );
-        if let Some(message) = message {
-            announce(ctx, message);
-        }
+        let prev_still = prev
+            .as_ref()
+            .map(|p| (p.name.as_str(), still_sharing(&p.key)));
+        let next = received.map(|t| t.name.as_str());
+        let swapped = received.is_some_and(|t| tracker.demoted.iter().any(|d| d.key == t.key))
+            && prev_still.is_some_and(|(_, sharing)| sharing);
+        let message = match window {
+            _ if swapped => None,
+            true => window_switch_announcement(prev_still, next),
+            false => switch_announcement(prev_still, next, cta),
+        };
+        said.extend(message.filter(|_| !in_window));
+        notes.extend(window_note(prev_still, next).filter(|_| in_window && !swapped));
     }
+    if window && target_changed {
+        bind_window(ctx, received);
+    }
+    if let Some(note) = join_announcements(&notes) {
+        #[cfg(target_arch = "wasm32")]
+        crate::components::screen_share_detach::say(&note);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = note;
+    }
+    if let Some(message) = join_announcements(&said) {
+        announce(ctx, message);
+    }
+    let mut stage = ctx.stage;
+    if stage
+        .try_peek()
+        .is_ok_and(|s| s.primary_target.as_ref() != received)
+    {
+        stage.with_mut(|s| {
+            let moved = s.primary_target.as_ref().map(|p| &p.key) != received.map(|t| &t.key);
+            if let Some(t) = received.filter(|_| s.window && moved) {
+                s.toast_seq += 1;
+                let text = format!("{} is sharing in the separate window", t.name);
+                s.toast = Some((s.toast_seq, text));
+            } else if received.is_none() {
+                s.toast = None;
+            }
+            s.primary_target = received.cloned();
+        });
+    }
+    tracker.demoted = demoted.to_vec();
     if let Some(t) = received.filter(|_| received_user_known) {
         if let Some(at_arrival) = tracker.pin_on_resolve.take() {
             if received_slot(ctx) == Some(at_arrival) {
@@ -919,7 +1379,8 @@ pub fn track_shares(
     match own {
         Some((t, stream)) => {
             let guard = mirror_guard_default(display_surface(stream).as_deref());
-            let plan = own_arrival_plan(load_share_view_pref(t.origin), detach_supported, guard);
+            let pref = load_share_view_pref(t.origin, meeting);
+            let plan = own_arrival_plan(pref, detach_supported, guard);
             begin_share(ctx, t, plan, guard);
             if guard {
                 announce(ctx, MIRROR_GUARD_ON.to_string());
@@ -955,7 +1416,7 @@ pub fn set_mirror_guard(ctx: ShareViewCtx, target: &ShareTarget, on: bool, detac
         .ok()
         .and_then(|s| s.as_ref().and_then(display_surface));
     let plan = show_preview_plan(
-        load_share_view_pref(target.origin),
+        load_own_share_view_pref(),
         detach_supported,
         surface.as_deref(),
     );
@@ -966,6 +1427,83 @@ pub fn set_mirror_guard(ctx: ShareViewCtx, target: &ShareTarget, on: bool, detac
     if plan.detach_now {
         dispatch(ctx, target, ShareAction::Detach);
     }
+}
+
+/// The own share's guard after its capture switched to `surface`, when that
+/// changes it. A guard the presenter chose only gives way to a whole screen.
+pub fn replaced_guard(surface: Option<&str>, guarded: bool, chosen: bool) -> Option<bool> {
+    let guard = mirror_guard_default(surface);
+    (guard != guarded && (guard || !chosen)).then_some(guard)
+}
+
+/// Hide or Show preview on the own share.
+pub fn choose_mirror_guard(
+    ctx: ShareViewCtx,
+    target: &ShareTarget,
+    on: bool,
+    detach_supported: bool,
+) {
+    set_mirror_guard(ctx, target, on, detach_supported);
+    let mut slots = ctx.slots;
+    let Ok(mut s) = slots.try_write() else {
+        return;
+    };
+    s.get_mut(target.origin).guard_chosen = true;
+}
+
+/// The presenter's confirmation once "Share something else" took effect.
+pub fn replaced_text(surface: Option<&str>) -> &'static str {
+    match surface {
+        Some("monitor") => "Switched to sharing your entire screen",
+        Some("window") => "Switched to sharing a window",
+        Some("browser") => "Switched to sharing a tab",
+        _ => "Switched to sharing new content",
+    }
+}
+
+/// The own share switched to `stream`: it becomes the own preview, its zoom
+/// resets and the switch is announced. The mirror guard changes only as
+/// [`replaced_guard`] decides; when it stays, an open own window plays `stream`.
+/// Returns the toast text.
+pub fn own_capture_replaced(
+    ctx: ShareViewCtx,
+    target: &ShareTarget,
+    stream: &web_sys::MediaStream,
+    detach_supported: bool,
+    mut zoom: Signal<HashMap<String, ScreenZoomState>>,
+) -> &'static str {
+    let mut own_stream = ctx.own_stream;
+    if let Ok(mut own) = own_stream.try_write() {
+        *own = Some(Clone::clone(stream));
+    }
+    if zoom.try_peek().is_ok_and(|z| z.contains_key(OWN_SHARE_KEY)) {
+        zoom.with_mut(|z| z.remove(OWN_SHARE_KEY));
+    }
+    let surface = display_surface(stream);
+    let text = replaced_text(surface.as_deref());
+    let own = ctx.slots.try_peek().map(|s| s.own).unwrap_or_default();
+    let message = match replaced_guard(surface.as_deref(), own.guard, own.guard_chosen) {
+        Some(true) => {
+            set_mirror_guard(ctx, target, true, detach_supported);
+            format!("{text}. {MIRROR_GUARD_ON}")
+        }
+        Some(false) => {
+            let plan = own_arrival_plan(load_own_share_view_pref(), detach_supported, false);
+            begin_share(ctx, target, plan, false);
+            if plan.cta == CtaState::Shown {
+                format!("{text}. {CTA_HINT}")
+            } else {
+                text.to_string()
+            }
+        }
+        None => {
+            #[cfg(target_arch = "wasm32")]
+            crate::components::screen_share_detach::replace_stream(Clone::clone(stream));
+            text.to_string()
+        }
+    };
+    announce(ctx, message);
+    text
 }
 
 /// Focus the first of `ids` that actually takes focus, else the grid.
@@ -1010,19 +1548,83 @@ mod tests {
     };
 
     #[test]
-    fn pref_parse_round_trips_and_unknown_is_tile() {
-        for m in [
-            ShareViewMode::Tile,
-            ShareViewMode::Enlarged,
-            ShareViewMode::Pinned,
-            ShareViewMode::Detached,
-        ] {
-            assert_eq!(ShareViewMode::parse(Some(m.as_str())), m);
+    fn a_stored_pref_round_trips_for_both_origins_at_any_width() {
+        for origin in [ShareOrigin::Received, ShareOrigin::Own] {
+            for m in [
+                ShareViewMode::Tile,
+                ShareViewMode::Enlarged,
+                ShareViewMode::Pinned,
+                ShareViewMode::Detached,
+            ] {
+                for at in [(390.0, 844.0), (719.0, 600.0), (1920.0, 1080.0)] {
+                    assert_eq!(origin.stored_mode(Some(m.as_str()), at), m, "{at:?}");
+                }
+            }
         }
-        assert_eq!(ShareViewMode::parse(None), ShareViewMode::Tile);
-        assert_eq!(ShareViewMode::parse(Some("")), ShareViewMode::Tile);
-        assert_eq!(ShareViewMode::parse(Some("Enlarged")), ShareViewMode::Tile);
-        assert_eq!(ShareViewMode::parse(Some("split")), ShareViewMode::Tile);
+    }
+
+    #[test]
+    fn with_no_usable_pref_a_received_share_enlarges_only_in_a_wide_meeting_area() {
+        for stored in [None, Some(""), Some("Enlarged"), Some("split")] {
+            for (meeting, received) in [
+                ((390.0, 844.0), ShareViewMode::Tile),
+                ((719.9, 500.0), ShareViewMode::Tile),
+                ((f64::NAN, 0.0), ShareViewMode::Tile),
+                ((768.0, 1024.0), ShareViewMode::Tile),
+                ((844.0, 390.0), ShareViewMode::Tile),
+                ((1280.0, 539.0), ShareViewMode::Tile),
+                ((1280.0, 540.0), ShareViewMode::Enlarged),
+                (
+                    (ENLARGED_DEFAULT_MIN_WIDTH_PX, 600.0),
+                    ShareViewMode::Enlarged,
+                ),
+                ((1920.0, 1080.0), ShareViewMode::Enlarged),
+            ] {
+                let at = format!("{stored:?} {meeting:?}");
+                assert_eq!(
+                    ShareOrigin::Received.stored_mode(stored, meeting),
+                    received,
+                    "{at}"
+                );
+                assert_eq!(
+                    ShareOrigin::Own.stored_mode(stored, meeting),
+                    ShareViewMode::Tile,
+                    "{at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_view_modes_spec_copies_the_enlarged_default_width() {
+        let spec = include_str!("../../../e2e/tests/screen-share-view-modes.spec.ts");
+        let copied = spec
+            .lines()
+            .find_map(|l| l.strip_prefix("const ENLARGED_DEFAULT_MIN_WIDTH_PX = "))
+            .and_then(|v| v.strip_suffix(';'))
+            .expect("premise: the spec copies the width");
+        assert_eq!(copied.parse::<f64>(), Ok(ENLARGED_DEFAULT_MIN_WIDTH_PX));
+    }
+
+    #[test]
+    fn an_open_peer_list_narrows_a_1024px_meeting_area_below_the_enlarged_default() {
+        use crate::components::attendants_layout::{
+            action_bar_band_width, drawer_reserves, DrawerState, CHAT_DRAWER_WIDTH,
+        };
+        let default_at_1024 = |peer_list_open| {
+            let reserves = drawer_reserves(DrawerState {
+                vw: 1024.0,
+                peer_list_open,
+                left_w: 320.0,
+                diagnostics_open: false,
+                right_w: 320.0,
+                chat_open: false,
+                chat_w: CHAT_DRAWER_WIDTH,
+            });
+            ShareOrigin::Received.default_mode((action_bar_band_width(1024.0, reserves), 768.0))
+        };
+        assert_eq!(default_at_1024(true), ShareViewMode::Tile);
+        assert_eq!(default_at_1024(false), ShareViewMode::Enlarged);
     }
 
     #[test]
@@ -1281,14 +1883,14 @@ mod tests {
     #[test]
     fn arrival_tile_pref_is_the_default() {
         assert_eq!(
-            arrival_plan(ShareViewMode::Tile, true, false),
+            arrival_plan(ShareViewMode::Tile, ShareViewMode::Enlarged, true, false),
             ArrivalPlan::default()
         );
     }
 
     #[test]
     fn arrival_enlarged_pref_stages_the_share() {
-        let p = arrival_plan(ShareViewMode::Enlarged, true, false);
+        let p = arrival_plan(ShareViewMode::Enlarged, ShareViewMode::Tile, true, false);
         assert_eq!(p.base, ShareBase::Enlarged);
         assert!(p.demote_other);
         assert!(!p.pin);
@@ -1296,7 +1898,7 @@ mod tests {
 
     #[test]
     fn arrival_pinned_pref_pins_over_a_tile_base() {
-        let p = arrival_plan(ShareViewMode::Pinned, true, false);
+        let p = arrival_plan(ShareViewMode::Pinned, ShareViewMode::Enlarged, true, false);
         assert_eq!(p.base, ShareBase::Tile);
         assert!(p.pin);
         assert!(
@@ -1306,24 +1908,43 @@ mod tests {
     }
 
     #[test]
-    fn arrival_detached_pref_offers_the_cta_and_never_opens() {
-        let p = arrival_plan(ShareViewMode::Detached, true, false);
+    fn arrival_detached_pref_offers_the_cta_over_the_default_view_and_never_opens() {
+        let p = arrival_plan(ShareViewMode::Detached, ShareViewMode::Tile, true, false);
         assert_eq!(p.base, ShareBase::Tile);
         assert_eq!(p.cta, CtaState::Shown);
         assert!(!p.detach_now, "C3: no popup without a user activation");
+        let wide = arrival_plan(
+            ShareViewMode::Detached,
+            ShareViewMode::Enlarged,
+            true,
+            false,
+        );
+        assert_eq!(wide.base, ShareBase::Enlarged);
+        assert!(wide.demote_other);
+        assert_eq!(wide.cta, CtaState::Shown);
+        assert!(!wide.detach_now);
     }
 
     #[test]
-    fn arrival_detached_pref_without_detach_support_is_plain_tile() {
+    fn arrival_detached_pref_without_detach_support_opens_in_the_default_view() {
         assert_eq!(
-            arrival_plan(ShareViewMode::Detached, false, false),
+            arrival_plan(ShareViewMode::Detached, ShareViewMode::Tile, false, false),
             ArrivalPlan::default()
+        );
+        assert_eq!(
+            arrival_plan(
+                ShareViewMode::Detached,
+                ShareViewMode::Enlarged,
+                false,
+                false
+            ),
+            arrival_plan(ShareViewMode::Enlarged, ShareViewMode::Tile, false, false)
         );
     }
 
     #[test]
     fn a_click_applies_the_detached_pref_directly() {
-        let p = arrival_plan(ShareViewMode::Detached, true, true);
+        let p = arrival_plan(ShareViewMode::Detached, ShareViewMode::Tile, true, true);
         assert!(p.detach_now);
         assert_eq!(p.cta, CtaState::Hidden);
     }
@@ -1628,6 +2249,7 @@ mod tests {
             cta: CtaState::Hidden,
             guard: false,
             pin_rank,
+            demoted: false,
         };
         assert_eq!(view(ShareOrigin::Received, None).root_style(), "order: -3;");
         assert_eq!(view(ShareOrigin::Own, None).root_style(), "order: -2;");
@@ -1635,6 +2257,268 @@ mod tests {
             view(ShareOrigin::Own, Some(1)).root_style(),
             "order: -999;",
             "a pin moves the share ahead of every unpinned tile"
+        );
+    }
+
+    fn keys(ks: &[&str]) -> Vec<String> {
+        ks.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn stage(window: bool, renders: &[&[&str]]) -> ReceivedStage {
+        let start = ReceivedStage {
+            window,
+            ..ReceivedStage::default()
+        };
+        renders
+            .iter()
+            .fold(start, |s, sharers| s.follow(&keys(sharers)))
+    }
+
+    #[test]
+    fn without_a_window_the_newest_share_replaces_the_shown_one() {
+        let s = stage(false, &[&["a"], &["a", "b"]]);
+        assert_eq!(s.primary.as_deref(), Some("b"));
+        assert!(
+            s.demoted.is_empty(),
+            "the older share is hidden, not demoted"
+        );
+        assert_eq!(
+            s.follow(&keys(&["a"])).primary.as_deref(),
+            Some("a"),
+            "the older share returns when the newer one stops"
+        );
+    }
+
+    #[test]
+    fn a_new_share_takes_the_window_and_demotes_the_one_it_showed() {
+        let s = stage(true, &[&["a"], &["a", "b"]]);
+        assert_eq!(s.primary.as_deref(), Some("b"));
+        assert_eq!(s.demoted, keys(&["a"]));
+        let s = s.follow(&keys(&["a", "b", "c"]));
+        assert_eq!(s.primary.as_deref(), Some("c"));
+        assert_eq!(s.demoted, keys(&["a", "b"]));
+        let together = stage(true, &[&["a"], &["a", "b", "c"]]);
+        assert_eq!(together, s, "two arrivals in one render demote in order");
+    }
+
+    #[test]
+    fn opening_the_window_turns_a_share_hidden_by_lifo_into_a_tile() {
+        let mut s = stage(false, &[&["a", "b"]]);
+        assert!(s.demoted.is_empty(), "premise: a is hidden under b");
+        s.window = true;
+        let s = s.follow(&keys(&["a", "b"]));
+        assert_eq!(s.primary.as_deref(), Some("b"));
+        assert_eq!(s.demoted, keys(&["a"]));
+    }
+
+    #[test]
+    fn a_demoted_share_stays_until_its_sharer_stops_even_after_the_window_closes() {
+        let mut s = stage(true, &[&["a"], &["a", "b"]]);
+        s.window = false;
+        let s = s.follow(&keys(&["a", "b", "c"]));
+        assert_eq!(s.primary.as_deref(), Some("c"));
+        assert_eq!(s.demoted, keys(&["a"]), "without a window b is only hidden");
+        let back = s.follow(&keys(&["a", "b"]));
+        assert_eq!(
+            back.primary.as_deref(),
+            Some("b"),
+            "LIFO: b returns, a stays a tile"
+        );
+        assert_eq!(back.demoted, keys(&["a"]));
+        assert_eq!(s.follow(&keys(&["b", "c"])).demoted, Vec::<String>::new());
+    }
+
+    #[test]
+    fn every_demoted_share_is_a_tile_cell_and_view() {
+        let tiles = shown_share_tiles(None, None, 2);
+        assert_eq!(share_layout(&tiles), ShareLayout::Tile);
+        assert_eq!(tiles.len(), 2);
+        let target = |key: &str| ShareTarget {
+            origin: ShareOrigin::Received,
+            key: key.into(),
+            pin: PinnedTile::screen(key),
+            name: key.into(),
+        };
+        let views = demoted_views(&[target("a"), target("b")], &[true, false], false);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].target.key, "b");
+        assert!(views[0].demoted && views[0].mode == ShareViewMode::Tile);
+    }
+
+    #[test]
+    fn the_window_waits_when_its_share_ends_and_binds_the_next_one() {
+        let s = stage(true, &[&["a"], &[]]);
+        assert!(s.window);
+        assert_eq!(s.primary, None, "the window waits");
+        let s = s.follow(&keys(&["c"]));
+        assert_eq!(s.primary.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn the_window_takes_the_newest_live_share_when_its_share_ends() {
+        let mut s = stage(false, &[&["a", "b"]]);
+        s.window = true;
+        assert_eq!(
+            s.follow(&keys(&["a"])).primary.as_deref(),
+            Some("a"),
+            "the older stacked share becomes the top share"
+        );
+
+        let s = stage(true, &[&["a"], &["a", "b"], &["a"]]);
+        assert_eq!(
+            s.primary.as_deref(),
+            Some("a"),
+            "a demoted share moves back"
+        );
+        assert!(s.demoted.is_empty());
+
+        let mut s = stage(true, &[&["a"], &["a", "b"]]);
+        s.window = false;
+        let s = s.follow(&keys(&["a"]));
+        assert_eq!(
+            s.primary.as_deref(),
+            Some("a"),
+            "the demoted share takes the slot"
+        );
+        assert!(s.demoted.is_empty());
+    }
+
+    #[test]
+    fn detaching_a_demoted_share_swaps_it_with_the_shown_one_in_place() {
+        let mut s = stage(true, &[&["a"], &["a", "b"], &["a", "b", "c"]]);
+        s.take_slot("a");
+        assert_eq!(s.primary.as_deref(), Some("a"));
+        assert_eq!(s.demoted, keys(&["c", "b"]));
+        assert_eq!(
+            s.follow(&keys(&["a", "b", "c"])),
+            s,
+            "a swap survives the next render"
+        );
+    }
+
+    #[test]
+    fn only_a_demoted_share_can_take_the_slot() {
+        let mut s = stage(true, &[&["a"], &["a", "b"]]);
+        let before = s.clone();
+        s.take_slot("b");
+        s.take_slot("z");
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn the_window_reattaches_only_the_share_it_shows() {
+        let ann = ShareTarget {
+            origin: ShareOrigin::Received,
+            key: "a".into(),
+            pin: PinnedTile::screen("ann"),
+            name: "Ann".into(),
+        };
+        let mut s = stage(true, &[&["a"]]);
+        s.primary_target = Some(ann.clone());
+        assert_eq!(s.bound_target(), Some(ann));
+        assert_eq!(
+            s.follow(&keys(&["a", "b"])).bound_target(),
+            None,
+            "a target left by an earlier share is never reattached"
+        );
+        s.window = false;
+        assert_eq!(s.bound_target(), None);
+    }
+
+    #[test]
+    fn a_window_switch_is_spoken_in_the_meeting_or_in_the_window() {
+        let (ann, gone, bea) = (Some(("Ann", true)), Some(("Ann", false)), Some("Bea"));
+        let switches = [(ann, bea), (gone, bea), (None, bea), (gone, None)];
+        let meeting = [
+            "Bea started sharing in the separate window. Ann's shared content moved to the \
+             meeting.",
+            "Ann stopped sharing. Showing Bea's shared content in the separate window.",
+            "Bea started sharing. Showing it in the separate window.",
+            "Ann stopped sharing. The separate window stays open for the next share.",
+        ];
+        let window = [
+            "Now showing Bea's shared content",
+            "Ann stopped sharing. Now showing Bea's shared content.",
+            "Bea started sharing",
+            "Ann stopped sharing. Shared content will be displayed here.",
+        ];
+        for (i, (prev, next)) in switches.into_iter().enumerate() {
+            let said = window_switch_announcement(prev, next);
+            assert_eq!(said.as_deref(), Some(meeting[i]));
+            assert_eq!(window_note(prev, next).as_deref(), Some(window[i]));
+        }
+        assert_eq!(window_switch_announcement(None, None), None);
+        assert_eq!(
+            swap_announcement("Ann", Some("Bea")),
+            "Showing Ann's shared content in the separate window. Bea's shared content moved to \
+             the meeting."
+        );
+    }
+
+    #[test]
+    fn closing_a_waiting_window_reopens_shares_in_the_view_it_was_opened_from() {
+        use ShareViewMode as M;
+        let slot = |base, pre_detach| ShareSlot {
+            base,
+            pre_detach,
+            ..ShareSlot::default()
+        };
+        for mode in [M::Tile, M::Enlarged, M::Pinned] {
+            assert_eq!(closed_waiting_pref(slot(ShareBase::Tile, Some(mode))), mode);
+        }
+        assert_eq!(
+            closed_waiting_pref(slot(ShareBase::Enlarged, None)),
+            M::Enlarged
+        );
+    }
+
+    #[test]
+    fn a_demoted_tile_joins_the_panel_in_the_split_and_keeps_its_seat() {
+        let mut placement = PanelPlacement::default();
+        let ab = keys(&["a", "b"]);
+        assert_eq!(placement.place_demoted(false, &ab), vec![false, false]);
+        assert_eq!(placement.place_demoted(true, &ab), vec![true, true]);
+        assert_eq!(
+            placement.place_demoted(false, &ab),
+            vec![true, true],
+            "no move when the split ends"
+        );
+        assert_eq!(
+            placement.place_demoted(false, &keys(&["b", "c"])),
+            vec![true, false],
+            "a new tile starts on the stage"
+        );
+    }
+
+    #[test]
+    fn the_replacement_names_what_is_shared_now() {
+        assert_eq!(
+            replaced_text(Some("monitor")),
+            "Switched to sharing your entire screen"
+        );
+        assert_eq!(
+            replaced_text(Some("window")),
+            "Switched to sharing a window"
+        );
+        assert_eq!(replaced_text(Some("browser")), "Switched to sharing a tab");
+        assert_eq!(replaced_text(None), "Switched to sharing new content");
+    }
+
+    #[test]
+    fn a_replaced_capture_rejudges_the_mirror_guard_by_its_surface() {
+        assert_eq!(replaced_guard(Some("monitor"), false, false), Some(true));
+        assert_eq!(replaced_guard(Some("window"), true, false), Some(false));
+        assert_eq!(replaced_guard(Some("browser"), false, false), None);
+        assert_eq!(replaced_guard(Some("monitor"), true, false), None);
+        assert_eq!(
+            replaced_guard(Some("window"), true, true),
+            None,
+            "hidden by hand"
+        );
+        assert_eq!(
+            replaced_guard(Some("monitor"), false, true),
+            Some(true),
+            "a whole screen always hides"
         );
     }
 }

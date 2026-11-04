@@ -109,6 +109,12 @@ pub struct Config {
     /// exceed the 5-renames-per-60s budget shared per `(user_id)` across
     /// every test in a window.
     pub display_name_rate_limit_disabled: bool,
+    /// `CAPTIONS_ENABLED=true` serves `POST /api/v1/meetings/{id}/captions`;
+    /// otherwise it answers 404. Default `false`.
+    pub captions_enabled: bool,
+    /// `GRAVATAR_ENABLED`: `false`/`0`/`no`/`off` turns off the Gravatar avatar source; unset,
+    /// empty or `true`/`1`/`yes`/`on` keeps it on; any other value fails [`Config::from_env`].
+    pub gravatar_enabled: bool,
     /// Dev-only auto-login user. `None` unless `DEV_USER` is set AND OAuth is
     /// disabled. See [`DevUser`] for format and security warnings.
     pub dev_user: Option<DevUser>,
@@ -255,6 +261,8 @@ impl Config {
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
     /// - `SEARCH_API_URL` + `SEARCH_API_TOKEN` (both required together to enable SearchV2 push;
     ///   either missing → push is silently disabled). See [`SearchConfig`].
+    /// - `CAPTIONS_ENABLED` (default: `false`) — `"true"` / `"1"` serves the live-captions
+    ///   lease route `POST /api/v1/meetings/{id}/captions`; otherwise it answers 404.
     /// - `DISPLAY_NAME_RATE_LIMIT_DISABLED` (default: `false`) — set to `"true"` / `"1"`
     ///   for the E2E test harness only. When enabled, the per-user display-name rename
     ///   rate limiter (5 renames per 60-second window) is bypassed entirely. Required
@@ -384,6 +392,24 @@ impl Config {
                  only; do not enable in production."
             );
         }
+
+        let captions_enabled = env::var("CAPTIONS_ENABLED")
+            .map(|v| {
+                let v = v.trim().to_lowercase();
+                v == "true" || v == "1"
+            })
+            .unwrap_or(false);
+
+        let gravatar_enabled = match env::var("GRAVATAR_ENABLED") {
+            Err(env::VarError::NotPresent) => true,
+            value => match value.map(|v| v.trim().to_lowercase()).as_deref() {
+                Ok("" | "true" | "1" | "yes" | "on") => true,
+                Ok("false" | "0" | "no" | "off") => false,
+                _ => {
+                    return Err("GRAVATAR_ENABLED must be true/false, 1/0, yes/no or on/off".into())
+                }
+            },
+        };
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
@@ -579,6 +605,8 @@ impl Config {
             service_version_urls,
             search,
             display_name_rate_limit_disabled,
+            captions_enabled,
+            gravatar_enabled,
             dev_user,
             oauth_allow_unverified,
         })
@@ -714,6 +742,8 @@ mod tests {
             service_version_urls: Vec::new(),
             search: None,
             display_name_rate_limit_disabled: false,
+            captions_enabled: false,
+            gravatar_enabled: true,
             dev_user: None,
             oauth_allow_unverified: false,
         }
@@ -1530,6 +1560,80 @@ mod tests {
             Some(v) => std::env::set_var("OAUTH_ISSUER", v),
             None => std::env::remove_var("OAUTH_ISSUER"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn gravatar_switch_parses_known_values_and_refuses_others() {
+        let prior: Vec<_> = [
+            "DATABASE_URL",
+            "JWT_SECRET",
+            "CORS_ALLOWED_ORIGIN",
+            "GRAVATAR_ENABLED",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var(key).ok()))
+        .collect();
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "room-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+
+        with_env_unset("GRAVATAR_ENABLED", || {
+            assert!(Config::from_env().unwrap().gravatar_enabled);
+        });
+        for (value, expected) in [
+            ("false", false),
+            (" FALSE ", false),
+            ("0", false),
+            ("no", false),
+            ("Off", false),
+            ("true", true),
+            (" TRUE ", true),
+            ("1", true),
+            ("yes", true),
+            ("ON", true),
+            ("", true),
+        ] {
+            std::env::set_var("GRAVATAR_ENABLED", value);
+            assert_eq!(
+                Config::from_env().map(|cfg| cfg.gravatar_enabled),
+                Ok(expected),
+                "{value:?}"
+            );
+        }
+        for value in ["disabled", "enabled", "2", "nope", "of f"] {
+            std::env::set_var("GRAVATAR_ENABLED", value);
+            let error = Config::from_env()
+                .err()
+                .unwrap_or_else(|| panic!("{value:?} must be refused"));
+            assert!(error.contains("GRAVATAR_ENABLED"), "{value:?}: {error}");
+        }
+
+        for (key, value) in prior {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn app_state_honours_the_gravatar_switch() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let mut cfg = base_config();
+        let state = |cfg: &Config| {
+            crate::state::AppState::new(
+                db.clone(),
+                cfg,
+                None,
+                crate::feed_events::new_feed_channel().0,
+            )
+        };
+        assert!(state(&cfg).avatars.gravatar_enabled());
+        cfg.gravatar_enabled = false;
+        assert!(!state(&cfg).avatars.gravatar_enabled());
     }
 
     #[test]

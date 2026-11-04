@@ -140,3 +140,58 @@ describe("resource-sampler.sh — live /proc capture", () => {
     },
   );
 });
+
+describe("resource-sampler.sh — processes matched by command line", () => {
+  it("uses no bash 4.4 builtin option or bare array expansion, so bash 4.2 hosts still match", () => {
+    expect(SCRIPT_TEXT).not.toMatch(/\b(mapfile|readarray)\b[^\n]*\s-d\b/);
+    expect(SCRIPT_TEXT).not.toMatch(/\$\{args\[[^\]]*\]\}/);
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "samples a process whose command line matches, under the given name",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "sampler-cmdline-"));
+      const out = join(dir, "raw.csv");
+      const marked = spawn(
+        process.execPath,
+        ["-e", "setTimeout(() => {}, 30_000)", "cq-marked-arg", "run"],
+        { stdio: "ignore" },
+      );
+      try {
+        await new Promise((r) => setTimeout(r, 300));
+        const started = Date.now();
+        execFileSync(
+          "bash",
+          [
+            SCRIPT,
+            "--out",
+            out,
+            "--interval",
+            "1",
+            "--max-seconds",
+            "1",
+            "--proc-grep",
+            "^no-such-comm$",
+            "--cmdline-grep",
+            "cq-marked-arg run$",
+            "--cmdline-name",
+            "probe-node",
+          ],
+          { timeout: 10_000, killSignal: "SIGKILL" },
+        );
+        expect(Date.now() - started).toBeLessThan(8_000);
+        const rows = readFileSync(out, "utf8")
+          .split("\n")
+          .filter((l) => l.startsWith("proc,"))
+          .map((l) => l.split(","));
+        expect(rows.filter((r) => r[2] === String(marked.pid)).map((r) => r[3])).toContain(
+          "probe-node",
+        );
+        expect(rows.every((r) => r[3] === "probe-node")).toBe(true);
+      } finally {
+        marked.kill("SIGKILL");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});

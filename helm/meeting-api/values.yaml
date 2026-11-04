@@ -79,6 +79,13 @@ env:
     value: "nats://nats:4222"
   - name: SERVICE_VERSION_URLS
     value: ""
+  # Optional (#3125): Gravatar avatar import, on when unset. Accepted (case-insensitive):
+  # false/0/no/off disable; true/1/yes/on or empty enable. Any other value makes meeting-api
+  # exit at startup. Quote it ("false") and use --set-string: plain --set renders a YAML
+  # bool, not the string an env value must be. When on, the pod needs egress to
+  # https://gravatar.com.
+  # - name: GRAVATAR_ENABLED
+  #   value: "false"
 # See the note in helm/global/us-east/meeting-api/values.yaml: below 1000m the
 # cgroup quota floors `available_parallelism()` to 1, pinning tokio to a single
 # worker thread and the Argon2 verifier (issue #1613) to a single permit. Memory
@@ -121,6 +128,9 @@ autoscaling:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+captions:
+  enabled: false
 
 consoleLogs:
   enabled: false

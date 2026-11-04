@@ -25,6 +25,7 @@ use crate::rtt_probe::RttProbeState;
 use crate::viewport_sender::ViewportSender;
 use protobuf::Message;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
@@ -195,6 +196,8 @@ pub struct InboundStats {
     /// Optional keyframe requester. When set, new peers trigger a
     /// KEYFRAME_REQUEST for VIDEO the first time they are observed.
     keyframe_requester: Option<KeyframeRequester>,
+    /// Bumped for each camera KEYFRAME_REQUEST that targets this bot.
+    keyframe_request_signal: Option<Arc<AtomicU64>>,
     /// Optional viewport sender. When set, the source session_id of every
     /// inbound media packet is fed here so the bot can emit VIEWPORT control
     /// packets like a real client (HCL issue #988).
@@ -260,6 +263,11 @@ impl InboundStats {
     /// a KEYFRAME_REQUEST for VIDEO.
     pub fn set_keyframe_requester(&mut self, requester: KeyframeRequester) {
         self.keyframe_requester = Some(requester);
+    }
+
+    /// Count camera KEYFRAME_REQUESTs addressed to this bot into `signal`.
+    pub fn set_keyframe_request_signal(&mut self, signal: Arc<AtomicU64>) {
+        self.keyframe_request_signal = Some(signal);
     }
 
     /// Attach a viewport sender. When set, the relay-stamped source session_id
@@ -424,10 +432,7 @@ impl InboundStats {
         }
     }
 
-    // `_my_user_id` is retained in the signature (many callers pass it) but is
-    // no longer used: DIAGNOSTICS filtering-by-sender moved out with the AQ
-    // fan-in removal (issue #1108).
-    pub fn record_packet(&mut self, _my_user_id: &str, data: &[u8]) {
+    pub fn record_packet(&mut self, my_user_id: &str, data: &[u8]) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -631,6 +636,16 @@ impl InboundStats {
                 #[cfg(feature = "metrics")]
                 self.bump_received("health");
                 self.heartbeat_packets += 1;
+            }
+            Ok(MediaType::KEYFRAME_REQUEST) => {
+                #[cfg(feature = "metrics")]
+                self.bump_received("other");
+                self.other_packets += 1;
+                if let Some(signal) = &self.keyframe_request_signal {
+                    if media.user_id == my_user_id.as_bytes() && media.data == b"VIDEO" {
+                        signal.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             _ => {
                 #[cfg(feature = "metrics")]
@@ -1001,6 +1016,46 @@ mod tests {
     use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket, VideoMetadata};
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
     use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    #[test]
+    fn a_camera_keyframe_request_for_this_bot_bumps_the_signal() {
+        use crate::keyframe_requester::build_keyframe_request;
+        let signal = Arc::new(AtomicU64::new(0));
+        let mut stats = InboundStats::default();
+        stats.set_keyframe_request_signal(Arc::clone(&signal));
+
+        stats.record_packet(
+            "bot-001",
+            &build_keyframe_request("probe", "bot-001").unwrap(),
+        );
+        assert_eq!(signal.load(Ordering::Relaxed), 1);
+        stats.record_packet(
+            "bot-001",
+            &build_keyframe_request("probe", "bot-002").unwrap(),
+        );
+        assert_eq!(
+            signal.load(Ordering::Relaxed),
+            1,
+            "another publisher's request"
+        );
+
+        let mut screen = MediaPacket::parse_from_bytes(
+            &PacketWrapper::parse_from_bytes(&build_keyframe_request("probe", "bot-001").unwrap())
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        screen.data = b"SCREEN".to_vec();
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: b"probe".to_vec(),
+            data: screen.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        stats.record_packet("bot-001", &wrapper.write_to_bytes().unwrap());
+        assert_eq!(signal.load(Ordering::Relaxed), 1, "a screen request");
+        assert_eq!(stats.other_packets, 3, "still counted as other packets");
+    }
 
     /// Build a serialized PacketWrapper containing a MediaPacket for testing.
     fn make_media_packet(sender: &str, media_type: MediaType, seq: u64, timestamp: f64) -> Vec<u8> {

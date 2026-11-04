@@ -3,15 +3,15 @@
  *
  * ## What this spec guards
  *
- * 1. **Host banner**: clicking the record button transitions the host's
- *    `.recording-status-banner` through "Starting recording…" → "Recording".
+ * 1. **Recorder's own status (issue 3126)**: while recording, the recorder sees
+ *    exactly ONE recording status — the `.meeting-status-item--self` item in
+ *    `.meeting-status-bar`, reading "You are recording" plus the file name.
  * 2. **Meeting-wide status bar**: after the host starts recording, the
  *    persistent `.meeting-status-bar` (an in-flow strip above the tile grid
- *    hosting the `.meeting-status-item--recording` item) appears for the guest
- *    AND for the recorder themselves (it is shown to every participant
- *    uniformly). This tests `PEER_EVENT_RECORDING_STARTED` delivery populating
- *    the session-keyed recording set that the `any_session_recording` aggregate
- *    reads.
+ *    hosting the `.meeting-status-item--recording` item) appears for the guest,
+ *    with the generic "Recording" item, AND for the recorder. This tests
+ *    `PEER_EVENT_RECORDING_STARTED` delivery populating the session-keyed
+ *    recording set that the `any_session_recording` aggregate reads.
  * 3. **Status bar clears on stop**: after the host stops recording, the bar
  *    detaches for everyone (collapsing its reserved top space back into the
  *    tile area).  This directly guards the abort-cleanup fix:
@@ -33,7 +33,8 @@
  * Two real browser contexts with `--use-fake-device-for-media-stream`.
  * `window.showSaveFilePicker` is stubbed before navigation with an
  * `addInitScript` so the recording never shows a real OS file-picker dialog
- * and the MediaRecorder writes to a no-op in-memory sink instead.
+ * and the MediaRecorder writes to a no-op in-memory sink, as if the user had
+ * picked `PICKED_FILE_NAME`.
  * Camera-on is seeded via `vc_prejoin_camera_on` so both peers publish video.
  *
  * ## Mutation sensitivity
@@ -41,6 +42,8 @@
  * - Remove `set_recording_active(false)` from the → Idle callback → indicator
  *   stays on the guest side even after stop.
  * - Remove `PEER_EVENT_RECORDING_STOPPED` fan-out → indicator never clears.
+ * - Show the `.recording-status-banner` toast while Recording again → the
+ *   recorder has two role=status regions reading "recording", not one.
  */
 
 import { test, expect, chromium, Page } from "@playwright/test";
@@ -50,6 +53,18 @@ import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 import { PIN_WEBSOCKET_TRANSPORT_INIT_SCRIPT } from "../helpers/auth-context";
 import { startScreenShare, stopScreenShare } from "../helpers/screen-share-meeting";
 import { enterMeetingAsHost, guestJoinsMeeting } from "../helpers/two-user-meeting";
+import {
+  PEER_STATUS_ITEM,
+  PENDING_STATUS_ITEM,
+  SELF_STATUS_ITEM,
+  STARTING_TOAST,
+  STATUS_BAR,
+  expectRecSlotInlineSize,
+  expectSavedToastNames,
+  expectSelfItemContained,
+  expectSelfRecording,
+  fileNameIn,
+} from "../helpers/recording-status";
 
 declare global {
   interface Window {
@@ -103,17 +118,20 @@ const BROWSER_ARGS = [
   "--renderer-process-limit=1",
 ];
 
+const PICKED_FILE_NAME = "Q4 review - quarterly planning.webm";
+
 /**
  * Stub script injected before page load.
  *
  * Replaces `window.showSaveFilePicker` with a function that returns a fake
- * FileHandle whose `createWritable()` returns a no-op WritableStream.
- * This prevents the real OS save-file dialog from blocking the test and lets
- * the MediaRecorder write to the fake writer without error.
+ * FileHandle named `PICKED_FILE_NAME` whose `createWritable()` returns a no-op
+ * WritableStream. This prevents the real OS save-file dialog from blocking the
+ * test and lets the MediaRecorder write to the fake writer without error.
  */
 const STUB_FILE_PICKER_SCRIPT = `
   window.showSaveFilePicker = async function () {
     return {
+      name: ${JSON.stringify(PICKED_FILE_NAME)},
       createWritable: async function () {
         return {
           write:  async function () { window.__e2eWrites = (window.__e2eWrites || 0) + 1; },
@@ -369,8 +387,6 @@ async function joinMeetingFromPage(
 
 /**
  * Open the peer-list sidebar by clicking the "Open Peers" video-controls button.
- * The button lives in `.controls-secondary`, which auto-hides after ~1s of mouse
- * inactivity, so wake the controls bar by hovering + moving the mouse first.
  * Mirrors the helper in `host-controls-menu-ux.spec.ts`.
  */
 async function openPeerListSidebar(page: Page): Promise<void> {
@@ -451,12 +467,27 @@ test.describe("Recording feature", () => {
       await expect(recordBtn).toBeVisible({ timeout: 10_000 });
       await recordBtn.click();
 
-      // Host must see its own local status banner transition to "Recording".
-      // The banner renders as `.recording-status-banner` > `.toast-name`.
-      const hostStatusBanner = hostPage.locator(".recording-status-banner .toast-name");
-      await expect(hostStatusBanner).toHaveText(/Recording/, {
-        timeout: 15_000,
-      });
+      // ── Issue 3126: ONE recording status ──────────────────────────────
+      const selfItem = hostPage.locator(SELF_STATUS_ITEM);
+      await expectSelfRecording(hostPage, "You are recording");
+      const recordingStatuses = hostPage
+        .locator('[role="status"]')
+        .filter({ hasText: /recording/i });
+      await expect(recordingStatuses).toHaveCount(1);
+      await expect(recordingStatuses).toHaveClass(/\bmeeting-status-item--self\b/);
+
+      const target = selfItem.locator(":scope > .rec-target");
+      await expect(target.locator(":scope > .rec-target-verb")).toHaveText("Saving to");
+      await expect(target.locator(":scope > .rec-target-head")).not.toBeEmpty();
+      expect(await fileNameIn(target)).toBe(PICKED_FILE_NAME);
+      await expect(selfItem).toHaveAttribute(
+        "title",
+        `You are recording. Saving to ${PICKED_FILE_NAME}`,
+      );
+      await expect(selfItem).not.toHaveAttribute("aria-label");
+      await expect(selfItem.locator(":scope > .visually-hidden")).toHaveText(
+        `, saving to ${PICKED_FILE_NAME}`,
+      );
 
       // ── Item 1 (a11y): honour `prefers-reduced-motion: reduce` ────────
       // The infinite `rec-pulse` on the active record button and on the
@@ -469,20 +500,18 @@ test.describe("Recording feature", () => {
       //
       // Mutation sensitivity: delete the reduced-motion block for
       // `.rec-dot, .video-control-button.record-active` in global.css and the
-      // `reduce` branch below stays `rec-pulse`, failing the `toBe("none")`.
-      const animName = (page: Page, selector: string) =>
-        page.evaluate((sel) => {
-          const el = document.querySelector(sel);
-          return el ? getComputedStyle(el).animationName : null;
-        }, selector);
+      // `reduce` branch below stays `rec-pulse`.
+      const activeRecordBtn = hostPage.getByTestId("record-button");
+      const selfDot = selfItem.locator(":scope > .rec-dot");
+      await expect(activeRecordBtn).toHaveClass(/\brecord-active\b/);
 
       await hostPage.emulateMedia({ reducedMotion: "reduce" });
-      expect(await animName(hostPage, ".video-control-button.record-active")).toBe("none");
-      expect(await animName(hostPage, ".recording-status-banner .rec-dot")).toBe("none");
+      await expect(activeRecordBtn).toHaveCSS("animation-name", "none");
+      await expect(selfDot).toHaveCSS("animation-name", "none");
 
       await hostPage.emulateMedia({ reducedMotion: "no-preference" });
-      expect(await animName(hostPage, ".video-control-button.record-active")).toBe("rec-pulse");
-      expect(await animName(hostPage, ".recording-status-banner .rec-dot")).toBe("rec-pulse");
+      await expect(activeRecordBtn).toHaveCSS("animation-name", "rec-pulse");
+      await expect(selfDot).toHaveCSS("animation-name", "rec-pulse");
 
       // ── Assert the persistent meeting-wide status bar appears ─────────
       // `.meeting-status-bar` is driven by the `any_session_recording`
@@ -494,6 +523,12 @@ test.describe("Recording feature", () => {
       await expect(hostPage.locator(".meeting-status-bar")).toBeVisible({
         timeout: 20_000,
       });
+
+      // The guest is not recording, so it keeps the generic item.
+      const guestItem = guestPage.locator(PEER_STATUS_ITEM);
+      await expect(guestItem).toHaveText("Recording");
+      await expect(guestItem).toHaveAttribute("aria-label", "This meeting is being recorded");
+      await expect(guestPage.locator(SELF_STATUS_ITEM)).toHaveCount(0);
 
       // ── Regression: status bar does NOT occlude the tile name label ───
       // The literal bug this bar fixed: the previous fixed-position recording
@@ -555,6 +590,8 @@ test.describe("Recording feature", () => {
       await expect(stopBtn).toBeVisible({ timeout: 5_000 });
       await stopBtn.click();
 
+      await expectSavedToastNames(hostPage, PICKED_FILE_NAME);
+
       // ── Assert the meeting-wide status bar detaches ───────────────────
       // PEER_EVENT_RECORDING_STOPPED must arrive and the `on_peer_event`
       // handler must remove the host's session from the recording set, which
@@ -568,14 +605,51 @@ test.describe("Recording feature", () => {
       await expect(hostPage.locator(".meeting-status-bar")).toHaveCount(0, {
         timeout: 20_000,
       });
-
-      // Host banner must also be gone after the recording finishes.
-      await expect(hostPage.locator(".recording-status-banner")).not.toBeVisible({
-        timeout: 10_000,
-      });
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  test("without a save picker the recorder's status names the file the stop click downloads", async ({
+    baseURL,
+  }) => {
+    // Issue 3126: the name shown while recording is the name downloaded.
+    const uiURL = baseURL || "http://localhost:3001";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-download@videocall.rs",
+        "RecDownloadHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(FORCE_FALLBACK_SCRIPT);
+      const hostPage = await hostCtx.newPage();
+      await enterMeetingAsHost(hostPage, `e2e_rec_download_${Date.now()}`, "RecDownloadHost");
+
+      const recordBtn = hostPage.getByTestId("record-button");
+      await recordBtn.click();
+      await expectSelfRecording(hostPage, "You are recording");
+      const selfItem = hostPage.locator(SELF_STATUS_ITEM);
+      const target = selfItem.locator(":scope > .rec-target");
+      await expect(target.locator(":scope > .rec-target-verb")).toHaveText("Will download as");
+      const name = await fileNameIn(target);
+      expect(name).toMatch(/^meeting-recording-.+\.(webm|mp4)$/);
+      await expect(selfItem).toHaveAttribute(
+        "title",
+        `You are recording. The file will download as ${name} when you stop.`,
+      );
+      await expect(selfItem.locator(":scope > .visually-hidden")).toHaveText(
+        `, will download as ${name}`,
+      );
+
+      const download = hostPage.waitForEvent("download", { timeout: 30_000 });
+      await recordBtn.click();
+      expect((await download).suggestedFilename()).toBe(name);
+      await expectSavedToastNames(hostPage, name);
+    } finally {
+      await browser1.close();
     }
   });
 
@@ -656,6 +730,7 @@ test.describe("Recording feature", () => {
           timeout: 15_000,
         })
         .toBe("recording");
+      await expect(hostPage.locator(SELF_STATUS_ITEM)).toBeVisible();
 
       // ── Core proof: it auto-stops and saves WITHOUT a stop click ───────
       // After the cap trips: recording → stopping → saving → saved → idle.
@@ -668,9 +743,9 @@ test.describe("Recording feature", () => {
         })
         .toMatch(/^(saved|idle)$/);
 
-      // The host's own status banner must also detach once the recording
+      // The host's own status item must also detach once the recording
       // finishes on its own.
-      await expect(hostPage.locator(".recording-status-banner")).not.toBeVisible({
+      await expect(hostPage.locator(SELF_STATUS_ITEM)).toHaveCount(0, {
         timeout: 10_000,
       });
 
@@ -914,8 +989,8 @@ test.describe("Recording feature", () => {
       );
 
       const hostPage = await hostCtx.newPage();
-      // The open peer list carves 320px out of the dock's band; below 1172px
-      // the Recording slot overflows into the menu (issue 2701).
+      // The open peer list carves 320px out of the dock's band; too narrow a
+      // band overflows the Recording slot into the menu (issue 2701).
       await hostPage.setViewportSize({ width: 1600, height: 900 });
       const guestPage = await guestCtx.newPage();
 
@@ -979,10 +1054,7 @@ test.describe("Recording feature", () => {
       await recordBtn.click();
 
       // Recording must be live (Recording state) before the local insert fires.
-      await expect(hostPage.locator(".recording-status-banner .toast-name")).toHaveText(
-        /Recording/,
-        { timeout: 15_000 },
-      );
+      await expectSelfRecording(hostPage, "You are recording");
 
       // Guest sees the host's recording icon ON THE HOST'S TILE.
       await expect(guestSeesHostTileIcon).toHaveCount(1, { timeout: 20_000 });
@@ -1118,18 +1190,12 @@ test.describe("Recording feature", () => {
       const hostRecordBtn = hostPage.getByTestId("record-button");
       await expect(hostRecordBtn).toBeVisible({ timeout: 15_000 });
       await hostRecordBtn.click();
-      await expect(hostPage.locator(".recording-status-banner .toast-name")).toHaveText(
-        /Recording/,
-        { timeout: 15_000 },
-      );
+      await expectSelfRecording(hostPage);
 
       const guestRecordBtn = guestPage.getByTestId("record-button");
       await expect(guestRecordBtn).toBeVisible({ timeout: 15_000 });
       await guestRecordBtn.click();
-      await expect(guestPage.locator(".recording-status-banner .toast-name")).toHaveText(
-        /Recording/,
-        { timeout: 15_000 },
-      );
+      await expectSelfRecording(guestPage);
 
       // Each peer sees the OTHER's recording icon on the other's tile.
       await expect(hostSeesGuestTileIcon).toHaveCount(1, { timeout: 20_000 });
@@ -1139,9 +1205,9 @@ test.describe("Recording feature", () => {
       await hostPage.getByTestId("record-button").click();
 
       // The guest's icon (seen on the host's page) must PERSIST — independence.
-      // We first confirm the host's own recording banner cleared (host stop
+      // We first confirm the host's own status item cleared (host stop
       // completed), then assert the guest's tile icon is still there.
-      await expect(hostPage.locator(".recording-status-banner")).not.toBeVisible({
+      await expect(hostPage.locator(SELF_STATUS_ITEM)).toHaveCount(0, {
         timeout: 15_000,
       });
       await expect(hostSeesGuestTileIcon).toHaveCount(1);
@@ -1261,10 +1327,7 @@ test.describe("Recording feature", () => {
       const hostRecordBtn = hostPage.getByTestId("record-button");
       await expect(hostRecordBtn).toBeVisible({ timeout: 15_000 });
       await hostRecordBtn.click();
-      await expect(hostPage.locator(".recording-status-banner .toast-name")).toHaveText(
-        /Recording/,
-        { timeout: 15_000 },
-      );
+      await expectSelfRecording(hostPage, "You are recording");
 
       // Visible to the non-recording guest AND to the recorder (host) itself.
       await expect(guestIndicator).toBeVisible({ timeout: 20_000 });
@@ -1274,57 +1337,76 @@ test.describe("Recording feature", () => {
       // `toBeVisible` alone would NOT catch this (Playwright treats opacity:0 as
       // visible), so assert the computed opacity directly.
       await guestPage.waitForTimeout(9000);
-      const guestOpacity = await guestPage.evaluate(() => {
-        const el = document.querySelector(".meeting-status-bar");
-        return el ? parseFloat(getComputedStyle(el).opacity) : -1;
-      });
-      expect(guestOpacity).toBeGreaterThan(0.5);
+      await expect(guestIndicator).toHaveCSS("opacity", "1");
       await expect(guestIndicator).toBeVisible();
       await expect(hostIndicator).toBeVisible();
 
-      // ── Item 2 regression: the recorder's OWN `.recording-status-banner` ─
-      // carries `.peer-toast` for layout, but its visibility is state-machine-
-      // controlled by `record_state()` (Recording persists for the whole
-      // multi-minute recording), NOT auto-dismissing. It must therefore
-      // override the inherited base `.peer-toast` `toast-exit ... 7.5s
-      // forwards` auto-fade. The 9s wait above is well past that ~7.9s exit
-      // window, so — with the `.peer-toast.recording-status-banner` override
-      // in style.css — the host's banner must still be fully opaque and its
-      // computed `animation-name` must NOT include `toast-exit`.
-      //
-      // Mutation sensitivity: drop the `.peer-toast.recording-status-banner`
-      // override in style.css and this banner fades to opacity 0 after ~8s
-      // (opacity assertion fails) and `animation-name` regains `toast-exit`.
-      const hostBanner = await hostPage.evaluate(() => {
-        const el = document.querySelector(".recording-status-banner");
-        if (!el) return null;
-        const cs = getComputedStyle(el);
-        return { opacity: parseFloat(cs.opacity), animationName: cs.animationName };
-      });
-      expect(hostBanner).not.toBeNull();
-      expect(hostBanner!.opacity).toBeGreaterThan(0.5);
-      expect(hostBanner!.animationName).not.toContain("toast-exit");
+      // ── Item 2 regression: the recorder's own status persists ─────────
+      // It is state-machine-controlled for the whole recording, so past the
+      // same window it must still read "You are recording" at full opacity.
+      await expectSelfRecording(hostPage, "You are recording");
+      await expect(hostPage.locator(SELF_STATUS_ITEM)).toHaveCSS("opacity", "1");
+      await expect(hostIndicator).toHaveCSS("opacity", "1");
 
       // ── (b) Second recorder (guest) starts — no change to the indicator ─
       const guestRecordBtn = guestPage.getByTestId("record-button");
       await expect(guestRecordBtn).toBeVisible({ timeout: 15_000 });
       await guestRecordBtn.click();
-      await expect(guestPage.locator(".recording-status-banner .toast-name")).toHaveText(
-        /Recording/,
-        { timeout: 15_000 },
-      );
+      // Each recorder's own item counts the other recorder.
+      await expectSelfRecording(guestPage, "You and 1 other are recording");
+      await expectSelfRecording(hostPage, "You and 1 other are recording");
       // Indicator remains present on both — the second start doesn't re-trigger it.
       await expect(hostIndicator).toHaveCount(1);
       await expect(hostIndicator).toBeVisible();
       await expect(guestIndicator).toHaveCount(1);
       await expect(guestIndicator).toBeVisible();
 
+      // ── Issue 3126: the self item follows its bar's width, not the viewport ─
+      // The open peer list narrows the bar while the viewport stays >= 568px.
+      const wide = { width: 1280, height: 720 };
+      const hostSelf = hostPage.locator(SELF_STATUS_ITEM);
+      const hostSep = hostSelf.locator(":scope > .rec-sep");
+      const hostTarget = hostSelf.locator(":scope > .rec-target");
+      const hostVerb = hostTarget.locator(":scope > .rec-target-verb");
+      await expect(hostSelf).toHaveClass(/\bmeeting-status-item--with-others\b/);
+
+      await hostPage.setViewportSize(wide);
+      await expectRecSlotInlineSize(hostPage, 460, Infinity);
+      await expect(hostVerb).toBeVisible();
+      await expect(hostTarget).toBeVisible();
+      await expectSelfItemContained(hostPage);
+
+      await openPeerListSidebar(hostPage);
+      await hostPage.setViewportSize({ width: 880, height: 720 });
+      await expectRecSlotInlineSize(hostPage, 460, 579);
+      await expect(hostVerb).toHaveCSS("display", "none");
+      await expect(hostTarget).toBeVisible();
+      await expect(hostTarget.locator(":scope > .rec-target-tail")).toHaveText(/\.(webm|mp4)$/);
+      await expectSelfItemContained(hostPage);
+
+      await hostPage.setViewportSize({ width: 760, height: 720 });
+      await expectRecSlotInlineSize(hostPage, 380, 459);
+      await expect(hostVerb).toHaveCSS("display", "none");
+      await expect(hostTarget).toBeVisible();
+      await expectSelfItemContained(hostPage);
+
+      await hostPage.setViewportSize({ width: 640, height: 720 });
+      await expectRecSlotInlineSize(hostPage, 0, 379);
+      await expect(hostSep).toHaveCSS("display", "none");
+      await expect(hostTarget).toHaveCSS("display", "none");
+      await expectSelfItemContained(hostPage);
+
+      await hostPage.setViewportSize(wide);
+      await hostPage.locator("#peer-list-container button.close-button").click();
+      await expect(hostPage.locator("#peer-list-container")).not.toHaveClass(/\bvisible\b/);
+
       // ── (c) Stop the host (a NON-last recorder — guest still records) ──
       await hostPage.getByTestId("record-button").click();
-      // Host's own detailed status banner clears (host stop completed)…
-      await expect(hostPage.locator(".recording-status-banner")).not.toBeVisible({
+      // Host's own status item gives way to the generic one (host stop completed)…
+      await expect(hostPage.locator(SELF_STATUS_ITEM)).toHaveCount(0, {
         timeout: 15_000,
       });
+      await expect(hostPage.locator(PEER_STATUS_ITEM)).toHaveText("Recording");
       // …but the meeting-wide indicator MUST remain, because the guest is still
       // recording. This is the exact case the old Option<String> banner got wrong.
       await expect(hostIndicator).toBeVisible();
@@ -1433,10 +1515,11 @@ test.describe("Recording feature", () => {
       // ── The host must NOT have transitioned to a recording state ─────────
       // (no local status banner text), and — critically — the guest must NOT
       // see a phantom meeting-wide recording bar from a spurious STARTED.
-      await expect(hostPage.locator(".recording-status-banner")).toHaveCount(0);
       // Give any (erroneous) STARTED fan-out ample time to propagate before
       // asserting its ABSENCE, so this is not a race that passes by being fast.
       await guestPage.waitForTimeout(3000);
+      await expect(hostPage.locator(STARTING_TOAST)).toHaveCount(0);
+      await expect(hostPage.locator(SELF_STATUS_ITEM)).toHaveCount(0);
       await expect(guestPage.locator(".meeting-status-bar")).toHaveCount(0);
       await expect(hostPage.locator(".meeting-status-bar")).toHaveCount(0);
     } finally {
@@ -1751,8 +1834,25 @@ test.describe("Recording feature", () => {
         .toBe("function");
       expect(await recordingState(hostPage)).toBe("activating");
 
+      const startingToast = hostPage.locator(STARTING_TOAST);
+      await expect(startingToast.locator(":scope > .toast-text > .toast-name")).toHaveText(
+        "Starting recording…",
+      );
+      await expect(startingToast).toBeVisible();
+      await expect(startingToast).toHaveCSS("opacity", "1");
+      // The `.peer-toast.recording-status-banner` override in style.css drops
+      // `.peer-toast`'s 7.5s `toast-exit`.
+      await expect(startingToast).not.toHaveCSS("animation-name", /toast-exit/);
+      await expect(hostPage.locator(".meeting-status-bar")).toHaveCount(0);
+      const pending = hostPage.locator(PENDING_STATUS_ITEM);
+      await expect(pending).toHaveCount(1);
+      await expect(pending).toBeEmpty();
+      await expect(pending).not.toHaveAttribute("title");
+
       await hostPage.evaluate(() => window.__vcRecording.stop());
       expect(await recordingState(hostPage)).toBe("idle");
+      await expect(startingToast).toHaveCount(0);
+      await expect(pending).toHaveCount(0);
       await hostPage.evaluate(() => window.__e2eResolvePicker!());
       await hostPage.waitForTimeout(2000);
       expect(await recordingState(hostPage)).toBe("idle");
@@ -1972,6 +2072,102 @@ test.describe("Recording feature", () => {
         .poll(() => hostPage.evaluate(() => window.__vcRecording.getState()), { timeout: 15_000 })
         .toBe("recording");
       expect((await recorderMic(hostPage)).count).toBe(0);
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("a busy Record item in the overflow menu ignores a click and the menu stays open", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-overflow-busy@videocall.rs",
+        "RecBusyHost",
+        uiURL,
+      );
+      await hostCtx.addInitScript(DEFERRED_PICKER_SCRIPT);
+      const hostPage = await hostCtx.newPage();
+      await enterMeetingAsHost(hostPage, `e2e_rec_overflow_busy_${Date.now()}`, "RecBusyHost");
+
+      const barButton = hostPage.getByTestId("record-button");
+      await expect(barButton).toBeVisible({ timeout: 10_000 });
+      await hostPage.setViewportSize({ width: 400, height: 720 });
+      await expect(barButton).toBeHidden();
+
+      const popover = hostPage.locator(".action-bar-overflow-popover");
+      const items = popover.locator(":scope > button.overflow-item");
+      await hostPage.locator(".video-controls-container").hover();
+      await hostPage.locator("#overflow-menu-trigger").click();
+      await items.filter({ hasText: /^Record$/ }).click();
+      await expect
+        .poll(() => hostPage.evaluate(() => typeof window.__e2eResolvePicker), { timeout: 15_000 })
+        .toBe("function");
+      expect(await recordingState(hostPage)).toBe("activating");
+
+      await hostPage.locator(".video-controls-container").hover();
+      await hostPage.locator("#overflow-menu-trigger").click();
+      const busy = items.filter({ hasText: /^Starting recording…$/ });
+      await expect(busy).toHaveCount(1);
+      await expect(busy).toHaveAttribute("aria-disabled", "true");
+      await expect(busy).toHaveAttribute("aria-busy", "true");
+
+      await busy.click({ force: true });
+      await hostPage.waitForTimeout(300);
+      await expect(popover).toBeVisible();
+      await expect(busy).toHaveCount(1);
+      expect(await recordingState(hostPage)).toBe("activating");
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("Record in the overflow menu shows its icon and starts and stops like the bar button", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-rec-overflow@videocall.rs",
+        "RecOverflowHost",
+        uiURL,
+      );
+      const hostPage = await hostCtx.newPage();
+      await enterMeetingAsHost(hostPage, `e2e_rec_overflow_${Date.now()}`, "RecOverflowHost");
+
+      const barButton = hostPage.getByTestId("record-button");
+      await expect(barButton).toBeVisible({ timeout: 10_000 });
+      await hostPage.setViewportSize({ width: 400, height: 720 });
+      await expect(barButton).toBeHidden();
+
+      const popover = hostPage.locator(".action-bar-overflow-popover");
+      const openItem = async (label: RegExp) => {
+        await hostPage.locator(".video-controls-container").hover();
+        await hostPage.locator("#overflow-menu-trigger").click();
+        const item = popover.locator(":scope > button.overflow-item").filter({ hasText: label });
+        await expect(item).toHaveCount(1);
+        return item;
+      };
+
+      const record = await openItem(/^Record$/);
+      await expect.soft(record.locator(":scope > svg > circle")).toHaveCount(2);
+      await record.click();
+      await expect(popover).toHaveCount(0);
+      await expect.poll(() => recordingState(hostPage), { timeout: 15_000 }).toBe("recording");
+      await expectSelfRecording(hostPage, "You are recording");
+      await expect(barButton).toHaveClass(/\brecord-active\b/);
+
+      const stop = await openItem(/^Stop recording$/);
+      await expect(stop.locator(":scope > svg > rect")).toHaveCount(1);
+      await stop.click();
+      await expectSavedToastNames(hostPage, PICKED_FILE_NAME);
+      await expect(hostPage.locator(STATUS_BAR)).toHaveCount(0, { timeout: 20_000 });
+      await expect(barButton).not.toHaveClass(/\brecord-active\b/);
     } finally {
       await browser1.close();
     }

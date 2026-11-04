@@ -2,7 +2,7 @@ COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 COMPOSE_E2E_MONITORING := $(COMPOSE_E2E) -f docker/docker-compose.monitoring.yaml --profile monitoring
 
-.PHONY: tests_up test test-scripts changelog changelog-pending build-videocall-postgres test-videocall-postgres test-webtransport-chart test-api-chart up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-up-monitoring e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
+.PHONY: tests_up test test-scripts scale-run fidelity-run cq-bot-image changelog changelog-pending build-videocall-postgres test-videocall-postgres test-webtransport-chart test-api-chart up down build connect_to_db connect_to_nats clippy-fix clippy-ci deny fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-up-monitoring e2e-down e2e-build e2e-cert e2e-doctor e2e-ci e2e-bots-clock
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -61,11 +61,14 @@ clippy-fix:
 test-scripts:
 		python3 -c 'import sys; sys.version_info >= (3, 9) or sys.exit("scripts require Python >= 3.9, runner has " + sys.version.split()[0])'
 		python3 scripts/test_parse_meeting_console_logs_census.py
-		python3 scripts/test_reconcile_skills.py
-		python3 scripts/test_comment_ratio.py
-		python3 scripts/test_guards.py
+		@if [ -f scripts/test_claim_sweep.py ]; then \
+			python3 scripts/test_claim_sweep.py; \
+		else \
+			echo "SKIP: scripts/test_claim_sweep.py absent (stripped for public sync)"; \
+		fi
 		python3 scripts/test_check_clippy_ci_sync.py
 		python3 scripts/test_check_protos_regen.py
+		python3 scripts/test_check_vendored_pins.py
 		python3 scripts/test_e2e_doctor_freshness.py
 		python3 scripts/test_e2e_up_stamp_clear.py
 		python3 scripts/test_e2e_backend_stop.py
@@ -77,6 +80,7 @@ test-scripts:
 		python3 scripts/test_check_call_quality_dashboard.py
 		python3 scripts/test_call_quality_dashboard_semantics.py
 		python3 scripts/test_check_dashboard_configmap_keys.py
+		python3 scripts/test_wasm_browser_test.py
 		@if [ -f helm/global/hcl/prometheus/values.yaml ] && [ -f helm/global/hcl-daily-deployment/prometheus/values.yaml ]; then \
 			python3 scripts/test_check_prometheus_alert_parity.py; \
 			PROMTOOL_SKIP_RUNTIME=1 python3 scripts/test_check_prometheus_rules_parse.py; \
@@ -89,14 +93,29 @@ test-scripts:
 		else \
 			echo "SKIP: scripts/test_verify_audio_single_layer.py absent (stripped for public sync)"; \
 		fi
-		python3 scripts/test_meeting_quality_xref.py
-		python3 scripts/test_meeting_quality_xref_load.py
+		@if [ -f scripts/test_meeting_quality_xref.py ]; then \
+			python3 scripts/test_meeting_quality_xref.py; \
+		else \
+			echo "SKIP: scripts/test_meeting_quality_xref.py absent (stripped for public sync)"; \
+		fi
+		@if [ -f scripts/test_meeting_quality_xref_load.py ]; then \
+			python3 scripts/test_meeting_quality_xref_load.py; \
+		else \
+			echo "SKIP: scripts/test_meeting_quality_xref_load.py absent (stripped for public sync)"; \
+		fi
 		python3 scripts/quality/test_call_quality_score.py
 		python3 scripts/quality/test_cq_collect.py
 		python3 scripts/quality/test_cq_collect_integration.py
 		python3 scripts/quality/test_cq_scenario.py
 		python3 scripts/quality/test_scenario_run.py
 		python3 scripts/quality/test_scenario_run_integration.py
+		python3 scripts/quality/test_cq_local.py
+		python3 scripts/quality/test_cq_shared_target.py
+		python3 scripts/quality/fidelity/test_fidelity.py
+		python3 scripts/quality/fidelity/test_fidelity_report.py
+		python3 scripts/quality/test_cq_remote.py
+		python3 scripts/quality/test_cq_bot_image.py
+		python3 scripts/quality/test_cq_probe_cost.py
 		@if command -v docker >/dev/null || [ -n "$$CI" ]; then \
 			python3 scripts/test_nginx_cache_headers.py; \
 		else \
@@ -111,6 +130,11 @@ test-scripts:
 			python3 scripts/test_update_changelog.py; \
 		else \
 			echo "SKIP: scripts/test_update_changelog.py absent (stripped for public sync)"; \
+		fi
+		@if [ -f scripts/test_gh_pr_screenshots.py ]; then \
+			python3 scripts/test_gh_pr_screenshots.py; \
+		else \
+			echo "SKIP: scripts/test_gh_pr_screenshots.py absent (stripped for public sync)"; \
 		fi
 
 # Stamp built pending sections of dioxus-ui/assets/changelog.json (GH_TOKEN for the Actions API).
@@ -170,6 +194,12 @@ clippy-ci:
 		cargo clippy -p videocall-transport --tests -- -D warnings
 		cargo clippy -p videocall-transport --features netsim --tests -- -D warnings
 		cargo clippy -p videocall-types --tests -- -D warnings
+		cargo clippy --manifest-path vendor/quinn-proto/Cargo.toml --tests -- -D warnings -A clippy::nonminimal_bool
+
+deny:
+		bash scripts/check-vendored-pins.sh
+		cargo deny --manifest-path vendor/advisories/Cargo.toml --config deny.toml check advisories
+		cargo deny check advisories
 
 fmt:
 		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo fmt --all"
@@ -220,6 +250,22 @@ e2e-install:
 # to run the preflight without writing anything.
 e2e-cert:
 	bash scripts/regen-dev-cert.sh $(ARGS)
+
+# One scale scenario end to end (scripts/quality/scenario_run.py); the run folder goes to $$CQ_RUNS_DIR or
+# ~/videocall-scale-runs. PORTS=auto|default|alt, RELEASE=1 for release builds, ARGS for the runner's own flags.
+scale-run:
+	@test -n "$(SCENARIO)" || { echo "usage: make scale-run SCENARIO=<name> [PORTS=auto|default|alt] [RELEASE=1] [ARGS=...]"; exit 3; }
+	CQ_PORTS=$(or $(PORTS),auto) CQ_RELEASE_BUILD=$(or $(RELEASE),0) python3 scripts/quality/scenario_run.py --scenario scripts/quality/scenarios/$(SCENARIO).yaml $(ARGS)
+
+# Bot-vs-browser fidelity table on a running e2e stack (docs/quality-at-scale/FIDELITY_HARNESS.md).
+# SCENARIO names a file in scripts/quality/fidelity/scenarios (default room10); ARGS for the harness's run flags.
+fidelity-run:
+	python3 scripts/quality/fidelity/fidelity_run.py run --scenario scripts/quality/fidelity/scenarios/$(or $(SCENARIO),room10).yaml $(ARGS)
+
+# The Rust bot image a shared-target scale run checks for: videocall-bot:cq-<sha12> from a clean tree
+# (scripts/quality/cq_bot_image.py). ENGINE=docker|podman; SAVE=path.tar.gz also writes the archive for a load host.
+cq-bot-image:
+	python3 scripts/quality/cq_bot_image.py --engine $(or $(ENGINE),docker) $(if $(SAVE),--save $(SAVE))
 
 # Diagnostic target: check every prerequisite for `make e2e` and report
 # pass/fail. Non-mutating (does NOT regen the cert; use `make e2e-cert
@@ -292,6 +338,10 @@ e2e-bvt0:
 # a faster alternative to the full suite.
 e2e-bvt1:
 	cd e2e && npx playwright test --project=bvt1
+
+# Real-Chromium check of the bots-app clock source (no stack needed).
+e2e-bots-clock:
+	cd e2e && npx playwright test --config bots-app/src/playwright.clock.config.ts
 
 # Run ONLY the toxiproxy-backed half of issue #1080: the `@impair`-tagged
 # WebSocket simulcast divergence test. REQUIRES the toxiproxy `impair` profile

@@ -79,9 +79,7 @@ impl EkgRenderer {
             dy += 60;
         }
 
-        let is_speaking = rms_value > 0.01 && max_rms > 0.01;
-
-        if is_speaking {
+        if ekg_frame_is_speaking(rms_value, max_rms) {
             let amplitude = (rms_value / max_rms).min(1.0) as f64;
             let wave_height = (amplitude * 280.0) as i32;
             let phase = frame_idx as f64 * 0.3;
@@ -156,6 +154,11 @@ impl EkgRenderer {
     pub fn color(&self) -> [u8; 3] {
         self.color
     }
+}
+
+/// Whether a frame with this RMS draws the speaking waveform rather than the flat line.
+pub fn ekg_frame_is_speaking(rms_value: f32, max_rms: f32) -> bool {
+    rms_value > 0.01 && max_rms > 0.01
 }
 
 /// Compute RMS energy per video frame from audio samples.

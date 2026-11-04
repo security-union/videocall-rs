@@ -30,11 +30,9 @@ import { describe, expect, it } from "vitest";
  * A scanner that can MISS a site does not deliver the acceptance criterion, so
  * it covers the whole launch family and the call shapes that actually occur:
  *
- *   - `launchPersistentContext` as well as `launch` — it shares
- *     `_launchProcess` and the same `handleSIG* = true` defaults (see
- *     {@link LAUNCH_METHODS}), so it is equally affected;
+ *   - every method in {@link LAUNCH_METHODS}, not just `launch`;
  *   - ALIASED receivers (`import { chromium as cr }`, or a local indirection)
- *     and LINE-BROKEN calls, by matching `.launch(` on any receiver with
+ *     and LINE-BROKEN calls, by matching the method on any receiver with
  *     optional whitespace before the paren.
  *
  * Verified against a probe file carrying all three shapes with no opt-out: the
@@ -62,7 +60,7 @@ function tsSources(dir: string): string[] {
       continue;
     }
     if (!entry.endsWith(".ts")) continue;
-    if (entry.endsWith(".test.ts")) continue;
+    if (entry.endsWith(".test.ts") || entry.endsWith(".spec.ts")) continue;
     out.push(full);
   }
   return out;
@@ -81,37 +79,25 @@ const MIN_EXPECTED_SITES = 3;
 /**
  * Launch-family methods that share Playwright's `_launchProcess` and therefore
  * its `handleSIGINT/TERM/HUP = true` defaults.
- *
- * `launchPersistentContext` is included because it is EXACTLY as affected as
- * `launch()` — verified in the installed playwright-core 1.62.0 (`coreBundle.js`
- * ~39416): it calls `_innerLaunchWithRetries` → `_launchProcess`, the same path
- * that reads those options. A scanner that only knew about `launch(` would let a
- * `launchPersistentContext` site silently re-install the global SIGTERM handler.
  */
-const LAUNCH_METHODS = ["launch", "launchPersistentContext"];
+const LAUNCH_METHODS = ["launch", "launchPersistentContext", "launchServer"];
 
 /**
  * Every Playwright browser-launch call site in `src/`, as `{ file, snippet }`
- * where `snippet` runs from the call to its closing `});`. Comments inside the
- * options object count as part of it, which is what makes the "documented
- * exception" escape hatch work.
+ * where `snippet` runs from the call to its closing `});`, comments included.
  *
- * Matches `<anything>.launch(` / `.launchPersistentContext(` rather than the
- * literal `chromium.launch(`, so an ALIASED import (`import { chromium as cr }`,
- * or a `const browserType = chromium` indirection) is still caught, as is a
- * LINE-BROKEN call where `(` sits on the next line.
+ * Matches any receiver rather than the literal `chromium`, so an ALIASED import
+ * (`import { chromium as cr }`, or a `const browserType = chromium` indirection)
+ * is still caught, as is a LINE-BROKEN call where `(` sits on the next line.
  */
 function launchSites(): Array<{ file: string; snippet: string }> {
   const sites: Array<{ file: string; snippet: string }> = [];
-  // `\.(launch|launchPersistentContext)\s*\(` — any receiver, optional
-  // whitespace/newline before the paren.
   const re = new RegExp(String.raw`\.(?:${LAUNCH_METHODS.join("|")})\s*\(`, "g");
   for (const file of tsSources(SRC)) {
     const text = readFileSync(file, "utf8");
     for (const m of text.matchAll(re)) {
       const idx = m.index;
-      // A doc-comment MENTION (e.g. bot.ts's `chromium.launch({ env })` prose)
-      // is not a call site.
+      // A doc-comment MENTION is not a call site.
       const lineStart = text.lastIndexOf("\n", idx) + 1;
       if (text.slice(lineStart, idx).trimStart().startsWith("*")) continue;
       // Take through the end of the call: the first `});` at or after it.
@@ -141,12 +127,11 @@ describe("chromium.launch signal-handler opt-out (#2089 / #2148)", () => {
   });
 
   it("scans for the whole launch FAMILY, not just chromium.launch(", () => {
-    // `launchPersistentContext` shares `_launchProcess` with `launch()` and its
-    // `handleSIG* = true` defaults (verified in playwright-core 1.62.0), so it is
-    // exactly as affected. Pinning the method list keeps a future `launch`-only
-    // narrowing from silently reopening that hole.
+    // Pinning the method list keeps a future narrowing from silently reopening
+    // the hole for the dropped methods.
     expect(LAUNCH_METHODS).toContain("launch");
     expect(LAUNCH_METHODS).toContain("launchPersistentContext");
+    expect(LAUNCH_METHODS).toContain("launchServer");
   });
 
   it("every launch site passes handleSIGTERM:false and handleSIGHUP:false", () => {
@@ -174,6 +159,24 @@ describe("chromium.launch signal-handler opt-out (#2089 / #2148)", () => {
         /handleSIGINT:/,
       );
     }
+  });
+});
+
+function withoutComments(snippet: string): string {
+  return snippet.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
+describe("chromium.launch secret-stripped env (#2914)", () => {
+  it("every launch site passes env: browserEnvWithoutSecrets()", () => {
+    const sites = launchSites();
+    expect(sites.length).toBeGreaterThanOrEqual(MIN_EXPECTED_SITES);
+    const offenders = sites.filter(
+      (s) => !/\benv:\s*browserEnvWithoutSecrets\(\)/.test(withoutComments(s.snippet)),
+    );
+    expect(
+      offenders.map((o) => o.file),
+      "a launch without `env` hands Chromium the whole process.env, JWT_SECRET and BOT_CTL_TOKEN included",
+    ).toEqual([]);
   });
 });
 

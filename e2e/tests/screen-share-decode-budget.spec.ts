@@ -249,7 +249,7 @@ test.describe("Screen-share panel decode-budget wiring (#1471)", () => {
       "SSDBHost",
       uiURL,
     );
-    // The SS right panel under test is the split layout, opt-in since #2792.
+    // The SS right panel under test is the split layout.
     await seedShareViewMode(hostCtx, "enlarged");
 
     // The camera-ON guest is the SHARER: it publishes video AND shares its

@@ -7,8 +7,11 @@
 
 mod support;
 
+use std::collections::HashSet;
+
 use dioxus::prelude::*;
 use dioxus_ui::components::display_name_edit::SelfTileName;
+use dioxus_ui::context::HostSetCtx;
 use support::{
     cleanup, create_mount_point, inject_app_config, render_into, restore_fetch, yield_now,
 };
@@ -45,10 +48,126 @@ fn Harness() -> Element {
                 display_name: "Alice".to_string(),
                 meeting_id: "room-2794".to_string(),
                 session_id: Some(7),
+                local_user_id: LOCAL.to_string(),
                 on_renamed: move |name: String| RENAMED.with(|r| r.borrow_mut().push(name)),
             }
         }
     }
+}
+
+const LOCAL: &str = "alice@example.com";
+const OWNER: &str = "owner@example.com";
+
+thread_local! {
+    static HOSTS: std::cell::RefCell<Option<Signal<HashSet<String>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[allow(non_snake_case)]
+fn RoleHarness() -> Element {
+    let hosts = use_signal(|| HashSet::from([LOCAL.to_string(), OWNER.to_string()]));
+    use_context_provider(|| HostSetCtx(hosts));
+    use_hook(move || HOSTS.with(|h| *h.borrow_mut() = Some(hosts)));
+    rsx! {
+        SelfTileName {
+            display_name: "Alice".to_string(),
+            meeting_id: "room-2794".to_string(),
+            session_id: Some(7),
+            local_user_id: LOCAL.to_string(),
+            owner_user_id: Some(OWNER.to_string()),
+            on_renamed: move |_: String| {},
+        }
+    }
+}
+
+thread_local! {
+    static TILE_WIDTH: std::cell::RefCell<Option<Signal<u32>>> = const { std::cell::RefCell::new(None) };
+    static TILE_NAME: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+    static TILE_SCALED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[allow(non_snake_case)]
+fn SizedRoleHarness() -> Element {
+    let width = use_signal(|| 1000u32);
+    let hosts = use_signal(|| HashSet::from([LOCAL.to_string(), OWNER.to_string()]));
+    use_context_provider(|| HostSetCtx(hosts));
+    use_hook(move || TILE_WIDTH.with(|w| *w.borrow_mut() = Some(width)));
+    let height = width() * 2 / 3;
+    let tile_vars = if TILE_SCALED.with(std::cell::Cell::get) {
+        format!("--tile-w: {width}px; --tile-h: {height}px;")
+    } else {
+        String::new()
+    };
+    rsx! {
+        div { style: "position: relative; width: {width}px; height: {height}px; {tile_vars}",
+            SelfTileName {
+                display_name: TILE_NAME.with(std::cell::Cell::get).to_string(),
+                meeting_id: "room-2794".to_string(),
+                session_id: Some(7),
+                local_user_id: LOCAL.to_string(),
+                owner_user_id: Some(OWNER.to_string()),
+                on_renamed: move |_: String| {},
+            }
+        }
+    }
+}
+
+/// The app's styles as a phone (`touch`) or a mouse sees them, whatever input
+/// the test browser itself reports: each hover/pointer media feature is
+/// rewritten to an always-true or never-true width query.
+fn inject_styles(touch: bool) -> web_sys::Element {
+    const ALWAYS: &str = "(min-width: 0px)";
+    const NEVER: &str = "(max-width: 0px)";
+    let (hover_none, hover_hover, coarse) = if touch {
+        (ALWAYS, NEVER, ALWAYS)
+    } else {
+        (NEVER, ALWAYS, NEVER)
+    };
+    let css = concat!(
+        include_str!("../static/style.css"),
+        include_str!("../static/global.css"),
+    )
+    .replace("(hover: none)", hover_none)
+    .replace("(hover: hover)", hover_hover)
+    .replace("(pointer: coarse)", coarse)
+    .replace("(any-pointer: coarse)", coarse);
+    for feature in ["(hover:", "(pointer:", "any-hover", "any-pointer"] {
+        assert!(
+            !css.contains(feature),
+            "{feature} would still follow the test browser's own input"
+        );
+    }
+    let doc = gloo_utils::document();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(&css));
+    doc.head().unwrap().append_child(&style).unwrap();
+    style
+}
+
+fn overflows(el: &web_sys::HtmlElement) -> bool {
+    el.scroll_width() > el.client_width() + 1
+}
+
+fn computed_px(el: &web_sys::HtmlElement, property: &str) -> f64 {
+    gloo_utils::window()
+        .get_computed_style(el)
+        .unwrap()
+        .expect("computed style")
+        .get_property_value(property)
+        .unwrap_or_default()
+        .trim_end_matches("px")
+        .parse()
+        .unwrap_or(0.0)
+}
+
+/// Mounts the self tile at 1000px wide, named `name`; `scaled` sizes the chip
+/// from the tile like the meeting grid does.
+async fn mount_sized_tile(name: &'static str, scaled: bool) -> (web_sys::Element, Signal<u32>) {
+    TILE_NAME.with(|n| n.set(name));
+    TILE_SCALED.with(|s| s.set(scaled));
+    let mount = create_mount_point();
+    render_into(&mount, SizedRoleHarness);
+    yield_now().await;
+    (mount, TILE_WIDTH.with(|w| w.borrow().expect("tile width")))
 }
 
 fn find(mount: &web_sys::Element, selector: &str) -> Option<web_sys::HtmlElement> {
@@ -305,6 +424,7 @@ fn UnmountHarness() -> Element {
                 display_name: "Alice".to_string(),
                 meeting_id: "room-2794".to_string(),
                 session_id: Some(7),
+                local_user_id: LOCAL.to_string(),
                 on_renamed: move |name: String| RENAMED.with(|r| r.borrow_mut().push(name)),
             }
         }
@@ -440,5 +560,195 @@ async fn enter_and_escape_during_ime_composition_are_ignored() {
         "Safari's keyCode-229 confirm Enter is still composition"
     );
 
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn the_you_pill_names_the_local_host_role() {
+    let mount = create_mount_point();
+    render_into(&mount, RoleHarness);
+    yield_now().await;
+    let mut hosts = HOSTS.with(|h| h.borrow().expect("role harness hosts"));
+    let pill = || find(&mount, ".self-indicator").expect("you pill");
+    let separator = || pill().query_selector("[aria-hidden='true']").ok().flatten();
+
+    assert_eq!(pill().text_content().as_deref(), Some("You · Co-host"));
+    assert_eq!(pill().get_attribute("dir").as_deref(), Some("ltr"));
+    assert_eq!(
+        separator().and_then(|s| s.text_content()).as_deref(),
+        Some("·")
+    );
+
+    hosts.write().remove(OWNER);
+    yield_now().await;
+    assert_eq!(pill().text_content().as_deref(), Some("You · Host"));
+
+    hosts.write().remove(LOCAL);
+    yield_now().await;
+    assert_eq!(pill().text_content().as_deref(), Some("You"));
+    assert!(separator().is_none());
+    let button = find(&mount, BUTTON).expect("name button");
+    assert_eq!(
+        button.get_attribute("aria-label").as_deref(),
+        Some("Edit display name, Alice")
+    );
+
+    cleanup(&mount);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pointer {
+    Mouse,
+    MouseFocused,
+    Touch,
+}
+
+async fn sweep_narrowing_self_tile(name: &'static str, pointer: Pointer) {
+    let style = inject_styles(pointer == Pointer::Touch);
+    let (mount, mut width) = mount_sized_tile(name, true).await;
+    let chip = || find(&mount, "h4.self-tile-name").expect("chip");
+    if pointer == Pointer::MouseFocused {
+        let button = find(&mount, BUTTON).expect("name button");
+        button.focus().unwrap();
+        yield_now().await;
+        assert!(
+            button.matches(":focus-visible").unwrap(),
+            "focusing the name button did not make it :focus-visible"
+        );
+    }
+    let natural = chip().get_bounding_client_rect().width();
+    let (mut name_alone_cut, mut role_cut) = (false, false);
+    for w in (70..=1000).rev().step_by(10) {
+        width.set(w);
+        yield_now().await;
+        let at = format!("{name:?} {pointer:?} {w}px");
+        let chip = chip();
+        let pill = find(&mount, ".self-indicator").expect("pill");
+        let role = find(&mount, ".self-indicator-role").expect("role");
+        let text = find(&mount, ".floating-name-text").expect("name");
+        let icon = mount
+            .query_selector(".self-tile-name-edit-icon")
+            .ok()
+            .flatten()
+            .expect("edit icon");
+        let (chip_box, pill_box) = (
+            chip.get_bounding_client_rect(),
+            pill.get_bounding_client_rect(),
+        );
+        assert_eq!(pill.text_content().as_deref(), Some("You · Co-host"));
+        assert!(
+            pill_box.right() <= chip_box.right() + 0.5,
+            "{at}: the chip clips the pill"
+        );
+        assert!(!overflows(&pill), "{at}: \"You\" overflows the pill");
+        let icon_box = icon.get_bounding_client_rect();
+        let icon_shown = icon_box.width() > 0.0;
+        assert_eq!(
+            icon_shown,
+            pointer != Pointer::Mouse,
+            "{at}: edit icon shown"
+        );
+        let mut name_end = text.get_bounding_client_rect().right();
+        if icon_shown {
+            name_end = name_end.max(icon_box.right());
+        }
+        let blank = pill_box.left() - name_end - computed_px(&chip, "column-gap");
+        assert!(blank <= 1.0, "{at}: {blank}px blank before the pill");
+        assert!(
+            blank >= -1.0,
+            "{at}: the name overlaps the pill by {}px",
+            -blank
+        );
+        if icon_shown {
+            let button = find(&mount, BUTTON).expect("name button");
+            assert!(
+                icon_box.right() <= button.get_bounding_client_rect().right() + 0.5,
+                "{at}: the edit icon spills out of the name button"
+            );
+        }
+        if chip_box.width() >= natural - 0.5 {
+            assert!(
+                !overflows(&text) && !overflows(&role),
+                "{at}: truncated though the chip fits"
+            );
+        }
+        if overflows(&role) {
+            role_cut = true;
+            let kept = text.get_bounding_client_rect().width();
+            assert!(
+                kept < 1.0,
+                "{at}: the role is cut while the name keeps {kept}px"
+            );
+        } else if overflows(&text) {
+            name_alone_cut = true;
+        }
+    }
+    assert!(
+        name_alone_cut,
+        "{name:?} {pointer:?}: no width cut the name alone"
+    );
+    assert!(role_cut, "{name:?} {pointer:?}: no width reached the role");
+    style.remove();
+    cleanup(&mount);
+}
+
+async fn sweep_every_pointer(name: &'static str) {
+    for pointer in [Pointer::Mouse, Pointer::MouseFocused, Pointer::Touch] {
+        sweep_narrowing_self_tile(name, pointer).await;
+    }
+}
+
+#[wasm_bindgen_test]
+async fn a_short_name_gives_way_before_the_role_and_you_stays_whole() {
+    sweep_every_pointer("Jo").await;
+}
+
+#[wasm_bindgen_test]
+async fn a_medium_name_gives_way_before_the_role_and_you_stays_whole() {
+    sweep_every_pointer("Alice").await;
+}
+
+#[wasm_bindgen_test]
+async fn a_long_name_gives_way_before_the_role_and_you_stays_whole() {
+    sweep_every_pointer("Alexandra Whitfield").await;
+}
+
+#[wasm_bindgen_test]
+async fn while_renaming_the_input_fills_all_the_room_beside_you() {
+    let style = inject_styles(false);
+    let (mount, mut width) = mount_sized_tile("Alice", false).await;
+    let natural = open_editor(&mount).await.get_bounding_client_rect().width();
+    for w in (100..=1000).rev().step_by(10) {
+        width.set(w);
+        yield_now().await;
+        let at = format!("editing {w}px");
+        let chip = find(&mount, "h4.self-tile-name").expect("chip");
+        let pill = find(&mount, ".self-indicator").expect("pill");
+        let input = find(&mount, INPUT).expect("still editing");
+        let role = find(&mount, ".self-indicator-role").expect("role");
+        let (pill_box, input_box) = (
+            pill.get_bounding_client_rect(),
+            input.get_bounding_client_rect(),
+        );
+        let you_pill = pill_box.width() - role.get_bounding_client_rect().width();
+        assert!(
+            input_box.right() <= pill_box.left() + 0.5,
+            "{at}: the input runs under the pill"
+        );
+        assert!(
+            pill_box.right() <= chip.get_bounding_client_rect().right() + 0.5,
+            "{at}: the chip clips the pill"
+        );
+        let inner = f64::from(chip.client_width())
+            - computed_px(&chip, "padding-left")
+            - computed_px(&chip, "padding-right");
+        let room = natural.min(inner - computed_px(&chip, "column-gap") - you_pill);
+        assert!(
+            input_box.width() >= room - 1.0,
+            "{at}: the input gets {}px of the {room}px beside \"You\"",
+            input_box.width()
+        );
+    }
+    style.remove();
     cleanup(&mount);
 }

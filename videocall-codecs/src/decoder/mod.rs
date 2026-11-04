@@ -111,4 +111,4 @@ pub use self::native::NativeDecoder as Decoder;
 #[cfg(feature = "wasm")]
 mod wasm;
 #[cfg(feature = "wasm")]
-pub use self::wasm::WasmDecoder; // Export WasmDecoder directly for VideoFrame callbacks
+pub use self::wasm::{BootOutcome, BootSettled, WasmDecoder, WorkerStarter}; // Export WasmDecoder directly for VideoFrame callbacks

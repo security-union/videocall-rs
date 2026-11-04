@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::announcement::{deserialize_strict, AnnouncementOverride};
+
 /// Placeholder substituted for every plaintext password field by the manual
 /// [`std::fmt::Debug`] impls in this module.
 ///
@@ -82,6 +84,39 @@ pub struct CreateMeetingRequest {
     #[serde(default)]
     pub chat_allowed_for_all: Option<bool>,
 
+    /// Meeting-wide override of showing a message when someone joins.
+    /// `None` stores [`AnnouncementOverride::Participant`].
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub entry_message_override: Option<AnnouncementOverride>,
+
+    /// Meeting-wide override of playing a sound when someone joins.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub entry_sound_override: Option<AnnouncementOverride>,
+
+    /// Meeting-wide override of showing a message when someone leaves.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exit_message_override: Option<AnnouncementOverride>,
+
+    /// Meeting-wide override of playing a sound when someone leaves.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exit_sound_override: Option<AnnouncementOverride>,
+
     /// User IDs to designate as persistent co-hosts (max 100).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub co_hosts: Vec<String>,
@@ -99,6 +134,10 @@ impl std::fmt::Debug for CreateMeetingRequest {
             .field("allow_guests", &self.allow_guests)
             .field("recording_allowed_for_all", &self.recording_allowed_for_all)
             .field("chat_allowed_for_all", &self.chat_allowed_for_all)
+            .field("entry_message_override", &self.entry_message_override)
+            .field("entry_sound_override", &self.entry_sound_override)
+            .field("exit_message_override", &self.exit_message_override)
+            .field("exit_sound_override", &self.exit_sound_override)
             .field("co_hosts", &self.co_hosts)
             .finish()
     }
@@ -133,6 +172,38 @@ pub struct UpdateMeetingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_allowed_for_all: Option<bool>,
 
+    /// Set the meeting-wide override of showing a message when someone joins.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub entry_message_override: Option<AnnouncementOverride>,
+
+    /// Set the meeting-wide override of playing a sound when someone joins.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub entry_sound_override: Option<AnnouncementOverride>,
+
+    /// Set the meeting-wide override of showing a message when someone leaves.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exit_message_override: Option<AnnouncementOverride>,
+
+    /// Set the meeting-wide override of playing a sound when someone leaves.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_strict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exit_sound_override: Option<AnnouncementOverride>,
+
     /// Set the meeting password to this plaintext value, Argon2-hashed
     /// server-side. `None` leaves it untouched; `""` is rejected. Mutually
     /// exclusive with [`Self::remove_password`].
@@ -154,6 +225,10 @@ impl std::fmt::Debug for UpdateMeetingRequest {
             .field("allow_guests", &self.allow_guests)
             .field("recording_allowed_for_all", &self.recording_allowed_for_all)
             .field("chat_allowed_for_all", &self.chat_allowed_for_all)
+            .field("entry_message_override", &self.entry_message_override)
+            .field("entry_sound_override", &self.entry_sound_override)
+            .field("exit_message_override", &self.exit_message_override)
+            .field("exit_sound_override", &self.exit_sound_override)
             .field("password", &self.password.as_ref().map(|_| REDACTED))
             .field("remove_password", &self.remove_password)
             .finish()
@@ -390,6 +465,10 @@ mod tests {
             allow_guests: None,
             recording_allowed_for_all: None,
             chat_allowed_for_all: None,
+            entry_message_override: None,
+            entry_sound_override: None,
+            exit_message_override: None,
+            exit_sound_override: None,
             co_hosts: vec![],
         };
         let join = JoinMeetingRequest {
@@ -408,6 +487,10 @@ mod tests {
             allow_guests: None,
             recording_allowed_for_all: None,
             chat_allowed_for_all: None,
+            entry_message_override: None,
+            entry_sound_override: None,
+            exit_message_override: None,
+            exit_sound_override: None,
             password: Some(SECRET.into()),
             remove_password: None,
         };
@@ -531,11 +614,72 @@ mod tests {
             allow_guests: None,
             recording_allowed_for_all: None,
             chat_allowed_for_all: None,
+            entry_message_override: None,
+            entry_sound_override: None,
+            exit_message_override: None,
+            exit_sound_override: None,
             password: None,
             remove_password: None,
         };
         let wire = serde_json::to_string(&toggle_only).expect("serializing an update request");
         assert_eq!(wire, r#"{"waiting_room_enabled":false}"#);
+    }
+
+    #[test]
+    fn update_body_reads_each_announcement_override_by_its_own_name() {
+        let update: UpdateMeetingRequest = serde_json::from_str(
+            r#"{"entry_message_override":"on","entry_sound_override":"off",
+                "exit_message_override":"participant"}"#,
+        )
+        .expect("update body with overrides");
+        assert_eq!(
+            [
+                update.entry_message_override,
+                update.entry_sound_override,
+                update.exit_message_override,
+                update.exit_sound_override,
+            ],
+            [
+                Some(AnnouncementOverride::On),
+                Some(AnnouncementOverride::Off),
+                Some(AnnouncementOverride::Participant),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn request_bodies_reject_an_unknown_announcement_override() {
+        for field in [
+            "entry_message_override",
+            "entry_sound_override",
+            "exit_message_override",
+            "exit_sound_override",
+        ] {
+            let body = format!(r#"{{"{field}":"chime_only"}}"#);
+            assert!(
+                serde_json::from_str::<UpdateMeetingRequest>(&body).is_err(),
+                "update {field}"
+            );
+            assert!(
+                serde_json::from_str::<CreateMeetingRequest>(&body).is_err(),
+                "create {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_body_without_overrides_still_deserializes_and_omits_them() {
+        let legacy: CreateMeetingRequest =
+            serde_json::from_str(r#"{"meeting_id":"standup"}"#).expect("legacy create body");
+        assert_eq!(legacy.entry_message_override, None);
+        assert_eq!(legacy.exit_sound_override, None);
+        let wire = serde_json::to_string(&legacy).expect("serializing a create request");
+        assert!(!wire.contains("_override"), "{wire}");
+
+        let with: CreateMeetingRequest =
+            serde_json::from_str(r#"{"exit_sound_override":"off"}"#).expect("create body");
+        assert_eq!(with.exit_sound_override, Some(AnnouncementOverride::Off));
     }
 
     #[test]

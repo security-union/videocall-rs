@@ -17,11 +17,13 @@ import {
   PEER_LIST_LEGACY_TOOLTIP,
   PEER_LIST_TOOLTIP,
   SCREEN_SHARE_LEGACY_TOOLTIP,
+  SCREEN_SHARE_MENU_STOP_SELECTOR,
   cameraControlSelector,
   peerListControlSelector,
   SCREEN_SHARE_TOOLTIP,
   micControlSelector,
   screenShareControlSelector,
+  unavailableOffSelector,
 } from "./control-buttons";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
@@ -77,6 +79,42 @@ describe("in-meeting control button drift locks", () => {
     }
   });
 
+  it("the share menu item the share-stop path clicks is the one that stops the share", () => {
+    const testid = testidOf(SCREEN_SHARE_MENU_STOP_SELECTOR, "SCREEN_SHARE_MENU_STOP_SELECTOR");
+    const item = componentBody("ScreenShareMenu")
+      .split(/\bbutton \{/)
+      .find((chunk) => chunk.includes(`"data-testid": "${testid}"`));
+    expect(
+      item,
+      `ScreenShareMenu no longer renders an item with data-testid="${testid}"`,
+    ).toBeDefined();
+    expect(item, `the "${testid}" item no longer calls on_stop`).toContain("on_stop.call(");
+    expect(item, `the "${testid}" item now calls on_replace`).not.toContain("on_replace");
+  });
+
+  it("the live bar's share slot is the menu-owning control, not a bare button", () => {
+    expect(
+      componentBody("ScreenShareControl"),
+      "ScreenShareControl no longer renders ScreenShareMenu",
+    ).toContain("ScreenShareMenu {");
+    const rs = repoSource(ATTENDANTS_REL);
+    expect(rs, "attendants.rs no longer renders ScreenShareControl").toContain(
+      "ScreenShareControl {",
+    );
+    expect(
+      rs.match(/\bScreenShareButton \{/g)?.length,
+      "attendants.rs renders a bare ScreenShareButton besides the drag-preview clone",
+    ).toBe(1);
+  });
+
+  // A pre-#3173 needle would match the menu UI's trigger, so the click would
+  // only open the menu and the share would keep running behind a logged click.
+  it("the pre-menu stop needle cannot match a live share's button", () => {
+    expect(componentBody("ScreenShareButton").toLowerCase()).not.toContain(
+      SCREEN_SHARE_LEGACY_TOOLTIP.on.toLowerCase(),
+    );
+  });
+
   it("PeerListButton carries the testid the peer-list selectors are built from", () => {
     const testid = testidOf(peerListControlSelector("off"), "peerListControlSelector");
     expect(
@@ -109,6 +147,63 @@ describe("in-meeting control button drift locks", () => {
       ).toContain(label!);
     }
   });
+
+  it.each([
+    [
+      "MicButton",
+      [
+        unavailableOffSelector("mic"),
+        micControlSelector("on"),
+        micControlSelector("off"),
+        MIC_UNMUTE_SELECTOR,
+      ],
+      [0, 1, 2, 2],
+    ],
+    [
+      "CameraButton",
+      [unavailableOffSelector("camera"), cameraControlSelector("on"), cameraControlSelector("off")],
+      [0, 1, 2],
+    ],
+    ["PeerListButton", [peerListControlSelector("on"), peerListControlSelector("off")], [0, 1]],
+  ] as const)("each %s aria-label needle matches its own tooltip title only", (name, sels, own) => {
+    const stmt = /let tooltip_title = ([\s\S]*?);\n/.exec(componentBody(name))?.[1];
+    const titles = [...(stmt ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(titles.length, `${name}'s tooltip_title branches changed shape`).toBe(
+      Math.max(...own) + 1,
+    );
+    sels.forEach((sel, i) => {
+      const label = /\[aria-label\*="([^"]+)"\]/.exec(sel)?.[1];
+      const hits = titles.flatMap((t, j) => (t.includes(label!) ? [j] : []));
+      expect(hits, `"${label}" must match only "${titles[own[i]]}"`).toEqual([own[i]]);
+    });
+  });
+
+  it.each([
+    ["mic", "MicButton"],
+    ["camera", "CameraButton"],
+  ] as const)(
+    "%s: the unavailable-off selector matches %s's unavailable, off render only",
+    (medium, component) => {
+      const src = componentBody(component);
+      const sel = unavailableOffSelector(medium);
+      expect(sel.startsWith(LIVE_ACTION_BAR_BUTTON)).toBe(true);
+      expect(src).toContain(`"data-testid": "${testidOf(sel, "unavailableOffSelector")}"`);
+      const label = /\[aria-label\*="([^"]+)"\]/.exec(sel)?.[1];
+      const unavailableTitle = /if !available \{\s*"([^"]+)"/.exec(src)?.[1];
+      expect(unavailableTitle, `${component} no longer titles an unavailable device`).toBeDefined();
+      expect(unavailableTitle).toContain(label);
+      expect(src, `${component}'s button no longer binds the computed class`).toMatch(
+        /button \{\s*class,/,
+      );
+      const cls = /\.([\w-]+)\[aria-label/.exec(sel)?.[1];
+      const offClasses = /\(false, false\) => "([^"]+)"/.exec(src)?.[1].split(" ");
+      const onClasses = /\(true, false\) => "([^"]+)"/.exec(src)?.[1].split(" ");
+      expect(offClasses, `${component} no longer styles an off, unavailable device`).toContain(cls);
+      expect(onClasses, `${component} styles an on, unavailable device ${cls} too`).not.toContain(
+        cls,
+      );
+    },
+  );
 
   it("HangUpButton carries the testid the leave-meeting selector is built from", () => {
     const testid = testidOf(HANG_UP_SELECTOR, "HANG_UP_SELECTOR");
@@ -173,10 +268,7 @@ describe("in-meeting control button drift locks", () => {
   it("every legacy tooltip needle still appears in its component's tooltip title", () => {
     const cases: [string, string][] = [
       ["HangUpButton", HANG_UP_LEGACY_TOOLTIP],
-      ...Object.values(SCREEN_SHARE_LEGACY_TOOLTIP).map((t): [string, string] => [
-        "ScreenShareButton",
-        t,
-      ]),
+      ["ScreenShareButton", SCREEN_SHARE_LEGACY_TOOLTIP.off],
       ...Object.values(PEER_LIST_LEGACY_TOOLTIP).map((t): [string, string] => [
         "PeerListButton",
         t,
@@ -207,6 +299,7 @@ describe("in-meeting control button drift locks", () => {
       MIC_TESTID_SELECTOR,
       CAMERA_TESTID_SELECTOR,
       SCREEN_SHARE_TESTID_SELECTOR,
+      SCREEN_SHARE_MENU_STOP_SELECTOR,
       PEER_LIST_TESTID_SELECTOR,
       HANG_UP_SELECTOR,
     ].map((sel) => /\[data-testid="([^"]+)"\]/.exec(sel)?.[1] ?? sel);

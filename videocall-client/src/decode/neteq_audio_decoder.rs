@@ -6,15 +6,18 @@ use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD,
 };
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
+use crate::decode::speaking_edge::{SpeakingEdge, SpeakingEdgeFilter};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::Float32Array;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_wasm_bindgen;
-use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
+use videocall_codecs::decoder::{BootOutcome, BootSettled};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
@@ -23,6 +26,87 @@ use web_sys::{AudioContext, AudioWorkletNode, GainNode, MessageEvent, Worker};
 
 const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
 
+/// Most `Insert`s held for a NetEq worker that has not posted `WorkerReady` yet (#3210): about one
+/// second of 20 ms packets, since NetEq resyncs to live past 1 s of lag
+/// (`neteq::neteq::DEFAULT_RESYNC_CEILING_MS`) and would drop older audio anyway.
+const NETEQ_BOOT_QUEUE_MAX: usize = 50;
+
+/// Queued audio older than this is dropped at `WorkerReady` (#3277): the worker stamps each insert
+/// as arriving when it is replayed, so older audio would only add latency NetEq cannot see.
+const NETEQ_BOOT_REPLAY_MAX_AGE_MS: f64 = 200.0;
+
+/// [`enqueue_while_booting`], keeping `arrivals[k]` as the arrival time of the k-th queued insert.
+fn enqueue_with_arrival(
+    queue: &mut VecDeque<WorkerMsg>,
+    arrivals: &mut VecDeque<f64>,
+    msg: WorkerMsg,
+    now_ms: f64,
+) {
+    let is_insert = matches!(msg, WorkerMsg::Insert { .. });
+    let is_flush = matches!(msg, WorkerMsg::Flush);
+    enqueue_while_booting(queue, msg);
+    if is_flush {
+        arrivals.clear();
+    } else if is_insert {
+        arrivals.push_back(now_ms);
+        let inserts = queue
+            .iter()
+            .filter(|m| matches!(m, WorkerMsg::Insert { .. }))
+            .count();
+        while arrivals.len() > inserts {
+            arrivals.pop_front();
+        }
+    }
+}
+
+/// Drops the queued inserts older than [`NETEQ_BOOT_REPLAY_MAX_AGE_MS`]; controls are kept.
+fn drop_stale_inserts(queue: &mut VecDeque<WorkerMsg>, arrivals: &mut VecDeque<f64>, now_ms: f64) {
+    let mut stale = arrivals
+        .iter()
+        .take_while(|at| now_ms - **at > NETEQ_BOOT_REPLAY_MAX_AGE_MS)
+        .count();
+    arrivals.drain(..stale);
+    queue.retain(|m| {
+        if stale > 0 && matches!(m, WorkerMsg::Insert { .. }) {
+            stale -= 1;
+            return false;
+        }
+        true
+    });
+}
+
+/// Queue `msg` for a worker that is still booting (#3210). The queue never exceeds
+/// `NETEQ_BOOT_QUEUE_MAX` inserts plus one message of each control kind:
+/// - `Insert`: the oldest queued insert is evicted once the cap is reached;
+/// - `Flush`: replaces every queued insert and earlier `Flush`, which it would discard on arrival;
+/// - any other control: replaces the queued message of the same kind (the latest state wins).
+fn enqueue_while_booting(queue: &mut VecDeque<WorkerMsg>, msg: WorkerMsg) {
+    match msg {
+        WorkerMsg::Insert { .. } => {
+            let inserts = queue
+                .iter()
+                .filter(|m| matches!(m, WorkerMsg::Insert { .. }))
+                .count();
+            if inserts >= NETEQ_BOOT_QUEUE_MAX {
+                if let Some(oldest) = queue
+                    .iter()
+                    .position(|m| matches!(m, WorkerMsg::Insert { .. }))
+                {
+                    queue.remove(oldest);
+                }
+            }
+        }
+        WorkerMsg::Flush => {
+            queue.retain(|m| !matches!(m, WorkerMsg::Insert { .. } | WorkerMsg::Flush));
+        }
+        _ => {
+            let kind = std::mem::discriminant(&msg);
+            queue.retain(|m| std::mem::discriminant(m) != kind);
+        }
+    }
+    queue.push_back(msg);
+}
+
 /// A peer's slot in the shared audio graph. `Dead` is terminal: once
 /// [`NetEqAudioPeerDecoder`]'s `Drop` has run, no pair may be stored again.
 #[derive(Debug)]
@@ -30,6 +114,258 @@ enum PlaybackSlot {
     Empty,
     Live(AudioWorkletNode, GainNode),
     Dead,
+}
+
+/// Devtools / e2e override for the direct worker-to-worklet PCM path; `"0"` restores the old path
+/// for peers wired after it is set.
+const DIRECT_PCM_GLOBAL: &str = "__VC_AUDIO_DIRECT_PCM";
+/// The same switch in the deployed `window.__APP_CONFIG` (`audioDirectPcm`).
+const DIRECT_PCM_CONFIG_KEY: &str = "audioDirectPcm";
+
+/// On unless a flag says off; the devtools global wins over the config key.
+fn direct_pcm_allowed(devtools: Option<&str>, config: Option<&str>) -> bool {
+    !matches!(
+        devtools
+            .or(config)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+fn flag_value(value: JsValue) -> Option<String> {
+    if value.is_undefined() || value.is_null() {
+        None
+    } else if let Some(b) = value.as_bool() {
+        Some(if b { "1" } else { "0" }.to_string())
+    } else {
+        value
+            .as_string()
+            .or_else(|| value.as_f64().map(|n| n.to_string()))
+    }
+}
+
+fn direct_pcm_enabled() -> bool {
+    let global = js_sys::global();
+    let devtools = js_sys::Reflect::get(&global, &JsValue::from_str(DIRECT_PCM_GLOBAL))
+        .ok()
+        .and_then(flag_value);
+    let config = js_sys::Reflect::get(&global, &JsValue::from_str("__APP_CONFIG"))
+        .ok()
+        .filter(|c| c.is_object())
+        .and_then(|c| js_sys::Reflect::get(&c, &JsValue::from_str(DIRECT_PCM_CONFIG_KEY)).ok())
+        .and_then(flag_value);
+    direct_pcm_allowed(devtools.as_deref(), config.as_deref())
+}
+
+thread_local! {
+    /// When the outstanding `resume()` was issued. It can stay pending while autoplay is blocked,
+    /// so it is cleared on the context's `statechange` and retried after `RESUME_RETRY_MS`.
+    static RESUME_PENDING_SINCE: Cell<Option<f64>> = const { Cell::new(None) };
+    /// Per playback slot: messages for a worklet not built yet, in arrival order.
+    static WORKLET_OUTBOX: RefCell<HashMap<usize, VecDeque<js_sys::Object>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The NetEQ worker protocol that posts `pause` and speaks `attachOutput`/`handoff`.
+const PAUSE_PROTOCOL: u32 = 2;
+
+/// About a second of frames: a worklet that keeps failing to build must not grow the outbox.
+const WORKLET_OUTBOX_MAX: usize = 100;
+
+fn is_frame(message: &js_sys::Object) -> bool {
+    js_sys::Reflect::get(message, &"command".into())
+        .ok()
+        .and_then(|c| c.as_string())
+        .is_some_and(|c| c == "play")
+}
+
+/// Queues `message` within `max`: a full queue loses its oldest PCM frame, or refuses a new frame
+/// when only controls are left. A `pause` or `handoff` is never dropped.
+fn enqueue_bounded(queue: &mut VecDeque<js_sys::Object>, message: js_sys::Object, max: usize) {
+    if queue.len() >= max {
+        match queue.iter().position(is_frame) {
+            Some(oldest_frame) => {
+                queue.remove(oldest_frame);
+            }
+            None if is_frame(&message) => return,
+            None => {}
+        }
+    }
+    queue.push_back(message);
+}
+
+fn slot_key(slot: &Rc<RefCell<PlaybackSlot>>) -> usize {
+    Rc::as_ptr(slot) as usize
+}
+
+const RESUME_RETRY_MS: f64 = 1_000.0;
+
+fn resume_needed(running: bool, pending_since: Option<f64>, now_ms: f64) -> bool {
+    !running && pending_since.is_none_or(|since| now_ms - since >= RESUME_RETRY_MS)
+}
+
+/// NetEQ stats JSON keys for the worklet's totals; `health_reporter` reads the same constants.
+pub(crate) const PLAYOUT_STATS_KEY: &str = "playout";
+pub(crate) const PLAYOUT_UNDERRUN_MS_KEY: &str = "underrun_ms_total";
+pub(crate) const PLAYOUT_UNDERRUN_EVENTS_KEY: &str = "underrun_events_total";
+
+/// The NetEQ worker's stats JSON with the worklet's `(silent_ms, events)` totals under
+/// `PLAYOUT_STATS_KEY`; unchanged when there are none or the JSON is not an object.
+pub(crate) fn with_playout_totals(mut stats_json: String, totals: Option<(u64, u64)>) -> String {
+    let Some((silent_ms, events)) = totals else {
+        return stats_json;
+    };
+    if !(stats_json.starts_with('{') && stats_json.ends_with('}')) {
+        return stats_json;
+    }
+    let close = stats_json.len() - 1;
+    let separator = if stats_json[1..close].trim().is_empty() {
+        ""
+    } else {
+        ","
+    };
+    stats_json.truncate(close);
+    let _ = write!(
+        stats_json,
+        r#"{separator}"{PLAYOUT_STATS_KEY}":{{"{PLAYOUT_UNDERRUN_MS_KEY}":{silent_ms},"{PLAYOUT_UNDERRUN_EVENTS_KEY}":{events}}}}}"#
+    );
+    stats_json
+}
+
+/// Silence the peer's AudioWorklet played while its audio was flowing, from the worklet's reports.
+#[derive(Debug, Default)]
+struct PlayoutCounters {
+    reported: Cell<bool>,
+    silent_ms: Cell<f64>,
+    events: Cell<u64>,
+}
+
+impl PlayoutCounters {
+    /// The worklet reports running totals; a lower or invalid reading never moves them back.
+    fn fold(&self, silent_ms: f64, events: f64) {
+        self.reported.set(true);
+        if silent_ms.is_finite() && silent_ms > self.silent_ms.get() {
+            self.silent_ms.set(silent_ms);
+        }
+        if events.is_finite() && events > self.events.get() as f64 {
+            self.events.set(events as u64);
+        }
+    }
+
+    /// A `{type: "underrun", silentMs, events}` report from the worklet; anything else is ignored.
+    fn record(&self, data: &JsValue) {
+        let field = |name: &str| js_sys::Reflect::get(data, &JsValue::from_str(name)).ok();
+        if field("type").and_then(|t| t.as_string()).as_deref() != Some("underrun") {
+            return;
+        }
+        let number = |name: &str| field(name).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        self.fold(number("silentMs"), number("events"));
+    }
+
+    /// Totals for the NetEQ stats JSON; `None` until the worklet has reported once.
+    fn totals(&self) -> Option<(u64, u64)> {
+        self.reported
+            .get()
+            .then(|| (self.silent_ms.get().round() as u64, self.events.get()))
+    }
+}
+
+type PortListener = Closure<dyn FnMut(MessageEvent)>;
+
+/// Wires one decoder's worklet: its underrun reports, and (unless switched off) a MessageChannel
+/// so the NetEQ worker posts PCM to the worklet without the main thread.
+#[derive(Debug, Default)]
+struct PlayoutLink {
+    wired: Cell<bool>,
+    /// From `WorkerReady`; below `PAUSE_PROTOCOL` the worker never says when it stops producing.
+    worker_protocol: Cell<u32>,
+    counters: Rc<PlayoutCounters>,
+    on_report: RefCell<Option<PortListener>>,
+}
+
+impl PlayoutLink {
+    fn wire_if_ready(&self, pcm_player: &RefCell<PlaybackSlot>, worker: &Worker, peer_id: &str) {
+        if self.wired.get() {
+            return;
+        }
+        if let PlaybackSlot::Live(worklet, _) = &*pcm_player.borrow() {
+            self.wire(worklet, worker, peer_id);
+        }
+    }
+
+    fn wire(&self, worklet: &AudioWorkletNode, worker: &Worker, peer_id: &str) {
+        self.wired.set(true);
+        let Ok(port) = worklet.port() else {
+            return;
+        };
+        let counters = self.counters.clone();
+        let on_report = Closure::wrap(Box::new(move |event: MessageEvent| {
+            counters.record(&event.data());
+        }) as Box<dyn FnMut(MessageEvent)>);
+        if port
+            .add_event_listener_with_callback("message", on_report.as_ref().unchecked_ref())
+            .is_ok()
+        {
+            port.start();
+            *self.on_report.borrow_mut() = Some(on_report);
+        }
+
+        if self.worker_protocol.get() < PAUSE_PROTOCOL {
+            log::info!(
+                "audio for peer {peer_id}: NetEQ worker protocol {} predates pause; no direct path, no underrun count",
+                self.worker_protocol.get()
+            );
+            return;
+        }
+        Self::post(&port, "countUnderruns");
+        if !direct_pcm_enabled() {
+            log::info!(
+                "audio for peer {peer_id}: PCM via the main thread ({DIRECT_PCM_GLOBAL} off)"
+            );
+            return;
+        }
+        match Self::attach_direct(&port, worker) {
+            Ok(()) => log::info!("audio for peer {peer_id}: PCM goes from NetEQ straight to the worklet"),
+            Err(e) => log::warn!(
+                "audio for peer {peer_id}: direct PCM path unavailable ({e:?}); keeping the main-thread path"
+            ),
+        }
+    }
+
+    fn post(port: &web_sys::MessagePort, command: &str) {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&msg, &"command".into(), &command.into());
+        let _ = port.post_message(&msg);
+    }
+
+    /// Must run before the decoder frees `on_report`.
+    fn detach(&self, worklet: &AudioWorkletNode) {
+        if let (Some(on_report), Ok(port)) = (self.on_report.borrow().as_ref(), worklet.port()) {
+            let _ = port
+                .remove_event_listener_with_callback("message", on_report.as_ref().unchecked_ref());
+        }
+    }
+
+    fn attach_direct(worklet_port: &web_sys::MessagePort, worker: &Worker) -> Result<(), JsValue> {
+        let channel = web_sys::MessageChannel::new()?;
+        let message = |key: &str, value: &str, port: &web_sys::MessagePort| {
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&msg, &JsValue::from_str(key), &JsValue::from_str(value));
+            let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("port"), port);
+            msg
+        };
+        let worklet_end = channel.port1();
+        worklet_port.post_message_with_transferable(
+            &message("command", "attachInput", &worklet_end),
+            &js_sys::Array::of1(&worklet_end),
+        )?;
+        let worker_end = channel.port2();
+        worker.post_message_with_transfer(
+            &message("cmd", "attachOutput", &worker_end),
+            &js_sys::Array::of1(&worker_end),
+        )
+    }
 }
 
 thread_local! {
@@ -100,6 +436,7 @@ fn seq_to_sample_timestamp(seq: u64) -> u32 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Clone, PartialEq))]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 enum WorkerMsg {
     Init {
@@ -129,7 +466,14 @@ enum WorkerMsg {
 enum WorkerResponse {
     WorkerReady {
         mute_state: bool,
+        /// Absent from a worker built before this protocol existed (a cached old worker).
+        #[serde(default)]
+        protocol: u32,
     },
+    /// No PCM follows until unmute: tells the worklet to stop counting silence.
+    Pause,
+    /// The last frame sent the old way is ahead of this; direct frames may play after it.
+    Handoff,
     Stats {
         #[serde(skip)]
         stats: JsValue, // Will be processed manually
@@ -139,7 +483,7 @@ enum WorkerResponse {
 /// Decoder-side voice-activity state for one peer.
 ///
 /// Lives in a single `Rc<RefCell<..>>` shared between the decoder and the NetEQ
-/// worker's `onmessage` closure. The three fields are deliberately kept in one
+/// worker's `onmessage` closure. The fields are deliberately kept in one
 /// cell rather than side-by-side `Rc`s: [`Self::observe`] consults `suppressed`
 /// and updates `speaking`/`audio_level` under a single borrow, so there is no
 /// interleaving in which a PCM frame is judged against a gate that no longer
@@ -161,12 +505,13 @@ struct VadState {
     ///
     /// The gate therefore cannot wedge the indicator off on a live stream: the
     /// single `set_muted` call that closes it is the same one that tells the
-    /// worker to stop producing (`should_produce` is false on the muted branch
-    /// of `neteq/src/bin/neteq_worker.rs`), and the matching `set_muted(false)`
+    /// worker to stop producing (`pace_tick` returns no frames when muted, in
+    /// `neteq/src/bin/neteq_worker.rs`), and the matching `set_muted(false)`
     /// reopens it. A state in which the gate is shut but PCM keeps flowing
     /// would mean the worker ignored its own mute — the peer would be audible
     /// while shown as muted, a louder failure than a dark glow.
     suppressed: bool,
+    edges: SpeakingEdgeFilter,
 }
 
 impl VadState {
@@ -175,7 +520,17 @@ impl VadState {
             speaking: false,
             audio_level: 0.0,
             suppressed: false,
+            edges: SpeakingEdgeFilter::new(),
         }
+    }
+
+    /// Feed one raw per-frame verdict to the edge log. Suppressed frames are
+    /// stale by the same argument as in [`Self::observe`].
+    fn observe_edge(&mut self, is_speaking: bool, now_ms: u64) -> Option<SpeakingEdge> {
+        if self.suppressed {
+            return None;
+        }
+        self.edges.observe(is_speaking, now_ms)
     }
 
     /// Fold one decoded PCM frame into the VAD, and report whether the caller
@@ -260,11 +615,11 @@ impl VadState {
     ///
     /// Used when a fresh decoder is taking over the same peer
     /// (`Peer::reset_for_decode_error` after an AUDIO decode error). Clearing
-    /// the state here is what makes the
-    /// subsequent `Drop` a no-op: [`Self::take_terminal`] finds the VAD already
-    /// idle and stays silent, so the UI never sees the peer stop speaking
-    /// mid-word. Suppressing is what stops the outgoing worker's already-posted
-    /// PCM from broadcasting for a peer the new decoder now owns.
+    /// the speaking state makes the subsequent `Drop` a no-op for the
+    /// broadcast: [`Self::take_terminal`] finds the VAD already idle, so the UI
+    /// never sees the peer stop speaking mid-word. Suppressing is what stops the
+    /// outgoing worker's already-posted PCM from broadcasting for a peer the new
+    /// decoder now owns.
     fn retire(&mut self) {
         self.suppressed = true;
         self.speaking = false;
@@ -273,9 +628,8 @@ impl VadState {
 }
 
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
-#[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
-    worker: Worker,
+    boot: Rc<NetEqWorkerSlot>,
     _audio_context: AudioContext,
     decoded: bool,
     /// Which peer this decoder belongs to.
@@ -294,12 +648,36 @@ pub struct NetEqAudioPeerDecoder {
 
     // Message queueing system
     pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+    pending_arrivals: Rc<RefCell<VecDeque<f64>>>,
     worker_ready: Rc<RefCell<bool>>,
+    /// Set when the worker errors before `WorkerReady` (#3210); nothing is queued or posted after.
+    worker_failed: Rc<Cell<bool>>,
 
     /// Voice activity detection state, shared with the worker's `onmessage`
-    /// closure (see `_on_message`).
+    /// closure (see `NetEqHandlers::on_message`).
     vad: Rc<RefCell<VadState>>,
 
+    /// Ring buffer of recently received audio sequence numbers.
+    /// Used to detect whether a redundant frame carried in a RED packet
+    /// was already received, avoiding duplicate injection.
+    received_sequences: VecDeque<u64>,
+
+    /// Worklet wiring and its underrun counters; the report closure is freed after `Drop`
+    /// detaches it from the worklet port.
+    playout: Rc<PlayoutLink>,
+}
+
+impl std::fmt::Debug for NetEqAudioPeerDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetEqAudioPeerDecoder")
+            .field("peer_id", &self.peer_id)
+            .field("worker_started", &self.boot.worker.borrow().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a started NetEq worker holds; dropped with [`NetEqWorkerSlot`].
+struct NetEqHandlers {
     /// The worker's `onmessage` handler.
     ///
     /// Issue 2225: this used to be `.forget()`-ed, leaking the closure, every
@@ -320,16 +698,17 @@ pub struct NetEqAudioPeerDecoder {
     /// reach the freed box — but it is still an avoidable error, so we avoid
     /// it.
     ///
-    /// The same requirement applies at the other end of the lifetime: see the
-    /// ORDERING INVARIANT on the `set_onmessage` call in [`Self::build`], which
-    /// keeps the install below every fallible `?` so no early return can drop
-    /// the closure while the worker still points at it.
-    _on_message: Closure<dyn FnMut(MessageEvent)>,
+    /// The same requirement applies at the other end of the lifetime:
+    /// [`NetEqWorkerSlot::start`] installs it only after every fallible `?`.
+    on_message: Closure<dyn FnMut(MessageEvent)>,
+
+    /// The worker's `onerror` handler; detached by [`Drop`] like `on_message`.
+    on_error: Closure<dyn FnMut(web_sys::Event)>,
 
     /// The one-shot `setTimeout` callback that posts `Init` to the worker.
     ///
     /// Issue 2225: also `.forget()`-ed before. Held here and cancelled by
-    /// [`Drop`] via `_init_timer_id`, for the same reason as `_on_message` — a
+    /// [`Drop`] via `init_timer_id`, for the same reason as `on_message` — a
     /// timer that fires after the closure has been freed would panic.
     _init_timer_cb: Closure<dyn FnMut()>,
 
@@ -339,17 +718,86 @@ pub struct NetEqAudioPeerDecoder {
     /// `clear_timeout_with_handle` while the timer is genuinely outstanding.
     /// That matters because the browser may reuse a completed timer's handle
     /// id: clearing a stale id could cancel an unrelated timer.
-    _init_timer_id: Rc<std::cell::Cell<i32>>,
+    init_timer_id: Rc<std::cell::Cell<i32>>,
+}
 
-    /// Ring buffer of recently received audio sequence numbers.
-    /// Used to detect whether a redundant frame carried in a RED packet
-    /// was already received, avoiding duplicate injection.
-    received_sequences: VecDeque<u64>,
+type InstallNetEqHandlers = Box<dyn FnOnce(&Worker) -> Result<NetEqHandlers, JsValue>>;
+
+/// The NetEq worker, which a deferred decoder creates only when its starter runs (#3277).
+struct NetEqWorkerSlot {
+    url: String,
+    worker: RefCell<Option<Worker>>,
+    handlers: RefCell<Option<NetEqHandlers>>,
+    install: RefCell<Option<InstallNetEqHandlers>>,
+    peer_id: Rc<str>,
+    worker_ready: Rc<RefCell<bool>>,
+    worker_failed: Rc<Cell<bool>>,
+    timed_out: Cell<bool>,
+    pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+    on_settled: Rc<RefCell<Option<BootSettled>>>,
+}
+
+impl NetEqWorkerSlot {
+    fn start(&self) -> Result<(), JsValue> {
+        let Some(install) = self.install.borrow_mut().take() else {
+            return Ok(());
+        };
+        let worker = Worker::new(&self.url)?;
+        let handlers = install(&worker)?;
+        // Installed only after every fallible step above, so no early return can drop a closure
+        // the worker still references.
+        worker.set_onmessage(Some(handlers.on_message.as_ref().unchecked_ref()));
+        worker.set_onerror(Some(handlers.on_error.as_ref().unchecked_ref()));
+        *self.handlers.borrow_mut() = Some(handlers);
+        *self.worker.borrow_mut() = Some(worker);
+        Ok(())
+    }
+
+    fn start_or_fail(&self) {
+        if let Err(e) = self.start() {
+            if self.worker_failed.replace(true) {
+                return;
+            }
+            self.pending_messages.borrow_mut().clear();
+            settle_boot(&self.on_settled, BootOutcome::Failed);
+            log::error!(
+                "NetEq worker for peer {} failed to start ({e:?}); this participant's audio cannot be played",
+                self.peer_id
+            );
+        }
+    }
+
+    /// Terminates a worker that has not reported ready and settles it as a failed boot.
+    fn abort(&self) {
+        if *self.worker_ready.borrow() || self.worker_failed.replace(true) {
+            return;
+        }
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.terminate();
+        }
+        self.pending_messages.borrow_mut().clear();
+        self.timed_out.set(true);
+        settle_boot(&self.on_settled, BootOutcome::Failed);
+        log::error!(
+            "NetEq worker for peer {} did not start in time",
+            self.peer_id
+        );
+    }
+}
+
+fn settle_boot(on_settled: &RefCell<Option<BootSettled>>, outcome: BootOutcome) {
+    let on_settled = on_settled.borrow_mut().take();
+    if let Some(on_settled) = on_settled {
+        on_settled(outcome);
+    }
 }
 
 impl NetEqAudioPeerDecoder {
     /// Send message through queue (immediate if worker ready, otherwise queued)
     fn send_worker_message(&self, msg: WorkerMsg) {
+        if self.worker_failed.get() {
+            return;
+        }
         let is_ready = *self.worker_ready.borrow();
 
         if is_ready {
@@ -361,45 +809,113 @@ impl NetEqAudioPeerDecoder {
                 "🔄 Queueing message for peer {} (worker not ready)",
                 self.peer_id
             );
-            self.pending_messages.borrow_mut().push_back(msg);
+            enqueue_with_arrival(
+                &mut self.pending_messages.borrow_mut(),
+                &mut self.pending_arrivals.borrow_mut(),
+                msg,
+                js_sys::Date::now(),
+            );
         }
+    }
+
+    /// The worker's `onerror`. Any error before `WorkerReady` is a failed boot (#3210), so the
+    /// decoder stops queuing.
+    fn create_error_handler(
+        worker: Worker,
+        peer_id: Rc<str>,
+        worker_ready: Rc<RefCell<bool>>,
+        worker_failed: Rc<Cell<bool>>,
+        pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+        on_settled: Rc<RefCell<Option<BootSettled>>>,
+    ) -> Closure<dyn FnMut(web_sys::Event)> {
+        Closure::wrap(Box::new(move |event: web_sys::Event| {
+            let detail = js_sys::Reflect::get(&event, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "worker error".to_string());
+            if *worker_ready.borrow() || worker_failed.get() {
+                log::warn!("NetEq worker for peer {peer_id} reported an error: {detail}");
+                return;
+            }
+            worker_failed.set(true);
+            // A failed boot never recovers; terminating stops its timers and frees what it holds.
+            worker.terminate();
+            pending_messages.borrow_mut().clear();
+            settle_boot(&on_settled, BootOutcome::Failed);
+            log::error!(
+                "NetEq worker for peer {peer_id} failed to start ({detail}); this participant's audio cannot be played"
+            );
+        }) as Box<dyn FnMut(web_sys::Event)>)
     }
 
     /// Send message immediately to worker
     fn send_message_immediate(&self, msg: WorkerMsg) {
+        let worker = self.boot.worker.borrow();
+        let Some(worker) = worker.as_ref() else {
+            return;
+        };
         if let Err(e) =
-            serde_wasm_bindgen::to_value(&msg).map(|js_msg| self.worker.post_message(&js_msg))
+            serde_wasm_bindgen::to_value(&msg).map(|js_msg| worker.post_message(&js_msg))
         {
             log::error!("Failed to send worker message: {e:?}");
             web_sys::console::error_1(&format!("Failed to send worker message: {e:?}").into());
         }
     }
 
-    /// Create a NetEq worker.
-    fn create_neteq_worker() -> Result<Worker, JsValue> {
+    fn neteq_worker_url() -> String {
         let window = web_sys::window().expect("no window");
         let document = window.document().expect("no document");
-        let worker_url = document
+        document
             .get_element_by_id("neteq-worker")
             .expect("neteq-worker link tag not found")
             .get_attribute("href")
-            .expect("link tag has no href");
-        Worker::new(&worker_url)
+            .expect("link tag has no href")
     }
 
     /// Send PCM data to Safari AudioWorklet (simple and efficient)
-    fn send_pcm_to_safari_worklet(pcm_player: &AudioWorkletNode, pcm: &Float32Array) {
-        // Create message object for the worklet
-        let message = js_sys::Object::new();
-        js_sys::Reflect::set(&message, &"command".into(), &"play".into()).unwrap();
-        js_sys::Reflect::set(&message, &"pcm".into(), pcm).unwrap();
-
-        // Send PCM data to the worklet - it handles all timing internally
-        if let Err(e) = pcm_player.port().unwrap().post_message(&message) {
-            web_sys::console::warn_1(
-                &format!("Safari: Failed to send PCM to worklet: {e:?}").into(),
-            );
+    fn post_to_worklet(worklet: &AudioWorkletNode, message: &js_sys::Object) {
+        if let Err(e) = worklet.port().and_then(|port| port.post_message(message)) {
+            web_sys::console::warn_1(&format!("Failed to post to the worklet: {e:?}").into());
         }
+    }
+
+    fn worklet_command(command: &str) -> js_sys::Object {
+        let message = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&message, &"command".into(), &command.into());
+        message
+    }
+
+    /// Posts `message` to the peer's worklet, or queues it behind earlier messages until the
+    /// worklet is built, so PCM, `pause` and `handoff` reach it in the order they arrived.
+    fn send_or_queue(
+        pcm_player: &Rc<RefCell<PlaybackSlot>>,
+        message: js_sys::Object,
+        speaker_device_id: Option<Rc<str>>,
+    ) {
+        let key = slot_key(pcm_player);
+        let queued = WORKLET_OUTBOX.with(|o| o.borrow().get(&key).is_some_and(|q| !q.is_empty()));
+        match &*pcm_player.borrow() {
+            PlaybackSlot::Live(worklet, _) if !queued => {
+                Self::post_to_worklet(worklet, &message);
+                return;
+            }
+            PlaybackSlot::Dead => return,
+            _ => {}
+        }
+        WORKLET_OUTBOX.with(|o| {
+            let mut outbox = o.borrow_mut();
+            enqueue_bounded(outbox.entry(key).or_default(), message, WORKLET_OUTBOX_MAX);
+        });
+        let pcm_player = pcm_player.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            Self::ensure_worklet_initialized(&pcm_player, speaker_device_id).await;
+            if let PlaybackSlot::Live(worklet, _) = &*pcm_player.borrow() {
+                let queued = WORKLET_OUTBOX.with(|o| o.borrow_mut().remove(&key));
+                for message in queued.into_iter().flatten() {
+                    Self::post_to_worklet(worklet, &message);
+                }
+            }
+        });
     }
 
     /// Create Safari-optimized AudioContext with PCM player worklet
@@ -494,19 +1010,35 @@ impl NetEqAudioPeerDecoder {
         vad: Rc<RefCell<VadState>>,
         vad_threshold: f32,
     ) {
-        // Calculate RMS for voice activity detection
-        let rms = Self::calculate_rms(&pcm);
+        Self::observe_level(
+            Self::calculate_rms(&pcm),
+            audio_context,
+            peer_id,
+            &vad,
+            vad_threshold,
+        );
+
+        let message = Self::worklet_command("play");
+        let _ = js_sys::Reflect::set(&message, &"pcm".into(), &pcm);
+        Self::send_or_queue(&pcm_player, message, speaker_device_id);
+    }
+
+    /// The per-frame main-thread work both paths share: the decoder-side VAD and keeping the
+    /// AudioContext running. On the direct path the worker sends only `rms`.
+    fn observe_level(
+        rms: f32,
+        audio_context: &AudioContext,
+        peer_id: &str,
+        vad: &Rc<RefCell<VadState>>,
+        vad_threshold: f32,
+    ) {
         let is_speaking = rms > vad_threshold;
 
         // Normalize RMS to a 0.0–1.0 intensity range using the shared
         // perceptual curve (sqrt for human hearing).
         let intensity = rms_to_intensity(rms, vad_threshold);
 
-        // Borrow ends with the statement, so the broadcast below never runs
-        // while the shared VAD state is borrowed.
-        let changed = vad.borrow_mut().observe(is_speaking, intensity);
-
-        if changed {
+        if Self::observe_frame(peer_id, vad, is_speaking, intensity, now_ms()) {
             let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "peer_speaking",
                 stream_id: Some(format!("speaking->{peer_id}")),
@@ -519,21 +1051,67 @@ impl NetEqAudioPeerDecoder {
             });
         }
 
-        // Ensure AudioContext is running
-        if let Err(e) = audio_context.resume() {
-            web_sys::console::warn_1(
-                &format!("[neteq-audio-decoder] AudioContext resume error: {e:?}").into(),
-            );
+        Self::keep_context_running(audio_context);
+    }
+
+    /// Resume a context that is not running.
+    fn keep_context_running(audio_context: &AudioContext) {
+        Self::watch_context_state(audio_context);
+        let running = audio_context.state() == web_sys::AudioContextState::Running;
+        let now = js_sys::Date::now();
+        if !resume_needed(running, RESUME_PENDING_SINCE.with(Cell::get), now) {
+            return;
         }
-
-        let pcm_player_clone = pcm_player.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            Self::ensure_worklet_initialized(&pcm_player_clone, speaker_device_id).await;
-
-            if let PlaybackSlot::Live(worklet, _peer_gain) = &*pcm_player_clone.borrow() {
-                Self::send_pcm_to_safari_worklet(worklet, &pcm);
+        match audio_context.resume() {
+            Ok(promise) => {
+                RESUME_PENDING_SINCE.with(|p| p.set(Some(now)));
+                wasm_bindgen_futures::spawn_local(async move {
+                    let result = wasm_bindgen_futures::JsFuture::from(promise).await;
+                    RESUME_PENDING_SINCE.with(|p| p.set(None));
+                    if let Err(e) = result {
+                        log::warn!("[neteq-audio-decoder] AudioContext resume error: {e:?}");
+                    }
+                });
             }
-        });
+            Err(e) => log::warn!("[neteq-audio-decoder] AudioContext resume error: {e:?}"),
+        }
+    }
+
+    /// Once per context: any `statechange` ends the wait on an outstanding `resume()`.
+    fn watch_context_state(audio_context: &AudioContext) {
+        let marker = JsValue::from_str("__vcResumeWatch");
+        if js_sys::Reflect::has(audio_context, &marker).unwrap_or(false) {
+            return;
+        }
+        let on_change = Closure::wrap(Box::new(|| {
+            RESUME_PENDING_SINCE.with(|p| p.set(None));
+        }) as Box<dyn FnMut()>);
+        if audio_context
+            .add_event_listener_with_callback("statechange", on_change.as_ref().unchecked_ref())
+            .is_ok()
+        {
+            let _ = js_sys::Reflect::set(audio_context, &marker, &JsValue::TRUE);
+            // The shared context lives for the page, so its listener does too.
+            on_change.forget();
+        }
+    }
+
+    /// Sends `command` to the worklet in order with the PCM the main thread forwarded; a peer
+    /// whose PCM never came the old way has no worklet to tell.
+    fn forward_control(
+        pcm_player: &Rc<RefCell<PlaybackSlot>>,
+        speaker_device_id: Option<Rc<str>>,
+        command: &str,
+    ) {
+        let queued = WORKLET_OUTBOX.with(|o| o.borrow().contains_key(&slot_key(pcm_player)));
+        if matches!(*pcm_player.borrow(), PlaybackSlot::Empty) && !queued {
+            return;
+        }
+        Self::send_or_queue(
+            pcm_player,
+            Self::worklet_command(command),
+            speaker_device_id,
+        );
     }
 
     /// Build the terminal `speaking: 0` event for `peer_id`.
@@ -562,10 +1140,10 @@ impl NetEqAudioPeerDecoder {
     /// The decoder-side VAD in [`Self::handle_pcm_data`] is edge-triggered: it
     /// only emits when the speaking flag flips or the level moves. It is driven
     /// purely by decoded PCM arriving from the NetEQ worker — and the worker
-    /// stops producing PCM entirely while muted (`should_produce` is false on
-    /// the muted branch of `neteq/src/bin/neteq_worker.rs`). So when a peer
-    /// mutes mid-word, the last event ever emitted is `speaking: 1` and the
-    /// glow stays lit. The same holds for `flush()` (buffer dropped) and for
+    /// stops producing PCM entirely while muted (`pace_tick` returns no frames
+    /// when muted, in `neteq/src/bin/neteq_worker.rs`). So when a peer mutes
+    /// mid-word, the last event ever emitted is `speaking: 1` and the glow
+    /// stays lit. The same holds for `flush()` (buffer dropped) and for
     /// `Drop` (worker terminated).
     ///
     /// This closes the fast path with an explicit terminal edge. Without it the
@@ -592,8 +1170,48 @@ impl NetEqAudioPeerDecoder {
     /// worker has already posted cannot re-arm it after the zero goes out, then
     /// emit the terminal zero if one is owed.
     fn suppress_and_emit_terminal_speaking_zero(peer_id: &str, vad: &Rc<RefCell<VadState>>) {
-        let owed = vad.borrow_mut().suppress_and_take_terminal();
+        let (owed, edge) = {
+            let mut vad = vad.borrow_mut();
+            let owed = vad.suppress_and_take_terminal();
+            (owed, vad.edges.force_off(now_ms()))
+        };
         Self::broadcast_terminal_zero(peer_id, owed);
+        Self::log_speaking_edge(peer_id, edge);
+    }
+
+    /// Fold one frame's verdict into the VAD and the edge log; returns whether a
+    /// `peer_speaking` event must be broadcast.
+    fn observe_frame(
+        peer_id: &str,
+        vad: &RefCell<VadState>,
+        is_speaking: bool,
+        intensity: f32,
+        now_ms: u64,
+    ) -> bool {
+        let (changed, edge) = {
+            let mut vad = vad.borrow_mut();
+            let changed = vad.observe(is_speaking, intensity);
+            (changed, vad.observe_edge(is_speaking, now_ms))
+        };
+        Self::log_speaking_edge(peer_id, edge);
+        changed
+    }
+
+    /// The VAD half of `retire_for_replacement`: silent on the bus, but the
+    /// edge log closes the episode so the replacement's `on` pairs with an `off`.
+    fn retire_vad(peer_id: &str, vad: &RefCell<VadState>) {
+        let edge = {
+            let mut vad = vad.borrow_mut();
+            vad.retire();
+            vad.edges.force_off(now_ms())
+        };
+        Self::log_speaking_edge(peer_id, edge);
+    }
+
+    fn log_speaking_edge(peer_id: &str, edge: Option<SpeakingEdge>) {
+        if let Some(edge) = edge {
+            log::info!("{}", edge.log_line(peer_id));
+        }
     }
 
     /// Instance-level wrapper around [`Self::emit_terminal_speaking_zero`],
@@ -675,7 +1293,7 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Handle statistics messages from NetEq worker
-    fn handle_stats_message(data: &JsValue, peer_id: &str) {
+    fn handle_stats_message(data: &JsValue, peer_id: &str, playout: &PlayoutCounters) {
         let obj = match data.dyn_ref::<js_sys::Object>() {
             Some(obj) => obj,
             None => return,
@@ -699,7 +1317,7 @@ impl NetEqAudioPeerDecoder {
         };
 
         let json_str = match stats_json.as_string() {
-            Some(s) => s,
+            Some(s) => with_playout_totals(s, playout.totals()),
             None => return,
         };
 
@@ -863,14 +1481,19 @@ impl NetEqAudioPeerDecoder {
         speaker_device_id: Option<Rc<str>>,
         worker_ready: Rc<RefCell<bool>>,
         pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+        pending_arrivals: Rc<RefCell<VecDeque<f64>>>,
         worker: Worker,
         vad: Rc<RefCell<VadState>>,
         vad_threshold: f32,
+        on_settled: Rc<RefCell<Option<BootSettled>>>,
+        playout: Rc<PlayoutLink>,
     ) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
 
-            if data.is_instance_of::<Float32Array>() {
+            if let Some(rms) = data.as_f64() {
+                Self::observe_level(rms as f32, &audio_context, &peer_id, &vad, vad_threshold);
+            } else if data.is_instance_of::<Float32Array>() {
                 // High-performance PCM path with voice activity detection
                 let pcm = Float32Array::from(data);
                 Self::handle_pcm_data(
@@ -882,12 +1505,17 @@ impl NetEqAudioPeerDecoder {
                     vad.clone(),
                     vad_threshold,
                 );
+                playout.wire_if_ready(&pcm_player, &worker, &peer_id);
             } else if data.is_object() {
                 // Try to parse as WorkerResponse first
                 if let Ok(response) = serde_wasm_bindgen::from_value::<WorkerResponse>(data.clone())
                 {
                     match response {
-                        WorkerResponse::WorkerReady { mute_state } => {
+                        WorkerResponse::WorkerReady {
+                            mute_state,
+                            protocol,
+                        } => {
+                            playout.worker_protocol.set(protocol);
                             // Handle worker ready - flush queue
                             log::info!(
                                 "✅ Worker ready for peer {peer_id} (worker mute: {mute_state})"
@@ -897,6 +1525,11 @@ impl NetEqAudioPeerDecoder {
 
                             // Flush queued messages in FIFO order
                             let mut queue = pending_messages.borrow_mut();
+                            drop_stale_inserts(
+                                &mut queue,
+                                &mut pending_arrivals.borrow_mut(),
+                                js_sys::Date::now(),
+                            );
                             let queue_length = queue.len();
 
                             if queue_length > 0 {
@@ -915,15 +1548,23 @@ impl NetEqAudioPeerDecoder {
                                     }
                                 }
                             }
+                            drop(queue);
+                            settle_boot(&on_settled, BootOutcome::Ready);
+                        }
+                        WorkerResponse::Pause => {
+                            Self::forward_control(&pcm_player, speaker_device_id.clone(), "pause")
+                        }
+                        WorkerResponse::Handoff => {
+                            Self::forward_control(&pcm_player, speaker_device_id.clone(), "handoff")
                         }
                         WorkerResponse::Stats { .. } => {
                             // Handle stats message (fallback to old method for now)
-                            Self::handle_stats_message(&data, &peer_id);
+                            Self::handle_stats_message(&data, &peer_id, &playout.counters);
                         }
                     }
                 } else {
                     // Fallback to old stats message handling
-                    Self::handle_stats_message(&data, &peer_id);
+                    Self::handle_stats_message(&data, &peer_id, &playout.counters);
                 }
             }
         }) as Box<dyn FnMut(_)>)
@@ -964,9 +1605,59 @@ impl NetEqAudioPeerDecoder {
         initial_muted: bool,
         vad_threshold: Option<f32>,
     ) -> Result<Self, JsValue> {
-        // Create worker
-        let worker = Self::create_neteq_worker()?;
+        let decoder = Self::build_unstarted(
+            speaker_device_id,
+            peer_id,
+            initial_muted,
+            vad_threshold,
+            None,
+        )?;
+        decoder.boot.start()?;
+        Ok(decoder)
+    }
 
+    /// A decoder whose worker is created only when the returned starter runs (#3277). Until
+    /// then messages wait in the boot queue, and `on_boot_settled` runs once the worker reports
+    /// `WorkerReady` or fails to start. The starter returns `false` once the decoder is gone.
+    pub(crate) fn new_deferred(
+        peer_id: String,
+        vad_threshold: Option<f32>,
+        on_boot_settled: BootSettled,
+    ) -> Result<
+        (
+            Box<dyn AudioPeerDecoderTrait>,
+            crate::decode::worker_boot_queue::BootHandle,
+        ),
+        JsValue,
+    > {
+        let decoder =
+            Self::build_unstarted(None, peer_id, true, vad_threshold, Some(on_boot_settled))?;
+        let slot = Rc::downgrade(&decoder.boot);
+        let abort_slot = slot.clone();
+        let handle = crate::decode::worker_boot_queue::BootHandle {
+            start: Box::new(move || match slot.upgrade() {
+                Some(slot) => {
+                    slot.start_or_fail();
+                    true
+                }
+                None => false,
+            }),
+            abort: Box::new(move || {
+                if let Some(slot) = abort_slot.upgrade() {
+                    slot.abort();
+                }
+            }),
+        };
+        Ok((Box::new(decoder), handle))
+    }
+
+    fn build_unstarted(
+        speaker_device_id: Option<String>,
+        peer_id: String,
+        initial_muted: bool,
+        vad_threshold: Option<f32>,
+        on_boot_settled: Option<BootSettled>,
+    ) -> Result<Self, JsValue> {
         // Use shared AudioContext and ensure worklet registered once
         let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
         SharedAudioContext::ensure_pcm_worklet(WORKLET_CODE);
@@ -986,73 +1677,57 @@ impl NetEqAudioPeerDecoder {
         let threshold = vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD);
 
         let worker_ready = Rc::new(RefCell::new(false));
+        let worker_failed = Rc::new(Cell::new(false));
         let pending_messages = Rc::new(RefCell::new(VecDeque::new()));
+        let pending_arrivals = Rc::new(RefCell::new(VecDeque::new()));
         let vad = Rc::new(RefCell::new(VadState::new()));
+        let on_settled = Rc::new(RefCell::new(on_boot_settled));
+        let playout = Rc::new(PlayoutLink::default());
 
-        // Set up worker message handling with decoder's queue references
-        let on_message_closure = Self::create_message_handler(
-            pcm_player_ref.clone(),
-            audio_context.clone(),
-            peer_id.clone(),
-            speaker_device_id.clone(),
-            worker_ready.clone(),
-            pending_messages.clone(),
-            worker.clone(),
-            vad.clone(),
-            threshold,
-        );
-
-        // Initialize worker
-        let init_msg = WorkerMsg::Init {
-            sample_rate: AUDIO_SAMPLE_RATE,
-            channels: AUDIO_CHANNELS as u8,
+        let install: InstallNetEqHandlers = {
+            let pcm_player = pcm_player_ref.clone();
+            let audio_context = audio_context.clone();
+            let peer_id = peer_id.clone();
+            let worker_ready = worker_ready.clone();
+            let worker_failed = worker_failed.clone();
+            let pending_messages = pending_messages.clone();
+            let pending_arrivals = pending_arrivals.clone();
+            let vad = vad.clone();
+            let on_settled = on_settled.clone();
+            let playout = playout.clone();
+            Box::new(move |worker: &Worker| {
+                Self::worker_handlers(
+                    worker,
+                    pcm_player,
+                    audio_context,
+                    peer_id,
+                    speaker_device_id,
+                    worker_ready,
+                    worker_failed,
+                    pending_messages,
+                    pending_arrivals,
+                    vad,
+                    threshold,
+                    on_settled,
+                    playout,
+                )
+            })
         };
-
-        let init_js = serde_wasm_bindgen::to_value(&init_msg)?;
-        let worker_clone = worker.clone();
-        // Zeroed by the callback itself so `Drop` can tell "still pending" from
-        // "already fired" — clearing an already-completed handle id risks
-        // cancelling an unrelated timer that inherited it.
-        let init_timer_id = Rc::new(std::cell::Cell::new(0i32));
-        let init_timer_id_for_cb = init_timer_id.clone();
-        let send_cb = Closure::wrap(Box::new(move || {
-            init_timer_id_for_cb.set(0);
-            if let Err(e) = worker_clone.post_message(&init_js) {
-                web_sys::console::error_2(&"[neteq-audio-decoder] failed to post Init:".into(), &e);
-            }
-        }) as Box<dyn FnMut()>);
-
-        // A `?` here leaves NO timer registered, so `send_cb` is dropped without
-        // the browser ever having held a reference to it.
-        let timer_id = web_sys::window()
-            .expect("no window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                send_cb.as_ref().unchecked_ref(),
-                10,
-            )?;
-        // `set_timeout` returns synchronously, before any callback can run, so
-        // this store cannot race the callback's own zeroing.
-        init_timer_id.set(timer_id);
-
-        // Issue 2225: install the handler but KEEP the closure (stored on the
-        // struct below) instead of `.forget()`-ing it. `Drop` detaches the
-        // handler before the field is freed, so nothing can invoke a freed
-        // closure, and every `Rc` the closure captures — plus the `Worker` JS
-        // wrapper it holds, which closed a worker→closure→worker reference cycle
-        // — is released with the decoder.
-        //
-        // ORDERING INVARIANT: this must stay BELOW every `?` in this function
-        // and directly above the struct literal that takes ownership. An early
-        // return between the install and that literal would drop the closure
-        // while the worker still referenced it, arming exactly the
-        // freed-closure panic this arrangement exists to avoid. Nothing is lost
-        // by installing late: `build` is synchronous, so the browser cannot
-        // dispatch a worker message until it returns.
-        worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
 
         // Create decoder with explicit mute state
         let mut decoder = Self {
-            worker: worker.clone(),
+            boot: Rc::new(NetEqWorkerSlot {
+                url: Self::neteq_worker_url(),
+                worker: RefCell::new(None),
+                handlers: RefCell::new(None),
+                install: RefCell::new(Some(install)),
+                peer_id: peer_id.clone(),
+                worker_ready: worker_ready.clone(),
+                worker_failed: worker_failed.clone(),
+                timed_out: Cell::new(false),
+                pending_messages: pending_messages.clone(),
+                on_settled,
+            }),
             _audio_context: audio_context.clone(),
             decoded: false,
             peer_id: peer_id.clone(),
@@ -1060,18 +1735,16 @@ impl NetEqAudioPeerDecoder {
 
             // Message queueing system
             pending_messages,
+            pending_arrivals,
             worker_ready,
+            worker_failed,
 
             // Voice activity detection state
             vad,
 
-            // Issue 2225: owned, not leaked — see the field docs.
-            _on_message: on_message_closure,
-            _init_timer_cb: send_cb,
-            _init_timer_id: init_timer_id,
-
             // RED redundancy: track recently received sequence numbers
             received_sequences: VecDeque::with_capacity(AUDIO_RED_SEQ_HISTORY_SIZE),
+            playout,
         };
 
         log::info!("NetEq audio decoder initialized for peer {peer_id} (muted: {initial_muted})");
@@ -1092,6 +1765,100 @@ impl NetEqAudioPeerDecoder {
         );
 
         Ok(decoder)
+    }
+
+    #[cfg(test)]
+    fn worker_for_test(&self) -> Worker {
+        self.boot
+            .worker
+            .borrow()
+            .clone()
+            .expect("the worker has started")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn worker_handlers(
+        worker: &Worker,
+        pcm_player_ref: Rc<RefCell<PlaybackSlot>>,
+        audio_context: AudioContext,
+        peer_id: Rc<str>,
+        speaker_device_id: Option<Rc<str>>,
+        worker_ready: Rc<RefCell<bool>>,
+        worker_failed: Rc<Cell<bool>>,
+        pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+        pending_arrivals: Rc<RefCell<VecDeque<f64>>>,
+        vad: Rc<RefCell<VadState>>,
+        threshold: f32,
+        on_settled: Rc<RefCell<Option<BootSettled>>>,
+        playout: Rc<PlayoutLink>,
+    ) -> Result<NetEqHandlers, JsValue> {
+        let on_error_closure = Self::create_error_handler(
+            worker.clone(),
+            peer_id.clone(),
+            worker_ready.clone(),
+            worker_failed.clone(),
+            pending_messages.clone(),
+            on_settled.clone(),
+        );
+
+        // Set up worker message handling with decoder's queue references
+        let on_message_closure = Self::create_message_handler(
+            pcm_player_ref,
+            audio_context,
+            peer_id,
+            speaker_device_id,
+            worker_ready,
+            pending_messages,
+            pending_arrivals,
+            worker.clone(),
+            vad,
+            threshold,
+            on_settled,
+            playout,
+        );
+
+        // Initialize worker
+        let init_msg = WorkerMsg::Init {
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS as u8,
+        };
+
+        let init_js = serde_wasm_bindgen::to_value(&init_msg)?;
+        let worker_clone = worker.clone();
+        // Zeroed by the callback itself so `Drop` can tell "still pending" from
+        // "already fired" — clearing an already-completed handle id risks
+        // cancelling an unrelated timer that inherited it.
+        let init_timer_id = Rc::new(std::cell::Cell::new(0i32));
+        let init_timer_id_for_cb = init_timer_id.clone();
+        let failed_for_init = worker_failed;
+        let send_cb = Closure::wrap(Box::new(move || {
+            init_timer_id_for_cb.set(0);
+            if failed_for_init.get() {
+                return;
+            }
+            if let Err(e) = worker_clone.post_message(&init_js) {
+                web_sys::console::error_2(&"[neteq-audio-decoder] failed to post Init:".into(), &e);
+            }
+        }) as Box<dyn FnMut()>);
+
+        // A `?` here leaves NO timer registered, so `send_cb` is dropped without
+        // the browser ever having held a reference to it.
+        let timer_id = web_sys::window()
+            .expect("no window")
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                send_cb.as_ref().unchecked_ref(),
+                10,
+            )?;
+        // `set_timeout` returns synchronously, before any callback can run, so
+        // this store cannot race the callback's own zeroing.
+        init_timer_id.set(timer_id);
+
+        Ok(NetEqHandlers {
+            on_message: on_message_closure,
+            on_error: on_error_closure,
+            _init_timer_cb: send_cb,
+            init_timer_id,
+        })
     }
 
     /// Record a sequence number as received for RED deduplication.
@@ -1203,7 +1970,7 @@ impl Drop for NetEqAudioPeerDecoder {
         Self::suppress_and_emit_terminal_speaking_zero(&self.peer_id, &self.vad);
 
         // Issue 2225: detach the handler and cancel the pending `Init` timer
-        // BEFORE their closures are freed. Struct fields (`_on_message`,
+        // BEFORE their closures are freed. Struct fields (`on_message`,
         // `_init_timer_cb`) are dropped after this body returns, so this is the
         // last point at which the browser can still hold a live reference to
         // either. Invoking a freed wasm-bindgen closure THROWS a JS `Error`
@@ -1222,8 +1989,18 @@ impl Drop for NetEqAudioPeerDecoder {
         // decoder that no longer exists). The suppression stays regardless: it
         // is also what `retire_for_replacement` relies on, and it still gates
         // any frame dispatched between the `suppress` and this line.
-        self.worker.set_onmessage(None);
-        if self._init_timer_id.get() != 0 {
+        let worker = self.boot.worker.borrow();
+        let init_timer_id = self
+            .boot
+            .handlers
+            .borrow()
+            .as_ref()
+            .map_or(0, |h| h.init_timer_id.get());
+        if let Some(worker) = worker.as_ref() {
+            worker.set_onmessage(None);
+            worker.set_onerror(None);
+        }
+        if init_timer_id != 0 {
             // A decoder cannot exist without a Window: `build` `.expect()`s one
             // to arm this very timer. So this lookup is unreachable-`None`, and
             // the skip below cannot silently strand a live timer.
@@ -1238,14 +2015,19 @@ impl Drop for NetEqAudioPeerDecoder {
                 "a decoder built with a Window must still see one at Drop"
             );
             if let Some(window) = window {
-                window.clear_timeout_with_handle(self._init_timer_id.get());
+                window.clear_timeout_with_handle(init_timer_id);
             }
         }
-        self.worker.terminate();
+        if let Some(worker) = worker.as_ref() {
+            worker.terminate();
+        }
+        drop(worker);
 
+        WORKLET_OUTBOX.with(|o| o.borrow_mut().remove(&slot_key(&self.pcm_player)));
         match self.pcm_player.try_borrow_mut() {
             Ok(mut slot) => {
                 if let PlaybackSlot::Live(worklet, peer_gain) = &*slot {
+                    self.playout.detach(worklet);
                     Self::retire_playback_pair(worklet, peer_gain);
                 }
                 *slot = PlaybackSlot::Dead;
@@ -1262,6 +2044,24 @@ impl Drop for NetEqAudioPeerDecoder {
 }
 
 impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
+    fn boot_timed_out(&self) -> bool {
+        self.boot.timed_out.get()
+    }
+
+    #[cfg(test)]
+    fn boot_state_for_test(&self) -> crate::decode::WorkerBootState {
+        use crate::decode::WorkerBootState;
+        if self.worker_failed.get() {
+            WorkerBootState::Failed
+        } else if *self.worker_ready.borrow() {
+            WorkerBootState::Ready
+        } else if self.boot.worker.borrow().is_some() {
+            WorkerBootState::Booting
+        } else {
+            WorkerBootState::Queued
+        }
+    }
+
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         match packet.audio_metadata.as_ref() {
             Some(audio_meta) => {
@@ -1424,7 +2224,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     /// good, so PCM it posted before `terminate()` cannot broadcast for a peer
     /// the new decoder now owns.
     fn retire_for_replacement(&mut self) {
-        self.vad.borrow_mut().retire();
+        Self::retire_vad(&self.peer_id, &self.vad);
     }
 }
 
@@ -1450,6 +2250,7 @@ mod tests {
             speaking,
             audio_level: level,
             suppressed: false,
+            edges: SpeakingEdgeFilter::new(),
         }
     }
 
@@ -1962,6 +2763,36 @@ mod tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    fn worker_stats_reach_the_bus_with_the_worklet_playout_totals() {
+        let peer_id = "pr-3281-playout-totals";
+        let stats = js_sys::JSON::parse(r#"{"cmd":"stats","stats":{"lifetime":{}}}"#).unwrap();
+        let counters = PlayoutCounters::default();
+        counters.fold(1_834.4, 12.0);
+        let mut rx = videocall_diagnostics::subscribe();
+
+        NetEqAudioPeerDecoder::handle_stats_message(&stats, peer_id, &counters);
+
+        let want = format!("current_user->{peer_id}");
+        let json = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|evt| evt.stream_id.as_deref() == Some(want.as_str()))
+            .flat_map(|evt| evt.metrics)
+            .find_map(|m| match m.value {
+                MetricValue::Text(json) if m.name == "stats_json" => Some(json.into_owned()),
+                _ => None,
+            })
+            .expect("the worker stats must reach the diagnostics bus");
+        let parsed: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed[PLAYOUT_STATS_KEY],
+            serde_json::json!({
+                PLAYOUT_UNDERRUN_MS_KEY: 1_834,
+                PLAYOUT_UNDERRUN_EVENTS_KEY: 12,
+            }),
+            "{json}"
+        );
+    }
+
     /// Install the `<link id="neteq-worker">` that
     /// [`NetEqAudioPeerDecoder::create_neteq_worker`] reads, pointing at a stub
     /// worker built from a blob URL. Idempotent, so several tests can call it.
@@ -2279,10 +3110,14 @@ mod tests {
         let decoder =
             NetEqAudioPeerDecoder::build(None, "issue-2225-detach".to_string(), true, None)
                 .expect("build decoder");
-        let worker = decoder.worker.clone();
+        let worker = decoder.worker_for_test();
         assert!(
             worker.onmessage().is_some(),
             "a live decoder must have its handler installed"
+        );
+        assert!(
+            worker.onerror().is_some(),
+            "a live decoder must have its error handler installed"
         );
 
         drop(decoder);
@@ -2290,6 +3125,10 @@ mod tests {
         assert!(
             worker.onmessage().is_none(),
             "Drop must detach the worker handler before the closure field is freed"
+        );
+        assert!(
+            worker.onerror().is_none(),
+            "Drop must detach the error handler before the closure field is freed"
         );
     }
 
@@ -2358,6 +3197,120 @@ mod tests {
             next_for_peer(&mut rx, peer_id).is_none(),
             "PCM posted before the mute must not re-light the speaking indicator"
         );
+    }
+
+    fn vad_with_logged_on() -> Rc<RefCell<VadState>> {
+        let vad = Rc::new(RefCell::new(vad_state(true, 0.5)));
+        let t0 = now_ms() - 10_000;
+        vad.borrow_mut().edges.observe(true, t0);
+        assert!(vad.borrow_mut().edges.observe(true, t0 + 300).is_some());
+        vad
+    }
+
+    fn capture(body: impl FnOnce()) -> Vec<(log::Level, String)> {
+        crate::connection::log_capture::capture_logs(
+            "videocall_client::decode::neteq_audio_decoder",
+            body,
+        )
+    }
+
+    /// Asserts exactly one info-level `off` line for peer `p`, stamped between
+    /// the wall-clock reads around `body`.
+    fn assert_one_off_line_now(body: impl FnOnce()) {
+        let before = now_ms();
+        let lines = capture(body);
+        let after = now_ms();
+        let prefix = "[PEER_SPEAKING] speaking=off peer=p edge_ms=";
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, log::Level::Info);
+        let edge_ms: u64 = lines[0].1.strip_prefix(prefix).unwrap().parse().unwrap();
+        assert!((before..=after).contains(&edge_ms), "{lines:?}");
+    }
+
+    #[test]
+    fn a_held_speech_run_logs_one_on_line_at_info() {
+        let vad = RefCell::new(VadState::new());
+        let lines = capture(|| {
+            for t in (1_000..=1_300).step_by(10) {
+                NetEqAudioPeerDecoder::observe_frame("p", &vad, true, 0.5, t);
+            }
+        });
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Info,
+                "[PEER_SPEAKING] speaking=on peer=p edge_ms=1000".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn muting_a_logged_speaker_logs_off_now() {
+        let vad = vad_with_logged_on();
+        assert_one_off_line_now(|| NetEqAudioPeerDecoder::apply_mute_to_vad("p", &vad, true));
+        assert_eq!(
+            capture(|| NetEqAudioPeerDecoder::apply_mute_to_vad("p", &vad, true)),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn teardown_of_a_logged_speaker_logs_off_now() {
+        let vad = vad_with_logged_on();
+        assert_one_off_line_now(|| {
+            NetEqAudioPeerDecoder::suppress_and_emit_terminal_speaking_zero("p", &vad)
+        });
+    }
+
+    #[test]
+    fn replacement_logs_one_off_then_the_new_decoders_on() {
+        let vad = vad_with_logged_on();
+        assert_one_off_line_now(|| NetEqAudioPeerDecoder::retire_vad("p", &vad));
+        assert_eq!(
+            capture(|| NetEqAudioPeerDecoder::suppress_and_emit_terminal_speaking_zero("p", &vad)),
+            vec![],
+            "the Drop after a replacement must not log a second off"
+        );
+
+        let replacement = RefCell::new(VadState::new());
+        let lines = capture(|| {
+            for t in (0..=300).step_by(10) {
+                NetEqAudioPeerDecoder::observe_frame("p", &replacement, true, 0.5, t);
+            }
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].1, "[PEER_SPEAKING] speaking=on peer=p edge_ms=0");
+    }
+
+    #[test]
+    fn suppressed_frames_do_not_move_the_edge_log() {
+        let mut vad = vad_state(false, 0.0);
+        vad.suppressed = true;
+        assert_eq!(vad.observe_edge(true, 0), None);
+        assert!(!vad.edges.is_pending_on());
+        vad.reopen();
+        assert_eq!(vad.observe_edge(true, 0), None);
+        assert!(vad.edges.is_pending_on());
+    }
+
+    #[wasm_bindgen_test]
+    fn a_speech_frame_reaches_the_speaking_edge_log() {
+        let vad = Rc::new(RefCell::new(VadState::new()));
+        vad.borrow_mut().edges.observe(true, now_ms() - 400);
+        let audio_context = AudioContext::new().expect("test needs a WebAudio context");
+        let speech = Float32Array::new_with_length(SAMPLES_PER_AUDIO_FRAME);
+        speech.fill(0.05, 0, SAMPLES_PER_AUDIO_FRAME);
+
+        NetEqAudioPeerDecoder::handle_pcm_data(
+            speech,
+            Rc::new(RefCell::new(PlaybackSlot::Empty)),
+            &audio_context,
+            None,
+            "issue-3093",
+            vad.clone(),
+            DEFAULT_VAD_THRESHOLD,
+        );
+        assert!(vad.borrow().edges.logged_speaking());
     }
 
     #[wasm_bindgen_test]
@@ -2705,6 +3658,293 @@ mod tests {
 mod host_tests {
     use super::*;
 
+    fn insert(seq: u64) -> WorkerMsg {
+        NetEqAudioPeerDecoder::build_insert_msg(seq, vec![0; 4])
+    }
+
+    fn insert_seqs(queue: &VecDeque<WorkerMsg>) -> Vec<u16> {
+        queue
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Insert { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_booting_worker_queue_caps_audio_at_the_newest_inserts_and_keeps_each_control() {
+        let mut queue = VecDeque::new();
+        enqueue_while_booting(&mut queue, WorkerMsg::Mute { muted: false });
+        let flood = (NETEQ_BOOT_QUEUE_MAX * 4) as u64;
+        for seq in 0..flood {
+            enqueue_while_booting(&mut queue, insert(seq));
+        }
+        enqueue_while_booting(&mut queue, WorkerMsg::SetDiagnostics { enabled: true });
+
+        assert_eq!(queue.len(), NETEQ_BOOT_QUEUE_MAX + 2);
+        assert!(matches!(
+            queue.front(),
+            Some(WorkerMsg::Mute { muted: false })
+        ));
+        assert!(matches!(
+            queue.back(),
+            Some(WorkerMsg::SetDiagnostics { enabled: true })
+        ));
+        let seqs = insert_seqs(&queue);
+        assert_eq!(seqs.len(), NETEQ_BOOT_QUEUE_MAX);
+        assert_eq!(
+            *seqs.first().unwrap() as u64,
+            flood - NETEQ_BOOT_QUEUE_MAX as u64
+        );
+        assert_eq!(*seqs.last().unwrap() as u64, flood - 1);
+    }
+
+    #[test]
+    fn arrival_times_follow_the_queued_inserts_through_eviction_and_flush() {
+        let mut queue = VecDeque::new();
+        let mut arrivals = VecDeque::new();
+        for seq in 0..(NETEQ_BOOT_QUEUE_MAX as u64 + 5) {
+            enqueue_with_arrival(&mut queue, &mut arrivals, insert(seq), seq as f64);
+        }
+        enqueue_with_arrival(
+            &mut queue,
+            &mut arrivals,
+            WorkerMsg::Mute { muted: false },
+            99.0,
+        );
+        assert_eq!(arrivals.len(), NETEQ_BOOT_QUEUE_MAX);
+        assert_eq!(
+            arrivals.front(),
+            Some(&5.0),
+            "the evicted inserts took their times along"
+        );
+        enqueue_with_arrival(&mut queue, &mut arrivals, WorkerMsg::Flush, 100.0);
+        assert!(arrivals.is_empty());
+    }
+
+    #[test]
+    fn only_inserts_older_than_the_replay_age_are_dropped_before_replay() {
+        let mut queue = VecDeque::new();
+        let mut arrivals = VecDeque::new();
+        enqueue_with_arrival(
+            &mut queue,
+            &mut arrivals,
+            WorkerMsg::Mute { muted: false },
+            0.0,
+        );
+        for seq in 0..5 {
+            enqueue_with_arrival(&mut queue, &mut arrivals, insert(seq), 0.0);
+        }
+        let recent = 1_000.0 - NETEQ_BOOT_REPLAY_MAX_AGE_MS / 2.0;
+        enqueue_with_arrival(&mut queue, &mut arrivals, insert(5), recent);
+        enqueue_with_arrival(&mut queue, &mut arrivals, insert(6), 1_000.0);
+        drop_stale_inserts(&mut queue, &mut arrivals, 1_000.0 + 1.0);
+
+        assert_eq!(insert_seqs(&queue), vec![5, 6]);
+        assert!(
+            queue.contains(&WorkerMsg::Mute { muted: false }),
+            "controls are kept"
+        );
+        assert_eq!(arrivals, VecDeque::from([recent, 1_000.0]));
+        drop_stale_inserts(
+            &mut queue,
+            &mut arrivals,
+            recent + NETEQ_BOOT_REPLAY_MAX_AGE_MS,
+        );
+        assert_eq!(
+            insert_seqs(&queue),
+            vec![5, 6],
+            "exactly the max age is still fresh"
+        );
+    }
+
+    #[test]
+    fn a_booting_worker_keeps_exactly_the_newest_50_of_51_inserts() {
+        let mut queue = VecDeque::new();
+        for seq in 0..51 {
+            enqueue_while_booting(&mut queue, insert(seq));
+        }
+        assert_eq!(insert_seqs(&queue), (1..51).collect::<Vec<u16>>());
+        assert_eq!(queue.len(), 50);
+    }
+
+    #[test]
+    fn repeated_controls_with_no_audio_keep_only_the_latest_of_each_kind() {
+        let mut queue = VecDeque::new();
+        for i in 0..1000 {
+            enqueue_while_booting(&mut queue, WorkerMsg::Mute { muted: i % 2 == 0 });
+            enqueue_while_booting(
+                &mut queue,
+                WorkerMsg::SetDiagnostics {
+                    enabled: i % 3 == 0,
+                },
+            );
+        }
+        assert_eq!(queue.len(), 2);
+        assert!(queue.contains(&WorkerMsg::Mute { muted: false }));
+        assert!(queue.contains(&WorkerMsg::SetDiagnostics { enabled: true }));
+    }
+
+    #[test]
+    fn a_flush_replaces_the_audio_and_flushes_queued_before_it() {
+        let mut queue = VecDeque::new();
+        enqueue_while_booting(&mut queue, WorkerMsg::Mute { muted: true });
+        for seq in 0..10 {
+            enqueue_while_booting(&mut queue, insert(seq));
+        }
+        enqueue_while_booting(&mut queue, WorkerMsg::Flush);
+        for seq in 10..13 {
+            enqueue_while_booting(&mut queue, insert(seq));
+        }
+        enqueue_while_booting(&mut queue, WorkerMsg::Flush);
+        enqueue_while_booting(&mut queue, insert(13));
+
+        assert_eq!(
+            queue.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                WorkerMsg::Mute { muted: true },
+                WorkerMsg::Flush,
+                insert(13)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_boot_queue_has_a_hard_bound_for_any_message_mix() {
+        let mut queue = VecDeque::new();
+        let controls = [
+            WorkerMsg::Init {
+                sample_rate: 48_000,
+                channels: 1,
+            },
+            WorkerMsg::Flush,
+            WorkerMsg::Clear,
+            WorkerMsg::Close,
+            WorkerMsg::Mute { muted: true },
+            WorkerMsg::SetDiagnostics { enabled: false },
+        ];
+        for i in 0..20_000u64 {
+            let msg = if i % 7 == 0 {
+                controls[(i / 7) as usize % controls.len()].clone()
+            } else {
+                insert(i)
+            };
+            enqueue_while_booting(&mut queue, msg);
+            assert!(queue.len() <= NETEQ_BOOT_QUEUE_MAX + controls.len());
+        }
+    }
+
+    #[test]
+    fn resume_only_a_stopped_context_and_retry_a_resume_that_never_settles() {
+        assert!(resume_needed(false, None, 5_000.0));
+        assert!(!resume_needed(true, None, 5_000.0));
+        assert!(
+            !resume_needed(false, Some(4_500.0), 5_000.0),
+            "one resume in flight"
+        );
+        assert!(
+            resume_needed(false, Some(4_000.0), 5_000.0),
+            "a resume pending for RESUME_RETRY_MS is retried"
+        );
+        assert!(!resume_needed(true, Some(0.0), 5_000.0));
+    }
+
+    #[test]
+    fn the_direct_pcm_path_is_on_unless_a_flag_turns_it_off() {
+        for off in ["0", "false", "off", "no", "FALSE", " Off ", "NO"] {
+            assert!(!direct_pcm_allowed(Some(off), None), "devtools {off:?}");
+            assert!(!direct_pcm_allowed(None, Some(off)), "config {off:?}");
+        }
+        for on in [None, Some("1"), Some("true"), Some("yes"), Some("")] {
+            assert!(direct_pcm_allowed(on, None), "devtools {on:?}");
+            assert!(direct_pcm_allowed(None, on), "config {on:?}");
+        }
+        assert!(!direct_pcm_allowed(Some("false"), Some("1")));
+        assert!(
+            direct_pcm_allowed(Some("1"), Some("0")),
+            "the devtools global must win over the deployed config"
+        );
+    }
+
+    /// The quoted value of `key: "value"` in a shipped config file.
+    fn shipped_value(text: &str, key: &str) -> Option<String> {
+        text.lines().find_map(|line| {
+            let value = line.trim().strip_prefix(key)?.strip_prefix(':')?;
+            Some(
+                value
+                    .trim()
+                    .trim_end_matches(',')
+                    .trim_matches('"')
+                    .to_string(),
+            )
+        })
+    }
+
+    #[test]
+    fn the_shipped_audio_direct_pcm_defaults_leave_the_direct_path_on() {
+        for (file, text) in [
+            (
+                "helm/videocall-ui/values.yaml",
+                include_str!("../../../helm/videocall-ui/values.yaml"),
+            ),
+            (
+                "dioxus-ui/scripts/config.js",
+                include_str!("../../../dioxus-ui/scripts/config.js"),
+            ),
+        ] {
+            let value = shipped_value(text, DIRECT_PCM_CONFIG_KEY)
+                .unwrap_or_else(|| panic!("{file} sets no {DIRECT_PCM_CONFIG_KEY}"));
+            assert!(
+                direct_pcm_allowed(None, Some(&value)),
+                "{file} ships {DIRECT_PCM_CONFIG_KEY}: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn playout_totals_are_spliced_into_any_stats_object_and_nothing_else() {
+        let spliced = |json: &str| -> Value {
+            serde_json::from_str(&with_playout_totals(json.to_string(), Some((7, 2)))).unwrap()
+        };
+        let totals = serde_json::json!({
+            PLAYOUT_UNDERRUN_MS_KEY: 7,
+            PLAYOUT_UNDERRUN_EVENTS_KEY: 2,
+        });
+        assert_eq!(
+            spliced("{}"),
+            serde_json::json!({ PLAYOUT_STATS_KEY: totals })
+        );
+        assert_eq!(
+            spliced(r#"{"a":{"b":1},"c":[]}"#),
+            serde_json::json!({ "a": { "b": 1 }, "c": [], PLAYOUT_STATS_KEY: totals })
+        );
+        for unchanged in ["[1]", "null", r#""{}""#, ""] {
+            assert_eq!(
+                with_playout_totals(unchanged.to_string(), Some((7, 2))),
+                unchanged
+            );
+        }
+        assert_eq!(with_playout_totals("{}".to_string(), None), "{}");
+    }
+
+    #[test]
+    fn playout_totals_are_absent_until_the_worklet_reports_then_track_its_running_totals() {
+        let counters = PlayoutCounters::default();
+        assert_eq!(counters.totals(), None);
+        counters.fold(0.0, 0.0);
+        assert_eq!(
+            counters.totals(),
+            Some((0, 0)),
+            "a zero report is still a report"
+        );
+        counters.fold(250.4, 1.0);
+        counters.fold(260.7, 3.0);
+        counters.fold(f64::NAN, -4.0);
+        counters.fold(10.0, 2.0);
+        assert_eq!(counters.totals(), Some((261, 3)));
+    }
+
     #[test]
     fn seq_maps_to_sample_domain_timestamp() {
         // The constant must resolve to exactly one Opus frame at 48 kHz.
@@ -2720,5 +3960,1036 @@ mod host_tests {
         // 4_500_000 * 960 = 4_320_000_000, which exceeds u32::MAX. After wrapping
         // (minus 4_294_967_296) the result is 25_032_704.
         assert_eq!(seq_to_sample_timestamp(4_500_000), 25_032_704);
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod boot_failure_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    const SHIPPED_LOADER: &str = include_str!("../../../neteq/src/bin/neteq_worker_loader.js");
+
+    // Runs the shipped loader with `importScripts` stubbed to a `wasm_bindgen` that fetches a
+    // wasm URL which 404s, so `wasm_bindgen()` rejects as it does when Chrome refuses a wasm
+    // memory. Returns the link's previous href so the test can restore it.
+    #[wasm_bindgen(inline_js = r#"
+export function install_neteq_loader_with_missing_wasm(loader) {
+  let link = document.getElementById("neteq-worker");
+  if (!link) {
+    link = document.createElement("link");
+    link.id = "neteq-worker";
+    document.head.appendChild(link);
+  }
+  const previous = link.getAttribute("href");
+  const base = JSON.stringify(new URL("/missing-3210/", location.href).href);
+  const src = `self.importScripts = () => {
+    self.wasm_bindgen = (p) => fetch(new URL(p, ${base})).then(WebAssembly.instantiateStreaming);
+  };
+${loader}`;
+  link.setAttribute("href", URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  return previous;
+}
+export function install_neteq_worker_script(src) {
+  let link = document.getElementById("neteq-worker");
+  if (!link) {
+    link = document.createElement("link");
+    link.id = "neteq-worker";
+    document.head.appendChild(link);
+  }
+  const previous = link.getAttribute("href");
+  link.setAttribute("href", URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  return previous;
+}
+export function count_worker_messages(worker) {
+  let n = 0;
+  worker.addEventListener("message", () => { n += 1; });
+  return () => n;
+}
+export function count_posts(worker) {
+  let posts = 0;
+  const post = worker.postMessage.bind(worker);
+  worker.postMessage = (...args) => { posts += 1; return post(...args); };
+  return () => posts;
+}
+export function count_posts_after_terminate(worker) {
+  let terminated = false;
+  let posts = 0;
+  const post = worker.postMessage.bind(worker);
+  const terminate = worker.terminate.bind(worker);
+  worker.postMessage = (...args) => { if (terminated) posts += 1; return post(...args); };
+  worker.terminate = () => { terminated = true; return terminate(); };
+  return () => posts;
+}
+export function count_insert_posts(worker) {
+  let n = 0;
+  const post = worker.postMessage.bind(worker);
+  worker.postMessage = (msg, ...rest) => {
+    if (msg && typeof msg === "object" && msg.cmd === "insert") n += 1;
+    return post(msg, ...rest);
+  };
+  return () => n;
+}
+export function fail_worker_now(worker) {
+  worker.dispatchEvent(new ErrorEvent("error", { message: "simulated wasm load failure" }));
+}
+export function restore_neteq_link(previous) {
+  const link = document.getElementById("neteq-worker");
+  if (!link) return;
+  if (previous === undefined || previous === null) link.remove();
+  else link.setAttribute("href", previous);
+}
+"#)]
+    extern "C" {
+        fn install_neteq_loader_with_missing_wasm(loader: &str) -> Option<String>;
+        fn install_neteq_worker_script(src: &str) -> Option<String>;
+        fn count_worker_messages(worker: &Worker) -> js_sys::Function;
+        fn count_posts(worker: &Worker) -> js_sys::Function;
+        fn count_posts_after_terminate(worker: &Worker) -> js_sys::Function;
+        fn fail_worker_now(worker: &Worker);
+        fn count_insert_posts(worker: &Worker) -> js_sys::Function;
+        fn restore_neteq_link(previous: Option<String>);
+    }
+
+    /// A worker that failed to start is terminated, so its timers stop.
+    #[wasm_bindgen_test]
+    async fn a_neteq_worker_that_fails_to_start_is_terminated() {
+        let previous = install_neteq_worker_script(
+            r#"setInterval(() => self.postMessage({ type: "tick" }), 10);
+setTimeout(() => { throw new Error("simulated wasm load failure"); }, 0);"#,
+        );
+        let decoder =
+            NetEqAudioPeerDecoder::build(None, "issue-3210-terminated".to_string(), false, None)
+                .expect("decoder constructs");
+        restore_neteq_link(previous);
+        let received = count_worker_messages(&decoder.worker_for_test());
+        let read = || {
+            received
+                .call0(&JsValue::NULL)
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(-1.0)
+        };
+
+        for _ in 0..250 {
+            if decoder.worker_failed.get() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        gloo_timers::future::TimeoutFuture::new(50).await;
+        let at_failure = read();
+        gloo_timers::future::TimeoutFuture::new(300).await;
+
+        assert!(decoder.worker_failed.get());
+        assert_eq!(
+            read(),
+            at_failure,
+            "a failed worker must stop posting: terminate it"
+        );
+    }
+
+    /// The delayed `Init` must not reach a worker terminated before it fires.
+    #[wasm_bindgen_test]
+    async fn nothing_is_posted_to_a_neteq_worker_after_it_is_terminated() {
+        let previous = install_neteq_worker_script("self.onmessage = () => {};");
+        let decoder =
+            NetEqAudioPeerDecoder::build(None, "issue-3210-no-post".to_string(), false, None)
+                .expect("decoder constructs");
+        restore_neteq_link(previous);
+        let posts_after = count_posts_after_terminate(&decoder.worker_for_test());
+        fail_worker_now(&decoder.worker_for_test());
+        decoder.send_worker_message(NetEqAudioPeerDecoder::build_insert_msg(1, vec![0; 4]));
+        gloo_timers::future::TimeoutFuture::new(100).await;
+
+        assert!(decoder.worker_failed.get());
+        assert_eq!(
+            posts_after
+                .call0(&JsValue::NULL)
+                .ok()
+                .and_then(|v| v.as_f64()),
+            Some(0.0),
+            "no post (the delayed Init included) may reach a terminated worker"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_neteq_worker_that_errors_after_it_is_ready_keeps_being_sent_to() {
+        let previous = install_neteq_worker_script(
+            r#"self.onmessage = () => {};
+self.postMessage({ type: "workerReady", mute_state: false });
+setTimeout(() => { throw new Error("runtime fault after boot"); }, 50);"#,
+        );
+        let decoder = NetEqAudioPeerDecoder::build(
+            None,
+            "issue-3210-ready-then-error".to_string(),
+            false,
+            None,
+        )
+        .expect("decoder constructs");
+        restore_neteq_link(previous);
+
+        gloo_timers::future::TimeoutFuture::new(300).await;
+        let posts = count_posts(&decoder.worker_for_test());
+        decoder.send_worker_message(NetEqAudioPeerDecoder::build_insert_msg(1, vec![0; 4]));
+
+        assert!(
+            *decoder.worker_ready.borrow(),
+            "the stub worker handed over"
+        );
+        assert_eq!(
+            posts.call0(&JsValue::NULL).ok().and_then(|v| v.as_f64()),
+            Some(1.0),
+            "the insert must be posted to the live worker"
+        );
+        assert!(
+            !decoder.worker_failed.get(),
+            "an error after WorkerReady must not mark a live worker failed"
+        );
+        assert_eq!(decoder.pending_messages.borrow().len(), 0);
+    }
+
+    type Outcome = Rc<Cell<Option<BootOutcome>>>;
+
+    fn deferred(peer: &str, outcome: &Outcome) -> NetEqAudioPeerDecoder {
+        let outcome = outcome.clone();
+        NetEqAudioPeerDecoder::build_unstarted(
+            None,
+            peer.to_string(),
+            true,
+            None,
+            Some(Box::new(move |settled| outcome.set(Some(settled)))),
+        )
+        .expect("decoder constructs")
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_neteq_decoder_waiting_for_its_boot_slot_holds_a_bounded_queue_until_it_starts() {
+        let previous = install_neteq_worker_script(
+            r#"self.onmessage = () => {};
+self.postMessage({ type: "workerReady", mute_state: true });"#,
+        );
+        let outcome = Outcome::default();
+        let decoder = deferred("issue-3277-deferred", &outcome);
+        restore_neteq_link(previous);
+        for seq in 0..(4 * NETEQ_BOOT_QUEUE_MAX as u64) {
+            decoder.send_worker_message(NetEqAudioPeerDecoder::build_insert_msg(seq, vec![0; 4]));
+        }
+        let inserts = |d: &NetEqAudioPeerDecoder| {
+            d.pending_messages
+                .borrow()
+                .iter()
+                .filter(|m| matches!(m, WorkerMsg::Insert { .. }))
+                .count()
+        };
+
+        assert!(
+            decoder.boot.worker.borrow().is_none(),
+            "no worker before its slot"
+        );
+        assert_eq!(inserts(&decoder), NETEQ_BOOT_QUEUE_MAX);
+
+        decoder.boot.start_or_fail();
+        for _ in 0..250 {
+            if outcome.get().is_some() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        assert_eq!(outcome.get(), Some(BootOutcome::Ready));
+        assert!(*decoder.worker_ready.borrow());
+        assert_eq!(
+            decoder.pending_messages.borrow().len(),
+            0,
+            "flushed at WorkerReady"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn only_fresh_audio_held_while_waiting_for_a_boot_slot_is_replayed() {
+        let previous = install_neteq_worker_script(
+            r#"self.onmessage = () => {};
+setTimeout(() => self.postMessage({ type: "workerReady", mute_state: true }), 50);"#,
+        );
+        let outcome = Outcome::default();
+        let decoder = deferred("issue-3277-stale", &outcome);
+        restore_neteq_link(previous);
+        for seq in 0..10 {
+            decoder.send_worker_message(NetEqAudioPeerDecoder::build_insert_msg(seq, vec![0; 4]));
+        }
+        gloo_timers::future::TimeoutFuture::new(NETEQ_BOOT_REPLAY_MAX_AGE_MS as u32 + 100).await;
+        for seq in 10..13 {
+            decoder.send_worker_message(NetEqAudioPeerDecoder::build_insert_msg(seq, vec![0; 4]));
+        }
+
+        decoder.boot.start_or_fail();
+        let posted = count_insert_posts(&decoder.worker_for_test());
+        for _ in 0..250 {
+            if outcome.get().is_some() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        assert_eq!(outcome.get(), Some(BootOutcome::Ready));
+        assert_eq!(
+            posted.call0(&JsValue::NULL).ok().and_then(|v| v.as_f64()),
+            Some(3.0),
+            "the ten inserts queued before the wait went stale"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_neteq_worker_that_cannot_be_constructed_settles_as_a_failed_boot() {
+        let previous = install_neteq_worker_script("");
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("neteq-worker"))
+            .expect("the worker <link> is installed")
+            .set_attribute("href", "http://[")
+            .expect("set href");
+        let outcome = Outcome::default();
+        let decoder = deferred("issue-3277-bad-url", &outcome);
+        restore_neteq_link(previous);
+        decoder.send_worker_message(NetEqAudioPeerDecoder::build_insert_msg(1, vec![0; 4]));
+
+        decoder.boot.start_or_fail();
+
+        assert!(decoder.worker_failed.get());
+        assert_eq!(outcome.get(), Some(BootOutcome::Failed));
+        assert_eq!(decoder.pending_messages.borrow().len(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_neteq_worker_whose_wasm_fails_to_load_is_marked_failed_and_never_queued_to() {
+        let previous = install_neteq_loader_with_missing_wasm(SHIPPED_LOADER);
+        let decoder =
+            NetEqAudioPeerDecoder::build(None, "issue-3210-failed-worker".to_string(), false, None)
+                .expect("the decoder constructs even though its worker will fail");
+        restore_neteq_link(previous);
+
+        for _ in 0..250 {
+            if decoder.worker_failed.get() {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        for seq in 0..500 {
+            decoder.send_worker_message(NetEqAudioPeerDecoder::build_insert_msg(seq, vec![0; 4]));
+        }
+
+        assert!(
+            decoder.worker_failed.get(),
+            "a rejected wasm_bindgen() in the NetEq worker must reach Worker.onerror"
+        );
+        assert_eq!(
+            decoder.pending_messages.borrow().len(),
+            0,
+            "audio for a worker that failed to start must not be queued"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod direct_pcm_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Speaks the real worker's protocol (`workerReady`, `attachOutput` -> `inputReady` ->
+    /// `handoff`, `mute` -> `pause`, levels every 5 frames), pacing one 10 ms frame per 10 ms
+    /// from a 5 ms timer. `CFG` adds the scripted cases the tests below need.
+    const PACED_WORKER: &str = r#"
+const C = Object.assign({ gapAtMs: -1, gapMs: 0, burst: 0, legacy: false }, CFG);
+const t0 = performance.now();
+let port = null, muted = false, start = t0, produced = 0, total = 0, level = 0, stopped = false;
+const frame = () => { total++; return new Float32Array(480).fill(0.05); };
+const sendOld = () => { const pcm = frame(); self.postMessage(pcm, [pcm.buffer]); };
+const sendDirect = () => {
+  const pcm = frame();
+  port.postMessage({ command: "play", pcm }, [pcm.buffer]);
+  if (++level % 5 === 0) self.postMessage(0.05);
+};
+self.onmessage = (e) => {
+  const d = e.data;
+  if (d && d.cmd === "attachOutput") {
+    d.port.onmessage = (m) => {
+      if (!(m.data && m.data.type === "inputReady")) return;
+      for (let i = 0; i < C.burst; i++) sendOld();
+      self.postMessage({ type: "handoff" });
+      port = d.port;
+      for (let i = 0; i < C.burst; i++) sendDirect();
+      if (C.burst) { stopped = true; setInterval(() => self.postMessage({ type: "testTotal", n: total }), 100); }
+    };
+    return;
+  }
+  if (d && d.cmd === "mute") {
+    muted = d.muted; start = performance.now(); produced = 0;
+    if (muted && !C.legacy) { if (port) port.postMessage({ command: "pause" }); else self.postMessage({ type: "pause" }); }
+  }
+};
+self.postMessage(C.legacy ? { type: "workerReady", mute_state: false } : { type: "workerReady", mute_state: false, protocol: 2 });
+setInterval(() => {
+  const now = performance.now();
+  const inGap = C.gapAtMs >= 0 && now - t0 >= C.gapAtMs && now - t0 < C.gapAtMs + C.gapMs;
+  if (muted || stopped || inGap) { start = now; produced = 0; return; }
+  const expected = Math.floor((now - start) / 10);
+  for (let i = 0; i < 2 && produced < expected; i++) { produced++; if (port) sendDirect(); else sendOld(); }
+}, 5);"#;
+
+    #[wasm_bindgen(inline_js = r#"
+export function install_worker(src) {
+  let link = document.getElementById("neteq-worker");
+  if (!link) {
+    link = document.createElement("link");
+    link.id = "neteq-worker";
+    document.head.appendChild(link);
+  }
+  const previous = link.getAttribute("href");
+  link.setAttribute("href", URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  return previous;
+}
+export function restore_link(previous) {
+  const link = document.getElementById("neteq-worker");
+  if (!link) return;
+  if (previous === undefined || previous === null) link.remove();
+  else link.setAttribute("href", previous);
+}
+export function block_main_thread(ms) {
+  const t = performance.now();
+  while (performance.now() - t < ms) {}
+}
+export function set_direct_flag(value) {
+  if (value === undefined || value === null) delete globalThis.__VC_AUDIO_DIRECT_PCM;
+  else globalThis.__VC_AUDIO_DIRECT_PCM = value;
+}
+export function watch_total(worker) {
+  const seen = { n: -1 };
+  worker.addEventListener("message", (e) => { if (e.data && e.data.type === "testTotal") seen.n = e.data.n; });
+  return () => seen.n;
+}
+export function frame_counts(port) {
+  return new Promise((resolve) => {
+    const on = (e) => {
+      if (e.data && e.data.type === "processCount") {
+        port.removeEventListener("message", on);
+        resolve([e.data.framesIn, e.data.framesIgnored, e.data.paused, e.data.direct, e.data.pausesIn]);
+      }
+    };
+    port.start();
+    port.addEventListener("message", on);
+    port.postMessage({ command: "reportProcessCount" });
+  });
+}
+"#)]
+    extern "C" {
+        fn install_worker(src: &str) -> Option<String>;
+        fn restore_link(previous: Option<String>);
+        fn block_main_thread(ms: f64);
+        fn set_direct_flag(value: Option<String>);
+        fn watch_total(worker: &Worker) -> js_sys::Function;
+        fn frame_counts(port: &web_sys::MessagePort) -> js_sys::Promise;
+    }
+
+    async fn sleep(ms: u32) {
+        gloo_timers::future::TimeoutFuture::new(ms).await;
+    }
+
+    /// A peer on the scripted worker; waits for its worklet to be wired and reporting.
+    async fn decoder_with(peer: &str, direct: bool, cfg: &str) -> NetEqAudioPeerDecoder {
+        set_direct_flag((!direct).then(|| "0".to_string()));
+        let ctx = SharedAudioContext::get_or_init(None).expect("shared AudioContext");
+        let _ = ctx.resume();
+        SharedAudioContext::ensure_pcm_worklet_ready(WORKLET_CODE)
+            .await
+            .expect("register the pcm-player worklet module");
+        let previous = install_worker(&format!("const CFG = {cfg};\n{PACED_WORKER}"));
+        let decoder =
+            NetEqAudioPeerDecoder::build(None, peer.to_string(), false, None).expect("decoder");
+        restore_link(previous);
+        for _ in 0..500 {
+            let reporting = decoder.playout.counters.totals().is_some()
+                || decoder.playout.worker_protocol.get() < PAUSE_PROTOCOL;
+            if decoder.playout.wired.get() && reporting {
+                break;
+            }
+            sleep(10).await;
+        }
+        set_direct_flag(None);
+        decoder
+    }
+
+    fn silent_ms(decoder: &NetEqAudioPeerDecoder) -> u64 {
+        decoder.playout.counters.totals().map_or(0, |(ms, _)| ms)
+    }
+
+    fn worklet_port(slot: &RefCell<PlaybackSlot>) -> web_sys::MessagePort {
+        match &*slot.borrow() {
+            PlaybackSlot::Live(worklet, _) => worklet.port().expect("worklet port"),
+            _ => panic!("no worklet was built"),
+        }
+    }
+
+    /// `(framesIn, framesIgnored, paused, direct)` from the worklet itself.
+    async fn worklet_state(slot: &RefCell<PlaybackSlot>) -> (f64, f64, bool, bool) {
+        let reply = wasm_bindgen_futures::JsFuture::from(frame_counts(&worklet_port(slot)))
+            .await
+            .expect("process count reply");
+        let r = js_sys::Array::from(&reply);
+        (
+            r.get(0).as_f64().unwrap_or(-1.0),
+            r.get(1).as_f64().unwrap_or(-1.0),
+            r.get(2).as_bool().unwrap_or(false),
+            r.get(3).as_bool().unwrap_or(false),
+        )
+    }
+
+    async fn both_paths() -> (NetEqAudioPeerDecoder, NetEqAudioPeerDecoder) {
+        let direct = decoder_with("both-direct", true, "{}").await;
+        let main = decoder_with("both-main", false, "{}").await;
+        for d in [&direct, &main] {
+            assert!(
+                d.playout.counters.totals().is_some(),
+                "a worklet never played and reported: the assertions would be vacuous"
+            );
+        }
+        (direct, main)
+    }
+
+    /// One pair of peers for both checks, to keep the suite short: main-thread stalls are heard
+    /// only on the old path, and a mute is not counted as silence on either path.
+    #[wasm_bindgen_test]
+    async fn stalls_silence_only_the_main_thread_path_and_mutes_count_on_neither() {
+        let (mut direct, mut main) = both_paths().await;
+        let before = (silent_ms(&direct), silent_ms(&main));
+        block_main_thread(250.0);
+        sleep(350).await;
+        let (on, off) = (silent_ms(&direct) - before.0, silent_ms(&main) - before.1);
+        assert!(
+            on < 10,
+            "direct path: a 250 ms stall must leave no silence, got {on} ms"
+        );
+        assert!(
+            off > 100,
+            "main-thread path: the stall must be heard, got {off} ms"
+        );
+
+        let before = (silent_ms(&direct), silent_ms(&main));
+        let frames_before = (
+            worklet_state(&direct.pcm_player).await.0,
+            worklet_state(&main.pcm_player).await.0,
+        );
+        direct.set_muted(true);
+        main.set_muted(true);
+        sleep(300).await;
+        direct.set_muted(false);
+        main.set_muted(false);
+        sleep(400).await;
+        for (d, b, f) in [
+            (&direct, before.0, frames_before.0),
+            (&main, before.1, frames_before.1),
+        ] {
+            assert!(
+                worklet_state(&d.pcm_player).await.0 > f + 20.0,
+                "audio must play again after the unmute"
+            );
+            let silence = silent_ms(d) - b;
+            assert!(
+                silence < 40,
+                "a muted gap is not an underrun, got {silence} ms"
+            );
+        }
+    }
+
+    fn speech_frame() -> Float32Array {
+        let pcm = Float32Array::new_with_length(480);
+        pcm.fill(0.05, 0, 480);
+        pcm
+    }
+
+    /// The pause arrives in the same turn as the frame that starts building the worklet, so the
+    /// slot is still `Empty` when it is forwarded.
+    #[wasm_bindgen_test]
+    async fn a_pause_queued_behind_worklet_creation_still_reaches_it() {
+        let ctx = SharedAudioContext::get_or_init(None).expect("shared AudioContext");
+        let _ = ctx.resume();
+        let slot = Rc::new(RefCell::new(PlaybackSlot::Empty));
+        let vad = Rc::new(RefCell::new(VadState::new()));
+        let play = |frames: u32| {
+            for _ in 0..frames {
+                NetEqAudioPeerDecoder::handle_pcm_data(
+                    speech_frame(),
+                    slot.clone(),
+                    &ctx,
+                    None,
+                    "pause-during-init",
+                    vad.clone(),
+                    DEFAULT_VAD_THRESHOLD,
+                );
+            }
+        };
+
+        play(1);
+        assert!(matches!(*slot.borrow(), PlaybackSlot::Empty));
+        NetEqAudioPeerDecoder::forward_control(&slot, None, "pause");
+        for _ in 0..50 {
+            if matches!(*slot.borrow(), PlaybackSlot::Live(..)) {
+                break;
+            }
+            sleep(10).await;
+        }
+
+        let link = PlayoutLink::default();
+        link.worker_protocol.set(PAUSE_PROTOCOL);
+        let worker = Worker::new(
+            &web_sys::Url::create_object_url_with_blob(
+                &web_sys::Blob::new_with_str_sequence(&js_sys::Array::of1(&JsValue::from_str("")))
+                    .expect("blob"),
+            )
+            .expect("blob url"),
+        )
+        .expect("idle worker");
+        set_direct_flag(Some("0".to_string()));
+        link.wire_if_ready(&slot, &worker, "pause-during-init");
+        set_direct_flag(None);
+        assert!(link.wired.get(), "the worklet was built");
+
+        sleep(250).await;
+        for _ in 0..3 {
+            play(10);
+            sleep(100).await;
+        }
+        NetEqAudioPeerDecoder::forward_control(&slot, None, "pause");
+        sleep(100).await;
+        let (frames_in, ..) = worklet_state(&slot).await;
+        assert_eq!(
+            frames_in, 31.0,
+            "every frame reached the worklet and played"
+        );
+        let (silent, _) = link
+            .counters
+            .totals()
+            .expect("0.3 s of audio spanning a report tick must produce a report");
+        assert!(
+            silent < 40,
+            "the gap before the first real audio was a pause, not an underrun, got {silent} ms"
+        );
+        if let PlaybackSlot::Live(worklet, gain) = &*slot.borrow() {
+            link.detach(worklet);
+            NetEqAudioPeerDecoder::retire_playback_pair(worklet, gain);
+        }
+        worker.terminate();
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_full_outbox_drops_the_oldest_frames_and_keeps_order_and_controls() {
+        let ctx = SharedAudioContext::get_or_init(None).expect("shared AudioContext");
+        let _ = ctx.resume();
+        let slot = Rc::new(RefCell::new(PlaybackSlot::Empty));
+        let vad = Rc::new(RefCell::new(VadState::new()));
+        for _ in 0..150 {
+            NetEqAudioPeerDecoder::handle_pcm_data(
+                speech_frame(),
+                slot.clone(),
+                &ctx,
+                None,
+                "outbox-overflow",
+                vad.clone(),
+                DEFAULT_VAD_THRESHOLD,
+            );
+        }
+        NetEqAudioPeerDecoder::forward_control(&slot, None, "pause");
+        NetEqAudioPeerDecoder::forward_control(&slot, None, "handoff");
+        let queued = WORKLET_OUTBOX.with(|o| o.borrow().get(&slot_key(&slot)).map(VecDeque::len));
+        assert_eq!(queued, Some(WORKLET_OUTBOX_MAX), "the outbox stays bounded");
+        let mut state = (0.0, 0.0, false, false);
+        for _ in 0..50 {
+            if matches!(*slot.borrow(), PlaybackSlot::Live(..)) {
+                state = worklet_state(&slot).await;
+                if state.3 {
+                    break;
+                }
+            }
+            sleep(10).await;
+        }
+        let (frames_in, ignored, paused, direct) = state;
+        assert_eq!(
+            frames_in,
+            (WORKLET_OUTBOX_MAX - 2) as f64,
+            "the oldest frames were dropped"
+        );
+        assert_eq!(ignored, 0.0, "no frame arrived after the handoff");
+        assert!(paused, "the pause was kept and arrived after every frame");
+        assert!(direct, "the handoff was kept");
+        let live = slot.borrow();
+        if let PlaybackSlot::Live(worklet, gain) = &*live {
+            NetEqAudioPeerDecoder::retire_playback_pair(worklet, gain);
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn a_full_queue_loses_its_oldest_frame_and_never_a_control() {
+        let command = |m: &js_sys::Object| {
+            js_sys::Reflect::get(m, &"command".into())
+                .ok()
+                .and_then(|c| c.as_string())
+                .unwrap_or_default()
+        };
+        let frame = |n: u32| {
+            let m = NetEqAudioPeerDecoder::worklet_command("play");
+            let _ = js_sys::Reflect::set(&m, &"n".into(), &n.into());
+            m
+        };
+        let control = NetEqAudioPeerDecoder::worklet_command;
+        let mut queue: VecDeque<js_sys::Object> = VecDeque::new();
+        for message in [
+            control("pause"),
+            control("handoff"),
+            frame(0),
+            frame(1),
+            frame(2),
+        ] {
+            enqueue_bounded(&mut queue, message, 10);
+        }
+        enqueue_bounded(&mut queue, frame(3), 5);
+        let left: Vec<String> = queue.iter().map(command).collect();
+        assert_eq!(left, ["pause", "handoff", "play", "play", "play"]);
+        let first = js_sys::Reflect::get(&queue[2], &"n".into())
+            .unwrap()
+            .as_f64();
+        assert_eq!(
+            first,
+            Some(1.0),
+            "the oldest frame went, the rest keep their order"
+        );
+
+        let mut controls: VecDeque<js_sys::Object> = VecDeque::new();
+        enqueue_bounded(&mut controls, control("pause"), 1);
+        enqueue_bounded(&mut controls, frame(9), 1);
+        enqueue_bounded(&mut controls, control("handoff"), 1);
+        let left: Vec<String> = controls.iter().map(command).collect();
+        assert_eq!(
+            left,
+            ["pause", "handoff"],
+            "a frame is refused rather than a control dropped"
+        );
+    }
+
+    #[wasm_bindgen(inline_js = r#"
+export function worklet_harness(code) {
+  let Processor = null;
+  const sent = [];
+  class AudioWorkletProcessor {
+    constructor() { this.port = { postMessage: (m) => sent.push(m), start() {} }; }
+  }
+  new Function("sampleRate", "registerProcessor", "AudioWorkletProcessor", "console", code)(
+    48000, (name, cls) => { Processor = cls; }, AudioWorkletProcessor, { log() {}, warn() {} });
+  const p = new Processor();
+  const pushed = [];
+  const push = p.buffer.pushInterleaved.bind(p.buffer);
+  p.buffer.pushInterleaved = (pcm) => { pushed.push(pcm[0]); return push(pcm); };
+  const out = [new Float32Array(128)];
+  return {
+    p, sent, pushed,
+    main: (m) => p.handleMessage(m),
+    direct: (m) => p.handleInput(m),
+    quanta: (n) => { for (let i = 0; i < n; i++) p.process([], [out], {}); },
+    frame: (v, n = 480) => ({ command: "play", pcm: new Float32Array(n).fill(v) }),
+    lastReportMs: () => { const r = sent.filter((m) => m.type === "underrun"); return r.length ? r[r.length - 1].silentMs : null; },
+    reportCount: () => sent.filter((m) => m.type === "underrun").length,
+    lastReport: () => sent.filter((m) => m.type === "underrun").pop(),
+  };
+}
+"#)]
+    extern "C" {
+        fn worklet_harness(code: &str) -> JsValue;
+    }
+
+    /// The production pcm-player worklet, driven by virtual render quanta (no audio clock, no sleep).
+    struct Harness(JsValue);
+
+    impl Harness {
+        fn new() -> Self {
+            Harness(worklet_harness(WORKLET_CODE))
+        }
+        fn call(&self, method: &str, args: &[JsValue]) -> JsValue {
+            let f: js_sys::Function = js_sys::Reflect::get(&self.0, &method.into())
+                .unwrap()
+                .unchecked_into();
+            f.apply(&JsValue::NULL, &args.iter().collect::<js_sys::Array>())
+                .unwrap()
+        }
+        fn frame(&self, value: f64) -> JsValue {
+            self.call("frame", &[value.into()])
+        }
+        fn main(&self, message: JsValue) {
+            self.call("main", &[message]);
+        }
+        fn command(&self, command: &str) {
+            self.main(NetEqAudioPeerDecoder::worklet_command(command).into());
+        }
+        fn direct(&self, message: JsValue) {
+            self.call("direct", &[message]);
+        }
+        fn quanta(&self, n: u32) {
+            self.call("quanta", &[n.into()]);
+        }
+        fn last_report_ms(&self) -> Option<f64> {
+            self.call("lastReportMs", &[]).as_f64()
+        }
+        fn last_report(&self) -> JsValue {
+            self.call("lastReport", &[])
+        }
+        fn report_count(&self) -> f64 {
+            self.call("reportCount", &[]).as_f64().unwrap_or(-1.0)
+        }
+        fn field(&self, name: &str) -> JsValue {
+            let p = js_sys::Reflect::get(&self.0, &"p".into()).unwrap();
+            js_sys::Reflect::get(&p, &name.into()).unwrap()
+        }
+        fn pushed(&self) -> Vec<f64> {
+            let a: js_sys::Array = js_sys::Reflect::get(&self.0, &"pushed".into())
+                .unwrap()
+                .unchecked_into();
+            a.iter().filter_map(|v| v.as_f64()).collect()
+        }
+    }
+
+    const QUANTUM_MS: f64 = 128.0 * 1000.0 / 48_000.0;
+
+    #[wasm_bindgen_test]
+    fn the_worklet_counts_a_gap_as_it_happens_and_in_full_but_only_when_asked() {
+        let h = Harness::new();
+        for _ in 0..10 {
+            h.main(h.frame(0.1));
+        }
+        h.quanta(400);
+        assert_eq!(h.last_report_ms(), None, "no count before 'countUnderruns'");
+
+        h.command("countUnderruns");
+        for _ in 0..8 {
+            h.main(h.frame(0.1));
+        }
+        h.quanta(30);
+        h.quanta(200);
+        let during = h.last_report_ms().expect("an ongoing gap is reported");
+        assert!(
+            during > 100.0,
+            "the gap is booked while it lasts, got {during} ms"
+        );
+        h.quanta(1_000);
+        h.command("pause");
+        h.quanta(94);
+        let total = h.last_report_ms().unwrap();
+        let expected = 1_200.0 * QUANTUM_MS;
+        assert!(
+            (total - expected).abs() < 0.1,
+            "a 3.2 s gap is booked in full: {total} ms of {expected} ms"
+        );
+        h.quanta(1_000);
+        assert_eq!(h.last_report_ms(), Some(total), "a pause stops the count");
+    }
+
+    #[wasm_bindgen_test]
+    fn each_gap_after_audio_resumes_is_a_new_underrun_event() {
+        let h = Harness::new();
+        h.command("countUnderruns");
+        for _ in 0..2 {
+            for _ in 0..8 {
+                h.main(h.frame(0.1));
+            }
+            h.quanta(200);
+        }
+        let counters = PlayoutCounters::default();
+        counters.record(&h.last_report());
+        let (silent_ms, events) = counters.totals().expect("the gaps were reported");
+        assert!(silent_ms > 0, "both gaps were silent");
+        assert_eq!(events, 2, "two gaps, each after audio played again");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_full_direct_queue_of_controls_refuses_a_frame() {
+        let h = Harness::new();
+        let fake_port = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &fake_port,
+            &"postMessage".into(),
+            &js_sys::Function::new_no_args(""),
+        );
+        let attach = NetEqAudioPeerDecoder::worklet_command("attachInput");
+        let _ = js_sys::Reflect::set(&attach, &"port".into(), &fake_port);
+        h.main(attach.into());
+        for _ in 0..200 {
+            h.direct(NetEqAudioPeerDecoder::worklet_command("pause").into());
+        }
+        h.direct(h.frame(0.3));
+        h.command("handoff");
+        assert_eq!(h.field("pausesIn").as_f64(), Some(200.0));
+        assert!(h.pushed().is_empty(), "the frame was refused, not queued");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_steady_stream_reports_once_and_a_gap_reports_again() {
+        let h = Harness::new();
+        h.command("countUnderruns");
+        let steady = |quanta: u32| {
+            for _ in 0..quanta / 15 {
+                for _ in 0..4 {
+                    h.main(h.frame(0.1));
+                }
+                h.quanta(15);
+            }
+        };
+        steady(1_500);
+        assert_eq!(h.report_count(), 1.0, "one report once the stream flows");
+        assert_eq!(h.last_report_ms(), Some(0.0));
+        h.quanta(200);
+        let reports = h.report_count();
+        assert!(reports > 1.0, "a gap is reported");
+        steady(1_500);
+        assert!(
+            h.report_count() <= reports + 1.0,
+            "unchanged totals are not posted again: {} reports after {reports}",
+            h.report_count()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_direct_queue_keeps_controls_and_plays_old_frames_first() {
+        let h = Harness::new();
+        let fake_port = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &fake_port,
+            &"postMessage".into(),
+            &js_sys::Function::new_no_args(""),
+        );
+        let attach = NetEqAudioPeerDecoder::worklet_command("attachInput");
+        let _ = js_sys::Reflect::set(&attach, &"port".into(), &fake_port);
+        h.main(attach.into());
+        h.direct(NetEqAudioPeerDecoder::worklet_command("pause").into());
+        for k in 1..=250 {
+            h.direct(h.frame(f64::from(k) / 1000.0));
+        }
+        h.main(h.frame(0.5));
+        h.command("handoff");
+        h.main(h.frame(0.9));
+
+        assert_eq!(
+            h.field("pausesIn").as_f64(),
+            Some(1.0),
+            "the queued pause survived the overflow"
+        );
+        assert_eq!(
+            h.field("framesIgnored").as_f64(),
+            Some(1.0),
+            "old-path PCM after the handoff is ignored"
+        );
+        let pushed = h.pushed();
+        assert_eq!(
+            pushed.len(),
+            200,
+            "the old frame, then the newest 199 direct frames"
+        );
+        assert!(
+            (pushed[0] - 0.5).abs() < 1e-6,
+            "the frame sent the old way plays first"
+        );
+        let direct: Vec<f64> = pushed[1..].iter().map(|v| (v * 1000.0).round()).collect();
+        let expected: Vec<f64> = (52..=250).map(f64::from).collect();
+        assert_eq!(
+            direct, expected,
+            "direct frames play in order, the oldest dropped"
+        );
+    }
+
+    #[wasm_bindgen(inline_js = r#"
+export function fake_suspended_context() {
+  const c = { state: "suspended", resumes: 0, listeners: [] };
+  c.resume = () => { c.resumes += 1; return new Promise(() => {}); };
+  c.addEventListener = (type, f) => { if (type === "statechange") c.listeners.push(f); };
+  c.removeEventListener = () => {};
+  c.change = (state) => { c.state = state; c.listeners.forEach((f) => f()); };
+  return c;
+}
+"#)]
+    extern "C" {
+        fn fake_suspended_context() -> JsValue;
+    }
+
+    /// A `resume()` that never settles (autoplay not yet allowed) must not stop later resumes.
+    #[wasm_bindgen_test]
+    fn a_resume_that_never_settles_is_retried_after_a_state_change() {
+        RESUME_PENDING_SINCE.with(|p| p.set(None));
+        let fake = fake_suspended_context();
+        let ctx: AudioContext = fake.clone().unchecked_into();
+        let resumes = || {
+            js_sys::Reflect::get(&fake, &"resumes".into())
+                .unwrap()
+                .as_f64()
+        };
+        NetEqAudioPeerDecoder::keep_context_running(&ctx);
+        NetEqAudioPeerDecoder::keep_context_running(&ctx);
+        assert_eq!(resumes(), Some(1.0), "one resume in flight at a time");
+        let change: js_sys::Function = js_sys::Reflect::get(&fake, &"change".into())
+            .unwrap()
+            .unchecked_into();
+        change.call1(&JsValue::NULL, &"suspended".into()).unwrap();
+        NetEqAudioPeerDecoder::keep_context_running(&ctx);
+        assert_eq!(resumes(), Some(2.0), "the state change ended the wait");
+        RESUME_PENDING_SINCE.with(|p| p.set(None));
+    }
+
+    #[wasm_bindgen_test]
+    async fn an_old_worker_without_pause_gets_no_underrun_count_and_no_direct_path() {
+        let mut decoder = decoder_with("legacy-worker", true, "{ legacy: true }").await;
+        decoder.set_muted(true);
+        sleep(300).await;
+        decoder.set_muted(false);
+        sleep(300).await;
+        let (frames_in, _, _, direct) = worklet_state(&decoder.pcm_player).await;
+        assert!(
+            frames_in > 30.0,
+            "the old worker's audio still plays, got {frames_in} frames"
+        );
+        assert!(!direct, "no direct path for a worker that cannot hand off");
+        assert_eq!(
+            decoder.playout.counters.totals(),
+            None,
+            "a worker that never sends pause must not have its mutes booked as underruns"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn no_frame_is_dropped_at_the_switch_to_the_direct_path() {
+        let decoder = decoder_with("handoff", true, "{ burst: 20 }").await;
+        let total = watch_total(&decoder.worker_for_test());
+        let mut sent = -1.0;
+        for _ in 0..50 {
+            sent = total
+                .call0(&JsValue::NULL)
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(-1.0);
+            if sent > 0.0 {
+                break;
+            }
+            sleep(10).await;
+        }
+        assert!(
+            sent > 40.0,
+            "the worker never reached the switch (sent {sent})"
+        );
+        let (frames_in, ignored, _, direct) = worklet_state(&decoder.pcm_player).await;
+        assert!(direct, "the worklet switched to the direct path");
+        assert_eq!(
+            ignored, 0.0,
+            "a frame sent the old way was discarded at the switch"
+        );
+        assert_eq!(
+            frames_in, sent,
+            "every frame the worker sent must reach the worklet"
+        );
     }
 }

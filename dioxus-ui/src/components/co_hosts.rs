@@ -7,6 +7,9 @@
 
 use crate::components::attendants::action_bar_announce_text;
 use crate::components::canvas_generator::focus_element_by_id;
+use crate::components::co_host_picker::{
+    person_label, use_co_host_picker, CoHostPicker, DraftError,
+};
 use crate::components::toggle_switch::ToggleSwitch;
 use crate::context::HostSetCtx;
 use crate::meeting_api::{CoHostEntry, JoinError};
@@ -94,6 +97,20 @@ pub fn owner_holds_host(host_set: Option<&HostSetCtx>, owner_user_id: Option<&st
     owner_user_id.is_some_and(|owner| peer_holds_host(host_set, owner_user_id, owner))
 }
 
+/// The local user's role; the roster's self row reads it too.
+pub fn local_host_role(
+    host_set: Option<&HostSetCtx>,
+    owner_user_id: Option<&str>,
+    local_user_id: &str,
+) -> Option<HostRole> {
+    host_role(
+        peer_holds_host(host_set, owner_user_id, local_user_id),
+        local_user_id,
+        owner_user_id,
+        owner_holds_host(host_set, owner_user_id),
+    )
+}
+
 /// Whether Meeting Options — the action-bar slot, the in-call dialog, and the
 /// pre-join controls — should be shown: the meeting OWNER, or anyone
 /// CURRENTLY holding the host role. Co-host management, the password, ending
@@ -106,11 +123,17 @@ pub fn can_edit_meeting_options(viewer: MeetingOwnership, is_host: bool) -> bool
     viewer.is_owner() || is_host
 }
 
-pub fn host_change_toast_text(granted: bool) -> &'static str {
-    if granted {
-        "You now have host controls"
-    } else {
-        "You no longer have host controls"
+/// A grant names the local user's live role, and has no text once they no
+/// longer hold it; a revoke ignores the role.
+pub fn host_change_toast_text(
+    change: HostChange,
+    live_role: Option<HostRole>,
+) -> Option<&'static str> {
+    match (change, live_role) {
+        (HostChange::Granted, Some(HostRole::CoHost)) => Some("You're now a co-host"),
+        (HostChange::Granted, Some(HostRole::Host)) => Some("You're now a host"),
+        (HostChange::Granted, None) => None,
+        (HostChange::Revoked, _) => Some("You no longer have host controls"),
     }
 }
 
@@ -252,6 +275,7 @@ pub enum CoHostErrorKind {
     LastPresentHost,
     NotACoHost,
     NotInMeeting,
+    TransferTargetOrCallerGone,
     MeetingNotFound,
     NotOwner,
     NotHost,
@@ -275,6 +299,7 @@ impl CoHostErrorKind {
             Self::LastPresentHost => "Can't remove the only host in the meeting.",
             Self::NotACoHost => "They're no longer a co-host or host of this meeting.",
             Self::NotInMeeting => "They're no longer in the meeting.",
+            Self::TransferTargetOrCallerGone => "They may have left, or you're no longer a host.",
             Self::MeetingNotFound => "This meeting could not be found.",
             Self::NotOwner => "Only the meeting owner can do that.",
             Self::NotHost => "Only hosts can do that.",
@@ -310,7 +335,9 @@ fn error_body_parts(body: &str) -> (Option<String>, String) {
 }
 
 fn classify_bad_request(message: &str) -> CoHostErrorKind {
-    if message.contains("persist") || message.contains("active meeting") {
+    if message.contains("not an admitted participant") {
+        CoHostErrorKind::TransferTargetOrCallerGone
+    } else if message.contains("persist") || message.contains("active meeting") {
         CoHostErrorKind::NeedsActiveMeeting
     } else if message.contains("at most") {
         CoHostErrorKind::LimitReached
@@ -423,9 +450,11 @@ pub struct CoHostNoticeCtx(pub Signal<Option<CoHostNotice>>);
 
 const NOTICE_MS: u32 = 6_000;
 const REFRESH_DEBOUNCE_MS: u32 = 1_500;
+const HOST_CHANGE_DEFER_MS: u32 = 300;
 
 thread_local! {
     static NOTICE_SEQ: Cell<u64> = const { Cell::new(0) };
+    static HOST_CHANGE_SEQ: Cell<u64> = const { Cell::new(0) };
     static SECTION_IDS: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -488,6 +517,7 @@ pub fn CoHostNoticeLayer(notice: Signal<Option<CoHostNotice>>) -> Element {
                 class: if n.is_error { "peer-toast toast-left co-host-notice co-host-notice--error" } else { "peer-toast toast-joined co-host-notice" },
                 role: n.is_error.then_some("alert"),
                 "data-testid": "co-host-notice",
+                onclick: move |e: MouseEvent| e.stop_propagation(),
                 span { class: "toast-text",
                     span { class: "toast-name", "{n.text}" }
                 }
@@ -496,17 +526,55 @@ pub fn CoHostNoticeLayer(notice: Signal<Option<CoHostNotice>>) -> Element {
     }
 }
 
-/// The local user's "you now have / no longer have host controls" toast, with
-/// an always-mounted status region beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostChange {
+    Granted,
+    Revoked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostChangeToast {
+    pub seq: u64,
+    pub change: HostChange,
+}
+
+/// Shows the local user's host-change toast after a short delay, replacing a
+/// pending or visible one. Dropping `timer` cancels it.
+pub fn show_host_change_toast(
+    change: HostChange,
+    mut toast: Signal<Option<HostChangeToast>>,
+    mut timer: Signal<Option<Timeout>>,
+) {
+    timer.set(Some(Timeout::new(HOST_CHANGE_DEFER_MS, move || {
+        let seq = bump(&HOST_CHANGE_SEQ);
+        toast.set(Some(HostChangeToast { seq, change }));
+        timer.set(Some(Timeout::new(NOTICE_MS, move || {
+            toast.set(None);
+            timer.set(None);
+        })));
+    })));
+}
+
+/// The local user's host-change toast, with an always-mounted status region
+/// beside it.
 #[component]
-pub fn HostChangeNotice(toast: Signal<Option<String>>) -> Element {
-    let shown = use_hook(|| Rc::new(Cell::new(0u32)));
-    let current = toast();
-    let status_text = match &current {
-        Some(text) => {
-            shown.set(shown.get().wrapping_add(1));
-            action_bar_announce_text(text, shown.get())
-        }
+pub fn HostChangeNotice(
+    toast: Signal<Option<HostChangeToast>>,
+    owner_user_id: Option<String>,
+    local_user_id: String,
+) -> Element {
+    let host_set = try_use_context::<HostSetCtx>();
+    let shown = toast().and_then(|t| {
+        let live_role = match t.change {
+            HostChange::Granted => {
+                local_host_role(host_set.as_ref(), owner_user_id.as_deref(), &local_user_id)
+            }
+            HostChange::Revoked => None,
+        };
+        host_change_toast_text(t.change, live_role).map(|text| (t.seq, text))
+    });
+    let status_text = match shown {
+        Some((seq, text)) => action_bar_announce_text(text, seq as u32),
         None => String::new(),
     };
     rsx! {
@@ -518,8 +586,11 @@ pub fn HostChangeNotice(toast: Signal<Option<String>>) -> Element {
             "data-testid": "host-change-status",
             "{status_text}"
         }
-        if let Some(text) = current {
-            div { class: "peer-toast toast-joined", "data-testid": "host-change-toast",
+        if let Some((seq, text)) = shown {
+            div {
+                key: "{seq}",
+                class: "peer-toast toast-joined",
+                "data-testid": "host-change-toast",
                 span { class: "toast-icon",
                     svg {
                         width: "16",
@@ -584,11 +655,59 @@ pub fn run_co_host_request(request: CoHostRequest, notice: Option<CoHostNoticeCt
     });
 }
 
-pub fn kick_failure_text(name: &str, error: &JoinError) -> String {
-    format!(
-        "Couldn't remove {name} from the meeting. {}",
-        co_host_error_message(error)
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostAction<'a> {
+    MuteAll,
+    DisableVideoAll,
+    Mute(&'a str),
+    DisableVideo(&'a str),
+    TransferHost(&'a str),
+    Kick(&'a str),
+}
+
+fn error_code(error: &JoinError) -> Option<String> {
+    match error {
+        JoinError::ServerError { body, .. }
+        | JoinError::Forbidden(body)
+        | JoinError::NotFound(body) => error_body_parts(body).0,
+        _ => None,
+    }
+}
+
+fn host_action_reason(error: &JoinError) -> &'static str {
+    match classify_co_host_error(error) {
+        CoHostErrorKind::GuestTarget => "Guests can't be made host.",
+        CoHostErrorKind::NotOwner if error_code(error).as_deref() != Some("NOT_OWNER") => {
+            CoHostErrorKind::NotHost.message()
+        }
+        kind => kind.message(),
+    }
+}
+
+pub fn host_action_failure_text(action: HostAction<'_>, error: &JoinError) -> String {
+    let reason = host_action_reason(error);
+    match action {
+        HostAction::MuteAll => format!("Couldn't mute everyone. {reason}"),
+        HostAction::DisableVideoAll => format!("Couldn't disable video for everyone. {reason}"),
+        HostAction::Mute(name) => format!("Couldn't mute {name}. {reason}"),
+        HostAction::DisableVideo(name) => format!("Couldn't disable video for {name}. {reason}"),
+        HostAction::TransferHost(name) => format!("Couldn't transfer host to {name}. {reason}"),
+        HostAction::Kick(name) => format!("Couldn't remove {name} from the meeting. {reason}"),
+    }
+}
+
+pub fn post_host_action_failure(
+    notice: Option<CoHostNoticeCtx>,
+    action: HostAction<'_>,
+    error: &JoinError,
+) {
+    if let Some(ctx) = notice {
+        post_co_host_notice(ctx, host_action_failure_text(action, error), true);
+    }
+}
+
+pub(crate) fn shared_name(cell: &std::cell::OnceCell<Rc<str>>, name: &str) -> Rc<str> {
+    cell.get_or_init(|| Rc::from(name)).clone()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -602,7 +721,10 @@ enum ListState {
 #[derive(Clone, Debug, PartialEq)]
 enum Mutation {
     /// No `persist`: a new grant is saved for future meetings by default.
-    Add { user_id: String },
+    Add {
+        user_id: String,
+        name: Option<String>,
+    },
     SetPersist {
         user_id: String,
         name: String,
@@ -618,9 +740,10 @@ enum Mutation {
 impl Mutation {
     fn success_text(&self) -> String {
         match self {
-            Mutation::Add { user_id } => {
-                format!("{user_id} was added as a co-host and saved for future meetings.")
-            }
+            Mutation::Add { user_id, name } => format!(
+                "{} was added as a co-host and saved for future meetings.",
+                person_label(user_id, name.as_deref())
+            ),
             Mutation::SetPersist {
                 name,
                 persist: true,
@@ -637,9 +760,10 @@ impl Mutation {
 
     fn failure_text(&self, reason: &str) -> String {
         match self {
-            Mutation::Add { user_id } => {
-                format!("Couldn't add {user_id} as a co-host. {reason}")
-            }
+            Mutation::Add { user_id, name } => format!(
+                "Couldn't add {} as a co-host. {reason}",
+                person_label(user_id, name.as_deref())
+            ),
             Mutation::SetPersist { name, .. } => format!("Couldn't update {name}. {reason}"),
             Mutation::Remove { name, .. } => CoHostMenuAction::Remove.failure_text(name, reason),
         }
@@ -699,7 +823,9 @@ pub fn CoHostsSection(
     let mut retrying = use_signal(|| false);
     let mut message = use_signal(|| None::<SectionMessage>);
     let mut draft = use_signal(String::new);
-    let mut draft_error = use_signal(|| None::<CoHostErrorKind>);
+    let mut draft_error = use_signal(|| None::<DraftError>);
+    let mut draft_error_seq = use_signal(|| 0u64);
+    let picker = use_co_host_picker();
     // The server said the meeting isn't running; cleared when it becomes active.
     let known_inactive = use_hook(|| Rc::new(Cell::new(false)));
     let was_active = use_hook(|| Rc::new(Cell::new(meeting_active)));
@@ -809,7 +935,7 @@ pub fn CoHostsSection(
             spawn(async move {
                 let result = match &mutation {
                     // No explicit `persist`: saved for future meetings by default.
-                    Mutation::Add { user_id } => {
+                    Mutation::Add { user_id, .. } => {
                         crate::meeting_api::grant_co_host(&meeting_id, user_id, None).await
                     }
                     Mutation::SetPersist {
@@ -880,13 +1006,25 @@ pub fn CoHostsSection(
             if *busy.peek() {
                 return;
             }
-            match validate_co_host_input(&draft.peek(), owner_user_id.as_deref()) {
-                Ok(user_id) => {
+            let submission = picker.submit(draft, &entries.peek()).and_then(|grant| {
+                grant
+                    .map(|(text, name)| {
+                        validate_co_host_input(&text, owner_user_id.as_deref())
+                            .map(|user_id| (user_id, name))
+                            .map_err(DraftError::Invalid)
+                    })
+                    .transpose()
+            });
+            match submission {
+                Ok(grant) => {
                     draft_error.set(None);
-                    mutate.call(Mutation::Add { user_id });
+                    if let Some((user_id, name)) = grant {
+                        mutate.call(Mutation::Add { user_id, name });
+                    }
                 }
-                Err(kind) => {
-                    draft_error.set(Some(kind));
+                Err(error) => {
+                    draft_error.set(Some(error));
+                    draft_error_seq += 1;
                     focus_element_by_id(&input_id);
                 }
             }
@@ -900,7 +1038,6 @@ pub fn CoHostsSection(
     let busy_attr = is_busy.then_some("true");
     let input_error_id = format!("{base}-input-error");
     let heading_id = format!("{base}-heading");
-    let invalid = draft_error().is_some();
     let status_text = match message() {
         Some(msg) if !msg.is_error => action_bar_announce_text(&msg.text, msg.seq as u32),
         _ => String::new(),
@@ -1073,31 +1210,35 @@ pub fn CoHostsSection(
                 // programmatic label for assistive tech.
                 label { r#for: "{input_id}", class: "visually-hidden", "Add co-host" }
                 div { class: "co-hosts-add-row",
-                    input {
-                        id: "{input_id}",
-                        class: "input-apple co-hosts-input",
-                        "data-testid": "co-host-input",
-                        r#type: "text",
-                        autocomplete: "off",
-                        placeholder: "Email or user ID",
-                        value: "{draft}",
-                        "aria-invalid": invalid.then_some("true"),
-                        "aria-describedby": invalid.then(|| input_error_id.clone()),
-                        oninput: move |e: FormEvent| {
-                            draft.set(e.value());
-                            draft_error.set(None);
-                        },
+                    CoHostPicker {
+                        state: picker,
+                        meeting_id: meeting_id.clone(),
+                        base: base.clone(),
+                        input_id: input_id.clone(),
+                        error_id: input_error_id.clone(),
+                        draft,
+                        draft_error,
+                        entries,
                     }
                     button {
                         r#type: "submit",
                         class: "btn-apple btn-primary co-hosts-add-btn",
                         "data-testid": "co-host-add",
                         "aria-disabled": busy_attr,
+                        onmousedown: move |e: MouseEvent| e.prevent_default(),
                         "Add"
                     }
                 }
-                if let Some(kind) = draft_error() {
-                    p { id: "{input_error_id}", class: "toggle-error", role: "alert", "{kind.message()}" }
+                if let Some(error) = draft_error() {
+                    {rsx! {
+                        p {
+                            key: "{draft_error_seq}",
+                            id: "{input_error_id}",
+                            class: "toggle-error",
+                            role: "alert",
+                            "{error.message()}"
+                        }
+                    }}
                 }
                 p { class: "co-hosts-hint", "New co-hosts are saved for future meetings." }
             }
@@ -1352,12 +1493,69 @@ mod tests {
     }
 
     #[test]
-    fn self_toast_is_role_neutral() {
-        assert_eq!(host_change_toast_text(true), "You now have host controls");
+    fn self_toast_names_the_role() {
+        use HostChange::{Granted, Revoked};
+        use HostRole::{CoHost, Host};
+        let cases = [
+            (Granted, Some(CoHost), Some("You're now a co-host")),
+            (Granted, Some(Host), Some("You're now a host")),
+            (Granted, None, None),
+            (
+                Revoked,
+                Some(CoHost),
+                Some("You no longer have host controls"),
+            ),
+            (
+                Revoked,
+                Some(Host),
+                Some("You no longer have host controls"),
+            ),
+            (Revoked, None, Some("You no longer have host controls")),
+        ];
+        for (change, role, want) in cases {
+            assert_eq!(
+                host_change_toast_text(change, role),
+                want,
+                "{change:?} {role:?}"
+            );
+        }
+    }
+
+    const LOCAL_ROLE_CASES: [(&[&str], &str, Option<HostRole>); 4] = [
+        (&[OWNER, COHOST], COHOST, Some(HostRole::CoHost)),
+        (&[COHOST], COHOST, Some(HostRole::Host)),
+        (&[OWNER], COHOST, None),
+        (&[OWNER, COHOST], OWNER, Some(HostRole::Host)),
+    ];
+
+    fn host_set_of(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn local_role_is_co_host_only_while_the_owner_also_holds_it() {
+        thread_local! {
+            static ROLES: RefCell<Vec<Option<HostRole>>> = const { RefCell::new(Vec::new()) };
+        }
+        #[allow(non_snake_case)]
+        fn Probe() -> Element {
+            for (set, local, _) in LOCAL_ROLE_CASES {
+                let hosts = use_signal(|| host_set_of(set));
+                let role = local_host_role(Some(&HostSetCtx(hosts)), Some(OWNER), local);
+                ROLES.with(|r| r.borrow_mut().push(role));
+            }
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(Probe);
+        vdom.rebuild_in_place();
+        let want: Vec<_> = LOCAL_ROLE_CASES.iter().map(|(_, _, role)| *role).collect();
+        assert_eq!(ROLES.with(|r| r.borrow().clone()), want, "live host set");
         assert_eq!(
-            host_change_toast_text(false),
-            "You no longer have host controls"
+            local_host_role(None, Some(OWNER), OWNER),
+            Some(HostRole::Host)
         );
+        assert_eq!(local_host_role(None, Some(OWNER), COHOST), None);
     }
 
     #[test]
@@ -1490,6 +1688,10 @@ mod tests {
                 CoHostErrorKind::SelfTarget,
             ),
             (
+                server_error(400, "BAD_REQUEST", "target is not an admitted participant"),
+                CoHostErrorKind::TransferTargetOrCallerGone,
+            ),
+            (
                 server_error(400, "BAD_REQUEST", "something new"),
                 CoHostErrorKind::InvalidRequest,
             ),
@@ -1508,6 +1710,34 @@ mod tests {
             assert!(!copy.contains("persist"), "raw API wording leaked: {copy}");
             assert!(copy.ends_with('.'), "{copy}");
         }
+    }
+
+    #[test]
+    fn host_action_refusals_use_host_wording() {
+        let guest = server_error(
+            400,
+            "BAD_REQUEST",
+            "cannot transfer host to a guest participant",
+        );
+        let bare_403 = JoinError::Forbidden("<html>Forbidden</html>".to_string());
+        let not_owner = JoinError::Forbidden(body("NOT_OWNER", "not the owner"));
+        assert_eq!(
+            [
+                host_action_failure_text(HostAction::TransferHost("Dana"), &guest),
+                host_action_failure_text(HostAction::Mute("Dana"), &bare_403),
+                host_action_failure_text(HostAction::Kick("Dana"), &not_owner),
+            ],
+            [
+                "Couldn't transfer host to Dana. Guests can't be made host.",
+                "Couldn't mute Dana. Only hosts can do that.",
+                "Couldn't remove Dana from the meeting. Only the meeting owner can do that.",
+            ]
+        );
+        assert_eq!(co_host_error_message(&guest), "Guests can't be co-hosts.");
+        assert_eq!(
+            co_host_error_message(&bare_403),
+            "Only the meeting owner can do that."
+        );
     }
 
     #[test]

@@ -205,10 +205,10 @@ static UNISTREAM_DROP_COUNT_BY_STREAM: [AtomicU64; PERSISTENT_STREAM_COUNTER_SLO
     AtomicU64::new(0),
 ];
 
-fn stream_counter(
-    counters: &[AtomicU64; PERSISTENT_STREAM_COUNTER_SLOTS],
+fn stream_counter<T>(
+    counters: &[T; PERSISTENT_STREAM_COUNTER_SLOTS],
     stream_key: u8,
-) -> Option<&AtomicU64> {
+) -> Option<&T> {
     match stream_key {
         1..=videocall_types::limits::MAX_MEDIA_STREAM_KEY => counters.get(usize::from(stream_key)),
         _ => None,
@@ -1123,6 +1123,44 @@ pub fn new_persistent_stream_map() -> PersistentStreamMap {
     Rc::new(AsyncMutex::new(HashMap::new()))
 }
 
+/// Framed bytes one session has handed each persistent unistream and not yet
+/// retired, per stream key (#3077). Owned by its [`WebTransportTask`].
+#[derive(Clone, Default)]
+pub struct UplinkStreamDepth(Rc<[Cell<u64>; PERSISTENT_STREAM_COUNTER_SLOTS]>);
+
+impl UplinkStreamDepth {
+    pub fn bytes(&self, stream_key: u8) -> u64 {
+        stream_counter(&self.0, stream_key).map_or(0, Cell::get)
+    }
+
+    pub fn admit(&self, stream_key: u8, bytes: u64) -> UplinkStreamDepthGuard {
+        if let Some(slot) = stream_counter(&self.0, stream_key) {
+            slot.set(slot.get().saturating_add(bytes));
+        }
+        UplinkStreamDepthGuard {
+            depth: self.clone(),
+            stream_key,
+            bytes,
+        }
+    }
+}
+
+/// Retires its admitted bytes on drop.
+#[must_use]
+pub struct UplinkStreamDepthGuard {
+    depth: UplinkStreamDepth,
+    stream_key: u8,
+    bytes: u64,
+}
+
+impl Drop for UplinkStreamDepthGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = stream_counter(&self.depth.0, self.stream_key) {
+            slot.set(slot.get().saturating_sub(self.bytes));
+        }
+    }
+}
+
 static SEND_ORDER_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Times [`create_persistent_unistream`] retried without the `sendOrder`
@@ -1607,9 +1645,15 @@ pub struct WebTransportTask {
     /// On stream-write error the entry is removed; the next send for that
     /// key opens a fresh stream.
     pub persistent_streams: PersistentStreamMap,
+    pub uplink_depth: UplinkStreamDepth,
 }
 
 impl WebTransportTask {
+    /// This session's unretired framed bytes for one persistent stream key.
+    pub fn stream_queue_depth_bytes(&self, stream_key: u8) -> u64 {
+        self.uplink_depth.bytes(stream_key)
+    }
+
     fn new(
         host: SessionHost,
         notification: Callback<WebTransportStatus>,
@@ -1626,6 +1670,7 @@ impl WebTransportTask {
             closed_closure: Some(closed_closure),
             fired,
             persistent_streams: new_persistent_stream_map(),
+            uplink_depth: UplinkStreamDepth::default(),
         }
     }
 
@@ -1644,6 +1689,7 @@ impl WebTransportTask {
             closed_closure: None,
             fired: Rc::default(),
             persistent_streams: new_persistent_stream_map(),
+            uplink_depth: UplinkStreamDepth::default(),
         }
     }
 }
@@ -2138,6 +2184,7 @@ impl WebTransportTask {
     pub fn send_on_persistent_stream(
         host: SessionHost,
         streams: PersistentStreamMap,
+        depth: &UplinkStreamDepth,
         stream_key: u8,
         send_order: i32,
         data: Vec<u8>,
@@ -2163,12 +2210,13 @@ impl WebTransportTask {
             return;
         }
 
+        let frame_bytes = 4 + data.len() as u64;
+        let queued = depth.admit(stream_key, frame_bytes);
         wasm_bindgen_futures::spawn_local(async move {
             let chunk = {
                 let framed = frame_persistent_stream_payload(&data);
                 Uint8Array::from(framed.as_slice())
             };
-            let frame_bytes = 4 + data.len() as u64;
             drop(data);
             // Captured alongside the writer when we acquire it from the
             // map; passed into the error handler so a stale failing send
@@ -2316,6 +2364,7 @@ impl WebTransportTask {
                 Ok(())
             }
             .await;
+            drop(queued);
 
             if let Err(e) = result {
                 // A media frame just failed to go out on this uplink. Count it
@@ -2526,6 +2575,57 @@ impl WebTransportTask {
 // WritableStream API) and is exercised by integration tests rather than
 // unit tests.
 // ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod uplink_stream_depth_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_bytes_stay_counted_per_key_until_their_guard_drops() {
+        let depth = UplinkStreamDepth::default();
+        let first = depth.admit(3, 1_000);
+        let second = depth.admit(3, 500);
+        let audio = depth.admit(1, 70);
+        assert_eq!(depth.bytes(3), 1_500);
+        assert_eq!(depth.bytes(1), 70);
+        assert_eq!(
+            depth.bytes(2),
+            0,
+            "a key nothing was admitted on reads empty"
+        );
+
+        drop(first);
+        assert_eq!(depth.bytes(3), 500);
+        drop(second);
+        assert_eq!(depth.bytes(3), 0);
+        assert_eq!(depth.bytes(1), 70, "retiring screen must not touch audio");
+        drop(audio);
+        assert_eq!(depth.bytes(1), 0);
+    }
+
+    #[test]
+    fn a_new_session_does_not_inherit_the_old_sessions_unretired_bytes() {
+        let old_session = UplinkStreamDepth::default();
+        let never_settles = old_session.admit(3, 4_000_000);
+        let new_session = UplinkStreamDepth::default();
+        assert_eq!(new_session.bytes(3), 0);
+        assert_eq!(old_session.bytes(3), 4_000_000);
+        drop(never_settles);
+    }
+
+    #[test]
+    fn a_key_outside_the_media_slots_is_never_counted() {
+        let depth = UplinkStreamDepth::default();
+        let zero = depth.admit(0, 100);
+        let past_the_end = depth.admit(videocall_types::limits::MAX_MEDIA_STREAM_KEY + 1, 100);
+        assert_eq!(depth.bytes(0), 0);
+        assert_eq!(
+            depth.bytes(videocall_types::limits::MAX_MEDIA_STREAM_KEY + 1),
+            0
+        );
+        drop((zero, past_the_end));
+    }
+}
+
 #[cfg(test)]
 mod close_status_tests {
     use super::*;
@@ -4417,6 +4517,97 @@ mod uplink_propagation_tests {
             1,
             "and the cert hashes must arrive as an array, not flattened"
         );
+    }
+
+    /// A sink whose writes park until [`release_parked`] resolves them.
+    fn parking_sink() -> (WritableStream, Rc<RefCell<Vec<js_sys::Function>>>) {
+        let parked: Rc<RefCell<Vec<js_sys::Function>>> = Rc::default();
+        let into = parked.clone();
+        let write = Closure::wrap(Box::new(move |_chunk: JsValue| -> JsValue {
+            Promise::new(&mut |resolve, _reject| into.borrow_mut().push(resolve)).into()
+        }) as Box<dyn FnMut(JsValue) -> JsValue>);
+        let underlying = Object::new();
+        Reflect::set(&underlying, &"write".into(), write.as_ref()).unwrap();
+        write.forget();
+        (
+            WritableStream::new_with_underlying_sink(&underlying).unwrap(),
+            parked,
+        )
+    }
+
+    fn release_parked(parked: &Rc<RefCell<Vec<js_sys::Function>>>) {
+        for resolve in parked.borrow_mut().drain(..) {
+            resolve.call0(&JsValue::UNDEFINED).unwrap();
+        }
+    }
+
+    /// An in-page host whose every new send stream is `writable`.
+    fn in_page_host_over(writable: WritableStream) -> SessionHost {
+        let fake = Object::new();
+        Reflect::set(
+            &fake,
+            &"ready".into(),
+            &Promise::resolve(&JsValue::UNDEFINED),
+        )
+        .unwrap();
+        let create = Closure::wrap(Box::new(move |_options: JsValue| -> JsValue {
+            Promise::resolve(&writable).into()
+        }) as Box<dyn FnMut(JsValue) -> JsValue>);
+        Reflect::set(&fake, &"createUnidirectionalStream".into(), create.as_ref()).unwrap();
+        create.forget();
+        SessionHost::InPage(Rc::new(fake.unchecked_into::<WebTransport>()))
+    }
+
+    async fn settle() {
+        gloo_timers::future::TimeoutFuture::new(50).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_stream_depth_holds_frames_a_stalled_send_stream_has_not_taken() {
+        let (sink, parked) = parking_sink();
+        let transform = build_uplink_transform(&sink).expect("transform");
+        let host = in_page_host_over(across_a_port(transform.writable).await);
+        let streams = new_persistent_stream_map();
+        let depth = UplinkStreamDepth::default();
+        const FRAMES: u64 = 8;
+        const PAYLOAD: usize = 1_000;
+
+        for _ in 0..FRAMES {
+            WebTransportTask::send_on_persistent_stream(
+                host.clone(),
+                streams.clone(),
+                &depth,
+                3,
+                150,
+                vec![7_u8; PAYLOAD],
+                None,
+            );
+        }
+        let framed = (PAYLOAD as u64) + 4;
+        assert_eq!(
+            depth.bytes(3),
+            FRAMES * framed,
+            "every frame counts the moment it is handed over"
+        );
+
+        settle().await;
+        let held = depth.bytes(3);
+        assert!(
+            held > 0 && held < FRAMES * framed,
+            "with the send stream parked, the frames it has not taken stay counted \
+             and only the few the pipe holds retire: {held} of {}",
+            FRAMES * framed
+        );
+
+        for _ in 0..(FRAMES * 4) {
+            release_parked(&parked);
+            settle().await;
+            if depth.bytes(3) == 0 {
+                break;
+            }
+        }
+        assert_eq!(depth.bytes(3), 0, "a drained stream retires every frame");
+        assert_eq!(depth.bytes(2), 0, "and no other key was ever charged");
     }
 }
 

@@ -363,7 +363,7 @@ pub fn HsvColorPicker(props: HsvColorPickerProps) -> Element {
     let mut copied = use_signal(|| false);
     let on_copy = move |evt: Event<MouseData>| {
         evt.stop_propagation();
-        let text = hex_input.read().clone();
+        let text = current_hex.clone();
         if let Some(window) = web_sys::window() {
             let clipboard = window.navigator().clipboard();
             let promise = clipboard.write_text(&text);

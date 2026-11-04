@@ -17,9 +17,10 @@
  */
 
 use crate::components::attendants::PreAcquiredScreenStream;
+use crate::components::avatar::{SelfAvatar, SelfAvatarOrIcon};
+use crate::components::avatar_settings::SelfAvatarEditButton;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::components::handler_cell::use_handler_cell;
-use crate::components::icons::peer::PeerIcon;
 use crate::components::media_metrics_overlay::{
     media_metrics_overlay, MediaMetricsOverlay, MediaMetricsOverlayCtx,
 };
@@ -29,7 +30,10 @@ use crate::components::performance_settings::{
     PerfControlsHandle, PerformancePreference, ReceivedReader, ScreenSnapshotReader,
     SimulcastSummary, SnapshotReader,
 };
-use crate::components::transport_fallback::ActiveTransportCtx;
+use crate::components::share_actions::ScreenReplacementCell;
+use crate::components::transport_fallback::{
+    use_polled_active_transport, ACTIVE_TRANSPORT_POLL_MS,
+};
 use crate::constants::*;
 use crate::context::{
     load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
@@ -115,19 +119,59 @@ pub fn host_video_wrapper_style(
     }
 }
 
+fn note_device_pick(mut picks: Signal<u32>) {
+    picks.with_mut(|n| *n = n.wrapping_add(1));
+}
+
 /// A hidden self view must not paint a placeholder over the collapsed tile.
 pub fn show_camera_off_placeholder(video_enabled: bool, self_hidden: bool) -> bool {
     !video_enabled && !self_hidden
 }
 
+/// The self tile's camera-off placeholder; `on_edit_avatar` fires from its avatar.
+#[component]
+pub fn SelfCameraOffPlaceholder(self_in_grid: bool, on_edit_avatar: EventHandler<()>) -> Element {
+    if self_in_grid {
+        rsx! {
+            div {
+                class: "self-tile-camera-off",
+                div { class: "placeholder-content",
+                    SelfAvatarEditButton { on_edit: on_edit_avatar, SelfAvatar {} }
+                }
+            }
+        }
+    } else {
+        rsx! {
+            div {
+                style: "padding:var(--space-4); display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; width:100%; aspect-ratio:16/9;",
+                div { class: "placeholder-content",
+                    SelfAvatarEditButton { on_edit: on_edit_avatar,
+                        SelfAvatarOrIcon {
+                            svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                                path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                            }
+                        }
+                    }
+                    span { class: "placeholder-text", "Camera Off" }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn Host(
     share_screen: bool,
+    /// Bumped once the share's replacement capture is in the [`ScreenReplacementCell`].
+    #[props(default)]
+    screen_replace_nonce: u32,
     mic_enabled: bool,
     video_enabled: bool,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
     on_device_settings_toggle: EventHandler<()>,
+    on_edit_avatar: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
     /// Classified permission failures from the live encoders' real `getUserMedia`
@@ -167,8 +211,13 @@ pub fn Host(
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
-    let active_transport_ctx = try_use_context::<ActiveTransportCtx>();
+    let active_transport =
+        use_polled_active_transport(device_settings_open, ACTIVE_TRANSPORT_POLL_MS, || {
+            let client = client.clone();
+            move || client.active_transport()
+        });
     let pre_acquired_stream = use_context::<PreAcquiredScreenStream>();
+    let screen_replacement = use_context::<ScreenReplacementCell>();
 
     use_hook(videocall_client::capability_probe::spawn_capability_probe);
 
@@ -441,6 +490,7 @@ pub fn Host(
                 screen: None,
             },
             prev_share_screen: false,
+            prev_screen_replace_nonce: 0,
             prev_mic_enabled: false,
             prev_video_enabled: false,
             prev_device_settings_open: false,
@@ -735,6 +785,18 @@ pub fn Host(
                 s.encoder_settings.screen = None;
             }
         }
+        if s.prev_screen_replace_nonce != screen_replace_nonce {
+            s.prev_screen_replace_nonce = screen_replace_nonce;
+            if let Some(stream) = screen_replacement.take() {
+                if !s.screen.replace_stream(stream) {
+                    log::info!(
+                        "Screen share replacement refused: the share holds no capture \
+                         (before start/start_with_stream gives it one, after it ends, \
+                         or while a restart is acquiring a new one)"
+                    );
+                }
+            }
+        }
 
         // Microphone
         if s.prev_mic_enabled != mic_enabled {
@@ -816,12 +878,15 @@ pub fn Host(
         });
     }
 
+    let device_picks = use_signal(|| 0u32);
+
     // Device change handlers (Rc-wrapped so they can be shared between two components)
     let on_mic_change: Rc<dyn Fn(DeviceInfo)> = {
         let state = state.clone();
         Rc::new(move |audio: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.audio_inputs.select(&audio.device_id);
+            note_device_pick(device_picks);
             // Persist so the next pre-join screen restores this mic. (issue #959)
             save_preferred_mic_id(&audio.device_id);
             if s.microphone.select(audio.device_id.clone()) {
@@ -839,6 +904,7 @@ pub fn Host(
         Rc::new(move |video: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.video_inputs.select(&video.device_id);
+            note_device_pick(device_picks);
             // Persist so the next pre-join screen restores this camera. (issue #959)
             save_preferred_camera_id(&video.device_id);
             if s.camera.select(video.device_id.clone()) {
@@ -986,6 +1052,7 @@ pub fn Host(
         Rc::new(move |speaker: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.audio_outputs.select(&speaker.device_id);
+            note_device_pick(device_picks);
             // Persist so the next pre-join screen restores this speaker. (issue #959)
             save_preferred_speaker_id(&speaker.device_id);
             if let Err(e) = client.update_speaker_device(Some(speaker.device_id.clone())) {
@@ -1167,6 +1234,7 @@ pub fn Host(
     }
 
     // Get device data
+    let _ = device_picks();
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
     let cameras = s.media_devices.video_inputs.devices();
@@ -1230,27 +1298,7 @@ pub fn Host(
             // the LED and persists through camera on/off from a single site.
         }
         if show_camera_off_placeholder(video_enabled, self_hidden) {
-            if self_in_grid {
-                div {
-                    class: "self-tile-camera-off",
-                    div { class: "placeholder-content", PeerIcon {} }
-                }
-            } else {
-                div {
-                    style: "padding:var(--space-4); display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; width:100%; aspect-ratio:16/9;",
-                    div { class: "placeholder-content",
-                        svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                            path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
-                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
-                        }
-                        span { class: "placeholder-text", "Camera Off" }
-                    }
-                    // Issue 1885: the transport badge is rendered once in the
-                    // `.host-tile-chrome` cluster (attendants.rs), a direct `.host`
-                    // child, so it already persists through camera-off — no per-branch
-                    // copy is needed here (this is what removed the LED overlap).
-                }
-            }
+            SelfCameraOffPlaceholder { self_in_grid, on_edit_avatar }
         }
 
         // Device Settings Menu Button
@@ -1288,11 +1336,7 @@ pub fn Host(
                     visible: device_settings_open,
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
-                    active_transport: if device_settings_open {
-                        active_transport_ctx.and_then(|ctx| (ctx.0)())
-                    } else {
-                        None
-                    },
+                    active_transport: active_transport,
                     initial_section: device_settings_initial_section.clone(),
                 }
             }
@@ -1343,6 +1387,7 @@ struct HostState {
     media_devices: MediaDeviceList,
     encoder_settings: EncoderSettings,
     prev_share_screen: bool,
+    prev_screen_replace_nonce: u32,
     prev_mic_enabled: bool,
     prev_video_enabled: bool,
     prev_device_settings_open: bool,

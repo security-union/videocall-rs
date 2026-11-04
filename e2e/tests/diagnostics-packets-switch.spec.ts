@@ -232,6 +232,21 @@ async function waitForDiagnosticsWindow(clock: Peer, peers: Peer[], beats = 5): 
   ).toBeGreaterThanOrEqual(beats);
 }
 
+async function openRawStatsBlock(peer: Peer, heading: string) {
+  await wakeControls(peer.page);
+  await peer.page
+    .locator("button", { has: peer.page.locator("span.tooltip", { hasText: "Open Diagnostics" }) })
+    .click();
+  const drawer = peer.page.locator("#diagnostics-sidebar");
+  await expect(drawer).toBeVisible({ timeout: 10_000 });
+  const rawSummary = drawer.locator("summary#diag-h-raw-stats");
+  await rawSummary.scrollIntoViewIfNeeded();
+  await rawSummary.click();
+  return drawer
+    .locator("details.diag-disclosure:has(> summary#diag-h-raw-stats) .diag-raw-block")
+    .filter({ has: peer.page.locator("h4", { hasText: heading }) });
+}
+
 async function expectStillSendsAndReceives(off: Peer): Promise<void> {
   expect(
     avSent(off),
@@ -244,19 +259,7 @@ async function expectStillSendsAndReceives(off: Peer): Promise<void> {
     `switch-OFF peer stopped sending HEALTH (${summary(off)})`,
   ).toBeGreaterThanOrEqual(2);
 
-  await wakeControls(off.page);
-  await off.page
-    .locator("button", { has: off.page.locator("span.tooltip", { hasText: "Open Diagnostics" }) })
-    .click();
-  const drawer = off.page.locator("#diagnostics-sidebar");
-  await expect(drawer).toBeVisible({ timeout: 10_000 });
-  const rawSummary = drawer.locator("summary#diag-h-raw-stats");
-  await rawSummary.scrollIntoViewIfNeeded();
-  await rawSummary.click();
-  const reception = drawer
-    .locator("details.diag-disclosure:has(> summary#diag-h-raw-stats) .diag-raw-block")
-    .filter({ has: off.page.locator("h4", { hasText: "Reception Stats" }) })
-    .locator("pre");
+  const reception = (await openRawStatsBlock(off, "Reception Stats")).locator("pre");
   await expect
     .poll(
       async () => {
@@ -291,30 +294,36 @@ test.describe("DiagnosticsPacket send switch (?diag_packets / diagnosticsPackets
     browsers = [];
   });
 
-  test("?diag_packets=0 on the meeting URL stops DIAGNOSTICS; the default peer still sends them", async ({
+  test("the default peer sends no DIAGNOSTICS; ?diag_packets=1 on the meeting URL sends them", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `diag_url_${Date.now()}`;
-    const control = await newPeer(await launch(), "diag-ctl@videocall.rs", uiURL);
-    const off = await newPeer(await launch(), "diag-off@videocall.rs", uiURL);
+    const off = await newPeer(await launch(), "diag-ctl@videocall.rs", uiURL);
+    const on = await newPeer(await launch(), "diag-on@videocall.rs", uiURL);
 
-    await submitHomeForm(control.page, "/", meetingId, "diag-control");
-    await enterGrid(control.page, { disableWaitingRoom: true });
+    await submitHomeForm(off.page, "/", meetingId, "diag-default");
+    await enterGrid(off.page, { disableWaitingRoom: true });
 
-    await off.page.context().addInitScript(() => {
-      window.localStorage.setItem("vc_display_name", "diag-off");
+    await on.page.context().addInitScript(() => {
+      window.localStorage.setItem("vc_display_name", "diag-on");
     });
-    await off.page.goto(`/meeting/${meetingId}?diag_packets=0`);
-    expect(new URL(off.page.url()).searchParams.get("diag_packets")).toBe("0");
-    await enterGrid(off.page, { admitBy: control.page });
+    await on.page.goto(`/meeting/${meetingId}?diag_packets=1`);
+    await enterGrid(on.page, { admitBy: off.page });
 
-    await expectSwitchLog(control, "ENABLED", "default");
-    await expectSwitchLog(off, "DISABLED", "url");
+    await expectSwitchLog(off, "DISABLED", "default");
+    await expectSwitchLog(on, "ENABLED", "url");
 
-    await waitForDiagnosticsWindow(control, [off]);
+    await waitForDiagnosticsWindow(on, [off]);
     expectNoDiagnostics(off);
+
+    // Each drawer's Sending Stats is fed only by DIAGNOSTICS its peer sends.
+    const onSending = await openRawStatsBlock(on, "Sending Stats");
+    const offSending = await openRawStatsBlock(off, "Sending Stats");
+    await expect(offSending.locator("pre")).toContainText("Sender:", { timeout: 15_000 });
+    await on.page.waitForTimeout(2_000);
+    await expect(onSending.locator("p")).toHaveText("No sending data available.");
   });
 
   test('config "0" is a ceiling: OFF alone and with ?diag_packets=1 (source=config)', async ({
@@ -355,7 +364,9 @@ test.describe("DiagnosticsPacket send switch (?diag_packets / diagnosticsPackets
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `diag_nav_${Date.now()}`;
-    const host = await newPeer(await launch(), "diag-host@videocall.rs", uiURL);
+    const host = await newPeer(await launch(), "diag-host@videocall.rs", uiURL, {
+      diagnosticsPacketsEnabled: "1",
+    });
     const off = await newPeer(await launch(), "diag-nav@videocall.rs", uiURL, {
       diagnosticsPacketsEnabled: "1",
     });
@@ -369,7 +380,7 @@ test.describe("DiagnosticsPacket send switch (?diag_packets / diagnosticsPackets
     await enterGrid(off.page, { admitBy: host.page });
     expect(new URL(off.page.url()).searchParams.has("diag_packets")).toBe(false);
 
-    await expectSwitchLog(host, "ENABLED", "default");
+    await expectSwitchLog(host, "ENABLED", "config");
     await expectSwitchLog(off, "DISABLED", "url");
 
     await waitForDiagnosticsWindow(host, [off]);

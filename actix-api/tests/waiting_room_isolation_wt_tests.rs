@@ -330,10 +330,19 @@ async fn connect_wt_with_token(
     token: &str,
     wt_port: u16,
 ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
-    let url = format!(
-        "https://127.0.0.1:{wt_port}/lobby?token={}",
-        urlencoding::encode(token)
-    );
+    connect_wt_path(
+        &format!("lobby?token={}", urlencoding::encode(token)),
+        wt_port,
+    )
+    .await
+}
+
+/// Connect to the WT server at `https://127.0.0.1:{wt_port}/{path_and_query}`.
+async fn connect_wt_path(
+    path_and_query: &str,
+    wt_port: u16,
+) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
+    let url = format!("https://127.0.0.1:{wt_port}/{path_and_query}");
     let url = url::Url::parse(&url)?;
     let client = web_transport_quinn::ClientBuilder::new()
         .dangerous()
@@ -523,6 +532,28 @@ fn make_media_packet(sender_user_id: &str) -> Vec<u8> {
     make_media_packet_typed(sender_user_id, MediaType::AUDIO)
 }
 
+async fn ws_send_heartbeat(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    user_id: &str,
+) {
+    ws.send(Message::Binary(make_media_packet_typed(
+        user_id,
+        MediaType::HEARTBEAT,
+    )))
+    .await
+    .expect("heartbeat send should succeed");
+}
+
+async fn wt_send_heartbeat(session: &web_transport_quinn::Session, user_id: &str) {
+    wt_send_via_unistream(
+        session,
+        make_media_packet_typed(user_id, MediaType::HEARTBEAT),
+    )
+    .await;
+}
+
 /// Build a non-MEDIA PacketWrapper of the given type, ready to send.
 fn make_packet_of_type(sender_user_id: &str, packet_type: PacketType) -> Vec<u8> {
     let mut wrapper = PacketWrapper::new();
@@ -564,6 +595,7 @@ async fn test_wt_admitted_receives_media_from_ws_admitted() {
         .await
         .expect("WT admitted connection should succeed");
     let persistent = wt_wait_for_session_assigned(&wt_session).await;
+    wt_send_heartbeat(&wt_session, "bob@test.com").await;
 
     // Give the server time to fully register both sessions.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -619,6 +651,7 @@ async fn test_wt_admitted_inbound_unistream_reaches_ws_peer() {
     let mut ws = ws_connect_with_token(ws_port, &token_ws).await;
     let _sid_ws = ws_wait_for_session_assigned(&mut ws).await;
     ws_wait_for_meeting_started(&mut ws).await;
+    ws_send_heartbeat(&mut ws, "alice@test.com").await;
 
     // Admitted participant connects via WT.
     let token_wt = make_admitted_token("bob@test.com", room, "Bob");
@@ -680,6 +713,7 @@ async fn test_wt_admitted_inbound_datagram_reaches_ws_peer() {
     let mut ws = ws_connect_with_token(ws_port, &token_ws).await;
     let _sid_ws = ws_wait_for_session_assigned(&mut ws).await;
     ws_wait_for_meeting_started(&mut ws).await;
+    ws_send_heartbeat(&mut ws, "alice@test.com").await;
 
     // Admitted participant connects via WT.
     let token_wt = make_admitted_token("bob@test.com", room, "Bob");
@@ -746,6 +780,7 @@ async fn test_wt_observer_does_not_receive_media() {
         .await
         .expect("WT observer connection should succeed");
     let persistent = wt_wait_for_session_assigned(&wt_session).await;
+    wt_send_heartbeat(&wt_session, "observer@test.com").await;
 
     // Give the server time to fully register both sessions.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -798,6 +833,7 @@ async fn test_wt_observer_inbound_media_via_unistream_is_dropped() {
     let mut ws_admitted = ws_connect_with_token(ws_port, &token_admitted).await;
     let _sid_admitted = ws_wait_for_session_assigned(&mut ws_admitted).await;
     ws_wait_for_meeting_started(&mut ws_admitted).await;
+    ws_send_heartbeat(&mut ws_admitted, "bob@test.com").await;
 
     // Observer connects via WT.
     let token_observer = make_observer_token("observer@test.com", room, "Observer");
@@ -853,6 +889,7 @@ async fn test_wt_observer_inbound_media_via_datagram_is_dropped() {
     let mut ws_admitted = ws_connect_with_token(ws_port, &token_admitted).await;
     let _sid_admitted = ws_wait_for_session_assigned(&mut ws_admitted).await;
     ws_wait_for_meeting_started(&mut ws_admitted).await;
+    ws_send_heartbeat(&mut ws_admitted, "charlie@test.com").await;
 
     // Observer connects via WT.
     let token_observer = make_observer_token("observer@test.com", room, "Observer");
@@ -918,6 +955,7 @@ async fn test_wt_observer_receives_only_allowlisted_packets() {
         .await
         .expect("WT observer connection should succeed");
     let persistent = wt_wait_for_session_assigned(&wt_session).await;
+    wt_send_heartbeat(&wt_session, "observer@test.com").await;
 
     // Give the server time to fully register both sessions.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -968,5 +1006,197 @@ async fn test_wt_observer_receives_only_allowlisted_packets() {
     );
 
     drop(ws_admitted);
+    drop(wt_session);
+}
+
+async fn wt_wait_for_meeting_started(session: &web_transport_quinn::Session) -> MeetingPacket {
+    let mut persistent: Option<web_transport_quinn::RecvStream> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let (data, stream) = wt_read_one(session, persistent, Duration::from_millis(200)).await;
+        persistent = stream;
+        let Some(wrapper) = data.and_then(|p| PacketWrapper::parse_from_bytes(&p).ok()) else {
+            continue;
+        };
+        if wrapper.packet_type != PacketType::MEETING.into() {
+            continue;
+        }
+        if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+            if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
+                return meeting;
+            }
+        }
+    }
+    panic!("Timeout waiting for WT MEETING_STARTED");
+}
+
+// =========================================================================
+// #3285: `?conn_seq=` reaches the activation's EvictInstance broadcast
+// =========================================================================
+
+const EVICT_INSTANCE_SUBJECT_3285: &str = "internal.evict_instance";
+
+async fn evict_subscription_3285() -> async_nats::Subscriber {
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .expect("Failed to connect to NATS");
+    let sub = nats_client
+        .subscribe(EVICT_INSTANCE_SUBJECT_3285)
+        .await
+        .expect("subscribe evict subject");
+    nats_client.flush().await.expect("flush subscription");
+    sub
+}
+
+/// The first EvictInstance payload naming `instance_id` within `window`.
+async fn next_eviction_for_3285(
+    sub: &mut async_nats::Subscriber,
+    instance_id: &str,
+    window: Duration,
+) -> Option<serde_json::Value> {
+    tokio::time::timeout(window, async {
+        while let Some(msg) = sub.next().await {
+            let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&msg.payload) else {
+                continue;
+            };
+            if payload["instance_id"] == instance_id {
+                return Some(payload);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[actix_rt::test]
+#[serial]
+async fn test_wt_meeting_started_carries_the_token_meeting_start_as_authoritative() {
+    let ws_port = WT_ISO_WS_PORT_BASE + 9;
+    let wt_port = WT_ISO_WT_PORT_BASE + 9;
+    setup_ws_and_wt_server(ws_port, wt_port).await;
+
+    let now = chrono::Utc::now().timestamp();
+    let room = format!("wt-start-3237-{now}");
+    let started_ms = (now - 15) * 1000 + 123;
+    let token = meeting_api::token::generate_room_token_at(
+        JWT_SECRET,
+        TOKEN_TTL_SECS,
+        now,
+        "late@test.com",
+        &room,
+        false,
+        "Late",
+        false,
+        false,
+        Some(started_ms),
+    )
+    .expect("room token");
+
+    let wt_session = connect_wt_with_token(&token, wt_port)
+        .await
+        .expect("WT connection should succeed");
+    let started = wt_wait_for_meeting_started(&wt_session).await;
+    assert_eq!(started.start_time_ms, started_ms as u64);
+    assert!(started.start_time_authoritative);
+
+    drop(wt_session);
+}
+
+#[actix_rt::test]
+#[serial]
+async fn test_wt_token_connect_conn_seq_reaches_eviction_broadcast_3285() {
+    let ws_port = WT_ISO_WS_PORT_BASE + 7;
+    let wt_port = WT_ISO_WT_PORT_BASE + 7;
+    setup_ws_and_wt_server(ws_port, wt_port).await;
+    let (room, user, iid) = ("wt-3285-conn-seq", "seq@test.com", "iid-wt-3285-token");
+    let mut sub = evict_subscription_3285().await;
+
+    let token = make_admitted_token(user, room, "Seq");
+    let wt_session = connect_wt_path(
+        &format!(
+            "lobby?token={}&instance_id={iid}&conn_seq=9",
+            urlencoding::encode(&token)
+        ),
+        wt_port,
+    )
+    .await
+    .expect("WT token connection should succeed");
+    let _persistent = wt_wait_for_session_assigned(&wt_session).await;
+    wt_send_heartbeat(&wt_session, user).await;
+
+    let payload = next_eviction_for_3285(&mut sub, iid, Duration::from_secs(5))
+        .await
+        .expect("activation should publish an EvictInstance for this instance");
+    assert_eq!(payload["new_conn_seq"], 9, "payload: {payload}");
+    assert_eq!(payload["room"], room);
+    assert_eq!(payload["user_id"], user);
+    assert!(payload["origin_relay"].is_u64(), "payload: {payload}");
+    assert!(payload["new_session_id"].is_u64(), "payload: {payload}");
+
+    drop(wt_session);
+}
+
+#[actix_rt::test]
+#[serial]
+async fn test_wt_meeting_started_without_a_token_start_is_not_authoritative() {
+    let ws_port = WT_ISO_WS_PORT_BASE + 10;
+    let wt_port = WT_ISO_WT_PORT_BASE + 10;
+    setup_ws_and_wt_server(ws_port, wt_port).await;
+
+    let now = chrono::Utc::now().timestamp();
+    let room = format!("wt-start-3237-claimless-{now}");
+    let token = meeting_api::token::generate_room_token_at(
+        JWT_SECRET,
+        TOKEN_TTL_SECS,
+        now,
+        "late@test.com",
+        &room,
+        false,
+        "Late",
+        false,
+        false,
+        None,
+    )
+    .expect("room token");
+
+    let wt_session = connect_wt_with_token(&token, wt_port)
+        .await
+        .expect("WT connection should succeed");
+    let started = wt_wait_for_meeting_started(&wt_session).await;
+    assert!(started.start_time_ms >= (now * 1000) as u64);
+    assert!(!started.start_time_authoritative);
+
+    drop(wt_session);
+}
+
+#[actix_rt::test]
+#[serial]
+async fn test_wt_tokenless_connect_drops_reconnect_hints_3285() {
+    let ws_port = WT_ISO_WS_PORT_BASE + 8;
+    let wt_port = WT_ISO_WT_PORT_BASE + 8;
+    setup_ws_and_wt_server(ws_port, wt_port).await;
+    FeatureFlags::set_meeting_management_override(false);
+    let (room, user, iid) = ("wt-3285-tokenless", "nouser", "iid-wt-3285-tokenless");
+    let mut sub = evict_subscription_3285().await;
+
+    let wt_session = connect_wt_path(
+        &format!("lobby/{user}/{room}?instance_id={iid}&conn_seq=9"),
+        wt_port,
+    )
+    .await
+    .expect("deprecated WT connection should succeed with the flag off");
+    let _persistent = wt_wait_for_session_assigned(&wt_session).await;
+    wt_send_heartbeat(&wt_session, user).await;
+
+    let payload = next_eviction_for_3285(&mut sub, iid, Duration::from_secs(2)).await;
+    FeatureFlags::clear_meeting_management_override();
+    assert!(
+        payload.is_none(),
+        "a tokenless connect must not register the claimed instance: {payload:?}"
+    );
+
     drop(wt_session);
 }

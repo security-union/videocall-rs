@@ -198,7 +198,7 @@ REFUSALS = [
                            "relay_keyframe_requests_total")}), "at most 2 known relay counters"),
     ("an exemption without a reason", lambda d: d["scoring"].update(
         relay_path_exemptions={"relay_layer_filtered_total": " "}), "each with a reason"),
-    ("cluster target", lambda d: d["run"].update(target="cluster"), "cluster runs come with PR-8"),
+    ("cluster target", lambda d: d["run"].update(target="cluster"), "run.target: must be one of local, ci, hcl-daily"),
     ("two steps", lambda d: d["steps"].append({"id": "n2", "hold": "5m", "headline": False}),
      "exactly one step (D4)"),
     ("a short hold", lambda d: d["steps"][0].update(hold="59s"), "at least 60 s"),
@@ -317,6 +317,85 @@ class Refusals(unittest.TestCase):
     def test_a_bad_run_id_is_refused(self):
         with self.assertRaisesRegex(cq_scenario.ScenarioError, "must match"):
             compile_doc(base(), run_id="CQ_local")
+
+
+class ProbePosture(unittest.TestCase):
+    """#2914 PR-5: browser probes default to decode budget off, and the plan labels that waiver."""
+
+    def test_off_is_the_default_and_is_labelled(self):
+        plan = compile_doc(base())
+        probes = [p for p in plan["processes"] if p["fleet"] == "browser"]
+        self.assertEqual({p["decode_budget"] for p in probes}, {"off"})
+        self.assertEqual({p.get("decode_budget") for p in plan["participants"] if p["fleet"] == "browser"}, {"off"})
+        self.assertNotIn("decode_budget", next(p for p in plan["participants"] if p["fleet"] == "rust"))
+        self.assertEqual(plan["fidelity_waivers"], [cq_scenario.DECODE_BUDGET_WAIVER])
+
+    def test_client_carries_no_waiver(self):
+        plan = compile_doc(edit(lambda d: d["population"][0].update(decode_budget="client")))
+        self.assertEqual({p["decode_budget"] for p in plan["processes"] if p["fleet"] == "browser"}, {"client"})
+        self.assertEqual(plan["fidelity_waivers"], [])
+
+    def test_a_declared_waiver_is_not_repeated(self):
+        plan = compile_doc(edit(lambda d: d["run"].update(fidelity_waivers=[cq_scenario.DECODE_BUDGET_WAIVER])))
+        self.assertEqual(plan["fidelity_waivers"], [cq_scenario.DECODE_BUDGET_WAIVER])
+
+    def test_skip_paint_and_diag_packets_off_reach_the_probe_process_and_skip_paint_is_a_waiver(self):
+        plan = compile_doc(edit(lambda d: d["population"][0].update(decode_budget="client", skip_canvas_paint=True,
+                                                                      diag_packets="off")))
+        self.assertEqual({(p["skip_canvas_paint"], p["diag_packets"]) for p in plan["processes"]
+                          if p["fleet"] == "browser"}, {(True, "off")})
+        self.assertEqual(plan["fidelity_waivers"], [cq_scenario.SKIP_PAINT_WAIVER,
+                                                    cq_scenario.PROBE_DIAG_PACKETS_OFF_WAIVER])
+        self.assertIn("painted fps, paint lag and render freezes are not observed", cq_scenario.SKIP_PAINT_WAIVER)
+        plan = compile_doc(edit(lambda d: d["run"].update(fidelity_waivers=[cq_scenario.SKIP_PAINT_WAIVER])
+                                or d["population"][0].update(skip_canvas_paint=True)))
+        self.assertEqual(plan["fidelity_waivers"], [cq_scenario.SKIP_PAINT_WAIVER, cq_scenario.DECODE_BUDGET_WAIVER])
+
+    def test_rust_bot_diagnostics_are_off_by_default_and_on_is_a_waiver(self):
+        plan = compile_doc(edit(lambda d: d["population"][0].update(decode_budget="client")))
+        self.assertEqual((plan["bot_diagnostics"], plan["fidelity_waivers"]), ("off", []))
+        plan = compile_doc(edit(lambda d: d["population"][0].update(decode_budget="client")
+                                or d["run"].update(bot_diagnostics="on")))
+        self.assertEqual((plan["bot_diagnostics"], plan["fidelity_waivers"]),
+                         ("on", [cq_scenario.BOT_DIAGNOSTICS_ON_WAIVER]))
+        with self.assertRaises(cq_scenario.ScenarioError) as cm:
+            compile_doc(edit(lambda d: d["run"].update(bot_diagnostics="quiet")))
+        self.assertIn("run.bot_diagnostics: must be on or off", cm.exception.errors)
+
+    def test_speaking_glow_off_reaches_the_probe_process_and_is_a_waiver(self):
+        plan = compile_doc(edit(lambda d: d["population"][0].update(decode_budget="client", speaking_glow="off")))
+        self.assertEqual({p["speaking_glow"] for p in plan["processes"] if p["fleet"] == "browser"}, {"off"})
+        self.assertEqual(plan["fidelity_waivers"], [cq_scenario.SPEAKING_GLOW_WAIVER])
+        plan = compile_doc(edit(lambda d: d["population"][0].update(decode_budget="client")))
+        self.assertEqual({p["speaking_glow"] for p in plan["processes"] if p["fleet"] == "browser"}, {"client"})
+        self.assertEqual(plan["fidelity_waivers"], [])
+        for fn, needle in ((lambda d: d["population"][0].update(speaking_glow="dim"), "must be client or off"),
+                           (lambda d: d["population"][3].update(speaking_glow="off"), "speaking_glow: only")):
+            with self.assertRaises(cq_scenario.ScenarioError) as cm:
+                compile_doc(edit(fn))
+            self.assertTrue(any(needle in e for e in cm.exception.errors), cm.exception.errors)
+
+    def test_probes_paint_and_keep_diag_packets_by_default(self):
+        plan = compile_doc(base())
+        self.assertEqual({(p["skip_canvas_paint"], p["diag_packets"]) for p in plan["processes"]
+                          if p["fleet"] == "browser"}, {(False, "default")})
+        self.assertNotIn(cq_scenario.SKIP_PAINT_WAIVER, plan["fidelity_waivers"])
+
+    def test_bad_paint_and_diag_postures_are_refused(self):
+        for fn, needle in ((lambda d: d["population"][0].update(skip_canvas_paint="yes"), "must be true or false"),
+                           (lambda d: d["population"][0].update(diag_packets="none"), "must be default or off"),
+                           (lambda d: d["population"][3].update(skip_canvas_paint=True), "skip_canvas_paint: only"),
+                           (lambda d: d["population"][3].update(diag_packets="off"), "diag_packets: only")):
+            with self.assertRaises(cq_scenario.ScenarioError) as cm:
+                compile_doc(edit(fn))
+            self.assertTrue(any(needle in e for e in cm.exception.errors), cm.exception.errors)
+
+    def test_bad_postures_are_refused(self):
+        for fn, needle in ((lambda d: d["population"][0].update(decode_budget="auto"), "must be off or client"),
+                           (lambda d: d["population"][3].update(decode_budget="off"), "only browser probes")):
+            with self.assertRaises(cq_scenario.ScenarioError) as cm:
+                compile_doc(edit(fn))
+            self.assertTrue(any(needle in e for e in cm.exception.errors), cm.exception.errors)
 
 
 class RunId(unittest.TestCase):

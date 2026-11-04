@@ -47,28 +47,6 @@ if (window.__APP_CONFIG) {
     // (production behavior). Omit or set "false" to hide; "true" shows them.
     // showBuildGitInfo: "false",
 
-    // Smatter chat integration local setup:
-    // keep these meet.localhost/id.localhost values out of config.js so the
-    // committed default remains generic for normal local dev and CI. Enable
-    // them only in your gitignored config.local.js when running the same-origin
-    // Caddy edge described in docs/Smatter-Integrate-Testing.md.
-    // apiBaseUrl: "https://meet.localhost",
-    // wsUrl: "wss://meet.localhost",
-    // oauthEnabled: "true",
-    // webTransportEnabled: "false",
-    // oauthProvider: "google",
-    // oauthAuthUrl: "https://id.localhost/oauth/authorize",
-    // oauthClientId: "<your-videocall-client-id>",
-    // oauthRedirectUrl: "https://meet.localhost/auth/callback",
-    // oauthIssuer: "https://id.localhost",
-    // oauthFlow: "pkce",
-
-    // Base URL prefix for the JMAP chat endpoints (/jmap, /sse/session, /sse).
-    // Leave empty (the default) for same-origin via the Caddy edge — required
-    // for the first-party SameSite=Lax SSE cookie. Set to an absolute origin
-    // only when chat is served from a different origin.
-    // jmapBaseUrl: "",
-
     // Issue #2728 rollback lever. The WebTransport session runs in a dedicated
     // Worker so a main-thread stall cannot starve the receive path. Set to "0"
     // to put it back on the main thread without a rebuild. Production default is
@@ -85,10 +63,14 @@ if (window.__APP_CONFIG) {
     // `docs/DEPLOYMENT_CONFIG_MAP.md`.
     // defaultTransport: "websocket",
 
-    // Stop sending DiagnosticsPackets ("0"/"false"/"off"/"no"). Absent means
-    // ON. A falsy value is authoritative: a `?diag_packets=` URL param cannot
-    // re-enable it. When this key allows sending, `?diag_packets=0` on the
-    // page-load URL can still turn it off for that tab.
-    // diagnosticsPacketsEnabled: "0",
+    // Rollback switch: "false" plays remote audio through the main thread
+    // again instead of straight from each NetEQ worker. Absent means ON.
+    // audioDirectPcm: "false",
+
+    // Send DiagnosticsPackets ("1"/"true"/"on"/"yes"). Absent means OFF. A
+    // falsy value is authoritative: a `?diag_packets=` URL param cannot enable
+    // it. Otherwise `?diag_packets=1` or `=0` on the page-load URL sets it for
+    // that tab.
+    // diagnosticsPacketsEnabled: "1",
   });
 }

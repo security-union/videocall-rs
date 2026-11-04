@@ -6,7 +6,7 @@
     "scrape_step_s": {"value": 15, "status": "proposal"}
   },
   "bands": {
-    "A": {"green": 0.01, "red": 0.05, "unit": "concealed share of continuous talker audio", "status": "proposal"},
+    "A": {"green": 0.01, "red": 0.05, "unit": "unusable share of continuous talker audio", "status": "proposal"},
     "V": {"green": 0.005, "red": 0.03, "unit": "freeze share of decoded tile-time", "status": "proposal"},
     "L": {"green": 100, "red": 300, "unit": "p95 audio-timestamp delay, ms (absolute on synced clocks, else excess over the pair's window minimum)", "status": "proposal"},
     "Q": {"green": 0.01, "red": 0.1, "unit": "share of tile-time with 0 < decoded video fps < 5", "status": "proposal"},
@@ -16,7 +16,14 @@
     "nominal_talker_pps": {"value": 50, "status": "proposal"},
     "talker_min_pps": {"value": 45, "status": "proposal"},
     "expand_ops_full_scale": {"value": 100, "status": "proposal"},
-    "near_frozen_fps": {"value": 5, "status": "proposal"}
+    "near_frozen_fps": {"value": 5, "status": "proposal"},
+    "discard_weight": {"value": 1.0, "status": "proposal", "note": "dimension A: each 20 ms packet NetEQ discarded (smart_flush, resync_to_live) is 20 ms of late talker audio; a bucket's discarded time counts only where it exceeds the concealment and playout silence already booked there, because discards cut the audio a stall already concealed or silenced; overrides may only raise it"},
+    "playout_underrun_weight": {"value": 1.0, "status": "proposal", "note": "dimension A: each ms the receiver's AudioWorklet played silence while the source's audio flowed (#3281) counts as 1 ms of unusable talker audio, added to concealment; an absent series is not measured, never 0; overrides may only raise it"}
+  },
+  "diagnostics": {
+    "correlated_freeze_share": {"value": 0.8, "status": "proposal", "note": "a scrape bucket where at least this share of a receiver's camera pairs that decoded during the hold accrued freeze time is reported as froze together; never gated"},
+    "correlated_freeze_min_pairs": {"value": 3, "status": "proposal", "note": "a receiver with fewer camera pairs that decoded during the hold is not evaluated"},
+    "target_delay_cap_ms": {"value": 300, "status": "proposal", "note": "NetEQ's maximum target delay on the wasm path (RESYNC_MAX_DELAY_MS); the diagnostic reports the share of samples at it; never gated"}
   },
   "quality_gates": {
     "k_red_fail": {"value": 2, "status": "proposal"},
@@ -30,6 +37,9 @@
   "latency_gate": {
     "audio_delay_metric": {"value": null, "status": "proposal", "note": "per-pair audio-timestamp delay series; the client metric does not exist yet (#2948). null = gate not yet measurable"},
     "allowed_unmeasured": {"value": true, "status": "proposal", "note": "lets G-Q5 stay unmeasured only while audio_delay_metric is null; set false when #2948 lands"}
+  },
+  "server_diagnostics": {
+    "throttle_pod_selector": {"value": null, "status": "proposal", "note": "label matchers naming the relay and NATS pods only, for the CFS throttling diagnostic; null = not collected. Set by the runner from the target profile"}
   },
   "validity_gates": {
     "health_reports_min_ratio": {"value": 0.95, "status": "proposal", "note": "calibration pending: measure the ratio and its spread on one clean run on a dedicated metrics-api"},

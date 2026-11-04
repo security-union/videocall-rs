@@ -133,6 +133,7 @@ class Harness:
             self.result = self.runner.run()
         except KeyboardInterrupt:
             self.tc.fail("KeyboardInterrupt escaped Runner.run")
+        self.tc.assertLessEqual(self.clock.sleeps, self.clock.max_sleeps or float("inf"), "the sleep cap tripped")
         return self.result
 
     def lines(self, kind=None):
@@ -167,12 +168,12 @@ class HealthyRun(unittest.TestCase):
         self.assertEqual((run["verdict"], run["exit_code"], h.failed(), run["error"]), ("PASS", 0, [], None))
         kinds = [e["type"] for e in h.lines()]
         firsts = [k for k, _ in itertools.groupby(kinds)]
-        self.assertEqual(firsts, ["preflight", "stack_ready", "join_start", "launched", "joined", "hold_start",
-                                  "hold_end", "teardown_start", "stopped", "collected", "scored", "done"])
+        self.assertEqual(firsts, ["preflight", "stack_ready", "join_start", "launched", "joined", "launched", "joined",
+                                  "hold_start", "hold_end", "teardown_start", "stopped", "collected", "scored", "done"])
         self.assertEqual(h.mark("join_start"), 940.0)
-        self.assertEqual(h.mark("hold_start"), 1000.0)
-        self.assertEqual(h.mark("hold_end"), 1600.0)
-        self.assertEqual(h.mark("teardown_start"), 1630.0)
+        self.assertEqual(h.mark("hold_start"), 1016.0)
+        self.assertEqual(h.mark("hold_end"), 1616.0)
+        self.assertEqual(h.mark("teardown_start"), 1646.0)
         self.assertTrue(os.path.exists(os.path.join(h.dir, "manifest.json")))
         self.assertEqual(h.stack.calls, [("up", "up"), ("down",)])
 
@@ -241,6 +242,15 @@ class Timeline(unittest.TestCase):
                 self.assertGreaterEqual(td, he + cq_runner.TEARDOWN_DELAY_S)
                 self.assertEqual(h.result["verdict"], "PASS", h.result["gates"])
 
+    def test_with_no_probe_the_hold_waits_for_rust_media_to_settle(self):
+        text = scenario_text().replace(
+            "  - {role: probe-ref, fleet: browser, count: 10, media: {camera: on, mic: muted}, join_stagger: 1s}\n", "")
+        plan = cq_scenario.compile_scenario(cq_scenario.parse_yaml(text), run_id=RUN_ID,
+                                            scenario_file="external:t.yaml", scenario_sha256="0" * 64)
+        h = Harness(self, plan=plan, fleet={"media_delay": 40.0})
+        h.run()
+        self.assertEqual(h.mark("hold_start"), 940.0 + 40.0 + cq_runner.MEDIA_SETTLE_S)
+
     def test_hold_marks_are_the_reached_times_not_the_planned_ones(self):
         h = Harness(self)
         h.clock.sleep = lambda s: h.clock.advance(s + 0.375) if s > 0 else None
@@ -259,16 +269,18 @@ class Timeline(unittest.TestCase):
         h.run()
         lines = h.lines("event")
         self.assertEqual([(e["event_id"], e["action"], e["t_issued"]) for e in lines],
-                         [("e0", "unmute", 1060.0), ("e1", "mute", 1120.0)])
-        self.assertEqual([e["t_confirmed"] for e in lines], [1060.5, 1120.5])
+                         [("e0", "unmute", 1076.0), ("e1", "mute", 1136.0)])
+        self.assertEqual([e["t_confirmed"] for e in lines], [1076.5, 1136.5])
         self.assertEqual(h.result["verdict"], "PASS")
 
-    def test_probes_launch_staggered_then_rust(self):
+    def test_rust_launches_first_and_probes_follow_staggered_once_rust_media_started(self):
         h = Harness(self, stagger="2s")
         h.run()
         launched = [(e["proc_id"], e["wall"]) for e in h.lines("launched")]
-        self.assertEqual([w for _, w in launched[:10]], [940.0 + 2 * k for k in range(10)])
-        self.assertEqual([p for p, _ in launched[10:]], ["rust-pub", "rust-role-viewers"])
+        self.assertEqual(launched[:2], [("rust-pub", 940.0), ("rust-role-viewers", 940.0)])
+        media = max(e["media_started_at"] for e in h.lines("joined") if e["media_started_at"])
+        self.assertEqual(media, 940.0 + h.fleet.media_delay)
+        self.assertEqual([w for _, w in launched[2:]], [media + 2 * k for k in range(10)])
 
     def test_teardown_stops_every_rust_process_before_any_probe(self):
         h = Harness(self)
@@ -301,7 +313,7 @@ class StoppedLines(unittest.TestCase):
         h.run()
         line = next(e for e in h.lines("stopped") if e["proc_id"] == "probe-03")
         self.assertEqual(line["wall"], crash)
-        self.assertEqual(line["logged"]["wall"], 1105.0)
+        self.assertEqual(line["logged"]["wall"], 1106.0)
         self.assertIn("probe-03", h.gate("R5")["detail"])
         self.assertEqual(h.result["verdict"], "INVALID")
 
@@ -316,7 +328,7 @@ class StoppedLines(unittest.TestCase):
                 self.assertEqual(h.result["verdict"], "INVALID")
 
     def test_an_exit_time_up_to_the_slack_after_the_reap_is_kept(self):
-        for exit_time, kept in ((1635.0 + cq_runner.EXIT_SLACK_S, True), (1636.25, False)):
+        for exit_time, kept in ((1651.0 + cq_runner.EXIT_SLACK_S, True), (1652.25, False)):
             with self.subTest(exit_time=exit_time):
                 h = Harness(self, fleet={"exit_time": {"rust-pub": exit_time}})
                 h.run()
@@ -347,10 +359,10 @@ class StoppedLines(unittest.TestCase):
                 self.assertTrue(h.gate("R5")["detail"].startswith("rust-leave-00"), h.gate("R5")["detail"])
 
     def test_an_exit_at_teardown_start_is_not_an_unplanned_exit(self):
-        h = Harness(self, fleet={"crash": {"probe-04": 1630.0}})
+        h = Harness(self, fleet={"crash": {"probe-04": 1646.0}})
         h.run()
-        self.assertEqual(h.mark("teardown_start"), 1630.0)
-        self.assertEqual([e["wall"] for e in h.lines("stopped") if e["proc_id"] == "probe-04"], [1630.0])
+        self.assertEqual(h.mark("teardown_start"), 1646.0)
+        self.assertEqual([e["wall"] for e in h.lines("stopped") if e["proc_id"] == "probe-04"], [1646.0])
         self.assertTrue(h.gate("R5")["ok"], h.gate("R5")["detail"])
 
     def test_an_exit_before_its_confirmed_leave_is_unplanned(self):
@@ -464,7 +476,7 @@ class GeneratorVerdict(unittest.TestCase):
         h.run()
         with open(os.path.join(h.dir, "generator-verdict.json"), encoding="utf-8") as fh:
             gv = json.load(fh)
-        self.assertEqual((gv["ok"], gv["window"]), (False, {"from": 1000.0, "to": 1600.0}))
+        self.assertEqual((gv["ok"], gv["window"]), (False, {"from": 1016.0, "to": 1616.0}))
         self.assertIn("ci: not ok", gv["detail"])
         score = next(a for s, a in h.tools.calls if s == "score")
         self.assertEqual(score[score.index("--generator-verdict") + 1], os.path.join(h.dir, "generator-verdict.json"))
@@ -652,7 +664,7 @@ class Gates(unittest.TestCase):
         self.assertFalse(next(g for g in h.runner.gates() if g["gate"] == "R1")["ok"])
 
     def test_r1_an_interrupt_after_hold_end_is_not_scored(self):
-        h = Harness(self, fleet={"interrupt_at": 1610.0})
+        h = Harness(self, fleet={"interrupt_at": 1626.0})
         run = h.run()
         self.assertEqual((run["verdict"], run["exit_code"], run["scorer_verdict"]), ("INVALID", 2, None))
         self.assertIn("R1", h.failed())
@@ -678,6 +690,28 @@ class Gates(unittest.TestCase):
         self.assertIn("not joined", run["aborted"])
         self.assertNotIn(h.uid("talkers"), [u for e in h.lines("joined") for u in e["participants"]])
 
+    def test_rust_media_that_never_starts_aborts_at_the_rust_bound_before_any_probe_launch(self):
+        h = Harness(self, fleet={"media_delay": 10_000.0})
+        run = h.run()
+        self.assertTrue(run["aborted"].startswith(f"Rust media did not start within {cq_runner.RUST_READY_S} s; "
+                                                  f"not joined: "), run["aborted"])
+        self.assertEqual(h.mark("teardown_start"), 940.0 + cq_runner.RUST_READY_S)
+        self.assertEqual([c[1] for c in h.fleet.calls if c[0] == "launch"], ["rust-pub", "rust-role-viewers"])
+
+    def test_rust_media_seen_only_after_the_rust_bound_aborts_even_when_launches_used_it_up(self):
+        h = Harness(self)
+        launch = h.fleet.launch
+
+        def slow(proc):
+            launch(proc)
+            if proc["fleet"] == "rust":
+                h.clock.advance(50.0)
+        h.fleet.launch = slow
+        run = h.run()
+        self.assertEqual(run["aborted"], f"Rust media did not start within {cq_runner.RUST_READY_S} s; seen 10.0 s "
+                                         "after the deadline")
+        self.assertEqual([c[1] for c in h.fleet.calls if c[0] == "launch"], ["rust-pub", "rust-role-viewers"])
+
     def test_r2_an_extra_participant_fails(self):
         h = Harness(self, fleet={"extra_joined": ["stranger@bots-app.local"]})
         h.run()
@@ -685,10 +719,10 @@ class Gates(unittest.TestCase):
         self.assertIn("extra ['stranger@bots-app.local']", h.gate("R2")["detail"])
 
     def test_a_process_exit_during_the_join_aborts(self):
-        h = Harness(self, fleet={"crash": {"probe-02": 945.0}})
+        h = Harness(self, fleet={"crash": {"probe-02": 960.0}})
         run = h.run()
         self.assertIn("exited during the join: probe-02", run["aborted"])
-        self.assertLess(h.mark("teardown_start"), 960.0)
+        self.assertLess(h.mark("teardown_start"), 976.0)
 
     def test_r4_a_manifest_changed_before_scoring_fails(self):
         def mutate(script, args):
@@ -886,12 +920,13 @@ class Gates(unittest.TestCase):
                 self.assertEqual(run["verdict"], "PASS", run["gates"])
 
     def test_the_forced_config_is_strict_and_loads(self):
-        h = Harness(self, stack={"selector": 'up{job=~"relay-.*"}'})
+        h = Harness(self, stack={"selector": 'up{job=~"relay-.*"}', "throttle": 'pod=~"relay-.*|nats-0"'})
         h.run()
         path = os.path.join(h.dir, "score", "config.json")
         cfg = cq_score.load_config(path)
         self.assertEqual(cq_score.cv(cfg, "validity_gates", "allowed_not_measured"), ["G-V2", "G-V4"])
         self.assertEqual(cq_score.cv(cfg, "validity_gates", "scrape_up_selector"), 'up{job=~"relay-.*"}')
+        self.assertEqual(cq_score.cv(cfg, "server_diagnostics", "throttle_pod_selector"), 'pod=~"relay-.*|nats-0"')
         score = next(a for s, a in h.tools.calls if s == "score")
         self.assertEqual(score[score.index("--config") + 1], path)
 
@@ -922,7 +957,8 @@ class JoinTimes(unittest.TestCase):
                 self.assertEqual((run["verdict"], run["error"]), ("INVALID", None))
                 self.assertRegex(run["aborted"], f"^{uid}: {field} [0-9.e+]+ is later than the runner's clock$")
                 self.assertEqual(sorted(c[1] for c in h.fleet.calls if c[0] == "stop"),
-                                 sorted(p["proc_id"] for p in h.plan["processes"]))
+                                 sorted(p["proc_id"] for p in h.plan["processes"]
+                                        if field == "join_ts" or p["fleet"] == "rust"))
                 self.assertEqual(h.stack.calls[-1], ("down",))
 
     def test_a_join_time_up_to_the_slack_ahead_is_kept(self):
@@ -1039,7 +1075,8 @@ class AbortPaths(unittest.TestCase):
         h.fleet.launch = fails
         run = h.run()
         self.assertEqual(run["verdict"], "ERROR")
-        self.assertEqual([c[1] for c in h.fleet.calls if c[0] == "stop"], [f"probe-0{k}" for k in range(4)])
+        self.assertEqual([c[1] for c in h.fleet.calls if c[0] == "stop"],
+                         ["rust-pub", "rust-role-viewers"] + [f"probe-0{k}" for k in range(4)])
 
     def test_a_failing_down_still_writes_run_json(self):
         h = Harness(self)
@@ -1346,7 +1383,7 @@ class Signals(unittest.TestCase):
 
     def test_a_signal_in_the_settle_out_after_hold_end_is_not_scored(self):
         h = Harness(self)
-        fired = self.signal_at(h, h.fleet, "poll", lambda: h.clock.wall >= 1605.0)
+        fired = self.signal_at(h, h.fleet, "poll", lambda: h.clock.wall >= 1621.0)
         run = h.run()
         self.check_unscored(h, run, fired)
         self.assertIn("hold_end", run["timeline"])
@@ -1512,6 +1549,19 @@ class Expectation(unittest.TestCase):
         self.assertTrue(cq_runner.check_expectation(expect, self.result(["G-V7"], {"G-V2": "not_measured"}),
                                                     self.OK)["met"])
 
+    def test_uncertain_gates_are_not_reported_as_unmeasured(self):
+        expect = {"verdict": "INVALID", "invalid_gates": []}
+        result = self.result([], invalid_reasons=["G-Q9"])
+        result["steps"][0]["uncertain_gates"] = ["G-Q9"]
+        self.assertEqual(cq_runner.check_expectation(expect, result, self.OK)["problems"],
+                         ["uncertain gates: ['G-Q9']"])
+
+    def test_unmeasured_gates_are_not_reported_as_uncertain(self):
+        expect = {"verdict": "INVALID", "invalid_gates": []}
+        self.assertEqual(cq_runner.check_expectation(expect, self.result([], invalid_reasons=["G-V3"]),
+                                                     self.OK)["problems"],
+                         ["blocking not-measured gates: ['G-V3']"])
+
     def test_not_met_when_the_run_ends_in_error(self):
         h = Harness(self, expect="{verdict: INVALID, invalid_gates: [G-V7]}",
                     tools=StubScorer(verdict="INVALID", validity={"G-V7": "fail"}))
@@ -1648,7 +1698,7 @@ class Cli(unittest.TestCase):
 
     def test_a_target_mismatch_or_no_adapters_exit_3(self):
         self.assertEqual(self.main("--target", "ci")[0], 3)
-        rc, _, err = self.main("--out-dir", os.path.join(self.tmp, "runs"))
+        rc, _, err = self.main("--out-dir", os.path.join(self.tmp, "runs"), adapters={})
         self.assertEqual(rc, 3)
         self.assertIn("no adapters for target local", err)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "runs")))
@@ -1658,17 +1708,25 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn("outside the repository", err)
 
-    def factory(self, plan):
+    def factory(self, plan, run_dir=None, stack_mode=None, problems=()):
         self.clock.wall, self.clock.mono = 900.0, 50.0
         self.fleet = fakes.FakeFleet(self.clock, plan)
-        return fakes.FakeStack(self.clock), self.fleet
+        stack = fakes.FakeStack(self.clock, problems=problems)
+        self.stack_calls, self.seen_run_dir, self.facts_asked = stack.calls, run_dir, False
+        facts = self.fleet.clock_facts
+
+        def asked():
+            self.facts_asked = True
+            return facts()
+        self.fleet.clock_facts = asked
+        return stack, self.fleet
 
     def test_a_run_with_injected_adapters_returns_the_verdict_exit_code(self):
         sigs = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
         before = [signal.getsignal(s) for s in sigs]
         seen = {}
 
-        def factory(plan):
+        def factory(plan, run_dir=None, stack_mode=None):
             stack, fleet = self.factory(plan)
             launch = fleet.launch
 
@@ -1704,7 +1762,7 @@ class Cli(unittest.TestCase):
     def test_sigterm_mid_hold_tears_down_and_exits_invalid(self):
         self.addCleanup(signal.signal, signal.SIGTERM, signal.signal(signal.SIGTERM, lambda *a: None))
 
-        def factory(plan):
+        def factory(plan, run_dir=None, stack_mode=None):
             stack, fleet = self.factory(plan)
             poll = fleet.poll
 
@@ -1779,6 +1837,84 @@ class Cli(unittest.TestCase):
                     for name in files:
                         with open(os.path.join(base, name), encoding="utf-8") as fh:
                             self.assertNotIn(self.tmp, fh.read(), name)
+
+    def test_preflight_only_runs_the_preflight_and_launches_nothing(self):
+        runs = os.path.join(self.tmp, "runs")
+        rc, out, err = self.main("--preflight-only", "--out-dir", runs, adapters={"local": self.factory})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, f"{RUN_ID}: preflight passed; nothing was launched\n")
+        self.assertEqual(self.stack_calls, [])
+        self.assertEqual([c for c in self.fleet.calls if c[0] in ("launch", "admit", "stop")], [])
+        self.assertTrue(self.facts_asked)
+        self.assertFalse(os.path.exists(runs))
+        self.assertFalse(os.path.exists(self.seen_run_dir))
+
+    def test_preflight_only_lists_every_problem_and_exits_3(self):
+        rc, out, err = self.main("--preflight-only", "--out-dir", os.path.join(self.tmp, "runs"),
+                                 adapters={"local": lambda *a: self.factory(*a, problems=("no docker", "port busy"))})
+        self.assertEqual((rc, out), (3, ""))
+        self.assertTrue(err.endswith(f"{RUN_ID}: preflight refused:\n  - no docker\n  - port busy\n"), err)
+        self.assertEqual(self.stack_calls, [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes through a read-only folder mode")
+    def test_preflight_only_refuses_an_out_dir_the_run_could_not_create(self):
+        locked, plain = os.path.join(self.tmp, "locked"), os.path.join(self.tmp, "a-file")
+        os.makedirs(locked)
+        os.chmod(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        open(plain, "w", encoding="utf-8").close()
+        for out_dir in (os.path.join(locked, "runs"), os.path.join(plain, "runs")):
+            with self.subTest(out_dir=os.path.basename(os.path.dirname(out_dir))):
+                rc, out, err = self.main("--preflight-only", "--out-dir", out_dir, adapters={"local": self.factory})
+                self.assertEqual((rc, out), (3, ""))
+                self.assertIn(f"--out-dir {out_dir}: cannot create the run folder there (", err)
+                self.assertFalse(getattr(self, "stack_calls", []))
+        self.assertEqual(os.listdir(locked), [])
+
+    def test_preflight_only_leaves_the_out_dirs_parent_as_it_found_it(self):
+        parent = os.path.join(self.tmp, "parent")
+        os.makedirs(parent)
+        rc, _, err = self.main("--preflight-only", "--out-dir", os.path.join(parent, "runs"),
+                               adapters={"local": self.factory})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(os.listdir(parent), [])
+
+    def test_preflight_only_accepts_an_out_dir_two_levels_below_the_nearest_folder(self):
+        rc, out, err = self.main("--preflight-only", "--out-dir", os.path.join(self.tmp, "a", "b", "runs"),
+                                 adapters={"local": self.factory})
+        self.assertEqual((rc, out), (0, f"{RUN_ID}: preflight passed; nothing was launched\n"), err)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "a")))
+
+    def test_preflight_only_takes_allow_dirty_as_the_run_does(self):
+        self.tree._dirty = True
+        rc, out, err = self.main("--preflight-only", "--allow-dirty", "--out-dir", os.path.join(self.tmp, "runs"),
+                                 adapters={"local": self.factory})
+        self.assertEqual((rc, out), (0, f"{RUN_ID}: preflight passed; nothing was launched\n"), err)
+
+    def test_preflight_only_lists_a_refusal_from_the_real_shared_target_factory(self):
+        self.scenario = os.path.join(HERE, "scenarios", "phase0", "s0.yaml")
+        env = {k: v for k, v in os.environ.items() if k not in ("CQ_TARGET_CONFIRM", cq_runner.SECRET_ENV)}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            rc, out, err = self.main("--target", "hcl-daily", "--stack", "reuse", "--preflight-only", "--out-dir",
+                                     os.path.join(self.tmp, "runs"))
+        self.assertEqual((rc, out), (3, ""))
+        self.assertTrue(err.endswith(": preflight refused:\n  - set CQ_TARGET_CONFIRM=hcl-daily to confirm the run "
+                                     "against the shared target\n"), err)
+
+    def test_preflight_only_makes_the_runners_own_checks(self):
+        self.tree._dirty = True
+        rc, _, err = self.main("--preflight-only", "--out-dir", os.path.join(self.tmp, "runs"),
+                               adapters={"local": self.factory})
+        self.assertEqual(rc, 3)
+        self.assertIn("the tree is dirty", err)
+        self.tree._dirty = False
+        rc, _, err = self.main("--preflight-only", "--out-dir", os.path.join(self.repo, "runs"),
+                               adapters={"local": self.factory})
+        self.assertEqual(rc, 3)
+        self.assertIn("outside the repository", err)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            scenario_run.main(["--scenario", self.scenario, "--preflight-only", "--compile-only"])
+        self.assertEqual(cm.exception.code, 3)
 
     def test_the_default_out_dir_is_outside_the_checkout(self):
         self.assertEqual(scenario_run.default_out_dir({"CQ_RUNS_DIR": "/srv/runs"}), "/srv/runs")

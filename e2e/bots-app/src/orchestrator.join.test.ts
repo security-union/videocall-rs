@@ -1,7 +1,8 @@
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ launchBot: vi.fn() }));
 vi.mock("./bot", async (importOriginal) => ({
@@ -10,10 +11,21 @@ vi.mock("./bot", async (importOriginal) => ({
 }));
 
 import { classifyHealthz } from "./control/conduct";
-import { JoinRejectedError } from "./meeting-join";
-import { type BotRunOptions } from "./bot";
-import { runBotsToCompletion, type BotTask } from "./orchestrator";
+import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
+import { type BotRunOptions, LaunchAbortedError } from "./bot";
+import { capTtl, FORCE_CLOSE_MS, runBotsToCompletion, type BotTask } from "./orchestrator";
+import { TransportNotAppliedError } from "./transport";
 import { SD_SOURCE } from "./posture";
+import { type PageReload, PageReloadedError } from "./page-reload";
+import { ParticipantRecorder } from "./run-record";
+import {
+  assignPersonas,
+  createPersonaPlanner,
+  personaFor,
+  resolvePersonaSettings,
+} from "./persona";
+import type { PersonaTally } from "./persona-driver";
+import { SPEECH_PLAN_DEFAULT } from "./speech-plan";
 
 function task(participant: string): BotTask {
   return {
@@ -32,8 +44,10 @@ function task(participant: string): BotTask {
 
 function fakeBot(): unknown {
   return {
+    closeBrowserNow: vi.fn(async () => {}),
     userHangupDetected: new Promise<void>(() => {}),
     crashDetected: new Promise<string>(() => {}),
+    pageReloaded: new Promise(() => {}),
     leaveMeeting: vi.fn(async () => {}),
     shutdown: vi.fn(async () => {}),
     sessionUserId: () => null,
@@ -57,6 +71,657 @@ describe("orchestrator diagnostics-packets instrumentation (#2970)", () => {
     });
     expect(seen.sort()).toEqual(["a:DISABLED:config", "b:DISABLED:url"]);
   });
+});
+
+describe("orchestrator aborts a pending launch", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const abortableLaunch = (seen: AbortSignal[]) => (opts: BotRunOptions) =>
+    new Promise((_resolve, reject) => {
+      if (opts.signal) seen.push(opts.signal);
+      opts.signal?.addEventListener("abort", () => reject(new LaunchAbortedError()));
+    });
+
+  it("on SIGTERM, and finishes the bot as a shutdown rather than a failure", async () => {
+    mocks.launchBot.mockReset();
+    const seen: AbortSignal[] = [];
+    mocks.launchBot.mockImplementation(abortableLaunch(seen));
+    const reasons: Array<string | undefined> = [];
+    const run = runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 60_000 }],
+      onFinish: (_id, _at, reason) => reasons.push(reason),
+    });
+    await sleep(100);
+    process.emit("SIGTERM");
+    await expect(
+      Promise.race([run.then(() => "done"), sleep(3_000).then(() => "stuck")]),
+    ).resolves.toBe("done");
+    expect(seen).toHaveLength(1);
+    expect(seen[0].aborted).toBe(true);
+    expect(reasons).toEqual(["shutdown-signal"]);
+  });
+
+  it("at the task's deadline", async () => {
+    mocks.launchBot.mockReset();
+    const seen: AbortSignal[] = [];
+    mocks.launchBot.mockImplementation(abortableLaunch(seen));
+    const deadline = Date.now() + 1_200;
+    await runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].aborted).toBe(true);
+  });
+});
+
+describe("orchestrator failure tally for a launch that never joined", () => {
+  const tally = async (launch: () => Promise<unknown>, runDeadlineMs?: number) => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(launch);
+    const warns: string[] = [];
+    const warn = vi
+      .spyOn(console, "warn")
+      .mockImplementation((...a) => void warns.push(a.join(" ")));
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await runBotsToCompletion({ tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs }] });
+    } finally {
+      warn.mockRestore();
+      err.mockRestore();
+    }
+    return warns.filter((l) => l.includes("ended with an error"));
+  };
+
+  it("counts a launch error", async () => {
+    expect(await tally(() => Promise.reject(new Error("boom")))).toHaveLength(1);
+  });
+
+  it.each([
+    ["an aborted launch", () => new LaunchAbortedError()],
+    ["a hang-up during the join", () => new MeetingNavigatedAwayError("left")],
+    ["a waiting room", () => new WaitingRoomError("waiting-room", "parked")],
+  ])("does not count %s", async (_what, make) => {
+    expect(await tally(() => Promise.reject(make()))).toEqual([]);
+  });
+
+  it("does not count a launch the run's deadline overtook", async () => {
+    expect(await tally(() => new Promise(() => {}), Date.now() + 1_200)).toEqual([]);
+  });
+});
+
+describe("orchestrator run deadline", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const launchUntilAborted = (close: () => void) => (opts: BotRunOptions) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(fakeBot()), 2_000);
+      opts.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        close();
+        reject(new LaunchAbortedError());
+      });
+    });
+
+  it("ends a bot, and bounds its session cookie, by the run deadline despite a slow launch", async () => {
+    mocks.launchBot.mockReset();
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const deadline = Date.now() + 1_200;
+    const seen: (number | null | undefined)[] = [];
+    mocks.launchBot.mockImplementation(async (opts: BotRunOptions) => {
+      seen.push(opts.sessionNotAfterMs);
+      await sleep(400);
+      return fakeBot();
+    });
+    let finishedAt = 0;
+    const run = runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+      onFinish: (_id, at) => {
+        finishedAt = at;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1_200 + FORCE_CLOSE_MS);
+    await run;
+    expect(seen).toEqual([deadline]);
+    expect(finishedAt).toBe(deadline);
+  });
+
+  it("bounds the session cookie by a TTL shorter than the run", async () => {
+    mocks.launchBot.mockReset();
+    const seen: number[] = [];
+    mocks.launchBot.mockImplementation(async (opts: BotRunOptions) => {
+      seen.push((opts.sessionNotAfterMs ?? Infinity) - Date.now());
+      return fakeBot();
+    });
+    await runBotsToCompletion({ tasks: [{ ...task("a"), ttl: 1_500 }] });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBeLessThanOrEqual(1_500);
+    expect(seen[0]).toBeGreaterThan(1_400);
+  });
+
+  it("does not launch once the run deadline is too close", async () => {
+    mocks.launchBot.mockReset();
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await runBotsToCompletion({
+        tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: Date.now() + 500 }],
+      });
+    } finally {
+      err.mockRestore();
+    }
+    expect(mocks.launchBot).not.toHaveBeenCalled();
+  });
+
+  it("aborts a launch that outlasts the deadline, which closes its browser by the deadline", async () => {
+    mocks.launchBot.mockReset();
+    const close = vi.fn();
+    mocks.launchBot.mockImplementation(launchUntilAborted(close));
+    const deadline = Date.now() + 1_200;
+    let finishedAt = 0;
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await runBotsToCompletion({
+        tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+        onFinish: (_id, at) => {
+          finishedAt = at;
+        },
+      });
+    } finally {
+      err.mockRestore();
+    }
+    expect(finishedAt).toBeLessThanOrEqual(deadline + 250);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a launch still joining at its join deadline, with that reason", async () => {
+    mocks.launchBot.mockReset();
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const close = vi.fn();
+    mocks.launchBot.mockImplementation(launchUntilAborted(close));
+    const deadline = Date.now() + 1_200;
+    let finishedAt = 0;
+    let reason: string | undefined;
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => err.mockRestore());
+    const run = runBotsToCompletion({
+      tasks: [
+        { ...task("a"), ttl: 60_000, joinDeadlineMs: deadline, runDeadlineMs: deadline + 3_000 },
+      ],
+      onFinish: (_id, at, why) => {
+        finishedAt = at;
+        reason = why;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1_200);
+    await run;
+    expect(finishedAt).toBe(deadline);
+    expect(reason).toBe("launch-error");
+    expect(err.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "the join deadline passed during the launch",
+    );
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["alone", { runDeadlineMs: 0 }],
+    ["at the join deadline's instant", { runDeadlineMs: 0, joinDeadlineMs: 0 }],
+    ["before a later join deadline, on a task without its own", { joinDeadlineMs: 3_000 }],
+  ])(
+    "records a launch the run's deadline timer aborts as a TTL expiry, run deadline %s",
+    async (_when, deadlines: { runDeadlineMs?: number; joinDeadlineMs?: number }) => {
+      mocks.launchBot.mockReset();
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      const close = vi.fn();
+      mocks.launchBot.mockImplementation(launchUntilAborted(close));
+      const deadline = Date.now() + 1_200;
+      const reasons: Array<string | undefined> = [];
+      const quiet = [
+        vi.spyOn(console, "log").mockImplementation(() => undefined),
+        vi.spyOn(console, "error").mockImplementation(() => undefined),
+      ];
+      onTestFinished(() => quiet.forEach((q) => q.mockRestore()));
+      const own = Object.fromEntries(
+        Object.entries(deadlines).map(([k, v]) => [k, deadline + v]),
+      ) as { runDeadlineMs?: number; joinDeadlineMs?: number };
+      const run = runBotsToCompletion({
+        tasks: [{ ...task("a"), ttl: 60_000, ...own }],
+        runDeadlineMs: deadline,
+        onFinish: (_id, _at, why) => reasons.push(why),
+      });
+      await vi.advanceTimersByTimeAsync(1_200 + FORCE_CLOSE_MS + 1_000);
+      await run;
+      expect(reasons).toEqual(["ttl-expired"]);
+      expect(close).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    ["the run's deadline", {}, 0],
+    ["the task's run deadline", { runDeadlineMs: 0 }, 0],
+    ["a join deadline", { joinDeadlineMs: 0 }, 3_000],
+  ])(
+    "records a SIGTERM abort as a shutdown when %s passes during its slow teardown",
+    async (_what, deadlines: { runDeadlineMs?: number; joinDeadlineMs?: number }, runAfter) => {
+      mocks.launchBot.mockReset();
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      mocks.launchBot.mockImplementation(
+        (opts: BotRunOptions) =>
+          new Promise((_resolve, reject) => {
+            opts.signal?.addEventListener("abort", () => {
+              setTimeout(() => reject(new LaunchAbortedError()), 2_200);
+            });
+          }),
+      );
+      const deadline = Date.now() + 2_000;
+      const own = Object.fromEntries(
+        Object.entries(deadlines).map(([k, v]) => [k, deadline + v]),
+      ) as { runDeadlineMs?: number; joinDeadlineMs?: number };
+      const reasons: Array<string | undefined> = [];
+      const quiet = [
+        vi.spyOn(console, "log").mockImplementation(() => undefined),
+        vi.spyOn(console, "error").mockImplementation(() => undefined),
+      ];
+      onTestFinished(() => quiet.forEach((q) => q.mockRestore()));
+      const run = runBotsToCompletion({
+        tasks: [{ ...task("a"), ttl: 60_000, ...own }],
+        runDeadlineMs: deadline + runAfter,
+        onFinish: (_id, _at, why) => reasons.push(why),
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      process.emit("SIGTERM");
+      await vi.advanceTimersByTimeAsync(5_000 + FORCE_CLOSE_MS + 1_000);
+      await run;
+      expect(reasons).toEqual(["shutdown-signal"]);
+    },
+  );
+
+  it("gives up a launch at the run deadline when it comes before the join deadline", async () => {
+    mocks.launchBot.mockReset();
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    mocks.launchBot.mockImplementation(() => new Promise(() => {}));
+    const runBy = Date.now() + 2_000;
+    let finishedAt = 0;
+    let reason: string | undefined;
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => err.mockRestore());
+    const run = runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: runBy, joinDeadlineMs: runBy + 3_000 }],
+      onFinish: (_id, at, why) => {
+        finishedAt = at;
+        reason = why;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(2_000 + 3_000 + FORCE_CLOSE_MS);
+    await run;
+    expect(finishedAt).toBe(runBy);
+    expect(reason).toBe("ttl-expired");
+    expect(err.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "the run's deadline passed during the launch",
+    );
+  });
+
+  it("closes a launch that finishes past its join deadline before the deadline's timer fires", async () => {
+    mocks.launchBot.mockReset();
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => err.mockRestore());
+    const bot = { ...(fakeBot() as object), shutdown: vi.fn(() => new Promise(() => {})) } as {
+      shutdown: ReturnType<typeof vi.fn>;
+      closeBrowserNow: ReturnType<typeof vi.fn>;
+    };
+    const deadline = Date.now() + 1_000;
+    mocks.launchBot.mockImplementation(async () => {
+      vi.setSystemTime(deadline + 50);
+      return bot;
+    });
+    let reason: string | undefined;
+    await runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 2_000, joinDeadlineMs: deadline }],
+      onFinish: (_id, _at, why) => {
+        reason = why;
+      },
+    });
+    expect(reason).toBe("launch-error");
+    expect(err.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "the join deadline passed during the launch",
+    );
+    expect(bot.shutdown).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(FORCE_CLOSE_MS - 1);
+    expect(bot.closeBrowserNow).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.closeBrowserNow).toHaveBeenCalled();
+  });
+
+  it("keeps a bot that joined before its join deadline running past it", async () => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async () => fakeBot());
+    const deadline = Date.now() + 300;
+    let finishedAt = 0;
+    let reason: string | undefined;
+    await runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 1_200, joinDeadlineMs: deadline }],
+      onFinish: (_id, at, why) => {
+        finishedAt = at;
+        reason = why;
+      },
+    });
+    expect(reason).toBe("ttl-expired");
+    expect(finishedAt).toBeGreaterThanOrEqual(deadline + 800);
+  });
+
+  it("closes the browser at the deadline without waiting for a leave", async () => {
+    mocks.launchBot.mockReset();
+    const bot = {
+      ...(fakeBot() as object),
+      leaveMeeting: vi.fn(() => sleep(1_500)),
+    };
+    mocks.launchBot.mockImplementation(async () => bot);
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const deadline = Date.now() + 1_200;
+    let finishedAt = 0;
+    const run = runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+      onFinish: (_id, at) => {
+        finishedAt = at;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1_200 + FORCE_CLOSE_MS - 500);
+    await run;
+    expect(mocks.launchBot).toHaveBeenCalledTimes(1);
+    expect(bot.leaveMeeting).not.toHaveBeenCalled();
+    expect(finishedAt).toBe(deadline);
+    expect(
+      (bot as unknown as { closeBrowserNow: ReturnType<typeof vi.fn> }).closeBrowserNow,
+    ).not.toHaveBeenCalled();
+  });
+
+  it("skips the leave when the deadline's timer fires a little early", async () => {
+    mocks.launchBot.mockReset();
+    const bot = { ...(fakeBot() as object), leaveMeeting: vi.fn(async () => {}) };
+    mocks.launchBot.mockImplementation(async () => bot);
+    const deadline = Date.now() + 1_200;
+    const realNow = Date.now.bind(Date);
+    const early = 50;
+    let clock: { mockRestore: () => void } | undefined;
+    const shift = setTimeout(() => {
+      clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() - early);
+    }, 900);
+    try {
+      await runBotsToCompletion({
+        tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+      });
+    } finally {
+      clearTimeout(shift);
+      clock?.mockRestore();
+    }
+    expect(clock).toBeDefined();
+    expect(bot.leaveMeeting).not.toHaveBeenCalled();
+  });
+
+  it("skips the leave when the run's deadline timer ends the bot before its TTL does", async () => {
+    mocks.launchBot.mockReset();
+    const bot = { ...(fakeBot() as object), leaveMeeting: vi.fn(async () => {}) };
+    const realNow = Date.now.bind(Date);
+    mocks.launchBot.mockImplementation(async () => {
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() - 300);
+      setTimeout(() => clock.mockRestore(), 50);
+      return bot;
+    });
+    const deadline = Date.now() + 1_200;
+    await runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+      runDeadlineMs: deadline,
+    });
+    expect(bot.leaveMeeting).not.toHaveBeenCalled();
+  });
+
+  it("leaves gracefully when the TTL ends just before the deadline", async () => {
+    mocks.launchBot.mockReset();
+    const bot = { ...(fakeBot() as object), leaveMeeting: vi.fn(async () => {}) };
+    mocks.launchBot.mockImplementation(async () => bot);
+    const deadline = Date.now() + 1_200;
+    await runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 1_150, runDeadlineMs: deadline }],
+    });
+    expect(bot.leaveMeeting).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends a bot whose browser close hangs within FORCE_CLOSE_MS of the deadline", async () => {
+    mocks.launchBot.mockReset();
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const bot = { ...(fakeBot() as object), shutdown: vi.fn(() => sleep(8_000)) };
+    mocks.launchBot.mockImplementation(async () => bot);
+    const deadline = Date.now() + 1_200;
+    let finishedAt = 0;
+    const run = runBotsToCompletion({
+      tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+      onFinish: (_id, at) => {
+        finishedAt = at;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1_200 + FORCE_CLOSE_MS + 1_000);
+    await run;
+    expect(bot.shutdown).toHaveBeenCalledTimes(1);
+    expect(finishedAt).toBe(deadline + FORCE_CLOSE_MS);
+  });
+
+  it("gives control launches the run deadline and closes the control server at it", async () => {
+    mocks.launchBot.mockReset();
+    const seen: Array<number | null | undefined> = [];
+    mocks.launchBot.mockImplementation(async (opts: BotRunOptions) => {
+      seen.push(opts.sessionNotAfterMs);
+      return fakeBot();
+    });
+    const deadline = Date.now() + 2_000;
+    let port = 0;
+    const run = runBotsToCompletion({
+      tasks: [],
+      runDeadlineMs: deadline,
+      control: {
+        port: 0,
+        token: "test-token",
+        tokenFilePath: join(tmpdir(), "bots-app-deadline-test-ctl.json"),
+        onListen: async (info) => {
+          port = info.port;
+        },
+      },
+    });
+    const launch = () =>
+      fetch(`http://127.0.0.1:${port}/launch`, {
+        method: "POST",
+        headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+        body: JSON.stringify({
+          meetingURL: "https://example.invalid/meeting/X",
+          participant: "late",
+          ttl: "1m",
+          headless: true,
+          network: "none",
+          authBackend: "jwt",
+          videoMode: "clock",
+        }),
+      });
+    while (port === 0) await sleep(10);
+    expect((await launch()).status).toBe(201);
+    await run;
+    expect(Date.now()).toBeLessThanOrEqual(deadline + FORCE_CLOSE_MS + 500);
+    expect(seen).toEqual([deadline]);
+    await expect(launch()).rejects.toThrow();
+  });
+
+  it("refuses a control launch while the run is closing after its deadline", async () => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async () => ({
+      ...(fakeBot() as object),
+      shutdown: vi.fn(() => sleep(1_500)),
+    }));
+    const deadline = Date.now() + 1_200;
+    const first = { ...task("a"), ttl: 60_000, runDeadlineMs: deadline };
+    let port = 0;
+    const run = runBotsToCompletion({
+      tasks: [first],
+      runDeadlineMs: deadline,
+      control: {
+        port: 0,
+        token: "test-token",
+        tokenFilePath: join(tmpdir(), "bots-app-deadline-late-ctl.json"),
+        onListen: async (info) => {
+          port = info.port;
+        },
+      },
+    });
+    while (port === 0 || Date.now() < deadline + 300) await sleep(10);
+    const late = await fetch(`http://127.0.0.1:${port}/launch`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        meetingURL: "https://example.invalid/meeting/X",
+        participant: "late",
+        ttl: "1m",
+        headless: true,
+        network: "none",
+        authBackend: "jwt",
+        videoMode: "clock",
+      }),
+    });
+    const duplicate = await fetch(`http://127.0.0.1:${port}/bots/${first.botId}/duplicate`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: JSON.stringify({ participant: "copy" }),
+    });
+    await run;
+    expect(late.status).not.toBe(201);
+    expect(duplicate.status).not.toBe(201);
+    expect(mocks.launchBot).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["a crash", "a SIGTERM before the deadline"] as const)(
+    "closes the browser and returns at the deadline when teardown after %s stalls",
+    async (cause) => {
+      mocks.launchBot.mockReset();
+      const close = vi.fn(async () => {});
+      mocks.launchBot.mockImplementation(async () => ({
+        ...(fakeBot() as object),
+        closeBrowserNow: close,
+        crashDetected:
+          cause === "a crash"
+            ? new Promise<string>((r) => setTimeout(() => r("page crashed"), 300))
+            : new Promise<string>(() => {}),
+        shutdown: vi.fn(() => sleep(8_000)),
+      }));
+      const deadline = Date.now() + 1_200;
+      let port = 0;
+      const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const run = runBotsToCompletion({
+          tasks: [{ ...task("a"), ttl: 60_000, runDeadlineMs: deadline }],
+          runDeadlineMs: deadline,
+          control: {
+            port: 0,
+            token: "test-token",
+            tokenFilePath: join(tmpdir(), "bots-app-deadline-stall-ctl.json"),
+            onListen: async (info) => {
+              port = info.port;
+            },
+          },
+        });
+        if (cause !== "a crash") setTimeout(() => process.emit("SIGTERM"), 300);
+        await run;
+      } finally {
+        err.mockRestore();
+      }
+      expect(Date.now()).toBeLessThanOrEqual(deadline + FORCE_CLOSE_MS + 1_000);
+      expect(close).toHaveBeenCalled();
+      expect(port).toBeGreaterThan(0);
+      await expect(
+        fetch(`http://127.0.0.1:${port}/bots`, { headers: { authorization: "Bearer test-token" } }),
+      ).rejects.toThrow();
+    },
+    15_000,
+  );
+
+  it("caps an infinite or longer TTL, and leaves one without a deadline alone", () => {
+    const now = Date.now();
+    expect(capTtl("infinite", null)).toBe("infinite");
+    expect(capTtl(5_000, undefined)).toBe(5_000);
+    const capped = capTtl("infinite", now + 2_000);
+    expect(capped).toBeLessThanOrEqual(2_000);
+    expect(capped).toBeGreaterThan(1_900);
+    expect(capTtl(500, now + 2_000)).toBe(500);
+    expect(capTtl(5_000, now - 10)).toBe(0);
+  });
+});
+
+describe("orchestrator transport instrumentation (issue 3087)", () => {
+  it("tags each bot's transport line with its id and passes its intent to launchBot", async () => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async (opts: BotRunOptions) => {
+      opts.onTransport?.({
+        kind: "elected",
+        active: opts.transport === "websocket" ? "websocket" : "webtransport",
+      });
+      return fakeBot();
+    });
+    const seen: string[] = [];
+    await runBotsToCompletion({
+      tasks: [{ ...task("a"), transport: "websocket" }, task("b")],
+      onTransport: (id, e) => seen.push(`${id.slice(-1)}:${e.kind === "elected" ? e.active : ""}`),
+    });
+    expect(seen.sort()).toEqual(["a:websocket", "b:webtransport"]);
+  });
+});
+
+describe("orchestrator with a control server attached (issue 3087)", () => {
+  it("keeps running after a bot fails its launch, until a shutdown signal", async () => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockRejectedValue(new TransportNotAppliedError("websocket", "test"));
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const finished: string[] = [];
+    let returned = false;
+    try {
+      const run = runBotsToCompletion({
+        tasks: [{ ...task("alice"), ttl: 60_000, transport: "websocket" }],
+        onFinish: (_id, _at, reason) => finished.push(String(reason)),
+        control: {
+          port: 0,
+          token: "test-token",
+          tokenFilePath: join(tmpdir(), "bots-app-idle-test-ctl.json"),
+        },
+      }).then(() => {
+        returned = true;
+      });
+      for (let i = 0; i < 300 && finished.length === 0; i += 1)
+        await new Promise((r) => setTimeout(r, 10));
+      expect(finished).toEqual(["launch-error"]);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(returned).toBe(false);
+      process.emit("SIGTERM");
+      await run;
+      expect(returned).toBe(true);
+    } finally {
+      err.mockRestore();
+    }
+  }, 20_000);
 });
 
 describe("orchestrator join instrumentation (#2294)", () => {
@@ -87,21 +752,27 @@ describe("orchestrator join instrumentation (#2294)", () => {
       joinMedia: { camera: false, mic: true },
       sessionUserId: () => "alice@labs.example",
       decodeBudgetReadback: "all",
+      skipCanvasPaintReadback: "true",
+      speakingGlowReadback: "false",
+      simulcastMaxLayersReadback: 3,
     }));
     const events: string[] = [];
     await runBotsToCompletion({
-      tasks: [{ ...task("alice"), decodeBudget: "off" }],
+      tasks: [{ ...task("alice"), decodeBudget: "off", speakingGlow: "off" }],
       onRegister: (t) => events.push(`register:${t.participant}`),
-      onJoin: (_id, _at, media, userId, readback) =>
-        events.push(`join:${JSON.stringify(media)}:${userId}:${readback}`),
+      onJoin: (_id, _at, media, userId, readback, paint, glow, layers) =>
+        events.push(
+          `join:${JSON.stringify(media)}:${userId}:${readback}:${paint}:${glow}:${layers}`,
+        ),
       onFinish: (_id, at, reason) => events.push(`finish:${reason}:${at > 0}`),
     });
     expect(events).toEqual([
       "register:alice",
-      'join:{"camera":false,"mic":true}:alice@labs.example:all',
+      'join:{"camera":false,"mic":true}:alice@labs.example:all:true:false:3',
       "finish:ttl-expired:true",
     ]);
     expect(mocks.launchBot.mock.calls[0][0].decodeBudget).toBe("off");
+    expect(mocks.launchBot.mock.calls[0][0].speakingGlow).toBe("off");
   });
 
   it("fires onFinish with the failure reason for a bot that never joined (#2914)", async () => {
@@ -212,6 +883,54 @@ describe("orchestrator join instrumentation (#2294)", () => {
     await api(`/bots/${botId}/leave`, { method: "POST" });
     // With a control server attached the run parks until a shutdown signal, so
     // closing it is what lets the listening socket go.
+    process.emit("SIGTERM");
+    await run;
+  }, 20_000);
+
+  it("relaunches a ctl rejoin with the same speakingGlow and forwards the new readback (#2914)", async () => {
+    mocks.launchBot.mockReset();
+    const readbacks = ["false", "true"];
+    mocks.launchBot.mockImplementation(async () => ({
+      ...(fakeBot() as object),
+      speakingGlowReadback: readbacks.shift() ?? null,
+    }));
+    const glows: Array<string | null | undefined> = [];
+    const token = "test-token";
+    let port = 0;
+    let listening!: () => void;
+    const listened = new Promise<void>((r) => {
+      listening = r;
+    });
+    const run = runBotsToCompletion({
+      tasks: [{ ...task("alice"), ttl: 60_000, speakingGlow: "off" }],
+      onJoin: (_id, _at, _media, _user, _budget, _paint, glow) => glows.push(glow),
+      control: {
+        port: 0,
+        token,
+        tokenFilePath: join(tmpdir(), "bots-app-join-test-ctl.json"),
+        onListen: async (info) => {
+          port = info.port;
+          listening();
+        },
+      },
+    });
+    await listened;
+    const until = async (pred: () => boolean): Promise<void> => {
+      for (let i = 0; i < 300 && !pred(); i += 1) await new Promise((r) => setTimeout(r, 10));
+      if (!pred()) throw new Error("condition never held");
+    };
+    const api = (path: string, body: object): Promise<Response> =>
+      fetch(`http://127.0.0.1:${port}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    await until(() => glows.length === 1);
+    await api(`/bots/${task("alice").botId}/network`, { network: "lossy_mobile" });
+    await until(() => glows.length === 2);
+    expect(glows).toEqual(["false", "true"]);
+    expect(mocks.launchBot.mock.calls.map((c) => c[0].speakingGlow)).toEqual(["off", "off"]);
+    await api(`/bots/${task("alice").botId}/leave`, {});
     process.emit("SIGTERM");
     await run;
   }, 20_000);
@@ -448,6 +1167,20 @@ describe("orchestrator /healthz in-meeting readiness (#2917)", () => {
     );
     expect(body).toMatchObject({ bots: 1, inMeeting: 1, expected: 1 });
     expect(classifyHealthz(body).state).toBe("in-meeting");
+  }, 20_000);
+
+  it("drops a bot whose meeting page reloaded after joining out of inMeeting, not expected", async () => {
+    const body = await healthzAfter(
+      async () => ({
+        ...(fakeBot() as object),
+        pageReloaded: new Promise<PageReload>((r) =>
+          setTimeout(() => r({ atMs: Date.now(), url: "https://example.com/meeting/X" }), 20),
+        ),
+      }),
+      (b) => b.bots === 0,
+    );
+    expect(body).toMatchObject({ bots: 0, inMeeting: 0, expected: 1 });
+    expect(classifyHealthz(body).state).toBe("not-joined");
   }, 20_000);
 
   it("drops a bot whose browser crashed after joining out of inMeeting, not expected (#2917)", async () => {
@@ -695,6 +1428,128 @@ describe("orchestrator diagnostics-packets surfacing (#2970)", () => {
     if (!(await pred())) throw new Error("condition never held");
   };
 
+  it("keeps the run deadline across a ctl rejoin", async () => {
+    const deadline = Date.now() + 2_500;
+    const seen: Array<number | null | undefined> = [];
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async (opts: BotRunOptions) => {
+      seen.push(opts.sessionNotAfterMs);
+      return fakeBot();
+    });
+    const t = { ...task("alice"), ttl: 60_000, runDeadlineMs: deadline };
+    let finishedAt = 0;
+    await withCtl(
+      [t],
+      {
+        onFinish: (_id, at) => {
+          finishedAt = at;
+        },
+      },
+      async (api) => {
+        await until(() => seen.length === 1);
+        await api(`/bots/${t.botId}/network`, {
+          method: "POST",
+          body: JSON.stringify({ network: "lossy_mobile" }),
+        });
+        await until(() => seen.length === 2);
+        await until(() => finishedAt > 0);
+      },
+    );
+    expect(seen).toEqual([deadline, deadline]);
+    expect(finishedAt).toBeLessThanOrEqual(deadline + 50);
+  }, 20_000);
+
+  it("launches a ctl rejoin after the first join's deadline has passed", async () => {
+    let launches = 0;
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async () => {
+      launches += 1;
+      await new Promise((r) => setTimeout(r, 100));
+      return fakeBot();
+    });
+    const joinBy = Date.now() + 1_000;
+    const t = {
+      ...task("alice"),
+      ttl: 60_000,
+      joinDeadlineMs: joinBy,
+      runDeadlineMs: joinBy + 2_000,
+    };
+    let reason: string | undefined;
+    await withCtl(
+      [t],
+      {
+        onFinish: (_id, _at, why) => {
+          reason = why;
+        },
+      },
+      async (api) => {
+        await until(() => launches === 1);
+        await new Promise((r) => setTimeout(r, joinBy + 200 - Date.now()));
+        await api(`/bots/${t.botId}/network`, {
+          method: "POST",
+          body: JSON.stringify({ network: "lossy_mobile" }),
+        });
+        await until(() => reason !== undefined);
+      },
+    );
+    expect(launches).toBe(2);
+    expect(reason).not.toBe("launch-error");
+  }, 20_000);
+
+  it("rearms the running TTL timer on a ctl TTL extension", async () => {
+    let launched = false;
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async () => {
+      launched = true;
+      return fakeBot();
+    });
+    const t = { ...task("alice"), ttl: 1_500 };
+    let finishedAt = 0;
+    let extendedAt = 0;
+    await withCtl(
+      [t],
+      {
+        onFinish: (_id, at) => {
+          finishedAt = at;
+        },
+      },
+      async (api) => {
+        await until(() => launched);
+        extendedAt = Date.now();
+        await api(`/bots/${t.botId}/ttl`, { method: "POST", body: JSON.stringify({ ttl: "4s" }) });
+        await new Promise((r) => setTimeout(r, 3_000));
+        await until(() => finishedAt > 0);
+      },
+    );
+    expect(finishedAt - extendedAt).toBeGreaterThanOrEqual(3_500);
+  }, 20_000);
+
+  it("caps a ctl TTL extension at the run deadline", async () => {
+    const deadline = Date.now() + 1_500;
+    let launched = false;
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async () => {
+      launched = true;
+      return fakeBot();
+    });
+    const t = { ...task("alice"), ttl: 60_000, runDeadlineMs: deadline };
+    let finishedAt = 0;
+    await withCtl(
+      [t],
+      {
+        onFinish: (_id, at) => {
+          finishedAt = at;
+        },
+      },
+      async (api) => {
+        await until(() => launched);
+        await api(`/bots/${t.botId}/ttl`, { method: "POST", body: JSON.stringify({ ttl: "1h" }) });
+        await until(() => finishedAt > 0);
+      },
+    );
+    expect(finishedAt).toBeLessThanOrEqual(deadline + 50);
+  }, 20_000);
+
   it("re-applies diagPackets on a ctl rejoin", async () => {
     const applied: Array<string | null | undefined> = [];
     mocks.launchBot.mockReset();
@@ -765,19 +1620,24 @@ describe("orchestrator diagnostics-packets surfacing (#2970)", () => {
     });
     const seen = { ...task("seen"), ttl: 60_000, diagPackets: "off" as const };
     const silent = { ...task("silent"), ttl: 60_000, diagPackets: "off" as const };
+    const silentOn = { ...task("silent-on"), ttl: 60_000, diagPackets: "on" as const };
     const quiet = { ...task("quiet"), ttl: 60_000 };
     const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const logs = async (api: (p: string) => Promise<Response>, id: string): Promise<string[]> =>
       ((await (await api(`/bots/${id}/log`)).json()) as { lines: string[] }).lines;
     try {
-      await withCtl([seen, silent, quiet], { diagPacketsVerifyMs: 30 }, async (api) => {
+      await withCtl([seen, silent, silentOn, quiet], { diagPacketsVerifyMs: 30 }, async (api) => {
         await until(async () => (await logs(api, silent.botId)).length > 0);
+        await until(async () => (await logs(api, silentOn.botId)).length > 0);
         await new Promise((r) => setTimeout(r, 60));
         expect(await logs(api, seen.botId)).toEqual([
           expect.stringContaining("diagnostics packets: DISABLED (source=config)"),
         ]);
         expect(await logs(api, silent.botId)).toEqual([
           expect.stringContaining("no 'diagnostics packets:' line within 30ms of joining"),
+        ]);
+        expect(await logs(api, silentOn.botId)).toEqual([
+          expect.stringContaining("--diag-packets on requested but no 'diagnostics packets:' line"),
         ]);
         expect(await logs(api, quiet.botId)).toEqual([]);
       });
@@ -788,9 +1648,26 @@ describe("orchestrator diagnostics-packets surfacing (#2970)", () => {
     }
   }, 20_000);
 
-  it("carries decodeBudget into a /duplicate copy and a ctl relaunch (#2914)", async () => {
+  it("carries decodeBudget, skipCanvasPaint, simulcastMaxLayers, transport and persona into a /duplicate copy and a ctl relaunch", async () => {
+    const settings = resolvePersonaSettings(true, {});
+    if (settings.kind !== "ok" || settings.value === null) throw new Error("persona defaults");
+    const room = assignPersonas(createPersonaPlanner(SPEECH_PLAN_DEFAULT, 3), 3, settings.value);
+    const persona = personaFor(room, { index: 0, fleetSize: 3 });
     mocks.launchBot.mockReset();
     mocks.launchBot.mockImplementation(async () => fakeBot());
+    const recorder = new ParticipantRecorder({
+      runDir: mkdtempSync(join(tmpdir(), "bots-join-record-")),
+      role: null,
+      kernelNetem: "none",
+      pod: {
+        ordinal: null,
+        node: null,
+        staggerMs: null,
+        staggerIncomplete: false,
+        imageRevision: null,
+      },
+    });
+    const registered: BotTask[] = [];
     const token = "test-token";
     let port = 0;
     let listening!: () => void;
@@ -798,7 +1675,22 @@ describe("orchestrator diagnostics-packets surfacing (#2970)", () => {
       listening = r;
     });
     const run = runBotsToCompletion({
-      tasks: [{ ...task("alice"), ttl: 60_000, decodeBudget: "off" }],
+      tasks: [
+        {
+          ...task("alice"),
+          ttl: 60_000,
+          decodeBudget: "off",
+          skipCanvasPaint: true,
+          simulcastMaxLayers: 3,
+          transport: "websocket",
+          persona,
+        },
+      ],
+      onPersona: (botId, tally) => recorder.personaToggled(botId, tally),
+      onRegister: (t) => {
+        registered.push(t);
+        recorder.register(t);
+      },
       control: {
         port: 0,
         token,
@@ -831,7 +1723,310 @@ describe("orchestrator diagnostics-packets surfacing (#2970)", () => {
       "off",
       "off",
     ]);
+    expect(mocks.launchBot.mock.calls.map((c) => (c[0] as BotRunOptions).transport)).toEqual([
+      "websocket",
+      "websocket",
+      "websocket",
+    ]);
+    expect(mocks.launchBot.mock.calls.map((c) => (c[0] as BotRunOptions).skipCanvasPaint)).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    expect(
+      mocks.launchBot.mock.calls.map((c) => (c[0] as BotRunOptions).simulcastMaxLayers),
+    ).toEqual([3, 3, 3]);
+    expect(registered).toHaveLength(2);
+    expect(recorder.snapshot(registered[1].botId)?.skip_canvas_paint.requested).toBe(true);
+    expect(recorder.snapshot(registered[1].botId)?.simulcast_max_layers.requested).toBe(3);
+    const calls = mocks.launchBot.mock.calls.map((c) => c[0] as BotRunOptions);
+    expect(calls.map((o) => o.persona)).toEqual([persona, persona, persona]);
+    const tally: PersonaTally = {
+      ok: 1,
+      failed: 0,
+      already: 0,
+      rendered: 1,
+      unrendered: 0,
+      medianAbsMs: 5,
+      minGapMs: null,
+    };
+    calls[1].onPersona?.(tally);
+    expect(recorder.snapshot(registered[1].botId)?.persona?.toggles).toEqual(tally);
+    expect(recorder.snapshot(registered[0].botId)?.persona?.toggles).toBeNull();
     process.emit("SIGTERM");
     await run;
   }, 20_000);
+});
+
+describe("orchestrator page reload after join", () => {
+  it("fails the bot at the reload and records the outcome, without a leave click", async () => {
+    mocks.launchBot.mockReset();
+    let reload!: (r: PageReload) => void;
+    const bot = {
+      ...(fakeBot() as object),
+      pageReloaded: new Promise<PageReload>((r) => {
+        reload = r;
+      }),
+    } as unknown as { leaveMeeting: ReturnType<typeof vi.fn>; shutdown: ReturnType<typeof vi.fn> };
+    mocks.launchBot.mockImplementation(async () => bot);
+    const recorder = new ParticipantRecorder({
+      runDir: mkdtempSync(join(tmpdir(), "bots-reload-record-")),
+      role: null,
+      kernelNetem: "none",
+      pod: {
+        ordinal: null,
+        node: null,
+        staggerMs: null,
+        staggerIncomplete: false,
+        imageRevision: null,
+      },
+    });
+    const reloadAtMs = Date.now() + 60_000;
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runBotsToCompletion({
+        tasks: [{ ...task("alice"), ttl: 3_000 }],
+        onRegister: (t) => recorder.register(t),
+        onJoin: (id, at, media, uid) => {
+          recorder.joined(id, at, media ?? null, uid ?? null);
+          setTimeout(() => reload({ atMs: reloadAtMs, url: "https://example.com/meeting/X" }), 10);
+        },
+        onFinish: (id, at, reason) => recorder.finished(id, at, reason),
+      });
+      expect(err.mock.calls.flat().join("\n")).toContain(
+        "left the meeting unasked: the meeting page loaded a new document after join",
+      );
+    } finally {
+      err.mockRestore();
+    }
+    const rec = recorder.snapshot(task("alice").botId);
+    expect(rec?.outcome).toBe("page-reloaded");
+    expect(rec?.participant.leave_ts).toBe(reloadAtMs / 1000);
+    expect(bot.leaveMeeting).not.toHaveBeenCalled();
+    expect(bot.shutdown).toHaveBeenCalledTimes(1);
+  }, 20_000);
+});
+
+describe("orchestrator teardown of a bot that left unasked", () => {
+  it.each([
+    [
+      "page-reloaded",
+      { pageReloaded: Promise.resolve({ atMs: Date.now(), url: "https://example.com/meeting/X" }) },
+    ],
+    ["browser-crash", { crashDetected: Promise.resolve("page crashed") }],
+  ])(
+    "records %s and closes the browser even when shutdown never settles",
+    async (outcome, signal) => {
+      mocks.launchBot.mockReset();
+      const bot = {
+        ...(fakeBot() as object),
+        ...signal,
+        shutdown: vi.fn(() => new Promise<void>(() => {})),
+      } as unknown as { closeBrowserNow: ReturnType<typeof vi.fn> };
+      mocks.launchBot.mockImplementation(async () => bot);
+      const reasons: Array<string | undefined> = [];
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await runBotsToCompletion({
+          tasks: [{ ...task("alice"), ttl: 60_000 }],
+          onFinish: (_id, _at, reason) => reasons.push(reason),
+        });
+      } finally {
+        err.mockRestore();
+      }
+      expect(reasons).toEqual([outcome]);
+      expect(bot.closeBrowserNow).toHaveBeenCalledTimes(1);
+    },
+    10_000,
+  );
+});
+
+describe("orchestrator page reload during the launch", () => {
+  const recorderFor = (): ParticipantRecorder =>
+    new ParticipantRecorder({
+      runDir: mkdtempSync(join(tmpdir(), "bots-reload-launch-")),
+      role: null,
+      kernelNetem: "none",
+      pod: {
+        ordinal: null,
+        node: null,
+        staggerMs: null,
+        staggerIncomplete: false,
+        imageRevision: null,
+      },
+    });
+  const run = async (recorder: ParticipantRecorder, joins: number[]): Promise<void> => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runBotsToCompletion({
+        tasks: [{ ...task("alice"), ttl: 3_000 }],
+        onRegister: (t) => recorder.register(t),
+        onJoin: (id, at, media, uid) => {
+          joins.push(at);
+          recorder.joined(id, at, media ?? null, uid ?? null);
+        },
+        onFinish: (id, at, reason) => recorder.finished(id, at, reason),
+      });
+    } finally {
+      err.mockRestore();
+    }
+  };
+
+  it("records a bot whose page reloaded before launchBot returned as never joined", async () => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockRejectedValue(
+      new PageReloadedError({ atMs: Date.now(), url: "https://example.com/meeting/X" }),
+    );
+    const recorder = recorderFor();
+    const joins: number[] = [];
+    await run(recorder, joins);
+    const rec = recorder.snapshot(task("alice").botId);
+    expect(joins).toEqual([]);
+    expect(rec?.outcome).toBe("page-reloaded");
+    expect(rec?.participant.join_ts).toBeNull();
+    expect(rec?.participant.leave_ts).toBeNull();
+  }, 20_000);
+
+  it("never records leave_ts before join_ts for a reload detected as the launch returned", async () => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(async () => ({
+      ...(fakeBot() as object),
+      pageReloaded: Promise.resolve({ atMs: Date.now() - 5, url: "https://example.com/meeting/X" }),
+    }));
+    const recorder = recorderFor();
+    await run(recorder, []);
+    const p = recorder.snapshot(task("alice").botId)?.participant;
+    expect(p?.join_ts).not.toBeNull();
+    expect(p?.leave_ts).toBeGreaterThanOrEqual(p?.join_ts ?? Infinity);
+  }, 20_000);
+
+  it("records a reload during the relaunch after a ctl rejoin at the time it was seen", async () => {
+    const reloadAtMs = Date.now() + 60_000;
+    mocks.launchBot.mockReset();
+    mocks.launchBot
+      .mockResolvedValueOnce(fakeBot())
+      .mockRejectedValueOnce(
+        new PageReloadedError({ atMs: reloadAtMs, url: "https://example.com/meeting/X" }),
+      );
+    const recorder = recorderFor();
+    const botId = task("alice").botId;
+    const finishes: number[] = [];
+    let port = 0;
+    let listening!: () => void;
+    const listened = new Promise<void>((r) => (listening = r));
+    const until = async (done: () => boolean): Promise<void> => {
+      for (let i = 0; i < 300 && !done(); i += 1) await new Promise((r) => setTimeout(r, 10));
+    };
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const run = runBotsToCompletion({
+        tasks: [{ ...task("alice"), ttl: 60_000 }],
+        onRegister: (t) => recorder.register(t),
+        onJoin: (id, at, media, uid) => recorder.joined(id, at, media ?? null, uid ?? null),
+        onFinish: (id, at, reason) => {
+          finishes.push(at);
+          recorder.finished(id, at, reason);
+        },
+        control: {
+          port: 0,
+          token: "test-token",
+          tokenFilePath: join(tmpdir(), "bots-app-reload-rejoin-ctl.json"),
+          onListen: async (info) => {
+            port = info.port;
+            listening();
+          },
+        },
+      });
+      await listened;
+      await until(() => recorder.snapshot(botId)?.participant.join_ts != null);
+      const res = await fetch(`http://127.0.0.1:${port}/bots/${botId}/network`, {
+        method: "POST",
+        headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+        body: JSON.stringify({ network: "lossy_mobile" }),
+      });
+      expect(res.status).toBe(202);
+      await until(() => finishes.length > 0);
+      process.emit("SIGTERM");
+      await run;
+    } finally {
+      err.mockRestore();
+    }
+    expect(finishes).toEqual([reloadAtMs]);
+    const rec = recorder.snapshot(botId);
+    expect(rec?.outcome).toBe("page-reloaded");
+    expect(rec?.participant.leave_ts).toBe(reloadAtMs / 1000);
+  }, 20_000);
+});
+
+describe("orchestrator failure tally for a page reload", () => {
+  const ended = async (launch: () => Promise<unknown>) => {
+    mocks.launchBot.mockReset();
+    mocks.launchBot.mockImplementation(launch);
+    const warns: string[] = [];
+    const warn = vi
+      .spyOn(console, "warn")
+      .mockImplementation((...a) => void warns.push(a.join(" ")));
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let snap: Record<string, unknown> | undefined;
+    try {
+      let port = 0;
+      let listening!: () => void;
+      const listened = new Promise<void>((r) => (listening = r));
+      const run = runBotsToCompletion({
+        tasks: [{ ...task("alice"), ttl: 60_000 }],
+        control: {
+          port: 0,
+          token: "test-token",
+          tokenFilePath: join(tmpdir(), "bots-app-reload-tally-ctl.json"),
+          onListen: async (info) => {
+            port = info.port;
+            listening();
+          },
+        },
+      });
+      await listened;
+      for (let i = 0; i < 300 && snap?.finishReason === undefined; i += 1) {
+        const res = await fetch(`http://127.0.0.1:${port}/bots`, {
+          headers: { authorization: "Bearer test-token" },
+        });
+        snap = ((await res.json()) as { bots: Array<Record<string, unknown>> }).bots[0];
+        if (snap?.finishReason === undefined) await new Promise((r) => setTimeout(r, 10));
+      }
+      process.emit("SIGTERM");
+      await run;
+    } finally {
+      warn.mockRestore();
+      err.mockRestore();
+    }
+    return { snap, tally: warns.filter((l) => l.includes("ended with an error")) };
+  };
+
+  it("counts a reload during the launch as failed", async () => {
+    const url = "https://example.com/meeting/X";
+    const { snap, tally } = await ended(() =>
+      Promise.reject(new PageReloadedError({ atMs: Date.now(), url })),
+    );
+    expect(snap).toMatchObject({ status: "failed", finishReason: "page-reloaded" });
+    expect(tally).toEqual([expect.stringContaining("1/1 bot(s) ended with an error")]);
+  }, 20_000);
+
+  it.each([
+    ["https://example.com/meeting/X", "the meeting page loaded a new document after join"],
+    ["chrome-error://chromewebdata/", "the meeting page failed to load a new document after join"],
+  ])(
+    "counts a reload to %s after join as failed",
+    async (url, cause) => {
+      const { snap, tally } = await ended(async () => ({
+        ...(fakeBot() as object),
+        pageReloaded: Promise.resolve({ atMs: Date.now(), url }),
+      }));
+      expect(snap).toMatchObject({
+        status: "failed",
+        finishReason: "page-reloaded",
+        lastError: `${cause} (${url})`,
+      });
+      expect(tally).toEqual([expect.stringContaining("1/1 bot(s) ended with an error")]);
+    },
+    20_000,
+  );
 });

@@ -14,3 +14,6 @@ bot/config*.yaml
 bot/conversation/
 bot/voices/
 bot/assets/
+# Claude Code: worktrees, agent scratch and personal instructions.
+.claude/
+CLAUDE.local.md

@@ -23,8 +23,8 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::priority_drop::{
-    evaluate_dual as evaluate_priority_drop_dual, OutboundPriority, PriorityDropDecision,
-    QueueByteMeter,
+    evaluate_dual as evaluate_priority_drop_dual, outbound_priority, OutboundPriority,
+    PriorityDropDecision, QueueByteMeter,
 };
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{
@@ -53,51 +53,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
-/// Classify a dropped outbound packet for the
-/// `videocall_outbound_channel_drops_total{kind=...}` label.
-///
-/// Mirrors the WT helper at `wt_chat_session::drop_kind_label`. Refining
-/// the legacy `media` bucket into `audio`/`video`/`screen` lets operators
-/// attribute a congestion storm to a specific media stream — the
-/// 2026-05-08 production storm dropped 25,081 packets in 3 minutes and
-/// the metric had no way to tell audio from video.
-///
-/// * `parsed=false` → `"unknown"` — outer parse failed.
-/// * `parsed=true && !is_media` → `"control"`.
-/// * `parsed=true && is_media && Some(AUDIO)`  → `"audio"`.
-/// * `parsed=true && is_media && Some(VIDEO)`  → `"video"`.
-/// * `parsed=true && is_media && Some(SCREEN)` → `"screen"`.
-/// * `parsed=true && is_media && anything else (HEARTBEAT, KEYFRAME_REQUEST,
-///   encrypted/unparseable inner)` → `"media"` — the legacy catch-all so
-///   existing alerts pivoting on `kind="media"` still see a series.
-// `pub(crate)` so the metric-taxonomy coverage guard
-// (`metrics::tests::relay_drop_kinds_covers_all_emitted_drop_labels`) can
-// enumerate this emit site's output directly instead of against a hand-copied
-// literal list (issue #1186). Kept in lock-step with the `wt_chat_session`
-// copy — that test asserts both copies agree.
-pub(crate) fn drop_kind_label(
-    parsed: bool,
-    is_media: bool,
-    media_type: Option<MediaType>,
-) -> &'static str {
-    if !parsed {
-        return "unknown";
-    }
-    if !is_media {
-        return "control";
-    }
-    match media_type {
-        Some(MediaType::AUDIO) => "audio",
-        Some(MediaType::VIDEO) => "video",
-        Some(MediaType::SCREEN) => "screen",
-        _ => "media",
-    }
-}
+use crate::actors::priority_drop::channel_full_drop_kind;
 
 /// One queued outbound packet. The priority rides WITH the payload, so the
 /// drain knows which [`QueueByteMeter`] bucket to credit — no parallel
@@ -115,7 +76,9 @@ pub(crate) fn ws_byte_budget_for(priority: OutboundPriority) -> usize {
         OutboundPriority::Audio
         | OutboundPriority::Critical
         | OutboundPriority::Control
-        | OutboundPriority::ProbeEcho => 0,
+        | OutboundPriority::ProbeEcho
+        | OutboundPriority::Caption
+        | OutboundPriority::CaptionStatus => 0,
     }
 }
 
@@ -131,6 +94,22 @@ pub(crate) fn ws_outbound_decision(
         WS_OUTBOUND_CHANNEL_CAPACITY,
         queued.queued_for(priority),
         ws_byte_budget_for(priority),
+    )
+}
+
+/// Classify a packet and decide its admission on the WS lane: the whole of the
+/// `Handler<Message>` policy except the drop metrics. Free so a test can drive
+/// the real path; a `WsChatSession` needs NATS.
+pub(crate) fn ws_classify_and_decide(
+    parsed: Option<&PacketWrapper>,
+    media_type: Option<MediaType>,
+    free_capacity: usize,
+    queued: &QueueByteMeter,
+) -> (OutboundPriority, PriorityDropDecision) {
+    let priority = outbound_priority(parsed, media_type);
+    (
+        priority,
+        ws_outbound_decision(priority, free_capacity, queued),
     )
 }
 
@@ -282,6 +261,25 @@ impl WsChatSession {
         self
     }
 
+    pub fn with_meeting_started_at_ms(mut self, meeting_started_at_ms: Option<u64>) -> Self {
+        self.logic.meeting_started_at_ms = meeting_started_at_ms;
+        self
+    }
+
+    /// Carry the client's `?conn_seq=` into `JoinRoom`.
+    pub fn with_conn_seq(mut self, conn_seq: Option<u64>) -> Self {
+        self.logic.conn_seq = conn_seq;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn join_room_message_for_test(
+        &self,
+        closer: actix::Recipient<crate::messages::session::ForceClose>,
+    ) -> crate::messages::server::JoinRoom {
+        self.logic.create_join_room_message(closer)
+    }
+
     /// Start heartbeat check (WebSocket-specific: uses ping frames)
     fn start_heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
@@ -382,20 +380,23 @@ impl Actor for WsChatSession {
         let room = self.logic.room.clone();
         let user_id = self.logic.user_id.clone();
         let session_id = self.logic.id;
+        let meeting_started_at_ms = self.logic.meeting_started_at_ms;
 
         ctx.wait(
             async move {
                 session_manager
-                    .start_session(&room, &user_id, session_id)
+                    .start_session(&room, &user_id, session_id, meeting_started_at_ms)
                     .await
             }
             .into_actor(self)
             .map(|result, act, ctx| match result {
                 Ok(result) => {
                     ctx.binary(act.logic.build_session_assigned());
-                    let bytes = act
-                        .logic
-                        .build_meeting_started(result.start_time_ms, &result.creator_id);
+                    let bytes = act.logic.build_meeting_started(
+                        result.start_time_ms,
+                        result.start_time_authoritative,
+                        &result.creator_id,
+                    );
                     ctx.binary(bytes);
                 }
                 Err(e) => {
@@ -517,22 +518,14 @@ impl Handler<Message> for WsChatSession {
         // The drop path discards `bytes` without sending it.
         let bytes = self.logic.handle_outbound(&msg);
 
-        // Cleartext even under E2EE, so it is what keeps the byte bound alive
-        // when the inner parse above yields `None` (#2717).
-        let media_kind = parsed
-            .as_ref()
-            .and_then(|pw| pw.media_kind.enum_value().ok())
-            .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED);
-        let priority = OutboundPriority::classify_sealed_aware(
-            parse_succeeded,
-            packet_type,
-            media_type,
-            media_kind,
-        );
         let free_capacity = self.outbound_tx.capacity();
-        if let PriorityDropDecision::Drop { reason } =
-            ws_outbound_decision(priority, free_capacity, &self.outbound_bytes)
-        {
+        let (priority, decision) = ws_classify_and_decide(
+            parsed.as_ref(),
+            media_type,
+            free_capacity,
+            &self.outbound_bytes,
+        );
+        if let PriorityDropDecision::Drop { reason } = decision {
             // Priority-driven preempt: record both the per-room and
             // protocol-wide counters with the policy-specific label,
             // and feed `on_outbound_drop` so the drop is recorded.
@@ -567,34 +560,11 @@ impl Handler<Message> for WsChatSession {
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "websocket", "channel_full"])
                     .inc();
-                // Real channel-full drop (priority policy already
-                // admitted this packet — it's Control or Critical,
-                // or the priority bands did not preempt). Record the
-                // drop for the upstream sender. The metric `kind`
-                // label distinguishes Critical (loud) from other
-                // channel-full drops.
-                //
-                // 2026-05-08 audio-quality follow-up: when the wrapper says
-                // MEDIA, peek at the inner `MediaPacket.media_type` so we
-                // can emit `kind="audio" | "video" | "screen"` instead of
-                // the catch-all `kind="media"`. Encrypted / unparseable
-                // inner payloads fall through to the legacy `media` label,
-                // preserving backwards compatibility.
-                //
-                // 2026-05-11 priority-drop policy (discussion #699):
-                // a Critical packet that still fails try_send goes to
-                // `overflow_critical` so an alerting rule can pivot on
-                // it directly. Anything else uses the existing label
-                // helper.
                 if sender_session_id != 0 {
                     self.logic
                         .on_outbound_drop(sender_session_id, &sender_user_id);
                 }
-                let kind = if priority == OutboundPriority::Critical {
-                    "overflow_critical"
-                } else {
-                    drop_kind_label(parse_succeeded, is_media, media_type)
-                };
+                let kind = channel_full_drop_kind(priority, parse_succeeded, is_media, media_type);
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["websocket", kind])
                     .inc();
@@ -629,15 +599,17 @@ impl Handler<Packet> for WsChatSession {
 impl Handler<ForceClose> for WsChatSession {
     type Result = ();
 
-    fn handle(&mut self, _msg: ForceClose, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: ForceClose, ctx: &mut Self::Context) -> Self::Result {
         info!(
-            "Closing WebSocket session {} in room {}: removed by host",
-            self.logic.id, self.logic.room
+            "Closing WebSocket session {} in room {}: {}",
+            self.logic.id,
+            self.logic.room,
+            msg.description()
         );
-        ctx.run_later(KICK_CLOSE_FLUSH_DELAY, |_act, ctx| {
+        ctx.run_later(KICK_CLOSE_FLUSH_DELAY, move |_act, ctx| {
             ctx.close(Some(ws::CloseReason {
                 code: ws::CloseCode::Policy,
-                description: Some("removed by host".to_string()),
+                description: Some(msg.description().to_string()),
             }));
             ctx.stop();
         });
@@ -855,6 +827,7 @@ mod tests {
     use serial_test::serial;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
+    use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
 
     // ----------------------------------------------------------------------
     // Issue #1057 (+ #1144 headroom + #1062 shared binding): mailbox capacity
@@ -1026,6 +999,56 @@ mod tests {
     }
 
     #[test]
+    fn ws_caption_sheds_with_screen_after_video_and_before_audio() {
+        let caption = OutboundPriority::classify_sealed_aware(
+            true,
+            PacketType::CAPTION,
+            None,
+            MediaKind::MEDIA_KIND_UNSPECIFIED,
+        );
+        let empty = QueueByteMeter::default();
+        let admits = |p, free| ws_outbound_decision(p, free, &empty) == PriorityDropDecision::Admit;
+        let (mut outlasts_video, mut shed_before_audio) = (false, false);
+        for free in 0..=WS_OUTBOUND_CHANNEL_CAPACITY {
+            let admitted = admits(caption, free);
+            assert_eq!(
+                admitted,
+                admits(OutboundPriority::Screen, free),
+                "free={free}"
+            );
+            outlasts_video |= admitted && !admits(OutboundPriority::Video, free);
+            shed_before_audio |= !admitted && admits(OutboundPriority::Audio, free);
+        }
+        assert!(outlasts_video && shed_before_audio);
+    }
+
+    #[test]
+    fn ws_caption_status_is_admitted_where_caption_text_is_shed() {
+        use crate::actors::priority_drop::{caption_bytes, caption_wrapper};
+        use videocall_types::protos::caption_packet::caption_packet::Kind;
+        let empty = QueueByteMeter::default();
+        let free = WS_OUTBOUND_CHANNEL_CAPACITY / 20;
+        let decide = |kind| {
+            ws_classify_and_decide(
+                Some(&caption_wrapper(caption_bytes(kind))),
+                None,
+                free,
+                &empty,
+            )
+        };
+        let (tier, decision) = decide(Kind::TEXT);
+        assert_eq!(tier, OutboundPriority::Caption);
+        assert!(matches!(decision, PriorityDropDecision::Drop { .. }));
+        for kind in [Kind::STATUS_ACTIVE, Kind::STATUS_STOPPED] {
+            assert_eq!(
+                decide(kind),
+                (OutboundPriority::CaptionStatus, PriorityDropDecision::Admit),
+                "{kind:?}",
+            );
+        }
+    }
+
+    #[test]
     fn ws_audio_is_slot_bound_never_byte_bound() {
         assert_eq!(ws_byte_budget_for(OutboundPriority::Audio), 0);
 
@@ -1115,74 +1138,6 @@ mod tests {
         assert!(ws_mailbox_capacity() >= WS_OUTBOUND_CHANNEL_CAPACITY);
         // Guard: well clear of actix's dumb 16-slot default.
         assert!(ws_mailbox_capacity() > ACTIX_DEFAULT_MAILBOX_CAPACITY);
-    }
-
-    // ----------------------------------------------------------------------
-    // Drop-kind label tests — mirror the WT helper tests so the WS site
-    // emits the same `audio` / `video` / `screen` / `media` / `control` /
-    // `unknown` set, and so the legacy `media` catch-all is preserved for
-    // packets we cannot classify (HEARTBEAT, KEYFRAME_REQUEST, encrypted
-    // inner). 2026-05-08 audio-quality follow-up.
-    // ----------------------------------------------------------------------
-
-    #[test]
-    fn ws_drop_kind_unknown_when_parse_failed() {
-        assert_eq!(
-            super::drop_kind_label(/*parsed=*/ false, /*is_media=*/ false, None),
-            "unknown",
-        );
-        assert_eq!(
-            super::drop_kind_label(
-                /*parsed=*/ false,
-                /*is_media=*/ true,
-                Some(MediaType::AUDIO),
-            ),
-            "unknown",
-            "parse-fail must override stale is_media + media_type"
-        );
-    }
-
-    #[test]
-    fn ws_drop_kind_control_when_parsed_and_not_media() {
-        assert_eq!(
-            super::drop_kind_label(/*parsed=*/ true, /*is_media=*/ false, None,),
-            "control",
-        );
-    }
-
-    #[test]
-    fn ws_drop_kind_audio_video_screen() {
-        assert_eq!(
-            super::drop_kind_label(true, true, Some(MediaType::AUDIO)),
-            "audio",
-        );
-        assert_eq!(
-            super::drop_kind_label(true, true, Some(MediaType::VIDEO)),
-            "video",
-        );
-        assert_eq!(
-            super::drop_kind_label(true, true, Some(MediaType::SCREEN)),
-            "screen",
-        );
-    }
-
-    #[test]
-    fn ws_drop_kind_media_catchall_for_other_media_types() {
-        // Backwards compat: legacy `media` bucket for HEARTBEAT,
-        // KEYFRAME_REQUEST, and encrypted/unparseable inner payloads.
-        assert_eq!(
-            super::drop_kind_label(true, true, None),
-            "media",
-            "encrypted/unparseable inner must fall back to legacy `media`"
-        );
-        assert_eq!(
-            super::drop_kind_label(true, true, Some(MediaType::HEARTBEAT)),
-            "media",
-        );
-        assert_eq!(
-            super::drop_kind_label(true, true, Some(MediaType::KEYFRAME_REQUEST)),
-            "media",
-        );
     }
 
     /// Test helper: create a database pool for future JWT flow integration tests.
@@ -1282,12 +1237,44 @@ mod tests {
         Ok(ws_stream)
     }
 
+    async fn send_heartbeat(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        user: &str,
+    ) {
+        use futures::SinkExt;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let heartbeat = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: user.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: user.as_bytes().to_vec(),
+            data: heartbeat.write_to_bytes().expect("serialize heartbeat"),
+            ..Default::default()
+        };
+        ws.send(Message::Binary(
+            wrapper
+                .write_to_bytes()
+                .expect("serialize heartbeat wrapper"),
+        ))
+        .await
+        .expect("send heartbeat");
+    }
+
     async fn wait_for_meeting_started(
         ws: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
         timeout: Duration,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<videocall_types::protos::meeting_packet::MeetingPacket> {
         use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -1302,7 +1289,7 @@ mod tests {
                             if wrapper.packet_type == PacketType::MEETING.into() {
                                 if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
                                     if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
-                                        return Ok(());
+                                        return Ok(meeting);
                                     }
                                 }
                             }
@@ -1412,6 +1399,7 @@ mod tests {
         let mut recv = connect_ws_client(port, room, "splice-receiver")
             .await
             .expect("connect receiver");
+        send_heartbeat(&mut recv, "splice-receiver").await;
 
         let build = |tag: u8, len: u32| -> Vec<u8> {
             let media = MediaPacket {
@@ -1637,6 +1625,7 @@ mod tests {
         let mut recv = connect_ws_client(port, room, "frag-receiver")
             .await
             .expect("connect receiver");
+        send_heartbeat(&mut recv, "frag-receiver").await;
 
         let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
         let media = MediaPacket {
@@ -1840,6 +1829,43 @@ mod tests {
         panic!("token WebSocket server not ready");
     }
 
+    #[actix_rt::test]
+    #[serial]
+    async fn meeting_started_carries_the_token_meeting_start_as_authoritative() {
+        let port = 18937;
+        start_token_websocket_server(port).await;
+        let now = chrono::Utc::now().timestamp();
+        let room = format!("ws-start-3237-{now}");
+        let started_ms = (now - 15) * 1000 + 123;
+        let token = meeting_api::token::generate_room_token_at(
+            KICK_JWT_SECRET,
+            600,
+            now,
+            "late@test.com",
+            &room,
+            false,
+            "late@test.com",
+            false,
+            false,
+            Some(started_ms),
+        )
+        .expect("room token");
+
+        let mut ws = connect_with_token(port, &token).await;
+        let started = wait_for_meeting_started(&mut ws, Duration::from_secs(5))
+            .await
+            .expect("MEETING_STARTED");
+        assert_eq!(started.start_time_ms, started_ms as u64);
+        assert!(started.start_time_authoritative);
+
+        let mut legacy = connect_with_token(port, &room_token("old@test.com", &room, now)).await;
+        let started = wait_for_meeting_started(&mut legacy, Duration::from_secs(5))
+            .await
+            .expect("MEETING_STARTED");
+        assert!(started.start_time_ms >= (now * 1000) as u64);
+        assert!(!started.start_time_authoritative);
+    }
+
     fn room_token(user: &str, room: &str, authorized_at: i64) -> String {
         meeting_api::token::generate_room_token_at(
             KICK_JWT_SECRET,
@@ -1851,6 +1877,7 @@ mod tests {
             user,
             false,
             false,
+            None,
         )
         .expect("room token")
     }

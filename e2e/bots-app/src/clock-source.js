@@ -19,7 +19,8 @@
   const SCALE_Y = HEIGHT / LAYOUT_HEIGHT;
   // Fonts take the smaller scale so glyphs never distort or overflow the width.
   const SCALE_FONT = Math.min(SCALE_X, SCALE_Y);
-  const BAR_W = 28 * SCALE_X;
+  const MARKER_BANDS_Y = [230 * SCALE_Y, 410 * SCALE_Y];
+  const MARKER_BAND_H = 20 * SCALE_Y;
   // Hoisted: the refactor turned these into per-frame template-literal builds
   // and float multiplies. Immaterial next to the canvas fill, but free to avoid.
   const MAXW_TIME = WIDTH - 160 * SCALE_X;
@@ -71,6 +72,85 @@
     throw new Error("clock source: silent audio destination produced no track");
   }
 
+  const SPEECH_TICK_MS = 250;
+  const SPEECH_LOOKAHEAD_SLACK_MS = 1_000;
+  const speechStatus = (status) => globalThis.console.info(`[talking-clock] ${status}`);
+
+  const positiveInteger = (value, fallback, min) =>
+    typeof value === "number" && Number.isInteger(value) && value >= min ? value : fallback;
+
+  function startTalkingClock() {
+    const speech = globalThis.__CLOCK_SPEECH;
+    const encodedClips = globalThis.__CLOCK_VOICE_CLIPS;
+    if (speech === undefined || encodedClips === null || typeof encodedClips !== "object") {
+      speechStatus("no voice");
+      return;
+    }
+    const lookaheadMs = speech.MAX_LEAD_MS + SPEECH_LOOKAHEAD_SLACK_MS;
+    const fleetIndex = positiveInteger(globalThis.__CLOCK_FLEET_INDEX, 0, 0);
+    const fleetSize = positiveInteger(globalThis.__CLOCK_FLEET_SIZE, 1, 1);
+    const clips = new Map();
+    const durationOf = (clip) => clips.get(clip)?.duration;
+    let scheduledTurn = null;
+    let scheduledSlot = null;
+
+    function play(clip, when) {
+      const buffer = clips.get(clip);
+      if (buffer === undefined || when < audioContext.currentTime) return;
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioDestination);
+      source.start(when);
+    }
+
+    function scheduleSpeech() {
+      if (audioContext.state !== "running") return;
+      const nowMs = Date.now();
+      const contextTimeAt = (epochSeconds) =>
+        audioContext.currentTime + (epochSeconds * 1_000 - nowMs) / 1_000;
+      const horizon = (nowMs + lookaheadMs) / 1_000;
+      const turnStart = speech.turnStartFor(Math.floor(horizon));
+      if (turnStart !== scheduledTurn) {
+        scheduledTurn = turnStart;
+        const { speaker, lead } = speech.turnPlanFor(turnStart, fleetSize);
+        if (speaker === fleetIndex) {
+          for (const { clip, at } of speech.turnClips(turnStart, durationOf, lead)) {
+            play(clip, contextTimeAt(turnStart) + at);
+          }
+        }
+      }
+      const slot = speech.backchannelSlotFor(horizon);
+      if (slot !== scheduledSlot) {
+        scheduledSlot = slot;
+        const backchannel = speech.backchannelForSlot(slot, fleetSize);
+        if (backchannel?.listener === fleetIndex) {
+          play(backchannel.clip, contextTimeAt(backchannel.start));
+        }
+      }
+    }
+
+    speechStatus("decoding");
+    const decodes = Object.entries(encodedClips).map(async ([clip, base64]) => {
+      const bytes = Uint8Array.from(globalThis.atob(base64), (c) => c.charCodeAt(0));
+      clips.set(clip, await audioContext.decodeAudioData(bytes.buffer));
+    });
+    void Promise.allSettled(decodes).then((results) => {
+      const failed = results.filter((r) => r.status === "rejected").length;
+      speechStatus(
+        `ready: ${clips.size} clips decoded, ${failed} failed, speech model ${speech.model}`,
+      );
+      globalThis.setInterval(scheduleSpeech, SPEECH_TICK_MS);
+    });
+  }
+
+  try {
+    startTalkingClock();
+  } catch (error) {
+    speechStatus(
+      `startTalkingClock failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
   const CLOCK_LOCALE = "en-GB";
   const CLOCK_TIME_ZONE = "UTC";
   const timeFormatter = new globalThis.Intl.DateTimeFormat(CLOCK_LOCALE, {
@@ -92,6 +172,72 @@
   let cachedDate = "";
   let cachedHue = 0;
 
+  // Injected per bot by bot.ts (issue 3089); the fallback must equal SD_VIDEO_NOISE
+  // in video-noise.ts — locked by clock-source.test.ts.
+  const injectedNoise = globalThis.__CLOCK_VIDEO_NOISE;
+  const NOISE_ALPHA =
+    typeof injectedNoise === "number" && injectedNoise >= 0 && injectedNoise <= 1
+      ? injectedNoise
+      : 0.1;
+  const NOISE_TILE_COUNT = 8;
+  const NOISE_PAD = 64;
+  const NOISE_CELL = 6;
+
+  function noiseTile() {
+    const tile = globalThis.document.createElement("canvas");
+    tile.width = WIDTH + NOISE_PAD;
+    tile.height = HEIGHT + NOISE_PAD;
+    const tileContext = tile.getContext("2d");
+    const image = tileContext.createImageData(tile.width, tile.height);
+    const gridWidth = Math.ceil(tile.width / NOISE_CELL) + 2;
+    const grid = new Float32Array(gridWidth * (Math.ceil(tile.height / NOISE_CELL) + 2));
+    for (let i = 0; i < grid.length; i++) grid[i] = Math.random();
+    const data = image.data;
+    for (let y = 0; y < tile.height; y++) {
+      const y0 = Math.floor(y / NOISE_CELL);
+      const fy = y / NOISE_CELL - y0;
+      for (let x = 0; x < tile.width; x++) {
+        const x0 = Math.floor(x / NOISE_CELL);
+        const fx = x / NOISE_CELL - x0;
+        const top = y0 * gridWidth + x0;
+        const bottom = top + gridWidth;
+        const texture =
+          (grid[top] * (1 - fx) + grid[top + 1] * fx) * (1 - fy) +
+          (grid[bottom] * (1 - fx) + grid[bottom + 1] * fx) * fy;
+        const i = (y * tile.width + x) * 4;
+        for (let channel = 0; channel < 3; channel++) {
+          data[i + channel] = 255 * (0.5 * texture + 0.5 * Math.random());
+        }
+        data[i + 3] = 255;
+      }
+    }
+    tileContext.putImageData(image, 0, 0);
+    return tile;
+  }
+
+  let noiseTiles = [];
+  if (NOISE_ALPHA > 0) {
+    try {
+      noiseTiles = Array.from({ length: NOISE_TILE_COUNT }, () => noiseTile());
+    } catch (error) {
+      globalThis.console.error(
+        `[clock-source] noise background OFF, tile build failed: ${String(error)}`,
+      );
+    }
+  }
+
+  function drawNoise() {
+    if (noiseTiles.length === 0) return;
+    const tile = noiseTiles[Math.floor(Math.random() * noiseTiles.length)];
+    context.globalAlpha = NOISE_ALPHA;
+    context.drawImage(
+      tile,
+      -Math.floor(Math.random() * NOISE_PAD),
+      -Math.floor(Math.random() * NOISE_PAD),
+    );
+    context.globalAlpha = 1;
+  }
+
   function drawClock() {
     const now = new Date();
     const second = Math.floor(now.getTime() / 1_000);
@@ -104,18 +250,13 @@
 
     context.fillStyle = `hsl(${cachedHue} 58% 18%)`;
     context.fillRect(0, 0, WIDTH, HEIGHT);
-
-    context.fillStyle = `hsl(${(cachedHue + 55) % 360} 72% 55%)`;
-    context.fillRect(0, 0, BAR_W, HEIGHT);
-    context.fillRect(WIDTH - BAR_W, 0, BAR_W, HEIGHT);
+    drawNoise();
 
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.fillStyle = "#ffffff";
     context.font = FONT_TIME;
     const milliseconds = String(now.getMilliseconds()).padStart(3, "0");
-    // maxWidth keeps the time clear of the side bars with horizontal padding
-    // (the full HH:MM:SS.mmm string in monospace otherwise clips the tile edges).
     context.fillText(`${cachedTime}.${milliseconds}`, WIDTH / 2, Y_TIME, MAXW_TIME);
 
     context.fillStyle = "rgba(255, 255, 255, 0.82)";
@@ -129,6 +270,9 @@
       context.font = FONT_NAME;
       context.fillText(participant, WIDTH / 2, Y_NAME, MAXW_NAME);
     }
+
+    context.fillStyle = `hsl(${(cachedHue + 55) % 360} 72% 55%)`;
+    for (const y of MARKER_BANDS_Y) context.fillRect(0, y, WIDTH, MARKER_BAND_H);
   }
 
   function waitForDimensions(track) {
@@ -150,13 +294,35 @@
     });
   }
 
+  // Draws only while a handed-out video track, or any clone of one, is live.
+  const liveVideoClones = new Set();
+  function registerVideo(track) {
+    liveVideoClones.add(track);
+    const nativeClone = track.clone;
+    track.clone = function (...args) {
+      const copy = Reflect.apply(nativeClone, this, args);
+      return liveVideoClones.has(this) ? registerVideo(copy) : copy;
+    };
+    return track;
+  }
+  function videoWanted() {
+    let wanted = false;
+    for (const track of liveVideoClones) {
+      if (track.readyState === "live") wanted = true;
+      else liveVideoClones.delete(track);
+    }
+    return wanted;
+  }
+
   drawClock();
-  globalThis.setInterval(drawClock, FRAME_INTERVAL_MS);
+  globalThis.setInterval(() => {
+    if (videoWanted()) drawClock();
+  }, FRAME_INTERVAL_MS);
 
   globalThis.navigator.mediaDevices.getUserMedia = async (constraints = {}) => {
     const tracks = [];
     if (constraints.video) {
-      tracks.push(baseVideoTrack.clone());
+      tracks.push(registerVideo(baseVideoTrack.clone()));
     }
     if (constraints.audio) {
       if (audioContext.state === "suspended") {

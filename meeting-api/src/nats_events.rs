@@ -299,6 +299,33 @@ pub async fn publish_participant_display_name_changed(
     );
 }
 
+/// `PARTICIPANT_AVATAR_CHANGED` for `target_user_id` in `room_id`.
+pub fn participant_avatar_changed_packet(room_id: &str, target_user_id: &str) -> Vec<u8> {
+    build_meeting_wrapper(&MeetingPacket {
+        event_type: MeetingEventType::PARTICIPANT_AVATAR_CHANGED.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    })
+}
+
+/// Publish [`participant_avatar_changed_packet`] on `room_id`'s system subject.
+pub async fn publish_participant_avatar_changed(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+) {
+    let (Some(nats), Some(subject)) = (nats, room_system_subject(room_id)) else {
+        return;
+    };
+    publish(
+        nats,
+        subject,
+        participant_avatar_changed_packet(room_id, target_user_id),
+    )
+    .await;
+}
+
 /// Publish `HOST_MUTE_PARTICIPANT` for one participant — or, with an empty
 /// `target_user_id`, for every participant in the room (mute-all).
 ///
@@ -443,6 +470,37 @@ pub async fn publish_kick_revocation(
         payload.revoke_iat_through
     );
     Ok(())
+}
+
+/// Publish [`MEETING_INSTANCE_STARTED_SUBJECT`] when `activation` started a new instance (#3287).
+///
+/// [`MEETING_INSTANCE_STARTED_SUBJECT`]: videocall_meeting_types::instance::MEETING_INSTANCE_STARTED_SUBJECT
+pub async fn publish_instance_started(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    activation: &crate::db::meetings::Activation,
+) {
+    let (Some(nats), Some(started_at_ms)) = (nats, activation.new_instance_started_at_ms()) else {
+        return;
+    };
+    let payload = videocall_meeting_types::instance::MeetingInstanceStartedPayload {
+        room_id: room_id.to_string(),
+        started_at_ms,
+    };
+    let bytes = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!("Failed to serialize instance start for room {room_id}: {e}");
+            return;
+        }
+    };
+    publish(
+        nats,
+        videocall_meeting_types::instance::MEETING_INSTANCE_STARTED_SUBJECT.to_string(),
+        bytes,
+    )
+    .await;
+    tracing::debug!("Published instance start for room {room_id} started_at_ms={started_at_ms}");
 }
 
 /// Publish `HOST_GRANTED` to tell every client a participant was promoted to
@@ -883,6 +941,25 @@ mod tests {
     }
 
     #[test]
+    fn test_build_participant_avatar_changed_packet() {
+        let bytes = participant_avatar_changed_packet("test-room", "tony@example.com");
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+        assert_eq!(wrapper.user_id, SYSTEM_USER_ID.as_bytes());
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(inner.event_type.value(), 20);
+        assert_eq!(
+            inner,
+            MeetingPacket {
+                event_type: MeetingEventType::PARTICIPANT_AVATAR_CHANGED.into(),
+                room_id: "test-room".to_string(),
+                target_user_id: b"tony@example.com".to_vec(),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
     fn test_build_host_granted_packet() {
         let packet = MeetingPacket {
             event_type: MeetingEventType::HOST_GRANTED.into(),
@@ -1002,6 +1079,7 @@ mod tests {
         publish_participant_rejected(None, "room", "user@test.com").await;
         publish_waiting_room_updated(None, "room").await;
         publish_meeting_settings_updated(None, "room").await;
+        publish_participant_avatar_changed(None, "room", "user@test.com").await;
         let _ = publish_host_mute(None, "room", "user@test.com", "host@test.com").await;
         let _ = publish_host_mute(None, "room", "", "host@test.com").await;
         let _ = publish_host_disable_video(None, "room", "user@test.com", "host@test.com").await;

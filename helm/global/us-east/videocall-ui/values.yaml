@@ -34,6 +34,8 @@ videocall-ui:
     showBuildGitInfo: "false"
     usersAllowedToStream: ""
     serverElectionPeriodMs: 2000
+    webTransportConnectTimeoutMs: 5000
+    webSocketConnectTimeoutMs: 5000
 
   service:
     type: ClusterIP

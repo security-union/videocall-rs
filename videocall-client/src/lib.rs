@@ -64,7 +64,12 @@
 //!     diagnostics_update_interval_ms: None,
 //!     enable_health_reporting: false,
 //!     on_encoder_settings_update: None,
-//!     rtt_testing_period_ms: 3000,
+//!     webtransport_connect_timeout_ms: 3000,
+//!     websocket_connect_timeout_ms: 3000,
+//!     prefer_webtransport: true,
+//!     on_election_progress: None,
+//!     start_in_fallback: false,
+//!     on_fallback_memory: None,
 //!     rtt_probe_interval_ms: None,
 //!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
 //!     on_peer_removed: None,
@@ -84,10 +89,13 @@
 //!     on_reaction: None,     // Option<Callback<(u64, i32, String, Option<String>)>> -- (sender_session_id, reaction_enum, resolved_name, custom_emoji)
 //!     on_raise_hand: None,   // Option<Callback<(u64, bool, u64, String)>> -- (sender_session_id, raised, raised_at_ms, resolved_name)
 //!     on_meeting_timer: None, // Option<Callback<MeetingTimerState>> -- the host's room-global countdown state (issue 2136)
+//!     on_caption: None,      // Option<Callback<CaptionUpdate>> -- server-authored caption text and room status
 //!     on_display_name_changed: None,
+//!     on_avatar_changed: None,
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,
 //!     on_participant_kicked: None,
+//!     on_instance_superseded: None,
 //!     on_host_granted: None,
 //!     on_host_revoked: None,
 //!     on_peer_event: None,
@@ -116,7 +124,12 @@
 //! #     display_name: "User".to_string(), meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
 //! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), enable_diagnostics: false, send_diagnostics_packets: true, diagnostics_update_interval_ms: None,
 //! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
-//! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
+//! #     webtransport_connect_timeout_ms: 3000,
+//! #     websocket_connect_timeout_ms: 3000,
+//! #     prefer_webtransport: true,
+//! #     on_election_progress: None,
+//! #     start_in_fallback: false,
+//! #     on_fallback_memory: None, rtt_probe_interval_ms: None,
 //! #     on_peer_removed: None,
 //! #     on_peers_removed_batch: None,
 //! #     on_meeting_info: None,
@@ -134,10 +147,13 @@
 //! #     on_reaction: None,
 //! #     on_raise_hand: None,
 //! #     on_meeting_timer: None,
+//! #     on_caption: None,
 //! #     on_display_name_changed: None,
+//! #     on_avatar_changed: None,
 //! #     on_host_mute: None,
 //! #     on_host_disable_video: None,
 //! #     on_participant_kicked: None,
+//! #     on_instance_superseded: None,
 //! #     on_host_granted: None,
 //! #     on_host_revoked: None,
 //! #     on_peer_event: None,
@@ -270,6 +286,12 @@ mod test_serial;
 pub mod utils;
 mod wrappers;
 pub mod wt_receive_inject;
+pub use client::captions::{
+    is_invisible_format_char, sanitize_caption_name, sanitize_caption_tail, sanitize_caption_text,
+    CaptionEvent, CaptionStatus, CaptionTranslation, CaptionUpdate, CAPTION_LANGUAGE_MAX_CHARS,
+    CAPTION_MAX_COMBINING_MARKS, CAPTION_MAX_TRANSLATIONS, CAPTION_MAX_TRANSLATIONS_SCANNED,
+    CAPTION_NAME_MAX_CHARS, CAPTION_TEXT_MAX_CHARS, CAPTION_TRUNCATION_MARK,
+};
 // Issue 2135: raise-hand send policy. Pure + host-testable; the UI owns one
 // `RaiseHandAnnouncer` and drives it (see the module docs for why this coalesces
 // rather than drops, unlike the reactions self-throttle below).
@@ -296,7 +318,9 @@ pub use client::reactions::{
 pub use client::{
     RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
 };
-pub use connection::{ConnectionLostReason, ConnectionState};
+pub use connection::{
+    ConnectionLostReason, ConnectionState, ElectionProgress, ELECTION_STARVED_GRACE_MS,
+};
 pub use videocall_transport::webtransport::prewarm_session_worker as prewarm_wt_session_worker;
 pub use videocall_transport::worker_session::SpareLease as WtSessionWorkerLease;
 // Issue #1080: runtime netsim control-surface installer. Feature-gated so
@@ -304,10 +328,10 @@ pub use videocall_transport::worker_session::SpareLease as WtSessionWorkerLease;
 #[cfg(feature = "netsim")]
 pub use connection::install_netsim_window_hook;
 pub use decode::{
-    create_audio_peer_decoder, max_layers_for_kind, quality_state, size_cap_layer,
-    AudioPeerDecoderTrait, DegradeReason, KindLayerBounds, PeerDecodeManager, PeerDeviceInfo,
-    PeerReceiveDiag, PrefMediaKind, QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot,
-    TileHint, VideoPeerDecoder,
+    create_audio_peer_decoder, is_mirrored_canvas, max_layers_for_kind, quality_state,
+    set_mirrored_canvas, size_cap_layer, AudioPeerDecoderTrait, DegradeReason, KindLayerBounds,
+    PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag, PrefMediaKind, QualityState,
+    ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint, VideoPeerDecoder,
 };
 pub use encode::{
     create_microphone_encoder, screen_capture_display_constraints,

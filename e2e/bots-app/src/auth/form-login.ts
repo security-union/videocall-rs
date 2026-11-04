@@ -1,5 +1,7 @@
 import { type Page } from "@playwright/test";
 
+import { notVisible, UI_PROBE_TIME_LIMIT_MS, withTimeLimit } from "../time-limit";
+
 /**
  * Programmatic username/password login for identity providers that drive a
  * standard PKCE auth-code flow where the *application* orchestrates the
@@ -323,7 +325,9 @@ export async function performFormLogin(args: {
   await emailInput.fill(email, { timeout: actionTimeout });
   await passwordInput.fill(password, { timeout: actionTimeout });
 
-  const submitVisible = await submitButton.isVisible({ timeout: 2_000 }).catch(() => false);
+  const submitVisible = await withTimeLimit("isVisible submit button", UI_PROBE_TIME_LIMIT_MS, () =>
+    submitButton.isVisible(),
+  ).catch(notVisible((m) => console.warn(`[${label}] form-login: ${m}`)));
   if (submitVisible) {
     await submitButton.click({ timeout: actionTimeout });
   } else {

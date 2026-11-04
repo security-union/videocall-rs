@@ -561,11 +561,12 @@ impl DiagnosticManager {
     // throttling so the AQ feedback loop and diagnostics reporting keep
     // running at the configured cadence even when the tab is hidden.
     fn setup_heartbeat(&mut self, sender: Sender<DiagnosticEvent>) {
-        let timer = HeartbeatTimer::start(HEARTBEAT_PERIOD_MS, move || {
-            if let Err(e) = sender.clone().try_send(DiagnosticEvent::HeartbeatTick) {
-                log::debug!("Failed to enqueue heartbeat event: {e:?}");
-            }
-        });
+        let timer =
+            HeartbeatTimer::start("diagnostics heartbeat", HEARTBEAT_PERIOD_MS, move || {
+                if let Err(e) = sender.clone().try_send(DiagnosticEvent::HeartbeatTick) {
+                    log::debug!("Failed to enqueue heartbeat event: {e:?}");
+                }
+            });
         self.timer = Some(timer);
     }
 
@@ -1231,14 +1232,15 @@ impl SenderDiagnosticManager {
     }
 
     fn setup_heartbeat(&mut self, sender: Sender<SenderDiagnosticEvent>) {
-        let timer = HeartbeatTimer::start(HEARTBEAT_PERIOD_MS, move || {
-            if let Err(e) = sender
-                .clone()
-                .try_send(SenderDiagnosticEvent::HeartbeatTick)
-            {
-                log::debug!("Failed to enqueue sender heartbeat event: {e:?}");
-            }
-        });
+        let timer =
+            HeartbeatTimer::start("diagnostics heartbeat", HEARTBEAT_PERIOD_MS, move || {
+                if let Err(e) = sender
+                    .clone()
+                    .try_send(SenderDiagnosticEvent::HeartbeatTick)
+                {
+                    log::debug!("Failed to enqueue sender heartbeat event: {e:?}");
+                }
+            });
         self.timer = Some(timer);
     }
 

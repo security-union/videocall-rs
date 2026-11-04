@@ -25,14 +25,16 @@ pub mod neteq_audio_decoder;
 pub mod peer_decode_manager;
 pub mod peer_decoder;
 pub mod pli_budget;
+pub(crate) mod speaking_edge;
 pub mod video_decoder_wrapper;
+pub(crate) mod worker_boot_queue;
 
 pub use layer_chooser::{
     max_layers_for_kind, quality_state, size_cap_layer, DegradeReason, KindLayerBounds,
     PrefMediaKind, QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
 };
 pub use peer_decode_manager::{PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag, PeerStatus};
-pub use peer_decoder::VideoPeerDecoder;
+pub use peer_decoder::{is_mirrored_canvas, set_mirrored_canvas, VideoPeerDecoder};
 
 use neteq_audio_decoder::NetEqAudioPeerDecoder;
 use peer_decoder::{
@@ -68,6 +70,15 @@ impl From<StandardDecodeStatus> for DecodeStatus {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerBootState {
+    Queued,
+    Booting,
+    Ready,
+    Failed,
+}
+
 /// Trait to abstract over different audio peer decoder implementations
 pub trait AudioPeerDecoderTrait {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
@@ -95,6 +106,16 @@ pub trait AudioPeerDecoderTrait {
     /// The default is a no-op: a decoder with no speaking indicator (see
     /// [`StandardAudioPeerDecoder`]) has nothing to retire.
     fn retire_for_replacement(&mut self) {}
+
+    /// True once the boot queue stopped this decoder's worker for not starting in time (#3277).
+    fn boot_timed_out(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn boot_state_for_test(&self) -> WorkerBootState {
+        unimplemented!("only a worker-backed decoder boots")
+    }
 }
 
 // Implement trait for standard audio peer decoder
@@ -114,6 +135,21 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
         // Standard decoder doesn't support muting at the decoder level
         log::debug!("set_muted called on standard audio decoder (no-op)");
     }
+}
+
+/// A NetEq decoder whose worker boots through the peer's [`worker_boot_queue`] (#3277).
+pub(crate) fn create_queued_audio_peer_decoder(
+    peer_id: String,
+    vad_threshold: Option<f32>,
+    mut reservation: worker_boot_queue::BootReservation,
+) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
+    let (decoder, starter) = NetEqAudioPeerDecoder::new_deferred(
+        peer_id,
+        vad_threshold,
+        reservation.take_settle_callback(),
+    )?;
+    reservation.submit(starter);
+    Ok(decoder)
 }
 
 /// Factory function to create the appropriate audio peer decoder based on platform detection

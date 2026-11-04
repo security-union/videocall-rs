@@ -2,16 +2,21 @@ import { existsSync } from "node:fs";
 
 import {
   type BotExitReason,
+  type BotHandle,
   type BotRunOptions,
   type DiagPacketsObservation,
   launchBot,
+  LaunchAbortedError,
 } from "./bot";
 import { type CameraCycleConfig } from "./camera-cycle";
+import { PAGE_RELOADED, type PageReload, PageReloadedError, reloadCause } from "./page-reload";
 import {
   cameraControlSelector,
   micControlSelector,
   resolveControlSelector,
+  SCREEN_SHARE_MENU_STOP_SELECTOR,
   screenShareCandidates,
+  screenShareControlSelector,
 } from "./control-buttons";
 import { defaultSsoStatePath } from "./auth/storage-state";
 import type { PrimeProgress } from "./auto-prime";
@@ -43,6 +48,7 @@ import {
 import { getHost, type SshHost } from "./control/ssh-hosts";
 import { spawnRemoteBot, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { taggedLine } from "./log-line";
+import type { SimulcastMaxLayersObserved } from "./simulcast-layers";
 import { loadManifest, type Manifest } from "./manifest";
 import {
   JoinRejectedError,
@@ -50,7 +56,9 @@ import {
   MeetingNavigatedAwayError,
   WaitingRoomError,
 } from "./meeting-join";
+import type { PersonaTally } from "./persona-driver";
 import { SD_SOURCE } from "./posture";
+import type { TransportEvent } from "./transport";
 import { type RemoteResourceManager } from "./resource/session";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
 
@@ -63,6 +71,12 @@ export interface BotTask extends BotRunOptions {
    */
   botId: string;
   ttl: Ttl;
+  /**
+   * Absolute end of the run (epoch ms): no launch or rejoin after it, the TTL never runs past it, and the
+   * session cookie expires by it. `null` or absent: the TTL alone bounds the bot.
+   */
+  runDeadlineMs?: number | null;
+  joinDeadlineMs?: number | null;
   /** Required here, optional on BotRunOptions: every task builder must decide (#2362). */
   cameraCycle: CameraCycleConfig | null;
 }
@@ -77,6 +91,8 @@ export interface BotTask extends BotRunOptions {
  */
 export interface RunOptions {
   tasks: readonly BotTask[];
+  /** Absolute end of the run (epoch ms): the run shuts down then, and control launches inherit it. */
+  runDeadlineMs?: number | null;
   control?: {
     port: number;
     token: string;
@@ -146,9 +162,16 @@ export interface RunOptions {
     media?: JoinMediaState,
     sessionUserId?: string | null,
     decodeBudgetReadback?: string | null,
+    skipCanvasPaintReadback?: string | null,
+    speakingGlowReadback?: string | null,
+    simulcastMaxLayersReadback?: SimulcastMaxLayersObserved,
   ) => void;
   /** Local bots only: each `diagnostics packets:` line a bot's client prints. */
   onDiagPackets?: (botId: string, obs: DiagPacketsObservation) => void;
+  /** Local bots only: each transport line a bot's client prints. */
+  onTransport?: (botId: string, event: TransportEvent) => void;
+  /** Local bots only: a persona bot's toggle tally after each toggle and at shutdown. */
+  onPersona?: (botId: string, tally: PersonaTally) => void;
   /** Overrides {@link DIAG_PACKETS_VERIFY_MS}. */
   diagPacketsVerifyMs?: number;
   /** Local bots only: fired when a task is registered, before it launches. */
@@ -177,6 +200,8 @@ interface RegisterSshTaskDeps {
   spawnRemoteBot?: (spec: SshLaunchSpec) => SshBotHandle;
   /** Remote-resource manager threaded from {@link RunOptions.remoteResource} (issue 2032). */
   remoteResource?: RemoteResourceManager;
+  /** The run's deadline (epoch ms), passed to the remote bot as `--deadline`. */
+  runDeadlineMs?: number | null;
 }
 
 /**
@@ -212,6 +237,7 @@ export async function registerSshTask(
     sourceGeometry: SD_SOURCE,
     cameraCycle: null,
     diagPackets: spec.diagPackets ?? null,
+    runDeadlineMs: deps.runDeadlineMs ?? null,
   };
   const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
   const entry = newRegistryEntry(task, hostKind);
@@ -233,6 +259,7 @@ export async function registerSshTask(
     headless: spec.headless,
     ssoStateFile,
     diagPackets: task.diagPackets,
+    deadlineSecs: deps.runDeadlineMs == null ? null : Math.floor(deps.runDeadlineMs / 1000),
     botId,
   });
   entry.sshHandle = sshHandle;
@@ -316,6 +343,25 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     );
     resolveShutdown();
   };
+  const runDeadlineMs = opts.runDeadlineMs ?? null;
+  const pastRunDeadline = (): boolean => runDeadlineMs != null && Date.now() >= runDeadlineMs;
+  let hardStopTimer: ReturnType<typeof setTimeout> | undefined;
+  const hardStop = new Promise<"hard-stop">((res) => {
+    if (runDeadlineMs == null) return;
+    const after = Math.max(0, runDeadlineMs - Date.now()) + RUN_END_AFTER_DEADLINE_MS;
+    hardStopTimer = setTimeout(() => res("hard-stop"), after);
+  });
+  let deadlineFired = false;
+  const deadlineTimer =
+    runDeadlineMs == null
+      ? undefined
+      : setTimeout(
+          () => {
+            deadlineFired = true;
+            requestShutdown("the run deadline");
+          },
+          Math.max(0, runDeadlineMs - Date.now()),
+        );
   const sigintHandler = (): void => requestShutdown("SIGINT");
   const sigtermHandler = (): void => requestShutdown("SIGTERM");
   process.on("SIGINT", sigintHandler);
@@ -337,7 +383,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   const inFlightWaiters: Array<() => void> = [];
   // Per-bot mutable scheduling state. Kept outside the registry entry
   // because none of it is safe to serialize over the control API.
-  const ttlTimers: Map<string, { cancel: () => void; rearm: (ttl: Ttl) => void }> = new Map();
+  const ttlTimers: Map<string, TtlControl> = new Map();
   // Per-bot "force shut down now" promises. Resolved by the control
   // server's `triggerLeave` / `forceKill` / `changeNetwork` to break
   // the wait loop in `runSingleBotTask` before the natural TTL fires.
@@ -444,14 +490,15 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
       if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("extend-ttl");
-      entry.ttl = newTtl;
-      entry.ttlDeadline = newTtl === "infinite" ? null : Date.now() + newTtl;
       const timer = ttlTimers.get(botId);
-      if (timer !== undefined) timer.rearm(newTtl);
+      const capped =
+        timer !== undefined ? timer.rearm(newTtl) : capTtl(newTtl, entry.task.runDeadlineMs);
+      entry.ttl = capped;
+      entry.ttlDeadline = capped === "infinite" ? null : Date.now() + capped;
       console.log(
         taggedLine(
           `${entry.task.participant}@${shortBotId(botId)}`,
-          `ttl rearmed → ${formatDuration(newTtl)}`,
+          `ttl rearmed → ${formatDuration(capped)}`,
         ),
       );
     },
@@ -490,6 +537,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       await toggleScreenShare(entry, share);
     },
     launchOne: async (spec: LaunchSpec) => {
+      if (pastRunDeadline()) throw new Error("the run's deadline has passed");
       const runLocation = spec.runLocation ?? { kind: "local" };
       if (runLocation.kind === "ssh") {
         const runDir = opts.control?.runDir;
@@ -508,6 +556,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
           inFlightWaiters,
           runDir,
           remoteResource: opts.remoteResource,
+          runDeadlineMs,
         });
         return botId;
       }
@@ -516,6 +565,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         manifestDir: dashboardManifestDir,
         runDir: opts.control?.runDir ?? null,
       });
+      newTask.runDeadlineMs = runDeadlineMs;
       registerTask(newTask);
       console.log(
         taggedLine(
@@ -529,6 +579,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       const src = registry.get(sourceBotId);
       if (src === undefined) throw new Error(`bot ${sourceBotId} not in registry`);
       if (src.host.kind === "ssh") throw new NotSupportedRemoteError("duplicate");
+      if (pastRunDeadline()) throw new Error("the run's deadline has passed");
       const newTask: BotTask = {
         ...src.task,
         botId: generateBotId(),
@@ -614,6 +665,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       task.botId,
       runSingleBotTask(task, entry, {
         shutdownRequested,
+        deadlineFired: () => deadlineFired,
         registerTtlTimer: (botId, ctl) => ttlTimers.set(botId, ctl),
         registerCtlSignal: (botId, sig) => ctlSignals.set(botId, sig),
         clearMaps: (botId) => {
@@ -623,6 +675,8 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         onEncoderFps: opts.onEncoderFps,
         onDiagPackets: opts.onDiagPackets,
         diagPacketsVerifyMs: opts.diagPacketsVerifyMs,
+        onTransport: opts.onTransport,
+        onPersona: opts.onPersona,
         onJoin: opts.onJoin,
         onRejoin: opts.onRejoin,
       }).then((reason) => {
@@ -673,14 +727,24 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       ]);
       continue;
     }
-    const winner = await Promise.race(
-      Array.from(inFlight, ([id, promise]) =>
+    const winner = await Promise.race([
+      ...Array.from(inFlight, ([id, promise]) =>
         promise.then(
           (reason) => ({ id, reason, kind: "ok" as const }),
           (err) => ({ id, err, kind: "err" as const }),
         ),
       ),
-    );
+      hardStop,
+    ]);
+    if (winner === "hard-stop") {
+      console.error(
+        taggedLine(
+          "orchestrator",
+          `${inFlight.size} bot(s) still tearing down past the run deadline`,
+        ),
+      );
+      break;
+    }
     inFlight.delete(winner.id);
     const finished = registry.get(winner.id);
     if (finished?.host.kind === "local") {
@@ -728,6 +792,8 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       );
     });
   }
+  clearTimeout(deadlineTimer);
+  clearTimeout(hardStopTimer);
   process.off("SIGINT", sigintHandler);
   process.off("SIGTERM", sigtermHandler);
 }
@@ -737,15 +803,25 @@ type CtlReason = "ctl-leave" | "ctl-kill" | "ctl-rejoin";
 /** How long after a join an `off` bot may go without a `diagnostics packets:` line. */
 export const DIAG_PACKETS_VERIFY_MS = 15_000;
 
+interface TtlControl {
+  cancel: () => void;
+  /** Re-arms the timer with `ttl` capped at the run deadline, and returns the capped value. */
+  rearm: (ttl: Ttl) => Ttl;
+}
+
 interface SingleBotDeps {
   shutdownRequested: Promise<void>;
-  registerTtlTimer: (botId: string, ctl: { cancel: () => void; rearm: (ttl: Ttl) => void }) => void;
+  /** Whether the run's own deadline timer has fired. */
+  deadlineFired: () => boolean;
+  registerTtlTimer: (botId: string, ctl: TtlControl) => void;
   registerCtlSignal: (botId: string, sig: { trigger: (reason: CtlReason) => void }) => void;
   clearMaps: (botId: string) => void;
   /** Per-bot FPS sink threaded from {@link RunOptions.onEncoderFps} (issue 2032). */
   onEncoderFps?: (botId: string, fps: number | null) => void;
   onDiagPackets?: (botId: string, obs: DiagPacketsObservation) => void;
   diagPacketsVerifyMs?: number;
+  onTransport?: (botId: string, event: TransportEvent) => void;
+  onPersona?: (botId: string, tally: PersonaTally) => void;
   /** Join sink threaded from {@link RunOptions.onJoin} (#2294). */
   onJoin?: (
     botId: string,
@@ -753,6 +829,9 @@ interface SingleBotDeps {
     media?: JoinMediaState,
     sessionUserId?: string | null,
     decodeBudgetReadback?: string | null,
+    skipCanvasPaintReadback?: string | null,
+    speakingGlowReadback?: string | null,
+    simulcastMaxLayersReadback?: SimulcastMaxLayersObserved,
   ) => void;
   onRejoin?: (botId: string, network: string | null) => void;
 }
@@ -790,11 +869,34 @@ async function runSingleBotTask(
     // Strip the orchestrator-only fields (`ttl`, `botId`) before
     // handing the rest to `launchBot` — and inject `botIdShort` so
     // the bot's log prefix reads `[participant@<id>]`.
-    const { ttl, botId, ...rest } = entry.task;
+    const { ttl, botId, runDeadlineMs, joinDeadlineMs, ...rest } = entry.task;
     void botId;
+    const launchAt = Date.now();
+    if (runDeadlineMs != null && runDeadlineMs - launchAt < MIN_LAUNCH_MS) {
+      const err = new Error(
+        `the run's deadline is ${runDeadlineMs - launchAt} ms away; not launching`,
+      );
+      console.error(taggedLine(label, `launch refused: ${err.message}`));
+      entry.status = "failed";
+      entry.lastError = err.message;
+      entry.finishReason = "launch-error";
+      entry.finishedAt = launchAt;
+      deps.clearMaps(task.botId);
+      return { kind: "launch-error", cause: err };
+    }
+    const sessionNotAfterMs = Math.min(
+      runDeadlineMs ?? Infinity,
+      ttl === "infinite" ? Infinity : launchAt + ttl,
+    );
     let diagSeen = false;
+    const launchAbort = new AbortController();
+    void deps.shutdownRequested.then(() =>
+      launchAbort.abort(deps.deadlineFired() ? RUN_DEADLINE_ABORT : SHUTDOWN_ABORT),
+    );
     const launchOpts = {
       ...rest,
+      signal: launchAbort.signal,
+      sessionNotAfterMs: Number.isFinite(sessionNotAfterMs) ? sessionNotAfterMs : null,
       botIdShort: shortBotId(task.botId),
       onEncoderFps: deps.onEncoderFps
         ? (fps: number | null): void => deps.onEncoderFps?.(task.botId, fps)
@@ -807,6 +909,8 @@ async function runSingleBotTask(
         );
         deps.onDiagPackets?.(task.botId, obs);
       },
+      onTransport: (event: TransportEvent): void => deps.onTransport?.(task.botId, event),
+      onPersona: (tally: PersonaTally): void => deps.onPersona?.(task.botId, tally),
       onPrimeProgress: willAutoPrime
         ? (p: PrimeProgress): void => {
             // Mirror the CLI's prefix format so the dashboard log
@@ -825,10 +929,39 @@ async function runSingleBotTask(
           }
         : null,
     };
+    const launchBy = Math.min(runDeadlineMs ?? Infinity, joinDeadlineMs ?? Infinity);
+    /** The first cause to abort the launch decides how it ended; `unaborted` stands in when none did. */
+    const endBeforeJoin = (unaborted: string): BotExitReason => {
+      const cause: unknown = launchAbort.signal.aborted ? launchAbort.signal.reason : unaborted;
+      entry.finishedAt = Date.now();
+      deps.clearMaps(task.botId);
+      if (cause === SHUTDOWN_ABORT) {
+        console.log(taggedLine(label, `exited cleanly: ${new LaunchAbortedError().message}`));
+        entry.status = "done";
+        entry.finishReason = "shutdown-signal";
+        return { kind: "shutdown-signal" };
+      }
+      if (cause === RUN_DEADLINE_ABORT || launchBy === runDeadlineMs) {
+        console.error(taggedLine(label, "the run's deadline passed during the launch"));
+        entry.status = "done";
+        entry.finishReason = "ttl-expired";
+        return { kind: "ttl-expired" };
+      }
+      const err = new Error("the join deadline passed during the launch");
+      console.error(taggedLine(label, err.message));
+      entry.status = "failed";
+      entry.lastError = err.message;
+      entry.finishReason = "launch-error";
+      return { kind: "launch-error", cause: err };
+    };
     let bot;
     try {
-      bot = await launchBot(launchOpts);
+      const launching = launchBot(launchOpts);
+      bot = Number.isFinite(launchBy)
+        ? await launchByDeadline(launching, launchBy, launchAbort)
+        : await launching;
     } catch (err) {
+      if (err instanceof LaunchAbortedError) return endBeforeJoin(SHUTDOWN_ABORT);
       if (err instanceof MeetingNavigatedAwayError) {
         console.log(taggedLine(label, "exited cleanly: user dismissed via browser hang-up"));
         entry.status = "done";
@@ -863,6 +996,15 @@ async function runSingleBotTask(
         deps.clearMaps(task.botId);
         return { kind: "meeting-rejected", reason: err.reason, detail: err.message };
       }
+      if (err instanceof PageReloadedError) {
+        console.error(taggedLine(label, `launch failed: ${err.message}`));
+        entry.status = "failed";
+        entry.lastError = err.message;
+        entry.finishReason = PAGE_RELOADED;
+        entry.finishedAt = err.reload.atMs;
+        deps.clearMaps(task.botId);
+        return { kind: "page-reloaded", detail: err.message };
+      }
       console.error(taggedLine(label, `launch failed: ${(err as Error).message}`));
       entry.status = "failed";
       entry.lastError = (err as Error).message;
@@ -871,38 +1013,44 @@ async function runSingleBotTask(
       deps.clearMaps(task.botId);
       return { kind: "launch-error", cause: err };
     }
+    if (bot === null) return endBeforeJoin(LAUNCH_DEADLINE_ABORT);
+    if (runDeadlineMs != null) armDeadlineWatchdog(bot, runDeadlineMs);
+    entry.task.joinDeadlineMs = null;
     entry.handle = bot;
     entry.status = "in-meeting";
     entry.joinedAt ??= Date.now();
-    entry.ttl = ttl;
-    entry.ttlDeadline = ttl === "infinite" ? null : Date.now() + ttl;
+    const ttlCtl = createRearmableTtl(runDeadlineMs);
+    const runTtl = ttlCtl.rearm(ttl);
+    entry.ttl = runTtl;
+    entry.ttlDeadline = runTtl === "infinite" ? null : Date.now() + runTtl;
     deps.onJoin?.(
       task.botId,
       entry.joinedAt,
       bot.joinMedia,
       bot.sessionUserId(),
       bot.decodeBudgetReadback,
+      bot.skipCanvasPaintReadback,
+      bot.speakingGlowReadback,
+      bot.simulcastMaxLayersReadback,
     );
-    console.log(taggedLine(label, `joined; ttl=${formatDuration(ttl)}`));
+    console.log(taggedLine(label, `joined; ttl=${formatDuration(runTtl)}`));
     const verifyMs = deps.diagPacketsVerifyMs ?? DIAG_PACKETS_VERIFY_MS;
-    const diagCheck =
-      entry.task.diagPackets === "off"
-        ? setTimeout(() => {
-            if (diagSeen) return;
-            const line = taggedLine(
-              label,
-              `--diag-packets off requested but no 'diagnostics packets:' line within ${verifyMs}ms of joining: its DIAGNOSTICS sends are unverified`,
-            );
-            appendLocalLog(entry, line);
-            console.error(line);
-          }, verifyMs)
-        : undefined;
+    const diagCheck = entry.task.diagPackets
+      ? setTimeout(() => {
+          if (diagSeen) return;
+          const line = taggedLine(
+            label,
+            `--diag-packets ${entry.task.diagPackets} requested but no 'diagnostics packets:' line within ${verifyMs}ms of joining: its DIAGNOSTICS sends are unverified`,
+          );
+          appendLocalLog(entry, line);
+          console.error(line);
+        }, verifyMs)
+      : undefined;
     diagCheck?.unref?.();
 
     // Build the rearmable TTL timer. The control server's `applyTtl`
     // calls `rearm()` to swap the underlying timer; cancellation
     // happens once on natural exit.
-    const ttlCtl = createRearmableTtl(ttl);
     deps.registerTtlTimer(task.botId, ttlCtl);
 
     // Build the ctl signal — a one-shot promise the orchestrator can
@@ -926,13 +1074,19 @@ async function runSingleBotTask(
     // and the post-race `kind !== "user-hangup"` check becomes
     // "always true" at the type level.
     let exitReason: BotExitReason = { kind: "ttl-expired" } as BotExitReason;
+    let ttlEnd: TtlEnd | null = null;
     let ctlReason: CtlReason | null = null;
     let crash: string | null = null;
+    let reload = null as PageReload | null;
     await Promise.race([
       bot.crashDetected.then((detail) => {
         crash = detail;
       }),
-      ttlCtl.done.then(() => {
+      bot.pageReloaded.then((r) => {
+        reload = r;
+      }),
+      ttlCtl.done.then((end) => {
+        ttlEnd = end;
         exitReason = { kind: "ttl-expired" };
       }),
       deps.shutdownRequested.then(() => {
@@ -953,11 +1107,24 @@ async function runSingleBotTask(
       entry.handle = null;
       entry.status = "failed";
       deps.clearMaps(task.botId);
-      await bot.shutdown().catch(() => {});
+      await abandon(bot);
       entry.lastError = crash;
       entry.finishReason = "browser-crash";
       entry.finishedAt = Date.now();
       return { kind: "browser-crash", detail: crash };
+    }
+
+    if (reload !== null) {
+      const detail = `${reloadCause(reload)} after join (${reload.url})`;
+      console.error(taggedLine(label, `left the meeting unasked: ${detail}`));
+      entry.handle = null;
+      entry.status = "failed";
+      deps.clearMaps(task.botId);
+      await abandon(bot);
+      entry.lastError = detail;
+      entry.finishReason = PAGE_RELOADED;
+      entry.finishedAt = Math.max(reload.atMs, entry.joinedAt ?? reload.atMs);
+      return { kind: "page-reloaded", detail };
     }
 
     if (ctlReason === "ctl-rejoin") {
@@ -997,14 +1164,15 @@ async function runSingleBotTask(
     // Skip leaveMeeting on user-hangup (the page already navigated
     // away — clicking a non-existent button is a no-op) and on
     // ctl-kill (force-kill semantics).
-    if (exitReason.kind !== "user-hangup" && ctlReason !== "ctl-kill") {
+    const pastDeadline = deps.deadlineFired() || ttlEnd === "deadline";
+    if (!pastDeadline && exitReason.kind !== "user-hangup" && ctlReason !== "ctl-kill") {
       try {
         await bot.leaveMeeting();
       } catch (e) {
         console.error(taggedLine(label, `leaveMeeting failed: ${(e as Error).message}`));
       }
     }
-    await bot.shutdown();
+    await (pastDeadline ? forceClose(bot) : bot.shutdown());
     entry.handle = null;
     entry.status = "done";
     entry.finishReason = finishReason;
@@ -1014,38 +1182,114 @@ async function runSingleBotTask(
   }
 }
 
+/** No launch with less than this left before the run's deadline. */
+const MIN_LAUNCH_MS = 1_000;
+const RUN_DEADLINE_ABORT = "the run deadline";
+const SHUTDOWN_ABORT = "a shutdown signal";
+const LAUNCH_DEADLINE_ABORT = "the launch's deadline";
+
+/** How long a browser close may take once the run's deadline has passed. */
+export const FORCE_CLOSE_MS = 2_000;
+
+/** After the forced closes, how long the run waits for its bots before it returns without them. */
+const HARD_STOP_SLACK_MS = 500;
+
+/** How long after its deadline the run stops waiting for its bots. */
+export const RUN_END_AFTER_DEADLINE_MS = FORCE_CLOSE_MS + HARD_STOP_SLACK_MS;
+
+/** `ttl` from now, never past `deadlineMs` (epoch ms); `infinite` stays so only without a deadline. */
+export function capTtl(ttl: Ttl, deadlineMs: number | null | undefined): Ttl {
+  if (deadlineMs == null) return ttl;
+  const left = Math.max(0, deadlineMs - Date.now());
+  return ttl === "infinite" ? left : Math.min(ttl, left);
+}
+
+async function forceClose(bot: BotHandle): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    bot.shutdown().catch(() => {}),
+    new Promise<void>((res) => {
+      timer = setTimeout(res, FORCE_CLOSE_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+}
+
+/** Teardown for a bot that left unasked: its shutdown gets `FORCE_CLOSE_MS`, then its browser is closed regardless. */
+async function abandon(bot: BotHandle): Promise<void> {
+  await forceClose(bot);
+  await bot.closeBrowserNow().catch(() => {});
+}
+
+/** Closes `bot`'s browser `FORCE_CLOSE_MS` after the deadline, whatever its teardown is doing then. */
+function armDeadlineWatchdog(bot: BotHandle, deadlineMs: number): void {
+  const close = (): void => void bot.closeBrowserNow().catch(() => {});
+  setTimeout(close, Math.max(0, deadlineMs - Date.now()) + FORCE_CLOSE_MS).unref?.();
+}
+
+/** The launched bot, or `null` once the deadline passes first; that aborts the pending launch, which closes its browser. */
+async function launchByDeadline(
+  launching: Promise<BotHandle>,
+  deadlineMs: number,
+  launchAbort: AbortController,
+): Promise<BotHandle | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<null>((res) => {
+    timer = setTimeout(() => res(null), Math.max(0, deadlineMs - Date.now()));
+  });
+  try {
+    const winner = await Promise.race([launching, expired]);
+    if (winner !== null && Date.now() >= deadlineMs) {
+      armDeadlineWatchdog(winner, deadlineMs);
+      void forceClose(winner);
+      return null;
+    }
+    if (winner === null) {
+      launchAbort.abort();
+      launching.catch(() => {});
+    }
+    return winner;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Which bound a bot's TTL timer ended at. */
+type TtlEnd = "ttl" | "deadline";
+
 /**
  * `waitForTtl`-style controller, but with a `rearm(newTtl)` method so
  * a control-API mutation can swap in a new duration mid-flight
- * without tearing the parent race down. `done` resolves the first
- * time *any* armed timer fires; subsequent `rearm` calls after that
- * are no-ops.
+ * without tearing the parent race down. Each arm is capped at
+ * `deadlineMs`; `done` resolves with the bound the first armed timer
+ * to fire ended at, and later `rearm` calls are no-ops.
  */
-function createRearmableTtl(initialTtl: Ttl): {
-  done: Promise<void>;
-  cancel: () => void;
-  rearm: (ttl: Ttl) => void;
+function createRearmableTtl(deadlineMs: number | null | undefined): TtlControl & {
+  done: Promise<TtlEnd>;
 } {
-  let resolveDone!: () => void;
-  const done = new Promise<void>((res) => {
+  let resolveDone!: (end: TtlEnd) => void;
+  const done = new Promise<TtlEnd>((res) => {
     resolveDone = res;
   });
   let timer: ReturnType<typeof setTimeout> | null = null;
   let resolved = false;
-  const arm = (ttl: Ttl): void => {
-    if (resolved) return;
+  const arm = (ttl: Ttl): Ttl => {
+    const left = deadlineMs == null ? null : Math.max(0, deadlineMs - Date.now());
+    const end: TtlEnd = left !== null && (ttl === "infinite" || ttl >= left) ? "deadline" : "ttl";
+    const capped = end === "deadline" ? (left as number) : ttl;
+    if (resolved) return capped;
     if (timer !== null) {
       clearTimeout(timer);
       timer = null;
     }
-    if (ttl === "infinite") return;
+    if (capped === "infinite") return capped;
     timer = setTimeout(() => {
       timer = null;
       resolved = true;
-      resolveDone();
-    }, ttl);
+      resolveDone(end);
+    }, capped);
+    return capped;
   };
-  arm(initialTtl);
   return {
     done,
     cancel: (): void => {
@@ -1102,19 +1346,29 @@ export async function toggleScreenShare(entry: BotRegistryEntry, share: boolean)
     .first()
     .hover()
     .catch(() => {});
-  await clickControlButton(
-    entry,
-    screenShareCandidates(share ? "off" : "on"),
-    share ? "share-start" : "share-stop",
-  );
+  if (share) {
+    await clickControlButton(entry, screenShareCandidates("off"), "share-start");
+    return;
+  }
+  // The trigger toggles the menu, so an already-open one is used as is.
+  const menuOpen = await page
+    .locator(SCREEN_SHARE_MENU_STOP_SELECTOR)
+    .isVisible()
+    .catch(() => false);
+  const opened =
+    menuOpen ||
+    (await clickControlButton(entry, screenShareCandidates("on"), "share-stop")) ===
+      screenShareControlSelector("on");
+  if (opened) await clickSelector(entry, SCREEN_SHARE_MENU_STOP_SELECTOR, "share-stop");
 }
 
+/** The selector it clicked, or null when nothing matched or the click failed. */
 async function clickControlButton(
   entry: BotRegistryEntry,
   candidates: readonly string[],
   action: string,
-): Promise<void> {
-  if (entry.handle === null) return;
+): Promise<string | null> {
+  if (entry.handle === null) return null;
   const { page } = entry.handle;
   const label = `${entry.task.participant}@${shortBotId(entry.botId)}`;
   const selector = await resolveControlSelector(page, candidates, `ctl ${action}`, (m) =>
@@ -1127,13 +1381,25 @@ async function clickControlButton(
         `ctl ${action}: no visible button matching ${candidates.join(" | ")} — action bar autohidden, control unavailable, or the bot is not in-meeting yet`,
       ),
     );
-    return;
+    return null;
   }
+  return (await clickSelector(entry, selector, action)) ? selector : null;
+}
+
+async function clickSelector(
+  entry: BotRegistryEntry,
+  selector: string,
+  action: string,
+): Promise<boolean> {
+  if (entry.handle === null) return false;
+  const label = `${entry.task.participant}@${shortBotId(entry.botId)}`;
   try {
-    await page.locator(selector).click({ timeout: 2_000 });
+    await entry.handle.page.locator(selector).click({ timeout: 2_000 });
     console.log(taggedLine(label, `ctl ${action} → clicked ${selector}`));
+    return true;
   } catch (e) {
     console.warn(taggedLine(label, `ctl ${action} click failed: ${(e as Error).message}`));
+    return false;
   }
 }
 

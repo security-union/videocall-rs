@@ -95,7 +95,7 @@ test.describe("Build timestamps render in the viewer's local timezone (issue #17
     // Pin showBuildGitInfo ON so the server table layout is the deterministic
     // 4-col `--git` form (Service / Version / Commit / Built). The Built value is
     // identical regardless of this flag; pinning only fixes the column layout so
-    // the "last mono cell == Built" locator below is unambiguous. Must run before
+    // the "last cell == Built" locator below is unambiguous. Must run before
     // the first navigation so the first /config.local.js is patched.
     await setShowBuildGitInfoFlag(context, "true");
     await page.goto("/");
@@ -110,13 +110,11 @@ test.describe("Build timestamps render in the viewer's local timezone (issue #17
     const serverSection = modal.locator('section[aria-labelledby="about-server-heading"]');
     await expect(serverSection).toContainText("meeting-api");
 
-    // The "Built" cell is the LAST `.about-modal-value--mono` span in the data
-    // row (Version, Commit, Built are the mono cells; the Service cell is
-    // `--strong`, not `--mono`). Robust whether or not the Commit column is shown.
+    // Built is the last cell of the data row whether or not Commit is shown.
     const meetingApiBuilt = serverSection
       .locator(".about-modal-row")
       .filter({ hasText: "meeting-api" })
-      .locator(".about-modal-value--mono")
+      .locator(".about-modal-value")
       .last();
 
     // Positive discriminators — present ONLY in the converted local rendering.
@@ -132,7 +130,7 @@ test.describe("Build timestamps render in the viewer's local timezone (issue #17
     const websocketBuilt = serverSection
       .locator(".about-modal-row")
       .filter({ hasText: "websocket" })
-      .locator(".about-modal-value--mono")
+      .locator(".about-modal-value")
       .last();
     await expect(websocketBuilt).toContainText("PDT");
     await expect(websocketBuilt).toContainText("3:30:00"); // 10:30Z shifted to 03:30 PDT
@@ -161,12 +159,10 @@ test.describe("Build timestamps render in the viewer's local timezone (issue #17
     await expect(modal).toBeVisible({ timeout: 5_000 });
 
     const clientSection = modal.locator('section[aria-labelledby="about-client-heading"]');
-    // The Built row is the client `.about-modal-row` whose `.about-modal-label`
-    // is "Built"; its value is the row's `.about-modal-value--mono` span.
     const clientBuilt = clientSection
       .locator(".about-modal-row")
-      .filter({ hasText: "Built" })
-      .locator(".about-modal-value--mono");
+      .filter({ has: page.locator(".about-modal-label", { hasText: /^Built$/ }) })
+      .locator(".about-modal-value");
     await expect(clientBuilt).toBeVisible();
 
     // Local zone label (PDT in summer, PST in winter — the build date's season is

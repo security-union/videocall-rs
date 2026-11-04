@@ -8,12 +8,14 @@ import os
 from collections import defaultdict
 
 from cq_manifest import non_finite_paths
-from cq_prom import any_of_regex, counter_delta, merge_max, selector
+from cq_prom import PromError, any_of_regex, counter_delta, selector
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "call_quality_config.json")
 DIMENSIONS = ("A", "V", "L", "Q", "S")
 QUALITY_GATE_DIMS = (("G-Q3", "A"), ("G-Q4", "V"), ("G-Q5", "L"))
 LATENCY_PENDING = "latency not gated: #2948 pending"
+AUDIO_TERM_NAMES = {"videocall_audio_packets_discarded_total": "discarded audio",
+                    "videocall_audio_playout_underrun_ms_total": "playout silence"}
 
 M_EXPAND = "videocall_neteq_expand_ops_per_sec"
 M_PPS = "videocall_neteq_packets_per_sec"
@@ -28,6 +30,14 @@ M_REELECT = "videocall_client_reelection_total"
 M_SERVER_CONN = "videocall_server_connections_active"
 M_HEALTH = "videocall_health_reports_total"
 M_ACTIVE_LAYERS = "videocall_encoder_active_layers"
+M_DISCARDS = "videocall_audio_packets_discarded_total"
+M_UNDERRUN = "videocall_audio_playout_underrun_ms_total"
+M_BUFFER = "videocall_neteq_audio_buffer_ms"
+M_TARGET = "videocall_neteq_target_delay_ms"
+M_ACCEL = "videocall_neteq_accelerate_ops_per_sec"
+AUDIO_COUNTERS = (M_DISCARDS, M_UNDERRUN)
+DELAY_METRICS = (M_BUFFER, M_TARGET, M_ACCEL)
+AUDIO_PACKET_MS = 20
 PAIR_METRICS = (M_EXPAND, M_PPS, M_FREEZE, M_STALE, M_FPS, M_CAN_LISTEN)
 DIM_SOURCES = {"A": (M_PPS, M_EXPAND), "V": (M_FREEZE, M_FPS), "L": ("latency_gate.audio_delay_metric",), "Q": (M_FPS,),
                "S": (M_SENT,)}
@@ -59,7 +69,9 @@ CONFIG_BOUNDS = {("sampling", "scrape_step_s"): (15, 15),
                  ("quality_gates", "split_rate_red"): (0, 0.02),
                  ("quality_gates", "per_talker_A_red"): (0, 0.05),
                  ("dimensions", "expand_ops_full_scale"): (1, 100),
-                 ("dimensions", "nominal_talker_pps"): (50, 50)}
+                 ("dimensions", "nominal_talker_pps"): (50, 50),
+                 ("dimensions", "discard_weight"): (1.0, None),
+                 ("dimensions", "playout_underrun_weight"): (1.0, None)}
 MAX_RELAY_EXEMPTIONS = 2
 RUST_HEALTH_INTERVALS_S = (1, 5)
 MIN_REQUIRED_DIMENSIONS = {"A", "V", "Q", "S"}
@@ -67,15 +79,30 @@ MIN_REQUIRED_DIMENSIONS = {"A", "V", "Q", "S"}
 
 class ConfigError(Exception):
     pass
-SERVER_DIAG = {
-    "sched_lag_le50": ("videocall_relay_scheduler_lag_ms_bucket", [("le", "=~", "50(\\.0)?")]),
-    "sched_lag_count": ("videocall_relay_scheduler_lag_ms_count", []),
-    "mailbox_drops": ("relay_inbound_mailbox_drops_total", []),
-    "shed_escalations_stage_two": ("relay_downlink_shed_escalations_total", [("stage", "=", "two")]),
-    "wt_session_closes": ("relay_wt_session_closes_total", []),
-    "overflow_cap": ("relay_downlink_stream_overflow_frames_total", [("cause", "=", "cap")]),
+WT, BOTH = ("webtransport",), ("webtransport", "websocket")
+RELAY_COUNTERS = {
+    "mailbox_drops": ("relay_inbound_mailbox_drops_total", [], None, (), BOTH),
+    "shed_escalations": ("relay_downlink_shed_escalations_total", [], "stage", ("one", "two"), WT),
+    "stream_resets": ("relay_outbound_bridge_stream_resets_total", [], "reason", ("write_timeout",), WT),
+    "wt_session_closes": ("relay_wt_session_closes_total", [], "reason", (), WT),
+    "overflow_cap": ("relay_downlink_stream_overflow_frames_total", [("cause", "=", "cap")], None, (), WT),
+    "outbound_channel_drops": ("videocall_outbound_channel_drops_total", [], "kind", ("audio",), BOTH),
+    "stream_queue_drops": ("relay_downlink_stream_queue_drops_total", [], "kind", ("other",), WT),
 }
-DIAGNOSTIC_SERIES = set(SERVER_DIAG) | {"relay_session_drops_room", M_RTT, M_ACTIVE_LAYERS}
+SCHED_LAG = {"sched_lag_le50": ("videocall_relay_scheduler_lag_ms_bucket", [("le", "=~", "50(\\.0)?")]),
+             "sched_lag_count": ("videocall_relay_scheduler_lag_ms_count", [])}
+QUIC = {"_quic_rtt": "videocall_relay_connection_rtt_ms", "_quic_lost": "videocall_relay_connection_path_lost_packets",
+        "_quic_sent": "videocall_relay_connection_path_sent_packets",
+        "_quic_congestion": "videocall_relay_connection_path_congestion_events"}
+CFS_QUERY = ("sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{{{0}}}[1m])) / "
+             "sum by (pod) (rate(container_cpu_cfs_periods_total{{{0}}}[1m]))")
+SERVER_QUERIES = set(RELAY_COUNTERS) | set(SCHED_LAG) | set(QUIC) | {"_room_sessions", "_session_drops", "_cfs"}
+DIAGNOSTIC_SERIES = SERVER_QUERIES | {M_RTT, M_ACTIVE_LAYERS, *DELAY_METRICS}
+NOT_COLLECTED, FAILED = "not collected", "query failed"
+
+
+class FailedQuery(list):
+    """An empty result standing for a diagnostic query that failed, so it reads 'query failed', never 0."""
 
 
 # ---------------------------------------------------------------- config
@@ -133,10 +160,23 @@ def validate_config(cfg):
                       f"(got {cv(cfg, 'validity_gates', 'rust_health_interval_s')!r})")
     if not isinstance(cv(cfg, "quality_gates", "reconnect_gate_enabled"), bool):
         errors.append("quality_gates.reconnect_gate_enabled must be true or false")
+    share, pairs, cap = (cv(cfg, "diagnostics", k) for k in
+                         ("correlated_freeze_share", "correlated_freeze_min_pairs", "target_delay_cap_ms"))
+    if not (_is_num(share) and 0 < share <= 1 and isinstance(pairs, int) and not isinstance(pairs, bool)
+            and pairs >= 1 and _is_num(cap) and cap > 0):
+        errors.append("diagnostics: correlated_freeze_share in (0, 1], correlated_freeze_min_pairs an integer >= 1 and "
+                      "target_delay_cap_ms > 0")
+    pods = cv(cfg, "server_diagnostics", "throttle_pod_selector")
+    if pods is not None and (not isinstance(pods, str) or not pods.strip() or set(pods) & set("{}\n")):
+        errors.append("server_diagnostics.throttle_pod_selector must be null or label matchers without braces")
     if not isinstance(cv(cfg, "latency_gate", "allowed_unmeasured"), bool):
         errors.append("latency_gate.allowed_unmeasured must be true or false")
     if errors:
         raise ConfigError("invalid scorer config:\n  " + "\n  ".join(errors))
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def config_overrides(cfg):
@@ -211,7 +251,6 @@ def step_queries(manifest, step, cfg, observers):
     """(name, promql, start, end) for everything one step needs. observers=None means no from_peer filter."""
     m = manifest["meeting_id"]
     obs = [("from_peer", "=~", any_of_regex(observers))] if observers else []
-    obs_peer = [("peer_id", "=~", any_of_regex(observers))] if observers else []
     hold = (step["hold_start"], step["hold_end"])
     step_s = cv(cfg, "sampling", "scrape_step_s")
     wide = (step["hold_start"] - step_s * math.ceil((step["hold_start"] - step["join_start"]) / step_s),
@@ -219,6 +258,7 @@ def step_queries(manifest, step, cfg, observers):
     meet = [("meeting_id", "=", m)]
     pairs = pair_metrics(cfg)
     q = [(name, selector(name, meet + obs), *hold) for name in pairs]
+    q += [(name, selector(name, meet + obs), *hold) for name in AUDIO_COUNTERS + DELAY_METRICS]
     q.append(("_pps_min", f"min_over_time({selector(M_PPS, meet + obs)}[{2 * cv(cfg, 'sampling', 'scrape_step_s')}s])",
               *hold))
     every_pair_family = selector("", [("__name__", "=~", any_of_regex(pairs))] + meet)
@@ -226,15 +266,20 @@ def step_queries(manifest, step, cfg, observers):
         ("_reporters", f"count by (from_peer) ({every_pair_family})", *hold),
         (M_SENT, selector(M_SENT, meet), *wide),
         (M_PEER_INFO, selector(M_PEER_INFO, meet), *wide),
-        (M_RTT, selector(M_RTT, meet + obs_peer), *hold),
+        (M_RTT, selector(M_RTT, meet), *wide),
         (M_REELECT, selector(M_REELECT, meet), *wide),
         (M_SERVER_CONN, selector(M_SERVER_CONN, meet), *wide),
         (M_ACTIVE_LAYERS, selector(M_ACTIVE_LAYERS, meet + [("media_kind", "=~", "camera|video")]), *hold),
         (M_HEALTH, M_HEALTH, *hold),
-        ("relay_session_drops_room", selector("relay_session_drops_total", [("room", "=", m)]), *hold),
+        ("_session_drops", selector("relay_session_drops_total", [("room", "=", m)]), *hold),
+        ("_room_sessions", selector("relay_active_sessions_per_room", [("room", "=", m)]), *hold),
     ]
-    for name, (metric, matchers) in SERVER_DIAG.items():
+    for name, (metric, matchers, *_) in {**RELAY_COUNTERS, **SCHED_LAG}.items():
         q.append((name, selector(metric, matchers) if matchers else metric, *hold))
+    q += [(name, selector(metric, [("room", "=", m)]), *hold) for name, metric in QUIC.items()]
+    pods = cv(cfg, "server_diagnostics", "throttle_pod_selector")
+    if pods:
+        q.append(("_cfs", CFS_QUERY.format(pods), *hold))
     for metric, matchers in required_relay_paths(cfg).items():
         q.append((metric, selector(metric, [("room", "=", m)] + matchers), *wide))
     for name, key in (("_up", "scrape_up_selector"), ("_restarts", "restarts_selector")):
@@ -246,8 +291,15 @@ def step_queries(manifest, step, cfg, observers):
 
 def fetch_step_data(client, manifest, step, cfg, observers):
     step_s = cv(cfg, "sampling", "scrape_step_s")
-    return {name: client.range(expr, start, end, step_s)
-            for name, expr, start, end in step_queries(manifest, step, cfg, observers)}
+    out = {}
+    for name, expr, start, end in step_queries(manifest, step, cfg, observers):
+        try:
+            out[name] = client.range(expr, start, end, step_s)
+        except PromError:
+            if name not in DIAGNOSTIC_SERIES:
+                raise
+            out[name] = FailedQuery()
+    return out
 
 
 # ---------------------------------------------------------------- scoring helpers
@@ -275,14 +327,50 @@ def _index(series, conflicts=None):
     return out
 
 
-def _increments(samples, window_start):
-    """{ts: increase since the previous sample} after window_start; per-sample form of counter_delta."""
-    prev, out = 0.0, {}
+def _series_increments(samples, start, base):
+    """{ts: increase} of one counter after start; a first sample after start is booked against `base`, the value
+    the counter had before this series (0 when it was created, None when unknown: that sample books nothing)."""
+    out, prev = {}, base
     for ts, val in samples:
-        if ts > window_start:
+        if ts > start and prev is not None:
             out[ts] = val - prev if val >= prev else val
         prev = val
     return out
+
+
+def _lane_increments(lane, start, upper):
+    """lane: [(birth, chain, samples, provably_new)] of one counter across sessions -> ({ts: increase}, [(why, amount)]).
+    A first sample after start books, on the lower reading, its rise over the largest earlier value of its chain it
+    could continue (nothing without a baseline), on the upper from 0; the amounts where they differ are listed."""
+    out, unproven = defaultdict(float), []
+    for birth, chain, pts, new in lane:
+        first_ts, first = pts[0]
+        others = [p for b, c, p, _ in lane if c == chain and b <= birth and p is not pts]
+        prior = [v[-1] for v in ([v for t, v in p if t <= first_ts] for p in others) if v]
+        if first_ts <= start:
+            low = high = None
+        elif others:
+            fit = [v for v in prior if v <= first]
+            low, high = (first if len(prior) < len(others) else max(fit, default=0.0)), 0.0
+        else:
+            low, high = (0.0, 0.0) if new else (first, 0.0)
+        if low:
+            unproven.append(("continuation or rebuild" if others else "baseline", low))
+        until = min((b for b, *_ in lane if b > birth), default=math.inf)
+        for ts, inc in _series_increments(pts, start, high if upper else low).items():
+            if ts <= until or upper:
+                out[ts] += inc
+            if ts > until and inc:
+                unproven.append(("after a later session started", inc))
+    return out, unproven
+
+
+def _series_total(samples, start, born_after):
+    """Increase of one session-scoped counter over the window, or None when it is unknown: no finite sample, or a
+    first sample after start for a counter that existed before it."""
+    if not samples or (samples[0][0] > start and not born_after):
+        return None
+    return sum(_series_increments(samples, start, 0.0 if born_after else None).values())
 
 
 def _session_births(data):
@@ -355,7 +443,7 @@ def _interval(part, hs, he):
 
 
 def _new_acc():
-    return {"A_bad": 0.0, "A_exp": 0, "A_loss": 0, "V_freeze": 0.0, "V_exp_s": 0.0, "Q_bad": 0, "Q_exp": 0,
+    return {"A_bad": 0.0, "A_exp": 0, "A_loss": 0, "A_terms": defaultdict(float), "V_freeze": 0.0, "V_exp_s": 0.0, "Q_bad": 0, "Q_exp": 0,
             "L": [], "stale": []}
 
 
@@ -363,6 +451,8 @@ def _dimension_values(acc):
     vals = {}
     if acc["A_exp"]:
         vals["A"] = acc["A_bad"] / acc["A_exp"]
+        if acc["A_terms"]:
+            vals["A_terms"] = {k: v / acc["A_exp"] for k, v in sorted(acc["A_terms"].items())}
     if acc["V_exp_s"]:
         vals["V"] = acc["V_freeze"] / acc["V_exp_s"]
     if acc["L"]:
@@ -492,7 +582,40 @@ def _sessions_of(data, user):
     return {s: sorted(ts) for s, ts in out.items()}
 
 
-def _stability(data, user, user2sess, step, part, away=(), filled=(), rejoins=0):
+def _reelection_increase(series, sessions, start, linger, upper):
+    """(booked, unproven) for one re-election result of one user. The count is a page-wide static, exported once
+    non-zero, and a re-election that proceeds opens a new session; so a series that appears after its session's
+    first report counts from 0, and one present from it continues the previous session when the user's sessions
+    are sequential (a lower value is a reload). With tied or concurrent sessions (two tabs) the lower reading
+    continues the largest earlier value it could and the upper reading counts it from 0."""
+    spans = {s: (ts[0], ts[-1]) for s, ts in sessions.items() if ts}
+    booked = unproven = 0.0
+    for sid, pts in series.items():
+        birth = spans.get(sid, (pts[0][0],))[0]
+        first_ts, first = pts[0]
+        base = None
+        if start < first_ts and birth < first_ts:
+            base = 0.0
+        elif start < first_ts:
+            chain = sorted(sp for s, sp in spans.items() if sp[0] <= birth)
+            sequential = len(chain) > 1 and all(a[0] < b[0] and a[1] <= b[0] + linger
+                                                for a, b in zip(chain, chain[1:]))
+            pred = next((s for s, sp in spans.items() if sequential and sp == chain[-2]), None)
+            held = [v for t, v in series.get(pred, ()) if t <= first_ts]
+            prev = held[-1] if held else 0.0
+            if sequential:
+                base = prev if first >= prev else 0.0
+            else:
+                earlier = [s for s, sp in spans.items() if s != sid and sp[0] <= birth]
+                held = [([v for t, v in series.get(s, ()) if t <= first_ts] or [0.0])[-1] for s in earlier]
+                low = max((v for v in held if v <= first), default=0.0) if earlier else first
+                unproven += low
+                base = 0.0 if upper else low
+        booked += sum(_series_increments(pts, start, base).values())
+    return booked, unproven
+
+
+def _stability(data, user, user2sess, step, part, away=(), filled=(), rejoins=0, upper=False):
     hs, he = step["hold_start"], step["hold_end"]
     sessions = _sessions_of(data, user)
     new_in_hold = sum(1 for ts in sessions.values() if ts and hs < ts[0] <= he)
@@ -500,8 +623,12 @@ def _stability(data, user, user2sess, step, part, away=(), filled=(), rejoins=0)
     by_result = defaultdict(list)
     for labels, samples in data.get(M_REELECT, []):
         if labels.get("session_id") in user2sess.get(user, set()):
-            by_result[labels.get("result", "")].append([(t, v) for t, v in samples if t <= he])
-    reelect = {r: counter_delta(merge_max(lst), hs) for r, lst in by_result.items()}
+            by_result[labels.get("result", "")].append((labels, [(t, v) for t, v in samples if t <= he]))
+    reelect, doubt = {}, {}
+    for r, group in by_result.items():
+        reelect[r], doubt[r] = _reelection_increase(
+            {sid: sorted(smp.items()) for (sid, _, _), smp in _index(group).items() if smp}, sessions, hs,
+            METRICS_SESSION_TIMEOUT_S + step.get("scrape_step_s", 15), upper)
     proceeded = reelect.get("proceeded", 0.0)
     proceeded = proceeded if math.isfinite(proceeded) else 0.0
     unplanned = max(0.0, new_in_hold - initial_join_in_hold - proceeded - rejoins)
@@ -524,6 +651,7 @@ def _stability(data, user, user2sess, step, part, away=(), filled=(), rejoins=0)
         "migrations": proceeded,
         "unplanned_reconnects": unplanned,
         "reelection_failed": reelect.get("failed", 0.0),
+        "reelections_unproven": {r: v for r, v in sorted(doubt.items()) if v},
         "max_presence_gap_s": max_gap,
         "S": unplanned / hours if hours > 0 else 0.0,
     }
@@ -545,12 +673,131 @@ def _reconnect_masked(data, user, step, grid, stab, away):
     return out
 
 
-def _transport(data, sessions):
+def _transport(data, sessions, hs):
+    if isinstance(data.get(M_RTT), FailedQuery):
+        return FAILED
     counts = defaultdict(int)
     for labels, samples in data.get(M_RTT, []):
-        if labels.get("session_id") in sessions:
-            counts[labels.get("server_type") or "unknown"] += len(samples)
+        n = sum(1 for t, _ in samples if t >= hs)
+        if labels.get("session_id") in sessions and n:
+            counts[labels.get("server_type") or "unknown"] += n
     return max(counts, key=counts.get) if counts else "unknown"
+
+
+def _pair_increments(series, sess2user, keep, births, start, conflicts, unproven, upper):
+    """(receiver, publisher) -> {ts: increase}. A per-pair client counter lives in the receiver's decoder for one
+    publisher session, which may survive the receiver's session change or be rebuilt, so series chain by to_peer."""
+    by_cause = defaultdict(list)
+    for labels, samples in series:
+        by_cause[labels.get("cause", "")].append((labels, samples))
+    out = defaultdict(lambda: defaultdict(float))
+    for group in by_cause.values():
+        lanes = defaultdict(list)
+        for (sid, recv, to_peer), samples in _index(group, conflicts).items():
+            if keep(recv) and samples:
+                pts = sorted(samples.items())
+                birth = max(births.get(s, (pts[0][0],))[0] for s in (sid, to_peer))
+                lanes[(recv, sess2user.get(to_peer))].append((birth, sid, to_peer, pts))
+        for key, lane in lanes.items():
+            incs, doubts = _lane_increments(
+                [(birth, to_peer, pts, any(births.get(s, (-math.inf,))[0] > start for s in (sid, to_peer)))
+                 for birth, sid, to_peer, pts in lane], start, upper)
+            for ts, inc in incs.items():
+                out[key][ts] += inc
+            out[key]
+            unproven[key] += doubts
+    return out
+
+
+def _correlated_freezes(freeze_inc, fps_tl, receivers, hs, share, min_pairs):
+    """Per receiver, the scrape buckets in which at least `share` of its camera pairs that decoded during the hold
+    accrued freeze time; pairs that never decoded neither count nor dilute."""
+    out = {}
+    for r in sorted(receivers):
+        inc = {k: v for k, v in freeze_inc.items() if k[0] == r and k[1]}
+        total = sum(sum(v.values()) for v in inc.values())
+        together, inside, worst, evaluated = [], 0.0, 0.0, 0
+        live = [k for k in inc if any(v > 0 for t, v in fps_tl.get(k, {}).items() if t >= hs)]
+        for ts in sorted({t for v in inc.values() for t in v}):
+            if len(live) < min_pairs:
+                continue
+            evaluated += 1
+            froze = [k for k in live if inc[k].get(ts, 0) > 0]
+            worst = max(worst, len(froze) / len(live))
+            if len(froze) >= share * len(live):
+                together.append(ts)
+                inside += sum(inc[k][ts] for k in froze)
+        if inc:
+            out[r] = {"buckets_evaluated": evaluated, "buckets_froze_together": together, "max_share_frozen": worst,
+                      "freeze_s": total, "freeze_s_in_those_buckets": inside}
+    return out
+
+
+def _audio_delay(tls, keep, cap):
+    """Per receiver over its talker pairs: p95 jitter-buffer level, share of samples with the target at the cap,
+    mean accelerate ops/s. Receiver jitter-buffer levels, not mouth-to-ear delay."""
+    vals = defaultdict(lambda: defaultdict(list))
+    for name, tl in tls.items():
+        for (r, pub), samples in tl.items():
+            if keep(r, pub):
+                vals[r][name] += list(samples.values())
+    return {r: {"buffer_ms_p95": percentile(v[M_BUFFER], 95),
+                "target_delay_at_cap_share": (sum(1 for x in v[M_TARGET] if x >= cap) / len(v[M_TARGET])
+                                              if v[M_TARGET] else None),
+                "accelerate_ops_per_sec_mean": sum(v[M_ACCEL]) / len(v[M_ACCEL]) if v[M_ACCEL] else None}
+            for r, v in sorted(vals.items())}
+
+
+def _sequential(a, b, linger):
+    """b replaced a: it started later, and a ended within the metrics linger of b's start. Anything else (a tie,
+    two tabs) is concurrent, and a transport change between them is not a provable switch."""
+    return a[0] < b[0] and a[1] <= b[0] + linger
+
+
+def _switches(rows, linger):
+    """rows: [(from, to, server_type)] -> (proven moves [(from_type, to_type, at)], sessions started alongside a
+    session on another transport). A change into a session is a switch only when every session that started before
+    it forms one sequential chain with it; otherwise the transport it left is unproven. Independent of row order."""
+    moves, unproven = [], 0
+    for b in rows:
+        earlier = sorted(r for r in rows if r[0] <= b[0] and r is not b)
+        if not earlier:
+            continue
+        chain = earlier + [b]
+        if all(_sequential(x, y, linger) for x, y in zip(chain, chain[1:])):
+            if earlier[-1][2] != b[2]:
+                moves.append((earlier[-1][2], b[2], b[0]))
+        elif any(r[2] != b[2] and (not _sequential(r, b, linger) or r[0] == earlier[-1][0]) for r in earlier):
+            unproven += 1
+    return moves, unproven
+
+
+def _transport_path(rows):
+    """'websocket+webtransport -> webtransport': sessions opened in the same scrape form one group."""
+    groups = defaultdict(set)
+    for r in rows:
+        groups[r["from"]].add(r["server_type"])
+    path = ["+".join(sorted(g)) for _, g in sorted(groups.items())]
+    return " -> ".join(p for i, p in enumerate(path) if not i or p != path[i - 1])
+
+
+def _transport_timeline(data, sessions, part, hs, he, linger):
+    """Each session's server_type over the step in start order, the switches between sequential sessions, the
+    changes between concurrent ones (unproven), and what the bots-app record saw over the whole run."""
+    recorded = ({"preferred": part.get("transport_preferred"), "observed": part.get("transport_observed"),
+                 "fallbacks": part["transport_fallbacks"]} if "transport_fallbacks" in part else None)
+    if isinstance(data.get(M_RTT), FailedQuery):
+        return {"status": FAILED, "sessions": [], "switches": None, "switches_in_hold": None, "recorded": recorded}
+    spans = defaultdict(list)
+    for labels, samples in data.get(M_RTT, []):
+        if labels.get("session_id") in sessions and samples:
+            spans[(labels["session_id"], labels.get("server_type") or "unknown")] += [t for t, _ in samples if t <= he]
+    rows = sorted(({"from": min(ts), "to": max(ts), "server_type": st, "session_id": sid}
+                   for (sid, st), ts in spans.items() if ts), key=lambda r: (r["from"], r["to"], r["server_type"]))
+    moves, unproven = _switches([(r["from"], r["to"], r["server_type"]) for r in rows], linger)
+    return {"status": "measured", "sessions": rows, "path": _transport_path(rows), "switches": len(moves),
+            "switches_in_hold": sum(1 for _, _, at in moves if hs < at),
+            "switches_unproven": unproven, "recorded": recorded}
 
 
 def _talker_sending(data, talker, ts_grid):
@@ -605,6 +852,45 @@ def _split_rate(receivers, talkers, iv, heard, sending, grid):
 
 
 def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, split_transport=False):
+    """Scores the step under the lower reading of every counter whose lineage the samples cannot prove and, when
+    there is one, under the upper reading too; a quality gate whose status differs between them is uncertain.
+    The lower reading's values are the ones reported."""
+    low = _score_step(manifest, step, data, cfg, mode, generator_verdict, split_transport, False)
+    low["uncertain_gates"] = []
+    if not low["diagnostics"]["counter_lineage_unproven"]:
+        return low
+    high = {g["gate"]: g for g in _score_step(manifest, step, data, cfg, mode, generator_verdict, split_transport,
+                                               True)["quality_gates"]}
+    gates = []
+    for g in low["quality_gates"]:
+        h = high.get(g["gate"], g)
+        if h["status"] != g["status"]:
+            g = dict(g, status="uncertain", detail=f"{g['status']} on the lower reading of unproven counters, "
+                                                   f"{h['status']} on the upper (diagnostics.counter_lineage_unproven)"
+                                                   + (f"; {g['detail']}" if g["detail"] else ""))
+        gates.append(g)
+    low["quality_gates"] = gates
+    low["uncertain_gates"] = [g["gate"] for g in gates if g["status"] == "uncertain"]
+    low["verdict"], low["invalid_reasons"] = _verdict(mode, low["validity"], gates, low["invalid_reasons"],
+                                                      low["headline_cell"])
+    return low
+
+
+def _verdict(mode, validity, quality, blocking, headline_cell):
+    """(verdict, invalid_reasons): a gate failing on both readings stands; an uncertain one only blocks a PASS."""
+    uncertain = [g["gate"] for g in quality if g["status"] == "uncertain"]
+    if mode == "real":
+        return "REPORT", blocking
+    if any(g["status"] == "fail" for g in validity) or blocking or headline_cell is None:
+        return "INVALID", blocking
+    if any(g["status"] == "fail" for g in quality):
+        return "FAIL", blocking
+    if uncertain:
+        return "INVALID", uncertain
+    return "PASS", blocking
+
+
+def _score_step(manifest, step, data, cfg, mode, generator_verdict, split_transport, upper):
     sid = step["step_id"]
     hs, he = step["hold_start"], step["hold_end"]
     step_s = cv(cfg, "sampling", "scrape_step_s")
@@ -635,7 +921,16 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
 
     def is_away(u, ts):
         return any(lo <= ts and (ts < hi or hi >= he) for lo, hi in away.get(u, ()))
-    transport = {u: _transport(data, user2sess.get(u, set())) for u in observers}
+    transport = {u: _transport(data, user2sess.get(u, set()), hs) for u in observers}
+    timelines_tr = {u: _transport_timeline(data, user2sess.get(u, set()), in_step[u], hs, he,
+                                           METRICS_SESSION_TIMEOUT_S + step_s) for u in in_step}
+    for u, tl in sorted(timelines_tr.items()):
+        if tl["switches"]:
+            flags.append(f"{u}: transport switched {tl['path']} (switches {tl['switches']}, in the hold "
+                         f"{tl['switches_in_hold']})")
+        if tl.get("switches_unproven"):
+            flags.append(f"{u}: {tl['switches_unproven']} session(s) started alongside a session on another "
+                         "transport; their transport changes are not counted as switches")
 
     def cell_of(recv, pub):
         r = "S" if shaped.get(recv) else "U"
@@ -673,7 +968,7 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
     non_finite = sorted((t, name) for name, series in data.items() if name not in DIAGNOSTIC_SERIES
                         for _, smp in series for t in smp_non_finite(smp))
     pipeline_gaps = {ts for ts in grid if ts in up_down or (health_ts and ts not in health_ts)}
-    stability = {u: _stability(data, u, user2sess, step, in_step[u], away[u], pipeline_gaps, rejoin_count[u])
+    stability = {u: _stability(data, u, user2sess, step, in_step[u], away[u], pipeline_gaps, rejoin_count[u], upper)
                  for u in everyone}
     masked = {u: _reconnect_masked(data, u, step, grid, stability[u], away[u]) for u in everyone}
     linger = METRICS_SESSION_TIMEOUT_S + step_s
@@ -729,6 +1024,22 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
     else:
         sending = {t: set(grid) for t in talkers}
 
+    unproven = {name: defaultdict(list) for name in AUDIO_COUNTERS + (M_FREEZE,)}
+    increments = {name: _pair_increments(data.get(name, []), sess2user, lambda r: r in observers, births, hs, conflicts,
+                                         unproven[name], upper) for name in AUDIO_COUNTERS + (M_FREEZE,)}
+    bucket_ms = step_s * 1000.0
+    w_cut, w_silent = cv(cfg, "dimensions", "discard_weight"), cv(cfg, "dimensions", "playout_underrun_weight")
+    coverage = defaultdict(dict)
+    for u in sorted(observers) if mode == "run" else ():
+        for t in sorted(talkers - {u}):
+            terms = coverage[u].setdefault(cell_of(u, t), {term: [0, 0] for term in AUDIO_TERM_NAMES.values()})
+            for name in AUDIO_COUNTERS:
+                terms[AUDIO_TERM_NAMES[name]][0] += (u, t) in increments[name]
+                terms[AUDIO_TERM_NAMES[name]][1] += 1
+    coverage = dict(coverage)
+    short = {term: [sum(c[term][i] for cells in coverage.values() for c in cells.values()) for i in (0, 1)]
+             for term in AUDIO_TERM_NAMES.values()}
+
     if mode == "run" and not idx[M_PPS]:
         a_status = f"absent (required series {M_PPS} returned nothing)"
     elif mode == "run":
@@ -753,8 +1064,15 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
                     deaf = not listen.get((r, t), {}).get(ts) or ts in masked[r] or ts in masked[t]
                     if pv is None or ev is None or deaf:
                         bad = 1.0
+                        a["A_terms"]["no_sample_or_not_listening"] += 1.0
                     else:
-                        bad = max(min(ev / full, 1.0), max(0.0, 1.0 - pv / nominal_pps))
+                        conceal, missing = min(ev / full, 1.0), max(0.0, 1.0 - pv / nominal_pps)
+                        cut = w_cut * increments[M_DISCARDS].get((r, t), {}).get(ts, 0.0) * AUDIO_PACKET_MS / bucket_ms
+                        silent = w_silent * increments[M_UNDERRUN].get((r, t), {}).get(ts, 0.0) / bucket_ms
+                        bad = min(1.0, max(max(conceal, missing) + silent, cut))
+                        a["A_terms"]["concealment" if conceal >= missing else "missing_packets"] += max(conceal, missing)
+                        a["A_terms"]["discarded"] += cut
+                        a["A_terms"]["playout_silence"] += silent
                     a["A_bad"] += bad
                     a["A_exp"] += 1
                     per_talker = talker_acc[cell_of(r, t)][t]
@@ -824,10 +1142,10 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
     iv = {u: _interval(in_step[u], hs, he) for u in split_receivers | split_talkers}
     split = _split_rate(split_receivers, split_talkers, iv, heard, sending, grid)
 
-    for (recv, pub), tl in freeze_tl.items():
-        delta = counter_delta(sorted(tl.items()), hs)
+    for recv, pub in sorted(set(freeze_tl) | set(increments[M_FREEZE]), key=str):
+        accrued = increments[M_FREEZE].get((recv, pub), {})
+        delta = sum(accrued.values())
         fps = fps_tl.get((recv, pub), {})
-        accrued = _increments(sorted(tl.items()), hs)
         exposure = sum(max(accrued.get(t, 0.0), step_s if fps.get(t, 0) > 0 else 0.0)
                        for t in set(accrued) | {t for t in fps if hs < t <= he})
         a = acc[cell_of(recv, pub if pub in shaped else None)][recv]
@@ -837,7 +1155,7 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
             diag["max_freeze"] = (delta, f"{recv} <- {pub}")
 
     stale_tl = timelines(idx[M_STALE])
-    for (recv, pub), fps in fps_tl.items():
+    for (recv, pub), fps in sorted(fps_tl.items(), key=lambda kv: str(kv[0])):
         a = acc[cell_of(recv, pub)][recv]
         stale = stale_tl.get((recv, pub), {})
         for ts, fv in fps.items():
@@ -863,7 +1181,10 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
     required = list(cv(cfg, "validity_gates", "required_dimensions"))
     cells = {}
     groups = [(cell, users) for cell, users in sorted(acc.items())]
-    if split_transport:
+    rtt_failed = isinstance(data.get(M_RTT), FailedQuery)
+    if split_transport and rtt_failed:
+        flags.append("--split-transport: no per-transport cells, the RTT query failed")
+    elif split_transport:
         groups += [(f"{cell}/{t}", {u: a for u, a in users.items() if transport.get(u, "unknown") == t})
                    for cell, users in sorted(acc.items())
                    for t in sorted({transport.get(u, "unknown") for u in users})]
@@ -894,7 +1215,7 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
             "absent_dimensions": [d for d in DIMENSIONS if d not in usable] + ["TTFF"],
             "participants": per_user,
             "audio_loss_share": loss,
-            "transport_mix": _count(transport.get(u, "unknown") for u in per_user),
+            "transport_mix": FAILED if rtt_failed else _count(transport.get(u, "unknown") for u in per_user),
         }
         if "/" in cell:
             cells[cell]["report_only"] = True
@@ -925,17 +1246,7 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
         allowed.add("G-Q5")
     blocking_unmeasured = [g["gate"] for g in validity + quality
                            if g["status"] == "not_measured" and g["gate"] not in allowed]
-
-    if mode == "real":
-        verdict = "REPORT"
-    elif any(g["status"] == "fail" for g in validity) or blocking_unmeasured:
-        verdict = "INVALID"
-    elif headline is None:
-        verdict = "INVALID"
-    elif any(g["status"] == "fail" for g in quality):
-        verdict = "FAIL"
-    else:
-        verdict = "PASS"
+    verdict, _ = _verdict(mode, validity, quality, blocking_unmeasured, headline_key)
 
     return {
         "step_id": sid,
@@ -945,6 +1256,8 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
         "join_start": step["join_start"],
         "verdict": verdict,
         "notices": ([LATENCY_PENDING] if latency_waived else [])
+        + [f"dimension A: {term} measured for {got} of {want} observer-talker pairs; A leaves it out where it is "
+           "missing" for term, (got, want) in short.items() if got < want]
         + ([f"G-Q9 unplanned-reconnect gate: {RECONNECT_PENDING}"] if mode == "run" else [])
         + [f"relay path exempted: {m} ({why})"
            for m, why in sorted(cv(cfg, "validity_gates", "relay_path_exemptions").items()) if mode == "run"],
@@ -961,8 +1274,10 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
         "cells": cells,
         "stability": stability,
         "transport": transport,
+        "transport_timeline": timelines_tr,
         "layer_mix": _layer_mix(data),
-        "server_diagnostics": _server_diagnostics(data, hs, step_s),
+        "server_diagnostics": _server_diagnostics(data, hs, sess2user, births,
+                                                  cv(cfg, "server_diagnostics", "throttle_pod_selector")),
         "diagnostics": {
             "note": "Max values and staleness are diagnostics only and never gate (doc sections 2.3, 3.4).",
             "max_staleness_ms": diag["max_staleness"][0],
@@ -974,6 +1289,17 @@ def score_step(manifest, step, data, cfg, mode="run", generator_verdict=None, sp
             "excluded_reporters": sorted(r for r in reporters if r not in observers),
             "rust_bot_reporters": rust_reporters,
             "unknown_publisher_sessions": sorted(unknown_pubs),
+            "audio_counter_coverage": coverage,
+            "counter_lineage_unproven": sorted(f"{r} <- {p}: {name} {why} ({v:g})" for name, by in unproven.items()
+                                               for (r, p), doubts in by.items() for why, v in doubts)
+            + sorted(f"{u}: re-election {r} not provably from this hold ({v:g})" for u, st in stability.items()
+                     for r, v in st["reelections_unproven"].items()),
+            "correlated_freeze": _correlated_freezes(
+                increments[M_FREEZE], fps_tl, observers, hs, cv(cfg, "diagnostics", "correlated_freeze_share"),
+                cv(cfg, "diagnostics", "correlated_freeze_min_pairs")),
+            "audio_delay": FAILED if any(isinstance(data.get(name), FailedQuery) for name in DELAY_METRICS)
+            else _audio_delay({name: timelines(_index(data.get(name, []))) for name in DELAY_METRICS},
+                              lambda r, pub: mode == "real" or pub in talkers, cv(cfg, "diagnostics", "target_delay_cap_ms")),
         },
     }
 
@@ -993,22 +1319,119 @@ def _count(items):
 
 def _layer_mix(data):
     fps = [v for _, samples in data.get(M_FPS, []) for _, v in samples if v > 0]
-    layers = [v for _, samples in data.get(M_ACTIVE_LAYERS, []) for _, v in samples]
-    return {"decoded_fps_p50": percentile(fps, 50), "publisher_active_video_layers_p50": percentile(layers, 50)}
+    series = data.get(M_ACTIVE_LAYERS, [])
+    layers = FAILED if isinstance(series, FailedQuery) else percentile([v for _, smp in series for _, v in smp], 50)
+    return {"decoded_fps_p50": percentile(fps, 50), "publisher_active_video_layers_p50": layers}
 
 
 def _sum_delta(series, start):
     return sum(counter_delta(s, start) for _, s in series) if series else None
 
 
-def _server_diagnostics(data, start, step_s):
-    out = {name: _sum_delta(data.get(name, []), start) for name in SERVER_DIAG}
-    le50, count = out.pop("sched_lag_le50"), out.pop("sched_lag_count")
-    late = (1 - le50 / count) if le50 is not None and count else None
-    out["scheduler_late_fraction_gt_50ms"] = late if late is None or math.isfinite(late) else None
-    out["relay_session_drops_room"] = _sum_delta(data.get("relay_session_drops_room", []), start)
-    out["note"] = ("All but relay_session_drops_room lack a room label, so they are attributable to this run "
-                   "only on a dedicated relay. Reported, not scored or gated in v1 (server-health sub-score deferred).")
+def _relay_counter(series, start, label, always, transports, room_failed):
+    """Hold increase by 'transport[/label]'. A relay counter exports nothing until its first increment, so an
+    absent combination reads 0 only on a transport that carried this room AND exports the counter (another
+    combination of it has a series); otherwise absence cannot be told from an image without the counter."""
+    if isinstance(series, FailedQuery):
+        return {"status": FAILED}
+    series = [(labels, samples) for labels, samples in series if samples]
+    by = defaultdict(float)
+    for labels, samples in series:
+        by["/".join([labels.get("transport", "?")] + ([labels.get(label, "?")] if label else []))] += \
+            counter_delta(samples, start)
+    exported = {labels.get("transport") for labels, _ in series}
+    silent = [t for t in transports if t not in exported]
+    for t in set(transports) & exported:
+        for v in always:
+            by.setdefault(f"{t}/{v}", 0.0)
+    if room_failed:
+        detail = "relay_active_sessions_per_room query failed: zero-fill skipped"
+    elif silent:
+        detail = f"no series on {', '.join(silent)}: never incremented, or not exported by that relay's image"
+    else:
+        detail = ""
+    if not by:
+        return {"status": FAILED if room_failed else NOT_COLLECTED, "detail": detail or "no series"}
+    return {"status": "measured", "by": dict(sorted(by.items()))} | ({"detail": detail} if detail else {})
+
+
+def _quic(data, start, sess2user, births, wt_in_room):
+    """Per-session QUIC path stats. lost, sent and congestion events are cumulative gauges GC'd at session end:
+    each session adds its own increase, a gauge without a series stays unknown (None), and a session whose first
+    sample comes after start although it was born before has an unknown baseline for that sample."""
+    if any(isinstance(data.get(name), FailedQuery) for name in QUIC):
+        return {"status": FAILED}
+    if not any(data.get(name) for name in QUIC):
+        return {"status": NOT_COLLECTED, "detail": "relay QUIC path series absent for this room"
+                + ("" if wt_in_room else " (no webtransport session of this room was scraped)")}
+    per = defaultdict(lambda: {"rtt": [], "lost": [], "sent": [], "congestion_events": []})
+    for name, field in (("_quic_lost", "lost"), ("_quic_sent", "sent"), ("_quic_congestion", "congestion_events")):
+        for labels, samples in data.get(name, []):
+            sid = labels.get("session_id", "?")
+            per[sid][field].append(_series_total(samples, start, births.get(sid, (-math.inf,))[0] > start))
+    for labels, samples in data.get("_quic_rtt", []):
+        per[labels.get("session_id", "?")]["rtt"] += [v for t, v in samples if t >= start]
+    by_user = defaultdict(list)
+    for sid, st in sorted(per.items()):
+        row = {k: (None if not v or None in v else sum(v)) for k, v in st.items() if k != "rtt"}
+        row["loss_fraction"] = row["lost"] / row["sent"] if row["lost"] is not None and row["sent"] else None
+        by_user[sess2user.get(sid, "?")].append({"session_id": sid, "rtt_ms_median": percentile(st["rtt"], 50), **row})
+    rows = [st for sessions in by_user.values() for st in sessions]
+    both = [st for st in rows if st["lost"] is not None and st["sent"] is not None]
+    medians = [st["rtt_ms_median"] for st in rows if st["rtt_ms_median"] is not None]
+    lost, sent = sum(st["lost"] for st in both), sum(st["sent"] for st in both)
+    events = [st["congestion_events"] for st in rows if st["congestion_events"] is not None]
+    return {"status": "measured", "rtt_ms_median": percentile(medians, 50), "rtt_ms_p95": percentile(medians, 95),
+            "lost": lost if both else None, "sent": sent if both else None,
+            "loss_fraction": lost / sent if sent else None, "loss_sessions": [len(both), len(rows)],
+            "congestion_events": sum(events) if events else None, "by_user": dict(by_user)}
+
+
+def _throttling(series, pods):
+    """CFS throttled share of periods for the target's relay and NATS pods only."""
+    if not pods:
+        return {"status": NOT_COLLECTED, "detail": "no relay and NATS pod selector for this target"}
+    if isinstance(series, FailedQuery):
+        return {"status": FAILED, "selector": pods}
+    by_pod = {labels.get("pod", "?"): {"max": max(v for _, v in smp), "mean": sum(v for _, v in smp) / len(smp)}
+              for labels, smp in series if smp}
+    if not by_pod:
+        return {"status": NOT_COLLECTED, "selector": pods, "detail": "the selector matched no CFS series"}
+    return {"status": "measured", "selector": pods, "max": max(p["max"] for p in by_pod.values()),
+            "by_pod": dict(sorted(by_pod.items()))}
+
+
+def _server_diagnostics(data, start, sess2user, births, pods):
+    room_sessions = data.get("_room_sessions", [])
+    room_failed = isinstance(room_sessions, FailedQuery)
+    in_room = {labels["transport"] for labels, smp in room_sessions
+               if labels.get("transport") and any(v > 0 for _, v in smp)}
+    out = {name: _relay_counter(data.get(name, []), start, label, always, sorted(in_room & set(emits)), room_failed)
+           for name, (_, _, label, always, emits) in RELAY_COUNTERS.items()}
+    drops = data.get("_session_drops", [])
+    out["session_drops"] = _relay_counter(drops, start, "kind", ("audio",), sorted(in_room), room_failed)
+    if out["session_drops"]["status"] == "measured":
+        by_user = defaultdict(lambda: defaultdict(float))
+        for labels, samples in [(lb, smp) for lb, smp in drops if smp]:
+            by_user[sess2user.get(labels.get("session_id"), "?")][labels.get("kind", "?")] += \
+                counter_delta(samples, start)
+        out["session_drops"]["by_user"] = {u: dict(sorted(k.items())) for u, k in sorted(by_user.items())}
+    le50, count = data.get("sched_lag_le50", []), data.get("sched_lag_count", [])
+    if isinstance(le50, FailedQuery) or isinstance(count, FailedQuery):
+        out["scheduler_late_fraction_gt_50ms"] = {"status": FAILED}
+    else:
+        le, n = _sum_delta(le50, start), _sum_delta(count, start)
+        late = 1 - le / n if le is not None and n else None
+        out["scheduler_late_fraction_gt_50ms"] = ({"status": "measured", "value": late}
+                                                  if late is not None and math.isfinite(late)
+                                                  else {"status": NOT_COLLECTED})
+    out["quic"] = _quic(data, start, sess2user, births, "webtransport" in in_room)
+    out["cpu_throttling"] = _throttling(data.get("_cfs", []), pods)
+    out["room_transports"] = FAILED if room_failed else sorted(in_room)
+    out["note"] = ("session_drops and quic are this room's; the other relay counters are relay-wide, so they are "
+                   "attributable to this run only while no other room used the relay. An absent counter combination "
+                   "reads 0 only on a transport of this room whose relay exports the counter. Reported, never scored "
+                   "or gated.")
     return out
 
 
@@ -1242,10 +1665,37 @@ def _reconnect_gate(cfg, mode, members, shaped, stability, bands):
                  + RECONNECT_PENDING)
 
 
+def _fallback_reconciliation(steps, linger):
+    """Per participant with a bots-app record: its run-wide fallbacks against the switches away from its preferred
+    transport that the health reports show across every scored window."""
+    out = {}
+    users = {u for s in steps for u, tl in s["transport_timeline"].items() if tl.get("recorded")}
+    for u in sorted(users):
+        rec = next(s["transport_timeline"][u]["recorded"] for s in steps if u in s["transport_timeline"])
+        spans, failed = {}, False
+        for s in steps:
+            tl = s["transport_timeline"].get(u, {})
+            failed |= tl.get("status") == FAILED
+            for r in tl.get("sessions", []):
+                k = (r["session_id"], r["server_type"])
+                lo, hi = spans.get(k, (r["from"], r["to"]))
+                spans[k] = (min(lo, r["from"]), max(hi, r["to"]))
+        rows = sorted((lo, hi, st) for (_, st), (lo, hi) in spans.items())
+        pref = rec["preferred"]
+        concurrent = not all(_sequential(a, b, linger) for a, b in zip(rows, rows[1:]))
+        seen = (None if failed or concurrent or not rows or pref not in ("webtransport", "websocket") else
+                sum(1 for a, b, _ in _switches(rows, linger)[0] if a == pref and b in ("webtransport", "websocket")))
+        out[u] = dict(rec, fallbacks_in_health_reports=seen)
+    return out
+
+
 def score_run(manifest, datasets, cfg, mode="run", generator_verdict=None, split_transport=False):
     steps = [score_step(manifest, s, datasets[s["step_id"]], cfg, mode, generator_verdict, split_transport)
              for s in manifest["steps"]]
     headline = next(s for s in steps if s["headline"])
+    fallbacks = _fallback_reconciliation(steps, METRICS_SESSION_TIMEOUT_S + cv(cfg, "sampling", "scrape_step_s"))
+    unseen = sum(1 for f in fallbacks.values()
+                 if f["fallbacks_in_health_reports"] is not None and f["fallbacks"] > f["fallbacks_in_health_reports"])
     return {
         "schema": "call-quality-score/v0",
         "run": {"run_id": manifest["run_id"], "meeting_id": manifest["meeting_id"],
@@ -1253,7 +1703,11 @@ def score_run(manifest, datasets, cfg, mode="run", generator_verdict=None, split
                 "bands_version": cfg.get("config_version"), "mode": mode,
                 "scrape_step_s": cv(cfg, "sampling", "scrape_step_s")},
         "verdict": headline["verdict"],
-        "notices": sorted({n for s in steps for n in s["notices"]}),
+        "notices": sorted({n for s in steps for n in s["notices"]}
+                          | ({f"transport: {unseen} participant(s) whose bots-app record counts fallbacks from the "
+                              "preferred transport that their health reports in the scored windows do not show"}
+                             if unseen else set())),
+        "transport_fallbacks": fallbacks,
         "config_overrides": config_overrides(cfg),
         "headline_step": headline["step_id"],
         "steps": steps,

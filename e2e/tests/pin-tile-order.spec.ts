@@ -11,6 +11,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  * other tile, most recent pin first. The DOM contract is the camera tile in
  * canvas_generator.rs (`tile-pin-button`, `data-pinned`, `data-pin-rank`) and
  * the peer loop in attendants.rs (`.ss-peer-panel`, `.grid-overflow-badge`).
+ * Issue 3128: the badge opens `#grid-overflow-list` (overflow_participants.rs).
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
@@ -20,12 +21,17 @@ const MOCK_TILES = `${PEER_TILES}[id^="peer-video-mock-"]`;
 const SELF_CELL = "host-controls-nav";
 const PIN = '[data-testid="tile-pin-button"]';
 const ANNOUNCER = '[data-testid="ss-detach-announce"]';
-const OVERFLOW_BADGE = `${GRID} .grid-overflow-badge`;
+const OVERFLOW_BADGE = `${GRID} > .ss-peer-panel > button#grid-overflow-badge.grid-overflow-badge`;
+const OVERFLOW_LIST = '#grid-overflow-list[role="dialog"]';
+const OVERFLOW_TITLE = `${OVERFLOW_LIST} > .grid-overflow-list-header > h2#grid-overflow-list-title`;
+const OVERFLOW_ROWS = `${OVERFLOW_LIST} > ul.grid-overflow-list-rows > li`;
+const OVERFLOW_CLOSE_ID = "grid-overflow-list-close";
+const OVERFLOW_CLOSE = `${OVERFLOW_LIST} > .grid-overflow-list-header > button#${OVERFLOW_CLOSE_ID}`;
 // Clears `PIN_DOUBLE_ACTIVATION_MS` (350, pin_order.rs), which drops a pin of a
 // different tile that lands sooner than that after the last one.
 const PIN_GUARD_WAIT_MS = 400;
 const SIZE_TOLERANCE_PX = 1;
-// A's signal and host-menu buttons may sit between B's pin and A's.
+// B's enlarge button and A's signal and host-menu buttons may sit between B's pin and A's.
 const TAB_STOPS_TO_A = 6;
 
 const HOST = "PinOrderHost";
@@ -43,6 +49,8 @@ function seedGridSelfView(): void {
 
 const tileOf = (page: Page, id: string): Locator => page.locator(`#${id}`);
 const pinOf = (page: Page, id: string): Locator => tileOf(page, id).locator(PIN);
+const overflowRowId = (tileId: string): string =>
+  `grid-overflow-row-${tileId.replace(/^peer-video-(.+)-div$/, "$1")}`;
 
 async function tileIdByName(page: Page, name: string): Promise<string> {
   const tile = page.locator(PEER_TILES).filter({
@@ -393,7 +401,7 @@ test.describe("Issue 2866: pinning reorders the grid", () => {
         const pinA = pinOf(host, a);
         await leaveTiles(host);
         await expect.poll(() => opacityOf(pinA), { timeout: 5_000 }).toBe("0");
-        // B is the tile before A in DOM order, so Tab from B's pin enters A's tile.
+        // B is the tile before A in DOM order, so Tab from B's pin reaches A's pin.
         await pinOf(host, b).focus();
         const visited: string[] = [];
         while (visited.length < TAB_STOPS_TO_A && visited.at(-1) !== `${a}-pin-btn`) {
@@ -516,6 +524,148 @@ test.describe("Issue 2866: pinning reorders the grid", () => {
         "unpinned, the camera-off late joiner folds into the +N badge",
       ).toHaveCount(0, { timeout: 15_000 });
       await expect(host.locator(OVERFLOW_BADGE)).toBeVisible();
+    } finally {
+      await Promise.all(browsers.map((br) => br.close().catch(() => undefined)));
+    }
+  });
+
+  test("the +N badge lists the hidden participants and pins one into the grid @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_overflow_list_${Date.now()}`;
+    const late = "OverflowListJoiner";
+    const lateEmail = "overflow-list-joiner@videocall.rs";
+    let browsers: Browser[] = [];
+    try {
+      browsers = await launchAll([BROWSER_ARGS, BROWSER_ARGS]);
+      const hostCtx = await createAuthenticatedContext(
+        browsers[0],
+        "overflow-list-host@videocall.rs",
+        HOST,
+        uiURL,
+      );
+      await hostCtx.addInitScript(seedGridSelfView);
+      const host = await hostCtx.newPage();
+      await enterMeetingAsHost(host, meetingId, HOST);
+      const lateCtx = await createAuthenticatedContext(browsers[1], lateEmail, late, uiURL);
+      await guestJoinsMeeting(host, await lateCtx.newPage(), meetingId, late);
+      const l = await tileIdByName(host, late);
+
+      expect(await setMockPeers(host, 40), "Mock Peers must be enabled").toBe(true);
+      await expect(
+        tileOf(host, l),
+        "the camera-off joiner folds into the +N badge behind the mocks",
+      ).toHaveCount(0, { timeout: 15_000 });
+      const badge = host.locator(OVERFLOW_BADGE);
+      const list = host.locator(OVERFLOW_LIST);
+      const rows = host.locator(OVERFLOW_ROWS);
+      const pinButtons = host.locator(`${OVERFLOW_ROWS} button`);
+      const lateRow = host.locator(`${OVERFLOW_ROWS} > button#${overflowRowId(l)}`);
+      const close = host.locator(OVERFLOW_CLOSE);
+      const mockPopover = host.locator(".mock-peers-popover");
+      await expect(badge).toHaveAttribute("aria-haspopup", "dialog");
+      await expect(badge).toHaveAttribute("aria-controls", "grid-overflow-list");
+      await expect(badge).toHaveAttribute("aria-expanded", "false");
+      await expect(list).toHaveCount(0);
+
+      await test.step("the badge opens a list of exactly the participants it counts", async () => {
+        await host.locator(".video-controls-container").hover({ timeout: 10_000 });
+        await host.locator("#mock-peers-trigger").click({ timeout: 10_000 });
+        await expect(mockPopover).toBeVisible({ timeout: 5_000 });
+        await badge.click({ timeout: 10_000 });
+        await expect(badge).toHaveAttribute("aria-expanded", "true");
+        await expect(list).toBeVisible();
+        await expect(mockPopover, "opening the list closes the transient popovers").toHaveCount(0);
+        await expect(list, "placed, so no longer transparent").toHaveAttribute("data-placed", "");
+        const n = Number(await badge.getAttribute("data-overflow-count"));
+        expect(n, "the badge hides the joiner and at least one mock").toBeGreaterThan(1);
+        await expect(rows).toHaveCount(n);
+        await expect(host.locator(OVERFLOW_TITLE)).toHaveText(`${n} more in meeting`);
+
+        await expect(lateRow).toHaveAttribute("aria-label", `Pin ${late}`);
+        await expect(lateRow).toHaveAttribute("aria-pressed", "false");
+        await expect(lateRow.locator(":scope > .grid-overflow-row-name")).toHaveText(late);
+        await expect(list).not.toContainText(lateEmail);
+        await expect(
+          host.locator(`${OVERFLOW_ROWS} > div.grid-overflow-row`),
+          "every other hidden participant is an unpinnable mock",
+        ).toHaveText(new Array<string>(n - 1).fill("Participant"));
+        await expect(pinButtons, "only the real participant's row is a pin button").toHaveCount(1);
+        await expect
+          .poll(() => activeId(host), {
+            timeout: 5_000,
+            message: "opening focuses the first pinnable row",
+          })
+          .toBe(overflowRowId(l));
+        await expect(close).toBeVisible();
+        const box = await close.boundingBox();
+        expect(box, "the close button has a layout box").not.toBeNull();
+        expect(box!.width, "a 44px close target").toBeCloseTo(44, 0);
+        expect(box!.height, "a 44px close target").toBeCloseTo(44, 0);
+        await host.keyboard.press("ArrowDown");
+        await expect.poll(() => activeId(host), { timeout: 5_000 }).toBe(OVERFLOW_CLOSE_ID);
+      });
+
+      await test.step("a pinned row holds under the pointer, then leaves for the grid", async () => {
+        await lateRow.click({ timeout: 10_000 });
+        await expect(lateRow, "rows hold while the pointer is over the list").toHaveAttribute(
+          "aria-pressed",
+          "true",
+        );
+        await expect(lateRow).toHaveAttribute("title", `Unpin ${late}`);
+        await expect.poll(() => activeId(host), { timeout: 5_000 }).toBe(overflowRowId(l));
+
+        await host.mouse.move(0, 0);
+        await expect(lateRow, "pointerleave drops the now-rendered participant").toHaveCount(0);
+        await expectPinState(host, l, late, 0);
+        await expect.poll(async () => (await domOrder(host))[0], { timeout: 10_000 }).toBe(l);
+        const mocks = (await domOrder(host)).filter((id) => id !== l).slice(0, 2);
+        await expect
+          .poll(async () => (await visualOrder(host, [SELF_CELL, ...mocks, l]))[0])
+          .toBe(l);
+        await expect(list, "the list stays open after a pin").toBeVisible();
+        await expect(pinButtons).toHaveCount(0);
+        const n = Number(await badge.getAttribute("data-overflow-count"));
+        expect(n).toBeGreaterThan(0);
+        await expect(rows).toHaveCount(n);
+        await expect
+          .poll(() => activeId(host), {
+            timeout: 5_000,
+            message: "no pinnable row survives, so focus falls to Close",
+          })
+          .toBe(OVERFLOW_CLOSE_ID);
+      });
+
+      await test.step("Escape closes the list and returns focus to the badge", async () => {
+        await host.keyboard.press("Escape");
+        await expect(list).toHaveCount(0);
+        await expect(badge).toHaveAttribute("aria-expanded", "false");
+        await expect.poll(() => activeId(host), { timeout: 5_000 }).toBe("grid-overflow-badge");
+      });
+
+      await test.step("Escape with focus on the grid still closes the list", async () => {
+        await host.keyboard.press("Enter");
+        await expect(list).toBeVisible();
+        await expect.poll(() => activeId(host), { timeout: 5_000 }).toBe(OVERFLOW_CLOSE_ID);
+        await host.locator(GRID).focus();
+        await expect.poll(() => activeId(host), { timeout: 5_000 }).toBe("grid-container");
+        await expect(list).toBeVisible();
+        await host.keyboard.press("Escape");
+        await expect(list).toHaveCount(0);
+        await expect(badge).toHaveAttribute("aria-expanded", "false");
+        await expect.poll(() => activeId(host), { timeout: 5_000 }).toBe("grid-overflow-badge");
+      });
+
+      await test.step("Enter on the badge reopens the list; a click outside closes it", async () => {
+        await host.keyboard.press("Enter");
+        await expect(list).toBeVisible();
+        await host.locator(GRID).click({ position: { x: 10, y: 10 }, timeout: 10_000 });
+        await expect(list).toHaveCount(0);
+        await expect(badge).toHaveAttribute("aria-expanded", "false");
+        await expectPinState(host, l, late, 0);
+      });
     } finally {
       await Promise.all(browsers.map((br) => br.close().catch(() => undefined)));
     }

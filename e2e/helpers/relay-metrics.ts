@@ -135,6 +135,16 @@ export async function readViewportForwardedTotal(
   return parseRoomCounter(text, "relay_viewport_forwarded_total", room);
 }
 
+/** `relay_keyframe_request_filtered_total{room}` on one relay (#3206). */
+export async function readKeyframeRequestFilteredTotal(
+  transport: "websocket" | "webtransport",
+  room: string,
+): Promise<number> {
+  const url = transport === "websocket" ? WS_RELAY_METRICS_URL : WT_RELAY_METRICS_URL;
+  const text = await fetchMetricsText(url);
+  return parseRoomCounter(text, "relay_keyframe_request_filtered_total", room);
+}
+
 // ===========================================================================
 // #1219 Half 2 — receiver-downlink congestion signal path metrics
 //
@@ -382,4 +392,19 @@ export async function snapshotDownlinkCongestionMetrics(
     layerFilteredTotal: parseRoomCounter(text, "relay_layer_filtered_total", room),
     layerForwardedTotal: parseRoomCounter(text, "relay_layer_forwarded_total", room),
   });
+}
+
+/** The series has no `room` label, so callers compare a before/after delta. */
+export async function readStaleInstanceRefusedTotal(
+  transport: "websocket" | "webtransport",
+): Promise<number> {
+  const url = transport === "websocket" ? WS_RELAY_METRICS_URL : WT_RELAY_METRICS_URL;
+  const text = await fetchMetricsText(url);
+  const re = new RegExp(
+    `^videocall_relay_join_stale_instance_refused_total\\{[^}]*\\btransport="${transport}"[^}]*\\}\\s+([0-9.eE+-]+)\\s*$`,
+    "m",
+  );
+  const m = text.match(re);
+  const v = m ? Number(m[1]) : 0;
+  return Number.isFinite(v) ? v : 0;
 }

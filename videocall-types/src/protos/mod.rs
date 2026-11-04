@@ -1,6 +1,7 @@
 // @generated
 
 pub mod aes_packet;
+pub mod caption_packet;
 pub mod connection_packet;
 pub mod diagnostics_packet;
 pub mod downlink_congestion_packet;

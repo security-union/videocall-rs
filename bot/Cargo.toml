@@ -77,5 +77,6 @@ prometheus = { version = "0.13", optional = true }
 hyper = { version = "0.14", features = ["server", "http1", "tcp"], optional = true }
 
 [dev-dependencies]
+jsonwebtoken = "9"
 rcgen = "0.13"
 tokio = { version = "1.28.1", features = ["full", "test-util"] }

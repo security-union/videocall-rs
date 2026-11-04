@@ -1,10 +1,10 @@
-use crate::local_storage::{load_json, save_json};
+use crate::local_storage::{load_json, remove_item, save_json};
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "vc_action_bar_layout";
 
 /// Slots that the user must always be able to access. They never appear in
-/// `hidden`, are never offered a remove button in the UI, and `Reset to Default`
+/// `hidden`, are never offered a remove button in the UI, and `Reset Buttons`
 /// also resets `hidden` to empty so a user cannot wedge themselves mid-call by
 /// removing their mute or camera-mute control.
 pub const NON_REMOVABLE_SLOTS: &[ActionBarSlot] = &[ActionBarSlot::Mic, ActionBarSlot::Camera];
@@ -34,6 +34,9 @@ pub enum ActionBarSlot {
     /// [`meeting_timer_slot_visible`].
     #[serde(rename = "meeting_timer")]
     MeetingTimer,
+    Captions,
+    #[serde(rename = "recent_actions")]
+    RecentActions,
 }
 
 impl ActionBarSlot {
@@ -52,6 +55,28 @@ impl ActionBarSlot {
             ActionBarSlot::Recording => "Record",
             ActionBarSlot::MeetingOptions => "Meeting options",
             ActionBarSlot::MeetingTimer => "Meeting timer",
+            ActionBarSlot::Captions => "Captions",
+            ActionBarSlot::RecentActions => "Recent actions",
+        }
+    }
+
+    /// What the control does, as the help page explains it.
+    pub fn help_text(self) -> &'static str {
+        match self {
+            ActionBarSlot::Mic => "Mute or unmute your microphone. If it shows a \"!\", the microphone isn't available; select it to try again.",
+            ActionBarSlot::Camera => "Turn your camera on or off. If it shows a \"!\", the camera isn't available; select it to try again.",
+            ActionBarSlot::Reactions => "Send a reaction everyone in the call can see.",
+            ActionBarSlot::RaiseHand => "Let everyone know you want to speak. Select it again to lower your hand.",
+            ActionBarSlot::ScreenShare => "Show a window or your entire screen to everyone. While you share, select it again to share something else or stop. iPhone and iPad can't share their screen.",
+            ActionBarSlot::PeerList => "See who's in the call. Search or sort the list, and use the pencil next to your name to rename yourself.",
+            ActionBarSlot::DensityMode => "Choose how tightly participant tiles are packed on screen.",
+            ActionBarSlot::Diagnostics => "See live connection quality, bitrate, packet loss and codec stats. It also holds the performance controls and the Show diagnostics on tiles option.",
+            ActionBarSlot::DeviceSettings => "Open Settings to switch your microphone, camera or speaker and change how the app looks and behaves.",
+            ActionBarSlot::Recording => "Record the call to a file on your device. Hosts get the Record button; other signed-in participants get it when a host allows recording for everyone. Guests can't use Record.",
+            ActionBarSlot::MeetingOptions => "Hosts only. Change meeting options during the call: waiting room, who can admit people, guests and recording.",
+            ActionBarSlot::MeetingTimer => "Hosts only. Show everyone a countdown, then add time or cancel it.",
+            ActionBarSlot::Captions => "Show or hide live captions. A host turns captions on or off for everyone. Available when your organization has captions turned on; hidden while end-to-end encryption is on, or after the server refuses to turn captions on.",
+            ActionBarSlot::RecentActions => "Jump back to features and settings you used recently. Choose how many to remember in Settings, under Preferences.",
         }
     }
 
@@ -79,6 +104,8 @@ impl ActionBarSlot {
             ActionBarSlot::Recording => "recording",
             ActionBarSlot::MeetingOptions => "meeting_options",
             ActionBarSlot::MeetingTimer => "meeting_timer",
+            ActionBarSlot::Captions => "captions",
+            ActionBarSlot::RecentActions => "recent_actions",
         }
     }
 
@@ -98,6 +125,8 @@ impl ActionBarSlot {
             "recording" => ActionBarSlot::Recording,
             "meeting_options" => ActionBarSlot::MeetingOptions,
             "meeting_timer" => ActionBarSlot::MeetingTimer,
+            "captions" => ActionBarSlot::Captions,
+            "recent_actions" => ActionBarSlot::RecentActions,
             _ => return None,
         })
     }
@@ -122,12 +151,50 @@ pub const DEFAULT_SLOTS: &[ActionBarSlot] = &[
     ActionBarSlot::DeviceSettings,
     ActionBarSlot::Recording,
     ActionBarSlot::MeetingOptions,
-    // Issue 2136: the meeting timer sits last in the default order, next to
-    // Meeting options — both are host-only surfaces, so a non-host sees neither
-    // and the visible bar is unchanged for them. Existing users get it appended
-    // by `migrate_stored_layout`'s forward-compat pass.
+    // Issue 2136: the meeting timer sits next to Meeting options — both are
+    // host-only surfaces, so a non-host sees neither and the visible bar is
+    // unchanged for them. Existing users get it appended by
+    // `migrate_stored_layout`'s forward-compat pass.
     ActionBarSlot::MeetingTimer,
+    ActionBarSlot::RecentActions,
 ];
+
+macro_rules! all_slots {
+    ($($slot:ident),+ $(,)?) => {
+        /// Every [`ActionBarSlot`].
+        pub const ALL_SLOTS: &[ActionBarSlot] = &[$(ActionBarSlot::$slot),+];
+        const _: fn(ActionBarSlot) = |slot| match slot {
+            $(ActionBarSlot::$slot)|+ => {}
+        };
+    };
+}
+
+all_slots!(
+    Mic,
+    Camera,
+    Reactions,
+    RaiseHand,
+    ScreenShare,
+    PeerList,
+    DensityMode,
+    Diagnostics,
+    DeviceSettings,
+    Recording,
+    MeetingOptions,
+    MeetingTimer,
+    Captions,
+    RecentActions,
+);
+
+/// [`DEFAULT_SLOTS`], plus the Captions slot when the captions flag is on, so a
+/// flag-off build never writes Captions into a stored layout.
+pub fn default_slots(captions_enabled: bool) -> Vec<ActionBarSlot> {
+    let mut slots = DEFAULT_SLOTS.to_vec();
+    if captions_enabled {
+        slots.insert(slots.len() - 1, ActionBarSlot::Captions);
+    }
+    slots
+}
 
 /// On-disk schema for the action-bar layout. Two shapes have ever shipped to
 /// users:
@@ -174,7 +241,7 @@ struct Migrated {
 /// tests call — so a regression in this logic is caught by the tests
 /// without them re-implementing the migration inline (the "test pins what
 /// it names" rule from CLAUDE.md).
-fn migrate_stored_layout(raw: serde_json::Value) -> Migrated {
+fn migrate_stored_layout(raw: serde_json::Value, defaults: &[ActionBarSlot]) -> Migrated {
     let (mut slots, hidden, came_from_v1) = match &raw {
         // v2 object form. Parse `slots` and `hidden` element-by-element so a
         // single unknown / future-renamed slot tag in either array is dropped
@@ -213,14 +280,14 @@ fn migrate_stored_layout(raw: serde_json::Value) -> Migrated {
         }
         // No saved value (fresh install) or an unrecognised shape. Fall back to
         // the full default ordering with nothing hidden.
-        _ => (DEFAULT_SLOTS.to_vec(), Vec::new(), false),
+        _ => (defaults.to_vec(), Vec::new(), false),
     };
 
     // Forward-compat: append defaults the user has neither chosen NOR hidden.
     // Critically, defaults present in `hidden` are NOT appended — that is
     // exactly the resurrect-on-reload bug we are fixing.
     let mut appended_default = false;
-    for default in DEFAULT_SLOTS {
+    for default in defaults {
         if !slots.contains(default) && !hidden.contains(default) {
             slots.push(*default);
             appended_default = true;
@@ -264,21 +331,21 @@ fn migrate_stored_layout(raw: serde_json::Value) -> Migrated {
 
 /// Returns `(visible_ordered_slots, removed_slots)` for the current user.
 ///
-/// Forward-compat rule (the only "auto-appears" path): a `DEFAULT_SLOTS` slot
+/// Forward-compat rule (the only "auto-appears" path): a [`default_slots`] slot
 /// that is present in NEITHER `slots` NOR `hidden` is appended to `slots` (and
 /// the result is saved as v2). A slot that lives in `hidden` is never
 /// resurrected by this function — that is what fixes the #1278 "removed widget
 /// re-appears on reload" regression.
-pub fn load_action_bar_layout() -> (Vec<ActionBarSlot>, Vec<ActionBarSlot>) {
+pub fn load_action_bar_layout(captions_enabled: bool) -> (Vec<ActionBarSlot>, Vec<ActionBarSlot>) {
     // Parse the raw storage value once. `serde_json::Value::Null` is a safe
     // fallback because it triggers the "missing / unrecognised" branch inside
-    // `migrate_stored_layout` (initial DEFAULT_SLOTS, empty hidden).
+    // `migrate_stored_layout` (initial `default_slots`, empty hidden).
     let raw: serde_json::Value = load_json(STORAGE_KEY, serde_json::Value::Null);
     let Migrated {
         slots,
         hidden,
         needs_persist,
-    } = migrate_stored_layout(raw);
+    } = migrate_stored_layout(raw, &default_slots(captions_enabled));
 
     if needs_persist {
         save_json(
@@ -320,6 +387,99 @@ pub fn remove_action_bar_layout() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item(STORAGE_KEY);
     }
+}
+
+pub const DOCK_AUTOHIDE_HINT: &str = "Fades out when idle";
+pub const DOCK_AUTOSHRINK_HINT: &str = "Fewer buttons until you need them";
+
+const SHRUNK_STORAGE_KEY: &str = "vc_action_bar_shrunk";
+
+/// The buttons that stay on the action bar while it is shrunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShrunkButtons {
+    pub slots: Vec<ActionBarSlot>,
+    pub hangup: bool,
+}
+
+impl Default for ShrunkButtons {
+    fn default() -> Self {
+        Self {
+            slots: vec![
+                ActionBarSlot::Mic,
+                ActionBarSlot::Camera,
+                ActionBarSlot::ScreenShare,
+            ],
+            hangup: true,
+        }
+    }
+}
+
+impl ShrunkButtons {
+    pub fn keeps(&self, slot: ActionBarSlot) -> bool {
+        self.slots.contains(&slot)
+    }
+
+    pub fn with_slot(&self, slot: ActionBarSlot, keep: bool) -> Self {
+        let mut next = self.clone();
+        next.slots.retain(|s| *s != slot);
+        if keep {
+            next.slots.push(slot);
+        }
+        next
+    }
+}
+
+fn parse_shrunk_buttons(raw: &serde_json::Value) -> ShrunkButtons {
+    let (Some(slots), Some(hangup)) = (
+        raw.get("slots").and_then(|v| v.as_array()),
+        raw.get("hangup").and_then(|v| v.as_bool()),
+    ) else {
+        return ShrunkButtons::default();
+    };
+    ShrunkButtons {
+        slots: slots
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect(),
+        hangup,
+    }
+}
+
+pub fn load_shrunk_buttons() -> ShrunkButtons {
+    parse_shrunk_buttons(&load_json(SHRUNK_STORAGE_KEY, serde_json::Value::Null))
+}
+
+pub fn save_shrunk_buttons(kept: &ShrunkButtons) {
+    save_json(SHRUNK_STORAGE_KEY, kept);
+}
+
+pub fn remove_shrunk_buttons() {
+    remove_item(SHRUNK_STORAGE_KEY);
+}
+
+pub fn stays_on_shrunk_bar(kept: &ShrunkButtons, slot: ActionBarSlot) -> bool {
+    kept.keeps(slot)
+}
+
+/// True when Hang up is not kept and nothing that stays is on the bar.
+pub fn no_kept_button_on_screen(
+    kept: &ShrunkButtons,
+    visible: &[ActionBarSlot],
+    overflowed: &[ActionBarSlot],
+) -> bool {
+    !kept.hangup
+        && !visible
+            .iter()
+            .any(|slot| stays_on_shrunk_bar(kept, *slot) && !overflowed.contains(slot))
+}
+
+/// `secondary` reordered for the overflow fit, so slots that stay on the shrunk
+/// bar overflow last. Stable within each group.
+pub fn kept_slots_first(secondary: &[ActionBarSlot], kept: &ShrunkButtons) -> Vec<ActionBarSlot> {
+    let (first, rest): (Vec<ActionBarSlot>, Vec<ActionBarSlot>) = secondary
+        .iter()
+        .partition(|slot| stays_on_shrunk_bar(kept, **slot));
+    [first, rest].concat()
 }
 
 /// Whether the Recording action-bar slot should render for the current user.
@@ -409,6 +569,130 @@ pub fn apply_keyboard_reorder(
     Some(KeyboardReorderResult { old_idx, new_idx })
 }
 
+pub const HOLD_TO_EDIT_MS: u32 = 2_000;
+pub const HOLD_SLOP_PX: f64 = 10.0;
+pub const HOLD_EDIT_IDLE_MS: u32 = 5_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomizeEntry {
+    Menu,
+    Hold(ActionBarSlot),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomizeExit {
+    Done,
+    Escape,
+    BandTooNarrow,
+    Idle,
+}
+
+pub fn customize_entry_announcement(entry: CustomizeEntry) -> &'static str {
+    match entry {
+        CustomizeEntry::Hold(_) => {
+            "Editing action bar buttons. Drag to move one. Press Done or Escape to finish."
+        }
+        CustomizeEntry::Menu => {
+            "Editing action bar buttons. Use arrow keys to move the focused button, or drag with the pointer. Press the minus button to hide one. Press Done or Escape to finish."
+        }
+    }
+}
+
+pub fn customize_exit_announcement(reason: CustomizeExit) -> &'static str {
+    match reason {
+        CustomizeExit::Idle => "Finished editing action bar buttons.",
+        CustomizeExit::Done | CustomizeExit::Escape | CustomizeExit::BandTooNarrow => "",
+    }
+}
+
+pub fn customize_session_is_timed(entry: CustomizeEntry) -> bool {
+    matches!(entry, CustomizeEntry::Hold(_))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldPress {
+    pub is_primary: bool,
+    pub button: i16,
+    pub ctrl_key: bool,
+    pub on_slot_primary_button: bool,
+    pub slot_menu_open: bool,
+}
+
+pub fn hold_should_arm(edit_fits: bool, press: HoldPress) -> bool {
+    edit_fits
+        && press.is_primary
+        && press.button == 0
+        && !press.ctrl_key
+        && press.on_slot_primary_button
+        && !press.slot_menu_open
+}
+
+pub fn hold_exceeds_slop(down: (f64, f64), now: (f64, f64)) -> bool {
+    let dx = now.0 - down.0;
+    let dy = now.1 - down.1;
+    dx * dx + dy * dy > HOLD_SLOP_PX * HOLD_SLOP_PX
+}
+
+pub fn hold_should_fire(
+    customize_mode: bool,
+    edit_fits: bool,
+    slot: ActionBarSlot,
+    rendered: &[ActionBarSlot],
+    overflowed: &[ActionBarSlot],
+) -> bool {
+    !customize_mode && edit_fits && rendered.contains(&slot) && !overflowed.contains(&slot)
+}
+
+pub fn drag_grab_offset(pointer: (f64, f64), origin: (f64, f64), size: (f64, f64)) -> (f64, f64) {
+    let dx = pointer.0 - origin.0;
+    let dy = pointer.1 - origin.1;
+    if (0.0..=size.0).contains(&dx) && (0.0..=size.1).contains(&dy) {
+        (dx, dy)
+    } else {
+        (size.0 / 2.0, size.1 / 2.0)
+    }
+}
+
+pub fn press_pointer(down: &mut Vec<i32>, pointer_id: i32) {
+    if !down.contains(&pointer_id) {
+        down.push(pointer_id);
+    }
+}
+
+pub fn release_pointer(down: &mut Vec<i32>, pointer_id: i32) -> bool {
+    let before = down.len();
+    down.retain(|id| *id != pointer_id);
+    down.len() != before
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleStep {
+    Exit,
+    Wait(u32),
+}
+
+pub fn idle_step(now_ms: f64, last_activity_ms: f64, pointer_down: bool) -> IdleStep {
+    let window = f64::from(HOLD_EDIT_IDLE_MS);
+    if pointer_down {
+        return IdleStep::Wait(HOLD_EDIT_IDLE_MS);
+    }
+    let remaining = last_activity_ms + window - now_ms;
+    if remaining <= 0.0 {
+        IdleStep::Exit
+    } else {
+        IdleStep::Wait(remaining.ceil().min(window) as u32)
+    }
+}
+
+pub fn hangup_press_is_swallowed(
+    pointer_down_ms: Option<f64>,
+    click_ms: f64,
+    from_pointer: bool,
+) -> bool {
+    from_pointer
+        && pointer_down_ms.is_some_and(|down| click_ms - down >= f64::from(HOLD_TO_EDIT_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,14 +753,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn all_slots_lists_every_slot_once() {
+        for slot in ALL_SLOTS.iter().copied() {
+            assert_eq!(ActionBarSlot::from_slug(slot.slug()), Some(slot));
+            assert_eq!(
+                ALL_SLOTS.iter().filter(|s| **s == slot).count(),
+                1,
+                "{slot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn captions_slot_round_trips_through_its_storage_tag() {
+        assert_eq!(ActionBarSlot::Captions.slug(), "captions");
+        assert_eq!(
+            ActionBarSlot::from_slug("captions"),
+            Some(ActionBarSlot::Captions)
+        );
+        assert_eq!(
+            serde_json::to_value(ActionBarSlot::Captions).unwrap(),
+            serde_json::json!("captions")
+        );
+    }
+
     /// Test wrapper: calls the EXACT same migration the production loader
     /// runs, but without touching `localStorage`. Because this delegates to
     /// `migrate_stored_layout` (the function `load_action_bar_layout` itself
     /// uses), a regression in the production migration is observable here.
     /// The tests do NOT re-implement the migration inline.
     fn migrate_for_test(raw: serde_json::Value) -> (Vec<ActionBarSlot>, Vec<ActionBarSlot>) {
-        let Migrated { slots, hidden, .. } = migrate_stored_layout(raw);
+        let Migrated { slots, hidden, .. } = migrate_stored_layout(raw, DEFAULT_SLOTS);
         (slots, hidden)
+    }
+
+    #[test]
+    fn the_captions_slot_is_only_a_default_while_the_flag_is_on() {
+        assert!(!DEFAULT_SLOTS.contains(&ActionBarSlot::Captions));
+        assert!(!default_slots(false).contains(&ActionBarSlot::Captions));
+        assert!(
+            default_slots(true).ends_with(&[ActionBarSlot::Captions, ActionBarSlot::RecentActions])
+        );
+
+        let stored = serde_json::to_value(build_stored_for_save(DEFAULT_SLOTS, &[])).unwrap();
+        let off = migrate_stored_layout(stored.clone(), &default_slots(false));
+        assert!(!off.needs_persist, "flag off must not rewrite the layout");
+        assert!(!off.slots.contains(&ActionBarSlot::Captions));
+
+        let on = migrate_stored_layout(stored, &default_slots(true));
+        assert!(on.needs_persist);
+        assert_eq!(on.slots.last(), Some(&ActionBarSlot::Captions));
+
+        let fresh = migrate_stored_layout(serde_json::Value::Null, &default_slots(false));
+        assert!(!fresh.slots.contains(&ActionBarSlot::Captions));
     }
 
     /// Regression for #1278 follow-up: a slot removed in v2 storage must NOT
@@ -825,6 +1155,347 @@ mod tests {
         assert_eq!(
             apply_keyboard_reorder(&mut empty, ActionBarSlot::Mic, Some(1), None),
             None,
+        );
+    }
+
+    fn press() -> HoldPress {
+        HoldPress {
+            is_primary: true,
+            button: 0,
+            ctrl_key: false,
+            on_slot_primary_button: true,
+            slot_menu_open: false,
+        }
+    }
+
+    #[test]
+    fn hold_arms_only_for_a_plain_primary_press_on_a_slot_button() {
+        assert!(hold_should_arm(true, press()));
+        assert!(
+            !hold_should_arm(false, press()),
+            "a band too narrow for edit mode must not arm a hold"
+        );
+        for rejected in [
+            HoldPress {
+                is_primary: false,
+                ..press()
+            },
+            HoldPress {
+                button: 2,
+                ..press()
+            },
+            HoldPress {
+                button: 1,
+                ..press()
+            },
+            HoldPress {
+                ctrl_key: true,
+                ..press()
+            },
+            HoldPress {
+                on_slot_primary_button: false,
+                ..press()
+            },
+            HoldPress {
+                slot_menu_open: true,
+                ..press()
+            },
+        ] {
+            assert!(!hold_should_arm(true, rejected), "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn hold_slop_is_ten_px_straight_line() {
+        let down = (100.0, 100.0);
+        assert!(!hold_exceeds_slop(down, down));
+        assert!(!hold_exceeds_slop(down, (110.0, 100.0)));
+        assert!(
+            !hold_exceeds_slop(down, (106.0, 108.0)),
+            "exactly 10px straight-line (14px Manhattan) must not cancel"
+        );
+        assert!(hold_exceeds_slop(down, (106.0, 108.01)));
+        assert!(hold_exceeds_slop(down, (100.0, 89.5)));
+        assert!(!hold_exceeds_slop(down, (104.0, 104.0)));
+        assert!(hold_exceeds_slop(down, (107.1, 107.1)));
+    }
+
+    #[test]
+    fn hold_fires_only_while_the_slot_is_still_reachable() {
+        let rendered = [ActionBarSlot::Mic, ActionBarSlot::PeerList];
+        let fire = |customize, fits, slot, overflowed: &[ActionBarSlot]| {
+            hold_should_fire(customize, fits, slot, &rendered, overflowed)
+        };
+        assert!(fire(false, true, ActionBarSlot::PeerList, &[]));
+        assert!(
+            !fire(false, false, ActionBarSlot::PeerList, &[]),
+            "a band that narrowed mid-hold must not enter edit mode"
+        );
+        assert!(!fire(true, true, ActionBarSlot::PeerList, &[]));
+        assert!(!fire(false, true, ActionBarSlot::Reactions, &[]));
+        assert!(!fire(
+            false,
+            true,
+            ActionBarSlot::PeerList,
+            &[ActionBarSlot::PeerList]
+        ));
+        assert!(fire(
+            false,
+            true,
+            ActionBarSlot::PeerList,
+            &[ActionBarSlot::Reactions]
+        ));
+    }
+
+    #[test]
+    fn lifting_one_finger_keeps_the_other_finger_down() {
+        let mut down = Vec::new();
+        press_pointer(&mut down, 1);
+        press_pointer(&mut down, 2);
+        press_pointer(&mut down, 2);
+        assert_eq!(down, vec![1, 2], "a repeated press is tracked once");
+        assert!(release_pointer(&mut down, 2));
+        assert_eq!(down, vec![1], "the first finger is still down");
+        assert!(
+            !release_pointer(&mut down, 7),
+            "an unknown pointer releases nothing"
+        );
+        assert!(release_pointer(&mut down, 1));
+        assert!(down.is_empty());
+    }
+
+    #[test]
+    fn drag_grab_keeps_the_offset_inside_the_slot_and_centres_outside_it() {
+        let origin = (100.0, 50.0);
+        let size = (40.0, 40.0);
+        assert_eq!(drag_grab_offset((110.0, 60.0), origin, size), (10.0, 10.0));
+        assert_eq!(drag_grab_offset((140.0, 90.0), origin, size), (40.0, 40.0));
+        assert_eq!(drag_grab_offset((100.0, 50.0), origin, size), (0.0, 0.0));
+        assert_eq!(
+            drag_grab_offset((174.0, 60.0), origin, size),
+            (20.0, 20.0),
+            "a slot that slid away from the finger must centre the preview on it"
+        );
+        assert_eq!(drag_grab_offset((110.0, 49.0), origin, size), (20.0, 20.0));
+        assert_eq!(drag_grab_offset((99.0, 60.0), origin, size), (20.0, 20.0));
+    }
+
+    #[test]
+    fn idle_step_exits_only_after_five_quiet_seconds_with_no_pointer_down() {
+        assert_eq!(idle_step(10_000.0, 5_000.0, false), IdleStep::Exit);
+        assert_eq!(idle_step(10_001.0, 5_000.0, false), IdleStep::Exit);
+        assert_eq!(idle_step(9_999.0, 5_000.0, false), IdleStep::Wait(1));
+        assert_eq!(idle_step(5_000.0, 5_000.0, false), IdleStep::Wait(5_000));
+        assert_eq!(idle_step(7_500.4, 5_000.0, false), IdleStep::Wait(2_500));
+        assert_eq!(idle_step(60_000.0, 5_000.0, true), IdleStep::Wait(5_000));
+        assert_eq!(
+            idle_step(1_000.0, 5_000.0, false),
+            IdleStep::Wait(5_000),
+            "a clock that steps backwards waits at most one window"
+        );
+    }
+
+    #[test]
+    fn hangup_swallows_only_a_pointer_press_held_for_the_hold_time() {
+        let hold = f64::from(HOLD_TO_EDIT_MS);
+        assert!(hangup_press_is_swallowed(
+            Some(1_000.0),
+            1_000.0 + hold,
+            true
+        ));
+        assert!(!hangup_press_is_swallowed(
+            Some(1_000.0),
+            1_000.0 + hold - 1.0,
+            true
+        ));
+        assert!(!hangup_press_is_swallowed(
+            Some(1_000.0),
+            1_000.0 + hold,
+            false
+        ));
+        assert!(!hangup_press_is_swallowed(None, 1_000.0 + hold, true));
+    }
+
+    #[test]
+    fn only_hold_entry_is_timed_and_only_idle_exit_speaks() {
+        assert!(customize_session_is_timed(CustomizeEntry::Hold(
+            ActionBarSlot::Mic
+        )));
+        assert!(!customize_session_is_timed(CustomizeEntry::Menu));
+        assert_eq!(
+            customize_exit_announcement(CustomizeExit::Idle),
+            "Finished editing action bar buttons."
+        );
+        for silent in [
+            CustomizeExit::Done,
+            CustomizeExit::Escape,
+            CustomizeExit::BandTooNarrow,
+        ] {
+            assert_eq!(customize_exit_announcement(silent), "");
+        }
+        assert_eq!(
+            customize_entry_announcement(CustomizeEntry::Hold(ActionBarSlot::Mic)),
+            "Editing action bar buttons. Drag to move one. Press Done or Escape to finish."
+        );
+    }
+
+    fn stored(kept: &ShrunkButtons) -> serde_json::Value {
+        serde_json::to_value(kept).expect("kept buttons serialize")
+    }
+
+    #[test]
+    fn shrunk_buttons_round_trip_through_storage_shape() {
+        let kept = ShrunkButtons {
+            slots: vec![ActionBarSlot::RaiseHand, ActionBarSlot::PeerList],
+            hangup: false,
+        };
+        assert_eq!(parse_shrunk_buttons(&stored(&kept)), kept);
+        assert_eq!(
+            parse_shrunk_buttons(&stored(&ShrunkButtons::default())),
+            ShrunkButtons::default()
+        );
+    }
+
+    #[test]
+    fn an_empty_selection_stays_empty_instead_of_returning_to_the_default() {
+        let empty = ShrunkButtons {
+            slots: Vec::new(),
+            hangup: false,
+        };
+        assert_eq!(parse_shrunk_buttons(&stored(&empty)), empty);
+    }
+
+    #[test]
+    fn one_unknown_stored_tag_is_dropped_and_the_rest_survive() {
+        let raw = serde_json::json!({ "slots": ["participants", "from_the_future", "mic"], "hangup": false });
+        assert_eq!(
+            parse_shrunk_buttons(&raw),
+            ShrunkButtons {
+                slots: vec![ActionBarSlot::PeerList, ActionBarSlot::Mic],
+                hangup: false,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_or_junk_storage_falls_back_to_the_default_kept_set() {
+        for raw in [
+            serde_json::Value::Null,
+            serde_json::json!("junk"),
+            serde_json::json!([]),
+            serde_json::json!({ "slots": ["mic"] }),
+            serde_json::json!({ "hangup": false }),
+            serde_json::json!({ "slots": "mic", "hangup": false }),
+            serde_json::json!({ "slots": ["mic"], "hangup": "no" }),
+        ] {
+            assert_eq!(
+                parse_shrunk_buttons(&raw),
+                ShrunkButtons::default(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_kept_set_is_camera_mic_share_and_hang_up() {
+        let kept = ShrunkButtons::default();
+        assert!(kept.hangup);
+        for slot in ALL_SLOTS.iter().copied() {
+            let expected = matches!(
+                slot,
+                ActionBarSlot::Mic | ActionBarSlot::Camera | ActionBarSlot::ScreenShare
+            );
+            assert_eq!(kept.keeps(slot), expected, "{slot:?}");
+        }
+    }
+
+    #[test]
+    fn with_slot_adds_and_removes_one_slot_without_duplicates() {
+        let kept = ShrunkButtons::default();
+        let without = kept.with_slot(ActionBarSlot::Mic, false);
+        assert!(!without.keeps(ActionBarSlot::Mic));
+        assert!(without.keeps(ActionBarSlot::Camera));
+        let again = without
+            .with_slot(ActionBarSlot::PeerList, true)
+            .with_slot(ActionBarSlot::PeerList, true);
+        assert_eq!(
+            again
+                .slots
+                .iter()
+                .filter(|s| **s == ActionBarSlot::PeerList)
+                .count(),
+            1
+        );
+        assert_eq!(again.hangup, kept.hangup);
+    }
+
+    fn kept_set(slots: &[ActionBarSlot], hangup: bool) -> ShrunkButtons {
+        ShrunkButtons {
+            slots: slots.to_vec(),
+            hangup,
+        }
+    }
+
+    #[test]
+    fn no_kept_button_on_screen_covers_hang_up_visibility_and_overflow() {
+        let mic = ActionBarSlot::Mic;
+        let share = ActionBarSlot::ScreenShare;
+        let on_screen =
+            |kept: &ShrunkButtons, visible: &[ActionBarSlot], over: &[ActionBarSlot]| {
+                !no_kept_button_on_screen(kept, visible, over)
+            };
+
+        assert!(!on_screen(&kept_set(&[], false), &[mic], &[]));
+        assert!(on_screen(&kept_set(&[], true), &[mic], &[]));
+        assert!(on_screen(&kept_set(&[mic], false), &[mic], &[]));
+        assert!(
+            !on_screen(&kept_set(&[share], false), &[mic], &[]),
+            "a kept slot this user cannot see, such as Share on iOS, is off the bar"
+        );
+        assert!(
+            !on_screen(&kept_set(&[share], false), &[mic, share], &[share]),
+            "a kept slot in the overflow menu is off the bar"
+        );
+        assert!(on_screen(
+            &kept_set(&[mic, share], false),
+            &[mic, share],
+            &[share]
+        ));
+    }
+
+    #[test]
+    fn only_the_kept_choice_keeps_a_slot_on_the_shrunk_bar() {
+        let none_kept = kept_set(&[], false);
+        for slot in ALL_SLOTS.iter().copied() {
+            assert!(
+                !stays_on_shrunk_bar(&none_kept, slot),
+                "{slot:?} was not selected"
+            );
+        }
+        assert!(stays_on_shrunk_bar(
+            &kept_set(&[ActionBarSlot::PeerList], false),
+            ActionBarSlot::PeerList,
+        ));
+    }
+
+    #[test]
+    fn an_unselected_mic_and_camera_leave_a_bare_bar() {
+        let visible = [ActionBarSlot::Mic, ActionBarSlot::Camera];
+        assert!(no_kept_button_on_screen(
+            &kept_set(&[], false),
+            &visible,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn slots_that_stay_come_first_for_the_fit_and_keep_their_order() {
+        use ActionBarSlot::{Diagnostics, PeerList, Reactions, ScreenShare};
+        let secondary = [Reactions, PeerList, ScreenShare, Diagnostics];
+        let kept = kept_set(&[ScreenShare], true);
+        assert_eq!(
+            kept_slots_first(&secondary, &kept),
+            [ScreenShare, Reactions, PeerList, Diagnostics]
         );
     }
 }

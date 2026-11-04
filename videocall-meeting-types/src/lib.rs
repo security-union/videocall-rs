@@ -17,7 +17,10 @@
 //! and its consumers (clients, frontend, integration tests).
 //! It is intentionally framework-agnostic — no actix-web, no database types.
 
+pub mod announcement;
+pub mod avatar;
 pub mod error;
+pub mod instance;
 pub mod kick;
 #[cfg(feature = "mint")]
 pub mod mint;
@@ -26,6 +29,7 @@ pub mod requests;
 pub mod responses;
 pub mod token;
 
+pub use announcement::AnnouncementOverride;
 pub use error::APIError;
 pub use responses::APIResponse;
 pub use token::RoomAccessTokenClaims;

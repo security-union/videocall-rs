@@ -16,17 +16,45 @@
  * conditions.
  */
 
+use crate::components::action_bar_gesture::{
+    arm_action_bar_hold, begin_slot_drag, focus_action_bar_slot,
+    install_action_bar_gesture_listeners, run_idle_clock, ActionBarGesture, ActionBarPopovers,
+    CustomizeCtl, HoldContext, PendingHold, SlotDragHandles, SlotDragStart,
+};
+#[cfg(test)]
+use crate::components::action_bar_layout::DEFAULT_SLOTS;
 use crate::components::action_bar_layout::{
-    apply_keyboard_reorder, load_action_bar_layout, meeting_timer_slot_visible,
-    record_slot_visible, remove_action_bar_layout, save_action_bar_layout, ActionBarSlot,
-    DEFAULT_SLOTS,
+    apply_keyboard_reorder, customize_entry_announcement, customize_session_is_timed,
+    default_slots, hangup_press_is_swallowed, hold_should_arm, kept_slots_first,
+    load_action_bar_layout, load_shrunk_buttons, meeting_timer_slot_visible,
+    no_kept_button_on_screen, record_slot_visible, remove_action_bar_layout, remove_shrunk_buttons,
+    save_action_bar_layout, stays_on_shrunk_bar, ActionBarSlot, CustomizeEntry, CustomizeExit,
+    HoldPress, ShrunkButtons, ALL_SLOTS, DOCK_AUTOHIDE_HINT, DOCK_AUTOSHRINK_HINT,
+};
+use crate::components::action_bar_shrink::{
+    any_pointer_is_coarse, bar_is_expanded, bar_popover_open, blur_clipped_focus,
+    click_pointer_type, expand_handle_reserve, handle_click_toggles_latch,
+    install_action_bar_shrink, BarExpansion, BarHoverIntent, BarLayout,
+};
+use crate::components::announcement_overrides::{
+    announcement_decision, use_orphaned_save_refresh, use_override_editor, AnnouncementOverrides,
+    AnnouncementOverridesCtx,
+};
+use crate::components::captions::{
+    captions_button_hint, CaptionsButtonState, CaptionsRole, CAPTIONS_STATUS_TIMEOUT_MS,
+};
+use crate::components::captions_overlay::{
+    use_captions, CaptionsLanguagePicker, CaptionsLayer, CaptionsLiveIndicator,
+};
+use crate::components::connection_status::{
+    election_progress_callback, ConnectionStatus, ConnectionStatusCard,
 };
 use crate::components::decode_budget::{
-    build_peer_tile_hints, build_unified_render_list, effective_cap, ios_decode_tile_ceiling,
-    is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles, plan_decode_publish,
-    presenter_cap_ceiling, presenter_extra_shed_pressure,
-    should_clear_force_decode_on_override_change, tile_hint_exemptions, viewport_roster,
-    BudgetSample, BudgetState, BudgetStep, TileRenderMode, MIN_CAP,
+    build_unified_render_list, effective_cap, ios_decode_tile_ceiling, is_sole_real_tile,
+    merge_user_requested_decode, partition_camera_tiles, plan_decode_publish,
+    presenter_cap_ceiling, presenter_extra_shed_pressure, screen_decode_sets,
+    should_clear_force_decode_on_override_change, viewport_roster, BudgetSample, BudgetState,
+    BudgetStep, TileRenderMode, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::decode_paused_pill::DecodePausedPill;
@@ -35,26 +63,30 @@ use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::self_view_hidden_pill::SelfViewHiddenPill;
 use crate::components::share_view::{
     self as share_view, PanelPlacement, ShareLayout, ShareOrigin, ShareSlots, ShareTarget,
-    ShareTileView, ShareTracker, ShareViewCtx, ShareViewMode, OWN_SHARE_KEY,
+    ShareTileView, ShareTracker, ShareViewCtx, OWN_SHARE_KEY,
 };
 use crate::components::signal_quality::SignalMeterMode;
-use crate::components::transport_fallback::{
-    use_transport_fallback, ActiveTransportCtx, TransportFallbackNotice, FALLBACK_TOAST_MS,
+use crate::components::video_control_buttons::{
+    slot_item, CaptionsButton, CaptionsIcon, RecentActionsButton, RecentActionsIcon,
 };
+use crate::components::window_event_listener::WindowEventListener;
 use crate::components::{
+    avatar::{avatar_change_listener, PeerAvatarCacheCtx},
+    avatar_settings::{use_self_avatar_settings_focus, use_settings_focus_return},
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{
         speak_style, transport_badge, transport_badge_from_str, OwnShareTile, PinnedTile, TileMode,
         TransportBadge,
     },
     co_hosts::{
-        can_edit_meeting_options, host_change_toast_text, CoHostNotice, CoHostNoticeCtx,
-        CoHostNoticeLayer, HostChangeNotice, MeetingOwnership,
+        can_edit_meeting_options, show_host_change_toast, CoHostNotice, CoHostNoticeCtx,
+        CoHostNoticeLayer, HostChange, HostChangeNotice, HostChangeToast, MeetingOwnership,
     },
     connection_quality_indicator::ConnectionQualityIndicator,
+    device_settings_modal::{focus_profile_tab, PROFILE_SECTION},
     diagnostics::Diagnostics,
     display_name_edit::SelfTileName,
-    emoji_picker::EmojiPicker,
+    emoji_picker::{primary_pointer_is_coarse, EmojiPicker},
     grid_overflow_badge::GridOverflowBadge,
     hero_orbs::HeroOrbs,
     host::Host,
@@ -66,8 +98,12 @@ use crate::components::{
     icons::raised_hand::RaisedHandIcon,
     media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY},
     meeting_ended_overlay::MeetingEndedOverlay,
-    meeting_footer::{MeetingFooter, MeetingInfoDialog},
+    meeting_footer::{
+        element_is_shown, focus_was_dropped, MeetingFooter, MeetingInfoDialog,
+        MEETING_FOOTER_PARTICIPANTS_TRIGGER_ID,
+    },
     meeting_options_controls::MeetingOptionsPanel,
+    meeting_restarted_overlay::{MeetingRestartedOverlay, RejoinOverlayVariant},
     peer_list::{PeerList, PeerListEntry, RosterLiveness},
     peer_tile::{camera_tiles, CameraTiles, PeerTile},
     performance_settings::{DiagnosticsReader, PerfControlsHandle},
@@ -83,33 +119,37 @@ use crate::components::{
     },
 };
 use crate::console_log_collector::{
-    flush_console_logs, set_console_log_auth_token, set_console_log_context,
+    flush_console_logs, set_console_log_auth_token, set_console_log_auth_token_for,
+    set_console_log_context,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
-    mock_peers_enabled, server_election_period_ms, transport_badge_enabled,
-    users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
+    connect_timeouts_ms, mock_peers_enabled, transport_badge_enabled, users_allowed_to_stream,
+    webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
-    html_media_set_sink_id_supported, load_appearance_settings_from_storage,
-    load_decode_budget_override, load_density_mode, load_dock_autohide, load_dock_position,
-    load_preferred_camera_on, load_preferred_device_ids, load_preferred_mic_on,
-    load_self_view_placement, load_self_view_visible, load_transport_preference_with_source,
+    fallback_memory_callback, html_media_set_sink_id_supported,
+    load_appearance_settings_from_storage, load_decode_budget_override, load_density_mode,
+    load_dock_autohide, load_dock_autoshrink, load_dock_position, load_preferred_camera_on,
+    load_preferred_device_ids, load_preferred_mic_on, load_self_view_placement,
+    load_self_view_visible, load_transport_fallback, load_transport_preference_with_source,
     resolve_initial_enabled, resolve_transport_config, restore_device_id,
     save_appearance_settings_to_storage, save_density_mode, save_display_name_to_storage,
-    save_dock_autohide, save_dock_position, save_preferred_camera_id, save_preferred_camera_on,
-    save_preferred_mic_id, save_preferred_mic_on, save_preferred_speaker_id,
-    save_self_view_placement, save_self_view_visible, validate_display_name, AppearanceSettingsCtx,
-    AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
-    DetachedShareCtx, DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx,
-    HostSetCtx, LocalAudioLevelCtx, LocalSpeakingCtx, MeetingTime, PeerAudioLivenessMap,
-    PeerMediaState, PeerMetadata, PeerMetadataCtx, PeerSignalHistoryMap, PeerStatusMap,
-    RaisedHandsCtx, RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState,
-    SelfViewPlacement, SelfViewPlacementCtx, SelfViewVisibleCtx, SignalPopupStateMap,
-    TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
+    save_dock_autohide, save_dock_autoshrink, save_dock_position, save_preferred_camera_id,
+    save_preferred_camera_on, save_preferred_mic_id, save_preferred_mic_on,
+    save_preferred_speaker_id, save_self_view_placement, save_self_view_visible,
+    validate_display_name, AppearanceSettingsCtx, AutohideCtx, AutoshrinkCtx, CroppedTilesCtx,
+    DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx, DetachedShareCtx, DisplayNameCtx,
+    DockPosition, DockPositionCtx, HostRefreshNonceCtx, HostSetCtx, LocalAudioLevelCtx,
+    LocalSpeakingCtx, MeetingRejoinCtx, MeetingTime, PeerAudioLivenessMap, PeerMediaState,
+    PeerMetadata, PeerMetadataCtx, PeerSignalHistoryMap, PeerStatusMap, RaisedHandsCtx,
+    RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, SelfViewPlacement,
+    SelfViewPlacementCtx, SelfViewVisibleCtx, ShrinkChoicesCtx, ShrunkButtonsCtx,
+    SignalPopupStateMap, TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
 use crate::local_storage::{load_bool, load_f64, load_json, remove_item, save_f64, save_json};
 use crate::types::DeviceInfo;
+use videocall_client::CaptionUpdate;
 // Issue 1884: reaction enum, the closed wire vocabulary the palette + overlay use.
 use crate::components::reactions::{
     clear_recent_custom_emojis, compose_reaction_announcement, integrate_reaction,
@@ -134,6 +174,11 @@ use crate::components::meeting_timer::{
     MeetingTimerLiveRegion, MeetingTimerPopover, MEETING_TIMER_BAND_LINGER_MS,
     MEETING_TIMER_EXTEND_STEP_MS,
 };
+use crate::components::recent_actions::{
+    focus_menu_item, focus_recents_return, focus_settings_dialog, install_recent_actions_listeners,
+    reveal_settings_target, trigger_arrow, use_recent_actions, RecentActionsMenu, SettingsTarget,
+    RECENT_ACTIONS_TRIGGER_ID,
+};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -157,7 +202,6 @@ use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
 use videocall_types::protos::reaction_packet::reaction_packet::ReactionType;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
 
 /// Call `window.__vcRecording.start(peerIds, onStateChange, localUserName, isLocalUserHost)` via
 /// `js_sys::Reflect` so we can pass a dynamic array and a Rust closure.
@@ -218,6 +262,21 @@ fn js_recording_start(
     true
 }
 
+fn js_recording_active() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let state = js_sys::Reflect::get(&window, &JsValue::from_str("__vcRecording"))
+        .and_then(|rec| {
+            let get: js_sys::Function =
+                js_sys::Reflect::get(&rec, &JsValue::from_str("getState"))?.dyn_into()?;
+            get.call0(&rec)
+        })
+        .ok()
+        .and_then(|s| s.as_string());
+    matches!(state.as_deref(), Some("recording" | "activating"))
+}
+
 /// Call `window.__vcRecording.stop()`.
 fn js_recording_stop() {
     let window = match web_sys::window() {
@@ -241,8 +300,27 @@ fn js_recording_stop() {
     }
 }
 
+pub type RecordingStateCallback = Rc<RefCell<Option<Closure<dyn FnMut(String)>>>>;
+
+/// Stops a recording still running when the meeting view unmounts.
+pub fn use_stop_recording_on_unmount(client: VideoCallClient, state_cb: RecordingStateCallback) {
+    use_drop(move || {
+        if !js_recording_active() {
+            return;
+        }
+        // Released first: its state writes target the dropping scope.
+        state_cb.borrow_mut().take();
+        js_recording_stop();
+        for session_id in client.sorted_peer_keys() {
+            if let Some(uid) = client.get_peer_user_id(&session_id) {
+                client.send_peer_event(&uid, videocall_client::PEER_EVENT_RECORDING_STOPPED);
+            }
+        }
+    });
+}
+
 /// Vertical space (px) reserved at the top of the tile grid for the meeting-wide
-/// status bar (`.meeting-status-bar`) while it is mounted. Added to the grid's
+/// status bar (`.meeting-status-bar`) while it is visible. Added to the grid's
 /// `pad_top` so the bar's contents never overlap tile chrome (e.g. the per-tile
 /// `.floating-name` label). MUST equal the `.meeting-status-bar` `height` in
 /// global.css — the bar sits in `[0, RESERVE]` and the grid's existing `pad_top`
@@ -294,6 +372,12 @@ pub enum ScreenShareToastState {
     SuccessfullyShared,
     /// The visibility window elapsed without any peer ack.
     Failed(String),
+    /// The share now shows the content picked with "Share something else".
+    Replaced(&'static str),
+    /// "Share something else" failed; the previous content is still shared.
+    ReplaceFailed,
+    /// The share ended while its replacement was being picked.
+    ReplaceAbandoned,
 }
 
 /// Shared cell that holds a pre-acquired `MediaStream` from `getDisplayMedia()`.
@@ -600,39 +684,19 @@ fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<S
     (websocket_urls, webtransport_urls)
 }
 
-/// Pure helper: combine the lobby URLs with the user's transport preference
-/// and the *current* server-side WebTransport-enabled flag.
-///
-/// Factored out so both component init AND `schedule_reconnect` go through
-/// exactly the same code path. Crucially, this means a reconnect happening
-/// after the runtime config finally loaded will see `server_wt_enabled ==
-/// true` even if the initial `use_hook` saw `false` — the previously empty
-/// WT URL list will populate, fixing the "stranded on a single server"
-/// regression from discussion 562 (Phase 7).
+/// Lobby URLs for the *current* server-side WebTransport flag, read at call
+/// time so a reconnect after a late runtime-config load picks up WebTransport
+/// (discussion 562, Phase 7).
 ///
 /// Returns `(effective_wt_enabled, websocket_urls, webtransport_urls)`.
 fn current_transport_urls(
     token: &str,
     user_id: &str,
     id: &str,
-    pref: TransportPreference,
     server_wt_enabled: bool,
 ) -> (bool, Vec<String>, Vec<String>) {
     let (ws, wt) = build_lobby_urls(token, user_id, id);
-    current_transport_urls_from_lists(pref, server_wt_enabled, ws, wt)
-}
-
-/// Pure-logic core of [`current_transport_urls`] — takes already-built URL
-/// lists so it can be unit-tested without `window().__APP_CONFIG` being
-/// initialised. The wasm-only `current_transport_urls` is a thin wrapper
-/// that pairs `build_lobby_urls` with this function.
-fn current_transport_urls_from_lists(
-    pref: TransportPreference,
-    server_wt_enabled: bool,
-    ws_urls: Vec<String>,
-    wt_urls: Vec<String>,
-) -> (bool, Vec<String>, Vec<String>) {
-    resolve_transport_config(pref, server_wt_enabled, ws_urls, wt_urls)
+    resolve_transport_config(server_wt_enabled, ws, wt)
 }
 
 fn play_user_joined() {
@@ -1221,7 +1285,7 @@ fn arm_reaction_autohide(mut reactions_open: Signal<bool>, gen: &Rc<Cell<u64>>) 
             *open = false;
         }
         if focus_inside {
-            focus_element_by_id("reactions-trigger");
+            focus_slot_trigger("reactions-trigger");
         }
     })
     .forget();
@@ -1230,9 +1294,44 @@ fn arm_reaction_autohide(mut reactions_open: Signal<bool>, gen: &Rc<Cell<u64>>) 
 /// `Signal::set` is `try_write().unwrap()` in Dioxus 0.7 — see the note in
 /// [`arm_dock_autohide`] — so a callback that fires while teardown is in
 /// flight must no-op rather than panic.
-fn try_set<T: 'static>(mut signal: Signal<T>, value: T) {
+pub(crate) fn try_set<T: 'static>(mut signal: Signal<T>, value: T) {
     if let Ok(mut v) = signal.try_write() {
         *v = value;
+    }
+}
+
+/// Show a toast about the share's capture, unless the share is still waiting
+/// for its first peer or no peer received it: that toast and its timer stay.
+pub(crate) fn show_share_toast(
+    toast: Signal<Option<ScreenShareToastState>>,
+    timer: Signal<Option<Timeout>>,
+    shown: ScreenShareToastState,
+) {
+    if toast.try_peek().is_ok_and(|t| {
+        matches!(
+            *t,
+            Some(ScreenShareToastState::Starting | ScreenShareToastState::Failed(_))
+        )
+    }) {
+        return;
+    }
+    let ms = match shown {
+        ScreenShareToastState::ReplaceFailed => 6_000,
+        _ => 4_000,
+    };
+    let shown = Some(shown);
+    try_set(toast, shown.clone());
+    let clear = Timeout::new(ms, move || {
+        if toast.try_peek().is_ok_and(|t| *t == shown) {
+            try_set(toast, None);
+        }
+    });
+    try_set(timer, Some(clear));
+}
+
+pub(crate) fn try_set_if_changed<T: PartialEq + 'static>(signal: Signal<T>, value: T) {
+    if signal.try_peek().is_ok_and(|v| *v != value) {
+        try_set(signal, value);
     }
 }
 
@@ -1250,12 +1349,17 @@ struct TerminalMediaSignals {
 
 impl TerminalMediaSignals {
     fn clear(&mut self) {
-        self.mic_enabled.set(false);
-        self.video_enabled.set(false);
-        self.pending_mic_enable.set(false);
-        self.pending_video_enable.set(false);
-        self.screen_share_state.set(ScreenShareState::Idle);
+        try_set(self.mic_enabled, false);
+        try_set(self.video_enabled, false);
+        try_set(self.pending_mic_enable, false);
+        try_set(self.pending_video_enable, false);
+        try_set(self.screen_share_state, ScreenShareState::Idle);
     }
+}
+
+#[cfg(all(test, feature = "media-server-jwt-auth"))]
+thread_local! {
+    static RECONNECT_TEST_DELAY_MS: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// Schedule a reconnection attempt with exponential backoff and jitter.
@@ -1269,24 +1373,55 @@ fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
     meeting_id: String,
     current_display_name: Signal<String>,
-    mut connection_error: Signal<Option<String>>,
-    mut meeting_ended_message: Signal<Option<String>>,
-    mut reconnect_gave_up: Signal<bool>,
+    connection_error: Signal<Option<String>>,
+    meeting_ended_message: Signal<Option<String>>,
+    reconnect_gave_up: Signal<bool>,
     mut media: TerminalMediaSignals,
-    transport_pref_signal: Signal<TransportPreference>,
+    instance_superseded: Signal<bool>,
+    overlay_variant: Signal<RejoinOverlayVariant>,
     attempt: u32,
+    last_poll_left: bool,
 ) {
+    if superseded_or_dropped(instance_superseded) {
+        return;
+    }
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
+        None if last_poll_left => {
+            handle_instance_superseded(
+                SupersededState {
+                    instance_superseded,
+                    overlay_variant,
+                    meeting_ended_message,
+                    connection_error,
+                    media,
+                },
+                RejoinOverlayVariant::NoLongerInMeeting,
+                || {
+                    if let Some(client) = client_cell.borrow().as_ref() {
+                        if let Err(e) = client.disconnect() {
+                            log::warn!("Reconnect: disconnect failed: {e}");
+                        }
+                    }
+                },
+            );
+            return;
+        }
         None => {
-            connection_error.set(Some(
-                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
-            ));
-            reconnect_gave_up.set(true);
+            try_set(
+                connection_error,
+                Some(
+                    "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+                ),
+            );
+            try_set(reconnect_gave_up, true);
             media.clear();
             return;
         }
     };
+
+    #[cfg(test)]
+    let delay_ms = RECONNECT_TEST_DELAY_MS.with(Cell::get).unwrap_or(delay_ms);
 
     log::info!(
         "Scheduling reconnect attempt {}/{} in {}ms",
@@ -1296,13 +1431,48 @@ fn schedule_reconnect(
     );
 
     Timeout::new(delay_ms, move || {
+        if superseded_or_dropped(instance_superseded) {
+            return;
+        }
         wasm_bindgen_futures::spawn_local(async move {
-            match crate::meeting_api::refresh_room_token(&meeting_id).await {
-                Ok(new_token) => {
+            let refreshed = crate::meeting_api::refresh_reconnect_token(&meeting_id).await;
+            if superseded_or_dropped(instance_superseded) {
+                return;
+            }
+            match refreshed {
+                Ok(crate::meeting_api::ReconnectToken::NoLongerInMeeting) => {
+                    if client_cell
+                        .try_borrow()
+                        .is_ok_and(|client| client.as_ref().is_some_and(|c| c.is_connected()))
+                    {
+                        return;
+                    }
+                    try_set(
+                        connection_error,
+                        Some("Connection lost, retrying...".to_string()),
+                    );
+                    schedule_reconnect(
+                        client_cell,
+                        meeting_id,
+                        current_display_name,
+                        connection_error,
+                        meeting_ended_message,
+                        reconnect_gave_up,
+                        media,
+                        instance_superseded,
+                        overlay_variant,
+                        attempt + 1,
+                        true,
+                    );
+                }
+                Ok(crate::meeting_api::ReconnectToken::Token(new_token)) => {
                     log::info!("Room token refreshed, reconnecting with new token");
                     // Keep console-log uploads authenticated after a reconnect
                     // (the token rotated). O(1); token value is never logged.
-                    set_console_log_auth_token(&new_token);
+                    set_console_log_auth_token_for(&meeting_id, &new_token);
+                    if crate::constants::captions_enabled().unwrap_or(false) {
+                        crate::components::captions::remember_room_token(&meeting_id, &new_token);
+                    }
                     let latest_display_name = current_display_name();
 
                     // Re-evaluate `webtransport_enabled()` at reconnect time —
@@ -1313,29 +1483,13 @@ fn schedule_reconnect(
                     // Going through the same `current_transport_urls` helper
                     // here means a delayed runtime config load now flows back
                     // into the manager via `update_server_urls`.
-                    let pref = transport_pref_signal();
                     let server_wt_enabled =
                         crate::constants::webtransport_enabled().unwrap_or(false);
                     let (_enable_wt, ws, wt) = current_transport_urls(
                         &new_token,
                         &latest_display_name,
                         &meeting_id,
-                        pref,
                         server_wt_enabled,
-                    );
-
-                    // Issue #1745 PR2 (observability only): same structured line
-                    // as the primary-join site, emitted on the token-refresh
-                    // reconnect path so a triager can see whether the user's
-                    // preference (and its source) changed the candidate lists on
-                    // reconnect vs. the initial join.
-                    let (_, pref_source) = load_transport_preference_with_source();
-                    log::info!(
-                        "Transport preference applied: pref={} source={} wt_urls={} ws_urls={}",
-                        pref,
-                        pref_source,
-                        wt.len(),
-                        ws.len()
                     );
 
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
@@ -1344,14 +1498,20 @@ fn schedule_reconnect(
                             log::error!("Reconnection with refreshed token failed: {e:?}");
                         }
                     }
-                    connection_error.set(None);
+                    try_set(connection_error, None);
                 }
                 Err(crate::meeting_api::JoinError::MeetingNotActive) => {
-                    meeting_ended_message.set(Some("The meeting has ended.".to_string()));
+                    try_set(
+                        meeting_ended_message,
+                        Some("The meeting has ended.".to_string()),
+                    );
                     media.clear();
                 }
                 Err(e) => {
-                    connection_error.set(Some(format!("Connection lost, retrying... ({e})")));
+                    try_set(
+                        connection_error,
+                        Some(format!("Connection lost, retrying... ({e})")),
+                    );
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
@@ -1360,8 +1520,10 @@ fn schedule_reconnect(
                         meeting_ended_message,
                         reconnect_gave_up,
                         media,
-                        transport_pref_signal,
+                        instance_superseded,
+                        overlay_variant,
                         attempt + 1,
+                        false,
                     );
                 }
             }
@@ -1377,18 +1539,25 @@ fn schedule_reconnect(
 #[cfg(not(feature = "media-server-jwt-auth"))]
 fn schedule_reconnect_no_jwt(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
-    mut connection_error: Signal<Option<String>>,
-    mut reconnect_gave_up: Signal<bool>,
+    connection_error: Signal<Option<String>>,
+    reconnect_gave_up: Signal<bool>,
     mut media: TerminalMediaSignals,
+    instance_superseded: Signal<bool>,
     attempt: u32,
 ) {
+    if superseded_or_dropped(instance_superseded) {
+        return;
+    }
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
         None => {
-            connection_error.set(Some(
-                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
-            ));
-            reconnect_gave_up.set(true);
+            try_set(
+                connection_error,
+                Some(
+                    "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+                ),
+            );
+            try_set(reconnect_gave_up, true);
             media.clear();
             return;
         }
@@ -1402,13 +1571,16 @@ fn schedule_reconnect_no_jwt(
     );
 
     Timeout::new(delay_ms, move || {
+        if superseded_or_dropped(instance_superseded) {
+            return;
+        }
         let reconnect_needed = {
             if let Some(client) = client_cell.borrow_mut().as_mut() {
                 if let Err(e) = client.connect() {
                     log::error!("Reconnection failed: {e:?}");
                     true
                 } else {
-                    connection_error.set(None);
+                    try_set(connection_error, None);
                     false
                 }
             } else {
@@ -1422,6 +1594,7 @@ fn schedule_reconnect_no_jwt(
                 connection_error,
                 reconnect_gave_up,
                 media,
+                instance_superseded,
                 attempt + 1,
             );
         }
@@ -1430,13 +1603,14 @@ fn schedule_reconnect_no_jwt(
 }
 
 use super::attendants_layout::{
-    action_bar_band_width, compute_effective_density, compute_layout, drawer_max_for_side,
-    drawer_reserves, drawers_to_close_on_open, drawers_to_close_on_resize, grid_pad_top,
-    grid_padding, handle_is_inert, overflow_budget_width, plan_camera_window, quantise_reserve,
-    resize_notice, screen_share_flow_style, screen_share_padding, screen_share_stage_tile_size,
-    select_display_candidates, sort_camera_off_window, tile_flow_style, CameraWindowInput,
-    DrawerKind, DrawerSide, DrawerState, DrawersToClose, SpeakerInputs, DRAWER_MAX_ABS,
-    DRAWER_MIN_WIDTH, TILE_AR,
+    action_bar_band_width, chat_is_sheet, compute_effective_density, drawer_max_for_side,
+    drawer_reserves, drawers_to_close_on_open, drawers_to_close_on_resize,
+    enlarged_tile_device_px_h, grid_pad_top, grid_padding, handle_is_inert, overflow_budget_width,
+    plan_camera_window, plan_grid_capacity, plan_tile_grid, quantise_reserve, resize_notice,
+    screen_share_flow_style, screen_share_padding, screen_share_stage_tile_size,
+    select_display_candidates, sort_camera_off_window, tile_flow_style, tile_size_vars,
+    CameraWindowInput, DrawerKind, DrawerSide, DrawerState, DrawersToClose, SpeakerInputs,
+    TilePlanInput, CHAT_DRAWER_WIDTH, DRAWER_MAX_ABS, DRAWER_MIN_WIDTH,
 };
 use super::density::{next_density_mode, DensityMode, DENSITY_MODES};
 
@@ -1523,8 +1697,8 @@ enum RecordingWriteOp {
 /// given whether the key is already present.
 ///
 /// `Signal::write()` marks the signal dirty — re-rendering every reactive
-/// dependent (the roster `PeerList`, and via `any_recording_active` the meeting
-/// status bar) — REGARDLESS of whether the underlying `HashSet` changed. So a
+/// dependent (the roster `PeerList` and the meeting status bar) — REGARDLESS
+/// of whether the underlying `HashSet` changed. So a
 /// redundant `insert` of a key already present, or a `remove` of a key already
 /// absent, fans out a wasted re-render. `STOPPED` can go out more than once per
 /// recording (e.g. saved, then idle ~3s later) and a reconnect
@@ -1699,21 +1873,12 @@ fn recording_start_outcome(js_handoff_ok: bool) -> RecordingStartOutcome {
     }
 }
 
-/// The meeting-wide "is anyone recording right now" aggregate that drives the
-/// single persistent recording indicator shown to EVERY participant (recorders
-/// included).
+/// The meeting-wide "is any session recording" aggregate.
 ///
 /// This is deliberately a set-emptiness check over `RecordingSetCtx`'s
-/// session-keyed set, NOT a single `Option<who-last-touched-it>`. That property
-/// is exactly the acceptance criterion the feature requires and the reason the
-/// old `remote_recording_banner: Signal<Option<String>>` was removed: an
-/// `Option<String>` can only record "who was the LAST session to start/stop",
-/// so with two concurrent recorders A then B, B's stop wrongly cleared the
-/// banner while A was still recording. Reference-counting via the set makes the
-/// indicator:
-///   - appear on the FIRST recorder's start (empty → non-empty),
-///   - stay unchanged on any additional concurrent start/stop while ≥1 remains,
-///   - disappear only when the LAST recorder stops (non-empty → empty).
+/// session-keyed set, NOT a single `Option<who-last-touched-it>`: with two
+/// concurrent recorders A then B, B's stop must not clear the aggregate while
+/// A is still recording.
 ///
 /// Because the set is session-keyed and maintained on `RECORDING_STARTED` /
 /// `RECORDING_STOPPED` AND on `on_peer_left` (a recorder crashing/leaving
@@ -1806,6 +1971,44 @@ fn apply_host_event(mut host_set: Signal<HashSet<String>>, target: &str, granted
     true
 }
 
+fn superseded_or_dropped(flag: Signal<bool>) -> bool {
+    match flag.try_peek() {
+        Ok(superseded) => *superseded,
+        Err(dioxus::signals::BorrowError::Dropped(_)) => true,
+        Err(dioxus::signals::BorrowError::AlreadyBorrowedMut(_)) => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SupersededState {
+    instance_superseded: Signal<bool>,
+    overlay_variant: Signal<RejoinOverlayVariant>,
+    meeting_ended_message: Signal<Option<String>>,
+    connection_error: Signal<Option<String>>,
+    media: TerminalMediaSignals,
+}
+
+fn handle_instance_superseded(
+    state: SupersededState,
+    variant: RejoinOverlayVariant,
+    disconnect: impl FnOnce(),
+) {
+    let SupersededState {
+        instance_superseded,
+        overlay_variant,
+        meeting_ended_message,
+        connection_error,
+        mut media,
+    } = state;
+    try_set(instance_superseded, true);
+    try_set(overlay_variant, variant);
+    try_set(meeting_ended_message, Some(variant.message().to_string()));
+    try_set(connection_error, None);
+    media.clear();
+    log::info!("Rejoin overlay raised: {variant:?}");
+    disconnect();
+}
+
 /// The local state a PARTICIPANT_KICKED aimed at this user tears down.
 #[derive(Clone, Copy)]
 struct KickedState {
@@ -1879,25 +2082,6 @@ fn reseed_host_set_from_roster(
     });
 }
 
-/// Show the one-shot host-change toast and dismiss it ~6s later. NATS-handler
-/// safe; a host change re-renders in place (no remount), so the toast is driven
-/// directly via these signals.
-fn show_host_change_toast(
-    message: &str,
-    mut toast: Signal<Option<String>>,
-    mut timer: Signal<Option<gloo_timers::callback::Timeout>>,
-) {
-    toast.set(Some(message.to_string()));
-    timer.set(None);
-    timer.set(Some(gloo_timers::callback::Timeout::new(
-        6_000,
-        move || {
-            toast.set(None);
-            timer.set(None);
-        },
-    )));
-}
-
 /// Where a settings deep link should land. The Performance controls moved out of
 /// the Settings modal into the Diagnostics drawer (#1131 unify), so an incoming
 /// `"performance"` section opens the DRAWER, not the modal; every other section
@@ -1941,23 +2125,9 @@ fn read_cached_capability_score() -> Option<u32> {
     }
 }
 
-/// Resolve the action-bar's actual axis gap (column-gap when horizontal,
-/// row-gap when vertical) from computed style instead of hard-coding a value
-/// that drifts whenever the CSS changes. Falls back to the design default
-/// (1.2rem ≈ 19.2px) when the lookup fails.
-fn read_nav_axis_gap_px(nav: &web_sys::Element, is_vertical: bool) -> f64 {
-    let prop = if is_vertical { "row-gap" } else { "column-gap" };
-    web_sys::window()
-        .and_then(|w| w.get_computed_style(nav).ok().flatten())
-        .and_then(|s| s.get_property_value(prop).ok())
-        .and_then(|s| s.trim().trim_end_matches("px").parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(19.2)
-}
-
 // ─── Shared `.glass-select-menu` keyboard-navigation helpers ────────────────
 // WCAG 2.1.1 keyboard equivalents for the dock-position dropdown that houses
-// Bottom/Left/Right, autohide, Customize, and Reset to Default. Before these
+// Bottom/Left/Right, autohide, Edit Buttons, and Reset Buttons. Before these
 // helpers the menu options were `<div>`s with only `onclick` — a keyboard user
 // could not enter customize mode or reset the bar at all.
 // The helpers are reusable across any wrapper that hosts a
@@ -1989,6 +2159,30 @@ fn focus_element_by_id(id: &str) {
     }
 }
 
+/// Where focus goes when a surface closes: its trigger, or what stands in for it
+/// when the slot is overflowed or removed.
+fn slot_trigger_chain(id: &str, shown: impl Fn(&str) -> bool) -> &str {
+    [id, OVERFLOW_MENU_TRIGGER_ID, RECENT_ACTIONS_TRIGGER_ID]
+        .into_iter()
+        .find(|candidate| shown(candidate))
+        .unwrap_or("grid-container")
+}
+
+pub(crate) fn focus_slot_trigger(id: &str) {
+    focus_trigger_or_grid(slot_trigger_chain(id, element_is_shown));
+}
+
+/// Runs after the render that closes a menu or dialog. A surface that took focus keeps it.
+pub(crate) fn settle_slot_focus(id: &'static str) {
+    Timeout::new(0, move || {
+        if focus_was_dropped() {
+            focus_slot_trigger(id);
+            blur_clipped_focus();
+        }
+    })
+    .forget();
+}
+
 pub(crate) fn focus_trigger_or_grid(id: &str) {
     let doc = web_sys::window().and_then(|w| w.document());
     let landed = doc
@@ -2008,7 +2202,7 @@ pub(crate) fn focus_trigger_or_grid(id: &str) {
     }
 }
 
-const DRAWER_RESIZE_NOTICE_MS: u32 = 7_900;
+pub(crate) const DRAWER_RESIZE_NOTICE_MS: u32 = 7_900;
 
 fn post_drawer_resize_notice(
     msg: Option<&'static str>,
@@ -2051,6 +2245,38 @@ fn focus_within(selector: &str) -> bool {
         .is_some()
 }
 
+const PLACEMENT_TOGGLE_TESTID: &str = "self-view-placement-toggle";
+
+fn split_hides() -> String {
+    use crate::components::{display_name_edit::SELF_TILE_NAME_CLASS, overflow_participants};
+    let badge = overflow_participants::BADGE_ID;
+    format!(
+        ".density-popover, .grid-overflow-list, #density-mode-trigger, #{badge}, \
+         [data-testid='{PLACEMENT_TOGGLE_TESTID}'], .{SELF_TILE_NAME_CLASS}"
+    )
+}
+
+fn peer_name_for_user(client: &VideoCallClient, user_id: &str) -> Option<String> {
+    let own = client.get_own_session_id();
+    client
+        .sorted_peer_keys()
+        .into_iter()
+        .filter(|sid| own.as_deref() != Some(sid.as_str()))
+        .find(|sid| client.get_peer_user_id(sid).as_deref() == Some(user_id))
+        .and_then(|sid| client.get_peer_display_name(&sid))
+}
+
+fn close_popovers_hidden_by_split(density_open: Signal<bool>, overflow_open: Signal<bool>) {
+    if focus_within(&split_hides()) {
+        focus_element_by_id("grid-container");
+    }
+    for mut open in [density_open, overflow_open] {
+        if *open.peek() {
+            open.set(false);
+        }
+    }
+}
+
 /// True when a click originated inside the action bar (`.video-controls-container`)
 /// or the meeting footer (`.meeting-footer`).
 fn click_within_persistent_chrome(evt: &MouseEvent) -> bool {
@@ -2075,24 +2301,56 @@ fn element_within_persistent_chrome(el: &web_sys::Element) -> bool {
 enum EscCloseTarget {
     Diagnostics,
     PeerList,
-    /// Issue 2693. Ranked below both drawers: a toast overlays nothing, so an
-    /// open drawer is always the layer the user meant to peel.
+    /// Issue 2693. Ranked below both drawers: the hide toast never paints over
+    /// an open drawer, so the drawer is always the layer the user meant to peel.
     SelfViewToast,
     /// Issue 2899: below the hide toast, one notice per press.
     HostNotice(HostActionKind),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PeerListOpener {
+    #[default]
+    ActionBar,
+    Footer,
+}
+
+const PEER_LIST_TRIGGER_ID: &str = "peer-list-trigger";
+pub(crate) const OVERFLOW_MENU_TRIGGER_ID: &str = "overflow-menu-trigger";
+
+impl PeerListOpener {
+    fn trigger_id(self) -> &'static str {
+        match self {
+            PeerListOpener::ActionBar => PEER_LIST_TRIGGER_ID,
+            PeerListOpener::Footer => MEETING_FOOTER_PARTICIPANTS_TRIGGER_ID,
+        }
+    }
+}
+
+fn peer_list_focus_fallback(opener: PeerListOpener, shown: impl Fn(&str) -> bool) -> &'static str {
+    (opener == PeerListOpener::Footer)
+        .then_some(MEETING_FOOTER_PARTICIPANTS_TRIGGER_ID)
+        .into_iter()
+        .chain([PEER_LIST_TRIGGER_ID, OVERFLOW_MENU_TRIGGER_ID])
+        .find(|id| shown(id))
+        .unwrap_or("grid-container")
+}
+
+fn settle_peer_list_focus(opener: PeerListOpener) {
+    Timeout::new(0, move || {
+        if focus_was_dropped() {
+            focus_trigger_or_grid(peer_list_focus_fallback(opener, element_is_shown));
+        }
+    })
+    .forget();
+}
+
 impl EscCloseTarget {
-    /// The id of the action-bar toggle button that owns this panel. Escape-close
-    /// restores focus here (WAI-ARIA APG disclosure pattern) so keyboard focus
-    /// never falls back to `<body>`. These strings are the fn's contract with the
-    /// rendered `id:` attributes on `PeerListButton` / `DiagnosticsButton`; the
-    /// rendered-id side of that contract is guarded by the e2e `activeElement`
-    /// assertions in `popup-layering.spec.ts`.
-    fn trigger_id(self) -> Option<&'static str> {
+    /// Where Escape-close restores focus (WAI-ARIA APG disclosure pattern).
+    fn trigger_id(self, peer_list_trigger: &'static str) -> Option<&'static str> {
         match self {
             EscCloseTarget::Diagnostics => Some("diagnostics-trigger"),
-            EscCloseTarget::PeerList => Some("peer-list-trigger"),
+            EscCloseTarget::PeerList => Some(peer_list_trigger),
             // No action-bar trigger owns the toast, and its focus move is
             // conditional — the dismiss handler decides.
             EscCloseTarget::SelfViewToast | EscCloseTarget::HostNotice(_) => None,
@@ -2243,7 +2501,7 @@ fn w_sys_computed_font_size(el: &web_sys::Element) -> Option<f64> {
 /// narrow-viewport overflow popover. Icons match the ones in
 /// `video_control_buttons.rs` but are rendered inline so the popover items
 /// are self-contained (no nested component state needed).
-fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
+pub(crate) fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
     match slot {
         ActionBarSlot::ScreenShare => rsx! {
             svg {
@@ -2357,9 +2615,42 @@ fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
         ActionBarSlot::RaiseHand => rsx! {
             RaisedHandIcon { decorative: true }
         },
-        // Mic + Camera never appear in the overflow popover.
-        _ => rsx! {},
+        ActionBarSlot::Captions => rsx! {
+            CaptionsIcon {}
+        },
+        ActionBarSlot::Recording => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                circle { cx: "12", cy: "12", r: "9" }
+                circle { cx: "12", cy: "12", r: "4", fill: "currentColor", stroke: "none" }
+            }
+        },
+        ActionBarSlot::RecentActions => rsx! {
+            RecentActionsIcon {}
+        },
+        ActionBarSlot::Mic | ActionBarSlot::Camera => rsx! {},
     }
+}
+
+pub(crate) fn live_slot_icon(slot: ActionBarSlot, record_state: &RecordButtonState) -> Element {
+    if slot == ActionBarSlot::Recording && *record_state == RecordButtonState::Recording {
+        return rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "currentColor",
+                stroke: "none",
+                rect { x: "5", y: "5", width: "14", height: "14", rx: "2" }
+            }
+        };
+    }
+    overflow_slot_icon(slot)
 }
 
 /// The flags that decide whether a given action-bar slot is rendered.
@@ -2384,6 +2675,8 @@ struct SlotVisibility {
     /// Pre-computed by [`meeting_timer_slot_visible`] (issue 2136). Derives from
     /// the caller's LIVE host signal, NOT the `is_owner` prop -- see that function.
     meeting_timer_visible: bool,
+    /// Pre-computed by `CaptionsHandle::available`.
+    captions_visible: bool,
 }
 
 fn is_action_bar_slot_visible(slot: ActionBarSlot, vis: SlotVisibility) -> bool {
@@ -2403,7 +2696,15 @@ fn is_action_bar_slot_visible(slot: ActionBarSlot, vis: SlotVisibility) -> bool 
         // the per-slot rule stays host-testable and this function keeps a single
         // `bool` for it, exactly as Recording does.
         ActionBarSlot::MeetingTimer => vis.meeting_timer_visible,
-        _ => true,
+        ActionBarSlot::Captions => vis.captions_visible,
+        ActionBarSlot::Mic
+        | ActionBarSlot::Camera
+        | ActionBarSlot::Reactions
+        | ActionBarSlot::RaiseHand
+        | ActionBarSlot::PeerList
+        | ActionBarSlot::Diagnostics
+        | ActionBarSlot::DeviceSettings
+        | ActionBarSlot::RecentActions => true,
     }
 }
 
@@ -2417,12 +2718,10 @@ fn visible_action_bar_slots(slots: &[ActionBarSlot], vis: SlotVisibility) -> Vec
 
 /// Pure fit computation for the action-bar overflow ("…") menu.
 ///
-/// `band_w` is the viewport less the drawer reserves — `action_bar_band_width`.
-///
-/// Given that band and the ordered list of *secondary* slots (every
+/// Given a band and the ordered list of *secondary* slots (every
 /// visible slot except the sacred Mic/Camera, which never overflow), returns
 /// the trailing slots that do NOT fit and must therefore be tucked behind the
-/// overflow trigger. `sacred_count` is the number of always-visible buttons
+/// overflow trigger. `sacred_count` is the number of buttons that never overflow
 /// (Mic + Camera + Hangup) and `rem_px` is the computed root font size so the
 /// estimate tracks browser zoom / OS text scaling.
 ///
@@ -2509,6 +2808,151 @@ fn apply_drawer_open_rule(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordingToggle {
+    Start,
+    Stop,
+    Nothing,
+}
+
+fn recording_toggle(state: &RecordButtonState, may_start: bool) -> RecordingToggle {
+    match state {
+        RecordButtonState::Idle if may_start => RecordingToggle::Start,
+        RecordButtonState::Recording => RecordingToggle::Stop,
+        _ => RecordingToggle::Nothing,
+    }
+}
+
+/// What activating a slot touches, so every menu entry runs the same path.
+#[derive(Clone, Copy)]
+struct SlotControls {
+    toggle_peer_list: Callback<PeerListOpener>,
+    toggle_raise_hand: Callback<()>,
+    toggle_captions: Callback<()>,
+    toggle_recording: Callback<()>,
+    close_transient_popovers: Callback<()>,
+    viewport_width: Signal<f64>,
+    peer_list_open: Signal<bool>,
+    diagnostics_open: Signal<bool>,
+    chat_open: Signal<bool>,
+    density_open: Signal<bool>,
+    density_mode: Signal<DensityMode>,
+    density_highlight: Signal<DensityMode>,
+    reactions_open: Signal<bool>,
+    reaction_highlight: Signal<ReactionType>,
+    dock_menu_open: Signal<bool>,
+    mock_peers_open: Signal<bool>,
+    share_menu_open: Signal<bool>,
+    meeting_options_open: Signal<bool>,
+    meeting_timer_open: Signal<bool>,
+    device_settings_open: Signal<bool>,
+    device_settings_initial_section: Signal<Option<String>>,
+    device_settings_generation: Signal<u32>,
+    recents_open: Signal<bool>,
+    recents_open_last: Signal<bool>,
+}
+
+impl SlotControls {
+    fn close_bar_popovers(&mut self) {
+        self.density_open.set(false);
+        self.reactions_open.set(false);
+        self.dock_menu_open.set(false);
+        self.mock_peers_open.set(false);
+        self.share_menu_open.set(false);
+    }
+
+    fn close_panels_and_popovers(&mut self) {
+        self.peer_list_open.set(false);
+        self.diagnostics_open.set(false);
+        self.close_bar_popovers();
+    }
+
+    fn open_recents(mut self, on_last: bool) {
+        self.close_transient_popovers.call(());
+        self.recents_open_last.set(on_last);
+        self.recents_open.set(true);
+    }
+
+    fn activate_slot(mut self, slot: ActionBarSlot) {
+        match slot {
+            ActionBarSlot::PeerList => self.toggle_peer_list.call(PeerListOpener::ActionBar),
+            ActionBarSlot::DensityMode => {
+                let opening = !*self.density_open.peek();
+                if opening {
+                    let mode = *self.density_mode.peek();
+                    self.density_highlight.set(mode);
+                    self.close_bar_popovers();
+                }
+                self.density_open.set(opening);
+            }
+            ActionBarSlot::Reactions => {
+                let opening = !*self.reactions_open.peek();
+                if opening {
+                    self.reaction_highlight.set(ReactionType::THUMBS_UP);
+                    self.close_bar_popovers();
+                }
+                self.reactions_open.set(opening);
+            }
+            ActionBarSlot::Diagnostics => {
+                let opening = !*self.diagnostics_open.peek();
+                self.diagnostics_open.set(opening);
+                if opening {
+                    self.device_settings_open.set(false);
+                    self.close_bar_popovers();
+                    self.meeting_options_open.set(false);
+                    apply_drawer_open_rule(
+                        self.viewport_width,
+                        DrawerKind::Diagnostics,
+                        self.peer_list_open,
+                        self.diagnostics_open,
+                        self.chat_open,
+                    );
+                }
+            }
+            ActionBarSlot::DeviceSettings => {
+                self.device_settings_initial_section.set(None);
+                let was_closed = !*self.device_settings_open.peek();
+                self.device_settings_open.set(was_closed);
+                if was_closed {
+                    let generation = *self.device_settings_generation.peek();
+                    self.device_settings_generation.set(generation + 1);
+                    self.close_panels_and_popovers();
+                    self.meeting_options_open.set(false);
+                }
+            }
+            ActionBarSlot::MeetingOptions => {
+                let was_closed = !*self.meeting_options_open.peek();
+                self.meeting_options_open.set(was_closed);
+                if was_closed {
+                    self.device_settings_open.set(false);
+                    self.close_panels_and_popovers();
+                }
+            }
+            ActionBarSlot::MeetingTimer => {
+                let was_closed = !*self.meeting_timer_open.peek();
+                self.meeting_timer_open.set(was_closed);
+                if was_closed {
+                    self.device_settings_open.set(false);
+                    self.close_panels_and_popovers();
+                    self.meeting_options_open.set(false);
+                }
+            }
+            ActionBarSlot::RaiseHand => self.toggle_raise_hand.call(()),
+            ActionBarSlot::Captions => self.toggle_captions.call(()),
+            ActionBarSlot::Recording => self.toggle_recording.call(()),
+            ActionBarSlot::RecentActions => {
+                if *self.recents_open.peek() {
+                    self.recents_open.set(false);
+                } else {
+                    self.open_recents(false);
+                }
+            }
+            // Pinned to the bar, or offered through `OverflowShareItems`.
+            ActionBarSlot::Mic | ActionBarSlot::Camera | ActionBarSlot::ScreenShare => {}
+        }
+    }
+}
+
 fn merge_visible_action_bar_slots(
     full_slots: &[ActionBarSlot],
     reordered_visible_slots: &[ActionBarSlot],
@@ -2546,7 +2990,7 @@ fn is_option_activate_key(evt: &Event<KeyboardData>) -> bool {
 }
 
 /// Screen-reader confirmation pushed into the action-bar live region when
-/// "Reset to Default" restores the stock layout (issue 1765). Reset lives in
+/// "Reset Buttons" restores the stock layout (issue 1765). Reset lives in
 /// the dock menu, which only renders while customize mode is OFF; the live
 /// region that carries this text is mounted unconditionally inside
 /// `.controls`, so the announcement is observable on both the pointer and the
@@ -2571,14 +3015,11 @@ const ACTION_BAR_SLOT_HINT_ID: &str = "action-bar-slot-reorder-hint";
 /// concludes hiding is OFF at the exact moment it is ON. WCAG 4.1.2
 /// Name/Role/Value. A noun label leaves `aria-checked` as the single source of
 /// truth for the state.
-///
-/// An `aria-label` override was rejected: it would strip the visible text from
-/// the accessible name and break WCAG 2.5.3 Label in Name.
 const DOCK_AUTOHIDE_LABEL: &str = "Auto-hide action bar";
+const DOCK_AUTOSHRINK_LABEL: &str = "Auto-shrink action bar";
 
 /// Number of `.glass-select-option` children the dock menu renders (issue
-/// 1762): Bottom, Left, Right, auto-hide, Customize, Reset to Default, Action
-/// Bar…. Drives the roving-tabindex arithmetic below. `.glass-select-separator`
+/// 1762). Drives the roving-tabindex arithmetic below. `.glass-select-separator`
 /// children are NOT counted — `focus_glass_option_relative` skips them, so the
 /// roving index must be over options only.
 ///
@@ -2586,7 +3027,7 @@ const DOCK_AUTOHIDE_LABEL: &str = "Auto-hide action bar";
 /// the `toHaveCount` assertion on `.dock-position-wrapper .glass-select-menu
 /// .glass-select-option` in `e2e/tests/dock-settings.spec.ts`, which fails loudly
 /// on drift.
-const DOCK_MENU_ITEM_COUNT: usize = 7;
+const DOCK_MENU_ITEM_COUNT: usize = 8;
 
 /// Next roving-tabindex index for the dock menu, wrapping at both ends.
 ///
@@ -2614,7 +3055,7 @@ fn next_dock_menu_index(current: usize, delta: i32, count: usize) -> usize {
 /// `dioxus-core`'s `diff_vtext` emits `set_node_text` solely when
 /// `left.value != right.value`, so writing the SAME string twice produces no
 /// DOM mutation and therefore no second announcement. That silently swallowed
-/// the second of two consecutive "Reset to Default" presses, and every repeat
+/// the second of two consecutive "Reset Buttons" presses, and every repeat
 /// of "X is already at position N of M." on the reorder path.
 ///
 /// The fix is an alternating invisible suffix driven by a nonce the writers
@@ -2635,94 +3076,6 @@ pub(crate) fn action_bar_announce_text(message: &str, nonce: u32) -> String {
     }
 }
 
-/// RAII guard for a `window` event listener: the handler is registered on
-/// construction and **removed on `Drop`**.
-///
-/// Generalised from the resize-only guard of issue 2053 (issue 2100): the event
-/// name is now a field, so the SAME guard covers the dock auto-hide
-/// `mousemove` / `touchstart` listeners and the permission-recheck `focus`
-/// listener, all of which had the identical `.forget()`-plus-signal-write
-/// defect.
-///
-/// Store one in a `use_hook` (wrapped in `Rc`, since `use_hook` requires
-/// `Clone` and hands back a clone each render) to bind the listener's lifetime
-/// to the component INSTANCE: Dioxus drops a scope's hook values when the scope
-/// is torn down, which is the very mechanism `use_drop` is built on
-/// (`dioxus_core::use_drop` stores an `Rc<LifeCycle>` in a `use_hook` and runs
-/// its callback from that value's `Drop`). So a `Drop`-implementing hook value
-/// is cleaned up on unmount just as reliably as a `use_drop` closure.
-///
-/// This type exists because `Closure::forget()` keeps a callback alive for the
-/// lifetime of the PAGE, not the component — so a SINGLE unmount is already a
-/// bug; no remount is needed. The reachable trigger is an in-page router
-/// unmount: `MeetingPage` is a client-side route
-/// (`#[route("/meeting/:id", MeetingPage)]` in `routing.rs`), so navigating away
-/// from it — browser Back being the easy one — unmounts `AttendantsComponent`
-/// while the wasm instance keeps running. A forgotten closure stays registered
-/// and still fires on the next resize, writing a signal whose scope is gone. In
-/// Dioxus 0.7 `Signal::write`/`with_mut` is `try_write().unwrap()`
-/// (dioxus-signals `write.rs:271`), so that write panics the client
-/// (issue 2053).
-///
-/// NOT the trigger, despite the issue body saying so: the transport reconnect
-/// (#1311) does not unmount this component. `MeetingPage`'s `on_connection_lost`
-/// only `log::warn!`s and never touches `meeting_status` (`pages/meeting.rs`),
-/// and the host-refresh path re-renders IN PLACE deliberately without a `key`
-/// (`context.rs`, `pages/meeting.rs`). Nor is it an `Admitted` round trip: once
-/// `Admitted` is reached the only later setter re-sets `Admitted`, and both
-/// leave paths hard-navigate via `location().set_href("/")`
-/// (`meeting_ended_overlay.rs`, and the hangup handler below), which resets the
-/// page instead of remounting within it.
-struct WindowEventListener {
-    /// The event this guard registered for, kept so `Drop` deregisters the
-    /// SAME event it registered — passing a different name to
-    /// `removeEventListener` is a silent no-op, i.e. the leak all over again.
-    event: &'static str,
-    /// `Some` while registered; taken by `Drop` after the listener is removed.
-    /// Dropping the `Closure` frees the wasm callback slot — the leak that
-    /// `Closure::forget()` made permanent.
-    cb: Option<Closure<dyn FnMut()>>,
-}
-
-impl WindowEventListener {
-    /// Registers `handler` for `window`'s `event` and returns the guard that
-    /// owns it. The handler fires until the guard is dropped.
-    ///
-    /// The handler takes no arguments even for events that carry one (`focus`,
-    /// `mousemove`, `touchstart`): JS ignores extra parameters a callback does
-    /// not declare, and none of the call sites read the event object.
-    fn new(event: &'static str, handler: impl FnMut() + 'static) -> Self {
-        let cb = Closure::<dyn FnMut()>::new(handler);
-        if let Some(win) = web_sys::window() {
-            let _ = win.add_event_listener_with_callback(event, cb.as_ref().unchecked_ref());
-        }
-        Self {
-            event,
-            cb: Some(cb),
-        }
-    }
-}
-
-impl Drop for WindowEventListener {
-    fn drop(&mut self) {
-        if let Some(cb) = self.cb.take() {
-            // Deregister BEFORE the `Closure` is dropped at the end of this
-            // scope: a still-registered closure whose backing storage has been
-            // freed throws "closure invoked after being dropped" when JS
-            // dispatches into it.
-            if let Some(win) = web_sys::window() {
-                let _ = win
-                    .remove_event_listener_with_callback(self.event, cb.as_ref().unchecked_ref());
-            }
-        }
-    }
-}
-
-/// Dock auto-hide narrows the action bar after this long without pointer input.
-const DOCK_NARROW_DELAY_MS: u32 = 1_000;
-/// Dock auto-hide hides the action bar entirely after this long without pointer
-/// input. Deliberately longer than `DOCK_NARROW_DELAY_MS`: the bar narrows
-/// first, then disappears.
 const DOCK_HIDE_DELAY_MS: u32 = 4_000;
 
 /// A pending dock auto-hide timer, shared between the pointer listeners and the
@@ -2736,22 +3089,12 @@ const DOCK_HIDE_DELAY_MS: u32 = 4_000;
 /// `controls_visible.set(false)` into a torn-down scope up to 4s later).
 type DockTimerCell = Rc<RefCell<Option<Timeout>>>;
 
-/// Owns every resource the dock auto-hide block installs, so that dropping it —
-/// which Dioxus does when the component's scope is torn down, because it is
-/// stored in a `use_hook` — deregisters both listeners and cancels both pending
-/// timers. See the block in `AttendantsComponent` for the full issue-2100
-/// rationale.
 struct DockAutoHide {
     _mouse_listener: WindowEventListener,
     _touch_listener: WindowEventListener,
-    _narrow_timer: DockTimerCell,
-    _hide_timer: DockTimerCell,
+    hide_timer: DockTimerCell,
 }
 
-/// (Re)arms the dock auto-hide timers: narrow after `DOCK_NARROW_DELAY_MS`,
-/// hide after `DOCK_HIDE_DELAY_MS`, each cancelling the pending timer it
-/// replaces.
-///
 /// The fired timer is deliberately NOT taken out of its cell from inside its
 /// own callback (the pre-fix code did the equivalent with raw handles): a
 /// `Timeout`'s `Drop` also drops the `Closure` it owns, and dropping a closure
@@ -2759,25 +3102,14 @@ struct DockAutoHide {
 /// the spent `Timeout` in place is harmless — it is dropped at the next arming
 /// or at unmount, and `clearTimeout` on an already-fired id is a no-op.
 fn arm_dock_autohide(
-    narrow_timer: &DockTimerCell,
     hide_timer: &DockTimerCell,
     autohide_enabled: Signal<bool>,
     mut controls_visible: Signal<bool>,
-    mut controls_expanded: Signal<bool>,
 ) {
-    let narrow = Timeout::new(DOCK_NARROW_DELAY_MS, move || {
+    let hide = Timeout::new(DOCK_HIDE_DELAY_MS, move || {
         // `try_peek`/`try_write`, not `()`/`set`: both are `try_*().unwrap()`
         // in Dioxus 0.7, and a timer that fires while teardown is in flight
         // must no-op rather than panic (issue 1884's stale-closure idiom).
-        if matches!(autohide_enabled.try_peek().map(|v| *v), Ok(true)) {
-            if let Ok(mut expanded) = controls_expanded.try_write() {
-                *expanded = false;
-            }
-        }
-    });
-    *narrow_timer.borrow_mut() = Some(narrow);
-
-    let hide = Timeout::new(DOCK_HIDE_DELAY_MS, move || {
         if matches!(autohide_enabled.try_peek().map(|v| *v), Ok(true)) {
             if let Ok(mut visible) = controls_visible.try_write() {
                 *visible = false;
@@ -2818,44 +3150,19 @@ fn use_toggle_request_decode(
     })
 }
 
-/// Pointer activity woke the dock: show it, expand it, and restart the
-/// auto-hide countdown.
-///
-/// Both signal writes are change-guarded. `Signal::write` marks subscribers
-/// dirty UNCONDITIONALLY (dioxus-signals 0.7.3 drops a `SignalSubscriberDrop`
-/// that calls `update_subscribers`, with no value comparison), so the pre-fix
-/// unconditional `set(true)` pair dirtied `AttendantsComponent` on EVERY
-/// `mousemove` — a full re-render of the meeting view for every frame in which
-/// the pointer moved, whether or not the dock's state actually changed. Writing
-/// only on a real `false -> true` transition renders identically (the value
-/// ends up `true` either way) while removing that per-event render.
-///
 /// A signal whose scope is gone reads `Err`; that is treated as "already
 /// awake", so the write is skipped rather than attempted.
 fn wake_dock(
-    narrow_timer: &DockTimerCell,
     hide_timer: &DockTimerCell,
     autohide_enabled: Signal<bool>,
     mut controls_visible: Signal<bool>,
-    mut controls_expanded: Signal<bool>,
 ) {
     if !controls_visible.try_peek().map(|v| *v).unwrap_or(true) {
         if let Ok(mut visible) = controls_visible.try_write() {
             *visible = true;
         }
     }
-    if !controls_expanded.try_peek().map(|v| *v).unwrap_or(true) {
-        if let Ok(mut expanded) = controls_expanded.try_write() {
-            *expanded = true;
-        }
-    }
-    arm_dock_autohide(
-        narrow_timer,
-        hide_timer,
-        autohide_enabled,
-        controls_visible,
-        controls_expanded,
-    );
+    arm_dock_autohide(hide_timer, autohide_enabled, controls_visible);
 }
 
 /// Publish the shared meeting-time context for this render — writing ONLY on a
@@ -2985,6 +3292,141 @@ fn on_connected_reset(
     reconnect_gave_up.set(false);
 }
 
+/// The meeting settings a participant mirrors from the server.
+#[derive(Clone, Copy)]
+struct LiveMeetingSettings {
+    waiting_room: Signal<bool>,
+    admitted_can_admit: Signal<bool>,
+    end_on_host_leave: Signal<bool>,
+    allow_guests: Signal<bool>,
+    recording_allowed_for_all: Signal<bool>,
+    chat_allowed_for_all: Signal<bool>,
+    announcement_overrides: crate::components::announcement_overrides::OverrideEditor,
+}
+
+/// Re-fetches the settings a participant mirrors. Each fetch is numbered when
+/// sent, so one landing after a later-sent one is dropped; the overrides share
+/// their numbering with the host's own saves.
+struct SettingsRefreshes {
+    meeting_id: String,
+    observer_token: String,
+    is_guest: bool,
+    live: LiveMeetingSettings,
+    started: Cell<u64>,
+    applied: Cell<u64>,
+}
+
+impl SettingsRefreshes {
+    fn new(
+        meeting_id: String,
+        observer_token: String,
+        is_guest: bool,
+        live: LiveMeetingSettings,
+    ) -> Self {
+        Self {
+            meeting_id,
+            observer_token,
+            is_guest,
+            live,
+            started: Cell::new(0),
+            applied: Cell::new(0),
+        }
+    }
+
+    fn start(&self) -> (u64, u64) {
+        let generation = self.started.get() + 1;
+        self.started.set(generation);
+        (generation, self.live.announcement_overrides.start_read())
+    }
+
+    fn apply(
+        &self,
+        (generation, overrides_read): (u64, u64),
+        status: &crate::meeting_api::JoinMeetingResponse,
+    ) {
+        let live = self.live;
+        if generation > self.applied.get() {
+            self.applied.set(generation);
+            try_set_if_changed(live.waiting_room, status.waiting_room_enabled);
+            try_set_if_changed(live.admitted_can_admit, status.admitted_can_admit);
+            try_set_if_changed(live.end_on_host_leave, status.end_on_host_leave);
+            try_set_if_changed(live.allow_guests, status.allow_guests);
+            try_set_if_changed(
+                live.recording_allowed_for_all,
+                status.recording_allowed_for_all,
+            );
+            try_set_if_changed(live.chat_allowed_for_all, status.chat_allowed_for_all);
+        }
+        live.announcement_overrides
+            .land_read(overrides_read, AnnouncementOverrides::from_status(status));
+    }
+
+    fn refresh(self: &Rc<Self>) {
+        self.read(Some(1_000 + (js_sys::Math::random() * 2_000.0) as u32));
+    }
+
+    fn read(self: &Rc<Self>, retry_after_ms: Option<u32>) {
+        let generation = self.start();
+        let refreshes = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            let error = match crate::meeting_api::fetch_participant_status(
+                &refreshes.meeting_id,
+                &refreshes.observer_token,
+                refreshes.is_guest,
+            )
+            .await
+            {
+                Ok(status) => return refreshes.apply(generation, &status),
+                Err(e) => e,
+            };
+            log::warn!("Failed to refresh meeting settings: {error}");
+            let Some(delay_ms) = retry_after_ms.filter(|_| settings_read_retries(&error)) else {
+                return;
+            };
+            gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+            if refreshes.live.waiting_room.try_peek().is_ok() {
+                refreshes.read(None);
+            }
+        });
+    }
+}
+
+fn settings_read_retries(error: &crate::meeting_api::JoinError) -> bool {
+    !matches!(error, crate::meeting_api::JoinError::NotAuthenticated)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PeerChange {
+    Joined,
+    Left,
+}
+
+/// `(show_toast, play_sound)` for a peer joining or leaving.
+fn peer_announcement(
+    change: PeerChange,
+    settings: &crate::context::AppearanceSettings,
+    overrides: &AnnouncementOverrides,
+    recorder: &RecordButtonState,
+) -> (bool, bool) {
+    let recording = !matches!(recorder, RecordButtonState::Idle);
+    match change {
+        PeerChange::Joined => announcement_decision(
+            overrides.entry_message,
+            overrides.entry_sound,
+            settings.show_entry_notifications,
+            settings.play_entry_sound,
+            recording,
+        ),
+        PeerChange::Left => announcement_decision(
+            overrides.exit_message,
+            overrides.exit_sound,
+            settings.show_exit_notifications,
+            settings.play_exit_sound,
+            recording,
+        ),
+    }
+}
+
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
@@ -3016,12 +3458,11 @@ pub fn AttendantsComponent(
     /// it back on live (e.g. to open the floor for end-of-meeting questions).
     #[props(default = true)]
     chat_allowed_for_all: bool,
+    #[props(default)] announcement_overrides: AnnouncementOverrides,
 ) -> DioxusElement {
     let meeting_ownership = MeetingOwnership::of(host_user_id.as_deref(), user_id.as_deref());
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
-    let meeting_id_for_settings_refresh = id.clone();
-    let status_observer_token_for_settings_refresh = status_observer_token.clone();
 
     // --- State signals ---
     // Declared here (rather than alongside its sibling meeting-option toggles
@@ -3031,22 +3472,23 @@ pub fn AttendantsComponent(
     // "allow recording for all" mid-meeting would leave the Record slot's
     // overflow-menu placement stale until an unrelated effect dependency (e.g.
     // a resize) happened to re-trigger this effect.
-    let mut recording_allowed_for_all_toggle = use_signal(move || recording_allowed_for_all);
+    let recording_allowed_for_all_toggle = use_signal(move || recording_allowed_for_all);
     // Live mirror of the `chat_allowed_for_all` prop. Seeded from the prop's
     // initial snapshot and updated in place when a host toggles chat mid-meeting
     // (via the `on_meeting_settings_updated` push below), so the chat send gate
     // reflects the CURRENT value, not the value frozen at mount.
-    let mut chat_allowed_for_all_toggle = use_signal(move || chat_allowed_for_all);
-    let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
+    let chat_allowed_for_all_toggle = use_signal(move || chat_allowed_for_all);
+    let announcement_overrides_live = use_signal(move || announcement_overrides);
+    let announcement_overrides_editor = use_override_editor(announcement_overrides_live);
+    let screen_share_state = use_signal(|| ScreenShareState::Idle);
     let screen_share_toast_state: Signal<Option<ScreenShareToastState>> = use_signal(|| None);
     let screen_share_toast_timer: Signal<Option<Timeout>> = use_signal(|| None);
 
     let mut mic_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
+    let mut peer_list_opener = use_signal(PeerListOpener::default);
     let mut diagnostics_open = use_signal(|| false);
-    // No UI can open this drawer on the public build; the reserve/pair-close
-    // math still reads it so the drawer-reflow code stays identical upstream.
     let mut chat_open = use_signal(|| false);
     // Latch: set true the first time the Diagnostics drawer is opened, never
     // reset. Once the drawer has been opened at least once, CLOSING it keeps a
@@ -3094,6 +3536,8 @@ pub fn AttendantsComponent(
     let right_raf_valid: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut mock_peers_open = use_signal(|| false);
     let mut overflow_menu_open = use_signal(|| false);
+    let mut recents_open = use_signal(|| false);
+    let recents_open_last = use_signal(|| false);
     // Dynamically-computed set of secondary slots that don't fit in the
     // action bar at the current viewport width. Populated by a pure
     // signal-driven `use_effect` — no DOM measurement. The effect reads
@@ -3107,7 +3551,7 @@ pub fn AttendantsComponent(
     // render body and read by the overflow effect so it can filter slots correctly.
     let mut split_layout_sig: Signal<bool> = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
-    let mut controls_expanded = use_signal(|| true);
+    let mut touch_latch = use_signal(|| false);
     let mut dock_position: Signal<DockPosition> = use_signal(load_dock_position);
     let mut self_view_placement: Signal<SelfViewPlacement> = use_signal(load_self_view_placement);
     let mut self_view_visible: Signal<bool> = use_signal(load_self_view_visible);
@@ -3118,13 +3562,15 @@ pub fn AttendantsComponent(
         use_signal(|| None);
     let mut dock_menu_open = use_signal(|| false);
     // Roving-tabindex position within the dock menu (issue 1762). Exactly one
-    // `.glass-select-option` carries `tabindex="0"`; the other six carry "-1",
+    // `.glass-select-option` carries `tabindex="0"`; the others carry "-1",
     // per the WAI-ARIA APG menu pattern. Kept in lock-step with DOM focus by
     // the menu's Arrow/Home/End branches, which move focus and advance this
     // index together, and reset to 0 whenever the menu opens.
     let mut dock_menu_highlight: Signal<usize> = use_signal(|| 0);
     let mut autohide_enabled = use_signal(load_dock_autohide);
-    let mut customize_mode = use_signal(|| false);
+    let mut autoshrink_enabled = use_signal(load_dock_autoshrink);
+    let mut shrunk_buttons: Signal<ShrunkButtons> = use_signal(load_shrunk_buttons);
+    let customize_mode = use_signal(|| false);
     // Text pushed into the customize-mode aria-live region on keyboard reorder
     // (WCAG 2.1.1). Empty when there is nothing new to announce. Reset to empty
     // when customize mode exits so the region is silent between edit sessions.
@@ -3139,11 +3585,13 @@ pub fn AttendantsComponent(
     // including writes that repeat the previous message verbatim. Its parity
     // selects the invisible suffix that makes the rendered text differ.
     let mut action_bar_announce_nonce: Signal<u32> = use_signal(|| 0);
+    let connection_status = use_signal(|| None::<ConnectionStatus>);
     // Action-bar layout is persisted as a (visible_slots, hidden_slots) pair so
     // that user-removed slots stay removed across reloads. `load_action_bar_layout`
     // returns the migrated pair; both signals must be kept in lock-step on every
     // mutation (drag-reorder, remove button, reset-to-default).
-    let (initial_slots, initial_hidden) = load_action_bar_layout();
+    let (initial_slots, initial_hidden) =
+        load_action_bar_layout(crate::constants::captions_enabled().unwrap_or(false));
     let mut action_bar_slots: Signal<Vec<ActionBarSlot>> = use_signal(|| initial_slots);
     let mut action_bar_hidden: Signal<Vec<ActionBarSlot>> = use_signal(|| initial_hidden);
     let mut dragging_slot: Signal<Option<ActionBarSlot>> = use_signal(|| None);
@@ -3154,12 +3602,56 @@ pub fn AttendantsComponent(
     let drag_grab_dx: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
     let drag_grab_dy: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
     let mut drag_started: Signal<bool> = use_signal(|| false);
-    let mut drag_orig_layout: Signal<Vec<ActionBarSlot>> = use_signal(Vec::new);
+    let drag_orig_layout: Signal<Vec<ActionBarSlot>> = use_signal(Vec::new);
     let drag_pointer_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(0)));
     let drag_start_x: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
     let drag_start_y: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
     let drag_nav_left: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
     let drag_nav_top: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
+    let customize_entry: Signal<CustomizeEntry> = use_signal(|| CustomizeEntry::Menu);
+    let customize_exit_announce: Signal<&'static str> = use_signal(|| "");
+    let customize_ctl = CustomizeCtl {
+        customize_mode,
+        entry: customize_entry,
+        exit_announce: customize_exit_announce,
+        action_bar_slots,
+        action_bar_hidden,
+    };
+    let drag_handles = SlotDragHandles {
+        dragging_slot,
+        drag_pointer_x,
+        drag_pointer_y,
+        drag_insertion_idx,
+        drag_started,
+        drag_orig_layout,
+        drag_slot_size: drag_slot_size.clone(),
+        drag_grab_dx: drag_grab_dx.clone(),
+        drag_grab_dy: drag_grab_dy.clone(),
+        drag_pointer_id: drag_pointer_id.clone(),
+        drag_start_x: drag_start_x.clone(),
+        drag_start_y: drag_start_y.clone(),
+        drag_nav_left: drag_nav_left.clone(),
+        drag_nav_top: drag_nav_top.clone(),
+    };
+    let gesture: Rc<ActionBarGesture> = use_hook(|| Rc::new(ActionBarGesture::default()));
+    let _gesture_listeners = use_hook({
+        let gesture = gesture.clone();
+        move || {
+            Rc::new(install_action_bar_gesture_listeners(
+                gesture,
+                customize_mode,
+            ))
+        }
+    });
+    let recent_actions = use_recent_actions();
+    let recent_settings_focus = use_settings_focus_return(focus_recents_return);
+    let _recent_actions_listeners = use_hook(|| {
+        Rc::new(install_recent_actions_listeners(
+            recent_actions,
+            recents_open,
+            customize_mode,
+        ))
+    });
 
     // Tear down any in-flight drag state when customize mode exits. Without this,
     // a pointer release missed by the nav (capture never set, off-nav release,
@@ -3170,8 +3662,12 @@ pub fn AttendantsComponent(
         let drag_pointer_id_reset = drag_pointer_id.clone();
         let drag_grab_dx_reset = drag_grab_dx.clone();
         let drag_grab_dy_reset = drag_grab_dy.clone();
+        let gesture = gesture.clone();
         use_effect(move || {
-            if !customize_mode() {
+            let editing = customize_mode();
+            gesture.cancel_hold();
+            if !editing {
+                gesture.reset_after_exit();
                 dragging_slot.set(None);
                 drag_started.set(false);
                 drag_insertion_idx.set(None);
@@ -3187,14 +3683,14 @@ pub fn AttendantsComponent(
         });
     }
 
-    // Always seed keyboard focus on customize-mode entry at the first
-    // actionable slot button (Mic/Sound by default). This runs on every
-    // false->true transition so re-entering customize mode is consistent,
-    // independent of which menu activation path was used.
+    // Always seed keyboard focus on customize-mode entry: the held slot after a
+    // hold, otherwise the first actionable slot button (Mic/Sound by default).
     use_effect(move || {
         if customize_mode() {
-            Timeout::new(0, || {
-                focus_first_action_bar_button();
+            let entry = *customize_entry.peek();
+            Timeout::new(0, move || match entry {
+                CustomizeEntry::Hold(slot) => focus_action_bar_slot(slot),
+                CustomizeEntry::Menu => focus_first_action_bar_button(),
             })
             .forget();
         }
@@ -3360,6 +3856,8 @@ pub fn AttendantsComponent(
     // with no timer callback and no opportunity to add one.
     // `None` when rendered without the provider (e.g. isolated component tests).
     let host_refresh_nonce = try_use_context::<HostRefreshNonceCtx>();
+    let rejoin_ctx = try_use_context::<MeetingRejoinCtx>();
+    let avatar_cache = try_use_context::<PeerAvatarCacheCtx>();
 
     // Issue 2136: does the LOCAL user hold host RIGHT NOW? This gates the
     // meeting-timer controls, and the choice of signal is the security-relevant
@@ -3410,7 +3908,8 @@ pub fn AttendantsComponent(
         let restore_to = if close.diagnostics && focus_within("#diagnostics-sidebar") {
             Some("diagnostics-trigger")
         } else if close.peer_list && focus_within("#peer-list-container") {
-            Some("peer-list-trigger")
+            settle_peer_list_focus(*peer_list_opener.peek());
+            None
         } else if close.chat && focus_within("#chat-sidebar") {
             Some("chat-trigger")
         } else {
@@ -3426,7 +3925,7 @@ pub fn AttendantsComponent(
             chat_open.set(false);
         }
         if let Some(id) = restore_to {
-            focus_trigger_or_grid(id);
+            focus_slot_trigger(id);
         }
         post_drawer_resize_notice(
             resize_notice(close, false),
@@ -3460,8 +3959,50 @@ pub fn AttendantsComponent(
             diagnostics_open: diagnostics_open(),
             right_w: right_width(),
             chat_open: chat_open(),
+            chat_w: CHAT_DRAWER_WIDTH,
         })
     });
+
+    // Live captions. The notice is driven by server status packets for every
+    // participant; the flag and E2EE gate only caption text and the CC control.
+    let captions_flag = use_hook(|| crate::constants::captions_enabled().unwrap_or(false));
+    use_hook(|| {
+        if captions_flag {
+            crate::components::captions::remember_room_token(&id, &room_token);
+        }
+    });
+    let captions_token_meeting = use_hook(|| Rc::new(RefCell::new(id.clone())));
+    if *captions_token_meeting.borrow() != id {
+        captions_token_meeting.replace(id.clone());
+    }
+    use_drop({
+        let mounted_id = id.clone();
+        let current_id = captions_token_meeting.clone();
+        move || {
+            crate::components::captions::forget_room_token(&mounted_id);
+            crate::components::captions::forget_room_token(&current_id.borrow());
+        }
+    });
+    let captions_is_host: ReadSignal<bool> = use_hook(|| local_is_host.into());
+    let captions = use_captions(
+        captions_flag,
+        e2ee_enabled,
+        captions_is_host,
+        CAPTIONS_STATUS_TIMEOUT_MS,
+    );
+    let captions_notice = captions.notice;
+    let captions_visible = captions.available();
+    let captions_button = if captions_visible {
+        Some(captions.button_state())
+    } else {
+        None
+    };
+    let toggle_captions = {
+        let captions = captions.clone();
+        let meeting_id = id.clone();
+        use_callback(move |_: ()| captions.toggle(&meeting_id))
+    };
+    let captions_lane_hidden = use_memo(move || chat_open() && chat_is_sheet(viewport_width()));
 
     // Issue 2136: whether the meeting-timer slot is rendered for this user.
     // Computed once here and threaded into every `is_action_bar_slot_visible`
@@ -3474,10 +4015,29 @@ pub fn AttendantsComponent(
     let meeting_options_visible =
         can_edit_meeting_options(meeting_ownership, local_is_host() || is_owner);
 
-    // Compute which secondary slots overflow — pure function of viewport
-    // size, visible slot count, dock position, customize mode, and slot
-    // visibility filters (iOS, screen-share, owner).
-    // No DOM style writes — Dioxus render is sole authority on visibility.
+    let slot_visibility = move |customize_mode: bool, split_layout: bool| SlotVisibility {
+        customize_mode,
+        ios_device: is_ios(),
+        split_layout,
+        meeting_options_visible,
+        recording_visible: record_slot_visible(
+            is_owner,
+            is_guest,
+            recording_allowed_for_all_toggle(),
+        ),
+        meeting_timer_visible,
+        captions_visible,
+    };
+
+    let shrink_choices_now =
+        visible_action_bar_slots(&action_bar_slots.read(), slot_visibility(false, false));
+    let mut shrink_choices = use_signal(|| shrink_choices_now.clone());
+    use_effect(use_reactive!(|shrink_choices_now| {
+        if *shrink_choices.peek() != shrink_choices_now {
+            shrink_choices.set(shrink_choices_now);
+        }
+    }));
+
     use_effect(move || {
         let vw = viewport_width();
         let vh = viewport_height();
@@ -3486,26 +4046,13 @@ pub fn AttendantsComponent(
         let slots = action_bar_slots.read();
         // Read BEFORE the early-return or a run that takes it unsubscribes.
         let has_ss = split_layout_sig();
+        let autoshrink = autoshrink_enabled();
+        let kept = shrunk_buttons.read();
         let band_w = action_bar_band_width(vw, drawer_reserves_memo());
         let is_vertical = dock != DockPosition::Bottom;
         let rem_px = rem_px_memo();
 
-        let ios_device = is_ios();
-        let visible = visible_action_bar_slots(
-            &slots,
-            SlotVisibility {
-                customize_mode: is_customize,
-                ios_device,
-                split_layout: has_ss,
-                meeting_options_visible,
-                recording_visible: record_slot_visible(
-                    is_owner,
-                    is_guest,
-                    recording_allowed_for_all_toggle(),
-                ),
-                meeting_timer_visible,
-            },
-        );
+        let visible = visible_action_bar_slots(&slots, slot_visibility(is_customize, has_ss));
 
         let primary_count = visible
             .iter()
@@ -3524,8 +4071,7 @@ pub fn AttendantsComponent(
             // Done lives in the wrapper, so a band without it strands the user.
             let budget = overflow_budget_width(is_vertical, band_w, vh);
             if !dock_wrapper_fits(budget, sacred_count, rem_px) {
-                save_action_bar_layout(&slots, &action_bar_hidden.peek().clone());
-                customize_mode.set(false);
+                customize_ctl.exit(CustomizeExit::BandTooNarrow);
                 post_drawer_resize_notice(
                     resize_notice(DrawersToClose::default(), true),
                     drawer_resize_notice,
@@ -3545,11 +4091,25 @@ pub fn AttendantsComponent(
             .filter(|s| !matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
             .collect();
 
+        let coarse = autoshrink && any_pointer_is_coarse();
+        let handle_reserve = expand_handle_reserve(autoshrink, coarse, rem_px);
+        let (band_w, vh) = (band_w - handle_reserve, vh - handle_reserve);
+
+        let fit_order = if autoshrink {
+            kept_slots_first(&secondary, &kept)
+        } else {
+            secondary.clone()
+        };
         // Pure, monotonic fit: widening only ever reveals more slots (issue
         // 2044). See `action_bar_overflow_hidden` for why full-size spacing is
         // budgeted at every width.
-        let hidden =
-            action_bar_overflow_hidden(band_w, vh, is_vertical, rem_px, sacred_count, &secondary);
+        let overflowed =
+            action_bar_overflow_hidden(band_w, vh, is_vertical, rem_px, sacred_count, &fit_order);
+        let hidden: Vec<ActionBarSlot> = secondary
+            .iter()
+            .copied()
+            .filter(|slot| overflowed.contains(slot))
+            .collect();
 
         if *overflowed_slots.peek() != hidden {
             overflowed_slots.set(hidden.clone());
@@ -3571,8 +4131,11 @@ pub fn AttendantsComponent(
     let encoder_settings = use_signal(|| None::<String>);
 
     // --- Recording state ---
-    // `RecordButtonState` drives the button appearance; `recording_banner` is the
-    // per-recording state message shown ONLY to the local recorder.
+    use crate::components::recording_status_bar::{
+        local_key_write, read_js_save_target, recorder_update, recording_status_bar_mounted,
+        recording_status_bar_visible, RecordingSavedToast, RecordingStartingToast,
+        RecordingStatusBar, SaveTarget, SavedNotice,
+    };
     let mut record_state: Signal<RecordButtonState> = use_signal(|| RecordButtonState::Idle);
     // Live set of the `session_id`(s) currently recording — local user and
     // remotes. Independent per recorder (see `RecordingSetCtx`): each entry is
@@ -3588,14 +4151,25 @@ pub fn AttendantsComponent(
     // least one other stays active) does not re-render this whole component —
     // only an actual true↔false flip does. See `any_session_recording`.
     let any_recording_active = use_memo(move || any_session_recording(&recording_peer_ids.read()));
+    let captions_shown = use_memo(move || captions_notice.read().is_some());
+    let status_bar_visible = use_memo(move || {
+        recording_status_bar_visible(
+            any_recording_active(),
+            &record_state.read(),
+            captions_shown(),
+        )
+    });
+    let status_bar_mounted =
+        use_memo(move || recording_status_bar_mounted(status_bar_visible(), &record_state.read()));
+    let recording_save_target: Signal<Option<SaveTarget>> = use_signal(|| None);
+    // The exact key the local `Recording` transition inserted into the set.
+    let local_recording_key: Signal<Option<String>> = use_signal(|| None);
     // Brief "Recording saved" toast shown to the recorder when recording completes.
-    let recording_saved_toast: Signal<bool> = use_signal(|| false);
+    let recording_saved_toast: Signal<Option<SavedNotice>> = use_signal(|| None);
     let recording_error_toast: Signal<Option<&'static str>> = use_signal(|| None);
     // Stable JS closure passed to `window.__vcRecording.start()` so the JS
     // callback updates `record_state` when the recorder transitions.
-    #[allow(clippy::type_complexity)]
-    let state_cb: Rc<RefCell<Option<Closure<dyn FnMut(String)>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
+    let state_cb: RecordingStateCallback = use_hook(|| Rc::new(RefCell::new(None)));
 
     // Last peer count logged by the meeting-view render log below — lets that
     // log fire only on changes (edge-trigger) instead of every re-render.
@@ -3851,12 +4425,9 @@ pub fn AttendantsComponent(
     //     dependency on a `client_render_fps` diagnostics event. The loop also
     //     clamps `decode_budget_cap` as a backstop / state bookkeeping.
     //   - `Auto`, never pressured: `effective_cap` tracks the live natural tile
-    //     count EXACTLY (== `total_tiles`, ∩ CANVAS_LIMIT). A healthy machine
-    //     therefore shows ALL natural tiles from the first render and keeps
-    //     showing every peer that joins later (staggered joins) with ZERO
-    //     avatars — independent of any FPS-event timing. `decode_budget_cap` is
+    //     count EXACTLY (== `total_tiles`, ∩ CANVAS_LIMIT). `decode_budget_cap` is
     //     NOT consulted on this path; the loop keeps `state.cap` synced to
-    //     `natural` so the first down-step starts from the displayed value.
+    //     `natural`.
     //   - `Auto`, pressured: once the loop has measured sustained pressure and
     //     taken a down-step, `decode_budget_pressured` latches true and the loop
     //     becomes the sole owner of `decode_budget_cap`, applying its
@@ -3892,9 +4463,6 @@ pub fn AttendantsComponent(
     // render observes no transition. Read via `.peek()` inside the effect (never
     // reactively) so writing it back cannot self-retrigger the effect.
     let mut prev_override = use_signal(|| *decode_budget_override.peek());
-    // The uncapped layout tile count (`total_tiles`), republished from render
-    // so the async control loop can pass it to `decide_step` as `natural_count`
-    // and never raise the cap above what the layout would actually show.
     // Seeded at MIN_CAP (matching the Auto cap seed pre-join); render overwrites
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
@@ -3976,87 +4544,56 @@ pub fn AttendantsComponent(
         }))
     });
 
-    // Dock-style auto-hide: narrow after 1s, hide after 4s of inactivity.
-    //
-    // LIFECYCLE (issue 2100). Everything this block schedules is owned by the
-    // value the `use_hook` returns, so Dioxus's scope teardown tears all of it
-    // down — the same mechanism `use_drop` is built on (see
-    // `WindowEventListener`). Three separate leaks lived here before:
-    //
-    //  1. `mouse_cb.forget()` / `touch_cb.forget()` kept the two listeners
-    //     registered for the lifetime of the PAGE. After one unmount they still
-    //     fired, and `controls_visible.set(true)` is `try_write().unwrap()` in
-    //     Dioxus 0.7 — a client panic on the very next pointer move, i.e. the
-    //     issue-2053 failure mode on a far more frequently fired event.
-    //  2. The pending `setTimeout`s were never cancelled, so
-    //     `controls_visible.set(false)` / `controls_expanded.set(false)` fired
-    //     up to 4s AFTER unmount into the same panic (the issue-1884 hazard).
-    //     `gloo` `Timeout` cancels on drop, so holding the pending timers in
-    //     hook-owned cells cancels them on teardown, and re-arming (replacing a
-    //     cell's contents) cancels the timer it supersedes.
-    //  3. Each pointer event built two `Closure::once`s and `forget()`-ed both,
-    //     leaking a boxed closure plus a permanent wasm function-table slot PER
-    //     MOUSEMOVE — the issue-2102 per-event class, at pointer-move rate.
-    //     `Timeout` owns its closure and frees it when the timer is dropped, so
-    //     at most two are live at a time.
-    //
-    // The handlers additionally use `try_write()` rather than `set()` (the
-    // issue-1884 stale-closure idiom): deregistration already prevents a
-    // post-unmount fire, so this is defence in depth for a fire that races
-    // teardown.
-    let _dock_autohide = use_hook(move || {
-        // Pending narrow (1s) / hide (4s) timers. `Rc` because both listeners
-        // and the initial arming share them; `RefCell<Option<Timeout>>` because
-        // arming REPLACES (and therefore cancels) whatever was pending.
-        let narrow_timer: DockTimerCell = Rc::new(RefCell::new(None));
+    let bar_hover: Rc<BarHoverIntent> = use_hook(|| Rc::new(BarHoverIntent::default()));
+    let hover_on_move = bar_hover.clone();
+    let dock_autohide = use_hook(move || {
         let hide_timer: DockTimerCell = Rc::new(RefCell::new(None));
 
-        let nt_mouse = narrow_timer.clone();
         let ht_mouse = hide_timer.clone();
-        let mouse_listener = WindowEventListener::new("mousemove", move || {
-            wake_dock(
-                &nt_mouse,
-                &ht_mouse,
-                autohide_enabled,
-                controls_visible,
-                controls_expanded,
-            );
+        let mouse_listener = WindowEventListener::with_event("mousemove", false, move |e| {
+            wake_dock(&ht_mouse, autohide_enabled, controls_visible);
+            hover_on_move.note_pointer_move(&e);
         });
 
-        let nt_touch = narrow_timer.clone();
         let ht_touch = hide_timer.clone();
         let touch_listener = WindowEventListener::new("touchstart", move || {
-            wake_dock(
-                &nt_touch,
-                &ht_touch,
-                autohide_enabled,
-                controls_visible,
-                controls_expanded,
-            );
+            wake_dock(&ht_touch, autohide_enabled, controls_visible);
         });
 
-        // Initial arming: the dock starts visible + expanded and collapses on
-        // its own if the user never moves the pointer.
-        arm_dock_autohide(
-            &narrow_timer,
-            &hide_timer,
-            autohide_enabled,
-            controls_visible,
-            controls_expanded,
-        );
+        arm_dock_autohide(&hide_timer, autohide_enabled, controls_visible);
 
         Rc::new(DockAutoHide {
             _mouse_listener: mouse_listener,
             _touch_listener: touch_listener,
-            _narrow_timer: narrow_timer,
-            _hide_timer: hide_timer,
+            hide_timer,
         })
     });
+
+    {
+        let gesture = gesture.clone();
+        let dock_autohide = dock_autohide.clone();
+        use_effect(move || {
+            let timed = customize_mode() && customize_session_is_timed(customize_entry());
+            gesture.stop_idle_clock();
+            if !timed {
+                return;
+            }
+            gesture.start_idle_clock();
+            let dock = dock_autohide.clone();
+            let wake = move || wake_dock(&dock.hide_timer, autohide_enabled, controls_visible);
+            gesture.set_idle_task(spawn(run_idle_clock(gesture.clone(), customize_ctl, wake)));
+        });
+    }
 
     use_effect(move || {
         if !autohide_enabled() {
             controls_visible.set(true);
-            controls_expanded.set(true);
+        }
+    });
+
+    use_effect(move || {
+        if !autoshrink_enabled() && *touch_latch.peek() {
+            touch_latch.set(false);
         }
     });
 
@@ -4130,6 +4667,8 @@ pub fn AttendantsComponent(
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
     let mut call_start_time = use_signal(|| None::<f64>);
     let meeting_ended_message = use_signal(|| None::<String>);
+    let instance_superseded = use_signal(|| false);
+    let overlay_variant = use_signal(RejoinOverlayVariant::default);
     let reconnect_gave_up = use_signal(|| false);
     let meeting_info_open = use_signal(|| false);
     let show_build_git = use_hook(crate::constants::show_build_git_info);
@@ -4151,7 +4690,11 @@ pub fn AttendantsComponent(
     let local_audio_level = use_signal(|| 0.0f32);
     // Issue 2866: the pinned tiles, most recent first (see `pin_order`).
     let mut pinned_tiles: Signal<Vec<PinnedTile>> = use_signal(Vec::new);
+    let mut enlarged_tiles: Signal<Vec<PinnedTile>> = use_signal(Vec::new);
+    let pointer_coarse = use_hook(primary_pointer_is_coarse);
+    let mut overflow_list_open = use_signal(|| false);
     let share_slots: Signal<ShareSlots> = use_signal(ShareSlots::default);
+    let share_stage = use_signal(share_view::ReceivedStage::default);
     let share_announce: Signal<(String, u32)> = use_signal(|| (String::new(), 0));
     let own_share_stream: Signal<Option<web_sys::MediaStream>> = use_signal(|| None);
     let share_tracker = use_hook(|| Rc::new(RefCell::new(ShareTracker::default())));
@@ -4218,10 +4761,10 @@ pub fn AttendantsComponent(
     let prejoin_devices: Rc<RefCell<MediaDeviceList>> =
         use_hook(|| Rc::new(RefCell::new(MediaDeviceList::new())));
 
-    let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
-    let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
-    let mut end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
-    let mut allow_guests_toggle = use_signal(move || allow_guests);
+    let waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
+    let end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
+    let allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
@@ -4260,10 +4803,7 @@ pub fn AttendantsComponent(
         });
     }
 
-    // One-shot toast shown to the local user on grant, driven directly via
-    // these signals from the HOST_GRANTED/HOST_REVOKED handler.
-    // See `show_host_change_toast`.
-    let host_change_toast: Signal<Option<String>> = use_signal(|| None);
+    let host_change_toast: Signal<Option<HostChangeToast>> = use_signal(|| None);
     let host_change_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> =
         use_signal(|| None);
     let co_host_notice: Signal<Option<CoHostNotice>> = use_signal(|| None);
@@ -4293,8 +4833,7 @@ pub fn AttendantsComponent(
     let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
     // Issue 1175: per-tile zoom/pan state for received shared content, and the
-    // single peer whose share is detached into a separate window. Created here
-    // (like crop) so `on_peer_removed` can clean them up when a sharer leaves.
+    // single peer whose share is detached into a separate window.
     let screen_zoom_signal: Signal<HashMap<String, ScreenZoomState>> = use_signal(HashMap::new);
     let detached_share_signal: Signal<Option<String>> = use_signal(|| None);
     // Issue 1821: the peer currently pinned to actual-size (1:1), or None. One at
@@ -4309,6 +4848,27 @@ pub fn AttendantsComponent(
 
     // Create the appearance settings signal on_peer_joined / on_peer_left callbacks
     let appearance_settings = use_signal(load_appearance_settings_from_storage);
+
+    let settings_refreshes = use_hook(|| {
+        Rc::new(SettingsRefreshes::new(
+            id.clone(),
+            status_observer_token.clone(),
+            is_guest,
+            LiveMeetingSettings {
+                waiting_room: waiting_room_toggle,
+                admitted_can_admit: admitted_can_admit_toggle,
+                end_on_host_leave: end_on_host_leave_toggle,
+                allow_guests: allow_guests_toggle,
+                recording_allowed_for_all: recording_allowed_for_all_toggle,
+                chat_allowed_for_all: chat_allowed_for_all_toggle,
+                announcement_overrides: announcement_overrides_editor,
+            },
+        ))
+    });
+    use_orphaned_save_refresh(&id, {
+        let settings_refreshes = settings_refreshes.clone();
+        move || settings_refreshes.refresh()
+    });
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -4342,13 +4902,8 @@ pub fn AttendantsComponent(
         // can repopulate the WT list and recover the user from the
         // "stranded on a single server" state (discussion 562, Phase 7).
         let server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
-        let (effective_wt_enabled, websocket_urls, webtransport_urls) = current_transport_urls(
-            &token,
-            &initial_display_name,
-            &id,
-            transport_pref,
-            server_wt_enabled,
-        );
+        let (effective_wt_enabled, websocket_urls, webtransport_urls) =
+            current_transport_urls(&token, &initial_display_name, &id, server_wt_enabled);
 
         // Issue #1745 PR2 (observability only): record the user's transport
         // preference and how it filtered the candidate lists at this call site
@@ -4382,6 +4937,7 @@ pub fn AttendantsComponent(
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
         let client_for_kick = client_for_reconnect.clone();
+        let client_for_superseded = client_for_reconnect.clone();
 
         let user_id_for_display_name_changed = user_id.clone();
         // The local user's authoritative id (resolved like `opts.user_id` below),
@@ -4393,6 +4949,7 @@ pub fn AttendantsComponent(
         // Tracks the first `on_connected` so the reconcile below skips
         // the initial connect (already seeded by the mount effect).
         let host_reconcile_first_connect = Rc::new(Cell::new(true));
+        let settings_refreshes = settings_refreshes.clone();
 
         let (send_diagnostics_packets, diagnostics_packets_source) =
             crate::constants::diagnostics_packets_resolution();
@@ -4406,6 +4963,7 @@ pub fn AttendantsComponent(
             diagnostics_packets_source
         );
 
+        let (webtransport_connect_timeout_ms, websocket_connect_timeout_ms) = connect_timeouts_ms();
         let opts = VideoCallClientOptions {
             user_id: user_id
                 .clone()
@@ -4417,6 +4975,10 @@ pub fn AttendantsComponent(
             webtransport_urls,
             enable_e2ee: e2ee_enabled,
             enable_webtransport: effective_wt_enabled,
+            prefer_webtransport: transport_pref == TransportPreference::WebTransport,
+            on_election_progress: Some(election_progress_callback(connection_status)),
+            start_in_fallback: load_transport_fallback(transport_pref),
+            on_fallback_memory: Some(fallback_memory_callback(transport_pref)),
             max_received_layer: crate::constants::max_received_layer(),
             skip_canvas_paint: crate::constants::skip_canvas_paint(),
             // Issue 1884: reaction receive callback. Fires ONLY for peers (the
@@ -4595,6 +5157,12 @@ pub fn AttendantsComponent(
                     state.set(Some(incoming));
                 }))
             },
+            on_caption: {
+                let captions = captions.clone();
+                Some(VcCallback::from(move |update: CaptionUpdate| {
+                    captions.on_update(update)
+                }))
+            },
             on_connected: {
                 let meeting_id_for_log = id.clone();
                 // Initial room_token for console-log upload auth. The collector
@@ -4621,6 +5189,7 @@ pub fn AttendantsComponent(
                 // re-sync host_set_signal from the roster on every
                 // reconnect (see `host_reconcile_first_connect` above).
                 let host_reconcile_first_connect = host_reconcile_first_connect.clone();
+                let settings_refreshes = settings_refreshes.clone();
                 let host_reconcile_meeting_id = id.clone();
                 let host_events_for_reconcile = host_events.clone();
                 let raise_hand_announcer = raise_hand_announcer.clone();
@@ -4761,6 +5330,7 @@ pub fn AttendantsComponent(
                             host_events_for_reconcile.clone(),
                         );
                     }
+                    settings_refreshes.refresh();
                     // Activate console log collection if enabled in config.
                     if crate::constants::console_log_upload_enabled().unwrap_or(false) {
                         // Raise the WASM log level so uploaded logs capture
@@ -4805,7 +5375,9 @@ pub fn AttendantsComponent(
                         reason.label(),
                         reason.message()
                     );
-                    let mut connection_error = connection_error;
+                    if superseded_or_dropped(instance_superseded) {
+                        return;
+                    }
                     let meeting_ended_message = meeting_ended_message;
                     let terminal_media = TerminalMediaSignals {
                         mic_enabled,
@@ -4814,7 +5386,10 @@ pub fn AttendantsComponent(
                         pending_video_enable,
                         screen_share_state,
                     };
-                    connection_error.set(Some("Connection lost, reconnecting...".to_string()));
+                    try_set(
+                        connection_error,
+                        Some("Connection lost, reconnecting...".to_string()),
+                    );
 
                     #[cfg(feature = "media-server-jwt-auth")]
                     {
@@ -4829,8 +5404,10 @@ pub fn AttendantsComponent(
                             meeting_ended_message,
                             reconnect_gave_up,
                             terminal_media,
-                            transport_pref_ctx.0,
+                            instance_superseded,
+                            overlay_variant,
                             0,
+                            false,
                         );
                     }
 
@@ -4842,6 +5419,7 @@ pub fn AttendantsComponent(
                             connection_error,
                             reconnect_gave_up,
                             terminal_media,
+                            instance_superseded,
                             0,
                         );
                     }
@@ -4898,16 +5476,9 @@ pub fn AttendantsComponent(
                 jt_map.write().remove(&peer_id);
                 let mut ct_map = cropped_tiles_signal;
                 ct_map.write().remove(&peer_id);
-                // Issue 1175: drop this peer's zoom state, and if its share was
-                // detached, tear the detached window down and clear the flag so
-                // a departed sharer can't leave a frozen popped-out window.
+                // Issue 1175: drop this peer's zoom state.
                 let mut zoom_map = screen_zoom_signal;
                 zoom_map.write().remove(&peer_id);
-                let mut detached = detached_share_signal;
-                if detached.peek().as_deref() == Some(peer_id.as_str()) {
-                    share_view::teardown_with_cause(&peer_id, share_view::TeardownCause::System);
-                    detached.set(None);
-                }
                 // Issue 1821: drop this peer's actual-size (1:1) intent if it held it.
                 let mut actual_size = screen_actual_size_signal;
                 if actual_size.peek().as_deref() == Some(peer_id.as_str()) {
@@ -4943,7 +5514,8 @@ pub fn AttendantsComponent(
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
             on_encoder_settings_update: None,
-            rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
+            webtransport_connect_timeout_ms,
+            websocket_connect_timeout_ms,
             rtt_probe_interval_ms: Some(200),
             on_meeting_info: Some(VcCallback::from(move |start_time_ms: f64| {
                 log::info!("Meeting started at Unix timestamp: {start_time_ms}");
@@ -4986,50 +5558,7 @@ pub fn AttendantsComponent(
             })),
             on_meeting_settings_updated: Some(VcCallback::from(move |_| {
                 log::info!("Meeting settings updated push received");
-
-                let meeting_id = meeting_id_for_settings_refresh.clone();
-                let observer_token = status_observer_token_for_settings_refresh.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    match crate::meeting_api::fetch_participant_status(
-                        &meeting_id,
-                        &observer_token,
-                        is_guest,
-                    )
-                    .await
-                    {
-                        Ok(status) => {
-                            if waiting_room_toggle() != status.waiting_room_enabled {
-                                waiting_room_toggle.set(status.waiting_room_enabled);
-                            }
-
-                            if admitted_can_admit_toggle() != status.admitted_can_admit {
-                                admitted_can_admit_toggle.set(status.admitted_can_admit);
-                            }
-
-                            if end_on_host_leave_toggle() != status.end_on_host_leave {
-                                end_on_host_leave_toggle.set(status.end_on_host_leave);
-                            }
-
-                            if allow_guests_toggle() != status.allow_guests {
-                                allow_guests_toggle.set(status.allow_guests);
-                            }
-
-                            if recording_allowed_for_all_toggle()
-                                != status.recording_allowed_for_all
-                            {
-                                recording_allowed_for_all_toggle
-                                    .set(status.recording_allowed_for_all);
-                            }
-
-                            if chat_allowed_for_all_toggle() != status.chat_allowed_for_all {
-                                chat_allowed_for_all_toggle.set(status.chat_allowed_for_all);
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to refresh meeting settings after push update: {e}");
-                        }
-                    }
-                });
+                settings_refreshes.refresh();
             })),
             on_host_mute: Some(VcCallback::from({
                 let self_uid = user_id_for_host_events.clone();
@@ -5083,6 +5612,36 @@ pub fn AttendantsComponent(
                     });
                 }
             })),
+            on_instance_superseded: Some(VcCallback::from({
+                let superseded = SupersededState {
+                    instance_superseded,
+                    overlay_variant,
+                    meeting_ended_message,
+                    connection_error,
+                    media: TerminalMediaSignals {
+                        mic_enabled,
+                        video_enabled,
+                        pending_mic_enable,
+                        pending_video_enable,
+                        screen_share_state,
+                    },
+                };
+                move |_: ()| {
+                    handle_instance_superseded(
+                        superseded,
+                        RejoinOverlayVariant::MeetingRestarted,
+                        || {
+                            if let Some(client) = client_for_superseded.borrow().as_ref() {
+                                if let Err(e) = client.disconnect() {
+                                    log::warn!(
+                                        "MEETING_INSTANCE_SUPERSEDED: disconnect failed: {e}"
+                                    );
+                                }
+                            }
+                        },
+                    );
+                }
+            })),
             // Broadcast to the whole room. Always update the live host set so the
             // promoted peer's "(Host)" indicator updates on every client
             // (including their own self row) without a reload. For self user_id:
@@ -5099,7 +5658,7 @@ pub fn AttendantsComponent(
                     }
                     if target == local_uid {
                         show_host_change_toast(
-                            host_change_toast_text(true),
+                            HostChange::Granted,
                             host_change_toast,
                             host_change_toast_timer,
                         );
@@ -5121,7 +5680,7 @@ pub fn AttendantsComponent(
                     }
                     if target == local_uid {
                         show_host_change_toast(
-                            host_change_toast_text(false),
+                            HostChange::Revoked,
                             host_change_toast,
                             host_change_toast_timer,
                         );
@@ -5323,12 +5882,12 @@ pub fn AttendantsComponent(
                             }
                         }
 
-                        let settings = appearance_settings.peek();
-                        // Always show notifications while recording so join/leave events are captured.
-                        let show_toast = settings.show_exit_notifications
-                            || !matches!(*record_state.peek(), RecordButtonState::Idle);
-                        let play_sound = settings.play_exit_sound;
-                        drop(settings);
+                        let (show_toast, play_sound) = peer_announcement(
+                            PeerChange::Left,
+                            &appearance_settings.peek(),
+                            &announcement_overrides_live.peek(),
+                            &record_state.peek(),
+                        );
 
                         if show_toast {
                             let mut toast_counter = toast_counter;
@@ -5445,13 +6004,12 @@ pub fn AttendantsComponent(
                             );
                         }
 
-                        let settings = appearance_settings.peek();
-                        // Always show notifications while recording so join/leave events are captured.
-                        let show_toast = settings.show_entry_notifications
-                            || !matches!(*record_state.peek(), RecordButtonState::Idle);
-                        let play_sound = settings.play_entry_sound;
-
-                        drop(settings);
+                        let (show_toast, play_sound) = peer_announcement(
+                            PeerChange::Joined,
+                            &appearance_settings.peek(),
+                            &announcement_overrides_live.peek(),
+                            &record_state.peek(),
+                        );
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
@@ -5666,6 +6224,7 @@ pub fn AttendantsComponent(
                     log::debug!("DIOXUS-UI: peer_display_name_version bumped");
                 }
             })),
+            on_avatar_changed: avatar_change_listener(avatar_cache.as_ref()),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
             // Honour user transport preference: only allow the connection
@@ -5702,7 +6261,13 @@ pub fn AttendantsComponent(
                                 // Keep console-log uploads authenticated across
                                 // token refreshes on long calls. O(1), and the
                                 // token value is never logged.
-                                set_console_log_auth_token(&new_token);
+                                set_console_log_auth_token_for(&meeting_id, &new_token);
+                                if crate::constants::captions_enabled().unwrap_or(false) {
+                                    crate::components::captions::remember_room_token(
+                                        &meeting_id,
+                                        &new_token,
+                                    );
+                                }
                                 let dn = display_name_signal();
                                 let (ws, wt) = build_lobby_urls(&new_token, &dn, &meeting_id);
                                 // Apply the user's transport preference so
@@ -5713,7 +6278,7 @@ pub fn AttendantsComponent(
                                 let server_wt_enabled =
                                     crate::constants::webtransport_enabled().unwrap_or(false);
                                 let (_enable_wt, ws, wt) =
-                                    resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                                    resolve_transport_config(server_wt_enabled, ws, wt);
                                 // Issue #1745 PR2 (observability only): same
                                 // structured line as the other call sites,
                                 // emitted from the re-election token-refresh
@@ -5785,6 +6350,9 @@ pub fn AttendantsComponent(
         });
     }
 
+    // Hooks drop in reverse, so this runs before the disconnect above.
+    use_stop_recording_on_unmount(client.clone(), state_cb.clone());
+
     // Release any pre-join preview hardware (camera + mic) and close the
     // AudioContext on unmount, covering the route-change / tab-close paths the
     // join handler's explicit shutdown does not. Idempotent. (issue #959)
@@ -5794,19 +6362,6 @@ pub fn AttendantsComponent(
             preview_engine_for_drop.shutdown();
         });
     }
-
-    let transport_fallback = use_transport_fallback(
-        call_start_time,
-        connection_error,
-        transport_pref_ctx.0,
-        || crate::constants::webtransport_enabled().unwrap_or(false),
-        FALLBACK_TOAST_MS,
-        || {
-            let client = client.clone();
-            move || client.active_transport()
-        },
-    );
-    use_context_provider(|| ActiveTransportCtx(transport_fallback.active));
 
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
@@ -6638,6 +7193,7 @@ pub fn AttendantsComponent(
         let client = client.clone();
         use_effect(move || client.set_room_host_user_ids(host_set_signal.read().clone()));
     }
+    let local_user_id = client.user_id().clone();
     // Provide the recording set so peer-list rows and video tiles render a
     // per-recorder indicator for every participant currently recording.
     use_context_provider(|| RecordingSetCtx(recording_peer_ids));
@@ -6687,6 +7243,83 @@ pub fn AttendantsComponent(
     let pre_acquired_screen_stream: PreAcquiredScreenStream =
         use_hook(|| Rc::new(RefCell::new(None)));
     use_context_provider(|| pre_acquired_screen_stream.clone());
+    let screen_replacement =
+        use_context_provider(crate::components::share_actions::ScreenReplacementCell::default);
+    let meeting_live = use_memo(move || {
+        meeting_joined() && meeting_ended_message().is_none() && !reconnect_gave_up()
+    });
+    let announce_share = use_callback(move |text: String| {
+        action_bar_announce_nonce += 1;
+        action_bar_announce.set(text);
+    });
+    let share_actions = crate::components::share_actions::use_share_actions(
+        pre_acquired_screen_stream.clone(),
+        screen_replacement.clone(),
+        screen_share_state,
+        meeting_live,
+        screen_share_toast_state,
+        screen_share_toast_timer,
+        announce_share,
+    );
+    let mut share_menu_open = share_actions.menu_open;
+    let action_bar_popovers = ActionBarPopovers {
+        density_open,
+        reactions_open,
+        mock_peers_open,
+        share_menu_open,
+        dock_menu_open,
+        meeting_timer_open,
+        recents_open,
+    };
+    let hold_context = HoldContext {
+        ctl: customize_ctl,
+        popovers: action_bar_popovers,
+        overflowed_slots,
+        dock_wrapper_hidden,
+    };
+    let hover_on_input = bar_hover.clone();
+    let _action_bar_shrink_listeners = use_hook(move || {
+        Rc::new(install_action_bar_shrink(
+            hover_on_input,
+            touch_latch,
+            customize_mode,
+            move || {
+                bar_popover_open(
+                    action_bar_popovers
+                        .transient()
+                        .into_iter()
+                        .chain([overflow_menu_open])
+                        .any(|open| open.try_peek().is_ok_and(|on| *on)),
+                    meeting_timer_open.try_peek().is_ok_and(|on| *on),
+                    local_is_host.try_peek().is_ok_and(|on| *on),
+                )
+            },
+        ))
+    });
+    let bar_pinned = recents_open()
+        || crate::components::share_actions::share_control_pins_bar(
+            share_menu_open(),
+            (share_actions.replacing)(),
+        );
+    let bar_expanded = bar_is_expanded(BarExpansion {
+        autoshrink: autoshrink_enabled(),
+        touch_latch: touch_latch(),
+        customize_mode: customize_mode(),
+        share_pinned: bar_pinned,
+        transient_popover_open: action_bar_popovers
+            .transient()
+            .into_iter()
+            .chain([overflow_menu_open])
+            .any(|open| open()),
+        meeting_timer_open: meeting_timer_open(),
+        is_host: local_is_host(),
+    });
+    let hover_on_layout = bar_hover.clone();
+    use_effect(use_reactive!(|bar_expanded| {
+        hover_on_layout.note_layout(BarLayout {
+            expanded: bar_expanded,
+        });
+    }));
 
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
@@ -6709,8 +7342,7 @@ pub fn AttendantsComponent(
     use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
 
     // Issue 1175: provide the received-shared-content zoom/pan state and the
-    // detached-share flag. Created near `cropped_tiles_signal` (above) so
-    // `on_peer_removed` can clean them up; consumed by the screen-share tile's
+    // detached-share flag, consumed by the screen-share tile's
     // zoom viewport / controls in `canvas_generator`.
     use_context_provider(|| ScreenZoomCtx(screen_zoom_signal));
     use_context_provider(|| DetachedShareCtx(detached_share_signal));
@@ -6723,7 +7355,9 @@ pub fn AttendantsComponent(
         detached: detached_share_signal,
         announce: share_announce,
         own_stream: own_share_stream,
+        stage: share_stage,
     });
+    share_view::use_received_window_lifetime(move || meeting_ended_message.read().is_some());
 
     // Issue 1768: media-metrics overlay toggle. `MediaMetricsOverlayCtx` is the
     // enabled flag every PeerTile (remote overlays) and `Host` (the self overlay)
@@ -6735,9 +7369,13 @@ pub fn AttendantsComponent(
     // the PreferencesSettingsPanel can read/write them.
     use_context_provider(|| DockPositionCtx(dock_position));
     use_context_provider(|| AutohideCtx(autohide_enabled));
+    use_context_provider(|| AutoshrinkCtx(autoshrink_enabled));
+    use_context_provider(|| ShrunkButtonsCtx(shrunk_buttons));
+    use_context_provider(|| ShrinkChoicesCtx(shrink_choices));
     use_context_provider(|| DensityModeCtx(density_mode));
     use_context_provider(|| SelfViewPlacementCtx(self_view_placement));
     use_context_provider(|| SelfViewVisibleCtx(self_view_visible));
+    use_context_provider(|| AnnouncementOverridesCtx(announcement_overrides_live));
     // Provide the decode-budget override so the settings UI (task 1a.5) can read
     // and mutate it. Exposed exactly like density: a single shared signal.
     use_context_provider(|| DecodeBudgetCtx(decode_budget_override));
@@ -6945,14 +7583,10 @@ pub fn AttendantsComponent(
     // Pressured-latch cap-ownership model (HCL #987 review FIX 1 + FIX 2,
     // replaces the old one-shot seed latches):
     //   - While NOT pressured (Auto): the render-side `effective_cap` tracks the
-    //     live `natural` tile count exactly, so a capable machine shows ALL
-    //     tiles (including staggered joins) with no avatars and NO dependence on
-    //     this loop's cadence. This loop does NOT write `decode_budget_cap` on
-    //     that path; it only keeps `state.cap` synced to `natural` so that, when
-    //     pressure first hits, `decide_step`'s down-step starts from the value
-    //     actually on screen rather than a stale seed. The FIRST time
-    //     `decide_step` returns `Down`, the loop latches `decode_budget_pressured`
-    //     true, applies the down-step, and writes `decode_budget_cap`.
+    //     live `natural` tile count exactly, with NO dependence on this loop's
+    //     cadence. This loop does NOT write `decode_budget_cap` on that path; it
+    //     only keeps `state.cap` synced to `natural` so that, when pressure first
+    //     hits, `decide_step`'s down-step does not start from a stale seed.
     //   - While pressured (Auto): this loop is the SOLE owner of
     //     `decode_budget_cap`, running the existing Down/Up/Hold-growth logic
     //     (including the non-distress growth gate, which now correctly governs
@@ -7459,12 +8093,11 @@ pub fn AttendantsComponent(
 
                 if !pressured {
                     // NOT-pressured path (HCL #987 review FIX 1 + FIX 2). The
-                    // render-side `effective_cap` already shows ALL natural tiles
-                    // here (including staggered joins), so this loop does NOT
-                    // write `decode_budget_cap`. It only keeps `state.cap` synced
-                    // to the live `natural` so that, when pressure FIRST hits,
-                    // `decide_step` computes the down-step from the value actually
-                    // on screen rather than a stale MIN_CAP seed. Likewise keep
+                    // render-side `effective_cap` ignores `decode_budget_cap`
+                    // here, so this loop does NOT write it. It only keeps
+                    // `state.cap` synced to the live `natural` so that, when
+                    // pressure FIRST hits, `decide_step` does not compute the
+                    // down-step from a stale MIN_CAP seed. Likewise keep
                     // `direction_hold` book-keeping live so the strict-recovery
                     // gate is warm if we ever do step down then recover.
                     state.cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
@@ -8408,13 +9041,8 @@ pub fn AttendantsComponent(
     }
     let num_display_peers = display_peers.len();
     let mock_count = debug_peer_count() as usize;
-    // CANVAS_LIMIT caps real peers (each drives a canvas + diagnostics task).
-    // Mock peers are layout-only placeholders and don't carry that cost.
     let capped_real = num_display_peers.min(CANVAS_LIMIT);
     let total_tiles = capped_real + mock_count;
-    // Republish the uncapped layout tile count so the adaptive decode-budget
-    // control loop (task 1a.3) can pass it to `decide_step` as `natural_count`
-    // and never raise the cap above what the layout would actually render.
     // Writing only on change keeps this off the per-render hot path.
     if *decode_budget_natural.peek() != total_tiles {
         decode_budget_natural.set(total_tiles);
@@ -8422,7 +9050,7 @@ pub fn AttendantsComponent(
 
     // --- Screen share stack: tracks the order of peer screen shares (LIFO) ---
     let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
-    let active_screen_sharer: Option<String> = {
+    let received_sharers: Vec<String> = {
         let mut stack = screen_share_stack.write();
         // Remove peers who stopped sharing or left
         stack.retain(|pid| {
@@ -8438,15 +9066,29 @@ pub fn AttendantsComponent(
                 }
             }
         }
-        stack.last().cloned()
+        stack.clone()
+    };
+    share_view::follow_stage(share_ctx, &received_sharers);
+    let (active_screen_sharer, demoted_sharers) = {
+        let stage = share_stage.read();
+        (stage.primary.clone(), stage.demoted.clone())
     };
 
     // Hoisted: a user who may not stream gets no nav, so no cell may be reserved.
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
     let latest_display_name = current_display_name();
     let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
+    let own_pin_user = effective_user_id.to_string();
     let can_stream =
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
+    crate::components::share_actions::use_release_share_unless(
+        can_stream,
+        share_actions,
+        pre_acquired_screen_stream.clone(),
+        screen_replacement.clone(),
+        screen_share_state,
+        own_share_stream,
+    );
 
     // --- Issue 2792: share tiles and the layout they put on screen ---
     #[cfg(target_arch = "wasm32")]
@@ -8464,8 +9106,8 @@ pub fn AttendantsComponent(
             .get_peer_user_id(sid)
             .or_else(|| known_sharer_user.clone())
     });
-    let received_share: Option<ShareTarget> = active_screen_sharer.as_ref().map(|sid| {
-        let uid = received_user.clone().unwrap_or_else(|| sid.clone());
+    let received_target = |sid: &String, uid: Option<String>| {
+        let uid = uid.unwrap_or_else(|| sid.clone());
         ShareTarget {
             origin: ShareOrigin::Received,
             key: sid.clone(),
@@ -8474,7 +9116,14 @@ pub fn AttendantsComponent(
                 .unwrap_or_else(|| uid.clone()),
             pin: PinnedTile::screen(uid),
         }
-    });
+    };
+    let received_share: Option<ShareTarget> = active_screen_sharer
+        .as_ref()
+        .map(|sid| received_target(sid, received_user.clone()));
+    let demoted_shares: Vec<ShareTarget> = demoted_sharers
+        .iter()
+        .map(|sid| received_target(sid, client.get_peer_user_id(sid)))
+        .collect();
     let own_share: Option<ShareTarget> = own_stream.as_ref().map(|_| ShareTarget {
         origin: ShareOrigin::Own,
         key: OWN_SHARE_KEY.to_string(),
@@ -8486,10 +9135,15 @@ pub fn AttendantsComponent(
         &mut share_tracker.borrow_mut(),
         share_ctx,
         received_share.as_ref(),
+        &demoted_shares,
         received_user.is_some(),
         &still_sharing,
         own_share.as_ref().zip(own_stream.as_ref()),
         detach_supported,
+        (
+            action_bar_band_width(*viewport_width.peek(), drawer_reserves_memo()),
+            *viewport_height.peek(),
+        ),
         screen_zoom_signal,
         screen_actual_size_signal,
     );
@@ -8514,7 +9168,7 @@ pub fn AttendantsComponent(
             .unwrap_or_else(|| sid.to_string())
     });
     let pin_rank_by_session: HashMap<String, usize> = camera_pins.iter().cloned().collect();
-    let pinned_sessions: Vec<String> = camera_pins.into_iter().map(|(sid, _)| sid).collect();
+    let pinned_sessions: Vec<String> = camera_pins.iter().map(|(sid, _)| sid.clone()).collect();
     let share_slots_now = *share_slots.read();
     let (received_mode, own_mode) = {
         let detached = detached_share_signal.read();
@@ -8534,16 +9188,20 @@ pub fn AttendantsComponent(
                 .map(|t| mode(t, share_slots_now.own.base)),
         )
     };
-    let share_tiles: Vec<(share_view::ShareBase, ShareViewMode)> = [
+    let share_tiles = share_view::shown_share_tiles(
         received_mode.map(|m| (share_slots_now.received.base, m)),
         own_mode.map(|m| (share_slots_now.own.base, m)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+        demoted_shares.len(),
+    );
     let share_layout = share_view::share_layout(&share_tiles);
     let has_share_tile = share_layout != ShareLayout::None;
     let split_layout = share_layout == ShareLayout::Enlarged;
+    let enlarged_sessions = camera_pin_sessions(&enlarged_tiles.read(), &display_peers, |sid| {
+        client
+            .get_peer_user_id(sid)
+            .unwrap_or_else(|| sid.to_string())
+    });
+    let grid_lead = pin_order::grid_lead(&enlarged_sessions, &camera_pins);
     let share_cells = share_view::share_grid_cells(
         share_layout,
         &share_tiles.iter().map(|(_, m)| *m).collect::<Vec<_>>(),
@@ -8551,6 +9209,9 @@ pub fn AttendantsComponent(
     // Keep the signal in sync so the overflow effect can react to split-layout changes.
     if split_layout != *split_layout_sig.peek() {
         split_layout_sig.set(split_layout);
+        if split_layout {
+            close_popovers_hidden_by_split(density_open, overflow_list_open);
+        }
     }
 
     // Issue 66: `total_tiles` is the DECODE population, `self_layout_tiles` the CELL one.
@@ -8566,7 +9227,6 @@ pub fn AttendantsComponent(
         share_cells,
     );
     let self_in_grid = self_counts.self_in_grid;
-    let self_cell = usize::from(self_in_grid);
     let self_layout_tiles = self_counts.layout_count;
 
     // Render-driven Fixed -> Auto pressured-reset (HCL #987 review). Reads
@@ -8730,16 +9390,15 @@ pub fn AttendantsComponent(
         .and_then(|v| v.as_f64())
         .unwrap_or(768.0);
     let (gap, pad_top, pad_right, pad_bottom, pad_left) = grid_padding(dock_position(), vw);
-    // Meeting-wide status bar reserve (recording status, today). While the bar
-    // is mounted it occupies `[0, reserve]` at the very top of `#main-container`;
-    // add that height to `pad_top` so tiles (and their `.floating-name` labels)
-    // are pushed below it instead of being overlapped. Because `avail_h` (and
-    // every downstream `compute_layout` call) is derived from this single
-    // `pad_top`, the tiles resize to fit the reduced area in ALL three layout
-    // paths, and expand back the instant the bar unmounts. Zero when idle, so no
-    // space is reserved when nothing is recording. Matched to the CSS bar height
-    // per viewport (the 568px breakpoint mirrors the padding branch above).
-    let status_bar_reserve = if any_recording_active() {
+    // Meeting-wide status bar reserve (recording status and the live-captions
+    // notice). While the bar is visible it occupies `[0, reserve]` at the very
+    // top of `#main-container`; add that height to `pad_top` so tiles (and their
+    // `.floating-name` labels) are pushed below it instead of being overlapped.
+    // Because `avail_h` (and every downstream `compute_layout` call) is derived
+    // from this single `pad_top`, the tiles resize to fit the reduced area in
+    // ALL three layout paths. Zero while neither shows. Matched to the CSS bar
+    // height per viewport (the 568px breakpoint mirrors the padding branch above).
+    let status_bar_reserve = if status_bar_visible() {
         if vw < 568.0 {
             STATUS_BAR_RESERVE_MOBILE
         } else {
@@ -8757,6 +9416,7 @@ pub fn AttendantsComponent(
         diagnostics_open: diagnostics_open(),
         right_w: right_width(),
         chat_open: chat_open(),
+        chat_w: CHAT_DRAWER_WIDTH,
     };
     let reserves = drawer_reserves_memo();
     let max_for_left = drawer_max_for_side(drawer_state, DrawerSide::Left);
@@ -8764,7 +9424,6 @@ pub fn AttendantsComponent(
     let dragging_drawer = resizing_drawer() != ResizingDrawer::None;
     let left_reserve_q = quantise_reserve(reserves.left_reserve, dragging_drawer);
     let right_reserve_q = quantise_reserve(reserves.right_reserve, dragging_drawer);
-    let diag_reserve_q = quantise_reserve(reserves.chat_right_offset, dragging_drawer);
     let avail_w = (vw - pad_left - pad_right - left_reserve_q - right_reserve_q).max(0.0);
     let avail_h = (vh - pad_top - pad_bottom).max(0.0);
 
@@ -8798,20 +9457,16 @@ pub fn AttendantsComponent(
     );
 
     // --- Determine visible tile count ---
-    let min_tw = effective_mode.min_tile_width(vw);
-    let effective_visible_cells = {
-        let mut t = self_layout_tiles;
-        while t > 1 {
-            let (_c, _r, tw) = compute_layout(t, avail_w, avail_h, gap);
-            if tw >= min_tw {
-                break;
-            }
-            t -= 1;
-        }
-        t
-    };
-    let effective_visible =
-        crate::components::self_view::remote_capacity(effective_visible_cells, &self_counts);
+    let roster_total = num_display_peers + mock_count;
+    let grid_capacity = plan_grid_capacity(
+        roster_total,
+        total_tiles,
+        &self_counts,
+        avail_w,
+        avail_h,
+        gap,
+        effective_mode.min_tile_width(vw),
+    );
 
     // --- Adaptive decode-budget actuator (issue #987, task 1a.3) ---
     // `effective_cap` is the real actuator: the ceiling on the number of RENDERED
@@ -8831,12 +9486,6 @@ pub fn AttendantsComponent(
     //   - `Auto`, pressured     → `decode_budget_cap()` (the loop owns the cap
     //                             with its conservative anti-oscillation growth)
     //
-    // On a healthy, unpressured machine (or one showing exactly `n` <= natural
-    // tiles) `effective_cap >= layout_limit`, so the `min()` below is a no-op and
-    // all displayed peers decode, including the mock-peer / `debug_peer_count`
-    // path. Avatars only materialise once Auto has measured real pressure and the
-    // loop steps `decode_budget_cap` below the layout capacity.
-    //
     // Capping `visible_tile_count` here naturally shrinks `visible_tiles` (the
     // slice below) and therefore the `active_decode_set` derived from it, so we
     // do NOT cap the decode set independently of layout.
@@ -8853,19 +9502,7 @@ pub fn AttendantsComponent(
     //        decode. They render as initials/avatar placeholders (no video
     //        decode → the CPU saving) but stay on screen so the user still sees
     //        who is present. Audio is untouched (see note below).
-    //   3. True overflow `[displayed_tile_count .. total_tiles)`
-    //        Peers beyond the natural layout capacity. Folded into the `+N`
-    //        badge exactly as before.
-    //
-    // CRITICAL no-cap invariant: whether the `+N` badge appears depends ONLY on
-    // the layout capacity (`effective_visible`), never on the budget cap. When
-    // the controller is idle (healthy, unpressured Auto), `effective_cap` equals
-    // `total_tiles ∩ CANVAS_LIMIT`, so `budget_cap >= effective_visible` always
-    // holds: `decoded_limit == layout_limit`, `avatar_count == 0`, and
-    // `visible_tile_count` / `overflow_count` are byte-for-byte identical to the
-    // pre-1a.4 values. The avatar tier only materialises when `effective_cap <
-    // effective_visible` — i.e. after the loop steps the cap down under measured
-    // pressure (Auto, pressured), or under an explicit `Fixed(n)` below natural.
+    //   3. True overflow: the rest of the roster, behind the `+N` badge.
     //
     // Audio note: `active_decode_set` (built below from `visible_tiles`) gates
     // ONLY video decode via `client.set_active_decode_set`. Audio playback runs
@@ -8892,20 +9529,10 @@ pub fn AttendantsComponent(
         device_decode_ceiling,
     );
     let budget_cap = effective_cap;
-    // Natural layout capacity (already bounded by CANVAS_LIMIT through
-    // `total_tiles`/`capped_real`). This decides the +N badge boundary.
-    let layout_limit = effective_visible;
     // Decode-budget ceiling: how many of the displayed tiles may decode video.
-    let decoded_limit = layout_limit.min(budget_cap.max(MIN_CAP));
-    // Tiles actually placed in the grid (video + avatar), and the +N count.
-    // Reserve one grid slot for the badge only when there is true overflow
-    // beyond the layout capacity — identical to the prior badge logic.
-    let (displayed_tile_count, overflow_count) = if total_tiles > layout_limit {
-        let displayed = layout_limit.saturating_sub(1).max(1);
-        (displayed, total_tiles - displayed)
-    } else {
-        (total_tiles, 0)
-    };
+    let decoded_limit = grid_capacity.layout_limit.min(budget_cap.max(MIN_CAP));
+    let displayed_tile_count = grid_capacity.displayed;
+    let overflow_count = grid_capacity.overflow;
     // --- Build unified tile list (real + mock peers) sorted by join time ---
     // Tiles are ordered by join time (earliest first) rather than by speech
     // activity. This provides a stable, predictable grid that doesn't shuffle
@@ -8943,7 +9570,7 @@ pub fn AttendantsComponent(
             &display_peers,
             capped_real,
             |peer_id| client.is_video_enabled_for_peer(peer_id),
-            |peer_id| pin_rank_by_session.get(peer_id).copied(),
+            |peer_id| grid_lead.rank.get(peer_id).copied(),
             &speech_map,
             &join_map,
             now_ms,
@@ -8965,14 +9592,7 @@ pub fn AttendantsComponent(
 
     // `all_tiles` now holds ONLY the peers with video to decode: camera-ON real
     // peers + mock placeholders. The decode-budget split (visible/avatar) below
-    // operates on this shrunken population. The LAYOUT counters (`total_tiles`,
-    // `displayed_tile_count`, `overflow_count`, `tile_count`) are UNCHANGED by the
-    // #1465 partition — they still size over the FULL population so the grid
-    // geometry and the +N badge are identical; only which peers feed the decode
-    // split changes. (The decode-split counters `visible_tile_count` /
-    // `avatar_tile_count` ARE recomputed below: the #1466 expansion may move the
-    // visible/avatar boundary outward within `displayed_tile_count` to admit PLAY
-    // requests — that does not touch the layout counters above.)
+    // operates on this shrunken population.
     let mut all_tiles: Vec<String> = Vec::with_capacity(camera_on_real.len() + mock_count);
     all_tiles.extend_from_slice(&camera_on_real);
     all_tiles.extend_from_slice(&mock_ids);
@@ -8995,7 +9615,7 @@ pub fn AttendantsComponent(
         let join_map = peer_join_time.read();
         plan_camera_window(
             CameraWindowInput {
-                pins: &pinned_sessions,
+                pins: &grid_lead.sessions,
                 camera_on: all_tiles,
                 camera_off: camera_off_real,
                 displayed: displayed_tile_count,
@@ -9042,14 +9662,6 @@ pub fn AttendantsComponent(
     // belong to the overflow region and must NOT render as tiles — they are
     // already accounted for in `overflow_count` / the +N badge.
     //
-    // Arithmetic proof that rendered-tile-count == `tile_count` (the value that
-    // drives `participants-N` + `compute_layout`):
-    //   rendered_on   = visible_tiles.len() + avatar_tiles.len()
-    //                 = min(all_tiles.len(), on_cells)               [plan_camera_window]
-    //   off_to_render = displayed_tile_count - rendered_on           [below]
-    //   rendered      = rendered_on + off_to_render + (overflow ? 1 : 0)
-    //                 = displayed_tile_count + (overflow ? 1 : 0)
-    //                 = tile_count                                    ∎
     // No-cap byte-identity (issue #1465 invariant 1): when EVERY peer is
     // camera-on, `camera_off_real` is empty, `all_tiles` equals the pre-#1465
     // list, `rendered_on == displayed_tile_count`, so `off_to_render == 0` and
@@ -9061,6 +9673,15 @@ pub fn AttendantsComponent(
         .take(off_to_render)
         .cloned()
         .collect();
+    let overflow_hidden = if !split_layout && overflow_count > 0 {
+        crate::components::overflow_participants::hidden_participants(
+            &display_peers,
+            &mock_ids,
+            &[&visible_tiles, &avatar_tiles, &camera_off_tiles],
+        )
+    } else {
+        Vec::new()
+    };
 
     // --- Lone-peer full-bleed predicate (issues #1465, #508) ---
     // The TOTAL displayed real-peer tiles across all three render groups
@@ -9084,7 +9705,7 @@ pub fn AttendantsComponent(
             &visible_tiles,
             &avatar_tiles,
             &camera_off_tiles,
-            &pin_rank_by_session,
+            &grid_lead.rank,
             &join_map,
         )
     };
@@ -9178,9 +9799,9 @@ pub fn AttendantsComponent(
 
     // ORDERING INVARIANT: the active decode set is built in 4 phases:
     //   1. Visible layout peers (here)
-    //   2. Active screen sharer (here)
-    //   3. Pinned camera-on peers: nothing to merge, the ones the budget
-    //      decodes lead phase 1 (`plan_camera_window`, issue 2866).
+    //   2. Received shares on show (here)
+    //   3. Enlarged and pinned camera-on peers: nothing to merge, the ones the
+    //      budget decodes lead phase 1 (`plan_camera_window`, issues 3367, 2866).
     //   4. User-requested force-decode peers (below, issue #1466) — the
     //      `merge_user_requested_decode` call after the stale-request prune,
     //      INTERSECTED with the decoded bucket so it can only re-affirm peers
@@ -9205,12 +9826,11 @@ pub fn AttendantsComponent(
     } else {
         decoded_bucket_non_ss
     };
-    let mut active_decode_set: HashSet<u64> = decoded_bucket.clone();
-    if let Some(active_peer) = active_screen_sharer.as_ref() {
-        if let Ok(session_id) = active_peer.parse::<u64>() {
-            active_decode_set.insert(session_id);
-        }
-    }
+    let (mut active_decode_set, hinted_sessions) = screen_decode_sets(
+        &decoded_bucket,
+        active_screen_sharer.as_deref(),
+        &demoted_sharers,
+    );
 
     // Screen share keeps its pre-fix source (the SS decode set + sharer) because the SS
     // panel scrolls every participant, so its render list is not an on-screen set.
@@ -9233,7 +9853,7 @@ pub fn AttendantsComponent(
     );
 
     // Tile count drives the `participants-N` class modifier on the grid
-    // container AND the `compute_layout` cell sizing, which lets CSS branch
+    // container AND the `plan_tile_grid` cell sizing, which lets CSS branch
     // layout behavior (see `.participants-1 .grid-item.full-bleed` rule in
     // style.css that drops the 3:2 cap on the lone tile for the 2-peer meeting
     // case — HCL #7).
@@ -9242,9 +9862,27 @@ pub fn AttendantsComponent(
     // 1a.4), because both occupy real grid cells. `avatar_tile_count` is 0 when
     // no budget cap is active, so `displayed_tile_count == visible_tile_count`
     // and this is identical to the pre-1a.4 value. Issue 66 adds the self cell.
-    let tile_count =
-        displayed_tile_count + if overflow_count > 0 { 1 } else { 0 } + self_cell + share_cells;
+    let tile_count = grid_capacity.tile_count(&self_counts);
 
+    let (tile_plan, enlarged_view) = plan_tile_grid(
+        TilePlanInput {
+            tile_count,
+            split_layout,
+            full_bleed: crate::components::self_view::remote_full_bleed(
+                sole_real_tile,
+                &self_counts,
+            ),
+            avail_w,
+            avail_h,
+            gap,
+            vw,
+        },
+        &unified_tiles,
+        &enlarged_sessions,
+        pointer_coarse,
+    );
+
+    let ss_pads = screen_share_padding(status_bar_reserve, timer_band_on, vw);
     let container_style = if split_layout {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85).
         // Inset by the drawer reserves; `left` AND `right` EVERY render, because
@@ -9276,23 +9914,23 @@ pub fn AttendantsComponent(
         // condition as the grid path, so the share/participant panels never sit
         // under the bar while recording is active. 16px is the base top padding.
         let (ss_tw, ss_th) = screen_share_stage_tile_size(avail_w, avail_h);
-        let (ss_pad_top, ss_pad_right, ss_pad_bottom, ss_pad_left) =
-            screen_share_padding(status_bar_reserve, timer_band_on, vw);
+        let (ss_pad_top, ss_pad_right, ss_pad_bottom, ss_pad_left) = ss_pads;
         let (ss_left, ss_right) = (left_reserve_q, right_reserve_q);
         let flow = screen_share_flow_style();
+        let sizes = tile_size_vars(ss_tw, ss_th, super::attendants_layout::SPLIT_GAP);
         format!(
             "position: absolute; left: {ss_left:.0}px; right: {ss_right:.0}px; top: 0; bottom: 0; height: 100%; \
-             gap: 10px; \
+             gap: {split_gap:.0}px; \
              padding: {ss_pad_top:.0}px {ss_pad_right:.0}px {ss_pad_bottom:.0}px {ss_pad_left:.0}px; \
              box-sizing: border-box; \
              {flow} \
-             --tile-w: {ss_tw:.0}px; --tile-h: {ss_th:.0}px;"
+             {sizes}",
+            split_gap = super::attendants_layout::SPLIT_GAP,
         )
     } else {
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
-        let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
-        let th = tw / TILE_AR;
-        let flow = tile_flow_style(tile_count, cols, rows);
+        let flow = tile_flow_style(tile_count, tile_plan);
+        let sizes = tile_size_vars(tile_plan.tile_w, tile_plan.tile_h(), gap);
         let (grid_left, grid_right) = (left_reserve_q, right_reserve_q);
         format!(
             "position: absolute; top: 0; bottom: 0; left: {grid_left:.0}px; right: {grid_right:.0}px; \
@@ -9301,7 +9939,7 @@ pub fn AttendantsComponent(
              box-sizing: border-box; overflow: hidden; \
              height: 100%; \
              {flow} \
-             --tile-w: {tw:.0}px; --tile-h: {th:.0}px; \
+             {sizes} \
              --status-bar-reserve: {status_bar_reserve:.0}px;"
         )
     };
@@ -9392,6 +10030,39 @@ pub fn AttendantsComponent(
     // must run unconditionally on every render.
     let last_pin_activation: Rc<RefCell<Option<(f64, PinnedTile)>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
+    let toggle_enlarge: EventHandler<PinnedTile> = use_callback({
+        let client = client.clone();
+        let last_pin_activation = last_pin_activation.clone();
+        move |target: PinnedTile| {
+            let normalized = PinnedTile {
+                user_id: client
+                    .get_peer_user_id(&target.user_id)
+                    .unwrap_or(target.user_id),
+                kind: target.kind,
+            };
+            let mut enlarged = enlarged_tiles.peek().clone();
+            let now_ms = web_sys::window()
+                .and_then(|w| w.performance())
+                .map(|p| p.now())
+                .unwrap_or_else(js_sys::Date::now);
+            let Some(change) = pin_order::activate_enlarge(
+                &mut enlarged,
+                &mut last_pin_activation.borrow_mut(),
+                now_ms,
+                normalized.clone(),
+            ) else {
+                return;
+            };
+            if let Ok(mut w) = enlarged_tiles.try_write() {
+                *w = enlarged;
+            }
+            let name = peer_name_for_user(&client, &normalized.user_id);
+            share_view::announce(
+                share_ctx,
+                pin_order::enlarge_announcement(name.as_deref(), change),
+            );
+        }
+    });
     let toggle_pin: EventHandler<PinnedTile> = use_callback({
         let client = client.clone();
         move |target: PinnedTile| {
@@ -9419,18 +10090,46 @@ pub fn AttendantsComponent(
             if let Ok(mut w) = pinned_tiles.try_write() {
                 *w = pins;
             }
-            let own = client.get_own_session_id();
-            let name = client
-                .sorted_peer_keys()
-                .into_iter()
-                .filter(|sid| own.as_deref() != Some(sid.as_str()))
-                .find(|sid| client.get_peer_user_id(sid).as_deref() == Some(&normalized.user_id))
-                .and_then(|sid| client.get_peer_display_name(&sid));
+            let name = peer_name_for_user(&client, &normalized.user_id);
             share_view::announce(
                 share_ctx,
                 pin_order::pin_announcement(name.as_deref(), change),
             );
         }
+    });
+    let close_transient_popovers: EventHandler<()> = use_callback(move |_: ()| {
+        density_open.set(false);
+        reactions_open.set(false);
+        dock_menu_open.set(false);
+        mock_peers_open.set(false);
+        share_menu_open.set(false);
+        overflow_menu_open.set(false);
+        meeting_timer_open.set(false);
+        meeting_options_open.set(false);
+        recents_open.set(false);
+    });
+    let mut toggle_autoshrink = move || {
+        let next = !autoshrink_enabled();
+        autoshrink_enabled.set(next);
+        save_dock_autoshrink(next);
+        dock_menu_open.set(false);
+        focus_element_by_id("dock-menu-trigger");
+    };
+    let mut open_settings_at = move |section: &'static str| {
+        let was_closed = !device_settings_open();
+        device_settings_open.set(true);
+        if was_closed {
+            device_settings_generation.set(device_settings_generation() + 1);
+            peer_list_open.set(false);
+            diagnostics_open.set(false);
+            close_transient_popovers.call(());
+        }
+        device_settings_initial_section.set(Some(section.to_string()));
+    };
+    let self_avatar_settings_focus = use_self_avatar_settings_focus();
+    let edit_avatar: EventHandler<()> = use_callback(move |_: ()| {
+        open_settings_at(PROFILE_SECTION);
+        self_avatar_settings_focus.opened(device_settings_generation(), focus_profile_tab);
     });
 
     // Shared no-op pin handler for the mock layout-placeholder tiles, which are
@@ -9854,6 +10553,190 @@ pub fn AttendantsComponent(
         dn_ctx.set(Some(new_name));
     });
 
+    let toggle_peer_list: Callback<PeerListOpener> = use_callback(move |opener| {
+        let opening = !peer_list_open();
+        peer_list_open.set(opening);
+        if opening {
+            peer_list_opener.set(opener);
+            density_open.set(false);
+            reactions_open.set(false);
+            dock_menu_open.set(false);
+            mock_peers_open.set(false);
+            share_menu_open.set(false);
+            apply_drawer_open_rule(
+                viewport_width,
+                DrawerKind::PeerList,
+                peer_list_open,
+                diagnostics_open,
+                chat_open,
+            );
+        }
+    });
+    let toggle_peer_list_from_footer: EventHandler<()> = use_callback(move |_| {
+        if customize_mode() {
+            return;
+        }
+        toggle_peer_list.call(PeerListOpener::Footer)
+    });
+    let toggle_recording: Callback<()> = use_callback({
+        let rec_client = client.clone();
+        let state_cb = state_cb.clone();
+        move |_: ()| match recording_toggle(
+            &record_state(),
+            record_slot_visible(is_owner, is_guest, *recording_allowed_for_all_toggle.peek()),
+        ) {
+            RecordingToggle::Start => {
+                let peer_ids: Vec<String> = rec_client.sorted_peer_keys();
+                rec_client.prepare_recording_audio_stream();
+                rec_client.prepare_recording_peer_canvases();
+                let rec_client_cb = rec_client.clone();
+                // Keyed by session id, so recording marks this tab only, not a
+                // sibling tab of the same account.
+                let self_session = rec_client.get_own_session_id().unwrap_or_default();
+                let mut rec_ids = recording_peer_ids;
+                let mut rec_key = local_recording_key;
+                let mut rec_target = recording_save_target;
+                let cb = Closure::new(move |js_state: String| {
+                    let new_state = js_state_to_record_button_state(&js_state);
+                    let update =
+                        recorder_update(&js_state, rec_target.peek().as_ref(), read_js_save_target);
+                    if new_state == RecordButtonState::Idle {
+                        // Every exit notifies peers: save, cancel or failure.
+                        for session_id in rec_client_cb.sorted_peer_keys() {
+                            if let Some(uid) = rec_client_cb.get_peer_user_id(&session_id) {
+                                rec_client_cb.send_peer_event(
+                                    &uid,
+                                    videocall_client::PEER_EVENT_RECORDING_STOPPED,
+                                );
+                            }
+                        }
+                        if js_state == "failed" {
+                            let mut err_toast = recording_error_toast;
+                            err_toast.set(Some("Recording failed."));
+                            Timeout::new(6_000, move || {
+                                if let Ok(mut t) = err_toast.try_write() {
+                                    t.take();
+                                }
+                            })
+                            .forget();
+                        }
+                        if let Some(notice) = update.saved_notice {
+                            let mut saved = recording_saved_toast;
+                            saved.set(Some(notice));
+                            // Can fire after unmount; `set()` panics on a dropped scope.
+                            Timeout::new(6_000, move || {
+                                if let Ok(mut t) = saved.try_write() {
+                                    *t = None;
+                                }
+                            })
+                            .forget();
+                        }
+                    }
+                    match local_recording_set_op(&new_state) {
+                        LocalRecordingSetOp::Insert => {
+                            if !self_session.is_empty()
+                                && recording_set_write_needed(
+                                    RecordingWriteOp::Insert,
+                                    rec_ids.peek().contains(&self_session),
+                                )
+                            {
+                                rec_ids.write().insert(self_session.clone());
+                            }
+                        }
+                        LocalRecordingSetOp::Remove => {
+                            if recording_set_write_needed(
+                                RecordingWriteOp::Remove,
+                                rec_ids.peek().contains(&self_session),
+                            ) {
+                                rec_ids.write().remove(&self_session);
+                            }
+                        }
+                        LocalRecordingSetOp::Noop => {}
+                    }
+                    let key_write =
+                        local_key_write(&new_state, &self_session, rec_key.peek().as_deref());
+                    if let Some(key) = key_write {
+                        rec_key.set(key);
+                    }
+                    if *rec_target.peek() != update.save_target {
+                        rec_target.set(update.save_target);
+                    }
+                    record_state.set(new_state);
+                });
+                let js_fn: &js_sys::Function = cb.as_ref().unchecked_ref();
+                let handoff_ok =
+                    js_recording_start(&peer_ids, js_fn, &current_display_name(), is_owner);
+                match recording_start_outcome(handoff_ok) {
+                    RecordingStartOutcome::Announce => {
+                        *state_cb.borrow_mut() = Some(cb);
+                        for session_id in &peer_ids {
+                            if let Some(uid) = rec_client.get_peer_user_id(session_id) {
+                                rec_client.send_peer_event(
+                                    &uid,
+                                    videocall_client::PEER_EVENT_RECORDING_STARTED,
+                                );
+                            }
+                        }
+                    }
+                    // A failed hand-off never calls back, so announcing would
+                    // leave peers with a permanent phantom "Recording" banner.
+                    RecordingStartOutcome::ShowError => {
+                        log::error!(
+                            "[recording] start hand-off failed — recording.js unavailable; not announcing to peers"
+                        );
+                        let mut err_toast = recording_error_toast;
+                        err_toast.set(Some(
+                            "Couldn't start recording. Please refresh and try again.",
+                        ));
+                        Timeout::new(6_000, move || {
+                            if let Ok(mut t) = err_toast.try_write() {
+                                t.take();
+                            }
+                        })
+                        .forget();
+                    }
+                }
+            }
+            RecordingToggle::Stop => js_recording_stop(),
+            RecordingToggle::Nothing => {}
+        }
+    });
+    let slot_controls = SlotControls {
+        toggle_peer_list,
+        toggle_raise_hand,
+        toggle_captions,
+        toggle_recording,
+        close_transient_popovers,
+        viewport_width,
+        peer_list_open,
+        diagnostics_open,
+        chat_open,
+        density_open,
+        density_mode,
+        density_highlight,
+        reactions_open,
+        reaction_highlight,
+        dock_menu_open,
+        mock_peers_open,
+        share_menu_open,
+        meeting_options_open,
+        meeting_timer_open,
+        device_settings_open,
+        device_settings_initial_section,
+        device_settings_generation,
+        recents_open,
+        recents_open_last,
+    };
+    let activate_bar_slot: Callback<ActionBarSlot> =
+        use_callback(move |slot| slot_controls.activate_slot(slot));
+    let open_recents: Callback<bool> =
+        use_callback(move |on_last| slot_controls.open_recents(on_last));
+    use_effect(move || {
+        if peer_list_open() {
+            settle_peer_list_focus(*peer_list_opener.peek());
+        }
+    });
+
     // --- Pre-join screen ---
     if !meeting_joined() {
         // Every device joins regardless of capabilities (issue #1054): the
@@ -9874,6 +10757,7 @@ pub fn AttendantsComponent(
                         PreJoinSettingsCard {
                             ownership: meeting_ownership,
                             is_host: is_owner,
+                            is_guest,
                             meeting_id: id.clone(),
                             owner_user_id: host_user_id.clone(),
                             co_host_refresh: host_event_seq,
@@ -9884,6 +10768,7 @@ pub fn AttendantsComponent(
                             allow_guests_toggle,
                             recording_allowed_for_all_toggle,
                             chat_allowed_for_all_toggle,
+                            announcement_overrides: announcement_overrides_editor,
                             saving,
                             toggle_error,
                             connection_error,
@@ -10106,50 +10991,51 @@ pub fn AttendantsComponent(
         }
     }
 
+    let shares_in_panel = share_placement.borrow_mut().place(
+        split_layout,
+        received_share
+            .as_ref()
+            .map(|t| t.key.as_str())
+            .zip(received_mode),
+        own_mode,
+    );
+    let (received_in_panel, own_in_panel) = shares_in_panel;
+    let demoted_in_panel = share_placement
+        .borrow_mut()
+        .place_demoted(split_layout, &demoted_sharers);
     // #1256 Phase 1: push the per-peer rendered-tile-size hints so the receiver can
     // LID the requested simulcast layer to the size actually painted. The decode
     // set is now fully settled (phases 1-4 above). Keyed over the VIEWPORT roster, not
     // the decode set: a peer the relay forwards but the budget is not decoding needs a
     // lid too, and an absent entry means Uncapped.
-    //
-    // Tile device-pixel height: in the grid layout every decoded tile is the same
-    // `compute_layout` cell (height = tile_w / TILE_AR), scaled by the device pixel
-    // ratio to compare against the layers' NATIVE device-pixel heights. In
-    // screen-share mode the participant panel tiles are not the same fixed grid
-    // thumbnail, so we apply NO lid (None -> Uncapped) and let the downlink chooser
-    // run unconstrained.
+    let split_panel = super::attendants_layout::split_panel(
+        vw - left_reserve_q - right_reserve_q,
+        vh,
+        ss_pads,
+        screen_share_ratio(),
+        ss_unified_tiles.len(),
+        share_view::panel_share_tiles(shares_in_panel, &demoted_in_panel),
+    );
     let dpr = window().device_pixel_ratio().max(1.0);
-    let tile_device_px_h: Option<u32> = if split_layout {
-        None
-    } else if tile_count == 1 {
-        // tile_count == 1 renders FULL-BLEED (.participants-1 .grid-item.full-bleed
-        // in style.css drops the 3:2 cap; the lone tile paints at the full cell
-        // height = avail_h). Use avail_h so the hint matches the PAINTED height — the
-        // 3:2-capped tw/TILE_AR under-estimates in portrait and would over-cap the
-        // full-screen 1-on-1 to a blurry low layer (#1256 P3).
-        Some((avail_h * dpr).round() as u32)
-    } else {
-        let (_c, _r, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
-        let th = tw / TILE_AR;
-        Some((th * dpr).round() as u32)
-    };
+    let tile_device_px_h = super::attendants_layout::decoded_tile_device_px_h(
+        split_layout,
+        split_panel,
+        tile_plan,
+        tile_count,
+        avail_h,
+        dpr,
+    );
 
     let peer_tile_hints: HashMap<u64, videocall_client::TileHint> = {
         let viewport_sessions: Vec<u64> = viewport_roster_ids
             .iter()
             .filter_map(|id| id.parse::<u64>().ok())
             .collect();
-        // `active_screen_sharer` is a SESSION_ID string (it comes from the
-        // session-id-keyed `screen_share_stack`).
-        let screen_session: Option<u64> = active_screen_sharer
-            .as_ref()
-            .and_then(|s| s.parse::<u64>().ok());
-        let uncapped = tile_hint_exemptions(screen_session, split_layout);
-        build_peer_tile_hints(
+        hinted_sessions.tile_hints(
             &viewport_sessions,
-            &active_decode_set,
-            &uncapped,
             tile_device_px_h,
+            &enlarged_view.painted_sessions(),
+            enlarged_tile_device_px_h(tile_plan, gap, dpr),
         )
     };
     {
@@ -10166,12 +11052,23 @@ pub fn AttendantsComponent(
         //
         let mut prev = previous_peer_tile_hints.borrow_mut();
         if *resizing_drawer.peek() == ResizingDrawer::None
+            && !*ss_resizing.peek()
             && *prev != peer_tile_hints
             && client.set_peer_tile_hints(peer_tile_hints.clone())
         {
             *prev = peer_tile_hints.clone();
         }
     }
+
+    let bar_empty = autoshrink_enabled()
+        && no_kept_button_on_screen(
+            &shrunk_buttons.read(),
+            &visible_action_bar_slots(
+                &action_bar_slots.read(),
+                slot_visibility(customize_mode(), split_layout),
+            ),
+            &overflowed_slots.read(),
+        );
 
     rsx! {
         div {
@@ -10183,10 +11080,7 @@ pub fn AttendantsComponent(
             style: format!(
                 "display:flex;gap:var(--space-2);\
                  --drawer-left-reserve:{left_reserve_q:.0}px;\
-                 --drawer-right-reserve:{right_reserve_q:.0}px;\
-                 --drawer-diag-reserve:{diag_reserve_q:.0}px;\
-                 --chat-drawer-width:{:.0}px",
-                reserves.chat_render_w
+                 --drawer-right-reserve:{right_reserve_q:.0}px"
             ),
             div { id: "main-container", class: "meeting-page",
                 onclick: move |evt: MouseEvent| {
@@ -10194,6 +11088,7 @@ pub fn AttendantsComponent(
                     density_open.set(false);
                     reactions_open.set(false);
                     mock_peers_open.set(false);
+                    share_menu_open.set(false);
                     overflow_menu_open.set(false);
                     // Background (video-grid) clicks also light-dismiss the open
                     // side panels — the peer list and diagnostics drawer (issue
@@ -10212,9 +11107,7 @@ pub fn AttendantsComponent(
                     }
                 },
                 onkeydown: move |evt: Event<KeyboardData>| {
-                    // Escape light-dismisses the topmost transient surface and
-                    // restores focus to its action-bar toggle (WAI-ARIA APG
-                    // disclosure pattern) so focus never drops to `<body>`. Popovers
+                    // Escape light-dismisses the topmost transient surface. Popovers
                     // (density, mock-peers) are more transient than the side panels,
                     // so Escape peels them FIRST (#1777); only when no popover is
                     // open does it close the topmost side panel — diagnostics, then
@@ -10228,16 +11121,31 @@ pub fn AttendantsComponent(
                     // out of issue-1790 scope.
                     let key = evt.key();
                     if key == Key::Escape {
-                        if overflow_menu_open() {
+                        if overflow_list_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            overflow_list_open.set(false);
+                            focus_element_by_id(crate::components::overflow_participants::BADGE_ID);
+                        } else if overflow_menu_open() {
                             evt.stop_propagation();
                             evt.prevent_default();
                             overflow_menu_open.set(false);
                             focus_element_by_id("overflow-menu-trigger");
+                        } else if recents_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            recents_open.set(false);
+                            focus_recents_return();
+                        } else if share_menu_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            share_menu_open.set(false);
+                            focus_element_by_id(crate::components::video_control_buttons::SCREEN_SHARE_TRIGGER_ID);
                         } else if density_open() {
                             evt.stop_propagation();
                             evt.prevent_default();
                             density_open.set(false);
-                            focus_element_by_id("density-mode-trigger");
+                            focus_slot_trigger("density-mode-trigger");
                         } else if reactions_open() {
                             // Issue 1884: the reactions palette is a density-tier
                             // popover, so Escape peels it before the side panels
@@ -10245,7 +11153,7 @@ pub fn AttendantsComponent(
                             evt.stop_propagation();
                             evt.prevent_default();
                             reactions_open.set(false);
-                            focus_element_by_id("reactions-trigger");
+                            focus_slot_trigger("reactions-trigger");
                         } else if mock_peers_open() {
                             evt.stop_propagation();
                             evt.prevent_default();
@@ -10276,8 +11184,15 @@ pub fn AttendantsComponent(
                                     dismiss_host_action_notice(HostActionKind::Camera, host_video_off_notice)
                                 }
                             }
-                            if let Some(id) = target.trigger_id() {
-                                focus_element_by_id(id);
+                            let opener = *peer_list_opener.peek();
+                            if target == EscCloseTarget::PeerList {
+                                if !focus_within("#peer-list-container") {
+                                    focus_element_by_id(opener.trigger_id());
+                                }
+                                settle_peer_list_focus(opener);
+                            } else if let Some(id) = target.trigger_id(opener.trigger_id()) {
+                                focus_slot_trigger(id);
+                                settle_slot_focus(id);
                             }
                         }
                     } else if density_open()
@@ -10298,34 +11213,18 @@ pub fn AttendantsComponent(
                 },
                 BrowserCompatibility {}
 
-                // Meeting-wide status bar (Google-Meet style). A general-purpose,
-                // in-flow horizontal strip anchored ABOVE the tile grid — it does
-                // not float over tiles. While mounted it reserves `pad_top` space
-                // (see `status_bar_reserve` above) so its contents never overlap
-                // tile chrome such as the per-tile `.floating-name` label. Today it
-                // hosts a single item — the meeting-wide recording status — but is
-                // structured so future meeting-level statuses can be appended as
-                // sibling `.meeting-status-item`s.
-                //
-                // Presence is driven by the `any_session_recording` aggregate over
-                // the session-keyed recording set: it appears on the first
-                // recorder's start, is unaffected by additional concurrent
-                // recorders starting/stopping, and the WHOLE bar unmounts (collapsing
-                // its reserved height back into the tile area) only when the LAST
-                // recorder stops or its session leaves. Deliberately does NOT carry
-                // the `.peer-toast` class: that class auto-fades via `toast-exit ...
-                // 7.5s forwards`, which would silently hide it after ~8s even while
-                // recording continues. It has an entrance animation only.
-                if any_recording_active() {
-                    div { class: "meeting-status-bar",
-                        div {
-                            class: "meeting-status-item meeting-status-item--recording",
-                            role: "status",
-                            aria_live: "polite",
-                            aria_label: "This meeting is being recorded",
-                            title: "This meeting is being recorded",
-                            span { class: "rec-dot" }
-                            span { class: "meeting-status-item-label", "Recording" }
+                if status_bar_mounted() {
+                    RecordingStatusBar {
+                        record_state,
+                        recording_peer_ids,
+                        save_target: recording_save_target,
+                        local_recording_key,
+                        captions_active: captions_shown(),
+                        if let Some(starter) = captions_notice() {
+                            CaptionsLiveIndicator { starter }
+                            if captions_visible {
+                                CaptionsLanguagePicker { captions: captions.clone() }
+                            }
                         }
                     }
                 }
@@ -10336,6 +11235,12 @@ pub fn AttendantsComponent(
                 // (#1296 blast radius, perf review). The signals are only PASSED
                 // here (a copy that does not subscribe); the child reads them.
                 ReactionsOverlay { active_reactions, reaction_announcement }
+
+                CaptionsLayer {
+                    meeting_id: id.clone(),
+                    captions: captions.clone(),
+                    lane_hidden: captions_lane_hidden,
+                }
 
                 // "participant joined/left" toast notifications
                 div { class: "peer-toasts",
@@ -10361,45 +11266,8 @@ pub fn AttendantsComponent(
                             }
                         }
                     }
-                    // Local recording status banner — visible only to the participant who started recording.
-                    {
-                        let label = match record_state() {
-                            RecordButtonState::Activating => Some("Starting recording…"),
-                            RecordButtonState::Recording => Some("Recording"),
-                            RecordButtonState::Stopping => Some("Stopping recording…"),
-                            RecordButtonState::Saving => Some("Saving recording…"),
-                            RecordButtonState::Idle => None,
-                        };
-                        if let Some(msg) = label {
-                            rsx! {
-                                div {
-                                    class: "peer-toast recording-status-banner",
-                                    role: "status",
-                                    aria_live: "polite",
-                                    aria_label: "{msg}",
-                                    span { class: "rec-dot" }
-                                    span { class: "toast-text",
-                                        span { class: "toast-name", "{msg}" }
-                                    }
-                                }
-                            }
-                        } else {
-                            rsx! {}
-                        }
-                    }
-                    // Recording-saved notification — shown briefly to the recorder when recording completes.
-                    if recording_saved_toast() {
-                        div {
-                            class: "peer-toast recording-saved-banner",
-                            role: "status",
-                            aria_live: "polite",
-                            aria_label: "Recording saved",
-                            span { class: "rec-dot" }
-                            span { class: "toast-text",
-                                span { class: "toast-name", "Recording saved" }
-                            }
-                        }
-                    }
+                    RecordingStartingToast { record_state }
+                    RecordingSavedToast { notice: recording_saved_toast }
                     if let Some(message) = recording_error_toast() {
                         div {
                             class: "peer-toast recording-error-banner",
@@ -10469,6 +11337,54 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             },
+                            Some(ScreenShareToastState::Replaced(text)) => rsx! {
+                                div {
+                                    class: "peer-toast toast-success screen-share-toast",
+                                    aria_hidden: "true",
+                                    "data-testid": "screen-share-replaced-toast",
+                                    span { class: "toast-icon",
+                                        svg {
+                                            width: "16",
+                                            height: "16",
+                                            view_box: "0 0 24 24",
+                                            fill: "none",
+                                            stroke: "currentColor",
+                                            stroke_width: "2",
+                                            stroke_linecap: "round",
+                                            stroke_linejoin: "round",
+                                            polyline { points: "20 6 9 17 4 12" }
+                                        }
+                                    }
+                                    span { class: "toast-text",
+                                        span { class: "toast-name", "{text}" }
+                                    }
+                                }
+                            },
+                            Some(ScreenShareToastState::ReplaceAbandoned) => rsx! {
+                                div {
+                                    class: "peer-toast screen-share-toast",
+                                    role: "status",
+                                    aria_live: "polite",
+                                    "data-testid": "screen-share-replace-abandoned-toast",
+                                    span { class: "toast-text",
+                                        span { class: "toast-name",
+                                            "Your share ended before the new content was picked."
+                                        }
+                                    }
+                                }
+                            },
+                            Some(ScreenShareToastState::ReplaceFailed) => rsx! {
+                                div {
+                                    class: "peer-toast toast-error screen-share-toast",
+                                    role: "alert",
+                                    "data-testid": "screen-share-replace-failed-toast",
+                                    span { class: "toast-text",
+                                        span { class: "toast-name",
+                                            "Couldn't switch shared content. You're still sharing the previous content."
+                                        }
+                                    }
+                                }
+                            },
                             Some(ScreenShareToastState::Failed(msg)) => rsx! {
                                 div {
                                     class: "peer-toast toast-error screen-share-toast",
@@ -10508,8 +11424,13 @@ pub fn AttendantsComponent(
                             None => rsx! {},
                         }
                     }
-                    HostChangeNotice { toast: host_change_toast }
-                    TransportFallbackNotice { toast: transport_fallback.toast }
+                    HostChangeNotice {
+                        toast: host_change_toast,
+                        owner_user_id: host_user_id.clone(),
+                        local_user_id: local_user_id.clone(),
+                    }
+                    crate::components::canvas_generator::ShareWindowToast {}
+                    ConnectionStatusCard { status: connection_status }
                     CoHostNoticeLayer { notice: co_host_notice }
                     for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                         {
@@ -10709,8 +11630,7 @@ pub fn AttendantsComponent(
                     // Meeting-level decode-budget banner (#1142 Phase 1). It owns
                     // its own anti-flap damper, so it is mounted UNCONDITIONALLY —
                     // it self-gates on `pressured`/`avatar_count` and the sustain /
-                    // dwell / back-off policy. `natural` is the uncapped layout
-                    // tile count (`total_tiles`); "Show all videos" sets the
+                    // dwell / back-off policy. "Show all videos" sets the
                     // override to `All`, which `effective_cap` resolves against
                     // the live natural count on the next render. Reading
                     // `decode_budget_pressured()` reactively keeps the props live.
@@ -10781,6 +11701,7 @@ pub fn AttendantsComponent(
                             mode,
                             cta: share_slots_now.received.cta,
                             guard: false,
+                            demoted: false,
                         });
                         let own_view = own_share.clone().zip(own_mode).map(|(target, mode)| ShareTileView {
                             pin_rank: share_rank(&target),
@@ -10788,12 +11709,11 @@ pub fn AttendantsComponent(
                             mode,
                             cta: share_slots_now.own.cta,
                             guard: share_slots_now.own.guard,
+                            demoted: false,
                         });
-                        let (received_in_panel, own_in_panel) = share_placement.borrow_mut().place(
-                            split_layout,
-                            received_share.as_ref().map(|t| t.key.as_str()).zip(received_mode),
-                            own_mode,
-                        );
+                        let demoted_views = |in_panel: bool| {
+                            share_view::demoted_views(&demoted_shares, &demoted_in_panel, in_panel)
+                        };
                         let tile_full_bleed = |tile_id: &str| {
                             !split_layout
                                 && !tile_id.starts_with("mock-")
@@ -10832,6 +11752,21 @@ pub fn AttendantsComponent(
                                 if let Some(view) = own_view.clone().filter(|_| !own_in_panel) {
                                     OwnShareTile { key: "ss-own-{OWN_SHARE_KEY}", view }
                                 }
+                                for view in demoted_views(false) {
+                                    PeerTile {
+                                        key: "ss-demoted-{view.target.key}",
+                                        peer_id: view.target.key.clone(),
+                                        full_bleed: true,
+                                        host_user_id: host_user_id.clone(),
+                                        render_mode: TileMode::ScreenOnly,
+                                        my_session_id: my_session_id.clone(),
+                                        pin_rank: None,
+                                        meter_mode: SignalMeterMode::ScreenOnly,
+                                        on_toggle_pin: toggle_pin,
+                                        on_request_decode: noop_request_decode,
+                                        share_view: Some(view),
+                                    }
+                                }
                             }
                             div {
                                 class: "{handle_class}",
@@ -10861,9 +11796,26 @@ pub fn AttendantsComponent(
                                 if let Some(view) = own_view.filter(|_| own_in_panel) {
                                     OwnShareTile { key: "ss-own-{OWN_SHARE_KEY}", view }
                                 }
+                                for view in demoted_views(true) {
+                                    PeerTile {
+                                        key: "ss-demoted-{view.target.key}",
+                                        peer_id: view.target.key.clone(),
+                                        full_bleed: true,
+                                        host_user_id: host_user_id.clone(),
+                                        render_mode: TileMode::ScreenOnly,
+                                        my_session_id: my_session_id.clone(),
+                                        pin_rank: None,
+                                        meter_mode: SignalMeterMode::ScreenOnly,
+                                        on_toggle_pin: toggle_pin,
+                                        on_request_decode: noop_request_decode,
+                                        share_view: Some(view),
+                                    }
+                                }
                                 {camera_tiles(CameraTiles {
                                     tiles: panel_tiles,
                                     pin_rank: &pin_rank_by_session,
+                                    enlarged: &enlarged_view,
+                                    on_toggle_enlarge: toggle_enlarge,
                                     full_bleed: &tile_full_bleed,
                                     host_user_id: &host_user_id,
                                     render_mode: &peer_mode,
@@ -10876,7 +11828,11 @@ pub fn AttendantsComponent(
                                     mock_on_request_decode: noop_request_decode,
                                 })}
                                 if !split_layout && overflow_count > 0 {
-                                    GridOverflowBadge { overflow_count }
+                                    GridOverflowBadge {
+                                        overflow_count: overflow_hidden.len(),
+                                        open: overflow_list_open,
+                                        on_open: close_transient_popovers,
+                                    }
                                 }
                                 // Invitation overlay when no peers (issue #1465): gated on
                                 // there being no peers at all, camera-on or camera-off.
@@ -10966,26 +11922,15 @@ pub fn AttendantsComponent(
                                 if customize_mode() {
                                     div { class: "customize-backdrop" }
                                 }
-                                // Enter-customize announcement.  Region is ALWAYS
-                                // mounted; only its text content toggles.  Some
-                                // older AT (JAWS, some NVDA versions) do not fire
-                                // a polite announcement when a live region enters
-                                // the DOM already containing text — they only
-                                // announce on subsequent text mutations.  Keeping
-                                // the region mounted with empty text on load and
-                                // filling it on customize-enter (empty → text) is
-                                // the mutation shape those readers reliably pick
-                                // up.  Cleared back to empty on exit so the
-                                // instructions are not re-announced next time.
                                 div {
                                     class: "visually-hidden",
                                     role: "status",
                                     "aria-live": "polite",
                                     {
                                         if customize_mode() {
-                                            "Customizing action bar. Tab to a button and press arrow keys to move its slot within the bar, or drag with the pointer. Press the minus button to hide a slot, then press Done to finish."
+                                            customize_entry_announcement(customize_entry())
                                         } else {
-                                            ""
+                                            customize_exit_announce()
                                         }
                                     }
                                 }
@@ -11066,11 +12011,46 @@ pub fn AttendantsComponent(
                                 nav {
                                     class: {
                                         let pos = dock_position().css_class();
-                                        let hidden = if controls_visible() { "" } else { " controls-hidden" };
-                                        let expanded = if controls_expanded() || customize_mode() { " controls-expanded" } else { "" };
+                                        let pinned = bar_pinned;
+                                        let hidden = if controls_visible() || pinned || customize_mode() { "" } else { " controls-hidden" };
+                                        let expanded = if bar_expanded { " controls-expanded" } else { "" };
+                                        let shrink = if autoshrink_enabled() { " auto-shrink" } else { "" };
+                                        let empty = if bar_empty { " shrink-empty" } else { "" };
                                         let cust = if customize_mode() { " customize-mode" } else { "" };
                                         let drag_cls = if customize_mode() && dragging_slot().is_some() && drag_started() { " drag-active" } else { "" };
-                                        format!("video-controls-container {pos}{hidden}{expanded}{cust}{drag_cls}")
+                                        format!("video-controls-container {pos}{hidden}{expanded}{shrink}{empty}{cust}{drag_cls}")
+                                    },
+                                    onpointerenter: {
+                                        let hover = bar_hover.clone();
+                                        move |evt: PointerEvent| hover.enter(&evt.pointer_type())
+                                    },
+                                    onpointerleave: {
+                                        let hover = bar_hover.clone();
+                                        move |evt: PointerEvent| hover.leave(&evt.pointer_type())
+                                    },
+                                    oncontextmenu: {
+                                        let gesture = gesture.clone();
+                                        move |evt: MouseEvent| {
+                                            if customize_mode() || gesture.has_pending() {
+                                                evt.prevent_default();
+                                            }
+                                        }
+                                    },
+                                    onfocusin: {
+                                        let gesture = gesture.clone();
+                                        move |evt: FocusEvent| {
+                                            if !customize_mode() { return; }
+                                            gesture.note_activity();
+                                            if !gesture.idle_is_timed() || gesture.pointer_held_in_bar() { return; }
+                                            let focus_visible = evt
+                                                .as_web_event()
+                                                .target()
+                                                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                                                .is_some_and(|el| el.matches(":focus-visible").unwrap_or(false));
+                                            if focus_visible {
+                                                gesture.stop_idle_clock();
+                                            }
+                                        }
                                     },
                                     // Keyboard reorder (WCAG 2.1.1): with focus on any
                                     // customize-mode slot button, Arrow keys / Home / End move
@@ -11094,147 +12074,189 @@ pub fn AttendantsComponent(
                                     //   and a held key still scrolls nothing.
                                     // - Target inside the remove button → skip. Arrow keys
                                     //   there mean "I'm about to click Remove", not "reorder".
-                                    onkeydown: move |evt: Event<KeyboardData>| {
-                                        if !customize_mode() { return; }
-                                        // Escape exits customize mode entirely (the standard
-                                        // modal-ish idiom). Handled BEFORE the modifier check
-                                        // so a user pressing plain Escape isn't gated by an
-                                        // accidentally-held modifier, and BEFORE the arrow
-                                        // match so it's an unambiguous exit path. Save +
-                                        // restore focus to the dock-menu trigger, exactly
-                                        // like the Done button's onclick above.
-                                        if evt.key() == Key::Escape {
-                                            evt.stop_propagation();
+                                    onkeydown: {
+                                        let gesture = gesture.clone();
+                                        move |evt: Event<KeyboardData>| {
+                                            if !customize_mode() { return; }
+                                            gesture.stop_idle_clock();
+                                            // Escape exits customize mode entirely (the standard
+                                            // modal-ish idiom). Handled BEFORE the modifier check
+                                            // so a user pressing plain Escape isn't gated by an
+                                            // accidentally-held modifier, and BEFORE the arrow
+                                            // match so it's an unambiguous exit path. Save +
+                                            // restore focus to the dock-menu trigger, exactly
+                                            // like the Done button's onclick above.
+                                            if evt.key() == Key::Escape {
+                                                evt.stop_propagation();
+                                                evt.prevent_default();
+                                                customize_ctl.exit(CustomizeExit::Escape);
+                                                return;
+                                            }
+                                            // Any modifier held → treat as a browser shortcut
+                                            // (Cmd/Ctrl+Arrow = Home/End on macOS, Alt+Arrow =
+                                            // history nav, Shift+Arrow = text selection).
+                                            let m = evt.modifiers();
+                                            if m.contains(Modifiers::CONTROL)
+                                                || m.contains(Modifiers::META)
+                                                || m.contains(Modifiers::ALT)
+                                                || m.contains(Modifiers::SHIFT)
+                                            {
+                                                return;
+                                            }
+                                            // Enum match (matches the codebase convention and
+                                            // avoids Key::to_string() edge cases across browsers).
+                                            let (delta, absolute): (Option<i32>, Option<i32>) = match evt.key() {
+                                                Key::ArrowLeft | Key::ArrowUp => (Some(-1), None),
+                                                Key::ArrowRight | Key::ArrowDown => (Some(1), None),
+                                                Key::Home => (None, Some(0)),
+                                                Key::End => (None, Some(i32::MAX)),
+                                                _ => return,
+                                            };
+                                            let ke: web_sys::KeyboardEvent = evt.as_web_event().unchecked_into();
+                                            let Some(target) = ke.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return; };
+                                            // If focus is on the − remove button inside a slot,
+                                            // arrow keys must not reorder that slot; the user is on
+                                            // that button to click Remove.
+                                            if let Ok(Some(_)) = target.closest(".action-bar-remove-btn") {
+                                                return;
+                                            }
+                                            let Ok(Some(wrapper)) = target.closest(".action-bar-slot-wrapper[data-slot]") else { return; };
+                                            let slug = wrapper.get_attribute("data-slot").unwrap_or_default();
+                                            let Some(slot) = ActionBarSlot::from_slug(&slug) else { return; };
+                                            // Always suppress the browser's default (page scroll on
+                                            // arrows, Home/End jump) so a focused slot in customize
+                                            // mode never scrolls the meeting view. "Always" means
+                                            // every key event this handler claims — including a
+                                            // no-op key (slot already at the edge) and including
+                                            // every OS auto-repeat of a HELD key.
                                             evt.prevent_default();
-                                            customize_mode.set(false);
+                                            // issue 1765: the auto-repeat guard sits BELOW
+                                            // `prevent_default()` on purpose. It used to sit above,
+                                            // which made the comment just above it a lie: each repeat
+                                            // returned before the default was suppressed, so holding
+                                            // an arrow scrolled the meeting view behind the customize
+                                            // backdrop. Suppressing first and skipping second gives a
+                                            // held key both properties it needs — non-scrolling AND
+                                            // single-step (one press moves a slot exactly one
+                                            // position, never fast-forwarding it across the bar).
+                                            if ke.repeat() { return; }
+                                            let ios_device = is_ios();
+                                            let current_full = action_bar_slots.read().clone();
+                                            let mut visible_slots = visible_action_bar_slots(
+                                                &current_full,
+                                                SlotVisibility {
+                                                    customize_mode: customize_mode(),
+                                                    ios_device,
+                                                    split_layout,
+                                                    meeting_options_visible,
+                                                    recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                    meeting_timer_visible,
+                                                    captions_visible,
+                                                },
+                                            );
+                                            let Some(result) = apply_keyboard_reorder(&mut visible_slots, slot, delta, absolute) else { return; };
+                                            let len = visible_slots.len();
+                                            if result.new_idx == result.old_idx {
+                                                // Nonce bump before every write, including
+                                                // this one — bumping a slot against the same
+                                                // end twice produces the SAME message, which
+                                                // would otherwise be silent on the repeat.
+                                                action_bar_announce_nonce += 1;
+                                                action_bar_announce.set(format!(
+                                                    "{} is already at position {} of {}.",
+                                                    slot.display_name(),
+                                                    result.old_idx + 1,
+                                                    len,
+                                                ));
+                                                return;
+                                            }
+                                            let next = merge_visible_action_bar_slots(
+                                                &current_full,
+                                                &visible_slots,
+                                                SlotVisibility {
+                                                    customize_mode: customize_mode(),
+                                                    ios_device,
+                                                    split_layout,
+                                                    meeting_options_visible,
+                                                    recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                    meeting_timer_visible,
+                                                    captions_visible,
+                                                },
+                                            );
+                                            action_bar_slots.set(next);
                                             save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                            Timeout::new(0, || {
-                                                focus_element_by_id("dock-menu-trigger");
-                                            })
-                                            .forget();
-                                            return;
-                                        }
-                                        // Any modifier held → treat as a browser shortcut
-                                        // (Cmd/Ctrl+Arrow = Home/End on macOS, Alt+Arrow =
-                                        // history nav, Shift+Arrow = text selection).
-                                        let m = evt.modifiers();
-                                        if m.contains(Modifiers::CONTROL)
-                                            || m.contains(Modifiers::META)
-                                            || m.contains(Modifiers::ALT)
-                                            || m.contains(Modifiers::SHIFT)
-                                        {
-                                            return;
-                                        }
-                                        // Enum match (matches the codebase convention and
-                                        // avoids Key::to_string() edge cases across browsers).
-                                        let (delta, absolute): (Option<i32>, Option<i32>) = match evt.key() {
-                                            Key::ArrowLeft | Key::ArrowUp => (Some(-1), None),
-                                            Key::ArrowRight | Key::ArrowDown => (Some(1), None),
-                                            Key::Home => (None, Some(0)),
-                                            Key::End => (None, Some(i32::MAX)),
-                                            _ => return,
-                                        };
-                                        let ke: web_sys::KeyboardEvent = evt.as_web_event().unchecked_into();
-                                        let Some(target) = ke.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return; };
-                                        // If focus is on the − remove button inside a slot,
-                                        // arrow keys must not reorder that slot; the user is on
-                                        // that button to click Remove.
-                                        if let Ok(Some(_)) = target.closest(".action-bar-remove-btn") {
-                                            return;
-                                        }
-                                        let Ok(Some(wrapper)) = target.closest(".action-bar-slot-wrapper[data-slot]") else { return; };
-                                        let slug = wrapper.get_attribute("data-slot").unwrap_or_default();
-                                        let Some(slot) = ActionBarSlot::from_slug(&slug) else { return; };
-                                        // Always suppress the browser's default (page scroll on
-                                        // arrows, Home/End jump) so a focused slot in customize
-                                        // mode never scrolls the meeting view. "Always" means
-                                        // every key event this handler claims — including a
-                                        // no-op key (slot already at the edge) and including
-                                        // every OS auto-repeat of a HELD key.
-                                        evt.prevent_default();
-                                        // issue 1765: the auto-repeat guard sits BELOW
-                                        // `prevent_default()` on purpose. It used to sit above,
-                                        // which made the comment just above it a lie: each repeat
-                                        // returned before the default was suppressed, so holding
-                                        // an arrow scrolled the meeting view behind the customize
-                                        // backdrop. Suppressing first and skipping second gives a
-                                        // held key both properties it needs — non-scrolling AND
-                                        // single-step (one press moves a slot exactly one
-                                        // position, never fast-forwarding it across the bar).
-                                        if ke.repeat() { return; }
-                                        let ios_device = is_ios();
-                                        let current_full = action_bar_slots.read().clone();
-                                        let mut visible_slots = visible_action_bar_slots(
-                                            &current_full,
-                                            SlotVisibility {
-                                                customize_mode: customize_mode(),
-                                                ios_device,
-                                                split_layout,
-                                                meeting_options_visible,
-                                                recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
-                                                meeting_timer_visible,
-                                            },
-                                        );
-                                        let Some(result) = apply_keyboard_reorder(&mut visible_slots, slot, delta, absolute) else { return; };
-                                        let len = visible_slots.len();
-                                        if result.new_idx == result.old_idx {
-                                            // Nonce bump before every write, including
-                                            // this one — bumping a slot against the same
-                                            // end twice produces the SAME message, which
-                                            // would otherwise be silent on the repeat.
                                             action_bar_announce_nonce += 1;
                                             action_bar_announce.set(format!(
-                                                "{} is already at position {} of {}.",
+                                                "{} moved to position {} of {}.",
                                                 slot.display_name(),
-                                                result.old_idx + 1,
+                                                result.new_idx + 1,
                                                 len,
                                             ));
-                                            return;
+                                            // Preserve keyboard continuity after reorder: keep
+                                            // focus on the moved slot's primary button so Tab
+                                            // continues from the user's current position.
+                                            let moved_selector = format!(
+                                                ".video-controls-container .action-bar-slot-wrapper[data-slot=\"{}\"] > button.video-control-button",
+                                                slot.slug()
+                                            );
+                                            Timeout::new(0, move || {
+                                                focus_by_selector(&moved_selector);
+                                            })
+                                            .forget();
                                         }
-                                        let next = merge_visible_action_bar_slots(
-                                            &current_full,
-                                            &visible_slots,
-                                            SlotVisibility {
-                                                customize_mode: customize_mode(),
-                                                ios_device,
-                                                split_layout,
-                                                meeting_options_visible,
-                                                recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
-                                                meeting_timer_visible,
-                                            },
-                                        );
-                                        action_bar_slots.set(next);
-                                        save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                        action_bar_announce_nonce += 1;
-                                        action_bar_announce.set(format!(
-                                            "{} moved to position {} of {}.",
-                                            slot.display_name(),
-                                            result.new_idx + 1,
-                                            len,
-                                        ));
-                                        // Preserve keyboard continuity after reorder: keep
-                                        // focus on the moved slot's primary button so Tab
-                                        // continues from the user's current position.
-                                        let moved_selector = format!(
-                                            ".video-controls-container .action-bar-slot-wrapper[data-slot=\"{}\"] > button.video-control-button",
-                                            slot.slug()
-                                        );
-                                        Timeout::new(0, move || {
-                                            focus_by_selector(&moved_selector);
-                                        })
-                                        .forget();
                                     },
                                     onpointermove: {
                                         let drag_slot_size = drag_slot_size.clone();
                                         let drag_start_x = drag_start_x.clone();
                                         let drag_start_y = drag_start_y.clone();
+                                        let gesture = gesture.clone();
+                                        let drag_handles = drag_handles.clone();
                                         move |evt: PointerEvent| {
-                                            if !customize_mode() || dragging_slot().is_none() { return; }
+                                            let editing = customize_mode();
+                                            if !editing && !gesture.has_pending() { return; }
                                             let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
                                             let cx = pe.client_x() as f64;
                                             let cy = pe.client_y() as f64;
-                                            drag_pointer_x.set(cx);
-                                            drag_pointer_y.set(cy);
+                                            if !editing {
+                                                gesture.track_hold_move(pe.pointer_id(), (cx, cy));
+                                                return;
+                                            }
+                                            gesture.note_activity();
+                                            if dragging_slot().is_none() && pe.buttons() & 1 != 0 {
+                                                if let Some(cont) = gesture.take_continuation(pe.pointer_id()) {
+                                                    let current_full = action_bar_slots.read().clone();
+                                                    let src_idx = visible_action_bar_slots(
+                                                        &current_full,
+                                                        SlotVisibility {
+                                                            customize_mode: true,
+                                                            ios_device: is_ios(),
+                                                            split_layout,
+                                                            meeting_options_visible,
+                                                            recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                            meeting_timer_visible,
+                                                            captions_visible,
+                                                        },
+                                                    )
+                                                    .iter()
+                                                    .position(|s| *s == cont.slot)
+                                                    .unwrap_or(0);
+                                                    begin_slot_drag(
+                                                        &drag_handles,
+                                                        SlotDragStart {
+                                                            slot: cont.slot,
+                                                            src_idx,
+                                                            pointer_id: pe.pointer_id(),
+                                                            x: cont.origin.0,
+                                                            y: cont.origin.1,
+                                                            grab_at: (cx, cy),
+                                                            is_vertical: dock_position() != DockPosition::Bottom,
+                                                        },
+                                                        current_full,
+                                                        Some(cont.wrapper),
+                                                    );
+                                                }
+                                            }
+                                            if dragging_slot().is_none() { return; }
                                             // Nav rect was captured at pointerdown; the nav doesn't
                                             // move during drag, so don't pay the layout cost of
                                             // closest(..) + getBoundingClientRect() on every move.
@@ -11244,6 +12266,8 @@ pub fn AttendantsComponent(
                                                 if dx + dy < 5.0 { return; }
                                                 drag_started.set(true);
                                             }
+                                            drag_pointer_x.set(cx);
+                                            drag_pointer_y.set(cy);
                                             let slot_size = drag_slot_size.get();
                                             if slot_size <= 0.0 { return; }
                                             let is_vertical = dock_position() != DockPosition::Bottom;
@@ -11261,6 +12285,7 @@ pub fn AttendantsComponent(
                                                     meeting_options_visible,
                                                     recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                                     meeting_timer_visible,
+                                                    captions_visible,
                                                 },
                                             );
                                             let orig_idx = orig_visible.iter().position(|s| *s == dragged).unwrap_or(0);
@@ -11282,6 +12307,7 @@ pub fn AttendantsComponent(
                                                         meeting_options_visible,
                                                         recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                                         meeting_timer_visible,
+                                                        captions_visible,
                                                     },
                                                 );
                                                 if let Some(cur) = next_visible.iter().position(|s| *s == dragged) {
@@ -11297,6 +12323,7 @@ pub fn AttendantsComponent(
                                                             meeting_options_visible,
                                                             recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                                             meeting_timer_visible,
+                                                            captions_visible,
                                                         },
                                                     );
                                                     action_bar_slots.set(next_full);
@@ -11372,8 +12399,17 @@ pub fn AttendantsComponent(
                                         let drag_pointer_id = drag_pointer_id.clone();
                                         let drag_start_x = drag_start_x.clone();
                                         let drag_start_y = drag_start_y.clone();
-                                        move |_evt: PointerEvent| {
-                                            if dragging_slot().is_some() {
+                                        let gesture = gesture.clone();
+                                        move |evt: PointerEvent| {
+                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
+                                            if gesture.pending_pointer() == Some(pe.pointer_id()) {
+                                                gesture.cancel_hold();
+                                            }
+                                            let on_nav = pe
+                                                .target()
+                                                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                                                .is_some_and(|el| el.class_list().contains("video-controls-container"));
+                                            if on_nav && dragging_slot().is_some() {
                                                 action_bar_slots.set(drag_orig_layout());
                                                 save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
                                                 dragging_slot.set(None);
@@ -11392,6 +12428,28 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     },
+                                    if autoshrink_enabled() && !customize_mode() {
+                                        button {
+                                            class: "action-bar-expand-handle",
+                                            r#type: "button",
+                                            tabindex: "-1",
+                                            "aria-label": "Show all action bar buttons",
+                                            "aria-expanded": if touch_latch() { "true" } else { "false" },
+                                            "data-testid": "action-bar-expand-handle",
+                                            onclick: {
+                                                let hover = bar_hover.clone();
+                                                move |evt: MouseEvent| {
+                                                    let pointer = click_pointer_type(&evt.as_web_event());
+                                                    if !handle_click_toggles_latch(pointer.as_deref()) {
+                                                        hover.open_now();
+                                                        return;
+                                                    }
+                                                    let next = !touch_latch();
+                                                    touch_latch.set(next);
+                                                }
+                                            },
+                                        }
+                                    }
                                     // Customizable slots: render only the visible subset so every
                                     // emitted sibling is keyed (no keyed+keyless fragment mix).
                                     for slot in visible_action_bar_slots(
@@ -11403,6 +12461,7 @@ pub fn AttendantsComponent(
                                             meeting_options_visible,
                                             recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                             meeting_timer_visible,
+                                            captions_visible,
                                         },
                                     ) {
                                         {
@@ -11445,63 +12504,91 @@ pub fn AttendantsComponent(
                                                 if overflow_hidden {
                                                     wrapper_class.push_str(" is-overflow-hidden");
                                                 }
-                                                let drag_slot_size_c = drag_slot_size.clone();
-                                                let drag_pointer_id_c = drag_pointer_id.clone();
-                                                let drag_grab_dx_c = drag_grab_dx.clone();
-                                                let drag_grab_dy_c = drag_grab_dy.clone();
-                                                let drag_start_x_c = drag_start_x.clone();
-                                                let drag_start_y_c = drag_start_y.clone();
-                                                let drag_nav_left_c = drag_nav_left.clone();
-                                                let drag_nav_top_c = drag_nav_top.clone();
+                                                if !stays_on_shrunk_bar(&shrunk_buttons.read(), slot) {
+                                                    wrapper_class.push_str(" slot-shrinkable");
+                                                }
+                                                if slot == ActionBarSlot::ScreenShare && share_menu_open() {
+                                                    wrapper_class.push_str(" menu-open");
+                                                }
+                                                let drag_handles_c = drag_handles.clone();
+                                                let gesture_down = gesture.clone();
+                                                let gesture_leave = gesture.clone();
                                                 rsx! {
                                                     div {
                                                         key: "{slug}",
                                                         "data-slot": slug,
+                                                        "data-recent-action": crate::components::recent_actions::slot_attr(slot),
                                                         class: "{wrapper_class}",
+                                                        onpointerleave: move |_| {
+                                                            if gesture_leave.pending_slot() == Some(slot) {
+                                                                gesture_leave.cancel_hold();
+                                                            }
+                                                        },
                                                         onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
                                                             let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
                                                             let cx = pe.client_x() as f64;
                                                             let cy = pe.client_y() as f64;
-                                                            drag_start_x_c.set(cx);
-                                                            drag_start_y_c.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_c.set(pe.pointer_id());
+                                                            let target = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+                                                            let editing = customize_mode();
+                                                            if !editing {
+                                                                let slot_wrapper = target
+                                                                    .as_ref()
+                                                                    .and_then(|t| t.closest("button.video-control-button").ok().flatten())
+                                                                    .and_then(|b| b.parent_element())
+                                                                    .filter(|w| w.get_attribute("data-slot").as_deref() == Some(slug));
+                                                                let press = HoldPress {
+                                                                    is_primary: pe.is_primary(),
+                                                                    button: pe.button(),
+                                                                    ctrl_key: pe.ctrl_key(),
+                                                                    on_slot_primary_button: slot_wrapper.is_some(),
+                                                                    slot_menu_open: slot == ActionBarSlot::ScreenShare && share_menu_open(),
+                                                                };
+                                                                if let (true, Some(wrapper)) = (hold_should_arm(!dock_wrapper_hidden(), press), slot_wrapper) {
+                                                                    arm_action_bar_hold(
+                                                                        &gesture_down,
+                                                                        PendingHold {
+                                                                            slot,
+                                                                            pointer_id: pe.pointer_id(),
+                                                                            down: (cx, cy),
+                                                                            last: (cx, cy),
+                                                                            touch: pe.pointer_type() == "touch",
+                                                                            wrapper,
+                                                                        },
+                                                                        hold_context,
+                                                                    );
+                                                                }
+                                                                return;
+                                                            }
                                                             let current_full = action_bar_slots.read().clone();
-                                                            drag_orig_layout.set(current_full.clone());
-                                                            let src_visible = visible_action_bar_slots(
+                                                            let src_idx = visible_action_bar_slots(
                                                                 &current_full,
                                                                 SlotVisibility {
-                                                                    customize_mode: customize_mode(),
+                                                                    customize_mode: editing,
                                                                     ios_device: is_ios(),
                                                                     split_layout,
                                                                     meeting_options_visible,
                                                                     recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                                                     meeting_timer_visible,
+                                                                    captions_visible,
                                                                 },
+                                                            )
+                                                            .iter()
+                                                            .position(|s| *s == slot)
+                                                            .unwrap_or(0);
+                                                            begin_slot_drag(
+                                                                &drag_handles_c,
+                                                                SlotDragStart {
+                                                                    slot,
+                                                                    src_idx,
+                                                                    pointer_id: pe.pointer_id(),
+                                                                    x: cx,
+                                                                    y: cy,
+                                                                    grab_at: (cx, cy),
+                                                                    is_vertical: dock_position() != DockPosition::Bottom,
+                                                                },
+                                                                current_full,
+                                                                target.and_then(|t| t.closest(".action-bar-slot-wrapper").ok().flatten()),
                                                             );
-                                                            let src_idx = src_visible.iter().position(|s| *s == slot).unwrap_or(0);
-                                                            dragging_slot.set(Some(slot));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_c.set(cx - rect.left());
-                                                                    drag_grab_dy_c.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_c.set(nrect.left());
-                                                                        drag_nav_top_c.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_c.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
                                                         },
                                                         // Slot-specific inner content
                                                         match slot {
@@ -11579,110 +12666,36 @@ pub fn AttendantsComponent(
                                                                 }
                                                             }
                                                             ActionBarSlot::ScreenShare => {
-                                                                let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                                let is_disabled = matches!(
-                                                                    screen_share_state(),
-                                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
-                                                                );
-                                                                let stream_cell = pre_acquired_screen_stream.clone();
+                                                                let surface = share_menu_open()
+                                                                    .then(|| own_share_stream.read().as_ref().and_then(share_view::display_surface))
+                                                                    .flatten();
                                                                 rsx! {
-                                                                    ScreenShareButton {
-                                                                        active: is_active,
-                                                                        disabled: is_disabled,
+                                                                    crate::components::video_control_buttons::ScreenShareControl {
+                                                                        state: crate::components::share_actions::share_button_state(&screen_share_state(), (share_actions.replacing)()),
+                                                                        heading: crate::components::video_control_buttons::share_menu_heading(surface.as_deref()),
+                                                                        open: share_menu_open,
+                                                                        locked: customize_mode() || overflow_hidden,
+                                                                        live_lock: customize_mode,
                                                                         describedby: slot_describedby,
-                                                                        onclick: move |_| {
+                                                                        on_start: move |_| {
                                                                             if customize_mode() { return; }
-                                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                                                let navigator = gloo_utils::window().navigator();
-                                                                                let media_devices = match navigator.media_devices() {
-                                                                                    Ok(md) => md,
-                                                                                    Err(e) => {
-                                                                                        log::error!("Failed to get media devices: {e:?}");
-                                                                                        return;
-                                                                                    }
-                                                                                };
-
-                                                                                // issue 1973: request the shared capture resolution ceiling
-                                                                                // (max 1920x1080) so a native 4K / ultra-wide source is bounded at
-                                                                                // capture time. This is the PRIMARY capture path (Safari needs
-                                                                                // getDisplayMedia in the sync gesture handler; Chrome/Firefox reuse
-                                                                                // the pre-acquired stream too), so the ceiling MUST be applied here,
-                                                                                // not only in ScreenEncoder::start().
-                                                                                let constraints =
-                                                                                    videocall_client::screen_capture_display_constraints(true);
-
-                                                                                let promise = match media_devices
-                                                                                    .get_display_media_with_constraints(&constraints)
-                                                                                {
-                                                                                    Ok(p) => p,
-                                                                                    Err(e) => {
-                                                                                        log::error!("getDisplayMedia failed synchronously: {e:?}");
-                                                                                        return;
-                                                                                    }
-                                                                                };
-                                                                                screen_share_state.set(ScreenShareState::Requesting);
-                                                                                let cell = stream_cell.clone();
-                                                                                // issue 1973: clone the handle so the async block can retry once
-                                                                                // without the ceiling if the browser rejects it (OverconstrainedError).
-                                                                                let media_devices_retry = media_devices.clone();
-                                                                                wasm_bindgen_futures::spawn_local(async move {
-                                                                                    // issue 1973: on OverconstrainedError retry ONCE without the
-                                                                                    // ceiling so it can never itself kill screen share.
-                                                                                    let acquired = match JsFuture::from(promise).await {
-                                                                                        Ok(stream) => Ok(stream),
-                                                                                        Err(e) => {
-                                                                                            let name = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
-                                                                                                .ok()
-                                                                                                .and_then(|v| v.as_string())
-                                                                                                .unwrap_or_default();
-                                                                                            if videocall_client::should_retry_screen_capture_without_ceiling(
-                                                                                                &name, false,
-                                                                                            ) {
-                                                                                                log::warn!("issue 1973: getDisplayMedia rejected the capture resolution ceiling (OverconstrainedError); retrying without max");
-                                                                                                let fallback =
-                                                                                                    videocall_client::screen_capture_display_constraints(false);
-                                                                                                match media_devices_retry
-                                                                                                    .get_display_media_with_constraints(&fallback)
-                                                                                                {
-                                                                                                    Ok(p) => JsFuture::from(p).await,
-                                                                                                    Err(e2) => Err(e2),
-                                                                                                }
-                                                                                            } else {
-                                                                                                Err(e)
-                                                                                            }
-                                                                                        }
-                                                                                    };
-                                                                                    match acquired {
-                                                                                        Ok(stream) => {
-                                                                                            let media_stream: web_sys::MediaStream = stream.unchecked_into();
-                                                                                            cell.borrow_mut().replace(media_stream);
-                                                                                            screen_share_state.set(ScreenShareState::StreamReady);
-                                                                                        }
-                                                                                        Err(e) => {
-                                                                                            let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
-                                                                                                .ok()
-                                                                                                .and_then(|v| v.as_string())
-                                                                                                .map(|n| n == "NotAllowedError")
-                                                                                                .unwrap_or(false);
-                                                                                            if is_cancel {
-                                                                                                log::info!("User cancelled screen sharing");
-                                                                                            } else {
-                                                                                                log::error!("getDisplayMedia rejected: {e:?}");
-                                                                                            }
-                                                                                            screen_share_state.set(ScreenShareState::Idle);
-                                                                                        }
-                                                                                    }
-                                                                                });
-                                                                            } else {
-                                                                                screen_share_state.set(ScreenShareState::Idle);
-                                                                            }
+                                                                            share_actions.start.call(());
                                                                         },
+                                                                        on_open: move |_| {
+                                                                            density_open.set(false);
+                                                                            reactions_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                            overflow_menu_open.set(false);
+                                                                        },
+                                                                        on_replace: move |_| share_actions.replace.call(()),
+                                                                        on_stop: move |_| share_actions.stop.call(()),
                                                                     }
                                                                 }
                                                             }
                                                             ActionBarSlot::PeerList => rsx! {
                                                                 PeerListButton {
-                                                                    id: "peer-list-trigger",
+                                                                    id: PEER_LIST_TRIGGER_ID,
                                                                     open: peer_list_open(),
                                                                     describedby: slot_describedby,
                                                                     onclick: move |e: MouseEvent| {
@@ -11693,21 +12706,7 @@ pub fn AttendantsComponent(
                                                                         // be ignored there anyway, but stopping here
                                                                         // keeps the popover-close identical to density).
                                                                         e.stop_propagation();
-                                                                        let opening = !peer_list_open();
-                                                                        peer_list_open.set(opening);
-                                                                        if opening {
-                                                                            density_open.set(false);
-                                                                            reactions_open.set(false);
-                                                                            dock_menu_open.set(false);
-                                                                            mock_peers_open.set(false);
-                                                                            apply_drawer_open_rule(
-                                                                                viewport_width,
-                                                                                DrawerKind::PeerList,
-                                                                                peer_list_open,
-                                                                                diagnostics_open,
-                                                                                chat_open,
-                                                                            );
-                                                                        }
+                                                                        activate_bar_slot.call(ActionBarSlot::PeerList);
                                                                     },
                                                                 }
                                                             },
@@ -11719,18 +12718,7 @@ pub fn AttendantsComponent(
                                                                     onclick: move |e: MouseEvent| {
                                                                         if customize_mode() { return; }
                                                                         e.stop_propagation();
-                                                                        let opening = !density_open();
-                                                                        if opening {
-                                                                            // Seed highlight synchronously before
-                                                                            // setting open to avoid a one-frame
-                                                                            // flash where the stale highlight is
-                                                                            // visible before use_effect runs.
-                                                                            density_highlight.set(density_mode());
-                                                                            dock_menu_open.set(false);
-                                                                            mock_peers_open.set(false);
-                                                                            reactions_open.set(false);
-                                                                        }
-                                                                        density_open.set(opening);
+                                                                        activate_bar_slot.call(ActionBarSlot::DensityMode);
                                                                     },
                                                                 }
                                                             },
@@ -11742,20 +12730,10 @@ pub fn AttendantsComponent(
                                                                     onclick: move |e: MouseEvent| {
                                                                         if customize_mode() { return; }
                                                                         e.stop_propagation();
-                                                                        let opening = !reactions_open();
-                                                                        if opening {
-                                                                            // Seed the keyboard highlight to the
-                                                                            // first option before opening (mirrors
-                                                                            // density) so no stale-highlight flash.
-                                                                            reaction_highlight
-                                                                                .set(ReactionType::THUMBS_UP);
-                                                                            // Close sibling action-bar popovers.
-                                                                            density_open.set(false);
-                                                                            dock_menu_open.set(false);
-                                                                            mock_peers_open.set(false);
+                                                                        if !reactions_open() {
                                                                             overflow_menu_open.set(false);
                                                                         }
-                                                                        reactions_open.set(opening);
+                                                                        activate_bar_slot.call(ActionBarSlot::Reactions);
                                                                     },
                                                                 }
                                                             },
@@ -11771,7 +12749,19 @@ pub fn AttendantsComponent(
                                                                         // handler, which light-dismisses side panels
                                                                         // (#1790).
                                                                         e.stop_propagation();
-                                                                        toggle_raise_hand.call(());
+                                                                        activate_bar_slot.call(ActionBarSlot::RaiseHand);
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::Captions => rsx! {
+                                                                CaptionsButton {
+                                                                    id: "captions-trigger",
+                                                                    state: captions_button.unwrap_or(CaptionsButtonState { role: CaptionsRole::Viewer, pressed: false, disabled: true, pending: false }),
+                                                                    describedby: slot_describedby,
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        e.stop_propagation();
+                                                                        activate_bar_slot.call(ActionBarSlot::Captions);
                                                                     },
                                                                 }
                                                             },
@@ -11786,23 +12776,7 @@ pub fn AttendantsComponent(
                                                                         // above): stop the click reaching
                                                                         // `#main-container`'s background handler.
                                                                         e.stop_propagation();
-                                                                        let opening = !diagnostics_open();
-                                                                        diagnostics_open.set(opening);
-                                                                        if opening {
-                                                                            device_settings_open.set(false);
-                                                                            density_open.set(false);
-                                                                            reactions_open.set(false);
-                                                                            dock_menu_open.set(false);
-                                                                            mock_peers_open.set(false);
-                                                                            meeting_options_open.set(false);
-                                                                            apply_drawer_open_rule(
-                                                                                viewport_width,
-                                                                                DrawerKind::Diagnostics,
-                                                                                peer_list_open,
-                                                                                diagnostics_open,
-                                                                                chat_open,
-                                                                            );
-                                                                        }
+                                                                        activate_bar_slot.call(ActionBarSlot::Diagnostics);
                                                                     },
                                                                 }
                                                             },
@@ -11812,20 +12786,7 @@ pub fn AttendantsComponent(
                                                                     describedby: slot_describedby,
                                                                     onclick: move |_| {
                                                                         if customize_mode() { return; }
-                                                                        device_settings_initial_section.set(None);
-                                                                        let was_closed = !device_settings_open();
-                                                                        device_settings_open.set(!device_settings_open());
-                                                                        if was_closed {
-                                                                            device_settings_generation
-                                                                                .set(device_settings_generation() + 1);
-                                                                            peer_list_open.set(false);
-                                                                            diagnostics_open.set(false);
-                                                                            density_open.set(false);
-                                                                            reactions_open.set(false);
-                                                                            dock_menu_open.set(false);
-                                                                            mock_peers_open.set(false);
-                                                                            meeting_options_open.set(false);
-                                                                        }
+                                                                        activate_bar_slot.call(ActionBarSlot::DeviceSettings);
                                                                     },
                                                                 }
                                                             },
@@ -11835,17 +12796,7 @@ pub fn AttendantsComponent(
                                                                     describedby: slot_describedby,
                                                                     onclick: move |_| {
                                                                         if customize_mode() { return; }
-                                                                        let was_closed = !meeting_options_open();
-                                                                        meeting_options_open.set(!meeting_options_open());
-                                                                        if was_closed {
-                                                                            device_settings_open.set(false);
-                                                                            peer_list_open.set(false);
-                                                                            diagnostics_open.set(false);
-                                                                            density_open.set(false);
-                                                                            reactions_open.set(false);
-                                                                            dock_menu_open.set(false);
-                                                                            mock_peers_open.set(false);
-                                                                        }
+                                                                        activate_bar_slot.call(ActionBarSlot::MeetingOptions);
                                                                     },
                                                                 }
                                                             },
@@ -11867,189 +12818,43 @@ pub fn AttendantsComponent(
                                                                         // panels (#1790) — without this the popover would
                                                                         // open and immediately close.
                                                                         evt.stop_propagation();
-                                                                        let was_closed = !meeting_timer_open();
-                                                                        meeting_timer_open.set(!meeting_timer_open());
-                                                                        if was_closed {
-                                                                            device_settings_open.set(false);
-                                                                            peer_list_open.set(false);
-                                                                            diagnostics_open.set(false);
-                                                                            density_open.set(false);
-                                                                            reactions_open.set(false);
-                                                                            dock_menu_open.set(false);
-                                                                            mock_peers_open.set(false);
-                                                                            meeting_options_open.set(false);
-                                                                        }
+                                                                        activate_bar_slot.call(ActionBarSlot::MeetingTimer);
                                                                     },
                                                                 }
                                                             },
-                                                            ActionBarSlot::Recording => {
-                                                                // Recording controls (#1746): host / allowed
-                                                                // participants start & stop a client-side
-                                                                // recording. Visibility is gated upstream in
-                                                                // `visible_action_bar_slots` via
-                                                                // `record_slot_visible`, so this arm only
-                                                                // renders when the slot is actually shown.
-                                                                let rec_client = client.clone();
-                                                                let state_cb_clone = state_cb.clone();
-                                                                rsx! {
-                                                                    RecordButton {
-                                                                        state: record_state(),
-                                                                        describedby: slot_describedby,
-                                                                        onclick: move |_| {
-                                                                            if customize_mode() { return; }
-                                                                            match record_state() {
-                                                                                RecordButtonState::Idle => {
-                                                                                    let peer_ids: Vec<String> =
-                                                                                        rec_client.sorted_peer_keys();
-                                                                                    rec_client.prepare_recording_audio_stream();
-                                                                                    rec_client.prepare_recording_peer_canvases();
-                                                                                    // Clone for the async state callback — the onclick
-                                                                                    // closure retains its own handle for the STARTED fan-out below.
-                                                                                    let rec_client_cb = rec_client.clone();
-                                                                                    // Own the LOCAL SESSION id up front so the state callback can
-                                                                                    // add/remove OUR OWN recording icon (mirrors the per-peer set
-                                                                                    // updates driven by remote RECORDING_STARTED/STOPPED events).
-                                                                                    // The set is keyed by session_id (per-recorder), and the peer
-                                                                                    // list self-row also keys on the local session id — so recording
-                                                                                    // marks THIS tab only, not a sibling tab of the same account.
-                                                                                    let self_session = rec_client.get_own_session_id().unwrap_or_default();
-                                                                                    let mut rec_ids = recording_peer_ids;
-                                                                                    let cb = Closure::new(
-                                                                                        move |js_state: String| {
-                                                                                            let new_state = js_state_to_record_button_state(&js_state);
-                                                                                            if new_state == RecordButtonState::Idle {
-                                                                                                // Notify peers for every exit: normal save AND any abort
-                                                                                                // (cancel on file picker, MediaRecorder failure, etc.).
-                                                                                                for session_id in rec_client_cb.sorted_peer_keys() {
-                                                                                                    if let Some(uid) =
-                                                                                                        rec_client_cb.get_peer_user_id(&session_id)
-                                                                                                    {
-                                                                                                        rec_client_cb.send_peer_event(
-                                                                                                            &uid,
-                                                                                                            videocall_client::PEER_EVENT_RECORDING_STOPPED,
-                                                                                                        );
-                                                                                                    }
-                                                                                                }
-                                                                                                if js_state == "failed" {
-                                                                                                    let mut err_toast = recording_error_toast;
-                                                                                                    err_toast.set(Some("Recording failed."));
-                                                                                                    Timeout::new(6_000, move || {
-                                                                                                        if let Ok(mut t) = err_toast.try_write() {
-                                                                                                            t.take();
-                                                                                                        }
-                                                                                                    })
-                                                                                                    .forget();
-                                                                                                }
-                                                                                                if js_state == "saved" {
-                                                                                                    let mut saved = recording_saved_toast;
-                                                                                                    saved.set(true);
-                                                                                                    // The removal Timeout is `.forget()`-ed and can fire up
-                                                                                                    // to 6s AFTER this component unmounts (user leaves the
-                                                                                                    // meeting right after a save completes). In dioxus-signals
-                                                                                                    // 0.7 `set()` == `try_write().unwrap()` and PANICS on a
-                                                                                                    // dropped scope (in wasm this can wedge the SPA), so use
-                                                                                                    // `try_write()` and no-op if the signal is already gone —
-                                                                                                    // matching the reaction-float timer precedent above.
-                                                                                                    Timeout::new(6_000, move || {
-                                                                                                        if let Ok(mut t) = saved.try_write() {
-                                                                                                            *t = false;
-                                                                                                        }
-                                                                                                    })
-                                                                                                    .forget();
-                                                                                                }
-                                                                                            }
-                                                                                            // Add/remove OUR OWN recording icon based on the
-                                                                                            // transition: insert on Recording, remove on Idle
-                                                                                            // (save or abort), untouched during busy states.
-                                                                                            // Peek-guard both writes via the shared
-                                                                                            // `recording_set_write_needed` predicate, exactly like the
-                                                                                            // remote STARTED/STOPPED and `on_peer_left` sites.
-                                                                                            match local_recording_set_op(&new_state) {
-                                                                                                LocalRecordingSetOp::Insert => {
-                                                                                                    if !self_session.is_empty()
-                                                                                                        && recording_set_write_needed(
-                                                                                                            RecordingWriteOp::Insert,
-                                                                                                            rec_ids.peek().contains(&self_session),
-                                                                                                        )
-                                                                                                    {
-                                                                                                        rec_ids.write().insert(self_session.clone());
-                                                                                                    }
-                                                                                                }
-                                                                                                LocalRecordingSetOp::Remove => {
-                                                                                                    if recording_set_write_needed(
-                                                                                                        RecordingWriteOp::Remove,
-                                                                                                        rec_ids.peek().contains(&self_session),
-                                                                                                    ) {
-                                                                                                        rec_ids.write().remove(&self_session);
-                                                                                                    }
-                                                                                                }
-                                                                                                LocalRecordingSetOp::Noop => {}
-                                                                                            }
-                                                                                            record_state.set(new_state);
-                                                                                        },
-                                                                                    );
-                                                                                    let js_fn: &js_sys::Function =
-                                                                                        cb.as_ref().unchecked_ref();
-                                                                                    let handoff_ok = js_recording_start(
-                                                                                        &peer_ids,
-                                                                                        js_fn,
-                                                                                        &current_display_name(),
-                                                                                        is_owner,
-                                                                                    );
-                                                                                    // Only retain the state callback and announce
-                                                                                    // RECORDING_STARTED to peers if the JS hand-off
-                                                                                    // succeeded. If it failed, the JS `onStateChange`
-                                                                                    // callback will never fire, so `record_state` stays
-                                                                                    // Idle and RECORDING_STOPPED is never sent — announcing
-                                                                                    // here would leave every peer with a permanent phantom
-                                                                                    // "Recording" banner. Surface an error to the local
-                                                                                    // user instead. See `recording_start_outcome`.
-                                                                                    match recording_start_outcome(handoff_ok) {
-                                                                                        RecordingStartOutcome::Announce => {
-                                                                                            *state_cb_clone.borrow_mut() = Some(cb);
-                                                                                            for session_id in &peer_ids {
-                                                                                                if let Some(uid) =
-                                                                                                    rec_client.get_peer_user_id(session_id)
-                                                                                                {
-                                                                                                    rec_client.send_peer_event(
-                                                                                                        &uid,
-                                                                                                        videocall_client::PEER_EVENT_RECORDING_STARTED,
-                                                                                                    );
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                        RecordingStartOutcome::ShowError => {
-                                                                                            // Drop `cb` (do not store it) — nothing owns it,
-                                                                                            // so the closure is freed. `record_state` was
-                                                                                            // never forced to Recording, so it stays Idle and
-                                                                                            // the button remains clickable for a retry.
-                                                                                            log::error!(
-                                                                                                "[recording] start hand-off failed — recording.js unavailable; not announcing to peers"
-                                                                                            );
-                                                                                            let mut err_toast = recording_error_toast;
-                                                                                            err_toast.set(Some("Couldn't start recording. Please refresh and try again."));
-                                                                                            // `.forget()`-ed: can fire up to 6s after the component
-                                                                                            // unmounts (user leaves the meeting within 6s of a failed
-                                                                                            // hand-off). `set()` == `try_write().unwrap()` PANICS on a
-                                                                                            // dropped scope, so use `try_write()` and no-op if gone.
-                                                                                            Timeout::new(6_000, move || {
-                                                                                                if let Ok(mut t) = err_toast.try_write() {
-                                                                                                    t.take();
-                                                                                                }
-                                                                                            })
-                                                                                            .forget();
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                                RecordButtonState::Recording => {
-                                                                                    // RECORDING_STOPPED is handled in the → Idle state callback so every
-                                                                                    // exit path (stop click, abort, failure) is covered once.
-                                                                                    js_recording_stop();
-                                                                                }
-                                                                                _ => {}
-                                                                            }
-                                                                        },
-                                                                    }
+                                                            ActionBarSlot::Recording => rsx! {
+                                                                RecordButton {
+                                                                    state: record_state(),
+                                                                    describedby: slot_describedby,
+                                                                    onclick: move |_| {
+                                                                        if customize_mode() { return; }
+                                                                        toggle_recording.call(());
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::RecentActions => rsx! {
+                                                                RecentActionsButton {
+                                                                    id: RECENT_ACTIONS_TRIGGER_ID,
+                                                                    open: recents_open(),
+                                                                    describedby: slot_describedby,
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        e.stop_propagation();
+                                                                        activate_bar_slot.call(ActionBarSlot::RecentActions);
+                                                                    },
+                                                                    onkeydown: move |evt: KeyboardEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        let Some((step, on_last)) = trigger_arrow(&evt.key(), density_open() || reactions_open()) else {
+                                                                            return;
+                                                                        };
+                                                                        evt.prevent_default();
+                                                                        evt.stop_propagation();
+                                                                        if recents_open() {
+                                                                            focus_menu_item(step);
+                                                                        } else {
+                                                                            open_recents.call(on_last);
+                                                                        }
+                                                                    },
                                                                 }
                                                             },
                                                         }
@@ -12088,7 +12893,7 @@ pub fn AttendantsComponent(
                                         // viewport-based overflow detector hides one or
                                         // more secondary slots.  Hidden in customize mode.
                                         div {
-                                            class: "action-bar-overflow-wrapper action-bar-overflow-trigger",
+                                            class: "action-bar-overflow-wrapper action-bar-overflow-trigger slot-shrinkable",
                                             style: {
                                                 let has_overflow = !overflowed_slots.read().is_empty() && !customize_mode();
                                                 if has_overflow {
@@ -12113,6 +12918,7 @@ pub fn AttendantsComponent(
                                                     density_open.set(false);
                                                     reactions_open.set(false);
                                                     mock_peers_open.set(false);
+                                                    share_menu_open.set(false);
                                                 }
                                             },
                                             // Horizontal three-dot icon
@@ -12142,205 +12948,52 @@ pub fn AttendantsComponent(
                                                     rsx! {
                                                         for slot in secondary_slots.iter().copied() {
                                                             {
-                                                                let label = slot.display_name();
-                                                                // Issue 2135: RaiseHand is the only
-                                                                // overflow item that carries STATE, so it
-                                                                // is the only one that gets `aria-pressed`
-                                                                // (a plain action item must not claim to
-                                                                // be a toggle). Without it the item read
-                                                                // "Raise hand, button" whether the hand was
-                                                                // up or down, while activating it did the
-                                                                // OPPOSITE half the time — and by the
-                                                                // migration's append-at-the-end rule this
-                                                                // is where existing users meet the control
-                                                                // FIRST, so it is the highest-traffic path.
-                                                                //
-                                                                // `display_name()` is already the stable
-                                                                // noun "Raise hand", which is exactly what
-                                                                // `aria-pressed` needs beside it: a name
-                                                                // that flips alongside the state cancels it
-                                                                // out (see `DOCK_AUTOHIDE_LABEL`).
+                                                                let item = slot_item(slot, &record_state(), captions_button);
+                                                                let label = item.label;
                                                                 let is_raise_hand = matches!(slot, ActionBarSlot::RaiseHand);
                                                                 let hand_up = is_raise_hand && self_hand_raised();
                                                                 let item_class = if hand_up { "overflow-item raised" } else { "overflow-item" };
                                                                 let aria_pressed = if is_raise_hand {
                                                                     Some(if hand_up { "true" } else { "false" })
+                                                                } else if let (ActionBarSlot::Captions, Some(state)) = (slot, captions_button) {
+                                                                    Some(if state.pressed { "true" } else { "false" })
                                                                 } else {
                                                                     None
                                                                 };
-                                                                rsx! {
-                                                                    button {
-                                                                        class: item_class,
-                                                                        "aria-pressed": aria_pressed,
-                                                                        "data-raised": if is_raise_hand { Some(if hand_up { "true" } else { "false" }) } else { None },
-                                                                        onclick: move |_| {
-                                                                            overflow_menu_open.set(false);
-                                                                            match slot {
-                                                                                ActionBarSlot::ScreenShare => {
-                                                                                    // Toggle screen share by clicking the
-                                                                                    // main slot button. The button is only
-                                                                                    // in the DOM on non-iOS (filtered by
-                                                                                    // visible_action_bar_slots), and may be
-                                                                                    // display:none when overflowed.
-                                                                                    if let Some(win) = web_sys::window() {
-                                                                                        if let Some(doc) = win.document() {
-                                                                                            if let Some(el) = doc.query_selector("[data-slot='screen'] button").ok().flatten() {
-                                                                                                use wasm_bindgen::JsCast;
-                                                                                                if let Ok(html_el) = el.dyn_into::<web_sys::HtmlElement>() {
-                                                                                                    html_el.click();
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
+                                                                if slot == ActionBarSlot::ScreenShare {
+                                                                    rsx! {
+                                                                        crate::components::video_control_buttons::OverflowShareItems {
+                                                                            state: crate::components::share_actions::share_button_state(&screen_share_state(), (share_actions.replacing)()),
+                                                                            icon: overflow_slot_icon(slot),
+                                                                            on_done: move |_| overflow_menu_open.set(false),
+                                                                            on_start: share_actions.start,
+                                                                            on_replace: share_actions.replace,
+                                                                            on_stop: share_actions.stop,
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    rsx! {
+                                                                        button {
+                                                                            class: item_class,
+                                                                            "data-recent-action": crate::components::recent_actions::slot_attr(slot),
+                                                                            "aria-pressed": aria_pressed,
+                                                                            "aria-busy": item.busy.then_some("true"),
+                                                                            "aria-disabled": item.disabled.then_some("true"),
+                                                                            title: captions_button.filter(|_| slot == ActionBarSlot::Captions).map(captions_button_hint),
+                                                                            "aria-description": captions_button.filter(|_| slot == ActionBarSlot::Captions).map(captions_button_hint),
+                                                                            "data-raised": if is_raise_hand { Some(if hand_up { "true" } else { "false" }) } else { None },
+                                                                            onclick: move |_| {
+                                                                                if item.disabled { return; }
+                                                                                overflow_menu_open.set(false);
+                                                                                slot_controls.activate_slot(slot);
+                                                                                if slot != ActionBarSlot::DeviceSettings {
+                                                                                    settle_slot_focus(OVERFLOW_MENU_TRIGGER_ID);
                                                                                 }
-                                                                                ActionBarSlot::PeerList => {
-                                                                                    let opening = !peer_list_open();
-                                                                                    peer_list_open.set(opening);
-                                                                                    if opening {
-                                                                                        density_open.set(false);
-                                                                                        reactions_open.set(false);
-                                                                                        dock_menu_open.set(false);
-                                                                                        mock_peers_open.set(false);
-                                                                                        apply_drawer_open_rule(
-                                                                                            viewport_width,
-                                                                                            DrawerKind::PeerList,
-                                                                                            peer_list_open,
-                                                                                            diagnostics_open,
-                                                                                            chat_open,
-                                                                                        );
-                                                                                    }
-                                                                                }
-                                                                                ActionBarSlot::DensityMode => {
-                                                                                    let opening = !density_open();
-                                                                                    density_open.set(opening);
-                                                                                    if opening {
-                                                                                        reactions_open.set(false);
-                                                                                        dock_menu_open.set(false);
-                                                                                        mock_peers_open.set(false);
-                                                                                    }
-                                                                                }
-                                                                                ActionBarSlot::Diagnostics => {
-                                                                                    let opening = !diagnostics_open();
-                                                                                    diagnostics_open.set(opening);
-                                                                                    if opening {
-                                                                                        device_settings_open.set(false);
-                                                                                        density_open.set(false);
-                                                                                        reactions_open.set(false);
-                                                                                        dock_menu_open.set(false);
-                                                                                        mock_peers_open.set(false);
-                                                                                        meeting_options_open.set(false);
-                                                                                        apply_drawer_open_rule(
-                                                                                            viewport_width,
-                                                                                            DrawerKind::Diagnostics,
-                                                                                            peer_list_open,
-                                                                                            diagnostics_open,
-                                                                                            chat_open,
-                                                                                        );
-                                                                                    }
-                                                                                }
-                                                                                ActionBarSlot::DeviceSettings => {
-                                                                                    device_settings_initial_section.set(None);
-                                                                                    let was_closed = !device_settings_open();
-                                                                                    device_settings_open.set(!device_settings_open());
-                                                                                    if was_closed {
-                                                                                        device_settings_generation
-                                                                                            .set(device_settings_generation() + 1);
-                                                                                        peer_list_open.set(false);
-                                                                                        diagnostics_open.set(false);
-                                                                                        density_open.set(false);
-                                                                                        reactions_open.set(false);
-                                                                                        dock_menu_open.set(false);
-                                                                                        mock_peers_open.set(false);
-                                                                                        meeting_options_open.set(false);
-                                                                                    }
-                                                                                }
-                                                                                ActionBarSlot::MeetingOptions => {
-                                                                                    let was_closed = !meeting_options_open();
-                                                                                    meeting_options_open.set(!meeting_options_open());
-                                                                                    if was_closed {
-                                                                                        device_settings_open.set(false);
-                                                                                        peer_list_open.set(false);
-                                                                                        diagnostics_open.set(false);
-                                                                                        density_open.set(false);
-                                                                                        reactions_open.set(false);
-                                                                                        dock_menu_open.set(false);
-                                                                                        mock_peers_open.set(false);
-                                                                                    }
-                                                                                }
-                                                                                // Issue #1884: open the reactions palette
-                                                                                // from the overflow menu (mirrors density).
-                                                                                ActionBarSlot::Reactions => {
-                                                                                    let opening = !reactions_open();
-                                                                                    reactions_open.set(opening);
-                                                                                    if opening {
-                                                                                        reaction_highlight
-                                                                                            .set(ReactionType::THUMBS_UP);
-                                                                                        density_open.set(false);
-                                                                                        dock_menu_open.set(false);
-                                                                                        mock_peers_open.set(false);
-                                                                                    }
-                                                                                }
-                                                                                // Issue 2135: toggle the raised hand from
-                                                                                // the overflow menu. Unlike its siblings
-                                                                                // this opens nothing, so there are no
-                                                                                // popovers to close — it just calls the
-                                                                                // same handler the action-bar button does,
-                                                                                // which keeps the announcer as the single
-                                                                                // authority for the level.
-                                                                                //
-                                                                                // Load-bearing, not cosmetic: RaiseHand is
-                                                                                // removable and lands at DEFAULT_SLOTS
-                                                                                // index 3, so it is genuinely reachable in
-                                                                                // overflow on a narrow bar — and existing
-                                                                                // users get it APPENDED to the end of their
-                                                                                // saved layout by the forward-compat
-                                                                                // migration, which makes overflow their
-                                                                                // MOST likely first encounter with it.
-                                                                                // Without this arm the menu item rendered
-                                                                                // and did nothing but close the menu.
-                                                                                ActionBarSlot::RaiseHand => {
-                                                                                    toggle_raise_hand.call(());
-                                                                                }
-                                                                                // Issue 2136: open the meeting-timer
-                                                                                // controls from the overflow menu. Mirrors
-                                                                                // the MeetingOptions arm above, including
-                                                                                // the mutual-exclusion set, so the popover
-                                                                                // behaves identically whichever route the
-                                                                                // host took to it.
-                                                                                //
-                                                                                // Load-bearing for exactly the reason the
-                                                                                // RaiseHand arm above records, and MORE so:
-                                                                                // `migrate_stored_layout` APPENDS a new slot
-                                                                                // to every existing user's saved layout, so
-                                                                                // overflow is the host's most likely FIRST
-                                                                                // encounter with this control. It is also
-                                                                                // the host's ONLY route to it on a bar
-                                                                                // narrower than the threshold this slot
-                                                                                // pushed up. Without this
-                                                                                // arm the item rendered (the icon and label
-                                                                                // arms both exist) and did nothing but
-                                                                                // close the menu.
-                                                                                ActionBarSlot::MeetingTimer => {
-                                                                                    let was_closed = !meeting_timer_open();
-                                                                                    meeting_timer_open.set(!meeting_timer_open());
-                                                                                    if was_closed {
-                                                                                        device_settings_open.set(false);
-                                                                                        peer_list_open.set(false);
-                                                                                        diagnostics_open.set(false);
-                                                                                        density_open.set(false);
-                                                                                        reactions_open.set(false);
-                                                                                        dock_menu_open.set(false);
-                                                                                        mock_peers_open.set(false);
-                                                                                        meeting_options_open.set(false);
-                                                                                    }
-                                                                                }
-                                                                                // Mic + Camera are never in overflow
-                                                                                _ => {}
-                                                                            }
-                                                                        },
-                                                                        // Per-slot SVG icon
-                                                                        {overflow_slot_icon(slot)}
-                                                                        span { "{label}" }
+                                                                            },
+                                                                            // Per-slot SVG icon
+                                                                            {live_slot_icon(slot, &record_state())}
+                                                                            span { "{label}" }
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -12350,8 +13003,8 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                         } // close action-bar-overflow-wrapper div
-                                        // (а) Dock position dropdown — not customizable (houses Customize/Reset)
-                                        div { class: "dock-position-wrapper",
+                                        // (а) Dock position dropdown — not customizable (houses Edit Buttons/Reset Buttons)
+                                        div { class: "dock-position-wrapper slot-shrinkable",
                                             style: if dock_wrapper_hidden() && !customize_mode() {
                                                 "order: 90; display: none"
                                             } else {
@@ -12360,24 +13013,12 @@ pub fn AttendantsComponent(
                                             if customize_mode() {
                                                 button {
                                                     class: "video-control-button action-bar-done-trigger",
-                                                    title: "Done customizing",
-                                                    "aria-label": "Done customizing",
+                                                    title: "Done editing buttons",
+                                                    "aria-label": "Done editing buttons",
                                                     r#type: "button",
                                                     onclick: move |e| {
                                                         e.stop_propagation();
-                                                        customize_mode.set(false);
-                                                        save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                        // Done unmounts on the next render (this branch
-                                                        // is `if customize_mode()`), so focus would drop
-                                                        // to <body> without a restore. Mirror the entry
-                                                        // path (Customize option focuses Done via
-                                                        // deferred Timeout after `customize_mode.set(true)`):
-                                                        // send focus back to the dock-menu trigger which
-                                                        // renders in the same slot after re-render.
-                                                        Timeout::new(0, || {
-                                                            focus_element_by_id("dock-menu-trigger");
-                                                        })
-                                                        .forget();
+                                                        customize_ctl.exit(CustomizeExit::Done);
                                                     },
                                                     svg {
                                                         xmlns: "http://www.w3.org/2000/svg",
@@ -12399,7 +13040,7 @@ pub fn AttendantsComponent(
                                                     // an option, Enter/Space activation) can return
                                                     // focus here via `focus_element_by_id`. Same id
                                                     // is intentionally NOT reused on the Done button
-                                                    // (customize-mode branch above); Customize's
+                                                    // (customize-mode branch above); Edit Buttons'
                                                     // activation now shifts focus to the first
                                                     // action-bar slot button (Mic/Sound by default)
                                                     // via the customize-mode entry effect.
@@ -12429,6 +13070,7 @@ pub fn AttendantsComponent(
                                                             density_open.set(false);
                                                             reactions_open.set(false);
                                                             mock_peers_open.set(false);
+                                                            share_menu_open.set(false);
                                                         }
                                                     },
                                                     // WCAG 2.1.1 keyboard entry to the dock menu.
@@ -12460,6 +13102,7 @@ pub fn AttendantsComponent(
                                                                 density_open.set(false);
                                                                 reactions_open.set(false);
                                                                 mock_peers_open.set(false);
+                                                                share_menu_open.set(false);
                                                                 Timeout::new(0, || {
                                                                     focus_glass_option_at(".dock-position-wrapper", false);
                                                                 })
@@ -12476,6 +13119,7 @@ pub fn AttendantsComponent(
                                                                 density_open.set(false);
                                                                 reactions_open.set(false);
                                                                 mock_peers_open.set(false);
+                                                                share_menu_open.set(false);
                                                                 Timeout::new(0, || {
                                                                     focus_glass_option_at(".dock-position-wrapper", true);
                                                                 })
@@ -12536,8 +13180,8 @@ pub fn AttendantsComponent(
                                                         // would make the three radios each other's
                                                         // only siblings AND make the wrapper their
                                                         // parent — so arrow keys would wrap inside the
-                                                        // group forever and auto-hide, Customize,
-                                                        // Reset and Action Bar… would become
+                                                        // group forever and auto-hide, Edit Buttons,
+                                                        // Reset Buttons and Action Bar… would become
                                                         // unreachable by keyboard. Adding the group
                                                         // requires rewriting the helper to a flat
                                                         // `querySelectorAll` over the menu first.
@@ -12729,6 +13373,8 @@ pub fn AttendantsComponent(
                                                             // "Turn Hiding On/Off" was a WCAG 4.1.2
                                                             // defect on a checkbox role.
                                                             role: "menuitemcheckbox",
+                                                            "aria-label": DOCK_AUTOHIDE_LABEL,
+                                                            "aria-describedby": "dock-menu-autohide-hint",
                                                             "aria-checked": if autohide_enabled() { "true" } else { "false" },
                                                             tabindex: if dock_menu_highlight() == 3 { "0" } else { "-1" },
                                                             onclick: move |e: MouseEvent| {
@@ -12750,15 +13396,46 @@ pub fn AttendantsComponent(
                                                                 focus_element_by_id("dock-menu-trigger");
                                                             },
                                                             {DOCK_AUTOHIDE_LABEL}
+                                                            span {
+                                                                id: "dock-menu-autohide-hint",
+                                                                class: "glass-select-option-hint",
+                                                                {DOCK_AUTOHIDE_HINT}
+                                                            }
+                                                        }
+                                                        div {
+                                                            class: if autoshrink_enabled() { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "menuitemcheckbox",
+                                                            "aria-label": DOCK_AUTOSHRINK_LABEL,
+                                                            "aria-describedby": "dock-menu-autoshrink-hint",
+                                                            "aria-checked": if autoshrink_enabled() { "true" } else { "false" },
+                                                            tabindex: if dock_menu_highlight() == 4 { "0" } else { "-1" },
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                toggle_autoshrink();
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                toggle_autoshrink();
+                                                            },
+                                                            {DOCK_AUTOSHRINK_LABEL}
+                                                            span {
+                                                                id: "dock-menu-autoshrink-hint",
+                                                                class: "glass-select-option-hint",
+                                                                {DOCK_AUTOSHRINK_HINT}
+                                                            }
                                                         }
                                                         div { class: "glass-select-separator", role: "separator" }
                                                         div {
                                                             class: "glass-select-option",
-                                                            // issue 1762: Customize invokes an
+                                                            // issue 1762: Edit Buttons invokes an
                                                             // action; it selects no value → plain
                                                             // `menuitem`.
                                                             role: "menuitem",
-                                                            tabindex: if dock_menu_highlight() == 4 { "0" } else { "-1" },
+                                                            "aria-label": "Edit Buttons",
+                                                            "aria-describedby": "dock-menu-edit-hint",
+                                                            tabindex: if dock_menu_highlight() == 5 { "0" } else { "-1" },
                                                             // No `focus_element_by_id` on either
                                                             // activation path, unlike its siblings:
                                                             // entering customize mode REPLACES
@@ -12770,28 +13447,33 @@ pub fn AttendantsComponent(
                                                             // "Always seed keyboard focus").
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
-                                                                customize_mode.set(true);
-                                                                dock_menu_open.set(false);
+                                                                customize_ctl.enter(CustomizeEntry::Menu, action_bar_popovers);
                                                             },
                                                             onkeydown: move |evt: Event<KeyboardData>| {
                                                                 if !is_option_activate_key(&evt) { return; }
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
-                                                                customize_mode.set(true);
-                                                                dock_menu_open.set(false);
+                                                                customize_ctl.enter(CustomizeEntry::Menu, action_bar_popovers);
                                                             },
-                                                            "Customize"
+                                                            "Edit Buttons"
+                                                            span {
+                                                                id: "dock-menu-edit-hint",
+                                                                class: "glass-select-option-hint",
+                                                                "or hold a button for 2 seconds"
+                                                            }
                                                         }
                                                         div {
                                                             class: "glass-select-option",
                                                             // issue 1762: Reset invokes an action.
                                                             role: "menuitem",
-                                                            tabindex: if dock_menu_highlight() == 5 { "0" } else { "-1" },
+                                                            tabindex: if dock_menu_highlight() == 6 { "0" } else { "-1" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
-                                                                action_bar_slots.set(DEFAULT_SLOTS.to_vec());
+                                                                action_bar_slots.set(default_slots(captions_flag));
                                                                 action_bar_hidden.set(Vec::new());
                                                                 remove_action_bar_layout();
+                                                                shrunk_buttons.set(ShrunkButtons::default());
+                                                                remove_shrunk_buttons();
                                                                 // issue 1765: Reset silently
                                                                 // rewrote the layout — an AT user
                                                                 // got no confirmation anything
@@ -12812,16 +13494,18 @@ pub fn AttendantsComponent(
                                                                 if !is_option_activate_key(&evt) { return; }
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
-                                                                action_bar_slots.set(DEFAULT_SLOTS.to_vec());
+                                                                action_bar_slots.set(default_slots(captions_flag));
                                                                 action_bar_hidden.set(Vec::new());
                                                                 remove_action_bar_layout();
+                                                                shrunk_buttons.set(ShrunkButtons::default());
+                                                                remove_shrunk_buttons();
                                                                 action_bar_announce_nonce += 1;
                                                                 action_bar_announce
                                                                     .set(ACTION_BAR_RESET_ANNOUNCEMENT.to_string());
                                                                 dock_menu_open.set(false);
                                                                 focus_element_by_id("dock-menu-trigger");
                                                             },
-                                                            "Reset to Default"
+                                                            "Reset Buttons"
                                                         }
                                                         div { class: "glass-select-separator", role: "separator" }
                                                         div {
@@ -12832,43 +13516,15 @@ pub fn AttendantsComponent(
                                                             tabindex: if dock_menu_highlight() == DOCK_MENU_ITEM_COUNT - 1 { "0" } else { "-1" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
-                                                                let was_closed = !device_settings_open();
-                                                                device_settings_open.set(true);
-                                                                if was_closed {
-                                                                    device_settings_generation
-                                                                        .set(device_settings_generation() + 1);
-                                                                    peer_list_open.set(false);
-                                                                    diagnostics_open.set(false);
-                                                                    density_open.set(false);
-                                                                    reactions_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                    meeting_options_open.set(false);
-                                                                }
-                                                                device_settings_initial_section
-                                                                    .set(Some("preferences".to_string()));
+                                                                open_settings_at("preferences");
                                                                 dock_menu_open.set(false);
                                                             },
                                                             onkeydown: move |evt: Event<KeyboardData>| {
                                                                 if !is_option_activate_key(&evt) { return; }
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
-                                                                let was_closed = !device_settings_open();
-                                                                device_settings_open.set(true);
-                                                                if was_closed {
-                                                                    device_settings_generation
-                                                                        .set(device_settings_generation() + 1);
-                                                                    peer_list_open.set(false);
-                                                                    diagnostics_open.set(false);
-                                                                    density_open.set(false);
-                                                                    reactions_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                    meeting_options_open.set(false);
-                                                                }
-                                                                device_settings_initial_section
-                                                                    .set(Some("preferences".to_string()));
+                                                                open_settings_at("preferences");
                                                                 dock_menu_open.set(false);
-                                                                // Settings modal manages its own focus on
-                                                                // open, so no explicit focus restore.
                                                             },
                                                             "Action Bar\u{2026}"
                                                         }
@@ -12879,7 +13535,7 @@ pub fn AttendantsComponent(
                                         }
                                         if mock_peers_enabled() {
                                             div {
-                                                class: "action-bar-mock-peers-wrapper",
+                                                class: "action-bar-mock-peers-wrapper slot-shrinkable",
                                                 style: "order: 91",
                                                 MockPeersButton {
                                                     open: mock_peers_open(),
@@ -12892,6 +13548,7 @@ pub fn AttendantsComponent(
                                                             density_open.set(false);
                                                             reactions_open.set(false);
                                                             dock_menu_open.set(false);
+                                                            share_menu_open.set(false);
                                                         }
                                                     },
                                                 }
@@ -12902,13 +13559,20 @@ pub fn AttendantsComponent(
                                         let hangup_id = id.clone();
                                         let hangup_is_guest = is_guest;
                                         let hangup_room_token = room_token.clone();
+                                        let hangup_press = gesture.clone();
+                                        let hangup_click = gesture.clone();
                                         rsx! {
                                             div {
-                                                class: "hangup-wrapper",
+                                                class: if shrunk_buttons.read().hangup { "hangup-wrapper" } else { "hangup-wrapper slot-shrinkable" },
                                                 style: "order: 99",
+                                                onpointerdown: move |_| hangup_press.mark_hangup_press(),
                                                 HangUpButton {
-                                                    onclick: move |_| {
+                                                    onclick: move |evt: MouseEvent| {
                                                         if customize_mode() { return; }
+                                                        let from_pointer = evt.as_web_event().detail() != 0;
+                                                        if hangup_press_is_swallowed(hangup_click.take_hangup_press(), js_sys::Date::now(), from_pointer) {
+                                                            return;
+                                                        }
                                                         log::info!("Hanging up - resetting to initial state");
                                                     // If recording is active, stop it and notify peers
                                                     // before disconnecting so no banner stays stuck.
@@ -12967,6 +13631,7 @@ pub fn AttendantsComponent(
                                                             )
                                                             .await;
                                                         }
+                                                        crate::components::captions::forget_room_token(&meeting_id);
                                                         #[cfg(target_arch = "wasm32")]
                                                         crate::components::screen_share_detach::close_all();
                                                         let _ = window().location().set_href("/");
@@ -12983,9 +13648,9 @@ pub fn AttendantsComponent(
                                         dragging_slot().filter(|_| customize_mode())
                                     {
                                         {
-                                            let px = drag_pointer_x();
-                                            let py = drag_pointer_y();
                                             if drag_started() {
+                                                let px = drag_pointer_x();
+                                                let py = drag_pointer_y();
                                                 let nav_left = drag_nav_left.get();
                                                 let nav_top = drag_nav_top.get();
                                                 let grab_dx = drag_grab_dx.get();
@@ -13013,6 +13678,8 @@ pub fn AttendantsComponent(
                                                             ActionBarSlot::Recording => rsx! { RecordButton { state: record_state(), onclick: |_| {} } },
                                                             ActionBarSlot::MeetingOptions => rsx! { MeetingOptionsButton { open: meeting_options_open(), onclick: |_| {} } },
                                                             ActionBarSlot::MeetingTimer => rsx! { MeetingTimerButton { open: false, running: false, onclick: |_| {} } },
+                                                            ActionBarSlot::Captions => rsx! { CaptionsButton { state: CaptionsButtonState { role: CaptionsRole::Viewer, pressed: false, disabled: false, pending: false }, onclick: |_: MouseEvent| {} } },
+                                                            ActionBarSlot::RecentActions => rsx! { RecentActionsButton { open: false, onclick: |_| {} } },
                                                         }
                                                     }
                                                 }
@@ -13096,19 +13763,25 @@ pub fn AttendantsComponent(
                             if media_access_granted() {
                                 Host {
                                     share_screen: screen_share_state().is_sharing(),
+                                    screen_replace_nonce: (share_actions.replace_nonce)(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    in_call: meeting_joined()
-                                        && meeting_ended_message().is_none()
-                                        && !reconnect_gave_up(),
+                                    in_call: meeting_live(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     device_settings_initial_section: device_settings_initial_section(),
                                     device_settings_generation: device_settings_generation(),
                                     on_device_settings_toggle: move |_| {
                                         device_settings_initial_section.set(None);
-                                        device_settings_open.set(!device_settings_open());
+                                        let closing = device_settings_open();
+                                        device_settings_open.set(!closing);
+                                        if closing {
+                                            self_avatar_settings_focus
+                                                .closed(device_settings_generation());
+                                            recent_settings_focus.closed(device_settings_generation());
+                                        }
                                     },
+                                    on_edit_avatar: edit_avatar,
                                     on_microphone_error: move |err: String| {
                                         log::error!("Microphone error: {err}");
                                         mic_enabled.set(false);
@@ -13183,8 +13856,8 @@ pub fn AttendantsComponent(
                                         log::info!("Screen share state changed: {event:?}");
                                         match event {
                                             ScreenShareEvent::Started(stream) => {
+                                                crate::components::share_actions::share_started(share_actions, screen_share_state);
                                                 try_set(own_share_stream, Some(stream));
-                                                try_set(screen_share_state, ScreenShareState::Active);
                                                 try_set(
                                                     screen_share_toast_state,
                                                     Some(ScreenShareToastState::Starting),
@@ -13218,7 +13891,18 @@ pub fn AttendantsComponent(
                                                     Some(starting_timeout),
                                                 );
                                             }
+                                            ScreenShareEvent::Replaced(stream) => {
+                                                let target = ShareTarget {
+                                                    origin: ShareOrigin::Own,
+                                                    key: OWN_SHARE_KEY.to_string(),
+                                                    pin: PinnedTile::own_screen(own_pin_user.clone()),
+                                                    name: ShareOrigin::Own.subject().to_string(),
+                                                };
+                                                let text = share_view::own_capture_replaced(share_ctx, &target, &stream, detach_supported, screen_zoom_signal);
+                                                show_share_toast(screen_share_toast_state, screen_share_toast_timer, ScreenShareToastState::Replaced(text));
+                                            }
                                             ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
+                                                crate::components::share_actions::share_ended(share_actions, &screen_replacement);
                                                 try_set(own_share_stream, None);
                                                 try_set(screen_share_state, ScreenShareState::Idle);
                                                 try_set(screen_share_toast_state, None);
@@ -13226,6 +13910,7 @@ pub fn AttendantsComponent(
                                             }
                                             ScreenShareEvent::Failed(ref msg) => {
                                                 log::error!("Screen share failed: {msg}");
+                                                crate::components::share_actions::share_ended(share_actions, &screen_replacement);
                                                 try_set(own_share_stream, None);
                                                 try_set(screen_share_state, ScreenShareState::Idle);
                                                 try_set(screen_share_toast_state, None);
@@ -13314,6 +13999,7 @@ pub fn AttendantsComponent(
                                                     reactions_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
+                                                    share_menu_open.set(false);
                                                     meeting_options_open.set(false);
                                                     apply_drawer_open_rule(
                                                         viewport_width,
@@ -13382,7 +14068,7 @@ pub fn AttendantsComponent(
                                             button {
                                                 r#type: "button",
                                                 class: "self-tile-action",
-                                                "data-testid": "self-view-placement-toggle",
+                                                "data-testid": PLACEMENT_TOGGLE_TESTID,
                                                 "aria-label": crate::components::self_view::placement_toggle_label(effective_self_placement),
                                                 title: crate::components::self_view::placement_toggle_label(effective_self_placement),
                                                 onclick: move |evt: MouseEvent| {
@@ -13403,7 +14089,7 @@ pub fn AttendantsComponent(
                                                     spawn(async move {
                                                         gloo_timers::future::TimeoutFuture::new(0).await;
                                                         if let Some(el) = gloo_utils::document()
-                                                            .query_selector("[data-testid='self-view-placement-toggle']")
+                                                            .query_selector(&format!("[data-testid='{PLACEMENT_TOGGLE_TESTID}']"))
                                                             .ok()
                                                             .flatten()
                                                             .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
@@ -13434,6 +14120,8 @@ pub fn AttendantsComponent(
                                     display_name: current_display_name(),
                                     meeting_id: id.clone(),
                                     session_id: rename_session_id,
+                                    local_user_id: local_user_id.clone(),
+                                    owner_user_id: host_user_id.clone(),
                                     on_renamed: apply_renamed_display_name,
                                 }
                             }
@@ -13514,6 +14202,7 @@ pub fn AttendantsComponent(
                                     display_name_modal_open.set(true);
                                 }
                             },
+                            peer_join_time,
                         }
                         div {
                             class: "drawer-resize-handle",
@@ -13712,6 +14401,7 @@ pub fn AttendantsComponent(
                     allow_guests_toggle,
                     recording_allowed_for_all_toggle,
                     chat_allowed_for_all_toggle,
+                    announcement_overrides: announcement_overrides_editor,
                     saving,
                     toggle_error,
                     co_host_refresh: host_event_seq,
@@ -13739,8 +14429,19 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                // Meeting ended overlay
-                if let Some(message) = meeting_ended_message() {
+                if instance_superseded() {
+                    MeetingRestartedOverlay {
+                        variant: overlay_variant(),
+                        on_rejoin: move |_| match rejoin_ctx {
+                            Some(ctx) => ctx.0.call(()),
+                            None => {
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window.location().reload();
+                                }
+                            }
+                        },
+                    }
+                } else if let Some(message) = meeting_ended_message() {
                     MeetingEndedOverlay { message }
                 }
 
@@ -13761,7 +14462,10 @@ pub fn AttendantsComponent(
                 if diagnostics_open() {
                     Diagnostics {
                         is_open: true,
-                        on_close: move |_| diagnostics_open.set(false),
+                        on_close: move |_| {
+                            diagnostics_open.set(false);
+                            settle_slot_focus("diagnostics-trigger");
+                        },
                         video_enabled: video_enabled(),
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
@@ -13901,6 +14605,7 @@ pub fn AttendantsComponent(
                                 evt.stop_propagation();
                                 evt.prevent_default();
                                 mock_peers_open.set(false);
+                                share_menu_open.set(false);
                                 focus_element_by_id("mock-peers-trigger");
                             }
                         },
@@ -13969,18 +14674,62 @@ pub fn AttendantsComponent(
                         on_start: move |ms: u64| {
                             start_meeting_timer.call(ms);
                             meeting_timer_open.set(false);
-                            focus_element_by_id("meeting-timer-trigger");
+                            focus_slot_trigger("meeting-timer-trigger");
                         },
                         on_extend: move |_| extend_meeting_timer.call(()),
                         on_cancel: move |_| {
                             cancel_meeting_timer.call(());
                             meeting_timer_open.set(false);
-                            focus_element_by_id("meeting-timer-trigger");
+                            focus_slot_trigger("meeting-timer-trigger");
                         },
                         on_close: move |_| {
                             meeting_timer_open.set(false);
-                            focus_element_by_id("meeting-timer-trigger");
+                            focus_slot_trigger("meeting-timer-trigger");
                         },
+                    }
+                }
+
+                if recents_open() {
+                    RecentActionsMenu {
+                        store: recent_actions,
+                        available_slots: ALL_SLOTS
+                            .iter()
+                            .copied()
+                            .filter(|slot| is_action_bar_slot_visible(*slot, slot_visibility(false, split_layout)))
+                            .collect::<Vec<_>>(),
+                        record_state: record_state(),
+                        hand_raised: self_hand_raised(),
+                        captions: captions_button,
+                        share_state: crate::components::share_actions::share_button_state(&screen_share_state(), (share_actions.replacing)()),
+                        open_on_last: recents_open_last(),
+                        on_close: move |_| recents_open.set(false),
+                        on_slot: move |slot: ActionBarSlot| {
+                            slot_controls.activate_slot(slot);
+                            if slot == ActionBarSlot::DeviceSettings {
+                                recent_settings_focus.opened(device_settings_generation(), focus_settings_dialog);
+                            }
+                        },
+                        on_setting: move |target: SettingsTarget| {
+                            open_settings_at(target.section());
+                            recent_settings_focus.opened(device_settings_generation(), move || reveal_settings_target(target));
+                        },
+                        on_share_start: share_actions.start,
+                        on_share_replace: share_actions.replace,
+                        on_share_stop: share_actions.stop,
+                    }
+                }
+
+                if overflow_list_open() && !split_layout && overflow_count > 0 {
+                    crate::components::overflow_participants::OverflowParticipantList {
+                        open: overflow_list_open,
+                        participants: crate::components::overflow_participants::describe(
+                            &overflow_hidden,
+                            |sid| client.get_peer_user_id(sid),
+                            |sid| client.get_peer_display_name(sid),
+                        ),
+                        owner_user_id: host_user_id.clone(),
+                        pins: pinned_tiles,
+                        on_toggle_pin: toggle_pin,
                     }
                 }
 
@@ -14002,7 +14751,7 @@ pub fn AttendantsComponent(
                                 density_mode.set(selected);
                                 save_density_mode(selected);
                                 density_open.set(false);
-                                focus_element_by_id("density-mode-trigger");
+                                focus_slot_trigger("density-mode-trigger");
                             } else if key == Key::ArrowDown {
                                 evt.stop_propagation();
                                 evt.prevent_default();
@@ -14031,7 +14780,7 @@ pub fn AttendantsComponent(
                                 // APG menu pattern: Tab closes the menu and
                                 // returns focus to the trigger.
                                 density_open.set(false);
-                                focus_element_by_id("density-mode-trigger");
+                                focus_slot_trigger("density-mode-trigger");
                             }
                         },
                         for mode in DENSITY_MODES {
@@ -14046,6 +14795,7 @@ pub fn AttendantsComponent(
                                     density_mode.set(mode);
                                     save_density_mode(mode);
                                     density_open.set(false);
+                                    settle_slot_focus("density-mode-trigger");
                                 },
                                 span { class: "density-option-label", "{mode.label()}" }
                                 span { class: "density-option-range", "{mode.description()}" }
@@ -14332,7 +15082,7 @@ pub fn AttendantsComponent(
                             onclick: move |e: MouseEvent| {
                                 e.stop_propagation();
                                 reactions_open.set(false);
-                                focus_element_by_id("reactions-trigger");
+                                focus_slot_trigger("reactions-trigger");
                             },
                             "\u{00d7}"
                         }
@@ -14344,6 +15094,8 @@ pub fn AttendantsComponent(
                     meeting_id: id.clone(),
                     participant_count: num_display_peers + 1,
                     is_active: meeting_ended_message().is_none(),
+                    participants_open: peer_list_open(),
+                    on_toggle_participants: toggle_peer_list_from_footer,
                 }
             }
                 MeetingInfoDialog {
@@ -14507,6 +15259,418 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    type BoolField = (
+        fn(&mut ParticipantStatusResponse),
+        fn(&LiveMeetingSettings) -> Signal<bool>,
+    );
+
+    const SETTINGS_FIELDS: [BoolField; 6] = [
+        (|s| s.waiting_room_enabled = true, |l| l.waiting_room),
+        (|s| s.admitted_can_admit = true, |l| l.admitted_can_admit),
+        (|s| s.end_on_host_leave = true, |l| l.end_on_host_leave),
+        (|s| s.allow_guests = true, |l| l.allow_guests),
+        (
+            |s| s.recording_allowed_for_all = true,
+            |l| l.recording_allowed_for_all,
+        ),
+        (
+            |s| s.chat_allowed_for_all = true,
+            |l| l.chat_allowed_for_all,
+        ),
+    ];
+
+    fn settings_status(set: &[fn(&mut ParticipantStatusResponse)]) -> ParticipantStatusResponse {
+        let mut status = ParticipantStatusResponse {
+            waiting_room_enabled: false,
+            end_on_host_leave: false,
+            chat_allowed_for_all: false,
+            ..roster_part("u", false)
+        };
+        for field in set {
+            field(&mut status);
+        }
+        status
+    }
+
+    fn live_flags(live: &LiveMeetingSettings) -> Vec<bool> {
+        SETTINGS_FIELDS
+            .iter()
+            .map(|(_, get)| *get(live).peek())
+            .collect()
+    }
+
+    thread_local! {
+        static LIVE: RefCell<Option<LiveMeetingSettings>> = const { RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn SettingsProbe() -> Element {
+        let live = LiveMeetingSettings {
+            waiting_room: use_signal(|| false),
+            admitted_can_admit: use_signal(|| false),
+            end_on_host_leave: use_signal(|| false),
+            allow_guests: use_signal(|| false),
+            recording_allowed_for_all: use_signal(|| false),
+            chat_allowed_for_all: use_signal(|| false),
+            announcement_overrides: use_override_editor(use_signal(AnnouncementOverrides::default)),
+        };
+        use_hook(move || LIVE.with(|l| *l.borrow_mut() = Some(live)));
+        rsx! { div {} }
+    }
+
+    fn settings_probe() -> (VirtualDom, SettingsRefreshes) {
+        let mut vdom = VirtualDom::new(SettingsProbe);
+        vdom.rebuild_in_place();
+        let live = LIVE.with(|l| l.borrow_mut().take().expect("probe published its signals"));
+        let refreshes = SettingsRefreshes::new(String::new(), String::new(), false, live);
+        (vdom, refreshes)
+    }
+
+    #[test]
+    fn a_settings_refresh_lands_each_field_and_drops_a_late_older_read() {
+        use crate::components::announcement_overrides::AnnouncementOverride::{Off, On};
+        let (vdom, refreshes) = settings_probe();
+        let live = refreshes.live;
+
+        for (i, (set, _)) in SETTINGS_FIELDS.iter().enumerate() {
+            let generation = vdom.in_runtime(|| refreshes.start());
+            vdom.in_runtime(|| refreshes.apply(generation, &settings_status(&[*set])));
+            let want: Vec<bool> = (0..SETTINGS_FIELDS.len()).map(|j| i == j).collect();
+            assert_eq!(live_flags(&live), want, "field {i}");
+        }
+
+        let mut all_on = settings_status(&SETTINGS_FIELDS.map(|(set, _)| set));
+        all_on.entry_message_override = Off;
+        all_on.exit_sound_override = On;
+        let older = vdom.in_runtime(|| refreshes.start());
+        let newer = vdom.in_runtime(|| refreshes.start());
+        vdom.in_runtime(|| refreshes.apply(newer, &all_on));
+        vdom.in_runtime(|| refreshes.apply(older, &settings_status(&[])));
+        assert_eq!(
+            live_flags(&live),
+            [true; 6],
+            "the older read must not undo the newer one"
+        );
+        assert_eq!(
+            *live.announcement_overrides.server.peek(),
+            AnnouncementOverrides::from_status(&all_on)
+        );
+
+        let latest = vdom.in_runtime(|| refreshes.start());
+        vdom.in_runtime(|| refreshes.apply(latest, &settings_status(&[])));
+        assert_eq!(live_flags(&live), [false; 6]);
+        assert_eq!(
+            *live.announcement_overrides.server.peek(),
+            AnnouncementOverrides::default()
+        );
+        drop(refreshes);
+        drop(vdom);
+    }
+
+    #[test]
+    fn a_refresh_sent_before_a_save_lands_every_setting_but_the_saved_overrides() {
+        use crate::components::announcement_overrides::AnnouncementOverride::On;
+        let (vdom, refreshes) = settings_probe();
+        let live = refreshes.live;
+        let editor = live.announcement_overrides;
+        let saved = AnnouncementOverrides {
+            entry_sound: On,
+            ..Default::default()
+        };
+
+        let older = vdom.in_runtime(|| refreshes.start());
+        let refresh = vdom.in_runtime(|| refreshes.start());
+        let save = vdom.in_runtime(|| editor.start_read());
+        vdom.in_runtime(|| editor.land_read(save, saved));
+        let all_on = settings_status(&SETTINGS_FIELDS.map(|(set, _)| set));
+        vdom.in_runtime(|| refreshes.apply(refresh, &all_on));
+        vdom.in_runtime(|| refreshes.apply(older, &settings_status(&[])));
+        assert_eq!(live_flags(&live), [true; 6]);
+        assert_eq!(
+            *editor.server.peek(),
+            saved,
+            "a refresh sent before the save must not roll it back"
+        );
+
+        let later = vdom.in_runtime(|| refreshes.start());
+        vdom.in_runtime(|| refreshes.apply(later, &all_on));
+        assert_eq!(*editor.server.peek(), AnnouncementOverrides::default());
+        drop(refreshes);
+        drop(vdom);
+    }
+
+    #[test]
+    fn a_failed_settings_read_retries_unless_it_was_a_401() {
+        use crate::meeting_api::JoinError;
+        assert!(!settings_read_retries(&JoinError::NotAuthenticated));
+        for error in [
+            JoinError::ServerError {
+                status: 503,
+                body: String::new(),
+            },
+            JoinError::Config(String::new()),
+            JoinError::Forbidden(String::new()),
+        ] {
+            assert!(settings_read_retries(&error), "{error}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_failed_settings_read_is_retried_once_and_not_after_unmount() {
+        use gloo_timers::future::TimeoutFuture;
+        let window = gloo_utils::window();
+        let key = JsValue::from_str("__APP_CONFIG");
+        let saved = js_sys::Reflect::get(&window, &key).unwrap();
+        js_sys::Reflect::delete_property(&window, &key).unwrap();
+        crate::constants::reset_config_cache_for_test();
+        let math = js_sys::Reflect::get(&window, &JsValue::from_str("Math")).unwrap();
+        let random_key = JsValue::from_str("random");
+        let random = js_sys::Reflect::get(&math, &random_key).unwrap();
+        let zero = Closure::<dyn Fn() -> f64>::new(|| 0.0);
+        js_sys::Reflect::set(&math, &random_key, zero.as_ref()).unwrap();
+        let stubbed = js_sys::Math::random();
+
+        let (vdom, mounted) = settings_probe();
+        let mounted = Rc::new(mounted);
+        let (unmounted_vdom, unmounted) = settings_probe();
+        let unmounted = Rc::new(unmounted);
+        mounted.refresh();
+        unmounted.refresh();
+        drop(unmounted_vdom);
+        TimeoutFuture::new(2_500).await;
+        let after_mounted = mounted.started.get();
+        let after_unmount = unmounted.started.get();
+        drop(vdom);
+
+        js_sys::Reflect::set(&math, &random_key, &random).unwrap();
+        drop(zero);
+        if !saved.is_undefined() {
+            js_sys::Reflect::set(&window, &key, &saved).unwrap();
+        }
+        crate::constants::reset_config_cache_for_test();
+        assert_eq!(stubbed, 0.0);
+        assert_eq!(after_mounted, 2, "one read, one retry");
+        assert_eq!(after_unmount, 1, "no retry once unmounted");
+        assert_eq!(mounted.applied.get() + unmounted.applied.get(), 0);
+    }
+
+    #[test]
+    fn a_join_or_leave_reads_its_own_channel_and_the_recorder() {
+        use crate::components::announcement_overrides::AnnouncementOverride::{Off, On};
+        use crate::context::AppearanceSettings;
+        use RecordButtonState::{Activating, Idle, Recording, Saving, Stopping};
+        let quiet = AppearanceSettings {
+            show_entry_notifications: false,
+            play_entry_sound: false,
+            show_exit_notifications: false,
+            play_exit_sound: false,
+            ..Default::default()
+        };
+        let all_off = AnnouncementOverrides {
+            entry_message: Off,
+            entry_sound: Off,
+            exit_message: Off,
+            exit_sound: Off,
+        };
+        for change in [PeerChange::Joined, PeerChange::Left] {
+            assert_eq!(
+                peer_announcement(change, &quiet, &all_off, &Idle),
+                (false, false)
+            );
+            for recorder in [Activating, Recording, Stopping, Saving] {
+                assert_eq!(
+                    peer_announcement(change, &quiet, &all_off, &recorder),
+                    (true, false),
+                    "{change:?} while {recorder:?} still toasts"
+                );
+            }
+        }
+
+        let joins_on = AnnouncementOverrides {
+            entry_message: On,
+            entry_sound: On,
+            ..all_off
+        };
+        assert_eq!(
+            peer_announcement(PeerChange::Joined, &quiet, &joins_on, &Idle),
+            (true, true)
+        );
+        assert_eq!(
+            peer_announcement(PeerChange::Left, &quiet, &joins_on, &Idle),
+            (false, false)
+        );
+
+        let own = AppearanceSettings {
+            show_entry_notifications: true,
+            play_entry_sound: false,
+            show_exit_notifications: false,
+            play_exit_sound: true,
+            ..Default::default()
+        };
+        let open = AnnouncementOverrides::default();
+        assert_eq!(
+            peer_announcement(PeerChange::Joined, &own, &open, &Idle),
+            (true, false)
+        );
+        assert_eq!(
+            peer_announcement(PeerChange::Left, &own, &open, &Idle),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn an_unchanged_value_does_not_re_render_its_readers() {
+        thread_local! {
+            static RENDERS: Cell<u32> = const { Cell::new(0) };
+            static FLAG: Cell<Option<Signal<bool>>> = const { Cell::new(None) };
+        }
+
+        #[allow(non_snake_case)]
+        fn Reader() -> Element {
+            let flag = use_signal(|| true);
+            use_hook(move || FLAG.with(|f| f.set(Some(flag))));
+            RENDERS.with(|r| r.set(r.get() + 1));
+            let _ = flag();
+            rsx! { div {} }
+        }
+
+        RENDERS.with(|r| r.set(0));
+        let mut vdom = VirtualDom::new(Reader);
+        vdom.rebuild_in_place();
+        let flag = FLAG.with(|f| f.get()).expect("reader published its signal");
+
+        vdom.in_runtime(|| try_set_if_changed(flag, true));
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert_eq!(RENDERS.with(|r| r.get()), 1);
+
+        vdom.in_runtime(|| try_set_if_changed(flag, false));
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert_eq!(RENDERS.with(|r| r.get()), 2, "a real change re-renders");
+        assert!(!*flag.peek());
+        FLAG.with(|f| f.set(None));
+        drop(vdom);
+    }
+
+    /// The `}` closing the `{` at `open` in `flat`.
+    fn block_close(flat: &str, open: usize) -> Option<usize> {
+        let mut depth = 0;
+        flat[open..].char_indices().find_map(|(i, c)| {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => return None,
+            }
+            (depth == 0).then_some(open + i)
+        })
+    }
+
+    /// `name`'s block in the client options, with all whitespace removed.
+    fn client_callback_source(name: &str, next: &str) -> String {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        let key = format!("{name}:");
+        assert_eq!(flat.matches(&key).count(), 1, "one `{name}` callback");
+        let start = flat.find(&key).unwrap();
+        let open = start + flat[start..].find('{').expect("a callback body");
+        let close =
+            block_close(&flat, open).unwrap_or_else(|| panic!("`{name}` callback never closes"));
+        let next_key = format!("{next}:");
+        assert!(close > open + 1, "`{name}` has an empty body");
+        assert!(
+            !flat[start..close].contains(&next_key),
+            "`{name}`'s block runs into `{next}`"
+        );
+        assert!(
+            flat[close..].contains(&next_key),
+            "`{next}` follows `{name}`"
+        );
+        flat[start..=close].to_string()
+    }
+
+    #[test]
+    fn a_push_and_every_connect_refresh_through_the_ordered_apply() {
+        let push = client_callback_source("on_meeting_settings_updated", "on_host_mute");
+        assert!(push.contains("settings_refreshes.refresh();"));
+        let connect = client_callback_source("on_connected", "on_connection_lost");
+        assert!(connect.contains(
+            "ifshould_reconcile_host_on_connect(&host_reconcile_first_connect,is_guest)\
+             {reseed_host_set_from_roster("
+        ));
+        assert_eq!(connect.matches(".refresh()").count(), 1);
+        let top = connect
+            .find("on_connected_reset(")
+            .expect("the connect reset");
+        let refresh = connect
+            .find("settings_refreshes.refresh();")
+            .expect("a connect refresh");
+        let mut depth = 0;
+        for c in connect[top..refresh].chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0);
+        }
+        assert_eq!(depth, 0, "the refresh runs on every connect, the first too");
+
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        let head = concat!("fnread(", "self:&Rc<Self>,retry_after_ms:Option<u32>){");
+        assert_eq!(flat.matches(head).count(), 1);
+        let start = flat.find(head).unwrap();
+        let body = &flat[start..=block_close(&flat, start + head.len() - 1).unwrap()];
+        let generation = body.find("letgeneration=self.start();");
+        let spawn = body.find("wasm_bindgen_futures::spawn_local(");
+        let fetch = body.find("fetch_participant_status(");
+        assert!(generation.is_some() && spawn.is_some() && fetch.is_some());
+        assert!(
+            generation < spawn && spawn < fetch,
+            "the generation is taken before the fetch is spawned"
+        );
+        assert!(body.contains("Ok(status)=>returnrefreshes.apply(generation,&status),"));
+        assert!(body.contains("refreshes.read(None);"));
+    }
+
+    #[test]
+    fn the_call_client_hands_avatar_changes_to_the_meetings_avatar_cache() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        let context = concat!(
+            "letavatar_cache=try_use_context::<",
+            "PeerAvatarCacheCtx>();"
+        );
+        let wiring = concat!(
+            "on_avatar_changed:avatar_change_",
+            "listener(avatar_cache.as_ref()),"
+        );
+        assert_eq!(flat.matches(context).count(), 1);
+        assert_eq!(flat.matches(wiring).count(), 1);
+        let block = client_callback_source("on_display_name_changed", "on_avatar_changed");
+        assert!(flat.find(&block).unwrap() < flat.find(wiring).unwrap());
+    }
+
+    #[test]
+    fn join_and_leave_announcements_read_the_live_overrides() {
+        for (callback, next, change) in [
+            ("on_peer_left", "on_peer_joined", "Left"),
+            ("on_peer_joined", "on_display_name_changed", "Joined"),
+        ] {
+            let block = client_callback_source(callback, next);
+            let decision = format!(
+                "let(show_toast,play_sound)=peer_announcement(PeerChange::{change},\
+                 &appearance_settings.peek(),&announcement_overrides_live.peek(),\
+                 &record_state.peek(),);"
+            );
+            assert!(
+                block.contains(&decision),
+                "{callback} must decide from the live settings, overrides and recorder"
+            );
+        }
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        assert!(flat.contains(concat!(
+            "AnnouncementOverridesCtx(",
+            "announcement_overrides_live)"
+        )));
+    }
 
     /// #2271 wiring pin: the budget loop is a spawned task, so no host test reaches
     /// its call site. Needles are fragmented so they do not self-match.
@@ -14824,42 +15988,24 @@ mod tests {
         fn DockProbe() -> Element {
             let autohide_enabled = use_signal(|| true);
             let controls_visible = use_signal(|| false);
-            let controls_expanded = use_signal(|| false);
 
-            // Same shape as the production `use_hook` in `AttendantsComponent`.
             let _guard = use_hook(move || {
-                let narrow_timer: DockTimerCell = Rc::new(RefCell::new(None));
                 let hide_timer: DockTimerCell = Rc::new(RefCell::new(None));
 
-                let nt = narrow_timer.clone();
                 let ht = hide_timer.clone();
                 let mouse_listener = WindowEventListener::new("mousemove", move || {
                     DOCK_HITS.with(|h| h.set(h.get() + 1));
-                    wake_dock(
-                        &nt,
-                        &ht,
-                        autohide_enabled,
-                        controls_visible,
-                        controls_expanded,
-                    );
+                    wake_dock(&ht, autohide_enabled, controls_visible);
                 });
-                let nt = narrow_timer.clone();
                 let ht = hide_timer.clone();
                 let touch_listener = WindowEventListener::new("touchstart", move || {
-                    wake_dock(
-                        &nt,
-                        &ht,
-                        autohide_enabled,
-                        controls_visible,
-                        controls_expanded,
-                    );
+                    wake_dock(&ht, autohide_enabled, controls_visible);
                 });
 
                 Rc::new(DockAutoHide {
                     _mouse_listener: mouse_listener,
                     _touch_listener: touch_listener,
-                    _narrow_timer: narrow_timer,
-                    _hide_timer: hide_timer,
+                    hide_timer,
                 })
             });
             rsx! { div {} }
@@ -14919,28 +16065,13 @@ mod tests {
     /// CANCELLED when the cell that owns it goes away, not fire into a
     /// torn-down scope up to `DOCK_HIDE_DELAY_MS` later.
     ///
-    /// Phase 1 is the positive control — with the cells held, the narrow timer
-    /// really does fire and collapse `controls_expanded`. Without it, phase 2
-    /// would pass vacuously (a timer that never fires proves nothing about
-    /// cancellation).
-    ///
-    /// Phase 2 arms the same way and then drops the cells, which is what scope
-    /// teardown does to the `DockAutoHide` hook value.
-    ///
-    /// MUTATION SENSITIVITY: reverting `arm_dock_autohide` to a `.forget()`-ed
-    /// timer (`Timeout::new(..).forget()`, leaving the cell `None`) makes the
-    /// phase-2 timer fire anyway and `controls_expanded` reads `false`.
-    ///
     /// The probe component deliberately does NOT read the signals, so they have
     /// no reactive subscribers and the writes performed from the timer callback
     /// need no ambient runtime — matching the production case, where these
     /// timers also fire outside any Dioxus render.
     #[wasm_bindgen_test]
     async fn dock_autohide_timer_is_cancelled_when_its_cell_is_dropped() {
-        /// `(autohide_enabled, controls_visible, controls_expanded)` — the trio
-        /// `arm_dock_autohide` takes, published by the probe so the test can
-        /// observe them from outside the render.
-        type DockSignals = (Signal<bool>, Signal<bool>, Signal<bool>);
+        type DockSignals = (Signal<bool>, Signal<bool>);
         thread_local! {
             static PROBE_SIGNALS: RefCell<Option<DockSignals>> = const { RefCell::new(None) };
         }
@@ -14949,9 +16080,8 @@ mod tests {
         fn SignalProbe() -> Element {
             let enabled = use_signal(|| true);
             let visible = use_signal(|| true);
-            let expanded = use_signal(|| true);
             use_hook(move || {
-                PROBE_SIGNALS.with(|s| *s.borrow_mut() = Some((enabled, visible, expanded)));
+                PROBE_SIGNALS.with(|s| *s.borrow_mut() = Some((enabled, visible)));
             });
             rsx! { div {} }
         }
@@ -14959,34 +16089,26 @@ mod tests {
         // Kept alive for the whole test: dropping it would drop the signals.
         let mut vdom = VirtualDom::new(SignalProbe);
         vdom.rebuild_in_place();
-        let (enabled, visible, mut expanded) =
+        let (enabled, mut visible) =
             PROBE_SIGNALS.with(|s| s.borrow().expect("probe published its signals"));
 
-        // Wait for the narrow delay plus a generous margin for a loaded CI
-        // browser. The hide timer (4s) is never awaited — only armed — so the
-        // test stays fast.
-        let settle_ms = DOCK_NARROW_DELAY_MS + 300;
+        let settle_ms = DOCK_HIDE_DELAY_MS + 300;
 
-        // ── Phase 1: cells held -> the timer fires. ──
-        let narrow_held: DockTimerCell = Rc::new(RefCell::new(None));
         let hide_held: DockTimerCell = Rc::new(RefCell::new(None));
-        arm_dock_autohide(&narrow_held, &hide_held, enabled, visible, expanded);
+        arm_dock_autohide(&hide_held, enabled, visible);
         TimeoutFuture::new(settle_ms).await;
         assert!(
-            !expanded.try_peek().map(|v| *v).unwrap_or(true),
-            "positive control: a LIVE narrow timer must collapse `controls_expanded`"
+            !visible.try_peek().map(|v| *v).unwrap_or(true),
+            "positive control: a LIVE hide timer must clear `controls_visible`"
         );
 
-        // ── Phase 2: same arming, cells dropped -> the timer is cancelled. ──
-        expanded.set(true);
-        let narrow_dropped: DockTimerCell = Rc::new(RefCell::new(None));
+        visible.set(true);
         let hide_dropped: DockTimerCell = Rc::new(RefCell::new(None));
-        arm_dock_autohide(&narrow_dropped, &hide_dropped, enabled, visible, expanded);
-        drop(narrow_dropped);
+        arm_dock_autohide(&hide_dropped, enabled, visible);
         drop(hide_dropped);
         TimeoutFuture::new(settle_ms).await;
         assert!(
-            expanded.try_peek().map(|v| *v).unwrap_or(false),
+            visible.try_peek().map(|v| *v).unwrap_or(false),
             "issue 2100: dropping the timer cells (what scope teardown does to the \
              `DockAutoHide` hook value) must CANCEL the pending auto-hide timer — a \
              `.forget()`-ed one fires into a torn-down scope up to 4s after unmount"
@@ -15105,6 +16227,111 @@ mod tests {
             "issue 2103: a fresh per-render closure gives the prop a new identity, so \
              `PeerTileProps::memoize` cannot short-circuit — this is the defect"
         );
+    }
+
+    #[test]
+    fn peer_tile_enlarge_state_memoizes_only_with_a_stable_handler() {
+        use crate::components::canvas_generator::TileEnlarge;
+        use crate::components::peer_tile::PeerTileProps;
+        use dioxus_core::Properties;
+
+        thread_local! {
+            static MEMOIZED: Cell<(bool, bool, bool)> = const { Cell::new((false, false, false)) };
+        }
+
+        #[allow(non_snake_case)]
+        fn MemoProbe() -> Element {
+            let pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+            let decode: EventHandler<String> = use_callback(|_: String| {});
+            let toggle: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+            let memo = |a: TileEnlarge, b: TileEnlarge| {
+                let props = |enlarge| {
+                    PeerTileProps::builder()
+                        .peer_id("peer-1".to_string())
+                        .on_toggle_pin(pin)
+                        .on_request_decode(decode)
+                        .enlarge(enlarge)
+                        .build()
+                };
+                props(a).memoize(&props(b))
+            };
+            let stable = TileEnlarge {
+                on_toggle: Some(toggle),
+                ..TileEnlarge::default()
+            };
+            let per_render = || TileEnlarge {
+                on_toggle: Some(EventHandler::new(|_: PinnedTile| {})),
+                ..TileEnlarge::default()
+            };
+            MEMOIZED.with(|m| {
+                m.set((
+                    memo(stable, stable),
+                    memo(
+                        stable,
+                        TileEnlarge {
+                            rank: Some(0),
+                            ..stable
+                        },
+                    ),
+                    memo(per_render(), per_render()),
+                ))
+            });
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(MemoProbe);
+        vdom.rebuild_in_place();
+        let (unchanged, painted, per_render) = MEMOIZED.with(|m| m.get());
+        assert!(unchanged, "an unchanged enlarge state must not re-render");
+        assert!(!painted, "a tile that changes size must re-render");
+        assert!(!per_render, "a per-render handler defeats memoization");
+    }
+
+    #[test]
+    fn the_enlarge_call_site_wires_its_handler_shared_guard_plan_and_lid() {
+        let src = include_str!("attendants.rs");
+        let decl_at = src
+            .find(concat!(
+                "let toggle_enlarge: EventHandler<PinnedTile> = ",
+                "use_callback({"
+            ))
+            .expect("the enlarge handler must be a `use_callback`");
+        assert!(
+            decl_at < src.find(concat!("    if !meeting_", "joined() {")).unwrap(),
+            "the hook must run before the pre-join early return"
+        );
+        let flat: String = src.split_whitespace().collect();
+        for needle in [
+            concat!("on_toggle_enlarge:toggle_", "enlarge,"),
+            concat!("tile_flow_style(tile_count,tile_", "plan)"),
+            concat!(
+                "tile_size_vars(tile_plan.tile_w,tile_",
+                "plan.tile_h(),gap)"
+            ),
+            concat!("split_panel,tile_", "plan,tile_count,avail_h,dpr,"),
+            concat!(
+                "&enlarged_view.painted_sessions(),enlarged_tile_device_px_h(tile_",
+                "plan,gap,dpr)"
+            ),
+            concat!("TilePlanInput{tile_count,split_", "layout,full_bleed:"),
+            concat!("use_hook(primary_pointer_is_", "coarse)"),
+            concat!("&unified_tiles,&enlarged_sessions,pointer_", "coarse,"),
+            concat!(
+                "full_bleed:crate::components::self_view::remote_full_",
+                "bleed(sole_real_tile,&self_counts,),"
+            ),
+            concat!(
+                "toggle_enlarge:EventHandler<PinnedTile>=use_callback({letclient=client.clone();",
+                "letlast_pin_activation=last_pin_",
+                "activation.clone();"
+            ),
+            concat!("|peer_id|grid_lead.rank.", "get(peer_id).copied()"),
+            concat!("pins:&grid_lead.", "sessions,"),
+            concat!("&camera_off_tiles,&grid_lead.", "rank,"),
+            concat!("pin_rank:&pin_rank_", "by_session,enlarged:&enlarged_view,"),
+        ] {
+            assert!(flat.contains(needle), "{needle}");
+        }
     }
 
     /// Issue 2693 + 2103: the pill memoizes only while `on_show` keeps one identity.
@@ -15253,6 +16480,7 @@ mod tests {
                 .display_name(name.to_string())
                 .meeting_id("room".to_string())
                 .session_id(Some(7))
+                .local_user_id("alice".to_string())
                 .on_renamed(on_renamed)
                 .build()
         }
@@ -16262,28 +17490,9 @@ mod tests {
 
     /// Issue 2100/2103: `wake_dock` must not dirty its scope when the dock is
     /// ALREADY awake.
-    ///
-    /// This is the render-cadence half of the dock fix, and the one that fires
-    /// in ordinary use: `mousemove` runs `wake_dock` on every pointer frame,
-    /// while `resize` only fires during a drag. `Signal::write` marks
-    /// subscribers dirty UNCONDITIONALLY (dioxus-signals 0.7.3
-    /// `SignalSubscriberDrop::drop` -> `update_subscribers`, no value
-    /// comparison), so the pre-fix `set(true)` pair re-rendered the whole
-    /// meeting view on every frame in which the pointer moved — with the dock
-    /// already visible and expanded, i.e. with nothing to change.
-    ///
-    /// wasm rather than native because `wake_dock` -> `arm_dock_autohide`
-    /// constructs `gloo` `Timeout`s, which need a browser.
-    ///
-    /// MUTATION SENSITIVITY: removing EITHER change-guard in `wake_dock` (i.e.
-    /// reverting that half to an unconditional `controls_visible.set(true)` /
-    /// `controls_expanded.set(true)`) makes the write unconditional, so
-    /// `update_subscribers` dirties the probe and it renders a second time,
-    /// failing the `== 1` assertion. Confirmed by performing both mutations
-    /// independently.
     #[wasm_bindgen_test]
     fn waking_an_already_awake_dock_does_not_dirty_its_subscribers() {
-        type DockSignals = (Signal<bool>, Signal<bool>, Signal<bool>);
+        type DockSignals = (Signal<bool>, Signal<bool>);
         thread_local! {
             static WAKE_SIGNALS: RefCell<Option<DockSignals>> = const { RefCell::new(None) };
             static WAKE_RENDERS: Cell<u32> = const { Cell::new(0) };
@@ -16291,28 +17500,21 @@ mod tests {
         WAKE_SIGNALS.with(|s| *s.borrow_mut() = None);
         WAKE_RENDERS.with(|r| r.set(0));
 
-        /// Unlike the `dock_autohide_timer_is_cancelled_when_its_cell_is_dropped`
-        /// probe, this one READS both dock signals — that subscription is the
-        /// whole point: it is what the meeting view does (`controls_visible` /
-        /// `controls_expanded` are consumed as CSS class strings in its render
-        /// body), and it is what an unconditional write re-renders.
         #[allow(non_snake_case)]
         fn WakeProbe() -> Element {
             let enabled = use_signal(|| true);
             let visible = use_signal(|| true);
-            let expanded = use_signal(|| true);
             let _ = visible();
-            let _ = expanded();
             WAKE_RENDERS.with(|r| r.set(r.get() + 1));
             use_hook(move || {
-                WAKE_SIGNALS.with(|s| *s.borrow_mut() = Some((enabled, visible, expanded)));
+                WAKE_SIGNALS.with(|s| *s.borrow_mut() = Some((enabled, visible)));
             });
             rsx! { div {} }
         }
 
         let mut vdom = VirtualDom::new(WakeProbe);
         vdom.rebuild_in_place();
-        let (enabled, visible, expanded) =
+        let (enabled, visible) =
             WAKE_SIGNALS.with(|s| s.borrow().expect("probe published its signals"));
         assert_eq!(
             WAKE_RENDERS.with(|r| r.get()),
@@ -16320,45 +17522,35 @@ mod tests {
             "positive control: the probe must have rendered exactly once at mount"
         );
 
-        // Cells kept alive so the armed auto-hide timers are cancelled on drop
-        // at the end of the test rather than firing into a live scope.
-        let narrow: DockTimerCell = Rc::new(RefCell::new(None));
         let hide: DockTimerCell = Rc::new(RefCell::new(None));
 
-        // The dock is already visible AND expanded, so both writes are no-ops.
-        vdom.in_runtime(|| wake_dock(&narrow, &hide, enabled, visible, expanded));
+        vdom.in_runtime(|| wake_dock(&hide, enabled, visible));
         vdom.render_immediate(&mut dioxus_core::NoOpMutations);
         assert_eq!(
             WAKE_RENDERS.with(|r| r.get()),
             1,
             "issue 2100: `wake_dock` must not dirty the scope when the dock is already \
-             awake — an unconditional `set(true)` pair re-renders the entire meeting \
-             view on every `mousemove` frame"
+             awake — an unconditional `set(true)` re-renders the entire meeting view on \
+             every `mousemove` frame"
         );
 
-        // POSITIVE CONTROL — a real wake (dock hidden and collapsed) MUST
-        // re-render. Without this the assertion above would also pass if
-        // `wake_dock` had simply stopped writing at all.
         let mut visible_mut = visible;
-        let mut expanded_mut = expanded;
         visible_mut.set(false);
-        expanded_mut.set(false);
         vdom.render_immediate(&mut dioxus_core::NoOpMutations);
         let before_real_wake = WAKE_RENDERS.with(|r| r.get());
-        vdom.in_runtime(|| wake_dock(&narrow, &hide, enabled, visible, expanded));
+        vdom.in_runtime(|| wake_dock(&hide, enabled, visible));
         vdom.render_immediate(&mut dioxus_core::NoOpMutations);
         assert!(
             WAKE_RENDERS.with(|r| r.get()) > before_real_wake,
-            "positive control: a REAL wake (dock hidden/collapsed) must still write the \
-             signals and re-render — the guard suppresses redundant writes, not real ones"
+            "positive control: a REAL wake (dock hidden) must still write the signal and \
+             re-render — the guard suppresses redundant writes, not real ones"
         );
         assert!(
-            visible.peek().to_owned() && expanded.peek().to_owned(),
-            "a real wake must leave the dock visible AND expanded"
+            visible.peek().to_owned(),
+            "a real wake must leave the dock visible"
         );
 
         WAKE_SIGNALS.with(|s| *s.borrow_mut() = None);
-        drop(narrow);
         drop(hide);
         drop(vdom);
     }
@@ -16391,7 +17583,7 @@ mod tests {
     //
     // `dioxus-core`'s `diff_vtext` emits `set_node_text` only when
     // `left.value != right.value`, so a live region fed the SAME string twice
-    // never mutates and never re-announces. Two consecutive "Reset to Default"
+    // never mutates and never re-announces. Two consecutive "Reset Buttons"
     // presses set a *constant*, so the second was silent — exactly the
     // complaint issue 1765 filed. `action_bar_announce_text` breaks the tie with
     // a nonce-parity invisible suffix.
@@ -16527,6 +17719,47 @@ mod tests {
     }
 
     #[test]
+    fn kept_slots_overflow_last_and_the_fit_stays_monotonic() {
+        let secondary: Vec<ActionBarSlot> = DEFAULT_SLOTS
+            .iter()
+            .copied()
+            .filter(|s| !matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
+            .collect();
+        let last = *secondary.last().unwrap();
+        let kept = ShrunkButtons {
+            slots: vec![ActionBarSlot::ScreenShare, last],
+            hangup: true,
+        };
+        let order = kept_slots_first(&secondary, &kept);
+        assert_eq!(order.len(), secondary.len());
+
+        let fit = |band: f64, slots: &[ActionBarSlot]| {
+            action_bar_overflow_hidden(band, 800.0, false, 16.0, 3, slots)
+        };
+        let mut losing_band = None;
+        let mut previous = usize::MAX;
+        for band in (300..=1600).step_by(4).map(f64::from) {
+            let hidden = fit(band, &order);
+            assert!(hidden.len() <= previous, "{band}: widening hid more");
+            previous = hidden.len();
+            if kept.slots.iter().any(|slot| hidden.contains(slot)) {
+                assert!(
+                    order[..secondary.len() - hidden.len()]
+                        .iter()
+                        .all(|slot| kept.slots.contains(slot)),
+                    "{band}: a kept slot overflowed while a non-kept one stayed: {hidden:?}"
+                );
+            } else if fit(band, &secondary).contains(&last) && !hidden.is_empty() {
+                losing_band = Some(band);
+            }
+        }
+        assert!(
+            losing_band.is_some(),
+            "premise: at some band the bar order loses the trailing kept slot and this keeps it"
+        );
+    }
+
+    #[test]
     fn action_bar_overflow_reveals_all_when_wide_and_overflows_when_narrow() {
         let secondary = overflow_test_secondary();
         // A wide window reveals every secondary slot (nothing overflows).
@@ -16586,20 +17819,42 @@ mod tests {
     /// The narrowest viewport width, in CSS px at a 16px root, that fits the
     /// WHOLE default action bar with nothing behind the overflow trigger.
     ///
-    /// Derived from `action_bar_overflow_hidden`'s constants at 10 secondary
+    /// Derived from `action_bar_overflow_hidden`'s constants at 11 secondary
     /// slots (`DEFAULT_SLOTS` minus Mic/Camera, as an owner sees it):
     ///   sacred 3.49.6 + 3.19.2 + 48 + 2 = 256.4 ; trigger 49.6 + 19.2 = 68.8 ;
-    ///   dock wrapper 68.8 ; secondary 49.6 + 9.68.8 = 668.8
-    ///   so vw >= 668.8 + 256.4 + 68.8 + 68.8 + 40
+    ///   dock wrapper 68.8 ; secondary 49.6 + 10.68.8 = 737.6
+    ///   so vw >= 737.6 + 256.4 + 68.8 + 68.8 + 40 = 1171.6
     /// Pinned rather than recomputed here so the test cannot drift with the
     /// production formula it is supposed to be watching.
-    ///
-    /// Moved 1034 -> 1103 in issue 2136, which added the host-only MeetingTimer
-    /// slot. Moved 1103 -> 1172 in issue 2701, which charges the budget for the
-    /// always-rendered `.dock-position-wrapper`. Back to 1103 here, where the
-    /// bar carries one slot fewer. 1103 leaves 177px under
-    /// `ACTION_BAR_E2E_WIDE_WIDTH` (1280).
-    const DEFAULT_ACTION_BAR_MIN_FIT_WIDTH: f64 = 1103.0;
+    const DEFAULT_ACTION_BAR_MIN_FIT_WIDTH: f64 = 1172.0;
+
+    #[test]
+    fn at_the_wide_width_the_whole_bar_fits_with_or_without_captions() {
+        let secondary = |captions: bool| -> Vec<ActionBarSlot> {
+            visible_action_bar_slots(
+                &default_slots(captions),
+                SlotVisibility {
+                    customize_mode: false,
+                    ios_device: false,
+                    split_layout: false,
+                    meeting_options_visible: true,
+                    recording_visible: true,
+                    meeting_timer_visible: true,
+                    captions_visible: captions,
+                },
+            )
+            .into_iter()
+            .filter(|s| !matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
+            .collect()
+        };
+        let hidden = |slots: &[ActionBarSlot]| {
+            action_bar_overflow_hidden(ACTION_BAR_E2E_WIDE_WIDTH, 800.0, false, 16.0, 3, slots)
+        };
+        let (flag_off, flag_on) = (secondary(false), secondary(true));
+        assert_eq!((flag_off.len(), flag_on.len()), (11, 12));
+        assert_eq!(hidden(&flag_off), []);
+        assert_eq!(hidden(&flag_on), []);
+    }
 
     /// The fresh-install secondary set, built by the PRODUCTION filter: every
     /// `DEFAULT_SLOTS` entry a non-iOS meeting OWNER sees, minus the sacred
@@ -16621,6 +17876,7 @@ mod tests {
                 recording_visible: true,
                 // Host-only, so an owner sees it (issue 2136).
                 meeting_timer_visible: true,
+                captions_visible: false,
             },
         )
         .into_iter()
@@ -16715,6 +17971,7 @@ mod tests {
             diagnostics_open: true,
             right_w: 560.0,
             chat_open: true,
+            chat_w: CHAT_DRAWER_WIDTH,
         }
     }
 
@@ -16761,6 +18018,7 @@ mod tests {
             diagnostics_open: false,
             right_w: 560.0,
             chat_open: false,
+            chat_w: CHAT_DRAWER_WIDTH,
         };
         let band = |s: DrawerState| action_bar_band_width(s.vw, drawer_reserves(s));
 
@@ -16804,6 +18062,34 @@ mod tests {
         assert!(!drag_is_orphaned(NoDrag, false, false));
     }
 
+    #[test]
+    fn captions_slot_follows_the_captions_gate() {
+        use crate::components::captions::captions_available;
+        let vis = |captions_visible| SlotVisibility {
+            customize_mode: true,
+            ios_device: false,
+            split_layout: false,
+            meeting_options_visible: true,
+            recording_visible: true,
+            meeting_timer_visible: true,
+            captions_visible,
+        };
+        assert!(is_action_bar_slot_visible(
+            ActionBarSlot::Captions,
+            vis(captions_available(true, false, false))
+        ));
+        for (flag, e2ee, vetoed) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            assert!(!is_action_bar_slot_visible(
+                ActionBarSlot::Captions,
+                vis(captions_available(flag, e2ee, vetoed))
+            ));
+        }
+    }
+
     /// The hoisted call passes the live flag, which is safe only because it
     /// gates ScreenShare and DensityMode, never the sacred pair.
     #[test]
@@ -16818,6 +18104,7 @@ mod tests {
             ),
             recording_visible: true,
             meeting_timer_visible: true,
+            captions_visible: false,
         };
         let sacred = |customize_mode| {
             visible_action_bar_slots(DEFAULT_SLOTS, vis(customize_mode))
@@ -16846,6 +18133,7 @@ mod tests {
             ),
             recording_visible: record_slot_visible(is_host, false, false),
             meeting_timer_visible: meeting_timer_slot_visible(is_host, false),
+            captions_visible: false,
         };
         let co_host = vis("cohost@example.com", true);
         assert!(
@@ -17105,7 +18393,7 @@ mod tests {
             Some(EscCloseTarget::HostNotice(HostActionKind::Mic))
         );
         assert_eq!(
-            EscCloseTarget::HostNotice(HostActionKind::Mic).trigger_id(),
+            EscCloseTarget::HostNotice(HostActionKind::Mic).trigger_id(PEER_LIST_TRIGGER_ID),
             None
         );
     }
@@ -17153,7 +18441,10 @@ mod tests {
     /// this one out and let the dismiss handler's own rule decide.
     #[test]
     fn esc_the_hide_toast_restores_focus_to_no_trigger() {
-        assert_eq!(EscCloseTarget::SelfViewToast.trigger_id(), None);
+        assert_eq!(
+            EscCloseTarget::SelfViewToast.trigger_id(PEER_LIST_TRIGGER_ID),
+            None
+        );
     }
 
     /// Only the peer list is open → Escape closes the peer list.
@@ -17183,19 +18474,525 @@ mod tests {
     }
 
     /// Lockstep pin on the trigger-button ids this handler restores focus to.
-    /// These strings are the fn's OUTPUT contract; the rendered-id side of the
-    /// contract (that a DOM element actually carries each id) is guarded by the
-    /// e2e `activeElement` assertions in `popup-layering.spec.ts`, not here.
     #[test]
     fn esc_close_target_trigger_ids() {
         assert_eq!(
-            EscCloseTarget::Diagnostics.trigger_id(),
+            EscCloseTarget::Diagnostics.trigger_id(MEETING_FOOTER_PARTICIPANTS_TRIGGER_ID),
             Some("diagnostics-trigger")
         );
         assert_eq!(
-            EscCloseTarget::PeerList.trigger_id(),
+            EscCloseTarget::PeerList.trigger_id(PeerListOpener::Footer.trigger_id()),
+            Some("meeting-footer-participants-trigger")
+        );
+        assert_eq!(
+            EscCloseTarget::PeerList.trigger_id(PeerListOpener::ActionBar.trigger_id()),
             Some("peer-list-trigger")
         );
+    }
+
+    #[test]
+    fn peer_list_focus_falls_back_through_the_shown_controls_in_order() {
+        const FOOTER: &str = "meeting-footer-participants-trigger";
+        const BAR: &str = "peer-list-trigger";
+        const MORE: &str = "overflow-menu-trigger";
+        let fallback =
+            |opener, shown: &[&str]| peer_list_focus_fallback(opener, |id| shown.contains(&id));
+        assert_eq!(
+            fallback(PeerListOpener::Footer, &[FOOTER, BAR, MORE]),
+            FOOTER
+        );
+        assert_eq!(fallback(PeerListOpener::Footer, &[BAR, MORE]), BAR);
+        assert_eq!(fallback(PeerListOpener::Footer, &[MORE]), MORE);
+        assert_eq!(fallback(PeerListOpener::Footer, &[]), "grid-container");
+        assert_eq!(
+            fallback(PeerListOpener::ActionBar, &[FOOTER, BAR, MORE]),
+            BAR
+        );
+        assert_eq!(fallback(PeerListOpener::ActionBar, &[FOOTER, MORE]), MORE);
+        assert_eq!(
+            fallback(PeerListOpener::ActionBar, &[FOOTER]),
+            "grid-container"
+        );
+    }
+
+    #[test]
+    fn peer_list_focus_measures_the_footer_count_only_for_a_footer_opener() {
+        let probed = RefCell::new(Vec::new());
+        let probe = |id: &str| {
+            probed.borrow_mut().push(id.to_string());
+            false
+        };
+        peer_list_focus_fallback(PeerListOpener::ActionBar, probe);
+        assert_eq!(
+            *probed.borrow(),
+            ["peer-list-trigger", "overflow-menu-trigger"]
+        );
+        probed.borrow_mut().clear();
+        peer_list_focus_fallback(PeerListOpener::Footer, |id: &str| {
+            probed.borrow_mut().push(id.to_string());
+            true
+        });
+        assert_eq!(*probed.borrow(), ["meeting-footer-participants-trigger"]);
+    }
+
+    #[wasm_bindgen_test]
+    async fn peer_list_focus_settles_after_the_render_that_hides_its_first_choice() {
+        let doc = web_sys::window().unwrap().document().unwrap();
+        let root = doc.create_element("div").unwrap();
+        root.set_inner_html(
+            "<button id='peer-list-trigger'>p</button>\
+             <button id='overflow-menu-trigger'>o</button>",
+        );
+        doc.body().unwrap().append_child(&root).unwrap();
+        let button = |id: &str| -> web_sys::HtmlElement {
+            doc.get_element_by_id(id).unwrap().dyn_into().unwrap()
+        };
+
+        button(PEER_LIST_TRIGGER_ID).focus().unwrap();
+        settle_peer_list_focus(PeerListOpener::ActionBar);
+        button(PEER_LIST_TRIGGER_ID)
+            .style()
+            .set_property("display", "none")
+            .unwrap();
+        gloo_timers::future::TimeoutFuture::new(20).await;
+        let landed = doc.active_element().map(|el| el.id());
+
+        button(OVERFLOW_MENU_TRIGGER_ID).blur().unwrap();
+        button(PEER_LIST_TRIGGER_ID)
+            .style()
+            .remove_property("display")
+            .unwrap();
+        button(PEER_LIST_TRIGGER_ID).focus().unwrap();
+        settle_peer_list_focus(PeerListOpener::ActionBar);
+        gloo_timers::future::TimeoutFuture::new(20).await;
+        let kept = doc.active_element().map(|el| el.id());
+        root.remove();
+
+        assert_eq!(landed.as_deref(), Some(OVERFLOW_MENU_TRIGGER_ID));
+        assert_eq!(
+            kept.as_deref(),
+            Some(PEER_LIST_TRIGGER_ID),
+            "focus that was not dropped stays put"
+        );
+    }
+
+    #[test]
+    fn the_peer_list_opens_in_one_place_and_the_footer_gets_a_stable_handler() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        assert_eq!(
+            flat.matches(concat!("peer_list_open", ".set(opening);"))
+                .count(),
+            1,
+            "the open side effects must live in `toggle_peer_list` alone"
+        );
+        assert!(flat.contains(concat!(
+            "on_toggle_participants:",
+            "toggle_peer_list_from_footer,"
+        )));
+        let decl = flat
+            .find(concat!(
+                "lettoggle_peer_list_from_footer:EventHandler<()>=",
+                "use_callback(move|_|{ifcustomize_mode(){return;}"
+            ))
+            .expect(
+                "the footer handler must be a `use_callback` that is a no-op in customize mode",
+            );
+        let early_return = flat
+            .find(concat!("if!meeting_", "joined(){"))
+            .expect("pre-join early return");
+        assert!(
+            decl < early_return,
+            "hooks must run before the early return"
+        );
+    }
+
+    fn missing_needles(flat: &str, needles: &[&str]) -> Vec<String> {
+        needles
+            .iter()
+            .filter(|n| !flat.contains(**n))
+            .map(|n| n.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn hold_to_edit_handlers_call_the_pure_decisions() {
+        let flat: String = [
+            include_str!("attendants.rs"),
+            include_str!("action_bar_gesture.rs"),
+            include_str!("window_event_listener.rs"),
+        ]
+        .concat()
+        .split_whitespace()
+        .collect();
+        let missing = missing_needles(
+            &flat,
+            &[
+                concat!(
+                    "iflet(true,Some(wrapper))=(hold_should_arm(!dock_wrapper_hidden(),press),",
+                    "slot_wrapper){arm_action_bar_hold("
+                ),
+                concat!(
+                    "slot_menu_open:slot==ActionBarSlot::ScreenShare",
+                    "&&share_menu_open(),"
+                ),
+                concat!(
+                    ".filter(|w|w.get_attribute(\"data-slot\").as_deref()==Some(slug));",
+                    "letpress=HoldPress{is_primary:pe.is_primary(),button:pe.button(),",
+                    "ctrl_key:pe.ctrl_key(),on_slot_primary_button:slot_wrapper.is_some(),"
+                ),
+                concat!("touch:pe.pointer_type()==", "\"touch\","),
+                concat!(
+                    "if!hold_should_fire(editing,!band_too_narrow,hold.slot,",
+                    "&rendered,&overflowed){"
+                ),
+                concat!(
+                    ".closest(NAV_SELECTOR).ok().flatten()",
+                    ".map(|nav|rendered_action_bar_slots(&nav)).unwrap_or_default();"
+                ),
+                concat!(
+                    "nav.query_selector_all(\".action-bar-slot-wrapper[data-slot]",
+                    ":not(.is-overflow-hidden)\")"
+                ),
+                concat!("hold.last=at;", "hold_exceeds_slop(hold.down,at)"),
+                concat!(
+                    "letediting=customize_mode();if!editing&&!gesture.has_pending()",
+                    "{return;}"
+                ),
+                concat!("gesture.track_hold_move(", "pe.pointer_id(),(cx,cy));"),
+                concat!(
+                    "onpointerleave:move|_|{ifgesture_leave.pending_slot()==Some(slot)",
+                    "{gesture_leave.cancel_hold();}}"
+                ),
+                concat!(
+                    "gesture.note_activity();ifdragging_slot().is_none()&&pe.buttons()&1!=0",
+                    "{ifletSome(cont)=gesture.take_continuation(pe.pointer_id()){"
+                ),
+                concat!(
+                    "pointer_id:pe.pointer_id(),x:cont.origin.0,y:cont.origin.1,",
+                    "grab_at:(cx,cy),is_vertical:dock_position()!=DockPosition::Bottom,",
+                    "},current_full,Some(cont.wrapper),);"
+                ),
+                concat!(
+                    "drag_started.set(true);}drag_pointer_x.set(cx);",
+                    "drag_pointer_y.set(cy);letslot_size=drag_slot_size.get();"
+                ),
+                concat!(
+                    "ifdrag_started(){letpx=drag_pointer_x();",
+                    "letpy=drag_pointer_y();"
+                ),
+                concat!(
+                    "let(grab_dx,grab_dy)=drag_grab_offset(start.grab_at,",
+                    "(rect.left(),rect.top()),(rect.width(),rect.height()),);",
+                    "h.drag_grab_dx.set(grab_dx);h.drag_grab_dy.set(grab_dy);"
+                ),
+                concat!(
+                    "ifgesture.pending_pointer()==Some(pe.pointer_id()){gesture.cancel_hold();}",
+                    "leton_nav=pe"
+                ),
+                concat!(
+                    ".is_some_and(|el|el.class_list().contains(\"video-controls-container\"));",
+                    "ifon_nav&&dragging_slot().is_some(){"
+                ),
+                concat!(
+                    "ifcustomize_mode()||gesture.has_pending()",
+                    "{evt.prevent_default();}"
+                ),
+                concat!(
+                    "gesture.last_activity.get(),",
+                    "gesture.pointer_held_in_bar(),"
+                ),
+                concat!(
+                    "move|evt:Event<KeyboardData>|{if!customize_mode(){return;}",
+                    "gesture.stop_idle_clock();"
+                ),
+                concat!(
+                    "if!customize_mode(){return;}gesture.note_activity();",
+                    "if!gesture.idle_is_timed()||gesture.pointer_held_in_bar(){return;}"
+                ),
+                concat!(
+                    "letfocus_visible=evt.as_web_event().target()",
+                    ".and_then(|t|t.dyn_into::<web_sys::Element>().ok())",
+                    ".is_some_and(|el|el.matches(\":focus-visible\").unwrap_or(false));",
+                    "iffocus_visible{gesture.stop_idle_clock();}"
+                ),
+                concat!(
+                    "ifcustomize_mode(){customize_entry_announcement(customize_entry())}",
+                    "else{customize_exit_announce()}"
+                ),
+                concat!(
+                    "lethidden=ifcontrols_visible()||pinned",
+                    "||customize_mode(){\"\"}else{\"controls-hidden\"};"
+                ),
+                concat!(
+                    "lettimed=customize_mode()&&customize_session_is_timed(customize_entry());",
+                    "gesture.stop_idle_clock();if!timed{return;}gesture.start_idle_clock();"
+                ),
+                concat!(
+                    "wake_dock(&dock.hide_timer,",
+                    "autohide_enabled,controls_visible)"
+                ),
+                concat!(
+                    "letediting=customize_mode();gesture.cancel_hold();",
+                    "if!editing{gesture.reset_after_exit();"
+                ),
+                concat!(
+                    "if!dock_wrapper_fits(budget,sacred_count,rem_px)",
+                    "{customize_ctl.exit(CustomizeExit::BandTooNarrow);"
+                ),
+                concat!(
+                    "locked:customize_mode()||overflow_hidden,",
+                    "live_lock:customize_mode,"
+                ),
+                concat!(
+                    "self.entry.set(entry);self.customize_mode.set(true);",
+                    "popovers.close_all();"
+                ),
+                concat!(
+                    "formutopenin[self.density_open,self.reactions_open,self.mock_peers_open,",
+                    "self.share_menu_open,self.dock_menu_open,self.meeting_timer_open,",
+                    "self.recents_open,]",
+                    "{if*open.peek(){open.set(false);}}"
+                ),
+                concat!("if!*self.customize_mode.peek(){", "returnfalse;}"),
+                concat!(
+                    "self.customize_mode.set(false);save_action_bar_layout(",
+                    "&self.action_bar_slots.peek(),&self.action_bar_hidden.peek(),);"
+                ),
+                concat!(
+                    "CustomizeExit::Idleiffocus_was_in_bar=>",
+                    "{Timeout::new(0,restore_focus_after_idle_exit).forget();}"
+                ),
+                concat!(
+                    "IdleStep::Exit=>{gesture.idle_task.set(None);",
+                    "ifctl.exit(CustomizeExit::Idle){on_idle_exit();}"
+                ),
+                concat!(
+                    "opts.set_prevent_scroll(true);",
+                    "let_=button.focus_with_options(&opts);"
+                ),
+                concat!(
+                    "ifjs_sys::Reflect::has(&navigator,&JsValue::from_str(\"vibrate\"))",
+                    ".unwrap_or(false){let_=navigator.vibrate_with_duration(15);}"
+                ),
+                concat!("ifhold.touch{", "vibrate_briefly();}"),
+                concat!(
+                    "gesture.cancel_hold();gesture.clear_settle();",
+                    "let_=hold.wrapper.set_attribute(\"data-hold\",\"pending\");"
+                ),
+                concat!(
+                    "let_=hold.wrapper.set_attribute(\"data-hold\",\"fired\");",
+                    "letsettled=hold.wrapper.clone();",
+                    "letsettle_timer=Timeout::new(SETTLE_CLEAR_MS,move||clear_marker(&settled));",
+                    "*gesture.settle.borrow_mut()=Some((hold.wrapper.clone(),settle_timer));",
+                    "gesture.press_in_bar(hold.pointer_id);"
+                ),
+                concat!(
+                    "fnreset_after_exit(&self){self.continuation.borrow_mut().take();",
+                    "self.pointers_down_in_bar.borrow_mut().clear();self.clear_settle();}"
+                ),
+                concat!(
+                    "fnabandon_pointers(&self){self.cancel_hold();",
+                    "self.continuation.borrow_mut().take();",
+                    "self.pointers_down_in_bar.borrow_mut().clear();}"
+                ),
+                concat!(
+                    "ifself.pending_pointer()==Some(pointer_id){self.cancel_hold();}",
+                    "let_=self.take_continuation(pointer_id);letreleased_in_bar=",
+                    "release_pointer(&mutself.pointers_down_in_bar.borrow_mut(),pointer_id);",
+                    "ifreleased_in_bar{self.note_activity();}"
+                ),
+                concat!(
+                    "WindowEventListener::with_event(\"pointerdown\",true,move|e|{",
+                    "on_down.hangup_down_at.set(None);",
+                    "ifon_down.has_pending(){on_down.cancel_hold();}"
+                ),
+                concat!(
+                    "iflet(true,Some(pe))=(editing,e.dyn_ref::<web_sys::PointerEvent>())",
+                    "{ifevent_in_action_bar(&e){on_down.press_in_bar(pe.pointer_id());}}"
+                ),
+                concat!(
+                    "WindowEventListener::with_event(\"blur\",false,",
+                    "move|_|on_blur.abandon_pointers())"
+                ),
+                concat!(
+                    "WindowEventListener::with_event(\"visibilitychange\",false,move|_|",
+                    "{ifweb_sys::window().and_then(|w|w.document()).is_some_and(|d|d.hidden())",
+                    "{on_hidden.abandon_pointers();}"
+                ),
+                concat!(
+                    "foreventin[\"pointerup\",\"pointercancel\"]{leton_end=gesture.clone();",
+                    "listeners.push(WindowEventListener::with_event(event,true,move|e|",
+                    "{ifletSome(pe)=e.dyn_ref::<web_sys::PointerEvent>()",
+                    "{on_end.end_pointer(pe.pointer_id());}}));}"
+                ),
+                concat!(
+                    "add_event_listener_with_callback_and_bool(event,",
+                    "cb.as_ref().unchecked_ref(),capture,)"
+                ),
+                concat!(
+                    "remove_event_listener_with_callback_and_bool(self.event,",
+                    "cb.as_ref().unchecked_ref(),self.capture,)"
+                ),
+                concat!(
+                    "ifhangup_press_is_swallowed(hangup_click.take_hangup_press(),",
+                    "js_sys::Date::now(),from_pointer){return;}"
+                ),
+            ],
+        );
+        assert!(missing.is_empty(), "missing call sites: {missing:#?}");
+    }
+
+    #[test]
+    fn auto_shrink_wiring_is_in_place() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        let missing = missing_needles(
+            &flat,
+            &[
+                concat!("hover.enter(", "&evt.pointer_type())"),
+                concat!("hover.leave(", "&evt.pointer_type())"),
+                concat!("hover_on_move.note_pointer_move(", "&e);"),
+                concat!(
+                    "button{class:\"action-bar-expand-handle\",",
+                    "r#type:\"button\",tabindex:\"-1\","
+                ),
+                concat!(
+                    "if!handle_click_toggles_latch(pointer.as_deref()){",
+                    "hover.open_now();return;}"
+                ),
+                concat!(
+                    "letfit_order=ifautoshrink{kept_slots_first(",
+                    "&secondary,&kept)}else{secondary.clone()};"
+                ),
+                concat!(
+                    "lethidden:Vec<ActionBarSlot>=secondary.iter().copied()",
+                    ".filter(|slot|overflowed.contains(slot)).collect();"
+                ),
+                concat!(
+                    "use_effect(use_reactive!(|bar_expanded|{",
+                    "hover_on_layout.note_layout(BarLayout{",
+                    "expanded:bar_expanded,});}));"
+                ),
+            ],
+        );
+        assert!(missing.is_empty(), "missing call sites: {missing:#?}");
+        assert_eq!(
+            flat.matches(concat!(
+                "shrunk_buttons.set(ShrunkButtons::default());",
+                "remove_shrunk_buttons();"
+            ))
+            .count(),
+            2,
+            "Reset Buttons resets the kept set on both activation paths"
+        );
+    }
+
+    #[test]
+    fn a_device_warning_does_not_keep_an_unselected_mic_or_camera() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        let missing = missing_needles(
+            &flat,
+            &[
+                concat!(
+                    "if!stays_on_shrunk_bar(&shrunk_buttons.read(),slot)",
+                    "{wrapper_class.push_str(\"slot-shrinkable\");}"
+                ),
+                concat!("no_kept_button_on_screen(", "&shrunk_buttons.read(),"),
+            ],
+        );
+        assert!(
+            missing.is_empty(),
+            "nothing may override the kept choice: {missing:#?}"
+        );
+    }
+
+    #[test]
+    fn hold_to_edit_css_rules_are_in_place() {
+        let flat: String = [
+            include_str!("../../static/style.css"),
+            include_str!("../../static/global.css"),
+        ]
+        .concat()
+        .split_whitespace()
+        .collect();
+        let missing = missing_needles(
+            &flat,
+            &[
+                concat!(
+                    ".action-bar-slot-wrapper{touch-action:none;-webkit-touch-callout:none;",
+                    "user-select:none;-webkit-user-select:none;}"
+                ),
+                concat!(".action-bar-slot-wrappersvg{", "-webkit-user-drag:none;}"),
+                concat!(
+                    "@property--action-bar-hold-sweep{syntax:\"<angle>\";",
+                    "inherits:false;initial-value:0deg;}"
+                ),
+                concat!(
+                    ".action-bar-slot-wrapper[data-hold=\"pending\"]::before,",
+                    ".action-bar-slot-wrapper[data-hold=\"pending\"]::after{",
+                    "content:\"\";position:absolute;border-radius:50%;pointer-events:none;",
+                    "animation:action-bar-hold-sweep1700mslinear300msboth;}"
+                ),
+                concat!(
+                    ".action-bar-slot-wrapper[data-hold=\"pending\"]::before{",
+                    "inset:-5px;background:conic-gradient(var(--fixed-dark-strong)",
+                    "var(--action-bar-hold-sweep),transparent0);",
+                    "-webkit-mask:radial-gradient(farthest-side,transparentcalc(100%-4.5px),",
+                    "var(--fixed-dark-strong)calc(100%-4px));",
+                    "mask:radial-gradient(farthest-side,transparentcalc(100%-4.5px),",
+                    "var(--fixed-dark-strong)calc(100%-4px));}"
+                ),
+                concat!(
+                    ".action-bar-slot-wrapper[data-hold=\"pending\"]::after{",
+                    "inset:-4px;background:conic-gradient(var(--accent)",
+                    "var(--action-bar-hold-sweep),transparent0);",
+                    "-webkit-mask:radial-gradient(farthest-side,transparentcalc(100%-2.5px),",
+                    "var(--accent)calc(100%-2px));",
+                    "mask:radial-gradient(farthest-side,transparentcalc(100%-2.5px),",
+                    "var(--accent)calc(100%-2px));}"
+                ),
+                concat!(
+                    "@media(forced-colors:active){.action-bar-slot-wrapper[data-hold=\"pending\"]",
+                    "::before{display:none;}"
+                ),
+                concat!(
+                    "outline:2pxsolidHighlight;",
+                    "animation:action-bar-hold-reveal1mslinear300msboth;"
+                ),
+                concat!(
+                    "@keyframesaction-bar-hold-sweep{from{--action-bar-hold-sweep:0deg;}",
+                    "to{--action-bar-hold-sweep:360deg;}}"
+                ),
+                concat!(
+                    "@keyframesaction-bar-hold-reveal{from{opacity:0;}",
+                    "to{opacity:1;}}"
+                ),
+                concat!(
+                    ".action-bar-slot-wrapper[data-hold=\"fired\"]{animation:",
+                    "action-bar-hold-settle150msease-out;}"
+                ),
+                concat!(
+                    "@keyframesaction-bar-hold-settle{",
+                    "50%{transform:scale(1.06);}}"
+                ),
+                concat!(
+                    "@media(prefers-reduced-motion:reduce){.action-bar-slot-wrapper",
+                    "[data-hold=\"fired\"]{animation:none;}}"
+                ),
+                concat!(
+                    ".glass-select-option-hint{display:block;margin-top:2px;",
+                    "font-size:var(--fs-3);}"
+                ),
+                concat!(
+                    ".dock-position-wrapper.glass-select-menu.glass-select-option-hint",
+                    "{color:var(--on-dark-text-secondary);}"
+                ),
+                concat!(
+                    "min-width:160px;",
+                    "max-height:min(440px,calc(100vh-140px));"
+                ),
+            ],
+        );
+        assert!(missing.is_empty(), "missing CSS rules: {missing:#?}");
     }
 
     // ── Settings deep-link routing (#1131 unify) ──
@@ -18011,6 +19808,10 @@ mod tests {
             allow_guests: false,
             recording_allowed_for_all: false,
             chat_allowed_for_all: true,
+            entry_message_override: Default::default(),
+            entry_sound_override: Default::default(),
+            exit_message_override: Default::default(),
+            exit_sound_override: Default::default(),
         }
     }
 
@@ -18109,6 +19910,857 @@ mod tests {
             "the removal overlay's message must be set"
         );
         assert!(!mic && !video);
+    }
+
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)]
+    struct SupersededProbeSignals {
+        superseded: Signal<bool>,
+        variant: Signal<RejoinOverlayVariant>,
+        ended: Signal<Option<String>>,
+        error: Signal<Option<String>>,
+        gave_up: Signal<bool>,
+        name: Signal<String>,
+        media: TerminalMediaSignals,
+    }
+
+    thread_local! {
+        static SUPERSEDED_PROBE: RefCell<Option<SupersededProbeSignals>> =
+            const { RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn SupersededProbe() -> Element {
+        let signals = SupersededProbeSignals {
+            superseded: use_signal(|| false),
+            variant: use_signal(RejoinOverlayVariant::default),
+            ended: use_signal(|| None),
+            error: use_signal(|| Some("Connection lost".to_string())),
+            gave_up: use_signal(|| false),
+            name: use_signal(|| "name".to_string()),
+            media: TerminalMediaSignals {
+                mic_enabled: use_signal(|| true),
+                video_enabled: use_signal(|| true),
+                pending_mic_enable: use_signal(|| true),
+                pending_video_enable: use_signal(|| true),
+                screen_share_state: use_signal(|| ScreenShareState::Idle),
+            },
+        };
+        use_hook(move || SUPERSEDED_PROBE.with(|s| *s.borrow_mut() = Some(signals)));
+        rsx! { div {} }
+    }
+
+    fn superseded_probe() -> (VirtualDom, SupersededProbeSignals) {
+        let mut vdom = VirtualDom::new(SupersededProbe);
+        vdom.rebuild_in_place();
+        let signals =
+            SUPERSEDED_PROBE.with(|s| s.borrow().expect("the probe published its signals"));
+        (vdom, signals)
+    }
+
+    #[test]
+    fn a_superseded_instance_flags_the_overlay_clears_media_and_disconnects() {
+        let (vdom, probe) = superseded_probe();
+        let disconnects = Cell::new(0u32);
+        vdom.in_runtime(|| {
+            handle_instance_superseded(
+                SupersededState {
+                    instance_superseded: probe.superseded,
+                    overlay_variant: probe.variant,
+                    meeting_ended_message: probe.ended,
+                    connection_error: probe.error,
+                    media: probe.media,
+                },
+                RejoinOverlayVariant::MeetingRestarted,
+                || disconnects.set(disconnects.get() + 1),
+            )
+        });
+
+        assert_eq!(disconnects.get(), 1);
+        vdom.in_runtime(|| {
+            assert!(*probe.superseded.peek());
+            assert_eq!(
+                probe.ended.peek().as_deref(),
+                Some(RejoinOverlayVariant::MeetingRestarted.message())
+            );
+            assert_eq!(*probe.error.peek(), None);
+            assert!(!*probe.media.mic_enabled.peek());
+            assert!(!*probe.media.video_enabled.peek());
+            assert!(!*probe.media.pending_mic_enable.peek());
+            assert!(!*probe.media.pending_video_enable.peek());
+        });
+    }
+
+    /// Past the last attempt the scheduler would give up with a refresh
+    /// message; once the instance is superseded it must do nothing instead,
+    /// leaving the restarted overlay's Rejoin as the only way forward.
+    #[test]
+    fn reconnect_scheduling_stops_once_the_instance_is_superseded() {
+        for superseded in [false, true] {
+            let (vdom, probe) = superseded_probe();
+            vdom.in_runtime(|| {
+                try_set(probe.superseded, superseded);
+                let client_cell = Rc::new(RefCell::new(None));
+                #[cfg(feature = "media-server-jwt-auth")]
+                schedule_reconnect(
+                    client_cell,
+                    "room".to_string(),
+                    probe.name,
+                    probe.error,
+                    probe.ended,
+                    probe.gave_up,
+                    probe.media,
+                    probe.superseded,
+                    probe.variant,
+                    MAX_RECONNECT_ATTEMPTS,
+                    false,
+                );
+                #[cfg(not(feature = "media-server-jwt-auth"))]
+                schedule_reconnect_no_jwt(
+                    client_cell,
+                    probe.error,
+                    probe.gave_up,
+                    probe.media,
+                    probe.superseded,
+                    MAX_RECONNECT_ATTEMPTS,
+                );
+            });
+            vdom.in_runtime(|| {
+                assert_eq!(
+                    *probe.gave_up.peek(),
+                    !superseded,
+                    "superseded={superseded}: only a live instance gives up with the refresh message"
+                );
+                assert_eq!(
+                    probe
+                        .error
+                        .peek()
+                        .as_deref()
+                        .is_some_and(|e| e.contains("Unable to reconnect")),
+                    !superseded
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_signal_whose_scope_was_dropped_counts_as_superseded() {
+        let (vdom, probe) = superseded_probe();
+        assert!(!vdom.in_runtime(|| superseded_or_dropped(probe.superseded)));
+        vdom.in_runtime(|| try_set(probe.superseded, true));
+        assert!(vdom.in_runtime(|| superseded_or_dropped(probe.superseded)));
+
+        let (vdom, probe) = superseded_probe();
+        drop(vdom);
+        SUPERSEDED_PROBE.with(|s| *s.borrow_mut() = None);
+        assert!(
+            superseded_or_dropped(probe.superseded),
+            "a signal whose scope is gone must stop the reconnect chain"
+        );
+    }
+
+    /// The lost-connection callback is built inside a component, so its gate is
+    /// pinned by source: nothing may run before the superseded check.
+    #[test]
+    fn a_lost_connection_does_nothing_once_the_instance_is_superseded() {
+        let block = client_callback_source("on_connection_lost", "on_peer_added");
+        let gate = block
+            .find("ifsuperseded_or_dropped(instance_superseded){return;}")
+            .expect("on_connection_lost gates on the superseded flag");
+        for effect in [
+            "try_set(connection_error",
+            "schedule_reconnect(",
+            "schedule_reconnect_no_jwt(",
+        ] {
+            if let Some(at) = block.find(effect) {
+                assert!(gate < at, "the gate must precede `{effect}`");
+            }
+        }
+        assert!(block.contains("schedule_reconnect"));
+    }
+
+    /// Counts the `fetch` calls and WebSocket opens made while it lives;
+    /// every WebSocket is a stub that never opens.
+    struct ReconnectEnv;
+
+    #[allow(dead_code)]
+    impl ReconnectEnv {
+        fn install() -> Self {
+            let config = js_sys::Object::new();
+            let set = |key: &str, val: &wasm_bindgen::JsValue| {
+                js_sys::Reflect::set(&config, &key.into(), val).unwrap();
+            };
+            set("apiBaseUrl", &"http://test:8080".into());
+            set("wsUrl", &"ws://test:8080".into());
+            set("webTransportHost", &"https://test:4433".into());
+            set("oauthEnabled", &"false".into());
+            set("e2eeEnabled", &"false".into());
+            set("webTransportEnabled", &"false".into());
+            set("usersAllowedToStream", &"".into());
+            set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
+            let frozen = js_sys::Object::freeze(&config);
+            js_sys::Reflect::set(&window(), &"__APP_CONFIG".into(), &frozen).unwrap();
+            crate::constants::reset_config_cache_for_test();
+            js_sys::eval(
+                r#"(function () {
+                    var rc = { fetches: 0, pending: [], sockets: [], closes: 0, reply: null,
+                               fetch: window.fetch, WebSocket: window.WebSocket };
+                    rc.response = function (body, status) {
+                        var resp = new Response(body, { status: status });
+                        Object.defineProperty(resp, 'url', { value: 'http://test:8080/api' });
+                        return resp;
+                    };
+                    window.__rc = rc;
+                    window.fetch = function () {
+                        rc.fetches++;
+                        if (rc.reply) {
+                            var r = rc.reply;
+                            return r.status === 0
+                                ? Promise.reject(new TypeError('network down'))
+                                : Promise.resolve(rc.response(r.body, r.status));
+                        }
+                        return new Promise(function (res, rej) { rc.pending.push({ res: res, rej: rej }); });
+                    };
+                    window.WebSocket = function (url) {
+                        rc.sockets.push(url);
+                        this.readyState = 0;
+                        this.close = function () { rc.closes++; };
+                        this.send = function () {};
+                        this.addEventListener = function () {};
+                        this.removeEventListener = function () {};
+                    };
+                })()"#,
+            )
+            .unwrap();
+            Self
+        }
+
+        fn fetches(&self) -> u32 {
+            js_sys::eval("window.__rc.fetches")
+                .unwrap()
+                .as_f64()
+                .unwrap() as u32
+        }
+
+        /// WebSockets opened since install, i.e. connection attempts.
+        fn sockets(&self) -> u32 {
+            js_sys::eval("window.__rc.sockets.length")
+                .unwrap()
+                .as_f64()
+                .unwrap() as u32
+        }
+
+        /// Answer every later `fetch` with `status` (0 = network failure) and `body`.
+        fn reply_with(&self, status: u16, body: &str) {
+            let body = serde_json::to_string(body).unwrap();
+            js_sys::eval(&format!(
+                "window.__rc.reply = {{ status: {status}, body: {body} }}"
+            ))
+            .unwrap();
+        }
+
+        /// Answer the first fetch still waiting.
+        fn resolve_first_fetch(&self, status: u16, body: &str) {
+            let body = serde_json::to_string(body).unwrap();
+            js_sys::eval(&format!(
+                "window.__rc.pending[0].res(window.__rc.response({body}, {status}))"
+            ))
+            .unwrap();
+        }
+
+        fn closes(&self) -> u32 {
+            js_sys::eval("window.__rc.closes")
+                .unwrap()
+                .as_f64()
+                .unwrap() as u32
+        }
+
+        fn reject_first_fetch(&self) {
+            js_sys::eval("window.__rc.pending[0].rej(new TypeError('network down'))").unwrap();
+        }
+    }
+
+    impl Drop for ReconnectEnv {
+        fn drop(&mut self) {
+            let _ = js_sys::eval(
+                r#"(function () {
+                    var rc = window.__rc;
+                    if (rc) { window.fetch = rc.fetch; window.WebSocket = rc.WebSocket; }
+                    delete window.__rc;
+                    delete window.__APP_CONFIG;
+                })()"#,
+            );
+            crate::constants::reset_config_cache_for_test();
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Interrupt {
+        Never,
+        Superseded,
+        ScopeDropped,
+    }
+
+    /// Past this the first attempt's timer (750..=1250 ms) has fired and the
+    /// second's (1500..2500 ms) has not.
+    const FIRST_TIMER_FIRED_MS: u32 = 1400;
+
+    fn interrupt(
+        interruption: Interrupt,
+        vdom: VirtualDom,
+        probe: SupersededProbeSignals,
+    ) -> Option<VirtualDom> {
+        match interruption {
+            Interrupt::Never => Some(vdom),
+            Interrupt::Superseded => {
+                vdom.in_runtime(|| try_set(probe.superseded, true));
+                Some(vdom)
+            }
+            Interrupt::ScopeDropped => {
+                drop(vdom);
+                SUPERSEDED_PROBE.with(|s| *s.borrow_mut() = None);
+                None
+            }
+        }
+    }
+
+    /// The timer's own guard: a superseded or dropped instance must not even
+    /// start the token refresh (the post-await guard alone would still let the
+    /// request go out).
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn the_reconnect_timer_refreshes_no_token_once_superseded_or_dropped() {
+        for (interruption, expected_fetches) in [
+            (Interrupt::Never, 1),
+            (Interrupt::Superseded, 0),
+            (Interrupt::ScopeDropped, 0),
+        ] {
+            let env = ReconnectEnv::install();
+            let (vdom, probe) = superseded_probe();
+            vdom.in_runtime(|| {
+                schedule_reconnect(
+                    Rc::new(RefCell::new(None)),
+                    "room".to_string(),
+                    probe.name,
+                    probe.error,
+                    probe.ended,
+                    probe.gave_up,
+                    probe.media,
+                    probe.superseded,
+                    probe.variant,
+                    0,
+                    false,
+                )
+            });
+            let vdom = interrupt(interruption, vdom, probe);
+            TimeoutFuture::new(FIRST_TIMER_FIRED_MS).await;
+
+            assert_eq!(
+                env.fetches(),
+                expected_fetches,
+                "{interruption:?}: token refreshes started"
+            );
+            if let Some(vdom) = vdom {
+                vdom.in_runtime(|| try_set(probe.superseded, true));
+            }
+        }
+    }
+
+    /// The post-await guard: the instance is superseded while the token refresh
+    /// is in flight, so its failure must not surface a retry or reschedule.
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn a_token_refresh_that_fails_after_the_instance_was_superseded_changes_nothing() {
+        for superseded in [false, true] {
+            let env = ReconnectEnv::install();
+            let (vdom, probe) = superseded_probe();
+            vdom.in_runtime(|| {
+                schedule_reconnect(
+                    Rc::new(RefCell::new(None)),
+                    "room".to_string(),
+                    probe.name,
+                    probe.error,
+                    probe.ended,
+                    probe.gave_up,
+                    probe.media,
+                    probe.superseded,
+                    probe.variant,
+                    0,
+                    false,
+                )
+            });
+            TimeoutFuture::new(FIRST_TIMER_FIRED_MS).await;
+            assert_eq!(env.fetches(), 1, "premise: the refresh is in flight");
+
+            if superseded {
+                vdom.in_runtime(|| try_set(probe.superseded, true));
+            }
+            env.reject_first_fetch();
+            TimeoutFuture::new(100).await;
+
+            let error = vdom.in_runtime(|| probe.error.peek().clone());
+            if superseded {
+                assert_eq!(error.as_deref(), Some("Connection lost"));
+            } else {
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("Connection lost, retrying")),
+                    "control: a live instance reports the failed refresh, got {error:?}"
+                );
+            }
+            vdom.in_runtime(|| try_set(probe.superseded, true));
+        }
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    fn status_body(status: &str) -> String {
+        serde_json::to_string(&videocall_meeting_types::responses::APIResponse::ok(
+            crate::meeting_api::reconnect_token_tests::status(status, None),
+        ))
+        .unwrap()
+    }
+
+    /// Run one reconnect attempt against a stubbed status endpoint and return
+    /// what the probe shows afterwards.
+    #[cfg(feature = "media-server-jwt-auth")]
+    async fn reconnect_against(
+        status: u16,
+        body: &str,
+    ) -> (SupersededProbeSignals, VirtualDom, ReconnectEnv) {
+        let env = ReconnectEnv::install();
+        env.reply_with(status, body);
+        let mut client = VideoCallClient::new_for_test("local-user");
+        client.update_server_urls(vec!["ws://reconnect.invalid/lobby".to_string()], Vec::new());
+        client.connect().expect("the stub socket opens");
+        let (vdom, probe) = superseded_probe();
+        vdom.in_runtime(|| {
+            schedule_reconnect(
+                Rc::new(RefCell::new(Some(client))),
+                "room".to_string(),
+                probe.name,
+                probe.error,
+                probe.ended,
+                probe.gave_up,
+                probe.media,
+                probe.superseded,
+                probe.variant,
+                0,
+                false,
+            )
+        });
+        TimeoutFuture::new(FIRST_TIMER_FIRED_MS + 300).await;
+        (probe, vdom, env)
+    }
+
+    /// Runs the whole attempt budget with `reply_for_poll(n)` answering poll `n`
+    /// (1-based), then returns once the chain has stopped.
+    #[cfg(feature = "media-server-jwt-auth")]
+    async fn run_reconnect_chain(
+        reply_for_poll: impl Fn(u32) -> (u16, String),
+    ) -> (SupersededProbeSignals, VirtualDom, ReconnectEnv) {
+        RECONNECT_TEST_DELAY_MS.with(|d| d.set(Some(40)));
+        let env = ReconnectEnv::install();
+        let (status, body) = reply_for_poll(1);
+        env.reply_with(status, &body);
+        let mut client = VideoCallClient::new_for_test("local-user");
+        client.update_server_urls(vec!["ws://reconnect.invalid/lobby".to_string()], Vec::new());
+        client.connect().expect("the stub socket opens");
+        let (vdom, probe) = superseded_probe();
+        vdom.in_runtime(|| {
+            schedule_reconnect(
+                Rc::new(RefCell::new(Some(client))),
+                "room".to_string(),
+                probe.name,
+                probe.error,
+                probe.ended,
+                probe.gave_up,
+                probe.media,
+                probe.superseded,
+                probe.variant,
+                0,
+                false,
+            )
+        });
+        let mut last_seen = 0;
+        let mut quiet_ticks = 0;
+        while quiet_ticks < 40 {
+            TimeoutFuture::new(5).await;
+            let fetches = env.fetches();
+            if fetches == last_seen {
+                quiet_ticks += 1;
+            } else {
+                quiet_ticks = 0;
+                last_seen = fetches;
+                let (status, body) = reply_for_poll(fetches + 1);
+                env.reply_with(status, &body);
+            }
+        }
+        RECONNECT_TEST_DELAY_MS.with(|d| d.set(None));
+        (probe, vdom, env)
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn a_left_poll_retries_without_disconnecting() {
+        let (probe, vdom, env) = reconnect_against(200, &status_body("left")).await;
+        let (superseded, gave_up, error) = vdom.in_runtime(|| {
+            (
+                *probe.superseded.peek(),
+                *probe.gave_up.peek(),
+                probe.error.peek().clone(),
+            )
+        });
+        assert!(!superseded);
+        assert!(!gave_up);
+        assert_eq!(error.as_deref(), Some("Connection lost, retrying..."));
+        assert_eq!(env.closes(), 0, "the socket may still recover");
+        vdom.in_runtime(|| try_set(probe.superseded, true));
+    }
+
+    /// Starts a chain at `attempt` against a `left` status endpoint, with a
+    /// client whose handshake is in progress and completes before the timer fires.
+    #[cfg(feature = "media-server-jwt-auth")]
+    async fn left_chain_with_client_connecting(
+        attempt: u32,
+    ) -> (
+        SupersededProbeSignals,
+        VirtualDom,
+        ReconnectEnv,
+        VideoCallClient,
+    ) {
+        RECONNECT_TEST_DELAY_MS.with(|d| d.set(Some(40)));
+        let env = ReconnectEnv::install();
+        env.reply_with(200, &status_body("left"));
+        let mut client = VideoCallClient::new_for_test("local-user");
+        client.update_server_urls(vec!["ws://reconnect.invalid/lobby".to_string()], Vec::new());
+        client.connect().expect("the stub socket opens");
+        assert!(
+            !client.is_connected(),
+            "a running handshake is not connected"
+        );
+        let (vdom, probe) = superseded_probe();
+        vdom.in_runtime(|| {
+            try_set(probe.error, None);
+            schedule_reconnect(
+                Rc::new(RefCell::new(Some(client.clone()))),
+                "room".to_string(),
+                probe.name,
+                probe.error,
+                probe.ended,
+                probe.gave_up,
+                probe.media,
+                probe.superseded,
+                probe.variant,
+                attempt,
+                false,
+            )
+        });
+        client.mark_connected_for_test();
+        assert!(client.is_connected());
+        TimeoutFuture::new(400).await;
+        RECONNECT_TEST_DELAY_MS.with(|d| d.set(None));
+        (probe, vdom, env, client)
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn a_left_poll_ends_the_chain_for_a_connected_client() {
+        let (probe, vdom, env, client) = left_chain_with_client_connecting(0).await;
+        let (error, superseded, ended) = vdom.in_runtime(|| {
+            (
+                probe.error.peek().clone(),
+                *probe.superseded.peek(),
+                probe.ended.peek().clone(),
+            )
+        });
+        assert_eq!(env.fetches(), 1, "the chain stops at the first poll");
+        assert_eq!(error, None, "connection_error stays cleared");
+        assert!(!superseded);
+        assert_eq!(ended, None);
+        assert!(client.is_connected());
+        vdom.in_runtime(|| try_set(probe.superseded, true));
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn a_client_connected_by_the_last_left_poll_gets_no_overlay_or_disconnect() {
+        let (probe, vdom, env, client) =
+            left_chain_with_client_connecting(MAX_RECONNECT_ATTEMPTS - 1).await;
+        let (error, superseded, ended, gave_up) = vdom.in_runtime(|| {
+            (
+                probe.error.peek().clone(),
+                *probe.superseded.peek(),
+                probe.ended.peek().clone(),
+                *probe.gave_up.peek(),
+            )
+        });
+        assert_eq!(env.fetches(), 1, "premise: the last poll ran");
+        assert!(!superseded, "no overlay");
+        assert_eq!(ended, None);
+        assert!(!gave_up);
+        assert_eq!(error, None);
+        assert_eq!(env.closes(), 0, "not disconnected");
+        assert!(client.is_connected());
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn left_on_the_last_poll_raises_the_overlay_only_when_attempts_run_out() {
+        let (probe, vdom, env) = run_reconnect_chain(|_| (200, status_body("left"))).await;
+        let (superseded, variant, ended, error, gave_up) = vdom.in_runtime(|| {
+            (
+                *probe.superseded.peek(),
+                *probe.variant.peek(),
+                probe.ended.peek().clone(),
+                probe.error.peek().clone(),
+                *probe.gave_up.peek(),
+            )
+        });
+        assert_eq!(
+            env.fetches(),
+            MAX_RECONNECT_ATTEMPTS,
+            "every attempt polled"
+        );
+        assert!(superseded);
+        assert_eq!(variant, RejoinOverlayVariant::NoLongerInMeeting);
+        assert_eq!(ended.as_deref(), Some(variant.message()));
+        assert_eq!(error, None);
+        assert!(!gave_up);
+        assert!(env.closes() > 0, "the client was disconnected");
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn a_last_poll_that_was_not_left_gives_todays_give_up_message() {
+        let (probe, vdom, env) = run_reconnect_chain(|poll| {
+            if poll >= MAX_RECONNECT_ATTEMPTS {
+                (500, "boom".to_string())
+            } else {
+                (200, status_body("left"))
+            }
+        })
+        .await;
+        let (superseded, gave_up, error) = vdom.in_runtime(|| {
+            (
+                *probe.superseded.peek(),
+                *probe.gave_up.peek(),
+                probe.error.peek().clone(),
+            )
+        });
+        assert_eq!(env.fetches(), MAX_RECONNECT_ATTEMPTS);
+        assert!(!superseded);
+        assert!(gave_up);
+        assert!(error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("Unable to reconnect")));
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn a_later_poll_with_a_token_recovers_from_left() {
+        let admitted = serde_json::to_string(&videocall_meeting_types::responses::APIResponse::ok(
+            crate::meeting_api::reconnect_token_tests::status("admitted", Some("fresh-token")),
+        ))
+        .unwrap();
+        let (probe, vdom, env) = run_reconnect_chain(|poll| {
+            if poll >= 3 {
+                (200, admitted.clone())
+            } else {
+                (200, status_body("left"))
+            }
+        })
+        .await;
+        let (superseded, gave_up, error) = vdom.in_runtime(|| {
+            (
+                *probe.superseded.peek(),
+                *probe.gave_up.peek(),
+                probe.error.peek().clone(),
+            )
+        });
+        assert_eq!(env.fetches(), 3, "the chain stops at the token");
+        assert!(!superseded);
+        assert!(!gave_up);
+        assert_eq!(error, None);
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn other_reconnect_poll_outcomes_do_not_raise_the_rejoin_overlay() {
+        let not_active =
+            r#"{"success":false,"result":{"code":"MEETING_NOT_ACTIVE","message":"x"}}"#;
+        let kicked = status_body("kicked");
+        let cases: [(&str, u16, &str); 6] = [
+            ("meeting not active", 400, not_active),
+            ("unauthenticated", 401, "{}"),
+            ("not found", 404, "nope"),
+            ("server error", 500, "boom"),
+            ("network failure", 0, ""),
+            ("kicked without a token", 200, kicked.as_str()),
+        ];
+        for (name, status, body) in cases {
+            let (probe, vdom, env) = reconnect_against(status, body).await;
+            let (superseded, variant, ended, error) = vdom.in_runtime(|| {
+                (
+                    *probe.superseded.peek(),
+                    *probe.variant.peek(),
+                    probe.ended.peek().clone(),
+                    probe.error.peek().clone(),
+                )
+            });
+            assert!(!superseded, "{name}");
+            assert_eq!(variant, RejoinOverlayVariant::default(), "{name}");
+            assert_eq!(env.closes(), 0, "{name}: no disconnect");
+            if status == 400 {
+                assert_eq!(ended.as_deref(), Some("The meeting has ended."), "{name}");
+            } else {
+                assert_eq!(ended, None, "{name}");
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("Connection lost, retrying")),
+                    "{name}: keeps retrying, got {error:?}"
+                );
+            }
+            vdom.in_runtime(|| try_set(probe.superseded, true));
+        }
+    }
+
+    #[test]
+    fn a_real_notice_after_the_fallback_ends_as_meeting_restarted() {
+        let (vdom, probe) = superseded_probe();
+        let state = SupersededState {
+            instance_superseded: probe.superseded,
+            overlay_variant: probe.variant,
+            meeting_ended_message: probe.ended,
+            connection_error: probe.error,
+            media: probe.media,
+        };
+        vdom.in_runtime(|| {
+            handle_instance_superseded(state, RejoinOverlayVariant::NoLongerInMeeting, || {});
+            handle_instance_superseded(state, RejoinOverlayVariant::MeetingRestarted, || {});
+            assert_eq!(
+                *probe.variant.peek(),
+                RejoinOverlayVariant::MeetingRestarted
+            );
+            assert_eq!(
+                probe.ended.peek().as_deref(),
+                Some(RejoinOverlayVariant::MeetingRestarted.message())
+            );
+        });
+    }
+
+    #[cfg(feature = "media-server-jwt-auth")]
+    #[wasm_bindgen_test]
+    async fn once_a_notice_arrived_the_left_fallback_cannot_run_or_land() {
+        for in_flight in [false, true] {
+            let env = ReconnectEnv::install();
+            if !in_flight {
+                env.reply_with(200, &status_body("left"));
+            }
+            let (vdom, probe) = superseded_probe();
+            vdom.in_runtime(|| {
+                schedule_reconnect(
+                    Rc::new(RefCell::new(None)),
+                    "room".to_string(),
+                    probe.name,
+                    probe.error,
+                    probe.ended,
+                    probe.gave_up,
+                    probe.media,
+                    probe.superseded,
+                    probe.variant,
+                    0,
+                    false,
+                )
+            });
+            let notice = || {
+                vdom.in_runtime(|| {
+                    handle_instance_superseded(
+                        SupersededState {
+                            instance_superseded: probe.superseded,
+                            overlay_variant: probe.variant,
+                            meeting_ended_message: probe.ended,
+                            connection_error: probe.error,
+                            media: probe.media,
+                        },
+                        RejoinOverlayVariant::MeetingRestarted,
+                        || {},
+                    )
+                })
+            };
+            if in_flight {
+                TimeoutFuture::new(FIRST_TIMER_FIRED_MS).await;
+                assert_eq!(env.fetches(), 1, "premise: the poll is in flight");
+                notice();
+                env.resolve_first_fetch(200, &status_body("left"));
+            } else {
+                notice();
+            }
+            TimeoutFuture::new(FIRST_TIMER_FIRED_MS).await;
+
+            let variant = vdom.in_runtime(|| *probe.variant.peek());
+            assert_eq!(
+                variant,
+                RejoinOverlayVariant::MeetingRestarted,
+                "in_flight={in_flight}"
+            );
+            if !in_flight {
+                assert_eq!(env.fetches(), 0, "the poll never started");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mutably_borrowed_signal_is_not_superseded_and_a_dropped_one_is() {
+        let (vdom, probe) = superseded_probe();
+        vdom.in_runtime(|| {
+            let mut writable = probe.superseded;
+            let _writer = writable.write();
+            assert!(!superseded_or_dropped(probe.superseded));
+        });
+        drop(vdom);
+        SUPERSEDED_PROBE.with(|s| *s.borrow_mut() = None);
+        assert!(superseded_or_dropped(probe.superseded));
+    }
+
+    /// The no-JWT timer's own guard: a superseded or dropped instance must not
+    /// reconnect the client (the rescheduling call's guard alone would not stop
+    /// this attempt).
+    #[cfg(not(feature = "media-server-jwt-auth"))]
+    #[wasm_bindgen_test]
+    async fn the_no_jwt_reconnect_timer_does_not_reconnect_once_superseded_or_dropped() {
+        for (interruption, expect_connect) in [
+            (Interrupt::Never, true),
+            (Interrupt::Superseded, false),
+            (Interrupt::ScopeDropped, false),
+        ] {
+            let env = ReconnectEnv::install();
+            let mut client = VideoCallClient::new_for_test("local-user");
+            client.update_server_urls(vec!["ws://reconnect.invalid/lobby".to_string()], Vec::new());
+            let (vdom, probe) = superseded_probe();
+            vdom.in_runtime(|| {
+                schedule_reconnect_no_jwt(
+                    Rc::new(RefCell::new(Some(client))),
+                    probe.error,
+                    probe.gave_up,
+                    probe.media,
+                    probe.superseded,
+                    0,
+                )
+            });
+            let vdom = interrupt(interruption, vdom, probe);
+            TimeoutFuture::new(FIRST_TIMER_FIRED_MS).await;
+
+            assert_eq!(
+                env.sockets() > 0,
+                expect_connect,
+                "{interruption:?}: the timer reconnected the client"
+            );
+            if let Some(vdom) = vdom {
+                vdom.in_runtime(|| try_set(probe.superseded, true));
+            }
+        }
     }
 
     /// A HOST_GRANTED / HOST_REVOKED that does not change
@@ -18251,122 +20903,6 @@ mod tests {
                 assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
             }
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Tests for current_transport_urls (Phase 7, discussion 562)
-    //
-    // These exercise the pure-logic core via `current_transport_urls_from_lists`
-    // so they don't require `window().__APP_CONFIG` to be set up. The full
-    // `current_transport_urls` (with `build_lobby_urls`) is a thin wrapper
-    // that just calls into this core.
-    // -----------------------------------------------------------------------
-
-    #[wasm_bindgen_test]
-    fn current_transport_urls_webtransport_with_wt_enabled_returns_both_lists() {
-        // WebTransport pref + server says WT enabled: both lists must come
-        // through. This is the WT-with-WS-fallback shape — the connection
-        // manager creates candidates for every URL and the election prefers
-        // WT, but if every WT candidate fails the WS candidates remain
-        // available for the manager to elect. This is the scenario the
-        // dioxus-ui hits on a normal reconnect once runtime config has
-        // loaded.
-        let ws = vec!["wss://ws-1".to_string()];
-        let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebTransport,
-            true,
-            ws.clone(),
-            wt.clone(),
-        );
-        assert!(enable_wt, "WebTransport+server-WT-enabled must enable WT");
-        assert_eq!(
-            ws_out, ws,
-            "WebTransport must keep the WS list — it's the fallback if every \
-             WT candidate fails its handshake"
-        );
-        assert_eq!(wt_out, wt, "WT list passed through unchanged");
-    }
-
-    #[wasm_bindgen_test]
-    fn current_transport_urls_webtransport_with_wt_disabled_returns_only_ws() {
-        // WebTransport pref + runtime config hasn't loaded (or WT disabled
-        // at the server): the WT list is dropped from the effective config,
-        // collapsing to WS-only. This is the *initial* shape that strands
-        // the user before the reconnect path re-evaluates.
-        let ws = vec!["wss://ws-1".to_string()];
-        let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebTransport,
-            false,
-            ws.clone(),
-            wt.clone(),
-        );
-        assert!(
-            !enable_wt,
-            "WebTransport+server-WT-disabled must disable WT"
-        );
-        assert_eq!(ws_out, ws, "WS list still populated");
-        assert!(
-            wt_out.is_empty(),
-            "a server-disabled deployment must surface NO WebTransport candidate: \
-             ConnectionManager::update_server_urls has no enable_webtransport gate"
-        );
-        let _ = wt;
-    }
-
-    #[wasm_bindgen_test]
-    fn current_transport_urls_websocket_drops_wt_list() {
-        // Explicit WebSocket preference: WT list must always be empty,
-        // regardless of what the server-side flag says.
-        let ws = vec!["wss://ws-1".to_string()];
-        let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) =
-            current_transport_urls_from_lists(TransportPreference::WebSocket, true, ws.clone(), wt);
-        assert!(!enable_wt, "WebSocket must report WT disabled");
-        assert_eq!(ws_out, ws);
-        assert!(wt_out.is_empty(), "WebSocket must drop the WT list");
-    }
-
-    #[wasm_bindgen_test]
-    fn current_transport_urls_recovery_path_repopulates_wt_after_runtime_load() {
-        // Regression for discussion 562: same input lists, but the user's
-        // initial `webtransport_enabled()` returned false (runtime config
-        // not loaded) and the reconnect's read returns true (loaded by
-        // then). The reconnect call must yield a richer URL set than the
-        // initial call — that's what flips `total_server_count() > 1` in
-        // the manager and lets the watchdog actually re-elect.
-        let ws = vec!["wss://ws-1".to_string()];
-        let wt = vec!["https://wt-1".to_string()];
-
-        // Initial call (runtime config still loading)
-        let (init_enable_wt, init_ws, init_wt) = current_transport_urls_from_lists(
-            TransportPreference::WebTransport,
-            false,
-            ws.clone(),
-            wt.clone(),
-        );
-        assert!(!init_enable_wt);
-        assert_eq!(init_ws, ws);
-        assert!(
-            init_wt.is_empty(),
-            "server flag off empties the WT list as well as clearing the bool"
-        );
-
-        // Reconnect call (runtime config now loaded — WT enabled)
-        let (reconn_enable_wt, reconn_ws, reconn_wt) = current_transport_urls_from_lists(
-            TransportPreference::WebTransport,
-            true,
-            ws.clone(),
-            wt,
-        );
-        assert!(reconn_enable_wt, "reconnect path now has WT enabled");
-        assert_eq!(reconn_ws, ws, "WS list still populated");
-        assert!(
-            !reconn_wt.is_empty(),
-            "reconnect path repopulates the WT list — this is the recovery \
-             from the single-server-stranding state"
-        );
     }
 
     // -----------------------------------------------------------------
@@ -18610,6 +21146,72 @@ mod auto_join_dom_tests {
         }
     }
 
+    thread_local! {
+        static TOKEN_MEETING: RefCell<Option<Signal<String>>> = const { RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn RoomTokenHarness() -> Element {
+        let name = use_signal(|| Some("Guest".to_string()));
+        use_context_provider(|| DisplayNameCtx(name));
+        let transport = use_signal(TransportPreference::default);
+        use_context_provider(|| TransportPreferenceCtx(transport));
+        let shown = use_signal(|| true);
+        let meeting = use_signal(|| "token-meeting-a".to_string());
+        use_hook(move || {
+            SHOWN.with(|s| *s.borrow_mut() = Some(shown));
+            TOKEN_MEETING.with(|m| *m.borrow_mut() = Some(meeting));
+        });
+        rsx! {
+            if shown() {
+                AttendantsComponent {
+                    id: meeting(),
+                    display_name: "Guest".to_string(),
+                    e2ee_enabled: false,
+                    is_guest: true,
+                    room_token: "room-token".to_string(),
+                }
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn unmounting_forgets_the_room_tokens_of_its_meetings_only() {
+        use crate::components::captions::{current_room_token, remember_room_token};
+        install_config();
+        let root = gloo_utils::document().create_element("div").unwrap();
+        gloo_utils::document()
+            .body()
+            .unwrap()
+            .append_child(&root)
+            .unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(RoomTokenHarness),
+            dioxus::web::Config::new().rootelement(root.clone()),
+        );
+        TimeoutFuture::new(100).await;
+        TOKEN_MEETING.with(|m| {
+            m.borrow()
+                .expect("meeting signal")
+                .set("token-meeting-b".into())
+        });
+        TimeoutFuture::new(100).await;
+        remember_room_token("token-meeting-a", "a");
+        remember_room_token("token-meeting-b", "b");
+        remember_room_token("token-meeting-other", "other");
+        SHOWN.with(|s| s.borrow().expect("shown signal").set(false));
+        TimeoutFuture::new(100).await;
+        let left = (
+            current_room_token("token-meeting-a"),
+            current_room_token("token-meeting-b"),
+            current_room_token("token-meeting-other"),
+        );
+        root.remove();
+        js_sys::eval("delete window.__APP_CONFIG;").unwrap();
+        crate::constants::reset_config_cache_for_test();
+        assert_eq!(left, (None, None, Some("other".to_string())));
+    }
+
     fn set_prefs(camera_on: &str, mic_on: &str) {
         let storage = gloo_utils::window().local_storage().unwrap().unwrap();
         storage.set_item("vc_prejoin_camera_on", camera_on).unwrap();
@@ -18680,5 +21282,1053 @@ mod auto_join_dom_tests {
         let (camera, mic) = auto_join_labels("false", "false").await;
         assert_eq!(camera, "Camera — Start Video");
         assert_eq!(mic, "Microphone — Unmute");
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod orphaned_override_save_dom_tests {
+    use super::*;
+    use crate::components::announcement_overrides::OrphanedOverrideSavesCtx;
+    use crate::components::meeting_options_controls::MeetingOptionsControls;
+    use crate::context::{DisplayNameCtx, TransportPreference, TransportPreferenceCtx};
+    use gloo_timers::future::TimeoutFuture;
+    use std::collections::HashMap;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    const MEETING: &str = "m-3168-held";
+    const SETTINGS: u8 = 0;
+    const NEITHER: u8 = 1;
+    const PRE_JOIN: u8 = 2;
+
+    thread_local! {
+        static START: Cell<u8> = const { Cell::new(SETTINGS) };
+        static PAGE: RefCell<Option<Signal<u8>>> = const { RefCell::new(None) };
+        static RENDERS: RefCell<Option<Signal<u32>>> = const { RefCell::new(None) };
+        static ORPHANED: RefCell<Option<Signal<HashMap<String, u32>>>> = const { RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn SettingsPage() -> Element {
+        let editor = use_override_editor(use_signal(AnnouncementOverrides::default));
+        let toggle = use_signal(|| false);
+        let error = use_signal(|| None::<String>);
+        rsx! {
+            MeetingOptionsControls {
+                meeting_id: MEETING.to_string(),
+                waiting_room_toggle: toggle,
+                admitted_can_admit_toggle: toggle,
+                end_on_host_leave_toggle: toggle,
+                allow_guests_toggle: toggle,
+                recording_allowed_for_all_toggle: toggle,
+                chat_allowed_for_all_toggle: toggle,
+                announcement_overrides: editor,
+                saving: toggle,
+                toggle_error: error,
+            }
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn Pages() -> Element {
+        let name = use_signal(|| Some("Host".to_string()));
+        use_context_provider(|| DisplayNameCtx(name));
+        let transport = use_signal(TransportPreference::default);
+        use_context_provider(|| TransportPreferenceCtx(transport));
+        let orphaned = use_signal(HashMap::new);
+        use_context_provider(|| OrphanedOverrideSavesCtx(orphaned));
+        let page = use_signal(|| START.with(Cell::get));
+        let renders = use_signal(|| 0u32);
+        use_hook(move || {
+            PAGE.with(|p| *p.borrow_mut() = Some(page));
+            RENDERS.with(|r| *r.borrow_mut() = Some(renders));
+            ORPHANED.with(|o| *o.borrow_mut() = Some(orphaned));
+        });
+        rsx! {
+            if page() == SETTINGS {
+                SettingsPage {}
+            } else if page() == PRE_JOIN {
+                AttendantsComponent {
+                    id: MEETING.to_string(),
+                    display_name: "Host".to_string(),
+                    user_name: Some(format!("Host {}", renders())),
+                    e2ee_enabled: false,
+                    is_owner: true,
+                    room_token: "room-token".to_string(),
+                }
+            }
+        }
+    }
+
+    fn install_mocks() {
+        js_sys::eval(
+            r#"
+            window.__APP_CONFIG = Object.freeze({
+                apiBaseUrl: 'http://test:8080', wsUrl: 'ws://test:8080',
+                webTransportHost: 'https://test:4433', oauthEnabled: 'false',
+                e2eeEnabled: 'false', webTransportEnabled: 'false', firefoxEnabled: 'false',
+                usersAllowedToStream: '', serverElectionPeriodMs: 2000, vadThreshold: 0.02
+            });
+            window.__patches = [];
+            window.__statusReads = 0;
+            window.__patchMode = 'hold';
+            window.__held = [];
+            window.__server = {
+                entry_message_override: 'participant', entry_sound_override: 'participant',
+                exit_message_override: 'participant', exit_sound_override: 'participant'
+            };
+            window.__original_fetch = window.__original_fetch || window.fetch;
+            window.fetch = function (input, init) {
+                var url = typeof input === 'string' ? input : input.url;
+                var method = typeof input === 'string' ? ((init && init.method) || 'GET') : input.method;
+                var reply = function (result) {
+                    var resp = new Response(JSON.stringify({ success: true, result: result }),
+                        { status: 200, headers: { 'Content-Type': 'application/json' } });
+                    Object.defineProperty(resp, 'url', { value: url });
+                    return resp;
+                };
+                if (method === 'GET' && url.endsWith('/api/v1/meetings/m-3168-held/status')) {
+                    window.__statusReads += 1;
+                    return Promise.resolve(reply(Object.assign({ user_id: 'host',
+                        status: 'admitted', is_host: true, joined_at: 0 }, window.__server)));
+                }
+                if (method !== 'PATCH' || !url.endsWith('/api/v1/meetings/m-3168-held')) {
+                    return window.__original_fetch(input, init);
+                }
+                return input.text().then(function (text) {
+                    window.__patches.push(text);
+                    var respond = function () {
+                        Object.assign(window.__server, JSON.parse(text));
+                        return reply(Object.assign({ meeting_id: 'm-3168-held', state: 'active',
+                            host: 'h', has_password: false, waiting_room_enabled: false,
+                            admitted_can_admit: false, end_on_host_leave: false,
+                            participant_count: 1, waiting_count: 0, started_at: 0 }, window.__server));
+                    };
+                    if (window.__patchMode === 'hold') {
+                        return new Promise(function (resolve) {
+                            window.__held.push(function () { resolve(respond()); });
+                        });
+                    }
+                    return respond();
+                });
+            };
+            window.__release = function (mode) {
+                window.__patchMode = mode;
+                var next = window.__held.shift();
+                if (next) { next(); }
+            };
+            "#,
+        )
+        .unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    fn remove_mocks() {
+        js_sys::eval(
+            "if (window.__original_fetch) { window.fetch = window.__original_fetch; \
+             delete window.__original_fetch; } delete window.__APP_CONFIG;",
+        )
+        .unwrap();
+        crate::constants::reset_config_cache_for_test();
+    }
+
+    fn js_number(name: &str) -> f64 {
+        js_sys::Reflect::get(&gloo_utils::window(), &name.into())
+            .unwrap()
+            .as_f64()
+            .unwrap_or_default()
+    }
+
+    fn patch_count() -> usize {
+        js_sys::Array::from(
+            &js_sys::Reflect::get(&gloo_utils::window(), &"__patches".into()).unwrap(),
+        )
+        .length() as usize
+    }
+
+    fn release(mode: &str) {
+        js_sys::eval(&format!("window.__release('{mode}')")).unwrap();
+    }
+
+    fn set_page(page: u8) {
+        PAGE.with(|p| p.borrow().expect("page signal").set(page));
+    }
+
+    fn orphaned_saves() -> u32 {
+        ORPHANED.with(|o| {
+            o.borrow()
+                .expect("orphaned saves signal")
+                .peek()
+                .get(MEETING)
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    fn count_orphaned_save(meeting: &str) {
+        ORPHANED.with(|o| {
+            *o.borrow()
+                .expect("orphaned saves signal")
+                .write()
+                .entry(meeting.to_owned())
+                .or_default() += 1;
+        });
+    }
+
+    fn rerender_the_card() {
+        RENDERS.with(|r| *r.borrow().expect("renders signal").write() += 1);
+    }
+
+    fn status_reads() -> f64 {
+        js_number("__statusReads")
+    }
+
+    async fn launch(start: u8) -> web_sys::Element {
+        install_mocks();
+        START.with(|s| s.set(start));
+        ORPHANED.with(|o| *o.borrow_mut() = None);
+        let root = gloo_utils::document().create_element("div").unwrap();
+        gloo_utils::document()
+            .body()
+            .unwrap()
+            .append_child(&root)
+            .unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(Pages),
+            dioxus::web::Config::new().rootelement(root.clone()),
+        );
+        wait_until("the pages", || ORPHANED.with(|o| o.borrow().is_some())).await;
+        root
+    }
+
+    async fn show_the_card(root: &web_sys::Element) {
+        set_page(PRE_JOIN);
+        wait_until("the pre-join card", || {
+            join_message(root, "#join-meeting-container").is_some()
+        })
+        .await;
+    }
+
+    async fn leave_the_card(root: &web_sys::Element) {
+        wait_until("the device permission and list to settle", || {
+            root.query_selector("[data-testid='prejoin-permission-prompt']")
+                .unwrap()
+                .is_none()
+                && root
+                    .query_selector("#prejoin-camera-select option")
+                    .unwrap()
+                    .is_some()
+        })
+        .await;
+        set_page(NEITHER);
+        TimeoutFuture::new(100).await;
+    }
+
+    async fn tear_down(root: web_sys::Element) {
+        leave_the_card(&root).await;
+        root.remove();
+        remove_mocks();
+    }
+
+    fn join_message(root: &web_sys::Element, scope: &str) -> Option<String> {
+        let selector = format!("{scope} input[data-testid^='meeting-option-join-message-']");
+        let radios = root.query_selector_all(&selector).unwrap();
+        (0..radios.length())
+            .filter_map(|i| radios.item(i))
+            .map(|node| node.unchecked_into::<web_sys::HtmlInputElement>())
+            .find(|radio| radio.checked())
+            .map(|radio| radio.value())
+    }
+
+    fn pick(root: &web_sys::Element, value: &str) {
+        root.query_selector(&format!(
+            "input[data-testid='meeting-option-join-message-{value}']"
+        ))
+        .unwrap()
+        .expect("the settings page's radio")
+        .unchecked_into::<web_sys::HtmlElement>()
+        .click();
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            TimeoutFuture::new(10).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_save_held_past_start_meeting_reaches_the_pre_join_card() {
+        for ends_before_the_card in [false, true] {
+            let root = launch(SETTINGS).await;
+            wait_until("the settings page", || {
+                join_message(&root, "").as_deref() == Some("participant")
+            })
+            .await;
+
+            pick(&root, "on");
+            wait_until("the first PATCH", || patch_count() == 1).await;
+            pick(&root, "off");
+            if ends_before_the_card {
+                set_page(NEITHER);
+                release("hold");
+                wait_until("the queued PATCH", || patch_count() == 2).await;
+                release("ok");
+                wait_until("the orphaned save to end", || orphaned_saves() == 1).await;
+            }
+            show_the_card(&root).await;
+            if !ends_before_the_card {
+                assert_eq!(
+                    join_message(&root, "#join-meeting-container").as_deref(),
+                    Some("participant"),
+                    "the card starts from its props default"
+                );
+                TimeoutFuture::new(100).await;
+                assert_eq!(status_reads(), 0.0, "nothing ended yet");
+                release("hold");
+                wait_until("the queued PATCH", || patch_count() == 2).await;
+                release("ok");
+            }
+            let saved = format!("the saved choice, ends before the card: {ends_before_the_card}");
+            wait_until(&saved, || {
+                join_message(&root, "#join-meeting-container").as_deref() == Some("off")
+            })
+            .await;
+            assert_eq!(orphaned_saves(), 0);
+            assert_eq!(
+                status_reads(),
+                1.0,
+                "ends before the card: {ends_before_the_card}"
+            );
+            tear_down(root).await;
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_pick_on_the_mounted_pre_join_card_saves_without_a_refresh() {
+        let root = launch(NEITHER).await;
+        show_the_card(&root).await;
+        js_sys::eval("window.__patchMode = 'ok'").unwrap();
+        pick(&root, "on");
+        wait_until("the saved choice", || {
+            js_sys::eval("window.__server.entry_message_override")
+                .unwrap()
+                .as_string()
+                .as_deref()
+                == Some("on")
+        })
+        .await;
+        TimeoutFuture::new(200).await;
+        assert_eq!(patch_count(), 1);
+        assert_eq!(orphaned_saves(), 0);
+        assert_eq!(status_reads(), 0.0, "the card's own save needs no re-read");
+        tear_down(root).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_save_chain_for_another_meeting_does_not_refresh_the_pre_join_card() {
+        let root = launch(NEITHER).await;
+        count_orphaned_save(MEETING);
+        show_the_card(&root).await;
+        wait_until("the mount refresh", || status_reads() == 1.0).await;
+        rerender_the_card();
+        TimeoutFuture::new(50).await;
+        count_orphaned_save("m-3168-other");
+        TimeoutFuture::new(200).await;
+        assert_eq!(status_reads(), 1.0);
+        tear_down(root).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_refreshed_save_chain_does_not_refresh_a_later_pre_join_card() {
+        let root = launch(NEITHER).await;
+        count_orphaned_save(MEETING);
+        show_the_card(&root).await;
+        wait_until("the mount refresh", || status_reads() == 1.0).await;
+        assert_eq!(orphaned_saves(), 0);
+        leave_the_card(&root).await;
+        show_the_card(&root).await;
+        TimeoutFuture::new(200).await;
+        assert_eq!(status_reads(), 1.0);
+        tear_down(root).await;
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod split_popover_dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    thread_local! {
+        static RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    #[allow(non_snake_case)]
+    fn Popovers() -> Element {
+        RENDERS.with(|r| r.set(r.get() + 1));
+        let density_open = use_signal(|| true);
+        let overflow_open = use_signal(|| true);
+        rsx! {
+            div { id: "grid-container", tabindex: "-1" }
+            if density_open() {
+                div { class: "density-popover", button { id: "density-opt" } }
+            }
+            if overflow_open() {
+                div { class: "grid-overflow-list", button { id: "overflow-row" } }
+            }
+            button { id: "density-mode-trigger" }
+            button { id: crate::components::overflow_participants::BADGE_ID }
+            button { id: "placement", "data-testid": PLACEMENT_TOGGLE_TESTID }
+            h4 { class: crate::components::display_name_edit::SELF_TILE_NAME_CLASS, button { id: "name-chip" } }
+            button {
+                id: "probe-split",
+                onclick: move |_| close_popovers_hidden_by_split(density_open, overflow_open),
+            }
+        }
+    }
+
+    async fn mount_popovers() -> web_sys::Element {
+        let root = gloo_utils::document().create_element("div").unwrap();
+        gloo_utils::document()
+            .body()
+            .unwrap()
+            .append_child(&root)
+            .unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(Popovers),
+            dioxus::web::Config::new().rootelement(root.clone()),
+        );
+        for _ in 0..200 {
+            if find(&root, "probe-split").is_some() {
+                break;
+            }
+            TimeoutFuture::new(10).await;
+        }
+        root
+    }
+
+    fn find(root: &web_sys::Element, id: &str) -> Option<web_sys::HtmlElement> {
+        root.query_selector(&format!("#{id}"))
+            .unwrap()
+            .map(|el| el.unchecked_into::<web_sys::HtmlElement>())
+    }
+
+    async fn engage_split_with_focus_on(id: &str) -> (String, bool) {
+        let root = mount_popovers().await;
+        find(&root, id)
+            .expect("premise: the focus target")
+            .focus()
+            .unwrap();
+        find(&root, "probe-split").unwrap().click();
+        TimeoutFuture::new(50).await;
+        let active = gloo_utils::document()
+            .active_element()
+            .map(|el| el.id())
+            .unwrap_or_default();
+        let open = root
+            .query_selector(".density-popover, .grid-overflow-list")
+            .unwrap()
+            .is_some();
+        root.remove();
+        (active, open)
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_split_closes_the_popovers_it_hides_and_keeps_focus_off_the_body() {
+        for inside in [
+            "density-opt",
+            "overflow-row",
+            "density-mode-trigger",
+            crate::components::overflow_participants::BADGE_ID,
+            "placement",
+            "name-chip",
+        ] {
+            assert_eq!(
+                engage_split_with_focus_on(inside).await,
+                ("grid-container".to_string(), false),
+                "{inside}"
+            );
+        }
+        assert_eq!(
+            engage_split_with_focus_on("probe-split").await,
+            ("probe-split".to_string(), false),
+            "focus outside the popovers stays put"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_split_with_the_popovers_already_closed_writes_nothing() {
+        let root = mount_popovers().await;
+        let probe = find(&root, "probe-split").unwrap();
+        let open = RENDERS.with(|r| r.get());
+        probe.click();
+        TimeoutFuture::new(50).await;
+        let closed = RENDERS.with(|r| r.get());
+        assert!(closed > open, "premise: closing re-renders");
+        probe.click();
+        TimeoutFuture::new(50).await;
+        let renders = RENDERS.with(|r| r.get());
+        root.remove();
+        assert_eq!(renders, closed);
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod replaced_toast_dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use std::cell::Cell;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    thread_local! {
+        static INITIAL: std::cell::RefCell<Option<ScreenShareToastState>> =
+            const { std::cell::RefCell::new(None) };
+        static STARTING_TIMER_FIRED: Cell<bool> = const { Cell::new(false) };
+        static SHOWN: std::cell::RefCell<Option<ScreenShareToastState>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn Toasts() -> Element {
+        let toast = use_signal(|| INITIAL.with(|s| s.borrow().clone()));
+        let timer = use_signal(|| {
+            toast
+                .peek()
+                .is_some()
+                .then(|| Timeout::new(30, || STARTING_TIMER_FIRED.with(|f| f.set(true))))
+        });
+        SHOWN.with(|s| *s.borrow_mut() = toast.read().clone());
+        rsx! {
+            button {
+                id: "probe-replaced",
+                onclick: move |_| show_share_toast(
+                    toast,
+                    timer,
+                    ScreenShareToastState::Replaced("Switched to sharing a tab"),
+                ),
+            }
+        }
+    }
+
+    async fn replace_with_toast(
+        initial: Option<ScreenShareToastState>,
+    ) -> (Option<ScreenShareToastState>, bool) {
+        INITIAL.with(|s| *s.borrow_mut() = initial);
+        STARTING_TIMER_FIRED.with(|f| f.set(false));
+        let root = gloo_utils::document().create_element("div").unwrap();
+        gloo_utils::document()
+            .body()
+            .unwrap()
+            .append_child(&root)
+            .unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(Toasts),
+            dioxus::web::Config::new().rootelement(root.clone()),
+        );
+        for _ in 0..200 {
+            if root.query_selector("#probe-replaced").unwrap().is_some() {
+                break;
+            }
+            TimeoutFuture::new(10).await;
+        }
+        root.query_selector("#probe-replaced")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<web_sys::HtmlElement>()
+            .click();
+        TimeoutFuture::new(80).await;
+        root.remove();
+        (
+            SHOWN.with(|s| s.borrow().clone()),
+            STARTING_TIMER_FIRED.with(|f| f.get()),
+        )
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_swap_before_any_peer_received_the_share_keeps_the_starting_toast() {
+        assert_eq!(
+            replace_with_toast(Some(ScreenShareToastState::Starting)).await,
+            (Some(ScreenShareToastState::Starting), true)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_swap_after_no_peer_received_the_share_keeps_the_alert() {
+        let failed = ScreenShareToastState::Failed("No peers".to_string());
+        assert_eq!(
+            replace_with_toast(Some(failed.clone())).await,
+            (Some(failed), true)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_swap_shows_its_confirmation() {
+        assert_eq!(
+            replace_with_toast(None).await,
+            (
+                Some(ScreenShareToastState::Replaced("Switched to sharing a tab")),
+                false
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod slot_activation_tests {
+    use super::*;
+
+    thread_local! {
+        static RECORD_CALLS: Cell<u32> = const { Cell::new(0) };
+        static RAISE_HAND_CALLS: Cell<u32> = const { Cell::new(0) };
+        static CAPTIONS_CALLS: Cell<u32> = const { Cell::new(0) };
+        static CONTROLS: Cell<Option<SlotControls>> = const { Cell::new(None) };
+    }
+
+    #[allow(non_snake_case)]
+    fn Probe() -> Element {
+        let toggle_recording: Callback<()> =
+            use_callback(|_| RECORD_CALLS.with(|calls| calls.set(calls.get() + 1)));
+        let toggle_raise_hand: Callback<()> =
+            use_callback(|_| RAISE_HAND_CALLS.with(|calls| calls.set(calls.get() + 1)));
+        let toggle_captions: Callback<()> =
+            use_callback(|_| CAPTIONS_CALLS.with(|calls| calls.set(calls.get() + 1)));
+        let mut peer_list_open = use_signal(|| false);
+        let toggle_peer_list: Callback<PeerListOpener> =
+            use_callback(move |_| peer_list_open.toggle());
+        let controls = SlotControls {
+            toggle_peer_list,
+            toggle_raise_hand,
+            toggle_captions,
+            toggle_recording,
+            close_transient_popovers: use_callback(|_| {}),
+            viewport_width: use_signal(|| 1280.0),
+            peer_list_open,
+            diagnostics_open: use_signal(|| false),
+            chat_open: use_signal(|| false),
+            density_open: use_signal(|| false),
+            density_mode: use_signal(|| DensityMode::Auto),
+            density_highlight: use_signal(|| DensityMode::Auto),
+            reactions_open: use_signal(|| false),
+            reaction_highlight: use_signal(|| ReactionType::THUMBS_UP),
+            dock_menu_open: use_signal(|| false),
+            mock_peers_open: use_signal(|| false),
+            share_menu_open: use_signal(|| false),
+            meeting_options_open: use_signal(|| false),
+            meeting_timer_open: use_signal(|| false),
+            device_settings_open: use_signal(|| false),
+            device_settings_initial_section: use_signal(|| None),
+            device_settings_generation: use_signal(|| 0),
+            recents_open: use_signal(|| false),
+            recents_open_last: use_signal(|| false),
+        };
+        use_hook(move || CONTROLS.with(|c| c.set(Some(controls))));
+        rsx! { div {} }
+    }
+
+    fn probe() -> (VirtualDom, SlotControls) {
+        let mut vdom = VirtualDom::new(Probe);
+        vdom.rebuild_in_place();
+        let controls = CONTROLS
+            .with(|c| c.get())
+            .expect("the probe published them");
+        (vdom, controls)
+    }
+
+    #[test]
+    fn activating_record_runs_the_record_control() {
+        let (vdom, controls) = probe();
+        vdom.in_runtime(|| controls.activate_slot(ActionBarSlot::Recording));
+        assert_eq!(RECORD_CALLS.with(|calls| calls.get()), 1);
+    }
+
+    #[test]
+    fn activating_raise_hand_and_captions_runs_each_ones_own_control() {
+        let (vdom, controls) = probe();
+        let calls = || (RAISE_HAND_CALLS.get(), CAPTIONS_CALLS.get());
+        vdom.in_runtime(|| controls.activate_slot(ActionBarSlot::RaiseHand));
+        assert_eq!(calls(), (1, 0));
+        vdom.in_runtime(|| controls.activate_slot(ActionBarSlot::Captions));
+        assert_eq!(calls(), (1, 1));
+    }
+
+    #[test]
+    fn opening_a_surface_closes_the_bar_popovers() {
+        let (vdom, mut controls) = probe();
+        vdom.in_runtime(|| {
+            for slot in [
+                ActionBarSlot::DensityMode,
+                ActionBarSlot::Reactions,
+                ActionBarSlot::Diagnostics,
+                ActionBarSlot::DeviceSettings,
+                ActionBarSlot::MeetingOptions,
+                ActionBarSlot::MeetingTimer,
+            ] {
+                let mut popovers = [
+                    (ActionBarSlot::DensityMode, controls.density_open),
+                    (ActionBarSlot::Reactions, controls.reactions_open),
+                    (ActionBarSlot::Mic, controls.dock_menu_open),
+                    (ActionBarSlot::Camera, controls.mock_peers_open),
+                    (ActionBarSlot::ScreenShare, controls.share_menu_open),
+                ];
+                for (owner, open) in &mut popovers {
+                    open.set(*owner != slot);
+                }
+                controls.device_settings_open.set(false);
+                controls.meeting_options_open.set(false);
+                controls.meeting_timer_open.set(false);
+                controls.diagnostics_open.set(false);
+                controls.activate_slot(slot);
+                for (owner, open) in popovers {
+                    assert_eq!(*open.peek(), owner == slot, "{owner:?} after {slot:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn opening_a_panel_surface_closes_the_panels_it_replaces() {
+        let (vdom, mut controls) = probe();
+        vdom.in_runtime(|| {
+            for slot in [
+                ActionBarSlot::DeviceSettings,
+                ActionBarSlot::MeetingOptions,
+                ActionBarSlot::MeetingTimer,
+            ] {
+                for mut panel in [controls.peer_list_open, controls.diagnostics_open] {
+                    panel.set(true);
+                }
+                controls.device_settings_open.set(false);
+                controls.meeting_options_open.set(false);
+                controls.meeting_timer_open.set(false);
+                controls.activate_slot(slot);
+                assert!(!*controls.peer_list_open.peek(), "{slot:?}");
+                assert!(!*controls.diagnostics_open.peek(), "{slot:?}");
+            }
+            controls.device_settings_open.set(true);
+            controls.meeting_options_open.set(false);
+            controls.activate_slot(ActionBarSlot::MeetingOptions);
+            assert!(!*controls.device_settings_open.peek());
+            controls.device_settings_open.set(true);
+            controls.meeting_timer_open.set(false);
+            controls.meeting_options_open.set(true);
+            controls.activate_slot(ActionBarSlot::MeetingTimer);
+            assert!(!*controls.device_settings_open.peek());
+            assert!(!*controls.meeting_options_open.peek());
+        });
+    }
+
+    #[test]
+    fn opening_diagnostics_or_settings_closes_the_dialogs_it_replaces() {
+        let (vdom, mut controls) = probe();
+        vdom.in_runtime(|| {
+            controls.device_settings_open.set(true);
+            controls.meeting_options_open.set(true);
+            controls.activate_slot(ActionBarSlot::Diagnostics);
+            assert!(
+                !*controls.device_settings_open.peek(),
+                "Diagnostics, Settings"
+            );
+            assert!(
+                !*controls.meeting_options_open.peek(),
+                "Diagnostics, Options"
+            );
+            controls.diagnostics_open.set(false);
+            controls.meeting_options_open.set(true);
+            controls.activate_slot(ActionBarSlot::DeviceSettings);
+            assert!(!*controls.meeting_options_open.peek(), "Settings, Options");
+        });
+    }
+
+    #[test]
+    fn opening_settings_bumps_the_generation_and_clears_a_deep_link() {
+        let (vdom, mut controls) = probe();
+        vdom.in_runtime(|| {
+            controls
+                .device_settings_initial_section
+                .set(Some("video".to_string()));
+            controls.activate_slot(ActionBarSlot::DeviceSettings);
+            assert_eq!(*controls.device_settings_generation.peek(), 1);
+            assert_eq!(*controls.device_settings_initial_section.peek(), None);
+            controls.activate_slot(ActionBarSlot::DeviceSettings);
+            assert_eq!(
+                *controls.device_settings_generation.peek(),
+                1,
+                "closing does not remount"
+            );
+        });
+    }
+
+    #[test]
+    fn opening_density_and_reactions_seeds_their_highlight() {
+        let (vdom, mut controls) = probe();
+        vdom.in_runtime(|| {
+            controls.density_mode.set(DensityMode::Dense);
+            controls.activate_slot(ActionBarSlot::DensityMode);
+            assert_eq!(*controls.density_highlight.peek(), DensityMode::Dense);
+            controls.reaction_highlight.set(ReactionType::HEART);
+            controls.activate_slot(ActionBarSlot::Reactions);
+            assert_eq!(*controls.reaction_highlight.peek(), ReactionType::THUMBS_UP);
+        });
+    }
+
+    #[test]
+    fn opening_a_drawer_on_a_narrow_viewport_closes_the_other_drawers() {
+        let (vdom, mut controls) = probe();
+        vdom.in_runtime(|| {
+            controls.viewport_width.set(320.0);
+            controls.chat_open.set(true);
+            controls.activate_slot(ActionBarSlot::Diagnostics);
+            assert!(!*controls.chat_open.peek(), "Diagnostics closes Chat");
+        });
+    }
+
+    #[test]
+    fn only_a_user_who_may_record_can_start_and_stop_stays_open() {
+        let revoked_co_host = record_slot_visible(false, false, false);
+        let guest = record_slot_visible(false, true, true);
+        let allowed_attendee = record_slot_visible(false, false, true);
+        let host = record_slot_visible(true, false, false);
+        for may_not in [revoked_co_host, guest] {
+            assert_eq!(
+                recording_toggle(&RecordButtonState::Idle, may_not),
+                RecordingToggle::Nothing,
+                "a stale Record row starts nothing"
+            );
+            assert_eq!(
+                recording_toggle(&RecordButtonState::Recording, may_not),
+                RecordingToggle::Stop,
+                "a demoted recorder can still stop"
+            );
+        }
+        for may in [allowed_attendee, host] {
+            assert_eq!(
+                recording_toggle(&RecordButtonState::Idle, may),
+                RecordingToggle::Start
+            );
+        }
+        for busy in [
+            RecordButtonState::Activating,
+            RecordButtonState::Stopping,
+            RecordButtonState::Saving,
+        ] {
+            assert_eq!(recording_toggle(&busy, true), RecordingToggle::Nothing);
+        }
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        assert!(flat.contains(concat!(
+            "matchrecording_toggle(&record_state(),record_slot_visible(is_owner,is_guest,",
+            "*recording_allowed_for_all_toggle.peek()),){"
+        )));
+    }
+
+    #[test]
+    fn the_bar_buttons_share_one_activation_callback() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        for slot in [
+            "PeerList",
+            "DensityMode",
+            "Reactions",
+            "RaiseHand",
+            "Captions",
+            "Diagnostics",
+            "DeviceSettings",
+            "MeetingOptions",
+            "MeetingTimer",
+            "RecentActions",
+        ] {
+            let call = format!(
+                "{}{slot});",
+                concat!("activate_bar_slot.call(", "ActionBarSlot::")
+            );
+            assert!(flat.contains(&call), "{call}");
+        }
+        assert!(flat.contains(concat!("open_recents.call(", "on_last);")));
+    }
+
+    #[test]
+    fn an_overflow_item_settles_focus_unless_it_opened_settings() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        assert!(flat.contains(concat!(
+            "slot_controls.activate_slot(slot);",
+            "ifslot!=ActionBarSlot::DeviceSettings{",
+            "settle_slot_focus(OVERFLOW_MENU_TRIGGER_ID);}"
+        )));
+    }
+
+    #[test]
+    fn the_paths_that_close_a_surface_keep_focus_reachable() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        for needle in [
+            concat!(
+                "on_close:move|_|{diagnostics_open.set(false);",
+                "settle_slot_focus(\"diagnostics-trigger\");}"
+            ),
+            concat!(
+                "save_density_mode(mode);density_open.set(false);",
+                "settle_slot_focus(\"density-mode-trigger\");"
+            ),
+            concat!(
+                "target.trigger_id(opener.trigger_id()){focus_slot_trigger(id);",
+                "settle_slot_focus(id);}"
+            ),
+            concat!("ifletSome(id)=restore_to{focus_", "slot_trigger(id);}"),
+        ] {
+            assert!(flat.contains(needle), "{needle}");
+        }
+    }
+
+    #[test]
+    fn an_open_recents_menu_holds_the_shrinking_bar_open() {
+        let (vdom, mut controls) = probe();
+        vdom.in_runtime(|| {
+            let popovers = ActionBarPopovers {
+                density_open: controls.density_open,
+                reactions_open: controls.reactions_open,
+                mock_peers_open: controls.mock_peers_open,
+                share_menu_open: controls.share_menu_open,
+                dock_menu_open: controls.dock_menu_open,
+                meeting_timer_open: controls.meeting_timer_open,
+                recents_open: controls.recents_open,
+            };
+            let any_open = || popovers.transient().iter().any(|open| *open.peek());
+            assert!(!any_open());
+            controls.recents_open.set(true);
+            assert!(any_open(), "Escape and tap handling read this list");
+        });
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        assert!(flat.contains(concat!(
+            "letbar_pinned=recents_open()||crate::components::share_actions::",
+            "share_control_pins_bar("
+        )));
+    }
+
+    #[test]
+    fn a_settled_trigger_obeys_the_clipped_focus_rule() {
+        let flat: String = include_str!("attendants.rs").split_whitespace().collect();
+        assert!(flat.contains(concat!(
+            "iffocus_was_dropped(){focus_slot_trigger(id);",
+            "blur_clipped_focus();}"
+        )));
+    }
+
+    #[test]
+    fn a_closing_surface_returns_focus_to_the_first_control_on_screen() {
+        let trigger = "density-mode-trigger";
+        assert_eq!(slot_trigger_chain(trigger, |_| true), trigger);
+        assert_eq!(
+            slot_trigger_chain(trigger, |id| id == OVERFLOW_MENU_TRIGGER_ID),
+            OVERFLOW_MENU_TRIGGER_ID
+        );
+        assert_eq!(slot_trigger_chain(trigger, |_| false), "grid-container");
+        assert_eq!(
+            slot_trigger_chain(trigger, |id| id != trigger),
+            OVERFLOW_MENU_TRIGGER_ID,
+            "not the Recent actions trigger, which the user never touched"
+        );
+        assert_eq!(
+            slot_trigger_chain(trigger, |id| id == RECENT_ACTIONS_TRIGGER_ID),
+            RECENT_ACTIONS_TRIGGER_ID
+        );
+        assert_eq!(
+            slot_trigger_chain(RECENT_ACTIONS_TRIGGER_ID, |_| true),
+            RECENT_ACTIONS_TRIGGER_ID
+        );
+    }
+
+    #[test]
+    fn each_surface_slot_toggles_its_own_surface() {
+        let (vdom, controls) = probe();
+        vdom.in_runtime(|| {
+            for (slot, open) in [
+                (ActionBarSlot::PeerList, controls.peer_list_open),
+                (ActionBarSlot::DensityMode, controls.density_open),
+                (ActionBarSlot::Reactions, controls.reactions_open),
+                (ActionBarSlot::Diagnostics, controls.diagnostics_open),
+                (ActionBarSlot::DeviceSettings, controls.device_settings_open),
+                (ActionBarSlot::MeetingOptions, controls.meeting_options_open),
+                (ActionBarSlot::MeetingTimer, controls.meeting_timer_open),
+                (ActionBarSlot::RecentActions, controls.recents_open),
+            ] {
+                controls.activate_slot(slot);
+                assert!(*open.peek(), "{slot:?} opens");
+                controls.activate_slot(slot);
+                assert!(!*open.peek(), "{slot:?} closes");
+            }
+        });
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod overflow_icon_dom_tests {
+    use super::*;
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[allow(non_snake_case)]
+    fn Icons() -> Element {
+        rsx! {
+            for slot in crate::components::action_bar_layout::ALL_SLOTS.iter().copied() {
+                div { key: "{slot.slug()}", "data-icon": slot.slug(), {overflow_slot_icon(slot)} }
+            }
+            div { "data-icon": "idle", {live_slot_icon(ActionBarSlot::Recording, &RecordButtonState::Idle)} }
+            div { "data-icon": "running", {live_slot_icon(ActionBarSlot::Recording, &RecordButtonState::Recording)} }
+            div { "data-icon": "peers", {live_slot_icon(ActionBarSlot::PeerList, &RecordButtonState::Recording)} }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropped_focus_settles_on_the_trigger_and_held_focus_stays() {
+        let doc = gloo_utils::document();
+        let root = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&root).unwrap();
+        root.set_inner_html(&format!(
+            "<button id='{OVERFLOW_MENU_TRIGGER_ID}'>more</button><button id='drawer-control'>x</button>"
+        ));
+        let button = |id: &str| {
+            doc.get_element_by_id(id)
+                .unwrap()
+                .unchecked_into::<web_sys::HtmlElement>()
+        };
+        button("drawer-control").focus().unwrap();
+        button("drawer-control").blur().unwrap();
+        settle_slot_focus(OVERFLOW_MENU_TRIGGER_ID);
+        TimeoutFuture::new(20).await;
+        let landed = doc.active_element().map(|el| el.id());
+        button("drawer-control").focus().unwrap();
+        settle_slot_focus(OVERFLOW_MENU_TRIGGER_ID);
+        TimeoutFuture::new(20).await;
+        let kept = doc.active_element().map(|el| el.id());
+        root.remove();
+        assert_eq!(landed.as_deref(), Some(OVERFLOW_MENU_TRIGGER_ID));
+        assert_eq!(kept.as_deref(), Some("drawer-control"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn every_slot_a_menu_can_list_has_an_icon() {
+        let doc = gloo_utils::document();
+        let root = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&root).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(Icons),
+            dioxus::web::Config::new().rootelement(root.clone()),
+        );
+        TimeoutFuture::new(50).await;
+        for slot in crate::components::action_bar_layout::ALL_SLOTS
+            .iter()
+            .copied()
+        {
+            let selector = format!("[data-icon='{}'] svg", slot.slug());
+            let has_icon = root.query_selector(&selector).unwrap().is_some();
+            let pinned = matches!(slot, ActionBarSlot::Mic | ActionBarSlot::Camera);
+            assert_eq!(has_icon, !pinned, "{slot:?}");
+        }
+        let has = |selector: &str| root.query_selector(selector).unwrap().is_some();
+        assert!(has("[data-icon='idle'] circle") && !has("[data-icon='idle'] rect"));
+        assert!(has("[data-icon='running'] rect") && !has("[data-icon='running'] circle"));
+        assert!(!has("[data-icon='peers'] rect"));
+        root.remove();
     }
 }

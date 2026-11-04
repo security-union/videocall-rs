@@ -81,6 +81,7 @@ async fn test_wr_off_toggle_reports_the_participants_it_admitted() {
         None,
         None,
         None,
+        db_meetings::Announcements::default(),
         &PasswordUpdate::Unchanged,
     )
     .await
@@ -123,6 +124,7 @@ async fn test_settings_update_that_admits_nobody_reports_nobody() {
         None,
         None,
         None,
+        db_meetings::Announcements::default(),
         &PasswordUpdate::Unchanged,
     )
     .await

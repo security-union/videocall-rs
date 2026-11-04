@@ -97,6 +97,8 @@ export interface SshLaunchSpec {
    */
   ssoStateFile?: string | null;
   diagPackets?: DiagPackets | null;
+  /** The run's deadline in epoch seconds. */
+  deadlineSecs?: number | null;
   /**
    * Optional `botId` used when emitting the warning log line that
    * fires when SSO forwarding is requested but the local state file
@@ -181,6 +183,7 @@ export function buildSshCommand(
     // wrapped launch command shape operators see today.
     ssoStateFileRaw: ssoWrap ? SSO_FORWARD_TEMP_TOKEN : null,
     diagPackets: spec.diagPackets ?? null,
+    deadlineSecs: spec.deadlineSecs ?? null,
   });
   const argv = ["ssh", ...buildSshArgsForLaunch(host, remoteCommand, { ssoWrap })];
   return {

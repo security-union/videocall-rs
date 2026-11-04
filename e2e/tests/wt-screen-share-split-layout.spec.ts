@@ -361,7 +361,7 @@ async function setupTwoUserMeetingWithTransport(
   // Also on the host so a future test variant where the host shares
   // doesn't surprise-fail; cost is negligible (an init-script eval).
   await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
-  // The host viewer asserts the split layout, which is opt-in since #2792.
+  // The host viewer asserts the split layout.
   await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();

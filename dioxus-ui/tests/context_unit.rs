@@ -12,13 +12,15 @@ use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
     apply_notification_prefs, apply_transport_decision, clear_display_name_from_storage,
-    clear_transport_sticky_and_pref, email_to_display_name, load_appearance_settings_from_storage,
-    load_display_name_from_storage, load_self_view_placement, load_self_view_visible,
+    clear_transport_sticky_and_pref, email_to_display_name, fallback_memory_callback,
+    load_appearance_settings_from_storage, load_display_name_from_storage,
+    load_self_view_placement, load_self_view_visible, load_transport_fallback,
     load_transport_preference, load_transport_preference_with_source, resolve_self_view_placement,
     resolve_self_view_visible, resolve_transport_config, save_appearance_settings_to_storage,
     save_display_name_to_storage, save_self_view_placement, save_self_view_visible,
-    save_transport_preference, save_transport_sticky, validate_display_name, AppearanceSettings,
-    SelfViewPlacement, TransportPreference, DISPLAY_NAME_MAX_LEN,
+    save_transport_fallback, save_transport_preference, save_transport_sticky,
+    validate_display_name, AppearanceSettings, SelfViewPlacement, TransportPreference,
+    DISPLAY_NAME_MAX_LEN,
 };
 use videocall_types::validation::normalize_spaces;
 
@@ -410,12 +412,7 @@ fn resolve_webtransport_with_server_wt_enabled_passes_through_both_lists() {
     // which had identical wire-level behaviour.
     let ws = vec!["ws://a:8080".to_string(), "ws://b:8080".to_string()];
     let wt = vec!["https://a:4433".to_string(), "https://b:4433".to_string()];
-    let (enable_wt, ws_out, wt_out) = resolve_transport_config(
-        TransportPreference::WebTransport,
-        true,
-        ws.clone(),
-        wt.clone(),
-    );
+    let (enable_wt, ws_out, wt_out) = resolve_transport_config(true, ws.clone(), wt.clone());
     assert!(
         enable_wt,
         "WebTransport + server WT enabled => enable_webtransport = true"
@@ -434,12 +431,7 @@ fn resolve_webtransport_with_server_wt_enabled_passes_through_both_lists() {
 fn resolve_webtransport_with_server_wt_disabled_empties_the_wt_list() {
     let ws = vec!["ws://a:8080".to_string()];
     let wt = vec!["https://a:4433".to_string()];
-    let (enable_wt, ws_out, wt_out) = resolve_transport_config(
-        TransportPreference::WebTransport,
-        false,
-        ws.clone(),
-        wt.clone(),
-    );
+    let (enable_wt, ws_out, wt_out) = resolve_transport_config(false, ws.clone(), wt.clone());
     assert!(
         !enable_wt,
         "WebTransport + server WT disabled => enable_webtransport = false"
@@ -457,8 +449,7 @@ fn resolve_webtransport_with_server_wt_disabled_empties_the_wt_list() {
 
 #[wasm_bindgen_test]
 fn resolve_webtransport_with_empty_urls_passes_through_empties() {
-    let (enable_wt, ws_out, wt_out) =
-        resolve_transport_config(TransportPreference::WebTransport, true, vec![], vec![]);
+    let (enable_wt, ws_out, wt_out) = resolve_transport_config(true, vec![], vec![]);
     assert!(enable_wt);
     assert!(
         ws_out.is_empty(),
@@ -468,57 +459,6 @@ fn resolve_webtransport_with_empty_urls_passes_through_empties() {
         wt_out.is_empty(),
         "WebTransport should pass empty WT list through"
     );
-}
-
-// ---------------------------------------------------------------------------
-// resolve_transport_config — WebSocket-only mode
-// ---------------------------------------------------------------------------
-
-#[wasm_bindgen_test]
-fn resolve_websocket_clears_wt_urls_and_disables_wt() {
-    let ws = vec!["ws://a:8080".to_string()];
-    let wt = vec!["https://a:4433".to_string(), "https://b:4433".to_string()];
-    let (enable_wt, ws_out, wt_out) =
-        resolve_transport_config(TransportPreference::WebSocket, false, ws.clone(), wt);
-    assert!(
-        !enable_wt,
-        "WebSocket should force enable_webtransport = false"
-    );
-    assert_eq!(ws_out, ws, "WebSocket should keep WS URLs unchanged");
-    assert!(wt_out.is_empty(), "WebSocket should clear all WT URLs");
-}
-
-#[wasm_bindgen_test]
-fn resolve_websocket_overrides_server_wt_enabled() {
-    // Even when the server says WT is enabled, WebSocket forces it off.
-    let ws = vec!["ws://a:8080".to_string()];
-    let wt = vec!["https://a:4433".to_string()];
-    let (enable_wt, ws_out, wt_out) =
-        resolve_transport_config(TransportPreference::WebSocket, true, ws.clone(), wt);
-    assert!(
-        !enable_wt,
-        "WebSocket should override server_wt_enabled=true and force false"
-    );
-    assert_eq!(
-        ws_out, ws,
-        "WebSocket should keep WS URLs even when server says WT enabled"
-    );
-    assert!(
-        wt_out.is_empty(),
-        "WebSocket should clear WT URLs even when server says WT enabled"
-    );
-}
-
-#[wasm_bindgen_test]
-fn resolve_websocket_with_empty_urls() {
-    let (enable_wt, ws_out, wt_out) =
-        resolve_transport_config(TransportPreference::WebSocket, true, vec![], vec![]);
-    assert!(
-        !enable_wt,
-        "WebSocket should disable WT even with empty URL lists"
-    );
-    assert!(ws_out.is_empty());
-    assert!(wt_out.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -536,12 +476,7 @@ fn resolve_webtransport_preserves_order_of_multiple_urls() {
         "https://first:4433".to_string(),
         "https://second:4433".to_string(),
     ];
-    let (_, ws_out, wt_out) = resolve_transport_config(
-        TransportPreference::WebTransport,
-        true,
-        ws.clone(),
-        wt.clone(),
-    );
+    let (_, ws_out, wt_out) = resolve_transport_config(true, ws.clone(), wt.clone());
     assert_eq!(ws_out, ws, "URL order must be preserved");
     assert_eq!(wt_out, wt, "URL order must be preserved");
 }
@@ -1211,4 +1146,28 @@ fn a_garbage_stored_placement_loads_as_corner() {
     assert_eq!(load_self_view_placement(), SelfViewPlacement::Corner);
     assert!(load_self_view_visible());
     clear_self_view_keys();
+}
+
+#[wasm_bindgen_test]
+fn transport_fallback_memory_is_per_tab_and_per_preference_and_never_the_saved_preference() {
+    clear_transport_sticky_and_pref();
+    let pref_before = load_transport_preference_with_source();
+    save_transport_fallback(TransportPreference::WebTransport, true);
+    assert!(load_transport_fallback(TransportPreference::WebTransport));
+    assert!(!load_transport_fallback(TransportPreference::WebSocket));
+    assert_eq!(load_transport_preference_with_source(), pref_before);
+    let local = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+    assert_eq!(local.get_item("vc_transport_fallback").unwrap(), None);
+
+    save_transport_fallback(TransportPreference::WebTransport, false);
+    assert!(!load_transport_fallback(TransportPreference::WebTransport));
+}
+
+#[wasm_bindgen_test]
+fn the_clients_fallback_memory_callback_writes_the_tab_memory() {
+    let callback = fallback_memory_callback(TransportPreference::WebTransport);
+    callback.emit(true);
+    assert!(load_transport_fallback(TransportPreference::WebTransport));
+    callback.emit(false);
+    assert!(!load_transport_fallback(TransportPreference::WebTransport));
 }

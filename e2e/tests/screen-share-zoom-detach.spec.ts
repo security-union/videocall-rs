@@ -16,16 +16,13 @@
  *     percentage, `aria-disabled` clamp state, and `is-zoomed` viewport class
  *     are deterministic.
  *   - DETACH: clicking `[data-testid=ss-detach]` opens a REAL separate window
- *     (Document PiP, or the `window.open` fallback forced headless below) that
- *     mirrors the canvas into a `<video>` and hosts its OWN zoom + reattach
- *     controls. The MAIN window then flips to a regular no-share meeting: the
- *     share tile (`data-share-mode="detached"`, `inert`) is hidden OFF-SCREEN but
- *     stays MOUNTED so the canvas keeps its node identity and keeps painting to
- *     feed the mirror; the peer grid goes full width. REATTACH (popup Reattach
- *     button / Escape / closing the window) restores the split layout and
- *     returns focus to ss-detach.
- *   - Issue 2792: a share opens as a grid tile by default; the host context is
- *     seeded with the Enlarged view so the split layout above is what it sees.
+ *     (a `window.open` popup) that mirrors the canvas into a `<video>` and
+ *     hosts its OWN zoom + reattach controls. The MAIN window then flips to a
+ *     regular no-share meeting: the share tile (`data-share-mode="detached"`,
+ *     `inert`) is hidden OFF-SCREEN but stays MOUNTED so the canvas keeps its
+ *     node identity and keeps painting to feed the mirror; the peer grid goes
+ *     full width. REATTACH (popup Reattach button / Escape / closing the
+ *     window) restores the split layout and returns focus to ss-detach.
  *   - Zoom state survives an unrelated re-render of the tile (v1 defect D7:
  *     imperative zoom reset on every re-render).
  *
@@ -50,9 +47,9 @@
  *   - `[data-testid=ss-zoom-out|ss-zoom-in]` `aria-disabled="true"` at the
  *     fit/max clamp (L2100/L2117, NOT native `disabled`); `ss-zoom-label` text
  *     (L2109); `ss-zoom-reset` L2128; `[data-testid=ss-detach]` (L2139)
- *     aria-pressed (L2142), gated by `detach_supported()` (screen_share_detach.rs
- *     L208; desktop 1280>768 → rendered). The old `.is-detached` overlay, bring-
- *     back button, and inert `.ss-tile-interior` were removed in 58deca56.
+ *     aria-pressed (L2142), gated by `detach_supported()` (screen_share_detach.rs).
+ *     The old `.is-detached` overlay, bring-back button, and inert
+ *     `.ss-tile-interior` were removed in 58deca56.
  *   MAIN window while detached (issue 2792):
  *   - the received share tile carries `data-share-mode="detached"` and `inert`;
  *     `.share-tile[data-share-mode="detached"]` (global.css) moves it to
@@ -78,15 +75,15 @@
  *     Escape + 400ms close-poll all route to teardown→reattach (finish_open
  *     L436-483). Controls always visible (DETACHED_CSS).
  *
- * Untagged (no `@bvt`): does not run in per-PR CI by design; the full-suite
- * dispatch covers it.
+ * Only the `@bvt1` hidden-meeting-page test runs in per-PR CI; the full-suite
+ * dispatch covers the rest.
  */
 
 import { test, expect, chromium, Browser, Locator, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
-import { FORCE_POPUP_DETACH_SCRIPT, seedShareViewMode } from "../helpers/screen-share-meeting";
+import { seedShareViewMode } from "../helpers/screen-share-meeting";
 
 const SPLIT_LAYOUT_ACTIVATION_TIMEOUT_MS = 15_000;
 
@@ -116,8 +113,8 @@ const MOCK_GET_DISPLAY_MEDIA_SCRIPT = `
 `;
 
 /**
- * ANIMATED getDisplayMedia mock, used ONLY by the detach test (Test 3a). A
- * canvas drawn ONCE emits no NEW captured frames, so a captureStream mirror of
+ * ANIMATED getDisplayMedia mock, used by the tests that read the mirror or the
+ * share's fps. A canvas drawn ONCE emits no NEW captured frames, so a captureStream mirror of
  * it cannot be proven "advancing" — its pixels never change (and under headless
  * --disable-gpu the mirror video never even reaches readyState>=2). Repaint every
  * frame (moving bar + counter) so the detached-window mirror receives
@@ -125,7 +122,7 @@ const MOCK_GET_DISPLAY_MEDIA_SCRIPT = `
  * meaningful. Verified: this renders to a live <video> even under headless
  * --disable-gpu (CI), which a static source does NOT.
  *
- * Scoped to Test 3a on purpose: the zoom / layout tests assert transform /
+ * Not the default on purpose: the zoom / layout tests assert transform /
  * identity / layout (not pixels), and the extra per-frame encode load competes
  * with the guest's CAMERA encode — enough, on a loaded headless box, to drop the
  * camera video the re-render test checks for ("Video Disabled"). Those tests keep
@@ -314,15 +311,12 @@ interface SharedScreenFixture {
 /**
  * Stand up a real 2-peer meeting where the guest publishes a mocked screen
  * share and the host VIEWS it, then return the host's `.split-screen-tile`.
- * `hostExtraInit` (e.g. `FORCE_POPUP_DETACH_SCRIPT`) is added to the host
- * context before nav.
  */
 async function setupViewerSeeingSharedScreen(
   uiURL: string,
   meetingId: string,
   hostName: string,
   guestName: string,
-  hostExtraInit?: string,
   shareMock: string = MOCK_GET_DISPLAY_MEDIA_SCRIPT,
   headless: boolean = true,
 ): Promise<SharedScreenFixture> {
@@ -351,9 +345,6 @@ async function setupViewerSeeingSharedScreen(
   // the cheap static mock; the detach test overrides it with ANIMATED_SHARE_MOCK
   // so its mirror pixel-liveness assertion is meaningful.
   await guestCtx.addInitScript(shareMock);
-  if (hostExtraInit) {
-    await hostCtx.addInitScript(hostExtraInit);
-  }
   await seedShareViewMode(hostCtx, "enlarged");
 
   const hostPage = await hostCtx.newPage();
@@ -422,13 +413,13 @@ async function readCanvasIdentity(canvas: Locator): Promise<string | null> {
  * throws.
  *
  * Why pixels (issue #1829): the detached window used to open BLANK — a
- * cross-realm `dyn_into` on the popup's `<video>` (and the Document PiP `Window`)
- * failed silently, so the mirror was never built and the share snapped back to
- * the main window. The old `!paused && readyState>=2` poll could NOT tell a
- * blank/frozen mirror from a live one. Two samples let a caller assert the
- * mirror is non-blank (mean above a near-black floor) AND advancing (signatures
- * differ). The mock share is animated, so a correctly-mirrored video advances
- * even under headless `--disable-gpu` (CI) — verified while fixing #1829.
+ * cross-realm `dyn_into` on the popup's `<video>` failed silently, so the
+ * mirror was never built and the share snapped back to the main window. The
+ * old `!paused && readyState>=2` poll could NOT tell a blank/frozen mirror
+ * from a live one. Two samples let a caller assert the mirror is non-blank
+ * (mean above a near-black floor) AND advancing (signatures differ). The mock
+ * share is animated, so a correctly-mirrored video advances even under
+ * headless `--disable-gpu` (CI) — verified while fixing #1829.
  */
 async function sampleDetachedMirror(popup: Page): Promise<{ mean: number; sig: number } | null> {
   return popup.evaluate(() => {
@@ -453,33 +444,6 @@ async function sampleDetachedMirror(popup: Page): Promise<{ mean: number; sig: n
       return null;
     }
   });
-}
-
-/**
- * Issue #1821: find the detached DOCUMENT among the context's pages. A real
- * Document PiP window (and a script-opened maximized popup) each surface as a
- * Playwright `Page` whose document carries `#ss-detached-maximize`. Polls because
- * the page-event → DOM-built latency is not instantaneous, and skips pages in
- * `exclude` (the main window) and any that error while navigating.
- */
-async function findDetachedDocPage(
-  context: import("@playwright/test").BrowserContext,
-  exclude: Page[],
-  timeoutMs: number,
-): Promise<Page | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    for (const p of context.pages()) {
-      if (exclude.includes(p) || p.isClosed()) continue;
-      try {
-        if (await p.evaluate(() => !!document.getElementById("ss-detached-maximize"))) return p;
-      } catch {
-        /* page mid-navigation / not ready — retry on the next sweep */
-      }
-    }
-    await new Promise((r) => setTimeout(r, 300));
-  }
-  return null;
 }
 
 /**
@@ -703,18 +667,15 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
   // Test 3a — detach opens a live, zoomable mirror window; the main window flips
   // to a regular meeting; the popup Reattach button restores everything.
   //
-  // Headless branch (verified against 58deca56): the desktop viewport (1280px >
-  // 768px) makes `detach_supported()` true, so `[data-testid=ss-detach]` IS
-  // rendered. FORCE_POPUP_DETACH_SCRIPT shadows Document PiP off, so `open()`
-  // takes the `window.open` fallback, which Playwright's headless Chromium
-  // honors and surfaces as a new context page. If an environment blocks the
-  // popup, `open()` resets the optimistic signal (no flip); the test asserts
+  // Headless branch: `open()` calls `window.open`, which Playwright's headless
+  // Chromium honors and surfaces as a new context page. If an environment blocks
+  // the popup, `open()` resets the optimistic signal (no flip); the test asserts
   // that revert and skips the window-dependent half.
   //
   // Fails-on-unfixed:
   //  - absent feature → no ss-detach testid (locator times out).
-  //  - issue #1829 (cross-realm `dyn_into` on the popup <video> / PiP Window
-  //    fails silently): the detached window never builds → the detached mode
+  //  - issue #1829 (cross-realm `dyn_into` on the popup <video> fails
+  //    silently): the detached window never builds → the detached mode
   //    reverts (assertMainWindowDetachedLook fails) OR the mirror stays blank →
   //    the pixel-liveness assertion below (non-blank + advancing) fails.
   //  - the detached mirror never PLAYS / freezes: the two pixel samples are
@@ -738,7 +699,6 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       meetingId,
       "SsDetachHost",
       "SsDetachGuest",
-      FORCE_POPUP_DETACH_SCRIPT,
       // Animated source so the detached-window mirror shows ADVANCING frames the
       // pixel-liveness assertion below can prove (a static canvas emits no new
       // captured frames).
@@ -760,8 +720,8 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       const id1 = await tagCanvasIdentity(canvas);
       expect(id1).toBeTruthy();
 
-      // Detach → a real separate window opens (window.open, forced above),
-      // surfaced by Playwright as a new context page.
+      // Detach → a real separate window opens (window.open), surfaced by
+      // Playwright as a new context page.
       //
       // Skip-vs-fail distinction (critical for the #1829 guard): the ONLY
       // legitimate skip is the `catch` below — `waitForEvent` timed out, i.e. NO
@@ -828,11 +788,11 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
 
       // ...and it must show LIVE, NON-BLANK, ADVANCING content — not merely be
       // "present and !paused". Issue #1829: the detached window opened BLANK (a
-      // cross-realm `dyn_into` on the popup's <video> / the Document PiP Window
-      // failed silently, so the mirror was never built and the share snapped
-      // back to the main window). The pre-#1829 `!paused && readyState>=2` poll
-      // could not distinguish a blank/frozen mirror from a live one — precisely
-      // why CI stayed green while the feature was broken. We now PIXEL-SAMPLE the
+      // cross-realm `dyn_into` on the popup's <video> failed silently, so the
+      // mirror was never built and the share snapped back to the main window).
+      // The pre-#1829 `!paused && readyState>=2` poll could not distinguish a
+      // blank/frozen mirror from a live one — precisely why CI stayed green
+      // while the feature was broken. We now PIXEL-SAMPLE the
       // popup <video> (see `sampleDetachedMirror`): first poll until a non-blank
       // frame decodes, then take two samples ~600ms apart and require they DIFFER
       // (frames are advancing). The animated mock keeps this meaningful under
@@ -896,6 +856,88 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
     }
   });
 
+  test("the detached mirror keeps playing while the meeting page is hidden @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const fx = await setupViewerSeeingSharedScreen(
+      baseURL || "http://localhost:3001",
+      `ss_detach_hidden_${Date.now()}`,
+      "SsHiddenHost",
+      "SsHiddenGuest",
+      ANIMATED_SHARE_MOCK,
+    );
+    const { hostPage, tile } = fx;
+
+    try {
+      const detach = tile.locator('[data-testid="ss-detach"]');
+      await expect(detach).toBeVisible();
+      const popupPromise = hostPage.context().waitForEvent("page", { timeout: 12_000 });
+      await tile.hover();
+      await detach.click();
+      const popup = await popupPromise;
+      await expect(tile).toHaveAttribute("data-share-mode", "detached", { timeout: 10_000 });
+      await expect
+        .poll(async () => (await sampleDetachedMirror(popup))?.mean ?? -1, {
+          timeout: 15_000,
+          message: "detached mirror never decoded a non-blank frame",
+        })
+        .toBeGreaterThan(8);
+
+      const expectMirrorAdvances = async (message: string): Promise<void> => {
+        const from = await sampleDetachedMirror(popup);
+        expect(from, "the mirror must be readable before it is measured").not.toBeNull();
+        await expect
+          .poll(async () => (await sampleDetachedMirror(popup))?.sig ?? from!.sig, {
+            timeout: 5_000,
+            message,
+          })
+          .not.toBe(from!.sig);
+      };
+      await expectMirrorAdvances("the mirror must advance while the meeting page is visible");
+
+      type HeldFrames = {
+        __realRaf: typeof requestAnimationFrame;
+        __heldRaf: FrameRequestCallback[];
+      };
+      // A hidden page holds its animation frame callbacks until it shows again.
+      const hidden = await hostPage.evaluate(() => {
+        Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          get: () => "hidden",
+        });
+        const w = window as unknown as HeldFrames;
+        w.__realRaf = window.requestAnimationFrame;
+        w.__heldRaf = [];
+        window.requestAnimationFrame = (cb) => {
+          w.__heldRaf.push(cb);
+          return 0;
+        };
+        return document.hidden && window.requestAnimationFrame(() => undefined) === 0;
+      });
+      expect(hidden, "the meeting page must read as hidden with no animation frames").toBe(true);
+      // Lets a paint scheduled before the hide land before the baseline sample.
+      await popup.waitForTimeout(1_000);
+      await expectMirrorAdvances("the mirror froze while the meeting page was hidden");
+
+      await hostPage.evaluate(() => {
+        Reflect.deleteProperty(document, "hidden");
+        Reflect.deleteProperty(document, "visibilityState");
+        const w = window as unknown as HeldFrames;
+        window.requestAnimationFrame = w.__realRaf;
+        w.__heldRaf.forEach((cb) => window.requestAnimationFrame(cb));
+      });
+      const closed = popup.waitForEvent("close", { timeout: 10_000 });
+      await popup.locator("#ss-detached-reattach").click();
+      await closed;
+      await expect(tile).toHaveAttribute("data-share-mode", "enlarged", { timeout: 10_000 });
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
   // ──────────────────────────────────────────────────────────────────────────
   // Test 3b — closing the detached window directly restores the share.
   //
@@ -914,13 +956,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `ss_detach_close_${Date.now()}`;
-    const fx = await setupViewerSeeingSharedScreen(
-      uiURL,
-      meetingId,
-      "SsCloseHost",
-      "SsCloseGuest",
-      FORCE_POPUP_DETACH_SCRIPT,
-    );
+    const fx = await setupViewerSeeingSharedScreen(uiURL, meetingId, "SsCloseHost", "SsCloseGuest");
     const { hostPage, tile } = fx;
 
     try {
@@ -1164,7 +1200,6 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       meetingId,
       "SsAspectHost",
       "SsAspectGuest",
-      FORCE_POPUP_DETACH_SCRIPT,
       WIDE_SHARE_MOCK,
       false, // headed: window.open size is only real with a compositor
     );
@@ -1258,7 +1293,6 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       meetingId,
       "SsStaticHost",
       "SsStaticGuest",
-      FORCE_POPUP_DETACH_SCRIPT,
       STATIC_SHARE_MOCK,
       false, // headed: a static captureStream mirror only paints with a real compositor
     );
@@ -1427,7 +1461,6 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       meetingId,
       "SsStatsHost",
       "SsStatsGuest",
-      undefined,
       ANIMATED_SHARE_MOCK,
     );
     const { hostPage, tile } = fx;
@@ -1498,7 +1531,6 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       meetingId,
       "SsMaxHost",
       "SsMaxGuest",
-      FORCE_POPUP_DETACH_SCRIPT,
       ANIMATED_SHARE_MOCK,
       false,
     );
@@ -1516,7 +1548,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       await expect(maximize).toBeVisible({ timeout: 10_000 });
       await expect(maximize).toHaveAttribute("aria-pressed", "false");
 
-      // 1. Maximize → the popup viewport goes full screen; the fullscreenchange
+      // 1. Maximize → the popup goes full screen; the fullscreenchange
       //    listener syncs aria-pressed to "true".
       await maximize.click();
       await expect
@@ -1546,15 +1578,8 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       await expect(tile).toHaveAttribute("data-share-mode", "detached");
       await expect(popup.locator("#ss-detached-viewport")).toHaveCount(1);
 
-      // 3. Exit full screen via OUR exit_fullscreen wiring: the Maximize toggle's
-      //    click handler calls document.exitFullscreen() when already fullscreen.
-      //    The button is in the DOM during fullscreen but is rendered BEHIND the
-      //    fullscreen viewport (request_fullscreen targets the viewport), so a
-      //    coordinate click can't hit it — dispatch the click on the element
-      //    directly, which still drives our click listener → exit_fullscreen.
-      await popup.evaluate(() =>
-        (document.getElementById("ss-detached-maximize") as HTMLElement | null)?.click(),
-      );
+      // 3. Maximize again exits full screen.
+      await maximize.click();
       await expect
         .poll(async () => popup.evaluate(() => document.fullscreenElement !== null), {
           timeout: 10_000,
@@ -1598,7 +1623,6 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       meetingId,
       "SsDwHost",
       "SsDwGuest",
-      FORCE_POPUP_DETACH_SCRIPT,
       ANIMATED_SHARE_MOCK,
       false,
     );
@@ -1637,164 +1661,6 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       // preventDefault held → the detached document did not browser layout-zoom.
       const clientWidthAfter = await popup.evaluate(() => document.documentElement.clientWidth);
       expect(clientWidthAfter).toBe(clientWidthBefore);
-    } finally {
-      await fx.browser1.close();
-      await fx.browser2.close();
-    }
-  });
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // Issue #1821 (HEADED, REAL Document PiP) — Maximize on a Document PiP detached
-  // window MIGRATES the mirror into a script-opened popup sized to the full
-  // available display, closes the PiP, and the popup survives; Reattach from the
-  // popup restores the meeting.
-  //
-  // This is the ONLY detach test that uses REAL Document Picture-in-Picture: it
-  // passes NO `FORCE_POPUP_DETACH_SCRIPT`, so `open()` takes the `via_pip=true`
-  // path where the fix lives. It needs a HEADED Chromium with a real compositor —
-  // `documentPictureInPicture.requestWindow()` resolves there, the PiP surfaces as
-  // a Playwright Page, and a TRUSTED Playwright click inside the PiP carries the
-  // transient activation `window.open` needs, which then honors the requested
-  // maximized geometry. (All four were confirmed empirically before this spec was
-  // written — a standalone real-PiP probe against the running stack.)
-  //
-  // Fails-on-unfixed: the pre-fix PiP Maximize did `moveTo`/`resizeTo` the PiP
-  // window IN PLACE — no new popup ever opens, the migration marker string does
-  // not exist, and the PiP is never closed. So the popup-page wait times out and
-  // the marker / PiP-closed / geometry assertions all go red on the un-fixed code.
-  // The PiP button's aria-label was also "Maximize window" pre-fix, not "Maximize
-  // to full display".
-  // ──────────────────────────────────────────────────────────────────────────
-  test("Document-PiP Maximize migrates the mirror to a maximized popup at the full display, closes the PiP, and Reattach restores (headed, real PiP)", async ({
-    baseURL,
-  }) => {
-    test.skip(
-      !process.env.HEADED,
-      "Real Document PiP (requestWindow) + window.open geometry need a real " +
-        "compositor/window. Run with HEADED=1. (issue #1821)",
-    );
-    test.setTimeout(240_000);
-    const uiURL = baseURL || "http://localhost:3001";
-    const meetingId = `ss_pip_maximize_${Date.now()}`;
-    // hostExtraInit is UNDEFINED on purpose — REAL Document PiP, not the forced
-    // window.open popup the other detach tests use.
-    const fx = await setupViewerSeeingSharedScreen(
-      uiURL,
-      meetingId,
-      "SsPipHost",
-      "SsPipGuest",
-      undefined,
-      ANIMATED_SHARE_MOCK,
-      false,
-    );
-    const { hostPage, tile } = fx;
-    const ctx = hostPage.context();
-
-    // The wasm `log` facade logs to the MAIN realm, where the migrate closure runs
-    // (it was created in the main window's wasm and attached to the PiP document).
-    const consoleLines: string[] = [];
-    hostPage.on("console", (m) => consoleLines.push(m.text()));
-
-    try {
-      const canvas = tile.locator('canvas[id^="screen-share-"]');
-      await expect(canvas).toHaveCount(1);
-      const canvasId = await tagCanvasIdentity(canvas);
-
-      const detach = tile.locator('[data-testid="ss-detach"]');
-      await expect(detach).toBeVisible();
-      await tile.hover();
-
-      // Detach → REAL Document PiP; it surfaces as a Playwright Page.
-      await detach.click();
-      const pip = await findDetachedDocPage(ctx, [hostPage], 15_000);
-      expect(pip, "the Document PiP window never surfaced as a page").not.toBeNull();
-
-      // Main window flips to the detached look (share off-screen + inert).
-      await assertMainWindowDetachedLook(hostPage, canvas, canvasId);
-
-      // The PiP's Maximize is the ONE-SHOT migrate control: PiP label + NO
-      // aria-pressed (not the popup's fullscreen toggle). Fails-on-unfixed: the old
-      // PiP label was "Maximize window" and it resized in place.
-      const pipMax = pip!.locator("#ss-detached-maximize");
-      await expect(pipMax).toBeVisible({ timeout: 10_000 });
-      await expect(pipMax).toHaveAttribute("aria-label", "Maximize to full display");
-      expect(await pipMax.getAttribute("aria-pressed")).toBeNull();
-
-      // The available display box the popup is requested to fill.
-      const avail = await hostPage.evaluate(() => ({
-        w: screen.availWidth,
-        h: screen.availHeight,
-      }));
-
-      // Click Maximize INSIDE the PiP. A trusted Playwright click carries the
-      // transient activation window.open consumes → migrate to a maximized popup.
-      const popupWait = ctx.waitForEvent("page", { timeout: 15_000 });
-      await pipMax.click();
-      const popup = await popupWait;
-      await popup.waitForLoadState("domcontentloaded").catch(() => {});
-
-      // 1) Success marker logged in the main-window console.
-      await expect
-        .poll(
-          () =>
-            consoleLines.some((l) =>
-              l.includes("detached content migrated to maximized popup (issue 1821)"),
-            ),
-          { timeout: 10_000, message: "migration success marker never logged" },
-        )
-        .toBe(true);
-
-      // 2) The popup IS the migrated detached document, sized to (near) the full
-      //    available display — the "true display" the issue asks for. Poll for the
-      //    window to settle to its requested size.
-      await expect(popup.locator("#ss-detached-video")).toHaveCount(1, { timeout: 10_000 });
-      let inner = { w: 0, h: 0 };
-      await expect
-        .poll(
-          async () => {
-            inner = await popup.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
-            return inner.w;
-          },
-          { timeout: 10_000, message: "popup never sized up to the maximized geometry" },
-        )
-        .toBeGreaterThan(800);
-      // Width tracks availWidth closely; height loses a little to browser chrome.
-      expect(inner.w).toBeGreaterThan(avail.w * 0.85);
-      expect(inner.h).toBeGreaterThan(avail.h * 0.6);
-
-      // 3) The PiP window is CLOSED by the migration (share moved, not duplicated).
-      await expect
-        .poll(() => pip!.isClosed(), { timeout: 10_000, message: "PiP not closed after migration" })
-        .toBe(true);
-
-      // 4) The mirror rebuilt in the popup and is PLAYING (non-blank + advancing).
-      let s1: { mean: number; sig: number } | null = null;
-      await expect
-        .poll(
-          async () => {
-            s1 = await sampleDetachedMirror(popup);
-            return s1?.mean ?? -1;
-          },
-          { timeout: 12_000, message: "popup mirror produced no non-blank frame" },
-        )
-        .toBeGreaterThan(8);
-      await popup.waitForTimeout(700);
-      const s2 = await sampleDetachedMirror(popup);
-      expect(s2, "popup mirror stopped after one frame").not.toBeNull();
-      expect(s2!.sig).not.toBe(s1!.sig);
-
-      // 5) The popup's Maximize is now the real fullscreen TOGGLE (aria-pressed) —
-      //    the two-stage semantic: PiP → maximized popup → fullscreen.
-      await expect(popup.locator("#ss-detached-maximize")).toHaveAttribute("aria-pressed", "false");
-
-      // 6) The share is STILL detached in the main window — the retired PiP's late
-      //    close events did not tear the live popup down (the session guard).
-      await expect(tile).toHaveAttribute("data-share-mode", "detached");
-
-      // 7) Reattach FROM THE POPUP restores the meeting and closes the popup.
-      await popup.locator("#ss-detached-reattach").click();
-      await assertMainWindowRestoredLook(hostPage, tile, canvas, canvasId);
-      await expect.poll(() => popup.isClosed(), { timeout: 10_000 }).toBe(true);
     } finally {
       await fx.browser1.close();
       await fx.browser2.close();

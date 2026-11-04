@@ -8,6 +8,7 @@ use crate::components::changelog::WhatsNew;
 use crate::components::meeting_format::format_datetime_zoned;
 use crate::constants::{build_date_local, build_datetime_local, short_sha};
 use crate::context::MeetingTimeCtx;
+use crate::routing::call_help_href;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
 use std::cell::{Cell, RefCell};
@@ -16,6 +17,9 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 const MEETING_FOOTER_TRIGGER_ID: &str = "meeting-footer-trigger";
+pub(crate) const MEETING_FOOTER_PARTICIPANTS_TRIGGER_ID: &str =
+    "meeting-footer-participants-trigger";
+const PEER_LIST_CONTAINER_ID: &str = "peer-list-container";
 const MEETING_INFO_DIALOG_ID: &str = "meeting-info-dialog";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const COPY_RESET_MS: u32 = 1_600;
@@ -76,6 +80,27 @@ fn at_or_after(node: &web_sys::Node, anchor: &web_sys::Node) -> bool {
         || anchor.compare_document_position(node) & web_sys::Node::DOCUMENT_POSITION_FOLLOWING != 0
 }
 
+fn has_box(el: &web_sys::Element) -> bool {
+    let rect = el.get_bounding_client_rect();
+    rect.width() > 0.0 && rect.height() > 0.0
+}
+
+pub fn element_is_shown(id: &str) -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .is_some_and(|el| has_box(&el))
+}
+
+pub fn focus_was_dropped() -> bool {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    doc.active_element().is_none_or(|active| {
+        doc.body().is_some_and(|body| same_node(&active, &body)) || !has_box(&active)
+    })
+}
+
 /// Wraps Tab / Shift+Tab between the first and last enabled button inside the
 /// element with id `dialog_id`; Tab from focused content after the last button
 /// wraps too. Returns `true` when it moved focus, so the caller prevents the
@@ -122,6 +147,8 @@ pub fn MeetingFooter(
     meeting_id: String,
     participant_count: usize,
     is_active: bool,
+    participants_open: bool,
+    on_toggle_participants: EventHandler<()>,
 ) -> Element {
     let meeting_time: MeetingTimeCtx = use_context();
     let built: Option<(String, String)> = use_hook(|| {
@@ -132,6 +159,8 @@ pub fn MeetingFooter(
         })
     });
     let meeting_start = meeting_time().meeting_start_time;
+    let participants = participants_label(participant_count);
+    let help_href = call_help_href();
 
     rsx! {
         footer { class: "meeting-footer", "data-testid": "meeting-footer",
@@ -142,35 +171,51 @@ pub fn MeetingFooter(
                 "data-testid": "meeting-footer-trigger",
                 "aria-haspopup": "dialog",
                 "aria-label": "{trigger_label(&meeting_id)}",
+                title: "Meeting info",
                 onclick: move |_| open.set(true),
-                span { class: "meeting-footer-content", "aria-hidden": "true",
-                    span { class: "meeting-footer-group meeting-footer-group--meeting",
-                        if is_active {
-                            span { class: "meeting-footer-live-dot" }
-                            span { class: "meeting-footer-status-label", "Live" }
-                            span {
-                                class: "meeting-footer-timer",
-                                "data-testid": "meeting-footer-timer",
-                                CallTimer { start_time_ms: meeting_start }
-                            }
-                        } else {
-                            span {
-                                class: "meeting-footer-ended",
-                                "data-testid": "meeting-footer-ended",
-                                "Ended"
-                            }
-                        }
-                        span { class: "meeting-footer-sep", "\u{00b7}" }
+            }
+            div { class: "meeting-footer-content",
+                span { class: "meeting-footer-group meeting-footer-group--meeting",
+                    if is_active {
+                        span { class: "meeting-footer-live-dot", "aria-hidden": "true" }
+                        span { class: "meeting-footer-status-label", "aria-hidden": "true", "Live" }
                         span {
-                            class: "meeting-footer-room",
-                            "data-testid": "meeting-footer-meeting-id",
-                            span { class: "meeting-footer-room-label", "Meeting ID " }
-                            "{meeting_id}"
+                            class: "meeting-footer-timer",
+                            "data-testid": "meeting-footer-timer",
+                            "aria-hidden": "true",
+                            CallTimer { start_time_ms: meeting_start }
                         }
-                        span { class: "meeting-footer-sep meeting-footer-sep--count", "\u{00b7}" }
+                    } else {
                         span {
-                            class: "meeting-footer-count",
-                            "data-testid": "meeting-footer-participants",
+                            class: "meeting-footer-ended",
+                            "data-testid": "meeting-footer-ended",
+                            "aria-hidden": "true",
+                            "Ended"
+                        }
+                    }
+                    span { class: "meeting-footer-sep", "aria-hidden": "true", "\u{00b7}" }
+                    span {
+                        class: "meeting-footer-room",
+                        "data-testid": "meeting-footer-meeting-id",
+                        "aria-hidden": "true",
+                        span { class: "meeting-footer-room-label", "Meeting ID " }
+                        "{meeting_id}"
+                    }
+                    span {
+                        class: "meeting-footer-sep meeting-footer-sep--count",
+                        "aria-hidden": "true",
+                        "\u{00b7}"
+                    }
+                    button {
+                        r#type: "button",
+                        id: MEETING_FOOTER_PARTICIPANTS_TRIGGER_ID,
+                        class: "meeting-footer-count meeting-footer-participants-trigger",
+                        "data-testid": "meeting-footer-participants",
+                        "aria-label": "{participants}",
+                        "aria-expanded": if participants_open { "true" } else { "false" },
+                        "aria-controls": PEER_LIST_CONTAINER_ID,
+                        onclick: move |_| on_toggle_participants.call(()),
+                        span { class: "meeting-footer-participants-pill",
                             span { class: "meeting-footer-count-compact",
                                 svg {
                                     xmlns: "http://www.w3.org/2000/svg",
@@ -185,42 +230,72 @@ pub fn MeetingFooter(
                                 }
                                 "{participant_count}"
                             }
-                            span { class: "meeting-footer-count-text",
-                                "{participants_label(participant_count)}"
+                            span { class: "meeting-footer-count-text", "{participants}" }
+                        }
+                    }
+                }
+                span {
+                    class: "meeting-footer-group meeting-footer-group--app",
+                    "aria-hidden": "true",
+                    span { class: "meeting-footer-app-text",
+                        span { class: "meeting-footer-app-id",
+                            span { class: "meeting-footer-app-name", "videocall-ui\u{00a0}" }
+                            span {
+                                class: "meeting-footer-version",
+                                "data-testid": "meeting-footer-version",
+                                "v{APP_VERSION}"
+                            }
+                        }
+                        if let Some((short, full)) = built {
+                            span { class: "meeting-footer-app-built",
+                                span { class: "meeting-footer-sep", "\u{00b7}" }
+                                span {
+                                    class: "meeting-footer-built",
+                                    "data-testid": "meeting-footer-built",
+                                    span { class: "meeting-footer-built-label", "Built\u{00a0}" }
+                                    span { class: "meeting-footer-built--short", "{short}" }
+                                    span { class: "meeting-footer-built--full", "{full}" }
+                                }
                             }
                         }
                     }
-                    span { class: "meeting-footer-group meeting-footer-group--app",
-                        span { class: "meeting-footer-app-name", "videocall-ui\u{00a0}" }
-                        span {
-                            class: "meeting-footer-version",
-                            "data-testid": "meeting-footer-version",
-                            "v{APP_VERSION}"
+                    span { class: "meeting-footer-affordance",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            circle { cx: "12", cy: "12", r: "10" }
+                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
+                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
                         }
-                        if let Some((short, full)) = built {
-                            span { class: "meeting-footer-sep", "\u{00b7}" }
-                            span {
-                                class: "meeting-footer-built",
-                                "data-testid": "meeting-footer-built",
-                                span { class: "meeting-footer-built-label", "Built\u{00a0}" }
-                                span { class: "meeting-footer-built--short", "{short}" }
-                                span { class: "meeting-footer-built--full", "{full}" }
-                            }
+                    }
+                }
+                a {
+                    class: "meeting-footer-help",
+                    "data-testid": "meeting-footer-help",
+                    href: help_href,
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "aria-label": "Help and FAQ (opens in a new tab)",
+                    title: "Help and FAQ (opens in a new tab)",
+                    span { class: "meeting-footer-help-pill", "aria-hidden": "true",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            circle { cx: "12", cy: "12", r: "10" }
+                            path { d: "M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" }
+                            line { x1: "12", y1: "17", x2: "12.01", y2: "17" }
                         }
-                        span { class: "meeting-footer-affordance",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg",
-                                view_box: "0 0 24 24",
-                                fill: "none",
-                                stroke: "currentColor",
-                                stroke_width: "2",
-                                stroke_linecap: "round",
-                                stroke_linejoin: "round",
-                                circle { cx: "12", cy: "12", r: "10" }
-                                line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                                line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                            }
-                        }
+                        span { class: "meeting-footer-help-label", "Help" }
                     }
                 }
             }

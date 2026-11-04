@@ -138,9 +138,17 @@ window.__APP_CONFIG = Object.freeze({
     oauthIssuer: "",             // OIDC issuer URL for discovery
     oauthPrompt: "",             // "login", "consent", "select_account", or "" to omit
     serverElectionPeriodMs: 2000,
+    webTransportConnectTimeoutMs: 5000,  // per-protocol connect timeout; absent: serverElectionPeriodMs
+    webSocketConnectTimeoutMs: 5000,     // per-protocol connect timeout; absent: serverElectionPeriodMs
     vadThreshold: 0.02,         // Voice activity detection sensitivity (0.01=high, 0.05=low)
 });
 ```
+
+`webTransportConnectTimeoutMs` and `webSocketConnectTimeoutMs` are clamped to
+500-30000 ms. In the container image they are set from the
+`WEBTRANSPORT_CONNECT_TIMEOUT_MS` and `WEBSOCKET_CONNECT_TIMEOUT_MS` environment
+variables (default 5000), next to `SERVER_ELECTION_PERIOD_MS`
+(`docker/start-dioxus.sh`).
 
 `audioBitrateKbps`, `videoBitrateKbps`, and `screenBitrateKbps` are not runtime
 configuration keys. They were retired by #1193 because the adaptive-quality and
@@ -274,7 +282,7 @@ Then approve it in **System Settings > Privacy & Security** if prompted.
 
 ```bash
 cd dioxus-ui
-CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
+CHROMEDRIVER=$(which chromedriver) ../scripts/wasm-browser-test cargo test --target wasm32-unknown-unknown
 ```
 
 **Run all tests in a visible browser (useful for debugging):**
@@ -288,14 +296,14 @@ WASM_BINDGEN_TEST_NO_HEADLESS=1 CHROMEDRIVER=$(which chromedriver) cargo test --
 
 ```bash
 cd dioxus-ui
-CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --test device_selector
+CHROMEDRIVER=$(which chromedriver) ../scripts/wasm-browser-test cargo test --target wasm32-unknown-unknown --test device_selector
 ```
 
 **Run a single test by name:**
 
 ```bash
 cd dioxus-ui
-CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --test device_selector device_settings_modal_close_button_present
+CHROMEDRIVER=$(which chromedriver) ../scripts/wasm-browser-test cargo test --target wasm32-unknown-unknown --test device_selector device_settings_modal_close_button_present
 ```
 
 ### Using Nix
@@ -305,7 +313,7 @@ If you use the Nix devShell, all tooling is pre-installed:
 ```bash
 nix develop .#frontend
 cd dioxus-ui
-CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
+CHROMEDRIVER=$(which chromedriver) ../scripts/wasm-browser-test cargo test --target wasm32-unknown-unknown
 ```
 
 ### How Device Integration Tests Work

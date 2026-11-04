@@ -1,6 +1,8 @@
 # US East NATS configuration with Singapore gateway
 nats:
   nats:
+    image:
+      tag: 2.14.8
     natsbox:
       enabled: true
     cluster:
@@ -34,6 +36,15 @@ nats:
       - name: "singapore"
         urls:
           - "nats://10.110.0.2:30722"  # Singapore private IP + NodePort
+  natsbox:
+    image:
+      tag: 0.20.1
+  reloader:
+    image:
+      tag: 0.25.0
+  exporter:
+    image:
+      tag: 0.20.3
 
 # Service configuration
 service:

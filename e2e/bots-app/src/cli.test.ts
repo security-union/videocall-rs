@@ -6,7 +6,10 @@ import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DECODE_BUDGET_WAIVER_NOTE } from "./decode-budget";
-import { type BotTask } from "./orchestrator";
+import { MAX_TIMER_MS } from "./dashboard";
+import { RUN_END_AFTER_DEADLINE_MS, type BotTask } from "./orchestrator";
+import { SPEECH_ENV_NAMES, SPEECH_PLAN_DEFAULT } from "./speech-plan";
+import { SKIP_CANVAS_PAINT_ENV } from "./receiver-caps";
 
 const mocks = vi.hoisted(() => ({ runBotsToCompletion: vi.fn() }));
 
@@ -298,6 +301,94 @@ describe("bots-app run — join media and participant record (#2914)", () => {
   });
 });
 
+describe("bots-app run — run deadline (#2914)", () => {
+  it("puts --deadline on every task in epoch ms, and refuses a malformed one", async () => {
+    const { tasks, runOpts } = await runCli([
+      ...baseArgs(),
+      "--participant",
+      "alice",
+      "--deadline",
+      "1791000835",
+    ]);
+    expect(tasks.map((t) => t.runDeadlineMs)).toEqual([1_791_000_835_000]);
+    expect((runOpts as { runDeadlineMs?: number }).runDeadlineMs).toBe(1_791_000_835_000);
+    const bad = await runCli([...baseArgs(), "--participant", "alice", "--deadline", "soon"]);
+    expect(bad.exits).toContain(2);
+    expect(bad.errors.join("\n")).toContain("--deadline must be epoch seconds");
+    const none = await runCli([...baseArgs(), "--participant", "alice"]);
+    expect(none.tasks.map((t) => t.runDeadlineMs)).toEqual([null]);
+  });
+
+  it("puts --join-deadline on every task in epoch ms, and refuses a malformed or distant one", async () => {
+    const at = Math.floor(Date.now() / 1000) + 300;
+    const { tasks } = await runCli([
+      ...baseArgs(),
+      "--participant",
+      "alice",
+      "--join-deadline",
+      `${at}`,
+    ]);
+    expect(tasks.map((t) => t.joinDeadlineMs)).toEqual([at * 1000]);
+    for (const [value, message] of [
+      ["soon", "--join-deadline must be epoch seconds"],
+      [`${at * 1000}`, "is over 24 days away"],
+    ]) {
+      const bad = await runCli([...baseArgs(), "--participant", "alice", "--join-deadline", value]);
+      expect(bad.exits).toContain(2);
+      expect(bad.errors.join("\n")).toContain(message);
+    }
+    const none = await runCli([...baseArgs(), "--participant", "alice"]);
+    expect(none.tasks.map((t) => t.joinDeadlineMs)).toEqual([null]);
+  });
+
+  it("refuses a --deadline too far away for a timer, such as epoch ms", async () => {
+    const nowS = Math.floor(Date.now() / 1000);
+    const ms = await runCli([
+      ...baseArgs(),
+      "--participant",
+      "alice",
+      "--deadline",
+      `${nowS * 1000}`,
+    ]);
+    expect(ms.exits).toContain(2);
+    expect(ms.errors.join("\n")).toContain("is over 24 days away");
+    const near = await runCli([
+      ...baseArgs(),
+      "--participant",
+      "alice",
+      "--deadline",
+      `${nowS + 24 * 86_400}`,
+    ]);
+    expect(near.exits).not.toContain(2);
+    expect(near.tasks.map((t) => t.runDeadlineMs)).toEqual([(nowS + 24 * 86_400) * 1000]);
+  });
+
+  it("leaves the run's timers past the deadline inside the timer range", async () => {
+    const deadlineS = Math.floor(Date.now() / 1000) + 24 * 86_400;
+    const limit = MAX_TIMER_MS - RUN_END_AFTER_DEADLINE_MS;
+    const at = async (msAhead: number) => {
+      const now = vi.spyOn(Date, "now").mockReturnValue(deadlineS * 1000 - msAhead);
+      try {
+        return await runCli([
+          ...baseArgs(),
+          "--participant",
+          "alice",
+          "--deadline",
+          `${deadlineS}`,
+        ]);
+      } finally {
+        now.mockRestore();
+      }
+    };
+    const max = await at(limit);
+    expect(max.exits).not.toContain(2);
+    expect(max.tasks.map((t) => t.runDeadlineMs)).toEqual([deadlineS * 1000]);
+    const over = await at(limit + 1);
+    expect(over.exits).toContain(2);
+    expect(over.errors.join("\n")).toContain("is over 24 days away");
+  });
+});
+
 describe("bots-app run — source geometry reaches the bot task (#2236)", () => {
   it.each([
     [0, 640, 480],
@@ -363,6 +454,75 @@ describe("bots-app run — source geometry reaches the bot task (#2236)", () => 
       { width: 640, height: 480 },
       { width: 1280, height: 720 },
     ]);
+  });
+
+  it("gives each bot its fleet index and the whole process's rotation size (issue 3072)", async () => {
+    const dir = workdir();
+    const configPath = join(dir, "meeting.yaml");
+    writeFileSync(
+      configPath,
+      ["meeting_url: http://127.0.0.1:3001/meeting/TalkTest", "bots:"]
+        .concat(["alice", "bob", "carol", "dave"].map((p) => `  - participant: ${p}`))
+        .join("\n"),
+      "utf8",
+    );
+    const { tasks } = await runCli(["--assets-dir", dir, "--config", configPath], {
+      BOT_INDEX: undefined,
+      BOT_FLEET_SIZE: undefined,
+    });
+    expect(tasks.map((t) => t.talkingClock)).toEqual(
+      [0, 1, 2, 3].map((index) => ({
+        index,
+        fleetSize: 4,
+      })),
+    );
+  });
+
+  it("takes the rotation size from BOT_FLEET_SIZE, the flag winning (issue 3072)", async () => {
+    const fromEnv = await runCli([...baseArgs(), "--participant", "alice", "--bot-index", "2"], {
+      BOT_FLEET_SIZE: "8",
+    });
+    expect(fromEnv.tasks[0].talkingClock).toEqual({ index: 2, fleetSize: 8 });
+    const flagWins = await runCli(
+      [...baseArgs(), "--participant", "alice", "--bot-index", "2", "--fleet-size", "5"],
+      { BOT_FLEET_SIZE: "8" },
+    );
+    expect(flagWins.tasks[0].talkingClock).toEqual({ index: 2, fleetSize: 5 });
+    const unset = await runCli([...baseArgs(), "--participant", "alice", "--bot-index", "2"], {
+      BOT_FLEET_SIZE: undefined,
+    });
+    expect(unset.tasks[0].talkingClock).toEqual({ index: 2, fleetSize: 3 });
+  });
+
+  it("exits 2 on a zero or malformed --fleet-size (issue 3072)", async () => {
+    for (const bad of ["0", "4junk"]) {
+      const { exits, errors } = await runCli([
+        ...baseArgs(),
+        "--participant",
+        "alice",
+        "--fleet-size",
+        bad,
+      ]);
+      expect(exits[0]).toBe(2);
+      expect(errors.join("\n")).toContain("--fleet-size (or BOT_FLEET_SIZE) must be a positive");
+    }
+  });
+
+  it("hands every bot the speech plan from BOT_SPEECH_*, weighted when unset (issue 3090)", async () => {
+    const unset = Object.fromEntries(SPEECH_ENV_NAMES.map((n) => [n, undefined]));
+    const dflt = await runCli([...baseArgs(), "--participant", "alice"], unset);
+    expect(dflt.tasks[0].speechPlan).toEqual(SPEECH_PLAN_DEFAULT);
+    const rotation = await runCli([...baseArgs(), "--participant", "alice"], {
+      ...unset,
+      BOT_SPEECH_MODEL: "rotation",
+    });
+    expect(rotation.tasks[0].speechPlan).toEqual({ model: "rotation" });
+    const bad = await runCli([...baseArgs(), "--participant", "alice"], {
+      ...unset,
+      BOT_SPEECH_KEEP: "1",
+    });
+    expect(bad.exits[0]).toBe(2);
+    expect(bad.errors.join("\n")).toContain("BOT_SPEECH_KEEP must be a decimal");
   });
 
   it("exits 2 on a malformed --bot-index instead of silently using 0", async () => {
@@ -508,6 +668,11 @@ describe("bots-app run — log-line forgery (#2375)", () => {
     ["BOT_MAX_RECEIVED_LAYER (LF)", [], { BOT_MAX_RECEIVED_LAYER: `2\n${FORGED}` }],
     ["BOT_SKIP_CANVAS_PAINT (LF)", [], { BOT_SKIP_CANVAS_PAINT: `true\n${FORGED}` }],
     ["BOT_INDEX (LF)", [], { BOT_INDEX: `0\n${FORGED}` }],
+    ["BOT_VIDEO_NOISE (LF)", [], { BOT_VIDEO_NOISE: `0.2\n${FORGED}` }],
+    ["BOT_SPEECH_MODEL (LF)", [], { BOT_SPEECH_MODEL: `weighted\n${FORGED}` }],
+    ["BOT_SPEECH_KEEP (CR)", [], { BOT_SPEECH_KEEP: `0.7\r${FORGED}` }],
+    ["BOT_SPEECH_DOMINANT (LF)", [], { BOT_SPEECH_DOMINANT: `0.3\n${FORGED}` }],
+    ["BOT_SPEECH_SEED (LF)", [], { BOT_SPEECH_SEED: `1\n${FORGED}` }],
     ["--ttl (LF)", ["--ttl", `5m\n${FORGED}`], {}],
     ["--auth (CR)", ["--auth", `jwt\r${FORGED}`], {}],
   ];
@@ -606,6 +771,33 @@ describe("bots-app non-run subcommands — log-line forgery (#2406)", () => {
       join(workdir(), "absent.yaml"),
     ]);
     assertCollapsed(output);
+  });
+
+  it("keeps a LF in report --logs out of the error line and exits 2", async () => {
+    const { output } = await runSubcommand(
+      ["report", "--logs", join(workdir(), `absent\n${FORGED}`), "--fleet-size", "8"],
+      {},
+      (s) => s.output.length > 0,
+    );
+    assertCollapsed(output);
+    expect(process.exitCode).toBe(2);
+    process.exitCode = undefined;
+  });
+
+  it("exits 2, a usage error, when report has no --fleet-size", async () => {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    try {
+      const { exits } = await runSubcommand(["report", "--logs", workdir()]);
+      expect(exits[0]).toBe(2);
+    } finally {
+      spy.mockRestore();
+      process.exitCode = undefined;
+    }
+    expect(stderr.join("")).toContain("required option '--fleet-size <n>' not specified");
   });
 
   it("keeps a LF in prep-assets --manifest out of the not-found line", async () => {
@@ -841,15 +1033,22 @@ describe("bots-app run — --diag-packets (#2970)", () => {
     expect(env.tasks[0].diagPackets).toBe("off");
     const unset = await runCli([...baseArgs(), "--participant", "a"], ENV);
     expect(unset.tasks[0].diagPackets).toBeNull();
+    const on = await runCli([...baseArgs(), "--participant", "a", "--diag-packets", "on"], {
+      ...ENV,
+      BOT_DIAG_PACKETS: "off",
+    });
+    expect(on.tasks[0].diagPackets).toBe("on");
   });
 
-  it("exits 2 on on: an injected truthy value would lift the deployment's ceiling", async () => {
+  it("exits 2 on an unknown value", async () => {
     const { exits, errors } = await runCli(
-      [...baseArgs(), "--participant", "a", "--diag-packets", "on"],
+      [...baseArgs(), "--participant", "a", "--diag-packets", "maybe"],
       ENV,
     );
     expect(exits[0]).toBe(2);
-    expect(errors.join("\n")).toContain('--diag-packets (or BOT_DIAG_PACKETS) must be "off"');
+    expect(errors.join("\n")).toContain(
+      '--diag-packets (or BOT_DIAG_PACKETS) must be "on", "off" or "default"',
+    );
   });
 
   it("routes each bot's observation into its participant record", async () => {
@@ -932,5 +1131,415 @@ describe("bots-app run — --decode-budget (#2914)", () => {
     );
     expect(rec.decode_budget).toEqual({ requested: "off", observed: "all" });
     expect(rec.unverified.map((u: { field: string }) => u.field)).toContain("decode_budget");
+  });
+});
+
+describe("bots-app run — --simulcast-max-layers (#3246)", () => {
+  const ENV = { BOT_SIMULCAST_MAX_LAYERS: undefined, BOTS_IMAGE_REVISION: undefined };
+
+  it("carries the flag, else the env, into the task; unset leaves it null", async () => {
+    const flag = await runCli(
+      [...baseArgs(), "--participant", "a", "--simulcast-max-layers", "3"],
+      { ...ENV, BOT_SIMULCAST_MAX_LAYERS: "1" },
+    );
+    expect(flag.exits).not.toContain(2);
+    expect(flag.tasks.map((t) => t.simulcastMaxLayers)).toEqual([3]);
+    const env = await runCli([...baseArgs(), "--participant", "a"], {
+      ...ENV,
+      BOT_SIMULCAST_MAX_LAYERS: "2",
+    });
+    expect(env.tasks.map((t) => t.simulcastMaxLayers)).toEqual([2]);
+    const unset = await runCli([...baseArgs(), "--participant", "a"], ENV);
+    expect(unset.tasks.map((t) => t.simulcastMaxLayers)).toEqual([null]);
+  });
+
+  it.each(["0", "4", "x"])("exits 2 on %j", async (raw) => {
+    const { exits, errors } = await runCli(
+      [...baseArgs(), "--participant", "a", "--simulcast-max-layers", raw],
+      ENV,
+    );
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain(
+      `--simulcast-max-layers (or BOT_SIMULCAST_MAX_LAYERS) must be an integer from 1 to 3, got "${raw}"`,
+    );
+  });
+
+  it("routes the join readback into the participant record", async () => {
+    const assetsDir = workdir();
+    const { tasks, runOpts } = await runCli(
+      [
+        "--meeting-url",
+        "http://127.0.0.1:3001/meeting/GeomTest",
+        "--assets-dir",
+        assetsDir,
+        "--participant",
+        "a",
+        "--simulcast-max-layers",
+        "3",
+      ],
+      ENV,
+    );
+    const hooks = runOpts as {
+      onRegister: (t: BotTask) => void;
+      onJoin: (...args: unknown[]) => void;
+    };
+    hooks.onRegister(tasks[0]);
+    hooks.onJoin(tasks[0].botId, 1_000, { camera: true, mic: true }, null, null, null, null, 3);
+    const rec = JSON.parse(
+      readFileSync(join(assetsDir, "participants", `${tasks[0].botId}.json`), "utf8"),
+    );
+    expect(rec.simulcast_max_layers).toEqual({ requested: 3, observed: 3 });
+  });
+});
+
+describe("bots-app run — --video-noise (issue 3089)", () => {
+  const ENV = { BOT_VIDEO_NOISE: undefined, BOT_INDEX: undefined, BOTS_IMAGE_REVISION: undefined };
+
+  it("leaves the alpha to the geometry when unset, reads the env, and lets the flag win", async () => {
+    const unset = await runCli([...baseArgs(), "--participant", "a"], ENV);
+    expect(unset.tasks.map((t) => t.videoNoise)).toEqual([null]);
+    const fromEnv = await runCli([...baseArgs(), "--participant", "a"], {
+      ...ENV,
+      BOT_VIDEO_NOISE: "0.2",
+    });
+    expect(fromEnv.tasks.map((t) => t.videoNoise)).toEqual([0.2]);
+    const flagWins = await runCli([...baseArgs(), "--participant", "a", "--video-noise", "0"], {
+      ...ENV,
+      BOT_VIDEO_NOISE: "0.2",
+    });
+    expect(flagWins.tasks.map((t) => t.videoNoise)).toEqual([0]);
+  });
+
+  it("exits 2 on an alpha outside 0..1", async () => {
+    const { exits, errors } = await runCli(
+      [...baseArgs(), "--participant", "a", "--video-noise", "1.5"],
+      ENV,
+    );
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain(
+      '--video-noise (or BOT_VIDEO_NOISE) must be a number from 0 to 1, got "1.5"',
+    );
+  });
+
+  it("records the HD default for an HD clock bot, and flags an override", async () => {
+    const record = async (extra: string[], env: Record<string, string | undefined>) => {
+      const assetsDir = workdir();
+      const { tasks, runOpts } = await runCli(
+        [
+          "--meeting-url",
+          "http://127.0.0.1:3001/meeting/GeomTest",
+          "--assets-dir",
+          assetsDir,
+          "--participant",
+          "a",
+          "--video-mode",
+          "clock",
+          "--bot-index",
+          "1",
+          ...extra,
+        ],
+        { ...ENV, ...env },
+      );
+      (runOpts as { onRegister: (t: BotTask) => void }).onRegister(tasks[0]);
+      return JSON.parse(
+        readFileSync(join(assetsDir, "participants", `${tasks[0].botId}.json`), "utf8"),
+      );
+    };
+    const byDefault = await record([], {});
+    expect(byDefault.video_noise).toEqual({ requested: null, alpha: 0.15 });
+    expect(byDefault.unverified.map((u: { field: string }) => u.field)).not.toContain(
+      "video_noise",
+    );
+    const overridden = await record([], { BOT_VIDEO_NOISE: "0" });
+    expect(overridden.video_noise).toEqual({ requested: 0, alpha: 0 });
+    expect(overridden.unverified).toContainEqual({
+      field: "video_noise",
+      reason:
+        "override 0 replaced the 0.15 default for 1280x720, so this bot's video upload is not the modelled camera's",
+    });
+  });
+});
+
+describe("bots-app run — BOT_SKIP_CANVAS_PAINT (issue 3086)", () => {
+  it("carries the fleet env into each task and routes the join readback into the record", async () => {
+    const assetsDir = workdir();
+    const { tasks, runOpts } = await runCli(
+      [
+        "--meeting-url",
+        "http://127.0.0.1:3001/meeting/GeomTest",
+        "--assets-dir",
+        assetsDir,
+        "--participant",
+        "a",
+      ],
+      { BOTS_IMAGE_REVISION: undefined, [SKIP_CANVAS_PAINT_ENV]: "true" },
+    );
+    expect(tasks.map((t) => t.skipCanvasPaint)).toEqual([true]);
+    const hooks = runOpts as {
+      onRegister: (t: BotTask) => void;
+      onJoin: (...a: [string, number, unknown, null, null, string]) => void;
+    };
+    hooks.onRegister(tasks[0]);
+    hooks.onJoin(tasks[0].botId, 1_000, { camera: true, mic: true }, null, null, "true");
+    const rec = JSON.parse(
+      readFileSync(join(assetsDir, "participants", `${tasks[0].botId}.json`), "utf8"),
+    );
+    expect(rec.skip_canvas_paint).toEqual({ requested: true, observed: "true" });
+  });
+});
+
+describe("bots-app run — --transport / BOT_TRANSPORT_WS_EVERY (issue 3087)", () => {
+  const ENV = {
+    BOT_TRANSPORT: undefined,
+    BOT_TRANSPORT_WS_EVERY: undefined,
+    BOT_FLEET_SIZE: undefined,
+    BOTS_IMAGE_REVISION: undefined,
+  };
+  const at = (index: number, extra: string[] = []): string[] => [
+    ...baseArgs(),
+    "--participant",
+    "a",
+    "--bot-index",
+    String(index),
+    ...extra,
+  ];
+
+  it("leaves an unconfigured bot on auto", async () => {
+    const { tasks } = await runCli(at(3), ENV);
+    expect(tasks[0].transport).toBe("auto");
+  });
+
+  it("puts the stride's indices on websocket and the rest on webtransport", async () => {
+    const env = { ...ENV, BOT_TRANSPORT_WS_EVERY: "4", BOT_FLEET_SIZE: "8" };
+    const ws = await runCli(at(7), env);
+    expect(ws.tasks[0].transport).toBe("websocket");
+    expect(ws.logs.join("\n")).toContain("websocket on index 3,7");
+    const wt = await runCli(at(2), env);
+    expect(wt.tasks[0].transport).toBe("webtransport");
+  });
+
+  it("warns about the HD share of the websocket group only for a stride sharing a factor with 6", async () => {
+    const env = { ...ENV, BOT_FLEET_SIZE: "8" };
+    const k4 = await runCli(at(3), { ...env, BOT_TRANSPORT_WS_EVERY: "4" });
+    expect(k4.errors.join("\n")).toContain(
+      "WARNING: BOT_TRANSPORT_WS_EVERY=4 puts 1280x720 bots at 1 of 2 websocket bots against 2 of 8",
+    );
+    const k5 = await runCli(at(2), { ...env, BOT_TRANSPORT_WS_EVERY: "5" });
+    expect(k5.errors.join("\n")).not.toContain("1280x720");
+    const empty = await runCli(at(0), { ...ENV, BOT_FLEET_SIZE: "3", BOT_TRANSPORT_WS_EVERY: "4" });
+    expect(empty.errors.join("\n")).toContain("websocket on index none");
+    expect(empty.errors.join("\n")).not.toContain("1280x720");
+  });
+
+  it("warns when the stride selects no bot in the fleet", async () => {
+    const { errors } = await runCli(at(0), {
+      ...ENV,
+      BOT_TRANSPORT_WS_EVERY: "4",
+      BOT_FLEET_SIZE: "3",
+    });
+    expect(errors.join("\n")).toContain("websocket on index none");
+  });
+
+  it("lets the flag beat BOT_TRANSPORT, and either beat the stride", async () => {
+    const flag = await runCli(at(3, ["--transport", "wt"]), {
+      ...ENV,
+      BOT_TRANSPORT: "ws",
+      BOT_TRANSPORT_WS_EVERY: "4",
+    });
+    expect(flag.tasks[0].transport).toBe("webtransport");
+    expect(flag.logs.join("\n")).toContain("BOT_TRANSPORT_WS_EVERY=4 ignored");
+    const env = await runCli(at(2), { ...ENV, BOT_TRANSPORT: "ws", BOT_TRANSPORT_WS_EVERY: "4" });
+    expect(env.tasks[0].transport).toBe("websocket");
+  });
+
+  it("lets an explicit auto, from the flag or the env, beat the stride", async () => {
+    const stride = { ...ENV, BOT_TRANSPORT_WS_EVERY: "4", BOT_FLEET_SIZE: "8" };
+    expect((await runCli(at(7), stride)).tasks[0].transport).toBe("websocket");
+    const flag = await runCli(at(7, ["--transport", "auto"]), stride);
+    expect(flag.tasks[0].transport).toBe("auto");
+    const env = await runCli(at(7), { ...stride, BOT_TRANSPORT: "auto" });
+    expect(env.tasks[0].transport).toBe("auto");
+  });
+
+  it("gives each bot of a multi-bot run its own index's transport", async () => {
+    const dir = workdir();
+    const configPath = join(dir, "meeting.yaml");
+    writeFileSync(
+      configPath,
+      [
+        "meeting_url: http://127.0.0.1:3001/meeting/T",
+        "bots:",
+        "  - participant: alice",
+        "  - participant: bob",
+      ].join("\n"),
+      "utf8",
+    );
+    const { tasks } = await runCli(
+      ["--assets-dir", dir, "--config", configPath, "--bot-index", "6"],
+      { ...ENV, BOT_INDEX: undefined, BOT_TRANSPORT_WS_EVERY: "4" },
+    );
+    expect(tasks.map((t) => t.transport)).toEqual(["webtransport", "websocket"]);
+  });
+
+  it("exits 2 on a malformed value", async () => {
+    for (const env of [
+      { ...ENV, BOT_TRANSPORT: "quic" },
+      { ...ENV, BOT_TRANSPORT_WS_EVERY: "0" },
+      { ...ENV, BOT_TRANSPORT_WS_EVERY: "6" },
+      { ...ENV, BOT_TRANSPORT_WS_EVERY: "12" },
+    ]) {
+      const { exits } = await runCli(at(0), env);
+      expect(exits[0]).toBe(2);
+    }
+  });
+
+  it("routes each bot's transport lines into its participant record", async () => {
+    const assetsDir = workdir();
+    const { tasks, runOpts } = await runCli(
+      [
+        "--meeting-url",
+        "http://127.0.0.1:3001/meeting/GeomTest",
+        "--assets-dir",
+        assetsDir,
+        "--participant",
+        "a",
+        "--transport",
+        "ws",
+      ],
+      ENV,
+    );
+    const hooks = runOpts as {
+      onRegister: (t: BotTask) => void;
+      onTransport: (id: string, e: unknown) => void;
+    };
+    hooks.onRegister(tasks[0]);
+    hooks.onTransport(tasks[0].botId, { kind: "elected", active: "websocket" });
+    const rec = JSON.parse(
+      readFileSync(join(assetsDir, "participants", `${tasks[0].botId}.json`), "utf8"),
+    );
+    expect(rec.participant.transport_intended).toBe("websocket");
+    expect(rec.transport_observed).toBe("websocket");
+  });
+});
+
+describe("bots-app run — --personas (issue 3091)", () => {
+  const ENV = {
+    BOT_PERSONAS: undefined,
+    BOT_CAMERA: undefined,
+    BOT_PERSONA_MIC_ON: undefined,
+    BOT_PERSONA_CAMERA_ON: undefined,
+    BOT_JOIN_CAMERA_OFF: undefined,
+    BOT_JOIN_MIC_MUTED: undefined,
+    BOT_CAMERA_ON_SECS_MIN: undefined,
+    BOT_CAMERA_ON_SECS_MAX: undefined,
+    BOT_CAMERA_OFF_SECS_MIN: undefined,
+    BOT_CAMERA_OFF_SECS_MAX: undefined,
+    BOT_FLEET_SIZE: undefined,
+    BOT_INDEX: undefined,
+    ...Object.fromEntries(SPEECH_ENV_NAMES.map((n) => [n, undefined])),
+  };
+  const clock = (extra: string[] = [], index = 0): string[] => [
+    ...baseArgs(),
+    "--participant",
+    "a",
+    "--bot-index",
+    String(index),
+    "--fleet-size",
+    "3",
+    "--video-mode",
+    "clock",
+    ...extra,
+  ];
+  // One run per index, as each fleet pod runs; runCli shares mocks, so in sequence.
+  const fleet = async (
+    extra: string[],
+    env: Record<string, string | undefined>,
+  ): Promise<BotTask[]> => {
+    const tasks: BotTask[] = [];
+    for (const i of [0, 1, 2]) tasks.push(...(await runCli(clock(extra, i), env)).tasks);
+    return tasks;
+  };
+
+  it("leaves bots without a persona when off", async () => {
+    const { tasks } = await runCli(clock(), ENV);
+    expect(tasks[0].persona ?? null).toBeNull();
+    expect(tasks[0].joinMedia).toEqual({ camera: true, mic: true });
+  });
+
+  it("gives every bot the shared room's persona and joins it in the persona's steady state", async () => {
+    const tasks = await fleet(["--personas"], ENV);
+    const { logs, errors } = await runCli(clock(["--personas"]), ENV);
+    expect(tasks.map((t) => [t.persona?.mic, t.persona?.camera])).toEqual([
+      ["push-to-talk", "always"],
+      ["push-to-talk", "never"],
+      ["open", "always"],
+    ]);
+    expect(tasks.map((t) => t.joinMedia)).toEqual([
+      { camera: true, mic: false },
+      { camera: false, mic: false },
+      { camera: true, mic: true },
+    ]);
+    expect(logs.join("\n")).toContain("personas: room of 3: mic open=1 push-to-talk=2 observer=0");
+    expect(errors.join("\n")).toContain(
+      "WARNING: expected mic-on share 0.54 is below the target 0.80",
+    );
+  });
+
+  it("joins a with-voice camera off", async () => {
+    const tasks = await fleet(["--personas"], {
+      ...ENV,
+      BOT_PERSONA_CAMERA_ON: "0.1501,0.48,0.14,0.01,0.08",
+    });
+    const voiced = tasks.filter((t) => t.persona?.camera === "with-voice");
+    expect(voiced.length).toBeGreaterThan(0);
+    expect(voiced.map((t) => t.joinMedia?.camera)).toEqual(voiced.map(() => false));
+  });
+
+  it("reads BOT_PERSONAS=on and BOT_CAMERA=always-on", async () => {
+    const tasks = await fleet([], { ...ENV, BOT_PERSONAS: "on", BOT_CAMERA: "always-on" });
+    expect(tasks.map((t) => t.persona?.camera)).toEqual(["always", "always", "always"]);
+  });
+
+  it.each([
+    [
+      "--join-camera-off",
+      clock(["--personas", "--join-camera-off"]),
+      {},
+      "--join-camera-off / --join-mic-muted",
+    ],
+    [
+      "--join-mic-muted",
+      clock(["--personas", "--join-mic-muted"]),
+      {},
+      "--join-camera-off / --join-mic-muted",
+    ],
+    [
+      "the camera duty cycle",
+      clock(["--personas"]),
+      {
+        BOT_CAMERA_ON_SECS_MIN: "5",
+        BOT_CAMERA_ON_SECS_MAX: "10",
+        BOT_CAMERA_OFF_SECS_MIN: "5",
+        BOT_CAMERA_OFF_SECS_MAX: "10",
+      },
+      "camera duty cycle",
+    ],
+    ["an index outside the fleet", clock(["--personas"], 3), {}, "inside the fleet size 3"],
+    [
+      "a non-clock video mode",
+      [...baseArgs(), "--participant", "a", "--personas"],
+      {},
+      "--video-mode clock",
+    ],
+    [
+      "BOT_CAMERA without personas",
+      clock(),
+      { BOT_CAMERA: "always-on" },
+      "has no effect without --personas",
+    ],
+  ])("exits 2 for personas with %s", async (_what, args, env, message) => {
+    const { exits, errors } = await runCli(args, { ...ENV, ...env });
+    expect(exits[0]).toBe(2);
+    expect(errors.join("\n")).toContain(message);
   });
 });

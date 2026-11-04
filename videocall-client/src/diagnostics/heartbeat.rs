@@ -16,7 +16,8 @@
  * conditions.
  */
 
-//! Background-throttling-immune heartbeat for the diagnostics managers.
+//! Background-throttling-immune heartbeat for the diagnostics managers and the
+//! connection keepalive.
 //!
 //! # Problem
 //!
@@ -41,9 +42,8 @@
 //! A `DedicatedWorkerGlobalScope` is exempt from main-thread visibility-based
 //! throttling. We spawn a tiny inline Worker (constructed from a Blob URL, so
 //! no extra Trunk-built crate is required) that fires `postMessage("tick")`
-//! every 500ms. The main thread receives those messages and dispatches the
-//! existing `HeartbeatTick` event through the same mpsc channel as before, so
-//! per-encoder state (which must stay on the main thread) is unchanged.
+//! every `period_ms`. The main thread receives those messages and runs the
+//! caller's `on_tick`, so state that must stay on the main thread does.
 //!
 //! # Fallback
 //!
@@ -57,8 +57,8 @@
 //! The returned [`HeartbeatTimer`] terminates the underlying Worker (or clears
 //! the fallback interval) in its `Drop` impl, so it is safe to embed inside
 //! the diagnostics managers and rely on normal ownership semantics for
-//! cleanup. One Worker per `DiagnosticManager`/`SenderDiagnosticManager` is
-//! cheap and matches the lifetime of the call.
+//! cleanup. Each owner (a diagnostics manager, the elected `Connection`) holds
+//! its own Worker for its own lifetime.
 
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
@@ -126,6 +126,8 @@ self.onmessage = (e) => {
 #[cfg(target_arch = "wasm32")]
 pub struct HeartbeatTimer {
     backend: HeartbeatBackend,
+    label: &'static str,
+    period_ms: u32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -166,7 +168,7 @@ impl HeartbeatTimer {
     /// Worker construction fails, falls back to a main-thread `setInterval` and
     /// logs a warning. The callback runs on the main thread either way, so
     /// shared state captured by `on_tick` can be `!Send`.
-    pub fn start<F>(period_ms: u32, on_tick: F) -> Self
+    pub fn start<F>(label: &'static str, period_ms: u32, on_tick: F) -> Self
     where
         F: FnMut() + 'static,
     {
@@ -178,7 +180,7 @@ impl HeartbeatTimer {
         // mode where the callback was orphaned inside a now-unused `Closure`.
         let on_tick: SharedOnTick = Rc::new(RefCell::new(Some(Box::new(on_tick))));
 
-        match Self::start_worker(period_ms, on_tick.clone()) {
+        match Self::start_worker(label, period_ms, on_tick.clone()) {
             Ok(timer) => timer,
             Err(reason) => {
                 // Recover the user callback from the shared slot. If the
@@ -189,10 +191,10 @@ impl HeartbeatTimer {
                 match recovered {
                     Some(boxed) => {
                         log::warn!(
-                            "diagnostics heartbeat: worker unavailable ({reason:?}), \
+                            "{label}: worker unavailable ({reason:?}), \
                              falling back to main-thread setInterval (will throttle when tab is hidden)"
                         );
-                        Self::start_interval(period_ms, boxed)
+                        Self::start_interval(label, period_ms, boxed)
                     }
                     None => {
                         // Defensive branch — should be unreachable because
@@ -200,11 +202,11 @@ impl HeartbeatTimer {
                         // every error return. Logging at error severity makes
                         // the failure mode loud rather than silent.
                         log::error!(
-                            "diagnostics heartbeat: worker unavailable ({reason:?}) and \
-                             user callback was orphaned; diagnostics will NOT function \
+                            "{label}: worker unavailable ({reason:?}) and \
+                             user callback was orphaned; it will NOT tick \
                              until reconnect"
                         );
-                        Self::start_dead()
+                        Self::start_dead(label, period_ms)
                     }
                 }
             }
@@ -216,7 +218,11 @@ impl HeartbeatTimer {
     /// On any error return, the user callback in `on_tick` is left intact in
     /// its `Rc<RefCell<Option<...>>>` slot so the caller (`start`) can recover
     /// it for the fallback `start_interval` path.
-    fn start_worker(period_ms: u32, on_tick: SharedOnTick) -> Result<Self, JsValue> {
+    fn start_worker(
+        label: &'static str,
+        period_ms: u32,
+        on_tick: SharedOnTick,
+    ) -> Result<Self, JsValue> {
         // Build a blob: URL containing the worker script.
         let parts = Array::new();
         parts.push(&JsValue::from_str(HEARTBEAT_WORKER_JS));
@@ -283,7 +289,7 @@ impl HeartbeatTimer {
         // Use `info!` so the spawn is visible at the default log level. E2E
         // tests scrape this line to assert that the Worker backend was chosen
         // over the fallback `setInterval`.
-        log::info!("diagnostics heartbeat: spawned worker (period={period_ms}ms, backend=worker)");
+        log::info!("{label}: spawned worker (period={period_ms}ms, backend=worker)");
 
         Ok(HeartbeatTimer {
             backend: HeartbeatBackend::Worker {
@@ -292,10 +298,12 @@ impl HeartbeatTimer {
                 blob_url,
                 _on_tick: on_tick,
             },
+            label,
+            period_ms,
         })
     }
 
-    fn start_interval(period_ms: u32, mut on_tick: BoxedOnTick) -> Self {
+    fn start_interval(label: &'static str, period_ms: u32, mut on_tick: BoxedOnTick) -> Self {
         let closure = Closure::wrap(Box::new(move || {
             on_tick();
         }) as Box<dyn FnMut()>);
@@ -313,6 +321,8 @@ impl HeartbeatTimer {
                 _closure: closure,
                 interval_id,
             },
+            label,
+            period_ms,
         }
     }
 
@@ -321,9 +331,11 @@ impl HeartbeatTimer {
     /// Constructed solely so we never silently install a no-op interval that
     /// pretends to be alive — the caller logs at `error!` level before this
     /// is built.
-    fn start_dead() -> Self {
+    fn start_dead(label: &'static str, period_ms: u32) -> Self {
         HeartbeatTimer {
             backend: HeartbeatBackend::Dead,
+            label,
+            period_ms,
         }
     }
 }
@@ -335,7 +347,7 @@ impl Drop for HeartbeatTimer {
             HeartbeatBackend::Worker {
                 worker, blob_url, ..
             } => {
-                log::info!("diagnostics heartbeat: terminating worker");
+                log::info!("{}: terminating worker", self.label);
                 // Best-effort: tell the worker to stop its interval before we
                 // terminate it, so any in-flight tick can drain.
                 let stop_msg = js_sys::Object::new();
@@ -355,8 +367,7 @@ impl Drop for HeartbeatTimer {
             }
             HeartbeatBackend::Dead => {
                 // Nothing to clean up — neither Worker nor interval was ever
-                // installed. The diagnostics manager will simply not receive
-                // ticks for this session.
+                // installed. `on_tick` never runs for this timer.
             }
         }
     }
@@ -371,7 +382,9 @@ impl std::fmt::Debug for HeartbeatTimer {
             HeartbeatBackend::Dead => "Dead",
         };
         f.debug_struct("HeartbeatTimer")
+            .field("label", &self.label)
             .field("kind", &kind)
+            .field("period_ms", &self.period_ms)
             .finish()
     }
 }
@@ -380,7 +393,7 @@ impl std::fmt::Debug for HeartbeatTimer {
 impl HeartbeatTimer {
     /// Non-wasm stub. Native consumers of `videocall-client` (e.g. the bot)
     /// don't need a browser heartbeat; the returned handle is a no-op.
-    pub fn start<F>(_period_ms: u32, _on_tick: F) -> Self
+    pub fn start<F>(_label: &'static str, _period_ms: u32, _on_tick: F) -> Self
     where
         F: FnMut() + 'static,
     {
@@ -412,7 +425,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn native_stub_is_constructible() {
-        let _timer = HeartbeatTimer::start(500, || {});
+        let _timer = HeartbeatTimer::start("test heartbeat", 500, || {});
     }
 
     /// Cross-target alias for the slot type used in the regression test

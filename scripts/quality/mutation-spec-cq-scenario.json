@@ -15,7 +15,7 @@
   "-p",
   "test_cq_scenario.py"
  ],
- "baseline_tests": 30,
+ "baseline_tests": 39,
  "mutations": [
   {
    "name": "YAML 1.1 booleans resolved",
@@ -200,8 +200,8 @@
   {
    "name": "report mode accepted",
    "file": "scripts/quality/cq_scenario.py",
-   "find": "    if scoring[\"mode\"] != \"gate\":",
-   "replace": "    if False:",
+   "find": "    elif target not in SHARED_TARGETS and scoring[\"mode\"] != \"gate\":",
+   "replace": "    elif False:",
    "expect_kills": [
     "test_each_refusal_names_its_reason"
    ]
@@ -218,8 +218,8 @@
   {
    "name": "cluster target accepted",
    "file": "scripts/quality/cq_scenario.py",
-   "find": "TARGETS = {\"local\": \"local\", \"ci\": \"ci-smoke\"}",
-   "replace": "TARGETS = {\"local\": \"local\", \"ci\": \"ci-smoke\", \"cluster\": \"cluster\"}",
+   "find": "TARGETS = {\"local\": \"local\", \"ci\": \"ci-smoke\", \"hcl-daily\": \"hcl-daily\",",
+   "replace": "TARGETS = {\"local\": \"local\", \"ci\": \"ci-smoke\", \"hcl-daily\": \"hcl-daily\", \"cluster\": \"cluster\",",
    "expect_kills": [
     "test_each_refusal_names_its_reason"
    ]

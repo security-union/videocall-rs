@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::announcement::AnnouncementOverride;
+
 // ---------------------------------------------------------------------------
 // Generic envelope
 // ---------------------------------------------------------------------------
@@ -88,6 +90,14 @@ pub struct CreateMeetingResponse {
     pub recording_allowed_for_all: bool,
     #[serde(default = "default_true")]
     pub chat_allowed_for_all: bool,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_sound_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_sound_override: AnnouncementOverride,
     #[serde(default)]
     pub co_hosts: Vec<String>,
 }
@@ -110,6 +120,19 @@ pub struct CoHostEntry {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ListCoHostsResponse {
     pub co_hosts: Vec<CoHostEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct CoHostSuggestion {
+    pub user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Response payload for `GET /api/v1/meetings/{meeting_id}/co-hosts/suggestions`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListCoHostSuggestionsResponse {
+    pub suggestions: Vec<CoHostSuggestion>,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -142,6 +165,14 @@ pub struct MeetingInfoResponse {
     pub recording_allowed_for_all: bool,
     #[serde(default = "default_true")]
     pub chat_allowed_for_all: bool,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_sound_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_sound_override: AnnouncementOverride,
     #[serde(default)]
     pub viewer_is_owner: bool,
     #[serde(default)]
@@ -288,6 +319,14 @@ pub struct MeetingFeedSummary {
     pub recording_allowed_for_all: bool,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub chat_allowed_for_all: bool,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_sound_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_sound_override: AnnouncementOverride,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub waiting_room_enabled: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -340,6 +379,14 @@ pub struct MeetingSummary {
     pub recording_allowed_for_all: bool,
     #[serde(default = "default_true")]
     pub chat_allowed_for_all: bool,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_sound_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_message_override: AnnouncementOverride,
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_sound_override: AnnouncementOverride,
 }
 
 /// Participant status returned by join, status, admit, reject, and leave endpoints.
@@ -403,6 +450,18 @@ pub struct ParticipantStatusResponse {
     /// it off to make chat host-only for an all-hands-style meeting.
     #[serde(default = "default_true")]
     pub chat_allowed_for_all: bool,
+    /// Meeting-level: override of showing a message when someone joins.
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_message_override: AnnouncementOverride,
+    /// Meeting-level: override of playing a sound when someone joins.
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub entry_sound_override: AnnouncementOverride,
+    /// Meeting-level: override of showing a message when someone leaves.
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_message_override: AnnouncementOverride,
+    /// Meeting-level: override of playing a sound when someone leaves.
+    #[serde(default, skip_serializing_if = "AnnouncementOverride::is_participant")]
+    pub exit_sound_override: AnnouncementOverride,
 }
 
 /// Returns `true`; used as the serde `default` for meeting-policy booleans
@@ -565,6 +624,10 @@ mod tests {
             allow_guests: false,
             recording_allowed_for_all: false,
             chat_allowed_for_all: true, // default-true!
+            entry_message_override: AnnouncementOverride::Participant,
+            entry_sound_override: AnnouncementOverride::Participant,
+            exit_message_override: AnnouncementOverride::Participant,
+            exit_sound_override: AnnouncementOverride::Participant,
             waiting_room_enabled: true, // default-true!
             admitted_can_admit: false,
             end_on_host_leave: true, // default-true!
@@ -591,6 +654,10 @@ mod tests {
             allow_guests: true,
             recording_allowed_for_all: true,
             chat_allowed_for_all: false, // flipped from default-true
+            entry_message_override: AnnouncementOverride::On,
+            entry_sound_override: AnnouncementOverride::Off,
+            exit_message_override: AnnouncementOverride::Off,
+            exit_sound_override: AnnouncementOverride::On,
             waiting_room_enabled: false, // flipped from default-true
             admitted_can_admit: true,
             end_on_host_leave: false, // flipped from default-true
@@ -615,6 +682,7 @@ mod tests {
         assert!(!json_default.contains("\"waiting_room_enabled\""));
         assert!(!json_default.contains("\"end_on_host_leave\""));
         assert!(!json_default.contains("\"has_password\""));
+        assert!(!json_default.contains("_override\""), "{json_default}");
 
         // 5. For the all-non-default instance, the now-non-default fields must
         // be PRESENT. `waiting_room_enabled` is `false` (non-default for a
@@ -622,6 +690,140 @@ mod tests {
         assert!(json_non_default.contains("\"waiting_room_enabled\""));
         assert!(json_non_default.contains("\"is_co_host\""));
         assert!(json_non_default.contains("\"is_owner\""));
+        assert!(json_non_default.contains(r#""exit_sound_override":"on""#));
+    }
+
+    const LEGACY_PARTICIPANT_STATUS: &str =
+        r#"{"user_id":"u@example.com","status":"admitted","is_host":false,"joined_at":1}"#;
+
+    const LEGACY_MEETING_INFO: &str = r#"{"meeting_id":"m","state":"active","host":"h",
+        "has_password":false,"waiting_room_enabled":true,"admitted_can_admit":false,
+        "end_on_host_leave":true,"participant_count":1,"waiting_count":0,"started_at":1}"#;
+
+    const LEGACY_CREATE_MEETING: &str = r#"{"meeting_id":"m","host":"h","created_at":1,
+        "state":"idle","attendees":[],"has_password":false,"waiting_room_enabled":true,
+        "admitted_can_admit":false,"end_on_host_leave":true}"#;
+
+    const LEGACY_MEETING_SUMMARY: &str = r#"{"meeting_id":"m","state":"idle",
+        "has_password":false,"created_at":1,"participant_count":0,"started_at":1,
+        "waiting_count":0,"waiting_room_enabled":true,"admitted_can_admit":false,
+        "end_on_host_leave":true}"#;
+
+    #[test]
+    fn responses_from_a_server_without_overrides_read_participant() {
+        let participant = [AnnouncementOverride::Participant; 4];
+
+        let s: ParticipantStatusResponse = serde_json::from_str(LEGACY_PARTICIPANT_STATUS).unwrap();
+        let got = [
+            s.entry_message_override,
+            s.entry_sound_override,
+            s.exit_message_override,
+            s.exit_sound_override,
+        ];
+        assert_eq!(got, participant, "ParticipantStatusResponse");
+
+        let m: MeetingInfoResponse = serde_json::from_str(LEGACY_MEETING_INFO).unwrap();
+        let got = [
+            m.entry_message_override,
+            m.entry_sound_override,
+            m.exit_message_override,
+            m.exit_sound_override,
+        ];
+        assert_eq!(got, participant, "MeetingInfoResponse");
+
+        let c: CreateMeetingResponse = serde_json::from_str(LEGACY_CREATE_MEETING).unwrap();
+        let got = [
+            c.entry_message_override,
+            c.entry_sound_override,
+            c.exit_message_override,
+            c.exit_sound_override,
+        ];
+        assert_eq!(got, participant, "CreateMeetingResponse");
+
+        let l: MeetingSummary = serde_json::from_str(LEGACY_MEETING_SUMMARY).unwrap();
+        let got = [
+            l.entry_message_override,
+            l.entry_sound_override,
+            l.exit_message_override,
+            l.exit_sound_override,
+        ];
+        assert_eq!(got, participant, "MeetingSummary");
+    }
+
+    const OVERRIDE_FIELDS: [&str; 4] = [
+        "entry_message_override",
+        "entry_sound_override",
+        "exit_message_override",
+        "exit_sound_override",
+    ];
+
+    fn wire_overrides<T: Serialize>(v: &T) -> serde_json::Map<String, serde_json::Value> {
+        let serde_json::Value::Object(map) = serde_json::to_value(v).unwrap() else {
+            panic!("a response must serialize to an object");
+        };
+        map.into_iter()
+            .filter(|(k, _)| k.ends_with("_override"))
+            .collect()
+    }
+
+    macro_rules! assert_only_non_participant_overrides_serialize {
+        ($ty:ty, $legacy:expr) => {
+            let base: $ty = serde_json::from_str($legacy).unwrap();
+            let at_default = wire_overrides(&base);
+            assert!(at_default.is_empty(), "{}: {at_default:?}", stringify!($ty));
+            for (i, field) in OVERRIDE_FIELDS.iter().enumerate() {
+                for value in [AnnouncementOverride::On, AnnouncementOverride::Off] {
+                    let mut v = base.clone();
+                    let slots = [
+                        &mut v.entry_message_override,
+                        &mut v.entry_sound_override,
+                        &mut v.exit_message_override,
+                        &mut v.exit_sound_override,
+                    ];
+                    *slots[i] = value;
+                    let wire = wire_overrides(&v);
+                    let keys: Vec<&String> = wire.keys().collect();
+                    assert_eq!(keys, [field], "{} {field}={value:?}", stringify!($ty));
+                    assert_eq!(wire[*field], value.as_str());
+                    let back: $ty =
+                        serde_json::from_value(serde_json::to_value(&v).unwrap()).unwrap();
+                    let mut want = [AnnouncementOverride::Participant; 4];
+                    want[i] = value;
+                    let got = [
+                        back.entry_message_override,
+                        back.entry_sound_override,
+                        back.exit_message_override,
+                        back.exit_sound_override,
+                    ];
+                    assert_eq!(got, want, "{} {field}={value:?}", stringify!($ty));
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn overrides_reach_the_wire_only_when_not_participant() {
+        assert_only_non_participant_overrides_serialize!(
+            ParticipantStatusResponse,
+            LEGACY_PARTICIPANT_STATUS
+        );
+        assert_only_non_participant_overrides_serialize!(MeetingInfoResponse, LEGACY_MEETING_INFO);
+        assert_only_non_participant_overrides_serialize!(
+            CreateMeetingResponse,
+            LEGACY_CREATE_MEETING
+        );
+        assert_only_non_participant_overrides_serialize!(MeetingSummary, LEGACY_MEETING_SUMMARY);
+    }
+
+    #[test]
+    fn a_response_carrying_an_unknown_override_still_deserializes() {
+        let mut body: serde_json::Value = serde_json::from_str(LEGACY_PARTICIPANT_STATUS).unwrap();
+        body["entry_sound_override"] = "chime_only".into();
+        body["exit_message_override"] = "off".into();
+        let s: ParticipantStatusResponse =
+            serde_json::from_value(body).expect("an unknown override must not fail the response");
+        assert_eq!(s.entry_sound_override, AnnouncementOverride::Participant);
+        assert_eq!(s.exit_message_override, AnnouncementOverride::Off);
     }
 
     #[test]

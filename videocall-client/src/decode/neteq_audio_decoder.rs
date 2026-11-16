@@ -782,21 +782,34 @@ fn plan_neteq_inserts_at(
 /// RED dedup window.
 pub(crate) const LEGACY_REORDER_WINDOW: u64 = AUDIO_RED_SEQ_HISTORY_SIZE as u64;
 
-/// Minimum receive idle time before a legacy packet with sequence 0 counts
-/// as a restart even inside the reorder window. A legacy browser sender
-/// restarts at 0 after mute or device switch, which takes well over this
-/// (getUserMedia + AudioContext + worklet load); a reordered first packet
-/// arrives within a few frames of its successors.
+/// Minimum receive idle time before a small legacy sequence (see
+/// [`LEGACY_RESTART_MAX_FIRST_SEQ`]) counts as a restart even inside the
+/// reorder window. A legacy browser sender restarts at 0 after mute or
+/// device switch, which takes well over this (getUserMedia + AudioContext +
+/// worklet load); a reordered packet arrives within a few frames of its
+/// successors.
 pub(crate) const LEGACY_RESTART_MIN_IDLE_MS: f64 = 100.0;
+
+/// Largest first-seen sequence that still identifies a restart inside the
+/// reorder window (after [`LEGACY_RESTART_MIN_IDLE_MS`] idle). 3 tolerates
+/// the first three packets of a restarted stream (60 ms) being lost or
+/// overtaken by later ones. Each packet travels on its own stream, so
+/// three in a row going missing at once is already rare, while a larger
+/// value widens the only false-positive case: a reordered packet near the
+/// start of an epoch arriving after a stall.
+pub(crate) const LEGACY_RESTART_MAX_FIRST_SEQ: u64 = 3;
 
 /// Maps a legacy sender's raw `sequence` (which restarts at 0 on every mic
 /// restart) to a monotonic extended frame count for one peer session.
 ///
-/// Within an epoch, `count = raw + offset`. A restart (raw goes backward past
-/// [`LEGACY_REORDER_WINDOW`], or back to 0 after [`LEGACY_RESTART_MIN_IDLE_MS`]
-/// of silence) opens a new epoch that continues after the highest count seen
-/// plus the receive idle time in whole 20 ms frames (at least one skipped
-/// frame), so NetEq sees skipped time instead of obsolete packets. O(1).
+/// Within an epoch, `count = raw + offset`, so `offset` is the count of the
+/// epoch's raw 0. A restart (raw goes backward past [`LEGACY_REORDER_WINDOW`],
+/// or back to at most [`LEGACY_RESTART_MAX_FIRST_SEQ`] after
+/// [`LEGACY_RESTART_MIN_IDLE_MS`] of silence) opens a new epoch whose raw 0
+/// sits after the highest count seen by the receive idle time in whole 20 ms
+/// frames (less the frames before the first seen raw, and always at least
+/// one skipped frame), so NetEq sees skipped time instead of obsolete
+/// packets, and a raw 0 that arrives late still lands just before raw 1. O(1).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct LegacySequenceExtender {
     offset: u64,
@@ -836,15 +849,22 @@ impl LegacySequenceExtender {
         let backward = epoch_highest_raw.saturating_sub(raw);
         let idle_ms = idle_ms.unwrap_or(0.0);
         let restarted = backward > LEGACY_REORDER_WINDOW
-            || (raw == 0 && backward > 0 && idle_ms >= LEGACY_RESTART_MIN_IDLE_MS);
+            || (raw <= LEGACY_RESTART_MAX_FIRST_SEQ
+                && backward > 0
+                && idle_ms >= LEGACY_RESTART_MIN_IDLE_MS);
         if restarted {
             // Same jump as libwebrtc on resume: idle time in whole frames
-            // past the last frame, but always at least one skipped frame so
-            // the restart never looks like contiguous audio.
+            // past the last frame. Raw 0 was captured `raw` frames before
+            // this packet, so its slot is that much earlier, but always at
+            // least one skipped frame past the old epoch so the restart
+            // never looks like contiguous audio.
             let idle_frames = (idle_ms.max(0.0) / 20.0).floor() as u64;
-            let count = self.highest_count.wrapping_add(idle_frames.max(2));
+            let base = self
+                .highest_count
+                .wrapping_add(idle_frames.saturating_sub(raw).max(2));
+            let count = base.wrapping_add(raw);
             self.previous_epoch = Some((self.offset, epoch_highest_raw));
-            self.offset = count.wrapping_sub(raw);
+            self.offset = base;
             self.epoch_highest_raw = Some(raw);
             self.highest_count = count;
             return count;
@@ -1541,9 +1561,10 @@ mod legacy_restart_tests {
     fn restart_with_no_idle_still_skips_at_least_one_frame() {
         let mut timeline = NetEqTimeline::default();
         let last = feed(&mut timeline, 0..=499, 0.0);
-        // Backward far beyond the window with no idle time at all.
+        // Backward far beyond the window with no idle time at all. The new
+        // epoch's raw 0 skips one frame past 499; raw 3 is three after it.
         let restarted = timeline.plan(&legacy(3), b"x", last + 1.0);
-        assert_eq!(restarted.primary.seq, 499 + 2);
+        assert_eq!(restarted.primary.seq, 499 + 2 + 3);
     }
 
     #[test]
@@ -1553,6 +1574,84 @@ mod legacy_restart_tests {
         // Muted after 11 frames, unmuted 500 ms later: back to 0.
         let restarted = timeline.plan(&legacy(0), b"x", last + 500.0);
         assert_eq!(restarted.primary.seq, 10 + 25);
+    }
+
+    /// Short first epoch (raw 0..=10), then a device switch 500 ms later
+    /// whose first packets are lost: the first seen raw is `first`.
+    fn restart_with_leading_loss(first: u64) {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=10, 0.0);
+        let arrival = last + 500.0;
+        let restarted = timeline.plan(&legacy(first), b"x", arrival);
+        // raw 0 of the new epoch would have arrived `first` frames earlier:
+        // it maps to 10 + (25 - first), and raw `first` is that plus `first`.
+        let base = 10 + 25 - first;
+        assert_eq!(
+            restarted.primary.seq,
+            base + first,
+            "first seen raw {first}"
+        );
+        assert!(
+            restarted.primary.seq > 10 + 1,
+            "skips time past the old epoch"
+        );
+        let next = timeline.plan(&legacy(first + 1), b"x", arrival + 20.0);
+        assert_eq!(next.primary.seq, base + first + 1);
+    }
+
+    #[test]
+    fn restart_with_packet_zero_lost_first_seen_1() {
+        restart_with_leading_loss(1);
+    }
+
+    #[test]
+    fn restart_with_packet_zero_lost_first_seen_2() {
+        restart_with_leading_loss(2);
+    }
+
+    #[test]
+    fn restart_with_packet_zero_lost_first_seen_3() {
+        restart_with_leading_loss(3);
+    }
+
+    #[test]
+    fn restart_where_raw_1_arrives_before_raw_0() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=10, 0.0);
+        let one = timeline.plan(&legacy(1), b"x", last + 500.0);
+        let zero = timeline.plan(&legacy(0), b"x", last + 505.0);
+        // Raw 0 lands just before raw 1 in the new epoch, not in the old one.
+        assert_eq!(zero.primary.seq + 1, one.primary.seq);
+        assert!(zero.primary.seq > 10 + 1);
+        assert_eq!(
+            zero.primary.timestamp.wrapping_add(FRAME),
+            one.primary.timestamp
+        );
+        let two = timeline.plan(&legacy(2), b"x", last + 520.0);
+        assert_eq!(two.primary.seq, one.primary.seq + 1);
+    }
+
+    #[test]
+    fn small_backward_jump_without_idle_is_still_reordering() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=10, 0.0);
+        let late = timeline.plan(&legacy(2), b"x", last + 5.0);
+        assert_eq!(late.primary.seq, 2);
+    }
+
+    /// Known limitation, documented: a reordered raw 0 at stream start that
+    /// arrives after a >= 100 ms stall is indistinguishable from a restart.
+    /// It opens a new epoch, so the stream jumps forward once by the stall
+    /// (here 180 ms) instead of NetEq dropping frames for up to 1.28 s.
+    #[test]
+    fn reordered_zero_after_stall_at_stream_start_is_read_as_restart() {
+        let mut timeline = NetEqTimeline::default();
+        timeline.plan(&legacy(1), b"x", 0.0);
+        timeline.plan(&legacy(2), b"x", 20.0);
+        let late_zero = timeline.plan(&legacy(0), b"x", 200.0);
+        assert_eq!(late_zero.primary.seq, 2 + 9);
+        let three = timeline.plan(&legacy(3), b"x", 205.0);
+        assert_eq!(three.primary.seq, 2 + 9 + 3);
     }
 
     #[test]

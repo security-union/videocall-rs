@@ -274,7 +274,7 @@ impl NetEq {
             decoders: HashMap::new(),
             bypass_audio_queue: VecDeque::new(),
             packets_received_this_second: 0,
-            last_packets_second_instant: Instant::now(),
+            last_packets_second_instant: crate::clock::now(),
             packets_per_sec_snapshot: 0,
             leftover_time_stretched_samples: Vec::new(),
             timestretch_added_samples: 0,
@@ -440,7 +440,7 @@ impl NetEq {
     /// Roll the packets-per-second window if ≥1s elapsed since last snapshot.
     /// Safe to call frequently; no-ops if interval hasn't elapsed.
     fn maybe_roll_packet_rate(&mut self) {
-        let now = Instant::now();
+        let now = crate::clock::now();
         if now.duration_since(self.last_packets_second_instant) >= Duration::from_secs(1) {
             self.packets_per_sec_snapshot = self.packets_received_this_second;
             self.packets_received_this_second = 0;
@@ -499,7 +499,7 @@ impl NetEq {
         self.consecutive_expands = 0;
         self.packets_received_this_second = 0;
         self.packets_per_sec_snapshot = 0;
-        self.last_packets_second_instant = Instant::now();
+        self.last_packets_second_instant = crate::clock::now();
         self.leftover_time_stretched_samples.clear();
         self.timestretch_added_samples = 0;
     }

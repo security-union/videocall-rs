@@ -156,14 +156,14 @@ impl RelativeArrivalDelayTracker {
         let packet_delay = PacketDelay {
             iat_delay_ms,
             _timestamp: timestamp,
-            arrival_time: Instant::now(),
+            arrival_time: crate::clock::now(),
         };
 
         self.delay_history.push_back(packet_delay);
 
         // Remove old entries based on max_history_ms
         let max_age = Duration::from_millis(self.config.max_history_ms as u64);
-        let now = Instant::now();
+        let now = crate::clock::now();
 
         self.delay_history
             .retain(|delay| now.duration_since(delay.arrival_time) <= max_age);
@@ -242,7 +242,7 @@ impl DelayManager {
             self.reset();
         }
 
-        let arrival_time = Instant::now();
+        let arrival_time = crate::clock::now();
 
         // Update arrival delay tracking
         let relative_delay =

@@ -96,7 +96,7 @@ impl AudioPacket {
         Self {
             header,
             payload,
-            arrival_time: Instant::now(),
+            arrival_time: crate::clock::now(),
             sample_rate,
             channels,
             duration_ms,
@@ -110,7 +110,7 @@ impl AudioPacket {
 
     /// Get the age of this packet since arrival
     pub fn age(&self) -> Duration {
-        self.arrival_time.elapsed()
+        crate::clock::now().saturating_duration_since(self.arrival_time)
     }
 
     /// Check if this packet is older than the given duration

@@ -324,7 +324,7 @@ impl Default for StatisticsCalculator {
 impl StatisticsCalculator {
     /// Create a new statistics calculator
     pub fn new() -> Self {
-        let now = Instant::now();
+        let now = crate::clock::now();
         Self {
             network_stats: NetworkStatistics::default(),
             lifetime_stats: LifetimeStatistics::default(),
@@ -416,7 +416,7 @@ impl StatisticsCalculator {
 
     /// Record a decode operation for per-second tracking
     pub fn record_decode_operation(&mut self, operation: Operation) {
-        let now = Instant::now();
+        let now = crate::clock::now();
 
         // Convert operation to array index
         let index = match operation {
@@ -540,7 +540,7 @@ impl StatisticsCalculator {
 
     /// Get uptime duration
     pub fn uptime(&self) -> Duration {
-        self.start_time.elapsed()
+        crate::clock::now().saturating_duration_since(self.start_time)
     }
 
     /// Reset all statistics

@@ -216,6 +216,75 @@ pub struct DelayManager {
     /// underrun_optimizer.cc `optimal_delay_ms_`: unset until the histogram
     /// has had its first update.
     optimal_delay_ms: Option<u32>,
+    /// delay_manager.cc `reorder_optimizer_`, present when
+    /// `use_reorder_optimizer` is set (the libwebrtc default).
+    reorder_optimizer: Option<ReorderOptimizer>,
+}
+
+/// reorder_optimizer.cc `kDelayBuckets`.
+const K_REORDER_DELAY_BUCKETS: usize = 100;
+
+/// reorder_optimizer.{h,cc} `ReorderOptimizer`: the delay that minimizes
+/// added delay plus the cost of losing reordered packets.
+#[derive(Debug)]
+struct ReorderOptimizer {
+    histogram: Histogram,
+    ms_per_loss_percent: i64,
+    optimal_delay_ms: Option<u32>,
+}
+
+impl ReorderOptimizer {
+    fn new(forget_factor: f64, ms_per_loss_percent: u32, start_forget_weight: Option<f64>) -> Self {
+        let mut histogram =
+            Histogram::new(K_REORDER_DELAY_BUCKETS, forget_factor, start_forget_weight);
+        histogram.reset();
+        Self {
+            histogram,
+            ms_per_loss_percent: i64::from(ms_per_loss_percent),
+            optimal_delay_ms: None,
+        }
+    }
+
+    /// reorder_optimizer.cc `ReorderOptimizer::Update`: in-order packets
+    /// count in bucket 0, reordered ones at their delay.
+    fn update(&mut self, relative_delay_ms: i32, reordered: bool, base_delay_ms: u32) {
+        let index = if reordered {
+            (relative_delay_ms.max(0) / K_BUCKET_SIZE_MS) as usize
+        } else {
+            0
+        };
+        if index < self.histogram.num_buckets() {
+            self.histogram.add(index);
+        }
+        let bucket = self.minimize_cost_function(base_delay_ms);
+        self.optimal_delay_ms = Some((1 + bucket as u32) * K_BUCKET_SIZE_MS as u32);
+    }
+
+    fn reset(&mut self) {
+        self.histogram.reset();
+        self.optimal_delay_ms = None;
+    }
+
+    /// reorder_optimizer.cc `MinimizeCostFunction`, Q30 as in libwebrtc.
+    fn minimize_cost_function(&self, base_delay_ms: u32) -> usize {
+        let mut loss_probability: i64 = 1 << 30;
+        let mut min_cost = i64::MAX;
+        let mut min_bucket = 0;
+        for (i, &bucket) in self.histogram.buckets().iter().enumerate() {
+            loss_probability -= i64::from(bucket);
+            let delay_ms =
+                ((i as i64 * i64::from(K_BUCKET_SIZE_MS)) - i64::from(base_delay_ms)).max(0) << 30;
+            let cost = delay_ms + 100 * self.ms_per_loss_percent * loss_probability;
+            if cost < min_cost {
+                min_cost = cost;
+                min_bucket = i;
+            }
+            if loss_probability == 0 {
+                break;
+            }
+        }
+        min_bucket
+    }
 }
 
 impl DelayManager {
@@ -231,8 +300,17 @@ impl DelayManager {
             config.start_forget_weight,
         );
         histogram.reset();
+        // delay_manager.cc MaybeCreateReorderOptimizer.
+        let reorder_optimizer = config.use_reorder_optimizer.then(|| {
+            ReorderOptimizer::new(
+                config.reorder_forget_factor,
+                config.ms_per_loss_percent,
+                config.start_forget_weight,
+            )
+        });
         Self {
             optimal_delay_ms: None,
+            reorder_optimizer,
             target_level_ms: K_START_DELAY_MS.max(config.base_minimum_delay_ms), // Start with 80ms or minimum delay
             minimum_delay_ms: 0,
             effective_minimum_delay_ms: config.base_minimum_delay_ms,
@@ -293,10 +371,25 @@ impl DelayManager {
     /// delay_manager.cc `DelayManager::Update` and underrun_optimizer.cc
     /// `UnderrunOptimizer::Update`. Until the first resample interval has
     /// passed the target stays at the 80 ms start delay
-    /// (`GetOptimalDelayMs().value_or(kStartDelayMs)`).
-    pub fn update_arrival_delay(&mut self, arrival_delay_ms: u32) {
+    /// (`GetOptimalDelayMs().value_or(kStartDelayMs)`). A reordered packet
+    /// only feeds the reorder optimizer when there is one.
+    pub fn update_arrival_delay(&mut self, arrival_delay_ms: u32, reordered: bool, now: Instant) {
         let delay = arrival_delay_ms.min(i32::MAX as u32) as i32;
-        let now = crate::clock::now();
+        if self.reorder_optimizer.is_none() || !reordered {
+            self.update_underrun_optimizer(delay, now);
+        }
+        let mut target = self.optimal_delay_ms.unwrap_or(K_START_DELAY_MS);
+        if let Some(reorder) = self.reorder_optimizer.as_mut() {
+            reorder.update(delay, reordered, target);
+            target = target.max(reorder.optimal_delay_ms.unwrap_or(0));
+        }
+        self.target_level_ms = target
+            .max(self.effective_minimum_delay_ms)
+            .min(self.effective_maximum_delay_ms);
+    }
+
+    /// underrun_optimizer.cc `UnderrunOptimizer::Update`.
+    fn update_underrun_optimizer(&mut self, delay: i32, now: Instant) {
         let mut histogram_update = None;
         if let Some(interval) = self.config.resample_interval_ms {
             match self.last_resample_time {
@@ -321,17 +414,15 @@ impl DelayManager {
             let bucket = self.histogram.quantile(self.config.quantile);
             self.optimal_delay_ms = Some((1 + bucket as u32) * K_BUCKET_SIZE_MS as u32);
         }
-        self.target_level_ms = self
-            .optimal_delay_ms
-            .unwrap_or(K_START_DELAY_MS)
-            .max(self.effective_minimum_delay_ms)
-            .min(self.effective_maximum_delay_ms);
     }
 
     /// Reset the delay manager
     pub fn reset(&mut self) {
         self.histogram.reset();
         self.optimal_delay_ms = None;
+        if let Some(reorder) = self.reorder_optimizer.as_mut() {
+            reorder.reset();
+        }
         self.arrival_delay_tracker.reset();
         self.target_level_ms = K_START_DELAY_MS.max(self.config.base_minimum_delay_ms);
         self.resampled_relative_delay = 0;
@@ -437,6 +528,48 @@ impl DelayManager {
 mod tests {
     use super::*;
     use std::thread;
+
+    /// Underrun target after 100 on-time packets, then `late` packets that
+    /// arrive 200 ms late marked `reordered`.
+    fn underrun_after(use_reorder_optimizer: bool, late: usize) -> Option<u32> {
+        let mut dm = DelayManager::new(DelayConfig {
+            resample_interval_ms: None,
+            use_reorder_optimizer,
+            ..DelayConfig::default()
+        });
+        for _ in 0..100 {
+            dm.update_arrival_delay(0, false, crate::clock::now());
+        }
+        for _ in 0..late {
+            dm.update_arrival_delay(200, true, crate::clock::now());
+        }
+        dm.optimal_delay_ms
+    }
+
+    #[test]
+    fn reordered_packets_skip_the_underrun_histogram_with_a_reorder_optimizer() {
+        // delay_manager.cc DelayManager::Update.
+        assert_eq!(underrun_after(true, 50), underrun_after(true, 0));
+        assert!(underrun_after(false, 50) > underrun_after(false, 0));
+    }
+
+    #[test]
+    fn reorder_optimizer_covers_frequent_reordering() {
+        // reorder_optimizer.cc: when many packets are reordered by 200 ms,
+        // waiting for them costs less than losing them.
+        let mut dm = DelayManager::new(DelayConfig {
+            resample_interval_ms: None,
+            ..DelayConfig::default()
+        });
+        for i in 0..400 {
+            dm.update_arrival_delay(
+                if i % 4 == 0 { 200 } else { 0 },
+                i % 4 == 0,
+                crate::clock::now(),
+            );
+        }
+        assert!(dm.target_delay_ms() >= 200, "{}", dm.target_delay_ms());
+    }
 
     #[test]
     fn test_delay_manager_creation() {

@@ -424,9 +424,7 @@ impl StatisticsCalculator {
     }
 
     /// Record a decode operation for per-second tracking
-    pub fn record_decode_operation(&mut self, operation: Operation) {
-        let now = crate::clock::now();
-
+    pub fn record_decode_operation(&mut self, operation: Operation, now: Instant) {
         // Convert operation to array index
         let index = match operation {
             Operation::Normal => 0,
@@ -612,7 +610,7 @@ mod tests {
         ];
         for (i, op) in ops.into_iter().enumerate() {
             for _ in 0..=i {
-                calc.record_decode_operation(op);
+                calc.record_decode_operation(op, crate::clock::now());
             }
         }
         // Close a window of exactly one second, so rates equal counts.

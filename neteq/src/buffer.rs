@@ -17,7 +17,7 @@
  */
 
 use std::collections::VecDeque;
-use web_time::Duration;
+use web_time::{Duration, Instant};
 
 use crate::statistics::StatisticsCalculator;
 use crate::{AudioPacket, Result};
@@ -62,6 +62,9 @@ pub struct PacketBuffer {
     smart_flush_config: SmartFlushConfig,
     /// Maximum age for packets before they're considered stale
     max_packet_age: Duration,
+    /// Sum of `expected_samples()` over `buffer`, kept as packets come and
+    /// go so `num_samples_in_buffer` does not walk the buffer.
+    total_samples: usize,
 }
 
 impl PacketBuffer {
@@ -72,6 +75,7 @@ impl PacketBuffer {
             buffer: VecDeque::with_capacity(max_packets),
             smart_flush_config: SmartFlushConfig::default(),
             max_packet_age: Duration::from_secs(2),
+            total_samples: 0,
         }
     }
 
@@ -82,6 +86,7 @@ impl PacketBuffer {
             buffer: VecDeque::with_capacity(max_packets),
             smart_flush_config,
             max_packet_age: Duration::from_secs(2),
+            total_samples: 0,
         }
     }
 
@@ -116,6 +121,7 @@ impl PacketBuffer {
     pub fn flush(&mut self, stats: &mut StatisticsCalculator) {
         let flushed_count = self.buffer.len();
         self.buffer.clear();
+        self.total_samples = 0;
 
         if flushed_count > 0 {
             stats.buffer_flush();
@@ -132,10 +138,11 @@ impl PacketBuffer {
         target_level_ms: u32,
         sample_rate: u32,
         stats: &mut StatisticsCalculator,
+        now: Instant,
     ) -> Result<BufferReturnCode> {
-        if self.buffer.is_empty() {
+        let Some(back) = self.buffer.back() else {
             return Ok(BufferReturnCode::BufferEmpty);
-        }
+        };
         let last_decoded_length = self.last_duration_samples(sample_rate);
         let target_level_samples = (u64::from(target_level_ms) * u64::from(sample_rate) / 1000)
             .min((self.max_packets * last_decoded_length / 2) as u64)
@@ -144,13 +151,17 @@ impl PacketBuffer {
                     * u64::from(sample_rate)
                     / 1000,
             );
+        // The last packet stays while the front is dropped, so the span is
+        // its timestamp minus the front's plus a fixed tail.
+        let back_timestamp = back.header.timestamp;
+        let tail = Self::span_tail(back, last_decoded_length, sample_rate, false, now);
         let mut removed = 0;
-        while !self.buffer.is_empty()
-            && (self.get_span_samples(last_decoded_length, sample_rate, false) as u64
-                > target_level_samples
-                || self.buffer.len() > self.max_packets / 2)
-        {
-            self.buffer.pop_front();
+        while let Some(front) = self.buffer.front() {
+            let span = back_timestamp.wrapping_sub(front.header.timestamp) as u64 + tail as u64;
+            if span <= target_level_samples && self.buffer.len() <= self.max_packets / 2 {
+                break;
+            }
+            self.pop_front();
             stats.packet_discarded(false);
             removed += 1;
         }
@@ -177,6 +188,8 @@ impl PacketBuffer {
             return Ok(BufferReturnCode::InvalidPacket);
         }
         let sample_rate = packet.sample_rate;
+        // The packet's arrival time is "now" for this insert.
+        let now = packet.arrival_time;
         let mut return_code = BufferReturnCode::Ok;
 
         // Smart flush when the span exceeds a multiple of the target level.
@@ -190,10 +203,11 @@ impl PacketBuffer {
             / 1000;
         let last_duration = self.last_duration_samples(sample_rate);
         let smart_flush = !self.buffer.is_empty()
-            && self.get_span_samples(last_duration, sample_rate, false) as u64 >= span_threshold;
+            && self.get_span_samples(last_duration, sample_rate, false, now) as u64
+                >= span_threshold;
         if self.buffer.len() >= self.max_packets || smart_flush {
             let before = self.buffer.len();
-            self.partial_flush(target_level_ms, sample_rate, stats)?;
+            self.partial_flush(target_level_ms, sample_rate, stats, now)?;
             if self.buffer.len() >= self.max_packets {
                 self.flush(stats);
                 return_code = BufferReturnCode::Flushed;
@@ -218,7 +232,9 @@ impl PacketBuffer {
             return Ok(return_code);
         }
         if pos < self.buffer.len() && self.buffer[pos].header.timestamp == packet.header.timestamp {
-            self.buffer.remove(pos);
+            if let Some(old) = self.buffer.remove(pos) {
+                self.total_samples -= old.expected_samples();
+            }
             stats.packet_discarded(false);
         }
         if pos < self.buffer.len() {
@@ -226,6 +242,7 @@ impl PacketBuffer {
         } else {
             stats.packet_in_order();
         }
+        self.total_samples += packet.expected_samples();
         self.buffer.insert(pos, packet);
         stats.packet_arrived(0);
         Ok(return_code)
@@ -250,7 +267,13 @@ impl PacketBuffer {
 
     /// Get the oldest packet from the buffer
     pub fn get_next_packet(&mut self) -> Option<AudioPacket> {
-        self.buffer.pop_front()
+        self.pop_front()
+    }
+
+    fn pop_front(&mut self) -> Option<AudioPacket> {
+        let packet = self.buffer.pop_front()?;
+        self.total_samples -= packet.expected_samples();
+        Some(packet)
     }
 
     /// Discard the next packet without returning it
@@ -258,7 +281,7 @@ impl PacketBuffer {
         &mut self,
         stats: &mut StatisticsCalculator,
     ) -> Result<BufferReturnCode> {
-        if self.buffer.pop_front().is_some() {
+        if self.pop_front().is_some() {
             stats.packet_discarded(true);
             Ok(BufferReturnCode::Ok)
         } else {
@@ -274,11 +297,13 @@ impl PacketBuffer {
         horizon_samples: u32,
         stats: &mut StatisticsCalculator,
     ) {
+        let total_samples = &mut self.total_samples;
         self.buffer.retain(|p| {
             let obsolete = timestamp_limit != p.header.timestamp
                 && is_obsolete_timestamp(p.header.timestamp, timestamp_limit, horizon_samples);
             if obsolete {
                 stats.packet_discarded(true);
+                *total_samples -= p.expected_samples();
             }
             !obsolete
         });
@@ -313,25 +338,46 @@ impl PacketBuffer {
         last_decoded_length: usize,
         sample_rate: u32,
         count_waiting_time: bool,
+        now: Instant,
     ) -> usize {
         let (Some(front), Some(back)) = (self.buffer.front(), self.buffer.back()) else {
             return 0;
         };
-        let mut span = back.header.timestamp.wrapping_sub(front.header.timestamp) as usize;
-        let waiting = back.age().as_millis() as usize * (sample_rate / 1000) as usize;
+        back.header.timestamp.wrapping_sub(front.header.timestamp) as usize
+            + Self::span_tail(
+                back,
+                last_decoded_length,
+                sample_rate,
+                count_waiting_time,
+                now,
+            )
+    }
+
+    /// What `GetSpanSamples` adds after the last packet's timestamp: its
+    /// waiting time, or its duration (at least its waiting time if DTX).
+    /// The waiting time is only computed when it is used.
+    fn span_tail(
+        back: &AudioPacket,
+        last_decoded_length: usize,
+        sample_rate: u32,
+        count_waiting_time: bool,
+        now: Instant,
+    ) -> usize {
+        let waiting = || {
+            now.saturating_duration_since(back.arrival_time).as_millis() as usize
+                * (sample_rate / 1000) as usize
+        };
         if count_waiting_time {
-            span += waiting;
-        } else {
-            let mut duration = back.duration_samples();
-            if duration == 0 {
-                duration = last_decoded_length;
-            }
-            if back.is_dtx() {
-                duration = duration.max(waiting);
-            }
-            span += duration;
+            return waiting();
         }
-        span
+        let mut duration = back.duration_samples();
+        if duration == 0 {
+            duration = last_decoded_length;
+        }
+        if back.is_dtx() {
+            duration = duration.max(waiting());
+        }
+        duration
     }
 
     /// packet_buffer.cc `ContainsDtxOrCngPacket`.
@@ -346,10 +392,14 @@ impl PacketBuffer {
 
     /// Get the total number of samples in the buffer
     pub fn num_samples_in_buffer(&self) -> usize {
-        self.buffer
-            .iter()
-            .map(|packet| packet.expected_samples())
-            .sum()
+        debug_assert_eq!(
+            self.total_samples,
+            self.buffer
+                .iter()
+                .map(AudioPacket::expected_samples)
+                .sum::<usize>()
+        );
+        self.total_samples
     }
 
     fn last_duration_samples(&self, sample_rate: u32) -> usize {
@@ -501,7 +551,10 @@ mod tests {
             .insert_packet(create_test_packet(0, u32::MAX - 319, 20), &mut stats, 100)
             .unwrap();
         assert_eq!(buffer.peek_next_timestamp(), Some(u32::MAX - 319));
-        assert_eq!(buffer.get_span_samples(320, 16000, false), 640 + 320);
+        assert_eq!(
+            buffer.get_span_samples(320, 16000, false, crate::clock::now()),
+            640 + 320
+        );
     }
 
     #[test]

@@ -93,19 +93,18 @@ impl PacketArrivalHistory {
         }
     }
 
-    fn now_samples(&self) -> i64 {
-        let ms = crate::clock::now()
-            .saturating_duration_since(self.base)
-            .as_millis() as i64;
+    fn now_samples(&self, now: Instant) -> i64 {
+        let ms = now.saturating_duration_since(self.base).as_millis() as i64;
         ms * self.sample_rate_khz
     }
 
     /// packet_arrival_history.cc `PacketArrivalHistory::Insert`. Returns
-    /// false if the timestamp is too old or already covered.
-    pub fn insert(&mut self, rtp_timestamp: u32, packet_length_samples: u32) -> bool {
+    /// false if the timestamp is too old or already covered. `now` is the
+    /// arrival time.
+    pub fn insert(&mut self, rtp_timestamp: u32, packet_length_samples: u32, now: Instant) -> bool {
         let packet = PacketArrival {
             rtp_timestamp: self.unwrapper.peek(rtp_timestamp),
-            arrival_timestamp: self.now_samples(),
+            arrival_timestamp: self.now_samples(now),
             length_samples: i64::from(packet_length_samples),
         };
         if self.is_obsolete(&packet) || self.contains(&packet) {
@@ -157,11 +156,11 @@ impl PacketArrivalHistory {
     }
 
     /// packet_arrival_history.cc `GetDelayMs`: how late `rtp_timestamp` is
-    /// now, relative to the earliest-arriving packet in the window.
-    pub fn get_delay_ms(&self, rtp_timestamp: u32) -> u32 {
+    /// at `now`, relative to the earliest-arriving packet in the window.
+    pub fn get_delay_ms(&self, rtp_timestamp: u32, now: Instant) -> u32 {
         let packet = PacketArrival {
             rtp_timestamp: self.unwrapper.peek(rtp_timestamp),
-            arrival_timestamp: self.now_samples(),
+            arrival_timestamp: self.now_samples(now),
             length_samples: 0,
         };
         self.packet_arrival_delay_ms(&packet)
@@ -230,25 +229,25 @@ mod tests {
     fn delay_is_relative_to_the_earliest_packet() {
         crate::clock::freeze();
         let mut h = PacketArrivalHistory::new(2000, 48_000);
-        assert!(h.insert(0, 960));
+        assert!(h.insert(0, 960, crate::clock::now()));
         crate::clock::advance(Duration::from_millis(20));
-        assert!(h.insert(960, 960));
+        assert!(h.insert(960, 960, crate::clock::now()));
         crate::clock::advance(Duration::from_millis(50)); // 30 ms late
-        assert!(h.insert(1920, 960));
-        assert_eq!(h.get_delay_ms(1920), 30);
+        assert!(h.insert(1920, 960, crate::clock::now()));
+        assert_eq!(h.get_delay_ms(1920, crate::clock::now()), 30);
         assert_eq!(h.get_max_delay_ms(), 30);
         // Duplicates are rejected.
-        assert!(!h.insert(960, 960));
+        assert!(!h.insert(960, 960, crate::clock::now()));
     }
 
     #[test]
     fn wraps_rtp_timestamps() {
         crate::clock::freeze();
         let mut h = PacketArrivalHistory::new(2000, 48_000);
-        assert!(h.insert(u32::MAX - 959, 960));
+        assert!(h.insert(u32::MAX - 959, 960, crate::clock::now()));
         crate::clock::advance(Duration::from_millis(20));
-        assert!(h.insert(0, 960));
-        assert_eq!(h.get_delay_ms(0), 0);
+        assert!(h.insert(0, 960, crate::clock::now()));
+        assert_eq!(h.get_delay_ms(0, crate::clock::now()), 0);
         assert!(h.is_newest_rtp_timestamp(0));
     }
 }

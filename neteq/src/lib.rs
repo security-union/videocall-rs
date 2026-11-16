@@ -22,6 +22,7 @@
 //! This library provides functionality to handle network jitter, packet reordering,
 //! and adaptive buffering for real-time audio applications.
 
+pub mod background_noise;
 pub mod buffer;
 pub mod buffer_level_filter;
 pub mod clock;

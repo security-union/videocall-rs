@@ -114,6 +114,15 @@ impl WebNetEq {
         Ok(out)
     }
 
+    /// Drop everything buffered; the next packet starts a new stream
+    /// (neteq_impl.cc `NetEqImpl::FlushBuffers`).
+    #[wasm_bindgen]
+    pub fn flush(&self) {
+        if let Some(neteq) = self.neteq.borrow_mut().as_mut() {
+            neteq.flush();
+        }
+    }
+
     /// Get current NetEq statistics as a JS object.
     #[wasm_bindgen(js_name = getStatistics)]
     pub fn get_statistics(&self) -> Result<JsValue, JsValue> {

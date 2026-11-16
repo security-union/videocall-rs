@@ -421,6 +421,65 @@ fn mute_95s_then_speech_plays_on_time() {
     }
 }
 
+/// The mute path as the browser worker ran it before it kept ticking: the
+/// remote peer mutes for 10 s (its sender sends nothing and its timestamps
+/// skip the gap) and the worker stops calling `get_audio` for exactly that
+/// time. NetEq's playout timestamp and noise stopwatch stand still, so the
+/// first packet after the mute is a future packet (decision_logic.cc
+/// PacketTooEarly) until the buffer passes the target window. Speech after
+/// the mute must still play on schedule, unclipped.
+#[test]
+fn worker_paused_while_muted_then_speech_plays_on_time() {
+    let script = Script::Edited(vec![
+        Segment::Speech(6_000),
+        Segment::Mute(10_000),
+        Segment::Speech(8_000),
+    ]);
+    let run = run(&Scenario::scripted(
+        "mute10s_worker_paused_continuous_rtp_clean",
+        script,
+        SenderMode::Continuous,
+        Network::clean(),
+    )
+    .with_receiver_pause(ReceiverPause {
+        from_ms: 6_000,
+        to_ms: 16_000,
+    }));
+    assert_sane(&run);
+    let name = &run.scenario.name;
+    let bound = clean_delay_bound(&run);
+    let spurts: Vec<_> = scored_talkspurts(&run)
+        .into_iter()
+        .filter(|t| t.start_ms >= 16_000)
+        .collect();
+    assert!(!spurts.is_empty(), "{name}: no talkspurts after the mute");
+    for t in spurts {
+        let d = t.delay_ms.unwrap_or_else(|| {
+            panic!(
+                "{name}: talkspurt at {} ms not found after the mute (correlation {:.2})",
+                t.start_ms, t.correlation
+            )
+        });
+        assert!(
+            d <= bound,
+            "{name}: talkspurt at {} ms delay {d} ms > {bound} ms after the mute",
+            t.start_ms
+        );
+        assert_eq!(
+            t.conceal_ms, 0,
+            "{name}: talkspurt at {} ms has {} ms concealed on a clean network",
+            t.start_ms, t.conceal_ms
+        );
+        for (what, ratio) in [("energy", t.energy_ratio), ("onset", t.onset_ratio)] {
+            assert!(
+                (0.8..=1.25).contains(&ratio),
+                "{name}: talkspurt at {} ms {what} ratio {ratio:.2}, want 0.8..1.25",
+                t.start_ms
+            );
+        }
+    }
+}
+
 /// Three loops of the clip (60 s) over 60 ms jitter: the buffer and the
 /// target delay must not drift.
 #[test]

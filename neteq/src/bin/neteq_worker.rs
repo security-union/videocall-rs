@@ -25,6 +25,8 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm_worker {
     const AUDIO_PRODUCTION_INTERVAL_MS: i32 = 5;
+    /// Frames pulled and discarded per timer callback while muted.
+    const MAX_MUTED_CATCH_UP_FRAMES: u64 = 4;
 
     use neteq::web::init_net_eq;
     use neteq::WebNetEq;
@@ -262,7 +264,20 @@ mod wasm_worker {
                     let frames_behind = expected_total_frames.saturating_sub(TOTAL_FRAMES_PRODUCED) as i32;
                                          // Decide whether to produce audio this cycle
                      let should_produce = if is_muted {
-                         // When muted, keep frame count in sync but don't produce audio
+                         // NetEq assumes get_audio every 10 ms, as libwebrtc
+                         // assumes GetAudio is called regardless of output:
+                         // its playout timestamp, noise stopwatch and buffer
+                         // only advance on a pull. Keep pulling while muted
+                         // and discard the audio (a few frames at most per
+                         // timer callback, so a stalled timer cannot burst).
+                         let missing = expected_total_frames.saturating_sub(TOTAL_FRAMES_PRODUCED);
+                         NETEQ.with(|cell| {
+                             if let Some(eq) = cell.borrow().as_ref() {
+                                 for _ in 0..missing.min(MAX_MUTED_CATCH_UP_FRAMES) {
+                                     let _ = eq.get_audio();
+                                 }
+                             }
+                         });
                          TOTAL_FRAMES_PRODUCED = expected_total_frames;
                          false
                      } else {
@@ -320,7 +335,7 @@ mod wasm_worker {
         // console::log_1(&format!("[neteq-worker] received message: {:?}", msg).into());
         match msg {
             WorkerMsg::Init {
-                sample_rate,
+                sample_rate: _,
                 channels: _,
             } => {
                 // NOTE: We don't set up a second timer here! The main timer in start() already handles audio production
@@ -344,8 +359,8 @@ mod wasm_worker {
             }
             WorkerMsg::Flush => {
                 NETEQ.with(|cell| {
-                    if let Some(_eq) = cell.borrow().as_ref() {
-                        // Flush is handled by the NetEq instance
+                    if let Some(eq) = cell.borrow().as_ref() {
+                        eq.flush();
                         console::log_1(&"[neteq-worker] flush".into());
                     }
                 });

@@ -45,7 +45,7 @@
 
 use neteq::codec::{AudioDecoder, NativeOpusDecoder};
 use neteq::neteq::SpeechType;
-use neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
+use neteq::{AudioPacket, Mode, NetEq, NetEqConfig, Operation, RtpHeader};
 use ropus::{Application, Bitrate, Channels, Encoder};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -627,6 +627,16 @@ pub struct Scenario {
     /// Virtual time played after the last source frame.
     pub tail_ms: u64,
     pub restart: Option<Restart>,
+    pub receiver_pause: Option<ReceiverPause>,
+}
+
+/// The receiver stops pulling audio, as the browser worker did while the
+/// remote peer was muted (`IS_MUTED` in `neteq_worker.rs`): no `get_audio`
+/// from `from_ms` until `to_ms`; packets are still inserted.
+#[derive(Clone, Copy, Debug)]
+pub struct ReceiverPause {
+    pub from_ms: u64,
+    pub to_ms: u64,
 }
 
 impl Scenario {
@@ -645,6 +655,7 @@ impl Scenario {
             network,
             tail_ms: 1000,
             restart: None,
+            receiver_pause: None,
         }
     }
     /// A scripted source; `name` must say what the script is.
@@ -657,6 +668,7 @@ impl Scenario {
             network,
             tail_ms: 1000,
             restart: None,
+            receiver_pause: None,
         }
     }
     pub fn named(mut self, name: &str) -> Self {
@@ -667,6 +679,10 @@ impl Scenario {
         self.restart = Some(restart);
         self
     }
+    pub fn with_receiver_pause(mut self, pause: ReceiverPause) -> Self {
+        self.receiver_pause = Some(pause);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -675,6 +691,10 @@ pub struct Tick {
     pub speech: SpeechType,
     pub buffer_ms: u32,
     pub target_ms: u32,
+    pub operation: Operation,
+    pub mode: Mode,
+    /// The receiver did not pull audio (`ReceiverPause`); marked Expand.
+    pub paused: bool,
 }
 
 pub struct Run {
@@ -694,6 +714,9 @@ pub struct Run {
     pub concealed_samples: u64,
     pub out_dir: PathBuf,
     pub report: Report,
+    /// Lifetime samples removed by accelerate and inserted by preemptive
+    /// expand.
+    pub stretch_samples: (u64, u64),
 }
 
 /// Run a scenario end to end, write its audio and metrics, print its line.
@@ -747,6 +770,22 @@ pub fn run(scenario: &Scenario) -> Run {
             next += 1;
         }
         advance_to(t, &mut now_ms);
+        if let Some(pause) = scenario.receiver_pause {
+            if (pause.from_ms..pause.to_ms).contains(&t) {
+                // Nothing is played while the worker is paused.
+                out.extend_from_slice(&[0.0; TICK]);
+                ticks.push(Tick {
+                    t_ms: t,
+                    speech: SpeechType::Expand,
+                    buffer_ms: neteq.current_buffer_size_ms(),
+                    target_ms: neteq.target_delay_ms(),
+                    operation: neteq.last_operation(),
+                    mode: neteq.last_mode(),
+                    paused: true,
+                });
+                continue;
+            }
+        }
         let (samples, speech) = match neteq.get_audio() {
             Ok(frame) => (frame.samples, frame.speech_type),
             Err(e) => {
@@ -765,9 +804,17 @@ pub fn run(scenario: &Scenario) -> Run {
             speech,
             buffer_ms: neteq.current_buffer_size_ms(),
             target_ms: neteq.target_delay_ms(),
+            operation: neteq.last_operation(),
+            mode: neteq.last_mode(),
+            paused: false,
         });
     }
-    let concealed_samples = neteq.get_statistics().lifetime.concealed_samples;
+    let lifetime = neteq.get_statistics().lifetime;
+    let concealed_samples = lifetime.concealed_samples;
+    let stretch_samples = (
+        lifetime.removed_samples_for_acceleration,
+        lifetime.inserted_samples_for_deceleration,
+    );
 
     // Ideal receiver: every transmitted packet, decoded in order, no jitter
     // buffer, placed at its source frame.
@@ -800,6 +847,7 @@ pub fn run(scenario: &Scenario) -> Run {
         get_audio_errors,
         frame_len_errors,
         concealed_samples,
+        stretch_samples,
         out_dir: output_root().join(&scenario.name),
         report: Report::default(),
     };
@@ -868,6 +916,22 @@ pub struct Report {
     pub sent_dtx: usize,
     pub encoded_dtx: usize,
     pub lost: usize,
+    /// Ticks whose operation was accelerate, by result.
+    pub accelerate: StretchCount,
+    /// Ticks whose operation was preemptive expand, by result.
+    pub preemptive: StretchCount,
+    /// Lifetime samples removed by accelerate.
+    pub removed_samples: u64,
+    /// Lifetime samples inserted by preemptive expand.
+    pub inserted_samples: u64,
+}
+
+/// Results of the ticks that ran one time-stretch operation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StretchCount {
+    pub success: usize,
+    pub low_energy: usize,
+    pub fail: usize,
 }
 
 impl Report {
@@ -888,7 +952,8 @@ impl Report {
             "HARNESS {name} | conceal startup/after/speech/silence {}/{}/{}/{} ms of deep {}/{} | cng {} (silence {}) \
              | silence out {:.1} src {:.1} dBFS spread {:.1} dB digsil {} \
              | spurts {} delay [{}] onset_min {:.2} energy_min {:.2} \
-             | target {}/{}/{} buf_end {} | sent {} dtx enc/sent {}/{} lost {}",
+             | target {}/{}/{} buf_end {} | sent {} dtx enc/sent {}/{} lost {} \
+             | accel ok/low/fail {}/{}/{} removed {} | pe ok/low/fail {}/{}/{} inserted {}",
             self.conceal_startup_ms,
             self.conceal_after_startup_ms,
             self.conceal_speech_ms,
@@ -913,6 +978,14 @@ impl Report {
             self.encoded_dtx,
             self.sent_dtx,
             self.lost,
+            self.accelerate.success,
+            self.accelerate.low_energy,
+            self.accelerate.fail,
+            self.removed_samples,
+            self.preemptive.success,
+            self.preemptive.low_energy,
+            self.preemptive.fail,
+            self.inserted_samples,
         )
     }
 
@@ -998,8 +1071,22 @@ fn analyze(run: &Run) -> Report {
         sent_dtx: run.sent_dtx,
         encoded_dtx: run.encoded_dtx_frames,
         lost: run.lost_frames.len(),
+        removed_samples: run.stretch_samples.0,
+        inserted_samples: run.stretch_samples.1,
         ..Report::default()
     };
+    for tick in &run.ticks {
+        let count = match tick.operation {
+            Operation::Accelerate | Operation::FastAccelerate => &mut r.accelerate,
+            Operation::PreemptiveExpand => &mut r.preemptive,
+            _ => continue,
+        };
+        match tick.mode {
+            Mode::AccelerateSuccess | Mode::PreemptiveExpandSuccess => count.success += 1,
+            Mode::AccelerateLowEnergy | Mode::PreemptiveExpandLowEnergy => count.low_energy += 1,
+            _ => count.fail += 1,
+        }
+    }
     let source_ms = run.source.duration_ms();
     let deep: Vec<Option<Deep>> = run.ticks.iter().map(|t| deep_kind(run, t)).collect();
     let mut silence_out = 0.0;
@@ -1216,7 +1303,8 @@ pub fn assert_sane(run: &Run) {
         r.max_abs,
         r.reference_max_abs
     );
-    let expand_samples = r.expand_ms / TICK_MS * TICK as u64;
+    let paused_ticks = run.ticks.iter().filter(|t| t.paused).count() as u64;
+    let expand_samples = (r.expand_ms / TICK_MS - paused_ticks) * TICK as u64;
     let total = r.ticks as u64 * TICK as u64;
     // Concealed samples come only from concealment frames; a frame may also
     // be marked Expand when a decode came up short (no counter), allowed for

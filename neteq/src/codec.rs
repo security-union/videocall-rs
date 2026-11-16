@@ -41,9 +41,16 @@ pub trait AudioDecoder {
 
     /// Continue codec-internal comfort noise after a DTX frame
     /// (neteq_impl.cc `NetEqImpl::DecodeCng`, which decodes an empty
-    /// payload). Returns `Ok(None)` when unsupported.
-    fn decode_comfort_noise(&mut self, _samples_per_channel: usize) -> Result<Option<Vec<f32>>> {
-        Ok(None)
+    /// payload). Appends the noise to `out` and returns `Ok(true)`, or
+    /// returns `Ok(false)` with `out` unchanged when unsupported. Appending
+    /// lets NetEq decode straight into its sync buffer, with no allocation
+    /// per 10 ms.
+    fn decode_comfort_noise(
+        &mut self,
+        _samples_per_channel: usize,
+        _out: &mut Vec<f32>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 }
 

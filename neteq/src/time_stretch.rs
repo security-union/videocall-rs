@@ -16,613 +16,694 @@
  * conditions.
  */
 
-const ENERGY_THRESHOLD_DECREASE_FACTOR: f32 = 0.995;
-const ENERGY_THRESHOLD_INCREASE_FACTOR: f32 = 1.002;
+//! Time stretching, ported from libwebrtc (commit aeb9b375):
+//! `modules/audio_coding/neteq/time_stretch.{h,cc}`, `accelerate.cc`,
+//! `preemptive_expand.cc`, and the helpers they call in `dsp_helper.cc` and
+//! `audio_vector.cc`.
+//!
+//! Both operations take about 30 ms of audio, estimate the pitch period on
+//! a 4 kHz copy of the first channel, and remove (accelerate) or repeat
+//! (preemptive expand) one pitch period by overlap-add at the 15 ms mark.
+//! Active speech is only stretched when the two periods correlate above
+//! 0.9; audio at background-noise level is always stretched.
+//!
+//! Analysis runs in `f64` on samples scaled to 16-bit range, so libwebrtc's
+//! energy constants carry over. libwebrtc's fixed-point arithmetic is not
+//! reproduced bit for bit, except in `parabolic_fit`.
 
-/// Return codes for time-stretching operations
-#[derive(Debug, Clone, Copy, PartialEq)]
+use crate::background_noise::BackgroundNoise;
+
+/// time_stretch.h `TimeStretch::ReturnCodes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeStretchResult {
+    /// Active speech was stretched.
     Success,
+    /// Background noise was stretched.
     SuccessLowEnergy,
+    /// The criteria were not met; the output is the input.
     NoStretch,
+    /// The input was too short; the output is the input.
     Error,
 }
 
-/// Audio time-stretching processor
-pub trait TimeStretcher {
-    /// Process audio samples and return the result
-    fn process(&mut self, input: &[f32], output: &mut [f32], fast_mode: bool) -> TimeStretchResult;
+/// time_stretch.h `kCorrelationLen`.
+const K_CORRELATION_LEN: usize = 50;
+/// time_stretch.h `kMinLag`.
+const K_MIN_LAG: usize = 10;
+/// time_stretch.h `kMaxLag`.
+const K_MAX_LAG: usize = 60;
+/// time_stretch.h `kDownsampledLen`.
+const K_DOWNSAMPLED_LEN: usize = K_CORRELATION_LEN + K_MAX_LAG;
+/// time_stretch.h `kCorrelationThreshold`: 0.9 in Q14.
+const K_CORRELATION_THRESHOLD: i32 = 14746;
+/// accelerate.cc `CheckCriteriaAndStretch`: 0.5 in Q14 in fast mode.
+const K_FAST_CORRELATION_THRESHOLD: i32 = 8192;
+/// accelerate.cc / preemptive_expand.cc `k15ms`, at 8 kHz.
+const K_15MS: usize = 120;
+/// time_stretch.cc `SpeechDetection`: background energy before any
+/// estimate exists.
+const K_DEFAULT_BACKGROUND_ENERGY: f64 = 75000.0;
 
-    // Returns the number of input samples used in the last operation
-    fn get_used_input_samples(&self) -> usize;
+/// dsp_helper.cc `kParabolaCoefficients`.
+const K_PARABOLA_COEFFICIENTS: [[i32; 3]; 17] = [
+    [120, 32, 64],
+    [140, 44, 75],
+    [150, 50, 80],
+    [160, 57, 85],
+    [180, 72, 96],
+    [200, 89, 107],
+    [210, 98, 112],
+    [220, 108, 117],
+    [240, 128, 128],
+    [260, 150, 139],
+    [270, 162, 144],
+    [280, 174, 149],
+    [300, 200, 160],
+    [320, 228, 171],
+    [330, 242, 176],
+    [340, 257, 181],
+    [360, 288, 192],
+];
 
-    /// Reset the time stretcher state
-    fn reset(&mut self);
+/// What the shared analysis (`TimeStretch::Process`) found.
+struct Analysis {
+    /// Pitch period in samples per channel.
+    peak_index: usize,
+    /// Correlation between the two periods, Q14.
+    best_correlation: i32,
+    active_speech: bool,
 }
 
-/// Accelerate algorithm - removes audio samples to speed up playback
-#[derive(Debug)]
+/// time_stretch.h `TimeStretch`: the part shared by both operations.
+#[derive(Debug, Clone)]
+struct TimeStretch {
+    sample_rate: u32,
+    /// `fs_mult_`: sample rate / 8000.
+    fs_mult: usize,
+    channels: usize,
+}
+
+impl TimeStretch {
+    fn new(sample_rate: u32, channels: usize) -> Self {
+        Self {
+            sample_rate,
+            fs_mult: (sample_rate / 8000) as usize,
+            channels: channels.max(1),
+        }
+    }
+
+    /// libwebrtc only supports 8, 16, 32 and 48 kHz (time_stretch.h
+    /// constructor DCHECK).
+    fn supported(&self) -> bool {
+        matches!(self.sample_rate, 8000 | 16000 | 32000 | 48000)
+    }
+
+    /// time_stretch.cc `TimeStretch::Process`, up to the call of
+    /// `CheckCriteriaAndStretch`.
+    fn analyze(&self, input: &[f32], background_noise: &BackgroundNoise) -> Analysis {
+        let fs_mult_120 = self.fs_mult * K_15MS;
+        // kRefChannel = 0, scaled to 16-bit range.
+        let signal: Vec<f64> = input
+            .iter()
+            .step_by(self.channels)
+            .map(|&s| f64::from(s) * 32768.0)
+            .collect();
+
+        let downsampled = downsample_to_4khz(&signal, self.sample_rate);
+        let auto_correlation = auto_correlation(&downsampled);
+        // DspHelper::PeakDetection with one peak, then shift by kMinLag.
+        let peak_index =
+            peak_detection(&auto_correlation, self.fs_mult) + K_MIN_LAG * self.fs_mult * 2;
+
+        let vec1 = &signal[fs_mult_120 - peak_index..fs_mult_120];
+        let vec2 = &signal[fs_mult_120..fs_mult_120 + peak_index];
+        let vec1_energy: f64 = vec1.iter().map(|x| x * x).sum();
+        let vec2_energy: f64 = vec2.iter().map(|x| x * x).sum();
+        let cross_corr: f64 = vec1.iter().zip(vec2).map(|(a, b)| a * b).sum();
+
+        let active_speech =
+            speech_detection(vec1_energy, vec2_energy, peak_index, background_noise);
+        let best_correlation = if active_speech {
+            // Normalized correlation in Q14, negative values not used,
+            // capped at 1.0.
+            let energy = (vec1_energy * vec2_energy).sqrt();
+            if energy > 0.0 {
+                ((cross_corr.max(0.0) / energy * 16384.0).floor() as i32).min(16384)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        Analysis {
+            peak_index,
+            best_correlation,
+            active_speech,
+        }
+    }
+}
+
+/// accelerate.{h,cc} `Accelerate`: removes one pitch period.
+#[derive(Debug, Clone)]
 pub struct Accelerate {
-    _sample_rate: u32,
-    _channels: u8,
-    used_input_samples: usize,
-    overlap_length: usize,
-    _max_change_rate: f32,
-    low_energy_threshold: f32,
+    base: TimeStretch,
 }
 
 impl Accelerate {
-    /// Create a new accelerate processor
-    pub fn new(sample_rate: u32, channels: u8) -> Self {
+    /// Create an accelerator for interleaved audio.
+    pub fn new(sample_rate: u32, channels: usize) -> Self {
         Self {
-            _sample_rate: sample_rate,
-            _channels: channels,
-            used_input_samples: 0,
-            overlap_length: Self::calculate_overlap_length(sample_rate),
-            _max_change_rate: 0.25, // Maximum 25% reduction
-            low_energy_threshold: 0.0001,
+            base: TimeStretch::new(sample_rate, channels),
         }
     }
 
-    fn calculate_overlap_length(sample_rate: u32) -> usize {
-        // Calculate overlap length based on sample rate (typically 4-6ms)
-        ((sample_rate as f32 * 0.003) as usize).max(32) // Minimum 32 samples
+    /// accelerate.cc `Accelerate::Process`. `input` is interleaved and
+    /// should be 30 ms long. The stretched audio is appended to `output`.
+    /// Returns the result and the number of samples per channel removed.
+    pub fn process(
+        &self,
+        input: &[f32],
+        fast_accelerate: bool,
+        background_noise: &BackgroundNoise,
+        output: &mut Vec<f32>,
+    ) -> (TimeStretchResult, usize) {
+        let ch = self.base.channels;
+        let fs_mult = self.base.fs_mult;
+        // "Input length must be (almost) 30 ms."
+        if !self.base.supported() || input.len() / ch < (2 * K_15MS - 1) * fs_mult {
+            output.extend_from_slice(input);
+            return (TimeStretchResult::Error, 0);
+        }
+        let analysis = self.base.analyze(input, background_noise);
+        // accelerate.cc SetParametersForPassiveSpeech: correlation is 0 and
+        // the peak is kept.
+        self.check_criteria_and_stretch(input, analysis, fast_accelerate, output)
     }
 
-    /// Accelerate the audio by removing samples
-    fn accelerate_internal(
-        &mut self,
+    /// accelerate.cc `Accelerate::CheckCriteriaAndStretch`.
+    fn check_criteria_and_stretch(
+        &self,
         input: &[f32],
-        output: &mut [f32],
+        analysis: Analysis,
         fast_mode: bool,
-    ) -> TimeStretchResult {
-        if input.len() <= output.len() {
-            // Input should always be longer then output for accelerate
-            output[..input.len()].copy_from_slice(input);
-            self.used_input_samples = input.len();
-            return TimeStretchResult::NoStretch;
-        }
-
-        if output.len() < self.overlap_length * 2 {
-            // Not enough samples to accelerate
-            output.copy_from_slice(&input[..output.len()]);
-            self.used_input_samples = output.len();
-            return TimeStretchResult::NoStretch;
-        }
-
-        let max_remove_low_energy = if fast_mode {
-            self.max_samples_to_remove(input, output, 0.4)
+        output: &mut Vec<f32>,
+    ) -> (TimeStretchResult, usize) {
+        let ch = self.base.channels;
+        let threshold = if fast_mode {
+            K_FAST_CORRELATION_THRESHOLD
         } else {
-            self.max_samples_to_remove(input, output, 0.2)
+            K_CORRELATION_THRESHOLD
         };
-        let max_remove_high_energy = if fast_mode {
-            self.max_samples_to_remove(input, output, 0.25)
-        } else {
-            // Don't use high energy remove in normal mode
-            0
-        };
-
-        let (mut best_pos, mut samples_to_remove) =
-            self.find_low_energy_to_remove(input, output, max_remove_low_energy);
-
-        let mut is_low_energy = true;
-        if !fast_mode {
-            if samples_to_remove == 0 {
-                // If no low-energy zone found, don't remove anything in normal mode
-                output.copy_from_slice(&input[..output.len()]);
-                self.used_input_samples = output.len();
-                return TimeStretchResult::NoStretch;
-            }
-        } else if samples_to_remove < max_remove_high_energy {
-            // In fast mode, always remove at least max_remove_high_energy samples
-            is_low_energy = false;
-            samples_to_remove = max_remove_high_energy;
-
-            // Find the best location to remove samples (lowest energy region)
-            best_pos = self.find_best_removal_point(
-                &input[..output.len() + samples_to_remove],
-                samples_to_remove,
-            );
+        if analysis.best_correlation <= threshold && analysis.active_speech {
+            output.extend_from_slice(input);
+            return (TimeStretchResult::NoStretch, 0);
         }
-
-        let usable_input = &input[..output.len() + samples_to_remove];
-
-        // original samples: 12346789
-        // samples_to_remove = 4, overlap_length = 2
-        // original:     |123456789|
-        // head+overlap: |1234 | // head_length = 2
-        // overlap+tail: |  789| // tail_start = 6
-        // result:       |12**9| // 2 samples overlapped
-        // head_length+overlap_length+(usable_input.len()-tail_start-overlap_length) = output.len()
-        // head_length+usable_input.len()-tail_start = output.len()
-        // tail_start= head_length+usable_input.len()-output.len() = head_length+(output.len()+samples_to_remove)-output.len() = head_length+samples_to_remove
-
-        // Copy the first part
-        output[..best_pos].copy_from_slice(&usable_input[..best_pos]);
-
-        crate::signal::crossfade(
-            &usable_input[best_pos..best_pos + self.overlap_length],
-            &usable_input
-                [best_pos + samples_to_remove..best_pos + samples_to_remove + self.overlap_length],
-            self.overlap_length,
-            &mut output[best_pos..best_pos + self.overlap_length],
+        let fs_mult_120 = self.base.fs_mult * K_15MS;
+        let mut peak_index = analysis.peak_index;
+        if fast_mode {
+            // "Fit as many multiples of `peak_index` as possible in
+            // fs_mult_120."
+            peak_index = (fs_mult_120 / peak_index) * peak_index;
+        }
+        // Copy 0 to 15 ms, then cross-fade the next `peak_index` samples
+        // onto its end, then copy the rest.
+        let start = output.len();
+        output.extend_from_slice(&input[..fs_mult_120 * ch]);
+        cross_fade(
+            output,
+            start,
+            &input[fs_mult_120 * ch..(fs_mult_120 + peak_index) * ch],
+            peak_index,
+            ch,
         );
-
-        // Copy the rest
-        output[best_pos + self.overlap_length..]
-            .copy_from_slice(&usable_input[best_pos + samples_to_remove + self.overlap_length..]);
-
-        self.used_input_samples = usable_input.len();
-
-        if is_low_energy {
-            TimeStretchResult::SuccessLowEnergy
-        } else {
+        output.extend_from_slice(&input[(fs_mult_120 + peak_index) * ch..]);
+        let result = if analysis.active_speech {
             TimeStretchResult::Success
-        }
-    }
-
-    fn max_samples_to_remove(
-        &mut self,
-        input: &[f32],
-        output: &[f32],
-        acceleration_factor: f32,
-    ) -> usize {
-        let max_remove = (output.len() as f32 * acceleration_factor) as usize;
-        let max_remove = max_remove.min(output.len() / 2); // Don't remove more than 1/3 of input (= 1/2 of output)
-        let max_remove = max_remove.min(input.len() - output.len());
-        max_remove.max(self.overlap_length)
-    }
-
-    fn find_low_energy_to_remove(
-        &mut self,
-        input: &[f32],
-        output: &mut [f32],
-        max_remove: usize,
-    ) -> (usize, usize) {
-        let usable_input = &input[..output.len() + max_remove];
-
-        let (best_pos, best_len) = Self::longest_low_energy_region(
-            usable_input,
-            self.low_energy_threshold,
-            |i: usize, len: usize| -> bool {
-                i + len.saturating_sub(self.overlap_length).min(max_remove) <= output.len()
-            },
-        );
-
-        if best_len > max_remove {
-            // we have more than enough to remove, lower the energy threshold
-            self.low_energy_threshold *= ENERGY_THRESHOLD_DECREASE_FACTOR;
-        } else if best_len < max_remove / 2 {
-            // not enough to remove, slowly increase the energy threshold
-            self.low_energy_threshold *= ENERGY_THRESHOLD_INCREASE_FACTOR;
-        }
-
-        let samples_to_remove = best_len.saturating_sub(self.overlap_length).min(max_remove);
-
-        if samples_to_remove < self.overlap_length {
-            return (0, 0);
-        }
-
-        (best_pos, samples_to_remove)
-    }
-
-    fn calculate_energy(&self, samples: &[f32]) -> f32 {
-        let sum_squares: f32 = samples.iter().map(|x| x * x).sum();
-        sum_squares / samples.len() as f32
-    }
-
-    fn find_best_removal_point(&self, input: &[f32], removal_length: usize) -> usize {
-        let mut best_position = input.len() / 3; // Default to middle-ish
-        let mut lowest_energy = f32::MAX;
-
-        // Search for the lowest energy region to remove
-        let search_start = self.overlap_length;
-        let search_end = input
-            .len()
-            .saturating_sub(removal_length + self.overlap_length);
-
-        for pos in (search_start..search_end).step_by(self.overlap_length / 2) {
-            let end_pos = (pos + removal_length).min(input.len());
-            let region_energy = self.calculate_energy(&input[pos..end_pos]);
-
-            if region_energy < lowest_energy {
-                lowest_energy = region_energy;
-                best_position = pos;
-            }
-        }
-
-        best_position
-    }
-
-    fn longest_low_energy_region<F>(
-        input: &[f32],
-        threshold: f32,
-        validate_candidate: F,
-    ) -> (usize, usize)
-    where
-        F: Fn(usize, usize) -> bool, // closure type
-    {
-        // Step 1: define energy as x^2. Compute the rolling sum of the energy deviation from
-        // threshold. In this rolling sum, if rolling_sum[j] - rolling_sum[j] <= 0, that means
-        // that the sum of the deviation from threshold between i and j is less then 0,
-        // which means that AVG(a[i..j]) <= threshold
-        // This algorithm finds the the largest range where that stands. The constainst
-        // validate_candidate is used to make sure that the final output size is correct.
-        let mut energy_deviation_rolling_sum = Vec::with_capacity(input.len() + 1);
-        energy_deviation_rolling_sum.push(0.0);
-        for &x in input {
-            energy_deviation_rolling_sum
-                .push(energy_deviation_rolling_sum.last().unwrap() + x * x - threshold);
-        }
-
-        // Step 2: build increasing peaks stack
-        // Rationale: if the range [i..j] statisfies the condition that rolling_sum[j] - rolling_sum[j] <= 0
-        // then any i' < i, where rolling_sum[i'] > rolling_sum[i] will also statisfy the condition.
-        // In other words, we need to find candidates that do not have a previous higher value.
-        let mut stack = Vec::new(); // stores indices of rolling_sum
-        for (i, &val) in energy_deviation_rolling_sum.iter().enumerate() {
-            if stack.is_empty() || val > energy_deviation_rolling_sum[*stack.last().unwrap()] {
-                stack.push(i);
-            }
-        }
-
-        // Step 3: reverse scan to find longest valid subarray
-        let mut max_len = 0;
-        let mut best_i = 0;
-
-        for j in (0..energy_deviation_rolling_sum.len()).rev() {
-            while !stack.is_empty() && stack[stack.len() - 1] >= j {
-                stack.pop();
-            }
-            if stack.is_empty() {
-                break;
-            }
-            let mut si = stack.len();
-            while si > 0 {
-                si -= 1;
-                let i = stack[si];
-                // Find the smallest i where the condition holds
-                if energy_deviation_rolling_sum[j] <= energy_deviation_rolling_sum[i] {
-                    let len = j - i;
-                    if len > max_len && validate_candidate(i, len) {
-                        max_len = len;
-                        best_i = i;
-                        stack.truncate(si);
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        (best_i, max_len)
+        } else {
+            TimeStretchResult::SuccessLowEnergy
+        };
+        (result, peak_index)
     }
 }
 
-// Allow Accelerate to be moved across threads (contains only primitive data, no interior mutability).
-unsafe impl Send for Accelerate {}
-
-impl TimeStretcher for Accelerate {
-    fn process(&mut self, input: &[f32], output: &mut [f32], fast_mode: bool) -> TimeStretchResult {
-        self.accelerate_internal(input, output, fast_mode)
-    }
-
-    fn get_used_input_samples(&self) -> usize {
-        self.used_input_samples
-    }
-
-    fn reset(&mut self) {
-        self.used_input_samples = 0;
-    }
-}
-
-/// Preemptive Expand algorithm - adds audio samples to slow down playback
-#[derive(Debug)]
+/// preemptive_expand.{h,cc} `PreemptiveExpand`: repeats one pitch period.
+#[derive(Debug, Clone)]
 pub struct PreemptiveExpand {
-    _sample_rate: u32,
-    _channels: u8,
-    used_input_samples: usize,
-    overlap_length: usize,
-    corr_threshold: f32,
+    base: TimeStretch,
+    /// `overlap_samples_`: neteq_impl.cc passes `expand_->overlap_length()`.
+    overlap_samples: usize,
 }
 
 impl PreemptiveExpand {
-    /// Create a new preemptive expand processor
-    pub fn new(sample_rate: u32, channels: u8) -> Self {
+    /// Create a preemptive expander for interleaved audio.
+    /// `overlap_samples` is the expand overlap length per channel.
+    pub fn new(sample_rate: u32, channels: usize, overlap_samples: usize) -> Self {
         Self {
-            _sample_rate: sample_rate,
-            _channels: channels,
-            used_input_samples: 0,
-            overlap_length: Self::calculate_overlap_length(sample_rate),
-            corr_threshold: 0.99,
+            base: TimeStretch::new(sample_rate, channels),
+            overlap_samples,
         }
     }
 
-    fn calculate_overlap_length(sample_rate: u32) -> usize {
-        // Calculate overlap length based on sample rate (typically 4-6ms)
-        ((sample_rate as f32 * 0.003) as usize).max(32) // Minimum 32 samples
-    }
-
-    /// Expand the audio by duplicating/stretching samples
-    fn expand_internal(
-        &mut self,
+    /// preemptive_expand.cc `PreemptiveExpand::Process`. `input` is
+    /// interleaved and should be 30 ms long; its first `old_data_length`
+    /// samples per channel have already been played and must not change.
+    /// The stretched audio is appended to `output`. Returns the result and
+    /// the number of samples per channel added.
+    pub fn process(
+        &self,
         input: &[f32],
-        output: &mut [f32],
-        _fast_mode: bool,
-    ) -> TimeStretchResult {
-        if input.len() < output.len() {
-            // Input should always be at least the length of output
-            output[..input.len()].copy_from_slice(input);
-            self.used_input_samples = input.len();
-            return TimeStretchResult::NoStretch;
+        old_data_length: usize,
+        background_noise: &BackgroundNoise,
+        output: &mut Vec<f32>,
+    ) -> (TimeStretchResult, usize) {
+        let ch = self.base.channels;
+        let fs_mult = self.base.fs_mult;
+        let len = input.len() / ch;
+        // "Input length must be (almost) 30 ms. Also, the new part must be
+        // at least `overlap_samples_` elements."
+        if !self.base.supported()
+            || len < (2 * K_15MS - 1) * fs_mult
+            || old_data_length + self.overlap_samples >= len
+        {
+            output.extend_from_slice(input);
+            return (TimeStretchResult::Error, 0);
         }
-
-        // Calculate energy of the input signal
-        let energy = self.calculate_energy(input);
-        let is_low_energy = energy < 0.01; // Threshold for low energy detection
-
-        // With 30ms input overlap_length is 3ms and max_add is about 13.5ms. Human voice
-        // is around 85 to 400Hz (including children). 85Hz is about 12ms, 400Hz is about
-        // 2.5ms. The correlation lag (aka: add_len) goes from overlap_length (3ms) to
-        // max_add (13.5ms), which mostly covers the range of the human voice.
-        let max_add = (output.len() - self.overlap_length) / 2;
-        if max_add < self.overlap_length {
-            // Not enough samples to expand
-            output.copy_from_slice(&input[..output.len()]);
-            self.used_input_samples = output.len();
-            return TimeStretchResult::NoStretch;
+        let mut analysis = self.base.analyze(input, background_noise);
+        if !analysis.active_speech {
+            // preemptive_expand.cc SetParametersForPassiveSpeech: the
+            // repeated part may not be longer than the new data.
+            analysis.peak_index = analysis.peak_index.min(len - old_data_length);
         }
+        self.check_criteria_and_stretch(input, old_data_length, analysis, output)
+    }
 
-        let mut best_corr = -1.0f32;
-        let mut best_pos = 0;
-        let mut best_add_len = 0;
-        for add_len in self.overlap_length..max_add {
-            let correlation_len = output.len() - add_len * 2;
-            let (pos, corr) = crate::signal::best_normalized_correlation(
-                &input[add_len..correlation_len + add_len],
-                &input[..correlation_len],
-                self.overlap_length,
-            );
-            if corr > best_corr {
-                best_corr = corr;
-                best_pos = pos;
-                best_add_len = add_len;
-            }
+    /// preemptive_expand.cc `PreemptiveExpand::CheckCriteriaAndStretch`.
+    fn check_criteria_and_stretch(
+        &self,
+        input: &[f32],
+        old_data_length: usize,
+        analysis: Analysis,
+        output: &mut Vec<f32>,
+    ) -> (TimeStretchResult, usize) {
+        let ch = self.base.channels;
+        let fs_mult_120 = self.base.fs_mult * K_15MS;
+        // "Check for strong correlation (>0.9 in Q14) and at least 15 ms new
+        // data, or passive speech."
+        let strong =
+            analysis.best_correlation > K_CORRELATION_THRESHOLD && old_data_length <= fs_mult_120;
+        if !(strong || !analysis.active_speech) {
+            output.extend_from_slice(input);
+            return (TimeStretchResult::NoStretch, 0);
         }
-
-        if best_corr < self.corr_threshold {
-            self.corr_threshold *= 0.98;
-
-            // Correlation is too low
-            output.copy_from_slice(&input[..output.len()]);
-            self.used_input_samples = output.len();
-            return TimeStretchResult::NoStretch;
-        } else {
-            self.corr_threshold = self.corr_threshold.max(best_corr * 0.95);
-        }
-
-        let usable_input = &input[..output.len() - best_add_len];
-
-        // Copy first part
-        output[..best_add_len + best_pos].copy_from_slice(&usable_input[..best_add_len + best_pos]);
-
-        // Crossfade duplicate region
-        crate::signal::crossfade(
-            &usable_input[best_add_len + best_pos..best_add_len + best_pos + self.overlap_length],
-            &usable_input[best_pos..best_pos + self.overlap_length],
-            self.overlap_length,
-            &mut output[best_add_len + best_pos..best_add_len + best_pos + self.overlap_length],
+        let peak_index = analysis.peak_index;
+        let unmodified_length = old_data_length.max(fs_mult_120);
+        // Copy the first part including the cross-fade region, cross-fade
+        // the `peak_index` samples before `unmodified_length` onto its end,
+        // then copy the rest from `unmodified_length`.
+        let start = output.len();
+        output.extend_from_slice(&input[..(unmodified_length + peak_index) * ch]);
+        cross_fade(
+            output,
+            start,
+            &input[(unmodified_length - peak_index) * ch..unmodified_length * ch],
+            peak_index,
+            ch,
         );
-
-        // Append rest
-        output[best_add_len + best_pos + self.overlap_length..]
-            .copy_from_slice(&usable_input[best_pos + self.overlap_length..]);
-
-        self.used_input_samples = usable_input.len();
-
-        if is_low_energy {
-            TimeStretchResult::SuccessLowEnergy
-        } else {
+        output.extend_from_slice(&input[unmodified_length * ch..]);
+        let result = if analysis.active_speech {
             TimeStretchResult::Success
+        } else {
+            TimeStretchResult::SuccessLowEnergy
+        };
+        (result, peak_index)
+    }
+}
+
+/// audio_vector.cc `AudioVector::CrossFade`, per channel on interleaved
+/// audio: the last `fade_length` samples of `output[start..]` fade into the
+/// first `fade_length` of `append`, and the rest of `append` is appended.
+fn cross_fade(output: &mut Vec<f32>, start: usize, append: &[f32], fade_length: usize, ch: usize) {
+    let have = (output.len() - start) / ch;
+    let append_len = append.len() / ch;
+    let fade_length = fade_length.min(have).min(append_len);
+    let position = output.len() - fade_length * ch;
+    // `alpha` is the mixing factor in Q14.
+    let alpha_step = 16384 / (fade_length as i32 + 1);
+    let mut alpha = 16384;
+    for i in 0..fade_length {
+        alpha -= alpha_step;
+        let a = alpha as f32 / 16384.0;
+        for c in 0..ch {
+            let idx = position + i * ch + c;
+            output[idx] = a * output[idx] + (1.0 - a) * append[i * ch + c];
         }
     }
+    output.extend_from_slice(&append[fade_length * ch..]);
+}
 
-    fn calculate_energy(&self, samples: &[f32]) -> f32 {
-        let sum_squares: f32 = samples.iter().map(|x| x * x).sum();
-        sum_squares / samples.len() as f32
+/// dsp_helper.cc `DspHelper::DownsampleTo4kHz` with delay compensation,
+/// via `WebRtcSpl_DownsampleFast` (downsample_fast.c).
+fn downsample_to_4khz(signal: &[f64], sample_rate: u32) -> [f64; K_DOWNSAMPLED_LEN] {
+    // Coefficients in Q12, decimation factor and phase delay.
+    let (coefficients, factor, delay): (&[i32], usize, usize) = match sample_rate {
+        8000 => (&[1229, 1638, 1229], 2, 2),
+        16000 => (&[614, 819, 1229, 819, 614], 4, 3),
+        32000 => (&[584, 512, 625, 667, 625, 512, 584], 8, 4),
+        _ => (&[1019, 390, 427, 440, 427, 390, 1019], 12, 4),
+    };
+    let mut out = [0.0f64; K_DOWNSAMPLED_LEN];
+    // `data_in` starts at `signal[filter_length - 1]` and is read at
+    // `data_in[i - j]`, which reaches back to `signal[0]`.
+    let offset = coefficients.len() - 1;
+    for (k, o) in out.iter_mut().enumerate() {
+        let i = offset + delay + factor * k;
+        let acc: f64 = coefficients
+            .iter()
+            .enumerate()
+            .map(|(j, &c)| f64::from(c) * signal[i - j])
+            .sum();
+        *o = acc / 4096.0;
+    }
+    out
+}
+
+/// time_stretch.cc `TimeStretch::AutoCorrelation`: correlation of the
+/// last `kCorrelationLen` downsampled samples with lags `kMinLag` to
+/// `kMaxLag - 1`, scaled to 16 bits as `WebRtcSpl_VectorBitShiftW32ToW16`
+/// does.
+fn auto_correlation(downsampled: &[f64; K_DOWNSAMPLED_LEN]) -> [i32; K_CORRELATION_LEN] {
+    let mut corr = [0.0f64; K_CORRELATION_LEN];
+    for (i, c) in corr.iter_mut().enumerate() {
+        let lagged = &downsampled[K_MAX_LAG - K_MIN_LAG - i..];
+        *c = downsampled[K_MAX_LAG..]
+            .iter()
+            .zip(lagged)
+            .take(K_CORRELATION_LEN)
+            .map(|(a, b)| a * b)
+            .sum();
+    }
+    let max_abs = corr.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+    // scaling = max(0, 17 - NormW32(max)): the largest value keeps 14 bits.
+    let scaling = if max_abs >= 1.0 {
+        (max_abs.log2().floor() as i32 - 13).max(0)
+    } else {
+        0
+    };
+    let divisor = 2f64.powi(scaling);
+    let mut out = [0i32; K_CORRELATION_LEN];
+    for (o, c) in out.iter_mut().zip(corr) {
+        *o = (c / divisor).floor() as i32;
+    }
+    out
+}
+
+/// dsp_helper.cc `DspHelper::PeakDetection` with one peak: index of the
+/// largest value, refined to the full sample rate.
+fn peak_detection(data: &[i32; K_CORRELATION_LEN], fs_mult: usize) -> usize {
+    // WebRtcSpl_MaxIndexW16: first index of the maximum.
+    let mut peak = 0;
+    for (i, &v) in data.iter().enumerate() {
+        if v > data[peak] {
+            peak = i;
+        }
+    }
+    let edge_index = K_CORRELATION_LEN - 1;
+    // dsp_helper.cc RefinePeak.
+    if peak == 0 {
+        0
+    } else if peak == edge_index {
+        // A single peak on the last sample: the sample past it is zero.
+        let next = 0;
+        if data[peak] > next {
+            parabolic_fit([data[peak - 1], data[peak], next], fs_mult, peak)
+        } else {
+            (peak * 2 + 1) * fs_mult
+        }
+    } else {
+        parabolic_fit([data[peak - 1], data[peak], data[peak + 1]], fs_mult, peak)
     }
 }
 
-// Safe because PreemptiveExpand only contains owned numeric data.
-unsafe impl Send for PreemptiveExpand {}
-
-impl TimeStretcher for PreemptiveExpand {
-    fn process(&mut self, input: &[f32], output: &mut [f32], fast_mode: bool) -> TimeStretchResult {
-        self.expand_internal(input, output, fast_mode)
+/// dsp_helper.cc `DspHelper::ParabolicFit`, integer arithmetic as in
+/// libwebrtc. Returns the refined peak index at the full sample rate.
+fn parabolic_fit(points: [i32; 3], fs_mult: usize, peak_index: usize) -> usize {
+    let fit_index: &[usize] = match fs_mult {
+        1 => &[0, 8, 16],
+        2 => &[0, 4, 8, 12, 16],
+        4 => &[0, 2, 4, 6, 8, 10, 12, 14, 16],
+        _ => &[0, 1, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15, 16],
+    };
+    let coefficient = |i: usize| K_PARABOLA_COEFFICIENTS[fit_index[i]][0] as i64;
+    let num = i64::from(points[0]) * -3 + i64::from(points[1]) * 4 - i64::from(points[2]);
+    let den = i64::from(points[0]) + i64::from(points[1]) * -2 + i64::from(points[2]);
+    let temp = num * 120;
+    let stp = coefficient(fs_mult) - coefficient(fs_mult - 1);
+    let strt = (coefficient(fs_mult) + coefficient(fs_mult - 1)) / 2;
+    let fs = fs_mult as i64;
+    let mut flag: i64 = 1;
+    if temp < -den * strt {
+        let mut lmt = strt - stp;
+        loop {
+            if flag == fs || temp > -den * lmt {
+                return (peak_index as i64 * 2 * fs - flag) as usize;
+            }
+            flag += 1;
+            lmt -= stp;
+        }
+    } else if temp > -den * (strt + stp) {
+        let mut lmt = strt + 2 * stp;
+        loop {
+            if flag == fs || temp < -den * lmt {
+                return (peak_index as i64 * 2 * fs + flag) as usize;
+            }
+            flag += 1;
+            lmt += stp;
+        }
     }
-
-    fn get_used_input_samples(&self) -> usize {
-        self.used_input_samples
-    }
-
-    fn reset(&mut self) {
-        self.used_input_samples = 0;
-    }
+    peak_index * 2 * fs_mult
 }
 
-/// Time stretch factory for creating time stretchers
-pub struct TimeStretchFactory;
-
-impl TimeStretchFactory {
-    /// Create an accelerate processor
-    pub fn create_accelerate(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher + Send> {
-        Box::new(Accelerate::new(sample_rate, channels))
-    }
-
-    /// Create a preemptive expand processor  
-    pub fn create_preemptive_expand(
-        sample_rate: u32,
-        channels: u8,
-    ) -> Box<dyn TimeStretcher + Send> {
-        Box::new(PreemptiveExpand::new(sample_rate, channels))
-    }
+/// time_stretch.cc `TimeStretch::SpeechDetection`: active speech when the
+/// mean energy of the two periods is more than eight times the background
+/// noise energy.
+fn speech_detection(
+    vec1_energy: f64,
+    vec2_energy: f64,
+    peak_index: usize,
+    background_noise: &BackgroundNoise,
+) -> bool {
+    let background = if background_noise.initialized() {
+        background_noise.energy()
+    } else {
+        K_DEFAULT_BACKGROUND_ENERGY
+    };
+    (vec1_energy + vec2_energy) / 16.0 > peak_index as f64 * background
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn generate_test_signal(length: usize, frequency: f32, sample_rate: u32) -> Vec<f32> {
-        (0..length)
+    const RATE: u32 = 48000;
+    const FS_MULT: usize = 6;
+    const MS30: usize = 1440;
+    const MS15: usize = 720;
+
+    /// A 200 Hz harmonic tone (period 240 samples at 48 kHz) at `amplitude`.
+    fn voiced(len: usize, amplitude: f32) -> Vec<f32> {
+        (0..len)
             .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.5
+                let t = i as f32 / RATE as f32;
+                let w = 2.0 * std::f32::consts::PI * 200.0 * t;
+                amplitude * (0.6 * w.sin() + 0.3 * (2.0 * w).sin() + 0.1 * (3.0 * w).sin())
             })
             .collect()
     }
 
-    #[test]
-    fn test_accelerate_creation() {
-        let accelerate = Accelerate::new(16000, 1);
-        assert_eq!(accelerate._sample_rate, 16000);
-        assert_eq!(accelerate._channels, 1);
+    fn noise(len: usize, amplitude: f32, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * amplitude
+            })
+            .collect()
+    }
+
+    fn near_multiple_of(value: usize, period: usize, tolerance: usize) -> bool {
+        let r = value % period;
+        r <= tolerance || period - r <= tolerance
     }
 
     #[test]
-    fn test_accelerate_processing() {
-        let mut accelerate = Accelerate::new(16000, 1);
-        let input = generate_test_signal(1600, 440.0, 16000); // 100ms of 440Hz tone
-        let mut output = vec![0.0; 800];
-
-        let result = accelerate.process(&input, &mut output, true);
-
-        // Should successfully accelerate
-        assert!(matches!(
-            result,
-            TimeStretchResult::Success | TimeStretchResult::SuccessLowEnergy
-        ));
-        // Should have recorder the number of used samples
-        assert!(accelerate.get_used_input_samples() > 0);
-        // Output should be shorter than used samples
-        assert!(output.len() < accelerate.get_used_input_samples());
+    fn passive_signal_always_expands_by_one_period() {
+        let pe = PreemptiveExpand::new(RATE, 1, 5 * FS_MULT);
+        // -60 dBFS noise: far below the default background energy.
+        let input = noise(MS30, 0.001, 7);
+        let mut output = Vec::new();
+        let (result, added) = pe.process(&input, 0, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::SuccessLowEnergy);
+        assert!((20 * FS_MULT..120 * FS_MULT).contains(&added), "{added}");
+        assert_eq!(output.len(), input.len() + added);
     }
 
     #[test]
-    fn test_preemptive_expand_creation() {
-        let expand = PreemptiveExpand::new(16000, 1);
-        assert_eq!(expand._sample_rate, 16000);
-        assert_eq!(expand._channels, 1);
+    fn passive_signal_always_accelerates_by_one_period() {
+        let accelerate = Accelerate::new(RATE, 1);
+        let input = noise(MS30, 0.001, 9);
+        let mut output = Vec::new();
+        let (result, removed) =
+            accelerate.process(&input, false, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::SuccessLowEnergy);
+        assert!(
+            (20 * FS_MULT..120 * FS_MULT).contains(&removed),
+            "{removed}"
+        );
+        assert_eq!(output.len(), input.len() - removed);
     }
 
     #[test]
-    fn test_preemptive_expand_processing() {
-        let mut expand = PreemptiveExpand::new(16000, 1);
-        let input = generate_test_signal(1600, 440.0, 16000); // 100ms of 440Hz tone
-        let mut output = vec![0.0; 800];
-
-        let result = expand.process(&input, &mut output, false);
-
-        // Should successfully expand
-        assert!(matches!(
-            result,
-            TimeStretchResult::Success | TimeStretchResult::SuccessLowEnergy
-        ));
-        // Should have recorder the number of used samples
-        assert!(expand.get_used_input_samples() > 0);
-        // Should have used less samples than the output size
-        assert!(expand.get_used_input_samples() < output.len());
+    fn correlated_speech_is_expanded_by_its_pitch_period() {
+        let pe = PreemptiveExpand::new(RATE, 1, 5 * FS_MULT);
+        let input = voiced(MS30, 0.5);
+        let mut output = Vec::new();
+        let (result, added) = pe.process(&input, 0, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::Success);
+        assert!(near_multiple_of(added, 240, 3), "{added}");
+        assert_eq!(output.len(), input.len() + added);
+        // Unmodified first 15 ms and an unmodified tail.
+        assert_eq!(output[..MS15], input[..MS15]);
+        assert_eq!(output[MS15 + added..], input[MS15..]);
     }
 
     #[test]
-    fn test_insufficient_input() {
-        let mut accelerate = Accelerate::new(16000, 1);
-        let input = vec![1.0; 10]; // Very short input
-        let mut output = vec![0.0; 20];
-
-        let result = accelerate.process(&input, &mut output, false);
-
-        // Should not stretch due to insufficient input
-        assert_eq!(result, TimeStretchResult::NoStretch);
-        assert_eq!(output[..10], input);
-        assert_eq!(output[10..], vec![0.0; 10]);
+    fn correlated_speech_is_accelerated_by_its_pitch_period() {
+        let accelerate = Accelerate::new(RATE, 1);
+        let input = voiced(MS30, 0.5);
+        let mut output = Vec::new();
+        let (result, removed) =
+            accelerate.process(&input, false, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::Success);
+        assert!(near_multiple_of(removed, 240, 3), "{removed}");
+        assert_eq!(output.len(), input.len() - removed);
+        assert_eq!(output[..MS15 - removed], input[..MS15 - removed]);
+        assert_eq!(output[MS15..], input[MS15 + removed..]);
     }
 
     #[test]
-    fn test_time_stretch_factory() {
-        let accelerate = TimeStretchFactory::create_accelerate(16000, 1);
-        let expand = TimeStretchFactory::create_preemptive_expand(16000, 1);
+    fn uncorrelated_loud_audio_is_not_stretched() {
+        let input = noise(MS30, 0.5, 3);
+        let bgn = BackgroundNoise::new();
 
-        // Should create valid processors
-        assert_eq!(accelerate.get_used_input_samples(), 0);
-        assert_eq!(expand.get_used_input_samples(), 0);
+        let mut output = Vec::new();
+        let pe = PreemptiveExpand::new(RATE, 1, 5 * FS_MULT);
+        assert_eq!(
+            pe.process(&input, 0, &bgn, &mut output),
+            (TimeStretchResult::NoStretch, 0)
+        );
+        assert_eq!(output, input);
+
+        let mut output = Vec::new();
+        let accelerate = Accelerate::new(RATE, 1);
+        assert_eq!(
+            accelerate.process(&input, false, &bgn, &mut output),
+            (TimeStretchResult::NoStretch, 0)
+        );
+        assert_eq!(output, input);
     }
 
     #[test]
-    fn test_reset_functionality() {
-        let mut accelerate = Accelerate::new(16000, 1);
-        let input = generate_test_signal(1600, 440.0, 16000);
-        let mut output = vec![0.0; 800];
-
-        // Process to change state
-        accelerate.process(&input, &mut output, false);
-        assert!(accelerate.get_used_input_samples() > 0);
-
-        // Reset should clear state
-        accelerate.reset();
-        assert_eq!(accelerate.get_used_input_samples(), 0);
+    fn fast_accelerate_removes_whole_periods_up_to_15ms() {
+        let accelerate = Accelerate::new(RATE, 1);
+        let input = voiced(MS30, 0.5);
+        let mut output = Vec::new();
+        let (result, removed) =
+            accelerate.process(&input, true, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::Success);
+        assert!(removed <= MS15 && removed > MS15 / 2, "{removed}");
+        assert_eq!(output.len(), input.len() - removed);
     }
 
     #[test]
-    fn test_longest_low_energy_region() {
-        let mut best_i: usize;
-        let mut best_len: usize;
+    fn short_input_is_an_error_and_passes_through() {
+        let input = voiced(MS30 / 2, 0.5);
+        let bgn = BackgroundNoise::new();
+        let mut output = Vec::new();
+        let pe = PreemptiveExpand::new(RATE, 1, 5 * FS_MULT);
+        assert_eq!(
+            pe.process(&input, 0, &bgn, &mut output),
+            (TimeStretchResult::Error, 0)
+        );
+        assert_eq!(output, input);
+        let mut output = Vec::new();
+        let accelerate = Accelerate::new(RATE, 1);
+        assert_eq!(
+            accelerate.process(&input, false, &bgn, &mut output),
+            (TimeStretchResult::Error, 0)
+        );
+        assert_eq!(output, input);
+    }
 
-        let mut input: Vec<f32>;
-        // energy:
-        // 0.04, 0.01, 0.09, 0.01, 0.04, 0.04, 0.01, 0.09, 0.25, 0.25, 0.01
-        // threshold avg: 0.03
-        // expected energy: 0.01, 0.04, 0.04, 0.01
-        // i = 3, len = 4
-        input = vec![0.2, -0.1, 0.3, 0.1, 0.2, -0.2, 0.1, 0.3, 0.5, -0.5, 0.1];
-        (best_i, best_len) =
-            Accelerate::longest_low_energy_region(&input, 0.03, |_i: usize, _len: usize| -> bool {
-                true
-            });
-        assert_eq!(best_i, 3);
-        assert_eq!(best_len, 4);
+    #[test]
+    fn expand_needs_15ms_of_new_data_for_active_speech() {
+        let pe = PreemptiveExpand::new(RATE, 1, 5 * FS_MULT);
+        let input = voiced(MS30, 0.5);
+        let mut output = Vec::new();
+        let result = pe.process(&input, MS15 + 1, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, (TimeStretchResult::NoStretch, 0));
+        assert_eq!(output, input);
+    }
 
-        input = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        (best_i, best_len) =
-            Accelerate::longest_low_energy_region(&input, 0.03, |_i: usize, _len: usize| -> bool {
-                true
-            });
-        assert_eq!(best_i, 0);
-        assert_eq!(best_len, 8);
+    #[test]
+    fn expand_never_changes_already_played_samples() {
+        let pe = PreemptiveExpand::new(RATE, 1, 5 * FS_MULT);
+        let input = noise(MS30, 0.001, 11);
+        let old = MS15 + 300;
+        let mut output = Vec::new();
+        let (result, added) = pe.process(&input, old, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::SuccessLowEnergy);
+        assert!(added <= MS30 - old);
+        assert_eq!(output[..old], input[..old]);
+    }
 
-        input = vec![
-            0.2, -0.1, 0.3, 0.1, 0.2, -0.2, 0.1, 0.3, 0.5, -0.5, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
-        ];
-        (best_i, best_len) =
-            Accelerate::longest_low_energy_region(&input, 0.03, |_i: usize, _len: usize| -> bool {
-                true
-            });
-        assert_eq!(best_i, 10);
-        assert_eq!(best_len, 7);
+    #[test]
+    fn stereo_changes_every_channel_by_the_same_length() {
+        let pe = PreemptiveExpand::new(RATE, 2, 5 * FS_MULT);
+        let mono = voiced(MS30, 0.5);
+        let input: Vec<f32> = mono.iter().flat_map(|&s| [s, -s]).collect();
+        let mut output = Vec::new();
+        let (result, added) = pe.process(&input, 0, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::Success);
+        assert_eq!(output.len(), input.len() + 2 * added);
+        assert!(output.as_chunks::<2>().0.iter().all(|f| f[0] == -f[1]));
+    }
 
-        (best_i, best_len) =
-            Accelerate::longest_low_energy_region(&input, 0.03, |i: usize, len: usize| -> bool {
-                let max_output_len = 15;
-                i + len <= max_output_len
-            });
-        assert_eq!(best_i, 10);
-        assert_eq!(best_len, 5);
+    #[test]
+    fn a_learned_background_level_makes_quiet_speech_active() {
+        // Quiet voiced audio at about -50 dBFS is below the default
+        // background energy, so it counts as passive; once a lower noise
+        // level is learned it is active speech.
+        let input = voiced(MS30, 0.004);
+        let pe = PreemptiveExpand::new(RATE, 1, 5 * FS_MULT);
+        let mut output = Vec::new();
+        let (result, _) = pe.process(&input, 0, &BackgroundNoise::new(), &mut output);
+        assert_eq!(result, TimeStretchResult::SuccessLowEnergy);
 
-        (best_i, best_len) =
-            Accelerate::longest_low_energy_region(&input, 0.03, |i: usize, len: usize| -> bool {
-                let max_output_len = 13;
-                i + len <= max_output_len
-            });
-        assert_eq!(best_i, 3);
-        assert_eq!(best_len, 4);
+        let mut bgn = BackgroundNoise::new();
+        assert!(bgn.update(&noise(256, 0.0002, 5)));
+        let mut output = Vec::new();
+        let (result, _) = pe.process(&input, 0, &bgn, &mut output);
+        assert_eq!(result, TimeStretchResult::Success);
+    }
+
+    #[test]
+    fn parabolic_fit_matches_libwebrtc_on_a_symmetric_peak() {
+        // A symmetric peak stays on its integer index.
+        assert_eq!(parabolic_fit([100, 200, 100], 6, 10), 10 * 12);
+        // A peak leaning right moves right by up to half a 4 kHz sample.
+        let right = parabolic_fit([100, 200, 190], 6, 10);
+        assert!(right > 120 && right <= 126, "{right}");
+        let left = parabolic_fit([190, 200, 100], 6, 10);
+        assert!((114..120).contains(&left), "{left}");
     }
 }

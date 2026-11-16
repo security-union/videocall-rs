@@ -166,6 +166,11 @@ impl Histogram {
         self.add_count = 0;
     }
 
+    /// The bucket probabilities in Q30 (histogram.h `buckets()`).
+    pub fn buckets(&self) -> &[i32] {
+        &self.buckets
+    }
+
     /// Number of buckets.
     pub fn num_buckets(&self) -> usize {
         self.buckets.len()

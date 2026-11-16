@@ -113,27 +113,36 @@ impl RelativeArrivalDelayTracker {
 
     /// Update with a new packet arrival
     pub fn update(&mut self, timestamp: u32, sample_rate: u32, arrival_time: Instant) -> i32 {
-        // Calculate expected time since last packet
-        let expected_iat_ms = if let Some(last_timestamp) = self.last_timestamp {
-            timestamp.saturating_sub(last_timestamp) * 1000 / sample_rate
-        } else {
-            0
-        };
-
-        // Calculate actual time since last packet
-        let actual_iat_ms = if let Some(last_time) = self.last_packet_time {
-            arrival_time.duration_since(last_time).as_millis() as i32
-        } else {
-            0
-        };
-
-        // Calculate jitter: positive means packet is late, negative means packet is early
-        let iat_delay_ms = actual_iat_ms - expected_iat_ms as i32;
+        if let (Some(last_timestamp), Some(last_time)) =
+            (self.last_timestamp, self.last_packet_time)
+        {
+            // Signed serial arithmetic: a duplicate or a reordered (e.g.
+            // RED-recovered) packet is not newer and says nothing about the
+            // spacing of the stream; it neither moves the baseline nor adds
+            // a sample.
+            let ts_delta = timestamp.wrapping_sub(last_timestamp) as i32;
+            if ts_delta <= 0 {
+                return self.calculate_relative_packet_arrival_delay();
+            }
+            // 64-bit: an RTP gap of more than ~89 s at 48 kHz overflowed u32.
+            let expected_iat_ms = i64::from(ts_delta) * 1000 / i64::from(sample_rate.max(1));
+            let actual_iat_ms = arrival_time.duration_since(last_time).as_millis() as i64;
+            let window_ms = i64::from(self.config.max_history_ms);
+            if expected_iat_ms <= window_ms && actual_iat_ms <= window_ms {
+                // Jitter: positive means the packet is late, negative early.
+                let iat_delay_ms = (actual_iat_ms - expected_iat_ms)
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                    as i32;
+                self.update_delay_history(iat_delay_ms, timestamp, sample_rate);
+            }
+            // A gap longer than the history window (a long DTX silence
+            // without refreshes, a muted or on-hold sender) restarts the
+            // baseline instead of producing one huge sample; older samples
+            // age out of the window as usual (as libwebrtc's
+            // PacketArrivalHistory does with its 2 s window).
+        }
 
         self.last_packet_time = Some(arrival_time);
-
-        // Update delay history
-        self.update_delay_history(iat_delay_ms, timestamp, sample_rate);
 
         // Calculate relative packet arrival delay
         let relative_delay = self.calculate_relative_packet_arrival_delay();
@@ -417,6 +426,39 @@ mod tests {
         // Target delay should adapt to the jitter
         let target_delay = delay_manager.target_delay_ms();
         assert!(target_delay >= 20); // At least one packet duration
+    }
+
+    #[test]
+    fn test_tracker_survives_long_gaps() {
+        // 95 s of RTP time between two packets (a muted or on-hold sender):
+        // the old u32 arithmetic overflowed after ~89 s at 48 kHz. A gap
+        // longer than the history window restarts the baseline instead of
+        // adding one huge sample.
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        let t0 = Instant::now();
+        tracker.update(0, 48_000, t0);
+        let delay = tracker.update(95 * 48_000, 48_000, t0 + Duration::from_millis(20));
+        assert_eq!(delay, 0);
+        assert!(tracker.delay_history.is_empty(), "no sample spans the gap");
+        // Spacing after the gap is measured from the new baseline.
+        let delay = tracker.update(95 * 48_000 + 960, 48_000, t0 + Duration::from_millis(60));
+        assert_eq!(delay, 20, "20 ms late relative to the new baseline");
+    }
+
+    #[test]
+    fn test_tracker_ignores_duplicates_and_older_packets() {
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        let t0 = Instant::now();
+        tracker.update(960, 48_000, t0);
+        tracker.update(1920, 48_000, t0 + Duration::from_millis(20));
+        let samples = tracker.delay_history.len();
+        // A duplicate, then an older (e.g. RED-recovered) packet: no sample,
+        // and the baseline stays at the newest packet. (Unsigned subtraction
+        // read the older one as a jump of ~4.3 billion samples.)
+        tracker.update(1920, 48_000, t0 + Duration::from_millis(25));
+        tracker.update(940, 48_000, t0 + Duration::from_millis(26));
+        assert_eq!(tracker.delay_history.len(), samples);
+        assert_eq!(tracker.last_timestamp, Some(1920));
     }
 
     #[test]

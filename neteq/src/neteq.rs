@@ -209,6 +209,111 @@ pub struct NetEq {
     /// Number of samples added by time-stretching operations (matches WebRTC sample_memory_,
     /// but with clearer meaning for positive/negative values).
     timestretch_added_samples: i32,
+    /// Discontinuous transmission (DTX) and comfort noise.
+    dtx: DtxState,
+}
+
+/// Comfort noise continues at most this long without any packet; then
+/// concealment takes over (WebRTC `kCngTimeoutMs`).
+const K_CNG_TIMEOUT_MS: u32 = 1000;
+/// After comfort noise, decoding resumes once the buffer (including the
+/// oldest packet's waiting time) reaches this share of the target level
+/// (WebRTC `kPostponeDecodingLevel`).
+const K_POSTPONE_DECODING_LEVEL_PERCENT: u32 = 50;
+
+/// An Opus DTX frame: a payload of at most 2 bytes carries no audio, only
+/// the signal that the encoder entered DTX (WebRTC `IsDtxPacket`).
+fn is_dtx_payload(payload: &[u8]) -> bool {
+    payload.len() <= 2
+}
+
+/// Duration of an Opus packet in samples at `sample_rate`, read from its
+/// TOC byte (RFC 6716 §3.1); `None` if the payload is not parseable.
+fn opus_packet_samples(payload: &[u8], sample_rate: u32) -> Option<u32> {
+    let toc = *payload.first()?;
+    let config = toc >> 3;
+    let frame_48k: u32 = match config {
+        0..=11 => [480, 960, 1920, 2880][usize::from(config % 4)], // SILK 10/20/40/60 ms
+        12..=15 => [480, 960][usize::from(config % 2)],            // Hybrid 10/20 ms
+        _ => [120, 240, 480, 960][usize::from(config % 4)],        // CELT 2.5/5/10/20 ms
+    };
+    let frames = match toc & 0x3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => u32::from(*payload.get(1)? & 0x3f),
+    };
+    (frames > 0).then(|| frame_48k * frames * sample_rate / 48_000)
+}
+
+/// Ceiling for comfort noise the decoder cannot produce itself (about -45
+/// dBFS RMS): a "noise floor" above it is speech, e.g. a talker who goes
+/// silent before any quiet frame was decoded, not background.
+const K_MAX_FALLBACK_NOISE_RMS: f32 = 0.0056;
+
+/// DTX and comfort-noise state.
+#[derive(Debug)]
+struct DtxState {
+    /// The last output was comfort noise (WebRTC's codec-internal CNG mode).
+    cng_active: bool,
+    /// The last decoded packet was a DTX frame.
+    last_decoded_dtx: bool,
+    /// Timing-detected DTX, for senders that drop every DTX frame (RFC 7587
+    /// allows not transmitting them): contiguous sequence numbers with a
+    /// timestamp jump beyond the previous packet's duration.
+    fallback: bool,
+    /// Comfort-noise samples (per channel) generated since the last packet.
+    generated_noise_samples: usize,
+    /// The last DTX payload and its payload type, decoded again to continue
+    /// comfort noise from the codec at the real noise floor.
+    last_dtx_payload: Option<(u8, Vec<u8>)>,
+    /// Payload type of the last decoded packet.
+    last_payload_type: Option<u8>,
+    /// Newest inserted packet: (sequence, timestamp, duration in samples).
+    last_inserted: Option<(u16, u32, u32)>,
+    /// Decoded comfort noise not yet played (decoders return whole packets).
+    cng_leftover: Vec<f32>,
+    /// Noise-floor estimate (RMS) of the decoded audio: comfort noise is
+    /// generated at this level when the decoder cannot produce it.
+    noise_floor_rms: f32,
+}
+
+impl Default for DtxState {
+    fn default() -> Self {
+        Self {
+            cng_active: false,
+            last_decoded_dtx: false,
+            fallback: false,
+            generated_noise_samples: 0,
+            last_dtx_payload: None,
+            last_payload_type: None,
+            last_inserted: None,
+            cng_leftover: Vec::new(),
+            noise_floor_rms: f32::MAX,
+        }
+    }
+}
+
+impl DtxState {
+    /// In a DTX period: the stream is silent on purpose, so an empty buffer
+    /// means comfort noise, not loss.
+    fn in_dtx(&self) -> bool {
+        self.cng_active || self.last_decoded_dtx || self.fallback
+    }
+
+    /// Track the noise floor as the minimum packet RMS, rising slowly (1% per
+    /// packet, about 4 dB/s at 20 ms packets) so that a louder background is
+    /// followed within seconds.
+    fn observe_decoded(&mut self, pcm: &[f32]) {
+        if pcm.is_empty() {
+            return;
+        }
+        let rms = (pcm.iter().map(|x| x * x).sum::<f32>() / pcm.len() as f32).sqrt();
+        self.noise_floor_rms = if rms < self.noise_floor_rms {
+            rms
+        } else {
+            self.noise_floor_rms * 1.01
+        };
+    }
 }
 
 impl NetEq {
@@ -278,6 +383,7 @@ impl NetEq {
             packets_per_sec_snapshot: 0,
             leftover_time_stretched_samples: Vec::new(),
             timestretch_added_samples: 0,
+            dtx: DtxState::default(),
         })
     }
 
@@ -310,7 +416,11 @@ impl NetEq {
         }
 
         // Normal NetEQ processing
-        // Update delay manager
+        self.observe_dtx_cadence(&packet);
+
+        // Update delay manager. DTX packets and comfort-noise refreshes are
+        // fed too: the tracker compares arrival spacing with timestamp
+        // spacing, so a 400 ms refresh interval reads as zero jitter.
         self.delay_manager
             .update(packet.header.timestamp, packet.sample_rate, false)?;
 
@@ -414,6 +524,10 @@ impl NetEq {
             }
         }
 
+        if frame.speech_type == SpeechType::Cng {
+            self.statistics
+                .generated_noise_samples(frame.samples_per_channel as u64);
+        }
         // Record decode operation for per-second tracking
         self.statistics.record_decode_operation(operation);
 
@@ -487,6 +601,68 @@ impl NetEq {
         self.reset();
     }
 
+    /// Duration of a packet in samples per channel: from the Opus TOC when a
+    /// decoder is registered for its payload type, else as declared.
+    fn packet_duration_samples(&self, packet: &AudioPacket) -> u32 {
+        let declared = (packet.expected_samples() / usize::from(packet.channels.max(1))) as u32;
+        if self.decoders.contains_key(&packet.header.payload_type) {
+            opus_packet_samples(&packet.payload, packet.sample_rate).unwrap_or(declared)
+        } else {
+            declared
+        }
+    }
+
+    /// Timing fallback for DTX, for senders that never transmit DTX frames.
+    /// Duplicates and older packets are ignored, with signed serial
+    /// arithmetic: a frame recovered from redundancy (RED) carries a
+    /// timestamp *before* the newest one, which unsigned subtraction would
+    /// read as a huge jump. DTX means at least one whole frame was not
+    /// transmitted: the timestamp advanced by at least one packet duration
+    /// more than the skipped sequence numbers can cover. A smaller excess is
+    /// inconsistent timing (e.g. a recovered frame stamped a few samples off),
+    /// not silence. The next sequence number at most one duration later
+    /// ends DTX.
+    fn observe_dtx_cadence(&mut self, packet: &AudioPacket) {
+        let seq = packet.header.sequence_number;
+        let ts = packet.header.timestamp;
+        let duration = self.packet_duration_samples(packet);
+        if let Some((last_seq, last_ts, last_duration)) = self.dtx.last_inserted {
+            let seq_delta = seq.wrapping_sub(last_seq) as i16;
+            if seq_delta <= 0 {
+                return;
+            }
+            let ts_delta = ts.wrapping_sub(last_ts) as i32;
+            if ts_delta > 0 && !is_dtx_payload(&packet.payload) {
+                let covered = i64::from(seq_delta) * i64::from(last_duration);
+                if i64::from(ts_delta) >= covered + i64::from(last_duration) {
+                    self.dtx.fallback = true;
+                } else if seq_delta == 1 && ts_delta as u32 <= last_duration {
+                    self.dtx.fallback = false;
+                }
+            }
+        }
+        self.dtx.last_inserted = Some((seq, ts, duration));
+    }
+
+    /// Keep playing comfort noise until the buffer, including the oldest
+    /// packet's waiting time, reaches half the target level, so speech does
+    /// not run dry right after a silence (WebRTC `PostponeDecode`).
+    fn postpone_decode(&self, current_buffer_samples: usize, target_level_samples: u32) -> bool {
+        let waited = self
+            .packet_buffer
+            .peek_next_packet()
+            .map(|p| p.age().as_millis() as usize * (self.config.sample_rate / 1000) as usize)
+            .unwrap_or(0);
+        // At least 3.5 output frames: the expand-start rule in get_decision
+        // conceals below 1.5 frames, and with packets arriving every 20 ms
+        // the buffer drops by two frames between arrivals — resuming with
+        // less ran dry right after the first packet (measured with real
+        // speech: a 20 ms concealment at every talkspurt start).
+        let min_level = ((target_level_samples * K_POSTPONE_DECODING_LEVEL_PERCENT / 100) as usize)
+            .max(self.output_frame_size_samples * 7 / 2);
+        current_buffer_samples + waited < min_level
+    }
+
     /// Reset internal state without clearing the incoming packet buffer.
     /// Used after prolonged expansion to recalibrate filters while preserving
     /// any packets that may have arrived during the expansion period.
@@ -502,6 +678,7 @@ impl NetEq {
         self.last_packets_second_instant = Instant::now();
         self.leftover_time_stretched_samples.clear();
         self.timestretch_added_samples = 0;
+        self.dtx = DtxState::default();
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
@@ -513,8 +690,12 @@ impl NetEq {
         self.buffer_level_filter
             .set_target_buffer_level(target_delay_ms);
 
-        self.buffer_level_filter
-            .update(current_buffer_samples, -self.timestretch_added_samples);
+        // Not during comfort noise: the buffer is empty on purpose (WebRTC
+        // skips the filter in CNG modes).
+        if !self.dtx.cng_active {
+            self.buffer_level_filter
+                .update(current_buffer_samples, -self.timestretch_added_samples);
+        }
 
         // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
         self.timestretch_added_samples = 0;
@@ -533,6 +714,57 @@ impl NetEq {
 
         if !self.leftover_time_stretched_samples.is_empty() {
             return Ok(Operation::TimeStretchBuffer);
+        }
+
+        // DTX: the sender is silent on purpose. An empty buffer plays comfort
+        // noise (up to K_CNG_TIMEOUT_MS), speech after silence waits for the
+        // buffer to refill, and nothing is time-stretched.
+        let next_is_dtx = self
+            .packet_buffer
+            .peek_next_packet()
+            .map(|p| is_dtx_payload(&p.payload));
+        if next_is_dtx == Some(true) {
+            // A DTX frame is decoded as it is (the codec turns it into
+            // comfort noise), after any leftover samples — never merged or
+            // time-stretched, even right after a concealment (WebRTC
+            // neteq_impl.cc). Waiting would let the low-limit rule below
+            // conceal until the next packet (measured: ~400 ms on a jittery
+            // link when 192 leftover samples were pending).
+            self.consecutive_expands = 0;
+            return Ok(Operation::Normal);
+        }
+        if self.dtx.in_dtx() {
+            if current_buffer_samples < self.output_frame_size_samples {
+                let timeout = (K_CNG_TIMEOUT_MS * samples_per_ms) as usize;
+                if self.dtx.generated_noise_samples <= timeout {
+                    self.consecutive_expands = 0;
+                    return Ok(Operation::ComfortNoise);
+                }
+                // Timed out: no packet for a second, fall through to
+                // concealment.
+            } else if self.dtx.cng_active
+                && self.leftover_samples.is_empty()
+                && self.postpone_decode(current_buffer_samples, target_level_samples)
+            {
+                return Ok(Operation::ComfortNoise);
+            } else if self.consecutive_expands == 0 {
+                if self.dtx.cng_active {
+                    // Leaving comfort noise: the filter was not updated during
+                    // the silence, so start it from the real buffer level, or
+                    // a stale pre-silence level triggers acceleration on an
+                    // almost empty buffer (WebRTC FuturePacketAvailable).
+                    self.buffer_level_filter
+                        .set_filtered_buffer_level(current_buffer_samples);
+                }
+                return Ok(Operation::Normal);
+            } else {
+                // A packet arrived while concealing in a DTX context (a
+                // sender without DTX frames, before its first refresh):
+                // blend into it now. Holding out for the low limit would
+                // trap a lone refresh until the next talkspurt.
+                self.consecutive_expands = 0;
+                return Ok(Operation::ExpandEnd);
+            }
         }
 
         if self.consecutive_expands > 0 && current_buffer_samples < low_limit as usize {
@@ -615,9 +847,19 @@ impl NetEq {
             match self.packet_buffer.get_next_packet() {
                 Some(packet) => {
                     // Decode based on payload type if we have a decoder; otherwise treat as raw f32 PCM.
-                    let packet_samples: Vec<f32> = if let Some(dec) =
-                        self.decoders.get_mut(&packet.header.payload_type)
-                    {
+                    let dtx_without_codec_support = is_dtx_payload(&packet.payload)
+                        && self
+                            .decoders
+                            .get(&packet.header.payload_type)
+                            .is_some_and(|d| !d.supports_dtx());
+                    let packet_samples: Vec<f32> = if dtx_without_codec_support {
+                        // Never hand a DTX frame to a decoder of unknown DTX
+                        // behaviour (a browser decoder may fail or, worse,
+                        // return a test tone): comfort noise for the frame.
+                        let samples = self.packet_duration_samples(&packet) as usize
+                            * usize::from(packet.channels.max(1));
+                        self.fallback_noise(samples)
+                    } else if let Some(dec) = self.decoders.get_mut(&packet.header.payload_type) {
                         match dec.decode(&packet.payload) {
                             Ok(pcm) => pcm,
                             Err(e) => {
@@ -638,6 +880,20 @@ impl NetEq {
                         v
                     };
 
+                    // DTX bookkeeping: decoding a DTX frame is comfort noise.
+                    let dtx = is_dtx_payload(&packet.payload);
+                    self.dtx.last_decoded_dtx = dtx;
+                    self.dtx.cng_active = dtx;
+                    self.dtx.generated_noise_samples = 0;
+                    self.dtx.cng_leftover.clear();
+                    self.dtx.last_payload_type = Some(packet.header.payload_type);
+                    if dtx {
+                        self.dtx.last_dtx_payload =
+                            Some((packet.header.payload_type, packet.payload.clone()));
+                    } else {
+                        self.dtx.observe_decoded(&packet_samples);
+                    }
+
                     let available = packet_samples.len();
                     let need_now = samples_needed - filled;
                     let to_copy = need_now.min(available);
@@ -656,8 +912,13 @@ impl NetEq {
                     }
 
                     self.last_decode_timestamp = Some(packet.header.timestamp);
-                    frame.speech_type = SpeechType::Normal;
-                    frame.vad_activity = true;
+                    if dtx {
+                        frame.speech_type = SpeechType::Cng;
+                        frame.vad_activity = false;
+                    } else {
+                        frame.speech_type = SpeechType::Normal;
+                        frame.vad_activity = true;
+                    }
                 }
                 None => {
                     // Buffer empty before we could fill frame
@@ -883,15 +1144,66 @@ impl NetEq {
     }
 
     fn generate_comfort_noise(&mut self, frame: &mut AudioFrame) -> Result<()> {
-        // Generate comfort noise
-        for sample in &mut frame.samples {
-            *sample = (simple_random() - 0.5) * 0.000005; // Much quieter comfort noise
+        // First the tail of the last decoded audio (less than a frame, e.g. a
+        // time-stretching remainder): it precedes the silence, and left in
+        // place it would sit through the whole DTX gap.
+        let tail = self.leftover_samples.len().min(frame.samples.len());
+        frame.samples[..tail].copy_from_slice(&self.leftover_samples[..tail]);
+        self.leftover_samples.drain(..tail);
+        let needed = frame.samples.len() - tail;
+        while self.dtx.cng_leftover.len() < needed {
+            match self.decode_comfort_noise() {
+                Some(pcm) if !pcm.is_empty() => self.dtx.cng_leftover.extend(pcm),
+                _ => {
+                    // The decoder cannot continue comfort noise (e.g. a
+                    // browser decoder): noise at the measured noise floor,
+                    // so the background does not pump.
+                    let missing = needed - self.dtx.cng_leftover.len();
+                    let noise = self.fallback_noise(missing);
+                    self.dtx.cng_leftover.extend(noise);
+                }
+            }
         }
+        frame.samples[tail..].copy_from_slice(&self.dtx.cng_leftover[..needed]);
+        self.dtx.cng_leftover.drain(..needed);
+        self.dtx.generated_noise_samples += frame.samples_per_channel;
+        self.dtx.cng_active = true;
 
         frame.speech_type = SpeechType::Cng;
         frame.vad_activity = false;
 
         Ok(())
+    }
+
+    /// Comfort noise from the codec, if it supports DTX: the last DTX frame
+    /// decoded again, or an empty payload when only the timing fallback
+    /// detected DTX. libopus continues comfort noise at the real noise floor
+    /// for both.
+    fn decode_comfort_noise(&mut self) -> Option<Vec<f32>> {
+        let (payload_type, payload) = match &self.dtx.last_dtx_payload {
+            Some((pt, payload)) => (*pt, payload.clone()),
+            None => (self.dtx.last_payload_type?, Vec::new()),
+        };
+        let decoder = self.decoders.get_mut(&payload_type)?;
+        if !decoder.supports_dtx() {
+            return None;
+        }
+        decoder.decode(&payload).ok()
+    }
+
+    /// `samples` of noise at the tracked noise floor (capped), for decoders
+    /// that cannot produce comfort noise.
+    fn fallback_noise(&self, samples: usize) -> Vec<f32> {
+        let floor = self.dtx.noise_floor_rms;
+        let rms = if floor.is_finite() {
+            floor.min(K_MAX_FALLBACK_NOISE_RMS)
+        } else {
+            0.000_001 // nothing decoded yet
+        };
+        let amplitude = rms * 3f32.sqrt(); // uniform noise of that RMS
+        (0..samples)
+            .map(|_| (simple_random() * 2.0 - 1.0) * amplitude)
+            .collect()
     }
 
     pub fn current_buffer_size_ms(&self) -> u32 {
@@ -1416,6 +1728,70 @@ mod tests {
                     .set_filtered_buffer_level(neteq.current_buffer_size_samples());
             }
         }};
+    }
+
+    /// RED recovery as videocall-client inserts it: frame 10 is lost, packet
+    /// 11 carries it; the recovered frame (timestamp of packet 11 minus 20)
+    /// goes in first, then the primary. Inserting the recovered frame must
+    /// not start DTX — with RTP timestamps (it lands 940 samples late, less
+    /// than one frame) or with saturated ones (it lands 20 *before* the
+    /// newest, which unsigned arithmetic reads as a jump of ~4.3 billion).
+    #[test]
+    fn test_red_recovered_frame_does_not_start_dtx() {
+        for saturated in [false, true] {
+            let mut neteq = NetEq::new(NetEqConfig {
+                sample_rate: 48_000,
+                channels: 1,
+                ..NetEqConfig::default()
+            })
+            .unwrap();
+            let ts = |k: u32| if saturated { u32::MAX } else { k * 960 };
+            let opus = vec![0x78, 0x01, 0x02, 0x03]; // a 20 ms SILK frame (TOC 0x78)
+            for k in 0..10u16 {
+                let header = RtpHeader::new(k, ts(u32::from(k)), 1, 111, false);
+                neteq
+                    .insert_packet(AudioPacket::new(header, opus.clone(), 48_000, 1, 20))
+                    .unwrap();
+            }
+            let recovered = RtpHeader::new(10, ts(11).saturating_sub(20), 1, 111, false);
+            neteq
+                .insert_packet(AudioPacket::new(recovered, opus.clone(), 48_000, 1, 20))
+                .unwrap();
+            assert!(
+                !neteq.dtx.in_dtx(),
+                "saturated={saturated}: recovered frame started DTX"
+            );
+            let primary = RtpHeader::new(11, ts(11), 1, 111, false);
+            neteq
+                .insert_packet(AudioPacket::new(primary, opus.clone(), 48_000, 1, 20))
+                .unwrap();
+            assert!(
+                !neteq.dtx.in_dtx(),
+                "saturated={saturated}: primary started DTX"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dtx_packet_is_never_time_stretched() {
+        // A buffer far above the high limit would normally accelerate; when
+        // the next packet is a DTX frame it is decoded as it is.
+        let mut neteq = NetEq::new(NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            ..NetEqConfig::default()
+        })
+        .unwrap();
+        for i in 0..40u16 {
+            let header = RtpHeader::new(i, u32::from(i) * 960, 1, 111, false);
+            neteq
+                .insert_packet(AudioPacket::new(header, vec![0x78], 48_000, 1, 20))
+                .unwrap();
+        }
+        neteq
+            .buffer_level_filter
+            .set_filtered_buffer_level(40 * 960);
+        assert_eq!(neteq.get_decision().unwrap(), Operation::Normal);
     }
 
     #[test]

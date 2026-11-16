@@ -243,6 +243,11 @@ impl PacketBuffer {
             .find(|packet| packet.header.timestamp >= timestamp)
     }
 
+    /// The oldest packet in the buffer, without removing it.
+    pub fn peek_next_packet(&self) -> Option<&AudioPacket> {
+        self.buffer.front()
+    }
+
     /// Get the oldest packet from the buffer
     pub fn get_next_packet(&mut self) -> Option<AudioPacket> {
         self.buffer.pop_front()

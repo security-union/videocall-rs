@@ -267,6 +267,10 @@ pub struct LifetimeStatistics {
     pub buffer_flushes: u64,
     /// Late packets discarded
     pub late_packets_discarded: u64,
+    /// Samples played as comfort noise during DTX. Silence on purpose is not
+    /// concealment, so these are not in `concealed_samples` (WebRTC
+    /// `generated_noise_samples`).
+    pub generated_noise_samples: u64,
 }
 
 /// Operations and internal state metrics
@@ -304,7 +308,11 @@ pub struct StatisticsCalculator {
     /// Total expanded samples for rate calculations
     total_expanded_samples: u64,
     /// Operation counters for rolling window tracking
-    operation_counts: [u32; 9], // One for each Operation variant
+    // One slot per Operation variant, indexed by record_decode_operation's
+    // mapping (Normal=0 … Undefined=11). Was [u32; 9]: recording the three
+    // highest variants (ComfortNoise/Dtmf/Undefined) panicked out of
+    // bounds — latent while nothing ever emitted them.
+    operation_counts: [u32; 12],
     /// Last time operation rates were calculated
     last_operation_update: Instant,
     /// Window duration for operation rate calculation (1 second)
@@ -330,7 +338,7 @@ impl StatisticsCalculator {
             _last_update: now,
             total_output_samples: 0,
             total_expanded_samples: 0,
-            operation_counts: [0; 9],
+            operation_counts: [0; 12],
             last_operation_update: now,
             operation_window_duration: Duration::from_secs(1),
         }
@@ -370,6 +378,11 @@ impl StatisticsCalculator {
         if is_silent {
             self.lifetime_stats.silent_concealed_samples += concealed_samples;
         }
+    }
+
+    /// Record samples played as comfort noise (DTX).
+    pub fn generated_noise_samples(&mut self, samples: u64) {
+        self.lifetime_stats.generated_noise_samples += samples;
     }
 
     /// Record time-stretching operation
@@ -451,20 +464,25 @@ impl StatisticsCalculator {
                 self.operation_counts[1] as f32 / elapsed_secs;
             self.network_stats.operation_counters.expand_per_sec =
                 self.operation_counts[2] as f32 / elapsed_secs;
+            // Indices follow record_decode_operation's mapping. (They
+            // previously followed a different, 9-slot layout, silently
+            // misattributing the per-second rates: accelerate_per_sec
+            // reported ExpandStart counts, comfort_noise_per_sec reported
+            // FastAccelerate, and so on.)
             self.network_stats.operation_counters.accelerate_per_sec =
-                self.operation_counts[3] as f32 / elapsed_secs;
+                self.operation_counts[5] as f32 / elapsed_secs;
             self.network_stats
                 .operation_counters
-                .fast_accelerate_per_sec = self.operation_counts[4] as f32 / elapsed_secs;
+                .fast_accelerate_per_sec = self.operation_counts[6] as f32 / elapsed_secs;
             self.network_stats
                 .operation_counters
-                .preemptive_expand_per_sec = self.operation_counts[5] as f32 / elapsed_secs;
+                .preemptive_expand_per_sec = self.operation_counts[7] as f32 / elapsed_secs;
             self.network_stats.operation_counters.comfort_noise_per_sec =
-                self.operation_counts[6] as f32 / elapsed_secs;
+                self.operation_counts[9] as f32 / elapsed_secs;
             self.network_stats.operation_counters.dtmf_per_sec =
-                self.operation_counts[7] as f32 / elapsed_secs;
+                self.operation_counts[10] as f32 / elapsed_secs;
             self.network_stats.operation_counters.undefined_per_sec =
-                self.operation_counts[8] as f32 / elapsed_secs;
+                self.operation_counts[11] as f32 / elapsed_secs;
 
             // Reset counters for next window
             self.operation_counts.fill(0);
@@ -571,6 +589,47 @@ pub enum TimeStretchOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every Operation variant can be recorded, and each per-second rate
+    /// reports its own operation's count.
+    #[test]
+    fn test_operation_rates_follow_the_recorded_operations() {
+        let mut calc = StatisticsCalculator::new();
+        // Record operation i exactly i + 1 times, so every rate is distinct.
+        let ops = [
+            Operation::Normal,
+            Operation::Merge,
+            Operation::Expand,
+            Operation::ExpandStart,
+            Operation::ExpandEnd,
+            Operation::Accelerate,
+            Operation::FastAccelerate,
+            Operation::PreemptiveExpand,
+            Operation::TimeStretchBuffer,
+            Operation::ComfortNoise,
+            Operation::Dtmf,
+            Operation::Undefined,
+        ];
+        for (i, op) in ops.into_iter().enumerate() {
+            for _ in 0..=i {
+                calc.record_decode_operation(op);
+            }
+        }
+        // Close a window of exactly one second, so rates equal counts.
+        let now = Instant::now();
+        calc.last_operation_update = now - Duration::from_secs(1);
+        calc.update_operation_rates(now);
+        let c = &calc.network_statistics().operation_counters;
+        assert_eq!(c.normal_per_sec, 1.0);
+        assert_eq!(c.merge_per_sec, 2.0);
+        assert_eq!(c.expand_per_sec, 3.0);
+        assert_eq!(c.accelerate_per_sec, 6.0);
+        assert_eq!(c.fast_accelerate_per_sec, 7.0);
+        assert_eq!(c.preemptive_expand_per_sec, 8.0);
+        assert_eq!(c.comfort_noise_per_sec, 10.0);
+        assert_eq!(c.dtmf_per_sec, 11.0);
+        assert_eq!(c.undefined_per_sec, 12.0);
+    }
 
     #[test]
     fn test_statistics_calculator() {

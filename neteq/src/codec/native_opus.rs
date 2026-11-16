@@ -113,6 +113,13 @@ impl AudioDecoder for NativeOpusDecoder {
         buf.truncate(decoded_samples * self.channels as usize);
         Ok(buf)
     }
+
+    /// Measured with ropus: decoding a DTX frame again continues comfort
+    /// noise at the real noise floor, steady within a few dB (an empty
+    /// payload gives the same level, 120 ms per call).
+    fn supports_dtx(&self) -> bool {
+        true
+    }
 }
 
 // -----------------------------------------------------------------------------

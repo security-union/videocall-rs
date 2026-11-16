@@ -76,10 +76,12 @@ pub struct NetEqAudioPeerDecoder {
     speaking: Rc<RefCell<bool>>,
     audio_level: Rc<RefCell<f32>>,
 
-    /// Ring buffer of recently received audio sequence numbers.
-    /// Used to detect whether a redundant frame carried in a RED packet
-    /// was already received, avoiding duplicate injection.
-    received_sequences: VecDeque<u64>,
+    /// Sequence/timestamp resolution for this peer: legacy-sender restart
+    /// handling and the RED dedup ring.
+    timeline: NetEqTimeline,
+    /// Origin of the monotonic arrival clock used to size a legacy sender's
+    /// restart gap (`performance.now()` in the browser via `web_time`).
+    arrival_epoch: web_time::Instant,
 }
 
 impl NetEqAudioPeerDecoder {
@@ -527,8 +529,8 @@ impl NetEqAudioPeerDecoder {
             speaking: Rc::new(RefCell::new(false)),
             audio_level: Rc::new(RefCell::new(0.0)),
 
-            // RED redundancy: track recently received sequence numbers
-            received_sequences: VecDeque::with_capacity(AUDIO_RED_SEQ_HISTORY_SIZE),
+            timeline: NetEqTimeline::default(),
+            arrival_epoch: web_time::Instant::now(),
         };
 
         // Set up worker message handling with decoder's queue references
@@ -593,19 +595,6 @@ impl NetEqAudioPeerDecoder {
         );
 
         Ok(Box::new(decoder))
-    }
-
-    /// Record a sequence number as received for RED deduplication.
-    fn record_sequence(&mut self, seq: u64) {
-        if self.received_sequences.len() >= AUDIO_RED_SEQ_HISTORY_SIZE {
-            self.received_sequences.pop_front();
-        }
-        self.received_sequences.push_back(seq);
-    }
-
-    /// Check whether a sequence number was already received.
-    fn has_sequence(&self, seq: u64) -> bool {
-        self.received_sequences.contains(&seq)
     }
 
     /// Unpack a RED-encoded audio data buffer.
@@ -682,6 +671,8 @@ pub(crate) struct NetEqInsertPlan {
 /// field emit one 20 ms frame per sequence number, so `sequence * 960` is
 /// exact for them. `MediaPacket.timestamp` (wall-clock ms since 1970) is
 /// never used: as a u32 it saturates to 4294967295 for every packet.
+/// Stateless (first-epoch) form; the decoder uses [`NetEqTimeline`].
+#[cfg(test)]
 pub(crate) fn primary_rtp_timestamp(meta: &AudioMetadata) -> u32 {
     meta.rtp_timestamp
         .unwrap_or_else(|| legacy_rtp_timestamp(meta.sequence))
@@ -694,30 +685,54 @@ pub(crate) fn primary_rtp_timestamp(meta: &AudioMetadata) -> u32 {
 /// (malformed, or too far back to dedupe), in which case the frame is not
 /// recovered. Correct for both sender generations because a sender never
 /// attaches redundancy across a timestamp gap.
+#[cfg(test)]
 pub(crate) fn redundant_rtp_timestamp(
     primary_timestamp: u32,
     primary_seq: u64,
     redundant_seq: u32,
 ) -> Option<u32> {
-    // The RED header carries only the low 32 bits of the sequence number.
-    let distance = (primary_seq as u32).wrapping_sub(redundant_seq);
-    if distance == 0 || distance as usize > AUDIO_RED_SEQ_HISTORY_SIZE {
-        return None;
-    }
-    Some(primary_timestamp.wrapping_sub(distance.wrapping_mul(OPUS_RTP_SAMPLES_PER_20MS_FRAME)))
+    red_distance(primary_seq, redundant_seq).map(|distance| {
+        primary_timestamp.wrapping_sub(distance.wrapping_mul(OPUS_RTP_SAMPLES_PER_20MS_FRAME))
+    })
 }
 
-/// Decide which frames (and with which timestamps) one audio packet feeds to
-/// NetEq. Pure so it can be tested natively; O(1) apart from copying the
-/// payload. `already_received(seq)` reports whether a sequence number has
-/// been inserted before (RED dedup).
+/// Frames between a RED primary and its redundant frame, from the sender's
+/// raw sequence numbers, if in `1..=AUDIO_RED_SEQ_HISTORY_SIZE`.
+fn red_distance(primary_seq: u64, redundant_seq: u32) -> Option<u32> {
+    // The RED header carries only the low 32 bits of the sequence number.
+    let distance = (primary_seq as u32).wrapping_sub(redundant_seq);
+    (distance != 0 && distance as usize <= AUDIO_RED_SEQ_HISTORY_SIZE).then_some(distance)
+}
+
+/// Stateless planning with the sender's raw sequence (no legacy restart
+/// handling). Tests use it; the decoder goes through [`NetEqTimeline`].
+#[cfg(test)]
 pub(crate) fn plan_neteq_inserts(
     meta: &AudioMetadata,
     data: &[u8],
     already_received: impl Fn(u64) -> bool,
 ) -> NetEqInsertPlan {
-    let seq = meta.sequence;
-    let timestamp = primary_rtp_timestamp(meta);
+    plan_neteq_inserts_at(
+        meta,
+        data,
+        meta.sequence,
+        primary_rtp_timestamp(meta),
+        already_received,
+    )
+}
+
+/// Decide which frames (and with which timestamps) one audio packet feeds to
+/// NetEq, given the primary frame's resolved sequence `seq` and `timestamp`.
+/// The RED-recovered frame is placed `distance` frames before the primary in
+/// both. O(1) apart from copying the payload. `already_received(seq)`
+/// reports whether a resolved sequence was inserted before (RED dedup).
+fn plan_neteq_inserts_at(
+    meta: &AudioMetadata,
+    data: &[u8],
+    seq: u64,
+    timestamp: u32,
+    already_received: impl Fn(u64) -> bool,
+) -> NetEqInsertPlan {
     let whole_blob = |red_malformed| NetEqInsertPlan {
         recovered: None,
         primary: NetEqInsert {
@@ -738,15 +753,18 @@ pub(crate) fn plan_neteq_inserts(
         return whole_blob(true);
     };
 
-    let recovered = if already_received(u64::from(redundant_seq)) {
-        None
-    } else {
-        redundant_rtp_timestamp(timestamp, seq, redundant_seq).map(|timestamp| NetEqInsert {
-            seq: u64::from(redundant_seq),
-            timestamp,
+    let recovered = red_distance(meta.sequence, redundant_seq).and_then(|distance| {
+        let redundant = seq.wrapping_sub(u64::from(distance));
+        if already_received(redundant) {
+            return None;
+        }
+        Some(NetEqInsert {
+            seq: redundant,
+            timestamp: timestamp
+                .wrapping_sub(distance.wrapping_mul(OPUS_RTP_SAMPLES_PER_20MS_FRAME)),
             payload: redundant_data,
         })
-    };
+    });
 
     NetEqInsertPlan {
         recovered,
@@ -756,6 +774,136 @@ pub(crate) fn plan_neteq_inserts(
             payload: primary,
         },
         red_malformed: false,
+    }
+}
+
+/// Backward distance (in sequence numbers) a legacy packet may arrive late
+/// and still count as reordering rather than a sender restart. Matches the
+/// RED dedup window.
+pub(crate) const LEGACY_REORDER_WINDOW: u64 = AUDIO_RED_SEQ_HISTORY_SIZE as u64;
+
+/// Minimum receive idle time before a legacy packet with sequence 0 counts
+/// as a restart even inside the reorder window. A legacy browser sender
+/// restarts at 0 after mute or device switch, which takes well over this
+/// (getUserMedia + AudioContext + worklet load); a reordered first packet
+/// arrives within a few frames of its successors.
+pub(crate) const LEGACY_RESTART_MIN_IDLE_MS: f64 = 100.0;
+
+/// Maps a legacy sender's raw `sequence` (which restarts at 0 on every mic
+/// restart) to a monotonic extended frame count for one peer session.
+///
+/// Within an epoch, `count = raw + offset`. A restart (raw goes backward past
+/// [`LEGACY_REORDER_WINDOW`], or back to 0 after [`LEGACY_RESTART_MIN_IDLE_MS`]
+/// of silence) opens a new epoch that continues after the highest count seen
+/// plus the receive idle time in whole 20 ms frames (at least one skipped
+/// frame), so NetEq sees skipped time instead of obsolete packets. O(1).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LegacySequenceExtender {
+    offset: u64,
+    epoch_highest_raw: Option<u64>,
+    /// `(offset, highest_raw)` of the epoch before the current one, so a
+    /// straggler from before the restart maps back to its old place.
+    previous_epoch: Option<(u64, u64)>,
+    highest_count: u64,
+    last_arrival_ms: Option<f64>,
+}
+
+impl LegacySequenceExtender {
+    /// Extended count for a legacy primary frame with raw sequence `raw`,
+    /// received at `arrival_ms` on a monotonic millisecond clock.
+    pub(crate) fn extend(&mut self, raw: u64, arrival_ms: f64) -> u64 {
+        let idle_ms = self.last_arrival_ms.map(|last| arrival_ms - last);
+        self.last_arrival_ms = Some(arrival_ms);
+
+        let Some(epoch_highest_raw) = self.epoch_highest_raw else {
+            // First packet: identity mapping, same as `sequence * 960`.
+            self.epoch_highest_raw = Some(raw);
+            self.highest_count = raw.wrapping_add(self.offset);
+            return self.highest_count;
+        };
+
+        // A late packet from the previous epoch: far ahead of this epoch,
+        // but within the reorder window of where the previous one ended.
+        if let Some((previous_offset, previous_highest_raw)) = self.previous_epoch {
+            if raw > epoch_highest_raw.saturating_add(LEGACY_REORDER_WINDOW)
+                && raw <= previous_highest_raw
+                && previous_highest_raw - raw <= LEGACY_REORDER_WINDOW
+            {
+                return raw.wrapping_add(previous_offset);
+            }
+        }
+
+        let backward = epoch_highest_raw.saturating_sub(raw);
+        let idle_ms = idle_ms.unwrap_or(0.0);
+        let restarted = backward > LEGACY_REORDER_WINDOW
+            || (raw == 0 && backward > 0 && idle_ms >= LEGACY_RESTART_MIN_IDLE_MS);
+        if restarted {
+            // Same jump as libwebrtc on resume: idle time in whole frames
+            // past the last frame, but always at least one skipped frame so
+            // the restart never looks like contiguous audio.
+            let idle_frames = (idle_ms.max(0.0) / 20.0).floor() as u64;
+            let count = self.highest_count.wrapping_add(idle_frames.max(2));
+            self.previous_epoch = Some((self.offset, epoch_highest_raw));
+            self.offset = count.wrapping_sub(raw);
+            self.epoch_highest_raw = Some(raw);
+            self.highest_count = count;
+            return count;
+        }
+
+        let count = raw.wrapping_add(self.offset);
+        if raw > epoch_highest_raw {
+            self.epoch_highest_raw = Some(raw);
+            self.highest_count = count;
+        }
+        count
+    }
+}
+
+/// Per-peer state that turns received audio packets into NetEq inserts:
+/// legacy sequence extension plus the RED dedup ring, both keyed by the
+/// sequence actually handed to NetEq. Pure (no browser APIs), O(1) per
+/// packet (the ring scan is bounded by `AUDIO_RED_SEQ_HISTORY_SIZE`).
+#[derive(Debug, Default)]
+pub(crate) struct NetEqTimeline {
+    legacy: LegacySequenceExtender,
+    received: VecDeque<u64>,
+}
+
+impl NetEqTimeline {
+    fn record(&mut self, seq: u64) {
+        if self.received.len() >= AUDIO_RED_SEQ_HISTORY_SIZE {
+            self.received.pop_front();
+        }
+        self.received.push_back(seq);
+    }
+
+    /// Plan the NetEq inserts for one packet that arrived at `arrival_ms`.
+    pub(crate) fn plan(
+        &mut self,
+        meta: &AudioMetadata,
+        data: &[u8],
+        arrival_ms: f64,
+    ) -> NetEqInsertPlan {
+        // New senders' sequence and timestamp never go backward: pass them
+        // through. Legacy ones go through the restart-aware extender, and
+        // both the NetEq sequence and timestamp derive from its count.
+        let (seq, timestamp) = match meta.rtp_timestamp {
+            Some(timestamp) => (meta.sequence, timestamp),
+            None => {
+                let count = self.legacy.extend(meta.sequence, arrival_ms);
+                (count, legacy_rtp_timestamp(count))
+            }
+        };
+        // The dedup ring is keyed by the resolved sequence, so raw sequence
+        // numbers from before a legacy restart cannot shadow new frames.
+        self.record(seq);
+        let received = &self.received;
+        let plan = plan_neteq_inserts_at(meta, data, seq, timestamp, |s| received.contains(&s));
+        if let Some(recovered) = &plan.recovered {
+            let seq = recovered.seq;
+            self.record(seq);
+        }
+        plan
     }
 }
 
@@ -771,14 +919,12 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
             Some(audio_meta) => {
                 let seq = audio_meta.sequence;
 
-                // Track this sequence number so we can detect duplicates from
-                // redundancy payloads later.
-                self.record_sequence(seq);
-
-                // Timestamps come from `rtp_timestamp` (or `sequence * 960`
-                // for senders that predate it), never from the wall-clock
-                // `packet.timestamp`, which saturates as a u32.
-                let plan = plan_neteq_inserts(audio_meta, &packet.data, |s| self.has_sequence(s));
+                // Timestamps come from `rtp_timestamp`, or for senders that
+                // predate it from a restart-aware extension of `sequence`;
+                // never from the wall-clock `packet.timestamp`, which
+                // saturates as a u32. The timeline also does RED dedup.
+                let arrival_ms = self.arrival_epoch.elapsed().as_secs_f64() * 1_000.0;
+                let plan = self.timeline.plan(audio_meta, &packet.data, arrival_ms);
 
                 if plan.red_malformed {
                     log::warn!(
@@ -797,7 +943,6 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                         recovered.timestamp,
                         self.peer_id
                     );
-                    self.record_sequence(recovered.seq);
                     self.send_worker_message(WorkerMsg::Insert {
                         seq: recovered.seq as u16,
                         timestamp: recovered.timestamp,
@@ -1274,5 +1419,233 @@ mod rtp_timestamp_tests {
         assert!(plan.recovered.is_none());
         assert_eq!(plan.primary.payload, vec![1, 2, 3]);
         assert_eq!(plan.primary.timestamp, 3 * 960);
+    }
+}
+
+/// Native tests for legacy-sender restarts (senders without `rtp_timestamp`
+/// restart `sequence` at 0 on every mic restart or device switch).
+#[cfg(test)]
+mod legacy_restart_tests {
+    use super::*;
+    use crate::adaptive_quality_constants::AUDIO_RED_FORMAT;
+
+    const FRAME: u32 = OPUS_RTP_SAMPLES_PER_20MS_FRAME;
+
+    fn legacy(sequence: u64) -> AudioMetadata {
+        AudioMetadata {
+            sequence,
+            ..Default::default()
+        }
+    }
+
+    fn legacy_red(sequence: u64) -> AudioMetadata {
+        AudioMetadata {
+            sequence,
+            audio_format: AUDIO_RED_FORMAT.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn red_payload(primary: &[u8], redundant_seq: u32, redundant: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(primary.len() as u32).to_le_bytes());
+        buf.extend_from_slice(primary);
+        buf.extend_from_slice(&redundant_seq.to_le_bytes());
+        buf.extend_from_slice(redundant);
+        buf
+    }
+
+    /// Feed raw legacy sequences `range` at 20 ms spacing starting at
+    /// `start_ms`; returns the arrival time of the last one.
+    fn feed(
+        timeline: &mut NetEqTimeline,
+        range: std::ops::RangeInclusive<u64>,
+        start_ms: f64,
+    ) -> f64 {
+        let mut t = start_ms;
+        let mut last = start_ms;
+        for raw in range {
+            timeline.plan(&legacy(raw), b"x", t);
+            last = t;
+            t += 20.0;
+        }
+        last
+    }
+
+    #[test]
+    fn in_order_legacy_stream_is_sequence_times_960() {
+        let mut timeline = NetEqTimeline::default();
+        for raw in 0..500u64 {
+            let plan = timeline.plan(&legacy(raw), b"x", raw as f64 * 20.0);
+            assert_eq!(plan.primary.seq, raw);
+            assert_eq!(plan.primary.timestamp, raw as u32 * FRAME);
+        }
+    }
+
+    #[test]
+    fn reordering_within_window_does_not_start_an_epoch() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=100, 0.0);
+        // A late packet from 30 frames back, arriving right away.
+        let late = timeline.plan(&legacy(70), b"x", last + 5.0);
+        assert_eq!(late.primary.seq, 70);
+        assert_eq!(late.primary.timestamp, 70 * FRAME);
+        let next = timeline.plan(&legacy(101), b"x", last + 20.0);
+        assert_eq!(next.primary.seq, 101);
+        assert_eq!(next.primary.timestamp, 101 * FRAME);
+    }
+
+    #[test]
+    fn red_recovered_older_frame_does_not_start_an_epoch() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=99, 0.0);
+        // Seq 100 lost; 101 carries it as redundancy.
+        let plan = timeline.plan(&legacy_red(101), &red_payload(b"p", 100, b"r"), last + 40.0);
+        let recovered = plan.recovered.expect("100 recovered");
+        assert_eq!(recovered.seq, 100);
+        assert_eq!(recovered.timestamp, 100 * FRAME);
+        assert_eq!(plan.primary.seq, 101);
+        let next = timeline.plan(&legacy(102), b"x", last + 60.0);
+        assert_eq!(next.primary.seq, 102);
+        assert_eq!(next.primary.timestamp, 102 * FRAME);
+    }
+
+    fn assert_restart_continues_forward(idle_ms: f64) {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=499, 0.0);
+        let restarted = timeline.plan(&legacy(0), b"x", last + idle_ms);
+        // Continues after the highest count (499) by the idle time in whole
+        // frames, like libwebrtc's resume jump.
+        let expected = 499 + (idle_ms / 20.0).floor() as u64;
+        assert_eq!(restarted.primary.seq, expected);
+        assert_eq!(restarted.primary.timestamp, legacy_rtp_timestamp(expected));
+        let next = timeline.plan(&legacy(1), b"x", last + idle_ms + 20.0);
+        assert_eq!(next.primary.seq, expected + 1);
+        assert_eq!(
+            next.primary.timestamp,
+            restarted.primary.timestamp.wrapping_add(FRAME)
+        );
+    }
+
+    #[test]
+    fn restart_at_zero_after_3_s_continues_forward_with_a_gap() {
+        assert_restart_continues_forward(3_000.0);
+    }
+
+    #[test]
+    fn restart_at_zero_after_60_s_continues_forward_with_a_gap() {
+        assert_restart_continues_forward(60_000.0);
+    }
+
+    #[test]
+    fn restart_with_no_idle_still_skips_at_least_one_frame() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=499, 0.0);
+        // Backward far beyond the window with no idle time at all.
+        let restarted = timeline.plan(&legacy(3), b"x", last + 1.0);
+        assert_eq!(restarted.primary.seq, 499 + 2);
+    }
+
+    #[test]
+    fn quick_restart_inside_window_is_detected_by_seq_zero_after_idle() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=10, 0.0);
+        // Muted after 11 frames, unmuted 500 ms later: back to 0.
+        let restarted = timeline.plan(&legacy(0), b"x", last + 500.0);
+        assert_eq!(restarted.primary.seq, 10 + 25);
+    }
+
+    #[test]
+    fn reordered_first_packet_is_not_a_restart() {
+        let mut timeline = NetEqTimeline::default();
+        timeline.plan(&legacy(1), b"x", 0.0);
+        timeline.plan(&legacy(2), b"x", 20.0);
+        let late_zero = timeline.plan(&legacy(0), b"x", 25.0);
+        assert_eq!(late_zero.primary.seq, 0);
+        assert_eq!(late_zero.primary.timestamp, 0);
+    }
+
+    #[test]
+    fn projections_wrap_u16_and_u32() {
+        let mut extender = LegacySequenceExtender::default();
+        // Around the u16 sequence wrap.
+        for raw in 65_530..65_545u64 {
+            let count = extender.extend(raw, raw as f64 * 20.0);
+            assert_eq!(count, raw);
+            assert_eq!(count as u16, (raw % 65_536) as u16);
+        }
+        // Around the u32 timestamp wrap (2^32 / 960 = 4_473_924.27).
+        let mut timeline = NetEqTimeline::default();
+        let mut prev: Option<u32> = None;
+        for raw in 4_473_920..4_473_930u64 {
+            let ts = timeline
+                .plan(&legacy(raw), b"x", raw as f64 * 20.0)
+                .primary
+                .timestamp;
+            if let Some(p) = prev {
+                assert_eq!(ts.wrapping_sub(p), FRAME);
+            }
+            prev = Some(ts);
+        }
+        // A restart epoch that crosses the u16 boundary keeps advancing.
+        let restarted = timeline.plan(&legacy(0), b"x", 4_473_929.0 * 20.0 + 3_000.0);
+        assert_eq!(restarted.primary.seq, 4_473_929 + 150);
+        assert_eq!(
+            restarted.primary.timestamp,
+            prev.unwrap().wrapping_add(150 * FRAME)
+        );
+    }
+
+    #[test]
+    fn present_rtp_timestamp_passes_through_and_leaves_legacy_state_alone() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=499, 0.0);
+        let new = AudioMetadata {
+            sequence: 3,
+            rtp_timestamp: Some(77_000),
+            ..Default::default()
+        };
+        let plan = timeline.plan(&new, b"x", last + 5_000.0);
+        assert_eq!(plan.primary.seq, 3);
+        assert_eq!(plan.primary.timestamp, 77_000);
+        // The legacy mapping is unaffected by the new-format packet.
+        let next = timeline.plan(&legacy(500), b"x", last + 20.0);
+        assert_eq!(next.primary.seq, 500);
+    }
+
+    #[test]
+    fn late_packet_from_before_the_restart_maps_into_the_old_epoch() {
+        let mut timeline = NetEqTimeline::default();
+        let last = feed(&mut timeline, 0..=499, 0.0);
+        let t = feed(&mut timeline, 0..=3, last + 3_000.0);
+        let new_epoch_3 = 499 + 150 + 3;
+        // A straggler from the old stream (raw 495) shows up late. It keeps
+        // its old place (NetEq drops it as obsolete) instead of being read
+        // as a forward jump in the new epoch.
+        let straggler = timeline.plan(&legacy(495), b"x", t + 5.0);
+        assert_eq!(straggler.primary.seq, 495);
+        let next = timeline.plan(&legacy(4), b"x", t + 20.0);
+        assert_eq!(next.primary.seq, new_epoch_3 + 1);
+    }
+
+    #[test]
+    fn red_dedup_survives_a_legacy_restart() {
+        let mut timeline = NetEqTimeline::default();
+        // A short first epoch, so raw seq 4 is still in the dedup ring.
+        let last = feed(&mut timeline, 0..=20, 0.0);
+        // Restart after 3 s; raw 0..=3 arrive, raw 4 is lost, raw 5 carries 4.
+        let t = feed(&mut timeline, 0..=3, last + 3_000.0);
+        let plan = timeline.plan(&legacy_red(5), &red_payload(b"p", 4, b"r"), t + 40.0);
+        let recovered = plan
+            .recovered
+            .expect("old raw seq 4 from before the restart must not suppress recovery");
+        assert_eq!(recovered.seq + 1, plan.primary.seq);
+        assert_eq!(
+            recovered.timestamp.wrapping_add(FRAME),
+            plan.primary.timestamp
+        );
+        // And a genuine duplicate in the new epoch is still suppressed.
+        let again = timeline.plan(&legacy_red(6), &red_payload(b"q", 5, b"p"), t + 60.0);
+        assert!(again.recovered.is_none());
     }
 }

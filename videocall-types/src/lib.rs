@@ -16,6 +16,7 @@
  * conditions.
  */
 
+pub mod audio_rtp;
 pub mod callback;
 pub mod feature_flags;
 pub mod protos;

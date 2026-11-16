@@ -445,12 +445,6 @@ pub const DATAGRAM_MAX_SIZE: usize = 1200;
 /// re-enabled if the transport layer ever switches to unreliable delivery.
 pub const AUDIO_REDUNDANCY_ENABLED: bool = false;
 
-/// Default Opus frame duration in milliseconds.
-///
-/// Standard Opus frames are 20ms, which gives ~50 frames/second.
-/// Used by RED unpacking to compute the recovered frame's timestamp.
-pub const OPUS_FRAME_DURATION_MS: u32 = 20;
-
 /// Audio format string signaling that a packet contains redundant data.
 /// When this value appears in `AudioMetadata.audio_format`, the `data` field
 /// uses the packed format: `[4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]`.

@@ -40,6 +40,7 @@ use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use videocall_types::audio_rtp::AudioRtpClock;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
     media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
@@ -57,9 +58,10 @@ use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
-use web_time::SystemTime;
+use web_time::{Instant, SystemTime};
 
 /// Holds the previous audio frame for RED-style redundancy.
+#[derive(Debug)]
 pub(crate) struct PreviousAudioFrame {
     data: Vec<u8>,
     sequence: u64,
@@ -83,43 +85,126 @@ fn pack_redundant_audio(primary: &[u8], redundant: &PreviousAudioFrame) -> Vec<u
     buf
 }
 
-pub fn transform_audio_chunk(
-    chunk: &Uint8Array,
+/// One encoded frame ready to be wrapped in a `MediaPacket`.
+#[derive(Debug)]
+pub(crate) struct OutgoingAudioFrame {
+    pub sequence: u64,
+    /// RTP timestamp in samples at 48 kHz (`AudioMetadata.rtp_timestamp`).
+    pub rtp_timestamp: u32,
+    pub primary: Vec<u8>,
+    /// The previous frame, attached as RED redundancy. Never set across a
+    /// send pause, because that frame is not contiguous with this one.
+    pub redundant: Option<PreviousAudioFrame>,
+}
+
+/// Sequence, timestamp and redundancy state for one microphone sender
+/// session. It outlives individual `start()`/`stop()` cycles (mute/unmute,
+/// device switch) so neither the sequence nor the RTP timestamp ever goes
+/// backward. Every call is O(1).
+pub(crate) struct AudioSendState {
+    clock: AudioRtpClock,
+    next_sequence: u64,
+    previous_frame: Option<PreviousAudioFrame>,
+    /// Keep a copy of each frame for the next packet's RED payload. Off when
+    /// RED is compiled out, which saves an allocation per frame.
+    keep_previous_frame: bool,
+}
+
+impl AudioSendState {
+    pub(crate) fn new() -> Self {
+        Self::with_clock(AudioRtpClock::opus_20ms(), AUDIO_REDUNDANCY_ENABLED)
+    }
+
+    fn with_clock(clock: AudioRtpClock, keep_previous_frame: bool) -> Self {
+        Self {
+            clock,
+            next_sequence: 0,
+            previous_frame: None,
+            keep_previous_frame,
+        }
+    }
+
+    /// Sending stopped (mute, encoder torn down, frame dropped). The next
+    /// frame's timestamp jumps by the elapsed time and carries no redundancy.
+    pub(crate) fn pause(&mut self) {
+        self.clock.pause();
+        self.previous_frame = None;
+    }
+
+    /// Stamp one encoded 20 ms frame captured at `capture_ms` (monotonic ms).
+    /// `redundancy_allowed` is the current RED/FEC setting.
+    pub(crate) fn next_frame(
+        &mut self,
+        primary: Vec<u8>,
+        capture_ms: f64,
+        redundancy_allowed: bool,
+    ) -> OutgoingAudioFrame {
+        let stamped = self.clock.stamp(capture_ms);
+        let previous = self.previous_frame.take();
+        let redundant = if redundancy_allowed && !stamped.after_gap {
+            previous
+        } else {
+            None
+        };
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        if self.keep_previous_frame {
+            self.previous_frame = Some(PreviousAudioFrame {
+                data: primary.clone(),
+                sequence,
+            });
+        }
+        OutgoingAudioFrame {
+            sequence,
+            rtp_timestamp: stamped.rtp_timestamp,
+            primary,
+            redundant,
+        }
+    }
+}
+
+/// Build the (unencrypted) `MediaPacket` for one frame. `wall_clock_ms` goes
+/// into `MediaPacket.timestamp` exactly as before; the media timestamp goes
+/// into `AudioMetadata.rtp_timestamp`.
+pub(crate) fn build_audio_media_packet(
+    frame: OutgoingAudioFrame,
+    wall_clock_ms: f64,
+) -> MediaPacket {
+    let (data, audio_format) = match &frame.redundant {
+        Some(prev) => (
+            pack_redundant_audio(&frame.primary, prev),
+            AUDIO_RED_FORMAT.to_string(),
+        ),
+        None => (frame.primary, String::new()),
+    };
+    MediaPacket {
+        user_id: Vec::new(),
+        media_type: MediaType::AUDIO.into(),
+        frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
+        data,
+        timestamp: wall_clock_ms,
+        audio_metadata: Some(AudioMetadata {
+            sequence: frame.sequence,
+            rtp_timestamp: Some(frame.rtp_timestamp),
+            audio_format,
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn transform_audio_chunk(
+    frame: OutgoingAudioFrame,
     user_id: &str,
-    sequence: u64,
     aes: Rc<Aes128State>,
-    previous_frame: Option<&PreviousAudioFrame>,
 ) -> PacketWrapper {
     let now_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as f64;
 
-    let primary_data = chunk.to_vec();
-
-    // Determine whether to include redundancy.
-    let (data, audio_format) = match previous_frame {
-        Some(prev) => {
-            let packed = pack_redundant_audio(&primary_data, prev);
-            (packed, AUDIO_RED_FORMAT.to_string())
-        }
-        None => (primary_data, String::new()),
-    };
-
-    let media_packet: MediaPacket = MediaPacket {
-        user_id: Vec::new(),
-        media_type: MediaType::AUDIO.into(),
-        frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
-        data,
-        timestamp: now_ms,
-        audio_metadata: Some(AudioMetadata {
-            sequence,
-            audio_format,
-            ..Default::default()
-        })
-        .into(),
-        ..Default::default()
-    };
+    let media_packet = build_audio_media_packet(frame, now_ms);
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
@@ -150,6 +235,12 @@ pub struct MicrophoneEncoder {
     /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
     /// previous frame as redundant data for loss recovery.
     tier_enable_fec: Rc<AtomicBool>,
+    /// Sequence / RTP timestamp / RED state for this sender session. Shared
+    /// with every `start()`'s output handler so it survives mic restarts.
+    send_state: Rc<RefCell<AudioSendState>>,
+    /// Origin of the monotonic capture clock fed to the RTP timestamp
+    /// (`performance.now()` in the browser via `web_time`).
+    capture_epoch: Instant,
 }
 
 impl MicrophoneEncoder {
@@ -185,6 +276,8 @@ impl MicrophoneEncoder {
                 .unwrap_or_else(|| Rc::new(AtomicU32::new(default_audio_bitrate_bps))),
             tier_enable_fec: shared_audio_tier_fec
                 .unwrap_or_else(|| Rc::new(AtomicBool::new(default_enable_fec))),
+            send_state: Rc::new(RefCell::new(AudioSendState::new())),
+            capture_epoch: Instant::now(),
         }
     }
 
@@ -201,6 +294,9 @@ impl MicrophoneEncoder {
             } else {
                 // First stop the codec to prevent new audio frames
                 let _ = self.codec.stop();
+                // The next frame (after unmute) jumps its RTP timestamp by the
+                // muted time and carries no redundancy.
+                self.send_state.borrow_mut().pause();
                 // The monitoring loop in start() will detect the enabled flag change
                 // and stop the microphone capture within 100ms
                 if let Some(interval) = self.vad_interval.borrow_mut().take() {
@@ -221,6 +317,7 @@ impl MicrophoneEncoder {
     pub fn stop(&mut self) {
         self.state.stop();
         self.codec.destroy();
+        self.send_state.borrow_mut().pause();
         if let Some(interval) = self.vad_interval.borrow_mut().take() {
             drop(interval);
         }
@@ -261,18 +358,23 @@ impl MicrophoneEncoder {
         let enabled_for_handler = enabled.clone();
         let enable_fec_for_handler = self.tier_enable_fec.clone();
 
+        // A fresh codec instance: whatever time passed since the last frame
+        // sent (if any) is a gap in the media timeline.
+        self.send_state.borrow_mut().pause();
+
         let audio_output_handler = {
             log::info!("Starting Microphone audio encoder with AnalyserNode VAD");
-            let mut sequence_number: u64 = 0;
             let client_for_send = client.clone();
-            // Buffer for RED-style redundancy: stores the previous frame's
-            // encoded data and sequence number so it can be included in the
-            // next packet for loss recovery.
-            let mut previous_frame: Option<PreviousAudioFrame> = None;
+            // Sequence, RTP timestamp and RED buffer live on the encoder so
+            // they continue across restarts instead of resetting to 0.
+            let send_state = self.send_state.clone();
+            let capture_epoch = self.capture_epoch;
 
             Box::new(move |chunk: MessageEvent| {
                 // Check if encoder should stop
                 if !enabled_for_handler.load(Ordering::Acquire) {
+                    // Dropping a frame is a send pause.
+                    send_state.borrow_mut().pause();
                     log::debug!(
                         "Audio handler stopping: enabled={}",
                         enabled_for_handler.load(Ordering::Acquire)
@@ -293,35 +395,23 @@ impl MicrophoneEncoder {
 
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
-                    // Decide whether to include redundancy based on the
-                    // AUDIO_REDUNDANCY_ENABLED constant and the current tier's
-                    // enable_fec flag.
-                    let use_redundancy = AUDIO_REDUNDANCY_ENABLED
-                        && enable_fec_for_handler.load(Ordering::Relaxed)
-                        && previous_frame.is_some();
-
-                    let red_ref = if use_redundancy {
-                        previous_frame.as_ref()
-                    } else {
-                        None
-                    };
-
-                    let packet: PacketWrapper = transform_audio_chunk(
-                        &data,
-                        &user_id,
-                        sequence_number,
-                        aes.clone(),
-                        red_ref,
+                    // Redundancy follows the AUDIO_REDUNDANCY_ENABLED constant
+                    // and the current tier's enable_fec flag.
+                    let use_redundancy =
+                        AUDIO_REDUNDANCY_ENABLED && enable_fec_for_handler.load(Ordering::Relaxed);
+                    // The worklet posts one 20 ms Opus packet per message and
+                    // no capture timestamp, so arrival time on a monotonic
+                    // clock is the best capture-time proxy. It only matters on
+                    // the first frame after a pause; while running, each frame
+                    // advances the RTP timestamp by exactly 960.
+                    let capture_ms = capture_epoch.elapsed().as_secs_f64() * 1_000.0;
+                    let frame = send_state.borrow_mut().next_frame(
+                        data.to_vec(),
+                        capture_ms,
+                        use_redundancy,
                     );
+                    let packet: PacketWrapper = transform_audio_chunk(frame, &user_id, aes.clone());
                     client_for_send.send_media_packet(packet);
-
-                    // Store current frame as the previous frame for the next
-                    // iteration's redundancy payload.
-                    previous_frame = Some(PreviousAudioFrame {
-                        data: data.to_vec(),
-                        sequence: sequence_number,
-                    });
-                    sequence_number += 1;
                 } else {
                     log::error!("Received non-MessageEvent: {chunk:?}");
                 }
@@ -813,5 +903,119 @@ mod tests {
         assert_eq!(unpacked_primary, primary);
         assert_eq!(unpacked_seq, 12345);
         assert_eq!(unpacked_redundant, redundant.data);
+    }
+}
+
+/// Native (`cargo test -p videocall-client --lib`) tests for the sender's
+/// sequence / RTP timestamp / RED decisions. No browser APIs are touched.
+#[cfg(test)]
+mod rtp_send_tests {
+    use super::*;
+    use crate::decode::neteq_audio_decoder::plan_neteq_inserts;
+
+    const FRAME: u32 = videocall_types::audio_rtp::OPUS_RTP_SAMPLES_PER_20MS_FRAME;
+
+    fn red_state() -> AudioSendState {
+        AudioSendState::with_clock(AudioRtpClock::opus_20ms(), true)
+    }
+
+    #[test]
+    fn consecutive_frames_advance_rtp_timestamp_by_960() {
+        let mut state = AudioSendState::new();
+        let mut capture_ms = 0.0;
+        for i in 0..200u32 {
+            let frame = state.next_frame(vec![i as u8], capture_ms, false);
+            assert_eq!(frame.sequence, u64::from(i));
+            assert_eq!(frame.rtp_timestamp, i * FRAME);
+            capture_ms += 20.0;
+        }
+    }
+
+    #[test]
+    fn packet_carries_rtp_timestamp_and_keeps_wall_clock_timestamp() {
+        let mut state = AudioSendState::new();
+        state.next_frame(vec![1], 0.0, false);
+        let frame = state.next_frame(vec![2], 20.0, false);
+        let packet = build_audio_media_packet(frame, 1_763_251_200_000.0);
+        let meta = packet.audio_metadata.as_ref().unwrap();
+        assert_eq!(meta.rtp_timestamp, Some(FRAME));
+        assert_eq!(meta.sequence, 1);
+        assert_eq!(packet.timestamp, 1_763_251_200_000.0);
+        assert_eq!(packet.data, vec![2]);
+        assert!(meta.audio_format.is_empty());
+    }
+
+    #[test]
+    fn pause_advances_by_gap_in_whole_frames_and_sequence_continues() {
+        let mut state = AudioSendState::new();
+        let a = state.next_frame(vec![0], 1_000.0, false);
+        let b = state.next_frame(vec![1], 1_020.0, false);
+        assert_eq!(b.rtp_timestamp, a.rtp_timestamp + FRAME);
+        // Muted for 3.01 s after frame b: 150 whole frames of wall time.
+        state.pause();
+        let c = state.next_frame(vec![2], 4_030.0, false);
+        assert_eq!(c.rtp_timestamp, b.rtp_timestamp + 150 * FRAME);
+        assert_eq!(c.sequence, b.sequence + 1, "sequence does not restart");
+        let d = state.next_frame(vec![3], 4_050.0, false);
+        assert_eq!(d.rtp_timestamp, c.rtp_timestamp + FRAME);
+    }
+
+    #[test]
+    fn redundancy_attached_while_running_but_never_across_a_gap() {
+        let mut state = red_state();
+        let first = state.next_frame(vec![10], 0.0, true);
+        assert!(first.redundant.is_none(), "nothing to repeat yet");
+        let second = state.next_frame(vec![11], 20.0, true);
+        let red = second.redundant.as_ref().expect("previous frame attached");
+        assert_eq!(red.sequence, first.sequence);
+        assert_eq!(red.data, vec![10]);
+
+        state.pause();
+        let resumed = state.next_frame(vec![12], 2_000.0, true);
+        assert!(resumed.redundant.is_none(), "no RED across the gap");
+        let after = state.next_frame(vec![13], 2_020.0, true);
+        assert_eq!(after.redundant.as_ref().unwrap().sequence, resumed.sequence);
+    }
+
+    #[test]
+    fn redundancy_off_attaches_nothing() {
+        let mut state = red_state();
+        state.next_frame(vec![1], 0.0, false);
+        assert!(state.next_frame(vec![2], 20.0, false).redundant.is_none());
+    }
+
+    #[test]
+    fn rtp_timestamp_wraps_modulo_2_pow_32() {
+        let start = u32::MAX - FRAME + 1;
+        let mut state = AudioSendState::with_clock(
+            AudioRtpClock::opus_20ms().with_initial_timestamp(start),
+            false,
+        );
+        assert_eq!(state.next_frame(vec![], 0.0, false).rtp_timestamp, start);
+        assert_eq!(state.next_frame(vec![], 20.0, false).rtp_timestamp, 0);
+        assert_eq!(state.next_frame(vec![], 40.0, false).rtp_timestamp, FRAME);
+    }
+
+    /// Sender and receiver agree end to end: the receiver passes the field
+    /// through, and a RED-recovered frame lands exactly where the lost frame
+    /// would have.
+    #[test]
+    fn receiver_sees_sender_timestamps_including_red_recovery() {
+        let mut state = red_state();
+        let mut sent = Vec::new();
+        for i in 0..5u8 {
+            let frame = state.next_frame(vec![i], f64::from(i) * 20.0, true);
+            sent.push(build_audio_media_packet(frame, 0.0));
+        }
+        // Packet 3 was lost; packet 4 carries it as redundancy.
+        let meta4 = sent[4].audio_metadata.as_ref().unwrap();
+        let plan = plan_neteq_inserts(meta4, &sent[4].data, |s| s != 3);
+        assert_eq!(plan.primary.timestamp, 4 * FRAME);
+        let recovered = plan.recovered.unwrap();
+        assert_eq!(recovered.seq, 3);
+        assert_eq!(
+            Some(recovered.timestamp),
+            sent[3].audio_metadata.as_ref().unwrap().rtp_timestamp
+        );
     }
 }

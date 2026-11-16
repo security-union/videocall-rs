@@ -1,6 +1,4 @@
-use crate::adaptive_quality_constants::{
-    AUDIO_RED_FORMAT, AUDIO_RED_SEQ_HISTORY_SIZE, OPUS_FRAME_DURATION_MS,
-};
+use crate::adaptive_quality_constants::{AUDIO_RED_FORMAT, AUDIO_RED_SEQ_HISTORY_SIZE};
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD,
@@ -16,7 +14,8 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
-use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::audio_rtp::{legacy_rtp_timestamp, OPUS_RTP_SAMPLES_PER_20MS_FRAME};
+use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
@@ -657,6 +656,109 @@ impl NetEqAudioPeerDecoder {
     }
 }
 
+/// One encoded frame to hand the NetEq worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetEqInsert {
+    pub seq: u64,
+    /// RTP timestamp in samples at 48 kHz (what NetEq orders and dedupes by).
+    pub timestamp: u32,
+    pub payload: Vec<u8>,
+}
+
+/// What one received audio packet turns into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetEqInsertPlan {
+    /// A RED-recovered earlier frame, inserted before `primary`.
+    pub recovered: Option<NetEqInsert>,
+    pub primary: NetEqInsert,
+    /// The packet claimed RED but its payload did not parse; `primary`
+    /// carries the whole blob.
+    pub red_malformed: bool,
+}
+
+/// RTP timestamp of a packet's primary frame.
+///
+/// Uses `rtp_timestamp` when the sender set it. Senders that predate the
+/// field emit one 20 ms frame per sequence number, so `sequence * 960` is
+/// exact for them. `MediaPacket.timestamp` (wall-clock ms since 1970) is
+/// never used: as a u32 it saturates to 4294967295 for every packet.
+pub(crate) fn primary_rtp_timestamp(meta: &AudioMetadata) -> u32 {
+    meta.rtp_timestamp
+        .unwrap_or_else(|| legacy_rtp_timestamp(meta.sequence))
+}
+
+/// RTP timestamp of a RED redundant frame: the primary's minus the sequence
+/// distance in 20 ms frames.
+///
+/// Returns `None` when the distance is not in `1..=AUDIO_RED_SEQ_HISTORY_SIZE`
+/// (malformed, or too far back to dedupe), in which case the frame is not
+/// recovered. Correct for both sender generations because a sender never
+/// attaches redundancy across a timestamp gap.
+pub(crate) fn redundant_rtp_timestamp(
+    primary_timestamp: u32,
+    primary_seq: u64,
+    redundant_seq: u32,
+) -> Option<u32> {
+    // The RED header carries only the low 32 bits of the sequence number.
+    let distance = (primary_seq as u32).wrapping_sub(redundant_seq);
+    if distance == 0 || distance as usize > AUDIO_RED_SEQ_HISTORY_SIZE {
+        return None;
+    }
+    Some(primary_timestamp.wrapping_sub(distance.wrapping_mul(OPUS_RTP_SAMPLES_PER_20MS_FRAME)))
+}
+
+/// Decide which frames (and with which timestamps) one audio packet feeds to
+/// NetEq. Pure so it can be tested natively; O(1) apart from copying the
+/// payload. `already_received(seq)` reports whether a sequence number has
+/// been inserted before (RED dedup).
+pub(crate) fn plan_neteq_inserts(
+    meta: &AudioMetadata,
+    data: &[u8],
+    already_received: impl Fn(u64) -> bool,
+) -> NetEqInsertPlan {
+    let seq = meta.sequence;
+    let timestamp = primary_rtp_timestamp(meta);
+    let whole_blob = |red_malformed| NetEqInsertPlan {
+        recovered: None,
+        primary: NetEqInsert {
+            seq,
+            timestamp,
+            payload: data.to_vec(),
+        },
+        red_malformed,
+    };
+
+    if meta.audio_format != AUDIO_RED_FORMAT {
+        return whole_blob(false);
+    }
+    // [4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]
+    let Some((primary, redundant_seq, redundant_data)) =
+        NetEqAudioPeerDecoder::unpack_red_audio(data)
+    else {
+        return whole_blob(true);
+    };
+
+    let recovered = if already_received(u64::from(redundant_seq)) {
+        None
+    } else {
+        redundant_rtp_timestamp(timestamp, seq, redundant_seq).map(|timestamp| NetEqInsert {
+            seq: u64::from(redundant_seq),
+            timestamp,
+            payload: redundant_data,
+        })
+    };
+
+    NetEqInsertPlan {
+        recovered,
+        primary: NetEqInsert {
+            seq,
+            timestamp,
+            payload: primary,
+        },
+        red_malformed: false,
+    }
+}
+
 impl Drop for NetEqAudioPeerDecoder {
     fn drop(&mut self) {
         self.worker.terminate();
@@ -673,65 +775,41 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                 // redundancy payloads later.
                 self.record_sequence(seq);
 
-                // Check whether the packet carries RED-style redundancy.
-                let is_red = audio_meta.audio_format == AUDIO_RED_FORMAT;
+                // Timestamps come from `rtp_timestamp` (or `sequence * 960`
+                // for senders that predate it), never from the wall-clock
+                // `packet.timestamp`, which saturates as a u32.
+                let plan = plan_neteq_inserts(audio_meta, &packet.data, |s| self.has_sequence(s));
 
-                if is_red {
-                    // Unpack the RED payload:
-                    // [4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]
-                    if let Some((primary, redundant_seq, redundant_data)) =
-                        Self::unpack_red_audio(&packet.data)
-                    {
-                        // First, check if the redundant frame was lost (not yet received).
-                        if !self.has_sequence(redundant_seq as u64) {
-                            log::debug!(
-                                "RED recovery: injecting lost audio seq {} for peer {}",
-                                redundant_seq,
-                                self.peer_id
-                            );
-                            self.record_sequence(redundant_seq as u64);
-                            // Inject the recovered frame with its original sequence and
-                            // an earlier timestamp (one Opus frame before the primary).
-                            let recovered_insert = WorkerMsg::Insert {
-                                seq: redundant_seq as u16,
-                                timestamp: (packet.timestamp as u32)
-                                    .saturating_sub(OPUS_FRAME_DURATION_MS),
-                                payload: redundant_data,
-                            };
-                            self.send_worker_message(recovered_insert);
-                        }
-
-                        // Now send the primary frame.
-                        let insert = WorkerMsg::Insert {
-                            seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
-                            payload: primary,
-                        };
-                        self.send_worker_message(insert);
-                    } else {
-                        // RED unpack failed -- fall back to treating the whole
-                        // data blob as a single frame.
-                        log::warn!(
-                            "RED unpack failed for peer {} seq {}, falling back to raw",
-                            self.peer_id,
-                            seq
-                        );
-                        let insert = WorkerMsg::Insert {
-                            seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
-                            payload: packet.data.clone(),
-                        };
-                        self.send_worker_message(insert);
-                    }
-                } else {
-                    // Standard (non-RED) audio packet.
-                    let insert = WorkerMsg::Insert {
-                        seq: seq as u16,
-                        timestamp: packet.timestamp as u32,
-                        payload: packet.data.clone(),
-                    };
-                    self.send_worker_message(insert);
+                if plan.red_malformed {
+                    log::warn!(
+                        "RED unpack failed for peer {} seq {}, falling back to raw",
+                        self.peer_id,
+                        seq
+                    );
                 }
+
+                // A lost earlier frame recovered from the RED payload goes in
+                // first, with its own sequence and timestamp.
+                if let Some(recovered) = plan.recovered {
+                    log::debug!(
+                        "RED recovery: injecting lost audio seq {} (ts {}) for peer {}",
+                        recovered.seq,
+                        recovered.timestamp,
+                        self.peer_id
+                    );
+                    self.record_sequence(recovered.seq);
+                    self.send_worker_message(WorkerMsg::Insert {
+                        seq: recovered.seq as u16,
+                        timestamp: recovered.timestamp,
+                        payload: recovered.payload,
+                    });
+                }
+
+                self.send_worker_message(WorkerMsg::Insert {
+                    seq: plan.primary.seq as u16,
+                    timestamp: plan.primary.timestamp,
+                    payload: plan.primary.payload,
+                });
 
                 let first_frame = !self.decoded;
                 self.decoded = true;
@@ -1024,5 +1102,177 @@ mod tests {
         // Sequence 10 should have been evicted
         assert!(!received.contains(&10));
         assert_eq!(received.len(), capacity);
+    }
+}
+
+/// Native (`cargo test -p videocall-client --lib`) tests for the timestamps
+/// handed to NetEq. No browser APIs are touched.
+#[cfg(test)]
+mod rtp_timestamp_tests {
+    use super::*;
+    use crate::adaptive_quality_constants::AUDIO_RED_FORMAT;
+    use protobuf::Message;
+    use videocall_types::protos::media_packet::media_packet::MediaType;
+
+    /// A wall-clock timestamp in ms since 1970, as legacy senders write it.
+    const EPOCH_MS: f64 = 1_763_251_200_000.0;
+
+    fn meta(sequence: u64, rtp_timestamp: Option<u32>, red: bool) -> AudioMetadata {
+        AudioMetadata {
+            sequence,
+            rtp_timestamp,
+            audio_format: if red {
+                AUDIO_RED_FORMAT.to_string()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn red_payload(primary: &[u8], redundant_seq: u32, redundant: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(primary.len() as u32).to_le_bytes());
+        buf.extend_from_slice(primary);
+        buf.extend_from_slice(&redundant_seq.to_le_bytes());
+        buf.extend_from_slice(redundant);
+        buf
+    }
+
+    /// Round-trip through the wire format so presence/absence is the real
+    /// decoded state, not just the struct we built.
+    fn over_the_wire(meta: AudioMetadata) -> AudioMetadata {
+        let packet = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            timestamp: EPOCH_MS,
+            audio_metadata: Some(meta).into(),
+            ..Default::default()
+        };
+        let bytes = packet.write_to_bytes().unwrap();
+        MediaPacket::parse_from_bytes(&bytes)
+            .unwrap()
+            .audio_metadata
+            .unwrap()
+    }
+
+    #[test]
+    fn present_rtp_timestamp_passes_through_unchanged() {
+        for ts in [0u32, 960, 123_456_789, u32::MAX - 959, u32::MAX] {
+            let m = over_the_wire(meta(7, Some(ts), false));
+            assert_eq!(m.rtp_timestamp, Some(ts), "presence survives the wire");
+            assert_eq!(primary_rtp_timestamp(&m), ts);
+            let plan = plan_neteq_inserts(&m, b"opus", |_| false);
+            assert_eq!(plan.primary.timestamp, ts);
+            assert_eq!(plan.primary.seq, 7);
+            assert_eq!(plan.primary.payload, b"opus");
+            assert!(plan.recovered.is_none());
+        }
+    }
+
+    #[test]
+    fn absent_rtp_timestamp_falls_back_to_sequence_times_960() {
+        for seq in [0u64, 1, 392, 4_473_925, u64::MAX] {
+            let m = over_the_wire(meta(seq, None, false));
+            assert_eq!(m.rtp_timestamp, None);
+            let expected = ((seq as u128 * 960) % (1u128 << 32)) as u32;
+            assert_eq!(primary_rtp_timestamp(&m), expected);
+            assert_eq!(
+                plan_neteq_inserts(&m, b"x", |_| false).primary.timestamp,
+                expected
+            );
+        }
+    }
+
+    /// The captured live call: 393 legacy packets with epoch-ms timestamps
+    /// all reached NetEq as 4294967295. They must now be distinct and
+    /// advance by exactly one frame.
+    #[test]
+    fn legacy_epoch_ms_packets_never_saturate() {
+        let mut previous: Option<u32> = None;
+        for seq in 0..393u64 {
+            let m = over_the_wire(meta(seq, None, false));
+            let ts = plan_neteq_inserts(&m, b"x", |_| false).primary.timestamp;
+            assert_ne!(ts, u32::MAX, "seq {seq} saturated");
+            if let Some(prev) = previous {
+                assert_eq!(ts.wrapping_sub(prev), 960);
+            }
+            previous = Some(ts);
+        }
+    }
+
+    #[test]
+    fn red_recovered_frame_is_one_frame_before_primary_new_sender() {
+        let m = over_the_wire(meta(11, Some(50_000), true));
+        let data = red_payload(b"primary", 10, b"redundant");
+        let plan = plan_neteq_inserts(&m, &data, |_| false);
+        let recovered = plan.recovered.expect("seq 10 was lost, so it is recovered");
+        assert_eq!(recovered.seq, 10);
+        assert_eq!(recovered.timestamp, 50_000 - 960);
+        assert_eq!(recovered.payload, b"redundant");
+        assert_eq!(plan.primary.timestamp, 50_000);
+        assert_eq!(plan.primary.payload, b"primary");
+        assert!(!plan.red_malformed);
+    }
+
+    #[test]
+    fn red_recovered_frame_is_one_frame_before_primary_legacy_sender() {
+        let m = over_the_wire(meta(11, None, true));
+        let data = red_payload(b"primary", 10, b"redundant");
+        let plan = plan_neteq_inserts(&m, &data, |_| false);
+        let recovered = plan.recovered.expect("seq 10 was lost, so it is recovered");
+        assert_eq!(plan.primary.timestamp, 11 * 960);
+        assert_eq!(recovered.timestamp, 10 * 960);
+        // Same value the legacy fallback gives seq 10 had it arrived itself,
+        // so NetEq sees a true duplicate, not two different frames.
+        assert_eq!(
+            recovered.timestamp,
+            primary_rtp_timestamp(&meta(10, None, false))
+        );
+    }
+
+    #[test]
+    fn red_recovery_wraps_below_zero() {
+        let m = meta(1, Some(100), true);
+        let plan = plan_neteq_inserts(&m, &red_payload(b"p", 0, b"r"), |_| false);
+        assert_eq!(plan.recovered.unwrap().timestamp, 100u32.wrapping_sub(960));
+        // Legacy seq 0 -> ts 0; its redundant frame from seq u32::MAX wraps too.
+        assert_eq!(
+            redundant_rtp_timestamp(0, 1u64 << 32, u32::MAX),
+            Some(0u32.wrapping_sub(960))
+        );
+    }
+
+    #[test]
+    fn red_frame_already_received_is_not_reinserted() {
+        let m = meta(11, Some(50_000), true);
+        let plan = plan_neteq_inserts(&m, &red_payload(b"p", 10, b"r"), |s| s == 10);
+        assert!(plan.recovered.is_none());
+        assert_eq!(plan.primary.payload, b"p");
+    }
+
+    #[test]
+    fn red_with_nonsense_distance_is_not_recovered() {
+        // Redundant seq equal to or after the primary, or far beyond the
+        // dedupe window: drop the redundant frame, keep the primary.
+        assert_eq!(redundant_rtp_timestamp(50_000, 11, 11), None);
+        assert_eq!(redundant_rtp_timestamp(50_000, 11, 12), None);
+        assert_eq!(redundant_rtp_timestamp(50_000, 1_000, 1), None);
+        let plan = plan_neteq_inserts(
+            &meta(11, Some(50_000), true),
+            &red_payload(b"p", 12, b"r"),
+            |_| false,
+        );
+        assert!(plan.recovered.is_none());
+        assert_eq!(plan.primary.timestamp, 50_000);
+    }
+
+    #[test]
+    fn malformed_red_falls_back_to_whole_blob() {
+        let m = meta(3, None, true);
+        let plan = plan_neteq_inserts(&m, &[1, 2, 3], |_| false);
+        assert!(plan.red_malformed);
+        assert!(plan.recovered.is_none());
+        assert_eq!(plan.primary.payload, vec![1, 2, 3]);
+        assert_eq!(plan.primary.timestamp, 3 * 960);
     }
 }

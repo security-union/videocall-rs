@@ -25,6 +25,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
+use videocall_types::audio_rtp::AudioRtpClock;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -139,6 +140,11 @@ impl AudioProducer {
 
         let mut audio_position = 0;
         let mut sequence = 0u64;
+        // 48 kHz RTP clock, +960 per 20 ms frame. The loop never pauses, so
+        // the clock only advances one frame per tick; a failed encode leaves
+        // a one-frame gap in the timestamps, which is what happened.
+        let mut rtp_clock = AudioRtpClock::opus_20ms();
+        let capture_epoch = std::time::Instant::now();
 
         loop {
             if quit.load(Ordering::Relaxed) {
@@ -154,6 +160,9 @@ impl AudioProducer {
             }
 
             let user_id_bytes = user_id.clone().into_bytes();
+            let rtp_timestamp = rtp_clock
+                .stamp(capture_epoch.elapsed().as_secs_f64() * 1_000.0)
+                .rtp_timestamp;
 
             // Encode to Opus
             let mut encoded = vec![0u8; 4000];
@@ -170,6 +179,7 @@ impl AudioProducer {
                         timestamp: get_timestamp_ms(),
                         audio_metadata: Some(AudioMetadata {
                             sequence,
+                            rtp_timestamp: Some(rtp_timestamp),
                             ..Default::default()
                         })
                         .into(),

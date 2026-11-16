@@ -27,6 +27,13 @@ message AudioMetadata {
   uint32 audio_number_of_frames = 3;
   float audio_sample_rate = 4;
   uint64 sequence = 5;
+  // RTP-style media timestamp of this frame, in samples at the codec clock
+  // rate (48000 for Opus, so +960 per 20 ms frame), wrapping modulo 2^32.
+  // Advances by the frame duration for every frame and jumps forward across
+  // a send pause, so a gap means the sender skipped audio. Explicit presence:
+  // senders that predate this field leave it unset (0 is a valid value), and
+  // receivers then derive `sequence * 960`.
+  optional uint32 rtp_timestamp = 6;
 }
 
 message VideoMetadata {

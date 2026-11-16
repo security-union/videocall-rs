@@ -25,6 +25,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info};
+use videocall_types::audio_rtp::AudioRtpClock;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -136,6 +137,11 @@ fn start_microphone(
         // (FnMut) data callback keeps framing stateful across invocations.
         let mut acc: Vec<f32> = Vec::with_capacity(frame_size * 2);
         let mut frames: u64 = 0;
+        // Opus RTP timestamps are always on a 48 kHz clock (RFC 7587), so
+        // each 20 ms frame advances by 960 whatever the device rate is. This
+        // stream never pauses, so the clock only ever advances by one frame.
+        let mut rtp_clock = AudioRtpClock::opus_20ms();
+        let capture_epoch = std::time::Instant::now();
 
         // One data callback per supported sample format: down-mix interleaved
         // input to mono, then encode full frames as the accumulator fills.
@@ -148,10 +154,17 @@ fn start_microphone(
                         acc.push(sum / in_channels as f32);
                     }
                     while acc.len() >= frame_size {
+                        let capture_ms = capture_epoch.elapsed().as_secs_f64() * 1_000.0;
+                        let rtp_timestamp = rtp_clock.stamp(capture_ms).rtp_timestamp;
                         match encoder.encode_float(&acc[..frame_size], &mut out) {
                             Ok(n) => {
-                                if let Err(e) = send_audio_packet(&out[..n], &wt_tx, &email, frames)
-                                {
+                                if let Err(e) = send_audio_packet(
+                                    &out[..n],
+                                    &wt_tx,
+                                    &email,
+                                    frames,
+                                    rtp_timestamp,
+                                ) {
                                     error!("Failed to send audio: {e}");
                                 }
                             }
@@ -219,8 +232,9 @@ fn send_audio_packet(
     wt_tx: &Sender<Vec<u8>>,
     email: &str,
     sequence: u64,
+    rtp_timestamp: u32,
 ) -> anyhow::Result<()> {
-    let packet = transform_audio_chunk(opus.to_vec(), email.to_string(), sequence)?;
+    let packet = transform_audio_chunk(opus.to_vec(), email.to_string(), sequence, rtp_timestamp)?;
     let bytes = packet.write_to_bytes()?;
     wt_tx.try_send(bytes)?;
     Ok(())
@@ -230,6 +244,7 @@ fn transform_audio_chunk(
     data: Vec<u8>,
     email: String,
     sequence: u64,
+    rtp_timestamp: u32,
 ) -> anyhow::Result<PacketWrapper> {
     let user_id_bytes = email.as_bytes();
     Ok(PacketWrapper {
@@ -240,8 +255,8 @@ fn transform_audio_chunk(
             data,
             user_id: user_id_bytes.to_vec(),
             frame_type: String::from("key"),
-            // Milliseconds — the NetEq decoder treats `timestamp` as ms (it
-            // subtracts an Opus frame duration in ms during RED recovery).
+            // Wall-clock ms since 1970. NetEq does not read this; it uses
+            // `audio_metadata.rtp_timestamp` below.
             timestamp: get_millis_now(),
             duration: 0.0,
             // Audio packets MUST carry `audio_metadata` (not `video_metadata`):
@@ -251,6 +266,7 @@ fn transform_audio_chunk(
             // frames — previously hard-coded to 0, which collapsed all packets.
             audio_metadata: Some(AudioMetadata {
                 sequence,
+                rtp_timestamp: Some(rtp_timestamp),
                 ..Default::default()
             })
             .into(),

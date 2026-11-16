@@ -32,6 +32,7 @@ pub mod expand;
 pub mod histogram;
 pub mod neteq;
 pub mod packet;
+pub mod packet_arrival_history;
 pub mod signal;
 pub mod statistics;
 pub mod time_stretch;
@@ -42,7 +43,7 @@ pub use statistics::q14;
 pub mod web;
 
 pub use error::{NetEqError, Result};
-pub use neteq::{NetEq, NetEqConfig, NetEqStats, Operation};
+pub use neteq::{Mode, NetEq, NetEqConfig, NetEqStats, Operation};
 pub use packet::{AudioPacket, RtpHeader};
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]

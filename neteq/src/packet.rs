@@ -67,6 +67,11 @@ impl RtpHeader {
     }
 }
 
+/// An Opus DTX payload: at most 2 bytes (see [`AudioPacket::is_dtx`]).
+pub fn is_dtx_payload(payload: &[u8]) -> bool {
+    payload.len() <= 2
+}
+
 /// Audio packet containing RTP header and audio data
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
@@ -116,6 +121,18 @@ impl AudioPacket {
     /// Check if this packet is older than the given duration
     pub fn is_older_than(&self, max_age: Duration) -> bool {
         self.age() > max_age
+    }
+
+    /// Duration in samples per channel.
+    pub fn duration_samples(&self) -> usize {
+        (u64::from(self.sample_rate) * u64::from(self.duration_ms) / 1000) as usize
+    }
+
+    /// An Opus DTX packet: a payload of at most 2 bytes carries no audio
+    /// (opus_frame.cc `OpusFrame::IsDtxPacket`, opus_interface.cc
+    /// `DetermineAudioType`).
+    pub fn is_dtx(&self) -> bool {
+        is_dtx_payload(&self.payload)
     }
 
     /// Calculate expected number of samples in this packet

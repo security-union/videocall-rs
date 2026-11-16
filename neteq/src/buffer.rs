@@ -85,9 +85,16 @@ impl PacketBuffer {
         }
     }
 
-    /// Set the maximum age for packets
+    /// Set the maximum age for packets. Kept for API compatibility: the
+    /// buffer no longer discards by wall-clock age (libwebrtc's packet
+    /// buffer has no such rule; obsolete packets go by RTP timestamp).
     pub fn set_max_packet_age(&mut self, max_age: Duration) {
         self.max_packet_age = max_age;
+    }
+
+    /// The value last given to [`Self::set_max_packet_age`].
+    pub fn max_packet_age(&self) -> Duration {
+        self.max_packet_age
     }
 
     /// Check if the buffer is empty
@@ -116,119 +123,112 @@ impl PacketBuffer {
         }
     }
 
-    /// Partial flush - remove older packets but keep some recent ones
+    /// Partial flush (packet_buffer.cc `PacketBuffer::PartialFlush`): drop
+    /// the oldest packets until the span is at most the target level (but
+    /// never below the smart-flush threshold) and at most half the capacity
+    /// is used.
     pub fn partial_flush(
         &mut self,
         target_level_ms: u32,
-        _sample_rate: u32,
+        sample_rate: u32,
         stats: &mut StatisticsCalculator,
     ) -> Result<BufferReturnCode> {
         if self.buffer.is_empty() {
             return Ok(BufferReturnCode::BufferEmpty);
         }
-
-        // Calculate target number of packets to keep
-        let target_duration = Duration::from_millis(target_level_ms as u64);
-        let mut current_duration = Duration::from_millis(0);
-        let mut keep_count = 0;
-
-        // Count from the newest packets backwards
-        for packet in self.buffer.iter().rev() {
-            current_duration += Duration::from_millis(packet.duration_ms as u64);
-            keep_count += 1;
-
-            if current_duration >= target_duration {
-                break;
-            }
+        let last_decoded_length = self.last_duration_samples(sample_rate);
+        let target_level_samples = (u64::from(target_level_ms) * u64::from(sample_rate) / 1000)
+            .min((self.max_packets * last_decoded_length / 2) as u64)
+            .max(
+                u64::from(self.smart_flush_config.target_level_threshold_ms)
+                    * u64::from(sample_rate)
+                    / 1000,
+            );
+        let mut removed = 0;
+        while !self.buffer.is_empty()
+            && (self.get_span_samples(last_decoded_length, sample_rate, false) as u64
+                > target_level_samples
+                || self.buffer.len() > self.max_packets / 2)
+        {
+            self.buffer.pop_front();
+            stats.packet_discarded(false);
+            removed += 1;
         }
-
-        // Remove older packets
-        let remove_count = self.buffer.len().saturating_sub(keep_count);
-        if remove_count > 0 {
-            for _ in 0..remove_count {
-                if let Some(packet) = self.buffer.pop_front() {
-                    stats.packet_discarded(packet.is_older_than(self.max_packet_age));
-                }
-            }
-
-            log::debug!("Partial flush: removed {remove_count} packets, kept {keep_count}");
+        if removed > 0 {
+            log::debug!("Partial flush: removed {removed} packets");
             return Ok(BufferReturnCode::PartialFlush);
         }
-
         Ok(BufferReturnCode::Ok)
     }
 
-    /// Insert a packet into the buffer with proper ordering
+    /// Insert a packet (packet_buffer.cc `PacketBuffer::InsertPacket`).
+    ///
+    /// Packets are ordered by RTP timestamp with the sequence number as the
+    /// tie-break, both wrap-aware (packet.h `Packet::operator<`). A packet
+    /// whose timestamp equals one already buffered is a duplicate: the one
+    /// with the earlier sequence number is kept.
     pub fn insert_packet(
         &mut self,
         packet: AudioPacket,
         stats: &mut StatisticsCalculator,
         target_level_ms: u32,
     ) -> Result<BufferReturnCode> {
-        // Check for stale packets and remove them
-        self.discard_old_packets(stats);
-
-        // Check if we need to trigger smart flushing
-        if self.should_smart_flush(target_level_ms) {
-            self.partial_flush(target_level_ms, packet.sample_rate, stats)?;
+        if packet.payload.is_empty() {
+            return Ok(BufferReturnCode::InvalidPacket);
         }
+        let sample_rate = packet.sample_rate;
+        let mut return_code = BufferReturnCode::Ok;
 
-        // Check if buffer is full
-        if self.buffer.len() >= self.max_packets {
-            // Try partial flush first
-            self.partial_flush(target_level_ms, packet.sample_rate, stats)?;
-
-            // If still full, flush completely
+        // Smart flush when the span exceeds a multiple of the target level.
+        let span_threshold = u64::from(self.smart_flush_config.target_level_multiplier)
+            * u64::from(
+                self.smart_flush_config
+                    .target_level_threshold_ms
+                    .max(target_level_ms),
+            )
+            * u64::from(sample_rate)
+            / 1000;
+        let last_duration = self.last_duration_samples(sample_rate);
+        let smart_flush = !self.buffer.is_empty()
+            && self.get_span_samples(last_duration, sample_rate, false) as u64 >= span_threshold;
+        if self.buffer.len() >= self.max_packets || smart_flush {
+            let before = self.buffer.len();
+            self.partial_flush(target_level_ms, sample_rate, stats)?;
             if self.buffer.len() >= self.max_packets {
                 self.flush(stats);
-                log::warn!("Buffer overflow: performed full flush");
-                stats.buffer_flush();
+                return_code = BufferReturnCode::Flushed;
+            } else if self.buffer.len() < before {
+                return_code = BufferReturnCode::PartialFlush;
             }
         }
 
-        // Find the correct position to insert the packet (ordered by timestamp)
-        let insert_pos = self.find_insert_position(&packet);
-
-        // Check for duplicate packets
-        if self.is_duplicate(&packet, insert_pos) {
+        // Search from the back for the first packet the new one is not
+        // earlier than (packet_buffer.cc NewTimestampIsLarger).
+        let mut pos = self.buffer.len();
+        while pos > 0 && packet_is_earlier(&packet, &self.buffer[pos - 1]) {
+            pos -= 1;
+        }
+        if pos > 0 && self.buffer[pos - 1].header.timestamp == packet.header.timestamp {
             log::debug!(
-                "Discarding duplicate packet: seq={}, ts={}",
+                "Discarding duplicate timestamp: seq={}, ts={}",
                 packet.header.sequence_number,
                 packet.header.timestamp
             );
             stats.packet_discarded(false);
-            return Ok(BufferReturnCode::Ok);
+            return Ok(return_code);
         }
-
-        // Detect reordering: if packet is not inserted at the end, it's reordered
-        let is_reordered = insert_pos < self.buffer.len();
-
-        if is_reordered {
-            // Calculate reorder distance (how far out of order)
-            let expected_pos = self.buffer.len();
-            let distance = (expected_pos - insert_pos) as u16;
-            stats.packet_reordered(distance);
-
-            log::debug!(
-                "Reordered packet detected: seq={}, ts={}, insert_pos={}, expected_pos={}, distance={}",
-                packet.header.sequence_number,
-                packet.header.timestamp,
-                insert_pos,
-                expected_pos,
-                distance
-            );
+        if pos < self.buffer.len() && self.buffer[pos].header.timestamp == packet.header.timestamp {
+            self.buffer.remove(pos);
+            stats.packet_discarded(false);
+        }
+        if pos < self.buffer.len() {
+            stats.packet_reordered((self.buffer.len() - pos) as u16);
         } else {
             stats.packet_in_order();
         }
-
-        // Insert the packet
-        self.buffer.insert(insert_pos, packet);
-
-        // Update statistics
-        let arrival_delay = self.calculate_arrival_delay(insert_pos);
-        stats.packet_arrived(arrival_delay);
-
-        Ok(BufferReturnCode::Ok)
+        self.buffer.insert(pos, packet);
+        stats.packet_arrived(0);
+        Ok(return_code)
     }
 
     /// Get the next packet timestamp without removing it
@@ -236,11 +236,16 @@ impl PacketBuffer {
         self.buffer.front().map(|packet| packet.header.timestamp)
     }
 
+    /// The next packet, without removing it (`PeekNextPacket`).
+    pub fn peek_next_packet(&self) -> Option<&AudioPacket> {
+        self.buffer.front()
+    }
+
     /// Get the next packet with timestamp >= the given timestamp
     pub fn peek_next_packet_from_timestamp(&self, timestamp: u32) -> Option<&AudioPacket> {
         self.buffer
             .iter()
-            .find(|packet| packet.header.timestamp >= timestamp)
+            .find(|packet| !is_newer_timestamp(timestamp, packet.header.timestamp))
     }
 
     /// Get the oldest packet from the buffer
@@ -253,60 +258,88 @@ impl PacketBuffer {
         &mut self,
         stats: &mut StatisticsCalculator,
     ) -> Result<BufferReturnCode> {
-        if let Some(packet) = self.buffer.pop_front() {
-            stats.packet_discarded(packet.is_older_than(self.max_packet_age));
+        if self.buffer.pop_front().is_some() {
+            stats.packet_discarded(true);
             Ok(BufferReturnCode::Ok)
         } else {
             Ok(BufferReturnCode::BufferEmpty)
         }
     }
 
-    /// Discard packets older than the given timestamp
+    /// packet_buffer.cc `DiscardOldPackets`: drop packets older than
+    /// `timestamp_limit` but no more than `horizon_samples` older (0: any).
+    pub fn discard_old_packets(
+        &mut self,
+        timestamp_limit: u32,
+        horizon_samples: u32,
+        stats: &mut StatisticsCalculator,
+    ) {
+        self.buffer.retain(|p| {
+            let obsolete = timestamp_limit != p.header.timestamp
+                && is_obsolete_timestamp(p.header.timestamp, timestamp_limit, horizon_samples);
+            if obsolete {
+                stats.packet_discarded(true);
+            }
+            !obsolete
+        });
+    }
+
+    /// Discard every packet older than the given timestamp
+    /// (`DiscardAllOldPackets`).
     pub fn discard_old_packets_by_timestamp(
         &mut self,
         timestamp_limit: u32,
         stats: &mut StatisticsCalculator,
     ) {
-        let initial_len = self.buffer.len();
-
-        self.buffer.retain(|packet| {
-            let should_keep = packet.header.timestamp >= timestamp_limit;
-            if !should_keep {
-                stats.packet_discarded(true);
-            }
-            should_keep
-        });
-
-        let discarded = initial_len - self.buffer.len();
-        if discarded > 0 {
-            log::debug!("Discarded {discarded} old packets by timestamp");
-        }
+        self.discard_old_packets(timestamp_limit, 0, stats);
     }
 
     /// Get the total duration of packets in the buffer (timestamp span)
     pub fn get_span_duration_ms(&self) -> u32 {
-        if self.buffer.is_empty() {
+        let Some(front) = self.buffer.front() else {
             return 0;
-        }
-
-        let oldest_ts = self.buffer.front().unwrap().header.timestamp;
-        let newest_ts = self.buffer.back().unwrap().header.timestamp;
-
-        // Handle timestamp wraparound
-        let span_samples = if newest_ts >= oldest_ts {
-            newest_ts - oldest_ts
-        } else {
-            // Wraparound case
-            (u32::MAX - oldest_ts) + newest_ts + 1
         };
+        let back = self.buffer.back().unwrap_or(front);
+        let span = back.header.timestamp.wrapping_sub(front.header.timestamp);
+        (u64::from(span) * 1000 / u64::from(front.sample_rate.max(1))) as u32
+    }
 
-        // Convert samples to milliseconds (assuming first packet sample rate)
-        let sample_rate = self.buffer.front().unwrap().sample_rate;
-        (span_samples * 1000) / sample_rate
+    /// packet_buffer.cc `PacketBuffer::GetSpanSamples`: timestamp span of the
+    /// buffer plus either the last packet's waiting time
+    /// (`count_waiting_time`) or its duration (for a DTX packet, at least its
+    /// waiting time). In samples per channel.
+    pub fn get_span_samples(
+        &self,
+        last_decoded_length: usize,
+        sample_rate: u32,
+        count_waiting_time: bool,
+    ) -> usize {
+        let (Some(front), Some(back)) = (self.buffer.front(), self.buffer.back()) else {
+            return 0;
+        };
+        let mut span = back.header.timestamp.wrapping_sub(front.header.timestamp) as usize;
+        let waiting = back.age().as_millis() as usize * (sample_rate / 1000) as usize;
+        if count_waiting_time {
+            span += waiting;
+        } else {
+            let mut duration = back.duration_samples();
+            if duration == 0 {
+                duration = last_decoded_length;
+            }
+            if back.is_dtx() {
+                duration = duration.max(waiting);
+            }
+            span += duration;
+        }
+        span
+    }
+
+    /// packet_buffer.cc `ContainsDtxOrCngPacket`.
+    pub fn contains_dtx_packet(&self) -> bool {
+        self.buffer.iter().any(AudioPacket::is_dtx)
     }
 
     /// Get the total content duration of packets in the buffer (sum of packet durations)
-    /// This is more reliable than span_duration when packets have close timestamps
     pub fn get_total_content_duration_ms(&self) -> u32 {
         self.buffer.iter().map(|packet| packet.duration_ms).sum()
     }
@@ -319,88 +352,41 @@ impl PacketBuffer {
             .sum()
     }
 
-    fn find_insert_position(&self, packet: &AudioPacket) -> usize {
-        // Binary search for the correct insertion position based on timestamp
-        let mut low = 0;
-        let mut high = self.buffer.len();
-
-        while low < high {
-            let mid = (low + high) / 2;
-            if self.buffer[mid].header.timestamp <= packet.header.timestamp {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-
-        low
+    fn last_duration_samples(&self, sample_rate: u32) -> usize {
+        self.buffer.back().map_or(
+            (sample_rate as usize / 1000) * 20,
+            AudioPacket::duration_samples,
+        )
     }
+}
 
-    fn is_duplicate(&self, packet: &AudioPacket, insert_pos: usize) -> bool {
-        // Check adjacent packets for duplicates
-        let check_positions = [
-            insert_pos.saturating_sub(1),
-            insert_pos,
-            (insert_pos + 1).min(self.buffer.len().saturating_sub(1)),
-        ];
+/// `a` is newer than `b`, wrap-aware (module_common_types_public.h
+/// `IsNewerTimestamp`).
+pub fn is_newer_timestamp(a: u32, b: u32) -> bool {
+    a != b && a.wrapping_sub(b) < 0x8000_0000
+}
 
-        for &pos in &check_positions {
-            if pos < self.buffer.len() {
-                if let Some(existing) = self.buffer.get(pos) {
-                    if existing.header.timestamp == packet.header.timestamp
-                        && existing.header.sequence_number == packet.header.sequence_number
-                        && existing.header.ssrc == packet.header.ssrc
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
+/// packet_buffer.h `PacketBuffer::IsObsoleteTimestamp`.
+pub fn is_obsolete_timestamp(timestamp: u32, timestamp_limit: u32, horizon_samples: u32) -> bool {
+    is_newer_timestamp(timestamp_limit, timestamp)
+        && (horizon_samples == 0
+            || is_newer_timestamp(timestamp, timestamp_limit.wrapping_sub(horizon_samples)))
+}
 
-        false
-    }
-
-    fn calculate_arrival_delay(&self, insert_pos: usize) -> i32 {
-        // Simple arrival delay calculation based on position in buffer
-        // In a real implementation, this would be more sophisticated
-        if insert_pos == 0 {
-            0
-        } else {
-            (insert_pos as i32) * 10 // Rough estimate: 10ms per position
-        }
-    }
-
-    fn should_smart_flush(&self, target_level_ms: u32) -> bool {
-        if self.buffer.is_empty() {
+/// packet.h `Packet::operator<`: by timestamp, then sequence number, both
+/// wrap-aware.
+fn packet_is_earlier(a: &AudioPacket, b: &AudioPacket) -> bool {
+    if a.header.timestamp == b.header.timestamp {
+        if a.header.sequence_number == b.header.sequence_number {
             return false;
         }
-
-        let current_span_ms = self.get_span_duration_ms();
-        let flush_threshold = self
-            .smart_flush_config
-            .target_level_threshold_ms
-            .max(target_level_ms)
-            * self.smart_flush_config.target_level_multiplier;
-
-        current_span_ms > flush_threshold
+        return b
+            .header
+            .sequence_number
+            .wrapping_sub(a.header.sequence_number)
+            < 0xFFFF / 2;
     }
-
-    fn discard_old_packets(&mut self, stats: &mut StatisticsCalculator) {
-        let initial_len = self.buffer.len();
-
-        self.buffer.retain(|packet| {
-            let should_keep = !packet.is_older_than(self.max_packet_age);
-            if !should_keep {
-                stats.packet_discarded(true);
-            }
-            should_keep
-        });
-
-        let discarded = initial_len - self.buffer.len();
-        if discarded > 0 {
-            log::debug!("Discarded {discarded} stale packets");
-        }
-    }
+    b.header.timestamp.wrapping_sub(a.header.timestamp) < 0xFFFF_FFFF / 2
 }
 
 #[cfg(test)]
@@ -485,6 +471,52 @@ mod tests {
 
         // Buffer should not exceed max capacity
         assert!(buffer.len() <= 2);
+    }
+
+    #[test]
+    fn same_timestamp_keeps_the_earlier_sequence_number() {
+        let mut buffer = PacketBuffer::new(10);
+        let mut stats = StatisticsCalculator::new();
+        buffer
+            .insert_packet(create_test_packet(5, 1000, 20), &mut stats, 100)
+            .unwrap();
+        buffer
+            .insert_packet(create_test_packet(6, 1000, 20), &mut stats, 100)
+            .unwrap();
+        buffer
+            .insert_packet(create_test_packet(4, 1000, 20), &mut stats, 100)
+            .unwrap();
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.get_next_packet().unwrap().header.sequence_number, 4);
+    }
+
+    #[test]
+    fn ordering_is_wrap_aware() {
+        let mut buffer = PacketBuffer::new(10);
+        let mut stats = StatisticsCalculator::new();
+        buffer
+            .insert_packet(create_test_packet(1, 320, 20), &mut stats, 100)
+            .unwrap();
+        buffer
+            .insert_packet(create_test_packet(0, u32::MAX - 319, 20), &mut stats, 100)
+            .unwrap();
+        assert_eq!(buffer.peek_next_timestamp(), Some(u32::MAX - 319));
+        assert_eq!(buffer.get_span_samples(320, 16000, false), 640 + 320);
+    }
+
+    #[test]
+    fn discard_old_packets_respects_the_horizon() {
+        let mut buffer = PacketBuffer::new(10);
+        let mut stats = StatisticsCalculator::new();
+        for (seq, ts) in [(1u16, 100u32), (2, 10_000), (3, 20_000)] {
+            buffer
+                .insert_packet(create_test_packet(seq, ts, 20), &mut stats, 100)
+                .unwrap();
+        }
+        // Limit 20_000, horizon 15_000: 10_000 is obsolete, 100 is beyond
+        // the horizon and kept.
+        buffer.discard_old_packets(20_000, 15_000, &mut stats);
+        assert_eq!(buffer.len(), 2);
     }
 
     #[test]

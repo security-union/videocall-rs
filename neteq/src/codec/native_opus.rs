@@ -113,6 +113,21 @@ impl AudioDecoder for NativeOpusDecoder {
         buf.truncate(decoded_samples * self.channels as usize);
         Ok(buf)
     }
+
+    fn supports_dtx(&self) -> bool {
+        true
+    }
+
+    /// opus_interface.cc `WebRtcOpus_Decode` with an empty payload: Opus PLC
+    /// for exactly the requested length (libwebrtc asks for 10 ms,
+    /// `kWebRtcOpusPlcFrameSizeMs`), which after a DTX frame is the codec's
+    /// comfort noise.
+    fn decode_comfort_noise(&mut self, samples_per_channel: usize) -> Result<Option<Vec<f32>>> {
+        let mut buf = vec![0.0f32; samples_per_channel * self.channels as usize];
+        let decoded = self.inner.decode_float(&[], &mut buf)?;
+        buf.truncate(decoded * self.channels as usize);
+        Ok(Some(buf))
+    }
 }
 
 // -----------------------------------------------------------------------------

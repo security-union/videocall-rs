@@ -115,7 +115,9 @@ impl RelativeArrivalDelayTracker {
     pub fn update(&mut self, timestamp: u32, sample_rate: u32, arrival_time: Instant) -> i32 {
         // Calculate expected time since last packet
         let expected_iat_ms = if let Some(last_timestamp) = self.last_timestamp {
-            timestamp.saturating_sub(last_timestamp) * 1000 / sample_rate
+            (u64::from(timestamp.saturating_sub(last_timestamp)) * 1000
+                / u64::from(sample_rate.max(1)))
+            .min(i32::MAX as u64) as u32
         } else {
             0
         };
@@ -211,6 +213,9 @@ pub struct DelayManager {
     resampled_relative_delay: i32,
     last_resample_time: Option<Instant>,
     histogram: Histogram,
+    /// underrun_optimizer.cc `optimal_delay_ms_`: unset until the histogram
+    /// has had its first update.
+    optimal_delay_ms: Option<u32>,
 }
 
 impl DelayManager {
@@ -218,7 +223,16 @@ impl DelayManager {
     pub fn new(config: DelayConfig) -> Self {
         let arrival_delay_tracker = RelativeArrivalDelayTracker::new(config.clone());
 
+        // delay_manager.cc DelayManager::DelayManager calls Reset(), which
+        // resets the histogram to its prior (histogram.cc Histogram::Reset).
+        let mut histogram = Histogram::new(
+            K_DELAY_BUCKETS,
+            config.forget_factor,
+            config.start_forget_weight,
+        );
+        histogram.reset();
         Self {
+            optimal_delay_ms: None,
             target_level_ms: K_START_DELAY_MS.max(config.base_minimum_delay_ms), // Start with 80ms or minimum delay
             minimum_delay_ms: 0,
             effective_minimum_delay_ms: config.base_minimum_delay_ms,
@@ -227,11 +241,7 @@ impl DelayManager {
             resampled_relative_delay: 0,
             last_resample_time: None,
             arrival_delay_tracker,
-            histogram: Histogram::new(
-                K_DELAY_BUCKETS,
-                config.forget_factor,
-                config.start_forget_weight,
-            ),
+            histogram,
             config,
         }
     }
@@ -278,8 +288,50 @@ impl DelayManager {
         Ok(())
     }
 
+    /// Update with one packet's arrival delay as measured by
+    /// [`crate::packet_arrival_history::PacketArrivalHistory::get_delay_ms`]:
+    /// delay_manager.cc `DelayManager::Update` and underrun_optimizer.cc
+    /// `UnderrunOptimizer::Update`. Until the first resample interval has
+    /// passed the target stays at the 80 ms start delay
+    /// (`GetOptimalDelayMs().value_or(kStartDelayMs)`).
+    pub fn update_arrival_delay(&mut self, arrival_delay_ms: u32) {
+        let delay = arrival_delay_ms.min(i32::MAX as u32) as i32;
+        let now = crate::clock::now();
+        let mut histogram_update = None;
+        if let Some(interval) = self.config.resample_interval_ms {
+            match self.last_resample_time {
+                None => self.last_resample_time = Some(now),
+                Some(start) => {
+                    if now.saturating_duration_since(start).as_millis() > u128::from(interval) {
+                        histogram_update = Some(self.resampled_relative_delay);
+                        self.last_resample_time = Some(now);
+                        self.resampled_relative_delay = 0;
+                    }
+                }
+            }
+            self.resampled_relative_delay = self.resampled_relative_delay.max(delay);
+        } else {
+            histogram_update = Some(delay);
+        }
+        if let Some(update) = histogram_update {
+            let index = (update / K_BUCKET_SIZE_MS) as usize;
+            if index < self.histogram.num_buckets() {
+                self.histogram.add(index);
+            }
+            let bucket = self.histogram.quantile(self.config.quantile);
+            self.optimal_delay_ms = Some((1 + bucket as u32) * K_BUCKET_SIZE_MS as u32);
+        }
+        self.target_level_ms = self
+            .optimal_delay_ms
+            .unwrap_or(K_START_DELAY_MS)
+            .max(self.effective_minimum_delay_ms)
+            .min(self.effective_maximum_delay_ms);
+    }
+
     /// Reset the delay manager
     pub fn reset(&mut self) {
+        self.histogram.reset();
+        self.optimal_delay_ms = None;
         self.arrival_delay_tracker.reset();
         self.target_level_ms = K_START_DELAY_MS.max(self.config.base_minimum_delay_ms);
         self.resampled_relative_delay = 0;

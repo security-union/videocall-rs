@@ -30,6 +30,21 @@ pub trait AudioDecoder {
 
     /// Decodes a single audio packet.
     fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>>;
+
+    /// Whether this decoder can take Opus DTX frames (payloads of at most
+    /// 2 bytes) and continue comfort noise with
+    /// [`AudioDecoder::decode_comfort_noise`]. Decoders that return `false`
+    /// are never handed a DTX or empty payload.
+    fn supports_dtx(&self) -> bool {
+        false
+    }
+
+    /// Continue codec-internal comfort noise after a DTX frame
+    /// (neteq_impl.cc `NetEqImpl::DecodeCng`, which decodes an empty
+    /// payload). Returns `Ok(None)` when unsupported.
+    fn decode_comfort_noise(&mut self, _samples_per_channel: usize) -> Result<Option<Vec<f32>>> {
+        Ok(None)
+    }
 }
 
 // Platform-specific codec implementations

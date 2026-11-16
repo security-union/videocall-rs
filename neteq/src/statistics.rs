@@ -267,6 +267,10 @@ pub struct LifetimeStatistics {
     pub buffer_flushes: u64,
     /// Late packets discarded
     pub late_packets_discarded: u64,
+    /// Comfort noise generated during DTX (counted apart from concealment;
+    /// libwebrtc statistics_calculator.cc `GeneratedNoiseSamples`).
+    #[serde(default)]
+    pub generated_noise_samples: u64,
 }
 
 /// Operations and internal state metrics
@@ -374,6 +378,11 @@ impl StatisticsCalculator {
         if is_silent {
             self.lifetime_stats.silent_concealed_samples += concealed_samples;
         }
+    }
+
+    /// Record comfort noise generated for DTX (not concealment).
+    pub fn generated_noise(&mut self, samples: u64) {
+        self.lifetime_stats.generated_noise_samples += samples;
     }
 
     /// Record time-stretching operation

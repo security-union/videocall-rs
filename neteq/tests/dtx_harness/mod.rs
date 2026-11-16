@@ -87,6 +87,10 @@ pub enum Segment {
     Speech(u32),
     /// Quiet room noise (about -60 dBFS) for this many ms.
     Silence(u32),
+    /// Microphone muted for this many ms: the sender encodes and sends
+    /// nothing, and its RTP timestamps skip the gap. The source is digital
+    /// silence there.
+    Mute(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -102,6 +106,8 @@ pub struct Source {
     pub voiced: Vec<bool>,
     /// Voiced runs of at least 300 ms, as frame ranges `[start, end)`.
     pub talkspurts: Vec<(usize, usize)>,
+    /// Per 20 ms frame: the sender was muted and sent nothing.
+    pub muted: Vec<bool>,
     pub threshold_dbfs: f64,
 }
 
@@ -172,6 +178,7 @@ fn voice_threshold_dbfs() -> f64 {
 fn build_source(script: &Script) -> Source {
     let clip = clip();
     let mut pcm = Vec::new();
+    let mut muted = Vec::new();
     match script {
         Script::Natural => pcm.extend_from_slice(clip),
         Script::Edited(segments) => {
@@ -191,6 +198,12 @@ fn build_source(script: &Script) -> Source {
                             pcm.push(noise.symmetric() * amplitude);
                         }
                     }
+                    Segment::Mute(ms) => {
+                        let at = pcm.len() / FRAME;
+                        pcm.resize(pcm.len() + ms as usize * RATE as usize / 1000, 0.0);
+                        muted.resize(at, false);
+                        muted.resize(pcm.len() / FRAME, true);
+                    }
                 }
             }
             pcm.truncate(pcm.len() / FRAME * FRAME);
@@ -209,10 +222,12 @@ fn build_source(script: &Script) -> Source {
         .into_iter()
         .filter(|(s, e)| e - s >= 15)
         .collect();
+    muted.resize(voiced.len(), false);
     Source {
         pcm,
         voiced,
         talkspurts,
+        muted,
         threshold_dbfs,
     }
 }
@@ -314,7 +329,11 @@ pub fn encoded(script: &Script, dtx: bool) -> Arc<Vec<Vec<u8>>> {
             source
                 .pcm
                 .chunks(FRAME)
-                .map(|frame| {
+                .zip(&source.muted)
+                .map(|(frame, &muted)| {
+                    if muted {
+                        return Vec::new(); // never encoded, never sent
+                    }
                     let pcm: Vec<i16> = frame
                         .iter()
                         .map(|&x| (x.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
@@ -379,6 +398,16 @@ impl Timestamps {
     }
 }
 
+/// The sender restarts at `at_frame`: from there its sequence numbers and
+/// RTP timestamps continue from new bases (RFC 3550 picks both at random),
+/// with no gap in the audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Restart {
+    pub at_frame: usize,
+    pub seq_base: u16,
+    pub ts_base: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct SentPacket {
     pub frame: usize,
@@ -388,11 +417,27 @@ pub struct SentPacket {
     pub payload: Vec<u8>,
 }
 
-fn send(encoded: &[Vec<u8>], mode: SenderMode, timestamps: Timestamps) -> Vec<SentPacket> {
+fn send(
+    encoded: &[Vec<u8>],
+    muted: &[bool],
+    mode: SenderMode,
+    timestamps: Timestamps,
+    restart: Option<Restart>,
+) -> Vec<SentPacket> {
     let mut out = Vec::new();
     let mut seq = SEQ_BASE;
+    let mut ts_base = TS_BASE;
+    let mut ts_frame0 = 0usize;
     let mut previous_dtx = false;
     for (frame, payload) in encoded.iter().enumerate() {
+        if let Some(r) = restart.filter(|r| r.at_frame == frame) {
+            seq = r.seq_base;
+            ts_base = r.ts_base;
+            ts_frame0 = frame;
+        }
+        if muted[frame] {
+            continue; // muted: nothing is sent and no sequence number is used
+        }
         let dtx = is_dtx_payload(payload);
         let transmit = match mode {
             SenderMode::Continuous => true,
@@ -404,7 +449,7 @@ fn send(encoded: &[Vec<u8>], mode: SenderMode, timestamps: Timestamps) -> Vec<Se
             continue;
         }
         let ts = match timestamps {
-            Timestamps::Rtp => TS_BASE.wrapping_add((frame * FRAME) as u32),
+            Timestamps::Rtp => ts_base.wrapping_add(((frame - ts_frame0) * FRAME) as u32),
             Timestamps::Saturated => u32::MAX,
         };
         out.push(SentPacket {
@@ -436,12 +481,24 @@ pub enum Delay {
         every_n: u64,
         hold_ms: u64,
     },
+    /// One packet in `every_n` (by source frame) is `extra_ms` late; the
+    /// rest are on time, so the late one arrives after its successors.
+    Straggler {
+        every_n: u64,
+        extra_ms: u64,
+    },
 }
+
+/// A duplicated packet's copy arrives this long after the original: late
+/// enough that the original has usually been played already.
+pub const DUPLICATE_LAG_MS: u64 = 40;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Network {
     pub delay: Delay,
     pub loss_percent: u64,
+    /// Share of delivered packets that arrive twice.
+    pub duplicate_percent: u64,
     pub seed: u64,
 }
 
@@ -450,6 +507,7 @@ impl Network {
         Self {
             delay: Delay::Clean,
             loss_percent: 0,
+            duplicate_percent: 0,
             seed: 0xC0FF_EE00,
         }
     }
@@ -469,6 +527,18 @@ impl Network {
             ..Self::clean()
         }
     }
+    pub fn straggler(every_n: u64, extra_ms: u64) -> Self {
+        Self {
+            delay: Delay::Straggler { every_n, extra_ms },
+            ..Self::clean()
+        }
+    }
+    pub fn with_duplicates(self, duplicate_percent: u64) -> Self {
+        Self {
+            duplicate_percent,
+            ..self
+        }
+    }
     pub fn with_loss(self, loss_percent: u64) -> Self {
         Self {
             loss_percent,
@@ -481,20 +551,30 @@ impl Network {
             Delay::Clean => 0,
             Delay::Jitter { max_ms } => max_ms,
             Delay::Bursty { hold_ms, .. } => hold_ms,
+            Delay::Straggler { extra_ms, .. } => extra_ms,
         };
-        (BASE_NET_DELAY_MS, BASE_NET_DELAY_MS + extra)
+        let dup = if self.duplicate_percent > 0 {
+            DUPLICATE_LAG_MS
+        } else {
+            0
+        };
+        (BASE_NET_DELAY_MS, BASE_NET_DELAY_MS + extra + dup)
     }
     pub fn label(&self) -> String {
         let delay = match self.delay {
             Delay::Clean => "clean".to_string(),
             Delay::Jitter { max_ms } => format!("jitter{max_ms}"),
             Delay::Bursty { every_n, hold_ms } => format!("bursty{every_n}x{hold_ms}"),
+            Delay::Straggler { every_n, extra_ms } => format!("straggler{every_n}x{extra_ms}"),
         };
+        let mut label = delay;
         if self.loss_percent > 0 {
-            format!("{delay}_loss{}", self.loss_percent)
-        } else {
-            delay
+            label = format!("{label}_loss{}", self.loss_percent);
         }
+        if self.duplicate_percent > 0 {
+            label = format!("{label}_dup{}", self.duplicate_percent);
+        }
+        label
     }
 
     /// Arrival time per delivered packet (index into `sent`), sorted by
@@ -514,8 +594,19 @@ impl Network {
                     let window = every_n * FRAME_MS;
                     (packet.send_ms / window) * window + hold_ms - packet.send_ms
                 }
+                Delay::Straggler { every_n, extra_ms } => {
+                    if (packet.frame as u64).checked_rem(every_n) == Some(0) {
+                        extra_ms
+                    } else {
+                        0
+                    }
+                }
             };
-            arrivals.push((packet.send_ms + BASE_NET_DELAY_MS + extra, index));
+            let at = packet.send_ms + BASE_NET_DELAY_MS + extra;
+            arrivals.push((at, index));
+            if frame_random(self.seed, packet.frame, 3) % 100 < self.duplicate_percent {
+                arrivals.push((at + DUPLICATE_LAG_MS, index));
+            }
         }
         arrivals.sort();
         (arrivals, lost)
@@ -535,6 +626,7 @@ pub struct Scenario {
     pub network: Network,
     /// Virtual time played after the last source frame.
     pub tail_ms: u64,
+    pub restart: Option<Restart>,
 }
 
 impl Scenario {
@@ -552,10 +644,27 @@ impl Scenario {
             timestamps,
             network,
             tail_ms: 1000,
+            restart: None,
+        }
+    }
+    /// A scripted source; `name` must say what the script is.
+    pub fn scripted(name: &str, script: Script, sender: SenderMode, network: Network) -> Self {
+        Self {
+            name: name.to_string(),
+            script,
+            sender,
+            timestamps: Timestamps::Rtp,
+            network,
+            tail_ms: 1000,
+            restart: None,
         }
     }
     pub fn named(mut self, name: &str) -> Self {
         self.name = name.to_string();
+        self
+    }
+    pub fn with_restart(mut self, restart: Restart) -> Self {
+        self.restart = Some(restart);
         self
     }
 }
@@ -591,7 +700,13 @@ pub struct Run {
 pub fn run(scenario: &Scenario) -> Run {
     let source = source(&scenario.script);
     let encoded = encoded(&scenario.script, scenario.sender.dtx());
-    let sent = send(&encoded, scenario.sender, scenario.timestamps);
+    let sent = send(
+        &encoded,
+        &source.muted,
+        scenario.sender,
+        scenario.timestamps,
+        scenario.restart,
+    );
     let (arrivals, lost_frames) = scenario.network.deliver(&sent);
 
     neteq::clock::freeze();
@@ -668,7 +783,11 @@ pub fn run(scenario: &Scenario) -> Run {
 
     let mut run = Run {
         scenario: scenario.clone(),
-        encoded_dtx_frames: encoded.iter().filter(|p| is_dtx_payload(p)).count(),
+        encoded_dtx_frames: encoded
+            .iter()
+            .zip(&source.muted)
+            .filter(|(p, &m)| !m && is_dtx_payload(p))
+            .count(),
         sent_dtx: sent.iter().filter(|p| is_dtx_payload(&p.payload)).count(),
         last_arrival_ms: arrivals.last().map_or(0, |a| a.0),
         source,
@@ -721,6 +840,7 @@ pub struct Report {
     pub ticks: usize,
     pub expand_ms: u64,
     pub cng_ms: u64,
+    pub normal_ms: u64,
     pub conceal_startup_ms: u64,
     /// Concealment from startup to the end of the source.
     pub conceal_after_startup_ms: u64,
@@ -893,6 +1013,7 @@ fn analyze(run: &Run) -> Report {
         let cng = tick.speech == SpeechType::Cng;
         r.expand_ms += if expand { TICK_MS } else { 0 };
         r.cng_ms += if cng { TICK_MS } else { 0 };
+        r.normal_ms += if !cng && !expand { TICK_MS } else { 0 };
         if tick.t_ms < STARTUP_MS {
             r.conceal_startup_ms += if expand { TICK_MS } else { 0 };
             continue;
@@ -1030,6 +1151,27 @@ pub fn median_target(run: &Run, from_ms: u64, to_ms: u64) -> u32 {
         .collect();
     t.sort_unstable();
     t.get(t.len() / 2).copied().unwrap_or(0)
+}
+
+/// Median buffer level over `[from_ms, to_ms)`.
+pub fn median_buffer(run: &Run, from_ms: u64, to_ms: u64) -> u32 {
+    let mut b: Vec<u32> = run
+        .ticks
+        .iter()
+        .filter(|t| t.t_ms >= from_ms && t.t_ms < to_ms)
+        .map(|t| t.buffer_ms)
+        .collect();
+    b.sort_unstable();
+    b.get(b.len() / 2).copied().unwrap_or(0)
+}
+
+/// Concealment (Expand frames) over `[from_ms, to_ms)`.
+pub fn conceal_ms_between(run: &Run, from_ms: u64, to_ms: u64) -> u64 {
+    run.ticks
+        .iter()
+        .filter(|t| t.t_ms >= from_ms && t.t_ms < to_ms && t.speech == SpeechType::Expand)
+        .count() as u64
+        * TICK_MS
 }
 
 /// Talkspurts that start after startup (earlier ones are startup's).

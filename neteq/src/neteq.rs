@@ -220,6 +220,9 @@ const K_CNG_TIMEOUT_MS: u32 = 1000;
 /// oldest packet's waiting time) reaches this share of the target level
 /// (WebRTC `kPostponeDecodingLevel`).
 const K_POSTPONE_DECODING_LEVEL_PERCENT: u32 = 50;
+/// A sequence number this far behind the newest is a sender restart, not
+/// reordering (RFC 3550 Appendix A.1 `MAX_MISORDER`).
+const K_MAX_MISORDER: i16 = 100;
 
 /// An Opus DTX frame: a payload of at most 2 bytes carries no audio, only
 /// the signal that the encoder entered DTX (WebRTC `IsDtxPacket`).
@@ -242,7 +245,10 @@ fn opus_packet_samples(payload: &[u8], sample_rate: u32) -> Option<u32> {
         1 | 2 => 2,
         _ => u32::from(*payload.get(1)? & 0x3f),
     };
-    (frames > 0).then(|| frame_48k * frames * sample_rate / 48_000)
+    // A code-3 packet declares up to 63 frames; RFC 6716 §3.2.5 caps a packet
+    // at 120 ms (5760 samples at 48 kHz). u64: the product overflowed u32.
+    let samples_48k = (u64::from(frame_48k) * u64::from(frames)).min(5760);
+    (frames > 0).then(|| (samples_48k * u64::from(sample_rate) / 48_000) as u32)
 }
 
 /// Ceiling for comfort noise the decoder cannot produce itself (about -45
@@ -628,11 +634,17 @@ impl NetEq {
         let duration = self.packet_duration_samples(packet);
         if let Some((last_seq, last_ts, last_duration)) = self.dtx.last_inserted {
             let seq_delta = seq.wrapping_sub(last_seq) as i16;
-            if seq_delta <= 0 {
+            // Further back than any reordering: the sender restarted (RFC
+            // 3550 A.1, MAX_MISORDER). Its timing says nothing about the old
+            // stream's silence, so the new stream starts out of DTX.
+            let restarted = seq_delta < -K_MAX_MISORDER;
+            if restarted {
+                self.dtx.fallback = false;
+            } else if seq_delta <= 0 {
                 return;
             }
             let ts_delta = ts.wrapping_sub(last_ts) as i32;
-            if ts_delta > 0 && !is_dtx_payload(&packet.payload) {
+            if !restarted && ts_delta > 0 && !is_dtx_payload(&packet.payload) {
                 let covered = i64::from(seq_delta) * i64::from(last_duration);
                 if i64::from(ts_delta) >= covered + i64::from(last_duration) {
                     self.dtx.fallback = true;
@@ -1792,6 +1804,99 @@ mod tests {
             .buffer_level_filter
             .set_filtered_buffer_level(40 * 960);
         assert_eq!(neteq.get_decision().unwrap(), Operation::Normal);
+    }
+
+    /// A sender that drops DTX frames goes silent (the timing fallback starts
+    /// DTX), then reconnects with fresh sequence numbers and timestamps that
+    /// land below the old ones. The new stream must not inherit the old DTX
+    /// state: while it does, time-stretching stays off and an empty buffer
+    /// plays comfort noise instead of concealing loss.
+    #[test]
+    fn test_sender_restart_ends_timing_fallback_dtx() {
+        let mut neteq = NetEq::new(NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            ..NetEqConfig::default()
+        })
+        .unwrap();
+        let opus_silk_20ms = vec![0x78, 0x01, 0x02, 0x03];
+        let insert = |neteq: &mut NetEq, sequence: u16, timestamp: u32| {
+            let header = RtpHeader::new(sequence, timestamp, 1, 111, false);
+            neteq
+                .insert_packet(AudioPacket::new(
+                    header,
+                    opus_silk_20ms.clone(),
+                    48_000,
+                    1,
+                    20,
+                ))
+                .unwrap();
+        };
+        let old_first_sequence: u16 = 30_000;
+        for packet_index in 0..50u16 {
+            insert(
+                &mut neteq,
+                old_first_sequence + packet_index,
+                u32::from(packet_index) * 960,
+            );
+        }
+        // Next sequence number, timestamp 200 ms later: a DTX gap.
+        insert(&mut neteq, old_first_sequence + 50, 60 * 960);
+        assert!(neteq.dtx.fallback, "precondition: the gap started DTX");
+        // The sender restarts at sequence 0, timestamp 0.
+        for packet_index in 0..10u16 {
+            insert(&mut neteq, packet_index, u32::from(packet_index) * 960);
+        }
+        assert!(
+            !neteq.dtx.fallback,
+            "10 contiguous packets of the restarted stream arrived, yet DTX \
+             is still on: the newest packet seen is still sequence {:?}",
+            neteq.dtx.last_inserted.map(|(sequence, _, _)| sequence)
+        );
+    }
+
+    /// A code-3 Opus packet declares its own frame count (up to 63). With
+    /// 60 ms SILK frames that is 3.78 s; multiplied by the sample rate it
+    /// overflowed u32. RFC 6716 §3.2.5 caps a packet at 120 ms.
+    #[test]
+    fn test_opus_packet_samples_caps_at_120_ms() {
+        // TOC 0x1B: config 3 (SILK 60 ms), code 3; frame-count byte 63.
+        let samples = opus_packet_samples(&[0x1B, 0x3F], 48_000);
+        assert_eq!(
+            samples,
+            Some(5760),
+            "63 frames of 60 ms should clamp to 120 ms (5760 samples)"
+        );
+    }
+
+    struct SilentDecoder;
+
+    impl crate::codec::AudioDecoder for SilentDecoder {
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn channels(&self) -> u8 {
+            1
+        }
+        fn decode(&mut self, _encoded: &[u8]) -> Result<Vec<f32>> {
+            Ok(vec![0.0; 960])
+        }
+    }
+
+    /// The same malformed packet through the public API: any remote peer can
+    /// send it, and NetEq reads the TOC of every packet on insert.
+    #[test]
+    fn test_insert_packet_accepts_an_oversized_opus_frame_count() {
+        let mut neteq = NetEq::new(NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            ..NetEqConfig::default()
+        })
+        .unwrap();
+        neteq.register_decoder(111, Box::new(SilentDecoder));
+        let header = RtpHeader::new(0, 0, 1, 111, false);
+        let result = neteq.insert_packet(AudioPacket::new(header, vec![0x1B, 0x3F], 48_000, 1, 20));
+        assert!(result.is_ok(), "insert failed: {result:?}");
     }
 
     #[test]

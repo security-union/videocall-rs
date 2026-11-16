@@ -91,6 +91,8 @@ pub struct RelativeArrivalDelayTracker {
     newest_timestamp: Option<u32>,
     last_timestamp: Option<u32>,
     last_packet_time: Option<Instant>,
+    /// The newest packet repeated the timestamp before it.
+    last_timestamp_repeated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +110,7 @@ impl RelativeArrivalDelayTracker {
             newest_timestamp: None,
             last_timestamp: None,
             last_packet_time: None,
+            last_timestamp_repeated: false,
         }
     }
 
@@ -121,14 +124,27 @@ impl RelativeArrivalDelayTracker {
             // spacing of the stream; it neither moves the baseline nor adds
             // a sample.
             let ts_delta = timestamp.wrapping_sub(last_timestamp) as i32;
-            if ts_delta <= 0 {
+            let window_ms = i64::from(self.config.max_history_ms);
+            let window_samples = window_ms * i64::from(sample_rate) / 1000;
+            // A one-off repeat is a duplicate. Timestamps that keep repeating
+            // come from a sender that does not advance them (videocall-client
+            // today: ms since 1970 saturated `as u32`); then only the arrival
+            // spacing is measured, as before this tracker ignored repeats.
+            let repeated_twice = ts_delta == 0 && self.last_timestamp_repeated;
+            if ts_delta >= 0 {
+                self.last_timestamp_repeated = ts_delta == 0;
+            }
+            // Older but within the history window: reordered or RED-recovered,
+            // ignored. Further back: the sender restarted, so the new stream
+            // becomes the baseline (no sample spans the two streams).
+            let restarted = i64::from(ts_delta) < -window_samples;
+            if ts_delta <= 0 && !repeated_twice && !restarted {
                 return self.calculate_relative_packet_arrival_delay();
             }
             // 64-bit: an RTP gap of more than ~89 s at 48 kHz overflowed u32.
-            let expected_iat_ms = i64::from(ts_delta) * 1000 / i64::from(sample_rate.max(1));
+            let expected_iat_ms = i64::from(ts_delta.max(0)) * 1000 / i64::from(sample_rate.max(1));
             let actual_iat_ms = arrival_time.duration_since(last_time).as_millis() as i64;
-            let window_ms = i64::from(self.config.max_history_ms);
-            if expected_iat_ms <= window_ms && actual_iat_ms <= window_ms {
+            if !restarted && expected_iat_ms <= window_ms && actual_iat_ms <= window_ms {
                 // Jitter: positive means the packet is late, negative early.
                 let iat_delay_ms = (actual_iat_ms - expected_iat_ms)
                     .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
@@ -159,6 +175,7 @@ impl RelativeArrivalDelayTracker {
         self.newest_timestamp = None;
         self.last_timestamp = None;
         self.last_packet_time = None;
+        self.last_timestamp_repeated = false;
     }
 
     fn update_delay_history(&mut self, iat_delay_ms: i32, timestamp: u32, _sample_rate: u32) {
@@ -459,6 +476,64 @@ mod tests {
         tracker.update(940, 48_000, t0 + Duration::from_millis(26));
         assert_eq!(tracker.delay_history.len(), samples);
         assert_eq!(tracker.last_timestamp, Some(1920));
+    }
+
+    /// videocall-client stamps audio with milliseconds since 1970
+    /// (`microphone_encoder.rs`) and the receiver casts that f64 `as u32`
+    /// (`neteq_audio_decoder.rs`), which saturates: every packet reaches
+    /// NetEq with timestamp `u32::MAX`. The tracker must still see jitter.
+    #[test]
+    fn test_tracker_measures_jitter_when_every_timestamp_is_identical() {
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        let start = Instant::now();
+        // 20 ms packets that arrive in bursts of five every 100 ms (the
+        // network holds them, then releases them together).
+        let mut relative_delay_ms = 0;
+        for packet_index in 0..50u64 {
+            let burst_release_ms = (packet_index / 5 + 1) * 100;
+            let arrival = start + Duration::from_millis(burst_release_ms);
+            relative_delay_ms = tracker.update(u32::MAX, 48_000, arrival);
+        }
+        assert!(
+            relative_delay_ms >= 60,
+            "packets arrived in 100 ms bursts but the tracker reported \
+             {relative_delay_ms} ms of relative delay with {} delay samples: \
+             identical timestamps were all discarded as duplicates",
+            tracker.delay_history.len()
+        );
+    }
+
+    /// A sender that reconnects starts a new RTP timestamp sequence, which
+    /// can land below the old one. The tracker must follow the new stream
+    /// instead of ignoring it until it overtakes the old timestamps.
+    #[test]
+    fn test_tracker_follows_a_sender_restart_with_lower_timestamps() {
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        let start = Instant::now();
+        let old_stream_start: u32 = 10_000_000;
+        for packet_index in 0..50u32 {
+            let arrival = start + Duration::from_millis(u64::from(packet_index) * 20);
+            tracker.update(old_stream_start + packet_index * 960, 48_000, arrival);
+        }
+        let samples_before_restart = tracker.delay_history.len();
+        let restart_arrival_ms = 50 * 20;
+        for packet_index in 0..10u32 {
+            let arrival =
+                start + Duration::from_millis(restart_arrival_ms + u64::from(packet_index) * 20);
+            tracker.update(packet_index * 960, 48_000, arrival);
+        }
+        assert_eq!(
+            tracker.last_timestamp,
+            Some(9 * 960),
+            "after 10 packets of the restarted stream the baseline is still \
+             the old stream's timestamp"
+        );
+        assert!(
+            tracker.delay_history.len() > samples_before_restart,
+            "10 packets of the restarted stream added no delay samples \
+             ({samples_before_restart} before, {} after)",
+            tracker.delay_history.len()
+        );
     }
 
     #[test]

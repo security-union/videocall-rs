@@ -627,16 +627,20 @@ pub struct Scenario {
     /// Virtual time played after the last source frame.
     pub tail_ms: u64,
     pub restart: Option<Restart>,
-    pub receiver_pause: Option<ReceiverPause>,
+    pub receiver_mute: Option<ReceiverMute>,
 }
 
-/// The receiver stops pulling audio, as the browser worker did while the
-/// remote peer was muted (`IS_MUTED` in `neteq_worker.rs`): no `get_audio`
-/// from `from_ms` until `to_ms`; packets are still inserted.
+/// The browser worker's mute path (`neteq_worker.rs`): at `from_ms` the
+/// peer's heartbeat says audio off, so the client sends Flush and Mute;
+/// from then on the worker pulls every 10 ms and discards the audio
+/// (`get_audio_muted`). The un-mute message arrives `unmute_lag_ms` after
+/// the first audio packet that follows; the worker un-mutes earlier, on
+/// that first insert, because a packet reaching it means the peer's mic
+/// is on.
 #[derive(Clone, Copy, Debug)]
-pub struct ReceiverPause {
+pub struct ReceiverMute {
     pub from_ms: u64,
-    pub to_ms: u64,
+    pub unmute_lag_ms: u64,
 }
 
 impl Scenario {
@@ -655,7 +659,7 @@ impl Scenario {
             network,
             tail_ms: 1000,
             restart: None,
-            receiver_pause: None,
+            receiver_mute: None,
         }
     }
     /// A scripted source; `name` must say what the script is.
@@ -668,7 +672,7 @@ impl Scenario {
             network,
             tail_ms: 1000,
             restart: None,
-            receiver_pause: None,
+            receiver_mute: None,
         }
     }
     pub fn named(mut self, name: &str) -> Self {
@@ -679,8 +683,8 @@ impl Scenario {
         self.restart = Some(restart);
         self
     }
-    pub fn with_receiver_pause(mut self, pause: ReceiverPause) -> Self {
-        self.receiver_pause = Some(pause);
+    pub fn with_receiver_mute(mut self, mute: ReceiverMute) -> Self {
+        self.receiver_mute = Some(mute);
         self
     }
 }
@@ -693,7 +697,8 @@ pub struct Tick {
     pub target_ms: u32,
     pub operation: Operation,
     pub mode: Mode,
-    /// The receiver did not pull audio (`ReceiverPause`); marked Expand.
+    /// The worker was muted and discarded this pull (`ReceiverMute`);
+    /// marked Expand, nothing was played.
     pub paused: bool,
 }
 
@@ -717,6 +722,10 @@ pub struct Run {
     /// Lifetime samples removed by accelerate and inserted by preemptive
     /// expand.
     pub stretch_samples: (u64, u64),
+    /// Concealed samples counted while the worker was muted.
+    pub muted_concealment: u64,
+    /// When the un-mute message arrived (`ReceiverMute`).
+    pub unmute_signal_ms: Option<u64>,
 }
 
 /// Run a scenario end to end, write its audio and metrics, print its line.
@@ -756,11 +765,33 @@ pub fn run(scenario: &Scenario) -> Run {
     let mut insert_errors = Vec::new();
     let mut get_audio_errors = Vec::new();
     let mut frame_len_errors = 0;
+    let mut muted = false;
+    let mut mute_done = false;
+    let mut unmute_signal_ms: Option<u64> = None;
+    let mut concealed_at_mute = 0;
+    let mut muted_concealment = 0;
     for tick in 0..total_ms / TICK_MS {
         let t = tick * TICK_MS;
+        if let Some(mute) = scenario.receiver_mute {
+            if !mute_done && t >= mute.from_ms {
+                // Flush + Mute, in the client's order.
+                mute_done = true;
+                muted = true;
+                neteq.flush();
+                concealed_at_mute = neteq.get_statistics().lifetime.concealed_samples;
+            }
+        }
         while next < arrivals.len() && arrivals[next].0 <= t {
             let (at, index) = arrivals[next];
             advance_to(at, &mut now_ms);
+            if let (Some(mute), true) = (scenario.receiver_mute, muted) {
+                // The first insert after the mute un-mutes the worker; the
+                // un-mute message itself only arrives later.
+                muted = false;
+                muted_concealment =
+                    neteq.get_statistics().lifetime.concealed_samples - concealed_at_mute;
+                unmute_signal_ms = Some(at + mute.unmute_lag_ms);
+            }
             let packet = &sent[index];
             let header = RtpHeader::new(packet.seq, packet.ts, SSRC, PT, false);
             let audio_packet = AudioPacket::new(header, packet.payload.clone(), RATE, 1, 20);
@@ -770,9 +801,11 @@ pub fn run(scenario: &Scenario) -> Run {
             next += 1;
         }
         advance_to(t, &mut now_ms);
-        if let Some(pause) = scenario.receiver_pause {
-            if (pause.from_ms..pause.to_ms).contains(&t) {
-                // Nothing is played while the worker is paused.
+        if muted {
+            if let Err(e) = neteq.get_audio_muted() {
+                get_audio_errors.push(format!("t={t} (muted): {e}"));
+            }
+            {
                 out.extend_from_slice(&[0.0; TICK]);
                 ticks.push(Tick {
                     t_ms: t,
@@ -848,6 +881,8 @@ pub fn run(scenario: &Scenario) -> Run {
         frame_len_errors,
         concealed_samples,
         stretch_samples,
+        muted_concealment,
+        unmute_signal_ms,
         out_dir: output_root().join(&scenario.name),
         report: Report::default(),
     };

@@ -450,6 +450,15 @@ impl StatisticsCalculator {
         }
     }
 
+    /// Close the per-second operation window if it has elapsed, without
+    /// recording an operation, so the rates fall to zero while nothing is
+    /// recorded (a muted peer).
+    pub fn roll_operation_window(&mut self, now: Instant) {
+        if now.duration_since(self.last_operation_update) >= self.operation_window_duration {
+            self.update_operation_rates(now);
+        }
+    }
+
     /// Update operation rates (operations per second)
     fn update_operation_rates(&mut self, now: Instant) {
         let elapsed = now.duration_since(self.last_operation_update);

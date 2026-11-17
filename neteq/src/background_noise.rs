@@ -92,7 +92,13 @@ impl BackgroundNoise {
     /// the last `K_VEC_LEN` samples are used. Returns whether a new
     /// estimate was saved.
     pub fn update(&mut self, signal: &[f32]) -> bool {
-        if signal.len() < K_VEC_LEN {
+        // libwebrtc's 16-bit samples are always finite; ours may not be, and
+        // one non-finite sample would stick in `max_energy` for good.
+        if signal.len() < K_VEC_LEN
+            || !signal[signal.len() - K_VEC_LEN..]
+                .iter()
+                .all(|s| s.is_finite())
+        {
             return false;
         }
         let x: Vec<f64> = signal[signal.len() - K_VEC_LEN..]
@@ -212,6 +218,19 @@ mod tests {
             "{} vs {expected}",
             bgn.energy()
         );
+    }
+
+    #[test]
+    fn a_non_finite_sample_is_ignored() {
+        let mut bgn = BackgroundNoise::new();
+        let mut seed = 1;
+        let mut signal = noise(K_VEC_LEN, 0.9, &mut seed);
+        signal[10] = f32::INFINITY;
+        assert!(!bgn.update(&signal));
+        assert_eq!(bgn.max_energy, 0.0);
+        assert_eq!(bgn.energy_update_threshold, 500_000.0);
+        // Quiet noise is still learned afterwards.
+        assert!(bgn.update(&noise(K_VEC_LEN, 0.01, &mut seed)));
     }
 
     #[test]

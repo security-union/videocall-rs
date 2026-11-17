@@ -114,6 +114,17 @@ impl WebNetEq {
         Ok(out)
     }
 
+    /// A 10 ms pull for a muted peer: NetEq advances, the audio is dropped
+    /// and nothing is counted in the statistics ([`NetEq::get_audio_muted`]).
+    #[wasm_bindgen(js_name = getAudioMuted)]
+    pub fn get_audio_muted(&self) -> Result<(), JsValue> {
+        let mut neteq_ref = self.neteq.borrow_mut();
+        let neteq = neteq_ref
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("NetEq not initialized. Call init() first."))?;
+        neteq.get_audio_muted().map_err(Self::map_err)
+    }
+
     /// Drop everything buffered; the next packet starts a new stream
     /// (neteq_impl.cc `NetEqImpl::FlushBuffers`).
     #[wasm_bindgen]

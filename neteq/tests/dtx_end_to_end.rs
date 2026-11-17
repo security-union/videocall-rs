@@ -421,32 +421,44 @@ fn mute_95s_then_speech_plays_on_time() {
     }
 }
 
-/// The mute path as the browser worker ran it before it kept ticking: the
-/// remote peer mutes for 10 s (its sender sends nothing and its timestamps
-/// skip the gap) and the worker stops calling `get_audio` for exactly that
-/// time. NetEq's playout timestamp and noise stopwatch stand still, so the
-/// first packet after the mute is a future packet (decision_logic.cc
-/// PacketTooEarly) until the buffer passes the target window. Speech after
-/// the mute must still play on schedule, unclipped.
+/// The browser worker's mute path: the remote peer turns its mic off for
+/// 10 s (its sender sends nothing and its timestamps skip the gap). The
+/// client flushes and mutes the worker, which keeps pulling every 10 ms and
+/// discards the audio. Speech resumes with a forward timestamp jump and the
+/// un-mute message arrives 60 ms after the first audio packet. The first
+/// talkspurt must not lose its onset, must play on schedule, and the muted
+/// pulls must not count as concealment.
 #[test]
-fn worker_paused_while_muted_then_speech_plays_on_time() {
+fn muted_worker_keeps_pulling_and_speech_after_unmute_is_whole() {
     let script = Script::Edited(vec![
         Segment::Speech(6_000),
         Segment::Mute(10_000),
         Segment::Speech(8_000),
     ]);
+    let unmute_lag_ms = 60;
     let run = run(&Scenario::scripted(
-        "mute10s_worker_paused_continuous_rtp_clean",
+        "mute10s_worker_muted_pulls_unmute_late60_continuous_rtp_clean",
         script,
         SenderMode::Continuous,
         Network::clean(),
     )
-    .with_receiver_pause(ReceiverPause {
-        from_ms: 6_000,
-        to_ms: 16_000,
+    // The mute heartbeat lands 200 ms after the mic went off: the client
+    // drops audio once it has it (peer_decode_manager.rs), so no straggler
+    // reaches the muted worker.
+    .with_receiver_mute(ReceiverMute {
+        from_ms: 6_200,
+        unmute_lag_ms,
     }));
     assert_sane(&run);
     let name = &run.scenario.name;
+    assert_eq!(
+        run.muted_concealment, 0,
+        "{name}: {} samples counted as concealed while muted",
+        run.muted_concealment
+    );
+    assert!(run.unmute_signal_ms.is_some(), "{name}: never un-muted");
+    // The un-mute message is late, but the worker does not wait for it:
+    // the clean-network bound applies, with no allowance for the lag.
     let bound = clean_delay_bound(&run);
     let spurts: Vec<_> = scored_talkspurts(&run)
         .into_iter()

@@ -228,6 +228,9 @@ pub struct NetEq {
     packet_buffer: PacketBuffer,
     delay_manager: DelayManager,
     statistics: StatisticsCalculator,
+    /// Where [`Self::get_audio_muted`] records, never read. Bounded: its
+    /// only growing record keeps at most 100 entries.
+    discarded_statistics: StatisticsCalculator,
     accelerate: Accelerate,
     preemptive_expand: PreemptiveExpand,
     /// background_noise.h: noise level that tells time stretching what is
@@ -293,6 +296,8 @@ struct Extracted {
     decoded_samples: usize,
     comfort_noise: bool,
     decoded_any: bool,
+    /// A decoder returned an error (neteq_impl.cc `Decode`).
+    decode_failed: bool,
 }
 
 impl NetEq {
@@ -350,6 +355,7 @@ impl NetEq {
             packet_buffer,
             delay_manager,
             statistics,
+            discarded_statistics: StatisticsCalculator::new(),
             accelerate,
             preemptive_expand,
             background_noise: BackgroundNoise::new(),
@@ -556,7 +562,12 @@ impl NetEq {
         // neteq_impl.cc GetAudioInternal: tick_timer_->Increment().
         self.tick += 1;
         let previous_mode = self.last_mode;
-        let (operation, extracted) = self.get_decision()?;
+        let (mut operation, extracted) = self.get_decision()?;
+        // neteq_impl.cc Decode: "*operation = Operation::kExpand; // Do
+        // expansion to get data instead."
+        if extracted.decode_failed {
+            operation = Operation::Expand;
+        }
         // neteq_impl.cc GetAudioInternal: a decoded codec-internal SID frame
         // starts a new generated-noise stopwatch.
         if extracted.comfort_noise {
@@ -603,6 +614,20 @@ impl NetEq {
             .jitter_buffer_delay(frame.duration_ms() as u64, frame.samples_per_channel as u64);
 
         Ok(frame)
+    }
+
+    /// A pull whose audio is thrown away, for a muted peer. libwebrtc
+    /// assumes GetAudio every 10 ms whether or not the audio is used, so
+    /// NetEq still advances (playout timestamp, noise stopwatch, buffer),
+    /// but nothing it does is recorded in the statistics: a muted peer
+    /// must not look like it is concealing. The per-second operation rates
+    /// keep rolling, so they read zero while muted.
+    pub fn get_audio_muted(&mut self) -> Result<()> {
+        std::mem::swap(&mut self.statistics, &mut self.discarded_statistics);
+        let result = self.get_audio().map(|_| ());
+        std::mem::swap(&mut self.statistics, &mut self.discarded_statistics);
+        self.statistics.roll_operation_window(self.now);
+        result
     }
 
     /// Roll the packets-per-second window if ≥1s elapsed since last snapshot.
@@ -948,8 +973,11 @@ impl NetEq {
                 self.statistics.generated_noise(decoded_per_channel as u64);
             } else if decoded_per_channel == 0 {
                 // neteq_impl.cc Decode: on a decoder error the timestamp still
-                // moves by one frame and the operation becomes expand.
+                // moves by one frame, decoding stops (DecodeLoop returns) and
+                // the operation becomes expand.
                 self.end_timestamp = packet.header.timestamp.wrapping_add(duration as u32);
+                result.decode_failed = true;
+                break;
             } else {
                 result.decoded_any = true;
                 self.decoder_frame_length = decoded_per_channel;
@@ -1211,7 +1239,12 @@ impl NetEq {
         let ch = self.channels();
         let old_part = (old * ch).min(output.len());
         let history_start = self.history.len() - old * ch;
-        self.history[history_start..history_start + old_part].copy_from_slice(&output[..old_part]);
+        self.history.truncate(history_start);
+        self.history.extend_from_slice(&output[..old_part]);
+        // DoAccelerate: an output shorter than the borrowed part shifts the
+        // sync buffer, PushFrontZeros fills the front.
+        let missing = old * ch - old_part;
+        self.history.splice(0..0, std::iter::repeat_n(0.0, missing));
         let keep = self.leftover_samples.len() - (input_len - old) * ch;
         self.leftover_samples.truncate(keep);
         self.leftover_samples.extend_from_slice(&output[old_part..]);
@@ -1454,6 +1487,9 @@ mod tests {
             1
         }
         fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>> {
+            if encoded == [0xEE; 40] {
+                return Err(NetEqError::DecoderError("corrupt".into()));
+            }
             let level = if encoded.len() <= 2 { 0.001 } else { 0.1 };
             Ok(vec![level; 960])
         }
@@ -1752,6 +1788,71 @@ mod tests {
                 .all(|s| *s == SpeechType::Normal),
             "{speech:?}"
         );
+    }
+
+    #[test]
+    fn muted_pulls_leave_statistics_unchanged() {
+        // A muted peer: the worker flushes, then pulls and discards every
+        // 10 ms. None of that may look like concealment.
+        let mut neteq = neteq48();
+        for k in 0..20u16 {
+            neteq
+                .insert_packet(opus_like(k, u32::from(k) * 960, &[1; 40]))
+                .unwrap();
+            tick(&mut neteq);
+            tick(&mut neteq);
+        }
+        neteq.flush();
+        let before = neteq.get_statistics();
+        for _ in 0..300 {
+            crate::clock::advance(Duration::from_millis(10));
+            neteq.get_audio_muted().unwrap();
+        }
+        let after = neteq.get_statistics();
+        let (b, a) = (&before.lifetime, &after.lifetime);
+        assert_eq!(a.concealed_samples, b.concealed_samples);
+        assert_eq!(a.concealment_events, b.concealment_events);
+        assert_eq!(a.generated_noise_samples, b.generated_noise_samples);
+        assert_eq!(after.network.expand_rate, before.network.expand_rate);
+        // The per-second rates roll over to the muted seconds: nothing ran.
+        let ops = &after.network.operation_counters;
+        assert_eq!(ops.expand_per_sec, 0.0);
+        assert_eq!(ops.normal_per_sec, 0.0);
+    }
+
+    #[test]
+    fn decode_failure_turns_a_stretch_into_expand() {
+        // neteq_impl.cc Decode: on a decoder error "*operation =
+        // Operation::kExpand; // Do expansion to get data instead."
+        // 150 ms of playout delay with 20 ms waiting is an accelerate that
+        // decodes one more frame; that frame fails.
+        let mut neteq = neteq_with_playout_delay(150, 960, false);
+        let ts = neteq.end_timestamp;
+        neteq
+            .packet_buffer
+            .insert_packet(opus_like(5, ts, &[0xEE; 40]), &mut neteq.statistics, 80)
+            .unwrap();
+        let frame = neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation(), Operation::Expand);
+        assert_eq!(frame.speech_type, SpeechType::Expand);
+    }
+
+    #[test]
+    fn stretch_output_shorter_than_the_played_part_pads_history_with_zeros() {
+        // neteq_impl.cc DoAccelerate: when the output is shorter than what
+        // was borrowed, sync_buffer_->PushFrontZeros fills the front.
+        let mut neteq = neteq48();
+        let len = neteq.history.len();
+        neteq.history = (0..len).map(|i| i as f32).collect();
+        neteq.leftover_samples.clear();
+        // 30 samples borrowed, all already played; 10 come back.
+        neteq.put_back_time_stretched(30, 30, &[-1.0; 10]);
+        assert_eq!(neteq.history.len(), len);
+        assert!(neteq.history[..20].iter().all(|&s| s == 0.0));
+        assert_eq!(neteq.history[20], 0.0); // first sample before the borrowed part
+        assert_eq!(neteq.history[len - 11], (len - 31) as f32);
+        assert!(neteq.history[len - 10..].iter().all(|&s| s == -1.0));
+        assert!(neteq.leftover_samples.is_empty());
     }
 
     #[test]

@@ -273,8 +273,10 @@ mod wasm_worker {
                          let missing = expected_total_frames.saturating_sub(TOTAL_FRAMES_PRODUCED);
                          NETEQ.with(|cell| {
                              if let Some(eq) = cell.borrow().as_ref() {
+                                 // Muted pulls are not counted in the
+                                 // statistics: a muted peer is not concealing.
                                  for _ in 0..missing.min(MAX_MUTED_CATCH_UP_FRAMES) {
-                                     let _ = eq.get_audio();
+                                     let _ = eq.get_audio_muted();
                                  }
                              }
                          });
@@ -346,7 +348,12 @@ mod wasm_worker {
                 timestamp,
                 payload,
             } => {
-                // console::log_1(&"[neteq-worker] insert_packet".into());
+                // Mute is the remote peer's mic state from its heartbeat, and
+                // the client drops audio while it believes the mic is off
+                // (peer_decode_manager.rs). A packet that reaches the worker
+                // therefore means the mic is on: un-mute now instead of
+                // discarding the start of speech until the heartbeat lands.
+                IS_MUTED.with(|muted_cell| *muted_cell.borrow_mut() = false);
                 NETEQ.with(|cell| {
                     if let Some(eq) = cell.borrow().as_ref() {
                         if let Err(e) = eq.insert_packet(seq, timestamp, &payload) {

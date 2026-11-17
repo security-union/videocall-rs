@@ -236,6 +236,11 @@ impl PacketBuffer {
         self.buffer.front().map(|packet| packet.header.timestamp)
     }
 
+    /// The next packet to be decoded, without removing it.
+    pub fn peek_next_packet(&self) -> Option<&AudioPacket> {
+        self.buffer.front()
+    }
+
     /// Get the next packet with timestamp >= the given timestamp
     pub fn peek_next_packet_from_timestamp(&self, timestamp: u32) -> Option<&AudioPacket> {
         self.buffer
@@ -292,17 +297,14 @@ impl PacketBuffer {
         let oldest_ts = self.buffer.front().unwrap().header.timestamp;
         let newest_ts = self.buffer.back().unwrap().header.timestamp;
 
-        // Handle timestamp wraparound
-        let span_samples = if newest_ts >= oldest_ts {
-            newest_ts - oldest_ts
-        } else {
-            // Wraparound case
-            (u32::MAX - oldest_ts) + newest_ts + 1
-        };
+        // The buffer is ordered wrap-aware, so the difference modulo 2^32 is
+        // the span, as in libwebrtc's PacketBuffer::GetSpanSamples.
+        let span_samples = u64::from(newest_ts.wrapping_sub(oldest_ts));
 
-        // Convert samples to milliseconds (assuming first packet sample rate)
-        let sample_rate = self.buffer.front().unwrap().sample_rate;
-        (span_samples * 1000) / sample_rate
+        // Convert samples to milliseconds (assuming first packet sample rate),
+        // in u64: more than 89 s at 48 kHz overflows a u32 multiply.
+        let sample_rate = u64::from(self.buffer.front().unwrap().sample_rate.max(1));
+        u32::try_from(span_samples * 1000 / sample_rate).unwrap_or(u32::MAX)
     }
 
     /// Get the total content duration of packets in the buffer (sum of packet durations)
@@ -326,7 +328,13 @@ impl PacketBuffer {
 
         while low < high {
             let mid = (low + high) / 2;
-            if self.buffer[mid].header.timestamp <= packet.header.timestamp {
+            // Wrap-aware `<=` (`is_timestamp_newer` is true for equal), as
+            // libwebrtc's `Packet::operator<` (packet.h) compares timestamps
+            // modulo 2^32.
+            if packet
+                .header
+                .is_timestamp_newer(self.buffer[mid].header.timestamp)
+            {
                 low = mid + 1;
             } else {
                 high = mid;
@@ -485,6 +493,40 @@ mod tests {
 
         // Buffer should not exceed max capacity
         assert!(buffer.len() <= 2);
+    }
+
+    fn packet_48k(seq: u16, ts: u32) -> AudioPacket {
+        let header = RtpHeader::new(seq, ts, 12345, 111, false);
+        AudioPacket::new(header, vec![0; 80], 48_000, 1, 20)
+    }
+
+    #[test]
+    fn packets_are_ordered_across_the_timestamp_wrap() {
+        let mut buffer = PacketBuffer::new(10);
+        let mut stats = StatisticsCalculator::new();
+        let before_wrap = u32::MAX - 959;
+        let after_wrap = before_wrap.wrapping_add(960); // 0
+        buffer
+            .insert_packet(packet_48k(2, after_wrap), &mut stats, 100)
+            .unwrap();
+        buffer
+            .insert_packet(packet_48k(1, before_wrap), &mut stats, 100)
+            .unwrap();
+        assert_eq!(buffer.peek_next_timestamp(), Some(before_wrap));
+        assert_eq!(buffer.get_span_duration_ms(), 20);
+    }
+
+    #[test]
+    fn span_longer_than_89_seconds_does_not_overflow() {
+        let mut buffer = PacketBuffer::new(10);
+        let mut stats = StatisticsCalculator::new();
+        buffer
+            .insert_packet(packet_48k(1, 0), &mut stats, 100)
+            .unwrap();
+        buffer
+            .insert_packet(packet_48k(2, 100 * 48_000), &mut stats, 100)
+            .unwrap();
+        assert_eq!(buffer.get_span_duration_ms(), 100_000);
     }
 
     #[test]

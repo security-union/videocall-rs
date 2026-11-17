@@ -113,22 +113,31 @@ impl RelativeArrivalDelayTracker {
 
     /// Update with a new packet arrival
     pub fn update(&mut self, timestamp: u32, sample_rate: u32, arrival_time: Instant) -> i32 {
-        // Calculate expected time since last packet
-        let expected_iat_ms = if let Some(last_timestamp) = self.last_timestamp {
-            timestamp.saturating_sub(last_timestamp) * 1000 / sample_rate
-        } else {
-            0
+        // Expected time since the last packet, from the signed RTP timestamp
+        // difference modulo 2^32: a reordered packet gives a negative value
+        // and a wrap past u32::MAX a small positive one, as in libwebrtc's
+        // wrap-aware comparison (packet.h `Packet::operator<`) and 64-bit
+        // unwrapping (PacketArrivalHistory::Insert). i64 so a long pause
+        // (more than 89 s at 48 kHz) cannot overflow the multiply.
+        let expected_iat_ms = match self.last_timestamp {
+            Some(last_timestamp) if sample_rate > 0 => {
+                i64::from(timestamp.wrapping_sub(last_timestamp) as i32) * 1000
+                    / i64::from(sample_rate)
+            }
+            _ => 0,
         };
 
         // Calculate actual time since last packet
         let actual_iat_ms = if let Some(last_time) = self.last_packet_time {
-            arrival_time.duration_since(last_time).as_millis() as i32
+            i64::try_from(arrival_time.duration_since(last_time).as_millis()).unwrap_or(i64::MAX)
         } else {
             0
         };
 
         // Calculate jitter: positive means packet is late, negative means packet is early
-        let iat_delay_ms = actual_iat_ms - expected_iat_ms as i32;
+        let iat_delay_ms = actual_iat_ms
+            .saturating_sub(expected_iat_ms)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
 
         self.last_packet_time = Some(arrival_time);
 
@@ -156,14 +165,14 @@ impl RelativeArrivalDelayTracker {
         let packet_delay = PacketDelay {
             iat_delay_ms,
             _timestamp: timestamp,
-            arrival_time: Instant::now(),
+            arrival_time: crate::clock::now(),
         };
 
         self.delay_history.push_back(packet_delay);
 
         // Remove old entries based on max_history_ms
         let max_age = Duration::from_millis(self.config.max_history_ms as u64);
-        let now = Instant::now();
+        let now = crate::clock::now();
 
         self.delay_history
             .retain(|delay| now.duration_since(delay.arrival_time) <= max_age);
@@ -242,7 +251,7 @@ impl DelayManager {
             self.reset();
         }
 
-        let arrival_time = Instant::now();
+        let arrival_time = crate::clock::now();
 
         // Update arrival delay tracking
         let relative_delay =
@@ -466,6 +475,56 @@ mod tests {
         assert_eq!(delay_manager.set_minimum_delay(0), 20);
         assert_eq!(delay_manager.effective_minimum_delay_ms, 20);
         assert_eq!(delay_manager.effective_maximum_delay_ms, 200);
+    }
+
+    /// 48 kHz RTP, 20 ms packets.
+    const RATE: u32 = 48_000;
+    const FRAME: u32 = 960;
+
+    #[test]
+    fn forward_timestamp_jump_after_a_long_pause_is_not_jitter() {
+        crate::clock::freeze();
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        tracker.update(1_000, RATE, crate::clock::now());
+        // The sender was muted for 95 s; it resumes with the timestamp 95 s
+        // ahead, exactly as far as the wall clock moved.
+        crate::clock::advance(Duration::from_secs(95));
+        let delay = tracker.update(1_000 + 95 * RATE, RATE, crate::clock::now());
+        assert_eq!(delay, 0);
+    }
+
+    #[test]
+    fn timestamp_jump_beyond_half_the_range_does_not_overflow() {
+        crate::clock::freeze();
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        tracker.update(100_000_000, RATE, crate::clock::now());
+        crate::clock::advance(Duration::from_millis(20));
+        // A restart onto an unrelated base; any finite answer is fine.
+        tracker.update(3_000_000_000, RATE, crate::clock::now());
+        crate::clock::advance(Duration::from_millis(20));
+        tracker.update(3_000_000_000 + FRAME, RATE, crate::clock::now());
+    }
+
+    #[test]
+    fn reordered_packet_registers_its_lateness() {
+        crate::clock::freeze();
+        let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
+        // Every 7th packet is 30 ms late, so it arrives after its successor.
+        let mut arrivals: Vec<(u64, u32)> = (0..70u32)
+            .map(|frame| {
+                let late = if frame % 7 == 3 { 30 } else { 0 };
+                (u64::from(frame) * 20 + late, frame * FRAME)
+            })
+            .collect();
+        arrivals.sort();
+        let mut now_ms = 0;
+        let mut delay = 0;
+        for (at, ts) in arrivals {
+            crate::clock::advance(Duration::from_millis(at - now_ms));
+            now_ms = at;
+            delay = tracker.update(ts, RATE, crate::clock::now());
+        }
+        assert!(delay >= 30, "relative delay {delay} ms, want >= 30");
     }
 
     #[test]

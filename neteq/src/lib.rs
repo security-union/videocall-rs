@@ -24,6 +24,7 @@
 
 pub mod buffer;
 pub mod buffer_level_filter;
+pub mod clock;
 pub mod codec;
 pub mod delay_manager;
 pub mod error;

@@ -267,6 +267,11 @@ pub struct LifetimeStatistics {
     pub buffer_flushes: u64,
     /// Late packets discarded
     pub late_packets_discarded: u64,
+    /// Samples of codec-internal comfort noise played during Opus DTX
+    /// (libwebrtc `kCodecInternalCng`). Not concealment: counted apart from
+    /// `concealed_samples`.
+    #[serde(default)]
+    pub comfort_noise_samples: u64,
 }
 
 /// Operations and internal state metrics
@@ -324,7 +329,7 @@ impl Default for StatisticsCalculator {
 impl StatisticsCalculator {
     /// Create a new statistics calculator
     pub fn new() -> Self {
-        let now = Instant::now();
+        let now = crate::clock::now();
         Self {
             network_stats: NetworkStatistics::default(),
             lifetime_stats: LifetimeStatistics::default(),
@@ -376,6 +381,11 @@ impl StatisticsCalculator {
         }
     }
 
+    /// Record samples of codec-internal comfort noise.
+    pub fn comfort_noise(&mut self, samples: u64) {
+        self.lifetime_stats.comfort_noise_samples += samples;
+    }
+
     /// Record time-stretching operation
     pub fn time_stretch_operation(&mut self, operation: TimeStretchOperation, samples: u64) {
         // Track total output samples for rate calculations
@@ -416,7 +426,7 @@ impl StatisticsCalculator {
 
     /// Record a decode operation for per-second tracking
     pub fn record_decode_operation(&mut self, operation: Operation) {
-        let now = Instant::now();
+        let now = crate::clock::now();
 
         // Convert operation to array index
         let index = match operation {
@@ -540,7 +550,7 @@ impl StatisticsCalculator {
 
     /// Get uptime duration
     pub fn uptime(&self) -> Duration {
-        self.start_time.elapsed()
+        crate::clock::now().saturating_duration_since(self.start_time)
     }
 
     /// Reset all statistics

@@ -637,10 +637,15 @@ pub struct Scenario {
 /// the first audio packet that follows; the worker un-mutes earlier, on
 /// that first insert, because a packet reaching it means the peer's mic
 /// is on.
+///
+/// `stale_mute_at_ms`: a second Mute{true} on its own (no Flush) that
+/// reaches the worker after speech has resumed; the worker discards pulls
+/// again until the next insert.
 #[derive(Clone, Copy, Debug)]
 pub struct ReceiverMute {
     pub from_ms: u64,
     pub unmute_lag_ms: u64,
+    pub stale_mute_at_ms: Option<u64>,
 }
 
 impl Scenario {
@@ -722,7 +727,7 @@ pub struct Run {
     /// Lifetime samples removed by accelerate and inserted by preemptive
     /// expand.
     pub stretch_samples: (u64, u64),
-    /// Concealed samples counted while the worker was muted.
+    /// Concealed samples counted while the worker was muted (all mutes).
     pub muted_concealment: u64,
     /// When the un-mute message arrived (`ReceiverMute`).
     pub unmute_signal_ms: Option<u64>,
@@ -767,6 +772,7 @@ pub fn run(scenario: &Scenario) -> Run {
     let mut frame_len_errors = 0;
     let mut muted = false;
     let mut mute_done = false;
+    let mut stale_done = false;
     let mut unmute_signal_ms: Option<u64> = None;
     let mut concealed_at_mute = 0;
     let mut muted_concealment = 0;
@@ -780,6 +786,13 @@ pub fn run(scenario: &Scenario) -> Run {
                 neteq.flush();
                 concealed_at_mute = neteq.get_statistics().lifetime.concealed_samples;
             }
+            if let Some(at) = mute.stale_mute_at_ms {
+                if mute_done && !muted && !stale_done && t >= at {
+                    stale_done = true;
+                    muted = true;
+                    concealed_at_mute = neteq.get_statistics().lifetime.concealed_samples;
+                }
+            }
         }
         while next < arrivals.len() && arrivals[next].0 <= t {
             let (at, index) = arrivals[next];
@@ -788,9 +801,11 @@ pub fn run(scenario: &Scenario) -> Run {
                 // The first insert after the mute un-mutes the worker; the
                 // un-mute message itself only arrives later.
                 muted = false;
-                muted_concealment =
+                muted_concealment +=
                     neteq.get_statistics().lifetime.concealed_samples - concealed_at_mute;
-                unmute_signal_ms = Some(at + mute.unmute_lag_ms);
+                if unmute_signal_ms.is_none() {
+                    unmute_signal_ms = Some(at + mute.unmute_lag_ms);
+                }
             }
             let packet = &sent[index];
             let header = RtpHeader::new(packet.seq, packet.ts, SSRC, PT, false);
@@ -1227,7 +1242,9 @@ fn analyze(run: &Run) -> Report {
             / energy(&run.reference, sample(s) - sample(2), sample(s + 20)).max(1e-12);
         let conceal_ms = (s + lag..(e + lag).min(run.ticks.len()))
             .filter(|&i| {
+                // A discarded (muted) pull is not concealment.
                 run.ticks[i].speech == SpeechType::Expand
+                    && !run.ticks[i].paused
                     && deep[i] == Some(Deep::Speech)
                     && run.ticks[i].t_ms >= STARTUP_MS
             })

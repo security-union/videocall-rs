@@ -68,6 +68,11 @@ pub struct PacketBuffer {
 }
 
 impl PacketBuffer {
+    /// The buffered packets, oldest timestamp first.
+    pub fn iter(&self) -> impl Iterator<Item = &AudioPacket> {
+        self.buffer.iter()
+    }
+
     /// Create a new packet buffer
     pub fn new(max_packets: usize) -> Self {
         Self {

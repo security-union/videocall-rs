@@ -425,31 +425,23 @@ fn mute_95s_then_speech_plays_on_time() {
 /// 10 s (its sender sends nothing and its timestamps skip the gap). The
 /// client flushes and mutes the worker, which keeps pulling every 10 ms and
 /// discards the audio. Speech resumes with a forward timestamp jump and the
-/// un-mute message arrives 60 ms after the first audio packet. The first
-/// talkspurt must not lose its onset, must play on schedule, and the muted
-/// pulls must not count as concealment.
-#[test]
-fn muted_worker_keeps_pulling_and_speech_after_unmute_is_whole() {
+/// un-mute message arrives 60 ms after the first audio packet.
+fn muted_worker_run(name: &str, mute: ReceiverMute) -> Run {
     let script = Script::Edited(vec![
         Segment::Speech(6_000),
         Segment::Mute(10_000),
         Segment::Speech(8_000),
     ]);
-    let unmute_lag_ms = 60;
-    let run = run(&Scenario::scripted(
-        "mute10s_worker_muted_pulls_unmute_late60_continuous_rtp_clean",
-        script,
-        SenderMode::Continuous,
-        Network::clean(),
+    run(
+        &Scenario::scripted(name, script, SenderMode::Continuous, Network::clean())
+            .with_receiver_mute(mute),
     )
-    // The mute heartbeat lands 200 ms after the mic went off: the client
-    // drops audio once it has it (peer_decode_manager.rs), so no straggler
-    // reaches the muted worker.
-    .with_receiver_mute(ReceiverMute {
-        from_ms: 6_200,
-        unmute_lag_ms,
-    }));
-    assert_sane(&run);
+}
+
+/// The first talkspurt after the mute must not lose its onset, must play
+/// on schedule, and the muted pulls must not count as concealment.
+fn assert_speech_after_mute_is_whole(run: &Run) {
+    assert_sane(run);
     let name = &run.scenario.name;
     assert_eq!(
         run.muted_concealment, 0,
@@ -459,8 +451,8 @@ fn muted_worker_keeps_pulling_and_speech_after_unmute_is_whole() {
     assert!(run.unmute_signal_ms.is_some(), "{name}: never un-muted");
     // The un-mute message is late, but the worker does not wait for it:
     // the clean-network bound applies, with no allowance for the lag.
-    let bound = clean_delay_bound(&run);
-    let spurts: Vec<_> = scored_talkspurts(&run)
+    let bound = clean_delay_bound(run);
+    let spurts: Vec<_> = scored_talkspurts(run)
         .into_iter()
         .filter(|t| t.start_ms >= 16_000)
         .collect();
@@ -490,6 +482,70 @@ fn muted_worker_keeps_pulling_and_speech_after_unmute_is_whole() {
             );
         }
     }
+}
+
+/// The mute heartbeat lands 200 ms after the mic went off: everything sent
+/// before it has played, so the flush drops nothing.
+#[test]
+fn muted_worker_keeps_pulling_and_speech_after_unmute_is_whole() {
+    let run = muted_worker_run(
+        "mute10s_worker_muted_pulls_unmute_late60_continuous_rtp_clean",
+        ReceiverMute {
+            from_ms: 6_000 + 200,
+            unmute_lag_ms: 60,
+            stale_mute_at_ms: None,
+        },
+    );
+    assert_speech_after_mute_is_whole(&run);
+}
+
+/// The mute lands while the last packets before the mic went off are still
+/// buffered: the flush drops them and a straggler arrives after it. The
+/// decoder must still see every packet (see `NetEq::flush`), or the onset
+/// 10 s later plays at 2.5 times its level.
+#[test]
+fn mute_landing_on_buffered_audio_leaves_the_next_onset_at_its_level() {
+    let run = muted_worker_run(
+        "mute10s_worker_flush_on_buffered_audio_straggler_continuous_rtp_clean",
+        ReceiverMute {
+            from_ms: 6_000,
+            unmute_lag_ms: 60,
+            stale_mute_at_ms: None,
+        },
+    );
+    assert_speech_after_mute_is_whole(&run);
+}
+
+/// A stale Mute{true} reaches the worker after speech has resumed. The
+/// worker discards pulls until the next packet un-mutes it, so the audio
+/// lost is at most one packet interval (20 ms) on a clean network, and
+/// none of it counts as concealment.
+#[test]
+fn stale_mute_after_speech_resumed_loses_at_most_one_packet() {
+    // Between two packet arrivals (they land on 20 ms boundaries), so at
+    // least one pull is discarded before the next packet un-mutes.
+    let stale_at = 16_510;
+    let run = muted_worker_run(
+        "mute10s_worker_stale_mute_at_16510_continuous_rtp_clean",
+        ReceiverMute {
+            from_ms: 6_000 + 200,
+            unmute_lag_ms: 60,
+            stale_mute_at_ms: Some(stale_at),
+        },
+    );
+    let name = &run.scenario.name;
+    let lost_ms = run
+        .ticks
+        .iter()
+        .filter(|t| t.paused && t.t_ms >= stale_at)
+        .count() as u64
+        * TICK_MS;
+    assert!(lost_ms > 0, "{name}: the stale mute never took effect");
+    assert!(
+        lost_ms <= PACKET_MS,
+        "{name}: {lost_ms} ms discarded after the stale mute, want <= {PACKET_MS} ms"
+    );
+    assert_speech_after_mute_is_whole(&run);
 }
 
 /// Three loops of the clip (60 s) over 60 ms jitter: the buffer and the
@@ -792,4 +848,196 @@ fn same_scenario_twice_gives_byte_identical_neteq_wav() {
         first_diff,
         first_diff.map(|i| i / TICK)
     );
+}
+
+/// What NetEq hands its decoder, in order.
+struct RecordingDecoder {
+    inner: neteq::codec::NativeOpusDecoder,
+    log: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl neteq::codec::AudioDecoder for RecordingDecoder {
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn channels(&self) -> u8 {
+        self.inner.channels()
+    }
+    fn decode(&mut self, encoded: &[u8]) -> neteq::Result<Vec<f32>> {
+        self.log.lock().expect("decoder log").push(encoded.to_vec());
+        self.inner.decode(encoded)
+    }
+    fn supports_dtx(&self) -> bool {
+        self.inner.supports_dtx()
+    }
+    fn decode_comfort_noise(&mut self, n: usize, out: &mut Vec<f32>) -> neteq::Result<bool> {
+        self.inner.decode_comfort_noise(n, out)
+    }
+}
+
+struct GapResume {
+    /// Packets sent, in order.
+    sent: Vec<Vec<u8>>,
+    /// Packets NetEq handed the decoder, in order.
+    decoded: Vec<Vec<u8>>,
+    /// Energy of the first 200 ms NetEq played after the resume, over the
+    /// same audio from an ideal receiver (every sent packet decoded in
+    /// order, no jitter buffer).
+    onset_ratio: f64,
+    /// When the resumed audio started to play, after its first packet
+    /// arrived.
+    resume_delay_ms: u64,
+}
+
+/// A handful of packets, 10 s of nothing while the receiver keeps pulling
+/// every 10 ms, then the stream resumes with a forward timestamp jump (an
+/// outage, a mute, a peer that says one word). With `flush`, NetEq played
+/// the stream from its start and was flushed just before the last `k`
+/// packets of the first segment arrived: whatever it held and had not
+/// decoded is dropped. Without, NetEq starts fresh on those `k` packets.
+/// The sender encodes only what it sends, as a muted browser mic does.
+fn gap_resume(k: usize, flush: bool) -> GapResume {
+    use neteq::codec::{AudioDecoder, NativeOpusDecoder};
+    use neteq::{AudioPacket, NetEq, NetEqConfig, Operation, RtpHeader};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let script = Script::Edited(vec![
+        Segment::Speech(6_000),
+        Segment::Mute(10_000),
+        Segment::Speech(8_000),
+    ]);
+    let payloads = encoded(&script, false);
+    let (stop, resume) = (300usize, 800usize); // frames
+    let first = if flush { 0 } else { stop - k };
+    let frames: Vec<usize> = (first..stop).chain(resume..resume + 50).collect();
+    let arrival_ms = |frame: usize| frame as u64 * FRAME_MS + BASE_NET_DELAY_MS;
+    let flush_at_ms = arrival_ms(stop - k);
+
+    neteq::clock::freeze();
+    let mut neteq = NetEq::new(NetEqConfig {
+        sample_rate: RATE,
+        channels: 1,
+        ..NetEqConfig::default()
+    })
+    .expect("neteq");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    neteq.register_decoder(
+        PT,
+        Box::new(RecordingDecoder {
+            inner: NativeOpusDecoder::new(RATE, 1).expect("decoder"),
+            log: log.clone(),
+        }),
+    );
+    let start_ms = arrival_ms(first) / TICK_MS * TICK_MS;
+    let end_ms = arrival_ms(resume + 50) + 500; // play out the last packets
+    let mut out = Vec::new();
+    let mut operations = Vec::new();
+    let mut next = 0;
+    let mut flushed = !flush;
+    for t in (start_ms..end_ms).step_by(TICK_MS as usize) {
+        if !flushed && t >= flush_at_ms {
+            neteq.flush();
+            flushed = true;
+        }
+        while next < frames.len() && arrival_ms(frames[next]) <= t {
+            let frame = frames[next];
+            let header = RtpHeader::new(
+                20_000u16.wrapping_add(next as u16),
+                100_000_000u32.wrapping_add((frame * FRAME) as u32),
+                0x5EED_0002,
+                PT,
+                false,
+            );
+            neteq
+                .insert_packet(AudioPacket::new(
+                    header,
+                    payloads[frame].clone(),
+                    RATE,
+                    1,
+                    20,
+                ))
+                .expect("insert");
+            next += 1;
+        }
+        neteq::clock::advance(Duration::from_millis(TICK_MS));
+        let frame_out = neteq.get_audio().expect("get_audio");
+        out.extend_from_slice(&frame_out.samples);
+        operations.push((t, neteq.last_operation()));
+    }
+
+    let sent: Vec<Vec<u8>> = frames.iter().map(|&f| payloads[f].clone()).collect();
+    let mut ideal_decoder = NativeOpusDecoder::new(RATE, 1).expect("decoder");
+    let mut ideal = Vec::new();
+    for &frame in &frames {
+        let pcm = ideal_decoder.decode(&payloads[frame]).expect("decode");
+        if frame >= resume {
+            ideal.extend_from_slice(&pcm);
+        }
+    }
+    let onset = 10 * FRAME; // 200 ms
+    let (played_at, _) = *operations
+        .iter()
+        .find(|(t, op)| *t >= arrival_ms(resume) && *op != Operation::Expand)
+        .expect("resumed audio never played");
+    let from = ((played_at - start_ms) / TICK_MS) as usize * TICK;
+    let energy = |x: &[f32]| x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>();
+    let decoded = log.lock().expect("decoder log").clone();
+    GapResume {
+        sent,
+        decoded,
+        onset_ratio: energy(&out[from..from + onset]) / energy(&ideal[..onset]).max(1e-12),
+        resume_delay_ms: played_at - arrival_ms(resume),
+    }
+}
+
+/// After a fresh start or a flush, a handful of packets, 10 s of pulls and
+/// a forward timestamp jump: the speech that resumes plays at its own
+/// level and on time. The decoder must see every packet the sender sent,
+/// in order: an Opus decoder that skips an encoded packet without being
+/// told keeps the wrong inter-frame state, and through a gap with nothing
+/// to decode that error lands on the next onset (C libopus 1.5 and the
+/// ropus port both decode the frame after one skipped packet here at 2.6x
+/// the level, and the onset 10 s later at 2.5x).
+#[test]
+fn speech_after_a_flush_or_fresh_start_and_a_gap_is_at_its_level() {
+    let mut failures = Vec::new();
+    for flush in [false, true] {
+        for k in [1usize, 3, 5, 10] {
+            let name = format!(
+                "{} then {k} packets",
+                if flush { "flush" } else { "fresh start" }
+            );
+            let run = gap_resume(k, flush);
+            println!(
+                "GAP {name}: decoded {}/{} onset {:.2} delay {} ms",
+                run.decoded.len(),
+                run.sent.len(),
+                run.onset_ratio,
+                run.resume_delay_ms
+            );
+            if run.decoded != run.sent {
+                failures.push(format!(
+                    "{name}: the decoder saw {} of the {} packets sent, or not in order",
+                    run.decoded.len(),
+                    run.sent.len()
+                ));
+            }
+            if !(0.8..=1.25).contains(&run.onset_ratio) {
+                failures.push(format!(
+                    "{name}: onset energy ratio {:.2} after the gap, want 0.8..1.25",
+                    run.onset_ratio
+                ));
+            }
+            // The start-up target (80 ms, delay_manager.cc kStartDelayMs)
+            // plus one packet.
+            if run.resume_delay_ms > 80 + FRAME_MS {
+                failures.push(format!(
+                    "{name}: resumed audio played {} ms after it arrived",
+                    run.resume_delay_ms
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

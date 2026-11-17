@@ -685,7 +685,18 @@ impl NetEq {
 
     /// Flush the buffer and reset all internal state (neteq_impl.cc
     /// `FlushBuffers`: the next packet starts a new stream).
+    ///
+    /// Deviation: libwebrtc drops the buffered packets without decoding
+    /// them and leaves the decoder alone. Opus predicts each frame from the
+    /// one before, so a decoder that never sees the dropped packets keeps
+    /// the wrong state. If only a packet or two follows before the stream
+    /// pauses, nothing heals that state and the error lands on the next
+    /// onset (2.5 times the level after one dropped packet, in C libopus as
+    /// in the ropus port; see `tests/dtx_end_to_end.rs`). The packets are
+    /// decoded here and their audio thrown away: none of it plays, and the
+    /// decoder stays in step with the encoder.
     pub fn flush(&mut self) {
+        self.decode_and_discard_buffered();
         self.packet_buffer.flush(&mut self.statistics);
         self.leftover_samples.clear();
         // sync_buffer.cc Flush: the history is zeros again.
@@ -694,6 +705,29 @@ impl NetEq {
         self.last_decoded = None;
         self.last_received_seq = None;
         self.soft_reset();
+    }
+
+    /// Run the packets playout would still decode through their decoders,
+    /// in order, and drop the audio (see [`NetEq::flush`]). Packets older
+    /// than the playout point would be discarded unplayed
+    /// (`DiscardOldPackets` in neteq_impl.cc `GetDecision`), so they are
+    /// skipped here too.
+    fn decode_and_discard_buffered(&mut self) {
+        let running = !self.first_packet && !self.new_codec;
+        for packet in self.packet_buffer.iter() {
+            if running && is_newer_timestamp(self.end_timestamp, packet.header.timestamp) {
+                continue;
+            }
+            let Some(decoder) = self.decoders.get_mut(&packet.header.payload_type) else {
+                continue;
+            };
+            // Same rule as `decode_packet`: a decoder that cannot take DTX
+            // frames is never handed one.
+            if packet.is_dtx() && !decoder.supports_dtx() {
+                continue;
+            }
+            let _ = decoder.decode(&packet.payload);
+        }
     }
 
     /// decision_logic.cc `DecisionLogic::SoftReset`.
@@ -1788,6 +1822,64 @@ mod tests {
                 .all(|s| *s == SpeechType::Normal),
             "{speech:?}"
         );
+    }
+
+    /// Counts what it is asked to decode; every frame is 0.1.
+    struct CountingDecoder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::codec::AudioDecoder for CountingDecoder {
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn channels(&self) -> u8 {
+            1
+        }
+        fn decode(&mut self, _encoded: &[u8]) -> Result<Vec<f32>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![0.1; 960])
+        }
+    }
+
+    #[test]
+    fn flush_decodes_what_it_drops_and_plays_none_of_it() {
+        // Opus predicts each frame from the one before: the decoder must
+        // see the packets a flush drops, or the next packet it decodes
+        // starts from the wrong state. None of their audio may play.
+        let decoded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut neteq = neteq48();
+        neteq.register_decoder(111, Box::new(CountingDecoder(decoded.clone())));
+        for k in 0..2u16 {
+            neteq
+                .insert_packet(opus_like(k, u32::from(k) * 960, &[1; 40]))
+                .unwrap();
+            tick(&mut neteq);
+            tick(&mut neteq);
+        }
+        let played = decoded.load(std::sync::atomic::Ordering::Relaxed);
+        for k in 2..6u16 {
+            neteq
+                .insert_packet(opus_like(k, u32::from(k) * 960, &[1; 40]))
+                .unwrap();
+        }
+        neteq.flush();
+        assert_eq!(
+            decoded.load(std::sync::atomic::Ordering::Relaxed),
+            played + 4,
+            "the dropped packets were not decoded"
+        );
+        assert!(neteq.is_empty());
+        for _ in 0..10 {
+            let frame = tick(&mut neteq);
+            assert_ne!(
+                frame.speech_type,
+                SpeechType::Normal,
+                "flushed audio played"
+            );
+        }
+        // A flush on an empty buffer decodes nothing.
+        let before = decoded.load(std::sync::atomic::Ordering::Relaxed);
+        neteq.flush();
+        assert_eq!(decoded.load(std::sync::atomic::Ordering::Relaxed), before);
     }
 
     #[test]

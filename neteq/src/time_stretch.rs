@@ -311,7 +311,7 @@ impl PreemptiveExpand {
         // data, or passive speech."
         let strong =
             analysis.best_correlation > K_CORRELATION_THRESHOLD && old_data_length <= fs_mult_120;
-        if !(strong || !analysis.active_speech) {
+        if !strong && analysis.active_speech {
             output.extend_from_slice(input);
             return (TimeStretchResult::NoStretch, 0);
         }

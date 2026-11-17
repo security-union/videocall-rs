@@ -491,6 +491,17 @@ mod tests {
         crate::clock::advance(Duration::from_secs(95));
         let delay = tracker.update(1_000 + 95 * RATE, RATE, crate::clock::now());
         assert_eq!(delay, 0);
+        // The packet itself was exactly on time. A u32 `* 1000` wraps here
+        // and gives 89 479 ms (and panics with overflow checks).
+        assert_eq!(last_iat_delay_ms(&tracker), 0);
+    }
+
+    fn last_iat_delay_ms(tracker: &RelativeArrivalDelayTracker) -> i32 {
+        tracker
+            .delay_history
+            .back()
+            .expect("a packet was recorded")
+            .iat_delay_ms
     }
 
     #[test]
@@ -499,10 +510,16 @@ mod tests {
         let mut tracker = RelativeArrivalDelayTracker::new(DelayConfig::default());
         tracker.update(100_000_000, RATE, crate::clock::now());
         crate::clock::advance(Duration::from_millis(20));
-        // A restart onto an unrelated base; any finite answer is fine.
+        // A restart onto an unrelated base 2.9e9 samples ahead: modulo 2^32
+        // that is 1 394 967 296 samples back (29 061 818 ms at 48 kHz), so
+        // the packet reads as that late, as libwebrtc's wrap-aware compare
+        // would order it.
         tracker.update(3_000_000_000, RATE, crate::clock::now());
+        assert_eq!(last_iat_delay_ms(&tracker), 20 + 29_061_818);
+        // The next packet is 20 ms on and 20 ms later: on time again.
         crate::clock::advance(Duration::from_millis(20));
         tracker.update(3_000_000_000 + FRAME, RATE, crate::clock::now());
+        assert_eq!(last_iat_delay_ms(&tracker), 0);
     }
 
     #[test]

@@ -645,6 +645,9 @@ pub struct Scenario {
     /// `get_audio` from the moment the first muted frame would have arrived
     /// until the first packet after the mute arrives (plus `unmute_lag_ms`).
     pub pause_pulls_during_mute: Option<PullPause>,
+    /// The receiver's decoder reports DTX support (`supports_dtx`); false
+    /// gives the same trace the handling decoders without it get.
+    pub decoder_dtx: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -670,6 +673,7 @@ impl Scenario {
             restart: None,
             ts_jump: None,
             pause_pulls_during_mute: None,
+            decoder_dtx: true,
         }
     }
     /// A scripted source; `name` must say what the script is.
@@ -684,6 +688,7 @@ impl Scenario {
             restart: None,
             ts_jump: None,
             pause_pulls_during_mute: None,
+            decoder_dtx: true,
         }
     }
     pub fn named(mut self, name: &str) -> Self {
@@ -692,6 +697,11 @@ impl Scenario {
     }
     pub fn with_restart(mut self, restart: Restart) -> Self {
         self.restart = Some(restart);
+        self
+    }
+    pub fn without_decoder_dtx(mut self) -> Self {
+        self.decoder_dtx = false;
+        self.name = format!("{}_nodtxdecoder", self.name);
         self
     }
     pub fn with_ts_jump(mut self, jump: TsJump) -> Self {
@@ -752,11 +762,18 @@ pub struct Run {
     pub never_decoded_frames: Vec<usize>,
 }
 
-/// Counts decode calls so the harness can tell played from discarded.
+/// Packets in NetEq by payload address: NetEq moves packets and never
+/// copies their payload, so the slice a decode receives identifies the
+/// packet, and with it its (sequence, timestamp).
+type InFlight = Arc<Mutex<HashMap<usize, (u16, u32)>>>;
+
+/// Counts decode calls and records which packet each one decoded.
 struct CountingDecoder {
     inner: NativeOpusDecoder,
     count: Arc<AtomicUsize>,
-    payloads: Arc<Mutex<Vec<Vec<u8>>>>,
+    in_flight: InFlight,
+    decoded: Arc<Mutex<Vec<(u16, u32)>>>,
+    dtx: bool,
 }
 
 impl AudioDecoder for CountingDecoder {
@@ -768,11 +785,18 @@ impl AudioDecoder for CountingDecoder {
     }
     fn decode(&mut self, encoded: &[u8]) -> neteq::Result<Vec<f32>> {
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.payloads.lock().unwrap().push(encoded.to_vec());
+        if let Some(&id) = self
+            .in_flight
+            .lock()
+            .unwrap()
+            .get(&(encoded.as_ptr() as usize))
+        {
+            self.decoded.lock().unwrap().push(id);
+        }
         self.inner.decode(encoded)
     }
     fn supports_dtx(&self) -> bool {
-        self.inner.supports_dtx()
+        self.dtx && self.inner.supports_dtx()
     }
     fn decode_comfort_noise(
         &mut self,
@@ -805,13 +829,16 @@ pub fn run(scenario: &Scenario) -> Run {
     })
     .expect("neteq");
     let decoded = Arc::new(AtomicUsize::new(0));
-    let decoded_payloads = Arc::new(Mutex::new(Vec::new()));
+    let in_flight: InFlight = Arc::default();
+    let decoded_ids = Arc::new(Mutex::new(Vec::new()));
     neteq.register_decoder(
         PT,
         Box::new(CountingDecoder {
             inner: NativeOpusDecoder::new(RATE, 1).expect("opus decoder"),
             count: decoded.clone(),
-            payloads: decoded_payloads.clone(),
+            in_flight: in_flight.clone(),
+            decoded: decoded_ids.clone(),
+            dtx: scenario.decoder_dtx,
         }),
     );
     // Mute windows in arrival time: from when the first muted frame would
@@ -855,6 +882,10 @@ pub fn run(scenario: &Scenario) -> Run {
             let packet = &sent[index];
             let header = RtpHeader::new(packet.seq, packet.ts, SSRC, PT, false);
             let audio_packet = AudioPacket::new(header, packet.payload.clone(), RATE, 1, 20);
+            in_flight.lock().unwrap().insert(
+                audio_packet.payload.as_ptr() as usize,
+                (packet.seq, packet.ts),
+            );
             if let Err(e) = neteq.insert_packet(audio_packet) {
                 insert_errors.push(format!("t={at} seq={}: {e}", packet.seq));
             }
@@ -899,12 +930,12 @@ pub fn run(scenario: &Scenario) -> Run {
     let mut unique: Vec<usize> = arrivals.iter().map(|&(_, index)| index).collect();
     unique.sort_unstable();
     unique.dedup();
-    let played: std::collections::HashSet<Vec<u8>> =
-        decoded_payloads.lock().unwrap().iter().cloned().collect();
+    let played: std::collections::HashSet<(u16, u32)> =
+        decoded_ids.lock().unwrap().iter().copied().collect();
     let never_decoded_frames: Vec<usize> = unique
         .iter()
         .map(|&index| &sent[index])
-        .filter(|p| !played.contains(&p.payload))
+        .filter(|p| !played.contains(&(p.seq, p.ts)))
         .map(|p| p.frame)
         .collect();
     let concealed_samples = lifetime.concealed_samples;
@@ -914,15 +945,25 @@ pub fn run(scenario: &Scenario) -> Run {
     );
 
     // Ideal receiver: every transmitted packet, decoded in order, no jitter
-    // buffer, placed at its source frame.
+    // buffer, placed at its source frame. A frame the sender left out after
+    // a DTX frame is the codec's own comfort noise (an empty-payload decode,
+    // as without NetEq), when the receiving decoder supports DTX.
     let mut reference = vec![0.0f32; source.pcm.len()];
     let mut decoder = NativeOpusDecoder::new(RATE, 1).expect("opus decoder");
-    for packet in &sent {
-        if let Ok(pcm) = decoder.decode(&packet.payload) {
-            let n = pcm.len().min(FRAME);
-            let at = packet.frame * FRAME;
-            reference[at..at + n].copy_from_slice(&pcm[..n]);
+    let by_frame: HashMap<usize, &SentPacket> = sent.iter().map(|p| (p.frame, p)).collect();
+    let mut in_dtx = false;
+    for frame in 0..source.pcm.len() / FRAME {
+        let mut pcm = Vec::new();
+        if let Some(packet) = by_frame.get(&frame) {
+            in_dtx = scenario.decoder_dtx && matches!(packet.payload.len(), 1 | 2);
+            pcm = decoder.decode(&packet.payload).unwrap_or_default();
+        } else if in_dtx {
+            decoder
+                .decode_comfort_noise(FRAME, &mut pcm)
+                .expect("comfort noise");
         }
+        let n = pcm.len().min(FRAME);
+        reference[frame * FRAME..frame * FRAME + n].copy_from_slice(&pcm[..n]);
     }
 
     let mut run = Run {
@@ -1006,6 +1047,9 @@ pub struct Report {
     /// Output and source level over the comfort-noise ticks in deep silence.
     pub cng_out_dbfs: f64,
     pub cng_src_dbfs: f64,
+    /// The same windows of the ideal receiver: the codec's comfort noise
+    /// decoded without NetEq.
+    pub cng_ref_dbfs: f64,
     /// 5th to 95th percentile of the 100 ms output level relative to the
     /// source over deep silence (pumping).
     pub silence_spread_db: f64,
@@ -1045,7 +1089,7 @@ impl Report {
         };
         format!(
             "HARNESS {name} | conceal startup/after/speech/silence {}/{}/{}/{} ms of deep {}/{} | cng {} (silence {}) \
-             | silence out {:.1} src {:.1} dBFS spread {:.1} dB digsil {} cng out {:.1} src {:.1} dBFS \
+             | silence out {:.1} src {:.1} dBFS spread {:.1} dB digsil {} cng out {:.1} src {:.1} codec {:.1} dBFS \
              | spurts {} delay [{}] onset_min {:.2} energy_min {:.2} \
              | target {}/{}/{} buf_end {} | sent {} dtx enc/sent {}/{} lost {} \
              | removed {} inserted {}",
@@ -1063,6 +1107,7 @@ impl Report {
             self.digital_silence_frames,
             self.cng_out_dbfs,
             self.cng_src_dbfs,
+            self.cng_ref_dbfs,
             self.talkspurts.len(),
             delays.join(","),
             min_of(|t| t.onset_ratio),
@@ -1171,7 +1216,7 @@ fn analyze(run: &Run) -> Report {
     let mut silence_out = 0.0;
     let mut silence_src = 0.0;
     let mut silence_n = 0usize;
-    let mut cng_level = (0.0, 0.0, 0usize);
+    let mut cng_level = (0.0, 0.0, 0usize, 0.0);
     let mut window = (0.0, 0.0, 0usize);
     let mut window_levels = Vec::new();
     for (i, tick) in run.ticks.iter().enumerate() {
@@ -1206,7 +1251,13 @@ fn analyze(run: &Run) -> Report {
                 silence_out += out_ms;
                 silence_src += src_ms;
                 if cng {
-                    cng_level = (cng_level.0 + out_ms, cng_level.1 + src_ms, cng_level.2 + 1);
+                    let ref_ms = rms(&run.reference[s..e]).powi(2);
+                    cng_level = (
+                        cng_level.0 + out_ms,
+                        cng_level.1 + src_ms,
+                        cng_level.2 + 1,
+                        cng_level.3 + ref_ms,
+                    );
                 }
                 silence_n += 1;
                 if out_ms.sqrt() < DIGITAL_SILENCE_RMS {
@@ -1233,9 +1284,11 @@ fn analyze(run: &Run) -> Report {
     if cng_level.2 > 0 {
         r.cng_out_dbfs = dbfs((cng_level.0 / cng_level.2 as f64).sqrt());
         r.cng_src_dbfs = dbfs((cng_level.1 / cng_level.2 as f64).sqrt());
+        r.cng_ref_dbfs = dbfs((cng_level.3 / cng_level.2 as f64).sqrt());
     } else {
         r.cng_out_dbfs = f64::NAN;
         r.cng_src_dbfs = f64::NAN;
+        r.cng_ref_dbfs = f64::NAN;
     }
     r.silence_windows = window_levels.len();
     r.silence_spread_db = if window_levels.len() >= 2 {

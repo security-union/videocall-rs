@@ -55,11 +55,12 @@ const K_BASE_MIN_DELAY_MS: u32 = 20;
 /// `kCngTimeoutMs`).
 const K_CNG_TIMEOUT_MS: usize = 1000;
 
-/// An Opus payload of at most 2 bytes is a DTX frame: a TOC byte with no
-/// audio (opus_interface.cc `WebRtcOpus_Encode` and `DetermineAudioType`,
-/// which treat 1 or 2 encoded bytes as DTX / comfort noise).
+/// An Opus payload of 1 or 2 bytes is a DTX frame: a TOC byte with no
+/// audio (opus_interface.cc `DetermineAudioType`: `encoded_bytes == 1 ||
+/// encoded_bytes == 2`). An empty payload is not a packet at all
+/// (neteq_impl.cc `InsertPacket` rejects it).
 fn is_dtx_payload(payload: &[u8]) -> bool {
-    payload.len() <= 2
+    matches!(payload.len(), 1 | 2)
 }
 
 /// Codec-internal comfort noise in progress (libwebrtc
@@ -336,6 +337,14 @@ impl NetEq {
         }
 
         // Normal NetEQ processing
+        // A DTX-capable decoder would turn an empty payload into 120 ms of
+        // PLC; libwebrtc rejects empty payloads outright (neteq_impl.cc
+        // `InsertPacket`: `payload.empty()` -> kFail). Other decoders keep
+        // their previous behavior.
+        if packet.payload.is_empty() && self.decoder_supports_dtx(packet.header.payload_type) {
+            return Err(NetEqError::InvalidPacket("empty payload".into()));
+        }
+
         // Update delay manager
         self.delay_manager
             .update(packet.header.timestamp, packet.sample_rate, false)?;
@@ -419,7 +428,23 @@ impl NetEq {
         // -----------------------------------------------------
 
         // Determine what operation to perform
-        let operation = self.get_decision()?;
+        let mut operation = self.get_decision()?;
+        operation = self.in_cng(operation);
+        // A DTX packet is never merged or time-stretched (neteq_impl.cc
+        // `NetEqImpl::GetDecision` rewrites exactly these to Normal; main's
+        // ExpandEnd is its merge).
+        if self.next_packet_is_dtx()
+            && matches!(
+                operation,
+                Operation::Merge
+                    | Operation::ExpandEnd
+                    | Operation::Accelerate
+                    | Operation::FastAccelerate
+                    | Operation::PreemptiveExpand
+            )
+        {
+            operation = Operation::Normal;
+        }
         self.last_operation = operation;
 
         match operation {
@@ -566,22 +591,29 @@ impl NetEq {
         let target_level_samples = target_delay_ms * samples_per_ms;
 
         // Calculate thresholds like WebRTC
-        let low_limit = std::cmp::max(
-            target_level_samples * 3 / 4,
-            target_level_samples
-                .saturating_sub(K_DECELERATION_TARGET_LEVEL_OFFSET_MS * samples_per_ms),
-        );
+        let low_limit = self.low_limit_samples(target_delay_ms);
         let high_limit = std::cmp::max(target_level_samples, low_limit + 20 * samples_per_ms);
 
         if !self.leftover_time_stretched_samples.is_empty() {
             return Ok(Operation::TimeStretchBuffer);
         }
 
+        self.discard_superseded_dtx_packets();
         if let Some(operation) = self.dtx_decision() {
             return Ok(operation);
         }
 
-        if self.consecutive_expands > 0 && current_buffer_samples < low_limit as usize {
+        // Main's analog of libwebrtc's PostponeDecode, which never waits
+        // when a DTX packet is buffered (decision_logic.cc PostponeDecode:
+        // `packet_buffer_info.dtx_or_cng`).
+        let dtx_buffered = self
+            .packet_buffer
+            .packets()
+            .any(|packet| self.is_dtx_packet(packet));
+        if self.consecutive_expands > 0
+            && current_buffer_samples < low_limit as usize
+            && !dtx_buffered
+        {
             // prefer a single continuous expand over many small ones
             self.consecutive_expands = self.consecutive_expands.saturating_add(1);
             return Ok(Operation::Expand);
@@ -691,8 +723,11 @@ impl NetEq {
                         .copy_from_slice(&packet_samples[..to_copy]);
                     filled += to_copy;
 
-                    // Save any extra samples for next frame
-                    if available > to_copy {
+                    // Save any extra samples for next frame. Not for a DTX
+                    // frame: its noise is generated per output request
+                    // (neteq_impl.cc `DecodeCng`), never at the length its
+                    // TOC declares, so DTX output cannot outrun real time.
+                    if available > to_copy && !self.is_dtx_packet(&packet) {
                         self.leftover_samples
                             .extend_from_slice(&packet_samples[to_copy..]);
                         log::trace!(
@@ -740,7 +775,10 @@ impl NetEq {
 
     fn decode_accelerate(&mut self, frame: &mut AudioFrame, fast_mode: bool) -> Result<()> {
         if !self.config.for_test_no_time_stretching {
-            let available_samples = self.current_buffer_size_samples();
+            let mut available_samples = self.current_buffer_size_samples();
+            let before_dtx = self.samples_before_dtx();
+            let dtx_limited = before_dtx < available_samples;
+            available_samples = available_samples.min(before_dtx);
             let mut output_len: usize = 0;
             let mut required_samples: usize = 0;
             for i in (1..=3).rev() {
@@ -754,6 +792,10 @@ impl NetEq {
                 if required_samples <= available_samples {
                     break;
                 }
+            }
+            if dtx_limited && required_samples > available_samples {
+                // The window would reach a DTX packet: no time-stretch.
+                return self.decode_normal(frame);
             }
 
             // Get more data than we need
@@ -811,6 +853,13 @@ impl NetEq {
     }
 
     fn decode_preemptive_expand(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        let before_dtx = self.samples_before_dtx();
+        if before_dtx < self.current_buffer_size_samples()
+            && before_dtx < self.output_frame_size_samples * 3
+        {
+            // The window would reach a DTX packet: no time-stretch.
+            return self.decode_normal(frame);
+        }
         if !self.config.for_test_no_time_stretching {
             // Preemtive expand requires more data (30ms)
             let mut extended_frame = AudioFrame::new(
@@ -941,48 +990,123 @@ impl NetEq {
         self.decode_normal(frame)
     }
 
-    /// Opus DTX decisions; `None` leaves the decision to the rules above.
+    /// Decisions while in codec-internal CNG; `None` leaves the decision to
+    /// main's rules, whose concealment `in_cng` turns into comfort noise.
     ///
-    /// libwebrtc: a DTX packet is decoded with Normal, never merged or
-    /// time-stretched (neteq_impl.cc `GetDecision`); with no packet while in
-    /// codec-internal CNG, comfort noise continues until `kCngTimeoutMs`,
-    /// then expand (decision_logic.cc `NoPacket`). A speech packet ends it
-    /// and is decoded without time-stretching.
+    /// libwebrtc: with no packet, comfort noise continues until
+    /// `kCngTimeoutMs`, then expand (decision_logic.cc `NoPacket`).
     fn dtx_decision(&mut self) -> Option<Operation> {
-        let next_is_dtx = self
-            .packet_buffer
-            .peek_next_packet()
-            .is_some_and(|packet| self.is_dtx_packet(packet));
-        if next_is_dtx {
+        self.dtx?;
+        if self.leftover_samples.len() >= self.output_frame_size_samples
+            || self.next_packet_is_dtx()
+        {
             return Some(Operation::Normal);
         }
-        let dtx = self.dtx?;
-        if self.leftover_samples.len() >= self.output_frame_size_samples {
-            return Some(Operation::Normal);
-        }
-        if !self.packet_buffer.is_empty() {
-            // Speech is due: leave DTX with a plain decode, as
-            // decision_logic.cc `FuturePacketAvailable` returns Normal after
-            // codec-internal CNG.
-            self.dtx = None;
-            return Some(Operation::Normal);
-        }
-        let timeout = K_CNG_TIMEOUT_MS * self.config.sample_rate as usize / 1000;
-        if dtx.noise_samples > timeout {
-            self.dtx = None;
+        if !self.packet_buffer.is_empty() || self.cng_timed_out() {
+            // A speech packet: see `in_cng`.
             return None;
         }
         Some(Operation::ComfortNoise)
     }
 
+    fn low_limit_samples(&self, target_delay_ms: u32) -> u32 {
+        let samples_per_ms = self.config.sample_rate / 1000;
+        let target_level_samples = target_delay_ms * samples_per_ms;
+        std::cmp::max(
+            target_level_samples * 3 / 4,
+            target_level_samples
+                .saturating_sub(K_DECELERATION_TARGET_LEVEL_OFFSET_MS * samples_per_ms),
+        )
+    }
+
+    /// Main's decision while in codec-internal CNG with a speech packet
+    /// buffered.
+    ///
+    /// libwebrtc continues comfort noise while the packet is too early
+    /// (decision_logic.cc `FuturePacketAvailable` -> `NoPacket`), then
+    /// resets the buffer level filter to the buffered span and decodes with
+    /// Normal, never Merge or a time-stretch. Main has no playout
+    /// timestamp; the packet is due once main's own rules would not conceal
+    /// right after it: the low limit is buffered, and so is one frame more
+    /// than main's ExpandStart threshold (1.5 frames).
+    fn in_cng(&mut self, operation: Operation) -> Operation {
+        if self.dtx.is_none() || self.packet_buffer.is_empty() || self.next_packet_is_dtx() {
+            return operation;
+        }
+        let buffered = self.current_buffer_size_samples();
+        let due = self
+            .low_limit_samples(self.delay_manager.target_delay_ms())
+            .max(self.output_frame_size_samples as u32 * 5 / 2);
+        if buffered < due as usize && !self.cng_timed_out() {
+            self.consecutive_expands = 0;
+            return Operation::ComfortNoise;
+        }
+        if self.dtx.is_some() {
+            self.buffer_level_filter.set_filtered_buffer_level(buffered);
+            self.consecutive_expands = 0;
+            return Operation::Normal;
+        }
+        operation
+    }
+
+    /// Comfort noise has run `kCngTimeoutMs` past the last DTX packet; DTX
+    /// handling ends.
+    fn cng_timed_out(&mut self) -> bool {
+        let timeout = K_CNG_TIMEOUT_MS * self.config.sample_rate as usize / 1000;
+        let timed_out = self.dtx.is_some_and(|dtx| dtx.noise_samples > timeout);
+        if timed_out {
+            self.dtx = None;
+        }
+        timed_out
+    }
+
     /// A DTX packet whose decoder can continue its comfort noise. Decoders
     /// without that support never see DTX handling.
     fn is_dtx_packet(&self, packet: &AudioPacket) -> bool {
-        is_dtx_payload(&packet.payload)
-            && self
-                .decoders
-                .get(&packet.header.payload_type)
-                .is_some_and(|decoder| decoder.supports_dtx())
+        is_dtx_payload(&packet.payload) && self.decoder_supports_dtx(packet.header.payload_type)
+    }
+
+    fn decoder_supports_dtx(&self, payload_type: u8) -> bool {
+        self.decoders
+            .get(&payload_type)
+            .is_some_and(|decoder| decoder.supports_dtx())
+    }
+
+    fn next_packet_is_dtx(&self) -> bool {
+        self.packet_buffer
+            .peek_next_packet()
+            .is_some_and(|packet| self.is_dtx_packet(packet))
+    }
+
+    /// A DTX packet with another DTX packet behind it carries nothing that
+    /// will be heard: drop it, so a backlog of DTX frames cannot queue
+    /// comfort noise ahead of later speech. libwebrtc gets the same effect
+    /// from timestamps: playout runs on in real time through CNG and
+    /// packets it has passed are discarded (neteq_impl.cc
+    /// `DiscardOldPackets` / `DiscardAllOldPackets`).
+    fn discard_superseded_dtx_packets(&mut self) {
+        loop {
+            let mut packets = self.packet_buffer.packets();
+            let first_is_dtx = packets.next().is_some_and(|p| self.is_dtx_packet(p));
+            let superseded = first_is_dtx && packets.next().is_some_and(|p| self.is_dtx_packet(p));
+            drop(packets);
+            if !superseded {
+                return;
+            }
+            let _ = self.packet_buffer.discard_next_packet(&mut self.statistics);
+        }
+    }
+
+    /// Samples available for a time-stretch window without reaching a DTX
+    /// packet, which is never stretched.
+    fn samples_before_dtx(&self) -> usize {
+        self.leftover_samples.len()
+            + self
+                .packet_buffer
+                .packets()
+                .take_while(|packet| !self.is_dtx_packet(packet))
+                .map(AudioPacket::expected_samples)
+                .sum::<usize>()
     }
 
     /// Codec-internal comfort noise for one output frame: the decoder
@@ -1641,6 +1765,8 @@ mod tests {
 
     #[test]
     fn speech_after_dtx_plays_normally() {
+        // Virtual time: the packets below arrive 20 ms apart.
+        crate::clock::freeze();
         let mut neteq = dtx_neteq(true);
         speech_then_dtx(&mut neteq);
         // Comfort noise timed out; a fresh DTX packet restarts it, and the
@@ -1650,16 +1776,224 @@ mod tests {
             neteq.get_audio().unwrap();
         }
         assert_eq!(neteq.get_audio().unwrap().speech_type, SpeechType::Cng);
-        for seq in 5..8 {
+        // Speech in real time: comfort noise continues until the buffer
+        // reaches the low limit (the packet is due), then speech plays.
+        let bound = neteq.target_delay_ms() as usize / 10 + 2;
+        let mut frames = 0;
+        let mut first_speech = None;
+        for seq in 5..40 {
+            neteq.insert_packet(opus_packet(seq, 60)).unwrap();
+            for _ in 0..2 {
+                frames += 1;
+                crate::clock::advance(Duration::from_millis(10));
+                let frame = neteq.get_audio().unwrap();
+                if first_speech.is_none() && frame.speech_type == SpeechType::Normal {
+                    first_speech = Some((frames, neteq.last_operation, frame.samples));
+                }
+            }
+            if first_speech.is_some() {
+                break;
+            }
+        }
+        let (frames, operation, samples) = first_speech.expect("speech never played");
+        assert!(frames <= bound, "speech after {frames} frames");
+        // Decoded as is (no time-stretch).
+        assert_eq!(operation, Operation::Normal);
+        assert_eq!(samples.last(), Some(&0.5));
+        assert!(neteq.dtx.is_none());
+    }
+
+    fn packet_with_payload(seq: u16, payload: Vec<u8>) -> AudioPacket {
+        let header = RtpHeader::new(seq, u32::from(seq) * 960, 1, 111, false);
+        AudioPacket::new(header, payload, 48_000, 1, 20)
+    }
+
+    #[test]
+    fn dtx_is_one_or_two_bytes_never_empty() {
+        assert!(!is_dtx_payload(&[]));
+        assert!(is_dtx_payload(&[0xF8]));
+        assert!(is_dtx_payload(&[0xF8, 0x00]));
+        assert!(!is_dtx_payload(&[0xF8, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn empty_payload_is_rejected_for_a_dtx_capable_decoder() {
+        // neteq_impl.cc InsertPacket: `payload.empty()` -> kFail.
+        let mut neteq = dtx_neteq(true);
+        assert!(neteq
+            .insert_packet(packet_with_payload(0, Vec::new()))
+            .is_err());
+        assert!(neteq.is_empty());
+    }
+
+    #[test]
+    fn empty_payload_is_kept_as_before_for_other_decoders() {
+        let mut neteq = dtx_neteq(false);
+        neteq
+            .insert_packet(packet_with_payload(0, Vec::new()))
+            .unwrap();
+        assert!(!neteq.is_empty());
+    }
+
+    /// The reviewer's stream: a 1-byte DTX payload whose TOC says 60 ms
+    /// (`0x18`), every 20 ms, into the real Opus decoder.
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    fn opus_neteq() -> NetEq {
+        let mut neteq = NetEq::new(NetEqConfig {
+            sample_rate: 48_000,
+            ..NetEqConfig::default()
+        })
+        .unwrap();
+        neteq.register_decoder(
+            111,
+            Box::new(crate::codec::NativeOpusDecoder::new(48_000, 1).unwrap()),
+        );
+        neteq
+    }
+
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    fn opus_speech_payload() -> Vec<u8> {
+        let mut encoder =
+            ropus::Encoder::builder(48_000, ropus::Channels::Mono, ropus::Application::Voip)
+                .build()
+                .unwrap();
+        let pcm: Vec<i16> = (0..960)
+            .map(|i| ((i as f32 * 0.06).sin() * 8_000.0) as i16)
+            .collect();
+        let mut buf = [0u8; 1500];
+        let len = encoder.encode(&pcm, &mut buf).unwrap();
+        assert!(len > 2);
+        buf[..len].to_vec()
+    }
+
+    /// Plays `seconds` of a packet every 20 ms; returns the largest buffer
+    /// level seen.
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    fn flood(neteq: &mut NetEq, payload: &[u8], seconds: u16) -> u32 {
+        let mut max_ms = 0;
+        for seq in 0..seconds * 50 {
+            let _ = neteq.insert_packet(packet_with_payload(seq, payload.to_vec()));
+            for _ in 0..2 {
+                neteq.get_audio().unwrap();
+                max_ms = max_ms.max(neteq.current_buffer_size_ms());
+            }
+        }
+        max_ms
+    }
+
+    /// Speech packets every 20 ms from `seq`; returns the 10 ms frames until
+    /// speech plays and comfort noise has ended.
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    fn frames_until_speech(neteq: &mut NetEq, seq: u16) -> usize {
+        let mut frames = 0;
+        for seq in seq..seq + 100 {
+            neteq
+                .insert_packet(packet_with_payload(seq, opus_speech_payload()))
+                .unwrap();
+            for _ in 0..2 {
+                frames += 1;
+                let speech = neteq.get_audio().unwrap().speech_type;
+                if speech == SpeechType::Normal && neteq.dtx.is_none() {
+                    return frames;
+                }
+            }
+        }
+        frames
+    }
+
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn dtx_flood_with_a_60ms_toc_cannot_outrun_real_time() {
+        let mut neteq = opus_neteq();
+        let max_ms = flood(&mut neteq, &[0x18], 4);
+        println!("60 ms TOC DTX flood: max buffer {max_ms} ms");
+        assert!(max_ms <= 40, "buffer grew to {max_ms} ms");
+        // Speech right after the flood waits for the target delay, as after
+        // any pause, and no longer.
+        let bound = neteq.target_delay_ms() as usize / 10 + 2;
+        let frames = frames_until_speech(&mut neteq, 200);
+        assert!(frames <= bound, "speech after {frames} frames");
+    }
+
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn empty_payload_flood_cannot_build_a_backlog() {
+        let mut neteq = opus_neteq();
+        let max_ms = flood(&mut neteq, &[], 4);
+        println!("empty payload flood: max buffer {max_ms} ms");
+        assert_eq!(max_ms, 0);
+        assert_eq!(neteq.get_statistics().lifetime.comfort_noise_samples, 0);
+    }
+
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn speech_behind_a_burst_of_dtx_packets_plays_at_once() {
+        let mut neteq = opus_neteq();
+        // 2 s of DTX frames arrive at once (a stalled link), then speech in
+        // real time.
+        for seq in 0..100 {
+            neteq
+                .insert_packet(packet_with_payload(seq, vec![0x18]))
+                .unwrap();
+        }
+        let bound = neteq.target_delay_ms() as usize / 10 + 2;
+        let frames = frames_until_speech(&mut neteq, 100);
+        // The backlog adds nothing: speech waits for the target delay, as
+        // after any pause.
+        assert!(frames <= bound, "speech after {frames} frames");
+    }
+
+    #[test]
+    fn dtx_packet_during_expand_ends_it_without_waiting_for_the_low_limit() {
+        let mut neteq = dtx_neteq(true);
+        for _ in 0..5 {
+            neteq.get_audio().unwrap();
+        }
+        assert_eq!(neteq.last_operation, Operation::Expand);
+        // 20 ms is below the start target's low limit, where main keeps
+        // expanding for speech; a DTX packet is not postponed
+        // (PostponeDecode), and the merge back is a plain decode
+        // (GetDecision).
+        neteq.insert_packet(opus_packet(0, 1)).unwrap();
+        neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::Normal);
+        assert_eq!(neteq.get_audio().unwrap().speech_type, SpeechType::Cng);
+    }
+
+    #[test]
+    fn speech_during_expand_still_waits_for_the_low_limit() {
+        let mut neteq = dtx_neteq(true);
+        neteq.delay_manager.set_base_minimum_delay(80);
+        neteq.delay_manager.set_base_maximum_delay(80);
+        for _ in 0..5 {
+            neteq.get_audio().unwrap();
+        }
+        neteq.insert_packet(opus_packet(0, 60)).unwrap();
+        neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::Expand);
+    }
+
+    #[test]
+    fn accelerate_window_stops_before_a_dtx_packet() {
+        let mut neteq = dtx_neteq(true);
+        for seq in 0..2 {
             neteq.insert_packet(opus_packet(seq, 60)).unwrap();
         }
-        let frame = neteq.get_audio().unwrap();
-        assert_eq!(frame.speech_type, SpeechType::Normal);
-        // Decoded as is (no time-stretch); a partial frame of comfort noise
-        // already decoded may precede it, in sample order.
-        assert_eq!(neteq.last_operation, Operation::Normal);
-        assert_eq!(frame.samples.last(), Some(&0.5));
-        assert_eq!(neteq.get_audio().unwrap().speech_type, SpeechType::Normal);
+        neteq.insert_packet(opus_packet(2, 1)).unwrap();
+        // A 20 ms target and a filtered level far above it: accelerate.
+        neteq.delay_manager.set_base_maximum_delay(20);
+        neteq.buffer_level_filter.set_filtered_buffer_level(48_000);
+        neteq.get_audio().unwrap();
+        assert!(
+            matches!(
+                neteq.last_operation,
+                Operation::Accelerate | Operation::FastAccelerate
+            ),
+            "{:?}",
+            neteq.last_operation
+        );
+        assert_eq!(neteq.packet_buffer.len(), 1, "the DTX packet was stretched");
+        assert!(neteq.dtx.is_none());
     }
 
     #[test]

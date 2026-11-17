@@ -236,6 +236,11 @@ impl PacketBuffer {
         self.buffer.front().map(|packet| packet.header.timestamp)
     }
 
+    /// The buffered packets in decode order.
+    pub fn packets(&self) -> impl Iterator<Item = &AudioPacket> {
+        self.buffer.iter()
+    }
+
     /// The next packet to be decoded, without removing it.
     pub fn peek_next_packet(&self) -> Option<&AudioPacket> {
         self.buffer.front()

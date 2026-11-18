@@ -234,7 +234,7 @@ The build system is native Nix, no flakes: `default.nix` (entry point), `shell.n
 ```bash
 nix-shell                                              # default dev shell (frontend toolchain)
 nix-shell default.nix -A shells.backend-dev           # backend toolchain + cargo-watch + dbmate
-nix-build release.nix -A packages.websocket-server    # a single service binary (static musl)
+nix-build release.nix -A packages.websocket-server    # one service binary (static Linux musl, even on macOS)
 make image-websocket-server                           # its Docker image, loaded into the daemon
 make pins-update                                       # refresh nixtamal pins (nix/tamal/)
 ```

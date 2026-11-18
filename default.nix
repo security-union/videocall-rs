@@ -1,7 +1,8 @@
 # videocall-rs — native Nix entry point (no flakes).
 #
 #   nix-shell                                 -> default dev shell
-#   nix-build -A packages.websocket-server    -> a service binary (Linux musl)
+#   nix-build -A packages.websocket-server    -> one service binary (static Linux musl,
+#                                                also on macOS: a cross build)
 #   nix-build release.nix -A images.…         -> Docker images (see release.nix)
 #
 # Inputs are pinned by nixtamal (nix/tamal/); see docs/nix-architecture.md.

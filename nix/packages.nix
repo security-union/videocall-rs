@@ -277,6 +277,30 @@ let
     postPatch = "cp ${./protobuf-codegen.Cargo.lock} Cargo.lock";
     doCheck = false;
   };
+
+  # All four actix-api server binaries in one compile — mirrors the old
+  # Dockerfile.actix, and lets the per-service images share one derivation:
+  # websocket_server, webtransport_server, metrics_server, metrics_server_snapshot.
+  videocall-api-bins = mkNativePackage {
+    pname = "videocall-api-bins";
+    cargoExtraArgs = "-p videocall-api";
+    mainProgram = "websocket_server";
+  };
+
+  # Per-service views of videocall-api-bins: a symlink to one binary, no extra
+  # cargo build. Keys match the image names in nix/images/.
+  mkApiServicePackage = name: bin:
+    pkgs.runCommandLocal name { meta.mainProgram = bin; } ''
+      mkdir -p $out/bin
+      ln -s ${videocall-api-bins}/bin/${bin} $out/bin/${bin}
+    '';
+
+  apiServicePackages = lib.mapAttrs mkApiServicePackage {
+    websocket-server = "websocket_server";
+    webtransport-server = "webtransport_server";
+    metrics-server = "metrics_server";
+    server-stats = "metrics_server_snapshot";
+  };
 in
 {
   inherit protobufCodegen website videocall-cli wasmBindgenCli;
@@ -300,14 +324,13 @@ in
     { name = "wasm-bindgen-cli"; path = wasmBindgenCli; }
   ];
 
-  # All four actix-api server binaries in one compile — mirrors the old
-  # Dockerfile.actix, and lets the per-service images share one derivation:
-  # websocket_server, webtransport_server, metrics_server, metrics_server_snapshot.
-  videocall-api-bins = mkNativePackage {
-    pname = "videocall-api-bins";
-    cargoExtraArgs = "-p videocall-api";
-    mainProgram = "websocket_server";
-  };
+  inherit videocall-api-bins;
+
+  # One attr per actix-api service, named like its image (images.<name>), so
+  # `nix-build release.nix -A packages.websocket-server` gives just that binary
+  # with the right meta.mainProgram.
+  inherit (apiServicePackages)
+    websocket-server webtransport-server metrics-server server-stats;
 
   meeting-api = mkNativePackage {
     pname = "meeting-api";

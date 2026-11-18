@@ -11,8 +11,19 @@ git_release_enable = true  # enable release creation on Github/Gitlab
 [[package]]
 name = "videocall-client"
 publish = true
+# TEMPORARY: remove after the next release. The semver check compares against
+# the published videocall-client 4.0.7 / videocall-transport 0.2.1, which no
+# longer compile against js-sys 0.3.107 (fixed in #927), so it cannot run.
+semver_check = false
 changelog_update = true
 git_release_enable = true
+
+[[package]]
+name = "videocall-transport"
+# TEMPORARY: remove after the next release. The semver check compares against
+# the published videocall-client 4.0.7 / videocall-transport 0.2.1, which no
+# longer compile against js-sys 0.3.107 (fixed in #927), so it cannot run.
+semver_check = false
 
 [[package]]
 name = "videocall-cli"

@@ -183,10 +183,14 @@ in
     # Google WebRTC at the rev the harness is validated against, sparse
     # (same dirs as neteq/parity/scripts/fetch_webrtc.sh, ~17 MB). A
     # fixed-output fetch has no .git, so the rev travels as WEBRTC_REV and
-    # build.rs checks that instead of `git rev-parse`.
+    # build.rs checks that instead of `git rev-parse`. The rev is in the
+    # store name on purpose: Nix finds a fixed-output path by name and hash
+    # alone, so bumping only `webrtcRev` would silently reuse the old
+    # sources. With the rev in the name, a bump refetches and a stale hash
+    # fails loudly.
     webrtcRev = "6341cca49ffcad6fcb4603bd6cd1325fd0fe28bd";
     webrtcSrc = pkgs.fetchgit {
-      name = "webrtc-neteq-src";
+      name = "webrtc-neteq-src-${builtins.substring 0 12 webrtcRev}";
       url = "https://webrtc.googlesource.com/src";
       rev = webrtcRev;
       sparseCheckout = [

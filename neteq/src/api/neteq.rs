@@ -265,24 +265,27 @@ impl NetEq {
         self.inner.sync_buffer_size_ms()
     }
 
-    /// Final operation of the last `get_audio`. Same value as
-    /// [`Self::last_operation_for_test`]; this name is for production
-    /// telemetry (`telemetry::TelemetryCollector::on_get_audio`).
+    /// Final operation of the last `get_audio` (C++
+    /// `last_operation_for_test`); this name is for production telemetry
+    /// (`telemetry::TelemetryCollector::on_get_audio`).
     pub fn last_operation(&self) -> Operation {
         self.inner.last_operation_for_test()
     }
 
     /// Final operation of the last `get_audio` (C++ `last_operation_for_test`).
+    #[cfg(any(test, feature = "parity"))]
     pub fn last_operation_for_test(&self) -> Operation {
         self.inner.last_operation_for_test()
     }
 
     /// Mode after the last `get_audio` (C++ `last_mode_`).
+    #[cfg(any(test, feature = "parity"))]
     pub fn last_mode_for_test(&self) -> Mode {
         self.inner.last_mode_for_test()
     }
 
     /// The sync buffer (C++ `sync_buffer_for_test`).
+    #[cfg(any(test, feature = "parity"))]
     pub fn sync_buffer_for_test(&self) -> &crate::neteq::sync_buffer::SyncBuffer {
         self.inner.sync_buffer_for_test()
     }

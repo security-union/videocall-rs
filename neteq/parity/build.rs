@@ -218,17 +218,28 @@ fn main() {
     // pkg-config already emitted the link lines for opus and absl_strings.
 }
 
-/// Warns (does not fail) when the checkout is not at the pinned revision.
+/// Checks the checkout against [`PINNED_REV`].
 ///
-/// The revision is `WEBRTC_REV` if set (a nix `fetchgit` output has no
-/// `.git`), else `git rev-parse HEAD`. If neither is available it says so.
+/// `WEBRTC_REV` (set by the nix shell, whose `fetchgit` output has no
+/// `.git`) must equal the pin: the two live in different files
+/// (`nix/shells.nix` and here), and a mismatch means the gate would compare
+/// against sources nobody validated, so the build fails. Without it the rev
+/// comes from `git rev-parse HEAD`, and a local checkout at another rev only
+/// warns, since trying a newer WebRTC is a normal local experiment.
 fn check_revision(webrtc: &Path) {
-    let rev = env::var("WEBRTC_REV")
+    let nix_rev = env::var("WEBRTC_REV")
         .ok()
         .map(|rev| rev.trim().to_string())
-        .filter(|rev| !rev.is_empty())
-        .or_else(|| git_head(webrtc));
-    match rev {
+        .filter(|rev| !rev.is_empty());
+    if let Some(rev) = &nix_rev {
+        assert!(
+            rev == PINNED_REV,
+            "WEBRTC_REV is {rev} but neteq/parity/build.rs pins {PINNED_REV}; \
+             bump PINNED_REV and nix/shells.nix together"
+        );
+        return;
+    }
+    match git_head(webrtc) {
         Some(rev) if rev == PINNED_REV => {}
         Some(rev) => println!(
             "cargo:warning=WEBRTC_SRC is at {rev}, harness is pinned to {PINNED_REV}; results may differ"

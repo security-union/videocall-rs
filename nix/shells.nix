@@ -170,15 +170,38 @@ in
   };
 
   # NetEQ parity harness (neteq/parity): compiles Google WebRTC's C++ NetEQ
-  # and diffs our Rust port against it. C++20 clang from the pinned stdenv,
-  # abseil + libopus from the same pin so they share one libc++. libopus is
-  # the fixed-point build (what Chromium ships on ARM): the Rust side decodes
-  # with ropus, a port of fixed-point libopus, so only this build can match
-  # it sample for sample. Intrinsics are off for the same reason the WebRTC
-  # SPL is built without NEON (generic C kernels only), and because 1.5.2's
-  # meson build fails to link fixed-point NEON on aarch64.
+  # and diffs our Rust port against it. C++20 from the pinned stdenv (clang on
+  # darwin, gcc on linux), abseil + libopus from the same pin so they share
+  # one C++ runtime. libopus is the fixed-point build (what Chromium ships on
+  # ARM): the Rust side decodes with ropus, a port of fixed-point libopus, so
+  # only this build can match it sample for sample. Intrinsics are off for
+  # the same reason the WebRTC SPL is built without NEON (generic C kernels
+  # only), and because 1.5.2's meson build fails to link fixed-point NEON on
+  # aarch64.
   #   nix-shell default.nix -A shells.neteq-parity --run 'cd neteq/parity && cargo test'
   neteq-parity = let
+    # Google WebRTC at the rev the harness is validated against, sparse
+    # (same dirs as neteq/parity/scripts/fetch_webrtc.sh, ~17 MB). A
+    # fixed-output fetch has no .git, so the rev travels as WEBRTC_REV and
+    # build.rs checks that instead of `git rev-parse`.
+    webrtcRev = "6341cca49ffcad6fcb4603bd6cd1325fd0fe28bd";
+    webrtcSrc = pkgs.fetchgit {
+      name = "webrtc-neteq-src";
+      url = "https://webrtc.googlesource.com/src";
+      rev = webrtcRev;
+      sparseCheckout = [
+        "api"
+        "common_audio"
+        "modules/audio_coding/codecs"
+        "modules/audio_coding/neteq"
+        "modules/include"
+        "modules/rtp_rtcp/include"
+        "modules/rtp_rtcp/source"
+        "rtc_base"
+        "system_wrappers"
+      ];
+      hash = "sha256-sOjgyUpj8on6BQMfE1uaqMhiKwpRmbNwrkRL++t+RQw=";
+    };
     libopusFixedC = (pkgs.libopus.override { fixedPoint = true; }).overrideAttrs (old: rec {
       version = "1.6.1";
       src = pkgs.fetchurl {
@@ -208,6 +231,8 @@ in
     # The cc crate passes --target arm64-apple-macosx; the nix clang wrapper
     # warns on every file about the spelling. It is the same target.
     NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING = "1";
+    WEBRTC_SRC = webrtcSrc;
+    WEBRTC_REV = webrtcRev;
   };
 
   # `make vlog`: serve the engineering vlog with the same zola the image uses

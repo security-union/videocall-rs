@@ -1,0 +1,62 @@
+# NetEQ parity gate: builds Google WebRTC's C++ NetEq (pinned via fetchgit in
+# nix/shells.nix) next to our Rust neteq and fails if they disagree on any
+# frame. Runs only when something under neteq/ changes.
+name: neteq parity
+
+on:
+  pull_request:
+    paths:
+      - 'neteq/**'
+  push:
+    branches: [main]
+    paths:
+      - 'neteq/**'
+
+concurrency:
+  group: neteq-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: C++ NetEq vs Rust neteq
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: videocall-rs
+          # pull works tokenless (public cache); push activates once the
+          # CACHIX_AUTH_TOKEN repo secret exists
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            neteq/parity/target
+          key: ${{ runner.os }}-cargo-neteq-parity-${{ hashFiles('neteq/parity/Cargo.lock', 'neteq/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-neteq-parity-
+
+      # The gate: C++ smoke tests plus the C++-vs-Rust parity tests.
+      - name: cargo test (rust-neteq)
+        run: nix-shell neteq/parity/shell.nix --run 'cd neteq/parity && cargo test --features rust-neteq'
+
+      # Full scenario x codec matrix; exits non-zero unless every run is IDENTICAL.
+      - name: Parity report (all scenarios, all codecs)
+        run: nix-shell neteq/parity/shell.nix --run 'cd neteq/parity && cargo run --release --features rust-neteq -- run --scenario all --codec all --candidate rust --json parity-report.json'
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neteq-parity-report
+          path: neteq/parity/parity-report.json
+          if-no-files-found: warn

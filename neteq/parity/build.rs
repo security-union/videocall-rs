@@ -5,6 +5,9 @@
 //! Inputs:
 //! - `WEBRTC_SRC`: path to a WebRTC checkout at [`PINNED_REV`] (see
 //!   `scripts/fetch_webrtc.sh`). Falls back to `<crate>/third_party/webrtc`.
+//!   The nix shell points it at a pinned `fetchgit` store path.
+//! - `WEBRTC_REV`: the revision of `WEBRTC_SRC` when it has no `.git` (the
+//!   nix shell sets it). Otherwise the rev comes from `git rev-parse HEAD`.
 //! - `abseil-cpp` and `opus` through pkg-config (the nix shell provides both).
 //!
 //! No WebRTC file is patched. Two GN-generated / third_party paths are
@@ -136,6 +139,7 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
 
     println!("cargo:rerun-if-env-changed=WEBRTC_SRC");
+    println!("cargo:rerun-if-env-changed=WEBRTC_REV");
     println!("cargo:rerun-if-changed=cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -215,24 +219,43 @@ fn main() {
 }
 
 /// Warns (does not fail) when the checkout is not at the pinned revision.
+///
+/// The revision is `WEBRTC_REV` if set (a nix `fetchgit` output has no
+/// `.git`), else `git rev-parse HEAD`. If neither is available it says so.
 fn check_revision(webrtc: &Path) {
-    let Ok(output) = Command::new("git")
+    let rev = env::var("WEBRTC_REV")
+        .ok()
+        .map(|rev| rev.trim().to_string())
+        .filter(|rev| !rev.is_empty())
+        .or_else(|| git_head(webrtc));
+    match rev {
+        Some(rev) if rev == PINNED_REV => {}
+        Some(rev) => println!(
+            "cargo:warning=WEBRTC_SRC is at {rev}, harness is pinned to {PINNED_REV}; results may differ"
+        ),
+        None => println!(
+            "cargo:warning=cannot tell which revision WEBRTC_SRC is at (no .git, WEBRTC_REV unset); \
+             harness is pinned to {PINNED_REV}"
+        ),
+    }
+}
+
+/// `git rev-parse HEAD` of `dir`, if it is a git checkout.
+fn git_head(dir: &Path) -> Option<String> {
+    // Without its own .git, rev-parse would report an enclosing repo's HEAD.
+    if !dir.join(".git").exists() {
+        return None;
+    }
+    let output = Command::new("git")
         .arg("-C")
-        .arg(webrtc)
+        .arg(dir)
         .args(["rev-parse", "HEAD"])
         .output()
-    else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if rev != PINNED_REV {
-        println!(
-            "cargo:warning=WEBRTC_SRC is at {rev}, harness is pinned to {PINNED_REV}; results may differ"
-        );
-    }
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Satisfies include paths that WebRTC resolves through its GN build.

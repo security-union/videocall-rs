@@ -9,13 +9,14 @@ It lives in its own Cargo workspace, so the root workspace and the wasm builds n
 ## Setup
 
 ```sh
-neteq/parity/scripts/fetch_webrtc.sh            # sparse clone at the pinned rev, ~20 MB
-nix-shell neteq/parity/shell.nix                 # clang 21 (C++20), abseil, libopus, pinned via nixtamal
+nix-shell neteq/parity/shell.nix                 # C++20 compiler, abseil, libopus, WebRTC source, pinned via nixtamal
 cd neteq/parity
 cargo test                                       # C++-only smoke tests, always on
 ```
 
-The script clones into `neteq/parity/third_party/webrtc` (gitignored), which `build.rs` uses by default. Point `WEBRTC_SRC` somewhere else if you already have a checkout. `build.rs` warns if it isn't at `6341cca49ffcad6fcb4603bd6cd1325fd0fe28bd`.
+The nix shell fetches WebRTC itself: a sparse `fetchgit` of `6341cca49ffcad6fcb4603bd6cd1325fd0fe28bd` (about 17 MB) lands in the store, and the shell exports `WEBRTC_SRC` at it and `WEBRTC_REV` with the rev. CI runs the same shell in `.github/workflows/neteq-parity.yaml` whenever something under `neteq/` changes.
+
+Without Nix, run `neteq/parity/scripts/fetch_webrtc.sh`. It makes a sparse git clone in `neteq/parity/third_party/webrtc` (gitignored), which `build.rs` uses when `WEBRTC_SRC` is unset. You bring your own C++20 compiler, abseil and fixed-point libopus. `build.rs` warns if the source isn't at the pinned rev, reading `WEBRTC_REV` first and `git rev-parse HEAD` otherwise.
 
 ## Running it
 

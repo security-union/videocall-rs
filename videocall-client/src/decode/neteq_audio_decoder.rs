@@ -1,28 +1,47 @@
-use crate::adaptive_quality_constants::{
-    AUDIO_RED_FORMAT, AUDIO_RED_SEQ_HISTORY_SIZE, OPUS_FRAME_DURATION_MS,
-};
+//! Remote peer audio: NetEq in a Dedicated Worker, played by an AudioWorklet.
+//!
+//! Data flow for one remote peer:
+//!
+//! ```text
+//! MediaPacket ──decode()──> RtpTimestampMapper ──Insert{seq, ts}──> NetEq worker
+//!                                                                     │  ▲
+//!                                     Float32Array / silence count    │  │ "n frames"
+//!                                                                     ▼  │
+//!                                                   AudioWorklet (pcm-player) ──> speakers
+//! ```
+//!
+//! The worklet and the worker talk over a `MessageChannel`, so audio never
+//! crosses the main thread. The worklet pulls 10 ms frames as the device
+//! consumes them, which paces NetEq's `GetAudio` by the audio clock. The
+//! worker reports a 50 ms audio level to the main thread for the speaking
+//! indicator, and NetEq stats once a second while the diagnostics UI is open
+//! ([`set_audio_diagnostics_enabled`]), every five seconds otherwise.
+
+use crate::adaptive_quality_constants::{AUDIO_RED_FORMAT, AUDIO_RED_SEQ_HISTORY_SIZE};
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD,
 };
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
+use crate::decode::rtp_timestamp::{RtpMapping, RtpTimestampMapper};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
-use js_sys::Float32Array;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use serde_wasm_bindgen;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
+use web_sys::{
+    AudioContext, AudioContextState, AudioWorkletNode, GainNode, MessageChannel, MessageEvent,
+    MessagePort, Worker,
+};
 
 const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
 
+/// Messages to the NetEq worker (matches `neteq/src/bin/neteq_worker.rs`).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 enum WorkerMsg {
@@ -30,6 +49,7 @@ enum WorkerMsg {
         sample_rate: u32,
         channels: u8,
     },
+    /// `timestamp` is in 48 kHz samples (from [`RtpTimestampMapper`]).
     Insert {
         seq: u16,
         timestamp: u32,
@@ -42,444 +62,350 @@ enum WorkerMsg {
     Mute {
         muted: bool,
     },
+    /// Stats every second (diagnostics UI open) or every five seconds.
     SetDiagnostics {
         enabled: bool,
     },
+    /// Sent with a transferred `MessagePort` leading to the worklet.
+    AttachWorklet,
 }
 
-/// Messages received from worker (matches neteq_worker.rs)
-#[derive(Debug, Serialize, Deserialize)]
+/// Messages received from worker (matches neteq_worker.rs). Stats arrive as
+/// `{type: "stats", json, ...}` and are read field by field in
+/// [`NetEqAudioPeerDecoder::handle_stats_message`] instead.
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum WorkerResponse {
     WorkerReady {
         mute_state: bool,
     },
-    Stats {
-        #[serde(skip)]
-        stats: JsValue, // Will be processed manually
+    /// Peak 10 ms RMS over the last 50 ms of played audio.
+    AudioLevel {
+        rms: f32,
     },
 }
 
-/// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
+/// Something to post to the worker.
+#[derive(Debug)]
+enum Outgoing {
+    Msg(WorkerMsg),
+    AttachWorklet(MessagePort),
+}
+
+/// Most messages held for a worker that has not reported ready. If its wasm
+/// never loads, packets keep arriving at 50 per second; past this cap the
+/// oldest queued packet is dropped. Queued packets are stale anyway: the
+/// worker flushes NetEq on the worklet's first pull.
+const MAX_PENDING_MESSAGES: usize = 256;
+
+/// Least time between two `AudioContext.resume()` attempts. Each attempt
+/// returns a promise that stays pending until the page gets a user gesture,
+/// so trying on every packet would pile them up.
+const RESUME_RETRY_MS: f64 = 1_000.0;
+
+thread_local! {
+    /// Whether the diagnostics UI is open, and the live workers to tell when
+    /// that changes.
+    static AUDIO_DIAGNOSTICS: RefCell<AudioDiagnostics> = RefCell::new(AudioDiagnostics::default());
+}
+
+#[derive(Debug, Default)]
+struct AudioDiagnostics {
+    enabled: bool,
+    links: Vec<Weak<WorkerLink>>,
+}
+
+/// Tell every NetEq worker, current and future, whether the diagnostics UI
+/// is showing. While it is, workers post stats every second for the charts;
+/// otherwise every five seconds, which is enough for health reporting.
+pub fn set_audio_diagnostics_enabled(enabled: bool) {
+    let links = AUDIO_DIAGNOSTICS.with(|cell| {
+        let mut diagnostics = cell.borrow_mut();
+        diagnostics.links.retain(|link| link.strong_count() > 0);
+        if diagnostics.enabled == enabled {
+            return Vec::new();
+        }
+        diagnostics.enabled = enabled;
+        diagnostics.links.clone()
+    });
+    // Send outside the borrow; `send` never re-enters it, but keep it simple.
+    for link in links.iter().filter_map(Weak::upgrade) {
+        link.send(Outgoing::Msg(WorkerMsg::SetDiagnostics { enabled }));
+    }
+}
+
+/// Register a new worker and return the current diagnostics state for it.
+fn register_for_diagnostics(link: &Rc<WorkerLink>) -> bool {
+    AUDIO_DIAGNOSTICS.with(|cell| {
+        let mut diagnostics = cell.borrow_mut();
+        diagnostics.links.retain(|link| link.strong_count() > 0);
+        diagnostics.links.push(Rc::downgrade(link));
+        diagnostics.enabled
+    })
+}
+
+/// The worker plus the queue that holds messages until it reports ready.
+/// The worker's wasm loads asynchronously; messages posted before its
+/// `onmessage` exists would be lost.
+#[derive(Debug)]
+struct WorkerLink {
+    worker: Worker,
+    ready: Cell<bool>,
+    pending: RefCell<VecDeque<Outgoing>>,
+}
+
+impl WorkerLink {
+    fn send(&self, item: Outgoing) {
+        if self.ready.get() {
+            self.post(item);
+            return;
+        }
+        let mut pending = self.pending.borrow_mut();
+        if pending.len() >= MAX_PENDING_MESSAGES {
+            // Drop the oldest packet; control messages (mute, attach) stay.
+            if let Some(index) = pending
+                .iter()
+                .position(|queued| matches!(queued, Outgoing::Msg(WorkerMsg::Insert { .. })))
+            {
+                pending.remove(index);
+            }
+        }
+        pending.push_back(item);
+    }
+
+    fn post(&self, item: Outgoing) {
+        let result = match item {
+            Outgoing::Msg(msg) => serde_wasm_bindgen::to_value(&msg)
+                .map_err(JsValue::from)
+                .and_then(|js| self.worker.post_message(&js)),
+            Outgoing::AttachWorklet(port) => {
+                serde_wasm_bindgen::to_value(&WorkerMsg::AttachWorklet)
+                    .map_err(JsValue::from)
+                    .and_then(|js| {
+                        self.worker
+                            .post_message_with_transfer(&js, &js_sys::Array::of1(&port))
+                    })
+            }
+        };
+        if let Err(e) = result {
+            log::error!("Failed to send worker message: {e:?}");
+        }
+    }
+
+    fn mark_ready(&self) {
+        self.ready.set(true);
+        // Drain into a local first so `post` never runs under the borrow.
+        let queued: Vec<Outgoing> = self.pending.borrow_mut().drain(..).collect();
+        for item in queued {
+            self.post(item);
+        }
+    }
+}
+
+/// The peer's playback nodes. Built asynchronously after the worklet module
+/// loads; `closed` tells a late build that the decoder is already gone.
+#[derive(Debug, Default)]
+struct Playback {
+    node: Option<AudioWorkletNode>,
+    gain: Option<GainNode>,
+    closed: bool,
+}
+
+/// Decoder-side speaking detection state.
+#[derive(Debug)]
+struct Vad {
+    peer_id: String,
+    threshold: f32,
+    speaking: Cell<bool>,
+    level: Cell<f32>,
+}
+
+impl Vad {
+    /// Emit a `peer_speaking` event when the speaking state flips or the
+    /// level moves by more than [`AUDIO_LEVEL_DELTA_THRESHOLD`].
+    ///
+    /// This is the decoder-side (remote peer) VAD: it gives the UI a speaking
+    /// indicator with sub-second latency instead of waiting for the 1 Hz
+    /// heartbeat that carries the remote user's own `is_speaking` flag.
+    fn update(&self, rms: f32) {
+        let is_speaking = rms > self.threshold;
+        let intensity = rms_to_intensity(rms, self.threshold);
+        let level_changed = (intensity - self.level.get()).abs() > AUDIO_LEVEL_DELTA_THRESHOLD;
+        if is_speaking == self.speaking.get() && !level_changed {
+            return;
+        }
+        self.speaking.set(is_speaking);
+        self.level.set(intensity);
+        let peer_id = &self.peer_id;
+        let _ = global_sender().try_broadcast(DiagEvent {
+            subsystem: "peer_speaking",
+            stream_id: Some(format!("speaking->{peer_id}")),
+            ts_ms: now_ms(),
+            metrics: vec![
+                metric!("to_peer", peer_id.clone()),
+                metric!("speaking", if is_speaking { 1u64 } else { 0u64 }),
+                metric!("audio_level", intensity as f64),
+            ],
+        });
+    }
+}
+
+/// Audio decoder that sends packets to a NetEq worker and plays its output
+/// through a per-peer AudioWorklet.
 #[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
-    worker: Worker,
-    _audio_context: AudioContext,
+    link: Rc<WorkerLink>,
+    audio_context: AudioContext,
+    playback: Rc<RefCell<Playback>>,
+    /// Owned so dropping the decoder frees it (and what it captures).
+    _on_message: Closure<dyn FnMut(MessageEvent)>,
     decoded: bool,
-    peer_id: String, // Track which peer this decoder belongs to
-    _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
-
-    // Message queueing system
-    pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
-    worker_ready: Rc<RefCell<bool>>,
-
-    // Voice activity detection state
-    speaking: Rc<RefCell<bool>>,
-    audio_level: Rc<RefCell<f32>>,
+    peer_id: String,
 
     /// Ring buffer of recently received audio sequence numbers.
     /// Used to detect whether a redundant frame carried in a RED packet
     /// was already received, avoiding duplicate injection.
     received_sequences: VecDeque<u64>,
+
+    /// Rebuilds RTP sequence numbers and 48 kHz timestamps for NetEq from
+    /// the wire's 64-bit sequence and sender wall clock.
+    rtp_mapper: RtpTimestampMapper,
+
+    /// `Date.now()` of the last `AudioContext.resume()` attempt.
+    last_resume_attempt_ms: f64,
 }
 
 impl NetEqAudioPeerDecoder {
-    /// Send message through queue (immediate if worker ready, otherwise queued)
-    fn send_worker_message(&self, msg: WorkerMsg) {
-        let is_ready = *self.worker_ready.borrow();
-
-        if is_ready {
-            // Worker ready - send immediately
-            self.send_message_immediate(msg);
-        } else {
-            // Worker not ready - queue the message
-            log::debug!(
-                "🔄 Queueing message for peer {} (worker not ready)",
-                self.peer_id
-            );
-            self.pending_messages.borrow_mut().push_back(msg);
-        }
-    }
-
-    /// Send message immediately to worker
-    fn send_message_immediate(&self, msg: WorkerMsg) {
-        if let Err(e) =
-            serde_wasm_bindgen::to_value(&msg).map(|js_msg| self.worker.post_message(&js_msg))
-        {
-            log::error!("Failed to send worker message: {e:?}");
-            web_sys::console::error_1(&format!("Failed to send worker message: {e:?}").into());
-        }
-    }
-
     /// Create a NetEq worker.
     fn create_neteq_worker() -> Result<Worker, JsValue> {
-        let window = web_sys::window().expect("no window");
-        let document = window.document().expect("no document");
+        let document = web_sys::window()
+            .and_then(|window| window.document())
+            .ok_or_else(|| JsValue::from_str("no document"))?;
         let worker_url = document
             .get_element_by_id("neteq-worker")
-            .expect("neteq-worker link tag not found")
-            .get_attribute("href")
-            .expect("link tag has no href");
+            .and_then(|link| link.get_attribute("href"))
+            .ok_or_else(|| JsValue::from_str("neteq-worker link tag not found"))?;
         Worker::new(&worker_url)
     }
 
-    /// Send PCM data to Safari AudioWorklet (simple and efficient)
-    fn send_pcm_to_safari_worklet(pcm_player: &AudioWorkletNode, pcm: &Float32Array) {
-        // Create message object for the worklet
-        let message = js_sys::Object::new();
-        js_sys::Reflect::set(&message, &"command".into(), &"play".into()).unwrap();
-        js_sys::Reflect::set(&message, &"pcm".into(), pcm).unwrap();
-
-        // Send PCM data to the worklet - it handles all timing internally
-        if let Err(e) = pcm_player.port().unwrap().post_message(&message) {
-            web_sys::console::warn_1(
-                &format!("Safari: Failed to send PCM to worklet: {e:?}").into(),
-            );
+    /// Browsers start an AudioContext suspended until a user gesture (and
+    /// Safari moves it to "interrupted" on a phone call). Try to resume while
+    /// audio is flowing, at most once per [`RESUME_RETRY_MS`]; it succeeds
+    /// once the page has had a gesture. A closed context cannot resume.
+    fn resume_if_suspended(&mut self) {
+        let state = self.audio_context.state();
+        if state == AudioContextState::Running || state == AudioContextState::Closed {
+            return;
+        }
+        let now = js_sys::Date::now();
+        if now - self.last_resume_attempt_ms < RESUME_RETRY_MS {
+            return;
+        }
+        self.last_resume_attempt_ms = now;
+        if let Err(e) = self.audio_context.resume() {
+            log::warn!("[neteq-audio-decoder] AudioContext resume error: {e:?}");
         }
     }
 
-    /// Create Safari-optimized AudioContext with PCM player worklet
-    async fn create_safari_audio_context(
-        speaker_device_id: Option<String>,
-    ) -> Result<(AudioContext, AudioWorkletNode), JsValue> {
-        // Use shared context and ensure worklet is registered before creating node
-        let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
-        SharedAudioContext::ensure_pcm_worklet_ready(WORKLET_CODE).await?;
-
-        // Create per-peer nodes after registration completes
-        let (pcm_player, _peer_gain) = SharedAudioContext::create_peer_playback_nodes("safari")?;
-
-        Ok((audio_context, pcm_player))
-    }
-
-    /// Calculate RMS (Root Mean Square) of audio samples for voice activity detection.
-    ///
-    /// This is part of the **decoder-side (remote peer) VAD**.  We run a
-    /// fast-path RMS check on every decoded PCM frame so the UI can show a
-    /// speaking indicator for remote peers with sub-second latency, rather
-    /// than waiting for the 1Hz heartbeat update that carries the remote
-    /// user's own (encoder-side) `is_speaking` flag.
-    fn calculate_rms(pcm: &Float32Array) -> f32 {
-        let length = pcm.length() as usize;
-        if length == 0 {
-            return 0.0;
-        }
-
-        let mut sum_squares: f32 = 0.0;
-        for i in 0..length {
-            let sample = pcm.get_index(i as u32);
-            sum_squares += sample * sample;
-        }
-
-        (sum_squares / length as f32).sqrt()
-    }
-
-    /// Handle PCM audio data from NetEq worker.
-    ///
-    /// Includes decoder-side VAD: computes RMS on the decoded PCM and emits
-    /// a `peer_speaking` diagnostics event when the speaking state changes.
-    /// This gives the UI a faster speaking indicator for remote peers than
-    /// the 1Hz heartbeat, which only reflects the remote user's own
-    /// encoder-side VAD result.
-    #[allow(clippy::too_many_arguments)]
-    fn handle_pcm_data(
-        pcm: Float32Array,
-        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
-        audio_context: &AudioContext,
-        speaker_device_id: Option<String>,
+    /// Load the worklet module, create this peer's playback nodes and connect
+    /// the worklet to the worker with a `MessageChannel`.
+    async fn attach_playback(
+        link: Rc<WorkerLink>,
+        playback: Rc<RefCell<Playback>>,
         peer_id: String,
-        speaking: Rc<RefCell<bool>>,
-        audio_level: Rc<RefCell<f32>>,
-        vad_threshold: f32,
-    ) {
-        // Calculate RMS for voice activity detection
-        let rms = Self::calculate_rms(&pcm);
-        let is_speaking = rms > vad_threshold;
-
-        // Normalize RMS to a 0.0–1.0 intensity range using the shared
-        // perceptual curve (sqrt for human hearing).
-        let intensity = rms_to_intensity(rms, vad_threshold);
-
-        // Emit a diagnostics event when the speaking boolean toggles OR
-        // when the audio level changes by more than 0.02.  This keeps the
-        // event rate reasonable while giving the UI smooth level updates.
-        let prev_speaking = *speaking.borrow();
-        let prev_level = *audio_level.borrow();
-        let level_changed = (intensity - prev_level).abs() > AUDIO_LEVEL_DELTA_THRESHOLD;
-
-        if is_speaking != prev_speaking || level_changed {
-            *speaking.borrow_mut() = is_speaking;
-            *audio_level.borrow_mut() = intensity;
-
-            let _ = global_sender().try_broadcast(DiagEvent {
-                subsystem: "peer_speaking",
-                stream_id: Some(format!("speaking->{peer_id}")),
-                ts_ms: now_ms(),
-                metrics: vec![
-                    metric!("to_peer", peer_id.clone()),
-                    metric!("speaking", if is_speaking { 1u64 } else { 0u64 }),
-                    metric!("audio_level", intensity as f64),
-                ],
-            });
+    ) -> Result<(), JsValue> {
+        SharedAudioContext::ensure_pcm_worklet_ready(WORKLET_CODE).await?;
+        if playback.borrow().closed {
+            return Ok(());
         }
-
-        // Ensure AudioContext is running
-        if let Err(e) = audio_context.resume() {
-            web_sys::console::warn_1(
-                &format!("[neteq-audio-decoder] AudioContext resume error: {e:?}").into(),
-            );
-        }
-
-        let pcm_player_clone = pcm_player.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            Self::ensure_worklet_initialized(&pcm_player_clone, speaker_device_id).await;
-
-            if let Some(ref worklet) = *pcm_player_clone.borrow() {
-                Self::send_pcm_to_safari_worklet(worklet, &pcm);
-            }
-        });
+        let (node, gain) = SharedAudioContext::create_peer_playback_nodes(&peer_id)?;
+        let channel = MessageChannel::new()?;
+        let attach = js_sys::Object::new();
+        js_sys::Reflect::set(&attach, &"command".into(), &"attach".into())?;
+        node.port()?
+            .post_message_with_transferable(&attach, &js_sys::Array::of1(&channel.port1()))?;
+        link.send(Outgoing::AttachWorklet(channel.port2()));
+        let mut playback = playback.borrow_mut();
+        playback.node = Some(node);
+        playback.gain = Some(gain);
+        Ok(())
     }
 
-    /// Ensure AudioWorklet is initialized (lazy initialization)
-    async fn ensure_worklet_initialized(
-        pcm_player: &Rc<RefCell<Option<AudioWorkletNode>>>,
-        speaker_device_id: Option<String>,
-    ) {
-        if pcm_player.borrow().is_some() {
-            return;
-        }
-
-        log::info!("Initializing AudioWorklet for PCM playback");
-
-        match Self::create_safari_audio_context(speaker_device_id).await {
-            Ok((_, worklet)) => {
-                *pcm_player.borrow_mut() = Some(worklet);
-                log::info!("AudioWorklet initialized successfully");
-            }
-            Err(e) => {
-                web_sys::console::error_2(&"Failed to initialize worklet:".into(), &e);
-            }
-        }
-    }
-
-    /// Handle statistics messages from NetEq worker
+    /// Turn a worker `{type: "stats", json, ...}` message into one `neteq`
+    /// diagnostics event. The worker already serialized `json` and pulled
+    /// out the numbers, so nothing here stringifies or parses JSON.
     fn handle_stats_message(data: &JsValue, peer_id: &str) {
-        let obj = match data.dyn_ref::<js_sys::Object>() {
-            Some(obj) => obj,
-            None => return,
-        };
-
-        let cmd =
-            js_sys::Reflect::get(obj, &JsValue::from_str("cmd")).unwrap_or(JsValue::UNDEFINED);
-
-        if cmd.as_string().as_deref() != Some("stats") {
+        let field = |name: &str| js_sys::Reflect::get(data, &JsValue::from_str(name)).ok();
+        let Some(json) = field("json").and_then(|json| json.as_string()) else {
             return;
-        }
-
-        let stats_js = match js_sys::Reflect::get(obj, &JsValue::from_str("stats")) {
-            Ok(stats) => stats,
-            Err(_) => return,
+        };
+        // Non-negative integers below 2^53, so the casts are exact.
+        let number = |name: &str| {
+            field(name)
+                .and_then(|value| value.as_f64())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| value as u64)
         };
 
-        let stats_json = match js_sys::JSON::stringify(&stats_js) {
-            Ok(json) => json,
-            Err(_) => return,
-        };
-
-        let json_str = match stats_json.as_string() {
-            Some(s) => s,
-            None => return,
-        };
-
-        Self::emit_stats_diagnostics(&json_str, peer_id);
-        Self::emit_parsed_metrics(&json_str, peer_id);
-    }
-
-    /// Emit raw stats JSON for debugging
-    fn emit_stats_diagnostics(json_str: &str, peer_id: &str) {
-        // peer_id here is the target peer (whose audio we're decoding)
-        // We need to get the current user's ID for the reporting peer
-        // For now, we'll use a placeholder and enhance this later
+        // peer_id is the target peer (whose audio we're decoding). The
+        // reporting peer is a placeholder until the decoder knows the local
+        // user's id.
         let current_user = "current_user"; // TODO: Get from VideoCallClient
-
+        let mut metrics = vec![
+            metric!("stats_json", json),
+            metric!("reporting_peer", current_user),
+            metric!("target_peer", peer_id.to_string()),
+        ];
+        // Same names and sources as before: `audio_buffer_ms` is
+        // `network.current_buffer_size_ms`, the jitter values come from
+        // `lifetime`, and `packets_awaiting_decode` is top level.
+        if let Some(value) = number("buffer_ms") {
+            metrics.push(metric!("audio_buffer_ms", value));
+        }
+        if let Some(value) = number("jitter_buffer_delay_ms") {
+            metrics.push(metric!("jitter_buffer_delay_ms", value));
+        }
+        if let Some(value) = number("jitter_buffer_target_delay_ms") {
+            metrics.push(metric!("jitter_buffer_target_delay_ms", value));
+        }
+        if let Some(value) = number("packets_awaiting_decode") {
+            metrics.push(metric!("packets_awaiting_decode", value));
+        }
         let _ = global_sender().try_broadcast(DiagEvent {
             subsystem: "neteq",
             stream_id: Some(format!("{current_user}->{peer_id}")), // reporting_peer->target_peer
             ts_ms: now_ms(),
-            metrics: vec![
-                metric!("stats_json", json_str.to_string()),
-                metric!("reporting_peer", current_user),
-                metric!("target_peer", peer_id.to_string()),
-            ],
+            metrics,
         });
     }
 
-    /// Parse and emit specific metrics
-    fn emit_parsed_metrics(json_str: &str, peer_id: &str) {
-        let parsed: Value = match serde_json::from_str(json_str) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        Self::emit_jitter_metrics(&parsed, peer_id);
-        Self::emit_buffer_metrics(&parsed, peer_id);
-    }
-
-    /// Emit jitter buffer metrics
-    fn emit_jitter_metrics(parsed: &Value, peer_id: &str) {
-        let lifetime = match parsed.get("lifetime") {
-            Some(l) => l,
-            None => return,
-        };
-
-        if let Some(jitter) = lifetime
-            .get("jitter_buffer_delay_ms")
-            .and_then(|v| v.as_u64())
-        {
-            let _ = global_sender().try_broadcast(DiagEvent {
-                subsystem: "neteq",
-                stream_id: Some(format!("current_user->{peer_id}")),
-                ts_ms: now_ms(),
-                metrics: vec![
-                    metric!("jitter_buffer_delay_ms", jitter),
-                    metric!("reporting_peer", "current_user"),
-                    metric!("target_peer", peer_id.to_string()),
-                ],
-            });
-        }
-
-        if let Some(target) = lifetime
-            .get("jitter_buffer_target_delay_ms")
-            .and_then(|v| v.as_u64())
-        {
-            let _ = global_sender().try_broadcast(DiagEvent {
-                subsystem: "neteq",
-                stream_id: Some(format!("current_user->{peer_id}")),
-                ts_ms: now_ms(),
-                metrics: vec![
-                    metric!("jitter_buffer_target_delay_ms", target),
-                    metric!("reporting_peer", "current_user"),
-                    metric!("target_peer", peer_id.to_string()),
-                ],
-            });
-        }
-    }
-
-    /// Emit buffer size metrics
-    fn emit_buffer_metrics(parsed: &Value, peer_id: &str) {
-        let network = match parsed.get("network") {
-            Some(n) => n,
-            None => return,
-        };
-
-        // Audio data buffered for playback
-        if let Some(buf) = network
-            .get("current_buffer_size_ms")
-            .and_then(|v| v.as_u64())
-        {
-            let _ = global_sender().try_broadcast(DiagEvent {
-                subsystem: "neteq",
-                stream_id: Some(format!("current_user->{peer_id}")),
-                ts_ms: now_ms(),
-                metrics: vec![
-                    metric!("audio_buffer_ms", buf),
-                    metric!("reporting_peer", "current_user"),
-                    metric!("target_peer", peer_id.to_string()),
-                ],
-            });
-        }
-
-        // Encoded packets awaiting decode
-        if let Some(packets) = network
-            .get("packets_awaiting_decode")
-            .and_then(|v| v.as_u64())
-        {
-            let _ = global_sender().try_broadcast(DiagEvent {
-                subsystem: "neteq",
-                stream_id: Some(format!("current_user->{peer_id}")),
-                ts_ms: now_ms(),
-                metrics: vec![
-                    metric!("packets_awaiting_decode", packets),
-                    metric!("reporting_peer", "current_user"),
-                    metric!("target_peer", peer_id.to_string()),
-                ],
-            });
-        }
-    }
-
     /// Create message handler for NetEq worker
-    #[allow(clippy::too_many_arguments)]
-    fn create_message_handler(
-        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
-        audio_context: AudioContext,
-        peer_id: String,
-        speaker_device_id: Option<String>,
-        worker_ready: Rc<RefCell<bool>>,
-        pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
-        worker: Worker,
-        speaking: Rc<RefCell<bool>>,
-        audio_level: Rc<RefCell<f32>>,
-        vad_threshold: f32,
-    ) -> Closure<dyn FnMut(MessageEvent)> {
+    fn create_message_handler(link: Rc<WorkerLink>, vad: Vad) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
-
-            if data.is_instance_of::<Float32Array>() {
-                // High-performance PCM path with voice activity detection
-                let pcm = Float32Array::from(data);
-                Self::handle_pcm_data(
-                    pcm,
-                    pcm_player.clone(),
-                    &audio_context,
-                    speaker_device_id.clone(),
-                    peer_id.clone(),
-                    speaking.clone(),
-                    audio_level.clone(),
-                    vad_threshold,
-                );
-            } else if data.is_object() {
-                // Try to parse as WorkerResponse first
-                if let Ok(response) = serde_wasm_bindgen::from_value::<WorkerResponse>(data.clone())
-                {
-                    match response {
-                        WorkerResponse::WorkerReady { mute_state } => {
-                            // Handle worker ready - flush queue
-                            log::info!(
-                                "✅ Worker ready for peer {peer_id} (worker mute: {mute_state})"
-                            );
-
-                            *worker_ready.borrow_mut() = true;
-
-                            // Flush queued messages in FIFO order
-                            let mut queue = pending_messages.borrow_mut();
-                            let queue_length = queue.len();
-
-                            if queue_length > 0 {
-                                log::info!(
-                                    "📤 Flushing {queue_length} queued messages for peer {peer_id}"
-                                );
-
-                                // Send each queued message immediately
-                                while let Some(msg) = queue.pop_front() {
-                                    if let Err(e) = serde_wasm_bindgen::to_value(&msg)
-                                        .map(|js_msg| worker.post_message(&js_msg))
-                                    {
-                                        log::error!("Failed to send queued message: {e:?}");
-                                    } else {
-                                        log::debug!("📤 Sent queued message: {msg:?}");
-                                    }
-                                }
-                            }
-                        }
-                        WorkerResponse::Stats { .. } => {
-                            // Handle stats message (fallback to old method for now)
-                            Self::handle_stats_message(&data, &peer_id);
-                        }
-                    }
-                } else {
-                    // Fallback to old stats message handling
-                    Self::handle_stats_message(&data, &peer_id);
+            if !data.is_object() {
+                return;
+            }
+            let kind = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+                .ok()
+                .and_then(|kind| kind.as_string());
+            if kind.as_deref() == Some("stats") {
+                Self::handle_stats_message(&data, &vad.peer_id);
+                return;
+            }
+            match serde_wasm_bindgen::from_value::<WorkerResponse>(data) {
+                Ok(WorkerResponse::WorkerReady { mute_state }) => {
+                    log::info!(
+                        "Worker ready for peer {} (worker mute: {mute_state})",
+                        vad.peer_id
+                    );
+                    link.mark_ready();
                 }
+                // Levels only arrive while the worklet pulls audio, so the
+                // context is already running here.
+                Ok(WorkerResponse::AudioLevel { rms }) => vad.update(rms),
+                // Log bridge messages and anything unknown.
+                Err(_) => {}
             }
         }) as Box<dyn FnMut(_)>)
     }
@@ -501,99 +427,93 @@ impl NetEqAudioPeerDecoder {
         initial_muted: bool,
         vad_threshold: Option<f32>,
     ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
-        // Create worker
         let worker = Self::create_neteq_worker()?;
+        let audio_context = SharedAudioContext::get_or_init(speaker_device_id)?;
+        let link = Rc::new(WorkerLink {
+            worker,
+            ready: Cell::new(false),
+            pending: RefCell::new(VecDeque::new()),
+        });
 
-        // Use shared AudioContext and ensure worklet registered once
-        let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
-        SharedAudioContext::ensure_pcm_worklet(WORKLET_CODE);
-
-        let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
-
-        let threshold = vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD);
-
-        // Create decoder with explicit mute state first
-        let mut decoder = Self {
-            worker: worker.clone(),
-            _audio_context: audio_context.clone(),
-            decoded: false,
+        let vad = Vad {
             peer_id: peer_id.clone(),
-            _pcm_player: pcm_player_ref.clone(),
+            threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
+            speaking: Cell::new(false),
+            level: Cell::new(0.0),
+        };
+        let diagnostics = register_for_diagnostics(&link);
+        let on_message = Self::create_message_handler(link.clone(), vad);
+        link.worker
+            .set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
-            // Message queueing system
-            pending_messages: Rc::new(RefCell::new(VecDeque::new())),
-            worker_ready: Rc::new(RefCell::new(false)),
-
-            // Voice activity detection state
-            speaking: Rc::new(RefCell::new(false)),
-            audio_level: Rc::new(RefCell::new(0.0)),
-
-            // RED redundancy: track recently received sequence numbers
+        let playback = Rc::new(RefCell::new(Playback::default()));
+        {
+            let link = link.clone();
+            let playback = playback.clone();
+            let peer_id = peer_id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = Self::attach_playback(link, playback, peer_id.clone()).await {
+                    log::error!("Failed to set up audio playback for peer {peer_id}: {e:?}");
+                }
+            });
+        }
+        let mut decoder = Self {
+            link,
+            audio_context,
+            playback,
+            _on_message: on_message,
+            decoded: false,
+            peer_id,
             received_sequences: VecDeque::with_capacity(AUDIO_RED_SEQ_HISTORY_SIZE),
+            rtp_mapper: RtpTimestampMapper::new(),
+            last_resume_attempt_ms: f64::NEG_INFINITY,
         };
 
-        // Set up worker message handling with decoder's queue references
-        let on_message_closure = Self::create_message_handler(
-            pcm_player_ref.clone(),
-            audio_context.clone(),
-            peer_id.clone(),
-            speaker_device_id.clone(),
-            decoder.worker_ready.clone(),
-            decoder.pending_messages.clone(),
-            worker.clone(),
-            decoder.speaking.clone(),
-            decoder.audio_level.clone(),
-            threshold,
-        );
-
-        worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
-        // Intentionally leaked: the closure must live as long as the Worker,
-        // which has no mechanism for preventing the closure from being GC'd
-        // other than calling `.forget()`.  All captured `Rc`s (including
-        // `speaking`, `pcm_player`, `worker_ready`, `pending_messages`) are
-        // therefore permanently held until the Worker is terminated via Drop.
-        on_message_closure.forget();
-
-        // Initialize worker
-        let init_msg = WorkerMsg::Init {
+        decoder.send(WorkerMsg::Init {
             sample_rate: AUDIO_SAMPLE_RATE,
             channels: AUDIO_CHANNELS as u8,
-        };
-
-        let init_js = serde_wasm_bindgen::to_value(&init_msg)?;
-        let worker_clone = worker.clone();
-        let send_cb = Closure::wrap(Box::new(move || {
-            if let Err(e) = worker_clone.post_message(&init_js) {
-                web_sys::console::error_2(&"[neteq-audio-decoder] failed to post Init:".into(), &e);
-            }
-        }) as Box<dyn FnMut()>);
-
-        web_sys::window()
-            .expect("no window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                send_cb.as_ref().unchecked_ref(),
-                10,
-            )?;
-        send_cb.forget();
-
-        log::info!("NetEq audio decoder initialized for peer {peer_id} (muted: {initial_muted})");
-
-        // Set the initial mute state explicitly
+        });
         decoder.set_muted(initial_muted);
+        decoder.send(WorkerMsg::SetDiagnostics {
+            enabled: diagnostics,
+        });
         log::info!(
-            "✅ NetEq decoder initialized for peer {} with muted: {}",
-            decoder.peer_id,
-            initial_muted
-        );
-
-        // Enable diagnostics in the NetEQ worker
-        decoder.send_worker_message(WorkerMsg::SetDiagnostics { enabled: true });
-        log::info!(
-            "🔧 Enabled diagnostics for NetEq worker for peer {}",
+            "NetEq audio decoder initialized for peer {} (muted: {initial_muted})",
             decoder.peer_id
         );
 
         Ok(Box::new(decoder))
+    }
+
+    fn send(&self, msg: WorkerMsg) {
+        self.link.send(Outgoing::Msg(msg));
+    }
+
+    fn insert(&self, mapping: RtpMapping, payload: Vec<u8>) {
+        self.send(WorkerMsg::Insert {
+            seq: mapping.sequence_number,
+            timestamp: mapping.timestamp,
+            payload,
+        });
+    }
+
+    /// Map a packet onto NetEq's RTP timeline. `None` drops a straggler from
+    /// before a sender restart.
+    fn map(&mut self, sequence: u64, sender_time_ms: f64, opus: &[u8]) -> Option<RtpMapping> {
+        let mapping = self.rtp_mapper.map(sequence, sender_time_ms, opus);
+        match mapping {
+            Some(mapping) if mapping.stream_reset => log::info!(
+                "Audio sequence restarted for peer {} (epoch {})",
+                self.peer_id,
+                mapping.stream_epoch
+            ),
+            None => log::debug!(
+                "Dropping audio seq {sequence} from before a sender restart (peer {})",
+                self.peer_id
+            ),
+            _ => {}
+        }
+        mapping
     }
 
     /// Record a sequence number as received for RED deduplication.
@@ -659,105 +579,101 @@ impl NetEqAudioPeerDecoder {
 
 impl Drop for NetEqAudioPeerDecoder {
     fn drop(&mut self) {
-        self.worker.terminate();
+        // Peer left or was reset: stop the worker and take the worklet out of
+        // the audio graph so it stops rendering and can be collected.
+        self.link.worker.set_onmessage(None);
+        self.link.worker.terminate();
+        let mut playback = self.playback.borrow_mut();
+        playback.closed = true;
+        if let Some(node) = playback.node.take() {
+            let close = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&close, &"command".into(), &"close".into());
+            if let Ok(port) = node.port() {
+                let _ = port.post_message(&close);
+            }
+            let _ = node.disconnect();
+        }
+        if let Some(gain) = playback.gain.take() {
+            let _ = gain.disconnect();
+        }
     }
 }
 
 impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
-        match packet.audio_metadata.as_ref() {
-            Some(audio_meta) => {
-                let seq = audio_meta.sequence;
+        let Some(audio_meta) = packet.audio_metadata.as_ref() else {
+            // Malformed/old packet that lacks metadata – skip with a warning instead of
+            // propagating an error that would reset the entire peer.
+            log::warn!(
+                "Received audio packet with length {} without metadata – skipping",
+                packet.data.len()
+            );
+            return Ok(DecodeStatus::SKIPPED);
+        };
+        // Playback is pulled by the worklet, so nothing plays (and nothing
+        // else would retry) while the context is suspended. Packets arriving
+        // is the cue to try again, as the old per-frame push path did.
+        self.resume_if_suspended();
 
-                // Track this sequence number so we can detect duplicates from
-                // redundancy payloads later.
-                self.record_sequence(seq);
+        let seq = audio_meta.sequence;
+        // `MediaPacket.timestamp` is the sender's wall clock in ms. NetEq needs
+        // 48 kHz RTP timestamps; the mapper derives them (see rtp_timestamp.rs).
+        let sender_time_ms = packet.timestamp;
 
-                // Check whether the packet carries RED-style redundancy.
-                let is_red = audio_meta.audio_format == AUDIO_RED_FORMAT;
+        // Track this sequence number so we can detect duplicates from
+        // redundancy payloads later.
+        self.record_sequence(seq);
 
-                if is_red {
-                    // Unpack the RED payload:
-                    // [4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]
-                    if let Some((primary, redundant_seq, redundant_data)) =
-                        Self::unpack_red_audio(&packet.data)
-                    {
-                        // First, check if the redundant frame was lost (not yet received).
-                        if !self.has_sequence(redundant_seq as u64) {
-                            log::debug!(
-                                "RED recovery: injecting lost audio seq {} for peer {}",
-                                redundant_seq,
-                                self.peer_id
-                            );
-                            self.record_sequence(redundant_seq as u64);
-                            // Inject the recovered frame with its original sequence and
-                            // an earlier timestamp (one Opus frame before the primary).
-                            let recovered_insert = WorkerMsg::Insert {
-                                seq: redundant_seq as u16,
-                                timestamp: (packet.timestamp as u32)
-                                    .saturating_sub(OPUS_FRAME_DURATION_MS),
-                                payload: redundant_data,
-                            };
-                            self.send_worker_message(recovered_insert);
-                        }
-
-                        // Now send the primary frame.
-                        let insert = WorkerMsg::Insert {
-                            seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
-                            payload: primary,
-                        };
-                        self.send_worker_message(insert);
-                    } else {
-                        // RED unpack failed -- fall back to treating the whole
-                        // data blob as a single frame.
-                        log::warn!(
-                            "RED unpack failed for peer {} seq {}, falling back to raw",
-                            self.peer_id,
-                            seq
-                        );
-                        let insert = WorkerMsg::Insert {
-                            seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
-                            payload: packet.data.clone(),
-                        };
-                        self.send_worker_message(insert);
-                    }
-                } else {
-                    // Standard (non-RED) audio packet.
-                    let insert = WorkerMsg::Insert {
-                        seq: seq as u16,
-                        timestamp: packet.timestamp as u32,
-                        payload: packet.data.clone(),
-                    };
-                    self.send_worker_message(insert);
-                }
-
-                let first_frame = !self.decoded;
-                self.decoded = true;
-                Ok(DecodeStatus {
-                    rendered: true,
-                    first_frame,
-                })
-            }
-            None => {
-                // Malformed/old packet that lacks metadata – skip with a warning instead of
-                // propagating an error that would reset the entire peer.
-                log::warn!(
-                    "Received audio packet with length {} without metadata – skipping",
-                    packet.data.len()
-                );
-                Ok(DecodeStatus {
-                    rendered: false,
-                    first_frame: false,
-                })
-            }
+        let red = (audio_meta.audio_format == AUDIO_RED_FORMAT)
+            .then(|| Self::unpack_red_audio(&packet.data))
+            .flatten();
+        if audio_meta.audio_format == AUDIO_RED_FORMAT && red.is_none() {
+            log::warn!(
+                "RED unpack failed for peer {} seq {}, falling back to raw",
+                self.peer_id,
+                seq
+            );
         }
+
+        if let Some((primary, redundant_seq, redundant_data)) = red {
+            // [4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]
+            let Some(primary_mapping) = self.map(seq, sender_time_ms, &primary) else {
+                return Ok(DecodeStatus::SKIPPED);
+            };
+            // If the redundant frame was lost (not yet received), inject it
+            // at its own slot on the timeline, one frame before the primary.
+            if !self.has_sequence(u64::from(redundant_seq)) {
+                if let Some(recovered) = self.rtp_mapper.map_red_recovered(seq, redundant_seq) {
+                    log::debug!(
+                        "RED recovery: injecting lost audio seq {} for peer {}",
+                        redundant_seq,
+                        self.peer_id
+                    );
+                    self.record_sequence(u64::from(redundant_seq));
+                    self.insert(recovered, redundant_data);
+                }
+            }
+            self.insert(primary_mapping, primary);
+        } else {
+            let Some(mapping) = self.map(seq, sender_time_ms, &packet.data) else {
+                return Ok(DecodeStatus::SKIPPED);
+            };
+            self.insert(mapping, packet.data.clone());
+        }
+
+        let first_frame = !self.decoded;
+        self.decoded = true;
+        Ok(DecodeStatus {
+            rendered: true,
+            first_frame,
+        })
     }
 
     fn flush(&mut self) {
-        // Send flush message to NetEq worker through queue
-        self.send_worker_message(WorkerMsg::Flush);
+        // Drops NetEq's buffered packets and audio; the next packet starts a
+        // fresh stream. The mapper keeps its timeline so the gap shows up as
+        // a timestamp jump.
+        self.send(WorkerMsg::Flush);
         log::debug!(
             "Sent flush message to NetEq worker for peer {}",
             self.peer_id
@@ -765,40 +681,12 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     }
 
     fn set_muted(&mut self, muted: bool) {
-        // Send mute message to NetEq worker through queue
-        let mute_msg = WorkerMsg::Mute { muted };
-        let now = js_sys::Date::now();
-        let is_ready = *self.worker_ready.borrow();
-        let queue_length = self.pending_messages.borrow().len();
-
-        // Enhanced logging for mute state tracking
-        log::info!(
-            "🔇 [MUTE DEBUG] Peer {} set_muted({}) at {:.0}ms - worker_ready: {}, queue_length: {}",
-            self.peer_id,
-            muted,
-            now,
-            is_ready,
-            queue_length
-        );
-
-        self.send_worker_message(mute_msg);
-
         log::debug!(
-            "Sent mute message to NetEq worker for peer {} (muted: {})",
+            "Peer {} set_muted({muted}), worker ready: {}",
             self.peer_id,
-            muted
+            self.link.ready.get()
         );
-        log::debug!(
-            "✅ Mute message {} for peer {} (muted: {}) at {:.0}ms",
-            if is_ready {
-                "sent immediately"
-            } else {
-                "queued"
-            },
-            self.peer_id,
-            muted,
-            now
-        );
+        self.send(WorkerMsg::Mute { muted });
     }
 }
 

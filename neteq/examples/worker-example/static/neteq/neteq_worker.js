@@ -1,14 +1,9 @@
-import * as opus from 'https://cdn.jsdelivr.net/npm/opus-decoder@0.7.11/+esm';
-
 let netEq;
 let audioPort;
 
 let framesReturned = 0;
 let bufferSizeMs = 0;
 let targetDelayMs = 0;
-
-// The wasm will look for the opus decoder here
-self['opus-decoder'] = opus;
 
 function sendFrame({ willPlayInMs, maxPlaybackDelayMs }) {
   if (!netEq) {
@@ -32,7 +27,7 @@ function sendFrame({ willPlayInMs, maxPlaybackDelayMs }) {
 }
 
 async function init(config) {
-  const { wasmUrl, wasmJsUrl, port, additionalDelayMs } = config;
+  const { wasmUrl, wasmJsUrl, port } = config;
 
   audioPort = port;
   audioPort.onmessage = (e) => {
@@ -48,9 +43,8 @@ async function init(config) {
 
   initSync(bytes);
   initNetEq();
-  const ne = new WebNetEq(48000, 1, additionalDelayMs);
-  await ne.init();
-  netEq = ne;
+  // Opus decodes inside the wasm (ropus); no JS decoder is needed.
+  netEq = new WebNetEq(48000, 1);
 }
 
 self.onmessage = (event) => {

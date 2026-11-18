@@ -452,6 +452,9 @@ pub fn Diagnostics(
     let mut diag_task = use_signal(|| None::<Task>);
     let mut backend_versions = use_signal(Vec::<serde_json::Value>::new);
 
+    // The panel is unmounted when it closes; slow the NetEq stats back down.
+    use_drop(|| videocall_client::set_audio_diagnostics_enabled(false));
+
     // Subscribe to diagnostics events using Dioxus `spawn`.
     // `spawn` runs within the Dioxus runtime so signal mutations properly
     // trigger re-renders.  We explicitly cancel the previous Task on each
@@ -463,6 +466,8 @@ pub fn Diagnostics(
         }
 
         if !is_open {
+            // Back to slow (every 5 s) NetEq stats, enough for health reports.
+            videocall_client::set_audio_diagnostics_enabled(false);
             diagnostics_data.set(None);
             sender_stats.set(None);
             connection_manager_state.set(None);
@@ -475,6 +480,9 @@ pub fn Diagnostics(
 
         let task = spawn(async move {
             let mut rx = subscribe();
+            // NetEq workers post stats every second only while this panel is
+            // open. Ask after subscribing so the first report is not missed.
+            videocall_client::set_audio_diagnostics_enabled(true);
             let mut connection_events = Vec::<SerializableDiagEvent>::new();
             let mut neteq_stats = HashMap::<String, Vec<String>>::new();
             let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();

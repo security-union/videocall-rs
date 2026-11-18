@@ -1,0 +1,42 @@
+[package]
+name = "neteq-parity"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Differential test harness: Google WebRTC's C++ NetEq vs our Rust neteq"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# Standalone workspace: this crate compiles WebRTC C++ (needs WEBRTC_SRC,
+# abseil and libopus), so it must never join the root workspace or any wasm
+# build. Build it from this directory, ideally inside `nix-shell shell.nix`.
+[workspace]
+
+[lib]
+name = "neteq_parity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "neteq-parity"
+path = "src/main.rs"
+
+[features]
+default = []
+# Compile the adapter for our Rust neteq crate and the C++-vs-Rust comparison
+# tests. Opus decodes through C libopus on the Rust side by default (ropus is opt-in).
+rust-neteq = ["dep:neteq", "neteq/ropus", "neteq/tools", "neteq/parity"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+neteq = { path = "..", default-features = false, optional = true }
+
+[build-dependencies]
+cc = { version = "1.2", features = ["parallel"] }
+pkg-config = "0.3"
+
+# The synth and diff loops are hot; keep debug test runs quick.
+[profile.dev]
+opt-level = 2

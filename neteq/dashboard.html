@@ -323,7 +323,7 @@
                             yAxisID: 'y'
                         },
                         {
-                            label: 'Avg Frames',
+                            label: 'Frame Size (ms)',
                             data: [],
                             borderColor: '#ffc107',
                             backgroundColor: 'rgba(255, 193, 7, 0.1)',
@@ -428,7 +428,30 @@
             });
         }
 
-        function updateCharts(data) {
+        // One line of `neteq_player --json-stats`: `telemetry::NetEqStats`
+        // plus the player's `timestamp`, `callbacks_per_sec` and `underruns`.
+        // Rates arrive in Q14; the charts show per mille.
+        function toChartData(line) {
+            const network = line.network || {};
+            const q14ToPerMille = (value) => (value || 0) / 16.384;
+            return {
+                timestamp: line.timestamp,
+                buffer_ms: line.current_buffer_size_ms,
+                target_ms: line.target_delay_ms,
+                packets: line.packets_awaiting_decode,
+                underruns: line.underruns,
+                expand_rate: q14ToPerMille(network.expand_rate),
+                accel_rate: q14ToPerMille(network.accelerate_rate),
+                reorder_rate: network.reorder_rate_permyriad,
+                reordered_packets: network.reordered_packets,
+                max_reorder_distance: network.max_reorder_distance,
+                calls_per_sec: line.callbacks_per_sec,
+                avg_frames: line.operations ? line.operations.current_frame_size_ms : 0,
+            };
+        }
+
+        function updateCharts(line) {
+            const data = toChartData(line);
             const time = new Date(data.timestamp).toLocaleTimeString();
             
             // Update status display

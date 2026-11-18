@@ -199,6 +199,7 @@ pub mod utils;
 mod wrappers;
 pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use connection::ConnectionState;
+pub use decode::neteq_audio_decoder::set_audio_diagnostics_enabled;
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };

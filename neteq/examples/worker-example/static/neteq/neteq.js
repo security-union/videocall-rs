@@ -7,10 +7,9 @@ class NetEq {
   onStatsCb;
   worker;
 
-  constructor({ wasmUrl, wasmJsUrl, additionalDelayMs }) {
+  constructor({ wasmUrl, wasmJsUrl }) {
     this.wasmUrl = wasmUrl;
     this.wasmJsUrl = wasmJsUrl;
-    this.additionalDelayMs = additionalDelayMs || additionalDelayMs === 0 ? additionalDelayMs : 80;
   }
 
   async init(audioCtx) {
@@ -27,7 +26,6 @@ class NetEq {
         port: node.port,
         wasmUrl: this.wasmUrl,
         wasmJsUrl: this.wasmJsUrl,
-        additionalDelayMs: this.additionalDelayMs,
       },
       [node.port],
     );

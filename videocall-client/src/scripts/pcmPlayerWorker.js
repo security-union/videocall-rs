@@ -1,231 +1,239 @@
 /**
- * Ultra-Fast PCM Audio Player Worklet
- * 
- * Highly optimized JavaScript implementation designed for low-end Android devices.
- * Uses advanced optimizations to minimize GC pressure and maximize performance.
- * 
- * This worklet receives PCM audio data via postMessage and plays it directly
- * through the AudioContext.destination() without using MediaStream APIs.
- * This approach is Safari-compatible and avoids the problematic MediaStreamTrackGenerator
- * and related APIs that cause issues in WebKit.
- * 
- * Usage:
- * 1. Load this worklet in an AudioContext
- * 2. Send PCM data via port.postMessage({ command: 'play', pcm: Float32Array })
- * 3. The worklet buffers and plays the audio directly
-
+ * PCM player AudioWorklet, paced pull from the peer's NetEq worker.
+ *
+ * The worklet owns playback timing. It keeps a small prebuffer and, as the
+ * audio device consumes samples, asks the NetEq worker for more over a
+ * MessagePort that connects the two directly (no main-thread hop). So NetEq's
+ * GetAudio runs at the sound card's rate, which is what NetEq's delay
+ * estimate assumes (one GetAudio per 10 ms of played audio).
+ *
+ * Protocol over the attached port:
+ *   worklet -> worker: "send n more 10 ms frames", either the number n or a
+ *                      Float32Array holding n in element 0. The array is a
+ *                      buffer the worker sent before, transferred back so
+ *                      the worker can reuse it.
+ *   worker -> worklet: a Float32Array of n frames (interleaved, its buffer
+ *                      transferred), or the number n meaning n frames of
+ *                      silence
+ * The worker answers every request with exactly the frames asked for, so
+ * `pendingFrames` (asked, not yet answered) stays exact.
+ *
+ * Requests go out when buffered plus requested audio drops below
+ * TARGET_FRAMES (30 ms, the worker's headroom to answer), and ask for at
+ * least BATCH_FRAMES, so there is one round trip per 20 ms of audio rather
+ * than per 10 ms. The cost is about 5 ms more average buffering.
+ *
+ * Returning the reply buffers means steady playback allocates no sample
+ * memory. SharedArrayBuffer would avoid the messages entirely but needs
+ * cross-origin isolation, which the app does not enable.
+ *
+ * Messages on this node's own port (from the main thread):
+ *   { command: 'configure', channels }
+ *   { command: 'attach' } with one transferred MessagePort (to the worker)
+ *   { command: 'flush' }  drop buffered audio
+ *   { command: 'close' }  stop processing; the node can be garbage collected
+ *
+ * process() allocates nothing: the ring buffer is preallocated, copies are
+ * plain loops (no subarray views), and request buffers are recycled.
  */
 
-// Ultra-fast circular buffer implementation  
-class UltraFastPCMBuffer {
-    constructor(maxSamples, channels) {
-        this.maxSamples = maxSamples;
+// 10 ms at 48 kHz.
+const FRAME_SAMPLES = 480;
+// Low-water mark: audio buffered plus requested. Gives the worker about 25 ms
+// to answer before the device runs dry, enough for a busy low-end phone.
+const TARGET_FRAMES = 3;
+// Least frames per request. Two halves the message rate; the ring then holds
+// 30 to 50 ms instead of 30 to 40 ms.
+const BATCH_FRAMES = 2;
+// Ring capacity: 200 ms. Only reachable if the worker answers in bursts.
+const CAPACITY_SAMPLES = 9600;
+// If a request goes unanswered for this many render quanta (~500 ms), assume
+// the worker restarted and forget what was in flight.
+const PENDING_TIMEOUT_QUANTA = 188;
+// Returned reply buffers kept for the next requests. Steady playback cycles
+// one or two.
+const MAX_SPARE_BUFFERS = 4;
+
+class PcmRing {
+    constructor(capacity, channels) {
+        this.capacity = capacity;
         this.channels = channels;
-        this.totalSize = maxSamples * channels;
-        
-        // Pre-allocate all buffers to avoid GC during playback
-        this.buffer = new Float32Array(this.totalSize);
+        // Planar storage: channel c lives at [c * capacity, (c + 1) * capacity).
+        this.data = new Float32Array(capacity * channels);
         this.readPos = 0;
         this.writePos = 0;
-        this.availableSamples = 0;
-        
-        console.log(`Ultra-fast PCM buffer: ${maxSamples} samples (~${(maxSamples/48000*1000).toFixed(1)}ms), ${channels} channels`);
-    }
-    
-    // Drop the oldest samples to make room (advance read pointer)
-    dropOldestSamples(samplesToDrop) {
-        if (samplesToDrop <= 0) return 0;
-        const drop = Math.min(samplesToDrop, this.availableSamples);
-        this.readPos = (this.readPos + drop) % this.maxSamples;
-        this.availableSamples -= drop;
-        return drop;
+        this.available = 0;
     }
 
-    // Ensure capacity for a frame by applying a burst-drop policy (drop oldest)
-    // Returns number of samples dropped
-    ensureCapacityFor(frameLength, highWatermark, lowWatermark) {
-        // If we're above the high watermark, proactively reduce to low watermark
-        let dropped = 0;
-        if (this.availableSamples >= highWatermark) {
-            const target = Math.max(0, Math.min(lowWatermark, this.maxSamples));
-            const toDrop = this.availableSamples - target;
-            dropped += this.dropOldestSamples(toDrop);
-        }
-
-        // If still not enough room for the incoming frame, drop just enough
-        const overflow = (this.availableSamples + frameLength) - this.maxSamples;
-        if (overflow > 0) {
-            dropped += this.dropOldestSamples(overflow);
-        }
-        return dropped;
-    }
-
-    // Optimized push with minimal branching
-    pushInterleaved(data) {
-        const frameLength = data.length / this.channels;
-        
-        if (this.availableSamples + frameLength > this.maxSamples) {
-            return false; // Caller should ensure capacity first
-        }
-        
-        if (this.channels === 1) {
-            // Mono: direct copy using fastest possible method
-            const writeStart = this.writePos;
-            if (writeStart + frameLength <= this.maxSamples) {
-                // Fast path: no wraparound
-                this.buffer.set(data, writeStart);
-            } else {
-                // Wraparound: split copy
-                const firstChunk = this.maxSamples - writeStart;
-                this.buffer.set(data.subarray(0, firstChunk), writeStart);
-                this.buffer.set(data.subarray(firstChunk), 0);
-            }
-        } else {
-            // Stereo: deinterleave to planar format for faster processing
-            const channelOffset = this.maxSamples;
-            for (let i = 0; i < frameLength; i++) {
-                const writeIndex = (this.writePos + i) % this.maxSamples;
-                this.buffer[writeIndex] = data[i * 2];         // Left
-                this.buffer[channelOffset + writeIndex] = data[i * 2 + 1]; // Right
-            }
-        }
-        
-        this.writePos = (this.writePos + frameLength) % this.maxSamples;
-        this.availableSamples += frameLength;
-        return true;
-    }
-    
-    // Ultra-fast pull with SIMD-friendly operations
-    pullToChannels(leftOut, rightOut) {
-        const frameLength = leftOut.length;
-        
-        if (this.availableSamples < frameLength) {
-            leftOut.fill(0);
-            if (this.channels > 1) rightOut.fill(0);
-            return false;
-        }
-        
-        if (this.channels === 1) {
-            // Mono: copy to left, duplicate to right if needed
-            if (this.readPos + frameLength <= this.maxSamples) {
-                leftOut.set(this.buffer.subarray(this.readPos, this.readPos + frameLength));
-            } else {
-                const firstChunk = this.maxSamples - this.readPos;
-                leftOut.set(this.buffer.subarray(this.readPos, this.maxSamples));
-                leftOut.set(this.buffer.subarray(0, frameLength - firstChunk), firstChunk);
-            }
-            if (rightOut !== leftOut) rightOut.set(leftOut);
-        } else {
-            // Stereo: extract from planar format
-            const channelOffset = this.maxSamples;
-            if (this.readPos + frameLength <= this.maxSamples) {
-                leftOut.set(this.buffer.subarray(this.readPos, this.readPos + frameLength));
-                rightOut.set(this.buffer.subarray(channelOffset + this.readPos, channelOffset + this.readPos + frameLength));
-            } else {
-                const firstChunk = this.maxSamples - this.readPos;
-                leftOut.set(this.buffer.subarray(this.readPos, this.maxSamples));
-                leftOut.set(this.buffer.subarray(0, frameLength - firstChunk), firstChunk);
-                rightOut.set(this.buffer.subarray(channelOffset + this.readPos, channelOffset + this.maxSamples));
-                rightOut.set(this.buffer.subarray(channelOffset, channelOffset + frameLength - firstChunk), firstChunk);
-            }
-        }
-        
-        this.readPos = (this.readPos + frameLength) % this.maxSamples;
-        this.availableSamples -= frameLength;
-        return true;
-    }
-    
     reset() {
         this.readPos = 0;
         this.writePos = 0;
-        this.availableSamples = 0;
+        this.available = 0;
+    }
+
+    dropOldest(count) {
+        const drop = Math.min(count, this.available);
+        this.readPos = (this.readPos + drop) % this.capacity;
+        this.available -= drop;
+    }
+
+    // Append `frames` per channel from interleaved `pcm`, or zeros when `pcm`
+    // is null. Drops the oldest audio if the ring would overflow.
+    push(pcm, frames) {
+        const overflow = this.available + frames - this.capacity;
+        if (overflow > 0) this.dropOldest(overflow);
+        const channels = this.channels;
+        if (channels === 1) {
+            // Plain loops: subarray() would allocate a view per call.
+            const data = this.data;
+            const first = Math.min(frames, this.capacity - this.writePos);
+            const writePos = this.writePos;
+            if (pcm) {
+                for (let i = 0; i < first; i++) data[writePos + i] = pcm[i];
+                for (let i = first; i < frames; i++) data[i - first] = pcm[i];
+            } else {
+                data.fill(0, writePos, writePos + first);
+                data.fill(0, 0, frames - first);
+            }
+        } else {
+            for (let i = 0; i < frames; i++) {
+                const index = (this.writePos + i) % this.capacity;
+                for (let c = 0; c < channels; c++) {
+                    this.data[c * this.capacity + index] = pcm ? pcm[i * channels + c] : 0;
+                }
+            }
+        }
+        this.writePos = (this.writePos + frames) % this.capacity;
+        this.available += frames;
+    }
+
+    // Copy `out[c].length` samples per channel into `out`. Underruns fill the
+    // rest with zeros.
+    pull(out) {
+        const length = out[0].length;
+        const count = Math.min(length, this.available);
+        const data = this.data;
+        const first = Math.min(count, this.capacity - this.readPos);
+        for (let c = 0; c < out.length; c++) {
+            const channel = out[c];
+            const offset = Math.min(c, this.channels - 1) * this.capacity;
+            // Plain loops: subarray() would allocate a view per quantum.
+            const start = offset + this.readPos;
+            for (let i = 0; i < first; i++) channel[i] = data[start + i];
+            for (let i = first; i < count; i++) channel[i] = data[offset + i - first];
+            if (count < length) channel.fill(0, count);
+        }
+        this.readPos = (this.readPos + count) % this.capacity;
+        this.available -= count;
+        return count === length;
     }
 }
 
 class PCMPlayerProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
-        
-        // Initialize with optimized settings for low-end devices
-        this.buffer = new UltraFastPCMBuffer(4096 * 3, 1); // 85ms at 48kHz
-        this.sampleRate = 48000;
         this.channels = 1;
-        // Burst-drop policy configuration
-        this.highWatermarkRatio = 0.80; // start dropping when >= 80% full
-        this.lowWatermarkRatio = 0.50;  // drop down to 20%
-        this.lastDropWarnTime = 0;
-        this.dropWarnCooldownMs = 1000; // rate-limit warnings
-        
-        console.log('Ultra-Fast PCM Player Worklet initialized - JavaScript optimized for maximum performance');
-        
-        // Setup message handler  
-        this.port.onmessage = (event) => this.handleMessage(event.data);
+        this.ring = new PcmRing(CAPACITY_SAMPLES, this.channels);
+        this.neteqPort = null;
+        this.pendingFrames = 0;
+        this.quantaSinceAnswer = 0;
+        // Reply buffers to hand back to the worker with the next requests.
+        this.spare = [];
+        // Reused one-element transfer list, so a request allocates no array.
+        this.transfer = [null];
+        this.closed = false;
+        this.port.onmessage = (event) => this.handleMessage(event);
     }
-    
-    handleMessage(data) {
-        const { command, pcm, sampleRate, channels } = data;
-        
-        switch (command) {
-            case 'configure':
-                this.sampleRate = sampleRate || 48000;
-                this.channels = channels || 2;
-                // Recreate buffer with new configuration
-                this.buffer = new UltraFastPCMBuffer(4096 * 2, this.channels);
-                break;
-                
-            case 'play':
-                if (pcm && pcm instanceof Float32Array) {
-                    // Apply burst-drop policy before enqueuing
-                    const frameLength = pcm.length / this.channels;
-                    const highWM = Math.floor(this.buffer.maxSamples * this.highWatermarkRatio);
-                    const lowWM = Math.floor(this.buffer.maxSamples * this.lowWatermarkRatio);
-                    const dropped = this.buffer.ensureCapacityFor(frameLength, highWM, lowWM);
 
-                    if (dropped > 0) {
-                        const now = Date.now();
-                        if (now - this.lastDropWarnTime >= this.dropWarnCooldownMs) {
-                            console.warn(`PCM buffer high-watermark: dropped ${dropped} samples to cap latency (avail=${this.buffer.availableSamples}/${this.buffer.maxSamples})`);
-                            this.lastDropWarnTime = now;
-                        }
-                    }
-
-                    // Enqueue after ensuring capacity. If this still fails, frame is too large.
-                    const success = this.buffer.pushInterleaved(pcm);
-                    if (!success) {
-                        // Extremely rare: frame larger than buffer capacity
-                        const now = Date.now();
-                        if (now - this.lastDropWarnTime >= this.dropWarnCooldownMs) {
-                            console.warn('Failed to enqueue PCM data: frame larger than buffer capacity');
-                            this.lastDropWarnTime = now;
-                        }
-                    }
+    handleMessage(event) {
+        const data = event.data || {};
+        switch (data.command) {
+            case 'configure': {
+                const channels = data.channels === 2 ? 2 : 1;
+                if (channels !== this.channels) {
+                    this.channels = channels;
+                    this.ring = new PcmRing(CAPACITY_SAMPLES, channels);
                 }
                 break;
-                
+            }
+            case 'attach': {
+                const port = event.ports && event.ports[0];
+                if (!port) break;
+                if (this.neteqPort) this.neteqPort.close();
+                this.neteqPort = port;
+                this.neteqPort.onmessage = (e) => this.handleFrames(e.data);
+                this.pendingFrames = 0;
+                this.quantaSinceAnswer = 0;
+                this.ring.reset();
+                this.requestFrames();
+                break;
+            }
             case 'flush':
-                this.buffer.reset();
+                this.ring.reset();
+                break;
+            case 'close':
+                this.closed = true;
+                if (this.neteqPort) {
+                    this.neteqPort.onmessage = null;
+                    this.neteqPort.close();
+                    this.neteqPort = null;
+                }
                 break;
         }
     }
-    
-    /**
-     * Process audio - called by Web Audio API at ~375Hz  
-     * This is the critical hot path - must be ultra-fast
-     */
-    process(inputs, outputs, parameters) {
-        const output = outputs[0];
-        
-        if (output.length >= 2) {
-            // Stereo output - use direct channel access for maximum speed
-            this.buffer.pullToChannels(output[0], output[1]);
+
+    handleFrames(data) {
+        const frameLength = FRAME_SAMPLES * this.channels;
+        let frames;
+        if (typeof data === 'number') {
+            frames = data;
+            this.ring.push(null, frames * FRAME_SAMPLES);
+        } else if (data instanceof Float32Array) {
+            frames = Math.floor(data.length / frameLength);
+            this.ring.push(data, frames * FRAME_SAMPLES);
+            if (data.length > 0 && this.spare.length < MAX_SPARE_BUFFERS) this.spare.push(data);
         } else {
-            // Mono output - pass the same channel twice
-            this.buffer.pullToChannels(output[0], output[0]);
+            return;
         }
-        
+        this.pendingFrames = Math.max(0, this.pendingFrames - frames);
+        this.quantaSinceAnswer = 0;
+    }
+
+    // Once buffered + requested drops below the target, ask for enough frames
+    // to get back above it, and at least BATCH_FRAMES.
+    requestFrames() {
+        if (!this.neteqPort) return;
+        const queued = this.ring.available + this.pendingFrames * FRAME_SAMPLES;
+        const missing = TARGET_FRAMES * FRAME_SAMPLES - queued;
+        if (missing <= 0) return;
+        const frames = Math.max(BATCH_FRAMES, Math.ceil(missing / FRAME_SAMPLES));
+        this.pendingFrames += frames;
+        const buffer = this.spare.pop();
+        if (buffer) {
+            // Element 0 carries the count; the worker overwrites the rest.
+            buffer[0] = frames;
+            this.transfer[0] = buffer.buffer;
+            this.neteqPort.postMessage(buffer, this.transfer);
+            this.transfer[0] = null;
+        } else {
+            this.neteqPort.postMessage(frames);
+        }
+    }
+
+    process(inputs, outputs) {
+        if (this.closed) return false;
+        const output = outputs[0];
+        if (output && output.length > 0) {
+            this.ring.pull(output);
+        }
+        if (this.pendingFrames > 0 && ++this.quantaSinceAnswer > PENDING_TIMEOUT_QUANTA) {
+            this.pendingFrames = 0;
+            this.quantaSinceAnswer = 0;
+        }
+        this.requestFrames();
         return true;
     }
-    
+
     static get parameterDescriptors() {
         return [];
     }

@@ -32,7 +32,7 @@ console_log = "1.0.0"
 log = "0.4.19"
 gloo-timers = { version = "0.2.6", features = ["futures"] }
 gloo-utils = "0.1"
-neteq = { path = "../neteq", version = "0.9.1", features = ["web"], default-features = false }
+neteq = { path = "../neteq", version = "1.0.0", features = ["web"], default-features = false }
 wasm-bindgen-futures = { workspace = true }
 futures = "0.3.31"
 web-time = "1.1.0"

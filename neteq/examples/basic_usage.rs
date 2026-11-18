@@ -16,235 +16,113 @@
  * conditions.
  */
 
-use neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
-use web_time::Duration;
+//! Feed NetEq a jittery stream of 20 ms PCM16B (L16) packets on a simulated
+//! clock, pull 10 ms frames, and print what NetEq did.
+//!
+//! Run with `cargo run -p neteq --example basic_usage`.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use neteq::api::{Clock, SimulatedClock};
+use neteq::codecs::pcm16b::pcm16b_encode;
+use neteq::{
+    AudioFrame, Config, NetEq, Operation, RtpHeader, RtpPacketInfo, SdpAudioFormat,
+    TelemetryCollector,
+};
+
+const SAMPLE_RATE_HZ: i32 = 16_000;
+const PAYLOAD_TYPE: u8 = 96;
+const PACKET_MS: i64 = 20;
+const SAMPLES_PER_PACKET: usize = (SAMPLE_RATE_HZ as usize / 1000) * PACKET_MS as usize;
+
+/// One 20 ms packet of a 440 Hz tone, PCM16B encoded.
+fn tone_packet(first_sample: usize) -> Vec<u8> {
+    let speech: Vec<i16> = (first_sample..first_sample + SAMPLES_PER_PACKET)
+        .map(|n| {
+            let t = n as f64 / f64::from(SAMPLE_RATE_HZ);
+            (8000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16
+        })
+        .collect();
+    let mut payload = vec![0u8; speech.len() * 2];
+    let written = pcm16b_encode(&speech, &mut payload);
+    payload.truncate(written);
+    payload
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    println!("NetEQ Jitter Buffer Example");
-    println!("============================");
+    // A simulated clock makes the run deterministic: time only moves when we
+    // say so, 10 ms per GetAudio, like an audio device would pull.
+    let clock = SimulatedClock::new(0);
+    let mut neteq = NetEq::builder(Config::default())
+        .clock(Arc::new(clock.clone()))
+        .build();
+    let codecs = BTreeMap::from([(
+        i32::from(PAYLOAD_TYPE),
+        SdpAudioFormat::new("L16", SAMPLE_RATE_HZ, 1),
+    )]);
+    neteq.set_codecs(&codecs);
 
-    // Create NetEQ configuration
-    let config = NetEqConfig {
-        sample_rate: 16000,
-        channels: 1,
-        max_packets_in_buffer: 50,
-        max_delay_ms: 500,
-        min_delay_ms: 20,
-        for_test_no_time_stretching: false,
-        ..Default::default()
-    };
+    // Packet n is sent at n * 20 ms and arrives after 0..60 ms of jitter.
+    let jitter_ms = [0, 35, 10, 60, 5, 20, 0, 45, 15, 30];
+    let packet_count = 100usize;
+    let mut arrivals: Vec<(i64, usize)> = (0..packet_count)
+        .map(|n| {
+            let send_ms = n as i64 * PACKET_MS;
+            (send_ms + jitter_ms[n % jitter_ms.len()], n)
+        })
+        .collect();
+    arrivals.sort();
 
-    // Create NetEQ instance
-    let mut neteq = NetEq::new(config)?;
+    let mut collector = TelemetryCollector::new();
+    let mut frame = AudioFrame::new();
+    let mut next_arrival = 0;
+    let mut operations: BTreeMap<String, u32> = BTreeMap::new();
+    let end_ms = packet_count as i64 * PACKET_MS + 200;
 
-    println!(
-        "Created NetEQ with target delay: {}ms",
-        neteq.target_delay_ms()
-    );
-
-    // Simulate incoming audio packets with some jitter
-    let mut sequence_number = 0u16;
-    let mut timestamp = 0u32;
-    let packet_duration_ms = 20; // 20ms packets
-    let samples_per_packet = 320; // 20ms at 16kHz = 320 samples
-
-    println!("\nSimulating incoming packets with jitter...");
-
-    // Send packets with varying delays to simulate network jitter
-    for i in 0..30 {
-        // Create audio packet with sine wave content
-        let packet = create_audio_packet(
-            sequence_number,
-            timestamp,
-            samples_per_packet,
-            16000,
-            packet_duration_ms,
-        );
-
-        // Insert packet into NetEQ
-        neteq.insert_packet(packet)?;
-
-        // Simulate jitter by adding random delays
-        let jitter_delay = match i % 5 {
-            0 => 5,  // 5ms extra delay
-            1 => 0,  // No extra delay
-            2 => 15, // 15ms extra delay
-            3 => 2,  // 2ms extra delay
-            _ => 8,  // 8ms extra delay
-        };
-
-        if jitter_delay > 0 {
-            std::thread::sleep(Duration::from_millis(jitter_delay));
+    for now_ms in (0..end_ms).step_by(10) {
+        // Insert everything that has arrived by now, then pull 10 ms.
+        while next_arrival < arrivals.len() && arrivals[next_arrival].0 <= now_ms {
+            let n = arrivals[next_arrival].1;
+            let header = RtpHeader {
+                marker_bit: false,
+                payload_type: PAYLOAD_TYPE,
+                sequence_number: n as u16,
+                timestamp: (n * SAMPLES_PER_PACKET) as u32,
+                ssrc: 0x1234_5678,
+            };
+            let info = RtpPacketInfo::new(&header, Some(clock.current_time_us()));
+            neteq.insert_packet(&header, &tone_packet(n * SAMPLES_PER_PACKET), info)?;
+            collector.on_packet_inserted(header.sequence_number, now_ms as u64);
+            next_arrival += 1;
         }
 
-        sequence_number = sequence_number.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(samples_per_packet as u32);
-
-        // Print buffer status every few packets
-        if i % 5 == 0 {
-            let stats = neteq.get_statistics();
-            println!(
-                "Packet {}: Buffer size: {}ms, Target delay: {}ms, Packets: {}",
-                i,
-                stats.current_buffer_size_ms,
-                stats.target_delay_ms,
-                stats.packets_awaiting_decode
-            );
-        }
+        neteq.get_audio(&mut frame, None)?;
+        let operation = neteq.last_operation();
+        collector.on_get_audio(operation, now_ms as u64);
+        *operations.entry(format!("{operation:?}")).or_default() += 1;
+        clock.advance_time_ms(10);
     }
 
-    println!("\nRetrieving audio frames...");
-
-    // Retrieve audio frames (10ms each)
-    let mut total_samples = 0;
-    let mut expand_count = 0;
-
-    for frame_num in 0..50 {
-        let frame = neteq.get_audio()?;
-        total_samples += frame.samples.len();
-
-        // Count different frame types
-        match frame.speech_type {
-            neteq::neteq::SpeechType::Expand => expand_count += 1,
-            neteq::neteq::SpeechType::Normal => {
-                // Check if this was likely an accelerate operation
-                // (simplified detection based on frame energy changes)
-            }
-            _ => {}
-        }
-
-        // Print status every 10 frames
-        if frame_num % 10 == 0 {
-            let stats = neteq.get_statistics();
-            println!(
-                "Frame {}: {}ms, Type: {:?}, Buffer: {}ms, VAD: {}",
-                frame_num,
-                frame.duration_ms(),
-                frame.speech_type,
-                stats.current_buffer_size_ms,
-                frame.vad_activity
-            );
-        }
+    let stats = neteq::NetEqStats::from_neteq(&neteq, &collector);
+    let lifetime = &stats.lifetime;
+    println!("NetEq basic usage: {packet_count} packets of 20 ms L16 with up to 60 ms jitter");
+    println!("  target delay        {} ms", neteq.target_delay_ms());
+    println!("  buffered now        {} ms", stats.current_buffer_size_ms);
+    println!(
+        "  concealed samples   {} of {}",
+        lifetime.concealed_samples, lifetime.total_samples_received
+    );
+    println!(
+        "  reordered packets   {} of {}",
+        stats.network.reordered_packets, stats.network.total_packets_received
+    );
+    println!("  operations per 10 ms tick:");
+    for (operation, count) in &operations {
+        println!("    {operation:<18} {count}");
     }
-
-    // Print final statistics
-    let final_stats = neteq.get_statistics();
-    println!("\nFinal Statistics:");
-    println!("================");
-    println!("Total samples processed: {total_samples}");
-    println!(
-        "Packets received: {}",
-        final_stats.lifetime.jitter_buffer_packets_received
-    );
-    println!(
-        "Concealment events: {}",
-        final_stats.lifetime.concealment_events
-    );
-    println!("Buffer flushes: {}", final_stats.lifetime.buffer_flushes);
-    println!("Expand frames: {expand_count}");
-    println!(
-        "Current buffer size: {}ms",
-        final_stats.current_buffer_size_ms
-    );
-    println!("Target delay: {}ms", final_stats.target_delay_ms);
-
-    println!("Network Statistics:");
-    println!(
-        "  Current buffer: {}ms",
-        final_stats.network.current_buffer_size_ms
-    );
-    println!(
-        "  Preferred buffer: {}ms",
-        final_stats.network.preferred_buffer_size_ms
-    );
-    println!(
-        "  Mean waiting time: {}ms",
-        final_stats.network.mean_waiting_time_ms
-    );
-    println!("  Accelerate rate: {}", final_stats.network.accelerate_rate);
-    println!("  Expand rate: {}", final_stats.network.expand_rate);
-
-    println!("\nExample completed successfully!");
-
-    Ok(())
-}
-
-/// Create a test audio packet with sine wave content
-fn create_audio_packet(
-    sequence_number: u16,
-    timestamp: u32,
-    samples: usize,
-    sample_rate: u32,
-    duration_ms: u32,
-) -> AudioPacket {
-    let header = RtpHeader::new(sequence_number, timestamp, 12345, 96, false);
-
-    // Generate sine wave audio data
-    let frequency = 440.0; // A4 note
-    let mut payload = Vec::new();
-
-    for i in 0..samples {
-        let t = i as f32 / sample_rate as f32;
-        let sample = (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.1;
-        payload.extend_from_slice(&sample.to_le_bytes());
-    }
-
-    AudioPacket::new(header, payload, sample_rate, 1, duration_ms)
-}
-
-/// Demonstrate adaptive behavior with burst loss
-#[allow(dead_code)]
-fn demonstrate_packet_loss() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\nDemonstrating packet loss handling...");
-
-    let config = NetEqConfig::default();
-    let mut neteq = NetEq::new(config)?;
-
-    let mut sequence_number = 0u16;
-    let mut timestamp = 0u32;
-
-    // Send some normal packets
-    for _i in 0..10 {
-        let packet = create_audio_packet(sequence_number, timestamp, 160, 16000, 10);
-        neteq.insert_packet(packet)?;
-
-        sequence_number = sequence_number.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(160);
-    }
-
-    // Simulate burst loss (skip 5 packets)
-    println!("Simulating burst loss of 5 packets...");
-    sequence_number = sequence_number.wrapping_add(5);
-    timestamp = timestamp.wrapping_add(5 * 160);
-
-    // Continue with normal packets
-    for _i in 0..10 {
-        let packet = create_audio_packet(sequence_number, timestamp, 160, 16000, 10);
-        neteq.insert_packet(packet)?;
-
-        sequence_number = sequence_number.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(160);
-    }
-
-    // Retrieve frames and observe concealment
-    for frame_num in 0..30 {
-        let frame = neteq.get_audio()?;
-
-        if frame_num % 5 == 0 {
-            println!(
-                "Frame {}: Type: {:?}, VAD: {}",
-                frame_num, frame.speech_type, frame.vad_activity
-            );
-        }
-    }
-
-    let stats = neteq.get_statistics();
-    println!(
-        "Concealment events after loss: {}",
-        stats.lifetime.concealment_events
-    );
-
+    assert!(operations.contains_key(&format!("{:?}", Operation::Normal)));
     Ok(())
 }

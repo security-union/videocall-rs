@@ -1,187 +1,81 @@
-# Rust NetEQ — Adaptive Jitter Buffer for Real-Time Audio
+# neteq
 
-Part of the **[videocall.rs](https://github.com/security-union/videocall-rs)** real-time communication stack.
+A line-by-line Rust port of Google WebRTC's NetEq: the jitter buffer, the decision logic, and the fixed-point packet loss concealment and time stretching that Chrome uses to play remote audio. It's part of [videocall.rs](https://github.com/security-union/videocall-rs).
 
-> **Project status:** early preview – API is settling, performance tuning in progress.
+The port tracks WebRTC at rev `6341cca49ffcad6fcb4603bd6cd1325fd0fe28bd`. The harness in [`parity/`](parity) builds the real C++ NetEq and diffs it against this crate tick by tick: every output sample, every operation, every statistic. PCM16B is the gate, and it matches on all 80 scenarios.
 
-Rust NetEQ is a pure-Rust, libWebRTC-inspired jitter buffer designed for professional, low-latency audio applications. It smooths out bursty networks, conceals packet loss, and keeps playback on time so that downstream DSP or audio renderers can focus on sound, not sockets.
+## What NetEq does
 
-## Why Rust NetEQ?
+The example I give people is a water tower. Packets arrive in bursts, like a pump that runs when it feels like it. The speaker drinks at a steady 10 ms at a time, like the taps in town. The tower in between keeps enough water that the taps never notice the pump.
 
-* **Latency you control** – adaptive target delay with hard minimum/maximum bounds.
-* **Rock-solid ordering** – duplicate detection, re-sequencing, and smart flushing protect against wild packet arrival patterns.
-* **Seamless playout** – accelerate, pre-emptive expand, and classical expand algorithms reduce audible artifacts without introducing heavy CPU cost.
-* **Actionable metrics** – detailed runtime statistics make debugging network conditions trivial.
-* **Zero unsafe ✨** – implemented in 100 % safe Rust; integrates into `no_std` builds that provide an allocator.
+NetEq picks the water level for you. It watches how late packets arrive and sets a target delay that covers about 95% of them. When the tank is too full it plays audio a little faster (accelerate). When it's running low it stretches what it has (preemptive expand). When it runs dry it makes up audio that sounds like what came before (expand), which is where the water tower analogy runs out.[^1]
 
-## At a Glance
+## Using it
 
-### Native Rust Applications
+Insert packets as they arrive, call `get_audio` every 10 ms, read stats when you want them. This is the core of [`examples/basic_usage.rs`](examples/basic_usage.rs):
 
-```toml
-[dependencies]
-neteq = "0.1"
+```rust
+let mut neteq = NetEq::builder(Config::default())
+    .clock(Arc::new(clock.clone()))
+    .build();
+neteq.set_codecs(&codecs);
+
+let info = RtpPacketInfo::new(&header, Some(clock.current_time_us()));
+neteq.insert_packet(&header, &tone_packet(n * SAMPLES_PER_PACKET), info)?;
+
+neteq.get_audio(&mut frame, None)?;
+let operation = neteq.last_operation();
 ```
 
-Insert RTP payloads as they arrive, call `get_audio()` every 10 ms, and let the buffer handle the rest.  Full runnable snippets live in the [examples](examples) directory — open `basic_usage.rs` first.
+The rest of that file builds a jittery stream of tone packets on a simulated clock and prints what NetEq did with them. Run it with `cargo run -p neteq --example basic_usage`.
 
-### Web Applications (WASM + WebWorker)
+One thing trips people up: `RtpHeader::timestamp` counts samples of the codec clock (48 kHz for Opus), not milliseconds. NetEq matches packets to the playout point by timestamp, so wall-clock milliseconds make it expand on nearly every packet.
 
-```toml
-[dependencies]
-neteq = { version = "0.1", features = ["web"], default-features = false }
-```
+Codecs come from `codecs::BuiltinAudioDecoderFactory`: PCM16B (`L16`), Opus on [ropus](https://crates.io/crates/ropus) (pure Rust), and RFC 3389 comfort noise. RED and telephone-event are handled by NetEq itself.
 
-For browser environments, NetEq ships with:
-- **🕸️ WebWorker binary** (`neteq_worker`) for off-main-thread audio processing
-- **🎵 Embedded Opus decoder** - no external dependencies to serve
-- **🌐 Cross-browser support** - unified decoder works on Chrome, Firefox, Safari
-- **⚡ WASM integration** - `WebNetEq` wrapper with JavaScript bindings
+## Statistics
 
-```javascript
-// Main thread: spawn NetEq worker
-const worker = new Worker('/neteq_worker.js');
+`network_statistics()`, `current_network_statistics()`, `lifetime_statistics()` and `operations_and_state()` are the WebRTC structs with the WebRTC field meanings. Rates are Q14, like in WebRTC.
 
-// Send Opus packets to worker
-worker.postMessage({
-  cmd: 'insert',
-  seq: sequenceNumber,
-  timestamp: rtpTimestamp,
-  payload: opusPacketBytes
-});
+For dashboards, `telemetry::NetEqStats::from_neteq` packs those into one JSON object, adds per-second operation counts and reorder counters from `telemetry::TelemetryCollector`, and never resets NetEq's counters. That's the schema the browser worker posts and the [dashboard](DASHBOARD_README.md) reads.
 
-// Receive decoded PCM frames
-worker.onmessage = (event) => {
-  if (event.data instanceof Float32Array) {
-    // 10ms of decoded audio ready for playback
-    audioWorklet.port.postMessage(event.data);
-  }
-};
-```
+## In the browser
 
-## Feature Highlights
-
-| Category             | What you get                                                    |
-|----------------------|-----------------------------------------------------------------|
-| Delay management     | Quantile-based estimator, exponential smoothing                 |
-| Time-stretching      | Accelerate • Pre-emptive Expand • Classical Expand              |
-| Buffer housekeeping  | Age trimming • Overflow flush • Duplicate suppression           |
-| Statistics           | Per-frame network & lifetime counters for observability         |
-| Configuration        | Sample-rate aware, channel agnostic, compile-time feature flags |
-| **Web deployment**   | **WebWorker binary • Embedded Opus decoder • Zero dependencies** |
-
-
-## Architecture Overview
-
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   AudioPacket   │    │  PacketBuffer   │    │  DelayManager   │
-│                 │───▶│                 │───▶│                 │
-│ • RTP Header    │    │ • Ordered Queue │    │ • Adaptive      │
-│ • Audio Data    │    │ • Duplicate Det │    │ • Statistics    │
-│ • Timestamps    │    │ • Smart Flush   │    │ • Target Delay  │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-                                   │
-                                   ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ TimeStretching  │    │     NetEQ       │    │   Statistics    │
-│                 │◀───│                 │───▶│                 │
-│ • Accelerate    │    │ • Decision      │    │ • Network Stats │
-│ • Preemptive    │    │ • Decode        │    │ • Lifetime      │
-│ • Expand        │    │ • Control       │    │ • Operations    │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-```
-
-Each 10 ms tick NetEQ decides between **Normal**, **Accelerate**, **Pre-emptive Expand**, or **Expand** based on buffer fullness and arrival trends.  Decisions and their rationale are exposed through the statistics API for post-analysis.
-
-## 🌐 Web Deployment & Embedded Opus Decoder
-
-NetEq includes a complete web deployment solution with **zero external dependencies**:
-
-### WebWorker Architecture
-- **`neteq_worker`** binary runs NetEq off the main thread
-- Receives Opus packets via `postMessage()`
-- Returns decoded PCM frames as `Float32Array`
-- Built-in mute/unmute and diagnostics controls
-
-### Self-Contained Opus Decoding
-- **Embedded `opus-decoder.min.js`** - compiled at build time, no CDN required
-- **Cross-browser compatibility** - works on Chrome, Firefox, Safari
-- **Automatic fallback** - graceful degradation on unsupported browsers
-- **Zero configuration** - decoder loads automatically in worker context
-
-### Build Integration
-When you build with `--features web`, the Opus decoder JavaScript is embedded directly into the WASM binary using `include_str!()`. This means:
-
-- ✅ No external files to serve alongside your application
-- ✅ No version mismatches between NetEq and Opus decoder
-- ✅ Works in any deployment environment (CDN, static hosting, etc.)
-- ✅ Offline-capable applications
+Build with `--no-default-features --features web` for `wasm32-unknown-unknown`. You get `web::WebNetEq` and the `neteq_worker` binary, a Dedicated Worker that runs one NetEq per remote peer:
 
 ```bash
-# Build NetEq worker for web deployment
-cargo build --target wasm32-unknown-unknown --bin neteq_worker --features web --no-default-features
+cargo build --target wasm32-unknown-unknown -p neteq --bin neteq_worker \
+  --no-default-features --features web
 ```
+
+Opus decodes with ropus inside the worker on every browser. NetEq decodes synchronously inside `GetAudio`, and the WebCodecs `AudioDecoder` is asynchronous, so it can't sit there.
+
+Playback is pulled, not pushed. The page connects the worker to an AudioWorklet with a `MessageChannel`. The worklet keeps at least 30 ms queued and asks the worker for more 10 ms frames, two or three at a time, as the sound card consumes them, so `GetAudio` runs on the audio clock. Reply buffers travel back with the next request, so steady playback allocates no sample memory. NetEq measures arrival delay in `GetAudio` ticks, which is why a free-running timer isn't good enough. The message protocol is documented at the top of [`src/bin/neteq_worker.rs`](src/bin/neteq_worker.rs), and [`examples/worker-example`](examples/worker-example) is a standalone page that uses it.
+
+Configuration matches Chrome's audio receiver: WebRTC defaults, no minimum delay floor, smart flushing off, and muted state on, so a silent peer costs almost nothing per tick.
 
 ## Examples
 
-### Native Examples
+| Example | What it shows |
+|---|---|
+| `basic_usage.rs` | Insert, pull, read stats, on a simulated clock |
+| `neteq_player.rs` | A WAV through Opus, simulated jitter and reordering, played from the sound card callback |
+| `worker-example/` | The browser worker and worklet outside videocall.rs |
 
-| Example              | Highlights                                              |
-|----------------------|---------------------------------------------------------|
-| `basic_usage.rs`     | Minimal integration loop                                |
-| `neteq_player.rs`    | WAV replay with user-defined jitter & re-ordering knobs |
+`cargo run -p neteq --example neteq_player --release -- song.wav --max-jitter-ms 80 --json-stats` also writes `neteq_stats.jsonl` for the dashboard.
 
-```bash
-cargo run --release --example basic_usage
-```
+## Features
 
-### Web Integration
-
-The **[videocall.rs](https://github.com/security-union/videocall-rs)** project demonstrates production NetEq WebWorker usage:
-- Real-time Opus packet processing from WebRTC
-- AudioWorklet integration for glitch-free playback  
-- Mute/unmute synchronization across worker threads
-- Live performance monitoring with metrics dashboard
-
-## Performance Dashboard
-
-Monitor NetEq performance in real-time with our interactive web dashboard. Track buffer health, network adaptation rates, and audio quality metrics.
-
-📊 **[Complete Dashboard Setup Guide →](DASHBOARD_README.md)**
-
-![NetEq Performance Dashboard](stats_dashboard_sample.png)
-
-Key features:
-- Real-time buffer size vs target monitoring
-- Network adaptation rate visualization  
-- Audio quality metrics and underrun detection
-- Configurable volume control for silent testing
-- Native Rust axum web server
-
-## Roadmap
-
-1. Advanced concealment (pitch-based PLC)
-2. Voice Activity Detection integration
-3. Multi-codec framing helpers (Opus, LC3 …)
-4. SIMD accelerations for time-stretch routines
-
-Contributions are welcome — please skim the [CONTRIBUTING.md](CONTRIBUTING.md) first.
+| Feature | Default | What it adds |
+|---|---|---|
+| `native` | yes | ropus Opus decoder, and the deps for the player and dashboard |
+| `audio_files` | yes | WAV reading for `neteq_player` |
+| `web` | no | `WebNetEq`, the worker binary, ropus |
+| `tools` | no | `tools::NetEqTest`, the simulation driver the tests and harness share |
+| `parity` | no | Per-tick observer hooks for the harness, compiled out otherwise |
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0 for our code. Most of this crate is a translation of WebRTC source, so those parts stay under WebRTC's BSD-3-Clause license; the notice and the `PATENTS` grant are in [`LICENSE-WEBRTC`](LICENSE-WEBRTC). Hence the crate's `(MIT OR Apache-2.0) AND BSD-3-Clause`.
 
-## License and Attribution
-
-This project is licensed under MIT OR Apache-2.0.
-
-### WebRTC Attribution
-
-This NetEQ implementation is algorithmically inspired by and compatible with the WebRTC NetEQ jitter buffer. The original WebRTC project is:
-- Copyright (c) 2011, The WebRTC project authors
-- Licensed under the 3-clause BSD license  
-- Available at: https://webrtc.googlesource.com/src/
-
-This Rust implementation is an independent rewrite and is not a derivative work of the WebRTC source code.
-
+[^1]: For the nerds: expand isn't interpolation. It runs LPC analysis on the last pitch period, then synthesizes from a mix of that periodic excitation and filtered noise, fading toward background noise the longer the gap lasts. That's `neteq/expand.rs`, ported from `modules/audio_coding/neteq/expand.cc`.

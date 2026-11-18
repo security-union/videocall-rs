@@ -169,6 +169,47 @@ in
     nativeBuildInputs = [ pkgs.protobuf packages.protobufCodegen ];
   };
 
+  # NetEQ parity harness (neteq/parity): compiles Google WebRTC's C++ NetEQ
+  # and diffs our Rust port against it. C++20 clang from the pinned stdenv,
+  # abseil + libopus from the same pin so they share one libc++. libopus is
+  # the fixed-point build (what Chromium ships on ARM): the Rust side decodes
+  # with ropus, a port of fixed-point libopus, so only this build can match
+  # it sample for sample. Intrinsics are off for the same reason the WebRTC
+  # SPL is built without NEON (generic C kernels only), and because 1.5.2's
+  # meson build fails to link fixed-point NEON on aarch64.
+  #   nix-shell default.nix -A shells.neteq-parity --run 'cd neteq/parity && cargo test'
+  neteq-parity = let
+    libopusFixedC = (pkgs.libopus.override { fixedPoint = true; }).overrideAttrs (old: rec {
+      version = "1.6.1";
+      src = pkgs.fetchurl {
+        url = "https://downloads.xiph.org/releases/opus/opus-${version}.tar.gz";
+        sha256 = "188i4ibr80az4217q04z22cyrfv4xmk29cqmvy22bsbv429vbz3g";
+      };
+      # The pin's patch targets 1.5.2's test meson file; tests are off anyway.
+      patches = [ ];
+      mesonFlags = map
+        (flag:
+          if flag == "-Dintrinsics=enabled" then "-Dintrinsics=disabled"
+          else if flag == "-Drtcd=enabled" then "-Drtcd=disabled"
+          else flag)
+        old.mesonFlags;
+      doCheck = false;
+    });
+  in pkgs.mkShell {
+    nativeBuildInputs = [
+      rust.backendRustDev
+      pkgs.pkg-config
+      pkgs.git
+    ];
+    buildInputs = [
+      pkgs.abseil-cpp
+      libopusFixedC
+    ];
+    # The cc crate passes --target arm64-apple-macosx; the nix clang wrapper
+    # warns on every file about the spelling. It is the same target.
+    NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING = "1";
+  };
+
   # `make vlog`: serve the engineering vlog with the same zola the image uses
   vlog = pkgs.mkShell {
     nativeBuildInputs = [ pkgs.zola ];

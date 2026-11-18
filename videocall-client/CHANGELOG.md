@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.7...videocall-client-v5.0.0) - 2026-11-18
+
+### Added
+
+- *(neteq)* [**breaking**] bit-exact port of WebRTC NetEQ with C++ parity harness ([#925](https://github.com/security-union/videocall-rs/pull/925))
+
+### Fixed
+
+- *(deps)* build against js-sys/web-sys 0.3.107 and wasm-bindgen 0.2.130 ([#927](https://github.com/security-union/videocall-rs/pull/927))
+
 ## [4.0.7](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.6...videocall-client-v4.0.7) - 2026-08-13
 
 ### Other

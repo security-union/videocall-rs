@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1](https://github.com/security-union/videocall-rs/compare/neteq-v1.0.0...neteq-v1.0.1) - 2026-11-18
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [1.0.0]
 
 A rewrite. The crate is now a line-by-line port of WebRTC NetEq (rev

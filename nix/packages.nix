@@ -251,6 +251,20 @@ let
     '';
   };
 
+  # wasm-bindgen CLI matching the `wasm-bindgen` crate in Cargo.lock. The CLI
+  # and the library must be the exact same version or trunk rejects the wasm,
+  # and the pinned nixpkgs stops at 0.2.108. Built with crane from the
+  # crate's own published Cargo.lock (nixpkgs' fetchCargoVendor gets 403'd by
+  # crates.io; crane vendors from the static CDN). Bump `version` + `hash`
+  # (in pkgs.nix) whenever Cargo.lock moves wasm-bindgen.
+  wasmBindgenCli = craneLibHost.buildPackage {
+    pname = "wasm-bindgen-cli";
+    version = "0.2.130";
+    src = p.wasmBindgenCliSrc;
+    doCheck = false;
+    meta.mainProgram = "wasm-bindgen";
+  };
+
   # protoc plugin for `protoc --rs_out=…` — must match the protobuf runtime
   # crate version pinned in videocall-types (generated files assert the
   # runtime version). The crate tarball ships no Cargo.lock; ours is
@@ -265,7 +279,7 @@ let
   };
 in
 {
-  inherit protobufCodegen website videocall-cli;
+  inherit protobufCodegen website videocall-cli wasmBindgenCli;
 
   # The cache units, exposed so CI can warm them serially before fanning out
   # (and so `nix-build release.nix -A packages.nativeDeps` works by hand).
@@ -283,6 +297,7 @@ in
     { name = "dbmate"; path = pkgsLinuxStatic.dbmate; }
     { name = "tzdata"; path = pkgsLinux.tzdata; }
     { name = "cacert"; path = pkgsLinux.dockerTools.caCertificates; }
+    { name = "wasm-bindgen-cli"; path = wasmBindgenCli; }
   ];
 
   # All four actix-api server binaries in one compile — mirrors the old
@@ -319,7 +334,7 @@ in
 
     nativeBuildInputs = [
       pkgs.trunk
-      pkgs.wasm-bindgen-cli_0_2_108
+      wasmBindgenCli
       pkgs.binaryen
       pkgs.tailwindcss
       pkgs.nukeReferences

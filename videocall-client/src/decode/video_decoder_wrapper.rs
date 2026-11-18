@@ -51,8 +51,12 @@ impl VideoDecoderTrait for VideoDecoderWrapper {
         let chunk_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
         let video_data = Uint8Array::new_with_length(image.data.len().try_into().unwrap());
         video_data.copy_from(&image.data);
-        let video_chunk = EncodedVideoChunkInit::new(&video_data, image.timestamp, chunk_type);
-        video_chunk.set_duration(image.duration);
+        // See the audio wrapper: the constructor's `timestamp` is i32 in
+        // web-sys >= 0.3.107, so the real f64 values go through the `_f64`
+        // setters to avoid truncation and overflow.
+        let video_chunk = EncodedVideoChunkInit::new(&video_data, 0, chunk_type);
+        video_chunk.set_timestamp_f64(image.timestamp);
+        video_chunk.set_duration_f64(image.duration);
         let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
         self.0.decode(&encoded_video_chunk)
     }

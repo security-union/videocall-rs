@@ -69,7 +69,15 @@ let
     version = "3.7.2";
     hash = "sha256-0d+xjYXpl87Sq/DdE8K2olnKa5bNpEHX7RTjp/2xza4=";
   };
+
+  # Source of wasm-bindgen-cli, built with crane in packages.nix for the same
+  # reason. Must match the `wasm-bindgen` crate version in Cargo.lock.
+  wasmBindgenCliSrc = pkgs.fetchCrate {
+    pname = "wasm-bindgen-cli";
+    version = "0.2.130";
+    hash = "sha256-9Og1O/6/VC3sc5hBjoIWBErmLW2UHGMsTQO+6+m/dng=";
+  };
 in
 {
-  inherit pkgs pkgsLinux pkgsLinuxStatic pkgsLeptos linuxSystem muslTarget caddyStatic protobufCodegenSrc;
+  inherit pkgs pkgsLinux pkgsLinuxStatic pkgsLeptos linuxSystem muslTarget caddyStatic protobufCodegenSrc wasmBindgenCliSrc;
 }

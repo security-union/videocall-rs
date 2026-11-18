@@ -53,9 +53,14 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
             EncodedAudioChunkType::from_js_value(&JsValue::from(audio.frame_type.clone())).unwrap();
         let audio_data = Uint8Array::new_with_length(audio.data.len().try_into().unwrap());
         audio_data.copy_from(&audio.data);
-        let audio_chunk =
-            EncodedAudioChunkInit::new(&audio_data.into(), audio.timestamp, chunk_type);
-        audio_chunk.set_duration(audio.duration);
+        // web-sys >= 0.3.107 narrowed the `timestamp` constructor argument and
+        // the plain `set_duration` setter to 32-bit integers. Our values are
+        // microseconds as f64 and a 32-bit timestamp would overflow after ~35
+        // minutes, so the constructor gets a placeholder and the real values go
+        // through the `_f64` setters, which write the same JS number as before.
+        let audio_chunk = EncodedAudioChunkInit::new(&audio_data.into(), 0, chunk_type);
+        audio_chunk.set_timestamp_f64(audio.timestamp);
+        audio_chunk.set_duration_f64(audio.duration);
         let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
 
         match self.0.decode(&encoded_audio_chunk) {

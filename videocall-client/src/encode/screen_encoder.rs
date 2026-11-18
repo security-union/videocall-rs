@@ -500,7 +500,7 @@ impl ScreenEncoder {
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
             let screen_encoder_config =
                 VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
-            screen_encoder_config.set_bitrate(local_bitrate as f64);
+            screen_encoder_config.set_bitrate_f64(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
                 let msg = format!("Error configuring screen encoder: {e:?}");
@@ -581,7 +581,7 @@ impl ScreenEncoder {
                         current_encoder_height,
                         current_encoder_width,
                     );
-                    new_config.set_bitrate(local_bitrate as f64);
+                    new_config.set_bitrate_f64(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     if let Err(e) = screen_encoder.configure(&new_config) {
                         error!("Error reconfiguring screen encoder for tier change: {e:?}");
@@ -606,7 +606,7 @@ impl ScreenEncoder {
                         current_encoder_height,
                         current_encoder_width,
                     );
-                    new_config.set_bitrate(local_bitrate as f64);
+                    new_config.set_bitrate_f64(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     if let Err(e) = screen_encoder.configure(&new_config) {
                         error!("Error configuring screen encoder: {e:?}");
@@ -660,7 +660,7 @@ impl ScreenEncoder {
                                 current_encoder_height,
                                 current_encoder_width,
                             );
-                            new_config.set_bitrate(local_bitrate as f64);
+                            new_config.set_bitrate_f64(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             if let Err(e) = screen_encoder.configure(&new_config) {
                                 error!(

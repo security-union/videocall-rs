@@ -2,7 +2,7 @@
 name = "videocall-transport"
 version = "0.2.1"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.81"
 license = "MIT OR Apache-2.0"
 description = "Framework-agnostic WebSocket and WebTransport wrappers for videocall.rs"
 homepage = "https://github.com/security-union/videocall-rs"
@@ -25,7 +25,7 @@ anyhow = { workspace = true }
 futures = "0.3"
 gloo = "0.8.0"
 gloo-console = "0.3"
-js-sys = "0.3"
+js-sys = "0.3.107"
 log = "0.4"
 thiserror = "1.0"
 videocall-types = { path = "../videocall-types", version = "6.0.1" }
@@ -33,7 +33,7 @@ wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 
 [dependencies.web-sys]
-version = "0.3"
+version = "0.3.107"
 features = [
     "BinaryType",
     "CloseEvent",

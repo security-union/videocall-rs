@@ -232,7 +232,11 @@ impl Decodable for WebDecoder {
             };
 
             let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
-            let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
+            // web-sys >= 0.3.107 made the constructor's `timestamp` an i32;
+            // set the real f64 microsecond value via the `_f64` setter so it
+            // is neither truncated nor overflows on long calls.
+            let init = EncodedVideoChunkInit::new(&data.into(), 0, chunk_type);
+            init.set_timestamp_f64(frame.frame.timestamp);
 
             match EncodedVideoChunk::new(&init) {
                 Ok(chunk) => {

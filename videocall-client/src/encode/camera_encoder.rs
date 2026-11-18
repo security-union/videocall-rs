@@ -566,7 +566,7 @@ impl CameraEncoder {
             let video_encoder_config =
                 VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
             video_encoder_config
-                .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
+                .set_bitrate_f64(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);
 
             if let Err(e) = video_encoder.configure(&video_encoder_config) {
@@ -642,7 +642,7 @@ impl CameraEncoder {
                         current_encoder_height,
                         current_encoder_width,
                     );
-                    new_config.set_bitrate(local_bitrate as f64);
+                    new_config.set_bitrate_f64(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     if let Err(e) = video_encoder.configure(&new_config) {
                         error!("Error reconfiguring camera encoder for tier change: {e:?}");
@@ -662,7 +662,7 @@ impl CameraEncoder {
                 if new_current_bitrate != local_bitrate && !tier_dims_changed {
                     log::info!("Updating video bitrate to {new_current_bitrate}");
                     local_bitrate = new_current_bitrate;
-                    video_encoder_config.set_bitrate(local_bitrate as f64);
+                    video_encoder_config.set_bitrate_f64(local_bitrate as f64);
                     if let Err(e) = video_encoder.configure(&video_encoder_config) {
                         error!("Error configuring video encoder: {e:?}");
                     }
@@ -707,7 +707,7 @@ impl CameraEncoder {
                                 current_encoder_height,
                                 current_encoder_width,
                             );
-                            new_config.set_bitrate(local_bitrate as f64);
+                            new_config.set_bitrate_f64(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             if let Err(e) = video_encoder.configure(&new_config) {
                                 error!(

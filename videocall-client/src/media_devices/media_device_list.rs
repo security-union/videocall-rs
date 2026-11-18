@@ -102,7 +102,10 @@ impl MediaDevicesProvider for MockMediaDevicesProvider {
         for device in devices {
             array.push(&device);
         }
-        Promise::resolve(&array)
+        // Resolve with the array as a plain `JsValue` so the result is the
+        // untyped `Promise` the trait returns (js-sys >= 0.3.107 would infer
+        // `Promise<Array>` from `&Array`).
+        Promise::resolve(&JsValue::from(array))
     }
 
     fn set_device_change_handler(&self, handler: &js_sys::Function) {

@@ -148,10 +148,13 @@ and its publish workflow stay untouched until then.)
 Notes:
 
 - The wasm in `dioxus-ui` is **arch-neutral** — built by the host toolchain targeting
-  `wasm32-unknown-unknown` (trunk, tailwindcss, wasm-bindgen-cli 0.2.108, binaryen); only the web
+  `wasm32-unknown-unknown` (trunk, tailwindcss, wasm-bindgen-cli 0.2.130, binaryen); only the web
   server comes from the Linux set. That server is **Caddy** (static Go binary), not nginx:
   cross-nginx drags in cross-perl, which does not build at the current nixpkgs pin. The Caddyfile
   replicates `nginx.conf` (SPA `try_files` fallback + no-cache headers).
+- wasm-bindgen-cli is built with crane (`wasmBindgenCli` in `nix/packages.nix`, source pinned as
+  `wasmBindgenCliSrc` in `nix/pkgs.nix`). The CLI must match the `wasm-bindgen` crate in
+  `Cargo.lock` exactly, and the nixpkgs pin stops at 0.2.108. Bump both on every wasm-bindgen move.
 - `media-server` exists for prod parity: helm's websocket and webtransport charts both point at one
   `securityunion/videocall-media-server` image with different commands, exactly like the old
   `Dockerfile.actix`.

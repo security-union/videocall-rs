@@ -61,7 +61,8 @@ let
 
   frontendBuildInputs = [
     pkgs.trunk
-    pkgs.wasm-bindgen-cli_0_2_108
+    # Must match the wasm-bindgen crate in Cargo.lock; see packages.nix.
+    packages.wasmBindgenCli
     pkgs.tailwindcss
   ] ++ coreInputs;
 
@@ -134,6 +135,9 @@ in
     nativeBuildInputs = [
       rust.frontendRustMinimal
       pkgs.wasm-pack
+      # wasm-pack uses a wasm-bindgen on PATH when its version matches
+      # Cargo.lock, instead of downloading one.
+      packages.wasmBindgenCli
       pkgs.nodejs_20
       pkgs.cmake
       pkgs.nasm

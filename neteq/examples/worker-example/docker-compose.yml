@@ -24,7 +24,7 @@ services:
         RUN apt-get update -y && apt-get install -y git curl
 
         RUN rustup target add wasm32-unknown-unknown
-        RUN cargo install wasm-bindgen-cli --version 0.2.104
+        RUN cargo install wasm-bindgen-cli --version 0.2.130
 
         WORKDIR /app
 

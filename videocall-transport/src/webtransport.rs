@@ -314,12 +314,23 @@ impl WebTransportService {
         let closed_closure = Rc::new(Closure::wrap(Box::new(move |e: JsValue| {
             notify.emit(WebTransportStatus::Closed(e));
         }) as Box<dyn FnMut(JsValue)>));
+        // js-sys >= 0.3.107 types promises (`ready()` is `Promise<Undefined>`,
+        // `closed()` is `Promise<WebTransportCloseInfo>`), so `then` would want
+        // a closure over that exact type. Our closures take `JsValue`, which is
+        // what the browser hands them anyway. `unchecked_into::<Promise>()` is a
+        // zero-cost cast of the same JS promise object, so the callback still
+        // receives exactly the value it received before. Once the promise is
+        // the untyped `Promise`, `then`/`catch` expect a concrete
+        // `&Closure<dyn FnMut(JsValue)>` again, so `&Rc<Closure>` deref-coerces
+        // as it always did and the Rc-shared closure is unchanged.
         let ready = transport
             .ready()
+            .unchecked_into::<Promise>()
             .then(&opened_closure)
             .catch(&closed_closure);
         let closed = transport
             .closed()
+            .unchecked_into::<Promise>()
             .then(&closed_closure)
             .catch(&closed_closure);
 

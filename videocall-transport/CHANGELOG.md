@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/security-union/videocall-rs/compare/videocall-transport-v0.2.1...videocall-transport-v0.2.2) - 2026-11-18
+
+### Fixed
+
+- *(deps)* build against js-sys/web-sys 0.3.107 and wasm-bindgen 0.2.130 ([#927](https://github.com/security-union/videocall-rs/pull/927))
+
 ## [0.2.1](https://github.com/security-union/videocall-rs/compare/videocall-transport-v0.2.0...videocall-transport-v0.2.1) - 2026-08-13
 
 ### Other

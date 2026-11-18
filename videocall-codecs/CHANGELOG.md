@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.15...videocall-codecs-v0.1.16) - 2026-11-18
+
+### Fixed
+
+- *(deps)* build against js-sys/web-sys 0.3.107 and wasm-bindgen 0.2.130 ([#927](https://github.com/security-union/videocall-rs/pull/927))
+
 ## [0.1.15](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.14...videocall-codecs-v0.1.15) - 2026-08-13
 
 ### Added

@@ -143,7 +143,7 @@ window.__APP_CONFIG = Object.freeze({
 - Rust stable with `wasm32-unknown-unknown` target
 - [Trunk](https://trunkrs.dev/) (`cargo install trunk`)
 - [tailwindcss](https://tailwindcss.com/blog/standalone-cli) standalone CLI
-- [wasm-bindgen-cli](https://rustwasm.github.io/wasm-bindgen/) at the exact `wasm-bindgen` version in `Cargo.lock` (`cargo install wasm-bindgen-cli --version 0.2.130`)
+- [wasm-bindgen-cli](https://rustwasm.github.io/wasm-bindgen/) (`cargo install wasm-bindgen-cli`)
 
 Or use the Nix devShell (includes all tools):
 
@@ -225,7 +225,7 @@ Tests live in `dioxus-ui/tests/` and share a common harness in `tests/support/mo
 
 **Prerequisites:**
 - ChromeDriver matching your Chrome version
-- `wasm-bindgen-cli` matching `Cargo.lock` (`nix-shell default.nix -A shells.frontend-tests` provides it, or `cargo install wasm-bindgen-cli --version 0.2.130`)
+- `wasm-bindgen-cli` installed (`cargo install wasm-bindgen-cli`)
 
 On macOS, install ChromeDriver and allow it through Gatekeeper:
 

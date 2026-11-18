@@ -175,6 +175,9 @@ let
         nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake pkgs.nasm pkgs.perl ];
         buildInputs = [ pkgs.alsa-lib pkgs.openssl ];
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        # bindgen for v4l2-sys-mit (nokhwa) parses linux/videodev2.h; clang in
+        # the sandbox sees no kernel or libc headers unless they are passed in.
+        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.linuxHeaders}/include -isystem ${pkgs.glibc.dev}/include";
         meta.mainProgram = "videocall-cli";
       }
     else

@@ -1,0 +1,54 @@
+name: Release-plz check
+
+# Dry run of what the Release-plz PR job does on main: work out the next
+# versions, which runs cargo-semver-checks on every crate with unreleased
+# changes. Catches the failures before merge instead of after.
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - ".release-plz.toml"
+      - ".github/workflows/release-plz.yml"
+      - ".github/workflows/release-plz-check.yml"
+
+concurrency:
+  group: release-plz-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  release-plz-check:
+    name: Release-plz dry run
+    # Keep in sync with release-plz.yml.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libclang-dev libasound2-dev libv4l-dev libvpx-dev cmake
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      # Same versions release-plz/action@v0.5 installed on main.
+      - name: Install release-plz and cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz@0.4.3,cargo-semver-checks@0.51
+      - name: Compute next versions (runs the semver checks)
+        run: release-plz update --config .release-plz.toml
+        env:
+          LOGIN_URL: ""
+          ACTIX_UI_BACKEND_URL: "wss://api.rustlemania.com"
+          WEBTRANSPORT_HOST: "https://transport.rustlemania.com"
+      - name: Show the release that would be proposed
+        if: always()
+        run: git --no-pager diff --stat

@@ -301,8 +301,7 @@ async fn main() -> std::io::Result<()> {
         std::env::var("OAUTH_AUTH_URL").unwrap_or_else(|_| String::from(""));
     let oauth_token_url: String =
         std::env::var("OAUTH_TOKEN_URL").unwrap_or_else(|_| String::from(""));
-    let oauth_secret: String =
-        std::env::var("OAUTH_CLIENT_SECRET").unwrap_or_else(|_| String::from(""));
+    let oauth_secret: String = std::env::var("OAUTH_SECRET").unwrap_or_else(|_| String::from(""));
     let oauth_redirect_url: String =
         std::env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
     let after_login_url: String =

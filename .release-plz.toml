@@ -17,6 +17,9 @@ git_release_enable = true
 [[package]]
 name = "videocall-cli"
 publish = true
+# The semver check builds every feature, and the opt-in `libvpx` one does not build
+# on the ubuntu-latest runner. VP9 is pure Rust by default.
+semver_check = false
 changelog_update = true
 git_release_enable = true
 
@@ -64,6 +67,11 @@ name = "videocall-sdk"
 publish = false
 changelog_update = true
 git_release_enable = false
+
+[[package]]
+name = "videocall-codecs"
+# Same reason as videocall-cli: the opt-in `libvpx` feature does not build on the runner.
+semver_check = false
 
 [[package]]
 name = "neteq"

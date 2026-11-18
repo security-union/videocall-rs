@@ -1,29 +1,16 @@
 # NetEQ parity gate: builds Google WebRTC's C++ NetEq (pinned via fetchgit in
 # nix/shells.nix) next to our Rust neteq and fails if they disagree on any
-# frame. Runs when neteq/ or one of the pins it builds with changes.
+# frame. Runs only when something under neteq/ changes.
 name: neteq parity
 
 on:
   pull_request:
     paths:
       - 'neteq/**'
-      # The pins the gate builds with: WebRTC rev, toolchain, nixpkgs.
-      - 'nix/shells.nix'
-      - 'nix/rust.nix'
-      - 'nix/pkgs.nix'
-      - 'nix/tamal/**'
-      - 'default.nix'
-      - '.github/workflows/neteq-parity.yaml'
   push:
     branches: [main]
     paths:
       - 'neteq/**'
-      - 'nix/shells.nix'
-      - 'nix/rust.nix'
-      - 'nix/pkgs.nix'
-      - 'nix/tamal/**'
-      - 'default.nix'
-      - '.github/workflows/neteq-parity.yaml'
 
 concurrency:
   group: neteq-parity-${{ github.ref }}

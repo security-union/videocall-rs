@@ -20,7 +20,7 @@ audioCtx.suspend();
 const streaming = new Streaming();
 
 async function start() {
-  const netEq = new NetEq({ wasmUrl: '/wasm/neteq_wasm_bg.wasm', wasmJsUrl: '/wasm/neteq_wasm.js', additionalDelayMs: 0 });
+  const netEq = new NetEq({ wasmUrl: '/wasm/neteq_wasm_bg.wasm', wasmJsUrl: '/wasm/neteq_wasm.js' });
   await netEq.init(audioCtx);
 
   let lastStatUpdate = Date.now();

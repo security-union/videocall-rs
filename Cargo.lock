@@ -4769,31 +4769,28 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "axum 0.7.9",
  "clap",
  "console_error_panic_hook",
  "cpal",
  "env_logger",
- "gloo-utils 0.2.0",
  "hound",
  "js-sys",
  "log",
  "matomo-logger",
- "once_cell",
  "rand 0.9.5",
- "ringbuf",
  "ropus",
  "serde",
  "serde-wasm-bindgen 0.6.5",
  "serde_bytes",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "wasm-bindgen",
- "wasm-bindgen-futures",
  "web-sys",
  "web-time",
 ]
@@ -6021,15 +6018,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "ringbuf"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79abed428d1fd2a128201cec72c5f6938e2da607c6f3745f769fabea399d950a"
-dependencies = [
- "crossbeam-utils",
 ]
 
 [[package]]

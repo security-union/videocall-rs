@@ -6,6 +6,25 @@ Part of the **[videocall.rs](https://github.com/security-union/videocall-rs)** r
 
 Rust NetEQ is a pure-Rust, libWebRTC-inspired jitter buffer designed for professional, low-latency audio applications. It smooths out bursty networks, conceals packet loss, and keeps playback on time so that downstream DSP or audio renderers can focus on sound, not sockets.
 
+## A line-by-line port of WebRTC NetEq
+
+Since 1.0 this crate is a line-by-line Rust port of Google WebRTC's NetEq: the jitter buffer, the decision logic, and the fixed-point packet loss concealment and time stretching that Chrome uses to play remote audio.
+
+The port tracks WebRTC at rev `6341cca49ffcad6fcb4603bd6cd1325fd0fe28bd`. The harness in [`parity/`](parity) builds the real C++ NetEq and diffs it against this crate tick by tick: every output sample, every operation, every statistic. All 100 scenario × codec runs (PCM16B at 8–48 kHz and Opus, mono and stereo) are identical.
+
+## Keeping in sync with WebRTC
+
+The WebRTC source is a Nix input, so everyone builds the same baseline:
+
+* **The pin** is a hashed `fetchgit` of that rev in `nix/shells.nix` (`shells.neteq-parity`). The shell exports it as `WEBRTC_SRC`.
+* **The gate** runs in CI on every change under `neteq/**` (`.github/workflows/neteq-parity.yaml`):
+  ```bash
+  nix-shell neteq/parity/shell.nix --run 'cd neteq/parity && cargo test --features rust-neteq'
+  ```
+* **The goldens** are per-component hashes from the real C++, committed in the Rust tests, so `cargo test -p neteq` needs no C++. Regenerate them with `neteq/src/spl/golden/build.sh` in the same shell.
+
+To move to a newer WebRTC rev: bump the rev and hash in `nix/shells.nix` and `PINNED_REV` in `parity/build.rs`, run the gate, port whatever diverges, and regenerate the goldens.
+
 ## Why Rust NetEQ?
 
 * **Latency you control** – adaptive target delay with hard minimum/maximum bounds.
@@ -20,7 +39,7 @@ Rust NetEQ is a pure-Rust, libWebRTC-inspired jitter buffer designed for profess
 
 ```toml
 [dependencies]
-neteq = "0.1"
+neteq = "1.0"
 ```
 
 Insert RTP payloads as they arrive, call `get_audio()` every 10 ms, and let the buffer handle the rest.  Full runnable snippets live in the [examples](examples) directory — open `basic_usage.rs` first.
@@ -29,12 +48,12 @@ Insert RTP payloads as they arrive, call `get_audio()` every 10 ms, and let the 
 
 ```toml
 [dependencies]
-neteq = { version = "0.1", features = ["web"], default-features = false }
+neteq = { version = "1.0", features = ["web"], default-features = false }
 ```
 
 For browser environments, NetEq ships with:
 - **🕸️ WebWorker binary** (`neteq_worker`) for off-main-thread audio processing
-- **🎵 Embedded Opus decoder** - no external dependencies to serve
+- **🎵 Built-in Opus decoder** - pure-Rust ropus compiled into the worker, nothing external to serve
 - **🌐 Cross-browser support** - unified decoder works on Chrome, Firefox, Safari
 - **⚡ WASM integration** - `WebNetEq` wrapper with JavaScript bindings
 
@@ -50,14 +69,15 @@ worker.postMessage({
   payload: opusPacketBytes
 });
 
-// Receive decoded PCM frames
-worker.onmessage = (event) => {
-  if (event.data instanceof Float32Array) {
-    // 10ms of decoded audio ready for playback
-    audioWorklet.port.postMessage(event.data);
-  }
-};
+// Connect the worker straight to your AudioWorklet. The worklet asks for
+// 10 ms frames as the sound card consumes them, so PCM never touches the
+// main thread.
+const channel = new MessageChannel();
+worker.postMessage({ cmd: 'attachWorklet' }, [channel.port1]);
+audioWorklet.port.postMessage({ command: 'attach' }, [channel.port2]);
 ```
+
+`rtpTimestamp` counts 48 kHz samples, not milliseconds. The worklet side of the protocol is documented at the top of [`src/bin/neteq_worker.rs`](src/bin/neteq_worker.rs).
 
 ## Feature Highlights
 
@@ -101,17 +121,17 @@ NetEq includes a complete web deployment solution with **zero external dependenc
 ### WebWorker Architecture
 - **`neteq_worker`** binary runs NetEq off the main thread
 - Receives Opus packets via `postMessage()`
-- Returns decoded PCM frames as `Float32Array`
+- Hands decoded 10 ms frames to the AudioWorklet over a `MessagePort`, when the worklet asks for them
 - Built-in mute/unmute and diagnostics controls
 
 ### Self-Contained Opus Decoding
-- **Embedded `opus-decoder.min.js`** - compiled at build time, no CDN required
+- **ropus** - a pure-Rust Opus decoder, compiled into the worker, no CDN required
 - **Cross-browser compatibility** - works on Chrome, Firefox, Safari
-- **Automatic fallback** - graceful degradation on unsupported browsers
-- **Zero configuration** - decoder loads automatically in worker context
+- **Synchronous** - NetEq decodes inside `GetAudio`, which the async WebCodecs `AudioDecoder` can't do
+- **Zero configuration** - nothing to load at runtime
 
 ### Build Integration
-When you build with `--features web`, the Opus decoder JavaScript is embedded directly into the WASM binary using `include_str!()`. This means:
+When you build with `--features web`, the Opus decoder is compiled straight into the WASM binary. This means:
 
 - ✅ No external files to serve alongside your application
 - ✅ No version mismatches between NetEq and Opus decoder
@@ -170,18 +190,18 @@ Contributions are welcome — please skim the [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
 
-MIT OR Apache-2.0
+(MIT OR Apache-2.0) AND BSD-3-Clause
 
 ## License and Attribution
 
-This project is licensed under MIT OR Apache-2.0.
+Our own code is licensed under MIT OR Apache-2.0.
 
 ### WebRTC Attribution
 
-This NetEQ implementation is algorithmically inspired by and compatible with the WebRTC NetEQ jitter buffer. The original WebRTC project is:
+Since 1.0 most of this crate is a translation of the WebRTC NetEq source, so those parts stay under WebRTC's license. The original WebRTC project is:
 - Copyright (c) 2011, The WebRTC project authors
 - Licensed under the 3-clause BSD license  
 - Available at: https://webrtc.googlesource.com/src/
 
-This Rust implementation is an independent rewrite and is not a derivative work of the WebRTC source code.
+The full notice and the `PATENTS` grant are in [`LICENSE-WEBRTC`](LICENSE-WEBRTC).
 

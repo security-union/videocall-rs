@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-pub use neteq::NetEqStats as RawNetEqStats;
+pub use neteq::telemetry::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
 
 // UI-friendly structure for charts (keeping the old one)
@@ -34,17 +34,31 @@ pub struct NetEqStats {
 
 impl From<RawNetEqStats> for NetEqStats {
     fn from(raw: RawNetEqStats) -> Self {
+        let ops = raw.network.operation_counters;
+        // Every GetAudio runs exactly one operation, so the per-second
+        // operation counts add up to GetAudio calls per second (about 100
+        // when the AudioWorklet paces the worker).
+        let get_audio_per_sec = ops.normal_per_sec
+            + ops.expand_per_sec
+            + ops.accelerate_per_sec
+            + ops.fast_accelerate_per_sec
+            + ops.preemptive_expand_per_sec
+            + ops.merge_per_sec
+            + ops.comfort_noise_per_sec
+            + ops.dtmf_per_sec
+            + ops.undefined_per_sec;
         Self {
             timestamp: 0,
             buffer_ms: raw.current_buffer_size_ms,
             target_ms: raw.target_delay_ms,
             packets_awaiting_decode: raw.packets_awaiting_decode as u32,
             packets_per_sec: raw.packets_per_sec,
-            expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate),
-            accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate),
-            calls_per_sec: 0,
+            expand_rate: neteq::telemetry::q14::to_per_mille(raw.network.expand_rate),
+            accel_rate: neteq::telemetry::q14::to_per_mille(raw.network.accelerate_rate),
+            calls_per_sec: get_audio_per_sec.round() as u64,
             avg_frames: 0,
-            underruns: 0,
+            // WebRTC lifetime stat: expand events that concealed lost audio.
+            underruns: raw.lifetime.concealment_events,
             reorder_rate: raw.network.reorder_rate_permyriad as u32,
             reordered_packets: raw.network.reordered_packets,
             max_reorder_distance: raw.network.max_reorder_distance as u32,
@@ -444,7 +458,7 @@ impl ChartConfig {
                         .map(|s| s.underruns as f64 * 0.3)
                         .collect(),
                     color: "#dc3545",
-                    label: "Underruns",
+                    label: "Concealment events",
                     scale_factor: 0.3,
                 },
             ],
@@ -515,7 +529,7 @@ impl ChartConfig {
                         .map(|s| s.calls_per_sec as f64)
                         .collect(),
                     color: "#28a745",
-                    label: "Calls/sec",
+                    label: "GetAudio/sec",
                     scale_factor: 1.0,
                 },
                 ChartSeries {

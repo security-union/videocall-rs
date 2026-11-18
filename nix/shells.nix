@@ -169,6 +169,76 @@ in
     nativeBuildInputs = [ pkgs.protobuf packages.protobufCodegen ];
   };
 
+  # NetEQ parity harness (neteq/parity): compiles Google WebRTC's C++ NetEQ
+  # and diffs our Rust port against it. C++20 from the pinned stdenv (clang on
+  # darwin, gcc on linux), abseil + libopus from the same pin so they share
+  # one C++ runtime. libopus is the fixed-point build (what Chromium ships on
+  # ARM): the Rust side decodes with ropus, a port of fixed-point libopus, so
+  # only this build can match it sample for sample. Intrinsics are off for
+  # the same reason the WebRTC SPL is built without NEON (generic C kernels
+  # only), and because 1.5.2's meson build fails to link fixed-point NEON on
+  # aarch64.
+  #   nix-shell default.nix -A shells.neteq-parity --run 'cd neteq/parity && cargo test'
+  neteq-parity = let
+    # Google WebRTC at the rev the harness is validated against, sparse
+    # (same dirs as neteq/parity/scripts/fetch_webrtc.sh, ~17 MB). A
+    # fixed-output fetch has no .git, so the rev travels as WEBRTC_REV and
+    # build.rs checks that instead of `git rev-parse`. The rev is in the
+    # store name on purpose: Nix finds a fixed-output path by name and hash
+    # alone, so bumping only `webrtcRev` would silently reuse the old
+    # sources. With the rev in the name, a bump refetches and a stale hash
+    # fails loudly.
+    webrtcRev = "6341cca49ffcad6fcb4603bd6cd1325fd0fe28bd";
+    webrtcSrc = pkgs.fetchgit {
+      name = "webrtc-neteq-src-${builtins.substring 0 12 webrtcRev}";
+      url = "https://webrtc.googlesource.com/src";
+      rev = webrtcRev;
+      sparseCheckout = [
+        "api"
+        "common_audio"
+        "modules/audio_coding/codecs"
+        "modules/audio_coding/neteq"
+        "modules/include"
+        "modules/rtp_rtcp/include"
+        "modules/rtp_rtcp/source"
+        "rtc_base"
+        "system_wrappers"
+      ];
+      hash = "sha256-sOjgyUpj8on6BQMfE1uaqMhiKwpRmbNwrkRL++t+RQw=";
+    };
+    libopusFixedC = (pkgs.libopus.override { fixedPoint = true; }).overrideAttrs (old: rec {
+      version = "1.6.1";
+      src = pkgs.fetchurl {
+        url = "https://downloads.xiph.org/releases/opus/opus-${version}.tar.gz";
+        sha256 = "188i4ibr80az4217q04z22cyrfv4xmk29cqmvy22bsbv429vbz3g";
+      };
+      # The pin's patch targets 1.5.2's test meson file; tests are off anyway.
+      patches = [ ];
+      mesonFlags = map
+        (flag:
+          if flag == "-Dintrinsics=enabled" then "-Dintrinsics=disabled"
+          else if flag == "-Drtcd=enabled" then "-Drtcd=disabled"
+          else flag)
+        old.mesonFlags;
+      doCheck = false;
+    });
+  in pkgs.mkShell {
+    nativeBuildInputs = [
+      rust.backendRustDev
+      pkgs.pkg-config
+      pkgs.git
+    ];
+    buildInputs = [
+      pkgs.abseil-cpp
+      libopusFixedC
+    ];
+    # The cc crate passes --target arm64-apple-macosx; the nix clang wrapper
+    # warns on every file about the spelling. It is the same target.
+    NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING = "1";
+    WEBRTC_SRC = webrtcSrc;
+    WEBRTC_REV = webrtcRev;
+  };
+
   # `make vlog`: serve the engineering vlog with the same zola the image uses
   vlog = pkgs.mkShell {
     nativeBuildInputs = [ pkgs.zola ];

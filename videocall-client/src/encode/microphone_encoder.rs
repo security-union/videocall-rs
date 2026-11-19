@@ -297,6 +297,7 @@ impl MicrophoneEncoder {
         // Clone atomic values for use in different closures
         let enabled_for_handler = enabled.clone();
         let enable_fec_for_handler = self.tier_enable_fec.clone();
+        let on_error_for_handler = on_error.clone();
 
         let audio_output_handler = {
             log::info!("Starting Microphone audio encoder with AnalyserNode VAD");
@@ -320,6 +321,13 @@ impl MicrophoneEncoder {
                 // Check if this is an actual audio frame message (not control messages)
                 if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
                     if let Some(msg_str) = message_type.as_string() {
+                        if msg_str == "error" {
+                            // The worklet could not start its encoder.
+                            if let Some(cb) = &on_error_for_handler {
+                                cb.emit("Microphone encoder failed to initialize".to_string());
+                            }
+                            return;
+                        }
                         if msg_str != "page" {
                             // This is a control message (ready, done, flushed), not an audio frame
                             log::debug!("Received control message: {msg_str}");
@@ -526,6 +534,17 @@ impl MicrophoneEncoder {
                 Closure::wrap(audio_output_handler as Box<dyn FnMut(MessageEvent)>);
             codec.set_onmessage(output_handler.as_ref().unchecked_ref());
             output_handler.forget();
+
+            // A throw inside the worklet (e.g. the wasm traps) kills the
+            // processor and fires processorerror on the main thread.
+            let on_error_for_worklet = on_error.clone();
+            let processor_error = Closure::<dyn FnMut()>::new(move || {
+                if let Some(cb) = &on_error_for_worklet {
+                    cb.emit("Microphone encoder stopped with an error".to_string());
+                }
+            });
+            worklet.set_onprocessorerror(Some(processor_error.as_ref().unchecked_ref()));
+            processor_error.forget();
 
             // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
             // and pass FEC/DTX settings from the initial audio tier.

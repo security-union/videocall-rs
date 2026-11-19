@@ -23,12 +23,12 @@
 //! resamples to 48 kHz when needed, cuts 20 ms frames and encodes each one
 //! with ropus. Nothing here touches the browser, so it is tested natively.
 
-mod constants;
-
-pub use constants::MIC_OPUS_COMPLEXITY;
 use ropus::{Application, Bitrate, Channels, Encoder};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction};
+
+/// Opus complexity for the mic: 5 of 10 keeps the audio thread light on slow laptops.
+pub const MIC_OPUS_COMPLEXITY: u8 = 5;
 
 /// Opus encode rate. The wire format and NetEq both assume 48 kHz.
 pub const OPUS_SAMPLE_RATE_HZ: u32 = 48_000;

@@ -143,7 +143,7 @@ let
   # contain each invocation's exact dependency variants (e.g. three different
   # web-sys feature sets) or cargo recompiles them inside the dist build.
   #
-  # One derivation, three builds into one target dir. NOT a chain of
+  # One derivation, four builds into one target dir. NOT a chain of
   # buildDepsOnly calls: buildDepsOnly hard-codes `cargoArtifacts = null`
   # (crane lib/buildDepsOnly.nix), so chained stages silently discard their
   # predecessor and only the last invocation's graph survives.
@@ -375,6 +375,15 @@ in
       pushd dioxus-ui
       tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify
       trunk build --release --offline --skip-version-check --locked
+      # mic_encoder_worklet.js stubs exactly one wasm-bindgen import. If a
+      # dependency bump adds another, fail here instead of in the browser.
+      mic_imports=$(wasm-dis dist/mic_encoder_bg.wasm | grep '(import ')
+      if [ "$(printf '%s\n' "$mic_imports" | grep -c .)" != 1 ] \
+        || ! printf '%s' "$mic_imports" | grep -q '"__wbindgen_init_externref_table"'; then
+        echo "mic_encoder_bg.wasm imports changed; update mic_encoder_worklet.js:" >&2
+        echo "$mic_imports" >&2
+        exit 1
+      fi
       version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
       printf '{"service":"dioxus-ui","version":"%s","git_sha":"%s","git_branch":"%s","build_timestamp":"%s"}\n' \
         "$version" "$(echo "$GIT_SHA" | cut -c1-8)" "$GIT_BRANCH" "$BUILD_TIMESTAMP" \

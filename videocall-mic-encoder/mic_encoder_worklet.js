@@ -5,11 +5,17 @@ class EncoderWorklet extends AudioWorkletProcessor {
   constructor(options) {
     super();
     // processorOptions is the WebAssembly.Module compiled on the main thread.
-    // wasm-bindgen leaves one import (its externref table setup, run from
-    // __wbindgen_start). I never call that, so no-op stubs are enough.
+    // wasm-bindgen leaves one import, its externref table setup, which only
+    // __wbindgen_start calls. I never call that, so a no-op is enough. Any
+    // other import means a dependency changed the module: fail loudly.
     const module = options.processorOptions;
     const imports = {};
     for (const { module: from, name } of WebAssembly.Module.imports(module)) {
+      if (name !== "__wbindgen_init_externref_table") {
+        throw new Error(
+          `mic encoder wasm has an unexpected import: ${from}.${name}`,
+        );
+      }
       (imports[from] ??= {})[name] = () => {};
     }
     this.wasm = new WebAssembly.Instance(module, imports).exports;
@@ -53,16 +59,15 @@ class EncoderWorklet extends AudioWorkletProcessor {
     const samples = inputs[0]?.[0];
     if (!this.encoding || !samples?.length) return this.alive;
     const wasm = this.wasm;
-    // Read wasm.memory.buffer after each call: memory may grow and detach it.
+    // Any wasm call may grow memory and detach the old buffer, so I make the
+    // calls first and only then take wasm.memory.buffer for the view.
     const ptr = wasm.mic_encoder_input(samples.length);
     new Float32Array(wasm.memory.buffer, ptr, samples.length).set(samples);
     const count = wasm.mic_encoder_encode(samples.length);
     for (let i = 0; i < count; i++) {
-      const page = new Uint8Array(
-        wasm.memory.buffer,
-        wasm.mic_encoder_packet_ptr(i),
-        wasm.mic_encoder_packet_len(i),
-      ).slice();
+      const start = wasm.mic_encoder_packet_ptr(i);
+      const len = wasm.mic_encoder_packet_len(i);
+      const page = new Uint8Array(wasm.memory.buffer, start, len).slice();
       this.port.postMessage({ message: "page", page }, [page.buffer]);
     }
     return this.alive;

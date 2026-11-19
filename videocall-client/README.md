@@ -37,11 +37,10 @@ screen.start();
 screen.stop();
 ```
 
-### Host page requirement: the microphone encoder worker
+### Mic encoder worker
 
-The microphone is encoded to Opus (pure Rust, ropus) in a Web Worker built
-from this crate's `audio_encoder_worker` bin. The host page has to build it
-and point to it with a `<link id="audio-encoder-worker">`. With trunk:
+The mic gets encoded with ropus in a Web Worker, built from this crate's
+`audio_encoder_worker` bin. Your page has to build it and link it. With trunk:
 
 ```html
 <link data-trunk rel="rust" href="path/to/videocall-client/Cargo.toml"
@@ -49,10 +48,8 @@ and point to it with a `<link id="audio-encoder-worker">`. With trunk:
 <link id="audio-encoder-worker" href="/audio_encoder_worker_loader.js" />
 ```
 
-Without it, starting the microphone reports an error through the encoder's
-`on_error` callback. [dioxus-ui's index.html](https://github.com/videocall-rs/videocall-rs/blob/main/dioxus-ui/index.html) is a
-working example; it also builds the worker with a size-tuned cargo profile
-(`audio-worker-release` in the workspace `Cargo.toml`).
+Without it the mic won't start and you get the error in `on_error`.
+[dioxus-ui's index.html](https://github.com/videocall-rs/videocall-rs/blob/main/dioxus-ui/index.html) does exactly this.
 
 ### Device access permission:
 

@@ -287,7 +287,7 @@ deliverable:
    builds once (tens of minutes), then lives in the store. Escape hatch if ever needed:
    zig-as-cross-linker (the `cargo-zigbuild` pattern).
 3. **dioxus-ui vendoring.** Trunk must run offline over `importCargoLock`-vendored deps and build
-   three extra wasm workers (`worker_decoder`, `neteq_worker`, `audio_encoder_worker`). Contained: it replicates exactly what
-   `Dockerfile.dioxus` did, and wasm has no cross dimension.
+   three extra wasm workers (`worker_decoder`, `neteq_worker`, `audio_encoder_worker`). Contained:
+   it replicates exactly what `Dockerfile.dioxus` did, and wasm has no cross dimension.
 4. **cargo-leptos 0.2.x + nightly + musl.** If the website build fights the cross target, the
    website image slips to Stage 3 without blocking anything else.

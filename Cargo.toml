@@ -35,3 +35,13 @@ anyhow = "1.0.75"
 wasm-bindgen-futures = { version = "0.4.80" }
 wasm-bindgen = "0.2.130"
 web-transport-quinn = "0.8.1"
+
+# Release profile for the microphone encoder worker only (dioxus-ui/index.html
+# selects it with data-cargo-profile-release). Size beats speed here: the
+# worker is downloaded on every page load and encodes 50 frames a second, a
+# light load. Other crates and workers keep the default release profile.
+[profile.audio-worker-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1

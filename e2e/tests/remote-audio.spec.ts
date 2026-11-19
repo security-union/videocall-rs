@@ -39,6 +39,27 @@ interface Call {
   listener: Page;
   speaker: Page;
   meetingId: string;
+  /** Uncaught page errors and encoder-related console errors, both pages. */
+  errors: string[];
+}
+
+// The speaker encodes with ropus in a Rust wasm worker, with Opus DTX on:
+// during silence it sends almost no audio packets. The fake mic beeps with
+// gaps, so nothing here may assume a steady packet rate. Receive-side checks
+// wait for packets after the beep starts instead of asserting a rate.
+const ENCODER_ERROR = /audio encoder|encoder worker|audio_encoder_worker|media source/i;
+
+function collectErrors(page: Page, label: string, errors: string[]): void {
+  page.on("pageerror", (err) => errors.push(`${label} pageerror: ${err.message}`));
+  page.on("console", (msg) => {
+    if (msg.type() === "error" && ENCODER_ERROR.test(msg.text())) {
+      errors.push(`${label} console: ${msg.text()}`);
+    }
+  });
+}
+
+function expectNoErrors(call: Call): void {
+  expect(call.errors, "page errors or audio encoder failures").toEqual([]);
 }
 
 async function startCall(tag: string, uiURL: string, fullRateStats = true): Promise<Call> {
@@ -64,6 +85,9 @@ async function startCall(tag: string, uiURL: string, fullRateStats = true): Prom
 
   const listener = await listenerCtx.newPage();
   const speaker = await speakerCtx.newPage();
+  const errors: string[] = [];
+  collectErrors(listener, "listener", errors);
+  collectErrors(speaker, "speaker", errors);
 
   // The listener hosts, so the speaker can leave and come back.
   await startTwoPartyMeeting(listener, LISTENER, speaker, SPEAKER, meetingId);
@@ -71,7 +95,7 @@ async function startCall(tag: string, uiURL: string, fullRateStats = true): Prom
     listener.locator("#grid-container .floating-name", { hasText: SPEAKER }).first(),
   ).toBeVisible({ timeout: 30_000 });
 
-  return { listenerBrowser, speakerBrowser, listener, speaker, meetingId };
+  return { listenerBrowser, speakerBrowser, listener, speaker, meetingId, errors };
 }
 
 async function endCall(call: Call | undefined): Promise<void> {
@@ -167,6 +191,7 @@ test.describe("Remote audio playback (NetEq worker + AudioWorklet, WebSocket)", 
       await expect
         .poll(async () => Number(await packetsPerSec.textContent()), { timeout: 15_000 })
         .toBeGreaterThan(0);
+      expectNoErrors(call);
     } finally {
       await endCall(call);
     }
@@ -269,6 +294,64 @@ test.describe("Remote audio playback (NetEq worker + AudioWorklet, WebSocket)", 
       await expect(peerAudioIndicator(listener, SPEAKER)).toHaveClass(/speaking/, {
         timeout: 20_000,
       });
+      expectNoErrors(call);
+    } finally {
+      await endCall(call);
+    }
+  });
+
+  test("mic toggle off and on again keeps audio flowing (encoder restarts cleanly)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    let call: Call | undefined;
+    try {
+      call = await startCall("toggle", baseURL || "http://localhost:3001");
+      const { listener, speaker } = call;
+
+      for (let cycle = 1; cycle <= 2; cycle++) {
+        const unmutedAt = Date.now();
+        await unmute(speaker);
+        await expectAudibleSince(listener, unmutedAt);
+        await collectFlowingStats(listener, unmutedAt, 2);
+        await mute(speaker);
+      }
+      expectNoErrors(call);
+    } finally {
+      await endCall(call);
+    }
+  });
+
+  test("switching microphone while live keeps audio flowing", async ({ baseURL }) => {
+    test.setTimeout(180_000);
+    let call: Call | undefined;
+    try {
+      call = await startCall("switchmic", baseURL || "http://localhost:3001");
+      const { listener, speaker } = call;
+
+      await unmute(speaker);
+      await expectAudibleSince(listener, Date.now() - 1_000);
+
+      await speaker.locator('[data-testid="open-settings"]').click();
+      const micSelect = speaker.locator("#modal-audio-select");
+      await expect(micSelect).toBeVisible({ timeout: 10_000 });
+      const options = await micSelect.locator("option").evaluateAll((nodes) =>
+        nodes.map((n) => ({
+          value: (n as HTMLOptionElement).value,
+          selected: (n as HTMLOptionElement).selected,
+        })),
+      );
+      // Chromium's fake device exposes several fake inputs.
+      test.skip(options.length < 2, "fewer than two microphones available");
+      const target = options.find((o) => !o.selected) ?? options[0];
+
+      const switchedAt = Date.now();
+      await micSelect.selectOption(target.value);
+      await expect(micSelect).toHaveValue(target.value);
+
+      await expectAudibleSince(listener, switchedAt, 30_000);
+      await collectFlowingStats(listener, switchedAt, 2);
+      expectNoErrors(call);
     } finally {
       await endCall(call);
     }

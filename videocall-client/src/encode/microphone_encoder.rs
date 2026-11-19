@@ -23,12 +23,12 @@ use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
     VAD_SMOOTHING_TIME_CONSTANT,
 };
-use crate::audio_worklet_codec::EncoderInitOptions;
-use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
-use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_SAMPLE_RATE;
+use crate::audio_worklet_codec::{
+    AudioWorkletCodec, CodecStartError, EncodedPacket, EncoderInitOptions, EncoderWorker,
+};
 use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
+use crate::encode::mic_opus::{BitrateFollower, PacketClock};
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
 use gloo::timers::callback::Interval;
@@ -46,7 +46,6 @@ use videocall_types::protos::{
     packet_wrapper::packet_wrapper::PacketType,
 };
 use videocall_types::Callback;
-use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -56,7 +55,6 @@ use web_sys::EncodedAudioChunkType;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
-use web_sys::MessageEvent;
 use web_time::SystemTime;
 
 /// Holds the previous audio frame for RED-style redundancy.
@@ -83,18 +81,19 @@ fn pack_redundant_audio(primary: &[u8], redundant: &PreviousAudioFrame) -> Vec<u
     buf
 }
 
+/// Build the wire packet for one Opus packet.
+///
+/// `timestamp_ms` goes into `MediaPacket.timestamp`. For audio it is the
+/// frame-exact stamp from [`PacketClock`] (session start + frame index *
+/// 20 ms), which receivers turn into the RTP timestamp.
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
     user_id: &str,
     sequence: u64,
+    timestamp_ms: f64,
     aes: Rc<Aes128State>,
     previous_frame: Option<&PreviousAudioFrame>,
 ) -> PacketWrapper {
-    let now_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as f64;
-
     let primary_data = chunk.to_vec();
 
     // Determine whether to include redundancy.
@@ -111,7 +110,7 @@ pub fn transform_audio_chunk(
         media_type: MediaType::AUDIO.into(),
         frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
         data,
-        timestamp: now_ms,
+        timestamp: timestamp_ms,
         audio_metadata: Some(AudioMetadata {
             sequence,
             audio_format,
@@ -130,21 +129,43 @@ pub fn transform_audio_chunk(
     }
 }
 
+/// Destroys a codec handle when dropped.
+struct DestroyOnDrop(AudioWorkletCodec);
+
+impl Drop for DestroyOnDrop {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+
+fn now_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
 pub struct MicrophoneEncoder {
     client: VideoCallClient,
     state: EncoderState,
     _on_encoder_settings_update: Option<Callback<String>>,
+    /// The current capture session. Replaced by every `start()`.
     codec: AudioWorkletCodec,
+    /// The Opus encoder worker, kept across sessions.
+    encoder_worker: EncoderWorker,
+    /// Stamps `MediaPacket.timestamp`; kept across sessions so a new
+    /// session never stamps behind the previous one.
+    packet_clock: Rc<RefCell<PacketClock>>,
     on_error: Option<Callback<String>>,
     is_speaking: Rc<AtomicBool>,
+    /// The current session's VAD timer. Replaced by every `start()`, so an
+    /// old session's cleanup only clears its own.
     vad_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
     /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
-    /// Shared with the camera encoder's quality manager.
-    /// Currently not read at runtime because the AudioWorklet does not
-    /// support dynamic bitrate reconfiguration. Kept for forward-
-    /// compatibility when the worklet gains that capability.
-    #[allow(dead_code)]
+    /// Shared with the camera encoder's quality manager. Read when a session
+    /// starts and polled while it runs; changes go to the worker as a
+    /// `reconfigure`.
     tier_audio_bitrate: Rc<AtomicU32>,
     /// Whether the current audio tier has FEC enabled.
     /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
@@ -172,11 +193,18 @@ impl MicrophoneEncoder {
     ) -> Self {
         let default_audio_bitrate_bps = AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000;
         let default_enable_fec = AUDIO_QUALITY_TIERS[0].enable_fec;
+        // Start downloading the encoder worker now, so the first unmute
+        // doesn't wait for it. (Browser only: web-sys calls panic natively.)
+        let encoder_worker = EncoderWorker::default();
+        #[cfg(target_arch = "wasm32")]
+        encoder_worker.prefetch();
         Self {
             client,
             state: EncoderState::new(),
             _on_encoder_settings_update: Some(on_encoder_settings_update),
             codec: AudioWorkletCodec::default(),
+            encoder_worker,
+            packet_clock: Rc::new(RefCell::new(PacketClock::default())),
             on_error: Some(on_error),
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
@@ -192,25 +220,31 @@ impl MicrophoneEncoder {
         self.on_error = Some(on_error);
     }
 
+    /// Stop the session's VAD timer and clear the speaking indicator. Only
+    /// for when the session ends; a mute keeps the timer (see set_enabled).
+    fn reset_vad(&self) {
+        if let Some(interval) = self.vad_interval.borrow_mut().take() {
+            drop(interval);
+        }
+        self.clear_speaking();
+    }
+
+    fn clear_speaking(&self) {
+        self.is_speaking.store(false, Ordering::Relaxed);
+        self.client.set_speaking(false);
+        self.client.set_audio_level(0.0);
+    }
+
     // delegates to self.state
     pub fn set_enabled(&mut self, value: bool) -> bool {
         let is_changed = self.state.set_enabled(value);
-        if is_changed {
-            if value {
-                let _ = self.codec.start();
-            } else {
-                // First stop the codec to prevent new audio frames
-                let _ = self.codec.stop();
-                // The monitoring loop in start() will detect the enabled flag change
-                // and stop the microphone capture within 100ms
-                if let Some(interval) = self.vad_interval.borrow_mut().take() {
-                    drop(interval);
-                }
-                // Reset speaking state and audio level when mic is disabled
-                self.is_speaking.store(false, Ordering::Relaxed);
-                self.client.set_speaking(false);
-                self.client.set_audio_level(0.0);
-            };
+        if is_changed && !value {
+            // The packet handler drops frames once `enabled` is false, and
+            // the monitoring loop in start() tears down the capture, the
+            // session and its VAD timer within VAD_POLL_INTERVAL_MS. The
+            // timer stays until then: an unmute inside that window keeps
+            // the session (start() returns early), and needs its VAD.
+            self.clear_speaking();
         }
         is_changed
     }
@@ -218,16 +252,11 @@ impl MicrophoneEncoder {
     pub fn select(&mut self, device: String) -> bool {
         self.state.select(device)
     }
+
     pub fn stop(&mut self) {
         self.state.stop();
         self.codec.destroy();
-        if let Some(interval) = self.vad_interval.borrow_mut().take() {
-            drop(interval);
-        }
-        // Reset speaking state and audio level when encoder stops
-        self.is_speaking.store(false, Ordering::Relaxed);
-        self.client.set_speaking(false);
-        self.client.set_audio_level(0.0);
+        self.reset_vad();
     }
 
     pub fn start(&mut self) {
@@ -245,17 +274,31 @@ impl MicrophoneEncoder {
             return;
         }
 
-        if self.state.switching.load(Ordering::Acquire) && self.codec.is_instantiated() {
-            self.stop();
+        if self.state.switching.swap(false, Ordering::AcqRel) {
+            // Device switch: end the current session (starting or running)
+            // and keep `enabled` as it is. The old session's monitor loop
+            // sees its codec destroyed and releases its track and context.
+            self.codec.destroy();
+            self.reset_vad();
         }
-        if self.state.is_enabled() && self.codec.is_instantiated() {
+        if self.codec.is_instantiated() {
             return;
         }
+        // A fresh handle per session: the previous session's cleanup can
+        // only destroy its own worklet and worker session, never this one's.
+        let codec = AudioWorkletCodec::default();
+        codec.mark_starting();
+        self.codec = codec.clone();
+        let vad_interval_holder = Rc::new(RefCell::new(None));
+        self.vad_interval = vad_interval_holder.clone();
+        self.packet_clock.borrow_mut().start_session();
+
         let aes = client.aes();
         let on_error = self.on_error.clone();
-        let EncoderState {
-            enabled, switching, ..
-        } = self.state.clone();
+        let enabled = self.state.enabled.clone();
+        let encoder_worker = self.encoder_worker.clone();
+        let packet_clock = self.packet_clock.clone();
+        let tier_bitrate = self.tier_audio_bitrate.clone();
 
         // Clone atomic values for use in different closures
         let enabled_for_handler = enabled.clone();
@@ -269,79 +312,78 @@ impl MicrophoneEncoder {
             // encoded data and sequence number so it can be included in the
             // next packet for loss recovery.
             let mut previous_frame: Option<PreviousAudioFrame> = None;
+            let mut previous_frame_index: Option<u64> = None;
 
-            Box::new(move |chunk: MessageEvent| {
+            Box::new(move |packet: EncodedPacket| {
                 // Check if encoder should stop
                 if !enabled_for_handler.load(Ordering::Acquire) {
-                    log::debug!(
-                        "Audio handler stopping: enabled={}",
-                        enabled_for_handler.load(Ordering::Acquire)
-                    );
                     return;
                 }
+                let EncodedPacket { frame_index, data } = packet;
 
-                // Check if this is an actual audio frame message (not control messages)
-                if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
-                    if let Some(msg_str) = message_type.as_string() {
-                        if msg_str != "page" {
-                            // This is a control message (ready, done, flushed), not an audio frame
-                            log::debug!("Received control message: {msg_str}");
-                            return;
-                        }
-                    }
-                }
+                // One Opus packet from the encoder worker. During DTX silence
+                // the worker sends none: the sequence stays contiguous, and
+                // the frame-exact stamp carries the pause.
+                let timestamp_ms = packet_clock.borrow_mut().stamp(now_ms(), frame_index);
 
-                let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
-                if let Ok(data) = data.dyn_into::<Uint8Array>() {
-                    // Decide whether to include redundancy based on the
-                    // AUDIO_REDUNDANCY_ENABLED constant and the current tier's
-                    // enable_fec flag.
-                    let use_redundancy = AUDIO_REDUNDANCY_ENABLED
-                        && enable_fec_for_handler.load(Ordering::Relaxed)
-                        && previous_frame.is_some();
-
-                    let red_ref = if use_redundancy {
-                        previous_frame.as_ref()
-                    } else {
-                        None
-                    };
-
-                    let packet: PacketWrapper = transform_audio_chunk(
-                        &data,
-                        &user_id,
-                        sequence_number,
-                        aes.clone(),
-                        red_ref,
-                    );
-                    client_for_send.send_media_packet(packet);
-
-                    // Store current frame as the previous frame for the next
-                    // iteration's redundancy payload.
-                    previous_frame = Some(PreviousAudioFrame {
-                        data: data.to_vec(),
-                        sequence: sequence_number,
-                    });
-                    sequence_number += 1;
+                // Redundancy only when the previous packet is the previous
+                // frame: after a DTX gap the receiver could not place it.
+                let adjacent = previous_frame_index.is_some_and(|prev| prev + 1 == frame_index);
+                let use_redundancy = AUDIO_REDUNDANCY_ENABLED
+                    && enable_fec_for_handler.load(Ordering::Relaxed)
+                    && adjacent;
+                let red_ref = if use_redundancy {
+                    previous_frame.as_ref()
                 } else {
-                    log::error!("Received non-MessageEvent: {chunk:?}");
-                }
-            })
+                    None
+                };
+
+                let wire: PacketWrapper = transform_audio_chunk(
+                    &data,
+                    &user_id,
+                    sequence_number,
+                    timestamp_ms,
+                    aes.clone(),
+                    red_ref,
+                );
+                client_for_send.send_media_packet(wire);
+
+                // Store current frame as the previous frame for the next
+                // iteration's redundancy payload.
+                previous_frame = Some(PreviousAudioFrame {
+                    data: data.to_vec(),
+                    sequence: sequence_number,
+                });
+                previous_frame_index = Some(frame_index);
+                sequence_number += 1;
+            }) as Box<dyn FnMut(EncodedPacket)>
         };
 
-        let codec = self.codec.clone();
         let is_speaking_for_vad = self.is_speaking.clone();
         let client_for_vad = client.clone();
-        let vad_interval_holder = self.vad_interval.clone();
         let vad_threshold = self.vad_threshold;
 
         wasm_bindgen_futures::spawn_local(async move {
+            // Whatever way this task ends (an early return or the stop
+            // below), the session's worklet and worker session go with it,
+            // and is_instantiated() turns false so start() can run again.
+            let _destroy_codec = DestroyOnDrop(codec.clone());
+            // Errors of a session that was stopped meanwhile (mute, device
+            // switch, the encoder dropped with its UI) are not reported.
+            let report = |message: String| {
+                if !codec.is_instantiated() {
+                    log::info!("Microphone session stopped; not reporting: {message}");
+                    return;
+                }
+                if let Some(cb) = &on_error {
+                    cb.emit(message);
+                }
+            };
             let navigator = window().navigator();
             let media_devices = match navigator.media_devices() {
                 Ok(md) => md,
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to access media devices: {e:?}"));
-                    }
+                    report(format!("Failed to access media devices: {e:?}"));
                     return;
                 }
             };
@@ -354,12 +396,14 @@ impl MicrophoneEncoder {
                 constraints.set_audio(&JsValue::TRUE);
             } else {
                 let exact = js_sys::Object::new();
-                js_sys::Reflect::set(
+                if let Err(e) = js_sys::Reflect::set(
                     &exact,
                     &JsValue::from_str("exact"),
                     &JsValue::from_str(&device_id),
-                )
-                .unwrap();
+                ) {
+                    report(format!("Failed to build microphone constraints: {e:?}"));
+                    return;
+                }
 
                 log::info!("MicrophoneEncoder: deviceId.exact = {}", device_id);
                 media_info.set_device_id(&exact.into());
@@ -370,28 +414,34 @@ impl MicrophoneEncoder {
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
                 Ok(p) => p,
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Microphone access failed: {e:?}"));
-                    }
+                    report(format!("Microphone access failed: {e:?}"));
                     return;
                 }
             };
             let device = match JsFuture::from(devices_query).await {
                 Ok(ok) => ok.unchecked_into::<MediaStream>(),
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to get microphone stream: {e:?}"));
-                    }
+                    report(format!("Failed to get microphone stream: {e:?}"));
                     return;
                 }
             };
 
-            let audio_track = Box::new(
-                device
-                    .get_audio_tracks()
-                    .find(&mut |_: JsValue, _: u32, _: Array| true)
-                    .unchecked_into::<MediaStreamTrack>(),
-            );
+            let audio_track = device
+                .get_audio_tracks()
+                .find(&mut |_: JsValue, _: u32, _: Array| true)
+                .unchecked_into::<MediaStreamTrack>();
+
+            // Stopped (mute, device switch) while the permission prompt or
+            // device open was pending: release the device quietly.
+            if !codec.is_instantiated() {
+                audio_track.stop();
+                return;
+            }
+            // From here on, every early return stops the track.
+            let fail = |message: String| {
+                audio_track.stop();
+                report(message);
+            };
 
             let track_settings = audio_track.get_settings();
 
@@ -413,20 +463,14 @@ impl MicrophoneEncoder {
                                 rate
                             }
                             Err(e) => {
-                                if let Some(cb) = &on_error {
-                                    cb.emit(format!(
-                                        "Could not determine microphone sample rate: {e:?}"
-                                    ));
-                                }
+                                fail(format!("Could not determine microphone sample rate: {e:?}"));
                                 return;
                             }
                         }
                     }
                 },
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed reading microphone settings: {e:?}"));
-                    }
+                    fail(format!("Failed reading microphone settings: {e:?}"));
                     return;
                 }
             };
@@ -440,86 +484,78 @@ impl MicrophoneEncoder {
             let context = match AudioContext::new_with_context_options(&options) {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to create audio context: {e:?}"));
-                    }
+                    fail(format!("Failed to create audio context: {e:?}"));
                     return;
                 }
             };
-            log::info!("Created AudioContext with sample rate: {input_rate} Hz");
+            // The browser may not honor the requested rate; the worklet
+            // captures at whatever the context actually runs at.
+            let context_rate = context.sample_rate() as u32;
+            log::info!("Created AudioContext with sample rate: {context_rate} Hz");
+            let fail = |message: String| {
+                let _ = context.close();
+                fail(message);
+            };
 
             let analyser = match context.create_analyser() {
                 Ok(a) => a,
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to create analyser: {e:?}"));
-                    }
-                    let _ = context.close();
+                    fail(format!("Failed to create analyser: {e:?}"));
                     return;
                 }
             };
             analyser.set_fft_size(VAD_FFT_SIZE);
             analyser.set_smoothing_time_constant(VAD_SMOOTHING_TIME_CONSTANT);
 
+            // ropus in the encoder worker: 48 kHz mono VoIP, 20 ms frames,
+            // the current audio tier's bitrate, DTX from the initial tier.
+            // Opus in-band FEC stays off; the tier's enable_fec drives RED.
+            let initial_bitrate = tier_bitrate.load(Ordering::Relaxed);
+            let options = EncoderInitOptions {
+                input_sample_rate: context_rate,
+                bitrate_bps: initial_bitrate,
+                dtx: AUDIO_QUALITY_TIERS[0].enable_dtx,
+            };
+            let on_worker_error = on_error.clone();
             let worklet = match codec
-                .create_node(
+                .create(
                     &context,
-                    "/encoderWorker.min.js",
-                    "encoder-worklet",
-                    AUDIO_CHANNELS,
+                    &encoder_worker,
+                    options,
+                    audio_output_handler,
+                    Box::new(move |message: String| {
+                        log::error!("{message}");
+                        if let Some(cb) = &on_worker_error {
+                            cb.emit(message);
+                        }
+                    }),
                 )
                 .await
             {
                 Ok(node) => node,
-                Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to initialize audio encoder: {e:?}"));
-                    }
+                Err(CodecStartError::Cancelled) => {
+                    log::info!("Microphone encoder stopped while starting");
+                    audio_track.stop();
                     let _ = context.close();
+                    return;
+                }
+                Err(CodecStartError::Failed(e)) => {
+                    fail(format!("Failed to initialize audio encoder: {e}"));
                     return;
                 }
             };
 
-            let output_handler =
-                Closure::wrap(audio_output_handler as Box<dyn FnMut(MessageEvent)>);
-            codec.set_onmessage(output_handler.as_ref().unchecked_ref());
-            output_handler.forget();
-
-            // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
-            // and pass FEC/DTX settings from the initial audio tier.
-            // NOTE: FEC and DTX require AudioWorklet support; the fields are
-            // serialized here for forward-compatibility but the worklet currently
-            // ignores them.  See audio_worklet_codec.rs for details.
-            let initial_tier = &AUDIO_QUALITY_TIERS[0];
-            let _ = codec.send_message(&CodecMessages::Init {
-                options: Some(EncoderInitOptions {
-                    encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
-                    original_sample_rate: Some(input_rate),
-                    encoder_bit_rate: Some(initial_tier.bitrate_kbps * 1000),
-                    encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
-                    encoder_fec: Some(initial_tier.enable_fec),
-                    encoder_dtx: Some(initial_tier.enable_dtx),
-                    ..Default::default()
-                }),
-            });
-
             let source_node = match context.create_media_stream_source(&device) {
                 Ok(s) => s,
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to create media source: {e:?}"));
-                    }
-                    let _ = context.close();
+                    fail(format!("Failed to create media source: {e:?}"));
                     return;
                 }
             };
             let gain_node = match context.create_gain() {
                 Ok(g) => g,
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to create gain node: {e:?}"));
-                    }
-                    let _ = context.close();
+                    fail(format!("Failed to create gain node: {e:?}"));
                     return;
                 }
             };
@@ -528,10 +564,7 @@ impl MicrophoneEncoder {
                 .and_then(|g| g.connect_with_audio_node(&analyser))
                 .and_then(|a| a.connect_with_audio_node(&worklet))
             {
-                if let Some(cb) = &on_error {
-                    cb.emit(format!("Failed to connect audio graph: {e:?}"));
-                }
-                let _ = context.close();
+                fail(format!("Failed to connect audio graph: {e:?}"));
                 return;
             }
 
@@ -539,7 +572,6 @@ impl MicrophoneEncoder {
             let data_array = Rc::new(RefCell::new(vec![0.0f32; buffer_length]));
 
             let enabled_check = enabled.clone();
-            let switching_check = switching.clone();
             let data_array_for_interval = data_array.clone();
             let is_speaking_clone = is_speaking_for_vad.clone();
             let client_clone = client_for_vad.clone();
@@ -554,9 +586,8 @@ impl MicrophoneEncoder {
             // flag is included in the 1Hz heartbeat so that *remote* peers
             // can show a speaking indicator for this user.
             let vad_interval = Interval::new(VAD_POLL_INTERVAL_MS, move || {
-                if !enabled_check.load(Ordering::Acquire) || switching_check.load(Ordering::Acquire)
-                {
-                    // Reset audio level to zero when mic is disabled/switching
+                if !enabled_check.load(Ordering::Acquire) {
+                    // Reset audio level to zero when mic is disabled
                     let prev_lvl = prev_level_clone.get();
                     if prev_lvl > 0.0 {
                         prev_level_clone.set(0.0);
@@ -600,54 +631,59 @@ impl MicrophoneEncoder {
 
             *vad_interval_holder.borrow_mut() = Some(vad_interval);
 
-            // Monitor for stop conditions and clean up when needed
-            let check_interval = VAD_POLL_INTERVAL_MS as i32; // Check every VAD_POLL_INTERVAL_MS
-            let enabled_check_monitor = enabled.clone();
-            let switching_check_monitor = switching.clone();
+            // Monitor for stop conditions and clean up when needed. Also
+            // carries audio tier changes to the encoder.
+            let mut bitrate = BitrateFollower::new(initial_bitrate);
             loop {
-                // Wait for the check interval
-                let delay_promise = js_sys::Promise::new(&mut |resolve, _| {
-                    web_sys::window()
-                        .unwrap()
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                            &resolve,
-                            check_interval,
-                        )
-                        .unwrap();
-                });
-                let _ = wasm_bindgen_futures::JsFuture::from(delay_promise).await;
+                gloo_timers::future::TimeoutFuture::new(VAD_POLL_INTERVAL_MS).await;
 
-                // Check if we should stop
-                if !enabled_check_monitor.load(Ordering::Acquire)
-                    || switching_check_monitor.load(Ordering::Acquire)
-                {
+                let disabled = !enabled.load(Ordering::Acquire);
+                // Destroyed by stop(), a device switch, or a worker failure.
+                let superseded = !codec.is_instantiated();
+                if disabled || superseded {
                     log::info!("Stopping Microphone audio encoder");
-                    switching_check_monitor.store(false, Ordering::Release);
 
-                    is_speaking_for_vad.store(false, Ordering::Relaxed);
-                    client_for_vad.set_speaking(false);
-                    client_for_vad.set_audio_level(0.0);
-
+                    // Only this session's VAD timer; a newer session has its own.
                     if let Some(interval) = vad_interval_holder.borrow_mut().take() {
                         drop(interval);
                     }
+                    // No UI calls here: set_enabled(false) and stop() already
+                    // cleared the indicators, a newer session owns them after
+                    // a switch, and after a drop the UI may be gone.
+                    if disabled {
+                        is_speaking_for_vad.store(false, Ordering::Relaxed);
+                    }
 
-                    // Stop the media track
                     audio_track.stop();
-
-                    // Close the AudioContext
                     if let Err(e) = context.close() {
                         log::error!("Error closing AudioContext: {e:?}");
                     }
-
-                    // Destroy the codec
+                    // End the worker session and detach the worklet.
                     codec.destroy();
 
                     log::info!("Microphone audio encoder stopped and cleaned up");
                     break;
                 }
+
+                if let Some(bps) = bitrate.poll(tier_bitrate.load(Ordering::Relaxed)) {
+                    log::info!("Microphone encoder bitrate -> {bps} bps");
+                    codec.set_bitrate(bps);
+                }
             }
         });
+    }
+}
+
+impl Drop for MicrophoneEncoder {
+    /// Ends the session and the worker without touching the UI: the
+    /// client's speaking and audio-level callbacks may write to UI state
+    /// that is already gone (a Dioxus signal write then panics in wasm).
+    fn drop(&mut self) {
+        if let Some(interval) = self.vad_interval.borrow_mut().take() {
+            drop(interval);
+        }
+        self.codec.destroy();
+        self.encoder_worker.terminate();
     }
 }
 

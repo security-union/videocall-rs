@@ -502,11 +502,18 @@ impl NetEqAudioPeerDecoder {
     fn map(&mut self, sequence: u64, sender_time_ms: f64, opus: &[u8]) -> Option<RtpMapping> {
         let mapping = self.rtp_mapper.map(sequence, sender_time_ms, opus);
         match mapping {
-            Some(mapping) if mapping.stream_reset => log::info!(
-                "Audio sequence restarted for peer {} (epoch {})",
-                self.peer_id,
-                mapping.stream_epoch
-            ),
+            Some(mapping) if mapping.stream_reset => {
+                log::info!(
+                    "Audio sequence restarted for peer {} (epoch {})",
+                    self.peer_id,
+                    mapping.stream_epoch
+                );
+                // The old counter's numbers mean nothing in the new epoch:
+                // left in, they would block RED recovery of the new
+                // session's frames with the same numbers.
+                self.received_sequences.clear();
+                self.received_sequences.push_back(sequence);
+            }
             None => log::debug!(
                 "Dropping audio seq {sequence} from before a sender restart (peer {})",
                 self.peer_id
@@ -616,8 +623,9 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
         self.resume_if_suspended();
 
         let seq = audio_meta.sequence;
-        // `MediaPacket.timestamp` is the sender's wall clock in ms. NetEq needs
-        // 48 kHz RTP timestamps; the mapper derives them (see rtp_timestamp.rs).
+        // `MediaPacket.timestamp` is the sender's frame-exact stamp in ms
+        // (session start + frame index * 20 ms). NetEq needs 48 kHz RTP
+        // timestamps; the mapper derives them (see rtp_timestamp.rs).
         let sender_time_ms = packet.timestamp;
 
         // Track this sequence number so we can detect duplicates from

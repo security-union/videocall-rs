@@ -143,6 +143,23 @@
 //! screen.set_enabled(false);
 //! ```
 //!
+//! ## Host page requirement: the microphone encoder worker
+//!
+//! The microphone is encoded to Opus in a Web Worker built from this
+//! crate's `audio_encoder_worker` bin. The host page has to build it and
+//! say where it is, with a `<link id="audio-encoder-worker">` whose `href`
+//! is the worker's loader script. With trunk:
+//!
+//! ```html
+//! <link data-trunk rel="rust" href="path/to/videocall-client/Cargo.toml"
+//!       data-bin="audio_encoder_worker" data-type="worker" data-loader-shim />
+//! <link id="audio-encoder-worker" href="/audio_encoder_worker_loader.js" />
+//! ```
+//!
+//! Without it, starting the microphone reports an error through the
+//! encoder's `on_error` callback. dioxus-ui's `index.html` is a working
+//! example; it also builds the worker with a size-tuned cargo profile.
+//!
 //! ## Device access permission:
 //!
 //! ```no_run
@@ -185,7 +202,7 @@
 pub mod adaptive_quality_constants;
 pub mod audio;
 pub mod audio_constants;
-pub mod audio_worklet_codec;
+pub(crate) mod audio_worklet_codec;
 mod client;
 mod connection;
 pub mod constants;

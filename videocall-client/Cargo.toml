@@ -42,6 +42,14 @@ serde_bytes = "0.11"
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.4" }
 serde_json = { version = "1.0" }
 async-broadcast = "0.7.2"
+# Microphone encode path (src/encode/mic_opus.rs, run by the
+# audio_encoder_worker bin): pure-Rust Opus, same crate NetEq decodes with,
+# and rubato's sinc resampler to bring any capture rate to Opus's 48 kHz
+# (default features off: the FFT resampler would add ~170 KB to the worker).
+# The lib's main-thread code never calls into them, so they are dead-stripped
+# from the UI wasm and only land in the worker's wasm.
+ropus = "0.12"
+rubato = { version = "5.1", default-features = false }
 
 [features]
 default = []
@@ -79,6 +87,12 @@ features = [
     "EncodedVideoChunkType",
     "MediaStreamAudioDestinationNode",
     "MessageChannel",
+    "ChannelCountMode",
+    "ErrorEvent",
+    "Worker",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
     "MessagePort",
     "OffscreenCanvas",
     "AudioDestinationNode",
@@ -135,10 +149,14 @@ features = [
     "IntersectionObserverInit",
 ]
 
+# 1.0 no longer reads a clock, so the old "wasm" feature (web-time) is not
+# needed.
 [dependencies.pidgeon]
-version = "0.3.1"
-features = ["wasm"]
+version = "1.0.1"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.20"
+# tests/mic_dtx_neteq.rs: native round trip of the mic encoder's DTX stream
+# through the receiver's timestamp mapper and NetEq.
+neteq = { path = "../neteq", version = "1.0.1", default-features = false, features = ["ropus"] }
 

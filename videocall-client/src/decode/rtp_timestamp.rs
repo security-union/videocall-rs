@@ -20,40 +20,55 @@
 //!
 //! WebRTC NetEq orders, deduplicates and schedules packets by their RTP
 //! timestamp, counted in samples of the codec clock (48 kHz for Opus). Our
-//! wire format does not carry one: `MediaPacket.timestamp` is the sender's
-//! wall clock in milliseconds as an `f64`, and `AudioMetadata.sequence` is a
-//! `u64` packet counter. (Forwarding `timestamp as u32` does not work: epoch
-//! milliseconds exceed `u32::MAX`, so the cast saturates and every packet
-//! would reach NetEq with timestamp `u32::MAX`.)
+//! wire format carries the same information in milliseconds: the sender
+//! stamps `MediaPacket.timestamp` as `session start + frame index * 20 ms`,
+//! where the frame index counts every encoded 20 ms frame, including the
+//! ones Opus DTX did not send. That is libwebrtc's RTP timestamp (960
+//! samples per frame, advancing over dropped DTX frames) in ms, as an `f64`
+//! anchored to the sender's wall clock when the session starts.
+//! `AudioMetadata.sequence` is a `u64` counter of sent packets only.
+//! (Forwarding `timestamp as u32` does not work: epoch milliseconds exceed
+//! `u32::MAX`, so the cast saturates.)
 //!
-//! [`RtpTimestampMapper`] rebuilds an RTP-style timeline without a wire
-//! change:
+//! [`RtpTimestampMapper`] turns that into an RTP timeline:
 //!
-//! - The sequence number drives the timeline: each packet advances it by its
-//!   duration in samples, read from the Opus TOC byte (RFC 6716 section 3.1),
-//!   so 10, 40 or 60 ms frames work too. A lost packet still advances the
-//!   timeline, because the next sequence number skips it.
-//! - The sender clock only detects pauses. When the sender stops producing
-//!   packets (mic muted, Opus DTX) the sequence stays contiguous but real
-//!   time moves on. RTP senders reflect that as a timestamp jump, and NetEq
-//!   relies on it: after a long expand, a packet whose timestamp lands behind
-//!   the playout point is discarded as old. So a sender-clock excess of at
-//!   least [`SENDER_GAP_THRESHOLD_MS`] becomes a timestamp jump rounded to
-//!   whole frames. Sender scheduling jank stays under that threshold.
-//! - A restarted sender counter (encoder restarted after a device switch)
-//!   starts a new stream epoch. The new timeline continues from the old one,
-//!   moved forward by the elapsed sender time, so NetEq sees a gap rather
-//!   than a backward jump.
+//! - The timestamp is the stamp's distance from the epoch's first stamp,
+//!   in 48 kHz samples, rounded to whole packets (the packet duration comes
+//!   from the Opus TOC byte, RFC 6716 section 3.1). DTX pauses, mutes and
+//!   lost packets all fall out of the stamp; nothing is guessed from
+//!   thresholds, and when the sender's main thread posted a packet does not
+//!   matter.
+//! - A late or reordered packet maps from its own stamp.
+//! - A restarted sender counter (a new capture session after unmute or a
+//!   device switch) starts a new stream epoch on the new session's grid.
+//!   It continues forward from the old timeline, by the stamps' distance or
+//!   at least one packet, so NetEq never sees a backward jump. Frame-derived
+//!   stamps drift from the wall clock by the capture clock's error, and the
+//!   new session re-anchors to the wall clock, so this can matter.
+//! - With no usable stamp (NaN, zero), the sequence number drives the
+//!   timeline from the last mapped packet.
+//! - A stamp that disagrees with the sequence numbers is not trusted, and
+//!   its packet maps by sequence. Within one session two sent packets are
+//!   at least one frame apart and, because DTX still sends a noise refresh
+//!   every 400 ms, at most [`MAX_SENT_PACKET_SPACING_MS`] apart per
+//!   sequence step; [`FORWARD_JUMP_CLOCK_TOLERANCE_MS`] on top covers
+//!   jitter and worker stalls. If the stamps keep disagreeing but agree
+//!   with each other ([`REANCHOR_PACKETS`] in a row), the epoch re-anchors
+//!   on them: its own first stamp was the bad one.
 //!
 //! The mapper outputs exactly what the NetEq worker's `Insert { seq,
 //! timestamp }` message takes (`u16` sequence, `u32` timestamp). NetEq
 //! handles `u16` sequence and `u32` timestamp wraparound itself.
 //!
-//! The sequence number and sender clock come from the remote peer, so every
-//! step here tolerates hostile values (`u64::MAX`, NaN) without panicking,
-//! debug builds included.
-
-use std::collections::VecDeque;
+//! The sequence number and stamp come from the remote peer, so every step
+//! here tolerates hostile values (`u64::MAX`, NaN, 1e300) without panicking,
+//! debug builds included. A hostile stamp on an in-order or late packet is
+//! ignored (the packet maps by sequence) and is never used as a reference
+//! for later packets. Two cases cost more than one packet: a bad first
+//! stamp of an epoch misplaces the next few packets until the epoch
+//! re-anchors, and a late packet stamped newer than the stream forces a
+//! restart (a new epoch). Either way only the sending peer's own stream is
+//! affected.
 
 /// RTP clock rate for Opus (RFC 7587): always 48 kHz.
 pub const RTP_CLOCK_RATE_HZ: u32 = 48_000;
@@ -61,30 +76,38 @@ pub const RTP_CLOCK_RATE_HZ: u32 = 48_000;
 /// Samples per packet assumed until a TOC byte says otherwise: 20 ms Opus.
 pub const DEFAULT_SAMPLES_PER_PACKET: u32 = 960;
 
-/// Sender-clock excess over the sequence-implied duration that counts as a
-/// pause in sending. Opus DTX pauses are at least 400 ms and mic mutes are
-/// seconds, while sender main-thread jank stays well below this.
-pub const SENDER_GAP_THRESHOLD_MS: f64 = 200.0;
-
 /// How far behind the highest sequence number a packet may arrive and still
 /// count as reordered. 250 packets of 20 ms is 5 s, the same horizon NetEq
 /// uses to discard old packets.
 pub const MAX_REORDER_PACKETS: u64 = 250;
 
-/// A packet with an older sequence number whose sender clock is newer than
-/// the highest packet's by more than this comes from a restarted counter,
-/// not from reordering.
+/// A packet with an older sequence number whose stamp is newer than the
+/// highest packet's by more than this comes from a restarted counter, not
+/// from reordering.
 pub const RESTART_CLOCK_TOLERANCE_MS: f64 = 100.0;
 
-/// A forward sequence jump that outruns the sender clock by more than this
-/// cannot be packet loss: the counter changed.
+/// A forward sequence jump that outruns the stamps by more than this cannot
+/// be packet loss: the counter changed.
 pub const FORWARD_JUMP_CLOCK_TOLERANCE_MS: f64 = 2_000.0;
+
+/// Upper bound on the stamp distance between two consecutive sent packets
+/// of one session. libopus in DTX still sends a background-noise refresh
+/// every 400 ms; this leaves room for lost refreshes.
+pub const MAX_SENT_PACKET_SPACING_MS: f64 = 1_000.0;
+
+/// Mutually consistent packets, all disagreeing with the epoch's stamps,
+/// after which the epoch re-anchors on them.
+pub const REANCHOR_PACKETS: u32 = 5;
 
 /// Longest Opus packet (RFC 6716): 120 ms at 48 kHz.
 const MAX_OPUS_PACKET_SAMPLES: u32 = 5_760;
 
-/// Bound on the timeline segments kept for late-packet lookups.
-const MAX_SEGMENTS: usize = 32;
+/// Samples per millisecond at the RTP clock rate.
+const SAMPLES_PER_MS: f64 = RTP_CLOCK_RATE_HZ as f64 / 1000.0;
+
+/// Bound on packets counted from one stamp difference: far more than a
+/// `u32` timeline holds, and small enough that `i64` math cannot overflow.
+const MAX_STAMP_PACKETS: f64 = (1u64 << 40) as f64;
 
 /// One packet's RTP header fields for NetEq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,83 +124,99 @@ pub struct RtpMapping {
     pub stream_reset: bool,
 }
 
-/// A run of packets with the same duration and no sender pause inside.
 #[derive(Debug, Clone, Copy)]
-struct Segment {
-    start_seq: u64,
-    start_ts: u32,
-    samples_per_packet: u32,
-}
-
-impl Segment {
-    fn timestamp_at(&self, seq: u64) -> u32 {
-        // Modular arithmetic: (a * b mod 2^64) mod 2^32 == a * b mod 2^32,
-        // so wrapping u64 math truncated to u32 is exact RTP wraparound.
-        let spp = u64::from(self.samples_per_packet);
-        if seq >= self.start_seq {
-            let offset = (seq - self.start_seq).wrapping_mul(spp) as u32;
-            self.start_ts.wrapping_add(offset)
-        } else {
-            let offset = (self.start_seq - seq).wrapping_mul(spp) as u32;
-            self.start_ts.wrapping_sub(offset)
-        }
-    }
-
-    fn frame_ms(&self) -> f64 {
-        f64::from(self.samples_per_packet) * 1000.0 / f64::from(RTP_CLOCK_RATE_HZ)
-    }
-}
-
-#[derive(Debug, Clone)]
 struct StreamState {
-    /// Ordered by `start_seq`, never empty.
-    segments: VecDeque<Segment>,
+    /// First stamp of the epoch and the timestamp it maps to. `None` while
+    /// the epoch has seen no usable stamp.
+    base: Option<(f64, u32)>,
     highest_seq: u64,
-    highest_sender_ms: Option<f64>,
+    /// Timestamp and duration of the packet at `highest_seq`.
+    highest_ts: u32,
+    highest_samples: u32,
+    highest_stamp_ms: Option<f64>,
+    /// The packet mapped last, for RED recovery right after it.
+    last_mapped: Option<(u64, u32)>,
+    /// Whether a later packet has agreed with the epoch's stamps. Until
+    /// then the first stamp may be garbage and cannot mark stragglers.
+    confirmed: bool,
+    /// The last packet whose stamp disagreed with the epoch, and how many
+    /// such packets in a row agree with each other.
+    suspect: Option<(u64, f64)>,
+    suspect_streak: u32,
 }
 
 impl StreamState {
-    fn new(seq: u64, ts: u32, samples_per_packet: u32, sender_ms: Option<f64>) -> Self {
-        let mut segments = VecDeque::with_capacity(4);
-        segments.push_back(Segment {
-            start_seq: seq,
-            start_ts: ts,
-            samples_per_packet,
-        });
+    fn new(seq: u64, ts: u32, samples: u32, stamp_ms: Option<f64>) -> Self {
         Self {
-            segments,
+            base: stamp_ms.map(|stamp| (stamp, ts)),
             highest_seq: seq,
-            highest_sender_ms: sender_ms,
+            highest_ts: ts,
+            highest_samples: samples,
+            highest_stamp_ms: stamp_ms,
+            last_mapped: Some((seq, ts)),
+            confirmed: false,
+            suspect: None,
+            suspect_streak: 0,
         }
     }
 
-    fn current(&self) -> Segment {
-        // Invariant: `segments` is never empty.
-        self.segments[self.segments.len() - 1]
+    fn packet_ms(&self) -> f64 {
+        f64::from(self.highest_samples) / SAMPLES_PER_MS
     }
 
-    fn timestamp_at(&self, seq: u64) -> u32 {
-        self.segments
-            .iter()
-            .rev()
-            .find(|segment| segment.start_seq <= seq)
-            .unwrap_or(&self.segments[0])
-            .timestamp_at(seq)
+    /// Record a packet whose stamp disagrees with the epoch. True when
+    /// enough of them in a row agree with each other to re-anchor.
+    fn note_suspect(&mut self, seq: u64, stamp: f64) -> bool {
+        let packet_ms = self.packet_ms();
+        let follows = matches!(self.suspect, Some((prev_seq, prev_stamp))
+            if seq > prev_seq && stamp_plausible(seq - prev_seq, stamp - prev_stamp, packet_ms));
+        self.suspect_streak = if follows { self.suspect_streak + 1 } else { 1 };
+        self.suspect = Some((seq, stamp));
+        self.suspect_streak >= REANCHOR_PACKETS
     }
 
-    fn push_segment(&mut self, segment: Segment) {
-        self.segments.push_back(segment);
-        // Drop segments no in-window late packet can land in.
-        while self.segments.len() > 1
-            && (self.segments.len() > MAX_SEGMENTS
-                || self.segments[1]
-                    .start_seq
-                    .saturating_add(MAX_REORDER_PACKETS)
-                    <= self.highest_seq)
-        {
-            self.segments.pop_front();
+    /// Timestamp for a packet stamped `stamp_ms` lasting `samples`, or the
+    /// sequence-derived one when there is no stamp or no base.
+    fn timestamp_for(&self, seq: u64, stamp_ms: Option<f64>, samples: u32) -> u32 {
+        match (stamp_ms, self.base) {
+            (Some(stamp), Some((base_ms, base_ts))) => {
+                base_ts.wrapping_add(stamp_offset_samples(stamp - base_ms, samples))
+            }
+            _ => {
+                // Modular arithmetic: wrapping u64 math truncated to u32 is
+                // exact RTP wraparound.
+                let spp = u64::from(self.highest_samples);
+                if seq >= self.highest_seq {
+                    let offset = (seq - self.highest_seq).wrapping_mul(spp) as u32;
+                    self.highest_ts.wrapping_add(offset)
+                } else {
+                    let offset = (self.highest_seq - seq).wrapping_mul(spp) as u32;
+                    self.highest_ts.wrapping_sub(offset)
+                }
+            }
         }
     }
+}
+
+/// Whether two packets `steps` sequence numbers apart can be `delta_ms`
+/// apart in stamp: at least a frame per step (loss included), at most
+/// [`MAX_SENT_PACKET_SPACING_MS`] per step, give or take
+/// [`FORWARD_JUMP_CLOCK_TOLERANCE_MS`].
+fn stamp_plausible(steps: u64, delta_ms: f64, packet_ms: f64) -> bool {
+    let steps = steps as f64;
+    delta_ms >= steps * packet_ms - FORWARD_JUMP_CLOCK_TOLERANCE_MS
+        && delta_ms <= steps * MAX_SENT_PACKET_SPACING_MS + FORWARD_JUMP_CLOCK_TOLERANCE_MS
+}
+
+/// `delta_ms` in 48 kHz samples, rounded to whole packets of `samples`,
+/// wrapped to `u32`.
+fn stamp_offset_samples(delta_ms: f64, samples: u32) -> u32 {
+    let packets = (delta_ms * SAMPLES_PER_MS / f64::from(samples))
+        .round()
+        .clamp(-MAX_STAMP_PACKETS, MAX_STAMP_PACKETS);
+    // NaN cannot reach here (stamps are finite), and the clamp keeps the
+    // product well inside i64.
+    ((packets as i64) * i64::from(samples)) as u32
 }
 
 /// Derives RTP sequence numbers and 48 kHz timestamps for one remote audio
@@ -218,8 +257,8 @@ impl RtpTimestampMapper {
     /// Map one received packet.
     ///
     /// - `sequence`: `AudioMetadata.sequence` from the wire.
-    /// - `sender_time_ms`: `MediaPacket.timestamp` (sender wall clock). A
-    ///   non-finite or non-positive value disables pause detection.
+    /// - `sender_time_ms`: `MediaPacket.timestamp`, the frame-exact stamp.
+    ///   A non-finite or non-positive value falls back to the sequence.
     /// - `opus_payload`: the Opus packet (the RED primary for RED packets),
     ///   used only for its TOC byte. Pass an empty slice when the payload is
     ///   not a plain Opus packet, to keep the current frame size.
@@ -231,7 +270,7 @@ impl RtpTimestampMapper {
         sender_time_ms: f64,
         opus_payload: &[u8],
     ) -> Option<RtpMapping> {
-        let sender_ms =
+        let stamp_ms =
             (sender_time_ms.is_finite() && sender_time_ms > 0.0).then_some(sender_time_ms);
         let toc_samples = opus_packet_samples_48k(opus_payload);
 
@@ -241,136 +280,136 @@ impl RtpTimestampMapper {
                 sequence,
                 self.initial_timestamp,
                 samples,
-                sender_ms,
+                stamp_ms,
             ));
-            return Some(self.mapping(sequence, false));
+            return Some(self.mapping(sequence, self.initial_timestamp, false));
         };
-
-        let current = state.current();
-        let wall_delta_ms = match (sender_ms, state.highest_sender_ms) {
+        let samples = toc_samples.unwrap_or(state.highest_samples);
+        let stamp_delta_ms = match (stamp_ms, state.highest_stamp_ms) {
             (Some(now), Some(prev)) => Some(now - prev),
             _ => None,
         };
 
-        if sequence == state.highest_seq {
-            // Duplicate: same timestamp, NetEq discards it.
-            return Some(self.mapping(sequence, false));
-        }
-
-        if sequence < state.highest_seq {
+        if sequence <= state.highest_seq {
             let behind = state.highest_seq - sequence;
             let clock_says_restart =
-                matches!(wall_delta_ms, Some(delta) if delta > RESTART_CLOCK_TOLERANCE_MS);
-            if behind > MAX_REORDER_PACKETS || clock_says_restart {
-                return Some(self.restart(sequence, sender_ms, wall_delta_ms, toc_samples));
+                matches!(stamp_delta_ms, Some(delta) if delta > RESTART_CLOCK_TOLERANCE_MS);
+            if behind > MAX_REORDER_PACKETS || (behind > 0 && clock_says_restart) {
+                return Some(self.restart(sequence, stamp_ms, samples));
             }
-            // Reordered or late packet: look it up, leave state alone.
-            return Some(self.mapping(sequence, false));
+            // Reordered, late or duplicate: its own stamp places it, if the
+            // stamp fits where the sequence says it belongs.
+            let stamp_ms = stamp_ms.filter(|_| {
+                stamp_delta_ms
+                    .is_none_or(|delta| stamp_plausible(behind, -delta, state.packet_ms()))
+            });
+            let ts = state.timestamp_for(sequence, stamp_ms, samples);
+            state.last_mapped = Some((sequence, ts));
+            return Some(self.mapping(sequence, ts, false));
         }
 
         let ahead = sequence - state.highest_seq;
-        let sequence_ms = ahead as f64 * current.frame_ms();
         if ahead > MAX_REORDER_PACKETS {
-            match wall_delta_ms {
-                // Far ahead in sequence but sent earlier: a straggler from the
-                // counter that a restart replaced.
-                Some(delta) if delta < 0.0 => return None,
+            let packet_ms = f64::from(state.highest_samples) / SAMPLES_PER_MS;
+            let sequence_ms = ahead as f64 * packet_ms;
+            match stamp_delta_ms {
+                // Far ahead in sequence but stamped earlier: a straggler from
+                // the counter that a restart replaced. Only once the epoch's
+                // stamps are confirmed; a bad first stamp must not strand
+                // the stream.
+                Some(delta) if delta < 0.0 && state.confirmed => return None,
                 Some(delta) if sequence_ms - delta > FORWARD_JUMP_CLOCK_TOLERANCE_MS => {
-                    return Some(self.restart(sequence, sender_ms, wall_delta_ms, toc_samples));
+                    return Some(self.restart(sequence, stamp_ms, samples));
                 }
                 // Long loss (e.g. a transport reconnect): just advance.
                 _ => {}
             }
         }
 
-        let gap_packets = match wall_delta_ms {
-            Some(delta) if delta - sequence_ms >= SENDER_GAP_THRESHOLD_MS => {
-                ((delta - sequence_ms) / current.frame_ms()).round() as u64
+        if state.base.is_none() {
+            // First usable stamp of the epoch anchors it.
+            if let Some(stamp) = stamp_ms {
+                let ts = state.timestamp_for(sequence, None, samples);
+                state.base = Some((stamp, ts));
             }
-            _ => 0,
-        };
-        let samples = toc_samples.unwrap_or(current.samples_per_packet);
-        if gap_packets > 0 || samples != current.samples_per_packet {
-            // The pause (or frame-size change) starts right after the last
-            // packet seen; lost packets after it belong to the new segment.
-            let start_seq = state.highest_seq.wrapping_add(1);
-            let gap_samples = gap_packets.wrapping_mul(u64::from(current.samples_per_packet));
-            let start_ts = current
-                .timestamp_at(start_seq)
-                .wrapping_add(gap_samples as u32);
-            state.highest_seq = sequence;
-            state.push_segment(Segment {
-                start_seq,
-                start_ts,
-                samples_per_packet: samples,
-            });
-        } else {
-            state.highest_seq = sequence;
         }
-        if sender_ms.is_some() {
-            state.highest_sender_ms = sender_ms;
+        let mut stamp_ms = stamp_ms;
+        if let (Some(stamp), Some(delta)) = (stamp_ms, stamp_delta_ms) {
+            if stamp_plausible(ahead, delta, state.packet_ms()) {
+                state.confirmed = true;
+                state.suspect = None;
+                state.suspect_streak = 0;
+            } else if state.note_suspect(sequence, stamp) {
+                // The stamps agree with each other, not with the epoch: the
+                // epoch's reference stamp was the bad one. Keep the
+                // sequence-derived timeline and continue from these stamps.
+                let ts = state.timestamp_for(sequence, None, samples);
+                state.base = Some((stamp, ts));
+                state.confirmed = true;
+                state.suspect = None;
+                state.suspect_streak = 0;
+            } else {
+                stamp_ms = None;
+            }
         }
-        Some(self.mapping(sequence, false))
+        let ts = state.timestamp_for(sequence, stamp_ms, samples);
+        state.highest_seq = sequence;
+        state.highest_ts = ts;
+        state.highest_samples = samples;
+        if stamp_ms.is_some() {
+            state.highest_stamp_ms = stamp_ms;
+        }
+        state.last_mapped = Some((sequence, ts));
+        Some(self.mapping(sequence, ts, false))
     }
 
     /// Map a frame recovered from a RED packet. `redundant_sequence` is the
     /// 32-bit sequence carried in the RED payload; it is widened against the
-    /// primary's 64-bit sequence. Call after [`Self::map`] for the primary.
-    /// Does not change state. Returns `None` if the distance is implausible.
+    /// primary's 64-bit sequence. Call right after [`Self::map`] for the
+    /// primary. The sender attaches RED only when the redundant frame is the
+    /// frame just before the primary, so only a distance of one is accepted
+    /// and the frame lands one packet before the primary.
     pub fn map_red_recovered(
         &self,
         primary_sequence: u64,
         redundant_sequence: u32,
     ) -> Option<RtpMapping> {
-        self.state.as_ref()?;
-        let behind = u64::from((primary_sequence as u32).wrapping_sub(redundant_sequence));
-        if behind == 0 || behind > MAX_REORDER_PACKETS {
+        let state = self.state.as_ref()?;
+        let (last_seq, last_ts) = state.last_mapped?;
+        if last_seq != primary_sequence
+            || (primary_sequence as u32).wrapping_sub(redundant_sequence) != 1
+        {
             return None;
         }
-        let sequence = primary_sequence.checked_sub(behind)?;
-        Some(self.mapping(sequence, false))
+        let sequence = primary_sequence.checked_sub(1)?;
+        Some(self.mapping(sequence, last_ts.wrapping_sub(state.highest_samples), false))
     }
 
-    fn restart(
-        &mut self,
-        sequence: u64,
-        sender_ms: Option<f64>,
-        wall_delta_ms: Option<f64>,
-        toc_samples: Option<u32>,
-    ) -> RtpMapping {
+    /// Start a new epoch at `sequence`, on the new session's stamp grid,
+    /// at least one packet after the old timeline's newest packet.
+    fn restart(&mut self, sequence: u64, stamp_ms: Option<f64>, samples: u32) -> RtpMapping {
         let start_ts = match self.state.as_ref() {
             Some(state) => {
-                let current = state.current();
-                let next = current.timestamp_at(state.highest_seq.wrapping_add(1));
-                let elapsed_packets = match wall_delta_ms {
-                    Some(delta) if delta > current.frame_ms() => {
-                        ((delta - current.frame_ms()) / current.frame_ms()).round() as u64
-                    }
-                    _ => 0,
+                let next = state.highest_ts.wrapping_add(state.highest_samples);
+                let from_stamp = match (stamp_ms, state.base) {
+                    (Some(_), Some(_)) => state.timestamp_for(sequence, stamp_ms, samples),
+                    _ => next,
                 };
-                next.wrapping_add(
-                    elapsed_packets.wrapping_mul(u64::from(current.samples_per_packet)) as u32,
-                )
+                // Signed distance on the wrapping timeline.
+                if (from_stamp.wrapping_sub(next) as i32) < 0 {
+                    next
+                } else {
+                    from_stamp
+                }
             }
             None => self.initial_timestamp,
         };
-        let samples = toc_samples.unwrap_or_else(|| {
-            self.state
-                .as_ref()
-                .map_or(DEFAULT_SAMPLES_PER_PACKET, |state| {
-                    state.current().samples_per_packet
-                })
-        });
         self.epoch = self.epoch.wrapping_add(1);
-        self.state = Some(StreamState::new(sequence, start_ts, samples, sender_ms));
-        self.mapping(sequence, true)
+        self.state = Some(StreamState::new(sequence, start_ts, samples, stamp_ms));
+        self.mapping(sequence, start_ts, true)
     }
 
-    fn mapping(&self, sequence: u64, stream_reset: bool) -> RtpMapping {
-        let timestamp = self
-            .state
-            .as_ref()
-            .map_or(self.initial_timestamp, |state| state.timestamp_at(sequence));
+    fn mapping(&self, sequence: u64, timestamp: u32, stream_reset: bool) -> RtpMapping {
         RtpMapping {
             sequence_number: sequence as u16,
             timestamp,
@@ -406,10 +445,13 @@ pub fn opus_packet_samples_48k(packet: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
+    // Three bytes: one or two would be a DTX packet (TOC only).
     /// CELT fullband 20 ms, one frame (config 31, code 0).
-    const OPUS_20MS: &[u8] = &[0xF8, 0x00];
+    const OPUS_20MS: &[u8] = &[0xF8, 0x00, 0x00];
     /// SILK wideband 40 ms, one frame (config 10, code 0).
-    const OPUS_40MS: &[u8] = &[0x50, 0x00];
+    const OPUS_40MS: &[u8] = &[0x50, 0x00, 0x00];
+    /// SILK wideband 20 ms TOC with no frame data: a DTX packet.
+    const OPUS_DTX: &[u8] = &[0x48];
     const FRAME: u32 = 960;
     const FRAME_MS: f64 = 20.0;
 
@@ -456,6 +498,34 @@ mod tests {
             assert_eq!(m.stream_epoch, 0);
             assert!(!m.stream_reset);
         }
+    }
+
+    /// Opus DTX: one TOC-only packet, then nothing until speech resumes some
+    /// whole number of frames later. The sequence stays contiguous; the
+    /// stamp carries the pause, at any length.
+    #[test]
+    fn dtx_pause_of_any_length_follows_the_stamp() {
+        let mut mapper = RtpTimestampMapper::new();
+        feed(&mut mapper, 0, 1_000.0, 3);
+        assert_eq!(mapper.map(3, 1_060.0, OPUS_DTX).unwrap().timestamp, ts(3));
+        // Speech resumes 7 frames after the DTX packet.
+        let resumed = mapper.map(4, 1_060.0 + 7.0 * FRAME_MS, OPUS_20MS).unwrap();
+        assert_eq!(resumed.timestamp, ts(10));
+        // A one-frame gap is kept too: there is no pause threshold.
+        assert_eq!(mapper.map(5, 1_240.0, OPUS_20MS).unwrap().timestamp, ts(12));
+        assert!(!resumed.stream_reset);
+    }
+
+    /// Stamps are frame-exact (`session start + frame index * 20 ms`), so
+    /// the time a packet happened to be sent never shows up. A stamp off the
+    /// grid (an older sender) still lands on a whole frame.
+    #[test]
+    fn stamps_round_to_whole_frames() {
+        let mut mapper = RtpTimestampMapper::new();
+        mapper.map(0, 1_000.0, OPUS_20MS).unwrap();
+        assert_eq!(mapper.map(1, 1_027.0, OPUS_20MS).unwrap().timestamp, ts(1));
+        assert_eq!(mapper.map(2, 1_049.9, OPUS_20MS).unwrap().timestamp, ts(2));
+        assert_eq!(mapper.map(3, 1_120.0, OPUS_20MS).unwrap().timestamp, ts(6));
     }
 
     #[test]
@@ -517,40 +587,14 @@ mod tests {
     }
 
     #[test]
-    fn sender_pause_becomes_timestamp_jump() {
-        // Mic muted for 3 s: the sequence stays contiguous, the clock does not.
+    fn late_packet_after_pause_uses_its_own_stamp() {
         let mut mapper = RtpTimestampMapper::new();
-        // Last packet at 181 ms.
-        feed(&mut mapper, 0, 1.0, 10);
-        let m = mapper.map(10, 181.0 + 3_000.0, OPUS_20MS).unwrap();
-        // 3000 ms covers 1 frame plus 149 frames of pause.
-        assert_eq!(m.timestamp, ts(10 + 149));
-        assert!(!m.stream_reset);
-        // The following packets continue from there.
-        assert_eq!(
-            mapper.map(11, 3_201.0, OPUS_20MS).unwrap().timestamp,
-            ts(160)
-        );
-    }
-
-    #[test]
-    fn sender_jank_below_threshold_is_not_a_pause() {
-        let mut mapper = RtpTimestampMapper::new();
-        feed(&mut mapper, 0, 1_000.0, 2);
-        // Stamped 150 ms late, then the backlog arrives in a burst.
-        assert_eq!(mapper.map(2, 1_190.0, OPUS_20MS).unwrap().timestamp, ts(2));
-        assert_eq!(mapper.map(3, 1_191.0, OPUS_20MS).unwrap().timestamp, ts(3));
-    }
-
-    #[test]
-    fn late_packet_after_pause_uses_post_pause_timeline() {
-        let mut mapper = RtpTimestampMapper::new();
-        // Last packet at 1180 ms. Packet 10 is late; 11 arrives after a 1 s pause.
-        feed(&mut mapper, 0, 1_000.0, 10);
+        feed(&mut mapper, 0, 1_000.0, 10); // last at 1180 ms
+                                           // Packet 10 (DTX) is late; 11 comes after a 1 s pause and arrives first.
         let eleven = mapper.map(11, 2_200.0, OPUS_20MS).unwrap();
-        let ten = mapper.map(10, 2_180.0, OPUS_20MS).unwrap();
-        assert_eq!(eleven.timestamp.wrapping_sub(ten.timestamp), FRAME);
-        assert!(ten.timestamp > ts(10));
+        let ten = mapper.map(10, 1_200.0, OPUS_DTX).unwrap();
+        assert_eq!(ten.timestamp, ts(10));
+        assert_eq!(eleven.timestamp, ts(60));
     }
 
     #[test]
@@ -577,6 +621,39 @@ mod tests {
         assert_eq!(m.timestamp.wrapping_sub(last), ts(100));
         let next = mapper.map(1, 13_000.0, OPUS_20MS).unwrap();
         assert!(!next.stream_reset);
+        assert_eq!(next.timestamp, m.timestamp + FRAME);
+    }
+
+    /// A new session's stamps start on its own grid, possibly off the old
+    /// one; the new epoch follows the new grid exactly.
+    #[test]
+    fn restart_rebases_on_the_new_sessions_grid() {
+        let mut mapper = RtpTimestampMapper::new();
+        let before = feed(&mut mapper, 0, 1_000.0, 100); // last at 2_980 ms
+        let last = before.last().unwrap().timestamp;
+        let first = mapper.map(0, 5_007.0, OPUS_20MS).unwrap();
+        assert!(first.stream_reset);
+        assert_eq!(first.timestamp.wrapping_sub(last), ts(101));
+        for frame in 1..5u64 {
+            let m = mapper
+                .map(frame, 5_007.0 + frame as f64 * FRAME_MS, OPUS_20MS)
+                .unwrap();
+            assert_eq!(m.timestamp.wrapping_sub(first.timestamp), ts(frame));
+        }
+    }
+
+    /// Frame-derived stamps drift from the wall clock by the audio clock's
+    /// error. If a new session's stamp lands behind the old one, the new
+    /// epoch still moves forward.
+    #[test]
+    fn restart_never_goes_backwards() {
+        let mut mapper = RtpTimestampMapper::new();
+        let before = feed(&mut mapper, 0, 1_000.0, 500); // last at 10_980 ms
+        let last = before.last().unwrap().timestamp;
+        let m = mapper.map(0, 10_900.0, &[0xF8, 0x01, 0x02]).unwrap();
+        assert!(m.stream_reset);
+        assert_eq!(m.timestamp.wrapping_sub(last), FRAME);
+        let next = mapper.map(1, 10_920.0, OPUS_20MS).unwrap();
         assert_eq!(next.timestamp, m.timestamp + FRAME);
     }
 
@@ -647,6 +724,8 @@ mod tests {
         assert_eq!(primary.timestamp.wrapping_sub(recovered.timestamp), FRAME);
     }
 
+    /// The sender attaches RED only when the previous packet is the previous
+    /// frame, so only a distance of one is trusted.
     #[test]
     fn red_with_implausible_distance_is_rejected() {
         let mut mapper = RtpTimestampMapper::new();
@@ -654,7 +733,10 @@ mod tests {
         mapper.map(10, 1_000.0, OPUS_20MS).unwrap();
         assert_eq!(mapper.map_red_recovered(10, 10), None);
         assert_eq!(mapper.map_red_recovered(10, 11), None);
+        assert_eq!(mapper.map_red_recovered(10, 8), None);
         assert_eq!(mapper.map_red_recovered(1_000, 1), None);
+        // Only right after its primary was mapped.
+        assert_eq!(mapper.map_red_recovered(11, 10), None);
     }
 
     #[test]
@@ -667,23 +749,68 @@ mod tests {
         assert_eq!(m.stream_epoch, 0);
     }
 
+    /// One in-order packet stamped far in the future must not become the
+    /// reference: later packets, even after a long loss, still map.
     #[test]
-    fn segment_history_stays_bounded() {
+    fn far_future_stamp_does_not_strand_later_packets() {
         let mut mapper = RtpTimestampMapper::new();
-        let mut ms = 1_000.0;
-        for seq in 0..1_000u64 {
-            // A 1 s pause before every packet.
-            ms += 1_000.0;
-            mapper.map(seq, ms, OPUS_20MS).unwrap();
+        feed(&mut mapper, 0, 1_000.0, 10);
+        let hostile = mapper.map(10, 1_000.0 + 1e9, OPUS_20MS).unwrap();
+        // Mapped by its sequence number instead.
+        assert_eq!(hostile.timestamp, ts(10));
+        // More than the reorder window later, with an honest stamp.
+        let m = mapper
+            .map(400, 1_000.0 + 400.0 * FRAME_MS, OPUS_20MS)
+            .expect("not taken for a straggler");
+        assert!(!m.stream_reset);
+        assert_eq!(m.timestamp, ts(400));
+        let next = mapper
+            .map(401, 1_000.0 + 401.0 * FRAME_MS, OPUS_20MS)
+            .unwrap();
+        assert_eq!(next.timestamp, ts(401));
+    }
+
+    /// A garbage first stamp would anchor the epoch and collapse every later
+    /// timestamp onto one value. Consistent stamps re-anchor the epoch.
+    #[test]
+    fn garbage_first_stamp_is_reanchored() {
+        let mut mapper = RtpTimestampMapper::new();
+        mapper.map(0, 1e15, OPUS_20MS).unwrap();
+        let out: Vec<u32> = (1..40)
+            .map(|i| {
+                mapper
+                    .map(i, 1_000.0 + i as f64 * FRAME_MS, OPUS_20MS)
+                    .unwrap()
+                    .timestamp
+            })
+            .collect();
+        for (i, timestamp) in out.iter().enumerate() {
+            assert_eq!(*timestamp, ts(i as u64 + 1), "packet {}", i + 1);
         }
-        let segments = mapper.state.as_ref().unwrap().segments.len();
-        assert!(segments <= MAX_SEGMENTS, "{segments} segments kept");
+        // Re-anchored: a DTX pause now follows the stamp again.
+        let resumed = mapper
+            .map(40, 1_000.0 + 50.0 * FRAME_MS, OPUS_20MS)
+            .unwrap();
+        assert_eq!(resumed.timestamp, ts(50));
+    }
+
+    /// A late packet with a nonsense stamp falls back to its sequence slot.
+    #[test]
+    fn late_packet_with_nonsense_stamp_keeps_its_sequence_slot() {
+        let mut mapper = RtpTimestampMapper::new();
+        feed(&mut mapper, 0, 1e9, 20);
+        // Stamped 11 days before the stream started.
+        assert_eq!(mapper.map(15, 10.0, OPUS_20MS).unwrap().timestamp, ts(15));
+        assert_eq!(
+            mapper.map(20, 1e9 + 400.0, OPUS_20MS).unwrap().timestamp,
+            ts(20)
+        );
     }
 
     #[test]
     fn hostile_sequence_and_clock_values_do_not_panic() {
         let mut mapper = RtpTimestampMapper::new();
-        let hostile_clocks = [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e300, 1_000.0];
+        let hostile_clocks = [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e300, 1_000.0, -1e300];
         let hostile_sequences = [u64::MAX, 0, u64::MAX - 1, u64::MAX / 2, 1, u64::MAX];
         for &sequence in &hostile_sequences {
             for &clock in &hostile_clocks {
@@ -693,10 +820,9 @@ mod tests {
                 let _ = mapper.map_red_recovered(sequence, u32::MAX);
             }
         }
-        // Pause detection on the u64::MAX packet pushes a segment there.
         let mut mapper = RtpTimestampMapper::new();
         mapper.map(u64::MAX - 1, 1_000.0, OPUS_20MS).unwrap();
-        mapper.map(u64::MAX, 5_000.0, OPUS_20MS).unwrap();
-        mapper.map(u64::MAX, 9_000.0, OPUS_40MS).unwrap();
+        mapper.map(u64::MAX, 1e300, OPUS_20MS).unwrap();
+        mapper.map(u64::MAX, -1e300, OPUS_40MS).unwrap();
     }
 }

@@ -136,6 +136,11 @@ fn start_microphone(
         // (FnMut) data callback keeps framing stateful across invocations.
         let mut acc: Vec<f32> = Vec::with_capacity(frame_size * 2);
         let mut frames: u64 = 0;
+        // Wall clock of frame 0, set on the first packet. Each packet is
+        // stamped `start + frame * 20 ms`, not when the callback happened to
+        // run: receivers derive the RTP timestamp from the stamp, and cpal
+        // delivers several frames per callback.
+        let mut start_ms: Option<f64> = None;
 
         // One data callback per supported sample format: down-mix interleaved
         // input to mono, then encode full frames as the accumulator fills.
@@ -150,7 +155,14 @@ fn start_microphone(
                     while acc.len() >= frame_size {
                         match encoder.encode_float(&acc[..frame_size], &mut out) {
                             Ok(n) => {
-                                if let Err(e) = send_audio_packet(&out[..n], &wt_tx, &email, frames)
+                                // Frames before the first sent one (failed
+                                // encodes) already count, so anchor frame 0
+                                // that many frames back.
+                                let start = *start_ms
+                                    .get_or_insert_with(|| get_millis_now() - frames as f64 * 20.0);
+                                let stamp = start + frames as f64 * 20.0;
+                                if let Err(e) =
+                                    send_audio_packet(&out[..n], &wt_tx, &email, frames, stamp)
                                 {
                                     error!("Failed to send audio: {e}");
                                 }
@@ -219,8 +231,9 @@ fn send_audio_packet(
     wt_tx: &Sender<Vec<u8>>,
     email: &str,
     sequence: u64,
+    timestamp_ms: f64,
 ) -> anyhow::Result<()> {
-    let packet = transform_audio_chunk(opus.to_vec(), email.to_string(), sequence)?;
+    let packet = transform_audio_chunk(opus.to_vec(), email.to_string(), sequence, timestamp_ms)?;
     let bytes = packet.write_to_bytes()?;
     wt_tx.try_send(bytes)?;
     Ok(())
@@ -230,6 +243,7 @@ fn transform_audio_chunk(
     data: Vec<u8>,
     email: String,
     sequence: u64,
+    timestamp_ms: f64,
 ) -> anyhow::Result<PacketWrapper> {
     let user_id_bytes = email.as_bytes();
     Ok(PacketWrapper {
@@ -240,9 +254,9 @@ fn transform_audio_chunk(
             data,
             user_id: user_id_bytes.to_vec(),
             frame_type: String::from("key"),
-            // Milliseconds — the NetEq decoder treats `timestamp` as ms (it
-            // subtracts an Opus frame duration in ms during RED recovery).
-            timestamp: get_millis_now(),
+            // Frame-exact milliseconds (`start + frame * 20 ms`): receivers
+            // derive the RTP timestamp from it (rtp_timestamp.rs).
+            timestamp: timestamp_ms,
             duration: 0.0,
             // Audio packets MUST carry `audio_metadata` (not `video_metadata`):
             // the receiver skips any audio packet without it. The empty

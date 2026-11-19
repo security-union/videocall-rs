@@ -220,6 +220,27 @@ impl DiagnosticPackets {
     }
 }
 
+/// The PID that turns an FPS shortfall into a bitrate cut.
+///
+/// Setpoint is the target FPS, the reading is the worst peer's received FPS
+/// (never above target), so the error is never negative. The output, in
+/// `[PID_OUTPUT_MIN, PID_OUTPUT_MAX]`, maps to a 0..90% bitrate reduction.
+/// pidgeon defaults: D on the measurement (a target FPS change doesn't kick
+/// the output), D low-pass filter N = 10, conditional anti-windup.
+fn fps_pid(target_fps: f64) -> pidgeon::PidController {
+    let config = pidgeon::ControllerConfig::builder()
+        .with_kp(PID_KP)
+        .with_ki(PID_KI)
+        .with_kd(PID_KD)
+        .with_setpoint(target_fps)
+        .with_deadband(PID_DEADBAND_FPS)
+        .with_output_limits(PID_OUTPUT_MIN, PID_OUTPUT_MAX)
+        .with_anti_windup(true)
+        .build()
+        .expect("PID controller config is valid");
+    pidgeon::PidController::new(config)
+}
+
 pub struct EncoderBitrateController {
     pid: pidgeon::PidController,
     last_update: f64,
@@ -279,20 +300,7 @@ impl EncoderBitrateController {
     ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
-        // Configure PID: setpoint = target FPS, process_value = received FPS.
-        // The controller computes error = setpoint − process_value internally.
-        let controller_config = pidgeon::ControllerConfig::builder()
-            .with_kp(PID_KP)
-            .with_ki(PID_KI)
-            .with_kd(PID_KD)
-            .with_setpoint(initial_target)
-            .with_deadband(PID_DEADBAND_FPS)
-            .with_output_limits(PID_OUTPUT_MIN, PID_OUTPUT_MAX)
-            .with_anti_windup(true)
-            .build()
-            .expect("PID controller config is valid");
-
-        let pid = pidgeon::PidController::new(controller_config);
+        let pid = fps_pid(initial_target);
         let diagnostic_packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
 
         Self {
@@ -1258,5 +1266,98 @@ mod tests {
             controller.ideal_bitrate_kbps, expected_bitrate,
             "Initial ideal_bitrate_kbps should match the starting tier's ideal_bitrate_kbps"
         );
+    }
+}
+
+/// Native tests of the PID tuning. The controller tests above need a JS
+/// clock and run in a browser; these pin what the PID itself does.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fps_pid_tests {
+    use super::*;
+
+    const TARGET: f64 = 30.0;
+    /// The controller corrects at most once per PID_CORRECTION_THROTTLE_MS.
+    const DT: f64 = PID_CORRECTION_THROTTLE_MS / 1000.0;
+
+    #[test]
+    fn no_cut_at_target_or_inside_the_deadband() {
+        for reading in [TARGET, TARGET - PID_DEADBAND_FPS] {
+            let mut pid = fps_pid(TARGET);
+            for _ in 0..30 {
+                assert_eq!(pid.compute(reading, DT).unwrap(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn sustained_shortfall_grows_the_cut_until_the_limit() {
+        let mut pid = fps_pid(TARGET);
+        let mut previous = 0.0;
+        let mut outputs = Vec::new();
+        for _ in 0..400 {
+            let output = pid.compute(15.0, DT).unwrap();
+            assert!(output >= previous, "{output} after {previous}");
+            assert!((PID_OUTPUT_MIN..=PID_OUTPUT_MAX).contains(&output));
+            previous = output;
+            outputs.push(output);
+        }
+        // P alone: 0.2 * (15 - 0.5) = 2.9, plus one I step of 0.725.
+        assert!((outputs[0] - 3.625).abs() < 1e-9, "{}", outputs[0]);
+        // pidgeon 1.0's conditional anti-windup stops the integral at the
+        // last step that fits under the limit, and the output is the sum of
+        // the terms it keeps. So the cut settles within one integral step
+        // (Ki * error * dt = 0.725) below the limit, not on it.
+        let settled = *outputs.last().unwrap();
+        let integral_step = PID_KI * (15.0 - PID_DEADBAND_FPS) * DT;
+        assert!(
+            settled <= PID_OUTPUT_MAX && settled > PID_OUTPUT_MAX - integral_step,
+            "{settled}"
+        );
+    }
+
+    #[test]
+    fn integral_does_not_wind_up_while_clamped() {
+        let mut pid = fps_pid(TARGET);
+        // Held at the limit for a long time...
+        for _ in 0..2000 {
+            pid.compute(0.0, DT).unwrap();
+        }
+        let integral_step = PID_KI * (TARGET - PID_DEADBAND_FPS) * DT;
+        assert!(pid.compute(0.0, DT).unwrap() > PID_OUTPUT_MAX - integral_step);
+        assert!(pid.state().integral_contribution <= PID_OUTPUT_MAX);
+        // ...so a partial recovery leaves the limit within a few steps
+        // instead of waiting for a huge integral to unwind.
+        let steps_to_leave_limit = (1..=20)
+            .find(|_| pid.compute(29.0, DT).unwrap() < PID_OUTPUT_MAX - integral_step)
+            .expect("left the limit");
+        assert!(steps_to_leave_limit <= 2, "{steps_to_leave_limit}");
+    }
+
+    #[test]
+    fn target_change_does_not_kick_the_output() {
+        let mut pid = fps_pid(TARGET);
+        for _ in 0..5 {
+            pid.compute(25.0, DT).unwrap();
+        }
+        let integral = pid.state().integral_contribution;
+        assert!(integral > 0.0);
+        // The target drops to the received rate. The reading did not move,
+        // so there is no derivative spike: only the integral remains.
+        pid.set_setpoint(25.0).unwrap();
+        assert_eq!(pid.compute(25.0, DT).unwrap(), integral);
+    }
+
+    #[test]
+    fn rejects_zero_dt_without_changing_state() {
+        let mut pid = fps_pid(TARGET);
+        let first = pid.compute(15.0, DT).unwrap();
+        assert!(pid.compute(15.0, 0.0).is_err());
+        let mut fresh = fps_pid(TARGET);
+        fresh.compute(15.0, DT).unwrap();
+        assert_eq!(
+            pid.compute(15.0, DT).unwrap(),
+            fresh.compute(15.0, DT).unwrap()
+        );
+        assert!(first > 0.0);
     }
 }

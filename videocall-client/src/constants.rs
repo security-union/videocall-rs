@@ -55,6 +55,13 @@ pub fn get_video_codec() -> VideoCodec {
 pub const AUDIO_CHANNELS: u32 = 1u32;
 pub const AUDIO_SAMPLE_RATE: u32 = 48000u32;
 
+/// Opus encoder complexity (0..=10) for the microphone. libwebrtc uses 5 on
+/// mobile (`kDefaultComplexity` for ARM/Android/iOS in
+/// audio_encoder_opus.cc) and 9 or 10 on desktop. Our encoder is pure Rust
+/// compiled to wasm in a worker, so the mobile setting keeps the CPU cost
+/// low on every device; the quality loss at voice bitrates is small.
+pub const MIC_OPUS_COMPLEXITY: u8 = 5;
+
 pub const RSA_BITS: usize = 1024;
 
 use videocall_types::protos::media_packet::media_packet::MediaType;

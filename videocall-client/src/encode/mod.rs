@@ -18,6 +18,8 @@
 
 mod camera_encoder;
 mod encoder_state;
+#[doc(hidden)]
+pub mod mic_opus;
 mod microphone_encoder;
 mod screen_encoder;
 mod transform;

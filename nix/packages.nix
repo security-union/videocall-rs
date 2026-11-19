@@ -138,12 +138,12 @@ let
     CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
   };
 
-  # Trunk runs THREE cargo invocations (index.html: the UI crate + two worker
+  # Trunk runs FOUR cargo invocations (index.html: the UI crate + three worker
   # bins), each resolving features per-invocation — so the deps artifacts must
-  # contain each invocation's exact dependency variants (e.g. three different
+  # contain each invocation's exact dependency variants (e.g. different
   # web-sys feature sets) or cargo recompiles them inside the dist build.
   #
-  # One derivation, three builds into one target dir. NOT a chain of
+  # One derivation, four builds into one target dir. NOT a chain of
   # buildDepsOnly calls: buildDepsOnly hard-codes `cargoArtifacts = null`
   # (crane lib/buildDepsOnly.nix), so chained stages silently discard their
   # predecessor and only the last invocation's graph survives.
@@ -154,6 +154,9 @@ let
       cargoWithProfile build --locked -p videocall-ui
       cargoWithProfile build --locked -p videocall-codecs --no-default-features --features wasm
       cargoWithProfile build --locked -p neteq --no-default-features --features web
+      # index.html builds this worker with the size-tuned profile
+      # (data-cargo-profile-release), so cache that variant.
+      cargo build --locked --profile audio-worker-release -p videocall-client --bin audio_encoder_worker
     '';
   });
   # ---- videocall-cli --------------------------------------------------------
@@ -347,9 +350,9 @@ in
     mainProgram = "bot";
   };
 
-  # Dioxus UI static site: trunk build of the main crate + the two wasm worker
-  # bins wired in index.html (videocall-codecs worker_decoder, neteq
-  # neteq_worker), tailwind compile, and version.json — replicating the old
+  # Dioxus UI static site: trunk build of the main crate + the three wasm
+  # worker bins wired in index.html (videocall-codecs worker_decoder, neteq
+  # neteq_worker, videocall-client audio_encoder_worker), tailwind compile, and version.json — replicating the old
   # Dockerfile.dioxus builder stage on top of the shared wasm dep artifacts.
   dioxus-ui-dist = craneLibWasm.mkCargoDerivation (buildMetaEnv // wasmCommonArgs // {
     pname = "dioxus-ui-dist";

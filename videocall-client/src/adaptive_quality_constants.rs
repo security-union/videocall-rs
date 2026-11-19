@@ -186,6 +186,10 @@ pub struct AudioQualityTier {
     pub label: &'static str,
     pub bitrate_kbps: u32,
     pub enable_dtx: bool,
+    /// Turns on RED: each audio packet also carries the previous frame
+    /// (`AUDIO_REDUNDANCY_ENABLED` must be on too). It does not turn on Opus
+    /// in-band FEC, which stays off on purpose: NetEq conceals loss, and RED
+    /// recovers a lost frame whole instead of as a low-bitrate copy.
     pub enable_fec: bool,
 }
 

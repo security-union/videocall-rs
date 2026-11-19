@@ -12,9 +12,6 @@
         <link data-trunk rel="css" href="./static/global.css" />
         <link data-trunk rel="copy-dir" href="./static" />
         <link data-trunk rel="copy-file" href="./scripts/config.js" />
-        <!-- TOFIX: these files are not being hashed correctly, so they are not being cached -->
-        <link data-trunk rel="copy-file" href="./scripts/encoderWorker.min.js" />
-        <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
         <script src="/config.js"></script>
         <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
         <link
@@ -41,6 +38,20 @@
         data-loader-shim
         />
         <link id="neteq-worker" href="/neteq_worker_loader.js" />
+        <!-- Microphone Opus encoder worker (ropus, pure Rust). The capture
+             AudioWorklet is inlined in videocall-client; this is the worker
+             it feeds. No cargo features needed; release builds use the
+             size-tuned audio-worker-release profile from the root Cargo.toml. -->
+        <link
+        data-trunk
+        rel="rust"
+        href="../videocall-client/Cargo.toml"
+        data-bin="audio_encoder_worker"
+        data-type="worker"
+        data-cargo-profile-release="audio-worker-release"
+        data-loader-shim
+        />
+        <link id="audio-encoder-worker" href="/audio_encoder_worker_loader.js" />
 
         <!-- Load wasm worker scripts from the videocall-codecs crate -->
         <!-- MediaStreamTrackProcessor polyfill using LiveKit's approach:

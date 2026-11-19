@@ -139,6 +139,10 @@ impl AudioProducer {
 
         let mut audio_position = 0;
         let mut sequence = 0u64;
+        // Stamps are frame-exact (`start + frame * 20 ms`), not the time a
+        // timer tick happened to fire: receivers derive the RTP timestamp
+        // from them. Every frame is sent, so the frame index is the sequence.
+        let start_ms = get_timestamp_ms();
 
         loop {
             if quit.load(Ordering::Relaxed) {
@@ -167,7 +171,7 @@ impl AudioProducer {
                         media_type: MediaType::AUDIO.into(),
                         data: encoded,
                         frame_type: "key".to_string(),
-                        timestamp: get_timestamp_ms(),
+                        timestamp: start_ms + sequence as f64 * 20.0,
                         audio_metadata: Some(AudioMetadata {
                             sequence,
                             ..Default::default()

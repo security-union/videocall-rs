@@ -1,6 +1,7 @@
 name: Docker Build Check
 
-# PR gate: prove every app image derivation builds (no push). Same
+# PR gate: prove every app image and every `packages.*` attr in release.nix
+# builds (no push). A new package attr belongs in one of the legs below. Same
 # `release.nix` attrs CI publishes and `make images` loads locally — see
 # docs/nix-architecture.md.
 on:
@@ -23,6 +24,9 @@ on:
       - 'dbmate/**'
       # Bot dependencies
       - 'bot/**'
+      # CLI
+      - 'videocall-cli/**'
+      - '.github/workflows/docker-build-check.yaml'
       # Nix build system
       - 'default.nix'
       - 'release.nix'
@@ -50,13 +54,15 @@ jobs:
       matrix:
         include:
           - name: actix-services
-            attrs: -A images.media-server -A images.websocket-server -A images.webtransport-server -A images.metrics-server -A images.server-stats
+            attrs: -A images.media-server -A images.websocket-server -A images.webtransport-server -A images.metrics-server -A images.server-stats -A packages.videocall-api-bins -A packages.websocket-server -A packages.webtransport-server -A packages.metrics-server -A packages.server-stats
           - name: meeting-api-and-bot
-            attrs: -A images.meeting-api -A images.bot
+            attrs: -A images.meeting-api -A images.bot -A packages.meeting-api -A packages.bot
           - name: dioxus-ui
-            attrs: -A images.dioxus-ui
+            attrs: -A images.dioxus-ui -A packages.dioxus-ui-dist -A packages.wasmBindgenCli
           - name: website-and-vlog
-            attrs: -A images.website -A images.engineering-vlog
+            attrs: -A images.website -A images.engineering-vlog -A packages.website
+          - name: cli-and-tools
+            attrs: -A packages.videocall-cli -A packages.protobufCodegen -A packages.ciWarm
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4

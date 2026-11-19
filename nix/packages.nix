@@ -4,7 +4,7 @@
 #   nativeDeps  — every workspace dependency compiled for musl Linux, once.
 #                 Shared by videocall-api-bins, meeting-api and bot; cached by
 #                 the CI nix cache and only rebuilt when Cargo.lock/toml move.
-#   wasmDeps    — dependencies of the three wasm crates (ui, codecs, neteq),
+#   wasmDeps    — dependencies of the wasm crates (ui, codecs, neteq, mic encoder),
 #                 shared by the trunk build.
 #
 # Without this split every buildRustPackage recompiled the full dependency
@@ -138,7 +138,7 @@ let
     CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
   };
 
-  # Trunk runs THREE cargo invocations (index.html: the UI crate + two worker
+  # Trunk runs FOUR cargo invocations (index.html: the UI crate + three worker
   # bins), each resolving features per-invocation — so the deps artifacts must
   # contain each invocation's exact dependency variants (e.g. three different
   # web-sys feature sets) or cargo recompiles them inside the dist build.
@@ -154,6 +154,7 @@ let
       cargoWithProfile build --locked -p videocall-ui
       cargoWithProfile build --locked -p videocall-codecs --no-default-features --features wasm
       cargoWithProfile build --locked -p neteq --no-default-features --features web
+      cargoWithProfile build --locked -p videocall-mic-encoder
     '';
   });
   # ---- videocall-cli --------------------------------------------------------
@@ -347,9 +348,9 @@ in
     mainProgram = "bot";
   };
 
-  # Dioxus UI static site: trunk build of the main crate + the two wasm worker
-  # bins wired in index.html (videocall-codecs worker_decoder, neteq
-  # neteq_worker), tailwind compile, and version.json — replicating the old
+  # Dioxus UI static site: trunk build of the main crate + the three wasm
+  # worker bins wired in index.html (videocall-codecs worker_decoder, neteq
+  # neteq_worker, videocall-mic-encoder mic_encoder), tailwind compile, and version.json — replicating the old
   # Dockerfile.dioxus builder stage on top of the shared wasm dep artifacts.
   dioxus-ui-dist = craneLibWasm.mkCargoDerivation (buildMetaEnv // wasmCommonArgs // {
     pname = "dioxus-ui-dist";

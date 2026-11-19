@@ -36,6 +36,7 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::Uint8Array;
+use js_sys::WebAssembly;
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -57,7 +58,43 @@ use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
+use web_sys::Response;
 use web_time::SystemTime;
+
+/// The mic AudioWorklet script and its ropus encoder wasm, both built from the
+/// `videocall-mic-encoder` crate. Host pages serve them at these paths.
+const MIC_ENCODER_WORKLET_PATH: &str = "/mic_encoder_worklet.js";
+const MIC_ENCODER_WASM_PATH: &str = "/mic_encoder_bg.wasm";
+
+thread_local! {
+    /// Compiled once per page, reused on every mic start or device switch.
+    static MIC_ENCODER_MODULE: RefCell<Option<WebAssembly::Module>> = const { RefCell::new(None) };
+}
+
+/// Fetches and compiles the encoder wasm on the main thread. The worklet has
+/// no fetch, so it gets the compiled module through `processorOptions`.
+async fn mic_encoder_module() -> Result<WebAssembly::Module, JsValue> {
+    if let Some(module) = MIC_ENCODER_MODULE.with_borrow(Clone::clone) {
+        return Ok(module);
+    }
+    let response: Response = JsFuture::from(window().fetch_with_str(MIC_ENCODER_WASM_PATH))
+        .await?
+        .dyn_into()?;
+    if !response.ok() {
+        return Err(JsValue::from_str(&format!(
+            "fetching {MIC_ENCODER_WASM_PATH}: HTTP {}",
+            response.status()
+        )));
+    }
+    // compile() on the bytes, not compileStreaming(), so a server that
+    // sends the wrong Content-Type for .wasm still works.
+    let bytes = JsFuture::from(response.array_buffer()?).await?;
+    let module: WebAssembly::Module = JsFuture::from(WebAssembly::compile(&bytes))
+        .await?
+        .dyn_into()?;
+    MIC_ENCODER_MODULE.with_borrow_mut(|slot| *slot = Some(module.clone()));
+    Ok(module)
+}
 
 /// Holds the previous audio frame for RED-style redundancy.
 pub(crate) struct PreviousAudioFrame {
@@ -461,14 +498,19 @@ impl MicrophoneEncoder {
             analyser.set_fft_size(VAD_FFT_SIZE);
             analyser.set_smoothing_time_constant(VAD_SMOOTHING_TIME_CONSTANT);
 
-            let worklet = match codec
-                .create_node(
-                    &context,
-                    "/encoderWorker.min.js",
-                    "encoder-worklet",
-                    AUDIO_CHANNELS,
-                )
-                .await
+            let worklet = match async {
+                let module = mic_encoder_module().await?;
+                codec
+                    .create_node_with_processor_options(
+                        &context,
+                        MIC_ENCODER_WORKLET_PATH,
+                        "encoder-worklet",
+                        AUDIO_CHANNELS,
+                        &module,
+                    )
+                    .await
+            }
+            .await
             {
                 Ok(node) => node,
                 Err(e) => {

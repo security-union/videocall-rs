@@ -52,7 +52,7 @@ pub struct MicOpusEncoder {
 }
 
 impl MicOpusEncoder {
-    /// A VoIP encoder at `bitrate_bps` for audio captured at `input_rate`.
+    /// An Audio-mode encoder at `bitrate_bps` for audio captured at `input_rate`.
     /// DTX and in-band FEC stay off, as they were with opus-recorder.
     pub fn new(input_rate: u32, bitrate_bps: u32) -> Result<Self, String> {
         // Browsers capture between 8 kHz and 384 kHz.
@@ -78,7 +78,7 @@ impl MicOpusEncoder {
             .map_err(|e| format!("resampler: {e}"))?;
             Some(resampler)
         };
-        let encoder = Encoder::builder(OPUS_SAMPLE_RATE_HZ, Channels::Mono, Application::Voip)
+        let encoder = Encoder::builder(OPUS_SAMPLE_RATE_HZ, Channels::Mono, Application::Audio)
             .bitrate(Bitrate::Bits(bitrate_bps))
             .complexity(MIC_OPUS_COMPLEXITY)
             .build()
@@ -185,11 +185,21 @@ mod tests {
 
     #[test]
     fn encoder_settings_match_the_old_worklet() {
-        let encoder = MicOpusEncoder::new(48_000, 50_000).unwrap();
+        let mut encoder = MicOpusEncoder::new(48_000, 50_000).unwrap();
         assert_eq!(encoder.encoder.complexity(), MIC_OPUS_COMPLEXITY);
         assert_eq!(encoder.encoder.bitrate(), Bitrate::Bits(50_000));
         assert!(!encoder.encoder.dtx());
         assert_eq!(encoder.encoder.inband_fec(), ropus::InbandFec::Disabled);
+
+        // opus-recorder defaulted to OPUS_APPLICATION_AUDIO (2049). ropus has
+        // no getter for it, so I check what it does: at 50 kbps mono, Audio
+        // picks CELT-only frames (TOC config 16..=31) where VoIP would stay
+        // in SILK or hybrid (0..=15) for this signal.
+        let packets = encode_in_blocks(&mut encoder, &voice(48_000, 48_000), BLOCK);
+        for packet in &packets[5..] {
+            let config = packet[0] >> 3;
+            assert!(config >= 16, "TOC config {config} is not CELT-only");
+        }
     }
 
     #[test]

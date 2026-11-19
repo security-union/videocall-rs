@@ -354,11 +354,7 @@ impl EncoderWorker {
 
     fn reconfigure(&self, id: u32, bitrate_bps: u32) {
         let shared = self.shared.borrow();
-        if !shared
-            .session
-            .as_ref()
-            .is_some_and(|active| active.id == id)
-        {
+        if shared.session.as_ref().is_none_or(|active| active.id != id) {
             return;
         }
         if let Some(worker) = shared.worker.as_ref() {

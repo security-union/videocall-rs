@@ -1,6 +1,6 @@
 \restrict dbmate
 
--- Dumped from database version 18.2
+-- Dumped from database version 17.10
 -- Dumped by pg_dump version 18.2
 
 SET statement_timeout = 0;
@@ -40,7 +40,7 @@ SET default_table_access_method = heap;
 CREATE TABLE public.meeting_participants (
     id integer NOT NULL,
     meeting_id integer NOT NULL,
-    user_id character varying(255) CONSTRAINT meeting_participants_email_not_null NOT NULL,
+    user_id character varying(255) NOT NULL,
     status character varying(50) DEFAULT 'waiting'::character varying NOT NULL,
     is_host boolean DEFAULT false NOT NULL,
     is_required boolean DEFAULT false NOT NULL,

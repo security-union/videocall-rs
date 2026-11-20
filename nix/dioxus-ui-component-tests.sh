@@ -1,7 +1,14 @@
-# Dioxus UI wasm component tests, run against the nix-pinned headless
-# Chrome + chromedriver (see browserTestInputs in nix/shells.nix). Invoke via:
+# Dioxus UI wasm component tests, run against headless Chrome + a matching
+# chromedriver passed in from the environment. Invoke via:
 #
-#   nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
+#   CHROME_BIN=/path/to/chrome CHROMEDRIVER=/path/to/chromedriver \
+#     nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
+#
+# The browser is not nix-pinned on purpose. Google's apt pool only hosts the
+# current stable google-chrome .deb, so a pinned one stops downloading as
+# soon as Chrome ships a new release. CI installs current stable Chrome and
+# its matching chromedriver with browser-actions/setup-chrome (see
+# .github/workflows/wasm-test.yaml) and exports CHROME_BIN/CHROMEDRIVER.
 #
 # Packaged with writeShellApplication, so shellcheck gates the build and
 # `set -euo pipefail` is prepended automatically (also set here so the raw
@@ -26,8 +33,8 @@
 #     session's processes without touching sibling sessions (the old global
 #     CI reap would have killed them).
 #
-# macOS: the nix-pinned Chrome is Linux-only, so local runs use the system
-# browser via the escape hatch (refused in CI):
+# macOS: local runs can use the system browser via the escape hatch, which
+# defaults CHROME_BIN to the installed Google Chrome (refused in CI):
 #   DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 \
 #   CHROMEDRIVER=/path/to/matching/chromedriver \
 #     nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
@@ -43,7 +50,7 @@ fi
 
 system_browser="${DIOXUS_UI_TESTS_SYSTEM_BROWSER:-0}"
 if [ "${system_browser}" = "1" ] && [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-  echo "error: DIOXUS_UI_TESTS_SYSTEM_BROWSER is a local-only escape hatch; CI must use the nix-pinned browser" >&2
+  echo "error: DIOXUS_UI_TESTS_SYSTEM_BROWSER is a local-only escape hatch; CI must pass CHROME_BIN/CHROMEDRIVER from setup-chrome" >&2
   exit 1
 fi
 
@@ -53,25 +60,25 @@ if [ "${system_browser}" = "1" ]; then
     echo "error: system browser not found at '${chrome}' (set CHROME_BIN)" >&2
     exit 1
   fi
-  CHROMEDRIVER="${CHROMEDRIVER:-$(command -v chromedriver)}"
+  CHROMEDRIVER="${CHROMEDRIVER:-$(command -v chromedriver || true)}"
 else
-  chrome="$(command -v google-chrome)"
-  CHROMEDRIVER="${CHROMEDRIVER:-$(command -v chromedriver)}"
-  case "${chrome}" in
-    /nix/store/*) ;;
-    *)
-      echo "error: google-chrome is not the nix-pinned one: ${chrome}" >&2
-      echo "hint: on macOS use DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 with a matching chromedriver" >&2
-      exit 1
-      ;;
-  esac
-  case "${CHROMEDRIVER}" in
-    /nix/store/*) ;;
-    *)
-      echo "error: chromedriver is not the nix-pinned one: ${CHROMEDRIVER}" >&2
-      exit 1
-      ;;
-  esac
+  # No PATH fallback: an explicit browser/driver pair keeps CI from quietly
+  # picking up whatever Chrome the runner image happens to ship.
+  chrome="${CHROME_BIN:-}"
+  CHROMEDRIVER="${CHROMEDRIVER:-}"
+  if [ -z "${chrome}" ] || [ -z "${CHROMEDRIVER}" ]; then
+    echo "error: set CHROME_BIN and CHROMEDRIVER (CI gets both from browser-actions/setup-chrome)" >&2
+    echo "hint: on macOS use DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 with a matching chromedriver" >&2
+    exit 1
+  fi
+fi
+if [ ! -x "${chrome}" ]; then
+  echo "error: browser not executable: '${chrome}'" >&2
+  exit 1
+fi
+if [ -z "${CHROMEDRIVER}" ] || [ ! -x "${CHROMEDRIVER}" ]; then
+  echo "error: chromedriver not executable: '${CHROMEDRIVER}'" >&2
+  exit 1
 fi
 export CHROMEDRIVER
 

@@ -1201,6 +1201,9 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
+                if let Some(sender_diagnostics) = &self.sender_diagnostics {
+                    sender_diagnostics.set_own_session_id(response.session_id);
+                }
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {

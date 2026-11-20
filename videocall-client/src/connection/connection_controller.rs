@@ -116,12 +116,18 @@ impl ConnectionController {
         let mgr_ref = mgr_weak.clone();
         timers.push(Interval::new(100, move || {
             if let Some(mgr) = mgr_ref.upgrade() {
-                if let Ok(mut mgr) = mgr.try_borrow_mut() {
-                    mgr.check_and_complete_election();
+                let announcement = if let Ok(mut mgr) = mgr.try_borrow_mut() {
+                    mgr.check_and_complete_election()
                 } else {
                     warn!(
                         "100ms election check timer: skipped — ConnectionManager already borrowed"
                     );
+                    None
+                };
+                // Outside the borrow: the client's handler calls back into
+                // the manager.
+                if let Some(announcement) = announcement {
+                    announcement.deliver();
                 }
             }
         }));

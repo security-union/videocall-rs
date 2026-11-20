@@ -284,6 +284,15 @@ pub const PID_CORRECTION_THROTTLE_MS: f64 = 1000.0;
 /// PID FPS history size for jitter calculation.
 pub const PID_FPS_HISTORY_SIZE: usize = 10;
 
+/// Longest time step (seconds) the PID integrates a single diagnostics report
+/// over. A report describes about one `DIAGNOSTICS_REPORT_INTERVAL_MS` of
+/// reception, so after a silence (backgrounded tab, lost reports on a lossy
+/// link) the next one must not be weighted as if it covered the whole gap.
+/// Three report intervals tolerate two lost reports in a row.
+/// The clamped step is the one handed to pidgeon, so it also scales the D
+/// term: the derivative after a long gap is the change over at most 3 s.
+pub const PID_MAX_DT_SEC: f64 = 3.0;
+
 // ---------------------------------------------------------------------------
 // Bitrate Change Threshold
 // ---------------------------------------------------------------------------

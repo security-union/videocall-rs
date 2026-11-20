@@ -137,6 +137,22 @@ pub enum ReconnectionPhase {
     Failed,
 }
 
+/// A session id the manager applied when an election completed, still to be
+/// delivered to the client as the SESSION_ASSIGNED packet it came in.
+#[must_use = "the client only learns the session id when this is delivered"]
+pub(crate) struct SessionAnnouncement {
+    on_inbound_media: Callback<PacketWrapper>,
+    packet: PacketWrapper,
+}
+
+impl SessionAnnouncement {
+    /// Hand the packet to the client. Call it after releasing the manager:
+    /// the client's handler borrows it again.
+    pub(crate) fn deliver(self) {
+        self.on_inbound_media.emit(self.packet);
+    }
+}
+
 #[derive(Debug)]
 pub struct ConnectionManager {
     connections: HashMap<String, Connection>,
@@ -150,8 +166,8 @@ pub struct ConnectionManager {
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
     own_session_id: Rc<RefCell<Option<u64>>>,
-    /// Per-connection session_ids received via SESSION_ASSIGNED before election completes.
-    pending_session_ids: Rc<RefCell<HashMap<String, u64>>>,
+    /// Per-connection SESSION_ASSIGNED packets received before election completes.
+    pending_session_ids: Rc<RefCell<HashMap<String, PacketWrapper>>>,
 
     // --- Reconnection state ---
     reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
@@ -423,7 +439,7 @@ impl ConnectionManager {
                 } else {
                     pending_session_ids
                         .borrow_mut()
-                        .insert(connection_id.clone(), sid);
+                        .insert(connection_id.clone(), packet);
                 }
                 return;
             }
@@ -652,9 +668,12 @@ impl ConnectionManager {
         }
     }
 
-    /// Complete the election and select the best connection
-    fn complete_election(&mut self) {
+    /// Complete the election and select the best connection. Returns the
+    /// session id it applied, for the caller to deliver once it has released
+    /// the manager.
+    fn complete_election(&mut self) -> Option<SessionAnnouncement> {
         info!("Completing connection election");
+        let mut announcement = None;
 
         // Stop probing
         if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
@@ -688,30 +707,7 @@ impl ConnectionManager {
                 };
 
                 // Apply pending session_id for the elected connection
-                if let Some(sid) = self
-                    .pending_session_ids
-                    .borrow()
-                    .get(&connection_id)
-                    .copied()
-                {
-                    if *self.own_session_id.borrow() == Some(sid) {
-                        debug!(
-                            "Pending SESSION_ASSIGNED already processed for session {}, skipping",
-                            sid
-                        );
-                    } else {
-                        info!(
-                            "Applying pending SESSION_ASSIGNED for elected connection {}: {}",
-                            connection_id, sid
-                        );
-                        *self.own_session_id.borrow_mut() = Some(sid);
-
-                        if let Some(connection) = self.connections.get(&connection_id) {
-                            connection.set_session_id(sid);
-                        }
-                    }
-                }
-                self.pending_session_ids.borrow_mut().clear();
+                announcement = self.take_pending_session_announcement(&connection_id);
 
                 // Start heartbeat only on the elected connection
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
@@ -750,6 +746,35 @@ impl ConnectionManager {
                 self.report_state();
             }
         }
+        announcement
+    }
+
+    /// Apply the SESSION_ASSIGNED the elected connection received while it
+    /// was a candidate, and clear the other candidates' ids.
+    ///
+    /// Returns the packet for the client when the applied id changed, so the
+    /// client learns it the same way as an immediately applied one.
+    fn take_pending_session_announcement(
+        &mut self,
+        connection_id: &str,
+    ) -> Option<SessionAnnouncement> {
+        let pending = self.pending_session_ids.borrow_mut().remove(connection_id);
+        self.pending_session_ids.borrow_mut().clear();
+        let packet = pending?;
+        let sid = packet.session_id;
+        if *self.own_session_id.borrow() == Some(sid) {
+            debug!("Pending SESSION_ASSIGNED already processed for session {sid}, skipping");
+            return None;
+        }
+        info!("Applying pending SESSION_ASSIGNED for elected connection {connection_id}: {sid}");
+        *self.own_session_id.borrow_mut() = Some(sid);
+        if let Some(connection) = self.connections.get(connection_id) {
+            connection.set_session_id(sid);
+        }
+        Some(SessionAnnouncement {
+            on_inbound_media: self.options.on_inbound_media.clone(),
+            packet,
+        })
     }
 
     /// Find the connection with the best (lowest) average RTT
@@ -1623,7 +1648,7 @@ impl ConnectionManager {
     /// times. This prevents high-latency connections (200ms+ RTT) from
     /// being misjudged or missed entirely because the handshake consumed
     /// most of the original election window.
-    pub fn check_and_complete_election(&mut self) {
+    pub fn check_and_complete_election(&mut self) -> Option<SessionAnnouncement> {
         if let ElectionState::Testing {
             start_time,
             duration_ms,
@@ -1633,7 +1658,7 @@ impl ConnectionManager {
         {
             let elapsed = monotonic_now_ms() - *start_time;
             if elapsed < *duration_ms as f64 {
-                return;
+                return None;
             }
 
             // Timer expired. Check if any connection has enough RTT samples.
@@ -1649,7 +1674,7 @@ impl ConnectionManager {
                         extensions_used, ELECTION_MIN_RTT_SAMPLES,
                     );
                 }
-                self.complete_election();
+                return self.complete_election();
             } else {
                 // Extend the deadline by 1 second.
                 let ext = *extensions_used;
@@ -1672,6 +1697,7 @@ impl ConnectionManager {
                 }
             }
         }
+        None
     }
 
     /// Get current connection state for UI
@@ -2670,4 +2696,92 @@ mod tests {
     // - `create_connection_lost_callback` -> spawns reconnection loop
     //
     // These should be covered by wasm-bindgen-test integration tests or E2E tests.
+
+    // -----------------------------------------------------------------------
+    // Session id delivery: the client must learn every session id the
+    // manager applies, whether SESSION_ASSIGNED arrived before or after the
+    // election picked that connection.
+    // -----------------------------------------------------------------------
+
+    fn session_assigned(session_id: u64) -> PacketWrapper {
+        PacketWrapper {
+            packet_type: PacketType::SESSION_ASSIGNED.into(),
+            user_id: b"system".to_vec(),
+            session_id,
+            ..Default::default()
+        }
+    }
+
+    /// A manager whose inbound media goes where the client's would: the
+    /// SESSION_ASSIGNED handler hands the id to the sender diagnostics.
+    fn manager_feeding_diagnostics(
+        own_session_id: Rc<std::cell::Cell<Option<u64>>>,
+    ) -> ConnectionManager {
+        let mut mgr = make_test_manager();
+        mgr.options.on_inbound_media = Callback::from(move |packet: PacketWrapper| {
+            if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
+                own_session_id.set(Some(packet.session_id));
+            }
+        });
+        mgr
+    }
+
+    /// Normal join: SESSION_ASSIGNED arrives while the connection is still a
+    /// candidate, then a re-election moves us to a new connection with a new
+    /// id. Reports about our stream must reach the encoder throughout.
+    #[test]
+    fn diagnostics_follow_the_session_id_across_elections() {
+        use crate::diagnostics::diagnostics_manager::SenderRoutingProbe;
+
+        let diagnostics_id = Rc::new(std::cell::Cell::new(None));
+        let mut mgr = manager_feeding_diagnostics(diagnostics_id.clone());
+        let mut probe = SenderRoutingProbe::new(diagnostics_id.clone());
+
+        // First election: the id arrives before the connection is elected.
+        let conn_a = mgr.create_inbound_media_callback("conn-a".to_string());
+        conn_a.emit(session_assigned(11));
+        mgr.active_connection_id
+            .borrow_mut()
+            .replace("conn-a".to_string());
+        if let Some(announcement) = mgr.take_pending_session_announcement("conn-a") {
+            announcement.deliver();
+        }
+        assert_eq!(*mgr.own_session_id.borrow(), Some(11));
+        assert_eq!(diagnostics_id.get(), Some(11));
+        assert!(probe.report_reaches_encoder(11), "first election");
+
+        // Re-election: the old connection stays active while conn-b is tested.
+        let conn_b = mgr.create_inbound_media_callback("conn-b".to_string());
+        conn_b.emit(session_assigned(22));
+        assert_eq!(diagnostics_id.get(), Some(11), "applied before election");
+        mgr.active_connection_id
+            .borrow_mut()
+            .replace("conn-b".to_string());
+        if let Some(announcement) = mgr.take_pending_session_announcement("conn-b") {
+            announcement.deliver();
+        }
+        assert_eq!(*mgr.own_session_id.borrow(), Some(22));
+        assert_eq!(diagnostics_id.get(), Some(22));
+        assert!(probe.report_reaches_encoder(22), "after re-election");
+        assert!(!probe.report_reaches_encoder(11), "old session's stream");
+    }
+
+    /// An id applied immediately (the connection was already elected) is
+    /// delivered at once and not announced a second time.
+    #[test]
+    fn immediate_session_id_is_delivered_once() {
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let mut mgr = make_test_manager();
+        let sink = delivered.clone();
+        mgr.options.on_inbound_media = Callback::from(move |packet: PacketWrapper| {
+            sink.borrow_mut().push(packet.session_id);
+        });
+        mgr.active_connection_id
+            .borrow_mut()
+            .replace("conn-a".to_string());
+        mgr.create_inbound_media_callback("conn-a".to_string())
+            .emit(session_assigned(7));
+        assert!(mgr.take_pending_session_announcement("conn-a").is_none());
+        assert_eq!(*delivered.borrow(), vec![7]);
+    }
 }

@@ -184,9 +184,8 @@ pub fn Host(
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
         camera.set_encoder_control(rx);
 
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
-        screen.set_encoder_control(rx);
+        // Screen share runs at a fixed bitrate until the bitrate controller
+        // redesign, so it is not subscribed to diagnostics.
 
         // Create MediaDeviceList
         let media_devices = MediaDeviceList::new();

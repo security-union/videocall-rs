@@ -17,7 +17,6 @@
  */
 
 use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::JsString;
@@ -52,9 +51,9 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
-use crate::adaptive_quality_constants::{BITRATE_CHANGE_THRESHOLD, SCREEN_QUALITY_TIERS};
+use crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
 use crate::constants::get_video_codec_string;
-use crate::diagnostics::EncoderBitrateController;
+use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
 
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
 ///
@@ -81,20 +80,15 @@ pub enum ScreenShareEvent {
 pub struct ScreenEncoder {
     client: VideoCallClient,
     state: EncoderState,
-    current_bitrate: Rc<AtomicU32>,
+    /// Fixed bitrate: screen share has no bitrate controller until the
+    /// controller redesign.
+    bitrate_kbps: u32,
     current_fps: Rc<AtomicU32>,
-    on_encoder_settings_update: Option<Callback<String>>,
     on_state_change: Option<Callback<ScreenShareEvent>>,
     /// Holds the active MediaStream so `stop()` can synchronously kill all tracks.
     /// Only used by the screen encoder -- this is screen-specific state, not generic encoder state.
     /// I do not like this but so far it is reliable.
     screen_stream: Rc<RefCell<Option<MediaStream>>>,
-    /// Tier-controlled max width for screen share.
-    tier_max_width: Rc<AtomicU32>,
-    /// Tier-controlled max height for screen share.
-    tier_max_height: Rc<AtomicU32>,
-    /// Tier-controlled keyframe interval (frames).
-    tier_keyframe_interval: Rc<AtomicU32>,
     /// When set to `true`, the next encoded frame will be forced as a keyframe.
     /// Used by the PLI (Picture Loss Indication) mechanism.
     force_keyframe: Arc<AtomicBool>,
@@ -111,87 +105,37 @@ impl ScreenEncoder {
     ///
     /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
     /// * `bitrate_kbps` - initial bitrate in kilobits per second
-    /// * `on_encoder_settings_update` - callback for encoder settings updates (e.g., bitrate changes)
+    /// * `on_encoder_settings_update` - unused: the screen share bitrate is
+    ///   fixed until the bitrate controller redesign, so it never changes
     /// * `on_state_change` - callback for screen share state changes (started, cancelled, stopped)
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     pub fn new(
         client: VideoCallClient,
         bitrate_kbps: u32,
-        on_encoder_settings_update: Callback<String>,
+        _on_encoder_settings_update: Callback<String>,
         on_state_change: Callback<ScreenShareEvent>,
     ) -> Self {
-        let default_tier = &SCREEN_QUALITY_TIERS[0];
         Self {
             client,
             state: EncoderState::new(),
-            current_bitrate: Rc::new(AtomicU32::new(bitrate_kbps)),
+            bitrate_kbps,
             current_fps: Rc::new(AtomicU32::new(0)),
-            on_encoder_settings_update: Some(on_encoder_settings_update),
             on_state_change: Some(on_state_change),
             screen_stream: Rc::new(RefCell::new(None)),
-            tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
-            tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
-            tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
         }
     }
 
+    /// Does nothing and drops `diagnostics_receiver`: screen share keeps
+    /// its starting bitrate and resolution until the bitrate controller
+    /// redesign. Don't subscribe the screen to diagnostics.
+    #[deprecated(note = "screen share runs at a fixed bitrate; don't subscribe it to diagnostics")]
     pub fn set_encoder_control(
         &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
+        _diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
     ) {
-        let current_bitrate = self.current_bitrate.clone();
-        let current_fps = self.current_fps.clone();
-        let on_encoder_settings_update = self.on_encoder_settings_update.clone();
-        let enabled = self.state.enabled.clone();
-        let tier_max_width = self.tier_max_width.clone();
-        let tier_max_height = self.tier_max_height.clone();
-        let tier_keyframe_interval = self.tier_keyframe_interval.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderBitrateController::new_with_tiers(
-                current_bitrate.load(Ordering::Relaxed),
-                current_fps.clone(),
-                SCREEN_QUALITY_TIERS,
-            );
-            while let Some(event) = diagnostics_receiver.next().await {
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
-                if let Some(bitrate) = output_wasted {
-                    if enabled.load(Ordering::Acquire) {
-                        // Only update if change is greater than threshold
-                        let current = current_bitrate.load(Ordering::Relaxed) as f64;
-                        let new = bitrate;
-                        let percent_change = (new - current).abs() / current;
-
-                        if percent_change > BITRATE_CHANGE_THRESHOLD {
-                            if let Some(callback) = &on_encoder_settings_update {
-                                callback.emit(format!("Bitrate: {bitrate:.2} kbps"));
-                            }
-                            current_bitrate.store(bitrate as u32, Ordering::Relaxed);
-                        }
-                    } else if let Some(callback) = &on_encoder_settings_update {
-                        callback.emit("Disabled".to_string());
-                    }
-                }
-
-                // Check for tier changes and update shared atomics.
-                if encoder_control.take_tier_changed() {
-                    let tier = encoder_control.current_video_tier();
-                    tier_max_width.store(tier.max_width, Ordering::Relaxed);
-                    tier_max_height.store(tier.max_height, Ordering::Relaxed);
-                    tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
-                    log::info!(
-                        "ScreenEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
-                        tier.label,
-                        tier.max_width,
-                        tier.max_height,
-                        tier.target_fps,
-                        tier.keyframe_interval_frames,
-                    );
-                }
-            }
-        });
     }
 
     /// Returns a handle to the active screen-share MediaStream.
@@ -227,10 +171,10 @@ impl ScreenEncoder {
         self.force_keyframe = flag;
     }
 
-    /// Allows setting a callback to receive encoder settings updates
-    pub fn set_encoder_settings_callback(&mut self, callback: Callback<String>) {
-        self.on_encoder_settings_update = Some(callback);
-    }
+    /// Does nothing: the screen share bitrate is fixed until the bitrate
+    /// controller redesign, so there are no settings updates to report.
+    #[deprecated(note = "screen share runs at a fixed bitrate; there are no updates")]
+    pub fn set_encoder_settings_callback(&mut self, _callback: Callback<String>) {}
 
     // The next two methods delegate to self.state
 
@@ -313,13 +257,10 @@ impl ScreenEncoder {
         let client_for_state = client.clone();
         let userid = client.user_id().clone();
         let aes = client.aes();
-        let current_bitrate = self.current_bitrate.clone();
+        let bitrate_kbps = self.bitrate_kbps;
         let current_fps = self.current_fps.clone();
         let on_state_change = self.on_state_change.clone();
         let screen_stream = self.screen_stream.clone();
-        let tier_max_width = self.tier_max_width.clone();
-        let tier_max_height = self.tier_max_height.clone();
-        let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
         let active_video_track = self.active_video_track.clone();
 
@@ -404,26 +345,18 @@ impl ScreenEncoder {
             let screen_output_handler = {
                 let mut buffer: Vec<u8> = Vec::with_capacity(150_000);
                 let mut sequence_number = 0;
-                let performance = window()
-                    .performance()
-                    .expect("Performance API not available");
-                let mut last_chunk_time = performance.now();
-                let mut chunks_in_last_second = 0;
+                let mut output_meter = FrameRateMeter::default();
 
                 Box::new(move |chunk: JsValue| {
-                    let now = window()
-                        .performance()
-                        .expect("Performance API not available")
-                        .now();
                     let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
-                    // Update FPS calculation
-                    chunks_in_last_second += 1;
-                    if now - last_chunk_time >= 1000.0 {
-                        let fps = chunks_in_last_second;
-                        current_fps.store(fps, Ordering::Relaxed);
-                        chunks_in_last_second = 0;
-                        last_chunk_time = now;
+                    // One chunk per captured frame. Static content produces
+                    // no frames, so a pause restarts the measurement rather
+                    // than being divided into a rate.
+                    if let FrameEvent::WindowClosed { fps, .. } =
+                        output_meter.on_frame(js_sys::Date::now())
+                    {
+                        current_fps.store(fps.round() as u32, Ordering::Relaxed);
                     }
 
                     // Ensure buffer is large enough for this chunk
@@ -496,8 +429,7 @@ impl ScreenEncoder {
 
             let width = track_settings.get_width().expect("width is None");
             let height = track_settings.get_height().expect("height is None");
-            // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
+            let local_bitrate: u32 = bitrate_kbps * 1000;
             let screen_encoder_config =
                 VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
             screen_encoder_config.set_bitrate_f64(local_bitrate as f64);
@@ -536,10 +468,13 @@ impl ScreenEncoder {
             let mut current_encoder_width = width as u32;
             let mut current_encoder_height = height as u32;
 
-            // Cache tier-controlled values
-            let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
-            let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
-            let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
+            // Fixed until the bitrate controller redesign: the first screen
+            // tier's limits, as main effectively ran (its controller never
+            // changed them).
+            let tier = &SCREEN_QUALITY_TIERS[0];
+            let local_keyframe_interval = tier.keyframe_interval_frames;
+            let local_tier_max_width = tier.max_width;
+            let local_tier_max_height = tier.max_height;
 
             loop {
                 // Check if we should stop encoding
@@ -550,69 +485,6 @@ impl ScreenEncoder {
                         error!("Error closing screen encoder: {e:?}");
                     }
                     break;
-                }
-
-                // Check for tier-driven dimension/keyframe changes.
-                let new_tier_w = tier_max_width.load(Ordering::Relaxed);
-                let new_tier_h = tier_max_height.load(Ordering::Relaxed);
-                let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
-
-                let tier_dims_changed =
-                    new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
-                if tier_dims_changed {
-                    local_tier_max_width = new_tier_w;
-                    local_tier_max_height = new_tier_h;
-
-                    let constrained_w = current_encoder_width.min(local_tier_max_width);
-                    let constrained_h = current_encoder_height.min(local_tier_max_height);
-
-                    log::info!(
-                        "ScreenEncoder: tier dimension change -> {}x{} (was {}x{})",
-                        constrained_w,
-                        constrained_h,
-                        current_encoder_width,
-                        current_encoder_height,
-                    );
-                    current_encoder_width = constrained_w;
-                    current_encoder_height = constrained_h;
-
-                    let new_config = VideoEncoderConfig::new(
-                        get_video_codec_string(),
-                        current_encoder_height,
-                        current_encoder_width,
-                    );
-                    new_config.set_bitrate_f64(local_bitrate as f64);
-                    new_config.set_latency_mode(LatencyMode::Realtime);
-                    if let Err(e) = screen_encoder.configure(&new_config) {
-                        error!("Error reconfiguring screen encoder for tier change: {e:?}");
-                    }
-                }
-
-                if new_kf != local_keyframe_interval {
-                    local_keyframe_interval = new_kf;
-                    log::info!(
-                        "ScreenEncoder: keyframe interval changed to {}",
-                        local_keyframe_interval
-                    );
-                }
-
-                // Update the bitrate if it has changed from diagnostics system
-                let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_bitrate != local_bitrate && !tier_dims_changed {
-                    info!("Updating screen bitrate to {new_bitrate}");
-                    local_bitrate = new_bitrate;
-                    let new_config = VideoEncoderConfig::new(
-                        get_video_codec_string(),
-                        current_encoder_height,
-                        current_encoder_width,
-                    );
-                    new_config.set_bitrate_f64(local_bitrate as f64);
-                    new_config.set_latency_mode(LatencyMode::Realtime);
-                    if let Err(e) = screen_encoder.configure(&new_config) {
-                        error!("Error configuring screen encoder: {e:?}");
-                    }
-                } else if new_bitrate != local_bitrate {
-                    local_bitrate = new_bitrate;
                 }
 
                 match JsFuture::from(screen_reader.read()).await {

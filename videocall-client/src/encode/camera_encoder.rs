@@ -23,6 +23,7 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
@@ -59,6 +60,7 @@ use crate::adaptive_quality_constants::{
     AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
+use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
 use crate::diagnostics::EncoderBitrateController;
 
 use futures::channel::mpsc::UnboundedReceiver;
@@ -79,6 +81,9 @@ pub struct CameraEncoder {
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
+    /// Frames the encoder produced, measured like the viewers measure what
+    /// they receive. Shared with the bitrate controller.
+    output_meter: Rc<RefCell<FrameRateMeter>>,
     on_encoder_settings_update: Callback<String>,
     on_error: Option<Callback<String>>,
     /// Tier-controlled max width. The encoding loop checks this and reconfigures
@@ -135,6 +140,7 @@ impl CameraEncoder {
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Rc::new(AtomicU32::new(0)),
+            output_meter: Rc::new(RefCell::new(FrameRateMeter::default())),
             on_encoder_settings_update,
             on_error: Some(on_error),
             tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
@@ -155,6 +161,7 @@ impl CameraEncoder {
     ) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let output_meter = self.output_meter.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -167,7 +174,8 @@ impl CameraEncoder {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
-            );
+            )
+            .with_source_meter(output_meter);
             while let Some(event) = diagnostics_receiver.next().await {
                 // Check for server congestion step-down request before
                 // processing the diagnostics packet so the forced step-down
@@ -328,6 +336,7 @@ impl CameraEncoder {
         } = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let output_meter = self.output_meter.clone();
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
@@ -335,21 +344,17 @@ impl CameraEncoder {
         let video_output_handler = {
             let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             let mut sequence_number = 0;
-            let mut last_chunk_time = window().performance().unwrap().now();
-            let mut chunks_in_last_second = 0;
 
             Box::new(move |chunk: JsValue| {
-                let now = window().performance().unwrap().now();
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
-                // Update FPS calculation
-                chunks_in_last_second += 1;
-                if now - last_chunk_time >= 1000.0 {
-                    let fps = chunks_in_last_second;
-                    current_fps.store(fps, Ordering::Relaxed);
-                    log::debug!("Encoder output FPS: {fps}");
-                    chunks_in_last_second = 0;
-                    last_chunk_time = now;
+                // One chunk per captured frame, measured like the viewers
+                // measure what they receive.
+                if let FrameEvent::WindowClosed { fps, .. } =
+                    output_meter.borrow_mut().on_frame(js_sys::Date::now())
+                {
+                    current_fps.store(fps.round() as u32, Ordering::Relaxed);
+                    log::debug!("Encoder output FPS: {fps:.1}");
                 }
 
                 // Ensure the backing buffer is large enough for this chunk

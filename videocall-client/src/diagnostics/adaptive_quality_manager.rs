@@ -85,7 +85,13 @@ impl AdaptiveQualityManager {
     ///
     /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
     pub fn new(video_tiers: &'static [VideoQualityTier]) -> Self {
-        let now = js_sys::Date::now();
+        Self::new_at(video_tiers, js_sys::Date::now())
+    }
+
+    /// Same as [`Self::new`], but with the creation time passed in instead of
+    /// read from `Date::now()`, so the warmup and transition timers can be
+    /// driven by simulated time (and on non-wasm targets).
+    pub(crate) fn new_at(video_tiers: &'static [VideoQualityTier], now: f64) -> Self {
         Self {
             video_tiers,
             video_tier_index: DEFAULT_VIDEO_TIER_INDEX,
@@ -295,6 +301,16 @@ impl AdaptiveQualityManager {
         }
 
         false
+    }
+
+    /// Forget how long the step-down and step-up conditions have held, so
+    /// time without evidence (the source was idle) does not count toward
+    /// the next transition.
+    pub(crate) fn restart_timers(&mut self) {
+        self.degrade_start_ms = None;
+        self.recover_start_ms = None;
+        self.audio_degrade_start_ms = None;
+        self.audio_recover_start_ms = None;
     }
 
     /// Get the current video quality tier recommendation.

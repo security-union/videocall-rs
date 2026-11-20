@@ -177,7 +177,11 @@ run_target_job() {
   local log="${logdir}/${slug}.log"
   local max_attempts=3 attempt attempt_tmp
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-    attempt_tmp="$(mktemp -d)"
+    # Under /tmp, not $TMPDIR: on the GitHub runner $TMPDIR is a long
+    # _temp/nix-shell-* path, and Chrome's SingletonSocket under it blows
+    # the 108-byte unix socket limit ("Socket path too long"), so every
+    # session dies at startup.
+    attempt_tmp="$(mktemp -d /tmp/dxt.XXXXXX)"
     echo "[${desc}] attempt ${attempt}/${max_attempts} started"
     if TMPDIR="${attempt_tmp}" wasm-bindgen-test-runner "${exe}" \
       >>"${log}" 2>&1; then

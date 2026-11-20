@@ -110,6 +110,34 @@ trap 'cp "${webdriver_backup}" "${webdriver_json}"; rm -f "${webdriver_backup}"'
 jq --arg bin "${chrome}" '."goog:chromeOptions".binary = $bin' \
   "${webdriver_backup}" > "${webdriver_json}"
 
+# Diagnostics for "session not created: Chrome instance exited". None of
+# this can fail the job; it only puts the browser's own stderr in the log.
+echo "::group::browser diagnostics"
+echo "uid: $(id -u)  kernel: $(uname -r)"
+echo "apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+df -h /dev/shm "${TMPDIR:-/tmp}" 2>/dev/null || true
+# One-shot launch with exactly the webdriver.json args plus a private
+# profile, so a browser that dies at startup shows why.
+mapfile -t chrome_args < <(jq -r '."goog:chromeOptions".args[]' "${webdriver_json}")
+smoke_dir="$(mktemp -d)"
+smoke_rc=0
+timeout 60 "${chrome}" "${chrome_args[@]}" --user-data-dir="${smoke_dir}/profile" \
+  --dump-dom about:blank >"${smoke_dir}/out.log" 2>&1 || smoke_rc=$?
+echo "smoke launch: ${chrome} ${chrome_args[*]} --dump-dom about:blank -> exit ${smoke_rc}"
+tail -50 "${smoke_dir}/out.log" || true
+pkill -9 -f "${smoke_dir}" 2>/dev/null || true
+rm -rf "${smoke_dir}"
+echo "::endgroup::"
+
+# Run chromedriver verbosely, logging into the attempt's private TMPDIR, so
+# a failed attempt can show what Chrome said before it exited.
+driver_wrapper_dir="$(mktemp -d)"
+# shellcheck disable=SC2016 # ${TMPDIR} must expand when the wrapper runs
+printf '#!/usr/bin/env bash\nexec %q --verbose --log-path="${TMPDIR:-/tmp}/chromedriver.log" "$@"\n' \
+  "${CHROMEDRIVER}" >"${driver_wrapper_dir}/chromedriver"
+chmod +x "${driver_wrapper_dir}/chromedriver"
+CHROMEDRIVER="${driver_wrapper_dir}/chromedriver"
+
 # Prebuild every test executable in one cargo invocation (compile uses all
 # cores), then harvest the artifact paths from a second, fully-fresh
 # --message-format=json pass.
@@ -158,6 +186,12 @@ run_target_job() {
       touch "${logdir}/${slug}.ok"
       return 0
     fi
+    if [ -f "${attempt_tmp}/chromedriver.log" ]; then
+      {
+        echo "--- tail of chromedriver verbose log (attempt ${attempt}) ---"
+        tail -100 "${attempt_tmp}/chromedriver.log"
+      } >>"${log}" 2>&1 || true
+    fi
     # Reap exactly this attempt's browser processes (their user-data-dir
     # lives under the private TMPDIR), then retry.
     pkill -9 -f "${attempt_tmp}" 2>/dev/null || true
@@ -195,7 +229,7 @@ for entry in "${targets[@]}"; do
   cat "${logdir}/${slug}.log" 2>/dev/null || true
   echo "::endgroup::"
 done
-rm -rf "${logdir}"
+rm -rf "${logdir}" "${driver_wrapper_dir}"
 
 if [ "${#failed_targets[@]}" -gt 0 ]; then
   echo "::error::dioxus-ui targets failed: ${failed_targets[*]}"

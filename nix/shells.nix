@@ -32,7 +32,7 @@ let
   # in via CHROME_BIN/CHROMEDRIVER (see the script header).
   dioxusUiComponentTests = pkgs.writeShellApplication {
     name = "dioxus-ui-component-tests";
-    runtimeInputs = [ pkgs.jq ];
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
     text = builtins.readFile ./dioxus-ui-component-tests.sh;
   };
 

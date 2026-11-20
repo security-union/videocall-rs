@@ -202,7 +202,7 @@ check-backend-sqlite: ensure-nix ## meeting-api integration tests on the SQLite 
 	DATABASE_URL="sqlite:$(SQLITE_TEST_DB)" \
 		cargo test -p meeting-api --no-default-features --features sqlite -- --test-threads=1
 
-check-ui: ensure-nix ## Dioxus UI wasm component tests (pinned headless Chrome, parallel)
+check-ui: ensure-nix ## Dioxus UI wasm component tests (headless Chrome, parallel; needs CHROME_BIN + CHROMEDRIVER, or DIOXUS_UI_TESTS_SYSTEM_BROWSER=1)
 	nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
 
 check-e2e: e2e-build e2e-install ## Full Playwright pipeline: warm builds, native stack, tests, teardown

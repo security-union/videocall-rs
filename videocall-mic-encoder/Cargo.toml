@@ -1,0 +1,18 @@
+[package]
+name = "videocall-mic-encoder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Microphone Opus encoder (ropus) that runs inside the videocall-client AudioWorklet."
+publish = false
+
+# The bin is the wasm the mic AudioWorklet instantiates. wasm-bindgen is only
+# here because trunk runs it on every rust asset; the worklet ignores the glue.
+[[bin]]
+name = "mic_encoder"
+path = "src/main.rs"
+
+[dependencies]
+ropus = "0.12"
+rubato = { version = "5.1", default-features = false }
+wasm-bindgen = { workspace = true }

@@ -36,6 +36,7 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::Uint8Array;
+use js_sys::WebAssembly;
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -57,7 +58,43 @@ use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
+use web_sys::Response;
 use web_time::SystemTime;
+
+/// The mic AudioWorklet script and its ropus encoder wasm, both built from the
+/// `videocall-mic-encoder` crate. Host pages serve them at these paths.
+const MIC_ENCODER_WORKLET_PATH: &str = "/mic_encoder_worklet.js";
+const MIC_ENCODER_WASM_PATH: &str = "/mic_encoder_bg.wasm";
+
+thread_local! {
+    /// Compiled once per page, reused on every mic start or device switch.
+    static MIC_ENCODER_MODULE: RefCell<Option<WebAssembly::Module>> = const { RefCell::new(None) };
+}
+
+/// Fetches and compiles the encoder wasm on the main thread. The worklet has
+/// no fetch, so it gets the compiled module through `processorOptions`.
+async fn mic_encoder_module() -> Result<WebAssembly::Module, JsValue> {
+    if let Some(module) = MIC_ENCODER_MODULE.with_borrow(Clone::clone) {
+        return Ok(module);
+    }
+    let response: Response = JsFuture::from(window().fetch_with_str(MIC_ENCODER_WASM_PATH))
+        .await?
+        .dyn_into()?;
+    if !response.ok() {
+        return Err(JsValue::from_str(&format!(
+            "fetching {MIC_ENCODER_WASM_PATH}: HTTP {}",
+            response.status()
+        )));
+    }
+    // compile() on the bytes, not compileStreaming(), so a server that
+    // sends the wrong Content-Type for .wasm still works.
+    let bytes = JsFuture::from(response.array_buffer()?).await?;
+    let module: WebAssembly::Module = JsFuture::from(WebAssembly::compile(&bytes))
+        .await?
+        .dyn_into()?;
+    MIC_ENCODER_MODULE.with_borrow_mut(|slot| *slot = Some(module.clone()));
+    Ok(module)
+}
 
 /// Holds the previous audio frame for RED-style redundancy.
 pub(crate) struct PreviousAudioFrame {
@@ -260,6 +297,7 @@ impl MicrophoneEncoder {
         // Clone atomic values for use in different closures
         let enabled_for_handler = enabled.clone();
         let enable_fec_for_handler = self.tier_enable_fec.clone();
+        let on_error_for_handler = on_error.clone();
 
         let audio_output_handler = {
             log::info!("Starting Microphone audio encoder with AnalyserNode VAD");
@@ -283,6 +321,13 @@ impl MicrophoneEncoder {
                 // Check if this is an actual audio frame message (not control messages)
                 if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
                     if let Some(msg_str) = message_type.as_string() {
+                        if msg_str == "error" {
+                            // The worklet could not start its encoder.
+                            if let Some(cb) = &on_error_for_handler {
+                                cb.emit("Microphone encoder failed to initialize".to_string());
+                            }
+                            return;
+                        }
                         if msg_str != "page" {
                             // This is a control message (ready, done, flushed), not an audio frame
                             log::debug!("Received control message: {msg_str}");
@@ -461,14 +506,19 @@ impl MicrophoneEncoder {
             analyser.set_fft_size(VAD_FFT_SIZE);
             analyser.set_smoothing_time_constant(VAD_SMOOTHING_TIME_CONSTANT);
 
-            let worklet = match codec
-                .create_node(
-                    &context,
-                    "/encoderWorker.min.js",
-                    "encoder-worklet",
-                    AUDIO_CHANNELS,
-                )
-                .await
+            let worklet = match async {
+                let module = mic_encoder_module().await?;
+                codec
+                    .create_node_with_processor_options(
+                        &context,
+                        MIC_ENCODER_WORKLET_PATH,
+                        "encoder-worklet",
+                        AUDIO_CHANNELS,
+                        &module,
+                    )
+                    .await
+            }
+            .await
             {
                 Ok(node) => node,
                 Err(e) => {
@@ -484,6 +534,17 @@ impl MicrophoneEncoder {
                 Closure::wrap(audio_output_handler as Box<dyn FnMut(MessageEvent)>);
             codec.set_onmessage(output_handler.as_ref().unchecked_ref());
             output_handler.forget();
+
+            // A throw inside the worklet (e.g. the wasm traps) kills the
+            // processor and fires processorerror on the main thread.
+            let on_error_for_worklet = on_error.clone();
+            let processor_error = Closure::<dyn FnMut()>::new(move || {
+                if let Some(cb) = &on_error_for_worklet {
+                    cb.emit("Microphone encoder stopped with an error".to_string());
+                }
+            });
+            worklet.set_onprocessorerror(Some(processor_error.as_ref().unchecked_ref()));
+            processor_error.forget();
 
             // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
             // and pass FEC/DTX settings from the initial audio tier.

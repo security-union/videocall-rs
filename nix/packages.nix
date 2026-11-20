@@ -4,7 +4,7 @@
 #   nativeDeps  — every workspace dependency compiled for musl Linux, once.
 #                 Shared by videocall-api-bins, meeting-api and bot; cached by
 #                 the CI nix cache and only rebuilt when Cargo.lock/toml move.
-#   wasmDeps    — dependencies of the three wasm crates (ui, codecs, neteq),
+#   wasmDeps    — dependencies of the wasm crates (ui, codecs, neteq, mic encoder),
 #                 shared by the trunk build.
 #
 # Without this split every buildRustPackage recompiled the full dependency
@@ -138,12 +138,12 @@ let
     CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
   };
 
-  # Trunk runs THREE cargo invocations (index.html: the UI crate + two worker
+  # Trunk runs FOUR cargo invocations (index.html: the UI crate + three worker
   # bins), each resolving features per-invocation — so the deps artifacts must
   # contain each invocation's exact dependency variants (e.g. three different
   # web-sys feature sets) or cargo recompiles them inside the dist build.
   #
-  # One derivation, three builds into one target dir. NOT a chain of
+  # One derivation, four builds into one target dir. NOT a chain of
   # buildDepsOnly calls: buildDepsOnly hard-codes `cargoArtifacts = null`
   # (crane lib/buildDepsOnly.nix), so chained stages silently discard their
   # predecessor and only the last invocation's graph survives.
@@ -154,6 +154,7 @@ let
       cargoWithProfile build --locked -p videocall-ui
       cargoWithProfile build --locked -p videocall-codecs --no-default-features --features wasm
       cargoWithProfile build --locked -p neteq --no-default-features --features web
+      cargoWithProfile build --locked -p videocall-mic-encoder
     '';
   });
   # ---- videocall-cli --------------------------------------------------------
@@ -347,9 +348,9 @@ in
     mainProgram = "bot";
   };
 
-  # Dioxus UI static site: trunk build of the main crate + the two wasm worker
-  # bins wired in index.html (videocall-codecs worker_decoder, neteq
-  # neteq_worker), tailwind compile, and version.json — replicating the old
+  # Dioxus UI static site: trunk build of the main crate + the three wasm
+  # worker bins wired in index.html (videocall-codecs worker_decoder, neteq
+  # neteq_worker, videocall-mic-encoder mic_encoder), tailwind compile, and version.json — replicating the old
   # Dockerfile.dioxus builder stage on top of the shared wasm dep artifacts.
   dioxus-ui-dist = craneLibWasm.mkCargoDerivation (buildMetaEnv // wasmCommonArgs // {
     pname = "dioxus-ui-dist";
@@ -374,6 +375,15 @@ in
       pushd dioxus-ui
       tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify
       trunk build --release --offline --skip-version-check --locked
+      # mic_encoder_worklet.js stubs exactly one wasm-bindgen import. If a
+      # dependency bump adds another, fail here instead of in the browser.
+      mic_imports=$(wasm-dis dist/mic_encoder_bg.wasm | grep '(import ')
+      if [ "$(printf '%s\n' "$mic_imports" | grep -c .)" != 1 ] \
+        || ! printf '%s' "$mic_imports" | grep -q '"__wbindgen_init_externref_table"'; then
+        echo "mic_encoder_bg.wasm imports changed; update mic_encoder_worklet.js:" >&2
+        echo "$mic_imports" >&2
+        exit 1
+      fi
       version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
       printf '{"service":"dioxus-ui","version":"%s","git_sha":"%s","git_branch":"%s","build_timestamp":"%s"}\n' \
         "$version" "$(echo "$GIT_SHA" | cut -c1-8)" "$GIT_BRANCH" "$BUILD_TIMESTAMP" \

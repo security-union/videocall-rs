@@ -103,6 +103,7 @@ features = [
     "ReadableStream",
     "ReadableStreamGetReaderOptions",
     "ReadableStreamDefaultReader",
+    "Response",
     "VideoEncoder",
     "VideoEncoderInit",
     "VideoEncoderConfig",

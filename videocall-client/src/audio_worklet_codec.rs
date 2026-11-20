@@ -18,7 +18,7 @@
 
 #[allow(unused_imports)]
 use gloo_utils::format::JsValueSerdeExt;
-use js_sys::{Array, Function};
+use js_sys::{Array, Function, Object};
 use serde::Serialize;
 use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen_futures::JsFuture;
@@ -71,7 +71,7 @@ pub struct EncoderInitOptions {
     // into the current frame, allowing the decoder to partially recover from
     // single-packet losses without retransmission. Adds ~10-20% overhead.
     //
-    // NOTE: The underlying AudioWorklet (encoderWorker) must be updated to
+    // NOTE: The underlying AudioWorklet (videocall-mic-encoder) must be updated to
     // support this parameter. Until then, this field is serialized but the
     // worklet will ignore it. See adaptive_quality_constants.rs for tier
     // definitions that set enable_fec per quality level.
@@ -85,7 +85,7 @@ pub struct EncoderInitOptions {
     // parameters (~1-2 packets/sec) instead of full frames (~50 packets/sec),
     // reducing audio bandwidth by 80-90% during silence periods.
     //
-    // NOTE: The underlying AudioWorklet (encoderWorker) must be updated to
+    // NOTE: The underlying AudioWorklet (videocall-mic-encoder) must be updated to
     // support this parameter. Until then, this field is serialized but the
     // worklet will ignore it. See adaptive_quality_constants.rs for tier
     // definitions that set enable_dtx per quality level.
@@ -154,9 +154,43 @@ impl AudioWorkletCodec {
         name: &str,
         channels: u32,
     ) -> Result<AudioWorkletNode, JsValue> {
+        self.create_node_inner(context, script_path, name, channels, None)
+            .await
+    }
+
+    /// Like [`create_node`](Self::create_node), but also hands
+    /// `processor_options` to the processor's constructor. It is
+    /// structured-cloned, so a `WebAssembly.Module` works.
+    pub async fn create_node_with_processor_options(
+        &self,
+        context: &AudioContext,
+        script_path: &str,
+        name: &str,
+        channels: u32,
+        processor_options: &Object,
+    ) -> Result<AudioWorkletNode, JsValue> {
+        self.create_node_inner(
+            context,
+            script_path,
+            name,
+            channels,
+            Some(processor_options),
+        )
+        .await
+    }
+
+    async fn create_node_inner(
+        &self,
+        context: &AudioContext,
+        script_path: &str,
+        name: &str,
+        channels: u32,
+        processor_options: Option<&Object>,
+    ) -> Result<AudioWorkletNode, JsValue> {
         let _ = JsFuture::from(context.audio_worklet()?.add_module(script_path)?).await;
 
         let options = AudioWorkletNodeOptions::new();
+        options.set_processor_options(processor_options);
         options.set_number_of_inputs(channels);
         options.set_number_of_outputs(channels);
         options.set_output_channel_count(

@@ -22,41 +22,18 @@ let
     pkgs.nodejs_20
   ] ++ coreInputs;
 
-  # Pinned browser stack for the dioxus-ui wasm component tests. Chrome and
-  # chromedriver come from the same nixpkgs pin so browser and driver move in
-  # lockstep, and only when nix/tamal pins are bumped. Guarded by availableOn
-  # because google-chrome has no aarch64-linux build.
-  chromePinned = lib.meta.availableOn pkgs.stdenv.hostPlatform pkgs.google-chrome
-    && lib.meta.availableOn pkgs.stdenv.hostPlatform pkgs.chromedriver;
-  # chromedriver's browser discovery looks for a binary named "google-chrome";
-  # the nix package only ships "google-chrome-stable", so alias it.
-  googleChromeAlias = pkgs.runCommand "google-chrome-alias" { } ''
-    mkdir -p $out/bin
-    ln -s ${pkgs.google-chrome}/bin/google-chrome-stable $out/bin/google-chrome
-  '';
   # Single entry point for the dioxus-ui wasm component tests:
   #   nix-shell -A shells.frontend-tests --run dioxus-ui-component-tests
-  # writeShellApplication shellchecks the script at build time. The pinned
-  # browser is Linux-only, so on darwin the script ships without it and is
-  # run with DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 against the system Chrome
-  # (see the script header).
+  # writeShellApplication shellchecks the script at build time. The browser
+  # is deliberately NOT nix-pinned: Google's apt pool only hosts the current
+  # stable google-chrome .deb, so a nixpkgs pin of it stops fetching as soon
+  # as Chrome ships a new release. CI installs current stable Chrome plus the
+  # matching chromedriver with browser-actions/setup-chrome and passes them
+  # in via CHROME_BIN/CHROMEDRIVER (see the script header).
   dioxusUiComponentTests = pkgs.writeShellApplication {
     name = "dioxus-ui-component-tests";
-    runtimeInputs = [ pkgs.jq ] ++ lib.optionals chromePinned [
-      pkgs.google-chrome
-      googleChromeAlias
-      pkgs.chromedriver
-    ];
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
     text = builtins.readFile ./dioxus-ui-component-tests.sh;
-  };
-
-  browserTestInputs = [ dioxusUiComponentTests ] ++ lib.optionals chromePinned [
-    pkgs.google-chrome
-    googleChromeAlias
-    pkgs.chromedriver
-  ];
-  browserTestEnv = lib.optionalAttrs chromePinned {
-    CHROMEDRIVER = "${pkgs.chromedriver}/bin/chromedriver";
   };
 
   frontendBuildInputs = [
@@ -114,14 +91,13 @@ in
     shellHook = frontendHook;
   };
 
-  # frontend + the pinned browser stack; only needed to run the dioxus-ui wasm
-  # component tests, so it's a separate shell to keep plain `nix-shell` from
-  # downloading google-chrome.
-  frontend-tests = pkgs.mkShell (browserTestEnv // {
+  # frontend + the dioxus-ui wasm component test runner. The browser and
+  # chromedriver come from outside nix (see dioxusUiComponentTests above).
+  frontend-tests = pkgs.mkShell {
     nativeBuildInputs = [ rust.frontendRustMinimal ] ++ frontendBuildInputs
-      ++ browserTestInputs;
+      ++ [ dioxusUiComponentTests ];
     shellHook = frontendHook;
-  });
+  };
 
   frontend-dev = frontendDev;
 

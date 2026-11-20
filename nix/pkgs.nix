@@ -27,22 +27,15 @@ let
 
   overlays = [ (import inputs.rust-overlay) ];
 
-  # google-chrome is unfree; allowed so the dioxus-ui wasm component tests run
-  # against a nix-pinned browser (see shells.nix), same as the old flake.
-  config = {
-    allowUnfreePredicate = pkg:
-      (pkg.pname or (builtins.parseDrvName pkg.name).name) == "google-chrome";
-  };
-
-  pkgs = import inputs.nixpkgs { inherit system overlays config; };
+  pkgs = import inputs.nixpkgs { inherit system overlays; };
 
   pkgsLinux = import inputs.nixpkgs {
-    inherit system overlays config;
+    inherit system overlays;
     crossSystem = { config = muslTarget; };
   };
 
   pkgsLinuxStatic = import inputs.nixpkgs {
-    inherit system overlays config;
+    inherit system overlays;
     crossSystem = {
       config = muslTarget;
       isStatic = true;

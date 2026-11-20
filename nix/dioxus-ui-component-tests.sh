@@ -1,7 +1,14 @@
-# Dioxus UI wasm component tests, run against the nix-pinned headless
-# Chrome + chromedriver (see browserTestInputs in nix/shells.nix). Invoke via:
+# Dioxus UI wasm component tests, run against headless Chrome + a matching
+# chromedriver passed in from the environment. Invoke via:
 #
-#   nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
+#   CHROME_BIN=/path/to/chrome CHROMEDRIVER=/path/to/chromedriver \
+#     nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
+#
+# The browser is not nix-pinned on purpose. Google's apt pool only hosts the
+# current stable google-chrome .deb, so a pinned one stops downloading as
+# soon as Chrome ships a new release. CI installs current stable Chrome and
+# its matching chromedriver with browser-actions/setup-chrome (see
+# .github/workflows/wasm-test.yaml) and exports CHROME_BIN/CHROMEDRIVER.
 #
 # Packaged with writeShellApplication, so shellcheck gates the build and
 # `set -euo pipefail` is prepended automatically (also set here so the raw
@@ -26,8 +33,8 @@
 #     session's processes without touching sibling sessions (the old global
 #     CI reap would have killed them).
 #
-# macOS: the nix-pinned Chrome is Linux-only, so local runs use the system
-# browser via the escape hatch (refused in CI):
+# macOS: local runs can use the system browser via the escape hatch, which
+# defaults CHROME_BIN to the installed Google Chrome (refused in CI):
 #   DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 \
 #   CHROMEDRIVER=/path/to/matching/chromedriver \
 #     nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
@@ -43,7 +50,7 @@ fi
 
 system_browser="${DIOXUS_UI_TESTS_SYSTEM_BROWSER:-0}"
 if [ "${system_browser}" = "1" ] && [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-  echo "error: DIOXUS_UI_TESTS_SYSTEM_BROWSER is a local-only escape hatch; CI must use the nix-pinned browser" >&2
+  echo "error: DIOXUS_UI_TESTS_SYSTEM_BROWSER is a local-only escape hatch; CI must pass CHROME_BIN/CHROMEDRIVER from setup-chrome" >&2
   exit 1
 fi
 
@@ -53,25 +60,25 @@ if [ "${system_browser}" = "1" ]; then
     echo "error: system browser not found at '${chrome}' (set CHROME_BIN)" >&2
     exit 1
   fi
-  CHROMEDRIVER="${CHROMEDRIVER:-$(command -v chromedriver)}"
+  CHROMEDRIVER="${CHROMEDRIVER:-$(command -v chromedriver || true)}"
 else
-  chrome="$(command -v google-chrome)"
-  CHROMEDRIVER="${CHROMEDRIVER:-$(command -v chromedriver)}"
-  case "${chrome}" in
-    /nix/store/*) ;;
-    *)
-      echo "error: google-chrome is not the nix-pinned one: ${chrome}" >&2
-      echo "hint: on macOS use DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 with a matching chromedriver" >&2
-      exit 1
-      ;;
-  esac
-  case "${CHROMEDRIVER}" in
-    /nix/store/*) ;;
-    *)
-      echo "error: chromedriver is not the nix-pinned one: ${CHROMEDRIVER}" >&2
-      exit 1
-      ;;
-  esac
+  # No PATH fallback: an explicit browser/driver pair keeps CI from quietly
+  # picking up whatever Chrome the runner image happens to ship.
+  chrome="${CHROME_BIN:-}"
+  CHROMEDRIVER="${CHROMEDRIVER:-}"
+  if [ -z "${chrome}" ] || [ -z "${CHROMEDRIVER}" ]; then
+    echo "error: set CHROME_BIN and CHROMEDRIVER (CI gets both from browser-actions/setup-chrome)" >&2
+    echo "hint: on macOS use DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 with a matching chromedriver" >&2
+    exit 1
+  fi
+fi
+if [ ! -x "${chrome}" ]; then
+  echo "error: browser not executable: '${chrome}'" >&2
+  exit 1
+fi
+if [ -z "${CHROMEDRIVER}" ] || [ ! -x "${CHROMEDRIVER}" ]; then
+  echo "error: chromedriver not executable: '${CHROMEDRIVER}'" >&2
+  exit 1
 fi
 export CHROMEDRIVER
 
@@ -102,6 +109,34 @@ cp "${webdriver_json}" "${webdriver_backup}"
 trap 'cp "${webdriver_backup}" "${webdriver_json}"; rm -f "${webdriver_backup}"' EXIT
 jq --arg bin "${chrome}" '."goog:chromeOptions".binary = $bin' \
   "${webdriver_backup}" > "${webdriver_json}"
+
+# Diagnostics for "session not created: Chrome instance exited". None of
+# this can fail the job; it only puts the browser's own stderr in the log.
+echo "::group::browser diagnostics"
+echo "uid: $(id -u)  kernel: $(uname -r)"
+echo "apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+df -h /dev/shm "${TMPDIR:-/tmp}" 2>/dev/null || true
+# One-shot launch with exactly the webdriver.json args plus a private
+# profile, so a browser that dies at startup shows why.
+mapfile -t chrome_args < <(jq -r '."goog:chromeOptions".args[]' "${webdriver_json}")
+smoke_dir="$(mktemp -d)"
+smoke_rc=0
+timeout 60 "${chrome}" "${chrome_args[@]}" --user-data-dir="${smoke_dir}/profile" \
+  --dump-dom about:blank >"${smoke_dir}/out.log" 2>&1 || smoke_rc=$?
+echo "smoke launch: ${chrome} ${chrome_args[*]} --dump-dom about:blank -> exit ${smoke_rc}"
+tail -50 "${smoke_dir}/out.log" || true
+pkill -9 -f "${smoke_dir}" 2>/dev/null || true
+rm -rf "${smoke_dir}"
+echo "::endgroup::"
+
+# Run chromedriver verbosely, logging into the attempt's private TMPDIR, so
+# a failed attempt can show what Chrome said before it exited.
+driver_wrapper_dir="$(mktemp -d)"
+# shellcheck disable=SC2016 # ${TMPDIR} must expand when the wrapper runs
+printf '#!/usr/bin/env bash\nexec %q --verbose --log-path="${TMPDIR:-/tmp}/chromedriver.log" "$@"\n' \
+  "${CHROMEDRIVER}" >"${driver_wrapper_dir}/chromedriver"
+chmod +x "${driver_wrapper_dir}/chromedriver"
+CHROMEDRIVER="${driver_wrapper_dir}/chromedriver"
 
 # Prebuild every test executable in one cargo invocation (compile uses all
 # cores), then harvest the artifact paths from a second, fully-fresh
@@ -142,7 +177,11 @@ run_target_job() {
   local log="${logdir}/${slug}.log"
   local max_attempts=3 attempt attempt_tmp
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-    attempt_tmp="$(mktemp -d)"
+    # Under /tmp, not $TMPDIR: on the GitHub runner $TMPDIR is a long
+    # _temp/nix-shell-* path, and Chrome's SingletonSocket under it blows
+    # the 108-byte unix socket limit ("Socket path too long"), so every
+    # session dies at startup.
+    attempt_tmp="$(mktemp -d /tmp/dxt.XXXXXX)"
     echo "[${desc}] attempt ${attempt}/${max_attempts} started"
     if TMPDIR="${attempt_tmp}" wasm-bindgen-test-runner "${exe}" \
       >>"${log}" 2>&1; then
@@ -150,6 +189,12 @@ run_target_job() {
       echo "[${desc}] passed on attempt ${attempt}"
       touch "${logdir}/${slug}.ok"
       return 0
+    fi
+    if [ -f "${attempt_tmp}/chromedriver.log" ]; then
+      {
+        echo "--- tail of chromedriver verbose log (attempt ${attempt}) ---"
+        tail -100 "${attempt_tmp}/chromedriver.log"
+      } >>"${log}" 2>&1 || true
     fi
     # Reap exactly this attempt's browser processes (their user-data-dir
     # lives under the private TMPDIR), then retry.
@@ -188,7 +233,7 @@ for entry in "${targets[@]}"; do
   cat "${logdir}/${slug}.log" 2>/dev/null || true
   echo "::endgroup::"
 done
-rm -rf "${logdir}"
+rm -rf "${logdir}" "${driver_wrapper_dir}"
 
 if [ "${#failed_targets[@]}" -gt 0 ]; then
   echo "::error::dioxus-ui targets failed: ${failed_targets[*]}"

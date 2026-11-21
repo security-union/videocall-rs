@@ -1426,3 +1426,275 @@ body {
   gap: 8px;
   flex-shrink: 0;
 }
+
+/* ==========================================================================
+   Control bar fit on phones. Buttons keep their 44px targets; the bar is
+   capped to the viewport and, on the narrowest phones, scrolls sideways
+   instead of squeezing the buttons.
+   ========================================================================== */
+
+.video-controls-container {
+  box-sizing: border-box;
+  max-width: calc(100vw - 16px);
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+}
+
+@media (max-width: 640px) {
+  .video-controls-container {
+    bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+@media (max-width: 520px) {
+  .video-controls-container {
+    gap: 0.25rem;
+    /* 7 x 44px buttons + 6 x 4px gaps + 2 x 4px padding + 2px border = 342px,
+       which fits a 360px phone (max-width 344px). */
+    padding: 0.25rem;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .video-controls-container::-webkit-scrollbar {
+    display: none;
+  }
+
+  .video-controls-container .video-control-button {
+    flex-shrink: 0;
+  }
+}
+
+/* ==========================================================================
+   Baby mode: transparent shield over the meeting, a dim lock in the corner,
+   and a plain unlock dialog. Video stays visible underneath.
+   Stacking: shield 9000 < scrim 9001 < lock/hint 9002 < dialog 9003.
+   ========================================================================== */
+
+/* Tile buttons stay in the DOM while baby mode is on; hide them. */
+.baby-mode-active .pin-icon,
+.baby-mode-active .crop-icon {
+  display: none !important;
+}
+
+.baby-mode-shield {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  background: transparent;
+  /* Block pinch-zoom, pan and double-tap zoom on touch screens. */
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.baby-mode-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 9001;
+  background: rgba(0, 0, 0, 0.5);
+  touch-action: none;
+}
+
+.baby-mode-lock {
+  position: fixed;
+  top: calc(12px + env(safe-area-inset-top, 0px));
+  inset-inline-end: calc(12px + env(safe-area-inset-right, 0px));
+  z-index: 9002;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.85);
+  opacity: 0.55;
+  cursor: pointer;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.baby-mode-lock:hover,
+.baby-mode-lock:focus-visible,
+.baby-mode-lock.holding {
+  opacity: 0.9;
+}
+
+.baby-mode-lock:focus-visible {
+  outline: 2px solid #0A84FF;
+  outline-offset: 2px;
+}
+
+.baby-mode-lock svg {
+  pointer-events: none;
+}
+
+.baby-mode-lock-icon {
+  width: 18px;
+  height: 18px;
+}
+
+.baby-mode-lock-progress {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+/* Circumference of r=16 is ~100.5. The duration comes from
+   HOLD_TO_UNLOCK_MS via an inline style on the circle. */
+.baby-mode-lock-progress circle {
+  stroke: rgba(255, 255, 255, 0.85);
+  stroke-dasharray: 100.53;
+  stroke-dashoffset: 100.53;
+}
+
+.baby-mode-lock.holding .baby-mode-lock-progress circle {
+  animation-name: baby-mode-hold;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+@keyframes baby-mode-hold {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.baby-mode-hint {
+  position: fixed;
+  top: calc(64px + env(safe-area-inset-top, 0px));
+  inset-inline-end: calc(12px + env(safe-area-inset-right, 0px));
+  z-index: 9002;
+  max-width: min(280px, calc(100vw - 24px));
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.85rem;
+  text-align: end;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.baby-mode-hint.visible {
+  opacity: 1;
+}
+
+.baby-mode-hint:empty {
+  padding: 0;
+}
+
+/* Solid background on purpose: no backdrop-filter over live video. */
+.baby-mode-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 9003;
+  box-sizing: border-box;
+  width: min(360px, calc(100vw - 32px));
+  padding: 20px;
+  border-radius: 16px;
+  border: 1px solid #38383A;
+  background: #1C1C1E;
+  color: #FFFFFF;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+}
+
+/* Anchor near the top on phones so the on-screen keyboard doesn't cover it. */
+@media (max-width: 640px) {
+  .baby-mode-dialog {
+    top: calc(env(safe-area-inset-top, 0px) + 12vh);
+    transform: translateX(-50%);
+  }
+}
+
+.baby-mode-dialog-title {
+  margin: 0 0 6px;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.baby-mode-dialog-body {
+  margin: 0 0 12px;
+  color: #AEAEB2;
+}
+
+.baby-mode-code {
+  margin: 0 0 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  text-align: center;
+}
+
+.baby-mode-code-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid #48484A;
+  background: #2C2C2E;
+  color: #FFFFFF;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 22px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+/* Keep the placeholder readable: no forced caps or wide tracking. */
+.baby-mode-code-input::placeholder {
+  font-family: inherit;
+  font-size: 16px;
+  letter-spacing: normal;
+  text-transform: none;
+  color: #8E8E93;
+}
+
+.baby-mode-feedback {
+  min-height: 1.25em;
+  margin: 8px 0 0;
+  font-size: 0.9rem;
+  color: #FF9F0A;
+}
+
+.baby-mode-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.baby-mode-dialog-actions .btn-apple {
+  min-height: 44px;
+  min-width: 96px;
+}
+
+@media (forced-colors: active) {
+  .baby-mode-lock {
+    border: 2px solid ButtonText;
+  }
+
+  .baby-mode-dialog {
+    border: 1px solid CanvasText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .baby-mode-hint {
+    transition: none;
+  }
+}

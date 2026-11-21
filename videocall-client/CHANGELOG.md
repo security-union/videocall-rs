@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v5.0.0...videocall-client-v6.0.0) - 2026-11-21
+
+### Added
+
+- *(videocall-client)* encode the mic with ropus inside the AudioWorklet ([#935](https://github.com/security-union/videocall-rs/pull/935))
+
+### Fixed
+
+- *(videocall-client)* bump pidgeon to 1.0.1 and fix the bitrate controller's inputs ([#938](https://github.com/security-union/videocall-rs/pull/938))
+
 ## [5.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.7...videocall-client-v5.0.0) - 2026-11-18
 
 ### Added

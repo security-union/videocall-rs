@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -24,10 +25,11 @@ use js_sys::Date;
 
 use crate::adaptive_quality_constants::{
     AudioQualityTier, VideoQualityTier, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
-    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
-    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_DT_SEC, PID_MAX_JITTER_PENALTY,
+    PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
 use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
+use crate::diagnostics::frame_rate::{FrameRate, FrameRateMeter};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -81,48 +83,38 @@ impl DiagnosticPacketWindow {
         self.last_cleanup = current_time;
     }
 
+    /// The fps a report carries for its media type, if it is a frame rate
+    /// at all (finite and not negative). Anything else would sit in the
+    /// window as its minimum.
+    fn packet_fps(packet: &DiagnosticsPacket) -> Option<f64> {
+        let fps = match packet.media_type.enum_value_or_default() {
+            MediaType::VIDEO => packet.video_metrics.as_ref().map(|m| m.fps_received as f64),
+            MediaType::AUDIO => packet.audio_metrics.as_ref().map(|m| m.fps_received as f64),
+            MediaType::SCREEN => packet.video_metrics.as_ref().map(|m| m.fps_received as f64),
+            _ => None,
+        };
+        fps.filter(|fps| fps.is_finite() && *fps >= 0.0)
+    }
+
     /// Get the latest received FPS from this peer
     pub fn latest_fps(&self) -> Option<f64> {
-        if let Some((_, packet)) = self.packets.last() {
-            let fps = match packet.media_type.enum_value_or_default() {
-                MediaType::VIDEO => packet.video_metrics.as_ref().map(|m| m.fps_received as f64),
-                MediaType::AUDIO => packet.audio_metrics.as_ref().map(|m| m.fps_received as f64),
-                MediaType::SCREEN => packet.video_metrics.as_ref().map(|m| m.fps_received as f64),
-                _ => None,
-            };
-            return fps;
-        }
-        None
+        self.packets
+            .last()
+            .and_then(|(_, packet)| Self::packet_fps(packet))
     }
 
     /// Get the minimum FPS received within the window
     pub fn min_fps(&self) -> Option<f64> {
-        if self.packets.is_empty() {
-            return None;
-        }
+        self.min_fps_since(f64::NEG_INFINITY)
+    }
 
-        let mut min_fps = f64::INFINITY;
-        let mut found_fps = false;
-
-        for (_, packet) in &self.packets {
-            let fps = match packet.media_type.enum_value_or_default() {
-                MediaType::VIDEO => packet.video_metrics.as_ref().map(|m| m.fps_received as f64),
-                MediaType::AUDIO => packet.audio_metrics.as_ref().map(|m| m.fps_received as f64),
-                MediaType::SCREEN => packet.video_metrics.as_ref().map(|m| m.fps_received as f64),
-                _ => None,
-            };
-
-            if let Some(fps) = fps {
-                min_fps = min_fps.min(fps);
-                found_fps = true;
-            }
-        }
-
-        if found_fps {
-            Some(min_fps)
-        } else {
-            None
-        }
+    /// Minimum FPS among the reports received at or after `since_ms`.
+    pub(crate) fn min_fps_since(&self, since_ms: f64) -> Option<f64> {
+        self.packets
+            .iter()
+            .filter(|(received_at, _)| *received_at >= since_ms)
+            .filter_map(|(_, packet)| Self::packet_fps(packet))
+            .reduce(f64::min)
     }
 
     /// Get the timestamp of the most recent packet
@@ -209,6 +201,14 @@ impl DiagnosticPackets {
         worst_peer
     }
 
+    /// Lowest FPS reported by any peer at or after `since_ms`.
+    pub(crate) fn worst_min_fps_since(&self, since_ms: f64) -> Option<f64> {
+        self.peer_windows
+            .values()
+            .filter_map(|window| window.min_fps_since(since_ms))
+            .reduce(f64::min)
+    }
+
     /// Get all active peer IDs
     pub fn get_peer_ids(&self) -> Vec<String> {
         self.peer_windows.keys().cloned().collect()
@@ -225,6 +225,8 @@ pub struct EncoderBitrateController {
     last_update: f64,
     ideal_bitrate_kbps: u32,
     target_fps: Rc<AtomicU32>,
+    /// The encoder's output meter; see [`Self::with_source_meter`].
+    source_meter: Option<Rc<RefCell<FrameRateMeter>>>,
     fps_history: std::collections::VecDeque<f64>,
     max_history_size: usize,
     initialization_complete: bool,
@@ -242,7 +244,7 @@ impl EncoderBitrateController {
     /// Create a new bitrate controller using the default `VIDEO_QUALITY_TIERS`.
     pub fn new(ideal_bitrate_kbps: u32, target_fps: Rc<AtomicU32>) -> Self {
         let quality_manager = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
+        Self::build(ideal_bitrate_kbps, target_fps, quality_manager, Date::now())
     }
 
     /// Create a new bitrate controller for screen share.
@@ -257,7 +259,7 @@ impl EncoderBitrateController {
     ) -> Self {
         let quality_manager = AdaptiveQualityManager::new_for_screen(video_tiers);
         let tier_ideal = quality_manager.current_video_tier().ideal_bitrate_kbps;
-        Self::build(tier_ideal, target_fps, quality_manager)
+        Self::build(tier_ideal, target_fps, quality_manager, Date::now())
     }
 
     /// Create a new bitrate controller using a custom video tier array
@@ -267,8 +269,18 @@ impl EncoderBitrateController {
         target_fps: Rc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
     ) -> Self {
-        let quality_manager = AdaptiveQualityManager::new(video_tiers);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
+        Self::new_with_tiers_at(ideal_bitrate_kbps, target_fps, video_tiers, Date::now())
+    }
+
+    /// Same as [`Self::new_with_tiers`], with the creation time passed in.
+    pub(crate) fn new_with_tiers_at(
+        ideal_bitrate_kbps: u32,
+        target_fps: Rc<AtomicU32>,
+        video_tiers: &'static [VideoQualityTier],
+        now_ms: f64,
+    ) -> Self {
+        let quality_manager = AdaptiveQualityManager::new_at(video_tiers, now_ms);
+        Self::build(ideal_bitrate_kbps, target_fps, quality_manager, now_ms)
     }
 
     /// Internal constructor shared by `new`, `new_with_tiers`, and `new_for_screen`.
@@ -276,6 +288,7 @@ impl EncoderBitrateController {
         ideal_bitrate_kbps: u32,
         target_fps: Rc<AtomicU32>,
         quality_manager: AdaptiveQualityManager,
+        now_ms: f64,
     ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
@@ -297,9 +310,10 @@ impl EncoderBitrateController {
 
         Self {
             pid,
-            last_update: Date::now(),
+            last_update: now_ms,
             ideal_bitrate_kbps,
             target_fps,
+            source_meter: None,
             fps_history: std::collections::VecDeque::with_capacity(PID_FPS_HISTORY_SIZE),
             max_history_size: PID_FPS_HISTORY_SIZE,
             initialization_complete: false,
@@ -350,13 +364,18 @@ impl EncoderBitrateController {
             return None; // Too soon since last correction, don't emit a new one
         }
 
-        // Get the worst performing peer's FPS
-        let worst_fps = match self.diagnostic_packets.get_worst_fps_peer() {
-            Some((_, fps)) => fps,
-            None => return None,
+        // What the encoder is producing, and the reports that describe it.
+        let Some((target_fps, evidence_since)) = self.source_rate(now) else {
+            self.hold(now);
+            return None;
         };
 
-        let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
+        // Get the worst performing peer's FPS
+        let Some(worst_fps) = self.diagnostic_packets.worst_min_fps_since(evidence_since) else {
+            self.hold(now);
+            return None;
+        };
+
         let fps_received = worst_fps.min(target_fps);
         if target_fps <= 0.0 {
             self.last_correction_time = now;
@@ -374,7 +393,9 @@ impl EncoderBitrateController {
         }
 
         let jitter = self.calculate_jitter();
-        let dt = (now - self.last_update) / 1000.0; // Convert ms to seconds
+        // Convert ms to seconds. A report covers about one report interval of
+        // reception, so a long silence before it is not integrated in full.
+        let dt = ((now - self.last_update) / 1000.0).min(PID_MAX_DT_SEC);
         self.last_update = now;
 
         // Wait for a few samples before reacting
@@ -389,13 +410,7 @@ impl EncoderBitrateController {
 
         // PID internally computes error = setpoint (target_fps) − process_value (fps_received).
         // Output is clamped to [0, 50] by the controller config.
-        let pid_output = match self.pid.compute(fps_received, dt) {
-            Ok(output) => output,
-            Err(e) => {
-                log::debug!("PID compute error (dt={dt:.3}): {e}");
-                0.0
-            }
-        };
+        let pid_output = self.pid_step(fps_received, dt);
 
         // The PID integral never decays on its own when error is within deadband.
         // Reset the controller when conditions are good so bitrate can recover.
@@ -468,6 +483,58 @@ impl EncoderBitrateController {
 
         self.last_correction_time = now;
         Some(tier_clamped)
+    }
+
+    /// One PID step. If pidgeon rejects the input (a non-finite reading or a
+    /// non-positive `dt`), hold the previous command: falling back to 0 would
+    /// mean no reduction, i.e. full bitrate in the middle of congestion.
+    fn pid_step(&mut self, fps_received: f64, dt: f64) -> f64 {
+        match self.pid.compute(fps_received, dt) {
+            Ok(output) => output,
+            Err(e) => {
+                log::debug!("PID compute error (dt={dt:.3}): {e}");
+                self.pid.state().last_output
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pid_state(&self) -> &pidgeon::PidState {
+        self.pid.state()
+    }
+
+    /// Measure the source with the encoder's own output meter, which the
+    /// encoder feeds one frame per encoded chunk, instead of `target_fps`.
+    ///
+    /// Screen capture delivers no frames while the content is static. With a
+    /// meter the controller holds (no bitrate change, no fps evidence for
+    /// the PID or the quality manager) while the encoder has no measured
+    /// rate, and it only reads reports received after the current run of
+    /// frames was first measured: earlier ones describe the pause.
+    pub(crate) fn with_source_meter(mut self, meter: Rc<RefCell<FrameRateMeter>>) -> Self {
+        self.source_meter = Some(meter);
+        self
+    }
+
+    /// The encoder's frame rate and the time from which reports describe it,
+    /// or `None` while the source is idle or still being measured.
+    fn source_rate(&self, now: f64) -> Option<(f64, f64)> {
+        let Some(meter) = &self.source_meter else {
+            let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
+            return Some((target_fps, f64::NEG_INFINITY));
+        };
+        let meter = meter.borrow();
+        match (meter.rate_at(now), meter.measured_since_ms()) {
+            (FrameRate::Rate(fps), Some(since)) => Some((fps, since)),
+            _ => None,
+        }
+    }
+
+    /// Nothing to measure: change nothing, and let neither the PID nor the
+    /// quality manager count the time without evidence.
+    fn hold(&mut self, now: f64) {
+        self.last_update = now;
+        self.quality_manager.restart_timers();
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
@@ -1260,3 +1327,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "encoder_bitrate_controller_sim_tests.rs"]
+mod sim_tests;

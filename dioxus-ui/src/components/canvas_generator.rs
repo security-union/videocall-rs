@@ -243,7 +243,7 @@ pub fn generate_for_peer(
 
     // ---- Split-layout: peer video right panel ---------------------------------
     if decision == TileDecision::RenderVideo {
-        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", key));
         let div_id_mobile = (*peer_video_div_id).clone();
         let pv_canvas_crop = key.clone();
         let key_clone = key.clone();
@@ -311,7 +311,7 @@ pub fn generate_for_peer(
 
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {
-        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", key));
         let div_id_mobile = (*peer_video_div_id).clone();
         let div_id_pin = (*peer_video_div_id).clone();
         let canvas_id_crop = key.clone();
@@ -391,8 +391,8 @@ pub fn generate_for_peer(
     } else {
         "grid-item"
     };
-    let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
-    let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+    let screen_share_div_id = Rc::new(format!("screen-share-{}-div", key));
+    let peer_video_div_id = Rc::new(format!("peer-video-{}-div", key));
 
     let ss_div_mobile = (*screen_share_div_id).clone();
     let ss_div_pin = (*screen_share_div_id).clone();

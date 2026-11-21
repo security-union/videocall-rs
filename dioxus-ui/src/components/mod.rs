@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod attendants;
+pub mod baby_mode;
 pub mod browser_compatibility;
 pub mod call_timer;
 pub mod config_error;

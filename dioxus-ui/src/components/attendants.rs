@@ -17,6 +17,7 @@
  */
 
 use crate::components::{
+    baby_mode::{load_baby_mode, save_baby_mode, BabyModeOverlay},
     browser_compatibility::BrowserCompatibility,
     canvas_generator::TileMode,
     diagnostics::Diagnostics,
@@ -26,8 +27,8 @@ use crate::components::{
     peer_list::PeerList,
     peer_tile::PeerTile,
     video_control_buttons::{
-        CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
-        PeerListButton, ScreenShareButton,
+        BabyModeButton, CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
+        MicButton, PeerListButton, ScreenShareButton,
     },
 };
 use crate::constants::actix_websocket_base;
@@ -43,7 +44,6 @@ use log::error;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
     MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
@@ -56,6 +56,20 @@ pub enum ScreenShareState {
     Idle,
     Requesting,
     Active,
+}
+
+/// Whether this browser can capture the screen, i.e.
+/// `navigator.mediaDevices.getDisplayMedia` exists. False on iOS Safari,
+/// Android browsers and insecure contexts (where `mediaDevices` is missing).
+fn supports_screen_share() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    js_sys::Reflect::get(&window.navigator(), &"mediaDevices".into())
+        .ok()
+        .filter(|devices| devices.is_object())
+        .and_then(|devices| js_sys::Reflect::get(&devices, &"getDisplayMedia".into()).ok())
+        .is_some_and(|f| f.is_function())
 }
 
 pub enum MediaErrorState {
@@ -399,6 +413,10 @@ pub fn AttendantsComponent(
     let mut diagnostics_open = use_signal(|| false);
     let encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
+    // Feature-detected once; the browser's capabilities don't change.
+    let can_share_screen = use_hook(supports_screen_share);
+    // Baby mode hides the controls and blocks taps; persisted across reloads.
+    let mut baby_mode = use_signal(load_baby_mode);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let current_display_name = use_signal(|| display_name.clone());
@@ -407,6 +425,13 @@ pub fn AttendantsComponent(
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
     let mut call_start_time = use_signal(|| None::<f64>);
     let meeting_ended_message = use_signal(|| None::<String>);
+    // Once the meeting ends, forget baby mode for this tab so the next
+    // meeting doesn't start locked. Covers every path that ends a meeting.
+    use_effect(move || {
+        if meeting_ended_message().is_some() {
+            save_baby_mode(false);
+        }
+    });
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
     let mut screen_share_version = use_signal(|| 0u32);
@@ -552,7 +577,7 @@ pub fn AttendantsComponent(
                 v.set(v() + 1);
             })),
             get_peer_video_canvas_id: VcCallback::from(|id| id),
-            get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", &id)),
+            get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", id)),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
@@ -1157,13 +1182,21 @@ pub fn AttendantsComponent(
 
     info!("Rendering meeting view with {} peers", display_peers.len());
 
+    // Baby mode is ignored once the meeting has ended (any path that sets
+    // `meeting_ended_message`, including the MeetingNotActive reconnect),
+    // so the "Meeting Ended" overlay stays usable.
+    let locked = baby_mode() && meeting_ended_message().is_none();
+
     rsx! {
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
             div {
                 id: "main-container",
-                class: "meeting-page",
+                class: if locked { "meeting-page baby-mode-active" } else { "meeting-page" },
+                // `inert` keeps keyboard focus (Tab/Enter/Space) out of the
+                // meeting while baby mode is on; the shield handles pointers.
+                "inert": if locked { Some("") } else { None },
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
@@ -1270,7 +1303,7 @@ pub fn AttendantsComponent(
                         }
 
                         // Invitation overlay when no peers
-                        if num_display_peers == 0 {
+                        if num_display_peers == 0 && !locked {
                         div {
                             id: "invite-overlay",
                             class: "card-apple",
@@ -1329,6 +1362,7 @@ pub fn AttendantsComponent(
                     // Controls nav
                     if can_stream {
                         nav { class: "host",
+                            if !locked {
                             div { class: "controls",
                                 nav { class: "video-controls-container",
                                     {
@@ -1385,7 +1419,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-                                    if !is_ios() {
+                                    if can_share_screen {
                                         {
                                             let is_active = matches!(screen_share_state(), ScreenShareState::Active);
                                             let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
@@ -1403,6 +1437,12 @@ pub fn AttendantsComponent(
                                                 }
                                             }
                                         }
+                                    }
+                                    BabyModeButton {
+                                        onclick: move |_| {
+                                            save_baby_mode(true);
+                                            baby_mode.set(true);
+                                        },
                                     }
                                     PeerListButton {
                                         open: peer_list_open(),
@@ -1465,7 +1505,10 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             }
-                            // User error dialog
+                            } // end if !locked
+                            // User error dialog (held back while locked: nobody
+                            // could dismiss it; it shows after unlock)
+                            if !locked {
                             if let Some(err) = user_error() {
                                 {
                                     let displayed: String = err.chars().take(200).collect();
@@ -1486,6 +1529,7 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             }
+                            } // end if !locked (user error)
                             // Host component (encoders)
                             if media_access_granted() {
                                 Host {
@@ -1493,7 +1537,7 @@ pub fn AttendantsComponent(
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
                                     on_encoder_settings_update: move |_s: String| {},
-                                    device_settings_open: device_settings_open(),
+                                    device_settings_open: device_settings_open() && !locked,
                                     on_device_settings_toggle: move |_| {
                                         device_settings_open.set(!device_settings_open());
                                     },
@@ -1542,7 +1586,9 @@ pub fn AttendantsComponent(
                 // Peer list sidebar
                 div {
                     id: "peer-list-container",
-                    class: if peer_list_open() { "visible" } else { "" },
+                    class: if peer_list_open() && !locked { "visible" } else { "" },
+                    // Stays mounted while locked (only the class hides it):
+                    // PeerList's diagnostics task isn't aborted on unmount.
                     if peer_list_open() {
                         PeerList {
                             peers: peers_for_display.clone(),
@@ -1567,6 +1613,9 @@ pub fn AttendantsComponent(
                 }
 
                 // Waiting room controls (host only)
+                // Stays mounted while locked (it sits under the shield and
+                // inside the inert container): unmounting it would orphan its
+                // polling closure and drop waiting-room knocks.
                 if is_owner {
                     HostControls {
                         meeting_id: id.clone(),
@@ -1581,7 +1630,7 @@ pub fn AttendantsComponent(
                 }
 
                 // Diagnostics sidebar
-                if diagnostics_open() {
+                if diagnostics_open() && !locked {
                     Diagnostics {
                         is_open: true,
                         on_close: move |_| diagnostics_open.set(false),
@@ -1590,6 +1639,17 @@ pub fn AttendantsComponent(
                         share_screen: screen_share_state().is_sharing(),
                         encoder_settings: encoder_settings(),
                     }
+                }
+            }
+
+            // Baby mode shield + lock. Rendered outside `main-container` so
+            // it stays interactive while the meeting itself is `inert`.
+            if locked {
+                BabyModeOverlay {
+                    on_unlock: move |_| {
+                        save_baby_mode(false);
+                        baby_mode.set(false);
+                    },
                 }
             }
         }

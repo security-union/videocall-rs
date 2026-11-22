@@ -1,0 +1,115 @@
+name: Bug report
+description: Something is broken or not working the way the docs say it should.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Only the fields marked required are needed, but call quality bugs are much easier to chase down with the browser, device and transport filled in.
+
+        Found a security problem? Please don't file it here. Use a [private security advisory](https://github.com/security-union/videocall-rs/security/advisories/new) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A short description of the bug. Screenshots or screen recordings help a lot, you can drag them in here.
+      placeholder: My video froze for everyone else after about 30 seconds, but my audio kept working.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we make it happen on our side?
+      placeholder: |
+        1. Join a meeting on iPhone Safari
+        2. Turn the camera on
+        3. Wait about 30 seconds
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      placeholder: Video keeps playing for the other participants.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Where did it happen?
+      options:
+        - Hosted (app.videocall.rs)
+        - Self-hosted
+        - Local dev stack
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Your best guess is fine.
+      options:
+        - Web UI (browser)
+        - Relay / media server (actix-api)
+        - Meeting API
+        - videocall-cli
+        - Mobile SDK (iOS / Android)
+        - Rust crates as a library (videocall-client, videocall-types, ...)
+        - Deployment (Helm / Nix)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+      description: Leave blank if this isn't a browser bug.
+      placeholder: Safari 18.2, Chrome 131
+
+  - type: input
+    id: device
+    attributes:
+      label: OS and device
+      placeholder: iOS 18.2 on iPhone 15, macOS 15.1 on a MacBook Air
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      description: If you know which one the call used.
+      options:
+        - WebTransport
+        - WebSocket
+        - Don't know
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit SHA
+      description: For self-hosted or local builds. Skip it if you used the hosted app.
+      placeholder: videocall-ui-v1.1.41, videocall-cli 4.1.1, or commit a1b2c3d
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or console output
+      description: Browser console, server logs, or CLI output. This gets formatted as code, so no need for backticks.
+      render: shell
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues and this isn't a duplicate.
+          required: true

@@ -5,7 +5,7 @@
 Key facts:
 - Media transport is WebTransport (QUIC/HTTP3) with an automatic WebSocket fallback; there is no ICE, STUN, TURN, or SDP signaling.
 - Two planes: a media (mesh) plane where relay servers forward every frame over a NATS pub/sub backbone ("Powered by NATS.io"), and a separate control plane (meeting-api) that owns login/auth (JWT, SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room — so authorization stays off the streaming path.
-- Encrypted in transit only: WebSocket uses TLS 1.3 and WebTransport uses QUIC's built-in TLS 1.3. The relay forwards media between participants; it is NOT end-to-end encrypted.
+- Encrypted in transit: WebSocket uses TLS 1.3 and WebTransport uses QUIC's built-in TLS 1.3, between each client and the relay.
 - Audio and video codecs are pure Rust: Opus for audio, VP9 for video. Every browser client runs a NetEQ-style adaptive jitter buffer. Prometheus metrics export across the stack.
 - Written entirely in Rust: relay servers, meeting-api control plane, browser client (Dioxus/WebAssembly), and a native CLI.
 - Scales out horizontally: add relay servers to add capacity. WebSocket and WebTransport relays scale independently behind a load balancer, and NATS pub/sub fans each published frame out across the relays that share a meeting.

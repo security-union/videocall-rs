@@ -23,11 +23,14 @@ use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::HealthReporter;
+use crate::rate_control::camera::DEFAULT_CAMERA_FPS;
+use crate::rate_control::wire::camera_report_for;
+use crate::rate_control::{CameraRateController, CameraRateStats};
 use crate::traffic_shaping::{
     ShapedKind, TrafficShaping, TrafficShapingSettings, TrafficShapingStatus,
 };
+use crate::utils::monotonic_now_ms;
 use anyhow::{anyhow, Result};
-use futures::channel::mpsc::UnboundedSender;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, warn};
@@ -53,6 +56,9 @@ use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
+
+/// Camera cap until the `CameraEncoder` sets the configured one, bps.
+const DEFAULT_CAMERA_MAX_BPS: f64 = 1_000_000.0;
 
 /// Configuration options for creating a [`VideoCallClient`].
 ///
@@ -158,10 +164,10 @@ struct Inner {
     force_camera_keyframe: Arc<AtomicBool>,
     /// Flag set by incoming KEYFRAME_REQUEST for screen share.
     force_screen_keyframe: Arc<AtomicBool>,
-    /// Flag set when a CONGESTION signal is received from the server.
-    /// The camera encoder's diagnostics loop checks this flag and calls
-    /// `force_video_step_down()` on the `EncoderBitrateController`.
-    congestion_step_down_requested: Arc<AtomicBool>,
+    /// Our camera's rate control. Viewers' reports about our camera stream
+    /// are fed here as they arrive; the `CameraEncoder` asks it what to do
+    /// with every captured frame.
+    camera_rate: Rc<RefCell<CameraRateController>>,
 }
 
 /// The main client handle for a video call session.
@@ -179,6 +185,8 @@ pub struct VideoCallClient {
     /// Hidden debug feature: a simulated narrow uplink for outgoing media.
     /// Off unless the UI turns it on; see [`crate::traffic_shaping`].
     traffic_shaping: Rc<TrafficShaping>,
+    /// Our camera's rate control, shared with the `CameraEncoder`.
+    camera_rate: Rc<RefCell<CameraRateController>>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -189,28 +197,81 @@ impl PartialEq for VideoCallClient {
     }
 }
 
+/// Whether a packet from `session_id` may create a peer entry. Diagnostics
+/// and the relay's CONGESTION signal never do: a diagnostics packet must not
+/// conjure the viewer it reports for, and a CONGESTION packet carries our
+/// own session id with the congested receiver's user id.
+fn creates_peer(packet_type: Option<PacketType>) -> bool {
+    !matches!(
+        packet_type,
+        Some(PacketType::DIAGNOSTICS) | Some(PacketType::CONGESTION)
+    )
+}
+
+/// The viewer and report in a diagnostics packet, if it is a report about
+/// our camera from a peer we already know. The viewer is the wrapper's
+/// `session_id`, which the server stamps with the real sender; the packet's
+/// own `target_id` is whatever the sender wrote and is not trusted.
+fn camera_report_from(
+    session_id: u64,
+    packet: &DiagnosticsPacket,
+    own_session: Option<u64>,
+    is_known_peer: impl FnOnce(u64) -> bool,
+) -> Option<(u64, videocall_rate_control::Report)> {
+    let report = camera_report_for(packet, own_session)?;
+    is_known_peer(session_id).then_some((session_id, report))
+}
+
+/// The peer manager's removal callback: a peer that leaves (by any path) is
+/// also a viewer whose reports about our camera no longer count; then the
+/// UI's callback.
+fn viewer_removal_callback(
+    camera_rate: Rc<RefCell<CameraRateController>>,
+    on_peer_removed: Option<Callback<String>>,
+) -> Callback<String> {
+    Callback::from(move |session_id: String| {
+        if let Ok(viewer) = session_id.parse::<u64>() {
+            match camera_rate.try_borrow_mut() {
+                Ok(mut camera_rate) => camera_rate.remove_viewer(viewer),
+                Err(_) => warn!("camera rate control busy, viewer {viewer} not removed"),
+            }
+        }
+        if let Some(callback) = &on_peer_removed {
+            callback.emit(session_id);
+        }
+    })
+}
+
 /// Hand an encoded media packet to the active connection (reliable stream on
 /// WebTransport, a binary frame on WebSocket). Used by unshaped media and by
-/// the traffic shaper when a queued packet is due.
+/// the traffic shaper when a queued packet is due. Returns whether the packet
+/// was handed to the transport; `false` for a drop known at once (no
+/// connection, a full WebSocket buffer).
 pub(crate) fn send_media_to_transport(
     connection_controller: &RefCell<Option<ConnectionController>>,
     media: PacketWrapper,
-) {
+) -> bool {
     let packet_type = media.packet_type.enum_value();
     match connection_controller.try_borrow() {
         Ok(cc) => {
             if let Some(controller) = cc.as_ref() {
-                if let Err(e) = controller.send_packet(media) {
-                    debug!("Failed to send {packet_type:?} media packet: {e}");
+                match controller.send_packet(media) {
+                    Ok(handed_off) => handed_off,
+                    Err(e) => {
+                        debug!("Failed to send {packet_type:?} media packet: {e}");
+                        false
+                    }
                 }
             } else {
                 error!("No connection manager available for {packet_type:?} media packet");
+                false
             }
         }
         Err(_) => {
             error!(
                 "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
-            )
+            );
+            false
         }
     }
 }
@@ -282,7 +343,11 @@ impl VideoCallClient {
 
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
-        let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        // The camera encoder sets its configured cap and capture rate.
+        let camera_rate = Rc::new(RefCell::new(CameraRateController::new(
+            DEFAULT_CAMERA_MAX_BPS,
+            DEFAULT_CAMERA_FPS,
+        )));
         let traffic_shaping = TrafficShaping::new(
             connection_controller.clone(),
             force_camera_keyframe.clone(),
@@ -316,6 +381,7 @@ impl VideoCallClient {
                 peer_decode_manager: Self::create_peer_decoder_manager(
                     &options,
                     diagnostics.clone(),
+                    camera_rate.clone(),
                 ),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
@@ -323,12 +389,13 @@ impl VideoCallClient {
                 recent_peer_events: HashMap::new(),
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
-                congestion_step_down_requested: congestion_step_down_requested.clone(),
+                camera_rate: camera_rate.clone(),
             })),
             connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
             traffic_shaping,
+            camera_rate,
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -458,6 +525,12 @@ impl VideoCallClient {
                             // decoder workers so stale WASM instances don't
                             // accumulate memory during reconnection.
                             if matches!(state, ConnectionState::Failed { .. }) {
+                                // The camera keeps the rate it had instead
+                                // of the cap; the viewers' reports go with
+                                // the peers just below.
+                                if let Ok(mut camera_rate) = inner.camera_rate.try_borrow_mut() {
+                                    camera_rate.on_link_lost(monotonic_now_ms());
+                                }
                                 inner.peer_decode_manager.clear_all_peers();
                             }
                         }
@@ -533,6 +606,7 @@ impl VideoCallClient {
     fn create_peer_decoder_manager(
         opts: &VideoCallClientOptions,
         diagnostics: Option<Rc<DiagnosticManager>>,
+        camera_rate: Rc<RefCell<CameraRateController>>,
     ) -> PeerDecodeManager {
         let mut peer_decode_manager = match diagnostics {
             Some(diagnostics) => PeerDecodeManager::new_with_diagnostics(diagnostics),
@@ -541,9 +615,8 @@ impl VideoCallClient {
         peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
         peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
         peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-        if let Some(cb) = opts.on_peer_removed.as_ref() {
-            peer_decode_manager.on_peer_removed = cb.clone();
-        }
+        peer_decode_manager.on_peer_removed =
+            viewer_removal_callback(camera_rate, opts.on_peer_removed.clone());
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
         peer_decode_manager
     }
@@ -578,12 +651,21 @@ impl VideoCallClient {
     /// read for the packet header, so passing it costs nothing. With shaping
     /// off the packet goes straight to the transport after one `Option`
     /// check.
-    pub(crate) fn send_media_packet(&self, media: PacketWrapper, kind: ShapedKind, keyframe: bool) {
+    ///
+    /// Returns whether the packet was handed off: to the transport, or to the
+    /// shaper's queue (a drop there comes later and counts as lost after
+    /// numbering, like one in the network).
+    pub(crate) fn send_media_packet(
+        &self,
+        media: PacketWrapper,
+        kind: ShapedKind,
+        keyframe: bool,
+    ) -> bool {
         let Some(media) = self.traffic_shaping.shape(media, kind, keyframe) else {
             // Queued in the shaper; it sends the packet when it is due.
-            return;
+            return true;
         };
-        send_media_to_transport(&self.connection_controller, media);
+        send_media_to_transport(&self.connection_controller, media)
     }
 
     /// Whether traffic shaping (hidden debug feature) is on.
@@ -684,6 +766,21 @@ impl VideoCallClient {
                 .collect(),
             Err(_) => Vec::<String>::new(),
         }
+    }
+
+    /// Like [`sorted_peer_keys`](Self::sorted_peer_keys), but `None` when
+    /// the client is busy, instead of an empty list that reads as "nobody
+    /// is here".
+    pub fn try_sorted_peer_keys(&self) -> Option<Vec<String>> {
+        let inner = self.inner.try_borrow().ok()?;
+        Some(
+            inner
+                .peer_decode_manager
+                .sorted_keys()
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
+        )
     }
 
     pub fn get_peer_user_id(&self, session_id: &str) -> Option<String> {
@@ -807,13 +904,14 @@ impl VideoCallClient {
         self.inner.borrow().force_screen_keyframe.clone()
     }
 
-    /// Returns a shared reference to the congestion step-down flag.
-    ///
-    /// Pass this to `CameraEncoder` so that incoming CONGESTION signals from
-    /// the server trigger an immediate quality tier step-down via the
-    /// `EncoderBitrateController`.
-    pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
-        self.inner.borrow().congestion_step_down_requested.clone()
+    /// Our camera's rate control, for the `CameraEncoder`.
+    pub(crate) fn camera_rate(&self) -> Rc<RefCell<CameraRateController>> {
+        self.camera_rate.clone()
+    }
+
+    /// The camera rate control's current state, for diagnostics.
+    pub fn camera_rate_stats(&self) -> CameraRateStats {
+        self.camera_rate.borrow().stats(monotonic_now_ms())
     }
 
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
@@ -966,18 +1064,6 @@ impl VideoCallClient {
         self.send_packet(wrapper);
     }
 
-    pub fn subscribe_diagnostics(
-        &self,
-        tx: UnboundedSender<DiagnosticsPacket>,
-        media_type: MediaType,
-    ) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(sender_diagnostics) = &inner.sender_diagnostics {
-                sender_diagnostics.add_sender_channel(tx, media_type);
-            }
-        }
-    }
-
     pub fn subscribe_global_diagnostics(&self) -> async_broadcast::Receiver<DiagEvent> {
         subscribe_global_diagnostics()
     }
@@ -1089,6 +1175,43 @@ impl VideoCallClient {
 }
 
 impl Inner {
+    fn relay_rtt_ms(&self) -> Option<f64> {
+        self.connection_controller
+            .try_borrow()
+            .ok()
+            .and_then(|cc| cc.as_ref().and_then(|c| c.active_server_rtt_ms()))
+    }
+
+    /// A viewer (`viewer_session`) reported on our camera stream.
+    fn on_camera_report(&self, viewer_session: u64, report: videocall_rate_control::Report) {
+        let relay_rtt_ms = self.relay_rtt_ms();
+        match self.camera_rate.try_borrow_mut() {
+            Ok(mut camera_rate) => {
+                camera_rate.set_relay_rtt(relay_rtt_ms);
+                if !camera_rate.on_report(viewer_session, monotonic_now_ms(), report) {
+                    debug!("camera report from {viewer_session} dropped (too soon)");
+                }
+            }
+            Err(_) => warn!("camera rate control busy, report from {viewer_session} dropped"),
+        }
+    }
+
+    /// The relay's CONGESTION signal about the receiver `viewer` (if known).
+    /// Returns whether the camera's limit was cut.
+    fn on_congestion_signal(&self, viewer: Option<u64>) -> bool {
+        let relay_rtt_ms = self.relay_rtt_ms();
+        match self.camera_rate.try_borrow_mut() {
+            Ok(mut camera_rate) => {
+                camera_rate.set_relay_rtt(relay_rtt_ms);
+                camera_rate.on_congestion_signal(monotonic_now_ms(), viewer)
+            }
+            Err(_) => {
+                warn!("camera rate control busy, CONGESTION signal dropped");
+                false
+            }
+        }
+    }
+
     /// Returns `true` if this peer event was already seen recently (within 30 s).
     ///
     /// Both WebSocket and WebTransport connections receive the same NATS system
@@ -1163,14 +1286,16 @@ impl Inner {
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
-                PeerStatus::NoChange
-            } else {
-                let peer_user_id = String::from_utf8_lossy(&response.user_id);
-                self.peer_decode_manager
-                    .ensure_peer(response.session_id, &peer_user_id)
-            };
+        let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
+            || response.session_id == 0
+            || !creates_peer(response.packet_type.enum_value().ok())
+        {
+            PeerStatus::NoChange
+        } else {
+            let peer_user_id = String::from_utf8_lossy(&response.user_id);
+            self.peer_decode_manager
+                .ensure_peer(response.session_id, &peer_user_id)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
@@ -1275,6 +1400,18 @@ impl Inner {
                 if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
                 {
                     debug!("Received diagnostics packet: {diagnostics_packet:?}");
+                    // A viewer's report about our camera stream, keyed by
+                    // the viewer's session (the wrapper's, stamped by the
+                    // server), from a peer we already know.
+                    let peers = &self.peer_decode_manager;
+                    if let Some((viewer, report)) = camera_report_from(
+                        response.session_id,
+                        &diagnostics_packet,
+                        self.own_session_id,
+                        |session| peers.has_peer(session),
+                    ) {
+                        self.on_camera_report(viewer, report);
+                    }
                     if let Some(sender_diagnostics) = &self.sender_diagnostics {
                         sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
                     }
@@ -1459,15 +1596,21 @@ impl Inner {
             },
             Ok(PacketType::CONGESTION) => {
                 // Server-side congestion feedback: the server is dropping
-                // packets destined for a receiver because the outbound channel
-                // is full. Only act on it if the target session matches ours.
+                // our packets to a receiver whose outbound channel is full.
+                // Only act on it if the target session matches ours. The
+                // packet names the receiver by user id; it maps to a viewer
+                // only when that user is in the meeting from one session.
+                // The camera's rate control cuts its limit unless that
+                // viewer already reports (viewers that never report, older
+                // or native clients, are what this signal is for).
                 if self.own_session_id == Some(response.session_id) {
+                    let receiver = String::from_utf8_lossy(&response.user_id);
+                    let viewer = self.peer_decode_manager.only_session_of_user(&receiver);
+                    let cut = self.on_congestion_signal(viewer);
                     warn!(
-                        "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
-                        String::from_utf8_lossy(&response.user_id),
+                        "Received CONGESTION signal from server (receiver: {receiver}, \
+                         session {viewer:?}, limit cut: {cut})",
                     );
-                    self.congestion_step_down_requested
-                        .store(true, Ordering::Release);
                 } else {
                     debug!(
                         "Ignoring CONGESTION signal targeted at session {} (our session: {:?})",
@@ -1562,4 +1705,77 @@ fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
 fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
         .map_err(|e| anyhow!("Failed to parse rsa public key: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use videocall_types::protos::diagnostics_packet::VideoMetrics;
+
+    const OUR_SESSION: u64 = 1;
+
+    /// A viewer's report about our camera, with a `target_id` that lies.
+    fn report_about_us(target_id: &str) -> DiagnosticsPacket {
+        let mut packet = DiagnosticsPacket::new();
+        packet.sender_id = OUR_SESSION.to_string();
+        packet.target_id = target_id.to_string();
+        packet.media_type = MediaType::VIDEO.into();
+        let mut metrics = VideoMetrics::new();
+        metrics.capacity_kbps = 800;
+        packet.video_metrics = ::protobuf::MessageField::some(metrics);
+        packet
+    }
+
+    #[test]
+    fn diagnostics_and_congestion_never_create_a_peer() {
+        assert!(!creates_peer(Some(PacketType::DIAGNOSTICS)));
+        assert!(!creates_peer(Some(PacketType::CONGESTION)));
+        assert!(creates_peer(Some(PacketType::MEDIA)));
+        assert!(creates_peer(Some(PacketType::AES_KEY)));
+    }
+
+    /// The viewer is the wrapper's server-stamped session, not the
+    /// `target_id` the sender wrote.
+    #[test]
+    fn reports_are_keyed_by_the_wrapper_session() {
+        let packet = report_about_us("999");
+        let (viewer, report) =
+            camera_report_from(5, &packet, Some(OUR_SESSION), |_| true).expect("a report");
+        assert_eq!(viewer, 5);
+        assert_eq!(report.capacity_kbps(), 800);
+    }
+
+    /// A session that is not a peer yet gets nothing, and asking creates
+    /// nothing: the check is a read.
+    #[test]
+    fn reports_from_unknown_sessions_are_ignored() {
+        let packet = report_about_us("5");
+        let peers = crate::decode::PeerDecodeManager::new();
+        let found = camera_report_from(5, &packet, Some(OUR_SESSION), |session| {
+            peers.has_peer(session)
+        });
+        assert_eq!(found, None);
+        assert!(!peers.has_peer(5));
+    }
+
+    /// Every removal path ends in this callback: the viewer is removed from
+    /// the camera's rate control, then the UI hears about it.
+    #[test]
+    fn a_removed_peer_is_removed_from_the_publisher() {
+        let camera_rate = Rc::new(RefCell::new(CameraRateController::new(1_000_000.0, 30.0)));
+        let ui = Rc::new(RefCell::new(Vec::new()));
+        let ui_log = ui.clone();
+        let callback = viewer_removal_callback(
+            camera_rate.clone(),
+            Some(Callback::from(move |sid: String| {
+                ui_log.borrow_mut().push(sid)
+            })),
+        );
+        let report = videocall_rate_control::Report::from_wire(800, 0);
+        camera_rate.borrow_mut().on_report(5, 0.0, report);
+        camera_rate.borrow_mut().on_report(6, 0.0, report);
+        callback.emit("5".to_string());
+        assert_eq!(camera_rate.borrow().stats(0.0).viewers_reporting, 1);
+        assert_eq!(*ui.borrow(), vec!["5".to_string()]);
+    }
 }

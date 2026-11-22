@@ -2744,3 +2744,47 @@ select {
     padding: 14px;
   }
 }
+
+/* Reception Stats: one row per remote peer and media type */
+.reception-stats-table {
+  font-size: 0.85em;
+}
+.reception-stats-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 4.5em 3em 5.5em 6.5em 5em;
+  gap: 8px;
+  padding: 2px 0;
+}
+.reception-stats-header {
+  color: #888;
+  font-weight: 600;
+  border-bottom: 1px solid #444;
+  padding-bottom: 4px;
+  margin-bottom: 2px;
+}
+.reception-stats-cell {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reception-stats-row:not(.reception-stats-header) .reception-stats-cell {
+  color: #fff;
+}
+.reception-stats-row:not(.reception-stats-header) .reception-stats-peer {
+  color: #ccc;
+}
+
+/* Encoder Settings: the camera's rate control, label and value pairs */
+.encoder-settings-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 12px;
+  font-size: 0.85em;
+}
+.encoder-settings-label {
+  color: #888;
+}
+.encoder-settings-value {
+  color: #fff;
+  overflow-wrap: anywhere;
+}

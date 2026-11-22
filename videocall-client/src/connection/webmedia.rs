@@ -40,8 +40,9 @@ pub struct ConnectOptions {
 pub(super) trait WebMedia<TASK> {
     fn connect(options: ConnectOptions) -> anyhow::Result<TASK>;
 
-    /// Send bytes via a reliable, ordered unidirectional stream.
-    fn send_bytes(&self, bytes: Vec<u8>);
+    /// Send bytes via a reliable, ordered unidirectional stream. Returns
+    /// whether they were handed to the transport (`false`: dropped at once).
+    fn send_bytes(&self, bytes: Vec<u8>) -> bool;
 
     /// Send bytes via an unreliable, unordered datagram (WebTransport only).
     ///
@@ -53,7 +54,8 @@ pub(super) trait WebMedia<TASK> {
         self.send_bytes(bytes);
     }
 
-    fn send_packet(&self, packet: PacketWrapper) {
+    /// Returns whether the packet was handed to the transport.
+    fn send_packet(&self, packet: PacketWrapper) -> bool {
         match packet
             .write_to_bytes()
             .map_err(|w| JsValue::from(format!("{w:?}")))
@@ -62,6 +64,7 @@ pub(super) trait WebMedia<TASK> {
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
                 error!("error sending {packet_type} packet: {e:?}");
+                false
             }
         }
     }

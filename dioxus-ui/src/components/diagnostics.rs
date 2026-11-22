@@ -16,8 +16,12 @@
  * conditions.
  */
 
+use crate::components::encoder_settings::EncoderSettingsSection;
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
+};
+use crate::components::reception_stats::{
+    parse_decoder_event, ReceptionRow, ReceptionStatsSection, ReceptionStore, RECEPTION_PUBLISH_MS,
 };
 use crate::components::traffic_shaping::{
     register_reveal_tap, TrafficShapingSection, TrafficShapingUi,
@@ -443,10 +447,9 @@ pub fn Diagnostics(
     video_enabled: bool,
     mic_enabled: bool,
     share_screen: bool,
-    encoder_settings: Option<String>,
 ) -> Element {
     let mut selected_peer = use_signal(|| "All Peers".to_string());
-    let mut diagnostics_data = use_signal(|| None::<String>);
+    let mut reception_rows = use_signal(Vec::<ReceptionRow>::new);
     let mut sender_stats = use_signal(|| None::<String>);
     let mut connection_manager_state = use_signal(|| None::<String>);
     let mut neteq_stats_per_peer = use_signal(HashMap::<String, Vec<String>>::new);
@@ -458,6 +461,10 @@ pub fn Diagnostics(
     let traffic_shaping_ui = try_use_context::<TrafficShapingUi>();
     let mut reveal_taps = use_signal(Vec::<f64>::new);
     let traffic_shaping_revealed = traffic_shaping_ui.is_some_and(|ui| (ui.revealed)());
+
+    // Resolves session ids to names and tells which peers are still here.
+    let client = use_context::<VideoCallClient>();
+    let effect_client = client.clone();
 
     // The panel is unmounted when it closes; slow the NetEq stats back down.
     use_drop(|| videocall_client::set_audio_diagnostics_enabled(false));
@@ -475,7 +482,7 @@ pub fn Diagnostics(
         if !is_open {
             // Back to slow (every 5 s) NetEq stats, enough for health reports.
             videocall_client::set_audio_diagnostics_enabled(false);
-            diagnostics_data.set(None);
+            reception_rows.set(Vec::new());
             sender_stats.set(None);
             connection_manager_state.set(None);
             neteq_stats_per_peer.set(HashMap::new());
@@ -485,6 +492,7 @@ pub fn Diagnostics(
             return;
         }
 
+        let client = effect_client.clone();
         let task = spawn(async move {
             let mut rx = subscribe();
             // NetEq workers post stats every second only while this panel is
@@ -494,41 +502,32 @@ pub fn Diagnostics(
             let mut neteq_stats = HashMap::<String, Vec<String>>::new();
             let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();
             let mut neteq_jitter = HashMap::<String, Vec<u64>>::new();
+            let mut reception = ReceptionStore::default();
+            let mut last_reception_publish = f64::NEG_INFINITY;
 
             while let Ok(evt) = rx.recv().await {
                 match evt.subsystem {
                     "decoder" => {
-                        let mut text = String::new();
-                        for m in &evt.metrics {
-                            match m.name {
-                                "fps" => {
-                                    if let MetricValue::F64(v) = &m.value {
-                                        text.push_str(&format!("FPS: {v:.2}\n"));
-                                    }
+                        // Latest stats per (peer, media type). The worker sends
+                        // one event per stream every 500 ms; republish at most
+                        // once a second and only when a row changed.
+                        if let Some(report) = parse_decoder_event(&evt) {
+                            reception.record(report, evt.ts_ms as f64);
+                            let now = js_sys::Date::now();
+                            if now - last_reception_publish >= RECEPTION_PUBLISH_MS {
+                                last_reception_publish = now;
+                                // Client busy: skip the leave check this
+                                // time rather than drop every row.
+                                let present = client.try_sorted_peer_keys();
+                                let rows = reception.rows(now, |peer| {
+                                    present
+                                        .as_ref()
+                                        .is_none_or(|keys| keys.iter().any(|p| p == peer))
+                                });
+                                if *reception_rows.peek() != rows {
+                                    reception_rows.set(rows);
                                 }
-                                "bitrate_kbps" => {
-                                    if let MetricValue::F64(v) = &m.value {
-                                        text.push_str(&format!("Bitrate: {v:.1} kbps\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(t) = &m.value {
-                                        text.push_str(&format!("Media Type: {t}\n"));
-                                    }
-                                }
-                                _ => {}
                             }
-                        }
-                        if !text.is_empty() {
-                            let peer_id = evt
-                                .stream_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            text.push_str(&format!(
-                                "Peer: {}\nTimestamp: {}\n",
-                                peer_id, evt.ts_ms
-                            ));
-                            diagnostics_data.set(Some(text));
                         }
                     }
                     "sender" => {
@@ -660,7 +659,6 @@ pub fn Diagnostics(
     });
 
     // Resolve numeric session IDs to display names via VideoCallClient context.
-    let client = use_context::<VideoCallClient>();
     let peer_display_name = move |session_id: &str| -> String {
         client
             .get_peer_user_id(session_id)
@@ -719,9 +717,13 @@ pub fn Diagnostics(
     };
 
     let conn_state = connection_manager_state();
-    let diag_data = diagnostics_data();
+    let reception = reception_rows();
+    let reception_peer_names: HashMap<String, String> = reception
+        .iter()
+        .filter_map(|row| row.key.peer.as_deref())
+        .map(|peer| (peer.to_string(), peer_display_name(peer)))
+        .collect();
     let send_stats = sender_stats();
-    let enc_settings = encoder_settings;
     let video_str = if video_enabled { "Enabled" } else { "Disabled" };
     let audio_str = if mic_enabled { "Enabled" } else { "Disabled" };
     let screen_str = if share_screen { "Enabled" } else { "Disabled" };
@@ -882,14 +884,7 @@ pub fn Diagnostics(
                     }
                 }
                 div { class: "diagnostics-data",
-                    div { class: "diagnostics-section",
-                        h3 { "Reception Stats" }
-                        if let Some(data) = &diag_data {
-                            pre { "{data}" }
-                        } else {
-                            p { "No reception data available." }
-                        }
-                    }
+                    ReceptionStatsSection { rows: reception, peer_names: reception_peer_names }
                     div { class: "diagnostics-section",
                         h3 { "Sending Stats" }
                         if let Some(data) = &send_stats {
@@ -898,13 +893,8 @@ pub fn Diagnostics(
                             p { "No sending data available." }
                         }
                     }
-                    div { class: "diagnostics-section",
-                        h3 { "Encoder Settings" }
-                        if let Some(data) = &enc_settings {
-                            pre { "{data}" }
-                        } else {
-                            p { "No encoder settings available." }
-                        }
+                    if is_open {
+                        EncoderSettingsSection { video_enabled }
                     }
                     div { class: "diagnostics-section",
                         h3 { "Media Status" }

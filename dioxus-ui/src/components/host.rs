@@ -27,12 +27,10 @@ use crate::context::{
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
-use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
-use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -82,8 +80,6 @@ pub fn Host(
     let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
-    let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
     let mic_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
     let screen_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -101,12 +97,6 @@ pub fn Host(
         let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
 
-        let cam_settings_cell = camera_settings_handler.clone();
-        let camera_settings_cb = VcCallback::from(move |settings: String| {
-            if let Some(handler) = cam_settings_cell.borrow().as_ref() {
-                handler.call(settings);
-            }
-        });
         let cam_error_cell = camera_error_handler.clone();
         let camera_error_cb = VcCallback::from(move |err: String| {
             if let Some(handler) = cam_error_cell.borrow().as_ref() {
@@ -117,7 +107,6 @@ pub fn Host(
             client.clone(),
             VIDEO_ELEMENT_ID,
             video_bitrate,
-            camera_settings_cb,
             camera_error_cb,
         );
 
@@ -133,16 +122,12 @@ pub fn Host(
                 handler.call(err);
             }
         });
-        // Microphone encoder is created after camera so it can share the
-        // camera's audio tier atomics (avoiding a duplicate quality manager).
         let microphone = create_microphone_encoder(
             client.clone(),
             audio_bitrate,
             mic_settings_cb,
             mic_error_cb,
             vad_threshold().ok(),
-            Some(camera.shared_audio_tier_bitrate()),
-            Some(camera.shared_audio_tier_fec()),
         );
 
         let screen_settings_cell = screen_settings_handler.clone();
@@ -172,20 +157,11 @@ pub fn Host(
             screen_state_cb,
         );
 
-        // Wire up congestion step-down and PLI keyframe flags
-        camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
+        // Wire up PLI keyframe flags. The camera's rate control lives in the
+        // client, which feeds it the viewers' reports; screen share runs at
+        // a fixed bitrate.
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
-
-        // Wire up encoder controls. The microphone encoder no longer needs
-        // its own diagnostics channel — it reads audio tier settings from
-        // the camera encoder's shared atomics.
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
-        camera.set_encoder_control(rx);
-
-        // Screen share runs at a fixed bitrate until the bitrate controller
-        // redesign, so it is not subscribed to diagnostics.
 
         // Create MediaDeviceList
         let media_devices = MediaDeviceList::new();
@@ -210,7 +186,6 @@ pub fn Host(
 
     // Update the indirection cells so encoder callbacks route to the current EventHandlers.
     // This runs on every render to keep them in sync with the latest prop values.
-    *camera_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
     *mic_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
     *screen_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
     *camera_error_handler.borrow_mut() = Some(on_camera_error);

@@ -21,14 +21,14 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use log::error;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
+use videocall_types::protos::media_packet::VideoCodec;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -36,6 +36,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::ConstrainDomStringParameters;
 use web_sys::HtmlVideoElement;
+use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
@@ -43,27 +44,26 @@ use web_sys::MediaStreamTrackProcessor;
 use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
 use web_sys::VideoEncoder;
+use web_sys::VideoEncoderBitrateMode;
+use web_sys::VideoEncoderConfig;
 use web_sys::VideoEncoderEncodeOptions;
 use web_sys::VideoEncoderInit;
+use web_sys::VideoEncoderSupport;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
 use super::capture_session::{ActiveCapture, CaptureSession};
 use super::encoder_dimensions::FrameSize;
 use super::encoder_state::EncoderState;
-use super::keyframe_schedule::KeyframeSchedule;
 use super::transform::transform_video_chunk;
-use super::{configure_encoder, keyframe_due, reconfigure_if_resized, FrameRead};
+use super::FrameRead;
 
-use crate::adaptive_quality_constants::{
-    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
-};
+use crate::constants::{get_video_codec, get_video_codec_string};
 use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
-use crate::diagnostics::EncoderBitrateController;
+use crate::rate_control::camera::{bitrate_change_applies, FrameSequence, KeyframeClock};
+use crate::rate_control::CameraRateController;
 use crate::traffic_shaping::ShapedKind;
-
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
+use crate::utils::monotonic_now_ms;
 
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
@@ -78,39 +78,168 @@ pub struct CameraEncoder {
     client: VideoCallClient,
     video_elem_id: String,
     state: EncoderState,
-    current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
     /// Frames the encoder produced, measured like the viewers measure what
-    /// they receive. Shared with the bitrate controller.
+    /// they receive.
     output_meter: Rc<RefCell<FrameRateMeter>>,
-    on_encoder_settings_update: Callback<String>,
     on_error: Option<Callback<String>>,
-    /// Tier-controlled max width. The encoding loop checks this and reconfigures
-    /// the encoder when it changes. 0 means "use camera native resolution".
-    tier_max_width: Rc<AtomicU32>,
-    /// Tier-controlled max height.
-    tier_max_height: Rc<AtomicU32>,
-    /// Tier-controlled keyframe interval (frames).
-    tier_keyframe_interval: Rc<AtomicU32>,
+    /// The viewer-driven rate control, owned by the client (which feeds it
+    /// the viewers' reports). Asked once per captured frame.
+    camera_rate: Rc<RefCell<CameraRateController>>,
     /// When set to `true`, the next encoded frame will be forced as a keyframe.
     /// Used by the PLI (Picture Loss Indication) mechanism: when a remote peer
     /// detects missing frames and sends a KEYFRAME_REQUEST, the VideoCallClient
     /// sets this flag so the encoder produces an immediate keyframe.
     force_keyframe: Arc<AtomicBool>,
-    /// When set to `true`, the encoder control loop calls
-    /// `force_video_step_down()` on the next iteration. Set by the
-    /// `VideoCallClient` when a CONGESTION signal arrives from the server.
-    congestion_step_down: Arc<AtomicBool>,
-    /// Shared audio tier bitrate (bps). Written by the camera encoder's
-    /// quality manager when the audio tier changes. The microphone encoder
-    /// reads this to know the current audio bitrate, avoiding a duplicate
-    /// `EncoderBitrateController`.
-    shared_audio_tier_bitrate: Rc<AtomicU32>,
-    /// Shared audio tier FEC flag. Written by the camera encoder's quality
-    /// manager alongside `shared_audio_tier_bitrate`.
-    shared_audio_tier_fec: Rc<AtomicBool>,
     /// The running capture, so stop() releases the camera without waiting for a frame.
     capture: ActiveCapture,
+}
+
+/// What the camera's `VideoEncoder` is configured with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CameraEncoderSettings {
+    pub(crate) size: FrameSize,
+    pub(crate) bitrate_bps: u32,
+    pub(crate) framerate: f64,
+}
+
+/// Whether to reconfigure the encoder for `wanted`, and whether that frame
+/// must be a keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reconfigure {
+    pub(crate) configure: bool,
+    pub(crate) keyframe: bool,
+}
+
+/// What the rate control asks of the encoder for one frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Wanted {
+    pub(crate) settings: CameraEncoderSettings,
+    /// The publisher's probe step, for the bitrate threshold.
+    pub(crate) probe_fraction: f64,
+    /// The publisher is draining a backlog.
+    pub(crate) draining: bool,
+}
+
+/// Whether to reconfigure the encoder, and whether that frame must be a
+/// keyframe. A size or frame-rate change always reconfigures. A bitrate-only
+/// change does when [`bitrate_change_applies`]: a probe step or a drain, not
+/// RTT jitter.
+///
+/// A size change forced by the source (first frame, rotation, a new camera
+/// mode) gets a keyframe, as before. A size change from the rate control's
+/// tier does not on VP9, which rescales its references (a live reconfigure
+/// measured on Chromium does not force one); on VP8, whose frame size lives
+/// only in keyframes, `keyframe_on_tier_resize` asks for one.
+pub(crate) fn plan_reconfigure(
+    current: Option<CameraEncoderSettings>,
+    wanted: Wanted,
+    previous_source: Option<FrameSize>,
+    source: FrameSize,
+    keyframe_on_tier_resize: bool,
+) -> Reconfigure {
+    let settings = wanted.settings;
+    let unchanged = Reconfigure {
+        configure: false,
+        keyframe: false,
+    };
+    if settings.size.is_empty() {
+        return unchanged;
+    }
+    let Some(current) = current else {
+        return Reconfigure {
+            configure: true,
+            keyframe: true,
+        };
+    };
+    let size_changed = current.size != settings.size;
+    let shape_changed = size_changed || current.framerate != settings.framerate;
+    if !shape_changed
+        && !bitrate_change_applies(
+            current.bitrate_bps,
+            settings.bitrate_bps,
+            wanted.probe_fraction,
+            wanted.draining,
+        )
+    {
+        return unchanged;
+    }
+    let source_changed = previous_source != Some(source);
+    Reconfigure {
+        configure: true,
+        keyframe: size_changed && (source_changed || keyframe_on_tier_resize),
+    }
+}
+
+/// How many times one capture recreates a failed encoder before it gives up
+/// and reports the camera as failed.
+const MAX_ENCODER_RECOVERIES: u32 = 3;
+
+/// The camera encoder config: realtime, `framerate` set (without it the
+/// encoder under-spends), and constant bitrate mode when the browser
+/// supports it (the default variable mode ignores low targets).
+fn camera_encoder_config(
+    settings: CameraEncoderSettings,
+    constant_bitrate: bool,
+) -> VideoEncoderConfig {
+    // web-sys takes height before width.
+    let config = VideoEncoderConfig::new(
+        get_video_codec_string(),
+        settings.size.height,
+        settings.size.width,
+    );
+    config.set_bitrate_f64(settings.bitrate_bps as f64);
+    config.set_framerate(settings.framerate);
+    config.set_latency_mode(LatencyMode::Realtime);
+    if constant_bitrate {
+        config.set_bitrate_mode(VideoEncoderBitrateMode::Constant);
+    }
+    config
+}
+
+/// Configures `encoder` for `settings`. A config the encoder rejects in
+/// constant bitrate mode is retried in variable mode, which then sticks.
+/// Returns whether the encoder took a config.
+fn configure_camera_encoder(
+    encoder: &VideoEncoder,
+    settings: CameraEncoderSettings,
+    constant_bitrate: &mut bool,
+) -> bool {
+    match encoder.configure(&camera_encoder_config(settings, *constant_bitrate)) {
+        Ok(()) => return true,
+        Err(e) if *constant_bitrate => {
+            log::warn!("CameraEncoder: constant bitrate config rejected ({e:?}), using variable");
+            *constant_bitrate = false;
+        }
+        Err(e) => {
+            error!("Error configuring video encoder: {e:?}");
+            return false;
+        }
+    }
+    match encoder.configure(&camera_encoder_config(settings, false)) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("Error configuring video encoder: {e:?}");
+            false
+        }
+    }
+}
+
+/// Whether this browser's encoder takes `settings` in constant bitrate mode.
+/// Anything but a clear yes (a rejection, an unsupported config) means no,
+/// and the encoder keeps the default variable mode.
+async fn constant_bitrate_supported(settings: CameraEncoderSettings) -> bool {
+    let config = camera_encoder_config(settings, true);
+    match JsFuture::from(VideoEncoder::is_config_supported(&config)).await {
+        Ok(support) => support
+            .unchecked_into::<VideoEncoderSupport>()
+            .get_supported()
+            .unwrap_or(false),
+        Err(e) => {
+            log::warn!("CameraEncoder: isConfigSupported failed: {e:?}");
+            false
+        }
+    }
 }
 
 impl CameraEncoder {
@@ -120,146 +249,37 @@ impl CameraEncoder {
     ///
     /// * `video_elem_id` - the the ID of an `HtmlVideoElement` to which the camera will be connected.  It does not need to currently exist.
     ///
-    /// * `initial_bitrate` - the initial bitrate for the encoder, in kbps.
-    ///
-    /// * `on_encoder_settings_update` - a callback that will be called when the encoder settings change.
+    /// * `max_bitrate_kbps` - the most the camera may send, in kbps. The encoder starts
+    ///   here and the viewer-driven rate control never goes above it.
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
     pub fn new(
         client: VideoCallClient,
         video_elem_id: &str,
-        initial_bitrate: u32,
-        on_encoder_settings_update: Callback<String>,
+        max_bitrate_kbps: u32,
         on_error: Callback<String>,
     ) -> Self {
-        let default_tier = &VIDEO_QUALITY_TIERS[0];
-        let default_audio_tier = &AUDIO_QUALITY_TIERS[0];
+        let camera_rate = client.camera_rate();
+        camera_rate
+            .borrow_mut()
+            .set_max_bitrate(f64::from(max_bitrate_kbps) * 1000.0, monotonic_now_ms());
         Self {
             client,
             video_elem_id: video_elem_id.to_string(),
             state: EncoderState::new(),
-            current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Rc::new(AtomicU32::new(0)),
             output_meter: Rc::new(RefCell::new(FrameRateMeter::default())),
-            on_encoder_settings_update,
             on_error: Some(on_error),
-            tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
-            tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
-            tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
+            camera_rate,
             force_keyframe: Arc::new(AtomicBool::new(false)),
-            congestion_step_down: Arc::new(AtomicBool::new(false)),
-            shared_audio_tier_bitrate: Rc::new(AtomicU32::new(
-                default_audio_tier.bitrate_kbps * 1000,
-            )),
-            shared_audio_tier_fec: Rc::new(AtomicBool::new(default_audio_tier.enable_fec)),
             capture: ActiveCapture::default(),
         }
-    }
-
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
-        let current_bitrate = self.current_bitrate.clone();
-        let current_fps = self.current_fps.clone();
-        let output_meter = self.output_meter.clone();
-        let on_encoder_settings_update = self.on_encoder_settings_update.clone();
-        let enabled = self.state.enabled.clone();
-        let tier_max_width = self.tier_max_width.clone();
-        let tier_max_height = self.tier_max_height.clone();
-        let tier_keyframe_interval = self.tier_keyframe_interval.clone();
-        let congestion_flag = self.congestion_step_down.clone();
-        let shared_audio_bitrate = self.shared_audio_tier_bitrate.clone();
-        let shared_audio_fec = self.shared_audio_tier_fec.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderBitrateController::new(
-                current_bitrate.load(Ordering::Relaxed),
-                current_fps.clone(),
-            )
-            .with_source_meter(output_meter);
-            while let Some(event) = diagnostics_receiver.next().await {
-                // Check for server congestion step-down request before
-                // processing the diagnostics packet so the forced step-down
-                // takes effect immediately.
-                if congestion_flag.swap(false, Ordering::AcqRel) {
-                    log::warn!(
-                        "CameraEncoder: server CONGESTION signal received, forcing video step-down"
-                    );
-                    encoder_control.force_video_step_down();
-                }
-
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
-                if let Some(bitrate) = output_wasted {
-                    if enabled.load(Ordering::Acquire) {
-                        // Only update if change is greater than threshold
-                        let current = current_bitrate.load(Ordering::Relaxed) as f64;
-                        let new = bitrate;
-                        let percent_change = (new - current).abs() / current;
-
-                        if percent_change > BITRATE_CHANGE_THRESHOLD {
-                            on_encoder_settings_update.emit(format!("Bitrate: {bitrate:.2} kbps"));
-                            current_bitrate.store(bitrate as u32, Ordering::Relaxed);
-                        }
-                    } else {
-                        on_encoder_settings_update.emit("Disabled".to_string());
-                    }
-                }
-
-                // Check if the quality manager triggered a tier change
-                // (either from regular adaptation OR from the forced congestion
-                // step-down above). Update shared atomics so the encoding loop
-                // picks up the new resolution and keyframe interval.
-                if encoder_control.take_tier_changed() {
-                    let tier = encoder_control.current_video_tier();
-                    tier_max_width.store(tier.max_width, Ordering::Relaxed);
-                    tier_max_height.store(tier.max_height, Ordering::Relaxed);
-                    tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
-                    log::info!(
-                        "CameraEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
-                        tier.label,
-                        tier.max_width,
-                        tier.max_height,
-                        tier.target_fps,
-                        tier.keyframe_interval_frames,
-                    );
-
-                    // Also update shared audio tier atomics so the microphone
-                    // encoder picks up the new audio quality settings without
-                    // needing its own EncoderBitrateController.
-                    let audio_tier = encoder_control.current_audio_tier();
-                    shared_audio_bitrate.store(audio_tier.bitrate_kbps * 1000, Ordering::Relaxed);
-                    shared_audio_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
-                    log::info!(
-                        "CameraEncoder: audio tier updated to '{}' ({}kbps, fec={})",
-                        audio_tier.label,
-                        audio_tier.bitrate_kbps,
-                        audio_tier.enable_fec,
-                    );
-                }
-            }
-        });
     }
 
     /// Gets the current encoder output frame rate
     pub fn get_current_fps(&self) -> u32 {
         self.current_fps.load(Ordering::Relaxed)
-    }
-
-    /// Returns the shared audio tier bitrate atomic (bps).
-    ///
-    /// The microphone encoder reads this to track the current audio quality
-    /// tier without needing its own `EncoderBitrateController`.
-    pub fn shared_audio_tier_bitrate(&self) -> Rc<AtomicU32> {
-        self.shared_audio_tier_bitrate.clone()
-    }
-
-    /// Returns the shared audio tier FEC flag.
-    ///
-    /// The microphone encoder reads this to decide whether to include
-    /// RED-style redundancy in audio packets.
-    pub fn shared_audio_tier_fec(&self) -> Rc<AtomicBool> {
-        self.shared_audio_tier_fec.clone()
     }
 
     /// Returns a shared reference to the force-keyframe flag.
@@ -283,14 +303,6 @@ impl CameraEncoder {
     /// which sets it when a remote peer sends a KEYFRAME_REQUEST.
     pub fn set_force_keyframe_flag(&mut self, flag: Arc<AtomicBool>) {
         self.force_keyframe = flag;
-    }
-
-    /// Replace the internal congestion step-down flag with an externally-owned one.
-    ///
-    /// Call this after construction to share the flag with `VideoCallClient`,
-    /// which sets it when a server CONGESTION signal is received.
-    pub fn set_congestion_step_down_flag(&mut self, flag: Arc<AtomicBool>) {
-        self.congestion_step_down = flag;
     }
 
     // The next three methods delegate to self.state
@@ -342,16 +354,16 @@ impl CameraEncoder {
         let EncoderState {
             enabled, switching, ..
         } = self.state.clone();
-        let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let output_meter = self.output_meter.clone();
-        let tier_max_width = self.tier_max_width.clone();
-        let tier_max_height = self.tier_max_height.clone();
-        let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        let camera_rate = self.camera_rate.clone();
         let force_keyframe = self.force_keyframe.clone();
         let video_output_handler = {
             let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
-            let mut sequence_number = 0;
+            // Numbered here, at the hand-off to the transport: a frame the
+            // rate control skipped never reaches this callback, and one the
+            // send path refuses at once gives its number back.
+            let mut sequence = FrameSequence::default();
 
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -371,15 +383,16 @@ impl CameraEncoder {
                     buffer.resize(byte_length, 0);
                 }
 
-                let (packet, is_keyframe) = transform_video_chunk(
-                    chunk,
-                    sequence_number,
-                    buffer.as_mut_slice(),
-                    &userid,
-                    aes.clone(),
-                );
-                client.send_media_packet(packet, ShapedKind::Camera, is_keyframe);
-                sequence_number += 1;
+                sequence.send_numbered(|seq| {
+                    let (packet, is_keyframe) = transform_video_chunk(
+                        chunk,
+                        seq,
+                        buffer.as_mut_slice(),
+                        &userid,
+                        aes.clone(),
+                    );
+                    client.send_media_packet(packet, ShapedKind::Camera, is_keyframe)
+                });
             })
         };
         let device_id = if let Some(vid) = &self.state.selected {
@@ -546,10 +559,54 @@ impl CameraEncoder {
                     .unchecked_into::<VideoTrack>(),
             );
 
-            // Setup video encoder
-            let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                error!("error_handler error {e:?}");
-            }) as Box<dyn FnMut(JsValue)>);
+            // Get track settings to get actual width, height and frame rate
+            let media_track = video_track
+                .as_ref()
+                .clone()
+                .unchecked_into::<MediaStreamTrack>();
+            let track_settings = media_track.get_settings();
+            camera_rate
+                .borrow_mut()
+                .set_camera_fps(track_settings.get_frame_rate());
+
+            // The settings before the first frame. A first guess: iOS can
+            // report the sensor orientation here, and the first frame
+            // corrects it.
+            let start = camera_rate.borrow().stats(monotonic_now_ms());
+            let tier_cap = FrameSize::new(start.tier_width, start.tier_height);
+            let start_size = FrameSize::of_settings(&track_settings).fit_within(tier_cap);
+            let start_settings = CameraEncoderSettings {
+                size: if start_size.is_empty() {
+                    tier_cap
+                } else {
+                    start_size
+                },
+                bitrate_bps: start.encoder_bitrate_bps,
+                framerate: start.tier_fps,
+            };
+            let constant_bitrate = constant_bitrate_supported(start_settings).await;
+            if !constant_bitrate {
+                log::warn!(
+                    "CameraEncoder: constant bitrate mode not supported, using variable bitrate"
+                );
+            }
+            if session.is_cancelled() {
+                stop_tracks(&device);
+                return;
+            }
+            // Tier resizes need a keyframe on VP8 only; see plan_reconfigure.
+            let keyframe_on_tier_resize = get_video_codec() == VideoCodec::VP8;
+
+            // Setup video encoder. An error closes the encoder; the loop
+            // sees the flag and recreates it (see below).
+            let encoder_failed = Rc::new(Cell::new(false));
+            let video_error_handler = {
+                let encoder_failed = encoder_failed.clone();
+                Closure::wrap(Box::new(move |e: JsValue| {
+                    log::warn!("CameraEncoder: encoder error: {e:?}");
+                    encoder_failed.set(true);
+                }) as Box<dyn FnMut(JsValue)>)
+            };
 
             let video_output_handler =
                 Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
@@ -559,7 +616,7 @@ impl CameraEncoder {
                 video_output_handler.as_ref().unchecked_ref(),
             );
 
-            let video_encoder = match VideoEncoder::new(&video_encoder_init) {
+            let mut video_encoder = match VideoEncoder::new(&video_encoder_init) {
                 Ok(enc) => Box::new(enc),
                 Err(e) => {
                     let msg = format!("Failed to create video encoder: {e:?}");
@@ -571,26 +628,18 @@ impl CameraEncoder {
                 }
             };
 
-            // Get track settings to get actual width and height
-            let media_track = video_track
-                .as_ref()
-                .clone()
-                .unchecked_into::<MediaStreamTrack>();
-            let track_settings = media_track.get_settings();
-
-            let tier_cap = || {
-                FrameSize::new(
-                    tier_max_width.load(Ordering::Relaxed),
-                    tier_max_height.load(Ordering::Relaxed),
-                )
-            };
-            let mut encoder_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-            // A first guess: iOS can report the sensor orientation here, and
-            // the first frame corrects it.
-            let mut encoder_size = FrameSize::of_settings(&track_settings).fit_within(tier_cap());
-            if !encoder_size.is_empty() {
-                if let Err(e) = configure_encoder(&video_encoder, encoder_size, encoder_bitrate) {
-                    error!("Error configuring video encoder: {e:?}");
+            let mut constant_bitrate = constant_bitrate;
+            let mut encoder_settings = None;
+            if !start_size.is_empty() {
+                let settings = CameraEncoderSettings {
+                    size: start_size,
+                    ..start_settings
+                };
+                if configure_camera_encoder(&video_encoder, settings, &mut constant_bitrate) {
+                    encoder_settings = Some(settings);
+                    camera_rate
+                        .borrow_mut()
+                        .on_encoder_configured(monotonic_now_ms());
                 }
             }
 
@@ -605,8 +654,10 @@ impl CameraEncoder {
                     .unchecked_into::<ReadableStreamDefaultReader>(),
             );
 
-            let mut keyframe_schedule = KeyframeSchedule::new();
-            let mut frame_counter: u32 = 0;
+            let mut keyframes = KeyframeClock::default();
+            let mut previous_source = None;
+            let mut recoveries = 0;
+            let mut recovered = false;
             loop {
                 if session.is_cancelled()
                     || !enabled.load(Ordering::Acquire)
@@ -627,38 +678,99 @@ impl CameraEncoder {
                     }
                 };
 
-                let bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                let resized = reconfigure_if_resized(
-                    &video_encoder,
-                    &mut encoder_size,
-                    FrameSize::of(&video_frame),
-                    tier_cap(),
-                    bitrate,
-                );
-                if resized {
-                    encoder_bitrate = bitrate;
-                } else if bitrate != encoder_bitrate && !encoder_size.is_empty() {
-                    log::info!("Updating video bitrate to {bitrate}");
-                    if let Err(e) = configure_encoder(&video_encoder, encoder_size, bitrate) {
-                        error!("Error configuring video encoder: {e:?}");
+                // A failed encoder is closed by the browser and viewers
+                // would see a frozen camera. Recreate it in variable bitrate
+                // mode (constant mode is the likeliest cause) and start
+                // over with a keyframe. Only if that keeps failing is the
+                // camera reported as failed, once: the UI turns the camera
+                // off on that report.
+                if encoder_failed.replace(false) {
+                    recoveries += 1;
+                    if recoveries > MAX_ENCODER_RECOVERIES {
+                        video_frame.close();
+                        let message =
+                            format!("Camera encoder failed {recoveries} times, giving up");
+                        report_unexpected_end(&session, &on_error, message);
+                        break;
                     }
-                    encoder_bitrate = bitrate;
+                    log::warn!(
+                        "CameraEncoder: recreating the encoder in variable bitrate mode \
+                         (recovery {recoveries} of {MAX_ENCODER_RECOVERIES})"
+                    );
+                    constant_bitrate = false;
+                    match VideoEncoder::new(&video_encoder_init) {
+                        Ok(encoder) => *video_encoder = encoder,
+                        Err(e) => {
+                            video_frame.close();
+                            let message = format!("Failed to recreate video encoder: {e:?}");
+                            report_unexpected_end(&session, &on_error, message);
+                            break;
+                        }
+                    }
+                    encoder_settings = None;
+                    recovered = true;
                 }
 
+                // The rate control decides per captured frame, on the
+                // frame's own capture time (µs). A skipped frame never
+                // reaches the encoder, so it takes no sequence number.
+                let timestamp_ms = video_frame.timestamp() / 1000.0;
+                let plan = camera_rate
+                    .borrow_mut()
+                    .on_camera_frame(monotonic_now_ms(), timestamp_ms);
+                if !plan.encode {
+                    video_frame.close();
+                    continue;
+                }
+
+                let source = FrameSize::of(&video_frame);
+                let wanted = Wanted {
+                    settings: CameraEncoderSettings {
+                        size: source.fit_within(FrameSize::new(plan.width, plan.height)),
+                        bitrate_bps: plan.bitrate_bps,
+                        framerate: plan.fps,
+                    },
+                    probe_fraction: plan.probe_fraction,
+                    draining: plan.draining,
+                };
+                let reconfigure = plan_reconfigure(
+                    encoder_settings,
+                    wanted,
+                    previous_source,
+                    source,
+                    keyframe_on_tier_resize,
+                );
+                previous_source = Some(source);
+                if reconfigure.configure {
+                    let settings = wanted.settings;
+                    log::debug!(
+                        "CameraEncoder: {}x{} @ {} fps, {} bps",
+                        settings.size.width,
+                        settings.size.height,
+                        settings.framerate,
+                        settings.bitrate_bps
+                    );
+                    if configure_camera_encoder(&video_encoder, settings, &mut constant_bitrate) {
+                        encoder_settings = Some(settings);
+                        camera_rate
+                            .borrow_mut()
+                            .on_encoder_configured(monotonic_now_ms());
+                    }
+                }
+
+                let pli = force_keyframe.swap(false, Ordering::AcqRel);
+                if pli {
+                    log::info!("CameraEncoder: forcing keyframe (PLI)");
+                }
+                let forced = pli || reconfigure.keyframe || std::mem::take(&mut recovered);
                 let options = VideoEncoderEncodeOptions::new();
-                options.set_key_frame(keyframe_due(
-                    &mut keyframe_schedule,
-                    tier_keyframe_interval.load(Ordering::Relaxed),
-                    force_keyframe.swap(false, Ordering::AcqRel),
-                    resized,
-                    frame_counter,
-                    "CameraEncoder",
-                ));
+                options.set_key_frame(keyframes.is_keyframe(timestamp_ms, forced));
                 if let Err(e) = video_encoder.encode_with_options(&video_frame, &options) {
-                    error!("Error encoding video frame: {e:?}");
+                    // Also what a closed encoder says until the error
+                    // callback has fired: not worth a log line per frame.
+                    log::debug!("Error encoding video frame: {e:?}");
                 }
                 video_frame.close();
-                frame_counter += 1;
             }
 
             switching.store(false, Ordering::Release);
@@ -691,5 +803,113 @@ fn report_unexpected_end(
 fn stop_tracks(stream: &MediaStream) {
     for track in stream.get_tracks().iter() {
         track.unchecked_into::<MediaStreamTrack>().stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: FrameSize = FrameSize::new(1280, 720);
+    /// The probe step at 30 fps and a 60 ms round trip: 33.3 / 560.
+    const PROBE: f64 = 0.0595;
+
+    fn settings(
+        width: u32,
+        height: u32,
+        bitrate_bps: u32,
+        framerate: f64,
+    ) -> CameraEncoderSettings {
+        CameraEncoderSettings {
+            size: FrameSize::new(width, height),
+            bitrate_bps,
+            framerate,
+        }
+    }
+
+    fn wanted(settings: CameraEncoderSettings, draining: bool) -> Wanted {
+        Wanted {
+            settings,
+            probe_fraction: PROBE,
+            draining,
+        }
+    }
+
+    fn plan(current: CameraEncoderSettings, next: Wanted) -> Reconfigure {
+        plan_reconfigure(Some(current), next, Some(SOURCE), SOURCE, false)
+    }
+
+    #[test]
+    fn nothing_to_do_when_nothing_changed() {
+        let current = settings(1280, 720, 1_000_000, 30.0);
+        let result = plan(current, wanted(current, false));
+        assert!(!result.configure && !result.keyframe);
+    }
+
+    /// A probe step up passes the threshold; a move under half a step (RTT
+    /// jitter) does not.
+    #[test]
+    fn a_probe_step_reconfigures_and_jitter_does_not() {
+        let current = settings(854, 480, 600_000, 30.0);
+        let probe_up = settings(854, 480, 635_700, 30.0);
+        let result = plan(current, wanted(probe_up, false));
+        assert!(result.configure && !result.keyframe);
+        let jitter = settings(854, 480, 610_000, 30.0);
+        assert!(!plan(current, wanted(jitter, false)).configure);
+        let small_down = settings(854, 480, 590_000, 30.0);
+        assert!(!plan(current, wanted(small_down, false)).configure);
+    }
+
+    /// A move down that enters a drain applies at once, however small.
+    #[test]
+    fn a_drain_applies_at_once() {
+        let current = settings(640, 360, 370_000, 30.0);
+        let floor = settings(640, 360, 360_000, 30.0);
+        assert!(!plan(current, wanted(floor, false)).configure);
+        assert!(plan(current, wanted(floor, true)).configure);
+    }
+
+    #[test]
+    fn a_tier_frame_rate_change_reconfigures_without_a_keyframe() {
+        let current = settings(640, 360, 360_000, 30.0);
+        let result = plan(current, wanted(settings(640, 360, 360_000, 15.0), false));
+        assert!(result.configure);
+        assert!(!result.keyframe);
+    }
+
+    /// A tier resize on VP9 needs no keyframe; on VP8 it does.
+    #[test]
+    fn a_tier_resize_forces_a_keyframe_only_on_vp8() {
+        let current = settings(1280, 720, 1_000_000, 30.0);
+        let next = wanted(settings(854, 480, 990_000, 30.0), false);
+        let vp9 = plan_reconfigure(Some(current), next, Some(SOURCE), SOURCE, false);
+        assert!(vp9.configure && !vp9.keyframe);
+        let vp8 = plan_reconfigure(Some(current), next, Some(SOURCE), SOURCE, true);
+        assert!(vp8.configure && vp8.keyframe);
+    }
+
+    /// The source changing size (first frame, iPhone rotation) still forces
+    /// a keyframe, as before; so does a fresh encoder.
+    #[test]
+    fn a_source_resize_or_a_new_encoder_forces_a_keyframe() {
+        let current = settings(1280, 720, 1_000_000, 30.0);
+        let portrait = FrameSize::new(720, 1280);
+        let next = wanted(settings(720, 1280, 1_000_000, 30.0), false);
+        let rotated = plan_reconfigure(Some(current), next, Some(SOURCE), portrait, false);
+        assert!(rotated.configure && rotated.keyframe);
+        let first = plan_reconfigure(None, wanted(current, false), Some(SOURCE), SOURCE, false);
+        assert!(first.configure && first.keyframe);
+    }
+
+    #[test]
+    fn an_empty_size_is_never_configured() {
+        let result = plan_reconfigure(
+            None,
+            wanted(settings(0, 0, 1_000_000, 30.0), false),
+            None,
+            FrameSize::default(),
+            false,
+        );
+        assert!(!result.configure);
     }
 }

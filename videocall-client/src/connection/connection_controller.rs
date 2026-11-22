@@ -138,8 +138,9 @@ impl ConnectionController {
 
     // Delegate methods to ConnectionManager
 
-    /// Send packet through active connection via reliable stream.
-    pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
+    /// Send packet through active connection via reliable stream. `Ok(true)`
+    /// when it was handed to the transport.
+    pub fn send_packet(&self, packet: PacketWrapper) -> Result<bool> {
         let mgr = self
             .manager
             .try_borrow()
@@ -222,6 +223,12 @@ impl ConnectionController {
             .try_borrow_mut()
             .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
         mgr.disconnect()
+    }
+
+    /// Averaged RTT to the active server, if measured and the manager is
+    /// not busy.
+    pub fn active_server_rtt_ms(&self) -> Option<f64> {
+        self.manager.try_borrow().ok()?.active_server_rtt_ms()
     }
 
     /// Get current connection state for UI

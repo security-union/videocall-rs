@@ -205,7 +205,9 @@ impl TrafficShaping {
             send,
             send_generation,
             || self.control.borrow().queue_generation(),
-            |packet| send_media_to_transport(&self.connection_controller, packet),
+            |packet| {
+                send_media_to_transport(&self.connection_controller, packet);
+            },
         );
 
         if let Some(enabled) = notify {

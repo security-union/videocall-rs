@@ -17,8 +17,8 @@
  */
 
 //! Frame-rate measurement shared by the encoders (frames sent) and the
-//! receiver's `FpsTracker` (frames received), so both sides of the bitrate
-//! controller's comparison use the same formula.
+//! receiver's `FpsTracker` (frames received), so both sides use the same
+//! formula.
 //!
 //! Screen capture is content-driven: Chrome delivers no frames at all while
 //! the shared content is static, then a burst when it changes. A gap is a
@@ -66,8 +66,6 @@ pub(crate) struct FrameRateMeter {
     last_frame_ms: Option<f64>,
     /// Rate of the last window closed since frames (re)started.
     fps: Option<f64>,
-    /// When the first window after the last restart closed.
-    measured_since_ms: Option<f64>,
 }
 
 impl FrameRateMeter {
@@ -81,7 +79,6 @@ impl FrameRateMeter {
             self.window_start_ms = now_ms;
             self.frames_in_window = 0;
             self.fps = None;
-            self.measured_since_ms = None;
             return FrameEvent::Restarted;
         }
         self.frames_in_window += 1;
@@ -91,7 +88,6 @@ impl FrameRateMeter {
         }
         let fps = self.frames_in_window as f64 * 1000.0 / elapsed_ms;
         self.fps = Some(fps);
-        self.measured_since_ms.get_or_insert(now_ms);
         self.window_start_ms = now_ms;
         self.frames_in_window = 0;
         FrameEvent::WindowClosed { fps, elapsed_ms }
@@ -105,12 +101,6 @@ impl FrameRateMeter {
             }
             _ => FrameRate::Silent,
         }
-    }
-
-    /// When the current run of frames first had a measured rate, i.e. the
-    /// close of its first full window. `None` while silent or measuring.
-    pub(crate) fn measured_since_ms(&self) -> Option<f64> {
-        self.measured_since_ms
     }
 }
 
@@ -144,7 +134,6 @@ mod tests {
             "1 s after the last frame"
         );
         assert_eq!(meter.on_frame(30_000.0), FrameEvent::Restarted);
-        assert_eq!(meter.measured_since_ms(), None);
         feed(
             &mut meter,
             (1..20).map(|i| 30_000.0 + i as f64 * 1000.0 / 30.0),
@@ -159,7 +148,6 @@ mod tests {
             "{:?}",
             meter.rate_at(31_300.0)
         );
-        assert!(meter.measured_since_ms().is_some_and(|at| at >= 31_000.0));
     }
 
     #[test]

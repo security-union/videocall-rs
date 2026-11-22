@@ -292,9 +292,12 @@ impl WebSocketTask {
     /// the packet is silently dropped to prevent unbounded memory growth on
     /// slow networks. This mirrors the congestion-drop behavior used on the
     /// WebTransport datagram path.
-    pub fn send_binary(&self, data: Vec<u8>) {
+    ///
+    /// Returns whether the data was handed to the browser's socket; `false`
+    /// when it was dropped here (inactive socket, full buffer, send error).
+    pub fn send_binary(&self, data: Vec<u8>) -> bool {
         if !self.is_active() {
-            return;
+            return false;
         }
         let buffered = self.ws.buffered_amount();
         if buffered > MAX_BUFFERED_AMOUNT {
@@ -304,7 +307,7 @@ impl WebSocketTask {
                 buffered,
                 MAX_BUFFERED_AMOUNT,
             );
-            return;
+            return false;
         }
 
         if self.ws.send_with_u8_array(&data).is_err() {
@@ -321,7 +324,9 @@ impl WebSocketTask {
                     data.len()
                 );
             }
+            return false;
         }
+        true
     }
 }
 

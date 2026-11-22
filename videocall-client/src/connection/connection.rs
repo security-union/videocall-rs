@@ -154,9 +154,13 @@ impl Connection {
         }
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    /// Returns whether the packet was handed to the transport; `false`
+    /// while not connected.
+    pub fn send_packet(&self, packet: PacketWrapper) -> bool {
         if let Status::Connected = self.status.get() {
-            self.task.send_packet(packet);
+            self.task.send_packet(packet)
+        } else {
+            false
         }
     }
 

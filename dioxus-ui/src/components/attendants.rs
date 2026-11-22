@@ -415,7 +415,6 @@ pub fn AttendantsComponent(
     // Hidden traffic shaping debug feature: per join, never persisted.
     let traffic_shaping_revealed = use_signal(|| false);
     let traffic_shaping_active = use_signal(|| false);
-    let encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     // Feature-detected once; the browser's capabilities don't change.
     let can_share_screen = use_hook(supports_screen_share);
@@ -1660,7 +1659,6 @@ pub fn AttendantsComponent(
                         video_enabled: video_enabled(),
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
-                        encoder_settings: encoder_settings(),
                     }
                 }
             }

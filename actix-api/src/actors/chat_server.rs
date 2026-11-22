@@ -35,7 +35,7 @@ use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
@@ -498,6 +498,42 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
     }
 }
 
+/// Stamps a client-originated packet with the session that actually sent
+/// it, overwriting whatever the client put in `PacketWrapper.session_id`.
+///
+/// Receivers key peers, congestion attribution and rate-control reports by
+/// this field, so a client must not choose it: a forged value would let it
+/// pose as another session or create phantom peers. Honest clients either
+/// leave it 0 or (heartbeats) set their own server-assigned id, so for them
+/// this changes nothing. Every client packet, WebSocket and WebTransport,
+/// reaches NATS through [`ClientMessage`], so this is the one place to do it.
+/// A payload that is not a `PacketWrapper` is forwarded unchanged; `None`
+/// (drop it) only if the re-encoded packet cannot be serialized.
+pub(crate) fn stamp_sender_session(data: &[u8], session: SessionId) -> Option<Vec<u8>> {
+    let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(data) else {
+        return Some(data.to_vec());
+    };
+    if packet_wrapper.session_id == session {
+        return Some(data.to_vec());
+    }
+    if packet_wrapper.session_id != 0 {
+        // Debug, not warn: a hostile client could otherwise flood the log.
+        debug!(
+            "session {session} sent a packet claiming session_id {}; overwriting",
+            packet_wrapper.session_id
+        );
+    }
+    packet_wrapper.session_id = session;
+    match packet_wrapper.write_to_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            // Never forward the client's own claim.
+            error!("Failed to serialize PacketWrapper with session_id: {}", e);
+            None
+        }
+    }
+}
+
 impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
@@ -529,21 +565,9 @@ impl Handler<ClientMessage> for ChatServer {
         let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
 
-        let packet_bytes =
-            if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
-                if packet_wrapper.session_id == 0 {
-                    packet_wrapper.session_id = session;
-                }
-                match packet_wrapper.write_to_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        error!("Failed to serialize PacketWrapper with session_id: {}", e);
-                        msg.data.to_vec()
-                    }
-                }
-            } else {
-                msg.data.to_vec()
-            };
+        let Some(packet_bytes) = stamp_sender_session(&msg.data, session) else {
+            return;
+        };
 
         let b = bytes::Bytes::from(packet_bytes);
         let fut = async move {
@@ -821,6 +845,63 @@ mod tests {
     use super::*;
     use actix::Actor;
     use serial_test::serial;
+
+    // ==========================================================================
+    // TEST: the sender's session id is stamped, never the client's claim
+    // ==========================================================================
+
+    fn wrapper_bytes(session_id: u64) -> Vec<u8> {
+        PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: b"mallory@example.com".to_vec(),
+            data: vec![1, 2, 3],
+            session_id,
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .expect("serialize")
+    }
+
+    fn stamped_session(data: &[u8], session: u64) -> u64 {
+        let bytes = stamp_sender_session(data, session).expect("forwarded");
+        <PacketWrapper as ProtobufMessage>::parse_from_bytes(&bytes)
+            .expect("still a PacketWrapper")
+            .session_id
+    }
+
+    #[test]
+    fn forged_session_id_is_replaced_with_the_sender() {
+        assert_eq!(stamped_session(&wrapper_bytes(424242), 7), 7);
+    }
+
+    #[test]
+    fn missing_session_id_is_filled_in() {
+        assert_eq!(stamped_session(&wrapper_bytes(0), 7), 7);
+    }
+
+    #[test]
+    fn own_session_id_is_kept_and_the_payload_untouched() {
+        // Heartbeats carry the client's own server-assigned id.
+        let original = wrapper_bytes(7);
+        assert_eq!(stamp_sender_session(&original, 7), Some(original));
+    }
+
+    #[test]
+    fn stamping_keeps_everything_else() {
+        let bytes = stamp_sender_session(&wrapper_bytes(99), 7).expect("forwarded");
+        let wrapper = <PacketWrapper as ProtobufMessage>::parse_from_bytes(&bytes).expect("parse");
+        assert_eq!(wrapper.packet_type, PacketType::MEDIA.into());
+        assert_eq!(wrapper.user_id, b"mallory@example.com".to_vec());
+        assert_eq!(wrapper.data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn non_wrapper_payload_is_forwarded_unchanged() {
+        let junk = b"\xff\xff\xff not protobuf".to_vec();
+        if <PacketWrapper as ProtobufMessage>::parse_from_bytes(&junk).is_err() {
+            assert_eq!(stamp_sender_session(&junk, 7), Some(junk));
+        }
+    }
 
     /// Test helper: create a database pool for integration tests.
     /// Kept for future JWT flow testing (create meeting -> get JWT -> connect via WS/WT).

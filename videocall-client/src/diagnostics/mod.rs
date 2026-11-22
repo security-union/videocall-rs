@@ -16,12 +16,8 @@
  * conditions.
  */
 
-pub mod adaptive_quality_manager;
 pub mod diagnostics_manager;
-pub mod encoder_bitrate_controller;
 pub(crate) mod frame_rate;
 
 // Re-export the modules
-pub use adaptive_quality_manager::AdaptiveQualityManager;
 pub use diagnostics_manager::{DiagnosticEvent, DiagnosticManager, SenderDiagnosticManager};
-pub use encoder_bitrate_controller::{EncoderBitrateController, EncoderControl};

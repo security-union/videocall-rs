@@ -25,6 +25,8 @@ use crate::adaptive_quality_constants::{
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
+use crate::rate_control::viewer::VideoArrival;
+use crate::utils::monotonic_now_ms;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
@@ -122,6 +124,9 @@ pub struct Peer {
     last_video_keyframe_request_ms: u64,
     /// Last time a screen keyframe request was sent (ms). Used for rate-limiting.
     last_screen_keyframe_request_ms: u64,
+    /// The camera frame the last `decode` call parsed, for the rate-control
+    /// estimator. Taken by the manager right after the call.
+    last_video_arrival: Option<VideoArrival>,
 }
 
 use std::fmt::Debug;
@@ -180,6 +185,7 @@ impl Peer {
             screen_gap_detected_at_ms: None,
             last_video_keyframe_request_ms: 0,
             last_screen_keyframe_request_ms: 0,
+            last_video_arrival: None,
         })
     }
 
@@ -313,6 +319,10 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
+                // Every camera frame that reaches us feeds the rate-control
+                // estimator, whether or not it is decoded below.
+                self.last_video_arrival = video_arrival(&packet);
+
                 // Track sequence numbers for gap detection (PLI).
                 let kf_request = self.track_sequence(media_type, &packet);
 
@@ -590,6 +600,11 @@ impl Peer {
         None
     }
 
+    /// The camera frame the last `decode` call parsed, if it was one.
+    fn take_video_arrival(&mut self) -> Option<VideoArrival> {
+        self.last_video_arrival.take()
+    }
+
     /// Record inbound activity from this peer. Called for ALL successfully
     /// dispatched media types (audio, video, screen, heartbeat) so that any
     /// traffic counts toward liveness, not just HEARTBEAT packets.
@@ -624,6 +639,17 @@ impl Peer {
         );
         true
     }
+}
+
+/// What the rate-control estimator needs from a camera packet. `None` for
+/// a packet without video metadata (no sequence number to order it by).
+fn video_arrival(packet: &MediaPacket) -> Option<VideoArrival> {
+    let metadata = packet.video_metadata.as_ref()?;
+    Some(VideoArrival {
+        seq: metadata.sequence,
+        timestamp_us: packet.timestamp,
+        bytes: u32::try_from(packet.data.len()).unwrap_or(u32::MAX),
+    })
 }
 
 fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
@@ -769,8 +795,17 @@ impl PeerDecodeManager {
             .connected_peers
             .remove_if_and_return(|peer| peer.check_heartbeat());
         for (_session_id, peer) in removed {
-            self.on_peer_removed.emit(peer.sid_str);
+            self.peer_removed(peer.sid_str);
         }
+    }
+
+    /// A peer is gone: drop what diagnostics kept about it, then tell the
+    /// client.
+    fn peer_removed(&self, sid_str: String) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.remove_peer(&sid_str);
+        }
+        self.on_peer_removed.emit(sid_str);
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
@@ -785,7 +820,16 @@ impl PeerDecodeManager {
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
                 peer.context_initialized = true;
             }
-            match peer.decode(&packet) {
+            let decoded = peer.decode(&packet);
+            if let (Some(diagnostics), Some(arrival)) =
+                (&self.diagnostics, peer.take_video_arrival())
+            {
+                // Read for camera frames only, right after the packet was
+                // parsed (the decode itself runs in a worker, so this is
+                // still the network's arrival time to within the parse).
+                diagnostics.on_video_arrival(&peer.sid_str, arrival, monotonic_now_ms());
+            }
+            match decoded {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_activity();
                     Ok(())
@@ -911,7 +955,7 @@ impl PeerDecodeManager {
 
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
-            self.on_peer_removed.emit(peer.sid_str);
+            self.peer_removed(peer.sid_str);
         }
     }
 
@@ -922,12 +966,32 @@ impl PeerDecodeManager {
     pub fn clear_all_peers(&mut self) {
         let removed = self.connected_peers.drain_all();
         for (_session_id, peer) in removed {
-            self.on_peer_removed.emit(peer.sid_str);
+            self.peer_removed(peer.sid_str);
         }
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
+    }
+
+    /// Whether `session_id` is a peer we know: one that joined and sent us
+    /// something that creates a peer (see `VideoCallClient`'s packet
+    /// handling), never one a diagnostics packet alone named.
+    pub(crate) fn has_peer(&self, session_id: u64) -> bool {
+        self.connected_peers.contains_key(&session_id)
+    }
+
+    /// The one session `user_id` is in the meeting with, if exactly one.
+    /// A user in the meeting from two tabs has two sessions, and then which
+    /// one is meant cannot be told.
+    pub(crate) fn only_session_of_user(&self, user_id: &str) -> Option<u64> {
+        let mut sessions = self.connected_peers.ordered_keys().iter().filter(|key| {
+            self.connected_peers
+                .get(key)
+                .is_some_and(|peer| peer.user_id == user_id)
+        });
+        let first = *sessions.next()?;
+        sessions.next().is_none().then_some(first)
     }
 
     pub fn ensure_peer(&mut self, session_id: u64, user_id: &str) -> PeerStatus {
@@ -1040,7 +1104,7 @@ impl PeerDecodeManager {
 mod tests {
     use super::*;
     use protobuf::Message;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use videocall_types::protos::media_packet::media_packet::MediaType;
     use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -1179,8 +1243,98 @@ mod tests {
             screen_gap_detected_at_ms: None,
             last_video_keyframe_request_ms: 0,
             last_screen_keyframe_request_ms: 0,
+            last_video_arrival: None,
         };
         (peer, muted_handle)
+    }
+
+    // -- rate control ----------------------------------------------------
+
+    fn manager_with_peers(sessions: &[u64]) -> (PeerDecodeManager, Rc<RefCell<Vec<String>>>) {
+        let mut manager = PeerDecodeManager::new();
+        let removed = Rc::new(RefCell::new(Vec::new()));
+        let log = removed.clone();
+        manager.on_peer_removed = Callback::from(move |sid: String| log.borrow_mut().push(sid));
+        for session in sessions {
+            let (peer, _muted) = make_test_peer(*session);
+            manager.connected_peers.insert(*session, peer);
+        }
+        (manager, removed)
+    }
+
+    /// Leave, heartbeat timeout and a failed link all tell the client, which
+    /// is what drops the viewer from the camera's rate control.
+    #[test]
+    fn every_removal_path_reports_the_peer() {
+        let (mut manager, removed) = manager_with_peers(&[1, 2, 3, 4]);
+        manager.delete_peer(1);
+        assert_eq!(*removed.borrow(), vec!["1".to_string()]);
+
+        // Peer 2 keeps sending; 3 and 4 go quiet. Three missed checks.
+        for _ in 0..4 {
+            if let Some(peer) = manager.connected_peers.get_mut(&2) {
+                peer.activity_count = 1;
+            }
+            manager.run_peer_monitor();
+        }
+        let mut timed_out = removed.borrow()[1..].to_vec();
+        timed_out.sort();
+        assert_eq!(timed_out, vec!["3".to_string(), "4".to_string()]);
+
+        manager.clear_all_peers();
+        assert_eq!(removed.borrow().last().map(String::as_str), Some("2"));
+        assert!(!manager.has_peer(2));
+    }
+
+    #[test]
+    fn a_user_maps_to_a_session_only_when_it_has_just_one() {
+        let (mut manager, _removed) = manager_with_peers(&[5, 6]);
+        if let Some(peer) = manager.connected_peers.get_mut(&6) {
+            peer.user_id = "bob@example.com".into();
+        }
+        assert!(manager.has_peer(5) && !manager.has_peer(7));
+        assert_eq!(manager.only_session_of_user("bob@example.com"), Some(6));
+        assert_eq!(manager.only_session_of_user("nobody@example.com"), None);
+        // test@test.com is in from session 5; a second tab makes it ambiguous.
+        assert_eq!(manager.only_session_of_user("test@test.com"), Some(5));
+        let (peer, _muted) = make_test_peer(8);
+        manager.connected_peers.insert(8, peer);
+        assert_eq!(manager.only_session_of_user("test@test.com"), None);
+    }
+
+    /// Every camera frame that reaches us is recorded for the rate-control
+    /// estimator, including one that is not decoded (a straggler after the
+    /// peer turned its camera off). Audio records nothing.
+    #[test]
+    fn every_camera_frame_is_recorded_for_rate_control() {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let (mut peer, _muted) = make_test_peer(2);
+        let _ = peer.decode(&heartbeat_packet(2, false, false, false));
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: "test@test.com".into(),
+            data: vec![0u8; 1200],
+            timestamp: 3_000_000.0,
+            video_metadata: Some(VideoMetadata {
+                sequence: 41,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let (_, status, _) = peer.decode(&wrap(&media, 2)).expect("straggler is skipped");
+        assert!(!status.rendered);
+        assert_eq!(
+            peer.take_video_arrival(),
+            Some(VideoArrival {
+                seq: 41,
+                timestamp_us: 3_000_000.0,
+                bytes: 1200,
+            })
+        );
+        assert_eq!(peer.take_video_arrival(), None, "taken once");
+        let _ = peer.decode(&audio_frame_packet(2));
+        assert_eq!(peer.take_video_arrival(), None);
     }
 
     // -- straggler guard tests --------------------------------------------

@@ -1,5 +1,14 @@
 # Performance Optimization Plan
 
+> **Historical.** The camera's adaptive bitrate described here (the PID
+> controller on `pidgeon`, the `AdaptiveQualityManager` tier switching and
+> its constants) has been replaced by a viewer-driven rate controller: each
+> viewer measures capacity and backlog and reports them, and the publisher
+> sets its bitrate, tier and frame skipping from those reports. See
+> [`videocall-rate-control/README.md`](../videocall-rate-control/README.md).
+> Audio and screen share run at fixed settings. The rest of this plan is
+> kept as a record of the investigation.
+
 ## Overview
 
 This document outlines the findings from a comprehensive investigation of the videocall-rs codebase, focused on improving performance under adverse network conditions (high latency, packet loss, low bandwidth) while maintaining high quality when conditions are good.
@@ -14,7 +23,7 @@ The investigation covered five areas: adaptive bitrate control, network transpor
 - **Server:** Distributed SFU using NATS pub/sub for media routing; server acts as transparent forwarder
 - **Video Codec:** VP9 (VP8 fallback on Firefox) via WebCodecs API
 - **Audio Codec:** Opus, 48 kHz, mono, 20ms frames
-- **Adaptive Bitrate:** PID controller (`pidgeon 0.3.1`) adjusts video bitrate based on received FPS feedback
+- **Adaptive Bitrate:** (at the time of writing) PID controller (`pidgeon 0.3.1`) adjusting video bitrate from received FPS feedback; since replaced, see the note above
 - **Jitter Buffer:** RFC 3550 jitter estimation, adaptive playout delay (10–500ms), keyframe-gated decoding
 - **Encryption:** AES-128 per-packet encryption with RSA key exchange
 

@@ -103,6 +103,8 @@ features = [
     "ReadableStream",
     "ReadableStreamGetReaderOptions",
     "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
+    "ConstrainDomStringParameters",
     "Response",
     "VideoEncoder",
     "VideoEncoderInit",

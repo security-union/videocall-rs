@@ -20,8 +20,6 @@ use gloo_timers::future::sleep;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
-use js_sys::JsString;
-use js_sys::Reflect;
 use log::error;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -37,6 +35,7 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::ConstrainDomStringParameters;
 use web_sys::HtmlVideoElement;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
@@ -45,6 +44,7 @@ use web_sys::MediaStreamTrack;
 use web_sys::MediaStreamTrackProcessor;
 use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
+use web_sys::ReadableStreamReadResult;
 use web_sys::VideoEncoder;
 use web_sys::VideoEncoderConfig;
 use web_sys::VideoEncoderEncodeOptions;
@@ -463,16 +463,11 @@ impl CameraEncoder {
                 log::warn!("Camera device_id is empty, using default constraint");
                 constraints.set_video(&JsValue::TRUE);
             } else {
-                let exact = js_sys::Object::new();
-                js_sys::Reflect::set(
-                    &exact,
-                    &JsValue::from_str("exact"),
-                    &JsValue::from_str(&device_id),
-                )
-                .unwrap();
+                let exact = ConstrainDomStringParameters::new();
+                exact.set_exact_str(&device_id);
 
                 log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
-                media_info.set_device_id(&exact.into());
+                media_info.set_device_id_constrain_dom_string_parameters(&exact);
                 constraints.set_video(&media_info.into());
             }
 
@@ -692,20 +687,20 @@ impl CameraEncoder {
                         }
                     }
                 };
-                let js_frame = match JsFuture::from(video_reader.read()).await {
-                    Ok(js_frame) => js_frame,
+                let result = match JsFuture::from(video_reader.read()).await {
+                    Ok(result) => result.unchecked_into::<ReadableStreamReadResult>(),
                     Err(e) => {
                         capture_failed(format!("Camera capture failed: {e:?}"));
                         break;
                     }
                 };
-                let value =
-                    Reflect::get(&js_frame, &JsString::from("value")).unwrap_or(JsValue::UNDEFINED);
-                if value.is_undefined() {
+                // read() always sets `done`; a result without it is treated
+                // as the end of the stream.
+                if result.get_done().unwrap_or(true) {
                     capture_failed("Camera capture ended".to_string());
                     break;
                 }
-                let video_frame = value.unchecked_into::<VideoFrame>();
+                let video_frame = result.get_value().unchecked_into::<VideoFrame>();
 
                 // Check for dimension changes (rotation, camera switch, tier
                 // change). The tier cap scales both sides by one factor so

@@ -19,8 +19,6 @@
 use futures::channel::mpsc::UnboundedReceiver;
 use gloo_utils::window;
 use js_sys::Array;
-use js_sys::JsString;
-use js_sys::Reflect;
 use log::error;
 use log::info;
 use std::cell::RefCell;
@@ -34,12 +32,14 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::DomException;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamTrack;
 use web_sys::MediaStreamTrackProcessor;
 use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
+use web_sys::ReadableStreamReadResult;
 use web_sys::VideoEncoder;
 use web_sys::VideoEncoderConfig;
 use web_sys::VideoEncoderEncodeOptions;
@@ -290,11 +290,9 @@ impl ScreenEncoder {
                     Ok(stream) => stream.unchecked_into::<MediaStream>(),
                     Err(e) => {
                         // Check if user cancelled (NotAllowedError = permission denied/cancelled)
-                        let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
-                            .ok()
-                            .and_then(|v| v.as_string())
-                            .map(|name| name == "NotAllowedError")
-                            .unwrap_or(false);
+                        let is_user_cancel = e
+                            .dyn_ref::<DomException>()
+                            .is_some_and(|exception| exception.name() == "NotAllowedError");
 
                         if is_user_cancel {
                             log::info!("User cancelled screen sharing");
@@ -526,16 +524,11 @@ impl ScreenEncoder {
                 }
 
                 match JsFuture::from(screen_reader.read()).await {
-                    Ok(js_frame) => {
-                        let value = match Reflect::get(&js_frame, &JsString::from("value")) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                error!("Failed to get frame value: {e:?}");
-                                continue;
-                            }
-                        };
-
-                        if value.is_undefined() {
+                    Ok(result) => {
+                        let result = result.unchecked_into::<ReadableStreamReadResult>();
+                        // read() always sets `done`; a result without it is
+                        // treated as the end of the stream.
+                        if result.get_done().unwrap_or(true) {
                             // stop() takes the reader out of the slot before
                             // cancelling it, and the browser's "Stop sharing"
                             // clears `enabled` in the onended handler. Either
@@ -548,7 +541,7 @@ impl ScreenEncoder {
                             break;
                         }
 
-                        let video_frame = value.unchecked_into::<VideoFrame>();
+                        let video_frame = result.get_value().unchecked_into::<VideoFrame>();
                         // Constrain to tier max dimensions, scaling both sides
                         // by one factor so a portrait window or monitor is
                         // shrunk instead of squashed.

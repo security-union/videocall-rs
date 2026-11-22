@@ -32,4 +32,6 @@ pub mod camera;
 pub(crate) mod viewer;
 pub(crate) mod wire;
 
-pub use camera::{CameraRateController, CameraRateStats, FramePlan};
+pub use camera::{CameraRateController, CameraRateStats, FramePlan, ReportedCapacity};
+/// `capacity_kbps` for "no ceiling seen", as the decoder diagnostics carry it.
+pub use videocall_rate_control::NO_CEILING_KBPS;

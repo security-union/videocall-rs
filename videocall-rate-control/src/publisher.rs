@@ -19,6 +19,10 @@
 //! - `C` is never taken below [`PublisherConfig::floor_bps`] (the bottom
 //!   tier's floor), so no report can ask for less than the bottom tier at
 //!   `f` of its frames.
+//! - A report without a capacity (the path never queued: what it delivered
+//!   is only a lower bound) does not lower anything: the target is the
+//!   maximum. An encoder that later fills a narrower path makes a queue,
+//!   and the queue's report brings the target down.
 //! - Never above the configured maximum; before any report, the start rate.
 
 use crate::viewer::Report;
@@ -66,7 +70,15 @@ impl PublisherConfig {
 
 /// The policy itself: the target for a report of this age, bps. Pure.
 pub fn drain_target_bps(config: &PublisherConfig, report: Report, age_ms: f64, rtt_ms: f64) -> f64 {
-    let capacity = (report.capacity_bps as f64).max(config.floor_bps.min(config.max_bps));
+    let floor = config.floor_bps.min(config.max_bps);
+    let capacity = match report.capacity_bps {
+        Some(bps) => (bps as f64).max(floor),
+        // No ceiling seen: the path took everything sent, so nothing here
+        // lowers the rate. (A backlog without a rate is not something this
+        // crate's viewer sends; from the wire it is taken at the floor.)
+        None if report.backlog_ms > 0.0 => floor,
+        None => return config.max_bps,
+    };
     let cycle = config.cycle_ms(rtt_ms);
     let backlog = report.backlog_ms;
     let fresh = age_ms <= config.fresh_ms(rtt_ms);

@@ -40,8 +40,12 @@
 //! - Otherwise capacity is held, and raised only by a delivered rate higher
 //!   than it: bytes over arrival span over one report interval in which no
 //!   frame waited more than one frame interval.
-//! - Before the first clean delivered window there is no capacity and no
-//!   report: the publisher keeps its start rate.
+//! - A capacity is a ceiling only once a queue showed it: a busy period
+//!   measured it, or the link is queueing now. Until then the delivered
+//!   rate is only a lower bound (an encoder on easy content sends far less
+//!   than it may), so the report carries no capacity and the publisher
+//!   keeps its rate. The lower bound is still kept internally to size the
+//!   single-frame excuse.
 //! - Silence (no frame released since the last report) sends no report:
 //!   the publisher ages the last one it has and holds. New news only.
 //!
@@ -141,19 +145,34 @@ pub struct FrameInfo {
     pub bytes: u32,
 }
 
+/// `capacity_kbps` on the wire for "frames flow and the path has not
+/// queued": an unbounded capacity as far as the viewer has seen. Capacity 0
+/// stays free for "no report" (the proto3 default, and what older clients
+/// send), so the two never mix.
+pub const NO_CEILING_KBPS: u32 = u32::MAX;
+
 /// What a viewer sends back to the publisher.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Report {
-    /// Bitrate the path carries, bps.
-    pub capacity_bps: u64,
+    /// Bitrate the path carries, bps, once the viewer has seen it limit the
+    /// stream (a queue that drained at that rate); `None` while the path has
+    /// never queued, because then the rate it delivered is only a lower
+    /// bound ("at least what was sent") and says nothing about a ceiling.
+    /// On the wire `None` is [`NO_CEILING_KBPS`].
+    pub capacity_bps: Option<u64>,
     /// Standing backlog at the viewer, ms of queueing every frame pays.
     pub backlog_ms: f64,
 }
 
 impl Report {
-    /// Capacity rounded to whole kbps, for the wire.
+    /// Capacity rounded to whole kbps, for the wire: [`NO_CEILING_KBPS`]
+    /// for `None`, otherwise at least 1 and below it.
     pub fn capacity_kbps(&self) -> u32 {
-        u32::try_from(self.capacity_bps.saturating_add(500) / 1000).unwrap_or(u32::MAX)
+        self.capacity_bps.map_or(NO_CEILING_KBPS, |bps| {
+            u32::try_from(bps.saturating_add(500) / 1000)
+                .unwrap_or(u32::MAX)
+                .clamp(1, NO_CEILING_KBPS - 1)
+        })
     }
 
     /// Backlog rounded to whole ms, for the wire.
@@ -162,10 +181,12 @@ impl Report {
         self.backlog_ms.max(0.0).round() as u32
     }
 
-    /// The report as it arrives off the wire (kbps, ms).
+    /// The report as it arrives off the wire (kbps, ms);
+    /// [`NO_CEILING_KBPS`] is "no ceiling seen".
     pub fn from_wire(capacity_kbps: u32, backlog_ms: u32) -> Self {
         Self {
-            capacity_bps: u64::from(capacity_kbps).saturating_mul(1000),
+            capacity_bps: (capacity_kbps != NO_CEILING_KBPS)
+                .then(|| u64::from(capacity_kbps).saturating_mul(1000)),
             backlog_ms: f64::from(backlog_ms),
         }
     }
@@ -249,7 +270,12 @@ pub struct ViewerEstimator {
     busy: VecDeque<Arrived>,
     /// Recent frames for the delivered rate.
     recent: VecDeque<Arrived>,
+    /// The path's rate as far as it is known: a busy-period measurement, or
+    /// before any, the best delivered rate (a lower bound, used only to
+    /// size the single-frame excuse).
     capacity_bps: Option<f64>,
+    /// A busy period has measured `capacity_bps`: it is a ceiling.
+    measured: bool,
     congested: bool,
     early_armed: bool,
     last_wait_ms: f64,
@@ -294,6 +320,7 @@ impl ViewerEstimator {
             busy: VecDeque::new(),
             recent: VecDeque::new(),
             capacity_bps: None,
+            measured: false,
             congested: false,
             early_armed: true,
             last_wait_ms: 0.0,
@@ -361,9 +388,7 @@ impl ViewerEstimator {
         // Frames released together are one instant: an early report carries
         // the capacity after all of them.
         let early_report = early_report.map(|report: Report| Report {
-            capacity_bps: self
-                .capacity_bps
-                .map_or(report.capacity_bps, |bps| bps.round() as u64),
+            capacity_bps: self.ceiling_bps().or(report.capacity_bps),
             ..report
         });
         if early_report.is_some() {
@@ -438,15 +463,16 @@ impl ViewerEstimator {
     }
 
     /// The periodic report tick: the values to send, or `None` to send
-    /// nothing. `None` before the first capacity (the publisher keeps its
-    /// start rate) and whenever no frame was released since the last tick
-    /// (a paused camera, frames held behind a gap): the publisher ages the
-    /// report it has and holds, instead of taking a copy as fresh news.
+    /// nothing. `None` whenever no frame was released since the last tick
+    /// (before the first frame, a paused camera, frames held behind a gap):
+    /// the publisher ages the report it has and holds, instead of taking a
+    /// copy as fresh news. A report without a capacity means "frames are
+    /// flowing and the path has not queued".
     pub fn report(&mut self, _now_ms: f64) -> Option<Report> {
         if self.frames_since_report == 0 {
             return None;
         }
-        let report = self.current_report()?;
+        let report = self.current_report();
         self.frames_since_report = 0;
         self.last_report = Some(report);
         self.last_report
@@ -549,16 +575,25 @@ impl ViewerEstimator {
         Some(bytes * 8.0 * 1000.0 / span)
     }
 
-    fn current_report(&self) -> Option<Report> {
-        let capacity = self.capacity_bps?;
-        Some(Report {
-            capacity_bps: capacity.round() as u64,
-            backlog_ms: if self.congested {
+    /// The capacity as a ceiling: only once a queue showed it (a busy
+    /// period measured it, or the link is queueing now).
+    fn ceiling_bps(&self) -> Option<u64> {
+        self.capacity_bps
+            .filter(|_| self.measured || self.congested)
+            .map(|bps| bps.round() as u64)
+    }
+
+    fn current_report(&self) -> Report {
+        let capacity_bps = self.ceiling_bps();
+        Report {
+            capacity_bps,
+            // A backlog is only actionable with the rate it drains at.
+            backlog_ms: if self.congested && capacity_bps.is_some() {
                 self.last_wait_ms
             } else {
                 0.0
             },
-        })
+        }
     }
 
     /// One frame in sequence order, at the instant every frame before it
@@ -671,6 +706,7 @@ impl ViewerEstimator {
         if clean && self.congested {
             if let Some(bps) = Self::rate_bps(&self.busy) {
                 self.capacity_bps = Some(bps);
+                self.measured = true;
             }
         }
         self.recent.push_back(arrived);
@@ -697,10 +733,15 @@ impl ViewerEstimator {
         // link idle, the part of its own service its bytes do not explain.
         self.last_wait_ms = wait_ms.max(excess_ms);
         let spaced = frame.arrival_ms - self.last_early_ms >= self.config.report_interval_ms;
-        let early_report = if self.congested && !was_congested && self.early_armed && spaced {
+        let early_report = if self.congested
+            && !was_congested
+            && self.early_armed
+            && spaced
+            && self.capacity_bps.is_some()
+        {
             self.early_armed = false;
             self.last_early_ms = frame.arrival_ms;
-            self.current_report()
+            Some(self.current_report())
         } else {
             None
         };

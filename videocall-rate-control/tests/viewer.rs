@@ -2,7 +2,7 @@
 //! sender skips, a lost frame, a real queue, silence, the early report, and
 //! frames that finish out of order.
 
-use videocall_rate_control::{FrameInfo, Report, ViewerConfig, ViewerEstimator};
+use videocall_rate_control::{FrameInfo, Report, ViewerConfig, ViewerEstimator, NO_CEILING_KBPS};
 
 const FRAME_MS: f64 = 1000.0 / 30.0;
 
@@ -75,7 +75,7 @@ fn steady(
 }
 
 #[test]
-fn no_report_before_any_frame_or_after_a_single_frame() {
+fn no_report_before_any_frame_and_no_ceiling_after_one() {
     let mut estimator = estimator();
     assert_eq!(estimator.report(500.0), None);
     estimator.on_frame(FrameInfo {
@@ -84,7 +84,15 @@ fn no_report_before_any_frame_or_after_a_single_frame() {
         arrival_ms: 60.0,
         bytes: 3_900,
     });
-    assert_eq!(estimator.report(1_000.0), None);
+    // Frames flow, nothing has queued: a report, but no ceiling.
+    assert_eq!(
+        estimator.report(1_000.0),
+        Some(Report {
+            capacity_bps: None,
+            backlog_ms: 0.0
+        })
+    );
+    assert_eq!(estimator.report(1_500.0), None, "nothing new");
 }
 
 #[test]
@@ -98,10 +106,15 @@ fn unknown_clock_offset_changes_nothing() {
 fn keyframes_on_a_healthy_link_are_not_congestion() {
     let run = steady(20.0, 2e6, 0.0, |_| true, |_| false);
     assert!(!run.congested_after_2s, "keyframe read as standing queue");
+    // The path never queued: what it delivered is only a lower bound, so
+    // the report says "flowing, no ceiling seen".
     let last = run.reports.last().copied().flatten().expect("a report");
-    assert!(
-        last.capacity_bps >= 936_000 && last.backlog_ms == 0.0,
-        "uncongested report {last:?}"
+    assert_eq!(
+        last,
+        Report {
+            capacity_bps: None,
+            backlog_ms: 0.0
+        }
     );
 }
 
@@ -199,7 +212,10 @@ fn a_queue_every_frame_pays_for_is_congestion() {
     let report = last_report.expect("a report");
     // The link within 10%, and a backlog.
     assert!(
-        report.backlog_ms > 0.0 && (450_000..=550_000).contains(&report.capacity_bps),
+        report.backlog_ms > 0.0
+            && report
+                .capacity_bps
+                .is_some_and(|bps| (450_000..=550_000).contains(&bps)),
         "{report:?}"
     );
 }
@@ -273,7 +289,7 @@ fn one_early_report_per_congestion_event() {
 #[test]
 fn report_wire_round_trip() {
     let report = Report {
-        capacity_bps: 1_234_567,
+        capacity_bps: Some(1_234_567),
         backlog_ms: 312.6,
     };
     assert_eq!(report.capacity_kbps(), 1_235);
@@ -281,10 +297,29 @@ fn report_wire_round_trip() {
     assert_eq!(
         Report::from_wire(1_235, 313),
         Report {
-            capacity_bps: 1_235_000,
+            capacity_bps: Some(1_235_000),
             backlog_ms: 313.0,
         }
     );
+    // No ceiling seen has its own wire value, both ways; 0 stays "no
+    // report" for the caller.
+    let open = Report {
+        capacity_bps: None,
+        backlog_ms: 0.0,
+    };
+    assert_eq!(open.capacity_kbps(), NO_CEILING_KBPS);
+    assert_eq!(Report::from_wire(NO_CEILING_KBPS, 0), open);
+    let huge = Report {
+        capacity_bps: Some(u64::MAX),
+        backlog_ms: 0.0,
+    };
+    assert_eq!(huge.capacity_kbps(), NO_CEILING_KBPS - 1);
+    // A known capacity never rounds to 0.
+    let tiny = Report {
+        capacity_bps: Some(100),
+        backlog_ms: 0.0,
+    };
+    assert_eq!(tiny.capacity_kbps(), 1);
 }
 
 #[test]

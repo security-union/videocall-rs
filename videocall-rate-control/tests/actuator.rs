@@ -305,3 +305,19 @@ fn closed_loop_decimation_only_during_drains() {
     }
     assert!(result.frames.windows(2).all(|w| w[1].seq == w[0].seq + 1));
 }
+
+/// A camera whose clock goes back (device switch, a new track) re-arms the
+/// tier-rate schedule at once instead of waiting for the old clock's due
+/// time.
+#[test]
+fn a_backwards_timestamp_rearms_the_gate() {
+    let bottom = &tiers()[3];
+    let mut gate = FrameGate::new();
+    for i in 0..60 {
+        gate.admit(bottom, 10_000.0 + i as f64 * CAMERA_MS, 270_000.0);
+    }
+    let kept = (0..60)
+        .filter(|i| gate.admit(bottom, *i as f64 * CAMERA_MS, 270_000.0) == FrameDecision::Encode)
+        .count();
+    assert_eq!(kept, 30, "camera dark after the clock went back");
+}

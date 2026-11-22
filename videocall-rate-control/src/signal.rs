@@ -70,6 +70,20 @@ impl CongestionLimit {
         (grown < max_bps).then_some(grown)
     }
 
+    /// Holds the rate at `limit_bps` from `now_ms` on, growing back by the
+    /// probe step per cycle like any cut (a lost link: what was being sent
+    /// is the best guess). No halving and no debounce.
+    pub fn hold(&mut self, now_ms: f64, limit_bps: f64) {
+        if limit_bps.is_finite() {
+            self.cut = Some((now_ms, limit_bps));
+        }
+    }
+
+    /// Whether no limit was ever set (or it was cleared).
+    pub fn is_unset(&self) -> bool {
+        self.cut.is_none()
+    }
+
     /// Forgets the signal.
     pub fn clear(&mut self) {
         self.cut = None;

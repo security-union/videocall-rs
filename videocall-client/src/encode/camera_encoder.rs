@@ -58,9 +58,10 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 use super::FrameRead;
 
+use crate::adaptive_quality_constants::CAMERA_KEYFRAME_INTERVAL_SECS;
 use crate::constants::{get_video_codec, get_video_codec_string};
 use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
-use crate::rate_control::camera::{bitrate_change_applies, FrameSequence, KeyframeClock};
+use crate::rate_control::camera::{bitrate_change_applies, CameraOutput, HandOff, KeyframeClock};
 use crate::rate_control::CameraRateController;
 use crate::traffic_shaping::ShapedKind;
 use crate::utils::monotonic_now_ms;
@@ -171,9 +172,64 @@ pub(crate) fn plan_reconfigure(
     }
 }
 
-/// How many times one capture recreates a failed encoder before it gives up
-/// and reports the camera as failed.
+/// How many failures in a row one capture recovers from (by recreating the
+/// encoder) before it gives up and reports the camera as failed.
 const MAX_ENCODER_RECOVERIES: u32 = 3;
+
+/// How long the encoder must produce output after a failure before earlier
+/// failures are forgotten: one keyframe period, so the recovered encoder
+/// has produced a full group of pictures.
+const HEALTHY_STRETCH_MS: f64 = CAMERA_KEYFRAME_INTERVAL_SECS * 1000.0;
+
+/// What to do after an encoder failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// Recreate the encoder and go on.
+    Recreate,
+    /// Too many failures in a row: report the camera as failed.
+    GiveUp,
+}
+
+/// Encoder failures in a row within one capture. Failures add up until the
+/// encoder has produced output for [`HEALTHY_STRETCH_MS`]; after that a new
+/// failure is the first again, so a transient error hours into a call does
+/// not count against the ones at its start.
+#[derive(Debug, Default)]
+pub(crate) struct EncoderHealth {
+    failures: u32,
+    /// The first output since the last failure.
+    healthy_since_ms: Option<f64>,
+}
+
+impl EncoderHealth {
+    /// The encoder failed (an error callback, or a configure it refused).
+    pub(crate) fn on_failure(&mut self) -> Recovery {
+        self.failures += 1;
+        self.healthy_since_ms = None;
+        if self.failures > MAX_ENCODER_RECOVERIES {
+            Recovery::GiveUp
+        } else {
+            Recovery::Recreate
+        }
+    }
+
+    /// The encoder produced a chunk.
+    pub(crate) fn on_output(&mut self, now_ms: f64) {
+        if self.failures == 0 {
+            return;
+        }
+        let since = *self.healthy_since_ms.get_or_insert(now_ms);
+        if now_ms - since >= HEALTHY_STRETCH_MS {
+            self.failures = 0;
+            self.healthy_since_ms = None;
+        }
+    }
+
+    /// Failures in a row so far.
+    pub(crate) fn failures(&self) -> u32 {
+        self.failures
+    }
+}
 
 /// The camera encoder config: realtime, `framerate` set (without it the
 /// encoder under-spends), and constant bitrate mode when the browser
@@ -358,15 +414,22 @@ impl CameraEncoder {
         let output_meter = self.output_meter.clone();
         let camera_rate = self.camera_rate.clone();
         let force_keyframe = self.force_keyframe.clone();
+        let encoder_health = Rc::new(RefCell::new(EncoderHealth::default()));
         let video_output_handler = {
+            let encoder_health = encoder_health.clone();
+            let camera_rate = camera_rate.clone();
             let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             // Numbered here, at the hand-off to the transport: a frame the
             // rate control skipped never reaches this callback, and one the
-            // send path refuses at once gives its number back.
-            let mut sequence = FrameSequence::default();
+            // send path refuses at once gives its number back. After a
+            // refusal the viewers would see no gap, so the stream must
+            // restart at a keyframe (see `CameraOutput`).
+            let mut output = CameraOutput::default();
+            let force_keyframe = force_keyframe.clone();
 
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                encoder_health.borrow_mut().on_output(monotonic_now_ms());
 
                 // One chunk per captured frame, measured like the viewers
                 // measure what they receive.
@@ -383,7 +446,8 @@ impl CameraEncoder {
                     buffer.resize(byte_length, 0);
                 }
 
-                sequence.send_numbered(|seq| {
+                let is_keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
+                let (outcome, request_keyframe) = output.hand_off(is_keyframe, |seq| {
                     let (packet, is_keyframe) = transform_video_chunk(
                         chunk,
                         seq,
@@ -393,6 +457,21 @@ impl CameraEncoder {
                     );
                     client.send_media_packet(packet, ShapedKind::Camera, is_keyframe)
                 });
+                if outcome == HandOff::Sent {
+                    // Drives the quiet-viewer signal; skipped and held
+                    // frames are not sent, so they do not count.
+                    match camera_rate.try_borrow_mut() {
+                        Ok(mut camera_rate) => {
+                            camera_rate.on_frame_sent(monotonic_now_ms());
+                        }
+                        Err(_) => log::debug!("camera rate control busy, sent frame not counted"),
+                    }
+                }
+                if request_keyframe {
+                    // The next frame the loop encodes is a keyframe; deltas
+                    // already queued in the encoder are held until it.
+                    force_keyframe.store(true, Ordering::Release);
+                }
             })
         };
         let device_id = if let Some(vid) = &self.state.selected {
@@ -656,7 +735,6 @@ impl CameraEncoder {
 
             let mut keyframes = KeyframeClock::default();
             let mut previous_source = None;
-            let mut recoveries = 0;
             let mut recovered = false;
             loop {
                 if session.is_cancelled()
@@ -685,17 +763,19 @@ impl CameraEncoder {
                 // camera reported as failed, once: the UI turns the camera
                 // off on that report.
                 if encoder_failed.replace(false) {
-                    recoveries += 1;
-                    if recoveries > MAX_ENCODER_RECOVERIES {
+                    let mut health = encoder_health.borrow_mut();
+                    let failures = health.failures() + 1;
+                    if health.on_failure() == Recovery::GiveUp {
                         video_frame.close();
                         let message =
-                            format!("Camera encoder failed {recoveries} times, giving up");
+                            format!("Camera encoder failed {failures} times in a row, giving up");
                         report_unexpected_end(&session, &on_error, message);
                         break;
                     }
+                    drop(health);
                     log::warn!(
                         "CameraEncoder: recreating the encoder in variable bitrate mode \
-                         (recovery {recoveries} of {MAX_ENCODER_RECOVERIES})"
+                         (recovery {failures} of {MAX_ENCODER_RECOVERIES})"
                     );
                     constant_bitrate = false;
                     match VideoEncoder::new(&video_encoder_init) {
@@ -755,6 +835,15 @@ impl CameraEncoder {
                         camera_rate
                             .borrow_mut()
                             .on_encoder_configured(monotonic_now_ms());
+                    } else {
+                        // A configure that throws fires no error callback,
+                        // and a recreated encoder that was never configured
+                        // would refuse every frame in silence. Count it as
+                        // a failure: the next frame recreates the encoder,
+                        // or gives up and reports it.
+                        encoder_failed.set(true);
+                        video_frame.close();
+                        continue;
                     }
                 }
 
@@ -911,5 +1000,39 @@ mod tests {
             false,
         );
         assert!(!result.configure);
+    }
+
+    #[test]
+    fn three_failures_recreate_and_the_fourth_gives_up() {
+        let mut health = EncoderHealth::default();
+        for _ in 0..3 {
+            assert_eq!(health.on_failure(), Recovery::Recreate);
+        }
+        assert_eq!(health.on_failure(), Recovery::GiveUp);
+    }
+
+    /// Hours apart, with good output in between, failures never add up.
+    #[test]
+    fn a_healthy_stretch_forgets_old_failures() {
+        let mut health = EncoderHealth::default();
+        let mut at = 0.0;
+        for _ in 0..10 {
+            assert_eq!(health.on_failure(), Recovery::Recreate);
+            health.on_output(at + 100.0);
+            health.on_output(at + 6_000.0);
+            at += 3_600_000.0;
+        }
+    }
+
+    /// Output too soon after a failure, or no output at all, does not count
+    /// as healthy.
+    #[test]
+    fn a_short_stretch_does_not_reset() {
+        let mut health = EncoderHealth::default();
+        for at in [0.0, 10_000.0, 20_000.0] {
+            assert_eq!(health.on_failure(), Recovery::Recreate);
+            health.on_output(at + 1_000.0);
+        }
+        assert_eq!(health.on_failure(), Recovery::GiveUp);
     }
 }

@@ -35,7 +35,9 @@ For every received video frame, call `on_frame(FrameInfo { .. })` with:
 | `arrival_ms` | viewer clock when the whole frame arrived, never decreasing |
 | `bytes` | the frame's payload size |
 
-Every report period (500 ms today), call `report(now_ms)`. It returns `None` when there is nothing new to say: before the first capacity, and whenever no frame was released since the last tick (a paused camera, frames held behind a lost one). Then you send nothing, and the publisher ages the report it has and holds. Otherwise put `capacity_kbps()` and `backlog_ms_rounded()` on `DiagnosticsPacket.video_metrics`. When `on_frame` returns `early_report: Some(report)`, send that diagnostics packet at once, outside the tick. At most one goes out per report period.
+Every report period (500 ms today), call `report(now_ms)`. It returns `None` when there is nothing new to say: whenever no frame was released since the last tick (a paused camera, frames held behind a lost one). Then you send nothing, and the publisher ages the report it has and holds. Otherwise put `capacity_kbps()` and `backlog_ms_rounded()` on `DiagnosticsPacket.video_metrics`. When `on_frame` returns `early_report: Some(report)`, send that diagnostics packet at once, outside the tick. At most one goes out per report period.
+
+A report carries a capacity only once the viewer has seen the path limit the stream, that is, once a queue drained at that rate. Before that the delivered rate is a lower bound. An encoder on a still scene sends a fifth of what it may, and "at least 270 kbps" says nothing about a ceiling. So the report says "no ceiling seen", which is `NO_CEILING_KBPS` (`u32::MAX`) in `capacity_kbps`. Same two fields. Zero keeps meaning "no report", which is what older clients send.
 
 There is no need to call `reset()` when the camera restarts. The estimator spots a new run of the sequence by itself: a sequence number that went back while the timestamp went forward. Call `reset()` only when the stream itself is replaced.
 
@@ -45,14 +47,20 @@ There is no need to call `reset()` when the camera restarts. The estimator spots
 
 Configure it with `PublisherConfig { start_bps, max_bps, frame_interval_ms, report_interval_ms, floor_bps }`. The report interval is the viewers' report period. `floor_bps` is the bottom tier's floor, `tiers.last().floor_bps()`. Keep one publisher for the whole call. On a camera restart or a frame-rate change, call `set_frame_interval_ms` or `reconfigure`, which keep the reports, so the target goes on from the remembered capacity instead of jumping back to the cap. Then:
 
-- On every diagnostics packet carrying the two fields: `on_report(viewer_id, now_ms, Report::from_wire(kbps, ms))`. On leave: `remove_viewer`.
+- On every diagnostics packet carrying the two fields: `on_report(viewer_id, now_ms, Report::from_wire(kbps, ms))`. On leave: `remove_viewer(&viewer_id, now_ms)`.
 - On the relay's CONGESTION packet: `on_congestion_signal(now_ms, rtt_ms, from)`. `from` is the congested receiver's viewer id when you can map it, else `None`.
+- For every frame handed to the transport: `on_frame_sent(now_ms, rtt_ms)`. That is how a viewer that has reported and then goes quiet gets noticed.
+- When the link to the relay drops: `on_link_lost(now_ms, rtt_ms)`, instead of rebuilding the publisher or reconfiguring its start rate. The rate in force becomes a limit that grows back by one probe step per cycle.
 - At every camera frame: `target_bps(now_ms, rtt_ms)`. The caller supplies `rtt_ms`, its round-trip estimate to the viewers (use the largest).
-- On every report and every signal: `choose_tier(&tiers, current, capacity, config.probe_fraction(rtt_ms))`, with `capacity` from `tier_capacity_bps(now_ms, rtt_ms)` (skip when it is `None`).
+- At every camera frame: `current = next_tier(&tiers, current, now_ms, rtt_ms)`. It goes down at once and up at most one rung per feedback cycle, because a step up only shows in the reports a cycle later. It keeps `current` when there is no capacity at all.
 - Encoder bitrate: `encoder_bitrate_bps(&tiers[current], target)`.
 - Per camera frame: `FrameGate::admit(&tiers[current], frame_timestamp_ms, target)`. Only `Encode` frames go to the encoder and get a sequence number.
 
 Viewers that never report (older web clients, and the native clients, which send no diagnostics) are covered by the relay signal. On a signal the target is capped at half of what it was, and the cap grows by one probe step per feedback cycle until it reaches the maximum and goes away. That is AIMD built from the policy's own numbers. A signal blamed on a viewer that reports is ignored, because its reports already say how much it takes.
+
+A viewer that has reported and then goes quiet while frames keep going out gets the same cut. Its frames are not being released, and that is congestion too. The trigger is its report going stale (one cycle plus one report period) plus one 2 s capacity window, the longest a healthy viewer stays quiet while it waits on a lost frame. Quiet time only counts while frames go out, so a camera that is off, a viewer that left and one that never reported cut nothing. When it reports again, its report takes over and the cut goes.
+
+The same reasoning sets the target when no report has a ceiling. Nothing has queued, so nothing pulls the rate down. It probes up from where it was (the start rate, or the ceiling of the viewer that just left) by one step per cycle, and the first queue brings it back.
 
 The tier table is data you pass in. `default_tiers(max_bps)` gives the measured ladder: 1280x720@30 from 960 kbps, 854x480@30 from 600 kbps, 640x360@30 from 360 kbps and 640x360@15 from 270 kbps, all capped at `max_bps`. When the cap is below 270 kbps, the bottom tier's floor drops to the cap, so a low bitrate setting never turns into endless frame skipping.
 
@@ -71,4 +79,5 @@ The first three are measured in this crate's simulation, and each has an `#[igno
 - **WebSocket, live (browser runs, not simulated).** 1 to 2 backlog reports per run in the 2 Mbps phase.
 - **Other traffic on the same uplink.** The viewer measures what the camera stream gets, not the whole pipe. A screen share or a file upload on the same uplink takes its share, so the camera's capacity ratchets down while it runs. Afterwards it recovers at the probe step, about 5% per feedback cycle.
 - **A stalled viewer.** A viewer whose main thread stalls (a slow phone, a busy tab) stamps arrivals late, and that reads as lateness on the path. The publisher drains for a network problem that is really a CPU one.
+- **A quiet viewer is noticed late.** The trigger is about 3 s (stale report plus one capacity window), and each cut halves the rate. In the simulation a viewer goes quiet behind 250 kbps while 936 kbps goes out: three cuts bring the target to 135 kbps, but the queue built before them peaks at 14 s. Without the rule the target stayed at 936 kbps for the whole 30 s.
 - **The relay signal is coarse.** It is one bit and arrives late, after the relay queue (256 messages) has filled. In the simulation a silent viewer behind 300 kbps gets the link fully used (294 kbps delivered), but the target saws between 135 and 720 kbps instead of settling.

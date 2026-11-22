@@ -16,23 +16,28 @@
  * conditions.
  */
 
-//! The "Encoder Settings" section of the diagnostics panel: what our camera's
-//! viewer-driven rate control is doing right now.
+//! The "Encoders" card of the diagnostics panel: what our encoders are doing
+//! right now. The camera rows come from its viewer-driven rate control; the
+//! audio encoder runs at a fixed bitrate. This card replaced the "Encoder
+//! Settings" section and keeps its test ids.
 
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
-use videocall_client::rate_control::CameraRateStats;
+use videocall_client::adaptive_quality_constants::AUDIO_QUALITY;
+use videocall_client::rate_control::{CameraRateStats, ReportedCapacity};
 use videocall_client::VideoCallClient;
 
-/// How often the section re-reads the rate control (about 2 Hz, the rate the
-/// viewers' reports arrive at).
-const REFRESH_MS: u32 = 500;
+/// How often the card re-reads the rate control.
+const REFRESH_MS: u32 = 1_000;
 
-/// One row of the section.
+/// One label / value row of the card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncoderSettingsRow {
     pub label: &'static str,
     pub test_id: &'static str,
+    /// The id the row had in the old Encoder Settings section, kept on an
+    /// inner element so existing selectors still find the value.
+    pub legacy_test_id: Option<&'static str>,
     pub value: String,
 }
 
@@ -40,28 +45,39 @@ fn kbps(bps: u32) -> String {
     format!("{} kbps", (bps + 500) / 1000)
 }
 
-/// The rows shown for `stats`. Capacity and backlog read "no reports" until a
-/// viewer that runs the rate control has reported. The relay limit row shows
-/// only while a relay congestion limit is in force.
+/// The camera rows shown for `stats`. Capacity and backlog read "no reports"
+/// until a viewer that runs the rate control has reported; capacity reads
+/// "not limited" while no viewer's path has queued. The relay limit
+/// row shows only while a relay congestion limit is in force.
 pub fn encoder_settings_rows(stats: &CameraRateStats) -> Vec<EncoderSettingsRow> {
     let row = |label, test_id, value| EncoderSettingsRow {
         label,
         test_id,
+        legacy_test_id: None,
+        value,
+    };
+    let renamed = |label, test_id, legacy, value| EncoderSettingsRow {
+        label,
+        test_id,
+        legacy_test_id: Some(legacy),
         value,
     };
     let mut rows = vec![
-        row(
-            "Target bitrate",
-            "encoder-target-bitrate",
-            kbps(stats.target_bps),
-        ),
-        row(
-            "Encoder bitrate",
+        renamed(
+            "Video bitrate",
+            "encoders-video-bitrate",
             "encoder-bitrate",
             kbps(stats.encoder_bitrate_bps),
         ),
-        row(
-            "Tier",
+        renamed(
+            "Video target",
+            "encoders-video-target",
+            "encoder-target-bitrate",
+            kbps(stats.target_bps),
+        ),
+        renamed(
+            "Video tier",
+            "encoders-video-tier",
             "encoder-tier",
             format!(
                 "{} ({}x{} @ {} fps)",
@@ -71,9 +87,11 @@ pub fn encoder_settings_rows(stats: &CameraRateStats) -> Vec<EncoderSettingsRow>
         row(
             "Capacity (combined)",
             "encoder-capacity",
-            stats
-                .capacity_kbps
-                .map_or_else(|| "no reports".to_string(), |c| format!("{c} kbps")),
+            match stats.capacity {
+                ReportedCapacity::NoReports => "no reports".to_string(),
+                ReportedCapacity::NotLimited => "not limited".to_string(),
+                ReportedCapacity::Kbps(capacity) => format!("{capacity} kbps"),
+            },
         ),
         row(
             "Backlog (combined)",
@@ -101,7 +119,7 @@ pub fn encoder_settings_rows(stats: &CameraRateStats) -> Vec<EncoderSettingsRow>
     ];
     if let Some(limit) = stats.relay_limit_kbps {
         rows.push(row(
-            "Relay limit",
+            "Congestion limit",
             "encoder-relay-limit",
             format!("{limit} kbps"),
         ));
@@ -109,10 +127,43 @@ pub fn encoder_settings_rows(stats: &CameraRateStats) -> Vec<EncoderSettingsRow>
     rows
 }
 
-/// The section. It polls the client only while mounted, and the diagnostics
-/// panel is mounted only while open.
+/// The audio row: the bitrate the Opus encoder is configured with, which is
+/// fixed ([`AUDIO_QUALITY`]), or "mic off".
+pub fn audio_encoder_row(mic_enabled: bool) -> EncoderSettingsRow {
+    EncoderSettingsRow {
+        label: "Audio bitrate",
+        test_id: "encoders-audio-bitrate",
+        legacy_test_id: None,
+        value: if mic_enabled {
+            format!("{} kbps", AUDIO_QUALITY.bitrate_kbps)
+        } else {
+            "mic off".to_string()
+        },
+    }
+}
+
 #[component]
-pub fn EncoderSettingsSection(video_enabled: bool) -> Element {
+fn EncoderRows(rows: Vec<EncoderSettingsRow>) -> Element {
+    rsx! {
+        div { class: "diagnostics-kv",
+            for row in rows {
+                span { class: "diagnostics-kv-label", "{row.label}" }
+                span { class: "diagnostics-kv-value", "data-testid": row.test_id,
+                    if let Some(legacy) = row.legacy_test_id {
+                        span { "data-testid": legacy, "{row.value}" }
+                    } else {
+                        "{row.value}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The card. It polls the client only while mounted, and the diagnostics
+/// panel mounts it only while open.
+#[component]
+pub fn EncodersSection(video_enabled: bool, mic_enabled: bool) -> Element {
     let client = use_context::<VideoCallClient>();
     let mut stats = use_signal({
         let client = client.clone();
@@ -131,23 +182,16 @@ pub fn EncoderSettingsSection(video_enabled: bool) -> Element {
         }
     });
 
-    let rows = encoder_settings_rows(&stats());
     rsx! {
-        div { class: "diagnostics-section", "data-testid": "encoder-settings",
-            h3 { "Encoder Settings" }
-            if video_enabled {
-                div { class: "encoder-settings-grid",
-                    for row in rows {
-                        span { class: "encoder-settings-label", "{row.label}" }
-                        span {
-                            class: "encoder-settings-value",
-                            "data-testid": row.test_id,
-                            "{row.value}"
-                        }
-                    }
+        div { class: "diagnostics-section", "data-testid": "encoders-card",
+            h3 { "Encoders" }
+            div { "data-testid": "encoder-settings",
+                if video_enabled {
+                    EncoderRows { rows: encoder_settings_rows(&stats()) }
+                } else {
+                    p { class: "diagnostics-kv-note", "data-testid": "encoder-settings-camera-off", "Camera is off." }
                 }
-            } else {
-                p { "data-testid": "encoder-settings-camera-off", "Camera is off." }
+                EncoderRows { rows: vec![audio_encoder_row(mic_enabled)] }
             }
         }
     }
@@ -165,7 +209,7 @@ mod tests {
             tier_width: 854,
             tier_height: 480,
             tier_fps: 30.0,
-            capacity_kbps: Some(950),
+            capacity: ReportedCapacity::Kbps(950),
             backlog_ms: Some(12),
             relay_limit_kbps: None,
             viewers_reporting: 2,
@@ -184,15 +228,55 @@ mod tests {
     #[test]
     fn every_field_has_a_row() {
         let rows = encoder_settings_rows(&stats());
-        assert_eq!(value(&rows, "encoder-target-bitrate"), "812 kbps");
-        assert_eq!(value(&rows, "encoder-bitrate"), "800 kbps");
-        assert_eq!(value(&rows, "encoder-tier"), "480p30 (854x480 @ 30 fps)");
+        assert_eq!(value(&rows, "encoders-video-target"), "812 kbps");
+        assert_eq!(value(&rows, "encoders-video-bitrate"), "800 kbps");
+        assert_eq!(
+            value(&rows, "encoders-video-tier"),
+            "480p30 (854x480 @ 30 fps)"
+        );
         assert_eq!(value(&rows, "encoder-capacity"), "950 kbps");
         assert_eq!(value(&rows, "encoder-backlog"), "12 ms");
         assert_eq!(value(&rows, "encoder-viewers"), "2");
         assert_eq!(value(&rows, "encoder-frames-skipped"), "41");
         assert_eq!(value(&rows, "encoder-reconfigures"), "1.5/s");
         assert!(rows.iter().all(|row| row.test_id != "encoder-relay-limit"));
+    }
+
+    /// The old Encoder Settings ids stay on the values they named, so the
+    /// existing selectors keep working.
+    #[test]
+    fn the_renamed_rows_keep_their_old_ids() {
+        let rows = encoder_settings_rows(&stats());
+        let legacy = |test_id: &str| {
+            rows.iter()
+                .find(|row| row.test_id == test_id)
+                .and_then(|row| row.legacy_test_id)
+        };
+        assert_eq!(legacy("encoders-video-bitrate"), Some("encoder-bitrate"));
+        assert_eq!(
+            legacy("encoders-video-target"),
+            Some("encoder-target-bitrate")
+        );
+        assert_eq!(legacy("encoders-video-tier"), Some("encoder-tier"));
+        assert_eq!(legacy("encoder-capacity"), None);
+    }
+
+    #[test]
+    fn the_audio_row_shows_the_configured_bitrate() {
+        let on = audio_encoder_row(true);
+        assert_eq!(on.test_id, "encoders-audio-bitrate");
+        assert_eq!(on.value, format!("{} kbps", AUDIO_QUALITY.bitrate_kbps));
+        assert_eq!(audio_encoder_row(false).value, "mic off");
+    }
+
+    #[test]
+    fn a_report_without_a_ceiling_reads_not_limited() {
+        let mut open = stats();
+        open.capacity = ReportedCapacity::NotLimited;
+        open.backlog_ms = Some(0);
+        let rows = encoder_settings_rows(&open);
+        assert_eq!(value(&rows, "encoder-capacity"), "not limited");
+        assert_eq!(value(&rows, "encoder-backlog"), "0 ms");
     }
 
     #[test]
@@ -206,7 +290,7 @@ mod tests {
     #[test]
     fn no_reports_yet_says_so() {
         let mut quiet = stats();
-        quiet.capacity_kbps = None;
+        quiet.capacity = ReportedCapacity::NoReports;
         quiet.backlog_ms = None;
         quiet.viewers_reporting = 0;
         let rows = encoder_settings_rows(&quiet);

@@ -16,20 +16,24 @@
  * conditions.
  */
 
-use crate::components::encoder_settings::EncoderSettingsSection;
+use crate::components::encoder_settings::EncodersSection;
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
 use crate::components::reception_stats::{
-    parse_decoder_event, ReceptionRow, ReceptionStatsSection, ReceptionStore, RECEPTION_PUBLISH_MS,
+    parse_decoder_event, reception_rows_at, ReceptionRow, ReceptionStatsSection, ReceptionStore,
+    RECEPTION_PUBLISH_MS,
 };
 use crate::components::traffic_shaping::{
     register_reveal_tap, TrafficShapingSection, TrafficShapingUi,
 };
 use dioxus::prelude::*;
 use dioxus_core::Task;
+use gloo_timers::future::TimeoutFuture;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, MetricValue};
 
@@ -502,138 +506,157 @@ pub fn Diagnostics(
             let mut neteq_stats = HashMap::<String, Vec<String>>::new();
             let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();
             let mut neteq_jitter = HashMap::<String, Vec<u64>>::new();
-            let mut reception = ReceptionStore::default();
+            // Shared with the 1 s refresh below, which ages rows out (and
+            // drops departed peers) when no decoder event arrives any more.
+            let reception = Rc::new(RefCell::new(ReceptionStore::default()));
             let mut last_reception_publish = f64::NEG_INFINITY;
-
-            while let Ok(evt) = rx.recv().await {
-                match evt.subsystem {
-                    "decoder" => {
-                        // Latest stats per (peer, media type). The worker sends
-                        // one event per stream every 500 ms; republish at most
-                        // once a second and only when a row changed.
-                        if let Some(report) = parse_decoder_event(&evt) {
-                            reception.record(report, evt.ts_ms as f64);
-                            let now = js_sys::Date::now();
-                            if now - last_reception_publish >= RECEPTION_PUBLISH_MS {
-                                last_reception_publish = now;
-                                // Client busy: skip the leave check this
-                                // time rather than drop every row.
-                                let present = client.try_sorted_peer_keys();
-                                let rows = reception.rows(now, |peer| {
-                                    present
-                                        .as_ref()
-                                        .is_none_or(|keys| keys.iter().any(|p| p == peer))
-                                });
-                                if *reception_rows.peek() != rows {
-                                    reception_rows.set(rows);
-                                }
-                            }
-                        }
+            let mut publish_reception = {
+                let client = client.clone();
+                let reception = reception.clone();
+                move |now: f64| {
+                    // Client busy: skip the leave check this time rather
+                    // than drop every row.
+                    let present = client.try_sorted_peer_keys();
+                    let rows = reception_rows_at(&mut reception.borrow_mut(), now, present);
+                    if *reception_rows.peek() != rows {
+                        reception_rows.set(rows);
                     }
-                    "sender" => {
-                        let mut text = String::new();
-                        for m in &evt.metrics {
-                            match m.name {
-                                "sender_id" => {
-                                    if let MetricValue::Text(v) = &m.value {
-                                        text.push_str(&format!("Sender: {v}\n"));
-                                    }
-                                }
-                                "target_id" => {
-                                    if let MetricValue::Text(v) = &m.value {
-                                        text.push_str(&format!("Target: {v}\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(v) = &m.value {
-                                        text.push_str(&format!("Media Type: {v}\n"));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !text.is_empty() {
-                            text.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
-                            sender_stats.set(Some(text));
-                        }
-                    }
-                    "neteq" => {
-                        let stream_id = evt
-                            .stream_id
-                            .clone()
-                            .unwrap_or_else(|| "unknown->unknown".to_string());
-                        let parts: Vec<&str> = stream_id.split("->").collect();
-                        let target_peer = if parts.len() == 2 {
-                            parts[1]
-                        } else {
-                            "unknown"
-                        };
-                        let mut stats_dirty = false;
-                        let mut buffer_dirty = false;
-                        let mut jitter_dirty = false;
-                        for m in &evt.metrics {
-                            match m.name {
-                                "stats_json" => {
-                                    if let MetricValue::Text(json) = &m.value {
-                                        let entry =
-                                            neteq_stats.entry(target_peer.to_string()).or_default();
-                                        entry.push(json.clone());
-                                        if entry.len() > 60 {
-                                            entry.remove(0);
-                                        }
-                                        stats_dirty = true;
-                                    }
-                                }
-                                "audio_buffer_ms" => {
-                                    if let MetricValue::U64(v) = &m.value {
-                                        let entry = neteq_buffer
-                                            .entry(target_peer.to_string())
-                                            .or_default();
-                                        entry.push(*v);
-                                        if entry.len() > 50 {
-                                            entry.remove(0);
-                                        }
-                                        buffer_dirty = true;
-                                    }
-                                }
-                                "jitter_buffer_delay_ms" => {
-                                    if let MetricValue::U64(v) = &m.value {
-                                        let entry = neteq_jitter
-                                            .entry(target_peer.to_string())
-                                            .or_default();
-                                        entry.push(*v);
-                                        if entry.len() > 50 {
-                                            entry.remove(0);
-                                        }
-                                        jitter_dirty = true;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Batch: update signals once per event, not per-metric.
-                        if stats_dirty {
-                            neteq_stats_per_peer.set(neteq_stats.clone());
-                        }
-                        if buffer_dirty {
-                            neteq_buffer_per_peer.set(neteq_buffer.clone());
-                        }
-                        if jitter_dirty {
-                            neteq_jitter_per_peer.set(neteq_jitter.clone());
-                        }
-                    }
-                    "connection_manager" => {
-                        connection_events.push(SerializableDiagEvent::from(evt));
-                        if connection_events.len() > 20 {
-                            connection_events.remove(0);
-                        }
-                        let serialized =
-                            serde_json::to_string(&connection_events).unwrap_or_default();
-                        connection_manager_state.set(Some(serialized));
-                    }
-                    _ => {}
                 }
-            }
+            };
+            let refresh = {
+                let mut publish_reception = publish_reception.clone();
+                async move {
+                    loop {
+                        TimeoutFuture::new(RECEPTION_PUBLISH_MS as u32).await;
+                        publish_reception(js_sys::Date::now());
+                    }
+                }
+            };
+
+            let events = async move {
+                while let Ok(evt) = rx.recv().await {
+                    match evt.subsystem {
+                        "decoder" => {
+                            // Latest stats per (peer, media type). The worker sends
+                            // one event per stream every 500 ms; republish at most
+                            // once a second and only when a row changed.
+                            if let Some(report) = parse_decoder_event(&evt) {
+                                reception.borrow_mut().record(report, evt.ts_ms as f64);
+                                let now = js_sys::Date::now();
+                                if now - last_reception_publish >= RECEPTION_PUBLISH_MS {
+                                    last_reception_publish = now;
+                                    publish_reception(now);
+                                }
+                            }
+                        }
+                        "sender" => {
+                            let mut text = String::new();
+                            for m in &evt.metrics {
+                                match m.name {
+                                    "sender_id" => {
+                                        if let MetricValue::Text(v) = &m.value {
+                                            text.push_str(&format!("Sender: {v}\n"));
+                                        }
+                                    }
+                                    "target_id" => {
+                                        if let MetricValue::Text(v) = &m.value {
+                                            text.push_str(&format!("Target: {v}\n"));
+                                        }
+                                    }
+                                    "media_type" => {
+                                        if let MetricValue::Text(v) = &m.value {
+                                            text.push_str(&format!("Media Type: {v}\n"));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !text.is_empty() {
+                                text.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
+                                sender_stats.set(Some(text));
+                            }
+                        }
+                        "neteq" => {
+                            let stream_id = evt
+                                .stream_id
+                                .clone()
+                                .unwrap_or_else(|| "unknown->unknown".to_string());
+                            let parts: Vec<&str> = stream_id.split("->").collect();
+                            let target_peer = if parts.len() == 2 {
+                                parts[1]
+                            } else {
+                                "unknown"
+                            };
+                            let mut stats_dirty = false;
+                            let mut buffer_dirty = false;
+                            let mut jitter_dirty = false;
+                            for m in &evt.metrics {
+                                match m.name {
+                                    "stats_json" => {
+                                        if let MetricValue::Text(json) = &m.value {
+                                            let entry = neteq_stats
+                                                .entry(target_peer.to_string())
+                                                .or_default();
+                                            entry.push(json.clone());
+                                            if entry.len() > 60 {
+                                                entry.remove(0);
+                                            }
+                                            stats_dirty = true;
+                                        }
+                                    }
+                                    "audio_buffer_ms" => {
+                                        if let MetricValue::U64(v) = &m.value {
+                                            let entry = neteq_buffer
+                                                .entry(target_peer.to_string())
+                                                .or_default();
+                                            entry.push(*v);
+                                            if entry.len() > 50 {
+                                                entry.remove(0);
+                                            }
+                                            buffer_dirty = true;
+                                        }
+                                    }
+                                    "jitter_buffer_delay_ms" => {
+                                        if let MetricValue::U64(v) = &m.value {
+                                            let entry = neteq_jitter
+                                                .entry(target_peer.to_string())
+                                                .or_default();
+                                            entry.push(*v);
+                                            if entry.len() > 50 {
+                                                entry.remove(0);
+                                            }
+                                            jitter_dirty = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Batch: update signals once per event, not per-metric.
+                            if stats_dirty {
+                                neteq_stats_per_peer.set(neteq_stats.clone());
+                            }
+                            if buffer_dirty {
+                                neteq_buffer_per_peer.set(neteq_buffer.clone());
+                            }
+                            if jitter_dirty {
+                                neteq_jitter_per_peer.set(neteq_jitter.clone());
+                            }
+                        }
+                        "connection_manager" => {
+                            connection_events.push(SerializableDiagEvent::from(evt));
+                            if connection_events.len() > 20 {
+                                connection_events.remove(0);
+                            }
+                            let serialized =
+                                serde_json::to_string(&connection_events).unwrap_or_default();
+                            connection_manager_state.set(Some(serialized));
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            // Both end when the panel closes: the task is cancelled.
+            futures::future::join(events, refresh).await;
         });
         diag_task.set(Some(task));
     });
@@ -658,6 +681,7 @@ pub fn Diagnostics(
         });
     });
 
+    let names_client = client.clone();
     // Resolve numeric session IDs to display names via VideoCallClient context.
     let peer_display_name = move |session_id: &str| -> String {
         client
@@ -718,10 +742,12 @@ pub fn Diagnostics(
 
     let conn_state = connection_manager_state();
     let reception = reception_rows();
+    // The name the meeting shows for each peer, when the client knows it;
+    // the cell falls back to the session id.
     let reception_peer_names: HashMap<String, String> = reception
         .iter()
         .filter_map(|row| row.key.peer.as_deref())
-        .map(|peer| (peer.to_string(), peer_display_name(peer)))
+        .filter_map(|peer| Some((peer.to_string(), names_client.get_peer_display_name(peer)?)))
         .collect();
     let send_stats = sender_stats();
     let video_str = if video_enabled { "Enabled" } else { "Disabled" };
@@ -758,8 +784,40 @@ pub fn Diagnostics(
                 button { class: "close-button", onclick: move |_| on_close.call(()), "\u{00d7}" }
             }
             div { class: "sidebar-content",
+                if available_peers.len() > 1 {
+                    div { class: "diagnostics-section",
+                        h3 { "Peer Selection" }
+                        select {
+                            class: "peer-selector",
+                            onchange: move |e: Event<FormData>| {
+                                selected_peer.set(e.value());
+                            },
+                            value: "{current_peer}",
+                            for peer in available_peers.iter() {
+                                {
+                                    let label = if peer == "All Peers" {
+                                        "All Peers".to_string()
+                                    } else {
+                                        peer_display_name(peer)
+                                    };
+                                    rsx! {
+                                        option {
+                                            value: "{peer}",
+                                            selected: peer == &current_peer,
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p { class: "peer-info", "{peer_info}" }
+                    }
+                }
                 if traffic_shaping_revealed {
                     TrafficShapingSection {}
+                }
+                if is_open {
+                    EncodersSection { video_enabled, mic_enabled }
                 }
                 div { class: "diagnostics-section",
                     h3 { "Build Info" }
@@ -795,35 +853,6 @@ pub fn Diagnostics(
                 div { class: "diagnostics-section",
                     h3 { "Connection Manager" }
                     ConnectionManagerDisplay { connection_manager_state: conn_state }
-                }
-                if available_peers.len() > 1 {
-                    div { class: "diagnostics-section",
-                        h3 { "Peer Selection" }
-                        select {
-                            class: "peer-selector",
-                            onchange: move |e: Event<FormData>| {
-                                selected_peer.set(e.value());
-                            },
-                            value: "{current_peer}",
-                            for peer in available_peers.iter() {
-                                {
-                                    let label = if peer == "All Peers" {
-                                        "All Peers".to_string()
-                                    } else {
-                                        peer_display_name(peer)
-                                    };
-                                    rsx! {
-                                        option {
-                                            value: "{peer}",
-                                            selected: peer == &current_peer,
-                                            "{label}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        p { class: "peer-info", "{peer_info}" }
-                    }
                 }
                 div { class: "diagnostics-section",
                     h3 { "Current Status" }
@@ -892,9 +921,6 @@ pub fn Diagnostics(
                         } else {
                             p { "No sending data available." }
                         }
-                    }
-                    if is_open {
-                        EncoderSettingsSection { video_enabled }
                     }
                     div { class: "diagnostics-section",
                         h3 { "Media Status" }

@@ -224,15 +224,17 @@ fn camera_report_from(
 
 /// The peer manager's removal callback: a peer that leaves (by any path) is
 /// also a viewer whose reports about our camera no longer count; then the
-/// UI's callback.
+/// UI's callback. `now_ms` is the rate control's clock (injected so the
+/// native tests need no browser).
 fn viewer_removal_callback(
     camera_rate: Rc<RefCell<CameraRateController>>,
     on_peer_removed: Option<Callback<String>>,
+    now_ms: fn() -> f64,
 ) -> Callback<String> {
     Callback::from(move |session_id: String| {
         if let Ok(viewer) = session_id.parse::<u64>() {
             match camera_rate.try_borrow_mut() {
-                Ok(mut camera_rate) => camera_rate.remove_viewer(viewer),
+                Ok(mut camera_rate) => camera_rate.remove_viewer(viewer, now_ms()),
                 Err(_) => warn!("camera rate control busy, viewer {viewer} not removed"),
             }
         }
@@ -616,7 +618,7 @@ impl VideoCallClient {
         peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
         peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
         peer_decode_manager.on_peer_removed =
-            viewer_removal_callback(camera_rate, opts.on_peer_removed.clone());
+            viewer_removal_callback(camera_rate, opts.on_peer_removed.clone(), monotonic_now_ms);
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
         peer_decode_manager
     }
@@ -1770,6 +1772,7 @@ mod tests {
             Some(Callback::from(move |sid: String| {
                 ui_log.borrow_mut().push(sid)
             })),
+            || 0.0,
         );
         let report = videocall_rate_control::Report::from_wire(800, 0);
         camera_rate.borrow_mut().on_report(5, 0.0, report);

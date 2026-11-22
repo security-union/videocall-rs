@@ -99,7 +99,14 @@ pub fn choose_tier(
             .unwrap_or(tiers.len() - 1);
         return down.max(current);
     }
-    if current > 0 && capacity_bps >= tiers[current - 1].floor_bps() * (1.0 + probe_fraction) {
+    // Up at one probe step above the upper floor, or at the upper tier's
+    // own maximum when that is lower (a capacity clamped to the cap must
+    // still reach a tier whose floor is just under the cap).
+    if current > 0
+        && capacity_bps
+            >= (tiers[current - 1].floor_bps() * (1.0 + probe_fraction))
+                .min(tiers[current - 1].hi_bps)
+    {
         return current - 1;
     }
     current
@@ -152,6 +159,15 @@ impl FrameGate {
     /// last camera gap >= due`), and the schedule then moves on by one tier
     /// interval. So the real camera rate counts, not the one it claims.
     pub fn admit(&mut self, tier: &Tier, timestamp_ms: f64, target_bps: f64) -> FrameDecision {
+        if self
+            .last_timestamp_ms
+            .is_some_and(|last| timestamp_ms < last)
+        {
+            // The clock went back (a new camera track): start the schedule
+            // over instead of waiting for the old clock's due time.
+            self.next_due_ms = None;
+            self.last_timestamp_ms = None;
+        }
         let half_gap = self
             .last_timestamp_ms
             .map_or(0.0, |last| (timestamp_ms - last).max(0.0) / 2.0);

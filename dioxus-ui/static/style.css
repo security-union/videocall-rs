@@ -2774,17 +2774,58 @@ select {
   color: #ccc;
 }
 
-/* Encoder Settings: the camera's rate control, label and value pairs */
-.encoder-settings-grid {
+/* Diagnostics label / value tables (Encoders card) */
+.diagnostics-kv {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
   gap: 2px 12px;
   font-size: 0.85em;
 }
-.encoder-settings-label {
+.diagnostics-kv + .diagnostics-kv {
+  margin-top: 2px;
+}
+.diagnostics-kv-label {
   color: #888;
 }
-.encoder-settings-value {
+.diagnostics-kv-value {
   color: #fff;
   overflow-wrap: anywhere;
+}
+#diagnostics-sidebar .diagnostics-section p.diagnostics-kv-note {
+  margin: 0 0 2px;
+  font-size: 0.85em;
+  text-align: left;
+}
+
+/* NetEQ Current Status: the same label / value look, one row per value */
+.neteq-status {
+  font-size: 0.85em;
+}
+.neteq-status .status-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+  background: none;
+  border-radius: 0;
+  text-align: left;
+}
+.neteq-status .status-label {
+  font-size: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #888;
+}
+.neteq-status .status-value {
+  font-size: inherit;
+  font-weight: 400;
+  margin: 0;
+  color: #fff;
+  white-space: nowrap;
+}
+.neteq-status .status-value.good {
+  color: #27ae60;
+}
+.neteq-status .status-value.warning {
+  color: #e74c3c;
 }

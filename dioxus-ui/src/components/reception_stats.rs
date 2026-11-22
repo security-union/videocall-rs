@@ -23,11 +23,13 @@
 //! it, and that is what ages a row out.
 //!
 //! VIDEO rows also show the rate-control report this client sends the
-//! peer about its camera: the capacity and backlog we measure, when the
-//! estimator has a capacity (the `capacity_kbps` and `backlog_ms` metrics).
+//! peer about its camera: the capacity and backlog we measure (the
+//! `capacity_kbps` and `backlog_ms` metrics), or "not limited" while the path
+//! has not queued.
 
 use dioxus::prelude::*;
 use std::collections::HashMap;
+use videocall_client::rate_control::NO_CEILING_KBPS;
 use videocall_diagnostics::{DiagEvent, MetricValue};
 
 /// A row whose stream carried no media for this long disappears.
@@ -104,7 +106,8 @@ impl ReceptionKey {
 /// The rate-control report we send a peer about its camera stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateReport {
-    pub capacity_kbps: u64,
+    /// `None`: frames flow and the path has not queued, no ceiling seen.
+    pub capacity_kbps: Option<u64>,
     pub backlog_ms: u64,
 }
 
@@ -114,7 +117,7 @@ pub struct DecoderReport {
     pub key: ReceptionKey,
     pub fps: f64,
     pub bitrate_kbps: f64,
-    /// Present on VIDEO events once we measure a capacity.
+    /// Present on VIDEO events we send a report about.
     pub rate: Option<RateReport>,
 }
 
@@ -160,7 +163,7 @@ pub fn parse_decoder_event(event: &DiagEvent) -> Option<DecoderReport> {
         fps,
         bitrate_kbps,
         rate: capacity_kbps.map(|capacity_kbps| RateReport {
-            capacity_kbps,
+            capacity_kbps: (capacity_kbps != u64::from(NO_CEILING_KBPS)).then_some(capacity_kbps),
             backlog_ms: backlog_ms.unwrap_or(0),
         }),
     })
@@ -245,6 +248,23 @@ impl ReceptionStore {
     }
 }
 
+/// The rows to show at `now_ms`. `present` is the peers still in the meeting,
+/// or `None` when the client could not say (busy): then nobody is dropped
+/// for having left, and rows only age out. Called on every decoder event and
+/// once a second while the panel is open, so rows go away after the last
+/// peer leaves even though no event comes any more.
+pub fn reception_rows_at(
+    store: &mut ReceptionStore,
+    now_ms: f64,
+    present: Option<Vec<String>>,
+) -> Vec<ReceptionRow> {
+    store.rows(now_ms, |peer| {
+        present
+            .as_ref()
+            .is_none_or(|keys| keys.iter().any(|key| key == peer))
+    })
+}
+
 /// "just now" under a second, then "N s ago".
 pub fn format_age(age_secs: u64) -> String {
     if age_secs == 0 {
@@ -269,10 +289,17 @@ pub fn format_bitrate(bitrate_kbps: f64) -> String {
 }
 
 /// The capacity / backlog cell: "950 / 12 ms" for a VIDEO row we report on,
-/// a dash otherwise.
+/// "not limited / 0 ms" while the path has not queued, a dash otherwise.
 pub fn format_rate(rate: Option<RateReport>) -> String {
     match rate {
-        Some(rate) => format!("{} / {} ms", rate.capacity_kbps, rate.backlog_ms),
+        Some(RateReport {
+            capacity_kbps: Some(capacity),
+            backlog_ms,
+        }) => format!("{capacity} / {backlog_ms} ms"),
+        Some(RateReport {
+            capacity_kbps: None,
+            backlog_ms,
+        }) => format!("not limited / {backlog_ms} ms"),
         None => "\u{2013}".to_string(),
     }
 }
@@ -512,6 +539,29 @@ mod tests {
         assert_eq!(store.rows(0.0, |_| true).len(), 2);
     }
 
+    /// The last peer left: the next refresh, with no new event, clears its
+    /// rows; a busy client keeps them.
+    #[test]
+    fn rows_of_a_departed_peer_go_on_the_next_refresh() {
+        let mut store = ReceptionStore::default();
+        store.record(report("9", ReceivedMedia::Video, 30.0, 800.0), 0.0);
+        store.record(report("9", ReceivedMedia::Audio, 50.0, 40.0), 0.0);
+        let busy = reception_rows_at(&mut store, 1_000.0, None);
+        assert_eq!(busy.len(), 2);
+        assert!(reception_rows_at(&mut store, 2_000.0, Some(Vec::new())).is_empty());
+    }
+
+    /// With the peer still there, a refresh with no new event ages the row.
+    #[test]
+    fn a_refresh_ages_rows_without_new_events() {
+        let mut store = ReceptionStore::default();
+        store.record(report("9", ReceivedMedia::Video, 30.0, 800.0), 0.0);
+        let rows = reception_rows_at(&mut store, 3_000.0, Some(vec!["9".to_string()]));
+        assert_eq!(rows[0].age_secs, 3);
+        let later = 1.0 + RECEPTION_STALE_MS;
+        assert!(reception_rows_at(&mut store, later, Some(vec!["9".to_string()])).is_empty());
+    }
+
     #[test]
     fn parses_the_rate_report_on_video() {
         let mut event = decoder_event("VIDEO", Some("4"), 30.0, 800.0);
@@ -520,7 +570,7 @@ mod tests {
         event.metrics.push(metric!("backlog_ms", 12u64));
         let parsed = parse_decoder_event(&event).unwrap();
         let rate = Some(RateReport {
-            capacity_kbps: 950,
+            capacity_kbps: Some(950),
             backlog_ms: 12,
         });
         assert_eq!(parsed.rate, rate);
@@ -533,6 +583,24 @@ mod tests {
         assert_eq!(store.rows(500.0, |_| true)[0].rate, None);
     }
 
+    /// The wire's "no ceiling" value is a report, not a number.
+    #[test]
+    fn parses_a_report_without_a_ceiling() {
+        let mut event = decoder_event("VIDEO", Some("4"), 30.0, 800.0);
+        event
+            .metrics
+            .push(metric!("capacity_kbps", u64::from(NO_CEILING_KBPS)));
+        event.metrics.push(metric!("backlog_ms", 0u64));
+        let rate = parse_decoder_event(&event).unwrap().rate;
+        assert_eq!(
+            rate,
+            Some(RateReport {
+                capacity_kbps: None,
+                backlog_ms: 0
+            })
+        );
+    }
+
     #[test]
     fn formats_cells() {
         assert_eq!(format_age(0), "just now");
@@ -543,10 +611,17 @@ mod tests {
         assert_eq!(format_bitrate(812.4), "812 kbps");
         assert_eq!(
             format_rate(Some(RateReport {
-                capacity_kbps: 950,
+                capacity_kbps: Some(950),
                 backlog_ms: 12
             })),
             "950 / 12 ms"
+        );
+        assert_eq!(
+            format_rate(Some(RateReport {
+                capacity_kbps: None,
+                backlog_ms: 0
+            })),
+            "not limited / 0 ms"
         );
         assert_eq!(format_rate(None), "\u{2013}");
     }

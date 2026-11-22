@@ -113,7 +113,7 @@ fn feed(arrivals: &[FrameInfo]) -> Seen {
     for frame in arrivals {
         while tick <= frame.arrival_ms {
             if let Some(report) = estimator.report(tick) {
-                seen.capacities.push(report.capacity_bps);
+                seen.capacities.extend(report.capacity_bps);
                 seen.backlogs += usize::from(report.backlog_ms > 0.0);
             }
             tick += 500.0;

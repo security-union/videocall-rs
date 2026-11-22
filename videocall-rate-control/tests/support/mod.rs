@@ -38,9 +38,8 @@ use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 
 use videocall_rate_control::{
-    choose_tier, default_tiers, encoder_bitrate_bps, FrameDecision, FrameGate, FrameInfo,
-    FrameOutcome, MultiViewerPublisher, PublisherConfig, Report, Tier, ViewerConfig,
-    ViewerEstimator,
+    default_tiers, encoder_bitrate_bps, FrameDecision, FrameGate, FrameInfo, FrameOutcome,
+    MultiViewerPublisher, PublisherConfig, Report, Tier, ViewerConfig, ViewerEstimator,
 };
 
 /// Drops within [`RELAY_WINDOW_MS`] that make the relay signal (actix-api
@@ -151,6 +150,13 @@ pub struct SimConfig {
     pub relay_queue_frames: Option<usize>,
     /// Viewers (indices, 0 is `schedule`) that never report.
     pub silent_viewers: Vec<usize>,
+    /// Encoder output as a fraction of its bitrate: `(start_ms, fraction)`,
+    /// sorted. Easy content (a still scene) makes a real encoder undershoot.
+    /// Empty means 1.0 throughout.
+    pub encoder_fill: Vec<(f64, f64)>,
+    /// `(viewer, from_ms, to_ms)`: the viewer sends no report in that span
+    /// (a viewer stuck behind a queue it cannot release).
+    pub muted_reports: Vec<(usize, f64, f64)>,
 }
 
 /// Appends a linear ramp from `from_bps` to `to_bps` over
@@ -200,6 +206,8 @@ impl SimConfig {
             tiers: None,
             relay_queue_frames: None,
             silent_viewers: Vec::new(),
+            encoder_fill: Vec::new(),
+            muted_reports: Vec::new(),
         }
     }
 
@@ -267,6 +275,24 @@ impl SimConfig {
             },
             ..Self::baseline()
         }
+    }
+
+    /// Encoder fill at `t_ms`.
+    pub fn fill_at(&self, t_ms: f64) -> f64 {
+        self.encoder_fill
+            .iter()
+            .take_while(|(start, _)| *start <= t_ms)
+            .last()
+            .map_or(1.0, |(_, fill)| *fill)
+    }
+
+    /// Whether `viewer` may report at `t_ms`.
+    pub fn reports_at(&self, viewer: usize, t_ms: f64) -> bool {
+        !self.silent_viewers.contains(&viewer)
+            && !self
+                .muted_reports
+                .iter()
+                .any(|(muted, from, to)| *muted == viewer && t_ms >= *from && t_ms < *to)
     }
 
     fn links(&self) -> Vec<Link> {
@@ -370,6 +396,8 @@ pub struct SimResult {
     pub arrivals: Vec<Vec<f64>>,
     /// CONGESTION signals delivered: `(t_ms, viewer, accepted)`.
     pub signals: Vec<(f64, usize, bool)>,
+    /// Times a quiet viewer cut the rate.
+    pub silence_cuts: Vec<f64>,
     /// Publisher target changes: `(t_ms, bps)`, starting at `(0, start)`.
     pub target_changes: Vec<(f64, f64)>,
     /// Every report, in send order.
@@ -448,7 +476,6 @@ pub fn run(config: &SimConfig) -> SimResult {
         .collect();
     let pub_config = publisher_config(config);
     let rtt = rtt_ms(config);
-    let probe = pub_config.probe_fraction(rtt);
     let mut publisher: MultiViewerPublisher<usize> = MultiViewerPublisher::new(pub_config);
     let mut gate = FrameGate::new();
     let mut tier = 0usize;
@@ -465,6 +492,7 @@ pub fn run(config: &SimConfig) -> SimResult {
     let mut reports: Vec<SentReport> = Vec::new();
     let mut tier_changes = vec![(0.0, 0usize)];
     let mut signals = Vec::new();
+    let mut silence_cuts = Vec::new();
     let mut skipped = Vec::new();
     let mut handed = 0u64;
 
@@ -504,7 +532,8 @@ pub fn run(config: &SimConfig) -> SimResult {
                         let per_key = (config.keyframe_interval_ms / frame_interval_ms).round();
                         let keyframe = index.is_multiple_of(per_key as u64);
                         let scale = if keyframe { config.keyframe_ratio } else { 1.0 };
-                        Some((target_bps / config.fps / 8.0 * scale, keyframe))
+                        let fill = config.fill_at(t_ms);
+                        Some((target_bps / config.fps / 8.0 * scale * fill, keyframe))
                     }
                     Some(tiers) => {
                         let current = &tiers[tier];
@@ -516,7 +545,8 @@ pub fn run(config: &SimConfig) -> SimResult {
                                 handed += 1;
                                 let scale = if keyframe { config.keyframe_ratio } else { 1.0 };
                                 let rate = encoder_bitrate_bps(current, target_bps);
-                                Some((rate / current.fps / 8.0 * scale, keyframe))
+                                let fill = config.fill_at(t_ms);
+                                Some((rate / current.fps / 8.0 * scale * fill, keyframe))
                             }
                             skip => {
                                 skipped.push((t_ms, skip));
@@ -536,6 +566,11 @@ pub fn run(config: &SimConfig) -> SimResult {
                         delay.min_ms + (delay.max_ms - delay.min_ms) * rng.next_f64()
                     });
                 let send_ms = t_ms + encode_ms;
+                if publisher.on_frame_sent(t_ms, rtt) {
+                    silence_cuts.push(t_ms);
+                    let bps = publisher.target_bps(t_ms, rtt);
+                    set_target(t_ms, bps, &mut target_bps);
+                }
                 let slot = frames.len();
                 for (viewer, link) in links.iter_mut().enumerate() {
                     while link.queued_ends.front().is_some_and(|end| *end <= send_ms) {
@@ -603,7 +638,7 @@ pub fn run(config: &SimConfig) -> SimResult {
                 }
                 if let Some(report) = outcome
                     .early_report
-                    .filter(|_| !config.silent_viewers.contains(&viewer))
+                    .filter(|_| config.reports_at(viewer, t_ms))
                 {
                     send_report(
                         &mut queue,
@@ -619,7 +654,7 @@ pub fn run(config: &SimConfig) -> SimResult {
             }
             Event::Report => {
                 for (viewer, estimator) in viewers.iter_mut().enumerate() {
-                    if config.silent_viewers.contains(&viewer) {
+                    if !config.reports_at(viewer, t_ms) {
                         continue;
                     }
                     if let Some(report) = estimator.report(t_ms + ESTIMATOR_CLOCK_ORIGIN_MS) {
@@ -643,10 +678,8 @@ pub fn run(config: &SimConfig) -> SimResult {
                 publisher.on_report(sent.viewer, t_ms, sent.report);
                 let bps = publisher.target_bps(t_ms, rtt);
                 set_target(t_ms, bps, &mut target_bps);
-                if let (Some(tiers), Some(capacity)) =
-                    (&config.tiers, publisher.tier_capacity_bps(t_ms, rtt))
-                {
-                    let next = choose_tier(tiers, tier, capacity, probe);
+                if let Some(tiers) = &config.tiers {
+                    let next = publisher.next_tier(tiers, tier, t_ms, rtt);
                     if next != tier {
                         tier = next;
                         tier_changes.push((t_ms, tier));
@@ -658,10 +691,8 @@ pub fn run(config: &SimConfig) -> SimResult {
                 signals.push((t_ms, viewer, accepted));
                 let bps = publisher.target_bps(t_ms, rtt);
                 set_target(t_ms, bps, &mut target_bps);
-                if let (Some(tiers), Some(capacity)) =
-                    (&config.tiers, publisher.tier_capacity_bps(t_ms, rtt))
-                {
-                    let next = choose_tier(tiers, tier, capacity, probe);
+                if let Some(tiers) = &config.tiers {
+                    let next = publisher.next_tier(tiers, tier, t_ms, rtt);
                     if next != tier {
                         tier = next;
                         tier_changes.push((t_ms, tier));
@@ -676,6 +707,7 @@ pub fn run(config: &SimConfig) -> SimResult {
         frames,
         arrivals,
         signals,
+        silence_cuts,
         target_changes,
         reports,
         outcomes,

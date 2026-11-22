@@ -68,7 +68,9 @@ pub(crate) struct ReceivedVideo {
 
 impl ReceivedVideo {
     /// A camera frame from `peer` arrived at `arrival_ms` (monotonic clock).
-    /// Returns a report to send at once when a backlog just started.
+    /// Returns a report to send at once when a backlog just started. An
+    /// early report always carries a capacity: one without is not sent
+    /// early (the periodic tick carries it).
     pub(crate) fn on_frame(
         &mut self,
         peer: &str,
@@ -77,21 +79,24 @@ impl ReceivedVideo {
     ) -> Option<Report> {
         let frame = arrival.frame_info(arrival_ms);
         // Looked up first so the common case allocates no key.
-        if let Some(estimator) = self.streams.get_mut(peer) {
-            return estimator.on_frame(frame).early_report;
-        }
-        let mut estimator = ViewerEstimator::new(ViewerConfig {
-            report_interval_ms: DIAGNOSTICS_REPORT_INTERVAL_MS as f64,
-        });
-        let early_report = estimator.on_frame(frame).early_report;
-        self.streams.insert(peer.to_string(), estimator);
-        early_report
+        let early_report = if let Some(estimator) = self.streams.get_mut(peer) {
+            estimator.on_frame(frame).early_report
+        } else {
+            let mut estimator = ViewerEstimator::new(ViewerConfig {
+                report_interval_ms: DIAGNOSTICS_REPORT_INTERVAL_MS as f64,
+            });
+            let early_report = estimator.on_frame(frame).early_report;
+            self.streams.insert(peer.to_string(), estimator);
+            early_report
+        };
+        early_report.filter(|report| report.capacity_bps.is_some())
     }
 
     /// The periodic report about `peer`'s camera stream. `None` means send
-    /// nothing this tick: no capacity yet, no frame released since the last
-    /// tick (paused camera, frames held behind a gap), or no camera from
-    /// that peer. The publisher then ages the report it has.
+    /// nothing this tick: no frame released since the last tick (paused
+    /// camera, frames held behind a gap), or no camera from that peer. The
+    /// publisher then ages the report it has. A report may carry no
+    /// capacity (the path never queued); it is sent all the same.
     pub(crate) fn report(&mut self, peer: &str, now_ms: f64) -> Option<Report> {
         self.streams.get_mut(peer)?.report(now_ms)
     }
@@ -155,7 +160,8 @@ mod tests {
         let mut video = ReceivedVideo::default();
         let now = feed_clean(&mut video, "42", 0, 60, 0.0, 600.0);
         let report = video.report("42", now).expect("a report after 2 s");
-        assert!(report.capacity_bps > 0);
+        // A clean path never queued: the report has no ceiling.
+        assert_eq!(report.capacity_bps, None);
         assert_eq!(report.backlog_ms, 0.0);
     }
 
@@ -192,7 +198,11 @@ mod tests {
             },
             now + 10.0,
         );
-        assert_eq!(video.report("43", now + 10.0), None);
+        // One frame: no ceiling, nothing from the old session's run.
+        let report = video
+            .report("43", now + 10.0)
+            .expect("a frame was released");
+        assert_eq!(report.capacity_bps, None);
     }
 
     /// The camera restarted (sequence back to 0, timestamps going on): the
@@ -204,8 +214,10 @@ mod tests {
         let now = feed_clean(&mut video, "42", 0, 60, 0.0, 600.0);
         assert!(video.report("42", now).is_some());
         let later = feed_clean(&mut video, "42", 0, 60, now + 1_000.0, 600.0);
-        let report = video.report("42", later).expect("the new run is measured");
-        assert!(report.capacity_bps > 0);
+        assert!(
+            video.report("42", later).is_some(),
+            "the new run is measured"
+        );
     }
 
     /// Nothing new since the last tick: send nothing, not a copy.

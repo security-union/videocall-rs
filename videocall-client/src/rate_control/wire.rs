@@ -21,8 +21,10 @@
 //! 500 ms.
 //!
 //! - `capacity_kbps`: what the path to the viewer carries. 0 means "no
-//!   report" (proto3 default): the viewer has no capacity yet, or it is an
-//!   older client that does not know the field.
+//!   report" (proto3 default): the viewer has nothing to say this tick, or
+//!   it is an older client that does not know the field. `NO_CEILING_KBPS`
+//!   (`u32::MAX`) means frames flow and the path has not queued: a report
+//!   with no ceiling.
 //! - `backlog_ms`: the standing queue the viewer sees. Only meaningful next
 //!   to a capacity.
 
@@ -45,7 +47,8 @@ pub(crate) fn write_report(metrics: &mut VideoMetrics, report: Option<Report>) {
 }
 
 /// The report `metrics` carries, if any. A capacity of 0 is "no report",
-/// whatever the backlog says.
+/// whatever the backlog says; `NO_CEILING_KBPS` is a report without a
+/// ceiling (the crate's `from_wire` maps it).
 pub(crate) fn read_report(metrics: &VideoMetrics) -> Option<Report> {
     (metrics.capacity_kbps > 0)
         .then(|| Report::from_wire(metrics.capacity_kbps, metrics.backlog_ms))
@@ -53,7 +56,7 @@ pub(crate) fn read_report(metrics: &VideoMetrics) -> Option<Report> {
 
 /// The report in `packet` if it is a viewer's report about our own camera
 /// stream: VIDEO, about the stream whose owner is `own_session` (viewers name
-/// it by its owner's session id in `sender_id`), and carrying a capacity.
+/// it by its owner's session id in `sender_id`), and carrying a report.
 /// Diagnostics reach the whole room, so most packets are about other
 /// participants' streams; before the server assigned our session none can
 /// be about ours.
@@ -77,7 +80,14 @@ mod tests {
 
     fn report(capacity_bps: u64, backlog_ms: f64) -> Report {
         Report {
-            capacity_bps,
+            capacity_bps: Some(capacity_bps),
+            backlog_ms,
+        }
+    }
+
+    fn no_ceiling(backlog_ms: f64) -> Report {
+        Report {
+            capacity_bps: None,
             backlog_ms,
         }
     }
@@ -106,6 +116,19 @@ mod tests {
         write_report(&mut metrics, Some(report(1_234_567, 87.6)));
         assert_eq!((metrics.capacity_kbps, metrics.backlog_ms), (1235, 88));
         assert_eq!(read_report(&metrics), Some(report(1_235_000, 88.0)));
+    }
+
+    /// Frames flow and the path never queued: the report goes out with no
+    /// ceiling, which is neither 0 nor a number.
+    #[test]
+    fn a_report_without_a_ceiling_survives_the_round_trip() {
+        let mut metrics = VideoMetrics::new();
+        write_report(&mut metrics, Some(no_ceiling(0.0)));
+        assert_eq!(
+            (metrics.capacity_kbps, metrics.backlog_ms),
+            (videocall_rate_control::NO_CEILING_KBPS, 0)
+        );
+        assert_eq!(read_report(&metrics), Some(no_ceiling(0.0)));
     }
 
     #[test]

@@ -31,5 +31,5 @@ pub use actuator::{
 };
 pub use publisher::{drain_target_bps, Publisher, PublisherConfig, MIN_DRAIN_FRACTION};
 pub use signal::CongestionLimit;
-pub use viewer::{FrameInfo, FrameOutcome, Report, ViewerConfig, ViewerEstimator};
+pub use viewer::{FrameInfo, FrameOutcome, Report, ViewerConfig, ViewerEstimator, NO_CEILING_KBPS};
 pub use viewers::{combine_reports, Combined, MultiViewerPublisher};

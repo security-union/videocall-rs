@@ -1698,3 +1698,100 @@ body {
     transition: none;
   }
 }
+
+/* ============================================================
+   Traffic shaping (hidden debug section in Diagnostics)
+   ============================================================ */
+
+/* Tapped seven times to reveal the section; don't select text while tapping. */
+.diagnostics-title {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.traffic-shaping-section {
+  border: 1px solid #ff9f0a;
+}
+
+.traffic-shaping-note {
+  margin: 4px 0 10px;
+  color: #aeaeb2;
+  font-size: 12px;
+}
+
+.traffic-shaping-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.traffic-shaping-label {
+  min-width: 56px;
+  color: #aeaeb2;
+  font-size: 13px;
+}
+
+.traffic-shaping-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.traffic-shaping-option,
+.traffic-shaping-step {
+  min-height: 32px;
+  padding: 4px 10px;
+  border: 1px solid #48484a;
+  border-radius: 6px;
+  background: #2c2c2e;
+  color: #ffffff;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.traffic-shaping-option.selected {
+  border-color: #0a84ff;
+  background: #0a84ff;
+}
+
+.traffic-shaping-option:focus-visible,
+.traffic-shaping-step:focus-visible {
+  outline: 2px solid #0a84ff;
+  outline-offset: 2px;
+}
+
+.traffic-shaping-readout {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #1c1c1e;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* Visible to the sender even with the Diagnostics panel closed and in baby
+   mode; it never takes input. */
+.traffic-shaping-badge {
+  position: fixed;
+  top: calc(12px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9003;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #ff9f0a;
+  color: #000000;
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.traffic-shaping-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}

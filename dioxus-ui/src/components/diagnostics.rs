@@ -19,6 +19,9 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
+use crate::components::traffic_shaping::{
+    register_reveal_tap, TrafficShapingSection, TrafficShapingUi,
+};
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
@@ -451,6 +454,10 @@ pub fn Diagnostics(
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut diag_task = use_signal(|| None::<Task>);
     let mut backend_versions = use_signal(Vec::<serde_json::Value>::new);
+    // Absent outside the meeting page (e.g. component tests): no hidden section.
+    let traffic_shaping_ui = try_use_context::<TrafficShapingUi>();
+    let mut reveal_taps = use_signal(Vec::<f64>::new);
+    let traffic_shaping_revealed = traffic_shaping_ui.is_some_and(|ui| (ui.revealed)());
 
     // The panel is unmounted when it closes; slow the NetEq stats back down.
     use_drop(|| videocall_client::set_audio_diagnostics_enabled(false));
@@ -732,10 +739,26 @@ pub fn Diagnostics(
             id: "diagnostics-sidebar",
             class: if is_open { "visible" } else { "" },
             div { class: "sidebar-header",
-                h2 { "Call Diagnostics" }
+                // Seven quick taps here reveal the hidden traffic shaping section.
+                h2 {
+                    class: "diagnostics-title",
+                    "data-testid": "diagnostics-title",
+                    onclick: move |_| {
+                        if let Some(ui) = traffic_shaping_ui {
+                            if register_reveal_tap(&mut reveal_taps.write(), js_sys::Date::now()) {
+                                let mut revealed = ui.revealed;
+                                revealed.set(true);
+                            }
+                        }
+                    },
+                    "Call Diagnostics"
+                }
                 button { class: "close-button", onclick: move |_| on_close.call(()), "\u{00d7}" }
             }
             div { class: "sidebar-content",
+                if traffic_shaping_revealed {
+                    TrafficShapingSection {}
+                }
                 div { class: "diagnostics-section",
                     h3 { "Build Info" }
                     div { class: "build-info-table",

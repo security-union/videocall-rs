@@ -23,6 +23,9 @@ use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::HealthReporter;
+use crate::traffic_shaping::{
+    ShapedKind, TrafficShaping, TrafficShapingSettings, TrafficShapingStatus,
+};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
@@ -173,6 +176,9 @@ pub struct VideoCallClient {
     connection_controller: Rc<RefCell<Option<ConnectionController>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
+    /// Hidden debug feature: a simulated narrow uplink for outgoing media.
+    /// Off unless the UI turns it on; see [`crate::traffic_shaping`].
+    traffic_shaping: Rc<TrafficShaping>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -180,6 +186,32 @@ impl PartialEq for VideoCallClient {
         Rc::ptr_eq(&self.inner, &other.inner)
             && Rc::ptr_eq(&self.connection_controller, &other.connection_controller)
             && self.options == other.options
+    }
+}
+
+/// Hand an encoded media packet to the active connection (reliable stream on
+/// WebTransport, a binary frame on WebSocket). Used by unshaped media and by
+/// the traffic shaper when a queued packet is due.
+pub(crate) fn send_media_to_transport(
+    connection_controller: &RefCell<Option<ConnectionController>>,
+    media: PacketWrapper,
+) {
+    let packet_type = media.packet_type.enum_value();
+    match connection_controller.try_borrow() {
+        Ok(cc) => {
+            if let Some(controller) = cc.as_ref() {
+                if let Err(e) = controller.send_packet(media) {
+                    debug!("Failed to send {packet_type:?} media packet: {e}");
+                }
+            } else {
+                error!("No connection manager available for {packet_type:?} media packet");
+            }
+        }
+        Err(_) => {
+            error!(
+                "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
+            )
+        }
     }
 }
 
@@ -251,6 +283,11 @@ impl VideoCallClient {
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        let traffic_shaping = TrafficShaping::new(
+            connection_controller.clone(),
+            force_camera_keyframe.clone(),
+            force_screen_keyframe.clone(),
+        );
 
         let client = Self {
             options: options.clone(),
@@ -291,6 +328,7 @@ impl VideoCallClient {
             connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
+            traffic_shaping,
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -402,7 +440,16 @@ impl VideoCallClient {
                 let on_connected = self.options.on_connected.clone();
                 let on_connection_lost = self.options.on_connection_lost.clone();
                 let inner = Rc::downgrade(&self.inner);
+                // Weak: the controller holds this callback, and the shaper
+                // holds the controller cell.
+                let traffic_shaping = Rc::downgrade(&self.traffic_shaping);
                 Callback::from(move |state: ConnectionState| {
+                    if let Some(traffic_shaping) = Weak::upgrade(&traffic_shaping) {
+                        traffic_shaping.on_connection_state(matches!(
+                            state,
+                            ConnectionState::Connected { .. }
+                        ));
+                    }
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
                             inner.connection_state = state.clone();
@@ -525,24 +572,65 @@ impl VideoCallClient {
     /// required to avoid visual/audio artifacts from packet loss. Control
     /// packets (heartbeats, RTT probes, diagnostics) use datagrams instead
     /// since they are periodic and expendable.
-    pub(crate) fn send_media_packet(&self, media: PacketWrapper) {
-        let packet_type = media.packet_type.enum_value();
-        match self.connection_controller.try_borrow() {
-            Ok(cc) => {
-                if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet(media) {
-                        debug!("Failed to send {packet_type:?} media packet: {e}");
-                    }
-                } else {
-                    error!("No connection manager available for {packet_type:?} media packet");
-                }
-            }
-            Err(_) => {
-                error!(
-                    "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
-                )
-            }
-        }
+    ///
+    /// `kind` tells the traffic shaper (a hidden debug feature) what the
+    /// packet carries. `keyframe` is the encoder's own frame type, already
+    /// read for the packet header, so passing it costs nothing. With shaping
+    /// off the packet goes straight to the transport after one `Option`
+    /// check.
+    pub(crate) fn send_media_packet(&self, media: PacketWrapper, kind: ShapedKind, keyframe: bool) {
+        let Some(media) = self.traffic_shaping.shape(media, kind, keyframe) else {
+            // Queued in the shaper; it sends the packet when it is due.
+            return;
+        };
+        send_media_to_transport(&self.connection_controller, media);
+    }
+
+    /// Whether traffic shaping (hidden debug feature) is on.
+    pub fn traffic_shaping_enabled(&self) -> bool {
+        self.traffic_shaping.is_enabled()
+    }
+
+    /// Turn traffic shaping on or off. Off drops whatever is queued. This
+    /// also cancels a running step test.
+    pub fn set_traffic_shaping_enabled(&self, enabled: bool) {
+        self.traffic_shaping.set_enabled(enabled);
+    }
+
+    /// The last chosen shaping settings (kept while off, for this client).
+    pub fn traffic_shaping_settings(&self) -> TrafficShapingSettings {
+        self.traffic_shaping.settings()
+    }
+
+    /// Change the shaping rate, delay or scope; applies at once if on.
+    pub fn set_traffic_shaping_settings(&self, settings: TrafficShapingSettings) {
+        self.traffic_shaping.set_settings(settings);
+    }
+
+    /// Shape at 500 kbps (audio and video, no added delay) for 15 s, then
+    /// turn shaping off.
+    pub fn start_traffic_shaping_step_test(&self) {
+        self.traffic_shaping.start_step_test();
+    }
+
+    /// Readout for the UI; `None` while shaping is off.
+    pub fn traffic_shaping_status(&self) -> Option<TrafficShapingStatus> {
+        self.traffic_shaping.status()
+    }
+
+    /// Called with `true`/`false` whenever shaping turns on or off, including
+    /// when a step test ends on its own.
+    pub fn set_on_traffic_shaping_changed(&self, listener: Callback<bool>) {
+        self.traffic_shaping.set_listener(Some(listener));
+    }
+
+    /// Remove the listener set by [`set_on_traffic_shaping_changed`]. Call it
+    /// when the component that registered it unmounts, so a step test that
+    /// ends later cannot write to a dropped signal.
+    ///
+    /// [`set_on_traffic_shaping_changed`]: Self::set_on_traffic_shaping_changed
+    pub fn clear_on_traffic_shaping_changed(&self) {
+        self.traffic_shaping.set_listener(None);
     }
 
     /// Returns `true` if the client has an active, elected connection.
@@ -558,6 +646,11 @@ impl VideoCallClient {
     /// Disconnect from the current session, tearing down the connection
     /// controller and clearing peer state.
     pub fn disconnect(&self) -> anyhow::Result<()> {
+        // Queued shaped media belongs to this connection; drop it. Shaping
+        // settings survive for a later connect() on this client; a running
+        // step test ends (shaping off).
+        self.traffic_shaping.on_disconnect();
+
         // Disconnect and clear the connection controller via its own RefCell
         if let Ok(mut cc) = self.connection_controller.try_borrow_mut() {
             if let Some(controller) = cc.as_mut() {

@@ -26,7 +26,7 @@ use videocall_types::protos::{
     media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
-use web_sys::EncodedVideoChunk;
+use web_sys::{EncodedVideoChunk, EncodedVideoChunkType};
 
 pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
     // Convert &mut [u8] to a Uint8Array
@@ -39,14 +39,17 @@ pub fn transform_video_chunk(
     buffer: &mut [u8],
     user_id: &str,
     aes: Rc<Aes128State>,
-) -> PacketWrapper {
+) -> (PacketWrapper, bool) {
     let byte_length = chunk.byte_length() as usize;
+    // Read once: the frame type goes into the packet and, as a keyframe bit,
+    // to the traffic shaper.
+    let chunk_type = chunk.type_();
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
         log::error!("Error copying video chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
-        frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
+        frame_type: EncodedVideoChunkTypeWrapper(chunk_type).to_string(),
         user_id: Vec::new(),
         media_type: MediaType::VIDEO.into(),
         timestamp: chunk.timestamp(),
@@ -63,12 +66,15 @@ pub fn transform_video_chunk(
     }
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
-    PacketWrapper {
-        data,
-        user_id: user_id.as_bytes().to_vec(),
-        packet_type: PacketType::MEDIA.into(),
-        ..Default::default()
-    }
+    (
+        PacketWrapper {
+            data,
+            user_id: user_id.as_bytes().to_vec(),
+            packet_type: PacketType::MEDIA.into(),
+            ..Default::default()
+        },
+        chunk_type == EncodedVideoChunkType::Key,
+    )
 }
 
 pub fn transform_screen_chunk(
@@ -77,15 +83,18 @@ pub fn transform_screen_chunk(
     buffer: &mut [u8],
     user_id: &str,
     aes: Rc<Aes128State>,
-) -> PacketWrapper {
+) -> (PacketWrapper, bool) {
     let byte_length = chunk.byte_length() as usize;
+    // Read once: the frame type goes into the packet and, as a keyframe bit,
+    // to the traffic shaper.
+    let chunk_type = chunk.type_();
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
         log::error!("Error copying video chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         user_id: Vec::new(),
         data: buffer[0..byte_length].to_vec(),
-        frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
+        frame_type: EncodedVideoChunkTypeWrapper(chunk_type).to_string(),
         media_type: MediaType::SCREEN.into(),
         timestamp: chunk.timestamp(),
         video_metadata: Some(VideoMetadata {
@@ -101,10 +110,13 @@ pub fn transform_screen_chunk(
     }
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
-    PacketWrapper {
-        data,
-        user_id: user_id.as_bytes().to_vec(),
-        packet_type: PacketType::MEDIA.into(),
-        ..Default::default()
-    }
+    (
+        PacketWrapper {
+            data,
+            user_id: user_id.as_bytes().to_vec(),
+            packet_type: PacketType::MEDIA.into(),
+            ..Default::default()
+        },
+        chunk_type == EncodedVideoChunkType::Key,
+    )
 }

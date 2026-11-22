@@ -26,7 +26,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -53,6 +52,7 @@ use super::{configure_encoder, keyframe_due, reconfigure_if_resized, FrameRead};
 
 use crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
 use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
+use crate::traffic_shaping::ShapedKind;
 
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
 ///
@@ -375,14 +375,14 @@ impl ScreenEncoder {
                         buffer.resize(byte_length, 0);
                     }
 
-                    let packet: PacketWrapper = transform_screen_chunk(
+                    let (packet, is_keyframe) = transform_screen_chunk(
                         chunk,
                         sequence_number,
                         buffer.as_mut_slice(),
                         &userid,
                         aes.clone(),
                     );
-                    client.send_media_packet(packet);
+                    client.send_media_packet(packet, ShapedKind::Screen, is_keyframe);
                     sequence_number += 1;
                 })
             };

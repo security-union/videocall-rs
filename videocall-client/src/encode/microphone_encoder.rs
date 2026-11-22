@@ -29,6 +29,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
+use crate::traffic_shaping::ShapedKind;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
 use gloo::timers::callback::Interval;
@@ -358,7 +359,7 @@ impl MicrophoneEncoder {
                         aes.clone(),
                         red_ref,
                     );
-                    client_for_send.send_media_packet(packet);
+                    client_for_send.send_media_packet(packet, ShapedKind::Audio, false);
 
                     // Store current frame as the previous frame for the next
                     // iteration's redundancy payload.

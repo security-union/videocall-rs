@@ -29,7 +29,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -61,6 +60,7 @@ use crate::adaptive_quality_constants::{
 };
 use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
 use crate::diagnostics::EncoderBitrateController;
+use crate::traffic_shaping::ShapedKind;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
@@ -371,14 +371,14 @@ impl CameraEncoder {
                     buffer.resize(byte_length, 0);
                 }
 
-                let packet: PacketWrapper = transform_video_chunk(
+                let (packet, is_keyframe) = transform_video_chunk(
                     chunk,
                     sequence_number,
                     buffer.as_mut_slice(),
                     &userid,
                     aes.clone(),
                 );
-                client.send_media_packet(packet);
+                client.send_media_packet(packet, ShapedKind::Camera, is_keyframe);
                 sequence_number += 1;
             })
         };

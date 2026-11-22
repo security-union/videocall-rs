@@ -26,6 +26,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
+    traffic_shaping::{TrafficShapingBadge, TrafficShapingUi},
     video_control_buttons::{
         BabyModeButton, CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
         MicButton, PeerListButton, ScreenShareButton,
@@ -411,6 +412,9 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    // Hidden traffic shaping debug feature: per join, never persisted.
+    let traffic_shaping_revealed = use_signal(|| false);
+    let traffic_shaping_active = use_signal(|| false);
     let encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     // Feature-detected once; the browser's capabilities don't change.
@@ -768,8 +772,22 @@ pub fn AttendantsComponent(
         };
 
         let client = VideoCallClient::new(opts);
+        // Keep the badge in sync with the shaper, including a step test
+        // that turns itself off while the Diagnostics panel is closed.
+        // `try_write`: never panic on a signal that is already dropped; the
+        // listener is also cleared on unmount below.
+        client.set_on_traffic_shaping_changed(VcCallback::from(move |on: bool| {
+            let mut traffic_shaping_active = traffic_shaping_active;
+            if let Ok(mut active) = traffic_shaping_active.try_write() {
+                *active = on;
+            };
+        }));
         *client_for_reconnect.borrow_mut() = Some(client.clone());
         client
+    });
+    use_drop({
+        let client = client.clone();
+        move || client.clear_on_traffic_shaping_changed()
     });
 
     let mda = use_hook(|| {
@@ -894,6 +912,10 @@ pub fn AttendantsComponent(
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
+    use_context_provider(|| TrafficShapingUi {
+        revealed: traffic_shaping_revealed,
+        active: traffic_shaping_active,
+    });
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
     use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
@@ -1191,6 +1213,7 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
+            TrafficShapingBadge {}
             div {
                 id: "main-container",
                 class: if locked { "meeting-page baby-mode-active" } else { "meeting-page" },

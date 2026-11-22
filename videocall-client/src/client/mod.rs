@@ -18,4 +18,5 @@
 
 mod video_call_client;
 
+pub(crate) use video_call_client::send_media_to_transport;
 pub use video_call_client::{VideoCallClient, VideoCallClientOptions};

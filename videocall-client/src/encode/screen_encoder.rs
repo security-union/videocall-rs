@@ -48,7 +48,10 @@ use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
+use super::encoder_dimensions::{fit_to_tier, visible_size};
 use super::encoder_state::EncoderState;
+use super::holds_reader;
+use super::keyframe_schedule::KeyframeSchedule;
 use super::transform::transform_screen_chunk;
 
 use crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
@@ -98,6 +101,12 @@ pub struct ScreenEncoder {
     /// original capture track is stopped; stopping a cloned track (e.g. from
     /// `MediaStream::clone()`) does **not** affect the indicator.
     active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
+    /// Reader of the frame stream, so `stop()` can cancel it at once. On
+    /// Safari the stream comes from the capture polyfill, whose worker holds
+    /// its own clone of the track; cancelling stops that clone too, which an
+    /// idle shared window (no frames, so no loop wake-up) would otherwise
+    /// keep alive.
+    active_reader: Rc<RefCell<Option<ReadableStreamDefaultReader>>>,
 }
 
 impl ScreenEncoder {
@@ -125,6 +134,7 @@ impl ScreenEncoder {
             screen_stream: Rc::new(RefCell::new(None)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
+            active_reader: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -216,6 +226,9 @@ impl ScreenEncoder {
             log::info!("stop: stopping original capture track to dismiss browser indicator");
             track.stop();
         }
+        if let Some(reader) = self.active_reader.borrow_mut().take() {
+            let _ = reader.cancel();
+        }
 
         // Synchronously stop all tracks from the stored (cloned) stream.
         // SAFETY: In WASM's single-threaded environment this lock can never be contended.
@@ -263,6 +276,7 @@ impl ScreenEncoder {
         let screen_stream = self.screen_stream.clone();
         let force_keyframe = self.force_keyframe.clone();
         let active_video_track = self.active_video_track.clone();
+        let active_reader = self.active_reader.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -430,8 +444,31 @@ impl ScreenEncoder {
             let width = track_settings.get_width().expect("width is None");
             let height = track_settings.get_height().expect("height is None");
             let local_bitrate: u32 = bitrate_kbps * 1000;
-            let screen_encoder_config =
-                VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
+
+            // Fixed until the bitrate controller redesign: the first screen
+            // tier's limits, as main effectively ran (its controller never
+            // changed them).
+            let tier = &SCREEN_QUALITY_TIERS[0];
+            let local_keyframe_interval = tier.keyframe_interval_frames;
+            let local_tier_max_width = tier.max_width;
+            let local_tier_max_height = tier.max_height;
+
+            // The initial config is fitted to the tier too: a 5K/6K display
+            // at raw size can exceed what the encoder accepts, and that
+            // configure error closes the encoder.
+            let (mut current_encoder_width, mut current_encoder_height) = fit_to_tier(
+                width as u32,
+                height as u32,
+                local_tier_max_width,
+                local_tier_max_height,
+            )
+            .unwrap_or((width as u32, height as u32));
+
+            let screen_encoder_config = VideoEncoderConfig::new(
+                get_video_codec_string(),
+                current_encoder_height,
+                current_encoder_width,
+            );
             screen_encoder_config.set_bitrate_f64(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
@@ -463,18 +500,19 @@ impl ScreenEncoder {
                 .readable()
                 .get_reader()
                 .unchecked_into::<ReadableStreamDefaultReader>();
+            active_reader.borrow_mut().replace(screen_reader.clone());
 
             let mut screen_frame_counter: u32 = 0;
-            let mut current_encoder_width = width as u32;
-            let mut current_encoder_height = height as u32;
+            let mut keyframe_schedule = KeyframeSchedule::new();
+            // Set after a dimension reconfigure; forces the next frame to be
+            // a keyframe.
+            let mut keyframe_after_reconfigure = false;
 
-            // Fixed until the bitrate controller redesign: the first screen
-            // tier's limits, as main effectively ran (its controller never
-            // changed them).
-            let tier = &SCREEN_QUALITY_TIERS[0];
-            let local_keyframe_interval = tier.keyframe_interval_frames;
-            let local_tier_max_width = tier.max_width;
-            let local_tier_max_height = tier.max_height;
+            // Whether a read that ended on `reader` means capture died on
+            // its own (see the comment at the call sites).
+            let capture_lost = |reader: &ReadableStreamDefaultReader| {
+                holds_reader(&active_reader, reader) && enabled.load(Ordering::Acquire)
+            };
 
             loop {
                 // Check if we should stop encoding
@@ -498,24 +536,30 @@ impl ScreenEncoder {
                         };
 
                         if value.is_undefined() {
-                            error!("Screen share stream ended");
+                            // stop() takes the reader out of the slot before
+                            // cancelling it, and the browser's "Stop sharing"
+                            // clears `enabled` in the onended handler. Either
+                            // way the end is expected.
+                            if capture_lost(&screen_reader) {
+                                error!("Screen share stream ended unexpectedly");
+                            } else {
+                                info!("Screen share stream ended");
+                            }
                             break;
                         }
 
                         let video_frame = value.unchecked_into::<VideoFrame>();
-                        let frame_width = video_frame.display_width();
-                        let frame_height = video_frame.display_height();
-                        // Constrain to tier max dimensions.
-                        let frame_width = if frame_width > 0 {
-                            (frame_width as u32).min(local_tier_max_width)
-                        } else {
-                            0
-                        };
-                        let frame_height = if frame_height > 0 {
-                            (frame_height as u32).min(local_tier_max_height)
-                        } else {
-                            0
-                        };
+                        // Constrain to tier max dimensions, scaling both sides
+                        // by one factor so a portrait window or monitor is
+                        // shrunk instead of squashed.
+                        let (source_width, source_height) = visible_size(&video_frame);
+                        let (frame_width, frame_height) = fit_to_tier(
+                            source_width,
+                            source_height,
+                            local_tier_max_width,
+                            local_tier_max_height,
+                        )
+                        .unwrap_or((0, 0));
 
                         if frame_width > 0
                             && frame_height > 0
@@ -539,18 +583,27 @@ impl ScreenEncoder {
                                     "Error reconfiguring screen encoder with new dimensions: {e:?}"
                                 );
                             }
+                            // Receivers need a keyframe to decode the new size.
+                            keyframe_after_reconfigure = true;
                         }
 
                         let opts = VideoEncoderEncodeOptions::new();
                         // Check if a keyframe was requested via PLI.
                         let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
-                        // Use tier-controlled keyframe interval.
-                        // Using `%` instead of `.is_multiple_of()` for compatibility
-                        // with Rust toolchains older than 1.87.
-                        #[allow(clippy::manual_is_multiple_of)]
-                        let is_periodic_keyframe = local_keyframe_interval > 0
-                            && screen_frame_counter % local_keyframe_interval == 0;
-                        opts.set_key_frame(is_periodic_keyframe || pli_requested);
+                        let reconfigured = std::mem::take(&mut keyframe_after_reconfigure);
+                        // Tier keyframe interval; a forced keyframe restarts
+                        // the period, so no periodic one follows right after.
+                        let is_keyframe = keyframe_schedule.next_is_keyframe(
+                            local_keyframe_interval,
+                            pli_requested || reconfigured,
+                        );
+                        opts.set_key_frame(is_keyframe);
+                        if reconfigured {
+                            log::info!(
+                                "ScreenEncoder: forcing keyframe at frame {} (reconfigured)",
+                                screen_frame_counter
+                            );
+                        }
                         if pli_requested {
                             log::info!(
                                 "ScreenEncoder: forcing keyframe at frame {} (PLI)",
@@ -565,7 +618,11 @@ impl ScreenEncoder {
                         screen_frame_counter += 1;
                     }
                     Err(e) => {
-                        error!("Error reading screen frame: {e:?}");
+                        if capture_lost(&screen_reader) {
+                            error!("Error reading screen frame: {e:?}");
+                        } else {
+                            info!("Screen frame read ended by stop: {e:?}");
+                        }
                         break;
                     }
                 }
@@ -574,6 +631,12 @@ impl ScreenEncoder {
             // At the end of the loop, ensure proper cleanup
             // Clear the active track reference so stop() doesn't try to stop it again.
             active_video_track.borrow_mut().take();
+            // Release this loop's reader, and clear the shared slot only if a
+            // newer start() has not already replaced it.
+            let _ = screen_reader.cancel();
+            if holds_reader(&active_reader, &screen_reader) {
+                active_reader.borrow_mut().take();
+            }
             // Clear the onended handler before dropping the closure to avoid dangling reference
             media_track.set_onended(None);
 

@@ -17,20 +17,40 @@
  */
 
 mod camera_encoder;
+mod encoder_dimensions;
 mod encoder_state;
+mod keyframe_schedule;
 mod microphone_encoder;
 mod screen_encoder;
 mod transform;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::VideoCallClient;
 use videocall_types::Callback;
+use wasm_bindgen::JsValue;
+use web_sys::ReadableStreamDefaultReader;
 
 pub use camera_encoder::CameraEncoder;
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{ScreenEncoder, ScreenShareEvent};
+
+/// Whether `slot` still holds `reader` (the same JS object).
+///
+/// An encoder loop parks its reader in a shared slot so stop() can cancel
+/// it. stop() and a device switch take the reader out before cancelling, so
+/// a loop whose read ends while its reader is still in the slot was not
+/// stopped by us: capture ended on its own.
+fn holds_reader(
+    slot: &RefCell<Option<ReadableStreamDefaultReader>>,
+    reader: &ReadableStreamDefaultReader,
+) -> bool {
+    slot.borrow()
+        .as_ref()
+        .is_some_and(|held| JsValue::from(held) == JsValue::from(reader))
+}
 
 /// Trait to abstract over different microphone encoder implementations
 pub trait MicrophoneEncoderTrait {

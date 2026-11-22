@@ -64,6 +64,9 @@ jobs:
       - name: Run tests for neteq
         run: nix-shell default.nix -A shells.wasm-tests --run "cd neteq && cargo test --no-default-features --features web"
 
+      - name: Run dioxus-ui capture polyfill tests (node)
+        run: nix-shell default.nix -A shells.wasm-tests --run "node --test dioxus-ui/tests/js/track-processor.test.cjs"
+
   dioxus-ui-component-tests:
     name: Dioxus UI Component Tests
     runs-on: ubuntu-latest

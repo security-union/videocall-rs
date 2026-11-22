@@ -110,6 +110,7 @@ features = [
     "VideoEncoderEncodeOptions",
     "VideoFrame",
     "VideoFrameInit",
+    "DomRectReadOnly",
     "VideoTrack",
     "VideoDecoder",
     "VideoDecoderConfig",

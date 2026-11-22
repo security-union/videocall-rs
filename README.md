@@ -6,7 +6,7 @@
 
 **videocall.rs is an open-source, low-latency video conferencing platform and streaming API written entirely in Rust.** It is a WebRTC alternative built on WebTransport (HTTP/3 and QUIC) with an automatic WebSocket fallback, and it runs in the browser, on native devices through a command-line client, and on mobile through iOS and Android SDKs. It is self-hostable, dual-licensed under MIT and Apache-2.0, and built for real-time video streaming from robots, drones, and embedded Linux boards (Raspberry Pi, Jetson) as well as conventional browser-to-browser calls.
 
-**[Website](https://videocall.rs)** | **[Documentation](https://docs.videocall.rs)** | **[Discord](https://discord.gg/JP38NRe4CJ)** | **[Crates.io](https://crates.io/crates/videocall-cli)**
+**[Website](https://videocall.rs)** | **[Documentation](https://github.com/security-union/videocall-rs/tree/main/docs)** | **[Discord](https://discord.gg/JP38NRe4CJ)** | **[Crates.io](https://crates.io/crates/videocall-cli)**
 
 **Project status:** Beta. Actively developed and used in production for non-critical workloads.
 
@@ -340,7 +340,7 @@ Design goals still in progress (minimizing data copies on the media path, furthe
 - **Authentication.** JWT-based access control with SSO/OAuth integration.
 - **Access controls.** Meeting ownership, waiting rooms, and host controls (see [Meeting management](#meeting-management)).
 
-For the full model, see the [security architecture](https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md#security-architecture) and the [security documentation](https://docs.videocall.rs/security).
+For the full model, see the [security architecture](https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md#security-architecture) and the [security policy](SECURITY.md).
 
 ## Feature flags
 

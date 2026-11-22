@@ -315,40 +315,15 @@ While the lowest common denominator approach ensures accessibility for all parti
 
 ## Security Architecture
 
-### End-to-End Encryption
+### Encryption
 
-videocall.rs implements true end-to-end encryption (E2EE) using a hybrid RSA/AES approach:
+Media is encrypted in transit only:
 
-1. **Key Generation**:
-   - Each client generates an RSA key pair (2048 bits) for asymmetric encryption
-   - Each client generates an AES-128-CBC key and initialization vector (IV) for symmetric encryption
-
-2. **Key Exchange Protocol**:
-   - When a new participant joins a room, they broadcast their RSA public key in a `RSA_PUB_KEY` packet
-   - Upon receiving another participant's RSA public key, a client encrypts their AES key using the received RSA public key
-   - The encrypted AES key is sent back in an `AES_KEY` packet
-   - This results in a secure peer-to-peer key exchange with no server access to keys
-
-3. **Media Encryption**:
-   - All media frames (audio/video) are encrypted with the sender's AES key before transmission
-   - The encrypted data is wrapped in a `MEDIA` packet with appropriate metadata
-   - Encryption is performed by the `Aes128State` component in the client code
-
-4. **Media Decryption**:
-   - Receivers use the decrypted AES key from the sender to decrypt incoming media frames
-   - Decryption happens client-side in the browser or native client
-
-5. **Server Blindness**:
-   - The server never has access to unencrypted media content
-   - Encryption/decryption happens only at client endpoints
-
-### Transport Security
-
-1. **TLS/HTTPS**: All WebSocket connections are secured with TLS 1.3
-2. **QUIC Security**: WebTransport inherits QUIC's built-in encryption
+1. **TLS/HTTPS**: WebSocket connections are secured with TLS 1.3
+2. **QUIC Security**: WebTransport inherits QUIC's built-in TLS 1.3 encryption
 3. **Connection Validation**: Strict path and format validation for connection URLs
 
-This security model ensures that even if the server infrastructure is compromised, the media content remains confidential between participants.
+This protects traffic between each client and the relay server. videocall.rs does not have end-to-end encryption: the relay terminates the transport encryption and can see the media it forwards between participants. The client still contains older RSA/AES code (and the `RSA_PUB_KEY` and `AES_KEY` packet types still exist in the protocol), but it is inactive and not supported.
 
 ## Deployment Architecture
 

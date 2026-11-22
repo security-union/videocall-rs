@@ -1,0 +1,59 @@
+name: Feature request
+description: Suggest an idea or an improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Starting from the problem, rather than the solution, makes it a lot easier for us to figure out the right fix.
+
+        Just want to bounce an idea around first? [GitHub Discussions](https://github.com/security-union/videocall-rs/discussions) is a good place for that.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      placeholder: When I share my screen I can't see the other participants, so I miss when someone raises a hand.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to happen?
+      placeholder: Keep a small strip of participant tiles visible while screen sharing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Workarounds you use today, or other ways this could work.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Your best guess is fine.
+      options:
+        - Web UI (browser)
+        - Relay / media server (actix-api)
+        - Meeting API
+        - videocall-cli
+        - Mobile SDK (iOS / Android)
+        - Rust crates as a library (videocall-client, videocall-types, ...)
+        - Deployment (Helm / Nix)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Want to help build it?
+      description: Totally optional. See [CONTRIBUTING.md](https://github.com/security-union/videocall-rs/blob/main/CONTRIBUTING.md) if you do.
+      options:
+        - label: I'd like to work on this myself.
+          required: false

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/security-union/videocall-rs/security/advisories/new
+    about: Please don't open a public issue. Report it privately here.
+  - name: Ask a question or get help
+    url: https://github.com/security-union/videocall-rs/discussions
+    about: Setup questions, self-hosting help and ideas go in GitHub Discussions.
+  - name: Chat on Discord
+    url: https://discord.gg/JP38NRe4CJ
+    about: Talk with the maintainers and other users.

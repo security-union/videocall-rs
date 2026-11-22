@@ -44,7 +44,7 @@
 //! use videocall_client::Callback;
 //!
 //! let options = VideoCallClientOptions {
-//!     enable_e2ee: true,
+//!     enable_e2ee: false,
 //!     enable_webtransport: true,
 //!     on_peer_added: Callback::noop(),
 //!     on_peer_first_frame: Callback::noop(),

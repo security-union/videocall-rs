@@ -68,9 +68,9 @@ pub(crate) struct ReceivedVideo {
 
 impl ReceivedVideo {
     /// A camera frame from `peer` arrived at `arrival_ms` (monotonic clock).
-    /// Returns a report to send at once when a backlog just started. An
-    /// early report always carries a capacity: one without is not sent
-    /// early (the periodic tick carries it).
+    /// Returns a report to send at once when a backlog just started, with
+    /// or without a ceiling (before a busy period is measured the onset has
+    /// none, and the publisher drains on its backlog).
     pub(crate) fn on_frame(
         &mut self,
         peer: &str,
@@ -79,17 +79,15 @@ impl ReceivedVideo {
     ) -> Option<Report> {
         let frame = arrival.frame_info(arrival_ms);
         // Looked up first so the common case allocates no key.
-        let early_report = if let Some(estimator) = self.streams.get_mut(peer) {
-            estimator.on_frame(frame).early_report
-        } else {
-            let mut estimator = ViewerEstimator::new(ViewerConfig {
-                report_interval_ms: DIAGNOSTICS_REPORT_INTERVAL_MS as f64,
-            });
-            let early_report = estimator.on_frame(frame).early_report;
-            self.streams.insert(peer.to_string(), estimator);
-            early_report
-        };
-        early_report.filter(|report| report.capacity_bps.is_some())
+        if let Some(estimator) = self.streams.get_mut(peer) {
+            return estimator.on_frame(frame).early_report;
+        }
+        let mut estimator = ViewerEstimator::new(ViewerConfig {
+            report_interval_ms: DIAGNOSTICS_REPORT_INTERVAL_MS as f64,
+        });
+        let early_report = estimator.on_frame(frame).early_report;
+        self.streams.insert(peer.to_string(), estimator);
+        early_report
     }
 
     /// The periodic report about `peer`'s camera stream. `None` means send
@@ -163,6 +161,34 @@ mod tests {
         // A clean path never queued: the report has no ceiling.
         assert_eq!(report.capacity_bps, None);
         assert_eq!(report.backlog_ms, 0.0);
+    }
+
+    /// Every early report the estimator produces goes out, with or without
+    /// a ceiling: the crate sends the onset as (no ceiling, backlog) until a
+    /// busy period is measured, and the publisher drains on it. Checked
+    /// against a bare estimator fed the same frames.
+    #[test]
+    fn every_early_report_goes_out_as_the_estimator_made_it() {
+        let mut video = ReceivedVideo::default();
+        let mut bare = ViewerEstimator::new(ViewerConfig {
+            report_interval_ms: DIAGNOSTICS_REPORT_INTERVAL_MS as f64,
+        });
+        let mut early = 0;
+        for i in 0..200u64 {
+            let sent = i as f64 * FRAME_MS;
+            // A queue builds from frame 60 on, 20 ms more per frame.
+            let wait = i.saturating_sub(60) as f64 * 20.0;
+            let arrival = VideoArrival {
+                seq: i,
+                timestamp_us: sent * 1000.0,
+                bytes: 2_500,
+            };
+            let arrival_ms = sent + 40.0 + wait;
+            let expected = bare.on_frame(arrival.frame_info(arrival_ms)).early_report;
+            assert_eq!(video.on_frame("42", arrival, arrival_ms), expected);
+            early += usize::from(expected.is_some());
+        }
+        assert!(early > 0, "the ramp makes an onset");
     }
 
     #[test]

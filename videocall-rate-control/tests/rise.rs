@@ -227,3 +227,124 @@ fn with_no_reports_the_tier_is_the_start_rates() {
     }
     assert_eq!(tier, 0);
 }
+
+/// Round 5, A: a backlog says the path carries less than what is being
+/// sent. Without a ceiling the drain works from the rate in force, and it
+/// lowers the target at once.
+#[test]
+fn a_backlog_without_a_ceiling_drains_from_the_rate_in_force() {
+    // The start rate, well under the cap.
+    let mut publisher = MultiViewerPublisher::new(config());
+    let before = publisher.target_bps(0.0, RTT_MS);
+    let backlog = Report {
+        capacity_bps: None,
+        backlog_ms: 300.0,
+    };
+    publisher.on_report("a", 0.0, backlog);
+    let after = publisher.target_bps(0.0, RTT_MS);
+    // T = 600 ms: a 300 ms queue halves the rate for the drain.
+    assert!(
+        after <= before * 0.5 * 1.000_001,
+        "{:.0} -> {:.0} kbps",
+        before / 1000.0,
+        after / 1000.0
+    );
+}
+
+/// A, the other half: a measured ceiling above the cap with a backlog
+/// still drains when the queue is more than the slack between them.
+#[test]
+fn a_backlog_under_a_ceiling_above_the_cap_drains() {
+    let mut publisher = MultiViewerPublisher::new(config());
+    send(&mut publisher, 0.0, 10_000.0, &[("a", ceiling(3_000_000))]);
+    assert_eq!(publisher.target_bps(10_000.0, RTT_MS), 1_500_000.0);
+    let backlog = Report {
+        capacity_bps: Some(3_000_000),
+        backlog_ms: 450.0,
+    };
+    publisher.on_report("a", 10_000.0, backlog);
+    // 3 Mbps for (1 - 450/600) of a cycle: 750 kbps clears the queue.
+    let after = publisher.target_bps(10_000.0, RTT_MS);
+    assert!(after <= 750_000.0 * 1.000_001, "{:.0} kbps", after / 1000.0);
+}
+
+/// A, reconciled with the jitter onset: a small queue under a ceiling far
+/// above the rate in force is already being cleared by what is sent, so
+/// nothing drops.
+#[test]
+fn a_small_backlog_under_a_high_ceiling_needs_no_drain() {
+    // The jitter onset of `delivery_jitter_up_to_40_ms...` seed 2: a
+    // 936 kbps cap, a 57 ms queue measured draining at 1.58 Mbps.
+    let capped = PublisherConfig {
+        max_bps: 936_000.0,
+        ..config()
+    };
+    let mut publisher = MultiViewerPublisher::new(capped);
+    send(&mut publisher, 0.0, 10_000.0, &[("a", ceiling(3_000_000))]);
+    let backlog = Report {
+        capacity_bps: Some(1_580_000),
+        backlog_ms: 57.0,
+    };
+    publisher.on_report("a", 10_000.0, backlog);
+    // 1.58 Mbps x (1 - 57/600) = 1.43 Mbps clears it in a cycle; 936 kbps
+    // already does.
+    assert_eq!(publisher.target_bps(10_000.0, RTT_MS), 936_000.0);
+}
+
+/// B: viewers whose reports stop together (our own downlink stalls) cross
+/// the silence threshold on different frames; that is one event, one cut.
+#[test]
+fn viewers_going_quiet_together_cut_once() {
+    let mut publisher = MultiViewerPublisher::new(config());
+    let viewers = ["a", "b", "c", "d", "e"];
+    for (i, viewer) in viewers.iter().enumerate() {
+        publisher.on_report(*viewer, i as f64 * 100.0, ceiling(1_200_000));
+    }
+    let cuts = send(&mut publisher, 0.0, 10_000.0, &[]);
+    assert_eq!(cuts.len(), 1, "{cuts:?}");
+}
+
+/// C: an unchanged ceiling measured long ago is not a new measurement:
+/// when the lower viewer leaves, the target climbs by steps.
+#[test]
+fn an_unchanged_ceiling_does_not_lift_when_a_lower_viewer_leaves() {
+    let mut publisher = MultiViewerPublisher::new(config());
+    let both = [("narrow", ceiling(400_000)), ("wide", ceiling(1_200_000))];
+    send(&mut publisher, 0.0, 10_000.0, &both);
+    let before = publisher.target_bps(10_000.0, RTT_MS);
+    publisher.remove_viewer(&"narrow");
+    assert_paced(
+        &mut publisher,
+        10_000.0,
+        40_000.0,
+        &[("wide", ceiling(1_200_000))],
+        before,
+    );
+}
+
+/// L-a: after a lost link with nobody reporting, the rate climbs back to
+/// where a call runs without reports (the start rate), or stays at the
+/// held rate when that was higher; never on to the cap.
+#[test]
+fn a_lost_link_climbs_back_to_the_start_rate_or_the_held_one() {
+    for (ceiling_bps, expected) in [(400_000, 936_000.0), (1_150_000, 0.0)] {
+        let mut publisher = MultiViewerPublisher::new(config());
+        send(
+            &mut publisher,
+            0.0,
+            10_000.0,
+            &[("a", ceiling(ceiling_bps))],
+        );
+        let held = publisher.target_bps(10_000.0, RTT_MS);
+        publisher.on_link_lost(10_000.0, RTT_MS);
+        send(&mut publisher, 10_000.0, 120_000.0, &[]);
+        let end = publisher.target_bps(120_000.0, RTT_MS);
+        let expected = if expected > 0.0 { expected } else { held };
+        assert!(
+            (end - expected).abs() < 1.0,
+            "held {:.0}: ended at {:.0} kbps",
+            held / 1000.0,
+            end / 1000.0
+        );
+    }
+}

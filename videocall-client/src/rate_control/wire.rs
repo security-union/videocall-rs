@@ -131,6 +131,18 @@ mod tests {
         assert_eq!(read_report(&metrics), Some(no_ceiling(0.0)));
     }
 
+    /// The early onset report: a backlog, no ceiling yet.
+    #[test]
+    fn a_backlog_without_a_ceiling_survives_the_round_trip() {
+        let mut metrics = VideoMetrics::new();
+        write_report(&mut metrics, Some(no_ceiling(120.0)));
+        assert_eq!(
+            (metrics.capacity_kbps, metrics.backlog_ms),
+            (videocall_rate_control::NO_CEILING_KBPS, 120)
+        );
+        assert_eq!(read_report(&metrics), Some(no_ceiling(120.0)));
+    }
+
     #[test]
     fn no_report_is_written_as_zero_and_read_as_none() {
         let mut metrics = VideoMetrics::new();

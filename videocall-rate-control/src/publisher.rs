@@ -69,15 +69,38 @@ impl PublisherConfig {
 }
 
 /// The policy itself: the target for a report of this age, bps. Pure.
+/// The rate in force is taken to be the maximum (the single-viewer
+/// [`Publisher`] keeps no other); see [`drain_target_in_force_bps`].
 pub fn drain_target_bps(config: &PublisherConfig, report: Report, age_ms: f64, rtt_ms: f64) -> f64 {
+    drain_target_in_force_bps(config, report, age_ms, rtt_ms, config.max_bps)
+}
+
+/// The policy with the rate in force, `in_force_bps`, known.
+///
+/// A fresh backlog `Q` says the path carries less than what is being sent.
+/// To clear it within one cycle `T` at the path's rate `C`, the target may
+/// be at most `C * (1 - Q/T)`: that is the whole drain rule, and it is
+/// capped by the rate in force, because sending less than that already
+/// clears the queue. With no ceiling, `C` is the rate in force (all that is
+/// known is that it is too much). Never below `MIN_DRAIN_FRACTION` of the
+/// lower of the two.
+///
+/// One rule covers both edges: a ceiling above the cap with a real queue
+/// (3 Mbps, 450 ms) drains to 750 kbps, while a jitter onset (1.58 Mbps,
+/// 57 ms) under a 936 kbps rate is already being cleared and changes
+/// nothing.
+pub(crate) fn drain_target_in_force_bps(
+    config: &PublisherConfig,
+    report: Report,
+    age_ms: f64,
+    rtt_ms: f64,
+    in_force_bps: f64,
+) -> f64 {
     let floor = config.floor_bps.min(config.max_bps);
-    let capacity = match report.capacity_bps {
-        Some(bps) => (bps as f64).max(floor),
-        // No ceiling seen: nothing here bounds the rate, so the policy works
-        // from the maximum (a backlog still drains from it).
-        // `MultiViewerPublisher` always passes its own paced capacity.
-        None => config.max_bps,
-    };
+    let in_force = in_force_bps.min(config.max_bps);
+    let capacity = report
+        .capacity_bps
+        .map_or(in_force, |bps| (bps as f64).max(floor));
     let cycle = config.cycle_ms(rtt_ms);
     let backlog = report.backlog_ms;
     let fresh = age_ms <= config.fresh_ms(rtt_ms);
@@ -86,7 +109,9 @@ pub fn drain_target_bps(config: &PublisherConfig, report: Report, age_ms: f64, r
     } else if backlog > 0.0 {
         let drain_ms = cycle.max(backlog / (1.0 - MIN_DRAIN_FRACTION));
         if age_ms < drain_ms {
-            capacity * (1.0 - backlog / cycle).max(MIN_DRAIN_FRACTION)
+            (capacity * (1.0 - backlog / cycle))
+                .max(capacity.min(in_force) * MIN_DRAIN_FRACTION)
+                .min(in_force)
         } else {
             capacity
         }

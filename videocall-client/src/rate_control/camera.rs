@@ -120,6 +120,10 @@ struct AcceptedReport {
     backlog: bool,
 }
 
+/// The least time between keyframe requests after refused hand-offs, ms:
+/// one report period.
+pub(crate) const KEYFRAME_REQUEST_SPACING_MS: f64 = DIAGNOSTICS_REPORT_INTERVAL_MS as f64;
+
 /// What happened to one encoded camera chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HandOff {
@@ -144,8 +148,9 @@ pub(crate) enum HandOff {
 /// caller is told to ask the encoder for one. The deltas already queued in
 /// the encoder arrive before it and are held too.
 ///
-/// Requests are paced: at most one per feedback cycle (report period plus
-/// round trip, [`CameraRateController::feedback_cycle_ms`]). A send path
+/// Requests are paced: at most one per [`KEYFRAME_REQUEST_SPACING_MS`]. What
+/// is paced is the local send buffer, not the round trip, so the spacing is
+/// fixed: one far viewer's RTT must not freeze everyone longer. A send path
 /// that keeps refusing (a reconnect, a WebSocket buffer hovering at its
 /// limit) would otherwise make every frame a keyframe, 5 to 15 times the
 /// size of a delta, which refills the very buffer that refused it. While
@@ -161,17 +166,15 @@ pub(crate) struct CameraOutput {
 impl CameraOutput {
     /// Hands one chunk off at `now_ms` with `send`, which builds the packet
     /// for the number it is given and returns whether the send path took
-    /// it. `cycle_ms` is the feedback cycle that paces keyframe requests.
-    /// Returns the outcome and whether to force a keyframe.
+    /// it. Returns the outcome and whether to force a keyframe.
     pub(crate) fn hand_off(
         &mut self,
         is_keyframe: bool,
         now_ms: f64,
-        cycle_ms: f64,
         send: impl FnOnce(u64) -> bool,
     ) -> (HandOff, bool) {
         if self.awaiting_keyframe && !is_keyframe {
-            return (HandOff::Held, self.request(now_ms, cycle_ms));
+            return (HandOff::Held, self.request(now_ms));
         }
         if send(self.next) {
             self.next += 1;
@@ -179,15 +182,15 @@ impl CameraOutput {
             (HandOff::Sent, false)
         } else {
             self.awaiting_keyframe = true;
-            (HandOff::Refused, self.request(now_ms, cycle_ms))
+            (HandOff::Refused, self.request(now_ms))
         }
     }
 
-    /// Whether to ask for a keyframe now: at most once per cycle.
-    fn request(&mut self, now_ms: f64, cycle_ms: f64) -> bool {
+    /// Whether to ask for a keyframe now: at most once per spacing.
+    fn request(&mut self, now_ms: f64) -> bool {
         if self
             .last_request_ms
-            .is_some_and(|last| now_ms - last < cycle_ms)
+            .is_some_and(|last| now_ms - last < KEYFRAME_REQUEST_SPACING_MS)
         {
             return false;
         }
@@ -388,11 +391,6 @@ impl CameraRateController {
     pub fn remove_viewer(&mut self, viewer: u64) {
         self.last_report.remove(&viewer);
         self.publisher.remove_viewer(&viewer);
-    }
-
-    /// The feedback cycle, ms: one report period plus the round trip.
-    pub fn feedback_cycle_ms(&self) -> f64 {
-        self.publisher.config().cycle_ms(self.rtt_ms)
     }
 
     /// A camera frame was handed to the transport at `now_ms`. This is how
@@ -898,8 +896,8 @@ mod tests {
 
     /// Runs `chunks` (keyframe?, accepted?) through a `CameraOutput`.
     /// Returns (numbers sent, outcomes, keyframe requests).
-    /// The feedback cycle the tests run with (report period, no RTT).
-    const CYCLE_MS: f64 = DIAGNOSTICS_REPORT_INTERVAL_MS as f64;
+    /// The request spacing.
+    const CYCLE_MS: f64 = KEYFRAME_REQUEST_SPACING_MS;
 
     /// Runs `chunks` (keyframe?, accepted?), one per 30 fps frame.
     fn run_output(chunks: &[(bool, bool)]) -> (Vec<u64>, Vec<HandOff>, usize) {
@@ -916,7 +914,7 @@ mod tests {
         let mut requests = 0;
         for (n, (is_keyframe, accept)) in chunks.iter().copied().enumerate() {
             let at = start_ms + n as f64 * FRAME_MS;
-            let (outcome, request) = output.hand_off(is_keyframe, at, CYCLE_MS, |seq| {
+            let (outcome, request) = output.hand_off(is_keyframe, at, |seq| {
                 if accept {
                     sent.push(seq);
                 }
@@ -1007,7 +1005,7 @@ mod tests {
         // Ten refusals in a row, every chunk a keyframe as asked: 333 ms.
         let (_, _, requests) = run_output_from(&mut output, 0.0, &[(KEY, false); 10]);
         assert_eq!(requests, 1);
-        // Three seconds of refusals: one request per 500 ms cycle at most.
+        // Three seconds of refusals: one request per 500 ms at most.
         let (_, _, requests) = run_output_from(&mut output, 400.0, &[(KEY, false); 90]);
         assert!(requests <= 7, "{requests} requests in 3 s");
         // Hand-off resumes: deltas still held until a keyframe goes out.
@@ -1018,6 +1016,17 @@ mod tests {
         );
         assert_eq!(outcomes, vec![HandOff::Held, HandOff::Sent, HandOff::Sent]);
         assert_eq!(sent, vec![0, 1]);
+    }
+
+    /// The pacing is the local send buffer's, not the round trip's: a
+    /// fixed report period, whatever the viewers' RTT.
+    #[test]
+    fn requests_are_paced_by_the_report_period() {
+        let mut output = CameraOutput::default();
+        let refuse = |output: &mut CameraOutput, at: f64| output.hand_off(KEY, at, |_| false).1;
+        assert!(refuse(&mut output, 0.0));
+        assert!(!refuse(&mut output, CYCLE_MS - 1.0));
+        assert!(refuse(&mut output, CYCLE_MS));
     }
 
     /// Deltas held past a cycle with no keyframe in sight ask again, so a
@@ -1044,6 +1053,15 @@ mod tests {
             !camera.on_report(2, 1_200.0, report(500, 200)),
             "not an onset"
         );
+    }
+
+    /// The onset report without a ceiling counts as an onset too.
+    #[test]
+    fn a_no_ceiling_onset_report_is_never_dropped() {
+        let mut camera = controller();
+        assert!(camera.on_report(2, 1_000.0, no_ceiling(0)));
+        assert!(camera.on_report(2, 1_050.0, no_ceiling(150)), "onset");
+        assert_eq!(camera.stats(1_050.0).backlog_ms, Some(150));
     }
 
     /// A hostile viewer alternating zero and non-zero backlog gains nothing:

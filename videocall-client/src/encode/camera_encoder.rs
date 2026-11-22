@@ -58,9 +58,7 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 use super::FrameRead;
 
-use crate::adaptive_quality_constants::{
-    CAMERA_KEYFRAME_INTERVAL_SECS, DIAGNOSTICS_REPORT_INTERVAL_MS,
-};
+use crate::adaptive_quality_constants::CAMERA_KEYFRAME_INTERVAL_SECS;
 use crate::constants::{get_video_codec, get_video_codec_string};
 use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
 use crate::rate_control::camera::{bitrate_change_applies, CameraOutput, HandOff, KeyframeClock};
@@ -233,6 +231,97 @@ impl EncoderHealth {
     /// Failures in a row so far.
     pub(crate) fn failures(&self) -> u32 {
         self.failures
+    }
+}
+
+/// The encoder's config as the encode loop tracks it: what it runs with, and
+/// the last config a working encoder refused.
+///
+/// Per WebCodecs a `configure()` that throws leaves a configured encoder on
+/// its previous config. Without remembering the refusal the loop would ask
+/// again on every frame ([`plan_reconfigure`] still sees the difference),
+/// and on VP8 every one of those asks wants a keyframe for the tier resize.
+/// So a refused config is not tried again (a different one may be), and a
+/// refused config never forces a keyframe.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct EncoderConfig {
+    /// What the encoder runs with; `None` before the first configure that
+    /// took, and after a recreate.
+    current: Option<CameraEncoderSettings>,
+    /// The last config a working encoder refused, until one takes.
+    refused: Option<CameraEncoderSettings>,
+}
+
+/// What a `configure()` attempt means for the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigureOutcome {
+    /// Took: the plan's keyframe applies.
+    Configured { keyframe: bool },
+    /// Refused by a working encoder: it keeps its old config, no keyframe.
+    Kept,
+    /// Refused by an encoder that was never configured: a failure.
+    Failed,
+}
+
+impl EncoderConfig {
+    #[cfg(test)]
+    fn current(&self) -> Option<CameraEncoderSettings> {
+        self.current
+    }
+
+    /// The encoder was (re)created: nothing configured, nothing refused.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// What to do for `wanted` ([`plan_reconfigure`]).
+    pub(crate) fn plan(
+        &self,
+        wanted: Wanted,
+        previous_source: Option<FrameSize>,
+        source: FrameSize,
+        keyframe_on_tier_resize: bool,
+    ) -> Reconfigure {
+        // The same as the refused config is what would not reconfigure an
+        // encoder running it: same shape, a bitrate within the threshold.
+        let refused_again = self.refused.is_some_and(|refused| {
+            !plan_reconfigure(Some(refused), wanted, Some(source), source, false).configure
+        });
+        if refused_again {
+            return Reconfigure {
+                configure: false,
+                keyframe: false,
+            };
+        }
+        plan_reconfigure(
+            self.current,
+            wanted,
+            previous_source,
+            source,
+            keyframe_on_tier_resize,
+        )
+    }
+
+    /// The result of configuring `settings` as `planned`.
+    pub(crate) fn on_configure(
+        &mut self,
+        settings: CameraEncoderSettings,
+        planned: Reconfigure,
+        took: bool,
+    ) -> ConfigureOutcome {
+        if took {
+            self.current = Some(settings);
+            self.refused = None;
+            return ConfigureOutcome::Configured {
+                keyframe: planned.keyframe,
+            };
+        }
+        if configure_failure_counts(self.current.is_some()) {
+            ConfigureOutcome::Failed
+        } else {
+            self.refused = Some(settings);
+            ConfigureOutcome::Kept
+        }
     }
 }
 
@@ -463,24 +552,16 @@ impl CameraEncoder {
 
                 let is_keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
                 let now_ms = monotonic_now_ms();
-                // Keyframe requests after a refusal are paced by the
-                // feedback cycle (report period + RTT).
-                let cycle_ms = camera_rate
-                    .try_borrow()
-                    .map_or(DIAGNOSTICS_REPORT_INTERVAL_MS as f64, |camera_rate| {
-                        camera_rate.feedback_cycle_ms()
-                    });
-                let (outcome, request_keyframe) =
-                    output.hand_off(is_keyframe, now_ms, cycle_ms, |seq| {
-                        let (packet, is_keyframe) = transform_video_chunk(
-                            chunk,
-                            seq,
-                            buffer.as_mut_slice(),
-                            &userid,
-                            aes.clone(),
-                        );
-                        client.send_media_packet(packet, ShapedKind::Camera, is_keyframe)
-                    });
+                let (outcome, request_keyframe) = output.hand_off(is_keyframe, now_ms, |seq| {
+                    let (packet, is_keyframe) = transform_video_chunk(
+                        chunk,
+                        seq,
+                        buffer.as_mut_slice(),
+                        &userid,
+                        aes.clone(),
+                    );
+                    client.send_media_packet(packet, ShapedKind::Camera, is_keyframe)
+                });
                 if outcome == HandOff::Sent {
                     // Drives the quiet-viewer signal; skipped and held
                     // frames are not sent, so they do not count.
@@ -732,14 +813,22 @@ impl CameraEncoder {
             };
 
             let mut constant_bitrate = constant_bitrate;
-            let mut encoder_settings = None;
+            let mut encoder_config = EncoderConfig::default();
             if !start_size.is_empty() {
                 let settings = CameraEncoderSettings {
                     size: start_size,
                     ..start_settings
                 };
-                if configure_camera_encoder(&video_encoder, settings, &mut constant_bitrate) {
-                    encoder_settings = Some(settings);
+                let took =
+                    configure_camera_encoder(&video_encoder, settings, &mut constant_bitrate);
+                // A refusal here is retried by the first frame's plan.
+                let start = Reconfigure {
+                    configure: true,
+                    keyframe: false,
+                };
+                if let ConfigureOutcome::Configured { .. } =
+                    encoder_config.on_configure(settings, start, took)
+                {
                     camera_rate
                         .borrow_mut()
                         .on_encoder_configured(monotonic_now_ms());
@@ -811,7 +900,7 @@ impl CameraEncoder {
                             break;
                         }
                     }
-                    encoder_settings = None;
+                    encoder_config.reset();
                     recovered = true;
                 }
 
@@ -837,14 +926,10 @@ impl CameraEncoder {
                     probe_fraction: plan.probe_fraction,
                     draining: plan.draining,
                 };
-                let reconfigure = plan_reconfigure(
-                    encoder_settings,
-                    wanted,
-                    previous_source,
-                    source,
-                    keyframe_on_tier_resize,
-                );
+                let reconfigure =
+                    encoder_config.plan(wanted, previous_source, source, keyframe_on_tier_resize);
                 previous_source = Some(source);
+                let mut reconfigure_keyframe = false;
                 if reconfigure.configure {
                     let settings = wanted.settings;
                     log::debug!(
@@ -854,29 +939,35 @@ impl CameraEncoder {
                         settings.framerate,
                         settings.bitrate_bps
                     );
-                    if configure_camera_encoder(&video_encoder, settings, &mut constant_bitrate) {
-                        encoder_settings = Some(settings);
-                        camera_rate
-                            .borrow_mut()
-                            .on_encoder_configured(monotonic_now_ms());
-                    } else if configure_failure_counts(encoder_settings.is_some()) {
-                        // Never configured (a recreated encoder): it would
-                        // refuse every frame and no error callback fires.
-                        // The next frame recreates it, or gives up.
-                        error!("CameraEncoder: configure failed on an unconfigured encoder");
-                        encoder_failed.set(true);
-                        video_frame.close();
-                        continue;
+                    let took =
+                        configure_camera_encoder(&video_encoder, settings, &mut constant_bitrate);
+                    match encoder_config.on_configure(settings, reconfigure, took) {
+                        ConfigureOutcome::Configured { keyframe } => {
+                            reconfigure_keyframe = keyframe;
+                            camera_rate
+                                .borrow_mut()
+                                .on_encoder_configured(monotonic_now_ms());
+                        }
+                        // The encoder keeps its previous config and goes on
+                        // encoding; these settings are not tried again.
+                        ConfigureOutcome::Kept => {}
+                        ConfigureOutcome::Failed => {
+                            // Never configured (a recreated encoder): it
+                            // would refuse every frame and no error callback
+                            // fires. The next frame recreates it, or gives up.
+                            error!("CameraEncoder: configure failed on an unconfigured encoder");
+                            encoder_failed.set(true);
+                            video_frame.close();
+                            continue;
+                        }
                     }
-                    // Otherwise the encoder keeps its previous config and
-                    // goes on encoding; the next frame tries again.
                 }
 
                 let pli = force_keyframe.swap(false, Ordering::AcqRel);
                 if pli {
                     log::info!("CameraEncoder: forcing keyframe (PLI)");
                 }
-                let forced = pli || reconfigure.keyframe || std::mem::take(&mut recovered);
+                let forced = pli || reconfigure_keyframe || std::mem::take(&mut recovered);
                 let options = VideoEncoderEncodeOptions::new();
                 options.set_key_frame(keyframes.is_keyframe(timestamp_ms, forced));
                 if let Err(e) = video_encoder.encode_with_options(&video_frame, &options) {
@@ -1068,5 +1159,76 @@ mod tests {
     fn a_refused_reconfigure_of_a_working_encoder_is_not_a_failure() {
         assert!(!configure_failure_counts(true));
         assert!(configure_failure_counts(false));
+    }
+
+    /// A working encoder refuses a VP8 tier resize: it keeps its config,
+    /// the same settings are not tried again on the next frames, and no
+    /// frame is made a keyframe for it.
+    #[test]
+    fn a_refused_config_is_not_retried_and_forces_no_keyframe() {
+        let old = settings(1280, 720, 1_000_000, 30.0);
+        let smaller = settings(854, 480, 600_000, 30.0);
+        let mut config = EncoderConfig::default();
+        let first = config.plan(wanted(old, false), None, SOURCE, true);
+        assert!(first.configure && first.keyframe);
+        config.on_configure(old, first, true);
+
+        let resize = config.plan(wanted(smaller, false), Some(SOURCE), SOURCE, true);
+        assert!(resize.configure && resize.keyframe, "VP8 tier resize");
+        assert_eq!(
+            config.on_configure(smaller, resize, false),
+            ConfigureOutcome::Kept
+        );
+        assert_eq!(config.current(), Some(old));
+        for _ in 0..5 {
+            let again = config.plan(wanted(smaller, false), Some(SOURCE), SOURCE, true);
+            assert!(!again.configure && !again.keyframe, "not retried");
+        }
+        // RTT jitter on the refused bitrate is the same config.
+        let jitter = settings(854, 480, 601_000, 30.0);
+        let again = config.plan(wanted(jitter, false), Some(SOURCE), SOURCE, true);
+        assert!(!again.configure);
+    }
+
+    /// A different wanted config may be tried; one that takes clears the
+    /// refusal.
+    #[test]
+    fn a_different_config_is_tried_after_a_refusal() {
+        let old = settings(1280, 720, 1_000_000, 30.0);
+        let smaller = settings(854, 480, 600_000, 30.0);
+        let smallest = settings(640, 360, 400_000, 30.0);
+        let mut config = EncoderConfig::default();
+        let first = config.plan(wanted(old, false), None, SOURCE, true);
+        config.on_configure(old, first, true);
+        let resize = config.plan(wanted(smaller, false), Some(SOURCE), SOURCE, true);
+        config.on_configure(smaller, resize, false);
+        let other = config.plan(wanted(smallest, false), Some(SOURCE), SOURCE, true);
+        assert!(other.configure);
+        assert_eq!(
+            config.on_configure(smallest, other, true),
+            ConfigureOutcome::Configured { keyframe: true }
+        );
+        // The earlier refusal is forgotten: going back is tried.
+        let back = config.plan(wanted(smaller, false), Some(SOURCE), SOURCE, true);
+        assert!(back.configure);
+    }
+
+    /// A recreated encoder that refuses its first config is a failure, and
+    /// a reset forgets any refusal.
+    #[test]
+    fn a_refusal_before_any_config_is_a_failure() {
+        let wanted_settings = settings(1280, 720, 1_000_000, 30.0);
+        let mut config = EncoderConfig::default();
+        let first = config.plan(wanted(wanted_settings, false), None, SOURCE, false);
+        assert_eq!(
+            config.on_configure(wanted_settings, first, false),
+            ConfigureOutcome::Failed
+        );
+        config.reset();
+        assert!(
+            config
+                .plan(wanted(wanted_settings, false), Some(SOURCE), SOURCE, false)
+                .configure
+        );
     }
 }

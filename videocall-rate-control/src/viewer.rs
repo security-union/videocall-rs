@@ -386,9 +386,10 @@ impl ViewerEstimator {
             self.next_seq = self.pending.first_key_value().map(|(seq, _)| *seq);
         }
         // Frames released together are one instant: an early report carries
-        // the capacity after all of them.
+        // the ceiling after all of them, by the same definition as the
+        // periodic report (measured, or none).
         let early_report = early_report.map(|report: Report| Report {
-            capacity_bps: self.ceiling_bps().or(report.capacity_bps),
+            capacity_bps: self.ceiling_bps(),
             ..report
         });
         if early_report.is_some() {

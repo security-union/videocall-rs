@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use crate::actuator::{choose_tier, Tier};
-use crate::publisher::{drain_target_bps, PublisherConfig};
+use crate::publisher::{drain_target_bps, drain_target_in_force_bps, PublisherConfig};
 use crate::signal::{LimitSource, PacedCapacity};
 use crate::viewer::{Report, CAPACITY_WINDOW_MS};
 
@@ -122,8 +122,10 @@ pub struct MultiViewerPublisher<K: Ord> {
     capacity: PacedCapacity,
     /// The last relay signal taken (its own debounce).
     relay_signal_ms: f64,
-    /// The link was lost and no report has come since.
-    link_lost: bool,
+    /// The last quiet-viewer cut (its own debounce).
+    quiet_cut_ms: f64,
+    /// The link was lost and no report has come since: the rate held then.
+    link_lost: Option<f64>,
     /// A report with a measured ceiling arrived since the last update.
     measured_since_update: bool,
     /// Start of the current unbroken run of sent frames.
@@ -142,7 +144,8 @@ impl<K: Ord> MultiViewerPublisher<K> {
             latest: BTreeMap::new(),
             capacity: PacedCapacity::new(config.start_bps.min(config.max_bps)),
             relay_signal_ms: f64::NEG_INFINITY,
-            link_lost: false,
+            quiet_cut_ms: f64::NEG_INFINITY,
+            link_lost: None,
             measured_since_update: false,
             sending_since_ms: f64::NEG_INFINITY,
             last_sent_ms: f64::NEG_INFINITY,
@@ -173,16 +176,26 @@ impl<K: Ord> MultiViewerPublisher<K> {
     /// report without a capacity (that path never queued) sets no ceiling.
     /// It also ends the viewer's silence, if it was quiet.
     ///
-    /// A report with a ceiling is a measurement, and a rise it shows is
-    /// taken at the next update (the next sent frame) instead of one probe
-    /// step per cycle. What one viewer can do with it is bounded: the
+    /// A report whose ceiling is the viewer's first, or rose above its own
+    /// previous one, is a new measurement, and the rise is taken at the next update (the
+    /// next sent frame) instead of one probe step per cycle. What one viewer can do with it is bounded: the
     /// ceiling acted on is the lowest among the reports, so a huge one
     /// (hostile or mistaken) lifts nothing past the others; alone, it is
     /// bounded by the maximum, and its own next backlog report brings the
     /// target down at once. It never undoes a relay cut, which speaks for
     /// viewers that do not report.
     pub fn on_report(&mut self, viewer: K, now_ms: f64, report: Report) {
-        self.measured_since_update |= report.capacity_bps.is_some();
+        let previous = self
+            .latest
+            .get(&viewer)
+            .and_then(|state| state.report.capacity_bps);
+        // A new measurement: this viewer's first ceiling, or one above its
+        // own last. An unchanged ceiling measured minutes ago is old news.
+        self.measured_since_update |= match (previous, report.capacity_bps) {
+            (Some(before), Some(now)) => now > before,
+            (None, Some(_)) => true,
+            (_, None) => false,
+        };
         self.latest.insert(
             viewer,
             ViewerState {
@@ -191,7 +204,7 @@ impl<K: Ord> MultiViewerPublisher<K> {
                 quiet_cut: false,
             },
         );
-        self.link_lost = false;
+        self.link_lost = None;
     }
 
     /// The viewer left: its report no longer counts.
@@ -263,10 +276,15 @@ impl<K: Ord> MultiViewerPublisher<K> {
                 quiet = true;
             }
         }
-        if quiet {
-            self.cut(now_ms, rtt_ms, LimitSource::QuietViewer);
+        // Viewers whose reports stop together (our own downlink stalls, a
+        // relay hiccup) cross the threshold on different frames: one event,
+        // so at most one quiet cut per cycle. Each episode is still marked.
+        if !quiet || now_ms - self.quiet_cut_ms < self.config.cycle_ms(rtt_ms) {
+            return false;
         }
-        quiet
+        self.quiet_cut_ms = now_ms;
+        self.cut(now_ms, rtt_ms, LimitSource::QuietViewer);
+        true
     }
 
     /// The link to the relay was lost and every viewer is gone with it.
@@ -277,7 +295,7 @@ impl<K: Ord> MultiViewerPublisher<K> {
     pub fn on_link_lost(&mut self, now_ms: f64, rtt_ms: f64) {
         let held = self.target_bps(now_ms, rtt_ms);
         self.latest.clear();
-        self.link_lost = true;
+        self.link_lost = Some(held);
         self.capacity.hold(now_ms, held, LimitSource::LinkLost);
     }
 
@@ -291,8 +309,8 @@ impl<K: Ord> MultiViewerPublisher<K> {
     /// The capacity the reports alone give: the lowest ceiling, or the
     /// maximum when no report has one (no path has queued); never above the
     /// maximum (a capacity beyond anything that could be sent means
-    /// nothing). With no report: the start rate, or the maximum after a
-    /// lost link (the held rate climbs back).
+    /// nothing). With no report: the start rate, where a call runs without
+    /// reports; after a lost link, the higher of that and the rate held.
     fn raw_capacity_bps(&self, now_ms: f64, rtt_ms: f64) -> f64 {
         let max = self.config.max_bps;
         match self.combined(now_ms, rtt_ms) {
@@ -300,8 +318,12 @@ impl<K: Ord> MultiViewerPublisher<K> {
                 .report
                 .capacity_bps
                 .map_or(max, |bps| (bps as f64).min(max)),
-            None if self.link_lost => max,
-            None => self.config.start_bps.min(max),
+            None => self
+                .link_lost
+                .map_or(self.config.start_bps, |held| {
+                    held.max(self.config.start_bps)
+                })
+                .min(max),
         }
     }
 
@@ -438,8 +460,15 @@ impl<K: Ord> MultiViewerPublisher<K> {
         let Some(combined) = self.combined(now_ms, rtt_ms) else {
             return ceiling;
         };
-        // The policy on the reported capacity as is: a drain from a capacity
-        // above the cap is a drain from that capacity, not from the cap.
-        drain_target_bps(&self.config, combined.report, combined.age_ms, rtt_ms).min(ceiling)
+        // The rate in force is the paced ceiling: what is being sent when
+        // nothing drains.
+        drain_target_in_force_bps(
+            &self.config,
+            combined.report,
+            combined.age_ms,
+            rtt_ms,
+            ceiling,
+        )
+        .min(ceiling)
     }
 }

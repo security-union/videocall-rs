@@ -437,8 +437,9 @@ fn a_lost_link_holds_the_rate_and_grows_it_back() {
         publisher.target_bps(100.0 + 4.0 * CYCLE_MS, RTT_MS),
         held * probe.powi(4)
     ));
+    // Up to the start rate, where a call runs without reports.
     send_frames(&mut publisher, 3_000.0, 120_000.0);
-    assert!(close(publisher.target_bps(120_000.0, RTT_MS), 1_500_000.0));
+    assert!(close(publisher.target_bps(120_000.0, RTT_MS), 936_000.0));
     assert_eq!(publisher.limit(120_000.0, RTT_MS), None);
 }
 

@@ -140,23 +140,28 @@ fn a_measurement_does_not_undo_a_relay_cut() {
     );
 }
 
-/// A quiet viewer returning with a measurement is believed at once; its
-/// own report replaces the guess its silence stood for.
+/// A quiet viewer returning with a new measurement (its ceiling rose) is
+/// believed at once; returning with the same ceiling is old news and the
+/// target climbs back by steps.
 #[test]
 fn a_quiet_viewer_returning_with_a_measurement_is_believed() {
     let mut publisher = MultiViewerPublisher::new(config());
     drive(&mut publisher, 0.0, 1_000.0, &[("a", ceiling(1_000_000))]);
     drive(&mut publisher, 1_000.0, 5_000.0, &[]);
-    assert!(publisher.target_bps(5_000.0, RTT_MS) < 800_000.0);
+    let cut = publisher.target_bps(5_000.0, RTT_MS);
+    assert!(cut < 800_000.0);
+    let mut same = publisher.clone();
+    drive(&mut same, 5_000.0, 5_100.0, &[("a", ceiling(1_000_000))]);
+    assert!(same.target_bps(5_100.0, RTT_MS) <= cut * step() * 1.000_001);
     drive(
         &mut publisher,
         5_000.0,
         5_100.0,
-        &[("a", ceiling(1_000_000))],
+        &[("a", ceiling(1_100_000))],
     );
     let target = publisher.target_bps(5_100.0, RTT_MS);
     assert!(
-        (target - 1_000_000.0 * step()).abs() < 1.0,
+        (target - 1_100_000.0 * step()).abs() < 1.0,
         "{:.0} kbps",
         target / 1000.0
     );

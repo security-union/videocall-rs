@@ -25,7 +25,7 @@ The investigation covered five areas: adaptive bitrate control, network transpor
 - **Audio Codec:** Opus, 48 kHz, mono, 20ms frames
 - **Adaptive Bitrate:** (at the time of writing) PID controller (`pidgeon 0.3.1`) adjusting video bitrate from received FPS feedback; since replaced, see the note above
 - **Jitter Buffer:** RFC 3550 jitter estimation, adaptive playout delay (10–500ms), keyframe-gated decoding
-- **Encryption:** AES-128 per-packet encryption with RSA key exchange
+- **Encryption:** TLS 1.3 in transit (WebSocket over TLS, WebTransport over QUIC)
 
 ---
 
@@ -509,11 +509,11 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 
 **Problem:** Connection loss requires manual rejoin. Transient network blips kill the call.
 
-**Automatic behavior:** On connection loss, reconnection begins immediately with no user interaction. The system attempts reconnection at exponentially increasing intervals (`RECONNECT_INITIAL_DELAY_MS` × `RECONNECT_BACKOFF_MULTIPLIER` per attempt), capped at `RECONNECT_MAX_DELAY_MS`. After `RECONNECT_MAX_ATTEMPTS` failures, the system gives up and surfaces a "disconnected" state to the UI. On successful reconnect, the session resumes automatically — peer list, encryption keys, and room membership are preserved.
+**Automatic behavior:** On connection loss, reconnection begins immediately with no user interaction. The system attempts reconnection at exponentially increasing intervals (`RECONNECT_INITIAL_DELAY_MS` × `RECONNECT_BACKOFF_MULTIPLIER` per attempt), capped at `RECONNECT_MAX_DELAY_MS`. After `RECONNECT_MAX_ATTEMPTS` failures, the system gives up and surfaces a "disconnected" state to the UI. On successful reconnect, the session resumes automatically — peer list and room membership are preserved.
 
 **Solution:**
 - Implement reconnection state machine in connection_manager with states: Connected → Reconnecting → Reconnected / Failed
-- Preserve session state (room ID, peer list, encryption keys) during reconnect window
+- Preserve session state (room ID, peer list) during reconnect window
 - Re-trigger server election on successful reconnect
 - Emit connection state events to UI (reconnecting, reconnected, failed)
 - All timing controlled by constants in `adaptive_quality_constants.rs`

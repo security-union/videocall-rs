@@ -46,7 +46,8 @@ impl Task {
         }
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    /// Returns whether the packet was handed to the transport.
+    pub fn send_packet(&self, packet: PacketWrapper) -> bool {
         match self {
             Task::WebSocket(ws) => ws.send_packet(packet),
             Task::WebTransport(wt) => wt.send_packet(packet),
@@ -60,7 +61,9 @@ impl Task {
     /// `send_packet()` since WebSocket has no datagram concept.
     pub fn send_packet_datagram(&self, packet: PacketWrapper) {
         match self {
-            Task::WebSocket(ws) => ws.send_packet(packet),
+            Task::WebSocket(ws) => {
+                ws.send_packet(packet);
+            }
             Task::WebTransport(wt) => wt.send_packet_datagram(packet),
         }
     }

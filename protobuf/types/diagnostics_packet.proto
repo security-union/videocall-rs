@@ -23,6 +23,11 @@ message DiagnosticsPacket {
 message VideoMetrics {
   float fps_received = 1;      // Frames per second being received (fps)
   uint32 bitrate_kbps = 2;     // Current measured bitrate (kilobits per second)
+  // Viewer-driven rate control (camera stream only, see the
+  // videocall-rate-control crate). 0 in capacity_kbps means "no report":
+  // the viewer has no capacity estimate yet, or is an older client.
+  uint32 capacity_kbps = 3;    // What the path to this viewer carries (kbps), not what was received
+  uint32 backlog_ms = 4;       // Standing queue every frame currently waits behind (ms)
 }
 
 // Audio-specific diagnostic metrics

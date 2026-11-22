@@ -2744,3 +2744,88 @@ select {
     padding: 14px;
   }
 }
+
+/* Reception Stats: one row per remote peer and media type */
+.reception-stats-table {
+  font-size: 0.85em;
+}
+.reception-stats-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 4.5em 3em 5.5em 6.5em 5em;
+  gap: 8px;
+  padding: 2px 0;
+}
+.reception-stats-header {
+  color: #888;
+  font-weight: 600;
+  border-bottom: 1px solid #444;
+  padding-bottom: 4px;
+  margin-bottom: 2px;
+}
+.reception-stats-cell {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reception-stats-row:not(.reception-stats-header) .reception-stats-cell {
+  color: #fff;
+}
+.reception-stats-row:not(.reception-stats-header) .reception-stats-peer {
+  color: #ccc;
+}
+
+/* Diagnostics label / value tables (Encoders card) */
+.diagnostics-kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 12px;
+  font-size: 0.85em;
+}
+.diagnostics-kv + .diagnostics-kv {
+  margin-top: 2px;
+}
+.diagnostics-kv-label {
+  color: #888;
+}
+.diagnostics-kv-value {
+  color: #fff;
+  overflow-wrap: anywhere;
+}
+#diagnostics-sidebar .diagnostics-section p.diagnostics-kv-note {
+  margin: 0 0 2px;
+  font-size: 0.85em;
+  text-align: left;
+}
+
+/* NetEQ Current Status: the same label / value look, one row per value */
+.neteq-status {
+  font-size: 0.85em;
+}
+.neteq-status .status-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+  background: none;
+  border-radius: 0;
+  text-align: left;
+}
+.neteq-status .status-label {
+  font-size: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #888;
+}
+.neteq-status .status-value {
+  font-size: inherit;
+  font-weight: 400;
+  margin: 0;
+  color: #fff;
+  white-space: nowrap;
+}
+.neteq-status .status-value.good {
+  color: #27ae60;
+}
+.neteq-status .status-value.warning {
+  color: #e74c3c;
+}

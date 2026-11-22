@@ -8,6 +8,8 @@ use dioxus::prelude::*;
 /// - `enabled` – current on/off state
 /// - `on_toggle` – called with the *new* value when clicked
 /// - `width` / `height` – pill dimensions in px (defaults: 44×24)
+/// - `test_id` – optional `data-testid` for automation
+/// - `labelled_by` – optional id of the element that labels the switch
 #[component]
 pub fn ToggleSwitch(
     enabled: bool,
@@ -15,6 +17,8 @@ pub fn ToggleSwitch(
     #[props(default = 44)] width: u32,
     #[props(default = 24)] height: u32,
     #[props(default = false)] disabled: bool,
+    #[props(default)] test_id: Option<&'static str>,
+    #[props(default)] labelled_by: Option<&'static str>,
 ) -> Element {
     let knob_size = height.saturating_sub(4);
     let knob_left_on = width.saturating_sub(knob_size + 2);
@@ -31,6 +35,8 @@ pub fn ToggleSwitch(
             r#type: "button",
             role: "switch",
             aria_checked: "{enabled}",
+            "aria-labelledby": labelled_by,
+            "data-testid": test_id,
             disabled: disabled,
             style: format!(
                 "position: relative; width: {width}px; height: {height}px; border-radius: {border_radius}px; \

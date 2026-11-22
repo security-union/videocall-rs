@@ -19,9 +19,10 @@
 //! Centralized tuning constants for adaptive quality control.
 //!
 //! This file is the **single source of truth** for all adaptation parameters
-//! across the videocall-client crate. All network condition classification,
-//! quality tier definitions, PID controller tuning, keyframe intervals,
-//! reconnection timing, and polling intervals are defined here.
+//! across the videocall-client crate. Network condition classification,
+//! screen share and audio tier definitions, keyframe intervals, reconnection
+//! timing, and polling intervals are defined here. The camera's rate control
+//! and its tier ladder live in the `videocall-rate-control` crate.
 //!
 //! To tune the system's behavior, edit constants in this file only.
 //! No magic numbers should exist in encoder, decoder, or connection code.
@@ -53,14 +54,11 @@ pub const JITTER_POOR_MS: f64 = 100.0;
 pub const RTT_AVERAGING_WINDOW_SAMPLES: usize = 10;
 
 // ---------------------------------------------------------------------------
-// Video Quality Tiers
+// Screen Share Quality Tiers
 // ---------------------------------------------------------------------------
 
 /// A video quality tier bundles resolution, framerate, and bitrate bounds.
-///
-/// The system automatically selects the appropriate tier based on network
-/// conditions. Step-down moves to a lower tier when conditions worsen;
-/// step-up moves to a higher tier when conditions improve and stabilize.
+/// Screen share runs on the first of [`SCREEN_QUALITY_TIERS`].
 pub struct VideoQualityTier {
     pub label: &'static str,
     pub max_width: u32,
@@ -72,75 +70,8 @@ pub struct VideoQualityTier {
     pub keyframe_interval_frames: u32,
 }
 
-/// Video quality tiers, ordered from highest (index 0) to lowest.
-pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
-    VideoQualityTier {
-        label: "high",
-        max_width: 1280,
-        max_height: 720,
-        target_fps: 30,
-        ideal_bitrate_kbps: 1500,
-        min_bitrate_kbps: 800,
-        max_bitrate_kbps: 2500,
-        keyframe_interval_frames: 150, // ~5s at 30fps
-    },
-    VideoQualityTier {
-        label: "medium",
-        max_width: 854,
-        max_height: 480,
-        target_fps: 25,
-        ideal_bitrate_kbps: 600,
-        min_bitrate_kbps: 300,
-        max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 125, // ~5s at 25fps
-    },
-    VideoQualityTier {
-        label: "low",
-        max_width: 640,
-        max_height: 360,
-        target_fps: 15,
-        ideal_bitrate_kbps: 300,
-        min_bitrate_kbps: 150,
-        max_bitrate_kbps: 500,
-        keyframe_interval_frames: 75, // ~5s at 15fps
-    },
-    VideoQualityTier {
-        label: "minimal",
-        max_width: 426,
-        max_height: 240,
-        target_fps: 10,
-        ideal_bitrate_kbps: 150,
-        min_bitrate_kbps: 50,
-        max_bitrate_kbps: 250,
-        keyframe_interval_frames: 50, // ~5s at 10fps
-    },
-];
-
-/// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
-///
-/// Starting at the lowest tier ("minimal", 240p/10fps/150kbps) ensures the
-/// system only ever upgrades from the initial state. This eliminates the
-/// visible dimension-change oscillation that occurred when starting at
-/// "medium": the PID controller allocates ~300 kbps during warmup, but
-/// medium expects ~600 kbps, so bitrate_ratio drops below the degrade
-/// threshold and triggers a step-down. Starting at minimal means the first
-/// tier transition the user sees is a quality *improvement*, not a jarring
-/// resolution drop.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
-
-/// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
-///
-/// Screen share starts at the lowest tier ("low", 480p/5fps/250kbps) to
-/// match the camera strategy: only upgrade, never visibly downgrade. The
-/// PID controller will quickly ramp up resolution once it measures
-/// sufficient bandwidth, so text readability recovers within seconds.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 2; // "low"
-
-// ---------------------------------------------------------------------------
-// Screen Share Quality Tiers
-// ---------------------------------------------------------------------------
-
 /// Screen share quality tiers, ordered from highest (index 0) to lowest.
+/// Screen share uses the first one, at a fixed bitrate.
 pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
     VideoQualityTier {
         label: "high",
@@ -175,13 +106,11 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Audio Quality Tiers
+// Audio Quality
 // ---------------------------------------------------------------------------
 
-/// An audio quality tier defines bitrate and resilience settings.
-///
-/// Audio is the LAST to degrade and FIRST to recover, because intelligible
-/// audio is more critical than high-resolution video for communication.
+/// The microphone's encoder settings: bitrate and resilience. Audio is not
+/// rate controlled; it always runs at these.
 pub struct AudioQualityTier {
     pub label: &'static str,
     pub bitrate_kbps: u32,
@@ -189,124 +118,22 @@ pub struct AudioQualityTier {
     pub enable_fec: bool,
 }
 
-/// Audio quality tiers, ordered from highest (index 0) to lowest.
-pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
-    AudioQualityTier {
-        label: "high",
-        bitrate_kbps: 50,
-        enable_dtx: true,
-        enable_fec: false,
-    },
-    AudioQualityTier {
-        label: "medium",
-        bitrate_kbps: 32,
-        enable_dtx: true,
-        enable_fec: true, // enable FEC under moderate loss
-    },
-    AudioQualityTier {
-        label: "low",
-        bitrate_kbps: 24,
-        enable_dtx: true,
-        enable_fec: true,
-    },
-    AudioQualityTier {
-        label: "emergency",
-        bitrate_kbps: 16,
-        enable_dtx: true,
-        enable_fec: true,
-    },
-];
-
-// ---------------------------------------------------------------------------
-// Tier Transition Thresholds
-// ---------------------------------------------------------------------------
-
-/// Hysteresis configuration for automatic tier transitions.
-/// Step-down uses the "degrade" threshold; step-up uses the "recover" threshold.
-/// The gap between them prevents oscillation.
-///
-/// FPS ratio (received/target) below which we step DOWN one video tier.
-pub const VIDEO_TIER_DEGRADE_FPS_RATIO: f64 = 0.50;
-/// FPS ratio above which we step UP one video tier (must be sustained).
-pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.85;
-
-/// Bitrate ratio (actual/ideal) below which we step DOWN one video tier.
-pub const VIDEO_TIER_DEGRADE_BITRATE_RATIO: f64 = 0.40;
-/// Bitrate ratio above which we step UP one video tier (must be sustained).
-pub const VIDEO_TIER_RECOVER_BITRATE_RATIO: f64 = 0.75;
-
-/// Audio degrades only when video is already at lowest tier AND these thresholds hit.
-pub const AUDIO_TIER_DEGRADE_FPS_RATIO: f64 = 0.30;
-pub const AUDIO_TIER_RECOVER_FPS_RATIO: f64 = 0.60;
-
-/// How long conditions must remain "good" before stepping UP (milliseconds).
-/// Prevents rapid oscillation on unstable connections.
-pub const STEP_UP_STABILIZATION_WINDOW_MS: u64 = 5000;
-
-/// How quickly we step DOWN (milliseconds). Degradation is faster than recovery.
-pub const STEP_DOWN_REACTION_TIME_MS: u64 = 1500;
-
-/// Minimum time between any two tier transitions (milliseconds).
-/// Prevents rapid toggling even if thresholds are crossed quickly.
-pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 3000;
-
-/// Warmup grace period after the quality manager is created (milliseconds).
-///
-/// During encoder startup, no frames have been produced yet so `fps_ratio`
-/// reads as 0.0, which triggers aggressive step-downs (high -> low -> minimal).
-/// Once frames start flowing the manager steps back up, causing visible
-/// aspect-ratio glitches. This warmup period suppresses all tier transitions
-/// until the encoder has had time to produce stable output.
-pub const QUALITY_WARMUP_MS: f64 = 5000.0;
-
-// ---------------------------------------------------------------------------
-// PID Controller Tuning
-// ---------------------------------------------------------------------------
-
-/// PID controller gains for bitrate adaptation.
-pub const PID_KP: f64 = 0.2; // Proportional gain
-pub const PID_KI: f64 = 0.05; // Integral gain
-pub const PID_KD: f64 = 0.02; // Derivative gain
-
-/// PID deadband -- no correction within +/-DEADBAND FPS of target.
-pub const PID_DEADBAND_FPS: f64 = 0.5;
-
-/// PID output limits (maps to 0-90% bitrate reduction).
-pub const PID_OUTPUT_MIN: f64 = 0.0;
-pub const PID_OUTPUT_MAX: f64 = 50.0;
-
-/// Maximum jitter-based bitrate penalty (0.0-1.0).
-pub const PID_MAX_JITTER_PENALTY: f64 = 0.30;
-
-/// Minimum interval between PID corrections (milliseconds).
-pub const PID_CORRECTION_THROTTLE_MS: f64 = 1000.0;
-
-/// PID FPS history size for jitter calculation.
-pub const PID_FPS_HISTORY_SIZE: usize = 10;
-
-/// Longest time step (seconds) the PID integrates a single diagnostics report
-/// over. A report describes about one `DIAGNOSTICS_REPORT_INTERVAL_MS` of
-/// reception, so after a silence (backgrounded tab, lost reports on a lossy
-/// link) the next one must not be weighted as if it covered the whole gap.
-/// Three report intervals tolerate two lost reports in a row.
-/// The clamped step is the one handed to pidgeon, so it also scales the D
-/// term: the derivative after a long gap is the change over at most 3 s.
-pub const PID_MAX_DT_SEC: f64 = 3.0;
-
-// ---------------------------------------------------------------------------
-// Bitrate Change Threshold
-// ---------------------------------------------------------------------------
-
-/// Only apply a bitrate change if it exceeds this ratio of the current bitrate.
-/// Prevents tiny fluctuations from causing unnecessary encoder reconfigurations.
-pub const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
+/// The one audio setting the microphone uses.
+pub const AUDIO_QUALITY: AudioQualityTier = AudioQualityTier {
+    label: "high",
+    bitrate_kbps: 50,
+    enable_dtx: true,
+    enable_fec: false,
+};
 
 // ---------------------------------------------------------------------------
 // Keyframe & Error Recovery
 // ---------------------------------------------------------------------------
 
-/// Camera keyframe interval (frames). Also defined per-tier in `VIDEO_QUALITY_TIERS`.
-pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
+/// Camera periodic keyframe spacing (seconds). Converted to encoded frames
+/// at the current tier's frame rate, so every tier keeps the same spacing in
+/// time (150 frames at 30 fps).
+pub const CAMERA_KEYFRAME_INTERVAL_SECS: f64 = 5.0;
 
 /// Screen share keyframe interval (frames).
 /// Periodic keyframes ensure recovery from packet loss on screen share streams.
@@ -400,8 +227,10 @@ pub const HEARTBEAT_KEEPALIVE_INTERVAL_MS: u32 = 5000;
 /// microphone is disabled, avoiding unnecessary audio analysis work.
 pub const VAD_POLL_INTERVAL_MS: u32 = 50;
 
-/// Diagnostics reporting interval (milliseconds).
-pub const DIAGNOSTICS_REPORT_INTERVAL_MS: u64 = 1000;
+/// Period of the diagnostics report every viewer sends about each stream it
+/// receives (milliseconds). Also the report period the camera rate control
+/// is built around (`videocall-rate-control`'s report interval).
+pub const DIAGNOSTICS_REPORT_INTERVAL_MS: u64 = 500;
 
 /// RTT probe interval during server election (milliseconds).
 pub const RTT_PROBE_ELECTION_INTERVAL_MS: u64 = 200;
@@ -479,136 +308,6 @@ mod tests {
     use super::*;
 
     // =====================================================================
-    // Video Quality Tier validation
-    // =====================================================================
-
-    #[test]
-    fn test_video_tiers_not_empty() {
-        assert!(
-            !VIDEO_QUALITY_TIERS.is_empty(),
-            "VIDEO_QUALITY_TIERS must have at least one tier"
-        );
-    }
-
-    #[test]
-    fn test_video_tier_bitrate_ordering() {
-        for tier in VIDEO_QUALITY_TIERS {
-            assert!(
-                tier.min_bitrate_kbps < tier.max_bitrate_kbps,
-                "tier '{}': min_bitrate ({}) must be less than max_bitrate ({})",
-                tier.label,
-                tier.min_bitrate_kbps,
-                tier.max_bitrate_kbps,
-            );
-            assert!(
-                tier.ideal_bitrate_kbps >= tier.min_bitrate_kbps,
-                "tier '{}': ideal_bitrate ({}) must be >= min_bitrate ({})",
-                tier.label,
-                tier.ideal_bitrate_kbps,
-                tier.min_bitrate_kbps,
-            );
-            assert!(
-                tier.ideal_bitrate_kbps <= tier.max_bitrate_kbps,
-                "tier '{}': ideal_bitrate ({}) must be <= max_bitrate ({})",
-                tier.label,
-                tier.ideal_bitrate_kbps,
-                tier.max_bitrate_kbps,
-            );
-        }
-    }
-
-    #[test]
-    fn test_video_tier_resolutions_positive() {
-        for tier in VIDEO_QUALITY_TIERS {
-            assert!(
-                tier.max_width > 0 && tier.max_height > 0,
-                "tier '{}': resolution must be positive ({}x{})",
-                tier.label,
-                tier.max_width,
-                tier.max_height,
-            );
-        }
-    }
-
-    #[test]
-    fn test_video_tier_fps_positive() {
-        for tier in VIDEO_QUALITY_TIERS {
-            assert!(
-                tier.target_fps > 0,
-                "tier '{}': target_fps must be positive",
-                tier.label,
-            );
-        }
-    }
-
-    #[test]
-    fn test_video_tier_keyframe_interval_positive() {
-        for tier in VIDEO_QUALITY_TIERS {
-            assert!(
-                tier.keyframe_interval_frames > 0,
-                "tier '{}': keyframe_interval_frames must be positive",
-                tier.label,
-            );
-        }
-    }
-
-    #[test]
-    fn test_video_tiers_descending_resolution() {
-        // Tiers are ordered highest to lowest. Each tier should have
-        // resolution <= the previous tier.
-        for window in VIDEO_QUALITY_TIERS.windows(2) {
-            let higher = &window[0];
-            let lower = &window[1];
-            let higher_pixels = higher.max_width as u64 * higher.max_height as u64;
-            let lower_pixels = lower.max_width as u64 * lower.max_height as u64;
-            assert!(
-                higher_pixels >= lower_pixels,
-                "tier '{}' ({}px) should have >= pixels than tier '{}' ({}px)",
-                higher.label,
-                higher_pixels,
-                lower.label,
-                lower_pixels,
-            );
-        }
-    }
-
-    #[test]
-    fn test_video_tiers_descending_fps() {
-        for window in VIDEO_QUALITY_TIERS.windows(2) {
-            let higher = &window[0];
-            let lower = &window[1];
-            assert!(
-                higher.target_fps >= lower.target_fps,
-                "tier '{}' ({}fps) should have >= fps than tier '{}' ({}fps)",
-                higher.label,
-                higher.target_fps,
-                lower.label,
-                lower.target_fps,
-            );
-        }
-    }
-
-    #[test]
-    fn test_default_video_tier_index_in_bounds() {
-        assert!(
-            DEFAULT_VIDEO_TIER_INDEX < VIDEO_QUALITY_TIERS.len(),
-            "DEFAULT_VIDEO_TIER_INDEX ({}) out of bounds (len={})",
-            DEFAULT_VIDEO_TIER_INDEX,
-            VIDEO_QUALITY_TIERS.len(),
-        );
-    }
-
-    #[test]
-    fn test_default_screen_tier_index_in_bounds() {
-        assert!(
-            DEFAULT_SCREEN_TIER_INDEX < SCREEN_QUALITY_TIERS.len(),
-            "DEFAULT_SCREEN_TIER_INDEX ({}) out of bounds (len={})",
-            DEFAULT_SCREEN_TIER_INDEX,
-            SCREEN_QUALITY_TIERS.len(),
-        );
-    }
-
-    // =====================================================================
     // Screen Share Quality Tier validation
     // =====================================================================
 
@@ -659,104 +358,13 @@ mod tests {
     }
 
     // =====================================================================
-    // Audio Quality Tier validation
+    // Audio Quality validation
     // =====================================================================
 
     #[test]
-    fn test_audio_tiers_not_empty() {
-        assert!(
-            !AUDIO_QUALITY_TIERS.is_empty(),
-            "AUDIO_QUALITY_TIERS must have at least one tier"
-        );
-    }
-
-    #[test]
-    fn test_audio_tier_bitrate_positive() {
-        for tier in AUDIO_QUALITY_TIERS {
-            assert!(
-                tier.bitrate_kbps > 0,
-                "audio tier '{}': bitrate must be positive",
-                tier.label,
-            );
-        }
-    }
-
-    #[test]
-    fn test_audio_tiers_descending_bitrate() {
-        for window in AUDIO_QUALITY_TIERS.windows(2) {
-            let higher = &window[0];
-            let lower = &window[1];
-            assert!(
-                higher.bitrate_kbps >= lower.bitrate_kbps,
-                "audio tier '{}' ({}kbps) should have >= bitrate than '{}' ({}kbps)",
-                higher.label,
-                higher.bitrate_kbps,
-                lower.label,
-                lower.bitrate_kbps,
-            );
-        }
-    }
-
-    // =====================================================================
-    // Tier transition threshold validation
-    // =====================================================================
-
-    #[test]
-    fn test_hysteresis_gap_video() {
-        // Recovery threshold must be higher than degrade threshold to prevent oscillation.
-        assert!(
-            VIDEO_TIER_RECOVER_FPS_RATIO > VIDEO_TIER_DEGRADE_FPS_RATIO,
-            "recover FPS ratio ({}) must be > degrade FPS ratio ({})",
-            VIDEO_TIER_RECOVER_FPS_RATIO,
-            VIDEO_TIER_DEGRADE_FPS_RATIO,
-        );
-        assert!(
-            VIDEO_TIER_RECOVER_BITRATE_RATIO > VIDEO_TIER_DEGRADE_BITRATE_RATIO,
-            "recover bitrate ratio ({}) must be > degrade bitrate ratio ({})",
-            VIDEO_TIER_RECOVER_BITRATE_RATIO,
-            VIDEO_TIER_DEGRADE_BITRATE_RATIO,
-        );
-    }
-
-    #[test]
-    fn test_hysteresis_gap_audio() {
-        assert!(
-            AUDIO_TIER_RECOVER_FPS_RATIO > AUDIO_TIER_DEGRADE_FPS_RATIO,
-            "audio recover FPS ratio ({}) must be > degrade FPS ratio ({})",
-            AUDIO_TIER_RECOVER_FPS_RATIO,
-            AUDIO_TIER_DEGRADE_FPS_RATIO,
-        );
-    }
-
-    #[test]
-    fn test_step_up_slower_than_step_down() {
-        assert!(
-            STEP_UP_STABILIZATION_WINDOW_MS > STEP_DOWN_REACTION_TIME_MS,
-            "step-up window ({}) should be > step-down reaction time ({})",
-            STEP_UP_STABILIZATION_WINDOW_MS,
-            STEP_DOWN_REACTION_TIME_MS,
-        );
-    }
-
-    // =====================================================================
-    // PID controller constant validation
-    // =====================================================================
-
-    #[test]
-    fn test_pid_gains_non_negative() {
-        assert!(PID_KP >= 0.0, "PID_KP must be non-negative");
-        assert!(PID_KI >= 0.0, "PID_KI must be non-negative");
-        assert!(PID_KD >= 0.0, "PID_KD must be non-negative");
-    }
-
-    #[test]
-    fn test_pid_output_limits() {
-        assert!(
-            PID_OUTPUT_MIN < PID_OUTPUT_MAX,
-            "PID output min ({}) must be < max ({})",
-            PID_OUTPUT_MIN,
-            PID_OUTPUT_MAX,
-        );
+    fn test_audio_bitrate_positive() {
+        let bitrate_kbps = AUDIO_QUALITY.bitrate_kbps;
+        assert!(bitrate_kbps > 0, "audio bitrate must be positive");
     }
 
     // =====================================================================
@@ -768,40 +376,6 @@ mod tests {
         assert!(CONGESTION_DROP_THRESHOLD > 0);
         assert!(CONGESTION_WINDOW_MS > 0);
         assert!(CONGESTION_NOTIFY_MIN_INTERVAL_MS > 0);
-    }
-
-    // =====================================================================
-    // Tier index lookup
-    // =====================================================================
-
-    #[test]
-    fn test_video_tier_lookup_by_index() {
-        let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "minimal", "default tier should be 'minimal'");
-    }
-
-    #[test]
-    fn test_all_video_tiers_have_unique_labels() {
-        let labels: Vec<&str> = VIDEO_QUALITY_TIERS.iter().map(|t| t.label).collect();
-        for (i, label) in labels.iter().enumerate() {
-            for (j, other) in labels.iter().enumerate() {
-                if i != j {
-                    assert_ne!(label, other, "duplicate video tier label: {}", label);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_all_audio_tiers_have_unique_labels() {
-        let labels: Vec<&str> = AUDIO_QUALITY_TIERS.iter().map(|t| t.label).collect();
-        for (i, label) in labels.iter().enumerate() {
-            for (j, other) in labels.iter().enumerate() {
-                if i != j {
-                    assert_ne!(label, other, "duplicate audio tier label: {}", label);
-                }
-            }
-        }
     }
 }
 

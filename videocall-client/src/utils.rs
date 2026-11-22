@@ -95,3 +95,23 @@ pub fn is_firefox() -> bool {
         false
     })
 }
+
+/// Returns a monotonic, high-resolution timestamp in milliseconds using
+/// `performance.now()`. This is immune to NTP adjustments, DST changes, and
+/// user clock manipulation, unlike `js_sys::Date::now()`, making it safe
+/// for RTT, elapsed-time and rate-control calculations.
+///
+/// Falls back to `js_sys::Date::now()` when the Performance API is
+/// unavailable (e.g. some headless WASM runtimes).
+///
+/// The `Performance` object is looked up once per thread: this runs for
+/// every received camera frame.
+pub(crate) fn monotonic_now_ms() -> f64 {
+    thread_local! {
+        static PERFORMANCE: Option<web_sys::Performance> =
+            window().and_then(|w| w.performance());
+    }
+    PERFORMANCE
+        .with(|performance| performance.as_ref().map(|p| p.now()))
+        .unwrap_or_else(js_sys::Date::now)
+}

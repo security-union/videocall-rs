@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use futures::channel::mpsc::UnboundedReceiver;
 use gloo_utils::window;
 use js_sys::Array;
 use log::error;
@@ -25,8 +24,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -53,6 +50,7 @@ use super::{configure_encoder, keyframe_due, reconfigure_if_resized, FrameRead};
 
 use crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
 use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
+use crate::traffic_shaping::ShapedKind;
 
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
 ///
@@ -79,8 +77,7 @@ pub enum ScreenShareEvent {
 pub struct ScreenEncoder {
     client: VideoCallClient,
     state: EncoderState,
-    /// Fixed bitrate: screen share has no bitrate controller until the
-    /// controller redesign.
+    /// Fixed bitrate: the viewer-driven rate control drives the camera only.
     bitrate_kbps: u32,
     current_fps: Rc<AtomicU32>,
     on_state_change: Option<Callback<ScreenShareEvent>>,
@@ -107,7 +104,7 @@ impl ScreenEncoder {
     /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
     /// * `bitrate_kbps` - initial bitrate in kilobits per second
     /// * `on_encoder_settings_update` - unused: the screen share bitrate is
-    ///   fixed until the bitrate controller redesign, so it never changes
+    ///   fixed (rate control drives the camera only), so it never changes
     /// * `on_state_change` - callback for screen share state changes (started, cancelled, stopped)
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
@@ -128,16 +125,6 @@ impl ScreenEncoder {
             active_video_track: Rc::new(RefCell::new(None)),
             capture: ActiveCapture::default(),
         }
-    }
-
-    /// Does nothing and drops `diagnostics_receiver`: screen share keeps
-    /// its starting bitrate and resolution until the bitrate controller
-    /// redesign. Don't subscribe the screen to diagnostics.
-    #[deprecated(note = "screen share runs at a fixed bitrate; don't subscribe it to diagnostics")]
-    pub fn set_encoder_control(
-        &mut self,
-        _diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
     }
 
     /// Returns a handle to the active screen-share MediaStream.
@@ -375,14 +362,14 @@ impl ScreenEncoder {
                         buffer.resize(byte_length, 0);
                     }
 
-                    let packet: PacketWrapper = transform_screen_chunk(
+                    let (packet, is_keyframe) = transform_screen_chunk(
                         chunk,
                         sequence_number,
                         buffer.as_mut_slice(),
                         &userid,
                         aes.clone(),
                     );
-                    client.send_media_packet(packet);
+                    client.send_media_packet(packet, ShapedKind::Screen, is_keyframe);
                     sequence_number += 1;
                 })
             };
@@ -477,7 +464,7 @@ impl ScreenEncoder {
                     .unchecked_into::<ReadableStreamDefaultReader>(),
             );
 
-            // Fixed until the bitrate controller redesign: the first screen tier.
+            // Fixed: the first screen tier (rate control drives the camera only).
             let tier = &SCREEN_QUALITY_TIERS[0];
             let tier_cap = FrameSize::new(tier.max_width, tier.max_height);
             let mut keyframe_schedule = KeyframeSchedule::new();

@@ -1,0 +1,18 @@
+[package]
+name = "videocall-rate-control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Viewer-driven video rate control for videocall-rs: capacity and backlog measured by the viewer, drain/probe/hold target and tier choice on the publisher"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["congestion-control", "bitrate", "video", "videocall"]
+categories = ["network-programming", "multimedia::video"]
+readme = "README.md"
+
+# Pure std, no I/O, time passed in: builds for wasm32-unknown-unknown and
+# native alike.
+[dependencies]

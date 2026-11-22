@@ -25,9 +25,6 @@ mod microphone_encoder;
 mod screen_encoder;
 mod transform;
 
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
-
 use crate::constants::get_video_codec_string;
 use crate::VideoCallClient;
 use encoder_dimensions::FrameSize;
@@ -161,19 +158,12 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 }
 
 /// Factory function to create the appropriate microphone encoder based on platform detection.
-///
-/// `shared_audio_tier_bitrate` and `shared_audio_tier_fec` are optional shared
-/// atomics from the `CameraEncoder`. When provided, the microphone encoder
-/// reads the audio quality tier from the camera encoder's quality manager
-/// instead of creating its own `EncoderBitrateController`.
 pub fn create_microphone_encoder(
     client: VideoCallClient,
     bitrate_kbps: u32,
     on_encoder_settings_update: Callback<String>,
     on_error: Callback<String>,
     vad_threshold: Option<f32>,
-    shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
-    shared_audio_tier_fec: Option<Rc<AtomicBool>>,
 ) -> Box<dyn MicrophoneEncoderTrait> {
     Box::new(MicrophoneEncoder::new(
         client,
@@ -181,7 +171,5 @@ pub fn create_microphone_encoder(
         on_encoder_settings_update,
         on_error,
         vad_threshold,
-        shared_audio_tier_bitrate,
-        shared_audio_tier_fec,
     ))
 }

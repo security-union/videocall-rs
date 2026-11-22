@@ -60,7 +60,7 @@ impl FrameSize {
 
     /// The encoder size for a frame of this size under a quality tier `cap`.
     ///
-    /// The tier caps (`VIDEO_QUALITY_TIERS`, `SCREEN_QUALITY_TIERS`) are
+    /// The tier caps (the camera's rate-control tiers, `SCREEN_QUALITY_TIERS`) are
     /// written landscape but describe a resolution class, so the cap is
     /// turned to match the frame: a portrait 720x1280 frame fits a 1280x720
     /// tier as-is instead of being squashed to 720x720.

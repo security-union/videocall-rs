@@ -53,7 +53,7 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
         Ok(task)
     }
 
-    fn send_bytes(&self, bytes: Vec<u8>) {
-        self.send_binary(bytes);
+    fn send_bytes(&self, bytes: Vec<u8>) -> bool {
+        self.send_binary(bytes)
     }
 }

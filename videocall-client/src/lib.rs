@@ -112,8 +112,7 @@
 //! let mut camera = CameraEncoder::new(
 //!     client.clone(),
 //!     "video-element",
-//!     1000000, // 1 Mbps initial bitrate
-//!     Callback::noop(),
+//!     1000, // 1 Mbps cap; viewer-driven rate control never goes above it
 //!     Callback::noop() // on_error callback for camera errors
 //! );
 //! let mut microphone = create_microphone_encoder(
@@ -122,8 +121,6 @@
 //!     Callback::noop(),
 //!     Callback::noop(),
 //!     None, // vad_threshold
-//!     Some(camera.shared_audio_tier_bitrate()),
-//!     Some(camera.shared_audio_tier_fec()),
 //! );
 //! let mut screen = ScreenEncoder::new(
 //!     client,
@@ -195,6 +192,8 @@ pub mod diagnostics;
 pub mod encode;
 pub mod health_reporter;
 mod media_devices;
+pub mod rate_control;
+pub mod traffic_shaping;
 pub mod utils;
 mod wrappers;
 pub use client::{VideoCallClient, VideoCallClientOptions};

@@ -16,6 +16,7 @@ members = [
     "neteq",
     "videocall-diagnostics",
     "videocall-transport",
+    "videocall-rate-control",
     "matomo-logger"
 ]
 

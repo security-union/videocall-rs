@@ -100,8 +100,11 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
         Ok(task)
     }
 
-    fn send_bytes(&self, bytes: Vec<u8>) {
+    fn send_bytes(&self, bytes: Vec<u8>) -> bool {
+        // The stream is opened and written asynchronously; a failure there
+        // is only known later, so the hand-off itself counts.
         WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+        true
     }
 
     fn send_bytes_datagram(&self, bytes: Vec<u8>) {

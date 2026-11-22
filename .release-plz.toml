@@ -14,6 +14,14 @@ publish = true
 changelog_update = true
 git_release_enable = true
 
+# videocall-client depends on it by path + version, so it is published
+# with (and before) videocall-client.
+[[package]]
+name = "videocall-rate-control"
+publish = true
+changelog_update = true
+git_release_enable = true
+
 [[package]]
 name = "videocall-cli"
 publish = true

@@ -5283,15 +5283,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pidgeon"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaa1a4d35b319bb558310c51b40e004e468ed2516b84e29b207ce71e20d13ddd"
-dependencies = [
- "web-time",
-]
-
-[[package]]
 name = "pin-project"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8089,7 +8080,6 @@ dependencies = [
  "js-sys",
  "log",
  "neteq",
- "pidgeon",
  "prost",
  "protobuf",
  "rand 0.8.7",
@@ -8100,6 +8090,7 @@ dependencies = [
  "serde_json",
  "videocall-codecs",
  "videocall-diagnostics",
+ "videocall-rate-control",
  "videocall-transport",
  "videocall-types",
  "wasm-bindgen",
@@ -8241,6 +8232,10 @@ dependencies = [
  "thiserror 2.0.17",
  "wgpu",
 ]
+
+[[package]]
+name = "videocall-rate-control"
+version = "0.1.0"
 
 [[package]]
 name = "videocall-sdk"

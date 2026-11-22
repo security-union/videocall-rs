@@ -43,23 +43,11 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
 
+use crate::utils::monotonic_now_ms;
+
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
 const RTT_SANITY_MAX_MS: f64 = 10_000.0;
-
-/// Returns a monotonic, high-resolution timestamp in milliseconds using
-/// `performance.now()`. This is immune to NTP adjustments, DST changes, and
-/// user clock manipulation — unlike `js_sys::Date::now()` — making it safe
-/// for RTT and elapsed-time calculations.
-///
-/// Falls back to `js_sys::Date::now()` when the Performance API is
-/// unavailable (e.g. some headless WASM runtimes).
-fn monotonic_now_ms() -> f64 {
-    web_sys::window()
-        .and_then(|w| w.performance())
-        .map(|p| p.now())
-        .unwrap_or_else(js_sys::Date::now)
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
@@ -1487,18 +1475,19 @@ impl ConnectionManager {
     /// During re-election, the old active connection (preserved in
     /// `old_active_connection`) is used if the elected connection is no
     /// longer in the main connections HashMap.
-    pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
+    ///
+    /// `Ok(false)`: there is a connection but it dropped the packet at once
+    /// (not connected yet, a full WebSocket buffer).
+    pub fn send_packet(&self, packet: PacketWrapper) -> Result<bool> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             // Try the main connections HashMap first.
             if let Some(connection) = self.connections.get(active_id) {
-                connection.send_packet(packet);
-                return Ok(());
+                return Ok(connection.send_packet(packet));
             }
             // During re-election, the old connection lives in old_active_connection.
             if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
                 if old_id == active_id {
-                    old_conn.send_packet(packet);
-                    return Ok(());
+                    return Ok(old_conn.send_packet(packet));
                 }
             }
         }
@@ -1628,6 +1617,12 @@ impl ConnectionManager {
     /// Get current RTT measurements (for debugging)
     pub fn get_rtt_measurements(&self) -> &HashMap<String, ServerRttMeasurement> {
         &self.rtt_measurements
+    }
+
+    /// Averaged RTT to the server we are sending through, if measured.
+    pub fn active_server_rtt_ms(&self) -> Option<f64> {
+        let active = self.active_connection_id.borrow();
+        self.rtt_measurements.get(active.as_ref()?)?.average_rtt
     }
 
     /// Send RTT probes to all connected servers (can be called externally)
@@ -2713,7 +2708,7 @@ mod tests {
     }
 
     /// A manager whose inbound media goes where the client's would: the
-    /// SESSION_ASSIGNED handler hands the id to the sender diagnostics.
+    /// SESSION_ASSIGNED handler records our session id.
     fn manager_feeding_diagnostics(
         own_session_id: Rc<std::cell::Cell<Option<u64>>>,
     ) -> ConnectionManager {
@@ -2728,14 +2723,24 @@ mod tests {
 
     /// Normal join: SESSION_ASSIGNED arrives while the connection is still a
     /// candidate, then a re-election moves us to a new connection with a new
-    /// id. Reports about our stream must reach the encoder throughout.
+    /// id. Viewers' reports about our camera stream must count throughout.
     #[test]
     fn diagnostics_follow_the_session_id_across_elections() {
-        use crate::diagnostics::diagnostics_manager::SenderRoutingProbe;
+        use crate::rate_control::wire::camera_report_for;
+        use videocall_types::protos::diagnostics_packet::{DiagnosticsPacket, VideoMetrics};
 
         let diagnostics_id = Rc::new(std::cell::Cell::new(None));
         let mut mgr = manager_feeding_diagnostics(diagnostics_id.clone());
-        let mut probe = SenderRoutingProbe::new(diagnostics_id.clone());
+        // A viewer's camera report about the stream owned by `session`.
+        let report_counts = |session: u64| {
+            let mut packet = DiagnosticsPacket::new();
+            packet.sender_id = session.to_string();
+            packet.media_type = MediaType::VIDEO.into();
+            let mut metrics = VideoMetrics::new();
+            metrics.capacity_kbps = 800;
+            packet.video_metrics = ::protobuf::MessageField::some(metrics);
+            camera_report_for(&packet, diagnostics_id.get()).is_some()
+        };
 
         // First election: the id arrives before the connection is elected.
         let conn_a = mgr.create_inbound_media_callback("conn-a".to_string());
@@ -2748,7 +2753,7 @@ mod tests {
         }
         assert_eq!(*mgr.own_session_id.borrow(), Some(11));
         assert_eq!(diagnostics_id.get(), Some(11));
-        assert!(probe.report_reaches_encoder(11), "first election");
+        assert!(report_counts(11), "first election");
 
         // Re-election: the old connection stays active while conn-b is tested.
         let conn_b = mgr.create_inbound_media_callback("conn-b".to_string());
@@ -2762,8 +2767,8 @@ mod tests {
         }
         assert_eq!(*mgr.own_session_id.borrow(), Some(22));
         assert_eq!(diagnostics_id.get(), Some(22));
-        assert!(probe.report_reaches_encoder(22), "after re-election");
-        assert!(!probe.report_reaches_encoder(11), "old session's stream");
+        assert!(report_counts(22), "after re-election");
+        assert!(!report_counts(11), "old session's stream");
     }
 
     /// An id applied immediately (the connection was already elected) is

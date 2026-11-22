@@ -17,7 +17,7 @@
  */
 
 use crate::adaptive_quality_constants::{
-    AUDIO_QUALITY_TIERS, AUDIO_REDUNDANCY_ENABLED, AUDIO_RED_FORMAT, VAD_POLL_INTERVAL_MS,
+    AUDIO_QUALITY, AUDIO_REDUNDANCY_ENABLED, AUDIO_RED_FORMAT, VAD_POLL_INTERVAL_MS,
 };
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
@@ -29,6 +29,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
+use crate::traffic_shaping::ShapedKind;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
 use gloo::timers::callback::Interval;
@@ -40,7 +41,7 @@ use js_sys::WebAssembly;
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
     media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
@@ -176,13 +177,6 @@ pub struct MicrophoneEncoder {
     is_speaking: Rc<AtomicBool>,
     vad_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
-    /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
-    /// Shared with the camera encoder's quality manager.
-    /// Currently not read at runtime because the AudioWorklet does not
-    /// support dynamic bitrate reconfiguration. Kept for forward-
-    /// compatibility when the worklet gains that capability.
-    #[allow(dead_code)]
-    tier_audio_bitrate: Rc<AtomicU32>,
     /// Whether the current audio tier has FEC enabled.
     /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
     /// previous frame as redundant data for loss recovery.
@@ -190,25 +184,15 @@ pub struct MicrophoneEncoder {
 }
 
 impl MicrophoneEncoder {
-    /// Construct a microphone encoder.
-    ///
-    /// `shared_audio_tier_bitrate` and `shared_audio_tier_fec` are shared
-    /// atomics owned by the `CameraEncoder`. The camera encoder's quality
-    /// manager writes to these when the audio tier changes, and the
-    /// microphone encoder reads them to apply the current audio settings.
-    /// This avoids creating a duplicate `EncoderBitrateController` that
-    /// would redundantly process the same diagnostics packets.
+    /// Construct a microphone encoder. It runs at the first audio tier
+    /// ([`AUDIO_QUALITY`]).
     pub fn new(
         client: VideoCallClient,
         _bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
         on_error: Callback<String>,
         vad_threshold: Option<f32>,
-        shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
-        shared_audio_tier_fec: Option<Rc<AtomicBool>>,
     ) -> Self {
-        let default_audio_bitrate_bps = AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000;
-        let default_enable_fec = AUDIO_QUALITY_TIERS[0].enable_fec;
         Self {
             client,
             state: EncoderState::new(),
@@ -218,10 +202,7 @@ impl MicrophoneEncoder {
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
             vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
-            tier_audio_bitrate: shared_audio_tier_bitrate
-                .unwrap_or_else(|| Rc::new(AtomicU32::new(default_audio_bitrate_bps))),
-            tier_enable_fec: shared_audio_tier_fec
-                .unwrap_or_else(|| Rc::new(AtomicBool::new(default_enable_fec))),
+            tier_enable_fec: Rc::new(AtomicBool::new(AUDIO_QUALITY.enable_fec)),
         }
     }
 
@@ -358,7 +339,7 @@ impl MicrophoneEncoder {
                         aes.clone(),
                         red_ref,
                     );
-                    client_for_send.send_media_packet(packet);
+                    client_for_send.send_media_packet(packet, ShapedKind::Audio, false);
 
                     // Store current frame as the previous frame for the next
                     // iteration's redundancy payload.
@@ -546,12 +527,11 @@ impl MicrophoneEncoder {
             worklet.set_onprocessorerror(Some(processor_error.as_ref().unchecked_ref()));
             processor_error.forget();
 
-            // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
-            // and pass FEC/DTX settings from the initial audio tier.
+            // The fixed audio settings (AUDIO_QUALITY), FEC/DTX included.
             // NOTE: FEC and DTX require AudioWorklet support; the fields are
             // serialized here for forward-compatibility but the worklet currently
             // ignores them.  See audio_worklet_codec.rs for details.
-            let initial_tier = &AUDIO_QUALITY_TIERS[0];
+            let initial_tier = &AUDIO_QUALITY;
             let _ = codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
                     encoder_frame_size: Some(20), // 20ms frames for 50Hz rate

@@ -572,22 +572,31 @@ pub fn NetEqAdvancedChart(
     }
 }
 
-#[component]
-pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
-    let common_styles = r#"
-        .neteq-status { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; padding: 8px; }
-        .status-item { background: rgba(255, 255, 255, 0.05); border-radius: 8px; padding: 20px 16px; text-align: center; border: 1px solid rgba(255, 255, 255, 0.1); transition: all 0.2s ease; min-height: 120px; display: flex; flex-direction: column; justify-content: flex-start; align-items: center; gap: 8px; }
-        .status-item:hover { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.2); }
-        .status-value { font-size: 36px; font-weight: 700; line-height: 1; color: #ffffff; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); white-space: nowrap; margin: 0; padding: 0; }
-        .status-value.good { color: #10b981; }
-        .status-value.warning { color: #f59e0b; }
-        .status-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #d1d5db; line-height: 1.2; text-align: center; max-width: 100%; margin: 0; padding: 0; width: 100%; }
-        .status-subtitle { font-size: 9px; color: #9ca3af; line-height: 1.3; font-weight: 400; text-align: center; max-width: 100%; margin: 0; padding: 0; width: 100%; }
-    "#;
+/// One row of the "Current Status" table: label, value, the value's color
+/// class and a hint shown as a tooltip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetEqStatusRow {
+    pub label: &'static str,
+    pub value: String,
+    pub class: &'static str,
+    pub hint: &'static str,
+}
 
-    if let Some(stats) = latest_stats {
-        let buffer_class = if stats.buffer_ms == 0 {
+/// The "Current Status" rows for `stats`; every value reads "--" before the
+/// first report.
+pub fn neteq_status_rows(stats: Option<&NetEqStats>) -> Vec<NetEqStatusRow> {
+    let row = |label, hint, value: Option<String>, class| NetEqStatusRow {
+        label,
+        value: value.unwrap_or_else(|| "--".to_string()),
+        class: if stats.is_some() {
+            class
+        } else {
+            "status-value"
+        },
+        hint,
+    };
+    let buffer_class = stats.map_or("status-value", |stats| {
+        if stats.buffer_ms == 0 {
             "status-value warning"
         } else if stats.buffer_ms >= (stats.target_ms as f32 * 0.8) as u32
             && stats.buffer_ms <= (stats.target_ms as f32 * 1.2) as u32
@@ -595,49 +604,156 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
             "status-value good"
         } else {
             "status-value"
-        };
-        let underrun_class = if stats.underruns > 0 {
+        }
+    });
+    let underrun_class = stats.map_or("status-value", |stats| {
+        if stats.underruns > 0 {
             "status-value warning"
         } else {
             "status-value good"
-        };
-        let expand_str = format!("{:.1}", stats.expand_rate);
-        let accel_str = format!("{:.1}", stats.accel_rate);
+        }
+    });
+    let plain = "status-value";
+    vec![
+        row(
+            "Buffer (ms)",
+            "Audio data buffered for playback",
+            stats.map(|s| s.buffer_ms.to_string()),
+            buffer_class,
+        ),
+        row(
+            "Target (ms)",
+            "Optimal buffer size for network",
+            stats.map(|s| s.target_ms.to_string()),
+            plain,
+        ),
+        row(
+            "Packets",
+            "Encoded packets awaiting decode",
+            stats.map(|s| s.packets_awaiting_decode.to_string()),
+            plain,
+        ),
+        row(
+            "Packets/s",
+            "Audio packets received in the last second",
+            stats.map(|s| s.packets_per_sec.to_string()),
+            plain,
+        ),
+        row(
+            "Underruns",
+            "Times audio buffer ran empty",
+            stats.map(|s| s.underruns.to_string()),
+            underrun_class,
+        ),
+        row(
+            "Expand rate",
+            "Audio stretching when buffer low",
+            stats.map(|s| format!("{:.1}", s.expand_rate)),
+            plain,
+        ),
+        row(
+            "Accel rate",
+            "Audio compression when buffer full",
+            stats.map(|s| format!("{:.1}", s.accel_rate)),
+            plain,
+        ),
+        row(
+            "Reorder rate",
+            "Out-of-order packet frequency",
+            stats.map(|s| s.reorder_rate.to_string()),
+            plain,
+        ),
+        row(
+            "Reordered packets",
+            "Total packets received out-of-order",
+            stats.map(|s| s.reordered_packets.to_string()),
+            plain,
+        ),
+        row(
+            "Max reorder distance",
+            "Largest gap in packet sequence",
+            stats.map(|s| s.max_reorder_distance.to_string()),
+            plain,
+        ),
+    ]
+}
 
-        rsx! {
-            style { "{common_styles}" }
-            div { class: "neteq-status",
-                div { class: "status-grid",
-                    div { class: "status-item", div { class: "{buffer_class}", "{stats.buffer_ms}" } div { class: "status-label", "BUFFER (MS)" } div { class: "status-subtitle", "Audio data buffered for playback" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.target_ms}" } div { class: "status-label", "TARGET (MS)" } div { class: "status-subtitle", "Optimal buffer size for network" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.packets_awaiting_decode}" } div { class: "status-label", "PACKETS" } div { class: "status-subtitle", "Encoded packets awaiting decode" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.packets_per_sec}" } div { class: "status-label", "PACKETS/S" } div { class: "status-subtitle", "Audio packets received in the last second" } }
-                    div { class: "status-item", div { class: "{underrun_class}", "{stats.underruns}" } div { class: "status-label", "UNDERRUNS" } div { class: "status-subtitle", "Times audio buffer ran empty" } }
-                    div { class: "status-item", div { class: "status-value", "{expand_str}" } div { class: "status-label", "EXPAND RATE" } div { class: "status-subtitle", "Audio stretching when buffer low" } }
-                    div { class: "status-item", div { class: "status-value", "{accel_str}" } div { class: "status-label", "ACCEL RATE" } div { class: "status-subtitle", "Audio compression when buffer full" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.reorder_rate}" } div { class: "status-label", "REORDER RATE" } div { class: "status-subtitle", "Out-of-order packet frequency" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.reordered_packets}" } div { class: "status-label", "REORDERED PACKETS" } div { class: "status-subtitle", "Total packets received out-of-order" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.max_reorder_distance}" } div { class: "status-label", "MAX REORDER DISTANCE" } div { class: "status-subtitle", "Largest gap in packet sequence" } }
+/// NetEQ's current status as a compact label / value table. Each row keeps
+/// the `status-item` / `status-label` / `status-value` classes it had as a
+/// card; the table look comes from `.neteq-status` in style.css.
+#[component]
+pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
+    let rows = neteq_status_rows(latest_stats.as_ref());
+    rsx! {
+        div { class: "neteq-status",
+            for row in rows {
+                div { class: "status-item", title: row.hint,
+                    span { class: "status-label", "{row.label}" }
+                    span { class: row.class, "{row.value}" }
                 }
             }
         }
-    } else {
-        rsx! {
-            style { "{common_styles}" }
-            div { class: "neteq-status",
-                div { class: "status-grid",
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "BUFFER (MS)" } div { class: "status-subtitle", "Audio data buffered for playback" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "TARGET (MS)" } div { class: "status-subtitle", "Optimal buffer size for network" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "PACKETS" } div { class: "status-subtitle", "Encoded packets awaiting decode" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "PACKETS/S" } div { class: "status-subtitle", "Audio packets received in the last second" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "UNDERRUNS" } div { class: "status-subtitle", "Times audio buffer ran empty" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "EXPAND RATE" } div { class: "status-subtitle", "Audio stretching when buffer low" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "ACCEL RATE" } div { class: "status-subtitle", "Audio compression when buffer full" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "REORDER RATE" } div { class: "status-subtitle", "Out-of-order packet frequency" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "REORDERED PACKETS" } div { class: "status-subtitle", "Total packets received out-of-order" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "MAX REORDER DISTANCE" } div { class: "status-subtitle", "Largest gap in packet sequence" } }
-                }
-            }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(buffer_ms: u32, underruns: u64) -> NetEqStats {
+        let mut json = serde_json::json!({
+            "timestamp": 0, "buffer_ms": buffer_ms, "target_ms": 80,
+            "packets_awaiting_decode": 3, "packets_per_sec": 50,
+            "expand_rate": 1.3, "accel_rate": 0.0, "calls_per_sec": 100,
+            "avg_frames": 0, "underruns": underruns, "reorder_rate": 0,
+            "reordered_packets": 2, "max_reorder_distance": 1,
+            "sequence_number": 0, "rtp_timestamp": 0,
+        });
+        for op in [
+            "normal",
+            "expand",
+            "accelerate",
+            "fast_accelerate",
+            "preemptive_expand",
+            "merge",
+            "comfort_noise",
+            "dtmf",
+            "undefined",
+        ] {
+            json[format!("{op}_per_sec")] = serde_json::json!(0.0);
         }
+        serde_json::from_value(json).expect("fixture")
+    }
+
+    fn row<'a>(rows: &'a [NetEqStatusRow], label: &str) -> &'a NetEqStatusRow {
+        rows.iter()
+            .find(|row| row.label == label)
+            .unwrap_or_else(|| panic!("no row {label}"))
+    }
+
+    #[test]
+    fn ten_rows_with_their_values() {
+        let rows = neteq_status_rows(Some(&stats(80, 0)));
+        assert_eq!(rows.len(), 10);
+        assert_eq!(row(&rows, "Packets/s").value, "50");
+        assert_eq!(row(&rows, "Expand rate").value, "1.3");
+        assert_eq!(row(&rows, "Buffer (ms)").class, "status-value good");
+        assert_eq!(row(&rows, "Underruns").class, "status-value good");
+    }
+
+    #[test]
+    fn an_empty_buffer_and_underruns_warn() {
+        let rows = neteq_status_rows(Some(&stats(0, 4)));
+        assert_eq!(row(&rows, "Buffer (ms)").class, "status-value warning");
+        assert_eq!(row(&rows, "Underruns").class, "status-value warning");
+    }
+
+    #[test]
+    fn before_the_first_report_every_value_is_a_dash() {
+        let rows = neteq_status_rows(None);
+        assert_eq!(rows.len(), 10);
+        assert!(rows
+            .iter()
+            .all(|row| row.value == "--" && row.class == "status-value"));
     }
 }

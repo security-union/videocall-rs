@@ -40,6 +40,7 @@ neteq = { path = "../neteq", features = ["web"], version = "1.0.1", optional = t
 serde-wasm-bindgen = "0.6.5"
 serde_bytes = "0.11"
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.4" }
+videocall-rate-control = { path = "../videocall-rate-control", version = "0.1.0" }
 serde_json = { version = "1.0" }
 async-broadcast = "0.7.2"
 
@@ -109,6 +110,8 @@ features = [
     "VideoEncoder",
     "VideoEncoderInit",
     "VideoEncoderConfig",
+    "VideoEncoderBitrateMode",
+    "VideoEncoderSupport",
     "VideoEncoderEncodeOptions",
     "VideoFrame",
     "VideoFrameInit",
@@ -138,10 +141,6 @@ features = [
     "IntersectionObserverEntry",
     "IntersectionObserverInit",
 ]
-
-[dependencies.pidgeon]
-version = "1.0.1"
-features = ["wasm"]
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.20"

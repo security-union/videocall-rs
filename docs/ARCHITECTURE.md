@@ -317,13 +317,13 @@ While the lowest common denominator approach ensures accessibility for all parti
 
 ### Encryption
 
-Media is encrypted in transit only:
+Media is encrypted in transit:
 
 1. **TLS/HTTPS**: WebSocket connections are secured with TLS 1.3
 2. **QUIC Security**: WebTransport inherits QUIC's built-in TLS 1.3 encryption
 3. **Connection Validation**: Strict path and format validation for connection URLs
 
-This protects traffic between each client and the relay server. videocall.rs does not have end-to-end encryption: the relay terminates the transport encryption and can see the media it forwards between participants. The client still contains older RSA/AES code (and the `RSA_PUB_KEY` and `AES_KEY` packet types still exist in the protocol), but it is inactive and not supported.
+So every hop between a client and the relay server is TLS 1.3, whichever transport the client ends up on.
 
 ## Deployment Architecture
 

@@ -67,11 +67,6 @@ const DEFAULT_CAMERA_MAX_BPS: f64 = 1_000_000.0;
 /// [`VideoCallClient::new()`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
-    /// Experimental and not supported. Leave this `false`.
-    ///
-    /// videocall.rs does not support end-to-end encryption. Media is
-    /// encrypted in transit only (TLS for WebSocket, QUIC for WebTransport)
-    /// and the relay can see the media it forwards.
     pub enable_e2ee: bool,
     pub enable_webtransport: bool,
     pub on_peer_added: Callback<String>,

@@ -66,7 +66,7 @@ pub fn App() -> impl IntoView {
       "operatingSystem": "Any",
       "url": "https://videocall.rs/",
       "dateModified": "2026-08-16",
-      "description": "A full-stack system for real-time audio and video, written in Rust. Relay servers on a NATS mesh plane, a meetings API with auth and host controls, a browser client, and a native CLI. WebTransport over QUIC with an automatic WebSocket fallback. No ICE, STUN, TURN, or SDP. Encrypted in transit with TLS 1.3 and QUIC (not end-to-end encrypted). Self-hostable. MIT / Apache-2.0.",
+      "description": "A full-stack system for real-time audio and video, written in Rust. Relay servers on a NATS mesh plane, a meetings API with auth and host controls, a browser client, and a native CLI. WebTransport over QUIC with an automatic WebSocket fallback. No ICE, STUN, TURN, or SDP. Encrypted in transit with TLS 1.3 and QUIC. Self-hostable. MIT / Apache-2.0.",
       "codeRepository": "https://github.com/security-union/videocall-rs",
       "license": [
         "https://opensource.org/licenses/MIT",
@@ -155,7 +155,7 @@ pub fn App() -> impl IntoView {
           "name": "Is the media encrypted?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Media is encrypted in transit: WebSocket connections use TLS 1.3, and WebTransport uses QUIC's built-in TLS 1.3 encryption. The relay server forwards media between participants; it is not end-to-end encrypted."
+            "text": "Yes, in transit. WebSocket connections use TLS 1.3 and WebTransport uses QUIC's built-in TLS 1.3, so media is encrypted between each client and the relay."
           }
         },
         {

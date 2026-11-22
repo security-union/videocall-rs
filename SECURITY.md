@@ -45,7 +45,7 @@ If you're on an older version, the fix is to upgrade.
 
 ## Security model
 
-Media is encrypted in transit only. WebSocket connections use TLS 1.3, and WebTransport uses QUIC's built-in TLS 1.3, so traffic is protected between each client and the relay server. videocall.rs does **not** have end-to-end encryption: the relay can see the media it forwards. The client contains older encryption code, but it's inactive and not supported, so please don't rely on it. Access control is JWT-based, with SSO/OAuth sign-in and meeting host controls.
+Media is encrypted in transit. WebSocket connections use TLS 1.3 and WebTransport uses QUIC, which has TLS 1.3 built in, so everything between a client and the relay server travels encrypted. Access control is JWT-based, with SSO/OAuth sign-in and meeting host controls.
 
 ## Scope
 

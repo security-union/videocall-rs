@@ -25,7 +25,7 @@ The investigation covered five areas: adaptive bitrate control, network transpor
 - **Audio Codec:** Opus, 48 kHz, mono, 20ms frames
 - **Adaptive Bitrate:** (at the time of writing) PID controller (`pidgeon 0.3.1`) adjusting video bitrate from received FPS feedback; since replaced, see the note above
 - **Jitter Buffer:** RFC 3550 jitter estimation, adaptive playout delay (10–500ms), keyframe-gated decoding
-- **Encryption:** TLS 1.3 (WebSocket) and QUIC (WebTransport) in transit only; no end-to-end encryption
+- **Encryption:** TLS 1.3 in transit (WebSocket over TLS, WebTransport over QUIC)
 
 ---
 

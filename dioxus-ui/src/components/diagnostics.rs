@@ -534,7 +534,15 @@ pub fn Diagnostics(
             };
 
             let events = async move {
-                while let Ok(evt) = rx.recv().await {
+                loop {
+                    let evt = match rx.recv().await {
+                        Ok(evt) => evt,
+                        // Lagged: the channel overwrote events we had not
+                        // read yet. Keep reading; only a closed channel ends
+                        // the panel's updates.
+                        Err(_) if !rx.is_closed() => continue,
+                        Err(_) => break,
+                    };
                     match evt.subsystem {
                         "decoder" => {
                             // Latest stats per (peer, media type). The worker sends
@@ -655,8 +663,11 @@ pub fn Diagnostics(
                     }
                 }
             };
-            // Both end when the panel closes: the task is cancelled.
-            futures::future::join(events, refresh).await;
+            // Both stop when the channel closes (the refresh must not go on
+            // aging rows out of a table nothing feeds) or the task is
+            // cancelled when the panel closes.
+            futures::pin_mut!(events, refresh);
+            futures::future::select(events, refresh).await;
         });
         diag_task.set(Some(task));
     });

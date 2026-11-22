@@ -58,7 +58,9 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 use super::FrameRead;
 
-use crate::adaptive_quality_constants::CAMERA_KEYFRAME_INTERVAL_SECS;
+use crate::adaptive_quality_constants::{
+    CAMERA_KEYFRAME_INTERVAL_SECS, DIAGNOSTICS_REPORT_INTERVAL_MS,
+};
 use crate::constants::{get_video_codec, get_video_codec_string};
 use crate::diagnostics::frame_rate::{FrameEvent, FrameRateMeter};
 use crate::rate_control::camera::{bitrate_change_applies, CameraOutput, HandOff, KeyframeClock};
@@ -191,13 +193,16 @@ pub(crate) enum Recovery {
 }
 
 /// Encoder failures in a row within one capture. Failures add up until the
-/// encoder has produced output for [`HEALTHY_STRETCH_MS`]; after that a new
-/// failure is the first again, so a transient error hours into a call does
-/// not count against the ones at its start.
+/// encoder has produced two outputs [`HEALTHY_STRETCH_MS`] apart with no
+/// failure in between; after that a new failure is the first again, so a
+/// transient error hours into a call does not count against the ones at its
+/// start. Continuity between those two outputs is not checked: a pause in
+/// output (camera paused, frames skipped) is no failure, and any failure
+/// restarts the stretch.
 #[derive(Debug, Default)]
 pub(crate) struct EncoderHealth {
     failures: u32,
-    /// The first output since the last failure.
+    /// The first output since the last failure; the stretch starts here.
     healthy_since_ms: Option<f64>,
 }
 
@@ -229,6 +234,15 @@ impl EncoderHealth {
     pub(crate) fn failures(&self) -> u32 {
         self.failures
     }
+}
+
+/// Whether a `configure()` that threw counts as an encoder failure. Per
+/// WebCodecs a synchronous throw leaves a configured encoder on its previous
+/// config, still encoding: that is no failure, the old settings stay. A
+/// (recreated) encoder that was never configured refuses every frame and
+/// fires no error callback: that is one.
+pub(crate) fn configure_failure_counts(configured_before: bool) -> bool {
+    !configured_before
 }
 
 /// The camera encoder config: realtime, `framerate` set (without it the
@@ -268,14 +282,15 @@ fn configure_camera_encoder(
             *constant_bitrate = false;
         }
         Err(e) => {
-            error!("Error configuring video encoder: {e:?}");
+            // The caller decides whether this is a failure.
+            log::debug!("Error configuring video encoder: {e:?}");
             return false;
         }
     }
     match encoder.configure(&camera_encoder_config(settings, false)) {
         Ok(()) => true,
         Err(e) => {
-            error!("Error configuring video encoder: {e:?}");
+            log::debug!("Error configuring video encoder: {e:?}");
             false
         }
     }
@@ -447,22 +462,31 @@ impl CameraEncoder {
                 }
 
                 let is_keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
-                let (outcome, request_keyframe) = output.hand_off(is_keyframe, |seq| {
-                    let (packet, is_keyframe) = transform_video_chunk(
-                        chunk,
-                        seq,
-                        buffer.as_mut_slice(),
-                        &userid,
-                        aes.clone(),
-                    );
-                    client.send_media_packet(packet, ShapedKind::Camera, is_keyframe)
-                });
+                let now_ms = monotonic_now_ms();
+                // Keyframe requests after a refusal are paced by the
+                // feedback cycle (report period + RTT).
+                let cycle_ms = camera_rate
+                    .try_borrow()
+                    .map_or(DIAGNOSTICS_REPORT_INTERVAL_MS as f64, |camera_rate| {
+                        camera_rate.feedback_cycle_ms()
+                    });
+                let (outcome, request_keyframe) =
+                    output.hand_off(is_keyframe, now_ms, cycle_ms, |seq| {
+                        let (packet, is_keyframe) = transform_video_chunk(
+                            chunk,
+                            seq,
+                            buffer.as_mut_slice(),
+                            &userid,
+                            aes.clone(),
+                        );
+                        client.send_media_packet(packet, ShapedKind::Camera, is_keyframe)
+                    });
                 if outcome == HandOff::Sent {
                     // Drives the quiet-viewer signal; skipped and held
                     // frames are not sent, so they do not count.
                     match camera_rate.try_borrow_mut() {
                         Ok(mut camera_rate) => {
-                            camera_rate.on_frame_sent(monotonic_now_ms());
+                            camera_rate.on_frame_sent(now_ms);
                         }
                         Err(_) => log::debug!("camera rate control busy, sent frame not counted"),
                     }
@@ -835,16 +859,17 @@ impl CameraEncoder {
                         camera_rate
                             .borrow_mut()
                             .on_encoder_configured(monotonic_now_ms());
-                    } else {
-                        // A configure that throws fires no error callback,
-                        // and a recreated encoder that was never configured
-                        // would refuse every frame in silence. Count it as
-                        // a failure: the next frame recreates the encoder,
-                        // or gives up and reports it.
+                    } else if configure_failure_counts(encoder_settings.is_some()) {
+                        // Never configured (a recreated encoder): it would
+                        // refuse every frame and no error callback fires.
+                        // The next frame recreates it, or gives up.
+                        error!("CameraEncoder: configure failed on an unconfigured encoder");
                         encoder_failed.set(true);
                         video_frame.close();
                         continue;
                     }
+                    // Otherwise the encoder keeps its previous config and
+                    // goes on encoding; the next frame tries again.
                 }
 
                 let pli = force_keyframe.swap(false, Ordering::AcqRel);
@@ -1034,5 +1059,14 @@ mod tests {
             health.on_output(at + 1_000.0);
         }
         assert_eq!(health.on_failure(), Recovery::GiveUp);
+    }
+
+    /// Per WebCodecs a configure that throws leaves a configured encoder on
+    /// its previous config, still working: not a failure. A recreated
+    /// encoder that was never configured is dead without one: a failure.
+    #[test]
+    fn a_refused_reconfigure_of_a_working_encoder_is_not_a_failure() {
+        assert!(!configure_failure_counts(true));
+        assert!(configure_failure_counts(false));
     }
 }

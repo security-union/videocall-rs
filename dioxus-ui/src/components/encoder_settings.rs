@@ -24,7 +24,7 @@
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 use videocall_client::adaptive_quality_constants::AUDIO_QUALITY;
-use videocall_client::rate_control::{CameraRateStats, ReportedCapacity};
+use videocall_client::rate_control::{CameraRateStats, LimitSource, ReportedCapacity};
 use videocall_client::VideoCallClient;
 
 /// How often the card re-reads the rate control.
@@ -38,7 +38,20 @@ pub struct EncoderSettingsRow {
     /// The id the row had in the old Encoder Settings section, kept on an
     /// inner element so existing selectors still find the value.
     pub legacy_test_id: Option<&'static str>,
+    /// `data-source` on the value: what set a limit (the enum name).
+    pub source: Option<&'static str>,
     pub value: String,
+}
+
+/// The limit row's label, in plain words, and the source's enum name for
+/// `data-source`.
+pub fn limit_label(source: LimitSource) -> (&'static str, &'static str) {
+    match source {
+        LimitSource::Rise => ("Climbing back", "Rise"),
+        LimitSource::RelaySignal => ("Relay congestion limit", "RelaySignal"),
+        LimitSource::QuietViewer => ("Quiet viewer limit", "QuietViewer"),
+        LimitSource::LinkLost => ("Link lost limit", "LinkLost"),
+    }
 }
 
 fn kbps(bps: u32) -> String {
@@ -47,19 +60,22 @@ fn kbps(bps: u32) -> String {
 
 /// The camera rows shown for `stats`. Capacity and backlog read "no reports"
 /// until a viewer that runs the rate control has reported; capacity reads
-/// "not limited" while no viewer's path has queued. The relay limit
-/// row shows only while a relay congestion limit is in force.
+/// "not limited" while no viewer's path has queued. The limit row shows only
+/// while something holds the rate below what the reports give, labelled by
+/// what does.
 pub fn encoder_settings_rows(stats: &CameraRateStats) -> Vec<EncoderSettingsRow> {
     let row = |label, test_id, value| EncoderSettingsRow {
         label,
         test_id,
         legacy_test_id: None,
+        source: None,
         value,
     };
     let renamed = |label, test_id, legacy, value| EncoderSettingsRow {
         label,
         test_id,
         legacy_test_id: Some(legacy),
+        source: None,
         value,
     };
     let mut rows = vec![
@@ -117,12 +133,15 @@ pub fn encoder_settings_rows(stats: &CameraRateStats) -> Vec<EncoderSettingsRow>
             format!("{:.1}/s", stats.reconfigures_per_sec),
         ),
     ];
-    if let Some(limit) = stats.relay_limit_kbps {
-        rows.push(row(
-            "Congestion limit",
-            "encoder-relay-limit",
-            format!("{limit} kbps"),
-        ));
+    if let Some(limit) = stats.limit {
+        let (label, source) = limit_label(limit.source);
+        rows.push(EncoderSettingsRow {
+            label,
+            test_id: "encoder-relay-limit",
+            legacy_test_id: None,
+            source: Some(source),
+            value: format!("{} kbps", limit.kbps),
+        });
     }
     rows
 }
@@ -134,6 +153,7 @@ pub fn audio_encoder_row(mic_enabled: bool) -> EncoderSettingsRow {
         label: "Audio bitrate",
         test_id: "encoders-audio-bitrate",
         legacy_test_id: None,
+        source: None,
         value: if mic_enabled {
             format!("{} kbps", AUDIO_QUALITY.bitrate_kbps)
         } else {
@@ -148,7 +168,10 @@ fn EncoderRows(rows: Vec<EncoderSettingsRow>) -> Element {
         div { class: "diagnostics-kv",
             for row in rows {
                 span { class: "diagnostics-kv-label", "{row.label}" }
-                span { class: "diagnostics-kv-value", "data-testid": row.test_id,
+                span {
+                    class: "diagnostics-kv-value",
+                    "data-testid": row.test_id,
+                    "data-source": row.source,
                     if let Some(legacy) = row.legacy_test_id {
                         span { "data-testid": legacy, "{row.value}" }
                     } else {
@@ -200,6 +223,7 @@ pub fn EncodersSection(video_enabled: bool, mic_enabled: bool) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use videocall_client::rate_control::RateLimit;
 
     fn stats() -> CameraRateStats {
         CameraRateStats {
@@ -211,7 +235,7 @@ mod tests {
             tier_fps: 30.0,
             capacity: ReportedCapacity::Kbps(950),
             backlog_ms: Some(12),
-            relay_limit_kbps: None,
+            limit: None,
             viewers_reporting: 2,
             frames_skipped: 41,
             reconfigures_per_sec: 1.5,
@@ -279,12 +303,34 @@ mod tests {
         assert_eq!(value(&rows, "encoder-backlog"), "0 ms");
     }
 
+    /// The limit row shows while a limit is in force, labelled by what set
+    /// it, with the source's name on `data-source`.
     #[test]
-    fn the_relay_limit_shows_while_in_force() {
-        let mut limited = stats();
-        limited.relay_limit_kbps = Some(450);
-        let rows = encoder_settings_rows(&limited);
-        assert_eq!(value(&rows, "encoder-relay-limit"), "450 kbps");
+    fn the_limit_shows_while_in_force_labelled_by_source() {
+        for (source, label, name) in [
+            (LimitSource::Rise, "Climbing back", "Rise"),
+            (
+                LimitSource::RelaySignal,
+                "Relay congestion limit",
+                "RelaySignal",
+            ),
+            (
+                LimitSource::QuietViewer,
+                "Quiet viewer limit",
+                "QuietViewer",
+            ),
+            (LimitSource::LinkLost, "Link lost limit", "LinkLost"),
+        ] {
+            let mut limited = stats();
+            limited.limit = Some(RateLimit { source, kbps: 450 });
+            let rows = encoder_settings_rows(&limited);
+            let row = rows
+                .iter()
+                .find(|row| row.test_id == "encoder-relay-limit")
+                .expect("limit row");
+            assert_eq!((row.label, row.source), (label, Some(name)));
+            assert_eq!(row.value, "450 kbps");
+        }
     }
 
     #[test]

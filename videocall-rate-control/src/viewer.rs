@@ -575,20 +575,22 @@ impl ViewerEstimator {
         Some(bytes * 8.0 * 1000.0 / span)
     }
 
-    /// The capacity as a ceiling: only once a queue showed it (a busy
-    /// period measured it, or the link is queueing now).
+    /// The capacity as a ceiling: only once a busy period measured it. A
+    /// queue that has just started has not been measured yet, and the rate
+    /// delivered before it is only a lower bound.
     fn ceiling_bps(&self) -> Option<u64> {
         self.capacity_bps
-            .filter(|_| self.measured || self.congested)
+            .filter(|_| self.measured)
             .map(|bps| bps.round() as u64)
     }
 
     fn current_report(&self) -> Report {
-        let capacity_bps = self.ceiling_bps();
         Report {
-            capacity_bps,
-            // A backlog is only actionable with the rate it drains at.
-            backlog_ms: if self.congested && capacity_bps.is_some() {
+            capacity_bps: self.ceiling_bps(),
+            // Before a busy period has measured the rate, a backlog still
+            // says "less than you are sending": the publisher drains from
+            // its own capacity until the measured one arrives.
+            backlog_ms: if self.congested {
                 self.last_wait_ms
             } else {
                 0.0
@@ -733,12 +735,7 @@ impl ViewerEstimator {
         // link idle, the part of its own service its bytes do not explain.
         self.last_wait_ms = wait_ms.max(excess_ms);
         let spaced = frame.arrival_ms - self.last_early_ms >= self.config.report_interval_ms;
-        let early_report = if self.congested
-            && !was_congested
-            && self.early_armed
-            && spaced
-            && self.capacity_bps.is_some()
-        {
+        let early_report = if self.congested && !was_congested && self.early_armed && spaced {
             self.early_armed = false;
             self.last_early_ms = frame.arrival_ms;
             Some(self.current_report())

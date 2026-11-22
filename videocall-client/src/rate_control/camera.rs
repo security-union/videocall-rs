@@ -30,8 +30,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use videocall_rate_control::{
-    default_tiers, encoder_bitrate_bps, FrameDecision, FrameGate, MultiViewerPublisher,
-    PublisherConfig, Report, Tier,
+    default_tiers, encoder_bitrate_bps, FrameDecision, FrameGate, LimitSource,
+    MultiViewerPublisher, PublisherConfig, Report, Tier,
 };
 
 use crate::adaptive_quality_constants::{
@@ -143,33 +143,56 @@ pub(crate) enum HandOff {
 /// is held (not numbered, not sent) until a keyframe is handed off, and the
 /// caller is told to ask the encoder for one. The deltas already queued in
 /// the encoder arrive before it and are held too.
+///
+/// Requests are paced: at most one per feedback cycle (report period plus
+/// round trip, [`CameraRateController::feedback_cycle_ms`]). A send path
+/// that keeps refusing (a reconnect, a WebSocket buffer hovering at its
+/// limit) would otherwise make every frame a keyframe, 5 to 15 times the
+/// size of a delta, which refills the very buffer that refused it. While
+/// chunks are held, a request goes out again once a cycle has passed, so a
+/// request the encoder missed cannot stall the stream.
 #[derive(Debug, Default)]
 pub(crate) struct CameraOutput {
     next: u64,
     awaiting_keyframe: bool,
+    last_request_ms: Option<f64>,
 }
 
 impl CameraOutput {
-    /// Hands one chunk off with `send`, which builds the packet for the
-    /// number it is given and returns whether the send path took it.
+    /// Hands one chunk off at `now_ms` with `send`, which builds the packet
+    /// for the number it is given and returns whether the send path took
+    /// it. `cycle_ms` is the feedback cycle that paces keyframe requests.
     /// Returns the outcome and whether to force a keyframe.
     pub(crate) fn hand_off(
         &mut self,
         is_keyframe: bool,
+        now_ms: f64,
+        cycle_ms: f64,
         send: impl FnOnce(u64) -> bool,
     ) -> (HandOff, bool) {
         if self.awaiting_keyframe && !is_keyframe {
-            return (HandOff::Held, false);
+            return (HandOff::Held, self.request(now_ms, cycle_ms));
         }
         if send(self.next) {
             self.next += 1;
             self.awaiting_keyframe = false;
             (HandOff::Sent, false)
         } else {
-            // Ask once per refusal; the deltas behind it need no new ask.
             self.awaiting_keyframe = true;
-            (HandOff::Refused, true)
+            (HandOff::Refused, self.request(now_ms, cycle_ms))
         }
+    }
+
+    /// Whether to ask for a keyframe now: at most once per cycle.
+    fn request(&mut self, now_ms: f64, cycle_ms: f64) -> bool {
+        if self
+            .last_request_ms
+            .is_some_and(|last| now_ms - last < cycle_ms)
+        {
+            return false;
+        }
+        self.last_request_ms = Some(now_ms);
+        true
     }
 }
 
@@ -203,6 +226,13 @@ pub enum ReportedCapacity {
     Kbps(u32),
 }
 
+/// A limit on the camera's rate, for display: what set it and the rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub source: LimitSource,
+    pub kbps: u32,
+}
+
 /// The camera's rate control state, for the diagnostics panel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraRateStats {
@@ -220,9 +250,9 @@ pub struct CameraRateStats {
     pub capacity: ReportedCapacity,
     /// `None` before any report.
     pub backlog_ms: Option<u32>,
-    /// The congestion limit (relay signal, quiet viewer or lost link),
-    /// while one is in force.
-    pub relay_limit_kbps: Option<u32>,
+    /// What holds the rate below what the reports give, while something
+    /// does.
+    pub limit: Option<RateLimit>,
     /// Viewers with a report.
     pub viewers_reporting: usize,
     /// Captured frames the gate kept from the encoder (tier frame rate and
@@ -355,10 +385,14 @@ impl CameraRateController {
     }
 
     /// The viewer left: its report no longer counts.
-    pub fn remove_viewer(&mut self, viewer: u64, now_ms: f64) {
+    pub fn remove_viewer(&mut self, viewer: u64) {
         self.last_report.remove(&viewer);
-        self.publisher.remove_viewer(&viewer, now_ms);
-        self.update_tier(now_ms);
+        self.publisher.remove_viewer(&viewer);
+    }
+
+    /// The feedback cycle, ms: one report period plus the round trip.
+    pub fn feedback_cycle_ms(&self) -> f64 {
+        self.publisher.config().cycle_ms(self.rtt_ms)
     }
 
     /// A camera frame was handed to the transport at `now_ms`. This is how
@@ -383,28 +417,15 @@ impl CameraRateController {
         self.publisher.on_link_lost(now_ms, self.rtt_ms);
     }
 
-    /// The tier for the capacity the publisher sees now: down at once, up
-    /// one rung per feedback cycle (the crate's `next_tier`). Run on every
-    /// report, signal and frame, so a limit that grows back (no report to
-    /// trigger it) lifts the tier too. Allocates nothing.
-    ///
-    /// With no capacity at all (no report, no limit) `next_tier` keeps the
-    /// tier, but the target is then the start rate, so the tier is the
-    /// start rate's. Without this a relay limit that grows out in a room of
-    /// viewers that never report (older and native clients) would leave the
-    /// camera on a lower tier for the rest of the call: the limit goes away
-    /// at the cap, before it reaches the top tier's step-up threshold.
+    /// The tier for the capacity the publisher sees now (the crate's
+    /// `next_tier`): down at once, up one rung per feedback cycle, and with
+    /// no report the start rate's tier. Run on every report, signal and
+    /// frame, so a limit that grows back (no report to trigger it) lifts
+    /// the tier too. Allocates nothing.
     fn update_tier(&mut self, now_ms: f64) {
-        let next = if self
+        let next = self
             .publisher
-            .tier_capacity_bps(now_ms, self.rtt_ms)
-            .is_none()
-        {
-            start_tier(&self.tiers, self.publisher.config().start_bps)
-        } else {
-            self.publisher
-                .next_tier(&self.tiers, self.tier, now_ms, self.rtt_ms)
-        };
+            .next_tier(&self.tiers, self.tier, now_ms, self.rtt_ms);
         if next != self.tier {
             log::info!(
                 "camera rate control: tier {} -> {}",
@@ -477,10 +498,13 @@ impl CameraRateController {
                 }
             }),
             backlog_ms: combined.map(|c| c.report.backlog_ms_rounded()),
-            relay_limit_kbps: self
+            limit: self
                 .publisher
-                .congestion_limit_bps(now_ms, self.rtt_ms)
-                .map(|limit| (limit / 1000.0).round() as u32),
+                .limit(now_ms, self.rtt_ms)
+                .map(|(source, bps)| RateLimit {
+                    source,
+                    kbps: (bps / 1000.0).round() as u32,
+                }),
             viewers_reporting: self.publisher.viewers(),
             frames_skipped: self.frames_skipped,
             reconfigures_per_sec: recent as f64 * 1000.0 / RECONFIGURE_RATE_WINDOW_MS,
@@ -555,7 +579,7 @@ mod tests {
         let stats = camera.stats(0.0);
         assert_eq!(stats.viewers_reporting, 0);
         assert_eq!(stats.capacity, ReportedCapacity::NoReports);
-        assert_eq!(stats.relay_limit_kbps, None);
+        assert_eq!(stats.limit, None);
     }
 
     /// An old viewer sends no capacity, so it never reaches `on_report`: the
@@ -592,13 +616,13 @@ mod tests {
         camera.on_report(3, 1_000.0, report(300, 0));
         assert_eq!(camera.stats(1_000.0).capacity, ReportedCapacity::Kbps(300));
         assert_eq!(camera.stats(1_000.0).viewers_reporting, 2);
-        camera.remove_viewer(3, 1_000.0);
+        camera.remove_viewer(3);
         assert_eq!(camera.stats(1_000.0).capacity, ReportedCapacity::Kbps(900));
         assert_eq!(camera.stats(1_000.0).viewers_reporting, 1);
-        camera.remove_viewer(2, 1_000.0);
+        camera.remove_viewer(2);
         assert_eq!(camera.stats(1_000.0).capacity, ReportedCapacity::NoReports);
         // Removing a viewer that never reported is harmless.
-        camera.remove_viewer(99, 1_000.0);
+        camera.remove_viewer(99);
     }
 
     /// A viewer that left and came back has a new session id: the old key
@@ -607,7 +631,7 @@ mod tests {
     fn a_rejoining_viewer_is_a_new_key() {
         let mut camera = controller();
         camera.on_report(2, 1_000.0, report(300, 0));
-        camera.remove_viewer(2, 1_000.0);
+        camera.remove_viewer(2);
         camera.on_report(5, 1_500.0, report(800, 0));
         let stats = camera.stats(1_500.0);
         assert_eq!(stats.viewers_reporting, 1);
@@ -636,7 +660,7 @@ mod tests {
     fn the_report_window_is_forgotten_with_the_viewer() {
         let mut camera = controller();
         camera.on_report(2, 1_000.0, report(900, 0));
-        camera.remove_viewer(2, 1_000.0);
+        camera.remove_viewer(2);
         assert!(camera.on_report(2, 1_010.0, report(900, 0)));
     }
 
@@ -738,12 +762,16 @@ mod tests {
         let held = camera.stats(1_010.0).target_bps;
         camera.on_link_lost(1_010.0);
         // What clear_all_peers then does, peer by peer.
-        camera.remove_viewer(2, 1_010.0);
-        camera.remove_viewer(3, 1_010.0);
+        camera.remove_viewer(2);
+        camera.remove_viewer(3);
         let stats = camera.stats(1_010.0);
         assert_eq!(stats.viewers_reporting, 0);
         assert_eq!(stats.target_bps, held);
         assert_eq!(stats.tier_label, "360p30");
+        assert_eq!(
+            stats.limit.map(|limit| limit.source),
+            Some(LimitSource::LinkLost)
+        );
         let later = camera.stats(5_000.0).target_bps;
         assert!(
             later > held && later < 1_000_000,
@@ -762,22 +790,23 @@ mod tests {
         assert!(camera.on_congestion_signal(1_000.0, None));
         let stats = camera.stats(1_000.0);
         assert_eq!(stats.target_bps, 500_000);
-        assert_eq!(stats.relay_limit_kbps, Some(500));
+        assert_eq!(
+            stats.limit.map(|limit| (limit.source, limit.kbps)),
+            Some((LimitSource::RelaySignal, 500))
+        );
         assert_eq!(stats.tier_label, "360p30");
-        // About 7% a cycle: past 600 kbps after a few cycles, one tier up.
-        camera.on_camera_frame(5_000.0, 5_000.0);
+        // Frames go on. About 7% a cycle: past 600 kbps after a few
+        // cycles, one tier up, still held by the signal's cut.
+        send_frames(&mut camera, 1_000.0, 5_000.0);
         let mid = camera.stats(5_000.0);
-        assert!(mid.relay_limit_kbps.is_some_and(|limit| limit > 640));
+        assert!(mid.limit.is_some_and(|limit| limit.kbps > 640), "{mid:?}");
         assert_eq!(mid.tier_label, "480p30", "one step");
-        // Frames go on; well past the cap after a minute the limit is gone
-        // and the rate and tier are back at the top.
-        let mut plan = camera.on_camera_frame(5_000.0, 5_000.0);
-        for n in 1..=1_680 {
-            let at = 5_000.0 + f64::from(n) * FRAME_MS;
-            plan = camera.on_camera_frame(at, at);
-        }
+        // Well past the cap after a minute the limit is gone and the rate
+        // and tier are back at the top.
+        send_frames(&mut camera, 5_000.0, 61_000.0);
+        let plan = camera.on_camera_frame(61_000.0, 61_000.0);
         assert_eq!(plan.bitrate_bps, 1_000_000);
-        assert_eq!(camera.stats(61_000.0).relay_limit_kbps, None);
+        assert_eq!(camera.stats(61_000.0).limit, None);
         assert_eq!(camera.stats(61_000.0).tier_label, "720p30");
     }
 
@@ -869,13 +898,25 @@ mod tests {
 
     /// Runs `chunks` (keyframe?, accepted?) through a `CameraOutput`.
     /// Returns (numbers sent, outcomes, keyframe requests).
+    /// The feedback cycle the tests run with (report period, no RTT).
+    const CYCLE_MS: f64 = DIAGNOSTICS_REPORT_INTERVAL_MS as f64;
+
+    /// Runs `chunks` (keyframe?, accepted?), one per 30 fps frame.
     fn run_output(chunks: &[(bool, bool)]) -> (Vec<u64>, Vec<HandOff>, usize) {
-        let mut output = CameraOutput::default();
+        run_output_from(&mut CameraOutput::default(), 0.0, chunks)
+    }
+
+    fn run_output_from(
+        output: &mut CameraOutput,
+        start_ms: f64,
+        chunks: &[(bool, bool)],
+    ) -> (Vec<u64>, Vec<HandOff>, usize) {
         let mut sent = Vec::new();
         let mut outcomes = Vec::new();
         let mut requests = 0;
-        for (is_keyframe, accept) in chunks.iter().copied() {
-            let (outcome, request) = output.hand_off(is_keyframe, |seq| {
+        for (n, (is_keyframe, accept)) in chunks.iter().copied().enumerate() {
+            let at = start_ms + n as f64 * FRAME_MS;
+            let (outcome, request) = output.hand_off(is_keyframe, at, CYCLE_MS, |seq| {
                 if accept {
                     sent.push(seq);
                 }
@@ -953,7 +994,42 @@ mod tests {
                 HandOff::Sent,
             ]
         );
-        assert_eq!(requests, 2);
+        // Both refusals fall in one feedback cycle: one request.
+        assert_eq!(requests, 1);
+    }
+
+    /// A send path that keeps refusing (reconnect, a full WebSocket buffer)
+    /// asks for at most one keyframe per feedback cycle, not one per frame,
+    /// and the stream is decodable once hand-off resumes.
+    #[test]
+    fn steady_refusals_ask_for_one_keyframe_per_cycle() {
+        let mut output = CameraOutput::default();
+        // Ten refusals in a row, every chunk a keyframe as asked: 333 ms.
+        let (_, _, requests) = run_output_from(&mut output, 0.0, &[(KEY, false); 10]);
+        assert_eq!(requests, 1);
+        // Three seconds of refusals: one request per 500 ms cycle at most.
+        let (_, _, requests) = run_output_from(&mut output, 400.0, &[(KEY, false); 90]);
+        assert!(requests <= 7, "{requests} requests in 3 s");
+        // Hand-off resumes: deltas still held until a keyframe goes out.
+        let (sent, outcomes, _) = run_output_from(
+            &mut output,
+            3_500.0,
+            &[(DELTA, true), (KEY, true), (DELTA, true)],
+        );
+        assert_eq!(outcomes, vec![HandOff::Held, HandOff::Sent, HandOff::Sent]);
+        assert_eq!(sent, vec![0, 1]);
+    }
+
+    /// Deltas held past a cycle with no keyframe in sight ask again, so a
+    /// request the encoder missed cannot stall the stream.
+    #[test]
+    fn held_deltas_ask_again_after_a_cycle() {
+        let mut chunks = vec![(DELTA, false)];
+        // 25 frames, 833 ms: one cycle past the refusal, not two.
+        chunks.extend([(DELTA, true); 25]);
+        let (sent, _, requests) = run_output(&chunks);
+        assert!(sent.is_empty());
+        assert_eq!(requests, 2, "the refusal, then once a cycle later");
     }
 
     /// The backlog onset report always gets through, however soon after
@@ -1027,7 +1103,8 @@ mod tests {
     }
 
     /// A viewer that reported and then went quiet while frames go out cuts
-    /// the rate; its next report takes over again.
+    /// the rate once; once it reports again nothing more is cut and the
+    /// rate climbs back until the limit is gone.
     #[test]
     fn a_quiet_viewer_cuts_the_rate_until_it_reports_again() {
         let mut camera = controller();
@@ -1035,10 +1112,21 @@ mod tests {
         assert!(!send_frames(&mut camera, 1_000.0, 2_000.0), "not quiet yet");
         assert!(send_frames(&mut camera, 2_000.0, 8_000.0), "quiet: cut");
         let cut = camera.stats(8_000.0);
-        assert!(cut.relay_limit_kbps.is_some());
+        assert_eq!(
+            cut.limit.map(|limit| limit.source),
+            Some(LimitSource::QuietViewer)
+        );
         assert!(cut.target_bps < 1_000_000);
-        camera.on_report(2, 8_100.0, no_ceiling(0));
-        assert_eq!(camera.stats(8_100.0).relay_limit_kbps, None);
+        // Reports again, every period, while frames go on for 20 s.
+        let mut at = 8_100.0;
+        while at < 28_100.0 {
+            camera.on_report(2, at, no_ceiling(0));
+            assert!(!send_frames(&mut camera, at, at + 499.0), "no new cut");
+            at += 500.0;
+        }
+        let back = camera.stats(at);
+        assert_eq!(back.limit, None);
+        assert_eq!(back.target_bps, 1_000_000);
     }
 
     /// With the camera off no frame goes out, so a viewer with nothing to
@@ -1050,6 +1138,6 @@ mod tests {
         send_frames(&mut camera, 1_000.0, 1_500.0);
         // Camera off from 1.5 s to 20 s, then on again for a second.
         assert!(!send_frames(&mut camera, 20_000.0, 21_000.0));
-        assert_eq!(camera.stats(21_000.0).relay_limit_kbps, None);
+        assert_eq!(camera.stats(21_000.0).limit, None);
     }
 }

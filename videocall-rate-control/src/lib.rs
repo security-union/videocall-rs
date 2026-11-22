@@ -11,8 +11,9 @@
 //!   an encoder target with a drain/probe/hold policy.
 //! - [`actuator`] maps target and capacity onto a tier table the caller
 //!   owns: tier, encoder bitrate, and which camera frames to encode.
-//! - [`signal::CongestionLimit`] turns the relay's one-bit CONGESTION signal
-//!   into a cap, for viewers that never report.
+//! - [`signal`]: the one rule for going up (one probe step per feedback
+//!   cycle, whatever the cause) and the one-bit cuts (the relay's
+//!   CONGESTION signal, a viewer that goes quiet) it brings back from.
 //!
 //! Pure std, no I/O and no clocks: every time is an argument in ms, so the
 //! crate builds for `wasm32-unknown-unknown` and native alike and every
@@ -30,6 +31,6 @@ pub use actuator::{
     choose_tier, default_tiers, encoder_bitrate_bps, FrameDecision, FrameGate, Tier,
 };
 pub use publisher::{drain_target_bps, Publisher, PublisherConfig, MIN_DRAIN_FRACTION};
-pub use signal::CongestionLimit;
+pub use signal::LimitSource;
 pub use viewer::{FrameInfo, FrameOutcome, Report, ViewerConfig, ViewerEstimator, NO_CEILING_KBPS};
 pub use viewers::{combine_reports, Combined, MultiViewerPublisher};

@@ -73,11 +73,10 @@ pub fn drain_target_bps(config: &PublisherConfig, report: Report, age_ms: f64, r
     let floor = config.floor_bps.min(config.max_bps);
     let capacity = match report.capacity_bps {
         Some(bps) => (bps as f64).max(floor),
-        // No ceiling seen: the path took everything sent, so nothing here
-        // lowers the rate. (A backlog without a rate is not something this
-        // crate's viewer sends; from the wire it is taken at the floor.)
-        None if report.backlog_ms > 0.0 => floor,
-        None => return config.max_bps,
+        // No ceiling seen: nothing here bounds the rate, so the policy works
+        // from the maximum (a backlog still drains from it).
+        // `MultiViewerPublisher` always passes its own paced capacity.
+        None => config.max_bps,
     };
     let cycle = config.cycle_ms(rtt_ms);
     let backlog = report.backlog_ms;

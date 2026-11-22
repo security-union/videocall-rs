@@ -1,8 +1,8 @@
 //! The drain/probe/hold policy and the multi-viewer rule, as pure functions.
 
 use videocall_rate_control::{
-    combine_reports, default_tiers, drain_target_bps, CongestionLimit, MultiViewerPublisher,
-    Publisher, PublisherConfig, Report, MIN_DRAIN_FRACTION,
+    combine_reports, default_tiers, drain_target_bps, LimitSource, MultiViewerPublisher, Publisher,
+    PublisherConfig, Report, MIN_DRAIN_FRACTION,
 };
 
 const RTT_MS: f64 = 100.0;
@@ -163,13 +163,20 @@ fn multi_viewer_publisher_drops_a_viewer_that_left() {
     publisher.on_report("slow", 0.0, report(300_000, 0.0));
     publisher.on_report("fast", 0.0, report(1_200_000, 0.0));
     let probe = 1.0 + config().probe_fraction(RTT_MS);
+    publisher.on_frame_sent(10.0, RTT_MS);
     assert!(close(publisher.target_bps(10.0, RTT_MS), 300_000.0 * probe));
-    publisher.remove_viewer(&"slow", 10.0);
+    publisher.remove_viewer(&"slow");
     assert_eq!(publisher.viewers(), 1);
-    assert!(close(
-        publisher.target_bps(10.0, RTT_MS),
-        1_200_000.0 * probe
-    ));
+    // The ceiling it set goes; the target climbs to the fast viewer's one
+    // probe step per cycle instead of leaping.
+    assert!(close(publisher.target_bps(10.0, RTT_MS), 300_000.0 * probe));
+    let mut t = 10.0;
+    while t < 30_000.0 {
+        publisher.on_report("fast", t, report(1_200_000, 0.0));
+        publisher.on_frame_sent(t, RTT_MS);
+        t += FRAME_MS;
+    }
+    assert!(close(publisher.target_bps(t, RTT_MS), 1_200_000.0 * probe));
 }
 
 /// A report of 1 kbps (hostile, or an honest hopeless viewer) is beyond
@@ -230,69 +237,6 @@ fn reconfigure_keeps_the_reports_and_the_remembered_capacity() {
     assert_eq!(publisher.viewers(), 1);
 }
 
-#[test]
-fn congestion_limit_halves_then_grows_one_probe_step_per_cycle() {
-    let config = config();
-    let cycle = config.cycle_ms(RTT_MS);
-    let p = config.probe_fraction(RTT_MS);
-    let mut limit = CongestionLimit::new();
-    assert_eq!(limit.limit_bps(0.0, cycle, p, 1_500_000.0), None);
-    assert!(limit.on_signal(1_000.0, 900_000.0, cycle, FLOOR_BPS));
-    assert!(close(
-        limit
-            .limit_bps(1_000.0, cycle, p, 1_500_000.0)
-            .expect("cut"),
-        450_000.0
-    ));
-    // Within one cycle the next signal is the same congestion: ignored.
-    assert!(!limit.on_signal(1_000.0 + cycle - 1.0, 450_000.0, cycle, FLOOR_BPS));
-    let later = limit
-        .limit_bps(1_000.0 + 3.0 * cycle, cycle, p, 1_500_000.0)
-        .expect("still limited");
-    assert!(close(later, 450_000.0 * (1.0 + p).powi(3)));
-    // Gone once it reaches the maximum.
-    assert_eq!(
-        limit.limit_bps(1_000.0 + 100.0 * cycle, cycle, p, 1_500_000.0),
-        None
-    );
-    // Never below the drain floor.
-    let mut low = CongestionLimit::new();
-    low.on_signal(0.0, 10_000.0, cycle, FLOOR_BPS);
-    assert!(close(
-        low.limit_bps(0.0, cycle, p, 1e9).expect("cut"),
-        FLOOR_BPS * MIN_DRAIN_FRACTION
-    ));
-}
-
-#[test]
-fn congestion_signal_caps_target_and_tier_capacity_without_reports() {
-    let mut publisher: MultiViewerPublisher<u64> = MultiViewerPublisher::new(config());
-    assert!(close(publisher.target_bps(0.0, RTT_MS), 936_000.0));
-    assert_eq!(publisher.tier_capacity_bps(0.0, RTT_MS), None);
-    assert!(publisher.on_congestion_signal(100.0, RTT_MS, None));
-    assert!(close(publisher.target_bps(100.0, RTT_MS), 468_000.0));
-    assert!(close(
-        publisher.tier_capacity_bps(100.0, RTT_MS).expect("limit"),
-        468_000.0
-    ));
-}
-
-/// A signal blamed on a viewer that reports fresh numbers is ignored: its
-/// reports already say what it takes.
-#[test]
-fn congestion_signal_from_a_reporting_viewer_is_ignored() {
-    let mut publisher = MultiViewerPublisher::new(config());
-    publisher.on_report(7u64, 0.0, report(800_000, 0.0));
-    assert!(!publisher.on_congestion_signal(100.0, RTT_MS, Some(&7)));
-    assert_eq!(publisher.congestion_limit_bps(100.0, RTT_MS), None);
-    // A silent viewer's signal counts.
-    assert!(publisher.on_congestion_signal(100.0, RTT_MS, Some(&8)));
-    // And so does the reporting one's once its report went stale.
-    let mut stale = MultiViewerPublisher::new(config());
-    stale.on_report(7u64, 0.0, report(800_000, 0.0));
-    assert!(stale.on_congestion_signal(FRESH_MS + 1.0, RTT_MS, Some(&7)));
-}
-
 /// Feedback cycle `T = I + RTT`.
 const CYCLE_MS: f64 = 600.0;
 const FRAME_MS: f64 = 1000.0 / 30.0;
@@ -304,45 +248,13 @@ fn open() -> Report {
     }
 }
 
-/// A report without a ceiling never lowers the target; the target probes
-/// up from the start rate by one step per cycle instead of leaping to max.
-#[test]
-fn a_report_without_a_ceiling_probes_up_from_the_start_rate() {
-    let mut publisher = MultiViewerPublisher::new(config());
-    publisher.on_report("a", 0.0, open());
-    let probe = 1.0 + config().probe_fraction(RTT_MS);
-    assert!(close(publisher.target_bps(0.0, RTT_MS), 936_000.0));
-    assert!(close(
-        publisher.target_bps(3.0 * CYCLE_MS, RTT_MS),
-        936_000.0 * probe.powi(3)
-    ));
-    assert!(close(publisher.target_bps(60_000.0, RTT_MS), 1_500_000.0));
-    assert_eq!(
-        publisher.tier_capacity_bps(60_000.0, RTT_MS),
-        Some(1_500_000.0)
-    );
-}
-
-/// The last viewer with a ceiling leaving: the rest probe up from it.
-#[test]
-fn the_last_ceiling_leaving_probes_up_from_it() {
-    let mut publisher = MultiViewerPublisher::new(config());
-    publisher.on_report("narrow", 0.0, report(400_000, 0.0));
-    publisher.on_report("open", 0.0, open());
-    publisher.remove_viewer(&"narrow", 100.0);
-    assert!(close(publisher.target_bps(100.0, RTT_MS), 400_000.0));
-}
-
-/// A capacity far above anything that could be sent chooses tiers as the
-/// maximum would, no more.
-#[test]
-fn an_implausible_capacity_counts_as_the_maximum() {
-    let mut publisher = MultiViewerPublisher::new(config());
-    publisher.on_report("a", 0.0, report(50_000_000, 0.0));
-    assert_eq!(publisher.tier_capacity_bps(0.0, RTT_MS), Some(1_500_000.0));
-}
-
-fn send_frames(publisher: &mut MultiViewerPublisher<&str>, from_ms: f64, to_ms: f64) -> Vec<f64> {
+/// Frames from `from_ms` to `to_ms` (moving the paced capacity on); the
+/// times a quiet viewer cut.
+fn send_frames<K: Ord>(
+    publisher: &mut MultiViewerPublisher<K>,
+    from_ms: f64,
+    to_ms: f64,
+) -> Vec<f64> {
     let mut cuts = Vec::new();
     let mut t = from_ms;
     while t < to_ms {
@@ -354,22 +266,126 @@ fn send_frames(publisher: &mut MultiViewerPublisher<&str>, from_ms: f64, to_ms: 
     cuts
 }
 
-/// A viewer that reported and then goes quiet while frames go out cuts
-/// the limit after `fresh + capacity window` = 1100 + 2000 ms, once per
-/// that span of continued silence.
+/// The relay signal halves the target, is debounced by one cycle, grows
+/// back one probe step per cycle, and never goes below the drain floor.
 #[test]
-fn a_viewer_quiet_while_frames_go_out_cuts_the_limit() {
+fn relay_signal_halves_then_grows_one_probe_step_per_cycle() {
+    let mut publisher: MultiViewerPublisher<u64> = MultiViewerPublisher::new(config());
+    let probe = 1.0 + config().probe_fraction(RTT_MS);
+    assert!(close(publisher.target_bps(0.0, RTT_MS), 936_000.0));
+    assert_eq!(publisher.limit(0.0, RTT_MS), None);
+    assert!(publisher.on_congestion_signal(100.0, RTT_MS, None));
+    assert!(close(publisher.target_bps(100.0, RTT_MS), 468_000.0));
+    assert_eq!(
+        publisher.limit(100.0, RTT_MS),
+        Some((LimitSource::RelaySignal, 468_000.0))
+    );
+    // Within one cycle the next signal is the same congestion: ignored.
+    assert!(!publisher.on_congestion_signal(100.0 + CYCLE_MS - 1.0, RTT_MS, None));
+    send_frames(&mut publisher, 100.0, 100.0 + 3.0 * CYCLE_MS + 1.0);
+    let later = publisher.target_bps(100.0 + 3.0 * CYCLE_MS, RTT_MS);
+    assert!(close(later, 468_000.0 * probe.powi(3)), "{later}");
+    // Back to the start rate, and then the reports (none) govern.
+    send_frames(&mut publisher, 2_000.0, 30_000.0);
+    assert!(close(publisher.target_bps(30_000.0, RTT_MS), 936_000.0));
+    assert_eq!(publisher.limit(30_000.0, RTT_MS), None);
+    // Never below the drain floor.
+    for k in 0..10 {
+        publisher.on_congestion_signal(40_000.0 + f64::from(k) * CYCLE_MS, RTT_MS, None);
+    }
+    assert!(close(
+        publisher.target_bps(40_000.0 + 9.0 * CYCLE_MS, RTT_MS),
+        FLOOR_BPS * MIN_DRAIN_FRACTION
+    ));
+}
+
+/// With no reports the tier capacity is the start rate, and a relay cut
+/// lowers it.
+#[test]
+fn congestion_signal_caps_target_and_tier_capacity_without_reports() {
+    let mut publisher: MultiViewerPublisher<u64> = MultiViewerPublisher::new(config());
+    assert!(close(publisher.capacity_bps(0.0, RTT_MS), 936_000.0));
+    assert!(publisher.on_congestion_signal(100.0, RTT_MS, None));
+    assert!(close(publisher.target_bps(100.0, RTT_MS), 468_000.0));
+    assert!(close(publisher.capacity_bps(100.0, RTT_MS), 468_000.0));
+}
+
+/// A signal blamed on a viewer whose fresh report has a ceiling is ignored:
+/// its reports already say what it takes.
+#[test]
+fn congestion_signal_from_a_reporting_viewer_is_ignored() {
     let mut publisher = MultiViewerPublisher::new(config());
-    publisher.on_report("a", 0.0, report(1_200_000, 0.0));
+    publisher.on_report(7u64, 0.0, report(800_000, 0.0));
+    assert!(!publisher.on_congestion_signal(100.0, RTT_MS, Some(&7)));
+    assert_eq!(publisher.limit(100.0, RTT_MS), None);
+    // A silent viewer's signal counts.
+    assert!(publisher.on_congestion_signal(100.0, RTT_MS, Some(&8)));
+    // And so does the reporting one's once its report went stale.
+    let mut stale = MultiViewerPublisher::new(config());
+    stale.on_report(7u64, 0.0, report(800_000, 0.0));
+    assert!(stale.on_congestion_signal(FRESH_MS + 1.0, RTT_MS, Some(&7)));
+}
+
+/// A report without a ceiling never lowers the target; the target probes
+/// up from the start rate by one step per cycle instead of leaping to max.
+#[test]
+fn a_report_without_a_ceiling_probes_up_from_the_start_rate() {
+    let mut publisher = MultiViewerPublisher::new(config());
+    let probe = 1.0 + config().probe_fraction(RTT_MS);
+    publisher.on_report("a", 0.0, open());
+    send_frames(&mut publisher, 0.0, 3.0 * CYCLE_MS + 1.0);
+    // The target is one probe step above the paced capacity.
+    assert!(close(
+        publisher.capacity_bps(3.0 * CYCLE_MS, RTT_MS),
+        936_000.0 * probe.powi(3)
+    ));
+    assert_eq!(
+        publisher.limit(3.0 * CYCLE_MS, RTT_MS).map(|limit| limit.0),
+        Some(LimitSource::Rise)
+    );
+    let mut t = 3.0 * CYCLE_MS;
+    while t < 60_000.0 {
+        publisher.on_report("a", t, open());
+        send_frames(&mut publisher, t, t + 500.0);
+        t += 500.0;
+    }
+    assert!(close(publisher.target_bps(t, RTT_MS), 1_500_000.0));
+    assert!(close(publisher.capacity_bps(t, RTT_MS), 1_500_000.0));
+}
+
+/// A capacity far above anything that could be sent chooses tiers as the
+/// maximum would, no more.
+#[test]
+fn an_implausible_capacity_counts_as_the_maximum() {
+    let mut publisher = MultiViewerPublisher::new(config());
+    publisher.on_report("a", 0.0, report(50_000_000, 0.0));
+    let mut t = 0.0;
+    while t < 30_000.0 {
+        publisher.on_report("a", t, report(50_000_000, 0.0));
+        send_frames(&mut publisher, t, t + 500.0);
+        t += 500.0;
+    }
+    assert!(close(publisher.capacity_bps(t, RTT_MS), 1_500_000.0));
+}
+
+/// A viewer that reported and then goes quiet while frames go out cuts
+/// after `fresh + capacity window` = 1100 + 2000 ms, once per episode.
+#[test]
+fn a_viewer_quiet_while_frames_go_out_cuts_once() {
+    let mut publisher = MultiViewerPublisher::new(config());
+    publisher.on_report("a", 0.0, report(800_000, 0.0));
     assert_eq!(publisher.silence_ms(RTT_MS), 3_100.0);
     let cuts = send_frames(&mut publisher, 0.0, 10_000.0);
-    assert_eq!(cuts.len(), 3, "{cuts:?}");
+    assert_eq!(cuts.len(), 1, "{cuts:?}");
     assert!(cuts[0] > 3_100.0 && cuts[0] < 3_100.0 + FRAME_MS + 1.0);
-    let limit = publisher.congestion_limit_bps(cuts[0], RTT_MS);
-    assert!(limit.is_some_and(|bps| bps < 1_200_000.0));
-    // It reports again: its report governs, the stand-in goes.
-    publisher.on_report("a", 10_000.0, report(400_000, 0.0));
-    assert_eq!(publisher.congestion_limit_bps(10_000.0, RTT_MS), None);
+    assert_eq!(
+        publisher.limit(cuts[0], RTT_MS).map(|limit| limit.0),
+        Some(LimitSource::QuietViewer)
+    );
+    // It reports again: a new episode can start after another silence.
+    publisher.on_report("a", 10_000.0, report(800_000, 0.0));
+    let cuts = send_frames(&mut publisher, 10_000.0, 20_000.0);
+    assert_eq!(cuts.len(), 1, "{cuts:?}");
 }
 
 /// No cut with the camera off, for a viewer that left, or for viewers
@@ -386,7 +402,7 @@ fn silence_needs_frames_and_a_viewer_that_reported() {
     // Left.
     let mut publisher = MultiViewerPublisher::new(config());
     publisher.on_report("a", 0.0, report(1_200_000, 0.0));
-    publisher.remove_viewer(&"a", 100.0);
+    publisher.remove_viewer(&"a");
     assert!(send_frames(&mut publisher, 0.0, 10_000.0).is_empty());
     // Never reported.
     let mut publisher: MultiViewerPublisher<&str> = MultiViewerPublisher::new(config());
@@ -400,24 +416,30 @@ fn silence_needs_frames_and_a_viewer_that_reported() {
     }
 }
 
-/// After the link is lost, the rate in force is a limit that grows back by
-/// one probe step per cycle and goes away at the maximum.
+/// After the link is lost the target in force is held and grows back one
+/// probe step per cycle, up to the maximum.
 #[test]
 fn a_lost_link_holds_the_rate_and_grows_it_back() {
     let mut publisher = MultiViewerPublisher::new(config());
     publisher.on_report("a", 0.0, report(500_000, 0.0));
+    send_frames(&mut publisher, 0.0, 100.0);
     let held = publisher.target_bps(100.0, RTT_MS);
     publisher.on_link_lost(100.0, RTT_MS);
     assert_eq!(publisher.viewers(), 0);
     let probe = 1.0 + config().probe_fraction(RTT_MS);
     assert!(close(publisher.target_bps(100.0, RTT_MS), held));
+    assert_eq!(
+        publisher.limit(100.0, RTT_MS),
+        Some((LimitSource::LinkLost, held))
+    );
+    send_frames(&mut publisher, 100.0, 100.0 + 4.0 * CYCLE_MS + 1.0);
     assert!(close(
         publisher.target_bps(100.0 + 4.0 * CYCLE_MS, RTT_MS),
         held * probe.powi(4)
     ));
-    assert_eq!(publisher.tier_capacity_bps(100.0, RTT_MS), Some(held));
-    assert!(close(publisher.target_bps(120_000.0, RTT_MS), 936_000.0));
-    assert_eq!(publisher.congestion_limit_bps(120_000.0, RTT_MS), None);
+    send_frames(&mut publisher, 3_000.0, 120_000.0);
+    assert!(close(publisher.target_bps(120_000.0, RTT_MS), 1_500_000.0));
+    assert_eq!(publisher.limit(120_000.0, RTT_MS), None);
 }
 
 /// Called on every frame, the tier goes up at most one rung per cycle and
@@ -425,7 +447,11 @@ fn a_lost_link_holds_the_rate_and_grows_it_back() {
 #[test]
 fn next_tier_climbs_one_rung_per_cycle_and_drops_at_once() {
     let tiers = default_tiers(1_500_000.0);
-    let mut publisher = MultiViewerPublisher::new(config());
+    let start = PublisherConfig {
+        start_bps: 1_500_000.0,
+        ..config()
+    };
+    let mut publisher = MultiViewerPublisher::new(start);
     publisher.on_report("a", 0.0, report(5_000_000, 0.0));
     let mut tier = 3;
     let mut ups = Vec::new();

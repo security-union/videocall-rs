@@ -284,6 +284,14 @@ fn one_early_report_per_congestion_event() {
     }
     assert_eq!(early.len(), 1, "{early:?}");
     assert!(early[0].backlog_ms > 0.0);
+    // A ceiling only from a measured busy period: the 500 kbps link, never
+    // the 936 kbps the wide link delivered before (a lower bound).
+    assert!(
+        early[0]
+            .capacity_bps
+            .is_none_or(|bps| (450_000..=600_000).contains(&bps)),
+        "{early:?}"
+    );
 }
 
 #[test]

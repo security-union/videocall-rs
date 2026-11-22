@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v6.0.1...videocall-types-v7.0.0) - 2026-11-22
+
+### Added
+
+- *(videocall-client)* viewer-driven camera rate control and traffic shaping ([#941](https://github.com/security-union/videocall-rs/pull/941))
+
 ## [6.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v6.0.0...videocall-types-v6.0.1) - 2026-08-13
 
 ### Other

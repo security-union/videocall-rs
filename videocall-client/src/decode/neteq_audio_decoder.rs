@@ -161,6 +161,12 @@ impl WorkerLink {
             return;
         }
         let mut pending = self.pending.borrow_mut();
+        // A queued Mute supersedes every earlier queued Mute: only the last
+        // state matters, and peers toggle mute repeatedly before the worker
+        // reports ready.
+        if matches!(item, Outgoing::Msg(WorkerMsg::Mute { .. })) {
+            pending.retain(|queued| !matches!(queued, Outgoing::Msg(WorkerMsg::Mute { .. })));
+        }
         if pending.len() >= MAX_PENDING_MESSAGES {
             // Drop the oldest packet; control messages (mute, attach) stay.
             if let Some(index) = pending
@@ -273,6 +279,10 @@ pub struct NetEqAudioPeerDecoder {
 
     /// `Date.now()` of the last `AudioContext.resume()` attempt.
     last_resume_attempt_ms: f64,
+
+    /// The mute state last handed to the worker. `set_muted` repeats often
+    /// (heartbeat updates), and only a change is worth a message.
+    last_mute_sent: Cell<Option<bool>>,
 }
 
 impl NetEqAudioPeerDecoder {
@@ -467,6 +477,7 @@ impl NetEqAudioPeerDecoder {
             received_sequences: VecDeque::with_capacity(AUDIO_RED_SEQ_HISTORY_SIZE),
             rtp_mapper: RtpTimestampMapper::new(),
             last_resume_attempt_ms: f64::NEG_INFINITY,
+            last_mute_sent: Cell::new(None),
         };
 
         decoder.send(WorkerMsg::Init {
@@ -681,6 +692,13 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     }
 
     fn set_muted(&mut self, muted: bool) {
+        // Mute is idempotent and repeats at heartbeat rate; a repeated state
+        // is not worth a message (and the worker would only log it as
+        // redundant).
+        if self.last_mute_sent.get() == Some(muted) {
+            return;
+        }
+        self.last_mute_sent.set(Some(muted));
         log::debug!(
             "Peer {} set_muted({muted}), worker ready: {}",
             self.peer_id,

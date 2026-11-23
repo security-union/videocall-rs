@@ -613,14 +613,23 @@
   /* The buttons inside the bar become fills (no glass on glass, in
      components.css). Hang Up keeps its red; on/off states invert and swap
      the icon. */
-  .call-controls {
+  .call-root .controls {
     position: fixed;
     bottom: max(var(--space-4), var(--safe-bottom));
     left: 50%;
     z-index: var(--z-bar);
-    gap: var(--space-3);
+    display: flex;
+    width: max-content;
     max-width: calc(100vw - 2 * var(--space-2));
     transform: translateX(-50%);
+  }
+
+  /* The bar sits in normal flow inside .controls, so the wrapper has the
+     bar's box. min-width: 0 lets the bar scroll instead of overflowing. */
+  .call-controls {
+    gap: var(--space-3);
+    min-width: 0;
+    max-width: 100%;
   }
 
   /* Narrow phones: tighter gaps rather than squeezed 44px buttons.

@@ -594,6 +594,20 @@
     --btn-pressed-layer: color-mix(in srgb, var(--color-black) 22%, transparent);
   }
 
+  /* Increase Contrast: a tinted fill under a colored label caps the label
+     near 3.5:1, because even the darker Increase Contrast blue and red only
+     reach about 4.6:1 on plain white. So the tint gives way to the page
+     background, opaque, and an outline in the label color keeps the shape.
+     4.6:1 in light, 7:1 and up in dark. */
+  @media (prefers-contrast: more) {
+    .btn-tinted,
+    .btn-destructive:not(.btn-prominent, .btn-plain),
+    .btn[aria-pressed="true"]:not(.btn-prominent, .btn-tinted, .btn-destructive, .btn-glass, .btn-glass-clear) {
+      --btn-bg: var(--color-bg);
+      border-color: currentColor;
+    }
+  }
+
   .btn-glass,
   .btn-glass-clear,
   .icon-btn-glass,

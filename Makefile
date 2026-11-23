@@ -222,8 +222,8 @@ check-e2e: e2e-build e2e-install ## Full Playwright pipeline: warm builds, nativ
 
 ##@ E2E utilities (Playwright against a running `make e2e-up` stack)
 
-e2e-install: ## Install e2e npm deps and the Playwright Chromium
-	cd e2e && npm ci && npx playwright install chromium
+e2e-install: ## Install e2e npm deps and the Playwright Chromium and WebKit
+	cd e2e && npm ci && npx playwright install chromium webkit
 
 # Warm everything the native E2E stack needs: the nix-built UI dist (and, on
 # Linux, the server binaries — CI substitutes them from cachix); darwin runs

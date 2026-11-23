@@ -20,7 +20,7 @@ pub fn Call() -> Element {
         Section {
             id: "call",
             title: "In-call",
-            lede: "Pinned to dark with .theme-dark and scoped with .over-media, so Clear is the only glass over the video, and a bottom fade under the bar. On is inverted and the icon changes too, so the state never rests on color alone. The toast is .toast-solid, and the first and last tooltips line up with their button so they stay on screen.",
+            lede: "Pinned to dark with .theme-dark and scoped with .over-media, so Clear is the only glass over the video, and a bottom fade under the bar. On is inverted and the icon changes too, so the state never rests on color alone. The toast is .toast-solid, and the first and last tooltips line up with their button so they stay on screen. The name label sits on --material-dim-label, 54% black, so it still reads when the picture is white.",
             div { class: "theme-dark over-media gallery-call",
                 div { class: "gallery-call-tile gallery-video",
                     MediaDim { edge: DimEdge::Bottom }

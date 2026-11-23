@@ -641,6 +641,8 @@
     }
   }
 
+  /* The tile's name label, on the darker label dim, as dioxus-ui draws it:
+     it has to read over a white frame too. */
   .gallery-call-name {
     position: absolute;
     top: var(--space-3);
@@ -648,6 +650,13 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-xs);
+    background-color: var(--material-dim-label);
+  }
+
+  .gallery-call-name .badge {
+    background-color: transparent;
   }
 
   .gallery-call-toast {
@@ -677,6 +686,14 @@
     width: max-content;
     max-width: calc(100% - 2 * var(--space-4));
     transform: translateX(-50%);
+  }
+
+  /* At the largest text sizes the segments and the button do not fit on
+     one line of a phone, so the button wraps under them. */
+  .gallery-controls > .bar {
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 100%;
   }
 
   /* The index is 15rem wide on regular screens; center the bar over the

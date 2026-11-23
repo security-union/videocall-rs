@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn the_sheets_use_the_queries_this_module_rewrites() {
         assert_eq!(media_uses(TOKENS_CSS, CONTRAST), 2);
-        assert_eq!(media_uses(COMPONENTS_CSS, CONTRAST), 2);
+        assert_eq!(media_uses(COMPONENTS_CSS, CONTRAST), 3);
         assert_eq!(media_uses(COMPONENTS_CSS, TRANSPARENCY), 1);
         assert_eq!(media_uses(COMPONENTS_CSS, MOTION), 1);
         assert_eq!(media_uses(BASE_CSS, MOTION), 1);

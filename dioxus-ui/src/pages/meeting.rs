@@ -623,7 +623,7 @@ pub fn MeetingPage(id: String) -> Element {
                                         required: true,
                                         // Quoted: `autofocus` is both a global and
                                         // an input attribute (ambiguous bare).
-                                        "autofocus": true,
+                                        "autofocus": crate::platform::autofocus_allowed(),
                                         value: "{input_value_state}",
                                         oninput: move |e: Event<FormData>| {
                                             input_value_state.set(e.value());

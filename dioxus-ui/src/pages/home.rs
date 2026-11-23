@@ -255,7 +255,7 @@ pub fn Home() -> Element {
                             required: true,
                             // Quoted: `autofocus` is both a global and an
                             // input attribute, so the bare name is ambiguous.
-                            "autofocus": true,
+                            "autofocus": crate::platform::autofocus_allowed(),
                             maxlength: DISPLAY_NAME_MAX_LEN as i64,
                             value: "{username_value}",
                             invalid: username_error().is_some(),

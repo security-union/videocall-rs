@@ -85,7 +85,7 @@
 
   .join-button {
     margin-top: var(--space-2);
-    min-width: 12rem;
+    min-width: min(12rem, 100%);
   }
 
   /* =========================================================================
@@ -255,9 +255,11 @@
     color: var(--color-label-secondary);
   }
 
-  /* Name label: a dim fill for legibility over video, not glass. The name
-     sits in .floating-name-text and truncates there, so a long name never
-     pushes the host badge out of view. */
+  /* Name label: a dim fill for legibility over video, not glass. It is the
+     darker --material-dim-label, not the 35% edge dim, because the label
+     has to read over a white frame too. The name sits in
+     .floating-name-text and truncates there, so a long name never pushes
+     the host badge out of view. */
   .floating-name {
     position: absolute;
     top: var(--space-2);
@@ -271,7 +273,7 @@
     padding: var(--space-1) var(--space-2);
     overflow: hidden;
     border-radius: var(--radius-xs);
-    background-color: var(--material-dim);
+    background-color: var(--material-dim-label);
     color: var(--color-label);
     font: var(--text-footnote-emphasized);
     white-space: nowrap;
@@ -287,9 +289,12 @@
   }
 
   /* The "(Host)" label is text in a badge, so it does not rest on color.
-     It never shrinks; the name gives way first. */
+     It never shrinks; the name gives way first. Its fill is the label's
+     own dim, not the gray badge fill: gray over the dim lightens it, and
+     over a white frame that took the badge text under 3:1. */
   .floating-name .host-indicator {
     flex: none;
+    background-color: var(--material-dim-label);
   }
 
   /* A right-to-left name anchors to the other corner, as the old
@@ -751,6 +756,17 @@
     to {
       opacity: 0;
       transform: translateY(calc(-1 * var(--space-2)));
+    }
+  }
+
+  /* On a phone the peer list and diagnostics open as full-height sheets
+     (sidebars.css, same breakpoint), and a toast at the top would cover
+     the sheet's header and search field. While one is open the toasts move
+     to the bottom edge, where the sheet has only list rows. */
+  @media (max-width: 37.5em) {
+    .call-root:has(#peer-list-container.visible, #diagnostics-sidebar.visible) .peer-toasts {
+      top: auto;
+      bottom: max(var(--space-4), var(--safe-bottom));
     }
   }
 

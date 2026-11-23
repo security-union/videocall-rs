@@ -98,6 +98,35 @@ test.describe("Appearance", () => {
   });
 });
 
+test.describe("Display name prompt", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test.beforeEach(async ({ context, baseURL }) => {
+    await injectSessionCookie(context, { baseURL });
+  });
+
+  // On a touch screen focusing the field raises the keyboard over the join
+  // button, so the field only takes focus by itself with a mouse.
+  test("the name field autofocuses with a mouse and not on a touch screen", async ({
+    page,
+  }, testInfo) => {
+    await page.goto(`/meeting/e2e_focus_${Date.now()}`);
+    const input = page.getByTestId("display-name-input");
+    await expect(input).toBeVisible({ timeout: 20_000 });
+    const coarse = await page.evaluate(() => matchMedia("(pointer: coarse)").matches);
+    if (testInfo.project.name === "webkit-iphone") {
+      expect(coarse).toBe(true);
+    }
+    if (coarse) {
+      await expect(input).not.toBeFocused();
+    } else {
+      await expect(input).toBeFocused();
+    }
+  });
+});
+
 test.describe("In-call control bar", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -115,6 +144,19 @@ test.describe("In-call control bar", () => {
       await expect(button).toBeVisible();
       await expect(button).toHaveAttribute("aria-pressed", "false");
     }
+  });
+
+  test("every control bar button has an accessible name", async ({ page }) => {
+    // The tooltips are visibility: hidden until hover or focus, so they do
+    // not name the button. Each button needs its own label for VoiceOver.
+    const buttons = page.locator(".call-controls button.video-control-button");
+    const count = await buttons.count();
+    expect(count).toBeGreaterThanOrEqual(4);
+    for (let index = 0; index < count; index++) {
+      await expect(buttons.nth(index), `button ${index}`).toHaveAccessibleName(/\S/);
+    }
+    await expect(controlButton(page, "Hang Up")).toHaveAccessibleName("Hang Up");
+    await expect(controlButton(page, "Open Peers")).toHaveAccessibleName("Open Peers");
   });
 
   test("aria-pressed flips when the mic and camera are toggled", async ({ page }) => {

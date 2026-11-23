@@ -51,6 +51,14 @@ App screens go in `features`. A later layer wins no matter the specificity, so a
 
 The full contract is the header comment of `styles/components.css`.
 
+Text that lives on video for good, like a tile's name label, sits on `--material-dim-label` instead. That's 54% black, the lowest alpha that keeps white footnote text at 4.5:1 when the picture behind it is pure white.
+
+## Text size and contrast
+
+On an iPhone or iPad, base.css gives the root `font: -apple-system-body`, so `1rem` follows the Dynamic Type setting. It's 17px at the default size, so `--type-scale` shrinks the text styles by 16/17 to keep them on the HIG sizes there. The rule only applies with `(hover: none) and (pointer: coarse)`, because a Mac supports the same keyword but reports a fixed 13px. An iPad with a trackpad attached reports hover, so it gets the plain 16px root and ignores Dynamic Type.
+
+Under Increase Contrast a tinted or destructive button drops its tint for the opaque page background plus an outline. A tinted fill under a blue or red label can't reach 4.5:1 in light mode, even with the darker Increase Contrast colors.
+
 ## Where the numbers come from
 
 Colors and the type scale are Apple's, measured on iOS 27.2. So are the 44px hit target and the 35% dim. Apple publishes no number for glass blur, tint, radii, spacing, shadows or motion, so those are my approximations, and tokens.css marks each one.

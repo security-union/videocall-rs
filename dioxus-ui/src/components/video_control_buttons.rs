@@ -179,9 +179,11 @@ pub fn ScreenShareButton(
 
 #[component]
 pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    // No label: the tooltip text names it.
+    // The label repeats the tooltip: the tooltip is visibility: hidden until
+    // hover or focus, so it does not count toward the accessible name.
+    let label = if open { "Close Peers" } else { "Open Peers" };
     rsx! {
-        ControlButton { state: on_when(open), onclick: move |evt| onclick.call(evt),
+        ControlButton { label, state: on_when(open), onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -224,9 +226,14 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
 
 #[component]
 pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    // No label: the tooltip text names it.
+    // The label repeats the tooltip, which is hidden from the accessible name.
+    let label = if open {
+        "Close Diagnostics"
+    } else {
+        "Open Diagnostics"
+    };
     rsx! {
-        ControlButton { state: on_when(open), onclick: move |evt| onclick.call(evt),
+        ControlButton { label, state: on_when(open), onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -271,6 +278,9 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
 
     rsx! {
         ControlButton {
+            // The label repeats the tooltip, which is hidden from the
+            // accessible name.
+            label: tooltip,
             state: on_when(open),
             "data-testid": "open-settings",
             onclick: move |evt| onclick.call(evt),
@@ -331,8 +341,10 @@ pub fn BabyModeButton(onclick: EventHandler<MouseEvent>) -> Element {
 #[component]
 pub fn HangUpButton(onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
-        // No label: the tooltip text names it, and tests find it by that text.
+        // The label repeats the tooltip, which is hidden from the accessible
+        // name. Tests find the button by the tooltip text.
         ControlButton {
+            label: "Hang Up",
             state: ControlState::Danger,
             onclick: move |evt| onclick.call(evt),
             // Last in the bar: the tooltip lines up with the right edge.

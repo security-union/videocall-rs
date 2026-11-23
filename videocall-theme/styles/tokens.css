@@ -326,7 +326,11 @@
   /* ---- Increase Contrast ----
      Light lists only what differs from light. The dark blocks list
      everything, so they also undo the light overrides above them. The two
-     dark blocks are copies of each other, like the plain dark ones. */
+     dark blocks are copies of each other, like the plain dark ones.
+     --color-link has no measured Increase Contrast value, so it takes the
+     mode's blue. #5CB8FF is 5.6:1 or more on every dark background.
+     #1E6EF4 is 4.6:1 on white but 3.9:1 on the gray grouped background, so
+     a link belongs on a card or row there, not on the bare page. */
   @media (prefers-contrast: more) {
     :root,
     .theme-light {
@@ -356,6 +360,7 @@
       --color-fill-secondary: rgba(120, 120, 128, 0.24);
       --color-fill-tertiary: rgba(118, 118, 128, 0.20);
       --color-fill-quaternary: rgba(116, 116, 128, 0.16);
+      --color-link: #1E6EF4;
       --color-bg-secondary: #EBEBF0;
       --color-bg-grouped: #EBEBF0;
       --color-bg-grouped-tertiary: #EBEBF0;
@@ -410,7 +415,7 @@
       --color-fill-quaternary: rgba(118, 118, 128, 0.26);
       --color-separator: rgba(84, 84, 88, 0.50);
       --color-separator-opaque: #2A2A2C;
-      --color-link: #0984FF;
+      --color-link: #5CB8FF;
 
       /* Label on accent and danger fills. Black: white on #5CB8FF is about
          2.1:1, black is about 9.8:1. */
@@ -497,7 +502,7 @@
       --color-fill-quaternary: rgba(118, 118, 128, 0.26);
       --color-separator: rgba(84, 84, 88, 0.50);
       --color-separator-opaque: #2A2A2C;
-      --color-link: #0984FF;
+      --color-link: #5CB8FF;
 
       /* Label on accent and danger fills. Black: white on #5CB8FF is about
          2.1:1, black is about 9.8:1. */
@@ -558,6 +563,13 @@
     /* The dimming layer under Clear glass. 35% is Apple's number. */
     --material-dim: rgba(0, 0, 0, 0.35);
 
+    /* A darker dim behind small text that sits on video for good, like a
+       tile's name label. Nothing promises the frame is dark, so it has to
+       hold over white. 54% is the lowest alpha that keeps white footnote
+       text at 4.5:1 over a pure white frame. Worked out from WCAG; Apple
+       publishes no value. */
+    --material-dim-label: rgba(0, 0, 0, 0.54);
+
     /* Glass blur and saturation. Approximation, Apple publishes no value.
        Kept moderate on purpose: a blur over live video is redrawn on every
        video frame. Clear blurs less than Regular. */
@@ -577,37 +589,41 @@
     --font-weight-bold: 700;
 
     /* The 11 iOS text styles (HIG Dynamic Type, "Large"). Use them as
-       `font: var(--text-body)`. Sizes are in rem so the browser's text size
-       setting scales them; 1rem is 16px by default, so 1.0625rem is 17pt.
+       `font: var(--text-body)`. Sizes are in rem so the text size setting
+       scales them; 1rem is 16px by default, so 1.0625rem is 17pt. On an
+       iPhone or iPad, base.css sets the root to the system body size, so
+       1rem follows Dynamic Type and is 17px at Large. --type-scale (below)
+       is 16/17 there, which puts every style back on its HIG size at Large.
        The line height is the HIG leading as a ratio (22/17 for body), so it
        still fits when something inherits it at another size. The comment on
        each line is size/leading in points.
        No letter-spacing: Safari may already apply SF's own tracking. */
-    --text-large-title: 400 2.125rem/1.2059 var(--font-sans); /* 34/41 */
-    --text-title-1: 400 1.75rem/1.2143 var(--font-sans); /* 28/34 */
-    --text-title-2: 400 1.375rem/1.2727 var(--font-sans); /* 22/28 */
-    --text-title-3: 400 1.25rem/1.25 var(--font-sans); /* 20/25 */
-    --text-headline: 600 1.0625rem/1.2941 var(--font-sans); /* 17/22 */
-    --text-body: 400 1.0625rem/1.2941 var(--font-sans); /* 17/22 */
-    --text-callout: 400 1rem/1.3125 var(--font-sans); /* 16/21 */
-    --text-subheadline: 400 0.9375rem/1.3333 var(--font-sans); /* 15/20 */
-    --text-footnote: 400 0.8125rem/1.3846 var(--font-sans); /* 13/18 */
-    --text-caption-1: 400 0.75rem/1.3333 var(--font-sans); /* 12/16 */
-    --text-caption-2: 400 0.6875rem/1.1818 var(--font-sans); /* 11/13 */
+    --type-scale: 1;
+    --text-large-title: 400 calc(2.125rem * var(--type-scale))/1.2059 var(--font-sans); /* 34/41 */
+    --text-title-1: 400 calc(1.75rem * var(--type-scale))/1.2143 var(--font-sans); /* 28/34 */
+    --text-title-2: 400 calc(1.375rem * var(--type-scale))/1.2727 var(--font-sans); /* 22/28 */
+    --text-title-3: 400 calc(1.25rem * var(--type-scale))/1.25 var(--font-sans); /* 20/25 */
+    --text-headline: 600 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans); /* 17/22 */
+    --text-body: 400 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans); /* 17/22 */
+    --text-callout: 400 calc(1rem * var(--type-scale))/1.3125 var(--font-sans); /* 16/21 */
+    --text-subheadline: 400 calc(0.9375rem * var(--type-scale))/1.3333 var(--font-sans); /* 15/20 */
+    --text-footnote: 400 calc(0.8125rem * var(--type-scale))/1.3846 var(--font-sans); /* 13/18 */
+    --text-caption-1: 400 calc(0.75rem * var(--type-scale))/1.3333 var(--font-sans); /* 12/16 */
+    --text-caption-2: 400 calc(0.6875rem * var(--type-scale))/1.1818 var(--font-sans); /* 11/13 */
 
     /* Emphasized variants, per the HIG table: bold for the three largest,
        semibold for the rest. */
-    --text-large-title-emphasized: 700 2.125rem/1.2059 var(--font-sans);
-    --text-title-1-emphasized: 700 1.75rem/1.2143 var(--font-sans);
-    --text-title-2-emphasized: 700 1.375rem/1.2727 var(--font-sans);
-    --text-title-3-emphasized: 600 1.25rem/1.25 var(--font-sans);
-    --text-headline-emphasized: 600 1.0625rem/1.2941 var(--font-sans);
-    --text-body-emphasized: 600 1.0625rem/1.2941 var(--font-sans);
-    --text-callout-emphasized: 600 1rem/1.3125 var(--font-sans);
-    --text-subheadline-emphasized: 600 0.9375rem/1.3333 var(--font-sans);
-    --text-footnote-emphasized: 600 0.8125rem/1.3846 var(--font-sans);
-    --text-caption-1-emphasized: 600 0.75rem/1.3333 var(--font-sans);
-    --text-caption-2-emphasized: 600 0.6875rem/1.1818 var(--font-sans);
+    --text-large-title-emphasized: 700 calc(2.125rem * var(--type-scale))/1.2059 var(--font-sans);
+    --text-title-1-emphasized: 700 calc(1.75rem * var(--type-scale))/1.2143 var(--font-sans);
+    --text-title-2-emphasized: 700 calc(1.375rem * var(--type-scale))/1.2727 var(--font-sans);
+    --text-title-3-emphasized: 600 calc(1.25rem * var(--type-scale))/1.25 var(--font-sans);
+    --text-headline-emphasized: 600 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans);
+    --text-body-emphasized: 600 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans);
+    --text-callout-emphasized: 600 calc(1rem * var(--type-scale))/1.3125 var(--font-sans);
+    --text-subheadline-emphasized: 600 calc(0.9375rem * var(--type-scale))/1.3333 var(--font-sans);
+    --text-footnote-emphasized: 600 calc(0.8125rem * var(--type-scale))/1.3846 var(--font-sans);
+    --text-caption-1-emphasized: 600 calc(0.75rem * var(--type-scale))/1.3333 var(--font-sans);
+    --text-caption-2-emphasized: 600 calc(0.6875rem * var(--type-scale))/1.1818 var(--font-sans);
 
     /* Spacing, on a 4px grid. Approximation, Apple publishes no scale. The
        number is the multiple of 4px. In rem, so it follows the text size. */
@@ -705,6 +721,20 @@
   @supports (height: 100dvh) {
     :root {
       --viewport-height: 100dvh;
+    }
+  }
+
+  /* Dynamic Type. base.css gives the root the system body font on a touch
+     screen with no hover, so 1rem is the person's body size (17px at Large,
+     23px at the largest standard size). The text styles are written for a
+     16px rem, so they scale by 16/17 here and land on the HIG sizes at
+     Large. Spacing and control sizes stay on the plain rem and grow with
+     the text. The same scope as base.css; keep the two in step. */
+  @supports (font: -apple-system-body) {
+    @media (hover: none) and (pointer: coarse) {
+      :root {
+        --type-scale: calc(16 / 17);
+      }
     }
   }
 

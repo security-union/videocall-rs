@@ -670,7 +670,7 @@ pub fn Host(
                         placeholder: "Enter new name",
                         // Quoted: `autofocus` is both a global and an input
                         // attribute, so the bare name is ambiguous here.
-                        "autofocus": true,
+                        "autofocus": crate::platform::autofocus_allowed(),
                     }
                     if let Some(err) = change_name_error() {
                         p { class: "field-error", "{err}" }

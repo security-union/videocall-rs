@@ -273,6 +273,24 @@
     -webkit-tap-highlight-color: transparent;
   }
 
+  /* Dynamic Type. iOS Safari ignores the text size in Settings unless the
+     page asks for a system text style; this is WebKit's documented way.
+     The root takes the body style, so 1rem becomes the person's body size,
+     and the family goes back to the token stack.
+     Scoped to a touch screen with no hover (iPhone, iPad without a
+     trackpad). macOS Safari supports the keyword too, but there it is a
+     fixed 13px, and a Mac always reports hover, so it keeps the 16px root.
+     tokens.css scales the text styles by 16/17 in the same scope. */
+  @supports (font: -apple-system-body) {
+    @media (hover: none) and (pointer: coarse) {
+      html {
+        font: -apple-system-body;
+        font-family: var(--font-sans);
+        line-height: 1.5;
+      }
+    }
+  }
+
   body {
     min-height: 100vh;
     min-height: var(--viewport-height);
@@ -410,6 +428,12 @@
     background-color: var(--color-bg);
     color: var(--color-label);
     text-align: center;
+  }
+
+  /* A grid item will not shrink below its longest word or widest control
+     unless told to. At the largest text sizes that is wider than a phone. */
+  .screen-center > * {
+    min-width: 0;
   }
 
   /* Column and row with a gap. The gap classes set the size. */

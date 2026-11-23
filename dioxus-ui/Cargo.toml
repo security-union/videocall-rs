@@ -75,6 +75,7 @@ features = [
     "MediaDeviceInfo",
     "MediaDeviceKind",
     "MediaDevices",
+    "MediaQueryList",
     "MediaStream",
     "MediaStreamConstraints",
     "Navigator",

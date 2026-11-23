@@ -21,6 +21,8 @@
     margin: 0;
     font: var(--text-title-1-emphasized);
     text-align: center;
+    /* At the largest text sizes "videocall.rs" is wider than a phone. */
+    overflow-wrap: anywhere;
   }
 
   .login-footer {

@@ -28,5 +28,17 @@ export default defineConfig({
         launchOptions: { args: CHROME_ARGS },
       },
     },
+    {
+      // Safari's engine at iPhone size, for the screens that need no camera.
+      // Playwright's WebKit cannot grant the capture prompt headless, so
+      // anything that joins a call stays Chromium-only.
+      name: "webkit-iphone",
+      testMatch: ["meetings.spec.ts", "restyle.spec.ts"],
+      grepInvert: /in-call/i,
+      use: {
+        baseURL: "http://localhost:3001",
+        ...devices["iPhone 15"],
+      },
+    },
   ],
 });

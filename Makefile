@@ -27,6 +27,9 @@ E2E_PC_PORT      ?= 28082
 E2E_DATA         ?= /tmp/videocall-e2e-data
 SQLITE_TEST_DB   ?= /tmp/meeting_api_test.sqlite3
 
+# The videocall-theme gallery (trunk serve). 3001 is the app, 3000 grafana.
+THEME_GALLERY_PORT ?= 3002
+
 # On macOS the nokhwa capture crates shell out to Swift/Xcode, which the pinned
 # nix-shell's Apple-SDK env breaks. Exclude them from the workspace clippy
 # there (the pre-push hook still lints them with the system toolchain); Linux
@@ -35,7 +38,7 @@ CLIPPY_EXCLUDES := $(shell [ "$$(uname -s)" = "Darwin" ] && echo "--exclude vide
 
 .PHONY: help all ensure-nix images shell pins-update \
 	dev dev-middleware dev-down status vlog \
-	dev-websocket dev-webtransport dev-meeting-api dev-metrics dev-server-stats dev-ui dev-website \
+	dev-websocket dev-webtransport dev-meeting-api dev-metrics dev-server-stats dev-ui dev-website theme-gallery theme-gallery-build \
 	check lint lint-fix fmt \
 	check-backend check-backend-down check-backend-sqlite check-ui check-e2e \
 	e2e e2e-headed e2e-debug e2e-interop e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build \
@@ -133,13 +136,21 @@ dev-server-stats: ## Watch the server-stats server (:9092)
 	$(DEV_ENV) METRICS_PORT=9092 SERVICE_TYPE=server-stats REGION=us-east SERVER_ID=server-1 \
 	cargo watch -x 'run --bin metrics_server_snapshot'
 
-# Frontend with hot reload (trunk serve on :3001). Needs trunk + tailwindcss
+# Frontend with hot reload (trunk serve on :3001). Needs trunk
 # (nix-shell default.nix -A shells.frontend provides the pinned versions).
 dev-ui: ## Watch the Dioxus UI (trunk serve, :3001)
 	./scripts/start-dioxus.sh
 
 dev-website: ## Watch the leptos marketing site (:4600) — not part of `make dev`
 	cd leptos-website && npm install && LEPTOS_SITE_ADDR=0.0.0.0:4600 cargo leptos watch
+
+# The design system (videocall-theme): every token and primitive on one page.
+# Needs trunk, like dev-ui.
+theme-gallery: ## Browse the design system gallery (trunk serve, :3002)
+	cd videocall-theme/gallery && trunk serve --address 127.0.0.1 --port $(THEME_GALLERY_PORT)
+
+theme-gallery-build: ## Build the design system gallery into videocall-theme/gallery/dist
+	cd videocall-theme/gallery && trunk build --release
 
 ##@ Images & shells (images are the k8s deliverable; docker daemon needed only to load them)
 
@@ -202,8 +213,8 @@ check-backend-sqlite: ensure-nix ## meeting-api integration tests on the SQLite 
 	DATABASE_URL="sqlite:$(SQLITE_TEST_DB)" \
 		cargo test -p meeting-api --no-default-features --features sqlite -- --test-threads=1
 
-check-ui: ensure-nix ## Dioxus UI wasm component tests (headless Chrome, parallel; needs CHROME_BIN + CHROMEDRIVER, or DIOXUS_UI_TESTS_SYSTEM_BROWSER=1)
-	nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
+check-ui: ensure-nix ## videocall-theme native tests, then Dioxus UI wasm component tests (headless Chrome, parallel; needs CHROME_BIN + CHROMEDRIVER, or DIOXUS_UI_TESTS_SYSTEM_BROWSER=1)
+	nix-shell default.nix -A shells.frontend-tests --run "cargo test -p videocall-theme && dioxus-ui-component-tests"
 
 check-e2e: e2e-build e2e-install ## Full Playwright pipeline: warm builds, native stack, tests, teardown
 	$(MAKE) e2e-up
@@ -211,8 +222,8 @@ check-e2e: e2e-build e2e-install ## Full Playwright pipeline: warm builds, nativ
 
 ##@ E2E utilities (Playwright against a running `make e2e-up` stack)
 
-e2e-install: ## Install e2e npm deps and the Playwright Chromium
-	cd e2e && npm ci && npx playwright install chromium
+e2e-install: ## Install e2e npm deps and the Playwright Chromium and WebKit
+	cd e2e && npm ci && npx playwright install chromium webkit
 
 # Warm everything the native E2E stack needs: the nix-built UI dist (and, on
 # Linux, the server binaries — CI substitutes them from cachix); darwin runs

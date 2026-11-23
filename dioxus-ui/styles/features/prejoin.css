@@ -1,0 +1,201 @@
+/*
+ * prejoin.css
+ *
+ * The screens a participant sees before video: checking sign-in, display
+ * name, joining, waiting for the host to start, waiting to be admitted,
+ * entry denied and join errors. Each one is a card centered on the page.
+ * They follow the system appearance.
+ */
+
+@layer features {
+  .prejoin-screen {
+    z-index: var(--z-content);
+    background-color: var(--color-bg-grouped);
+  }
+
+  /* A state with no card: just a spinner and a line of text. */
+  .prejoin-status {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-4);
+    color: var(--color-label-secondary);
+  }
+
+  .prejoin-status .spinner {
+    color: var(--color-label);
+  }
+
+  .prejoin-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    width: 100%;
+    max-width: 25rem;
+    padding: var(--space-8) var(--space-6);
+    border-radius: var(--radius-xl);
+    text-align: center;
+  }
+
+  .prejoin-card h2 {
+    font: var(--text-title-2);
+    color: var(--color-label);
+  }
+
+  .prejoin-card p {
+    margin: 0;
+  }
+
+  .prejoin-card .btn {
+    margin-top: var(--space-3);
+  }
+
+  .prejoin-form {
+    width: 100%;
+    margin-top: var(--space-3);
+  }
+
+  .prejoin-form .input {
+    text-align: start;
+  }
+
+  .prejoin-form .btn {
+    margin-top: var(--space-2);
+  }
+
+  /* Icon plus text, never color alone. */
+  .prejoin-icon-danger {
+    color: var(--color-danger);
+  }
+
+  .prejoin-icon-warning {
+    color: var(--color-warning);
+  }
+
+  .waiting-room-icon {
+    display: flex;
+    justify-content: center;
+    color: var(--color-label-secondary);
+  }
+
+  .waiting-room-identity {
+    color: var(--color-label);
+  }
+
+  .waiting-room-error {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font: var(--text-footnote);
+    color: var(--color-danger);
+  }
+
+  .waiting-room-error svg {
+    flex: none;
+  }
+
+  .waiting-room-spinner {
+    display: flex;
+    justify-content: center;
+    color: var(--color-label-secondary);
+  }
+
+  /* =========================================================================
+     Host admit controls (in call, dark). The panel is the one glass surface.
+     ========================================================================= */
+
+  .host-controls-container {
+    position: fixed;
+    top: max(var(--space-4), var(--safe-top));
+    left: 50%;
+    z-index: var(--z-popover);
+    width: min(25rem, calc(100vw - 2 * var(--space-4)));
+    max-height: calc(var(--viewport-height, 100dvh) - 2 * var(--space-4));
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+    transform: translateX(-50%);
+  }
+
+  /* Rows sit on the glass panel, so they are transparent, not cards. */
+  .host-controls-container .list-group {
+    background-color: transparent;
+    border-radius: 0;
+  }
+
+  .host-controls-toggle {
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .host-controls-toggle .chevron-icon {
+    margin-inline-start: auto;
+    transition: transform var(--duration-base) var(--ease-standard);
+  }
+
+  .host-controls-toggle .chevron-icon.expanded {
+    transform: rotate(180deg);
+  }
+
+  .host-controls-list {
+    max-height: 18.75rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-top: 1px solid var(--color-separator);
+  }
+
+  .admit-all-container {
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .admit-all-container .btn {
+    width: 100%;
+  }
+
+  .waiting-participant {
+    justify-content: space-between;
+  }
+
+  .participant-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .participant-name {
+    overflow: hidden;
+    font: var(--text-headline);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .participant-email {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .participant-actions {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  /* Check and cross differ in shape, so approve and reject read without the
+     color. The fill comes from .icon-btn-filled. */
+  .btn-admit {
+    --btn-fg: var(--color-success);
+  }
+
+  .btn-reject {
+    --btn-fg: var(--color-danger);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .host-controls-toggle .chevron-icon {
+      transition: none;
+    }
+  }
+}

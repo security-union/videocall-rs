@@ -1,8 +1,7 @@
 #!/bin/sh
 # Native dev server for the Dioxus UI (`make dev-ui`): generates the runtime
-# config.js from env, runs tailwind in watch mode, serves via trunk with hot
-# reload. Needs trunk + tailwindcss + the wasm32 target on PATH — the pinned
-# versions come from `nix-shell -A shells.frontend`.
+# config.js from env, serves via trunk with hot reload. Needs trunk + the
+# wasm32 target on PATH — the pinned versions come from `nix-shell -A shells.frontend`.
 set -eu
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,7 +29,5 @@ window.__APP_CONFIG = Object.freeze({
 EOF
 
 cd "$UI_DIR"
-
-tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify &
 
 exec trunk serve --address 0.0.0.0 --port "${TRUNK_SERVE_PORT:-3001}" --poll

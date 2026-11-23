@@ -6,6 +6,9 @@
 use crate::components::call_timer::CallTimer;
 use crate::context::MeetingTimeCtx;
 use dioxus::prelude::*;
+use videocall_theme::{
+    Badge, BadgeTone, ListGroup, ListRow, ListRowLabel, ListRowValue, StatusDot, StatusTone,
+};
 
 #[component]
 pub fn MeetingInfo(
@@ -25,34 +28,35 @@ pub fn MeetingInfo(
     let call_start = meeting_time().call_start_time;
 
     rsx! {
-        div { class: "meeting-info-compact",
-            div { class: "info-row",
-                span { class: "info-label", "Room" }
-                span { class: "info-value", "{room_id}" }
+        ListGroup { class: "meeting-info",
+            ListRow {
+                ListRowLabel { "Room" }
+                ListRowValue { class: "text-mono", "{room_id}" }
             }
-            div { class: "info-row",
-                span { class: "info-label", "Meeting Time" }
-                span { class: "info-value",
+            ListRow {
+                ListRowLabel { "Meeting Time" }
+                ListRowValue { class: "row gap-2",
                     if is_active {
-                        span { class: "live-dot" }
+                        StatusDot { tone: StatusTone::Success, label: "Live" }
                     }
                     CallTimer { start_time_ms: meeting_start }
                 }
             }
-            div { class: "info-row",
-                span { class: "info-label", "Your Time" }
-                span { class: "info-value",
+            ListRow {
+                ListRowLabel { "Your Time" }
+                ListRowValue {
                     CallTimer { start_time_ms: call_start }
                 }
             }
-            div { class: "info-row",
-                span { class: "info-label", "Participants" }
-                span { class: "info-value", "{num_participants + 1}" }
+            ListRow {
+                ListRowLabel { "Participants" }
+                ListRowValue { class: "text-tabular", "{num_participants + 1}" }
             }
-            div { class: "info-row",
-                span { class: "info-label", "Status" }
-                span {
-                    class: if is_active { "info-value status-active" } else { "info-value status-ended" },
+            ListRow {
+                ListRowLabel { "Status" }
+                Badge {
+                    tone: if is_active { BadgeTone::Success } else { BadgeTone::Neutral },
+                    class: "list-row-value",
                     if is_active { "Active" } else { "Ended" }
                 }
             }

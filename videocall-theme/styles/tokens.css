@@ -1,0 +1,776 @@
+/*
+ * tokens.css
+ *
+ * Every value the UI is allowed to use lives here. The other sheets only
+ * reference these names, so a color or a size gets changed in one place.
+ *
+ * Where the numbers come from:
+ *   - Colors and the type scale are Apple's. The colors were measured on
+ *     iOS 27.2 and match the HIG color table. The type scale is the HIG
+ *     Dynamic Type table at the default "Large" size.
+ *   - 44px hit targets and the 35% dimming layer are Apple's too.
+ *   - Everything else is my choice, because Apple publishes no number for it:
+ *     glass blur and tint, radii, spacing, margins, shadows, z-index, motion.
+ *     Those are marked "approximation" below.
+ *
+ * Three appearances: light, dark, and Increase Contrast for each. Appearance
+ * follows the OS (prefers-color-scheme, prefers-contrast). Three scope
+ * classes change it for a subtree:
+ *   .theme-dark         pins the subtree to the dark tokens
+ *   .theme-light        pins the subtree to the light tokens
+ *   .surface-elevated   swaps the backgrounds for the elevated set (sheets,
+ *                       popovers). Only dark mode has a different one.
+ * Increase Contrast still follows the OS inside a pinned subtree.
+ *
+ * The dark values are written twice, once for the OS setting and once for
+ * .theme-dark, and the same goes for dark Increase Contrast. A media query
+ * cannot share a rule with a class, so that is the price of the pin. The
+ * test `dark_blocks_match` in src/tokens.rs fails if a copy drifts.
+ *
+ * Breakpoints (media queries cannot read custom properties, so this is a
+ * convention): compact is below 640px, regular is 640px and up. Write them as
+ * (max-width: 639.98px) and (min-width: 640px). Approximation.
+ */
+
+/* Layer order, lowest priority first. This is the only place it is declared,
+   and this file is linked first so the order is fixed before any rule loads.
+     reset     element defaults. Lowest, so everything else overrides it.
+     tokens    this file.
+     base      page defaults, focus ring, safe-area and layout helpers.
+     components  the shared primitives.
+     features  the app's own sheets (dioxus-ui/styles/features/*.css), one
+               per screen or feature.
+     overrides last resort. Should stay empty.
+   One catch: !important runs the order backwards, so the earliest layer wins.
+   The reduced-motion rules use that (see base.css). */
+@layer reset, tokens, base, components, features, overrides;
+
+@layer tokens {
+  /* ---- Light (the default) ----
+     Also what .theme-light pins. The dark blocks below skip an element that
+     has .theme-light, so the pin holds on <html> too. */
+  :root,
+  .theme-light {
+    /* System colors. HIG color table, confirmed on iOS 27.2. */
+    --color-red: #FF383C;
+    --color-orange: #FF8D28;
+    --color-yellow: #FFCC00;
+    --color-green: #34C759;
+    --color-mint: #00C8B3;
+    --color-teal: #00C3D0;
+    --color-cyan: #00C0E8;
+    --color-blue: #0088FF;
+    --color-indigo: #6155F5;
+    --color-purple: #CB30E0;
+    --color-pink: #FF2D55;
+    --color-brown: #AC7F5E;
+
+    /* Grays. HIG color table, iOS systemGray to systemGray6. */
+    --color-gray: #8E8E93;
+    --color-gray-2: #AEAEB2;
+    --color-gray-3: #C7C7CC;
+    --color-gray-4: #D1D1D6;
+    --color-gray-5: #E5E5EA;
+    --color-gray-6: #F2F2F7;
+
+    /* Labels, fills, separators, link. Measured on iOS 27.2. */
+    --color-label: #000000;
+    --color-label-secondary: rgba(60, 60, 67, 0.60);
+    --color-label-tertiary: rgba(60, 60, 67, 0.30);
+    --color-label-quaternary: rgba(60, 60, 67, 0.18);
+    --color-placeholder: rgba(60, 60, 67, 0.30);
+    --color-fill: rgba(120, 120, 128, 0.20);
+    --color-fill-secondary: rgba(120, 120, 128, 0.16);
+    --color-fill-tertiary: rgba(118, 118, 128, 0.12);
+    --color-fill-quaternary: rgba(116, 116, 128, 0.08);
+    --color-separator: rgba(60, 60, 67, 0.12);
+    --color-separator-opaque: #E7E7E8;
+    --color-link: #007AFF;
+
+    /* Label on accent and danger fills. White on the default blues is
+       about 3.5:1 in light and 3.2:1 in dark, below the 4.5:1 that 17px
+       text needs. iOS draws its own prominent buttons this way too. It is a
+       known limitation, and Increase Contrast is the remedy: a darker blue
+       under white in light (about 4.6:1), black on the lighter blue in dark. */
+    --color-on-accent: #FFFFFF;
+
+    /* Backgrounds. Measured on iOS 27.2. */
+    --color-bg: #FFFFFF;
+    --color-bg-secondary: #F2F2F7;
+    --color-bg-tertiary: #FFFFFF;
+    --color-bg-grouped: #F2F2F7;
+    --color-bg-grouped-secondary: #FFFFFF;
+    --color-bg-grouped-tertiary: #F2F2F7;
+
+    /* Elevated backgrounds, what .surface-elevated switches to. Light has no
+       elevated set, so it repeats the base values. Dark is the measured
+       dark-elevated set. Nobody measured dark elevated under Increase
+       Contrast, so that column reuses plain dark elevated. */
+    --color-bg-elevated: #FFFFFF;
+    --color-bg-elevated-secondary: #F2F2F7;
+    --color-bg-elevated-tertiary: #FFFFFF;
+    --color-bg-grouped-elevated: #F2F2F7;
+    --color-bg-grouped-elevated-secondary: #FFFFFF;
+    --color-bg-grouped-elevated-tertiary: #F2F2F7;
+
+    /* Tinted fills: the semantic color at low alpha, for tinted buttons and
+       badges. Approximation, Apple publishes no value. */
+    --color-accent-tint: rgba(0, 136, 255, 0.15);
+    --color-success-tint: rgba(52, 199, 89, 0.15);
+    --color-warning-tint: rgba(255, 141, 40, 0.15);
+    --color-danger-tint: rgba(255, 56, 60, 0.15);
+
+    /* Interaction overlays and the modal scrim. Approximation, Apple
+       publishes no value. */
+    --color-state-hover: rgba(0, 0, 0, 0.04);
+    --color-state-pressed: rgba(0, 0, 0, 0.10);
+    --color-scrim: rgba(0, 0, 0, 0.20);
+    --color-shadow: rgba(0, 0, 0, 0.12);
+
+    /* Glass. Approximation, Apple publishes no value. The -opaque tints are
+       what the glass falls back to without backdrop-filter, under Reduce
+       Transparency and under Increase Contrast. */
+    --material-regular-tint: rgba(246, 246, 248, 0.78);
+    --material-regular-opaque: rgba(246, 246, 248, 0.97);
+    --material-clear-tint: rgba(255, 255, 255, 0.36);
+    --material-clear-opaque: rgba(250, 250, 252, 0.90);
+    --material-border: rgba(0, 0, 0, 0.08);
+    --material-highlight: rgba(255, 255, 255, 0.70);
+  }
+
+  :root {
+    color-scheme: light dark;
+  }
+
+  .theme-light {
+    color-scheme: light;
+  }
+
+  /* ---- Dark ----
+     The same values appear twice: once for the OS setting and once for
+     .theme-dark, which pins a subtree to dark (the in-call screen, where
+     video sits on black). If you change one, change the other; the
+     dark_blocks_match test checks that they are equal. */
+  @media (prefers-color-scheme: dark) {
+    :root:not(.theme-light) {
+      /* System colors. HIG color table, confirmed on iOS 27.2. */
+      --color-red: #FF4245;
+      --color-orange: #FF9230;
+      --color-yellow: #FFD600;
+      --color-green: #30D158;
+      --color-mint: #00DAC3;
+      --color-teal: #00D2E0;
+      --color-cyan: #3CD3FE;
+      --color-blue: #0091FF;
+      --color-indigo: #6D7CFF;
+      --color-purple: #DB34F2;
+      --color-pink: #FF375F;
+      --color-brown: #B78A66;
+
+      /* Grays. HIG color table, iOS systemGray to systemGray6. */
+      --color-gray: #8E8E93;
+      --color-gray-2: #636366;
+      --color-gray-3: #48484A;
+      --color-gray-4: #3A3A3C;
+      --color-gray-5: #2C2C2E;
+      --color-gray-6: #1C1C1E;
+
+      /* Labels, fills, separators, link. Measured on iOS 27.2. */
+      --color-label: #FFFFFF;
+      --color-label-secondary: rgba(235, 235, 245, 0.60);
+      --color-label-tertiary: rgba(235, 235, 245, 0.30);
+      --color-label-quaternary: rgba(235, 235, 245, 0.16);
+      --color-placeholder: rgba(235, 235, 245, 0.30);
+      --color-fill: rgba(120, 120, 128, 0.36);
+      --color-fill-secondary: rgba(120, 120, 128, 0.32);
+      --color-fill-tertiary: rgba(118, 118, 128, 0.24);
+      --color-fill-quaternary: rgba(118, 118, 128, 0.18);
+      --color-separator: rgba(84, 84, 88, 0.50);
+      --color-separator-opaque: #2A2A2C;
+      --color-link: #0984FF;
+
+      /* Label on accent and danger fills. White, as in light. */
+      --color-on-accent: #FFFFFF;
+
+      /* Backgrounds. Measured on iOS 27.2. */
+      --color-bg: #000000;
+      --color-bg-secondary: #1C1C1E;
+      --color-bg-tertiary: #2C2C2E;
+      --color-bg-grouped: #000000;
+      --color-bg-grouped-secondary: #1C1C1E;
+      --color-bg-grouped-tertiary: #2C2C2E;
+
+      /* Elevated backgrounds, what .surface-elevated switches to. Light has no
+         elevated set, so it repeats the base values. Dark is the measured
+         dark-elevated set. Nobody measured dark elevated under Increase
+         Contrast, so that column reuses plain dark elevated. */
+      --color-bg-elevated: #1C1C1E;
+      --color-bg-elevated-secondary: #2C2C2E;
+      --color-bg-elevated-tertiary: #3A3A3C;
+      --color-bg-grouped-elevated: #1C1C1E;
+      --color-bg-grouped-elevated-secondary: #2C2C2E;
+      --color-bg-grouped-elevated-tertiary: #3A3A3C;
+
+      /* Tinted fills: the semantic color at low alpha, for tinted buttons and
+         badges. Approximation, Apple publishes no value. */
+      --color-accent-tint: rgba(0, 145, 255, 0.24);
+      --color-success-tint: rgba(48, 209, 88, 0.24);
+      --color-warning-tint: rgba(255, 146, 48, 0.24);
+      --color-danger-tint: rgba(255, 66, 69, 0.24);
+
+      /* Interaction overlays and the modal scrim. Approximation, Apple
+         publishes no value. */
+      --color-state-hover: rgba(255, 255, 255, 0.06);
+      --color-state-pressed: rgba(255, 255, 255, 0.14);
+      --color-scrim: rgba(0, 0, 0, 0.48);
+      --color-shadow: rgba(0, 0, 0, 0.40);
+
+      /* Glass. Approximation, Apple publishes no value. The -opaque tints are
+         what the glass falls back to without backdrop-filter, under Reduce
+         Transparency and under Increase Contrast. */
+      --material-regular-tint: rgba(36, 36, 38, 0.76);
+      --material-regular-opaque: rgba(36, 36, 38, 0.97);
+      --material-clear-tint: rgba(28, 28, 30, 0.36);
+      --material-clear-opaque: rgba(28, 28, 30, 0.86);
+      --material-border: rgba(255, 255, 255, 0.14);
+      --material-highlight: rgba(255, 255, 255, 0.10);
+    }
+  }
+
+  .theme-dark {
+    color-scheme: dark;
+
+    /* System colors. HIG color table, confirmed on iOS 27.2. */
+    --color-red: #FF4245;
+    --color-orange: #FF9230;
+    --color-yellow: #FFD600;
+    --color-green: #30D158;
+    --color-mint: #00DAC3;
+    --color-teal: #00D2E0;
+    --color-cyan: #3CD3FE;
+    --color-blue: #0091FF;
+    --color-indigo: #6D7CFF;
+    --color-purple: #DB34F2;
+    --color-pink: #FF375F;
+    --color-brown: #B78A66;
+
+    /* Grays. HIG color table, iOS systemGray to systemGray6. */
+    --color-gray: #8E8E93;
+    --color-gray-2: #636366;
+    --color-gray-3: #48484A;
+    --color-gray-4: #3A3A3C;
+    --color-gray-5: #2C2C2E;
+    --color-gray-6: #1C1C1E;
+
+    /* Labels, fills, separators, link. Measured on iOS 27.2. */
+    --color-label: #FFFFFF;
+    --color-label-secondary: rgba(235, 235, 245, 0.60);
+    --color-label-tertiary: rgba(235, 235, 245, 0.30);
+    --color-label-quaternary: rgba(235, 235, 245, 0.16);
+    --color-placeholder: rgba(235, 235, 245, 0.30);
+    --color-fill: rgba(120, 120, 128, 0.36);
+    --color-fill-secondary: rgba(120, 120, 128, 0.32);
+    --color-fill-tertiary: rgba(118, 118, 128, 0.24);
+    --color-fill-quaternary: rgba(118, 118, 128, 0.18);
+    --color-separator: rgba(84, 84, 88, 0.50);
+    --color-separator-opaque: #2A2A2C;
+    --color-link: #0984FF;
+
+    /* Label on accent and danger fills. White, as in light. */
+    --color-on-accent: #FFFFFF;
+
+    /* Backgrounds. Measured on iOS 27.2. */
+    --color-bg: #000000;
+    --color-bg-secondary: #1C1C1E;
+    --color-bg-tertiary: #2C2C2E;
+    --color-bg-grouped: #000000;
+    --color-bg-grouped-secondary: #1C1C1E;
+    --color-bg-grouped-tertiary: #2C2C2E;
+
+    /* Elevated backgrounds, what .surface-elevated switches to. Light has no
+       elevated set, so it repeats the base values. Dark is the measured
+       dark-elevated set. Nobody measured dark elevated under Increase
+       Contrast, so that column reuses plain dark elevated. */
+    --color-bg-elevated: #1C1C1E;
+    --color-bg-elevated-secondary: #2C2C2E;
+    --color-bg-elevated-tertiary: #3A3A3C;
+    --color-bg-grouped-elevated: #1C1C1E;
+    --color-bg-grouped-elevated-secondary: #2C2C2E;
+    --color-bg-grouped-elevated-tertiary: #3A3A3C;
+
+    /* Tinted fills: the semantic color at low alpha, for tinted buttons and
+       badges. Approximation, Apple publishes no value. */
+    --color-accent-tint: rgba(0, 145, 255, 0.24);
+    --color-success-tint: rgba(48, 209, 88, 0.24);
+    --color-warning-tint: rgba(255, 146, 48, 0.24);
+    --color-danger-tint: rgba(255, 66, 69, 0.24);
+
+    /* Interaction overlays and the modal scrim. Approximation, Apple
+       publishes no value. */
+    --color-state-hover: rgba(255, 255, 255, 0.06);
+    --color-state-pressed: rgba(255, 255, 255, 0.14);
+    --color-scrim: rgba(0, 0, 0, 0.48);
+    --color-shadow: rgba(0, 0, 0, 0.40);
+
+    /* Glass. Approximation, Apple publishes no value. The -opaque tints are
+       what the glass falls back to without backdrop-filter, under Reduce
+       Transparency and under Increase Contrast. */
+    --material-regular-tint: rgba(36, 36, 38, 0.76);
+    --material-regular-opaque: rgba(36, 36, 38, 0.97);
+    --material-clear-tint: rgba(28, 28, 30, 0.36);
+    --material-clear-opaque: rgba(28, 28, 30, 0.86);
+    --material-border: rgba(255, 255, 255, 0.14);
+    --material-highlight: rgba(255, 255, 255, 0.10);
+  }
+
+  /* ---- Increase Contrast ----
+     Light lists only what differs from light. The dark blocks list
+     everything, so they also undo the light overrides above them. The two
+     dark blocks are copies of each other, like the plain dark ones.
+     --color-link has no measured Increase Contrast value, so it takes the
+     mode's blue. #5CB8FF is 5.6:1 or more on every dark background.
+     #1E6EF4 is 4.6:1 on white but 3.9:1 on the gray grouped background, so
+     a link belongs on a card or row there, not on the bare page. */
+  @media (prefers-contrast: more) {
+    :root,
+    .theme-light {
+      --color-red: #E9152D;
+      --color-orange: #C55300;
+      --color-yellow: #A16A00;
+      --color-green: #008932;
+      --color-mint: #008575;
+      --color-teal: #008198;
+      --color-cyan: #007EAE;
+      --color-blue: #1E6EF4;
+      --color-indigo: #564ADE;
+      --color-purple: #B02FC2;
+      --color-pink: #E7124D;
+      --color-brown: #956D51;
+      --color-gray: #6C6C70;
+      --color-gray-2: #8E8E93;
+      --color-gray-3: #AEAEB2;
+      --color-gray-4: #BCBCC0;
+      --color-gray-5: #D8D8DC;
+      --color-gray-6: #EBEBF0;
+      --color-label-secondary: rgba(60, 60, 67, 0.80);
+      --color-label-tertiary: rgba(60, 60, 67, 0.70);
+      --color-label-quaternary: rgba(60, 60, 67, 0.55);
+      --color-placeholder: rgba(60, 60, 67, 0.70);
+      --color-fill: rgba(120, 120, 128, 0.28);
+      --color-fill-secondary: rgba(120, 120, 128, 0.24);
+      --color-fill-tertiary: rgba(118, 118, 128, 0.20);
+      --color-fill-quaternary: rgba(116, 116, 128, 0.16);
+      --color-link: #1E6EF4;
+      --color-bg-secondary: #EBEBF0;
+      --color-bg-grouped: #EBEBF0;
+      --color-bg-grouped-tertiary: #EBEBF0;
+      --color-bg-elevated-secondary: #EBEBF0;
+      --color-bg-grouped-elevated: #EBEBF0;
+      --color-bg-grouped-elevated-tertiary: #EBEBF0;
+      --color-accent-tint: rgba(30, 110, 244, 0.18);
+      --color-success-tint: rgba(0, 137, 50, 0.18);
+      --color-warning-tint: rgba(197, 83, 0, 0.18);
+      --color-danger-tint: rgba(233, 21, 45, 0.18);
+      --color-state-hover: rgba(0, 0, 0, 0.08);
+      --color-state-pressed: rgba(0, 0, 0, 0.16);
+      --color-scrim: rgba(0, 0, 0, 0.40);
+      --material-regular-opaque: #FFFFFF;
+      --material-clear-opaque: #FFFFFF;
+      --material-border: #000000;
+      --material-highlight: rgba(255, 255, 255, 0);
+    }
+
+    .theme-dark {
+      /* System colors. HIG color table, confirmed on iOS 27.2. */
+      --color-red: #FF6165;
+      --color-orange: #FFA056;
+      --color-yellow: #FEDF43;
+      --color-green: #4AD968;
+      --color-mint: #54DFCB;
+      --color-teal: #3BDDEC;
+      --color-cyan: #6DD9FF;
+      --color-blue: #5CB8FF;
+      --color-indigo: #A7AAFF;
+      --color-purple: #EA8DFF;
+      --color-pink: #FF8AC4;
+      --color-brown: #DBA679;
+
+      /* Grays. HIG color table, iOS systemGray to systemGray6. */
+      --color-gray: #AEAEB2;
+      --color-gray-2: #7C7C80;
+      --color-gray-3: #545456;
+      --color-gray-4: #444446;
+      --color-gray-5: #363638;
+      --color-gray-6: #242426;
+
+      /* Labels, fills, separators, link. Measured on iOS 27.2. */
+      --color-label: #FFFFFF;
+      --color-label-secondary: rgba(235, 235, 245, 0.70);
+      --color-label-tertiary: rgba(235, 235, 245, 0.55);
+      --color-label-quaternary: rgba(235, 235, 245, 0.40);
+      --color-placeholder: rgba(235, 235, 245, 0.55);
+      --color-fill: rgba(120, 120, 128, 0.44);
+      --color-fill-secondary: rgba(120, 120, 128, 0.40);
+      --color-fill-tertiary: rgba(118, 118, 128, 0.32);
+      --color-fill-quaternary: rgba(118, 118, 128, 0.26);
+      --color-separator: rgba(84, 84, 88, 0.50);
+      --color-separator-opaque: #2A2A2C;
+      --color-link: #5CB8FF;
+
+      /* Label on accent and danger fills. Black: white on #5CB8FF is about
+         2.1:1, black is about 9.8:1. */
+      --color-on-accent: #000000;
+
+      /* Backgrounds. Measured on iOS 27.2. */
+      --color-bg: #000000;
+      --color-bg-secondary: #242426;
+      --color-bg-tertiary: #363638;
+      --color-bg-grouped: #000000;
+      --color-bg-grouped-secondary: #242426;
+      --color-bg-grouped-tertiary: #363638;
+
+      /* Elevated backgrounds, what .surface-elevated switches to. Light has no
+         elevated set, so it repeats the base values. Dark is the measured
+         dark-elevated set. Nobody measured dark elevated under Increase
+         Contrast, so that column reuses plain dark elevated. */
+      --color-bg-elevated: #1C1C1E;
+      --color-bg-elevated-secondary: #2C2C2E;
+      --color-bg-elevated-tertiary: #3A3A3C;
+      --color-bg-grouped-elevated: #1C1C1E;
+      --color-bg-grouped-elevated-secondary: #2C2C2E;
+      --color-bg-grouped-elevated-tertiary: #3A3A3C;
+
+      /* Tinted fills: the semantic color at low alpha, for tinted buttons and
+         badges. Approximation, Apple publishes no value. */
+      --color-accent-tint: rgba(92, 184, 255, 0.30);
+      --color-success-tint: rgba(74, 217, 104, 0.30);
+      --color-warning-tint: rgba(255, 160, 86, 0.30);
+      --color-danger-tint: rgba(255, 97, 101, 0.30);
+
+      /* Interaction overlays and the modal scrim. Approximation, Apple
+         publishes no value. */
+      --color-state-hover: rgba(255, 255, 255, 0.12);
+      --color-state-pressed: rgba(255, 255, 255, 0.22);
+      --color-scrim: rgba(0, 0, 0, 0.64);
+      --color-shadow: rgba(0, 0, 0, 0.40);
+
+      /* Glass. Approximation, Apple publishes no value. The -opaque tints are
+         what the glass falls back to without backdrop-filter, under Reduce
+         Transparency and under Increase Contrast. */
+      --material-regular-tint: rgba(36, 36, 38, 0.76);
+      --material-regular-opaque: #000000;
+      --material-clear-tint: rgba(28, 28, 30, 0.36);
+      --material-clear-opaque: #000000;
+      --material-border: #FFFFFF;
+      --material-highlight: rgba(255, 255, 255, 0);
+    }
+  }
+
+  @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+    :root:not(.theme-light) {
+      /* System colors. HIG color table, confirmed on iOS 27.2. */
+      --color-red: #FF6165;
+      --color-orange: #FFA056;
+      --color-yellow: #FEDF43;
+      --color-green: #4AD968;
+      --color-mint: #54DFCB;
+      --color-teal: #3BDDEC;
+      --color-cyan: #6DD9FF;
+      --color-blue: #5CB8FF;
+      --color-indigo: #A7AAFF;
+      --color-purple: #EA8DFF;
+      --color-pink: #FF8AC4;
+      --color-brown: #DBA679;
+
+      /* Grays. HIG color table, iOS systemGray to systemGray6. */
+      --color-gray: #AEAEB2;
+      --color-gray-2: #7C7C80;
+      --color-gray-3: #545456;
+      --color-gray-4: #444446;
+      --color-gray-5: #363638;
+      --color-gray-6: #242426;
+
+      /* Labels, fills, separators, link. Measured on iOS 27.2. */
+      --color-label: #FFFFFF;
+      --color-label-secondary: rgba(235, 235, 245, 0.70);
+      --color-label-tertiary: rgba(235, 235, 245, 0.55);
+      --color-label-quaternary: rgba(235, 235, 245, 0.40);
+      --color-placeholder: rgba(235, 235, 245, 0.55);
+      --color-fill: rgba(120, 120, 128, 0.44);
+      --color-fill-secondary: rgba(120, 120, 128, 0.40);
+      --color-fill-tertiary: rgba(118, 118, 128, 0.32);
+      --color-fill-quaternary: rgba(118, 118, 128, 0.26);
+      --color-separator: rgba(84, 84, 88, 0.50);
+      --color-separator-opaque: #2A2A2C;
+      --color-link: #5CB8FF;
+
+      /* Label on accent and danger fills. Black: white on #5CB8FF is about
+         2.1:1, black is about 9.8:1. */
+      --color-on-accent: #000000;
+
+      /* Backgrounds. Measured on iOS 27.2. */
+      --color-bg: #000000;
+      --color-bg-secondary: #242426;
+      --color-bg-tertiary: #363638;
+      --color-bg-grouped: #000000;
+      --color-bg-grouped-secondary: #242426;
+      --color-bg-grouped-tertiary: #363638;
+
+      /* Elevated backgrounds, what .surface-elevated switches to. Light has no
+         elevated set, so it repeats the base values. Dark is the measured
+         dark-elevated set. Nobody measured dark elevated under Increase
+         Contrast, so that column reuses plain dark elevated. */
+      --color-bg-elevated: #1C1C1E;
+      --color-bg-elevated-secondary: #2C2C2E;
+      --color-bg-elevated-tertiary: #3A3A3C;
+      --color-bg-grouped-elevated: #1C1C1E;
+      --color-bg-grouped-elevated-secondary: #2C2C2E;
+      --color-bg-grouped-elevated-tertiary: #3A3A3C;
+
+      /* Tinted fills: the semantic color at low alpha, for tinted buttons and
+         badges. Approximation, Apple publishes no value. */
+      --color-accent-tint: rgba(92, 184, 255, 0.30);
+      --color-success-tint: rgba(74, 217, 104, 0.30);
+      --color-warning-tint: rgba(255, 160, 86, 0.30);
+      --color-danger-tint: rgba(255, 97, 101, 0.30);
+
+      /* Interaction overlays and the modal scrim. Approximation, Apple
+         publishes no value. */
+      --color-state-hover: rgba(255, 255, 255, 0.12);
+      --color-state-pressed: rgba(255, 255, 255, 0.22);
+      --color-scrim: rgba(0, 0, 0, 0.64);
+      --color-shadow: rgba(0, 0, 0, 0.40);
+
+      /* Glass. Approximation, Apple publishes no value. The -opaque tints are
+         what the glass falls back to without backdrop-filter, under Reduce
+         Transparency and under Increase Contrast. */
+      --material-regular-tint: rgba(36, 36, 38, 0.76);
+      --material-regular-opaque: #000000;
+      --material-clear-tint: rgba(28, 28, 30, 0.36);
+      --material-clear-opaque: #000000;
+      --material-border: #FFFFFF;
+      --material-highlight: rgba(255, 255, 255, 0);
+    }
+  }
+
+  /* ---- Values that do not change with appearance ---- */
+  :root {
+    /* Fixed colors. The label on accent fills is --color-on-accent, in the
+       appearance blocks above, because Increase Contrast changes it. */
+    --color-white: #FFFFFF;
+    --color-black: #000000;
+
+    /* The dimming layer under Clear glass. 35% is Apple's number. */
+    --material-dim: rgba(0, 0, 0, 0.35);
+
+    /* A darker dim behind small text that sits on video for good, like a
+       tile's name label. Nothing promises the frame is dark, so it has to
+       hold over white. 54% is the lowest alpha that keeps white footnote
+       text at 4.5:1 over a pure white frame. Worked out from WCAG; Apple
+       publishes no value. */
+    --material-dim-label: rgba(0, 0, 0, 0.54);
+
+    /* Glass blur and saturation. Approximation, Apple publishes no value.
+       Kept moderate on purpose: a blur over live video is redrawn on every
+       video frame. Clear blurs less than Regular. */
+    --material-regular-blur: 20px;
+    --material-regular-saturate: 180%;
+    --material-clear-blur: 8px;
+    --material-clear-saturate: 150%;
+
+    /* Type. Two families and no webfonts. SF cannot be served legally, so
+       Apple devices get it from the OS and everyone else gets their own
+       system font. */
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+    --font-weight-regular: 400;
+    --font-weight-semibold: 600;
+    --font-weight-bold: 700;
+
+    /* The 11 iOS text styles (HIG Dynamic Type, "Large"). Use them as
+       `font: var(--text-body)`. Sizes are in rem so the text size setting
+       scales them; 1rem is 16px by default, so 1.0625rem is 17pt. On an
+       iPhone or iPad, base.css sets the root to the system body size, so
+       1rem follows Dynamic Type and is 17px at Large. --type-scale (below)
+       is 16/17 there, which puts every style back on its HIG size at Large.
+       The line height is the HIG leading as a ratio (22/17 for body), so it
+       still fits when something inherits it at another size. The comment on
+       each line is size/leading in points.
+       No letter-spacing: Safari may already apply SF's own tracking. */
+    --type-scale: 1;
+    --text-large-title: 400 calc(2.125rem * var(--type-scale))/1.2059 var(--font-sans); /* 34/41 */
+    --text-title-1: 400 calc(1.75rem * var(--type-scale))/1.2143 var(--font-sans); /* 28/34 */
+    --text-title-2: 400 calc(1.375rem * var(--type-scale))/1.2727 var(--font-sans); /* 22/28 */
+    --text-title-3: 400 calc(1.25rem * var(--type-scale))/1.25 var(--font-sans); /* 20/25 */
+    --text-headline: 600 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans); /* 17/22 */
+    --text-body: 400 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans); /* 17/22 */
+    --text-callout: 400 calc(1rem * var(--type-scale))/1.3125 var(--font-sans); /* 16/21 */
+    --text-subheadline: 400 calc(0.9375rem * var(--type-scale))/1.3333 var(--font-sans); /* 15/20 */
+    --text-footnote: 400 calc(0.8125rem * var(--type-scale))/1.3846 var(--font-sans); /* 13/18 */
+    --text-caption-1: 400 calc(0.75rem * var(--type-scale))/1.3333 var(--font-sans); /* 12/16 */
+    --text-caption-2: 400 calc(0.6875rem * var(--type-scale))/1.1818 var(--font-sans); /* 11/13 */
+
+    /* Emphasized variants, per the HIG table: bold for the three largest,
+       semibold for the rest. */
+    --text-large-title-emphasized: 700 calc(2.125rem * var(--type-scale))/1.2059 var(--font-sans);
+    --text-title-1-emphasized: 700 calc(1.75rem * var(--type-scale))/1.2143 var(--font-sans);
+    --text-title-2-emphasized: 700 calc(1.375rem * var(--type-scale))/1.2727 var(--font-sans);
+    --text-title-3-emphasized: 600 calc(1.25rem * var(--type-scale))/1.25 var(--font-sans);
+    --text-headline-emphasized: 600 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans);
+    --text-body-emphasized: 600 calc(1.0625rem * var(--type-scale))/1.2941 var(--font-sans);
+    --text-callout-emphasized: 600 calc(1rem * var(--type-scale))/1.3125 var(--font-sans);
+    --text-subheadline-emphasized: 600 calc(0.9375rem * var(--type-scale))/1.3333 var(--font-sans);
+    --text-footnote-emphasized: 600 calc(0.8125rem * var(--type-scale))/1.3846 var(--font-sans);
+    --text-caption-1-emphasized: 600 calc(0.75rem * var(--type-scale))/1.3333 var(--font-sans);
+    --text-caption-2-emphasized: 600 calc(0.6875rem * var(--type-scale))/1.1818 var(--font-sans);
+
+    /* Spacing, on a 4px grid. Approximation, Apple publishes no scale. The
+       number is the multiple of 4px. In rem, so it follows the text size. */
+    --space-0: 0;
+    --space-half: 0.125rem; /* 2px */
+    --space-1: 0.25rem; /* 4px */
+    --space-2: 0.5rem; /* 8px */
+    --space-3: 0.75rem; /* 12px */
+    --space-4: 1rem; /* 16px */
+    --space-5: 1.25rem; /* 20px */
+    --space-6: 1.5rem; /* 24px */
+    --space-8: 2rem; /* 32px */
+    --space-10: 2.5rem; /* 40px */
+    --space-12: 3rem; /* 48px */
+    --space-16: 4rem; /* 64px */
+
+    /* Page side margin. Approximation, the HIG gives no iOS number. */
+    --space-page: var(--space-4);
+
+    /* Sizes. 44px is Apple's minimum hit region and it stays in px so it
+       never shrinks. The control heights are approximations. */
+    --size-hit: 44px;
+    --size-control: max(2.75rem, 44px);
+    --size-control-sm: 2rem;
+    --size-control-lg: 3.25rem;
+    --size-icon: 1.5rem;
+    --size-icon-sm: 1.125rem;
+    --size-icon-lg: 3.75rem; /* 60px, an empty-state or alert symbol */
+
+    /* Radii. Approximation, Apple publishes no value. Three shape kinds:
+         fixed       var(--radius-md)
+         capsule     var(--radius-capsule)
+         concentric  max(outer radius - padding, fallback)
+       For concentric, the parent sets --concentric-outer and
+       --concentric-inset (its own radius and padding) and the child takes
+       the .radius-concentric class from base.css. Outside such a parent it
+       gets --radius-fallback. It is a class and not a token because a token
+       would be worked out once on :root and never see the parent's values. */
+    --radius-xs: 6px;
+    --radius-sm: 10px;
+    --radius-md: 14px;
+    --radius-lg: 20px;
+    --radius-xl: 28px;
+    --radius-capsule: 9999px;
+    --radius-fallback: var(--radius-sm);
+
+    /* Stacking. One scale, bottom to top. Approximation. The gaps leave room
+       for a feature to order its own parts with calc(var(--z-x) + 1).
+       --z-system is for a notice the app itself puts up (the meeting ended),
+       so a toast or a sheet with text other people chose cannot cover it.
+       The lock overlay (baby mode) sits above everything. */
+    --z-base: 0;
+    --z-content: 1;
+    --z-sticky: 10;
+    --z-bar: 100;
+    --z-sidebar: 200;
+    --z-popover: 300;
+    --z-scrim: 1000;
+    --z-sheet: 1100;
+    --z-toast: 1200;
+    --z-system: 5000; /* app-owned notices that must not be covered */
+    --z-lock: 10000;
+
+    /* Motion. Approximation, Apple publishes no curve or duration. The
+       three steps are for transitions; the longer ones are named for what
+       they time. */
+    --duration-fast: 120ms;
+    --duration-base: 200ms;
+    --duration-slow: 350ms;
+    --duration-pulse: 1400ms; /* one cycle of a pulsing status light */
+    --duration-release: 1400ms; /* a highlight fading after activity stops */
+    --duration-release-long: 4900ms; /* the slow tail of that fade */
+    --duration-burst: 700ms; /* a one-shot decorative burst */
+    --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+    --ease-enter: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+
+    /* Focus ring geometry. */
+    --focus-ring-width: 3px;
+    --focus-ring-offset: 2px;
+
+    /* Safe-area insets, so a rule can write
+       max(var(--space-4), var(--safe-bottom)). They are 0 unless the viewport
+       meta has viewport-fit=cover, which index.html sets. */
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-right: env(safe-area-inset-right, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-left: env(safe-area-inset-left, 0px);
+
+    /* Full viewport height. dvh follows the mobile browser's toolbars; vh is
+       the fallback where dvh is missing. */
+    --viewport-height: 100vh;
+  }
+
+  @supports (height: 100dvh) {
+    :root {
+      --viewport-height: 100dvh;
+    }
+  }
+
+  /* Dynamic Type. base.css gives the root the system body font on a touch
+     screen with no hover, so 1rem is the person's body size (17px at Large,
+     23px at the largest standard size). The text styles are written for a
+     16px rem, so they scale by 16/17 here and land on the HIG sizes at
+     Large. Spacing and control sizes stay on the plain rem and grow with
+     the text. The same scope as base.css; keep the two in step. */
+  @supports (font: -apple-system-body) {
+    @media (hover: none) and (pointer: coarse) {
+      :root {
+        --type-scale: calc(16 / 17);
+      }
+    }
+  }
+
+  /* ---- Tokens built from other tokens ----
+     A custom property is resolved where it is declared and then inherited as
+     a finished value. So anything built from an appearance token has to be
+     declared again on each pin, or the subtree would keep the page's
+     values. */
+  :root,
+  .theme-dark,
+  .theme-light {
+    /* Semantic colors */
+    --color-accent: var(--color-blue);
+    --color-success: var(--color-green);
+    --color-warning: var(--color-orange);
+    --color-danger: var(--color-red);
+    --focus-ring-color: var(--color-accent);
+
+    /* Elevation. Approximation, Apple publishes no value. 1 is for controls
+       and cards, 2 for menus and toasts, 3 for sheets and alerts. */
+    --shadow-1: 0 1px 2px var(--color-shadow), 0 2px 8px var(--color-shadow);
+    --shadow-2: 0 2px 6px var(--color-shadow), 0 8px 24px var(--color-shadow);
+    --shadow-3: 0 4px 12px var(--color-shadow), 0 16px 48px var(--color-shadow);
+  }
+
+  /* ---- Elevated surfaces ----
+     iOS draws sheets and popovers in dark mode on a lighter set of
+     backgrounds. This swaps the background tokens for that set. In light
+     mode the two sets are equal, so nothing changes. .sheet, .alert and
+     .menu do this themselves (components.css). */
+  .surface-elevated {
+    --color-bg: var(--color-bg-elevated);
+    --color-bg-secondary: var(--color-bg-elevated-secondary);
+    --color-bg-tertiary: var(--color-bg-elevated-tertiary);
+    --color-bg-grouped: var(--color-bg-grouped-elevated);
+    --color-bg-grouped-secondary: var(--color-bg-grouped-elevated-secondary);
+    --color-bg-grouped-tertiary: var(--color-bg-grouped-elevated-tertiary);
+  }
+}

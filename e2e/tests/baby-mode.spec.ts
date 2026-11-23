@@ -70,6 +70,9 @@ test.describe("Baby mode", () => {
     expect(viewport).not.toBeNull();
     expect(box!.x + box!.width).toBeGreaterThan((viewport!.width * 3) / 4);
     expect(box!.y).toBeLessThan(viewport!.height / 4);
+    // The lock is a 44x44 touch target.
+    expect(box!.width).toBeCloseTo(44, 0);
+    expect(box!.height).toBeCloseTo(44, 0);
 
     // The entry hint explains how to get out.
     await expect(babyModeHint(page)).toHaveText(ENTRY_HINT);

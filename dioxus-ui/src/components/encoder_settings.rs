@@ -207,7 +207,7 @@ pub fn EncodersSection(video_enabled: bool, mic_enabled: bool) -> Element {
 
     rsx! {
         div { class: "diagnostics-section", "data-testid": "encoders-card",
-            h3 { "Encoders" }
+            h3 { class: "card-title", "Encoders" }
             div { "data-testid": "encoder-settings",
                 if video_enabled {
                     EncoderRows { rows: encoder_settings_rows(&stats()) }

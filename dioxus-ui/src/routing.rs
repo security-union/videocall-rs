@@ -3,6 +3,7 @@
 //! Application route definitions.
 
 use dioxus::prelude::*;
+use videocall_theme::Card;
 
 use crate::components::login::Login;
 use crate::pages::home::Home;
@@ -26,6 +27,9 @@ pub enum Route {
     },
     #[route("/404")]
     NotFound {},
+    /// Any other URL. Without this the router renders its own parse error.
+    #[route("/:..segments", UnknownRoute)]
+    Unknown { segments: Vec<String> },
 }
 
 /// Wrapper component for MeetingSettings route.
@@ -40,15 +44,22 @@ fn MeetingPage2(id: String, webtransport_enabled: String) -> Element {
     rsx! { MeetingPage { id: id } }
 }
 
+/// Catch-all wrapper: an unknown URL shows the same page as `/404`.
+#[component]
+fn UnknownRoute(segments: Vec<String>) -> Element {
+    let _ = segments;
+    rsx! { NotFound {} }
+}
+
 /// Simple 404 page component.
 #[component]
 fn NotFound() -> Element {
     rsx! {
-        div { style: "display: flex; align-items: center; justify-content: center; height: 100vh; background: #000; color: #fff;",
-            div { style: "text-align: center;",
-                h1 { "404" }
-                p { "Page not found" }
-                a { href: "/", style: "color: #7928CA;", "Go Home" }
+        div { class: "screen-center surface-grouped",
+            Card { class: "status-card",
+                h1 { class: "text-large-title", "404" }
+                p { class: "text-body text-secondary", "Page not found" }
+                a { href: "/", class: "btn btn-prominent", "Go Home" }
             }
         }
     }

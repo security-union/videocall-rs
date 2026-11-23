@@ -27,6 +27,9 @@ videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.4" }
 videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.2" }
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
 videocall-types = { path = "../videocall-types", version = "7.0.0" }
+# The design system: stylesheets (linked in index.html) and typed primitives.
+# No features: dioxus-ui brings the web renderer itself.
+videocall-theme = { path = "../videocall-theme", version = "0.1.0" }
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 log = "0.4.19"
@@ -72,6 +75,7 @@ features = [
     "MediaDeviceInfo",
     "MediaDeviceKind",
     "MediaDevices",
+    "MediaQueryList",
     "MediaStream",
     "MediaStreamConstraints",
     "Navigator",

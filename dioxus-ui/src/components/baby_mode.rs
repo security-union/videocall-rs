@@ -29,6 +29,9 @@ use dioxus::prelude::*;
 use dioxus_core::Task;
 use futures::StreamExt;
 use gloo_timers::future::TimeoutFuture;
+use videocall_theme::{
+    icons, Alert, AlertActions, AlertMessage, AlertTitle, Button, ButtonType, ButtonVariant, Icon,
+};
 use wasm_bindgen::{closure::Closure, JsCast};
 
 /// How long the lock icon must be held before the unlock dialog opens.
@@ -356,16 +359,18 @@ pub fn BabyModeOverlay(on_unlock: EventHandler<()>) -> Element {
     };
 
     let lock_class = if holding() {
-        "baby-mode-lock holding"
+        "baby-mode-lock icon-btn icon-btn-glass-clear holding"
     } else {
-        "baby-mode-lock"
+        "baby-mode-lock icon-btn icon-btn-glass-clear"
     };
     let hint_class = if hint_visible() {
         "baby-mode-hint visible"
     } else {
         "baby-mode-hint"
     };
-    let ring_style = format!("animation-duration: {HOLD_TO_UNLOCK_MS}ms;");
+    // The only dynamic value: how long the ring takes to fill. Everything else
+    // is in baby-mode.css.
+    let ring_style = format!("--baby-mode-hold-duration: {HOLD_TO_UNLOCK_MS}ms;");
 
     rsx! {
         // Transparent shield: sits above the whole meeting and eats input.
@@ -394,7 +399,7 @@ pub fn BabyModeOverlay(on_unlock: EventHandler<()>) -> Element {
             // Dims the meeting behind the dialog. A tap here focuses the
             // input (iOS keyboard) instead of closing anything.
             div {
-                class: "baby-mode-scrim",
+                class: "baby-mode-scrim scrim",
                 "aria-hidden": "true",
                 onpointerdown: move |e| e.prevent_default(),
                 onpointerup: move |_| focus_by_id(CODE_INPUT_ID),
@@ -459,19 +464,7 @@ pub fn BabyModeOverlay(on_unlock: EventHandler<()>) -> Element {
                     style: "{ring_style}",
                 }
             }
-            svg {
-                class: "baby-mode-lock-icon",
-                xmlns: "http://www.w3.org/2000/svg",
-                view_box: "0 0 24 24",
-                fill: "none",
-                stroke: "currentColor",
-                stroke_width: "2",
-                stroke_linecap: "round",
-                stroke_linejoin: "round",
-                "aria-hidden": "true",
-                rect { x: "3", y: "11", width: "18", height: "11", rx: "2", ry: "2" }
-                path { d: "M7 11V7a5 5 0 0 1 10 0v4" }
-            }
+            Icon { glyph: &icons::LOCK, class: "baby-mode-lock-icon", "aria-hidden": "true" }
         }
 
         p {
@@ -485,7 +478,9 @@ pub fn BabyModeOverlay(on_unlock: EventHandler<()>) -> Element {
         }
 
         if dialog_open() {
-            div {
+            // A dialog that asks for input, so `role: "dialog"` replaces
+            // Alert's alertdialog (and its aria-modal, set here instead).
+            Alert {
                 id: "baby-mode-unlock-dialog",
                 class: "baby-mode-dialog",
                 "data-testid": "baby-mode-unlock-dialog",
@@ -500,26 +495,27 @@ pub fn BabyModeOverlay(on_unlock: EventHandler<()>) -> Element {
                     }
                 },
                 form {
+                    class: "baby-mode-form",
                     onsubmit: move |e: FormEvent| {
                         e.prevent_default();
                         submit();
                     },
-                    h2 { id: "baby-mode-unlock-title", class: "baby-mode-dialog-title",
+                    AlertTitle { id: "baby-mode-unlock-title", class: "baby-mode-dialog-title",
                         "Unlock controls"
                     }
-                    p { id: "baby-mode-unlock-desc", class: "baby-mode-dialog-body",
+                    AlertMessage { id: "baby-mode-unlock-desc", class: "baby-mode-dialog-body",
                         "Type this code to bring the controls back."
                     }
                     div {
                         id: "baby-mode-code",
-                        class: "baby-mode-code",
+                        class: "baby-mode-code text-mono",
                         "data-testid": "baby-mode-code",
                         "aria-label": spell_out(&code()),
                         "{code}"
                     }
                     input {
                         id: CODE_INPUT_ID,
-                        class: "baby-mode-code-input",
+                        class: "baby-mode-code-input input text-mono",
                         "data-testid": "baby-mode-code-input",
                         r#type: "text",
                         "inputmode": "text",
@@ -561,7 +557,7 @@ pub fn BabyModeOverlay(on_unlock: EventHandler<()>) -> Element {
                         },
                     }
                     p {
-                        class: "baby-mode-feedback",
+                        class: "baby-mode-feedback text-footnote",
                         "data-testid": "baby-mode-feedback",
                         role: "status",
                         "aria-live": "polite",
@@ -569,17 +565,16 @@ pub fn BabyModeOverlay(on_unlock: EventHandler<()>) -> Element {
                             "That didn't match. Here's a new code."
                         }
                     }
-                    div { class: "baby-mode-dialog-actions",
-                        button {
-                            r#type: "button",
-                            class: "btn-apple btn-secondary",
+                    AlertActions { class: "baby-mode-dialog-actions",
+                        Button {
                             "data-testid": "baby-mode-unlock-cancel",
                             onclick: move |_| close_dialog(),
                             "Cancel"
                         }
-                        button {
-                            r#type: "submit",
-                            class: "btn-apple btn-primary",
+                        // Submits the unlock form.
+                        Button {
+                            button_type: ButtonType::Submit,
+                            variant: ButtonVariant::Prominent,
                             "data-testid": "baby-mode-unlock-submit",
                             "Unlock"
                         }

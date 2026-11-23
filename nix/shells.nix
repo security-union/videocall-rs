@@ -40,7 +40,6 @@ let
     pkgs.trunk
     # Must match the wasm-bindgen crate in Cargo.lock; see packages.nix.
     packages.wasmBindgenCli
-    pkgs.tailwindcss
   ] ++ coreInputs;
 
   leptosEnv = {

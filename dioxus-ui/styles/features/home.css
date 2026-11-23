@@ -1,0 +1,275 @@
+/*
+ * home.css
+ *
+ * Landing page (pages/home.rs), the meetings list, the meeting-info rows,
+ * and the small standalone pages that share the status card. Primitives come
+ * from components.css; this sheet only lays them out.
+ *
+ * hero-container, hero-content and hero-title are the landing page's shell:
+ * the page container, its column and the title.
+ */
+
+@layer features {
+  /* ---- Page shell ---- */
+
+  .hero-container {
+    position: relative;
+    box-sizing: border-box;
+    min-height: var(--viewport-height, 100vh);
+    overflow-y: auto;
+    background-color: var(--color-bg-grouped);
+    color: var(--color-label);
+  }
+
+  .hero-content {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 32rem;
+    margin: 0 auto;
+    padding: var(--space-4) max(var(--space-page), var(--safe-right))
+      max(var(--space-8), var(--safe-bottom)) max(var(--space-page), var(--safe-left));
+  }
+
+  .hero-title {
+    margin: 0;
+    font: var(--text-large-title-emphasized);
+    text-align: center;
+  }
+
+  /* ---- Landing ---- */
+
+  .home-toolbar {
+    padding-top: max(var(--space-2), var(--safe-top));
+  }
+
+  .home-tagline {
+    margin: 0;
+    font: var(--text-title-3);
+    color: var(--color-label-secondary);
+    text-align: center;
+  }
+
+  .home-form-card {
+    --concentric-inset: var(--space-5);
+    padding: var(--space-5);
+  }
+
+  .home-form-card .card-title {
+    margin: 0;
+    text-align: center;
+  }
+
+  .home-contribute {
+    align-self: center;
+  }
+
+  /* ---- Account menu ---- */
+
+  .auth-dropdown-container {
+    position: relative;
+  }
+
+  .auth-dropdown-trigger {
+    max-width: 14rem;
+  }
+
+  .auth-dropdown-trigger > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .auth-dropdown-menu {
+    position: absolute;
+    top: calc(100% + var(--space-2));
+    right: 0;
+    z-index: var(--z-popover);
+    min-width: 14rem;
+  }
+
+  .auth-dropdown-menu .menu-header p {
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ---- Meetings list ---- */
+
+  .meetings-list-container {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  /* The disclosure row. It is a button, so it gets its own group look. */
+  .meetings-list-toggle {
+    width: 100%;
+    border: 0;
+    border-radius: var(--radius-lg);
+    background-color: var(--color-bg-grouped-secondary);
+    color: var(--color-label);
+    font: var(--text-headline);
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .meetings-list-toggle .chevron-icon {
+    flex: none;
+    transform: rotate(-90deg);
+    transition: transform var(--duration-fast) var(--ease-standard);
+  }
+
+  .meetings-list-toggle .chevron-icon.expanded {
+    transform: none;
+  }
+
+  .meetings-list-content {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .meetings-loading,
+  .meetings-error,
+  .meetings-empty,
+  .meetings-auth-prompt {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border-radius: var(--radius-lg);
+    background-color: var(--color-bg-grouped-secondary);
+    text-align: center;
+  }
+
+  .meetings-loading {
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .meetings-auth-prompt > p {
+    margin: 0;
+  }
+
+  .meetings-auth-prompt > button {
+    max-width: 20rem;
+  }
+
+  .meetings-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .meeting-item {
+    gap: var(--space-1);
+  }
+
+  .meeting-item-content {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding-block: var(--space-2);
+    cursor: pointer;
+  }
+
+  .meeting-ended .meeting-item-content {
+    color: var(--color-label-secondary);
+  }
+
+  .meeting-info {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .meeting-id {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .meeting-details {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-3);
+  }
+
+  .meeting-details > span {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+
+  .meeting-delete-btn {
+    --btn-fg: var(--color-danger);
+  }
+
+  /* ---- Meeting info rows (peer list) ---- */
+
+  .meeting-info.list-group {
+    display: block;
+  }
+
+  /* ---- Standalone status pages: 404, browser check, config error ---- */
+
+  .status-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-4);
+    box-sizing: border-box;
+    width: min(100%, 32rem);
+    padding: var(--space-6);
+    text-align: center;
+  }
+
+  .status-card > h1,
+  .status-card > p {
+    margin: 0;
+  }
+
+  /* The unsupported-browser notice: a card centered over the page (home or
+     pre-join), not a takeover, so the page around it stays usable. The
+     unlayered copy for browsers without cascade layers is in
+     unsupported-browser.css. */
+  .browser-compat-notice {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: var(--z-bar);
+    width: min(32rem, 80%);
+    max-height: calc(100% - 2 * var(--space-4));
+    overflow-y: auto;
+    box-shadow: var(--shadow-3);
+    transform: translate(-50%, -50%);
+  }
+
+  .instructions-gif {
+    max-width: 100%;
+    height: auto;
+    border-radius: var(--radius-md);
+  }
+
+  /* ---- Brand and external icons ---- */
+
+  .external-icon {
+    display: block;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+
+  .brand-overlay {
+    mix-blend-mode: overlay;
+  }
+}

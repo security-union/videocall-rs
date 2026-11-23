@@ -18,7 +18,8 @@
 
 use crate::constants::firefox_enabled;
 use dioxus::prelude::*;
-use wasm_bindgen::JsValue;
+use videocall_theme::Card;
+use wasm_bindgen::{JsCast, JsValue};
 
 #[component]
 pub fn BrowserCompatibility() -> Element {
@@ -33,10 +34,15 @@ pub fn BrowserCompatibility() -> Element {
         error
     });
 
+    // A card centered over the page, not a full-screen takeover: the page
+    // around it stays visible and usable, as it was before the restyle.
+    // `.browser-compat-notice` is also styled without cascade layers
+    // (styles/unsupported-browser.css), so it stays readable in a browser
+    // that drops every layered rule. `.error-container` is a test hook.
     if let Some(error) = &error {
         rsx! {
-            div { class: "error-container",
-                p { class: "error-message", "{error}" }
+            Card { class: "error-container browser-compat-notice status-card", role: "alert",
+                p { class: "text-headline", "{error}" }
                 img {
                     src: "/assets/street_fighter.gif",
                     alt: "Permission instructions",
@@ -116,8 +122,49 @@ fn check_browser_compatibility() -> Option<String> {
             browser_hint
         ))
     } else {
-        None
+        css_floor_message(supports_css_floor(&window))
     }
+}
+
+/// The CSS probe for the style floor. Every sheet sits in `@layer` (Chrome
+/// 99, Firefox 97, Safari 15.4) and the speaking ring uses `color-mix()`
+/// (Chrome 111, Firefox 113, Safari 16.2). Each engine shipped color-mix
+/// after cascade layers, so one probe covers both.
+const CSS_FLOOR_PROPERTY: &str = "color";
+const CSS_FLOOR_VALUE: &str = "color-mix(in srgb, red, blue)";
+
+/// Asks `CSS.supports` about the floor. A browser without `CSS.supports`
+/// is older than the floor, so a missing function or a failed call counts
+/// as unsupported.
+fn supports_css_floor(window: &web_sys::Window) -> bool {
+    let Ok(css) = js_sys::Reflect::get(window, &JsValue::from_str("CSS")) else {
+        return false;
+    };
+    let Ok(supports) = js_sys::Reflect::get(&css, &JsValue::from_str("supports")) else {
+        return false;
+    };
+    let Some(supports) = supports.dyn_ref::<js_sys::Function>() else {
+        return false;
+    };
+    supports
+        .call2(
+            &css,
+            &JsValue::from_str(CSS_FLOOR_PROPERTY),
+            &JsValue::from_str(CSS_FLOOR_VALUE),
+        )
+        .map(|result| result.is_truthy())
+        .unwrap_or(false)
+}
+
+/// The notice for a browser that runs the media code but not the styles.
+fn css_floor_message(supported: bool) -> Option<String> {
+    if supported {
+        return None;
+    }
+    Some(
+        "Hey friend! Your browser can run calls, but it is too old for this app's styles,         so the page would show up unstyled. Please update to Chrome or Edge 111+,         Firefox 113+, or Safari 16.2+."
+            .to_string(),
+    )
 }
 
 fn is_firefox() -> bool {
@@ -161,6 +208,16 @@ fn is_firefox_from_ua(user_agent: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_css_floor_message() {
+        assert_eq!(css_floor_message(true), None);
+
+        let message = css_floor_message(false).expect("an old browser gets a notice");
+        assert!(message.contains("Chrome or Edge 111+"));
+        assert!(message.contains("Firefox 113+"));
+        assert!(message.contains("Safari 16.2+"));
+    }
 
     #[test]
     fn test_firefox_detection() {

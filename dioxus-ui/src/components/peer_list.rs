@@ -25,6 +25,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
+use videocall_theme::{icons, Icon, IconButton, ListGroup, ListHeader, Menu, MenuItem, Toolbar};
 
 #[component]
 pub fn PeerList(
@@ -115,7 +116,7 @@ pub fn PeerList(
         .unwrap_or(false);
 
     rsx! {
-        div {
+        div { class: "sidebar-panel",
             // Show meeting information at the top when enabled
             if show_meeting_info {
                 MeetingInfo {
@@ -127,55 +128,30 @@ pub fn PeerList(
                 }
             }
 
-            div { class: "sidebar-header",
-                h2 { "Attendants" }
+            Toolbar { class: "sidebar-header",
+                h2 { class: "toolbar-title", "Attendants" }
                 div { class: "header-actions",
-                    button {
-                        class: "menu-button",
+                    IconButton {
+                        label: "More options",
                         onclick: move |e: MouseEvent| {
                             e.stop_propagation();
                             show_context_menu.set(!show_context_menu());
                         },
-                        aria_label: "More options",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg",
-                            width: "20",
-                            height: "20",
-                            view_box: "0 0 24 24",
-                            fill: "none",
-                            stroke: "currentColor",
-                            stroke_width: "2",
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "1" }
-                            circle { cx: "12", cy: "5", r: "1" }
-                            circle { cx: "12", cy: "19", r: "1" }
-                        }
+                        Icon { glyph: &icons::MORE_VERTICAL, size: "20" }
                     }
-                    button {
+                    IconButton {
+                        label: "Close",
                         class: "close-button",
                         onclick: move |e| onclose.call(e),
                         "\u{00d7}"
                     }
                     if show_context_menu() {
-                        div { class: "context-menu",
-                            button {
-                                class: "context-menu-item",
+                        // No menu roles today; `None` keeps it that way.
+                        Menu { role: None::<&str>,
+                            MenuItem {
+                                role: None::<&str>,
                                 onclick: move |_| on_toggle_meeting_info.call(()),
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg",
-                                    width: "16",
-                                    height: "16",
-                                    view_box: "0 0 24 24",
-                                    fill: "none",
-                                    stroke: "currentColor",
-                                    stroke_width: "2",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                    circle { cx: "12", cy: "12", r: "10" }
-                                    line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                                    line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                                }
+                                Icon { glyph: &icons::INFO, size: "16" }
                                 if show_meeting_info { "Hide Meeting Info" } else { "Show Meeting Info" }
                             }
                         }
@@ -185,7 +161,8 @@ pub fn PeerList(
 
             // Sidebar content
             div { class: "sidebar-content",
-                div { class: "search-container",
+                div { class: "search-field",
+                    Icon { glyph: &icons::SEARCH, "aria-hidden": "true" }
                     input {
                         r#type: "text",
                         placeholder: "Search attendants...",
@@ -193,16 +170,16 @@ pub fn PeerList(
                         oninput: move |e: Event<FormData>| {
                             search_query.set(e.value());
                         },
-                        class: "search-input",
                     }
                 }
 
                 div { class: "attendants-section",
-                    h3 { "In call" }
+                    ListHeader { "In call" }
                     div { class: "peer-list",
-                        ul {
+                        // The rows stay raw `li`s (PeerListItem): one per peer.
+                        ListGroup { list: true,
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, muted: self_muted, speaking: self_speaking } }
+                            PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, muted: self_muted, speaking: self_speaking }
 
                             for peer in filtered_peers.iter() {
                                 {
@@ -225,15 +202,13 @@ pub fn PeerList(
                                         .and_then(|sid| speaking_states.get(sid).copied())
                                         .unwrap_or(false);
                                     rsx! {
-                                        li {
+                                        PeerListItem {
                                             key: "{peer}",
-                                            PeerListItem {
-                                                name: peer_display_name,
-                                                tooltip: peer.clone(),
-                                                is_host: is_peer_host,
-                                                muted: muted,
-                                                speaking: speaking,
-                                            }
+                                            name: peer_display_name,
+                                            tooltip: peer.clone(),
+                                            is_host: is_peer_host,
+                                            muted: muted,
+                                            speaking: speaking,
                                         }
                                     }
                                 }

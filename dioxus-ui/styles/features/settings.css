@@ -1,0 +1,222 @@
+/*
+ * settings.css
+ *
+ * Two screens: the meeting settings page (a grouped iOS settings screen that
+ * follows the system appearance) and the device settings sheet that opens
+ * over the call. Primitives from components.css do the looks; this file only
+ * lays them out.
+ */
+
+@layer features {
+  /* =========================================================================
+     Meeting settings page
+     ========================================================================= */
+
+  .settings-page {
+    min-height: var(--viewport-height, 100dvh);
+    padding-bottom: max(var(--space-8), var(--safe-bottom));
+  }
+
+  .settings-container {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
+    width: 100%;
+    max-width: 40rem;
+    margin: 0 auto;
+    padding: 0 max(var(--space-page), var(--safe-right)) 0
+      max(var(--space-page), var(--safe-left));
+  }
+
+  /* The toolbar brings its own side padding; the container already has it. */
+  .settings-toolbar {
+    padding-right: 0;
+    padding-left: 0;
+  }
+
+  .settings-toolbar .toolbar-title {
+    font: var(--text-headline);
+    text-align: center;
+  }
+
+  /* Same width as the back button, so the title stays centered. */
+  .settings-toolbar-spacer {
+    flex: none;
+    width: var(--size-hit);
+  }
+
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .settings-group .list-row > svg {
+    flex: none;
+    color: var(--color-label-secondary);
+  }
+
+  .settings-group .list-row-value {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    text-align: end;
+  }
+
+  /* The label and the icon carry the meaning; the tone only backs them up. */
+  .settings-row-warning > svg,
+  .settings-row-warning .list-row-value {
+    color: var(--color-warning);
+  }
+
+  /* Waiting Room row: the info icon sits before the switch. */
+  .settings-option-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  /* Its explanation is the title attribute, also drawn as a small popover
+     on hover, the way it was before the restyle. */
+  .settings-info-icon {
+    position: relative;
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: var(--radius-capsule);
+    color: var(--color-label-tertiary);
+    cursor: help;
+    transition:
+      color var(--duration-base) var(--ease-standard),
+      background-color var(--duration-base) var(--ease-standard);
+  }
+
+  .settings-info-icon::after {
+    content: attr(title);
+    position: absolute;
+    top: 50%;
+    right: calc(100% + var(--space-2));
+    z-index: var(--z-popover);
+    width: max-content;
+    max-width: 12.5rem;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    background-color: var(--color-bg-elevated-secondary);
+    box-shadow: var(--shadow-2);
+    color: var(--color-label-secondary);
+    font: var(--text-caption-1);
+    text-align: start;
+    white-space: normal;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-50%);
+    transition: opacity var(--duration-fast) var(--ease-standard);
+  }
+
+  @media (hover: hover) {
+    .settings-info-icon:hover {
+      background-color: var(--color-state-hover);
+      color: var(--color-label-secondary);
+    }
+
+    .settings-info-icon:hover::after {
+      opacity: 1;
+    }
+  }
+
+  .settings-footer-error {
+    color: var(--color-danger);
+  }
+
+  .settings-actions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .settings-btn-warning {
+    --btn-bg: var(--color-warning-tint);
+    --btn-fg: var(--color-label);
+  }
+
+  /* Loading and error states, centered in the page. */
+  .settings-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-4);
+    margin-top: var(--space-12);
+    padding: var(--space-8) var(--space-4);
+    text-align: center;
+    color: var(--color-label-secondary);
+  }
+
+  .settings-state h2 {
+    font: var(--text-title-2);
+    color: var(--color-label);
+  }
+
+  .settings-state p {
+    font: var(--text-body);
+  }
+
+  .settings-state-icon {
+    color: var(--color-warning);
+  }
+
+  /* =========================================================================
+     Device settings sheet (over the call, dark)
+     ========================================================================= */
+
+  .device-settings-modal {
+    max-height: min(100%, 40rem);
+  }
+
+  .settings-layout {
+    display: flex;
+    gap: var(--space-5);
+  }
+
+  .settings-sidebar {
+    flex: none;
+    width: 10rem;
+  }
+
+  .settings-content {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .settings-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .device-settings-modal select {
+    text-overflow: ellipsis;
+  }
+
+  /* Narrow screens: the tabs become a row above the panel. */
+  @media (max-width: 639.98px) {
+    .settings-layout {
+      flex-direction: column;
+      gap: var(--space-3);
+    }
+
+    .settings-sidebar {
+      flex-direction: row;
+      width: auto;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+  }
+
+  /* Device selectors in the old inline dropdown (device_selector.rs). */
+  .device-selector-wrapper {
+    min-width: 12rem;
+  }
+}

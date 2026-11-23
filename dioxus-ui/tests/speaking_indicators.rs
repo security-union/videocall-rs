@@ -142,7 +142,7 @@ async fn peer_list_item_host_with_speaking_shows_crown_and_speaking() {
     yield_now().await;
 
     // Host indicator label should be rendered for host
-    let indicator = mount.query_selector(".peer-indicator").unwrap();
+    let indicator = mount.query_selector(".peer_item_text .badge").unwrap();
     assert!(indicator.is_some(), "host should have indicator label");
     let text = indicator.unwrap().text_content().unwrap_or_default();
     assert!(text.contains("Host"), "indicator should contain 'Host'");

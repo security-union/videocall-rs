@@ -17,6 +17,10 @@ use std::rc::Rc;
 use crate::constants::meeting_api_client;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use videocall_theme::{
+    icons, Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Glass, Icon, IconButton,
+    IconButtonVariant, ListGroup, ListRow, ListRowLabel,
+};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlAudioElement;
 
@@ -186,36 +190,25 @@ pub fn HostControls(
     };
 
     rsx! {
-        div { class: "host-controls-container",
-            button { class: "host-controls-toggle", onclick: move |_| expanded.set(!expanded()),
-                span { class: "waiting-badge", "{waiting().len()}" }
-                span { "Waiting to join" }
-                svg {
-                    class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "16", height: "16",
-                    view_box: "0 0 24 24",
-                    fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    polyline { points: "6 9 12 15 18 9" }
-                }
+        Glass { class: "host-controls-container",
+            ListRow { class: "host-controls-toggle", "aria-expanded": "{expanded()}", onclick: move |_| expanded.set(!expanded()),
+                Badge { tone: BadgeTone::Count, "{waiting().len()}" }
+                ListRowLabel { "Waiting to join" }
+                Icon { glyph: &icons::CHEVRON_DOWN, size: "16", class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" }, "aria-hidden": "true" }
             }
 
             if expanded() {
-                div { class: "host-controls-list",
+                ListGroup { class: "host-controls-list",
                     if show_admit_all {
                         div { class: "admit-all-container",
-                            button { class: "btn-admit-all", onclick: on_admit_all,
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                    polyline { points: "20 6 9 17 4 12" }
-                                }
+                            Button { variant: ButtonVariant::Tinted, size: ButtonSize::Small, onclick: on_admit_all,
+                                Icon { glyph: &icons::CHECK, size: "16" }
                                 "Admit all ({waiting().len()})"
                             }
                         }
                     }
+                    // Raw rows: one per waiting participant, re-rendered on
+                    // every poll.
                     for participant in waiting().iter() {
                         {
                             let peer_user_id = participant.user_id.clone();
@@ -239,12 +232,12 @@ pub fn HostControls(
                             let error_reject = error;
 
                             rsx! {
-                                div { key: "{uid_for_key}", class: "waiting-participant",
-                                    div { class: "participant-info",
+                                div { key: "{uid_for_key}", class: "waiting-participant list-row",
+                                    div { class: "participant-info list-row-label",
                                         if let Some(name) = display_name.clone() {
                                             if !name.trim().is_empty() {
                                                 div { class: "participant-name", "{name}" }
-                                                div { class: "participant-email", "{uid_for_view}" }
+                                                div { class: "participant-email list-row-subtitle", "{uid_for_view}" }
                                             } else {
                                                 div { class: "participant-name", "{uid_for_view}" }
                                             }
@@ -253,7 +246,9 @@ pub fn HostControls(
                                         }
                                     }
                                     div { class: "participant-actions",
-                                        button {
+                                        IconButton {
+                                            label: "Admit",
+                                            variant: IconButtonVariant::Filled,
                                             class: "btn-admit",
                                             title: "Admit",
                                             onclick: move |_| {
@@ -273,14 +268,11 @@ pub fn HostControls(
                                                     }
                                                 });
                                             },
-                                            svg {
-                                                xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                                polyline { points: "20 6 9 17 4 12" }
-                                            }
+                                            Icon { glyph: &icons::CHECK, size: "16", "aria-hidden": "true" }
                                         }
-                                        button {
+                                        IconButton {
+                                            label: "Reject",
+                                            variant: IconButtonVariant::Filled,
                                             class: "btn-reject",
                                             title: "Reject",
                                             onclick: move |_| {
@@ -300,13 +292,7 @@ pub fn HostControls(
                                                     }
                                                 });
                                             },
-                                            svg {
-                                                xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                                line { x1: "18", y1: "6", x2: "6", y2: "18" }
-                                                line { x1: "6", y1: "6", x2: "18", y2: "18" }
-                                            }
+                                            Icon { glyph: &icons::CLOSE, size: "16", "aria-hidden": "true" }
                                         }
                                     }
                                 }

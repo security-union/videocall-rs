@@ -179,7 +179,7 @@ That's it. `make dev` opens the process-compose TUI running the whole stack as n
 | `meeting-api` | dbmate migrations, then `cargo watch` | 8081 |
 | `websocket` / `webtransport` | `cargo watch` | 8080 / 4433 udp |
 | `metrics` / `server-stats` | `cargo watch` | 9091 / 9092 |
-| `dioxus-ui` | tailwind watch + `trunk serve` | 3001 |
+| `dioxus-ui` | `trunk serve` | 3001 |
 | `prometheus` / `grafana` | native, same dashboards/config as the container stack | 9090 / 3000 |
 
 Services wait for middleware health (compose-style `depends_on`), recompile and restart instantly on save, and the TUI can restart individual processes on demand. Open `http://localhost:3001` and navigate to a meeting at `http://localhost:3001/meeting/<username>/<meeting-id>`.
@@ -445,7 +445,7 @@ See the [Contributing Guidelines](https://github.com/security-union/videocall-rs
 ### Technology stack
 
 - **Backend:** Rust + Actix Web + PostgreSQL (or SQLite) + NATS.
-- **Frontend:** Rust + Dioxus + WebAssembly + Tailwind CSS.
+- **Frontend:** Rust + Dioxus + WebAssembly, styled with plain CSS from the `videocall-theme` crate.
 - **Transport:** WebTransport (QUIC/HTTP3) + WebSocket fallback.
 - **Media:** pure-Rust VP9 and Opus; NetEQ adaptive audio jitter buffer.
 - **Build system:** Cargo + Trunk + Nix + Helm.

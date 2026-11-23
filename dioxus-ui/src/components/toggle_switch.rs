@@ -1,61 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use dioxus::prelude::*;
+//! The iOS-style toggle switch now lives in the design system as
+//! [`videocall_theme::Switch`]. This module keeps the old name, so call sites
+//! (`toggle_switch::ToggleSwitch`) did not have to change.
+//!
+//! Two props changed. `width` and `height` are now `Option<u32>`: left
+//! out, the size comes from the `.switch` class, and given, they set the
+//! `--switch-width`/`--switch-height` variables. The default track is now
+//! 51x31 px, the iOS size, where it used to be 44x24. The rest (`enabled`,
+//! `on_toggle`, `disabled`, `test_id`, `labelled_by`) is unchanged, plus
+//! `class` and the usual pass-through of global attributes.
 
-/// Reusable iOS-style toggle switch component.
-///
-/// # Props
-/// - `enabled` – current on/off state
-/// - `on_toggle` – called with the *new* value when clicked
-/// - `width` / `height` – pill dimensions in px (defaults: 44×24)
-/// - `test_id` – optional `data-testid` for automation
-/// - `labelled_by` – optional id of the element that labels the switch
-#[component]
-pub fn ToggleSwitch(
-    enabled: bool,
-    on_toggle: EventHandler<bool>,
-    #[props(default = 44)] width: u32,
-    #[props(default = 24)] height: u32,
-    #[props(default = false)] disabled: bool,
-    #[props(default)] test_id: Option<&'static str>,
-    #[props(default)] labelled_by: Option<&'static str>,
-) -> Element {
-    let knob_size = height.saturating_sub(4);
-    let knob_left_on = width.saturating_sub(knob_size + 2);
-    let border_radius = height / 2;
-
-    let disabled_style = if disabled {
-        " opacity: 0.5; cursor: not-allowed;"
-    } else {
-        ""
-    };
-
-    rsx! {
-        button {
-            r#type: "button",
-            role: "switch",
-            aria_checked: "{enabled}",
-            "aria-labelledby": labelled_by,
-            "data-testid": test_id,
-            disabled: disabled,
-            style: format!(
-                "position: relative; width: {width}px; height: {height}px; border-radius: {border_radius}px; \
-                 border: none; cursor: pointer; background: {}; transition: background 0.2s; flex-shrink: 0;{disabled_style}",
-                if enabled { "#34c759" } else { "#636366" }
-            ),
-            onclick: move |_| {
-                if disabled {
-                    return;
-                }
-                on_toggle.call(!enabled);
-            },
-            div {
-                style: format!(
-                    "position: absolute; top: 2px; left: {}px; width: {knob_size}px; height: {knob_size}px; \
-                     border-radius: 50%; background: white; transition: left 0.2s;",
-                    if enabled { knob_left_on } else { 2 }
-                ),
-            }
-        }
-    }
-}
+pub use videocall_theme::Switch as ToggleSwitch;

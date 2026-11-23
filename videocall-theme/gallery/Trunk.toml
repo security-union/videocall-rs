@@ -1,0 +1,12 @@
+# Trunk config for the theme gallery. Run from this directory, or use
+# `make theme-gallery` / `make theme-gallery-build` from the repo root.
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+# The gallery is built from the whole crate: the library, the stylesheets
+# and this directory.
+watch = ["..", "."]
+ignore = ["dist"]

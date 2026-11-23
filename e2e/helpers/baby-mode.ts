@@ -1,4 +1,5 @@
 import { Locator, Page, expect } from "@playwright/test";
+import { clickBarControl } from "./meeting";
 
 /** Matches `HOLD_TO_UNLOCK_MS` in dioxus-ui/src/components/baby_mode.rs. */
 export const HOLD_TO_UNLOCK_MS = 3_000;
@@ -69,9 +70,12 @@ export async function storedBabyMode(page: Page): Promise<string | null> {
   return page.evaluate((key) => window.sessionStorage.getItem(key), BABY_MODE_STORAGE_KEY);
 }
 
-/** Click the control-bar button and wait for the locked state. */
+/**
+ * Click the control-bar button (on a phone, the More menu's row) and wait
+ * for the locked state.
+ */
 export async function enableBabyMode(page: Page): Promise<void> {
-  await babyModeButton(page).click();
+  await clickBarControl(page, ENABLE_BUTTON_NAME);
   await expect(babyModeLock(page)).toBeVisible();
   await expect(babyModeShield(page)).toBeVisible();
 }

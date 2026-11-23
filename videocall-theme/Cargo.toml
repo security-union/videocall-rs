@@ -1,0 +1,53 @@
+[package]
+name = "videocall-theme"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The videocall-rs design system: stylesheets, typed Dioxus primitives and a browsable gallery"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+keywords = ["dioxus", "design-system", "css", "video-conferencing"]
+categories = ["gui", "web-programming"]
+readme = "README.md"
+publish = false
+
+[lib]
+name = "videocall_theme"
+path = "src/lib.rs"
+
+# The gallery is a Trunk app (gallery/index.html). It only builds with the
+# `gallery` feature, so plain `cargo test` / `cargo check` of the library never
+# pull in the web renderer.
+[[bin]]
+name = "videocall-theme-gallery"
+path = "gallery/src/main.rs"
+required-features = ["gallery"]
+
+[dependencies]
+# The library only needs the component model. The renderer comes from the
+# app that uses it (dioxus-ui enables "web"), or from the `gallery` feature.
+dioxus = { version = "0.7.3", default-features = false, features = ["macro", "html", "signals", "hooks"] }
+# The menu's arrow-key navigation moves DOM focus between its items. On the
+# host (the SSR tests) these compile to stubs that are never called.
+wasm-bindgen = { workspace = true }
+web-sys = { version = "0.3.107", features = [
+    "CssStyleDeclaration",
+    "Document",
+    "DomTokenList",
+    "Element",
+    "HtmlElement",
+    "Location",
+    "MediaQueryList",
+    "Node",
+    "NodeList",
+    "Window",
+] }
+
+[features]
+default = []
+gallery = ["dioxus/web", "dioxus/launch", "dioxus/lib"]
+
+[dev-dependencies]
+# Renders components to HTML on the host, so the tests can check that
+# classes and pass-through attributes reach the element.
+dioxus-ssr = "=0.7.3"

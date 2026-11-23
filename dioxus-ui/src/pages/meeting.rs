@@ -24,6 +24,7 @@ use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
+use videocall_theme::{icons, Button, ButtonType, ButtonVariant, Card, Icon, Spinner, TextField};
 use web_sys::window;
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
@@ -300,8 +301,11 @@ pub fn MeetingPage(id: String) -> Element {
     // Early return for auth check
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return rsx! {
-            div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                p { style: "color: white; font-size: 1rem;", "Checking authentication..." }
+            div { class: "screen-center prejoin-screen",
+                div { class: "prejoin-status",
+                    Spinner { large: true, label: None }
+                    p { class: "text-body", "Checking authentication..." }
+                }
             }
         };
     }
@@ -501,17 +505,17 @@ pub fn MeetingPage(id: String) -> Element {
 
             // Waiting for host to start
             (Some(_), MeetingStatus::WaitingForMeeting { .. }) => rsx! {
-                div { class: "waiting-room-container",
-                    div { class: "waiting-room-card card-apple",
+                div { class: "screen-center prejoin-screen",
+                    Card { class: "prejoin-card",
                         div { class: "waiting-room-icon",
-                            div { class: "loading-spinner", style: "width: 48px; height: 48px;" }
+                            // Raw: a div, where Spinner renders a span.
+                            div { class: "spinner spinner-lg" }
                         }
-                        h2 { "Waiting for meeting to start" }
-                        p { class: "waiting-room-message",
+                        h2 { class: "text-title-2", "Waiting for meeting to start" }
+                        p { class: "waiting-room-message text-secondary",
                             "The host hasn't started this meeting yet. You'll automatically join once the meeting begins."
                         }
-                        button {
-                            class: "btn-apple btn-secondary",
+                        Button {
                             onclick: move |_| {
                                 if let Some(w) = web_sys::window() {
                                     let _ = w.location().set_href("/");
@@ -525,17 +529,13 @@ pub fn MeetingPage(id: String) -> Element {
 
             // Rejected
             (Some(_), MeetingStatus::Rejected) => rsx! {
-                div { class: "rejected-container",
-                    div { class: "rejected-card card-apple",
-                        svg { xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "#ff6b6b", stroke_width: "1.5",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "15", y1: "9", x2: "9", y2: "15" }
-                            line { x1: "9", y1: "9", x2: "15", y2: "15" }
-                        }
-                        h2 { "Entry denied" }
-                        p { "The meeting host has denied your request to join." }
-                        button {
-                            class: "btn-apple btn-primary",
+                div { class: "screen-center prejoin-screen",
+                    Card { class: "prejoin-card",
+                        Icon { glyph: &icons::ERROR, size: "64", stroke_width: "1.5", class: "prejoin-icon prejoin-icon-danger", "aria-hidden": "true" }
+                        h2 { class: "text-title-2", "Entry denied" }
+                        p { class: "text-secondary", "The meeting host has denied your request to join." }
+                        Button {
+                            variant: ButtonVariant::Prominent,
                             onclick: move |_| {
                                 if let Some(w) = web_sys::window() { let _ = w.location().set_href("/"); }
                             },
@@ -547,17 +547,13 @@ pub fn MeetingPage(id: String) -> Element {
 
             // Error
             (Some(_), MeetingStatus::Error(error)) => rsx! {
-                div { class: "error-container",
-                    div { class: "error-card card-apple",
-                        svg { xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "#ff9800", stroke_width: "1.5",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "8", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
-                        }
-                        h2 { "Unable to join" }
-                        p { "{error}" }
-                        button {
-                            class: "btn-apple btn-primary",
+                div { class: "error-container screen-center prejoin-screen",
+                    Card { class: "prejoin-card",
+                        Icon { glyph: &icons::ALERT, size: "64", stroke_width: "1.5", class: "prejoin-icon prejoin-icon-warning", "aria-hidden": "true" }
+                        h2 { class: "text-title-2", "Unable to join" }
+                        p { class: "text-secondary", "{error}" }
+                        Button {
+                            variant: ButtonVariant::Prominent,
                             onclick: move |_| {
                                 if let Some(w) = web_sys::window() { let _ = w.location().set_href("/"); }
                             },
@@ -571,12 +567,14 @@ pub fn MeetingPage(id: String) -> Element {
             (Some(_), MeetingStatus::Joining) => {
                 let display_name = maybe_username.as_deref().unwrap_or("...");
                 rsx! {
-                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                        div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                        p { style: "color: white; font-size: 1rem;",
-                            "Joining as "
-                            strong { "{display_name}" }
-                            "..."
+                    div { class: "screen-center prejoin-screen",
+                        div { class: "prejoin-status",
+                            Spinner { large: true, label: None }
+                            p { class: "text-body",
+                                "Joining as "
+                                strong { "{display_name}" }
+                                "..."
+                            }
                         }
                     }
                 }
@@ -587,20 +585,13 @@ pub fn MeetingPage(id: String) -> Element {
                 if maybe_username.is_none() {
                     // Show inline display name prompt instead of redirecting
                     rsx! {
-                        div {
-                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                            div {
-                                class: "card-apple p-8",
-                                style: "max-width: 400px; width: 90%;",
-                                h2 {
-                                    style: "color: white; text-align: center; margin-bottom: 0.5rem;",
-                                    "Enter your display name"
-                                }
-                                p {
-                                    style: "color: rgba(255,255,255,0.6); text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
+                        div { class: "screen-center prejoin-screen",
+                            Card { class: "prejoin-card",
+                                h2 { class: "text-title-2", "Enter your display name" }
+                                p { class: "text-subheadline text-secondary",
                                     "Choose a name to join the meeting"
                                 }
-                                form {
+                                form { class: "field prejoin-form",
                                     onsubmit: move |e| {
                                         e.prevent_default();
                                         let raw = input_value_state();
@@ -616,21 +607,24 @@ pub fn MeetingPage(id: String) -> Element {
                                             }
                                         }
                                     },
-                                    input {
-                                        class: "input-apple",
+                                    TextField {
+                                        "data-testid": "display-name-input",
+                                        "aria-label": "Display name",
                                         r#type: "text",
                                         placeholder: "Enter your display name",
                                         required: true,
-                                        autofocus: true,
+                                        // Quoted: `autofocus` is both a global and
+                                        // an input attribute (ambiguous bare).
+                                        "autofocus": crate::platform::autofocus_allowed(),
                                         value: "{input_value_state}",
                                         oninput: move |e: Event<FormData>| {
                                             input_value_state.set(e.value());
                                         },
                                     }
-                                    button {
-                                        r#type: "submit",
-                                        class: "btn-apple btn-primary w-full",
-                                        style: "margin-top: 1rem;",
+                                    Button {
+                                        button_type: ButtonType::Submit,
+                                        variant: ButtonVariant::Prominent,
+                                        block: true,
                                         "Join Meeting"
                                     }
                                 }
@@ -641,12 +635,14 @@ pub fn MeetingPage(id: String) -> Element {
                     // Username is set; the auto-join effect will fire momentarily
                     let display_name = maybe_username.as_deref().unwrap_or("Unknown");
                     rsx! {
-                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                            div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                            p { style: "color: white; font-size: 1rem;",
-                                "Joining as "
-                                strong { "{display_name}" }
-                                "..."
+                        div { class: "screen-center prejoin-screen",
+                            div { class: "prejoin-status",
+                                Spinner { large: true, label: None }
+                                p { class: "text-body",
+                                    "Joining as "
+                                    strong { "{display_name}" }
+                                    "..."
+                                }
                             }
                         }
                     }

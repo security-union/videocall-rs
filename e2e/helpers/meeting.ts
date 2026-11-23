@@ -121,22 +121,87 @@ export async function joinAsGuest(
   await admitGuestIfNeeded(hostPage, guestPage, guestResult);
 }
 
-/** A bottom-bar control button, found by its tooltip text (e.g. "Mute", "Hang Up"). */
+/**
+ * A bottom-bar control button, found by its tooltip text (e.g. "Hang Up",
+ * "Open Diagnostics"). The mic, camera and share toggles have fixed names
+ * instead; use `micButton`, `cameraButton` and `shareButton` for those.
+ */
 export function controlButton(page: Page, tooltip: string): Locator {
   return page.locator("button.video-control-button", {
     has: page.locator(".tooltip", { hasText: new RegExp(`^${tooltip}$`) }),
   });
 }
 
+/**
+ * The phone bar's More button. Below the phone breakpoint (37.5em) the bar
+ * holds only mic, camera, More and hang up; the other controls are rows of
+ * the menu More opens. On a wider screen it does not exist.
+ */
+export function moreButton(page: Page): Locator {
+  return page.locator(".call-controls").getByRole("button", { name: "More", exact: true });
+}
+
+/** The menu the More button opens. */
+export function moreMenu(page: Page): Locator {
+  return page.getByRole("menu", { name: "More" });
+}
+
+/**
+ * A control that moves into the More menu on a phone (peers, diagnostics,
+ * device settings, baby mode, share), by its accessible name, e.g.
+ * "Open Peers". Clicks it in the bar on a wide screen, or opens More and
+ * clicks its row on a phone.
+ */
+export async function clickBarControl(page: Page, name: string): Promise<void> {
+  // The bar renders after the call connects; isVisible() does not wait, so
+  // without this a phone viewport would take the wrong path.
+  await expect(page.locator(".call-controls")).toBeVisible();
+  if (await moreButton(page).isVisible()) {
+    await openMoreMenu(page);
+    await moreMenuItem(page, name).click();
+    return;
+  }
+  await page.locator(".call-controls").getByRole("button", { name, exact: true }).click();
+}
+
+/** A row of the open More menu, by its accessible name ("Open Peers"). */
+export function moreMenuItem(page: Page, name: string): Locator {
+  const menu = moreMenu(page);
+  return menu
+    .getByRole("menuitem", { name, exact: true })
+    .or(menu.getByRole("menuitemcheckbox", { name, exact: true }));
+}
+
+/** Open the More menu and wait for it. */
+export async function openMoreMenu(page: Page): Promise<void> {
+  await moreButton(page).click();
+  await expect(moreMenu(page)).toBeVisible();
+}
+
+/** The microphone toggle. Its name is fixed; `aria-pressed` says whether the mic is on. */
+export function micButton(page: Page): Locator {
+  return page.getByRole("button", { name: "Microphone" });
+}
+
+/** The camera toggle. Its name is fixed; `aria-pressed` says whether the camera is on. */
+export function cameraButton(page: Page): Locator {
+  return page.getByRole("button", { name: "Camera", exact: true });
+}
+
+/** The screen share toggle. Its name is fixed; `aria-pressed` says whether sharing is on. */
+export function shareButton(page: Page): Locator {
+  return page.getByRole("button", { name: "Share screen" });
+}
+
 /** Turn the local microphone on (the meeting starts with it off). */
 export async function unmute(page: Page): Promise<void> {
-  await controlButton(page, "Unmute").click();
-  await expect(controlButton(page, "Mute")).toBeVisible({ timeout: 10_000 });
+  await micButton(page).click();
+  await expect(micButton(page)).toHaveAttribute("aria-pressed", "true", { timeout: 10_000 });
 }
 
 export async function mute(page: Page): Promise<void> {
-  await controlButton(page, "Mute").click();
-  await expect(controlButton(page, "Unmute")).toBeVisible({ timeout: 10_000 });
+  await micButton(page).click();
+  await expect(micButton(page)).toHaveAttribute("aria-pressed", "false", { timeout: 10_000 });
 }
 
 /** The speaking indicator on the remote peer tile whose name is `peerName`. */

@@ -81,3 +81,9 @@ e2e/node_modules/**
 # native dev-stack state (make dev)
 .data/
 .env.local
+
+# local env variants (.env.bak and the like); the tracked .env-sample does not match
+.env.*
+
+# claude code agent memory, per developer
+.claude/agent-memory/

@@ -165,18 +165,21 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const glowOverlay = peerTile.first().locator(".glow-overlay");
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
-      // When silent: border-color is transparent, box-shadow is none.
-      const style = await glowOverlay.getAttribute("style");
-      expect(style).toBeTruthy();
-      expect(style).toContain("border: 1.5px solid transparent");
-      expect(style).toContain("box-shadow: none");
+      // When silent: no `speaking` class and the level custom property is 0.
+      // The border and glow colors come from the stylesheet, keyed off these.
+      await expect(glowOverlay).not.toHaveClass(/speaking/);
+      await expect(glowOverlay).toHaveAttribute("style", /--speak-level:\s*0\.00/);
+
+      // And nothing is drawn: the computed border is transparent.
+      const borderColor = await glowOverlay.evaluate((el) => getComputedStyle(el).borderTopColor);
+      expect(borderColor).toBe("rgba(0, 0, 0, 0)");
     } finally {
       await browser1.close();
       await browser2.close();
     }
   });
 
-  test("video tile has transition property in inline style", async ({ baseURL }) => {
+  test("video tile glow animates its border and shadow", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_glow_trans_${Date.now()}`;
@@ -219,11 +222,22 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const glowOverlay = peerTile.first().locator(".glow-overlay");
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
-      // The inline style should contain a transition property for the
-      // smooth fade-in/fade-out of the glow border.
-      const style = await glowOverlay.getAttribute("style");
-      expect(style).toBeTruthy();
-      expect(style).toContain("transition:");
+      // The overlay must animate its border and glow (smooth fade-in and
+      // fade-out). The transition now comes from the stylesheet, so read the
+      // computed style instead of the inline style attribute.
+      const transition = await glowOverlay.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return { property: cs.transitionProperty, duration: cs.transitionDuration };
+      });
+      expect(transition.property).toContain("border-color");
+      expect(transition.property).toContain("box-shadow");
+      // transitionDuration is a comma list, one entry per property
+      // ("1.4s, 1.4s"), so a plain "0s" check would pass for "0s, 0s".
+      const durationsMs = transition.duration.split(",").map((entry) => {
+        const value = entry.trim();
+        return value.endsWith("ms") ? parseFloat(value) : parseFloat(value) * 1000;
+      });
+      expect(durationsMs.some((ms) => ms > 0)).toBe(true);
     } finally {
       await browser1.close();
       await browser2.close();
@@ -258,10 +272,9 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const glowOverlay = page.locator(".glow-overlay").first();
       await expect(glowOverlay).toBeVisible({ timeout: 15_000 });
 
-      // The host's own tile should also have silent-state inline styles.
-      const style = await glowOverlay.getAttribute("style");
-      expect(style).toBeTruthy();
-      expect(style).toContain("border: 1.5px solid transparent");
+      // The host's own tile is also in the silent state.
+      await expect(glowOverlay).not.toHaveClass(/speaking/);
+      await expect(glowOverlay).toHaveAttribute("style", /--speak-level:\s*0\.00/);
     } finally {
       await browser.close();
     }

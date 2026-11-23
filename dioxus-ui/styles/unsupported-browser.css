@@ -1,0 +1,40 @@
+/*
+ * unsupported-browser.css
+ *
+ * The one sheet outside the cascade layers, on purpose. A browser without
+ * @layer drops every rule in the other sheets, and that is exactly the
+ * browser the unsupported-browser notice talks to. So the notice gets a
+ * plain copy of its look here.
+ *
+ * It is gated on the same probe the Rust check uses (color-mix, which every
+ * engine shipped after @layer). A current browser skips this block and the
+ * layered styles in features/home.css apply as usual. Literal values are
+ * fine here: a browser this old would not read the tokens either.
+ */
+
+@supports not (color: color-mix(in srgb, red, blue)) {
+  .browser-compat-notice {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: 100;
+    box-sizing: border-box;
+    width: 80%;
+    max-width: 32rem;
+    padding: 24px;
+    border-radius: 14px;
+    background: #FFFFFF;
+    color: #000000;
+    font: 600 17px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    text-align: center;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    transform: translate(-50%, -50%);
+  }
+
+  .browser-compat-notice img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 16px auto 0;
+  }
+}

@@ -1,5 +1,5 @@
 import { Locator, Page, expect } from "@playwright/test";
-import { controlButton } from "./meeting";
+import { clickBarControl } from "./meeting";
 
 /** Matches `REVEAL_TAPS` in dioxus-ui/src/components/traffic_shaping.rs. */
 export const REVEAL_TAPS = 7;
@@ -71,7 +71,7 @@ export function scopeButton(page: Page, scope: Scope): Locator {
 }
 
 export async function openDiagnostics(page: Page): Promise<void> {
-  await controlButton(page, "Open Diagnostics").click();
+  await clickBarControl(page, "Open Diagnostics");
   await expect(diagnosticsSidebar(page)).toBeVisible({ timeout: 10_000 });
   await expect(diagnosticsTitle(page)).toBeVisible();
 }

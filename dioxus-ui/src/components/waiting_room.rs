@@ -18,6 +18,7 @@ use crate::meeting_api::{check_status, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
+use videocall_theme::{icons, Button, Card, Icon, Spinner};
 use wasm_bindgen::JsCast;
 
 pub type ParticipantStatus = JoinMeetingResponse;
@@ -298,37 +299,31 @@ pub fn WaitingRoom(
     }
 
     rsx! {
-        div { class: "waiting-room-container",
-            div { class: "waiting-room-card card-apple",
+        div { class: "screen-center prejoin-screen",
+            Card { class: "prejoin-card",
                 div { class: "waiting-room-icon",
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64",
-                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                        stroke_width: "1.5", stroke_linecap: "round", stroke_linejoin: "round",
-                        circle { cx: "12", cy: "12", r: "10" }
-                        polyline { points: "12 6 12 12 16 14" }
-                    }
+                    Icon { glyph: &icons::CLOCK, size: "64", stroke_width: "1.5", "aria-hidden": "true" }
                 }
-                h2 { "Waiting to be admitted" }
+                h2 { class: "text-title-2", "Waiting to be admitted" }
                 if !display_name.trim().is_empty() {
-                    p { class: "waiting-room-identity", "Joining as {display_name}" }
+                    p { class: "waiting-room-identity text-headline", "Joining as {display_name}" }
                 }
-                p { class: "waiting-room-message",
+                p { class: "waiting-room-message text-secondary",
                     "The meeting host will let you in soon."
                 }
 
                 if let Some(err) = error() {
-                    p { class: "waiting-room-error", "{err}" }
+                    p { class: "waiting-room-error", role: "alert",
+                        Icon { glyph: &icons::ALERT, size: "16", "aria-hidden": "true" }
+                        span { "{err}" }
+                    }
                 }
 
                 div { class: "waiting-room-spinner",
-                    div { class: "spinner-dot" }
-                    div { class: "spinner-dot" }
-                    div { class: "spinner-dot" }
+                    Spinner { label: "Waiting" }
                 }
 
-                button {
-                    class: "btn-apple btn-secondary",
+                Button {
                     onclick: move |_| on_cancel.call(()),
                     "Leave waiting room"
                 }

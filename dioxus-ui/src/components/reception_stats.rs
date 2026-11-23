@@ -317,12 +317,12 @@ pub fn ReceptionStatsSection(
 ) -> Element {
     rsx! {
         div { class: "diagnostics-section", "data-testid": "reception-stats",
-            h3 { "Reception Stats" }
+            h3 { class: "card-title", "Reception Stats" }
             if rows.is_empty() {
-                p { "No reception data available." }
+                p { class: "diagnostics-empty", "No reception data available." }
             } else {
                 div { class: "reception-stats-table", role: "table",
-                    div { class: "reception-stats-row reception-stats-header", role: "row",
+                    div { class: "reception-stats-row reception-stats-header list-row", role: "row",
                         span { class: "reception-stats-cell", role: "columnheader", "Peer" }
                         span { class: "reception-stats-cell", role: "columnheader", "Media" }
                         span { class: "reception-stats-cell", role: "columnheader", "FPS" }
@@ -347,7 +347,7 @@ pub fn ReceptionStatsSection(
                             rsx! {
                                 div {
                                     key: "{peer_id}-{media}",
-                                    class: "reception-stats-row",
+                                    class: "reception-stats-row list-row",
                                     role: "row",
                                     "data-testid": "reception-stats-row",
                                     "data-peer": "{peer_id}",

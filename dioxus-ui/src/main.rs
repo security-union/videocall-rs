@@ -7,6 +7,7 @@ mod constants;
 mod context;
 pub mod meeting_api;
 mod pages;
+mod platform;
 mod routing;
 mod types;
 

@@ -1,0 +1,529 @@
+/*
+ * base.css
+ *
+ * Two layers live in this file.
+ *
+ * `reset` is the element reset. It started as the parts of Tailwind's
+ * preflight that the app leaned on: border-box sizing, zero margins, form
+ * controls that inherit font and color, block-level media, plain lists,
+ * headings without a size of their own. It is the lowest layer, so rules here
+ * are defaults and anything else overrides them.
+ *
+ * `base` is the page itself: font, colors, focus ring, and a handful of
+ * helpers (text styles, safe areas, stack and row, the full-screen centered
+ * state).
+ *
+ * No literal colors or font names in this file. They come from tokens.css.
+ */
+
+@layer reset {
+  *,
+  ::before,
+  ::after {
+    box-sizing: border-box;
+    /* Width 0 with a style and color already set, so a rule only has to give
+       a border-width to get a hairline. */
+    border: 0 solid var(--color-separator);
+  }
+
+  html {
+    line-height: 1.5;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    tab-size: 4;
+  }
+
+  body {
+    margin: 0;
+    line-height: inherit;
+  }
+
+  blockquote,
+  dd,
+  dl,
+  figure,
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  hr,
+  p,
+  pre,
+  fieldset {
+    margin: 0;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-size: inherit;
+    font-weight: inherit;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: inherit;
+  }
+
+  b,
+  strong {
+    font-weight: bolder;
+  }
+
+  code,
+  kbd,
+  pre,
+  samp {
+    font-family: var(--font-mono);
+    font-size: 1em;
+  }
+
+  small {
+    font-size: 80%;
+  }
+
+  sub,
+  sup {
+    position: relative;
+    font-size: 75%;
+    line-height: 0;
+    vertical-align: baseline;
+  }
+
+  sub {
+    bottom: -0.25em;
+  }
+
+  sup {
+    top: -0.5em;
+  }
+
+  hr {
+    height: 0;
+    border-top-width: 1px;
+    color: inherit;
+  }
+
+  table {
+    border-collapse: collapse;
+    border-color: inherit;
+    text-indent: 0;
+  }
+
+  menu,
+  ol,
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  fieldset,
+  legend,
+  dialog {
+    padding: 0;
+  }
+
+  summary {
+    display: list-item;
+  }
+
+  /* Form controls take the font and color of the text around them. */
+  button,
+  input,
+  optgroup,
+  select,
+  textarea {
+    margin: 0;
+    padding: 0;
+    color: inherit;
+    font-family: inherit;
+    font-size: 100%;
+    font-weight: inherit;
+    font-feature-settings: inherit;
+    font-variation-settings: inherit;
+    letter-spacing: inherit;
+    line-height: inherit;
+  }
+
+  button,
+  select {
+    text-transform: none;
+  }
+
+  button,
+  input:where([type="button"]),
+  input:where([type="reset"]),
+  input:where([type="submit"]) {
+    -webkit-appearance: button;
+    appearance: button;
+    background-color: transparent;
+    background-image: none;
+  }
+
+  button,
+  [role="button"] {
+    cursor: pointer;
+  }
+
+  :disabled {
+    cursor: default;
+  }
+
+  textarea {
+    resize: vertical;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-placeholder);
+    opacity: 1;
+  }
+
+  [type="search"] {
+    -webkit-appearance: textfield;
+    appearance: textfield;
+    outline-offset: -2px;
+  }
+
+  ::-webkit-search-decoration {
+    -webkit-appearance: none;
+  }
+
+  ::-webkit-inner-spin-button,
+  ::-webkit-outer-spin-button {
+    height: auto;
+  }
+
+  ::-webkit-file-upload-button {
+    -webkit-appearance: button;
+    font: inherit;
+  }
+
+  progress {
+    vertical-align: baseline;
+  }
+
+  audio,
+  canvas,
+  embed,
+  iframe,
+  img,
+  object,
+  svg,
+  video {
+    display: block;
+    vertical-align: middle;
+  }
+
+  img,
+  video {
+    max-width: 100%;
+    height: auto;
+  }
+
+  [hidden]:where(:not([hidden="until-found"])) {
+    display: none;
+  }
+
+  /* Reduce Motion. HIG: swap movement for fades and drop the elastic stuff.
+     Near-zero durations do that for every transition and animation at once.
+
+     Delays are left alone on purpose. A delay is timing, not movement: a
+     toast that fades out after 8 s uses one, and zeroing it made the toast
+     vanish the moment it appeared. With the duration near zero, a delayed
+     step still happens on time, it just jumps instead of moving.
+
+     Why this is in `reset`: with !important the layer order runs backwards,
+     so the first layer wins. Putting it here beats any !important in a
+     later layer and the inline transitions set from Rust.
+
+     .spinner is left out. A frozen spinner looks like a hang, so
+     components.css slows it down instead. */
+  @media (prefers-reduced-motion: reduce) {
+    *:not(.spinner),
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer base {
+  /* ---- Page ---- */
+
+  html {
+    /* The browser default (16px unless the person changed it). Every text
+       style is in rem, so their text size setting scales the whole UI. */
+    font-size: 100%;
+    font-family: var(--font-sans);
+    background-color: var(--color-bg);
+    color: var(--color-label);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* No gray flash on tap. Every control has its own press state. */
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Dynamic Type. iOS Safari ignores the text size in Settings unless the
+     page asks for a system text style; this is WebKit's documented way.
+     The root takes the body style, so 1rem becomes the person's body size,
+     and the family goes back to the token stack.
+     Scoped to a touch screen with no hover (iPhone, iPad without a
+     trackpad). macOS Safari supports the keyword too, but there it is a
+     fixed 13px, and a Mac always reports hover, so it keeps the 16px root.
+     tokens.css scales the text styles by 16/17 in the same scope. */
+  @supports (font: -apple-system-body) {
+    @media (hover: none) and (pointer: coarse) {
+      html {
+        font: -apple-system-body;
+        font-family: var(--font-sans);
+        line-height: 1.5;
+      }
+    }
+  }
+
+  body {
+    min-height: 100vh;
+    min-height: var(--viewport-height);
+    font: var(--text-body);
+    background-color: var(--color-bg);
+    color: var(--color-label);
+  }
+
+  /* .theme-dark and .theme-light swap the tokens (tokens.css). `color` is
+     inherited as a finished value, so the text color has to be set again
+     here. The background is the caller's: the in-call screen wants black. */
+  .theme-dark,
+  .theme-light {
+    color: var(--color-label);
+  }
+
+  /* ---- Focus ----
+     One ring for everything that can take keyboard focus. */
+  :focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring-color);
+    outline-offset: var(--focus-ring-offset);
+  }
+
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  /* ---- Text styles ----
+     The 11 iOS text styles as classes. Add .text-emphasized for the
+     emphasized weight of whichever style is on the element. */
+  .text-large-title {
+    font: var(--text-large-title);
+  }
+
+  .text-title-1 {
+    font: var(--text-title-1);
+  }
+
+  .text-title-2 {
+    font: var(--text-title-2);
+  }
+
+  .text-title-3 {
+    font: var(--text-title-3);
+  }
+
+  .text-headline {
+    font: var(--text-headline);
+  }
+
+  .text-body {
+    font: var(--text-body);
+  }
+
+  .text-callout {
+    font: var(--text-callout);
+  }
+
+  .text-subheadline {
+    font: var(--text-subheadline);
+  }
+
+  .text-footnote {
+    font: var(--text-footnote);
+  }
+
+  .text-caption-1 {
+    font: var(--text-caption-1);
+  }
+
+  .text-caption-2 {
+    font: var(--text-caption-2);
+  }
+
+  .text-emphasized {
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .text-large-title.text-emphasized,
+  .text-title-1.text-emphasized,
+  .text-title-2.text-emphasized {
+    font-weight: var(--font-weight-bold);
+  }
+
+  .text-mono {
+    font-family: var(--font-mono);
+  }
+
+  /* Digits that do not shift as they change: timers, counters, stats. */
+  .text-tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .text-secondary {
+    color: var(--color-label-secondary);
+  }
+
+  .text-tertiary {
+    color: var(--color-label-tertiary);
+  }
+
+  .text-danger {
+    color: var(--color-danger);
+  }
+
+  .text-center {
+    text-align: center;
+  }
+
+  .link {
+    color: var(--color-link);
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .link:hover {
+    text-decoration: underline;
+  }
+
+  /* ---- Layout helpers ----
+     Only the ones that replace inline styles repeated across the Rust code.
+     This is not a utility framework and should not grow into one. */
+
+  /* A full-screen centered state: loading, error, "meeting ended". */
+  .screen-center {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    overflow: auto;
+    padding: max(var(--space-page), var(--safe-top))
+      max(var(--space-page), var(--safe-right))
+      max(var(--space-page), var(--safe-bottom))
+      max(var(--space-page), var(--safe-left));
+    background-color: var(--color-bg);
+    color: var(--color-label);
+    text-align: center;
+  }
+
+  /* A grid item will not shrink below its longest word or widest control
+     unless told to. At the largest text sizes that is wider than a phone. */
+  .screen-center > * {
+    min-width: 0;
+  }
+
+  /* Column and row with a gap. The gap classes set the size. */
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap, var(--space-3));
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: var(--gap, var(--space-2));
+  }
+
+  .gap-1 {
+    --gap: var(--space-1);
+  }
+
+  .gap-2 {
+    --gap: var(--space-2);
+  }
+
+  .gap-4 {
+    --gap: var(--space-4);
+  }
+
+  .gap-6 {
+    --gap: var(--space-6);
+  }
+
+  /* Takes the leftover room in a .row or .stack. */
+  .grow {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  /* Read by screen readers, not drawn. */
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  /* Concentric corners: the parent sets --concentric-outer (its radius) and
+     --concentric-inset (its padding). Standalone, the fallback applies. */
+  .radius-concentric {
+    border-radius: max(
+      var(--concentric-outer, 0px) - var(--concentric-inset, 0px),
+      var(--radius-fallback)
+    );
+  }
+
+  /* ---- Safe areas ----
+     Padding that clears the notch, the home indicator and rounded corners,
+     and never drops under --safe-min. Set --safe-min on the element to keep
+     a minimum margin. */
+  .safe-top {
+    padding-top: max(var(--safe-min, 0px), var(--safe-top));
+  }
+
+  .safe-bottom {
+    padding-bottom: max(var(--safe-min, 0px), var(--safe-bottom));
+  }
+
+  .safe-x {
+    padding-left: max(var(--safe-min, 0px), var(--safe-left));
+    padding-right: max(var(--safe-min, 0px), var(--safe-right));
+  }
+
+  .safe-area {
+    padding: max(var(--safe-min, 0px), var(--safe-top))
+      max(var(--safe-min, 0px), var(--safe-right))
+      max(var(--safe-min, 0px), var(--safe-bottom))
+      max(var(--safe-min, 0px), var(--safe-left));
+  }
+
+  /* ---- Touch ----
+     The old sheet put this on every element, which turned off pinch-zoom for
+     the whole app. Now it is opt-in. The in-call screen can put it on its
+     root so a pinch does not zoom the page out from under the video. Panning
+     still works. */
+  .touch-pan-only {
+    touch-action: pan-x pan-y;
+  }
+}

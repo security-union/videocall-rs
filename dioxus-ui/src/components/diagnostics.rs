@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, MetricValue};
+use videocall_theme::IconButton;
 
 // Serializable versions of DiagEvent structures
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,6 +247,27 @@ impl ConnectionManagerState {
     }
 }
 
+/// Badge tone for the election state. The state name is also the badge text.
+fn election_badge(state: &str) -> &'static str {
+    match state {
+        "testing" => "badge-warning",
+        "elected" => "badge-accent",
+        "failed" => "badge-danger",
+        _ => "",
+    }
+}
+
+/// Badge tone for a round trip time in milliseconds. The value is the badge text.
+fn rtt_badge(rtt: f64) -> &'static str {
+    if rtt < 50.0 {
+        "badge-success"
+    } else if rtt < 150.0 {
+        "badge-warning"
+    } else {
+        "badge-danger"
+    }
+}
+
 #[component]
 pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Element {
     let parsed_state = connection_manager_state.as_ref().map(|json| {
@@ -253,13 +275,14 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
         ConnectionManagerState::from_serializable_events(&events)
     });
 
-    let common_styles = include_str!("diagnostics_cm_styles.css");
-
     if let Some(state) = parsed_state {
         let election_upper = state.election_state.to_uppercase();
-        let status_class = format!("status-value status-{}", state.election_state);
+        let status_class = format!(
+            "status-value badge {} status-{}",
+            election_badge(&state.election_state),
+            state.election_state
+        );
         rsx! {
-            style { "{common_styles}" }
             div { class: "connection-manager-display",
                 div { class: "connection-status",
                     h4 { "Connection Status" }
@@ -278,8 +301,7 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                                             span { class: "status-label", "Progress:" }
                                             div { class: "progress-container",
                                                 div { class: "progress-bar",
-                                                    div { class: "progress-fill", style: "width: {progress_pct}%",
-                                                    }
+                                                    div { class: "progress-fill", style: "width: {progress_pct}%" }
                                                 }
                                                 span { class: "progress-text", "{progress_pct_str}" }
                                             }
@@ -309,7 +331,7 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                             if let Some(server_type) = &state.active_server_type {
                                 {
                                     let st_upper = server_type.to_uppercase();
-                                    let type_class = format!("detail-value connection-type type-{server_type}");
+                                    let type_class = format!("detail-value badge badge-accent connection-type type-{server_type}");
                                     rsx! {
                                         div { class: "detail-item",
                                             span { class: "detail-label", "Type:" }
@@ -320,9 +342,9 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                             }
                             if let Some(rtt) = state.active_server_rtt {
                                 {
-                                    let rtt_class = if rtt < 50.0 { "rtt-good" } else if rtt < 150.0 { "rtt-ok" } else { "rtt-poor" };
+                                    let rtt_class = rtt_badge(rtt);
                                     let rtt_str = format!("{rtt:.1}ms");
-                                    let full_class = format!("detail-value rtt-value {rtt_class}");
+                                    let full_class = format!("detail-value badge {rtt_class}");
                                     rsx! {
                                         div { class: "detail-item",
                                             span { class: "detail-label", "RTT:" }
@@ -340,7 +362,7 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                         div { class: "servers-grid",
                             for server in state.servers.iter() {
                                 {
-                                    let card_class = if server.active { "server-card server-active" } else { "server-card" };
+                                    let card_class = if server.active { "server-card card server-active" } else { "server-card card" };
                                     let status_emoji = match server.status.as_str() {
                                         "connecting" => "\u{231b}",
                                         "connected" => "\u{1f517}",
@@ -349,16 +371,16 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                                         _ => "\u{2753}",
                                     };
                                     let st_upper = server.server_type.to_uppercase();
-                                    let type_class = format!("server-type type-{}", server.server_type);
+                                    let type_class = format!("badge badge-accent server-type type-{}", server.server_type);
                                     rsx! {
                                         div { class: "{card_class}",
                                             div { class: "server-header",
                                                 span { class: "server-id", "{server.connection_id}" }
                                                 div { class: "server-indicators",
                                                     if server.active {
-                                                        span { class: "indicator active-indicator", title: "Active", "\u{25cf}" }
+                                                        span { class: "active-indicator", title: "Active", "\u{25cf}" }
                                                     }
-                                                    span { class: "indicator status-indicator", title: "{server.status}", "{status_emoji}" }
+                                                    span { class: "status-indicator", title: "{server.status}", "{status_emoji}" }
                                                 }
                                             }
                                             div { class: "server-details",
@@ -367,18 +389,18 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                                                     span { class: "{type_class}", "{st_upper}" }
                                                     if let Some(rtt) = server.rtt {
                                                         {
-                                                            let rtt_class = if rtt < 50.0 { "rtt-good" } else if rtt < 150.0 { "rtt-ok" } else { "rtt-poor" };
+                                                            let rtt_class = rtt_badge(rtt);
                                                             let rtt_str = format!("{rtt:.1}ms");
                                                             rsx! {
-                                                                span { class: "server-rtt {rtt_class}", "{rtt_str}" }
+                                                                span { class: "server-rtt badge {rtt_class}", "{rtt_str}" }
                                                             }
                                                         }
                                                     } else {
-                                                        span { class: "server-rtt no-rtt", "\u{2014}" }
+                                                        span { class: "server-rtt no-rtt badge", "\u{2014}" }
                                                     }
                                                     if let Some(count) = server.measurement_count {
                                                         if count > 0 {
-                                                            span { class: "measurement-count", title: "RTT measurements", "{count}\u{1f4ca}" }
+                                                            span { class: "measurement-count badge", title: "RTT measurements", "{count}\u{1f4ca}" }
                                                         }
                                                     }
                                                 }
@@ -404,7 +426,6 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
         }
     } else {
         rsx! {
-            style { "{common_styles}" }
             div { class: "connection-manager-display",
                 p { class: "no-data", "No connection manager data available" }
             }
@@ -442,6 +463,31 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
         stats.drain(0..stats.len() - 60);
     }
     stats
+}
+
+/// What the diagnostics events brought since the panel last updated.
+///
+/// The events arrive far faster than the panel can usefully change: one
+/// NetEq report per remote peer per second, a viewer report per stream
+/// every 500 ms (the "sender" events), and a connection manager report
+/// every second plus one per server connection. Setting a signal per event
+/// re-rendered the whole panel, five SVG charts included, dozens of times a
+/// second in a large call. Events now only land here, and the panel's 1 s
+/// tick (`RECEPTION_PUBLISH_MS`, the rate the charts' NetEq data and the
+/// reception rows already arrive at) copies whatever changed into the
+/// signals: at most one render a second, with the same data.
+#[derive(Default)]
+struct PendingDiagnostics {
+    /// The latest viewer report's text, if one came in since the last tick.
+    sender_stats: Option<String>,
+    neteq_stats: HashMap<String, Vec<String>>,
+    neteq_buffer: HashMap<String, Vec<u64>>,
+    neteq_jitter: HashMap<String, Vec<u64>>,
+    connection_events: Vec<SerializableDiagEvent>,
+    stats_dirty: bool,
+    buffer_dirty: bool,
+    jitter_dirty: bool,
+    connection_dirty: bool,
 }
 
 #[component]
@@ -502,10 +548,9 @@ pub fn Diagnostics(
             // NetEq workers post stats every second only while this panel is
             // open. Ask after subscribing so the first report is not missed.
             videocall_client::set_audio_diagnostics_enabled(true);
-            let mut connection_events = Vec::<SerializableDiagEvent>::new();
-            let mut neteq_stats = HashMap::<String, Vec<String>>::new();
-            let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();
-            let mut neteq_jitter = HashMap::<String, Vec<u64>>::new();
+            // Events only fill this; the 1 s tick below moves it into the
+            // signals. See `PendingDiagnostics`.
+            let pending = Rc::new(RefCell::new(PendingDiagnostics::default()));
             // Shared with the 1 s refresh below, which ages rows out (and
             // drops departed peers) when no decoder event arrives any more.
             let reception = Rc::new(RefCell::new(ReceptionStore::default()));
@@ -523,17 +568,52 @@ pub fn Diagnostics(
                     }
                 }
             };
-            let refresh = {
+            // Moves the buffer into the signals. Runs once on mount, on the
+            // first event that arrives before the first tick, then every
+            // second, so the first paint does not wait a full tick.
+            let flush = {
                 let mut publish_reception = publish_reception.clone();
+                let pending = pending.clone();
+                Rc::new(RefCell::new(move || {
+                    publish_reception(js_sys::Date::now());
+                    let mut pending = pending.borrow_mut();
+                    if let Some(text) = pending.sender_stats.take() {
+                        sender_stats.set(Some(text));
+                    }
+                    if std::mem::take(&mut pending.stats_dirty) {
+                        neteq_stats_per_peer.set(pending.neteq_stats.clone());
+                    }
+                    if std::mem::take(&mut pending.buffer_dirty) {
+                        neteq_buffer_per_peer.set(pending.neteq_buffer.clone());
+                    }
+                    if std::mem::take(&mut pending.jitter_dirty) {
+                        neteq_jitter_per_peer.set(pending.neteq_jitter.clone());
+                    }
+                    if std::mem::take(&mut pending.connection_dirty) {
+                        let serialized =
+                            serde_json::to_string(&pending.connection_events).unwrap_or_default();
+                        connection_manager_state.set(Some(serialized));
+                    }
+                }))
+            };
+            // Set once the 1 s loop has ticked; the early flush is for events
+            // that beat the first tick only.
+            let tick_seen = Rc::new(std::cell::Cell::new(false));
+            let refresh = {
+                let flush = flush.clone();
+                let tick_seen = tick_seen.clone();
                 async move {
+                    (flush.borrow_mut())();
                     loop {
                         TimeoutFuture::new(RECEPTION_PUBLISH_MS as u32).await;
-                        publish_reception(js_sys::Date::now());
+                        tick_seen.set(true);
+                        (flush.borrow_mut())();
                     }
                 }
             };
 
             let events = async move {
+                let mut flushed_early = false;
                 loop {
                     let evt = match rx.recv().await {
                         Ok(evt) => evt,
@@ -581,7 +661,7 @@ pub fn Diagnostics(
                             }
                             if !text.is_empty() {
                                 text.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
-                                sender_stats.set(Some(text));
+                                pending.borrow_mut().sender_stats = Some(text);
                             }
                         }
                         "neteq" => {
@@ -595,71 +675,68 @@ pub fn Diagnostics(
                             } else {
                                 "unknown"
                             };
-                            let mut stats_dirty = false;
-                            let mut buffer_dirty = false;
-                            let mut jitter_dirty = false;
+                            let mut pending = pending.borrow_mut();
+                            let pending = &mut *pending;
                             for m in &evt.metrics {
                                 match m.name {
                                     "stats_json" => {
                                         if let MetricValue::Text(json) = &m.value {
-                                            let entry = neteq_stats
+                                            let entry = pending
+                                                .neteq_stats
                                                 .entry(target_peer.to_string())
                                                 .or_default();
                                             entry.push(json.clone());
                                             if entry.len() > 60 {
                                                 entry.remove(0);
                                             }
-                                            stats_dirty = true;
+                                            pending.stats_dirty = true;
                                         }
                                     }
                                     "audio_buffer_ms" => {
                                         if let MetricValue::U64(v) = &m.value {
-                                            let entry = neteq_buffer
+                                            let entry = pending
+                                                .neteq_buffer
                                                 .entry(target_peer.to_string())
                                                 .or_default();
                                             entry.push(*v);
                                             if entry.len() > 50 {
                                                 entry.remove(0);
                                             }
-                                            buffer_dirty = true;
+                                            pending.buffer_dirty = true;
                                         }
                                     }
                                     "jitter_buffer_delay_ms" => {
                                         if let MetricValue::U64(v) = &m.value {
-                                            let entry = neteq_jitter
+                                            let entry = pending
+                                                .neteq_jitter
                                                 .entry(target_peer.to_string())
                                                 .or_default();
                                             entry.push(*v);
                                             if entry.len() > 50 {
                                                 entry.remove(0);
                                             }
-                                            jitter_dirty = true;
+                                            pending.jitter_dirty = true;
                                         }
                                     }
                                     _ => {}
                                 }
                             }
-                            // Batch: update signals once per event, not per-metric.
-                            if stats_dirty {
-                                neteq_stats_per_peer.set(neteq_stats.clone());
-                            }
-                            if buffer_dirty {
-                                neteq_buffer_per_peer.set(neteq_buffer.clone());
-                            }
-                            if jitter_dirty {
-                                neteq_jitter_per_peer.set(neteq_jitter.clone());
-                            }
                         }
                         "connection_manager" => {
-                            connection_events.push(SerializableDiagEvent::from(evt));
-                            if connection_events.len() > 20 {
-                                connection_events.remove(0);
+                            let mut pending = pending.borrow_mut();
+                            pending
+                                .connection_events
+                                .push(SerializableDiagEvent::from(evt));
+                            if pending.connection_events.len() > 20 {
+                                pending.connection_events.remove(0);
                             }
-                            let serialized =
-                                serde_json::to_string(&connection_events).unwrap_or_default();
-                            connection_manager_state.set(Some(serialized));
+                            pending.connection_dirty = true;
                         }
                         _ => {}
+                    }
+                    if !tick_seen.get() && !flushed_early {
+                        flushed_early = true;
+                        (flush.borrow_mut())();
                     }
                 }
             };
@@ -776,11 +853,11 @@ pub fn Diagnostics(
     rsx! {
         div {
             id: "diagnostics-sidebar",
-            class: if is_open { "visible" } else { "" },
-            div { class: "sidebar-header",
+            class: if is_open { "glass-regular visible" } else { "glass-regular" },
+            div { class: "sidebar-header toolbar",
                 // Seven quick taps here reveal the hidden traffic shaping section.
                 h2 {
-                    class: "diagnostics-title",
+                    class: "diagnostics-title toolbar-title",
                     "data-testid": "diagnostics-title",
                     onclick: move |_| {
                         if let Some(ui) = traffic_shaping_ui {
@@ -792,14 +869,19 @@ pub fn Diagnostics(
                     },
                     "Call Diagnostics"
                 }
-                button { class: "close-button", onclick: move |_| on_close.call(()), "\u{00d7}" }
+                IconButton {
+                    label: "Close",
+                    class: "close-button",
+                    onclick: move |_| on_close.call(()),
+                    "\u{00d7}"
+                }
             }
             div { class: "sidebar-content",
                 if available_peers.len() > 1 {
-                    div { class: "diagnostics-section",
-                        h3 { "Peer Selection" }
+                    div { class: "diagnostics-section card",
+                        h3 { class: "card-title", "Peer Selection" }
                         select {
-                            class: "peer-selector",
+                            class: "select",
                             onchange: move |e: Event<FormData>| {
                                 selected_peer.set(e.value());
                             },
@@ -821,7 +903,7 @@ pub fn Diagnostics(
                                 }
                             }
                         }
-                        p { class: "peer-info", "{peer_info}" }
+                        p { class: "peer-info list-footer", "{peer_info}" }
                     }
                 }
                 if traffic_shaping_revealed {
@@ -830,8 +912,8 @@ pub fn Diagnostics(
                 if is_open {
                     EncodersSection { video_enabled, mic_enabled }
                 }
-                div { class: "diagnostics-section",
-                    h3 { "Build Info" }
+                div { class: "diagnostics-section card",
+                    h3 { class: "card-title", "Build Info" }
                     div { class: "build-info-table",
                         div { class: "build-info-header",
                             span { class: "build-info-cell", "Component" }
@@ -840,7 +922,7 @@ pub fn Diagnostics(
                         }
                         div { class: "build-info-row",
                             span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
-                            span { class: "build-info-cell monospace", "" }
+                            span { class: "build-info-cell text-mono text-tabular", "" }
                             span { class: "build-info-cell", "" }
                         }
                         for comp in backend_versions() {
@@ -853,7 +935,7 @@ pub fn Diagnostics(
                                 rsx! {
                                     div { class: "build-info-row",
                                         span { class: "build-info-cell build-info-service", "{label}" }
-                                        span { class: "build-info-cell monospace", "{sha}" }
+                                        span { class: "build-info-cell text-mono text-tabular", "{sha}" }
                                         span { class: "build-info-cell", "{br}" }
                                     }
                                 }
@@ -861,50 +943,50 @@ pub fn Diagnostics(
                         }
                     }
                 }
-                div { class: "diagnostics-section",
-                    h3 { "Connection Manager" }
+                div { class: "diagnostics-section card",
+                    h3 { class: "card-title", "Connection Manager" }
                     ConnectionManagerDisplay { connection_manager_state: conn_state }
                 }
-                div { class: "diagnostics-section",
-                    h3 { "Current Status" }
+                div { class: "diagnostics-section card",
+                    h3 { class: "card-title", "Current Status" }
                     NetEqStatusDisplay { latest_stats: latest_neteq_stats }
                 }
                 if !neteq_stats_history.is_empty() {
                     div { class: "diagnostics-charts",
                         div { class: "charts-grid",
-                            div { class: "chart-container",
+                            div { class: "chart-container card",
                                 NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::BufferVsTarget, width: 290, height: 200 }
                             }
-                            div { class: "chart-container",
+                            div { class: "chart-container card",
                                 NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::DecodeOperations, width: 290, height: 200 }
                             }
                         }
                         div { class: "charts-grid",
-                            div { class: "chart-container",
+                            div { class: "chart-container card",
                                 NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::QualityMetrics, width: 290, height: 200 }
                             }
-                            div { class: "chart-container",
+                            div { class: "chart-container card",
                                 NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, width: 290, height: 200 }
                             }
                         }
                         div { class: "charts-grid",
-                            div { class: "chart-container",
+                            div { class: "chart-container card",
                                 NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::SystemPerformance, width: 290, height: 200 }
                             }
                         }
                     }
                 } else {
-                    div { class: "diagnostics-section",
-                        h3 { "NetEQ Buffer / Jitter History" }
-                        div { style: "display:flex; gap:12px; align-items:center;",
+                    div { class: "diagnostics-section card",
+                        h3 { class: "card-title", "NetEQ Buffer / Jitter History" }
+                        div { class: "chart-pair",
                             NetEqChart { data: buffer_history.clone(), chart_type: ChartType::Buffer, width: 140, height: 80 }
                             NetEqChart { data: jitter_history.clone(), chart_type: ChartType::Jitter, width: 140, height: 80 }
                         }
                     }
                 }
                 if available_peers.len() > 2 {
-                    div { class: "diagnostics-section",
-                        h3 { "Per-Peer Summary" }
+                    div { class: "diagnostics-section card",
+                        h3 { class: "card-title", "Per-Peer Summary" }
                         div { class: "peer-summary",
                             for (peer_id, _) in stats_map.iter() {
                                 {
@@ -913,7 +995,7 @@ pub fn Diagnostics(
                                     let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
                                     let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
                                     rsx! {
-                                        div { class: "peer-summary-item",
+                                        div { class: "peer-summary-item list-row",
                                             strong { "{display}" }
                                             span { "{summary}" }
                                         }
@@ -925,16 +1007,16 @@ pub fn Diagnostics(
                 }
                 div { class: "diagnostics-data",
                     ReceptionStatsSection { rows: reception, peer_names: reception_peer_names }
-                    div { class: "diagnostics-section",
-                        h3 { "Sending Stats" }
+                    div { class: "diagnostics-section card",
+                        h3 { class: "card-title", "Sending Stats" }
                         if let Some(data) = &send_stats {
                             pre { "{data}" }
                         } else {
-                            p { "No sending data available." }
+                            p { class: "diagnostics-empty", "No sending data available." }
                         }
                     }
-                    div { class: "diagnostics-section",
-                        h3 { "Media Status" }
+                    div { class: "diagnostics-section card",
+                        h3 { class: "card-title", "Media Status" }
                         pre { "{media_status}" }
                     }
                 }

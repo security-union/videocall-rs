@@ -1,12 +1,15 @@
 # Dioxus UI: Caddy serving the trunk dist, with an entrypoint that regenerates
 # /usr/share/nginx/html/config.js from env at container start (runtime config —
 # the same contract scripts/start-dioxus.sh provides in native dev and the helm
-# configmap provides in k8s). Port 80.
+# configmap provides in k8s). Port 80. The design-system gallery
+# (packages.videocall-theme-gallery, built with --public-url /theme/) rides
+# along under /theme/, so it shows up wherever the app is deployed.
 #
 # Caddy (static Go binary) instead of nginx deliberately: cross-nginx drags in
 # cross-perl, which does not build at the current nixpkgs pin. The Caddyfile
 # replicates nginx.conf: SPA try_files fallback to /index.html and no-cache
-# headers on every response.
+# headers on every response. /theme/* is the exception to the SPA fallback: it
+# falls back to the gallery's own /theme/index.html.
 { common, packages, p }:
 let
   inherit (p) pkgs pkgsLinuxStatic;
@@ -17,6 +20,9 @@ let
   htmlRoot = pkgs.runCommand "dioxus-ui-html" { } ''
     mkdir -p $out/usr/share/nginx/html
     cp -r ${packages.dioxus-ui-dist}/. $out/usr/share/nginx/html/
+    chmod -R u+w $out/usr/share/nginx/html
+    mkdir -p $out/usr/share/nginx/html/theme
+    cp -r ${packages.videocall-theme-gallery}/. $out/usr/share/nginx/html/theme/
   '';
 
   caddyfile = pkgs.writeTextDir "etc/caddy/Caddyfile" ''
@@ -37,9 +43,19 @@ let
         -ETag
       }
 
-      # SPA fallback (nginx: try_files $uri $uri/ /index.html)
-      try_files {path} {path}/ /index.html
-      file_server
+      # Design-system gallery: static files built with --public-url /theme/,
+      # with its own index fallback instead of the app's.
+      redir /theme /theme/ permanent
+      handle /theme/* {
+        try_files {path} {path}/ /theme/index.html
+        file_server
+      }
+
+      # SPA fallback for everything else (nginx: try_files $uri $uri/ /index.html)
+      handle {
+        try_files {path} {path}/ /index.html
+        file_server
+      }
     }
   '';
 

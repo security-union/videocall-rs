@@ -4,8 +4,8 @@
 #   nativeDeps  — every workspace dependency compiled for musl Linux, once.
 #                 Shared by videocall-api-bins, meeting-api and bot; cached by
 #                 the CI nix cache and only rebuilt when Cargo.lock/toml move.
-#   wasmDeps    — dependencies of the wasm crates (ui, codecs, neteq, mic encoder),
-#                 shared by the trunk build.
+#   wasmDeps    — dependencies of the wasm crates (ui, codecs, neteq, mic encoder,
+#                 theme gallery), shared by the trunk builds.
 #
 # Without this split every buildRustPackage recompiled the full dependency
 # graph per package (the role the old `actix-base` docker image played).
@@ -138,8 +138,8 @@ let
     CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
   };
 
-  # Trunk runs FOUR cargo invocations (index.html: the UI crate + three worker
-  # bins), each resolving features per-invocation — so the deps artifacts must
+  # Trunk runs FOUR cargo invocations for the UI (index.html: the UI crate + three worker
+  # bins) and one more for the theme gallery, each resolving features per-invocation — so the deps artifacts must
   # contain each invocation's exact dependency variants (e.g. three different
   # web-sys feature sets) or cargo recompiles them inside the dist build.
   #
@@ -155,6 +155,7 @@ let
       cargoWithProfile build --locked -p videocall-codecs --no-default-features --features wasm
       cargoWithProfile build --locked -p neteq --no-default-features --features web
       cargoWithProfile build --locked -p videocall-mic-encoder
+      cargoWithProfile build --locked -p videocall-theme --features gallery --bin videocall-theme-gallery
     '';
   });
   # ---- videocall-cli --------------------------------------------------------
@@ -350,7 +351,7 @@ in
 
   # Dioxus UI static site: trunk build of the main crate + the three wasm
   # worker bins wired in index.html (videocall-codecs worker_decoder, neteq
-  # neteq_worker, videocall-mic-encoder mic_encoder), tailwind compile, and version.json — replicating the old
+  # neteq_worker, videocall-mic-encoder mic_encoder), and version.json — replicating the old
   # Dockerfile.dioxus builder stage on top of the shared wasm dep artifacts.
   dioxus-ui-dist = craneLibWasm.mkCargoDerivation (buildMetaEnv // wasmCommonArgs // {
     pname = "dioxus-ui-dist";
@@ -363,7 +364,6 @@ in
       pkgs.trunk
       wasmBindgenCli
       pkgs.binaryen
-      pkgs.tailwindcss
       pkgs.nukeReferences
     ];
 
@@ -373,7 +373,6 @@ in
       unset NO_COLOR
       export HOME="$TMPDIR"
       pushd dioxus-ui
-      tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify
       trunk build --release --offline --skip-version-check --locked
       # mic_encoder_worklet.js stubs exactly one wasm-bindgen import. If a
       # dependency bump adds another, fail here instead of in the browser.
@@ -396,6 +395,35 @@ in
       cp -r dioxus-ui/dist/. $out/
       # wasm panic-location strings embed the vendor dir path; scrub so the
       # static site has zero runtime closure (see the website note).
+      find $out -type f -exec nuke-refs {} +
+    '';
+  });
+  # The design-system gallery (videocall-theme/gallery), built as a static site
+  # with the public URL /theme/ so it can be served from a sub-path of the UI
+  # image (see nix/images/dioxus-ui.nix). Same shape as dioxus-ui-dist.
+  videocall-theme-gallery = craneLibWasm.mkCargoDerivation (wasmCommonArgs // {
+    pname = "videocall-theme-gallery";
+    cargoArtifacts = wasmDeps;
+    doInstallCargoArtifacts = false;
+
+    nativeBuildInputs = [
+      pkgs.trunk
+      wasmBindgenCli
+      pkgs.binaryen
+      pkgs.nukeReferences
+    ];
+
+    buildPhaseCargoCommand = ''
+      unset NO_COLOR
+      export HOME="$TMPDIR"
+      pushd videocall-theme/gallery
+      trunk build --release --offline --skip-version-check --locked --public-url /theme/
+      popd
+    '';
+
+    installPhaseCommand = ''
+      mkdir -p $out
+      cp -r videocall-theme/gallery/dist/. $out/
       find $out -type f -exec nuke-refs {} +
     '';
   });

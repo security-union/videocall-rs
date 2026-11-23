@@ -11,6 +11,7 @@ members = [
     "videocall-mic-encoder",
     "videocall-cli",
     "dioxus-ui",
+    "videocall-theme",
     "videocall-sdk",
     "videocall-codecs",
     "neteq",

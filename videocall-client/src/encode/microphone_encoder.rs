@@ -21,7 +21,7 @@ use crate::adaptive_quality_constants::{
 };
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
-    VAD_SMOOTHING_TIME_CONSTANT,
+    VAD_SMOOTHING_TIME_CONSTANT, VAD_SPEAKING_HOLD_MS,
 };
 use crate::audio_worklet_codec::EncoderInitOptions;
 use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
@@ -30,6 +30,7 @@ use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
 use crate::traffic_shaping::ShapedKind;
+use crate::utils::monotonic_now_ms;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
 use gloo::timers::callback::Interval;
@@ -588,6 +589,12 @@ impl MicrophoneEncoder {
             let prev_audio_level = Rc::new(Cell::new(0.0f32));
             let prev_level_clone = prev_audio_level.clone();
 
+            // Timestamp of the last poll that measured speech. `speaking` may
+            // flip to true immediately but must stay true for
+            // `VAD_SPEAKING_HOLD_MS` of continuous silence before flipping back.
+            let last_speech_ms = Rc::new(Cell::new(0.0f64));
+            let last_speech_clone = last_speech_ms.clone();
+
             // LOCAL user Voice Activity Detection (VAD) via AnalyserNode.
             //
             // This runs every 100ms and computes the RMS energy of the
@@ -631,11 +638,20 @@ impl MicrophoneEncoder {
                 log::trace!("VAD: RMS={:.4}, speaking={}", rms, speaking);
 
                 // Only propagate when the speaking state actually changes to
-                // avoid unnecessary callback emissions every 100ms.
+                // avoid unnecessary callback emissions every poll.
                 let prev = is_speaking_clone.load(Ordering::Relaxed);
-                if speaking != prev {
-                    is_speaking_clone.store(speaking, Ordering::Relaxed);
-                    client_clone.set_speaking(speaking);
+                if speaking {
+                    last_speech_clone.set(monotonic_now_ms());
+                    if !prev {
+                        is_speaking_clone.store(true, Ordering::Relaxed);
+                        client_clone.set_speaking(true);
+                    }
+                } else if prev
+                    && monotonic_now_ms() - last_speech_clone.get()
+                        >= f64::from(VAD_SPEAKING_HOLD_MS)
+                {
+                    is_speaking_clone.store(false, Ordering::Relaxed);
+                    client_clone.set_speaking(false);
                 }
             });
 

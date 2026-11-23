@@ -56,6 +56,13 @@ pub const VAD_SMOOTHING_TIME_CONSTANT: f64 = 0.8;
 /// visual indication that the participant was recently speaking.
 pub const MIC_HOLD_DURATION_MS: u32 = 1_000;
 
+/// How long (in ms) the local VAD must continuously measure silence before
+/// the `speaking` flag is allowed to flip to `false`. `speaking=true` still
+/// propagates immediately. Ambient noise near the threshold otherwise
+/// flips the flag every poll (~50ms), which re-renders `AttendantsComponent`
+/// on each flip.
+pub const VAD_SPEAKING_HOLD_MS: u32 = 200;
+
 /// Convert raw RMS energy to a perceptual intensity value (0.0–1.0).
 /// Uses sqrt curve for perceptual loudness mapping.
 pub fn rms_to_intensity(rms: f32, vad_threshold: f32) -> f32 {

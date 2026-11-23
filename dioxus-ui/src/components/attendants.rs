@@ -1320,10 +1320,28 @@ pub fn AttendantsComponent(
                 "inert": if locked { Some("") } else { None },
                 BrowserCompatibility {}
 
-                // "participant joined/left" toast notifications
-                if !peer_toasts().is_empty() {
+                // Connection state + "participant joined/left" toasts.
+                // connection_error renders inline on the join screen; inside
+                // the call it needs this persistent banner so a meeting whose
+                // transports all failed doesn't silently look like an empty
+                // one (#600).
+                if !peer_toasts().is_empty() || connection_error().is_some() {
                     div {
                         class: "peer-toasts toast-region",
+                        if let Some(err) = connection_error() {
+                            div {
+                                class: "peer-toast toast toast-solid toast-left",
+                                role: "alert",
+                                span { class: "toast-icon",
+                                    Icon { glyph: &icons::ERROR, size: "16" }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Connection problem" }
+                                    br {}
+                                    span { class: "toast-action", "{err}" }
+                                }
+                            }
+                        }
                         for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined { "peer-toast toast toast-solid toast-joined" } else { "peer-toast toast toast-solid toast-left" };

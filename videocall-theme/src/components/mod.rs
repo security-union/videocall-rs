@@ -26,11 +26,78 @@ mod overlays;
 mod status;
 mod switch;
 
+use dioxus::prelude::*;
+
+use crate::classes::with_extra;
+
 /// Whether the caller passed attribute `name`, even with a `None` value.
 /// That is how a component knows to leave its own default out.
-pub(crate) fn caller_sets(attributes: &[dioxus::prelude::Attribute], name: &str) -> bool {
+pub(crate) fn caller_sets(attributes: &[Attribute], name: &str) -> bool {
     attributes.iter().any(|attribute| attribute.name == name)
 }
+
+/// Props of the plain parts: [`Card`], [`CardTitle`], [`ListRowValue`],
+/// [`ListHeader`], [`ListFooter`], [`ToolbarTitle`], the sheet and alert
+/// parts, [`ToastRegion`] and [`MenuHeader`]. Each of them is one element
+/// with one system class, the caller's `class` after it, any other global
+/// attribute, and the children.
+#[derive(Props, Clone, PartialEq)]
+pub struct PartProps {
+    /// Extra classes, joined after the system one.
+    #[props(default)]
+    class: Option<String>,
+    #[props(extends = GlobalAttributes)]
+    attributes: Vec<Attribute>,
+    children: Element,
+}
+
+/// Declares a plain part.
+///
+/// A part is a `const` holding a plain `fn` pointer rather than a
+/// `#[component]` function, and that is about wasm size. Dioxus builds its
+/// per-component machinery (props comparison, cloning, rendering) once per
+/// component *type*. Every `#[component]` function is its own type, so each
+/// part would pay for its own copy. All parts share the one type
+/// `fn(PartProps) -> Element`, so they share one copy. Dioxus still tells
+/// them apart by the pointer, and `Card { .. }` in `rsx!` reads the same.
+macro_rules! part {
+    ($(#[$doc:meta])* $name:ident, $render:ident, $class:literal) => {
+        $(#[$doc])*
+        #[allow(non_upper_case_globals)]
+        pub const $name: fn($crate::components::PartProps) -> Element = {
+            fn render(props: $crate::components::PartProps) -> Element {
+                $crate::components::$render($class, props)
+            }
+            render
+        };
+    };
+}
+pub(crate) use part;
+
+// One renderer per tag. Not inlined into the parts, so the template for a
+// tag exists once however many parts use it.
+macro_rules! part_renderer {
+    ($name:ident, $tag:ident) => {
+        #[inline(never)]
+        pub(crate) fn $name(base: &'static str, props: PartProps) -> Element {
+            let PartProps {
+                class,
+                attributes,
+                children,
+            } = props;
+            let class = with_extra(base, class.as_deref());
+            rsx! {
+                $tag { class, ..attributes, {children} }
+            }
+        }
+    };
+}
+
+part_renderer!(part_div, div);
+part_renderer!(part_span, span);
+part_renderer!(part_h2, h2);
+part_renderer!(part_h3, h3);
+part_renderer!(part_p, p);
 
 pub use buttons::*;
 pub use content::*;

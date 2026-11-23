@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use super::caller_sets;
+use super::{caller_sets, part};
 use crate::classes::{join_classes, tab_class, with_extra};
 
 /// A row at a screen edge (`.toolbar`). No background: the groups inside it
@@ -30,18 +30,10 @@ pub fn Toolbar(
     }
 }
 
-/// The title in a toolbar (`.toolbar-title`). It truncates with an ellipsis.
-#[component]
-pub fn ToolbarTitle(
-    #[props(default)] class: Option<String>,
-    #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
-    children: Element,
-) -> Element {
-    let class = with_extra("toolbar-title", class.as_deref());
-    rsx! {
-        div { class, ..attributes, {children} }
-    }
-}
+part!(
+    /// The title in a toolbar (`.toolbar-title`). It truncates with an ellipsis.
+    ToolbarTitle, part_div, "toolbar-title"
+);
 
 /// A floating glass capsule holding controls (`.bar`). `clear` switches to
 /// Clear glass (`.bar-clear`), for a bar over video.

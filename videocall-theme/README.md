@@ -55,6 +55,10 @@ The full contract is the header comment of `styles/components.css`.
 
 Colors and the type scale are Apple's, measured on iOS 27.2. So are the 44px hit target and the 35% dim. Apple publishes no number for glass blur, tint, radii, spacing, shadows or motion, so those are my approximations, and tokens.css marks each one.
 
+## Wasm size
+
+Every component type costs dioxus-ui a few kilobytes of wasm, because Dioxus compiles its props comparison and render glue once per type. The single-class wrappers (`Card`, `ListRowValue`, `ListHeader`, the sheet and alert parts) are `part!` consts that share one props type, `PartProps`, so they share that glue. A new wrapper with no props of its own should be a `part!` too (see `src/components/mod.rs`).
+
 ## Tests
 
 `cargo test -p videocall-theme` runs on the host. It covers the class mapping, the tokens.css reader, and server-side renders that check attributes reach the element. It also checks that the two copies of the dark values in tokens.css (the OS query and the `.theme-dark` pin) are still equal, since nothing generates them.

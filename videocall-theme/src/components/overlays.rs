@@ -9,7 +9,7 @@
 
 use dioxus::prelude::*;
 
-use super::caller_sets;
+use super::{caller_sets, part};
 use crate::classes::{
     join_classes, toast_class, tooltip_class, with_extra, TooltipAlign, TooltipPlacement,
 };
@@ -91,55 +91,38 @@ pub fn Sheet(
     }
 }
 
-macro_rules! part {
-    ($(#[$doc:meta])* $name:ident, $tag:ident, $class:literal) => {
-        $(#[$doc])*
-        #[component]
-        pub fn $name(
-            #[props(default)] class: Option<String>,
-            #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
-            children: Element,
-        ) -> Element {
-            let class = with_extra($class, class.as_deref());
-            rsx! {
-                $tag { class, ..attributes, {children} }
-            }
-        }
-    };
-}
-
 part!(
     /// The title row of a sheet (`.sheet-header`): title plus a close button.
-    SheetHeader, div, "sheet-header"
+    SheetHeader, part_div, "sheet-header"
 );
 part!(
     /// The sheet's title (`h2.sheet-title`).
-    SheetTitle, h2, "sheet-title"
+    SheetTitle, part_h2, "sheet-title"
 );
 part!(
     /// The scrolling middle of a sheet (`.sheet-body`).
-    SheetBody, div, "sheet-body"
+    SheetBody, part_div, "sheet-body"
 );
 part!(
     /// The action row of a sheet (`.sheet-footer`).
-    SheetFooter, div, "sheet-footer"
+    SheetFooter, part_div, "sheet-footer"
 );
 part!(
     /// The alert's title (`h2.alert-title`).
-    AlertTitle, h2, "alert-title"
+    AlertTitle, part_h2, "alert-title"
 );
 part!(
     /// The alert's message (`p.alert-message`).
-    AlertMessage, p, "alert-message"
+    AlertMessage, part_p, "alert-message"
 );
 part!(
     /// The alert's buttons (`.alert-actions`). They share the width.
-    AlertActions, div, "alert-actions"
+    AlertActions, part_div, "alert-actions"
 );
 part!(
     /// A fixed stack at the top of the screen for toasts (`.toast-region`).
     /// Give it `role: "status"` if the toasts should be announced.
-    ToastRegion, div, "toast-region"
+    ToastRegion, part_div, "toast-region"
 );
 
 /// One message (`.toast`). The HIG has no toast; this one is ours.
@@ -161,7 +144,7 @@ pub fn Toast(
 
 part!(
     /// A label above a group of menu items (`.menu-header`).
-    MenuHeader, div, "menu-header"
+    MenuHeader, part_div, "menu-header"
 );
 
 /// A small centered dialog (`.alert`), `role="alertdialog"` with

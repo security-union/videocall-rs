@@ -4,33 +4,18 @@
 
 use dioxus::prelude::*;
 
+use super::part;
 use crate::classes::with_extra;
 
-/// A rounded content container (`.card`). Put it on a grouped background.
-#[component]
-pub fn Card(
-    #[props(default)] class: Option<String>,
-    #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
-    children: Element,
-) -> Element {
-    let class = with_extra("card", class.as_deref());
-    rsx! {
-        div { class, ..attributes, {children} }
-    }
-}
+part!(
+    /// A rounded content container (`.card`). Put it on a grouped background.
+    Card, part_div, "card"
+);
 
-/// The title line of a card (`h3.card-title`).
-#[component]
-pub fn CardTitle(
-    #[props(default)] class: Option<String>,
-    #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
-    children: Element,
-) -> Element {
-    let class = with_extra("card-title", class.as_deref());
-    rsx! {
-        h3 { class, ..attributes, {children} }
-    }
-}
+part!(
+    /// The title line of a card (`h3.card-title`).
+    CardTitle, part_h3, "card-title"
+);
 
 /// A rounded group of rows (`.list-group`).
 ///
@@ -119,41 +104,17 @@ pub fn ListRowLabel(
     }
 }
 
-/// The trailing value or control of a row (`.list-row-value`).
-#[component]
-pub fn ListRowValue(
-    #[props(default)] class: Option<String>,
-    #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
-    children: Element,
-) -> Element {
-    let class = with_extra("list-row-value", class.as_deref());
-    rsx! {
-        span { class, ..attributes, {children} }
-    }
-}
+part!(
+    /// The trailing value or control of a row (`.list-row-value`).
+    ListRowValue, part_span, "list-row-value"
+);
 
-/// The section header above a group (`h3.list-header`). Normal case.
-#[component]
-pub fn ListHeader(
-    #[props(default)] class: Option<String>,
-    #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
-    children: Element,
-) -> Element {
-    let class = with_extra("list-header", class.as_deref());
-    rsx! {
-        h3 { class, ..attributes, {children} }
-    }
-}
+part!(
+    /// The section header above a group (`h3.list-header`). Normal case.
+    ListHeader, part_h3, "list-header"
+);
 
-/// The note below a group (`p.list-footer`).
-#[component]
-pub fn ListFooter(
-    #[props(default)] class: Option<String>,
-    #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
-    children: Element,
-) -> Element {
-    let class = with_extra("list-footer", class.as_deref());
-    rsx! {
-        p { class, ..attributes, {children} }
-    }
-}
+part!(
+    /// The note below a group (`p.list-footer`).
+    ListFooter, part_p, "list-footer"
+);

@@ -43,7 +43,10 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
                 .on_connection_lost
                 .emit(JsValue::from_str("WebSocket error")),
         });
-        debug!("WebSocket connecting to {}", &options.websocket_url);
+        debug!(
+            "WebSocket connecting to {}",
+            crate::utils::redact_url_for_logging(&options.websocket_url)
+        );
         let task = WebSocketService::connect(
             &options.websocket_url,
             options.on_inbound_media,

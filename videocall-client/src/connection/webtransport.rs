@@ -88,7 +88,10 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 WebTransportStatus::Error(error) => connection_lost_callback.emit(error),
             })
         };
-        info!("WebTransport connecting to {}", &options.webtransport_url);
+        info!(
+            "WebTransport connecting to {}",
+            crate::utils::redact_url_for_logging(&options.webtransport_url)
+        );
         let task = WebTransportService::connect(
             &options.webtransport_url,
             on_datagram,

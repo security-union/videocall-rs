@@ -115,3 +115,116 @@ pub(crate) fn monotonic_now_ms() -> f64 {
         .with(|performance| performance.as_ref().map(|p| p.now()))
         .unwrap_or_else(js_sys::Date::now)
 }
+
+/// Query parameter names whose values must never appear in logs because they
+/// carry credentials or session secrets (e.g. the JWT `token` embedded in the
+/// server URL).
+const SENSITIVE_QUERY_PARAMS: &[&str] = &[
+    "token",
+    "key",
+    "password",
+    "passwd",
+    "secret",
+    "signature",
+    "auth",
+];
+
+/// Returns a copy of `url` with the values of sensitive query parameters
+/// replaced by `<redacted>` so the URL is safe to write to logs.
+///
+/// Non-sensitive parameters, ordering, and fragments are preserved so the
+/// logged URL still identifies the endpoint and transport.
+///
+/// ```
+/// use videocall_client::utils::redact_url_for_logging;
+/// assert_eq!(
+///     redact_url_for_logging("wss://host/lobby?token=abc123&room=x"),
+///     "wss://host/lobby?token=<redacted>&room=x"
+/// );
+/// ```
+pub fn redact_url_for_logging(url: &str) -> String {
+    let Some(query_start) = url.find('?') else {
+        return url.to_string();
+    };
+    let (base_with_sep, rest) = url.split_at(query_start + 1);
+    let (query, fragment) = match rest.find('#') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let redacted = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if is_sensitive_param(name) => format!("{name}=<redacted>"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base_with_sep}{redacted}{fragment}")
+}
+
+fn is_sensitive_param(name: &str) -> bool {
+    SENSITIVE_QUERY_PARAMS
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url_for_logging;
+
+    #[test]
+    fn redacts_token_param() {
+        assert_eq!(
+            redact_url_for_logging("wss://host/lobby?token=eyJ0eXA.eyJzdWI.sig"),
+            "wss://host/lobby?token=<redacted>"
+        );
+    }
+
+    #[test]
+    fn preserves_non_sensitive_params_and_order() {
+        assert_eq!(
+            redact_url_for_logging("wss://host/lobby?room=infra&token=abc&n=1"),
+            "wss://host/lobby?room=infra&token=<redacted>&n=1"
+        );
+    }
+
+    #[test]
+    fn matches_param_name_case_insensitively() {
+        assert_eq!(
+            redact_url_for_logging("wss://host/lobby?TOKEN=abc"),
+            "wss://host/lobby?TOKEN=<redacted>"
+        );
+    }
+
+    #[test]
+    fn preserves_fragment() {
+        assert_eq!(
+            redact_url_for_logging("wss://host/lobby?token=abc#frag"),
+            "wss://host/lobby?token=<redacted>#frag"
+        );
+    }
+
+    #[test]
+    fn leaves_param_without_value_alone() {
+        assert_eq!(
+            redact_url_for_logging("wss://host/lobby?token&room=x"),
+            "wss://host/lobby?token&room=x"
+        );
+    }
+
+    #[test]
+    fn does_not_redact_substring_names() {
+        assert_eq!(
+            redact_url_for_logging("wss://host/lobby?csrf_token=keepme"),
+            "wss://host/lobby?csrf_token=keepme"
+        );
+    }
+
+    #[test]
+    fn passes_through_url_without_query() {
+        assert_eq!(
+            redact_url_for_logging("wss://host/lobby"),
+            "wss://host/lobby"
+        );
+    }
+}

@@ -11,6 +11,7 @@
 
 use dioxus::prelude::*;
 use gloo_utils::window;
+use videocall_theme::{Button, ButtonSize, Card};
 
 use crate::components::google_sign_in_button::GoogleSignInButton;
 use crate::components::okta_sign_in_button::OktaSignInButton;
@@ -58,7 +59,11 @@ pub fn ProviderButton(onclick: EventHandler<MouseEvent>) -> Element {
         Some("google") => rsx! { GoogleSignInButton { onclick } },
         Some("okta") => rsx! { OktaSignInButton { onclick } },
         _ => rsx! {
-            button { class: "generic-sign-in-button", onclick: move |e| onclick.call(e),
+            Button {
+                size: ButtonSize::Large,
+                block: true,
+                class: "generic-sign-in-button",
+                onclick: move |e| onclick.call(e),
                 "Sign in"
             }
         },
@@ -68,17 +73,17 @@ pub fn ProviderButton(onclick: EventHandler<MouseEvent>) -> Element {
 #[component]
 pub fn Login() -> Element {
     rsx! {
-        div { class: "login-container",
-            div { class: "login-card",
+        div { class: "screen-center surface-grouped",
+            Card { class: "login-card",
                 h1 { class: "login-title", "videocall.rs" }
 
                 ProviderButton { onclick: move |_| do_login() }
 
                 p { class: "login-footer",
                     "By signing in, you agree to our "
-                    a { href: "https://github.com/security-union/videocall-rs", "Terms of Service" }
+                    a { class: "link", href: "https://github.com/security-union/videocall-rs", "Terms of Service" }
                     " and "
-                    a { href: "https://github.com/security-union/videocall-rs", "Privacy Policy" }
+                    a { class: "link", href: "https://github.com/security-union/videocall-rs", "Privacy Policy" }
                 }
             }
         }

@@ -54,14 +54,14 @@ pub fn PeerListItem(
     };
 
     rsx! {
-        div { class: "peer_item", title,
+        li { class: "peer_item list-row", title,
             div { class: "peer_item_icon",
                 PeerIcon {}
             }
-            div { class: "peer_item_text",
-                "{name}"
+            div { class: "peer_item_text list-row-label",
+                span { class: "peer_item_name", "{name}" }
                 if let Some(label) = indicator {
-                    span { class: "peer-indicator", "{label}" }
+                    span { class: "badge", "{label}" }
                 }
             }
             div { class: "{mic_class}",

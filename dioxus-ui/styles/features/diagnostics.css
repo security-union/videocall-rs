@@ -1,0 +1,522 @@
+/*
+ * diagnostics.css
+ *
+ * What goes inside the diagnostics panel (#diagnostics-sidebar, shell in
+ * sidebars.css). Every section is a .card sitting on the glass shell, so
+ * nothing in here is glass. Numbers are tabular monospace.
+ *
+ * Status colors map to success / warning / danger / accent, and every status
+ * also carries text: a badge label, a value, or a mark.
+ *
+ * Defined once here: .status-grid .status-item .status-label .status-value
+ * .server-url.
+ *
+ * Test-selected names kept: .status-item, .status-value (.good, .warning),
+ * .neteq-status, .reception-stats-peer, .reception-stats-row.
+ */
+
+@layer features {
+  /* ---------------------------------------------------------------------
+     Sections
+     --------------------------------------------------------------------- */
+
+  /* Tapped seven times to reveal the traffic shaping section: no text
+     selection while tapping. */
+  .diagnostics-title {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .diagnostics-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+
+  .diagnostics-data {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .diagnostics-empty,
+  .diagnostics-kv-note,
+  .no-data {
+    margin: 0;
+    color: var(--color-label-secondary);
+    font: var(--text-footnote);
+  }
+
+  .no-data {
+    padding: var(--space-4);
+    text-align: center;
+  }
+
+  .peer-info {
+    padding: 0;
+  }
+
+  /* Raw text blocks: sending stats, media status. */
+  .diagnostics-section pre {
+    max-height: 40vh;
+    overflow: auto;
+    padding: var(--space-3);
+    border-radius: var(--radius-md);
+    background-color: var(--color-fill-tertiary);
+    color: var(--color-label);
+    font: var(--text-caption-1);
+    font-family: var(--font-mono);
+    white-space: pre-wrap;
+  }
+
+  /* The rows inside a section sit in the card's padding already. */
+  .diagnostics-section .list-row {
+    min-height: 0;
+    padding: var(--space-1) 0;
+    font: var(--text-footnote);
+  }
+
+  .diagnostics-section .list-row + .list-row::before {
+    left: 0;
+  }
+
+  /* ---------------------------------------------------------------------
+     Label / value rows (connection status, NetEQ status)
+     --------------------------------------------------------------------- */
+
+  .status-grid,
+  .neteq-status,
+  .connection-details {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .status-item,
+  .detail-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    min-height: var(--space-6);
+  }
+
+  .status-label,
+  .detail-label {
+    color: var(--color-label-secondary);
+    font: var(--text-footnote);
+  }
+
+  .status-value,
+  .detail-value {
+    min-width: 0;
+    color: var(--color-label);
+    font: var(--text-footnote);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  /* Good and warning carry a mark as well as the color. The mark is
+     generated, so the element text stays the value. */
+  .status-value.good {
+    color: var(--color-success);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .status-value.good::before {
+    content: "\2713\00a0" / "";
+  }
+
+  .status-value.warning {
+    color: var(--color-warning);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .status-value.warning::before {
+    content: "!\00a0" / "";
+  }
+
+  /* A value that is a badge keeps the badge look. */
+  .status-value.badge,
+  .detail-value.badge {
+    font: var(--text-caption-1-emphasized);
+  }
+
+  .server-url {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--color-label-secondary);
+    font: var(--text-caption-1);
+    font-family: var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .server-card .server-url {
+    white-space: normal;
+    word-break: break-all;
+  }
+
+  /* ---------------------------------------------------------------------
+     Connection manager
+     --------------------------------------------------------------------- */
+
+  .connection-manager-display {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .connection-manager-display h4 {
+    margin-bottom: var(--space-2);
+    font: var(--text-subheadline-emphasized);
+  }
+
+  .progress-container {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 8rem;
+  }
+
+  .progress-bar {
+    flex: 1 1 auto;
+    height: var(--space-1);
+    overflow: hidden;
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-fill-secondary);
+  }
+
+  /* The width is the one dynamic value, set inline by the component. */
+  .progress-fill {
+    height: 100%;
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-accent);
+    transition: width var(--duration-base) var(--ease-standard);
+  }
+
+  .progress-text {
+    min-width: 2.5rem;
+    font: var(--text-caption-1-emphasized);
+    font-variant-numeric: tabular-nums;
+    text-align: end;
+  }
+
+  .active-connection {
+    padding: var(--space-3);
+    border-radius: var(--radius-md);
+    border-inline-start: var(--space-1) solid var(--color-accent);
+    background-color: var(--color-fill-tertiary);
+  }
+
+  .servers-grid {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .server-card {
+    padding: var(--space-3);
+    background-color: var(--color-fill-tertiary);
+  }
+
+  .server-card.server-active {
+    box-shadow: 0 0 0 2px var(--color-accent);
+  }
+
+  .server-header,
+  .server-info,
+  .server-indicators {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .server-header {
+    justify-content: space-between;
+    margin-bottom: var(--space-1);
+  }
+
+  .server-info {
+    flex-wrap: wrap;
+  }
+
+  .server-id {
+    font: var(--text-caption-1-emphasized);
+    font-family: var(--font-mono);
+  }
+
+  .active-indicator {
+    color: var(--color-success);
+  }
+
+  .server-details {
+    font: var(--text-caption-1);
+  }
+
+  .no-rtt,
+  .measurement-count {
+    color: var(--color-label-secondary);
+  }
+
+  .connection-error {
+    padding: var(--space-3);
+    border-radius: var(--radius-md);
+    background-color: var(--color-danger-tint);
+    color: var(--color-label);
+  }
+
+  .connection-error h4 {
+    color: var(--color-danger);
+  }
+
+  .error-reason {
+    margin: 0;
+    font: var(--text-footnote);
+  }
+
+  /* ---------------------------------------------------------------------
+     Tables
+     --------------------------------------------------------------------- */
+
+  .build-info-table {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    column-gap: var(--space-4);
+    font: var(--text-caption-1);
+  }
+
+  .build-info-header,
+  .build-info-row {
+    display: contents;
+  }
+
+  .build-info-cell {
+    overflow: hidden;
+    padding: var(--space-1) 0;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .build-info-row .build-info-cell {
+    border-top: 1px solid var(--color-separator);
+  }
+
+  .build-info-header .build-info-cell {
+    color: var(--color-label-secondary);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .build-info-cell.build-info-service {
+    color: var(--color-label-secondary);
+  }
+
+  /* One row per remote peer and media type. Wide on purpose: it scrolls
+     sideways on a phone instead of squeezing the numbers. */
+  .reception-stats-table {
+    overflow-x: auto;
+    font: var(--text-caption-1);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .reception-stats-row {
+    display: grid;
+    grid-template-columns: minmax(8rem, 1fr) 4.5em 3em 5.5em 6.5em 5em;
+    gap: var(--space-2);
+    min-width: 30rem;
+  }
+
+  .reception-stats-header {
+    color: var(--color-label-secondary);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .reception-stats-cell {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .reception-stats-row:not(.reception-stats-header) .reception-stats-cell:not(.reception-stats-peer) {
+    font-family: var(--font-mono);
+  }
+
+  /* Label / value pairs (Encoders card). */
+  .diagnostics-kv {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: var(--space-1) var(--space-3);
+    font: var(--text-footnote);
+  }
+
+  .diagnostics-kv + .diagnostics-kv {
+    margin-top: var(--space-1);
+  }
+
+  .diagnostics-kv-label {
+    color: var(--color-label-secondary);
+  }
+
+  .diagnostics-kv-value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+
+  .peer-summary {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .peer-summary-item {
+    justify-content: space-between;
+  }
+
+  .peer-summary-item span {
+    color: var(--color-label-secondary);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------------------------------------------------------------------
+     Charts. Series use the system colors, set on the SVG by the component
+     as var(--color-*): blue, green, orange, red, purple, teal.
+     --------------------------------------------------------------------- */
+
+  .diagnostics-charts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+    gap: var(--space-4);
+  }
+
+  .chart-container {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .chart-pair {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .neteq-chart,
+  .neteq-advanced-chart {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .neteq-chart .chart-title,
+  .neteq-advanced-chart .chart-title {
+    color: var(--color-label-secondary);
+    font: var(--text-caption-1-emphasized);
+    text-align: center;
+  }
+
+  .neteq-chart svg,
+  .neteq-advanced-chart svg {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border-radius: var(--radius-sm);
+    background-color: var(--color-bg-grouped-tertiary);
+  }
+
+  .neteq-advanced-chart svg {
+    width: 100%;
+  }
+
+  .chart-axis {
+    stroke: var(--color-separator-opaque);
+    stroke-width: 1;
+  }
+
+  .chart-series {
+    stroke-linejoin: round;
+    stroke-linecap: round;
+  }
+
+  .chart-label,
+  .chart-legend,
+  .chart-svg-title {
+    font: var(--text-caption-2);
+  }
+
+  .chart-label {
+    fill: var(--color-label-secondary);
+  }
+
+  .chart-svg-title {
+    fill: var(--color-label);
+    font: var(--text-caption-2-emphasized);
+  }
+
+  /* ---------------------------------------------------------------------
+     Traffic shaping (hidden debug section)
+     --------------------------------------------------------------------- */
+
+  .traffic-shaping-section {
+    box-shadow: inset 0 0 0 1px var(--color-warning);
+  }
+
+  .traffic-shaping-note {
+    margin: 0;
+    color: var(--color-label-secondary);
+    font: var(--text-footnote);
+  }
+
+  .traffic-shaping-row {
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .traffic-shaping-label {
+    min-width: 4.5rem;
+    color: var(--color-label-secondary);
+    font: var(--text-footnote);
+  }
+
+  /* A long preset list scrolls inside its own track on a narrow phone. */
+  .traffic-shaping-options {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .traffic-shaping-option:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .traffic-shaping-readout {
+    padding: var(--space-3);
+    border-radius: var(--radius-md);
+    background-color: var(--color-fill-tertiary);
+    font: var(--text-caption-1);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Visible to the sender with the panel closed and in baby mode, so it sits
+     above the baby mode lock. It never takes input. */
+  .traffic-shaping-badge {
+    position: fixed;
+    top: calc(var(--space-3) + var(--safe-top));
+    left: 50%;
+    z-index: calc(var(--z-lock) + 1);
+    transform: translateX(-50%);
+    background-color: var(--color-bg-elevated);
+    box-shadow: var(--shadow-2);
+    pointer-events: none;
+  }
+}

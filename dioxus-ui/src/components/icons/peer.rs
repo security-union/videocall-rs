@@ -11,6 +11,8 @@ pub fn PeerIcon() -> Element {
             version: "1.1",
             xmlns: "http://www.w3.org/2000/svg",
             view_box: "0 0 512 512",
+            fill: "currentColor",
+            "aria-hidden": "true",
             g {
                 path {
                     class: "st0",

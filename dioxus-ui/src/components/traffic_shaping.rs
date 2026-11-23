@@ -28,6 +28,7 @@ use videocall_client::traffic_shaping::{
     TRAFFIC_SHAPING_DELAY_PRESETS_MS, TRAFFIC_SHAPING_RATE_PRESETS_BPS,
 };
 use videocall_client::VideoCallClient;
+use videocall_theme::{StatusDot, StatusTone};
 
 use crate::components::toggle_switch::ToggleSwitch;
 
@@ -249,14 +250,14 @@ pub fn TrafficShapingSection() -> Element {
 
     rsx! {
         div {
-            class: "diagnostics-section traffic-shaping-section",
+            class: "diagnostics-section card traffic-shaping-section",
             "data-testid": "traffic-shaping-section",
-            h3 { "Traffic shaping" }
+            h3 { class: "card-title", "Traffic shaping" }
             p { class: "traffic-shaping-note",
                 "Simulates a narrow uplink for your own outgoing media. Only your sending is affected."
             }
 
-            div { class: "traffic-shaping-row",
+            div { class: "traffic-shaping-row list-row",
                 span { class: "traffic-shaping-label", id: "traffic-shaping-toggle-label", "Shaping" }
                 ToggleSwitch {
                     enabled,
@@ -274,14 +275,14 @@ pub fn TrafficShapingSection() -> Element {
             }
 
             for (label, options) in groups {
-                div { key: "{label}", class: "traffic-shaping-row", role: "group", "aria-label": "{label}",
+                div { key: "{label}", class: "traffic-shaping-row list-row", role: "group", "aria-label": "{label}",
                     span { class: "traffic-shaping-label", "{label}" }
-                    div { class: "traffic-shaping-options",
+                    div { class: "traffic-shaping-options segmented",
                         for option in options {
                             button {
                                 key: "{option.test_id}",
                                 r#type: "button",
-                                class: if option.selected { "traffic-shaping-option selected" } else { "traffic-shaping-option" },
+                                class: "traffic-shaping-option segment",
                                 disabled: step_running,
                                 "aria-pressed": if option.selected { "true" } else { "false" },
                                 "data-testid": "{option.test_id}",
@@ -297,10 +298,10 @@ pub fn TrafficShapingSection() -> Element {
                 }
             }
 
-            div { class: "traffic-shaping-row",
+            div { class: "traffic-shaping-row list-row",
                 button {
                     r#type: "button",
-                    class: "traffic-shaping-step",
+                    class: "traffic-shaping-step btn btn-tinted",
                     "data-testid": "traffic-shaping-step-test",
                     onclick: {
                         let client = client.clone();
@@ -373,9 +374,10 @@ pub fn TrafficShapingBadge() -> Element {
     }
     rsx! {
         div {
-            class: "traffic-shaping-badge",
+            class: "traffic-shaping-badge badge",
             "data-testid": "traffic-shaping-badge",
             role: "status",
+            StatusDot { tone: StatusTone::Warning }
             "Traffic shaping on"
         }
     }

@@ -148,7 +148,7 @@ and its publish workflow stay untouched until then.)
 Notes:
 
 - The wasm in `dioxus-ui` is **arch-neutral** — built by the host toolchain targeting
-  `wasm32-unknown-unknown` (trunk, tailwindcss, wasm-bindgen-cli, binaryen); only the web
+  `wasm32-unknown-unknown` (trunk, wasm-bindgen-cli, binaryen); only the web
   server comes from the Linux set. That server is **Caddy** (static Go binary), not nginx:
   cross-nginx drags in cross-perl, which does not build at the current nixpkgs pin. The Caddyfile
   replicates `nginx.conf` (SPA `try_files` fallback + no-cache headers).

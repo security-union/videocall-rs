@@ -67,6 +67,15 @@ changelog_update = false
 git_release_enable = false
 release = false
 
+# The design system (stylesheets, primitives, gallery). Consumed by dioxus-ui
+# by path; never published or released on its own.
+[[package]]
+name = "videocall-theme"
+publish = false
+changelog_update = false
+git_release_enable = false
+release = false
+
 [[package]]
 name = "videocall-sdk"
 publish = false

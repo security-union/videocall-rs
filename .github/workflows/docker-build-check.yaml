@@ -15,6 +15,7 @@ on:
       - 'Cargo.toml'
       # UI image dependencies
       - 'dioxus-ui/**'
+      - 'videocall-theme/**'
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'neteq/**'
@@ -58,7 +59,7 @@ jobs:
           - name: meeting-api-and-bot
             attrs: -A images.meeting-api -A images.bot -A packages.meeting-api -A packages.bot
           - name: dioxus-ui
-            attrs: -A images.dioxus-ui -A packages.dioxus-ui-dist -A packages.wasmBindgenCli
+            attrs: -A images.dioxus-ui -A packages.dioxus-ui-dist -A packages.videocall-theme-gallery -A packages.wasmBindgenCli
           - name: website-and-vlog
             attrs: -A images.website -A images.engineering-vlog -A packages.website
           - name: cli-and-tools

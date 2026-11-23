@@ -17,6 +17,9 @@ use std::rc::Rc;
 use crate::constants::meeting_api_client;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use videocall_theme::{
+    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Glass, ListGroup, ListRow, ListRowLabel,
+};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlAudioElement;
 
@@ -186,11 +189,12 @@ pub fn HostControls(
     };
 
     rsx! {
-        div { class: "host-controls-container",
-            button { class: "host-controls-toggle", onclick: move |_| expanded.set(!expanded()),
-                span { class: "waiting-badge", "{waiting().len()}" }
-                span { "Waiting to join" }
+        Glass { class: "host-controls-container",
+            ListRow { class: "host-controls-toggle", "aria-expanded": "{expanded()}", onclick: move |_| expanded.set(!expanded()),
+                Badge { tone: BadgeTone::Count, "{waiting().len()}" }
+                ListRowLabel { "Waiting to join" }
                 svg {
+                    "aria-hidden": "true",
                     class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
                     xmlns: "http://www.w3.org/2000/svg",
                     width: "16", height: "16",
@@ -202,10 +206,10 @@ pub fn HostControls(
             }
 
             if expanded() {
-                div { class: "host-controls-list",
+                ListGroup { class: "host-controls-list",
                     if show_admit_all {
                         div { class: "admit-all-container",
-                            button { class: "btn-admit-all", onclick: on_admit_all,
+                            Button { variant: ButtonVariant::Tinted, size: ButtonSize::Small, onclick: on_admit_all,
                                 svg {
                                     xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
                                     view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
@@ -216,6 +220,8 @@ pub fn HostControls(
                             }
                         }
                     }
+                    // Raw rows: one per waiting participant, re-rendered on
+                    // every poll.
                     for participant in waiting().iter() {
                         {
                             let peer_user_id = participant.user_id.clone();
@@ -239,12 +245,12 @@ pub fn HostControls(
                             let error_reject = error;
 
                             rsx! {
-                                div { key: "{uid_for_key}", class: "waiting-participant",
-                                    div { class: "participant-info",
+                                div { key: "{uid_for_key}", class: "waiting-participant list-row",
+                                    div { class: "participant-info list-row-label",
                                         if let Some(name) = display_name.clone() {
                                             if !name.trim().is_empty() {
                                                 div { class: "participant-name", "{name}" }
-                                                div { class: "participant-email", "{uid_for_view}" }
+                                                div { class: "participant-email list-row-subtitle", "{uid_for_view}" }
                                             } else {
                                                 div { class: "participant-name", "{uid_for_view}" }
                                             }
@@ -254,8 +260,10 @@ pub fn HostControls(
                                     }
                                     div { class: "participant-actions",
                                         button {
-                                            class: "btn-admit",
+                                            class: "btn-admit icon-btn icon-btn-filled",
+                                            r#type: "button",
                                             title: "Admit",
+                                            "aria-label": "Admit",
                                             onclick: move |_| {
                                                 waiting_admit.write().retain(|p| p.user_id != uid_admit);
                                                 let uid = uid_admit.clone();
@@ -274,6 +282,7 @@ pub fn HostControls(
                                                 });
                                             },
                                             svg {
+                                                "aria-hidden": "true",
                                                 xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
                                                 view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
                                                 stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
@@ -281,8 +290,10 @@ pub fn HostControls(
                                             }
                                         }
                                         button {
-                                            class: "btn-reject",
+                                            class: "btn-reject icon-btn icon-btn-filled",
+                                            r#type: "button",
                                             title: "Reject",
+                                            "aria-label": "Reject",
                                             onclick: move |_| {
                                                 waiting_reject.write().retain(|p| p.user_id != uid_reject);
                                                 let uid = uid_reject.clone();
@@ -301,6 +312,7 @@ pub fn HostControls(
                                                 });
                                             },
                                             svg {
+                                                "aria-hidden": "true",
                                                 xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
                                                 view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
                                                 stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",

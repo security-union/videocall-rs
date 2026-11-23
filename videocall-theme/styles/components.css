@@ -1,0 +1,1642 @@
+/*
+ * components.css
+ *
+ * The shared primitives. One implementation of each control, built only from
+ * the tokens in tokens.css. Feature sheets (styles/features/*.css) lay these
+ * out on a screen. They do not restyle them.
+ *
+ * This header is the contract. If a class is not listed here, it is not part
+ * of the system.
+ *
+ * ---------------------------------------------------------------------------
+ * GLASS RULES (read these before using a glass class)
+ * ---------------------------------------------------------------------------
+ *  1. Glass is for the layer that floats above content: bars, sheets, menus,
+ *     sidebars, floating controls. Content (cards, list rows, video tiles,
+ *     text) is never glass.
+ *  2. Never glass on glass. A control that sits on a glass surface uses a
+ *     fill (--color-fill-*). The stylesheet enforces this: a glass control
+ *     nested in a glass surface loses its blur and gets a fill.
+ *  3. Regular glass is the default. Clear glass is only for controls over
+ *     video or photos, and it needs a dimming layer when the picture is
+ *     bright (.media-dim, 35% black, Apple's number). A screen that shows
+ *     live media puts .over-media on its root. Inside it Clear is the only
+ *     glass: every Regular surface (panels, sheets, alerts, menus, toasts,
+ *     Regular buttons) turns into an opaque elevated fill with no
+ *     backdrop-filter. So the two materials never sit side by side, and
+ *     nothing but the small Clear controls re-blurs the video each frame.
+ *  4. Do not animate backdrop-filter, and do not add url() to it. Safari
+ *     drops the whole filter chain when it contains url().
+ *  5. An ancestor with opacity below 1, filter, mask, clip-path or its own
+ *     backdrop-filter cuts the blur off from what is behind it. Keep those
+ *     off the ancestors of a glass element.
+ *  6. Safari cannot report Reduce Transparency, so Regular is frosty enough
+ *     to read on its own. Where the browser does report it, or reports
+ *     Increase Contrast, glass turns near-opaque with a visible border.
+ *
+ * ---------------------------------------------------------------------------
+ * PRIMITIVES
+ * ---------------------------------------------------------------------------
+ * Materials
+ *   .glass-regular            Regular glass surface (sidebars, custom panels).
+ *   .glass-clear              Clear glass surface, over media only.
+ *   .media-dim                35% black layer over media. Position it inside
+ *                             the media container (it is absolute, inset 0).
+ *   .media-dim-top            Same dim, as a gradient that fades out
+ *   .media-dim-bottom         downward / upward. For a bar at one edge.
+ *   .surface-grouped          Grouped page background. Cards and list groups
+ *                             go on this, not on the plain page background.
+ *   .over-media               Scope for a screen with live media (the call).
+ *                             Regular glass inside it is opaque, no blur.
+ *                             Clear glass is unchanged. See rule 3.
+ *   (.theme-dark, .theme-light and .surface-elevated are in tokens.css.)
+ *
+ * Buttons
+ *   .btn                      Secondary button: gray fill, capsule, 44px.
+ *     .btn-prominent          Accent fill, --color-on-accent label. One or
+ *                             two per view.
+ *     .btn-tinted             Accent-tinted fill, accent label.
+ *     .btn-plain              No fill, accent label.
+ *     .btn-destructive        Red-tinted fill, red label. Add .btn-prominent
+ *                             for solid red, .btn-plain for red text only.
+ *     .btn-glass              Regular glass. For a button floating on content.
+ *     .btn-glass-clear        Clear glass. For a button floating on video.
+ *     .btn-sm                 32px tall. The hit area is still 44px.
+ *     .btn-lg                 52px tall.
+ *     .btn-block              Full width.
+ *     states                  :disabled, [aria-disabled="true"], .disabled;
+ *                             [aria-pressed="true"] for a toggle button. It
+ *                             composes with the variant: a default or plain
+ *                             button turns tinted, a filled one (prominent,
+ *                             tinted, destructive, glass) keeps its fill
+ *                             under a darker layer.
+ *     knobs                   --btn-bg and --btn-fg, for the rare button that
+ *                             needs another tint (a warning action).
+ *   .icon-btn                 Round 44px icon button, no fill. Close, back,
+ *                             menu. Give it an aria-label.
+ *     .icon-btn-filled        Gray fill.
+ *     .icon-btn-glass         Regular glass.
+ *     .icon-btn-glass-clear   Clear glass.
+ *     .icon-btn-sm            32px visual, 44px hit area.
+ *   .video-control-button     The in-call control: round, clear glass. Name
+ *                             kept because tests select it.
+ *     .active                 The device is on. Inverted fill.
+ *     .danger                 Hang up. Red fill.
+ *     .disabled / :disabled   Dimmed.
+ *     .device-warning         Child. The small "!" badge.
+ *     .tooltip                Child. See .tooltip below.
+ *
+ * Forms
+ *   .input                    Text input or textarea. 17px text, so iOS does
+ *                             not zoom on focus. [aria-invalid="true"] turns
+ *                             the border red.
+ *   .select                   Native select, same look, with a caret.
+ *   .search-field             Capsule wrapper: an icon and an input inside.
+ *   .field                    Label + control + hint, stacked.
+ *     .field-label  .field-hint  .field-error
+ *   .switch                   On a <button role="switch">. Green when
+ *                             aria-checked="true". Only inside a list row.
+ *                             Size with --switch-width / --switch-height.
+ *
+ * Content
+ *   .card                     Rounded content container.
+ *     .card-title
+ *   .list-group               Rounded group of rows.
+ *     .list-row               44px min, inset separators. On a button or a
+ *                             link it gets hover and press states.
+ *       .list-row-label       Leading text, takes the free width.
+ *       .list-row-subtitle    Second line inside the label.
+ *       .list-row-value       Trailing value or control.
+ *   .list-header              Section header above a group. Normal case.
+ *   .list-footer              Note below a group.
+ *
+ * Overlays
+ *   .scrim                    Full-screen dimmer that centers its child. On
+ *                             narrow screens the child sits at the bottom.
+ *   .sheet                    Dialog on wide screens, inset bottom sheet with
+ *                             safe-area padding on narrow ones.
+ *     .sheet-wide             Wider dialog (settings).
+ *     .sheet-grabber  .sheet-header  .sheet-title  .sheet-body  .sheet-footer
+ *   .alert                    Small centered dialog: title, message, buttons.
+ *     .alert-title  .alert-message  .alert-actions
+ *   .menu                     Popover list. Position it yourself.
+ *     .menu-item              Add .menu-item-destructive for red.
+ *     .menu-header  .menu-separator
+ *   .toast-region             Fixed stack at the top of the screen.
+ *   .toast                    One message. Regular glass.
+ *     .toast-solid            Opaque elevated fill, no blur. Inside
+ *                             .over-media every toast already looks like
+ *                             this; the class says so by name.
+ *   .tooltip                  Child of a positioned control. Shows on hover
+ *                             and keyboard focus, or with .is-open. Centered
+ *                             on the control, wraps before it gets wider
+ *                             than the viewport.
+ *     .tooltip-below
+ *     .tooltip-start          Aligned to the control's leading edge, for a
+ *                             control at the left edge of the screen.
+ *     .tooltip-end            Aligned to the trailing edge, for one at the
+ *                             right edge.
+ *
+ * Navigation
+ *   .toolbar                  A row at a screen edge. No background.
+ *     .toolbar-title
+ *   .bar                      Floating glass capsule holding controls.
+ *     .bar-clear              Clear glass version, over video.
+ *   .segmented                Segmented control (track).
+ *     .segment                One option. Selected by aria-selected="true",
+ *                             aria-pressed="true", aria-checked="true" or
+ *                             .active.
+ *   .tab-list                 Column of tabs (a settings sidebar).
+ *     .tab-list-horizontal    Same, as a scrolling row.
+ *     .tab                    Selected by aria-selected="true" or .active.
+ *
+ * Status
+ *   .badge                    Small label pill.
+ *     .badge-accent  .badge-success  .badge-warning  .badge-danger
+ *     .badge-count            Red count bubble.
+ *   .status-dot               8px dot.
+ *     .status-dot-accent  .status-dot-success  .status-dot-warning
+ *     .status-dot-danger
+ *   .spinner                  Uses currentColor.
+ *     .spinner-lg
+ *
+ * Helpers in base.css: .text-large-title .text-title-1 .text-title-2
+ *   .text-title-3 .text-headline .text-body .text-callout .text-subheadline
+ *   .text-footnote .text-caption-1 .text-caption-2 .text-emphasized
+ *   .text-mono .text-tabular .text-secondary .text-tertiary .text-danger
+ *   .text-center .link .screen-center .stack .row .gap-1 .gap-2 .gap-4 .gap-6 .grow
+ *   .visually-hidden .radius-concentric .safe-top .safe-bottom .safe-x
+ *   .safe-area .touch-pan-only
+ *
+ * ---------------------------------------------------------------------------
+ * OLD CLASS -> NEW CLASS
+ * ---------------------------------------------------------------------------
+ * Some old names are selected by tests (e2e and dioxus-ui/tests). Those are
+ * marked KEEP: leave the old name on the element and add the new classes
+ * next to it. Everything else gets replaced. A few more old names stayed
+ * next to the new classes as hooks for a feature sheet (.btn-admit,
+ * .meeting-delete-btn, .login-card, .server-card, .meeting-item and the
+ * like). They are the feature's, not part of this contract.
+ *
+ * Buttons (the 20 from the audit)
+ *   .btn-apple                         -> .btn
+ *   .btn-apple.btn-primary             -> .btn.btn-prominent
+ *   .btn-apple.btn-secondary           -> .btn
+ *   .btn-apple.btn-sm                  -> .btn.btn-sm
+ *   .btn-apple.btn-danger              -> .btn.btn-destructive
+ *   .btn-apple.btn-warning             -> .btn.btn-tinted plus a feature class
+ *                                         (.settings-btn-warning) that sets
+ *                                         --btn-bg: var(--color-warning-tint)
+ *                                         and --btn-fg: var(--color-label)
+ *   .secondary-button                  -> .btn
+ *   .cta-button (unused)               -> .btn.btn-prominent.btn-lg
+ *   .control-button (unused)           -> .icon-btn.icon-btn-filled
+ *   .retry-btn                         -> .btn.btn-sm
+ *   .settings-action-btn               -> .btn (plus a variant)
+ *   .settings-back-btn                 -> .icon-btn
+ *   .settings-nav-button (KEEP, .active) -> .tab
+ *   .meeting-edit-btn                  -> .icon-btn.icon-btn-sm
+ *   .meeting-delete-btn                -> .icon-btn.icon-btn-sm, red via
+ *                                         --btn-fg: var(--color-danger)
+ *   .btn-admit                         -> .icon-btn.icon-btn-filled, green
+ *                                         via --btn-fg: var(--color-success)
+ *   .btn-reject                        -> .icon-btn.icon-btn-filled, red via
+ *                                         --btn-fg: var(--color-danger)
+ *   .btn-admit-all                     -> .btn.btn-tinted.btn-sm
+ *   .change-name-fab                   -> .icon-btn.icon-btn-sm with the
+ *                                         .tile-action dim fill (call.css).
+ *                                         It sits on the camera for good, so
+ *                                         it is content, not Clear glass
+ *   .close-button (KEEP)               -> .icon-btn
+ *   .menu-button                       -> .icon-btn
+ *   .device-settings-menu-button       -> .icon-btn.icon-btn-glass-clear
+ *   .video-control-button (KEEP)       -> same name, restyled here
+ *   .host-controls-toggle, .meetings-list-toggle -> .list-row on a button
+ *                                         (they are disclosure rows)
+ *   .auth-dropdown-trigger             -> .btn.btn-glass or .icon-btn-glass
+ *   .auth-dropdown-signout             -> .menu-item.menu-item-destructive
+ *
+ * Sign-in buttons
+ *   .gsi-material-button*, .okta-sign-in-button*, .generic-sign-in-button
+ *                                      -> .btn.btn-lg.btn-block. The provider
+ *                                         logo keeps its literal brand colors.
+ *
+ * Forms
+ *   .input-apple                       -> .input
+ *   .search-input                      -> .search-field around the input
+ *   .username-input (unused)           -> .input
+ *   .baby-mode-code-input              -> .input.text-mono
+ *   .device-selector                   -> .select
+ *   ToggleSwitch (inline styles)       -> .switch (done)
+ *   label utility classes in home.rs   -> .field + .field-label
+ *
+ * Cards, lists
+ *   .card-apple                        -> .card
+ *   .login-card, .settings-card(-compact), .error-card, .rejected-card,
+ *   .waiting-room-card, .server-card   -> .card
+ *   .settings-panel                    -> .card or .list-group
+ *   .settings-card-title               -> .card-title or .list-header
+ *   .settings-option-row, .settings-stat-row, .traffic-shaping-row,
+ *   .waiting-participant, .meeting-item,
+ *   .peer_item                         -> .list-row inside a .list-group
+ *   .detail-item, .build-info-row      -> stayed feature rows in
+ *                                         diagnostics.css (a key/value grid
+ *                                         and a table row, not list rows)
+ *   .reception-stats-row (KEEP for its testid children) -> .list-row
+ *
+ * Overlays
+ *   .glass-backdrop                    -> .scrim. KEEP on the meeting-ended
+ *                                         overlay (.glass-backdrop
+ *                                         .meeting-ended-overlay.scrim), a
+ *                                         test selects it
+ *   .glass-backdrop > .card-apple      -> .scrim > .sheet (or .alert)
+ *   .modal-overlay + .modal-window     -> .scrim + .alert
+ *   .device-settings-modal-overlay     -> .scrim
+ *   .device-settings-modal (KEEP)      -> .sheet.sheet-wide
+ *   .baby-mode-scrim / .baby-mode-dialog -> .scrim / .alert, with z-index
+ *                                         from --z-lock in the feature sheet
+ *   inline full-screen fixed divs      -> .screen-center
+ *   #peer-list-container,
+ *   #diagnostics-sidebar (KEEP id)     -> .glass-regular, layout in a feature
+ *                                         sheet, z-index var(--z-sidebar)
+ *   .context-menu, .auth-dropdown-menu -> .menu
+ *   .context-menu-item                 -> .menu-item
+ *   .copy-toast                        -> .toast.toast-solid, placed under
+ *                                         the invite card by call.css (no
+ *                                         region)
+ *   .toggle-error                      -> stayed a p in the join panel, an
+ *                                         inline error styled by call.css
+ *   .peer-toasts (KEEP)                -> .toast-region
+ *   .peer-toast (KEEP)                 -> .toast.toast-solid. Its children
+ *                                         .toast-icon,
+ *                                         .toast-text, .toast-name,
+ *                                         .toast-action are KEEP and stay
+ *                                         feature-styled.
+ *   .video-control-button .tooltip (KEEP) -> .tooltip, same markup
+ *
+ * Navigation, status
+ *   .top-bar                           -> .toolbar
+ *   .video-controls-container          -> .bar.bar-clear (.call-controls in
+ *                                         call.css)
+ *   .waiting-badge, .traffic-shaping-badge, .meeting-count, .meeting-state
+ *                                      -> .badge (+ a tone)
+ *   .peer-indicator, .host-indicator   -> .badge
+ *   .live-dot, .tagline-dot, .indicator -> .status-dot (+ a tone)
+ *   .status-value.good / .warning (KEEP, unit-tested) -> keep the names, take
+ *                                         colors from --color-success /
+ *                                         --color-warning
+ *   .loading-spinner                   -> .spinner (.spinner-lg)
+ *   .waiting-room-spinner/.spinner-dot -> .spinner. The .waiting-room-spinner
+ *                                         wrapper stayed for layout
+ *                                         (prejoin.css)
+ *
+ * No literal colors or font names in this file. They come from tokens.css.
+ */
+
+@layer components {
+  /* =========================================================================
+     Materials
+     ========================================================================= */
+
+  /* Each glass class picks its tint and filter through two private
+     variables. The first block is the fallback for browsers without
+     backdrop-filter: a near-opaque tint and no filter. */
+  .glass-regular,
+  .bar,
+  .sheet,
+  .alert,
+  .menu,
+  .toast,
+  .btn-glass,
+  .icon-btn-glass {
+    --_glass-bg: var(--material-regular-opaque);
+    --_glass-filter: none;
+  }
+
+  .glass-clear,
+  .bar-clear,
+  .btn-glass-clear,
+  .icon-btn-glass-clear,
+  .video-control-button {
+    --_glass-bg: var(--material-clear-opaque);
+    --_glass-filter: none;
+  }
+
+  @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+    .glass-regular,
+    .bar,
+    .sheet,
+    .alert,
+    .menu,
+    .toast,
+    .btn-glass,
+    .icon-btn-glass {
+      --_glass-bg: var(--material-regular-tint);
+      --_glass-filter: blur(var(--material-regular-blur))
+        saturate(var(--material-regular-saturate));
+    }
+
+    .glass-clear,
+    .bar-clear,
+    .btn-glass-clear,
+    .icon-btn-glass-clear,
+    .video-control-button {
+      --_glass-bg: var(--material-clear-tint);
+      --_glass-filter: blur(var(--material-clear-blur))
+        saturate(var(--material-clear-saturate));
+    }
+  }
+
+  /* Reduce Transparency and Increase Contrast: near-opaque, no blur. The
+     border turns solid through --material-border in tokens.css. Safari never
+     matches the first query, Chrome does. */
+  @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+    .glass-regular,
+    .bar,
+    .sheet,
+    .alert,
+    .menu,
+    .toast,
+    .btn-glass,
+    .icon-btn-glass {
+      --_glass-bg: var(--material-regular-opaque);
+      --_glass-filter: none;
+    }
+
+    .glass-clear,
+    .bar-clear,
+    .btn-glass-clear,
+    .icon-btn-glass-clear,
+    .video-control-button {
+      --_glass-bg: var(--material-clear-opaque);
+      --_glass-filter: none;
+    }
+  }
+
+  /* Over live media (.over-media on the screen root): Regular is an
+     opaque elevated fill with no blur, the same path as Reduce
+     Transparency above. Clear keeps its blur (.bar-clear is also a .bar,
+     hence the :not). :where keeps the :not at zero specificity, so the rule
+     stays (0,2,0) like the no-glass-on-glass rules below, which still win
+     by order and turn nested controls into fills. */
+  .over-media :is(.glass-regular, .bar, .sheet, .alert, .menu, .toast, .btn-glass, .icon-btn-glass):not(:where(.bar-clear)) {
+    --_glass-bg: var(--color-bg-elevated);
+    --_glass-filter: none;
+  }
+
+  /* No glass on glass. A glass control inside a glass surface becomes a
+     fill, with no blur, border or shadow of its own. It could not blur
+     anyway: the surface's backdrop-filter cuts it off from the page. */
+  :is(.glass-regular, .glass-clear, .bar, .sheet, .alert, .menu, .toast)
+    :is(.btn-glass, .btn-glass-clear, .icon-btn-glass, .icon-btn-glass-clear, .video-control-button, .glass-regular, .glass-clear) {
+    --_glass-bg: var(--color-fill-secondary);
+    --_glass-filter: none;
+    --_glass-border: transparent;
+    --_glass-shadow: 0 0 0 0 transparent;
+  }
+
+  /* A whole surface nested in another one (a menu opened from a bar) cannot
+     blur either, so it takes the near-opaque tint to stay readable. */
+  :is(.glass-regular, .glass-clear, .bar, .sheet, .alert, .menu, .toast)
+    :is(.bar, .sheet, .alert, .menu, .toast) {
+    --_glass-bg: var(--material-regular-opaque);
+    --_glass-filter: none;
+  }
+
+  /* The surfaces paint themselves here. Buttons do it in their own rules. */
+  .glass-regular,
+  .glass-clear,
+  .bar,
+  .sheet,
+  .alert,
+  .menu,
+  .toast {
+    border: 1px solid var(--_glass-border, var(--material-border));
+    background-color: var(--_glass-bg);
+    -webkit-backdrop-filter: var(--_glass-filter);
+    backdrop-filter: var(--_glass-filter);
+    box-shadow:
+      inset 0 1px 0 var(--material-highlight),
+      var(--_elevation, var(--shadow-2));
+    color: var(--color-label);
+  }
+
+  /* Sheets, alerts and menus are raised surfaces: content inside them uses
+     the elevated backgrounds (same remap as .surface-elevated). */
+  .sheet,
+  .alert,
+  .menu {
+    --color-bg: var(--color-bg-elevated);
+    --color-bg-secondary: var(--color-bg-elevated-secondary);
+    --color-bg-tertiary: var(--color-bg-elevated-tertiary);
+    --color-bg-grouped: var(--color-bg-grouped-elevated);
+    --color-bg-grouped-secondary: var(--color-bg-grouped-elevated-secondary);
+    --color-bg-grouped-tertiary: var(--color-bg-grouped-elevated-tertiary);
+  }
+
+  /* The dimming layer for Clear glass over bright video. */
+  .media-dim,
+  .media-dim-top,
+  .media-dim-bottom {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  .media-dim {
+    background-color: var(--material-dim);
+  }
+
+  /* Height of the fade is an approximation. */
+  .media-dim-top {
+    bottom: auto;
+    height: 8rem;
+    background-image: linear-gradient(to bottom, var(--material-dim), transparent);
+  }
+
+  .media-dim-bottom {
+    top: auto;
+    height: 8rem;
+    background-image: linear-gradient(to top, var(--material-dim), transparent);
+  }
+
+  .surface-grouped {
+    background-color: var(--color-bg-grouped);
+  }
+
+  /* =========================================================================
+     Buttons
+     ========================================================================= */
+
+  .btn,
+  .icon-btn,
+  .video-control-button {
+    --btn-overlay: transparent;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-capsule);
+    background-color: var(--btn-bg);
+    color: var(--btn-fg);
+    text-decoration: none;
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+    /* The second shadow is the hover and press overlay, the third the
+       toggled-on layer of a filled button. An inset shadow that covers the
+       whole button tints any background without an extra element. */
+    box-shadow:
+      var(--btn-shadow, 0 0 0 0 transparent),
+      inset 0 0 0 100vmax var(--btn-overlay),
+      inset 0 0 0 100vmax var(--btn-pressed-layer, transparent);
+    transition:
+      transform var(--duration-fast) var(--ease-standard),
+      background-color var(--duration-base) var(--ease-standard),
+      color var(--duration-base) var(--ease-standard),
+      box-shadow var(--duration-base) var(--ease-standard),
+      opacity var(--duration-base) var(--ease-standard);
+  }
+
+  .btn {
+    --btn-bg: var(--color-fill);
+    --btn-fg: var(--color-label);
+    gap: var(--space-2);
+    min-width: var(--size-hit);
+    min-height: var(--size-control);
+    padding: var(--space-2) var(--space-5);
+    /* Semibold on every button, as on iOS. White on the default accent is
+       below 4.5:1; tokens.css (--color-on-accent) has the numbers. */
+    font: var(--text-body-emphasized);
+    text-align: center;
+  }
+
+  .btn svg {
+    flex: none;
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+  }
+
+  /* Icon buttons. Declared before the variants below so a glass variant
+     can replace the transparent background. */
+  .icon-btn {
+    --btn-bg: transparent;
+    --btn-fg: var(--color-label);
+    flex: none;
+    width: var(--size-hit);
+    height: var(--size-hit);
+    padding: 0;
+  }
+
+  .icon-btn svg {
+    width: var(--size-icon);
+    height: var(--size-icon);
+  }
+
+  .icon-btn-filled {
+    --btn-bg: var(--color-fill-secondary);
+  }
+
+  .icon-btn-sm {
+    width: var(--size-control-sm);
+    height: var(--size-control-sm);
+  }
+
+  .icon-btn-sm svg {
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+  }
+
+  .btn-prominent {
+    --btn-bg: var(--color-accent);
+    --btn-fg: var(--color-on-accent);
+  }
+
+  .btn-tinted {
+    --btn-bg: var(--color-accent-tint);
+    --btn-fg: var(--color-accent);
+  }
+
+  .btn-plain {
+    --btn-bg: transparent;
+    --btn-fg: var(--color-accent);
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+
+  .btn-destructive {
+    --btn-bg: var(--color-danger-tint);
+    --btn-fg: var(--color-danger);
+  }
+
+  .btn-destructive.btn-prominent {
+    --btn-bg: var(--color-danger);
+    --btn-fg: var(--color-on-accent);
+  }
+
+  .btn-destructive.btn-plain {
+    --btn-bg: transparent;
+  }
+
+  /* Toggled on (aria-pressed="true"). Pressed is a state, so it composes
+     with the variant instead of replacing it. A button with no fill of its
+     own (the default gray one and .btn-plain) takes the tinted look. A
+     button whose fill means something (prominent, tinted, destructive,
+     glass) keeps it and gets a darker layer, the same in light and dark. */
+  .btn[aria-pressed="true"]:not(.btn-prominent, .btn-tinted, .btn-destructive, .btn-glass, .btn-glass-clear) {
+    --btn-bg: var(--color-accent-tint);
+    --btn-fg: var(--color-accent);
+  }
+
+  .btn[aria-pressed="true"]:is(.btn-prominent, .btn-tinted, .btn-destructive, .btn-glass, .btn-glass-clear) {
+    --btn-pressed-layer: color-mix(in srgb, var(--color-black) 22%, transparent);
+  }
+
+  .btn-glass,
+  .btn-glass-clear,
+  .icon-btn-glass,
+  .icon-btn-glass-clear,
+  .video-control-button {
+    --btn-bg: var(--_glass-bg);
+    --btn-fg: var(--color-label);
+    --btn-shadow: var(--_glass-shadow, inset 0 1px 0 var(--material-highlight), var(--shadow-1));
+    border-color: var(--_glass-border, var(--material-border));
+    -webkit-backdrop-filter: var(--_glass-filter);
+    backdrop-filter: var(--_glass-filter);
+  }
+
+  .btn-sm {
+    min-height: var(--size-control-sm);
+    padding: var(--space-1) var(--space-3);
+    font: var(--text-subheadline-emphasized);
+  }
+
+  .btn-lg {
+    min-height: var(--size-control-lg);
+    padding-left: var(--space-6);
+    padding-right: var(--space-6);
+  }
+
+  .btn-block {
+    display: flex;
+    width: 100%;
+  }
+
+  /* Small controls keep a 44px hit area. The pseudo-element is part of the
+     control, so taps on it land on the control. */
+  .btn-sm::after,
+  .icon-btn-sm::after,
+  .switch::after,
+  .segment::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: max(100%, var(--size-hit));
+    height: max(100%, var(--size-hit));
+    transform: translate(-50%, -50%);
+  }
+
+  /* The in-call control */
+  .video-control-button {
+    --control-size: 3rem; /* approximation */
+    flex: none;
+    width: var(--control-size);
+    height: var(--control-size);
+    min-width: var(--size-hit);
+    min-height: var(--size-hit);
+    padding: 0;
+  }
+
+  .video-control-button svg {
+    width: var(--size-icon);
+    height: var(--size-icon);
+  }
+
+  /* On: inverted, so it stays monochrome over the video. The icon changes
+     too, so the state does not rest on color. */
+  .video-control-button.active {
+    --btn-bg: var(--color-label);
+    --btn-fg: var(--color-bg);
+    --btn-shadow: var(--shadow-1);
+    border-color: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  .video-control-button.danger {
+    --btn-bg: var(--color-danger);
+    --btn-fg: var(--color-on-accent);
+    --btn-shadow: var(--shadow-1);
+    border-color: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  .video-control-button .device-warning {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.125rem;
+    height: 1.125rem;
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-danger);
+    color: var(--color-on-accent);
+    font: var(--text-caption-2-emphasized);
+    line-height: 1;
+    pointer-events: none;
+  }
+
+  @media (max-width: 639.98px) {
+    .video-control-button {
+      --control-size: 2.75rem;
+    }
+  }
+
+  /* States, shared by all three button kinds */
+  @media (hover: hover) {
+    .btn:hover,
+    .icon-btn:hover,
+    .video-control-button:hover {
+      --btn-overlay: var(--color-state-hover);
+    }
+  }
+
+  .btn:active,
+  .icon-btn:active,
+  .video-control-button:active {
+    --btn-overlay: var(--color-state-pressed);
+    transform: scale(0.97);
+  }
+
+  .btn:disabled,
+  .btn[aria-disabled="true"],
+  .btn.disabled,
+  .icon-btn:disabled,
+  .icon-btn[aria-disabled="true"],
+  .icon-btn.disabled,
+  .video-control-button:disabled,
+  .video-control-button.disabled {
+    --btn-overlay: transparent;
+    opacity: 0.4;
+    transform: none;
+    cursor: not-allowed;
+  }
+
+  /* =========================================================================
+     Forms
+     ========================================================================= */
+
+  .input,
+  .select {
+    display: block;
+    width: 100%;
+    min-height: var(--size-control);
+    margin: 0;
+    padding: var(--space-2) var(--space-4);
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background-color: var(--color-fill-tertiary);
+    color: var(--color-label);
+    font: var(--text-body);
+    /* Never under 16px, or iOS Safari zooms the page on focus. */
+    font-size: max(1.0625rem, 16px);
+    -webkit-appearance: none;
+    appearance: none;
+    transition: border-color var(--duration-base) var(--ease-standard);
+  }
+
+  .input::placeholder {
+    color: var(--color-placeholder);
+  }
+
+  .input:focus-visible,
+  .select:focus-visible {
+    outline-offset: 0;
+  }
+
+  .input[aria-invalid="true"],
+  .select[aria-invalid="true"] {
+    border-color: var(--color-danger);
+  }
+
+  .input:disabled,
+  .select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  textarea.input {
+    min-height: 6rem;
+    padding-top: var(--space-3);
+    padding-bottom: var(--space-3);
+  }
+
+  /* The caret is two gradients, so it takes the text color and needs no
+     image file. */
+  .select {
+    padding-right: var(--space-10);
+    background-image:
+      linear-gradient(45deg, transparent 50%, currentColor 50%),
+      linear-gradient(135deg, currentColor 50%, transparent 50%);
+    background-position:
+      right calc(var(--space-4) + 5px) center,
+      right var(--space-4) center;
+    background-size: 5px 5px;
+    background-repeat: no-repeat;
+    cursor: pointer;
+  }
+
+  .search-field {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: var(--size-control);
+    padding: 0 var(--space-4);
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-fill-tertiary);
+    color: var(--color-label-secondary);
+  }
+
+  .search-field svg {
+    flex: none;
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+  }
+
+  .search-field input {
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0;
+    border: 0;
+    background-color: transparent;
+    color: var(--color-label);
+    font: var(--text-body);
+    font-size: max(1.0625rem, 16px);
+    /* The wrapper shows the ring. */
+    outline: none;
+  }
+
+  .search-field:focus-within {
+    outline: var(--focus-ring-width) solid var(--focus-ring-color);
+    outline-offset: 0;
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .field-label {
+    padding: 0 var(--space-1);
+    font: var(--text-subheadline-emphasized);
+    color: var(--color-label);
+  }
+
+  .field-hint,
+  .field-error {
+    padding: 0 var(--space-1);
+    font: var(--text-footnote);
+    color: var(--color-label-secondary);
+  }
+
+  .field-error {
+    color: var(--color-danger);
+  }
+
+  /* Switch. On a <button role="switch" aria-checked>. The size is an
+     approximation, Apple publishes no value. The knob moves, so the state
+     does not rest on the green alone; a visible label is still the
+     caller's job. */
+  .switch {
+    --switch-width: 3.1875rem;
+    --switch-height: 1.9375rem;
+    position: relative;
+    display: inline-block;
+    flex: none;
+    width: var(--switch-width);
+    height: var(--switch-height);
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-fill);
+    vertical-align: middle;
+    cursor: pointer;
+    transition: background-color var(--duration-base) var(--ease-standard);
+  }
+
+  .switch::before {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: calc(var(--switch-height) - 4px);
+    height: calc(var(--switch-height) - 4px);
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-white);
+    box-shadow: var(--shadow-1);
+    transition: transform var(--duration-base) var(--ease-standard);
+  }
+
+  .switch[aria-checked="true"] {
+    background-color: var(--color-green);
+  }
+
+  .switch[aria-checked="true"]::before {
+    transform: translateX(calc(var(--switch-width) - var(--switch-height)));
+  }
+
+  .switch:disabled,
+  .switch[aria-disabled="true"] {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  @media (prefers-contrast: more) {
+    .switch {
+      box-shadow: inset 0 0 0 1px var(--color-label);
+    }
+  }
+
+  /* =========================================================================
+     Cards and lists (content layer, never glass)
+     ========================================================================= */
+
+  .card {
+    --concentric-outer: var(--radius-lg);
+    --concentric-inset: var(--space-4);
+    padding: var(--space-4);
+    border-radius: var(--radius-lg);
+    background-color: var(--color-bg-grouped-secondary);
+    color: var(--color-label);
+  }
+
+  .card-title {
+    font: var(--text-headline);
+  }
+
+  .list-group {
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+    background-color: var(--color-bg-grouped-secondary);
+    color: var(--color-label);
+  }
+
+  .list-header {
+    padding: 0 var(--space-4) var(--space-2);
+    font: var(--text-headline);
+    color: var(--color-label);
+    text-transform: none;
+  }
+
+  .list-footer {
+    padding: var(--space-2) var(--space-4) 0;
+    font: var(--text-footnote);
+    color: var(--color-label-secondary);
+  }
+
+  .list-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    width: 100%;
+    min-height: var(--size-control);
+    margin: 0;
+    padding: var(--space-2) var(--space-4);
+    color: var(--color-label);
+    font: var(--text-body);
+    text-align: start;
+  }
+
+  /* Separator between rows, inset on the leading side. */
+  .list-row + .list-row::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: var(--space-4);
+    height: 1px;
+    background-color: var(--color-separator);
+  }
+
+  .list-row-label {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .list-row-subtitle {
+    display: block;
+    font: var(--text-footnote);
+    color: var(--color-label-secondary);
+  }
+
+  .list-row-value {
+    flex: none;
+    color: var(--color-label-secondary);
+  }
+
+  button.list-row,
+  a.list-row {
+    cursor: pointer;
+    transition: background-color var(--duration-fast) var(--ease-standard);
+  }
+
+  /* The group clips its children, so the ring goes inside the row. */
+  .list-row:focus-visible {
+    outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  @media (hover: hover) {
+    button.list-row:hover,
+    a.list-row:hover {
+      background-color: var(--color-fill-quaternary);
+    }
+  }
+
+  button.list-row:active,
+  a.list-row:active {
+    background-color: var(--color-fill-tertiary);
+  }
+
+  /* =========================================================================
+     Overlays
+     ========================================================================= */
+
+  /* The scrim dims and centers. It has no blur: blurring the whole screen
+     over live video costs too much, and the sheet brings its own. */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-scrim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    overscroll-behavior: contain;
+    padding: max(var(--space-4), var(--safe-top))
+      max(var(--space-4), var(--safe-right))
+      max(var(--space-4), var(--safe-bottom))
+      max(var(--space-4), var(--safe-left));
+    background-color: var(--color-scrim);
+  }
+
+  .sheet {
+    --_elevation: var(--shadow-3);
+    --concentric-outer: var(--radius-xl);
+    --concentric-inset: var(--space-5);
+    position: relative;
+    z-index: var(--z-sheet);
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: 28rem;
+    max-height: 100%;
+    overflow: hidden;
+    border-radius: var(--radius-xl);
+    animation: ds-sheet-in var(--duration-slow) var(--ease-enter);
+  }
+
+  .sheet-wide {
+    max-width: 48rem;
+  }
+
+  .sheet-grabber {
+    flex: none;
+    width: 2.25rem;
+    height: 5px;
+    margin: var(--space-2) auto 0;
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-label-tertiary);
+  }
+
+  .sheet-header {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-3) var(--space-3) var(--space-5);
+  }
+
+  .sheet-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    font: var(--text-headline);
+    text-align: start;
+  }
+
+  .sheet-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    padding: var(--space-2) var(--space-5) var(--space-5);
+  }
+
+  .sheet-footer {
+    display: flex;
+    flex: none;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-5) var(--space-5);
+  }
+
+  /* Narrow screens: the sheet drops to the bottom and stays inset from the
+     edges. The scrim's padding already clears the home indicator. */
+  @media (max-width: 639.98px) {
+    .scrim {
+      align-items: flex-end;
+      padding: max(var(--space-2), var(--safe-top))
+        max(var(--space-2), var(--safe-right))
+        max(var(--space-2), var(--safe-bottom))
+        max(var(--space-2), var(--safe-left));
+    }
+
+    .sheet,
+    .sheet-wide {
+      max-width: none;
+    }
+
+    .sheet-footer > .btn {
+      flex: 1 1 0;
+    }
+  }
+
+  /* An alert stays centered on every screen size. */
+  .alert {
+    --_elevation: var(--shadow-3);
+    position: relative;
+    z-index: var(--z-sheet);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    align-self: center;
+    width: 100%;
+    max-width: 20rem;
+    margin: auto;
+    padding: var(--space-5);
+    border-radius: var(--radius-xl);
+    text-align: start;
+    animation: ds-sheet-in var(--duration-slow) var(--ease-enter);
+  }
+
+  .alert-title {
+    font: var(--text-headline);
+  }
+
+  .alert-message {
+    font: var(--text-subheadline);
+    color: var(--color-label-secondary);
+  }
+
+  .alert-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+
+  .alert-actions > .btn {
+    flex: 1 1 0;
+  }
+
+  .menu {
+    --_elevation: var(--shadow-2);
+    z-index: var(--z-popover);
+    display: flex;
+    flex-direction: column;
+    min-width: 12.5rem;
+    max-width: min(20rem, calc(100vw - 2 * var(--space-4)));
+    padding: var(--space-1);
+    border-radius: var(--radius-lg);
+    animation: ds-pop-in var(--duration-base) var(--ease-enter);
+  }
+
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    width: 100%;
+    min-height: var(--size-hit);
+    margin: 0;
+    padding: var(--space-2) var(--space-3);
+    /* Concentric with the menu: its radius minus its padding. */
+    border-radius: max(var(--radius-lg) - var(--space-1), var(--radius-fallback));
+    color: inherit;
+    font: var(--text-body);
+    text-align: start;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .menu-item svg {
+    flex: none;
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+  }
+
+  @media (hover: hover) {
+    .menu-item:hover {
+      background-color: var(--color-fill-tertiary);
+    }
+  }
+
+  .menu-item:active {
+    background-color: var(--color-fill);
+  }
+
+  .menu-item:focus-visible {
+    outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  .menu-item:disabled,
+  .menu-item[aria-disabled="true"] {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .menu-item-destructive {
+    color: var(--color-danger);
+  }
+
+  .menu-header {
+    padding: var(--space-2) var(--space-3);
+    font: var(--text-footnote);
+    color: var(--color-label-secondary);
+  }
+
+  .menu-separator {
+    flex: none;
+    height: 1px;
+    margin: var(--space-1) var(--space-3);
+    background-color: var(--color-separator);
+  }
+
+  /* The HIG has no toast. This is our own, for messages that do not need an
+     answer. */
+  .toast-region {
+    position: fixed;
+    top: max(var(--space-4), var(--safe-top));
+    left: 50%;
+    z-index: var(--z-toast);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    width: min(26rem, calc(100% - 2 * var(--space-4)));
+    transform: translateX(-50%);
+    pointer-events: none;
+  }
+
+  .toast {
+    --_elevation: var(--shadow-2);
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    max-width: 100%;
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-lg);
+    font: var(--text-subheadline);
+    pointer-events: auto;
+    animation: ds-pop-in var(--duration-base) var(--ease-enter);
+  }
+
+  /* Over live video. Regular glass there would sit next to the Clear
+     control bar and mix the two materials, and a blur over video is redrawn
+     on every frame. Same border and shadow, an opaque raised fill. */
+  .toast-solid {
+    background-color: var(--color-bg-elevated);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  /* Tooltip. Small and short-lived, so it is an opaque chip, not glass. */
+  .tooltip {
+    position: absolute;
+    bottom: calc(100% + var(--space-2));
+    left: 50%;
+    z-index: var(--z-popover);
+    /* Never wider than the screen minus a margin. It stays on one line
+       until it would be, then wraps. */
+    width: max-content;
+    max-width: min(16rem, calc(100vw - 2 * var(--space-2)));
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--material-border);
+    border-radius: var(--radius-xs);
+    background-color: var(--material-regular-opaque);
+    color: var(--color-label);
+    box-shadow: var(--shadow-1);
+    font: var(--text-caption-1);
+    text-align: center;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateX(-50%);
+    pointer-events: none;
+    transition:
+      opacity var(--duration-fast) var(--ease-standard),
+      visibility var(--duration-fast) var(--ease-standard);
+  }
+
+  .tooltip-below {
+    top: calc(100% + var(--space-2));
+    bottom: auto;
+  }
+
+  /* A centered tooltip on a control at the screen edge hangs over the edge
+     by half its extra width. These line it up with the control instead, so
+     it grows away from the edge. Start and end follow the writing
+     direction. */
+  .tooltip-start,
+  .tooltip-end {
+    transform: none;
+    text-align: start;
+  }
+
+  /* The physical `left: auto` first: a later declaration of the same side
+     wins, and in a left-to-right page inset-inline-start is `left`. */
+  .tooltip-start {
+    left: auto;
+    inset-inline-start: 0;
+  }
+
+  .tooltip-end {
+    left: auto;
+    inset-inline-end: 0;
+  }
+
+  @media (hover: hover) {
+    :hover > .tooltip {
+      opacity: 1;
+      visibility: visible;
+    }
+  }
+
+  :focus-visible > .tooltip,
+  .tooltip.is-open {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  /* =========================================================================
+     Navigation
+     ========================================================================= */
+
+  /* A toolbar is only a row. No background and no border: the groups inside
+     it are the glass (.bar), and the content scrolls under them. */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    min-height: var(--size-control-lg);
+    padding: var(--space-2) max(var(--space-page), var(--safe-right)) var(--space-2)
+      max(var(--space-page), var(--safe-left));
+  }
+
+  .toolbar-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    font: var(--text-headline);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .bar {
+    --_elevation: var(--shadow-2);
+    --concentric-outer: var(--radius-capsule);
+    --concentric-inset: var(--space-2);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    max-width: 100%;
+    padding: var(--space-2);
+    border-radius: var(--radius-capsule);
+  }
+
+  .segmented {
+    display: inline-flex;
+    gap: var(--space-half);
+    padding: var(--space-half);
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-fill-tertiary);
+  }
+
+  .segment {
+    position: relative;
+    flex: 1 1 0;
+    min-width: var(--size-hit);
+    min-height: var(--size-control-sm);
+    margin: 0;
+    padding: 0 var(--space-4);
+    border-radius: var(--radius-capsule);
+    color: var(--color-label);
+    font: var(--text-subheadline);
+    text-align: center;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background-color var(--duration-base) var(--ease-standard),
+      box-shadow var(--duration-base) var(--ease-standard);
+  }
+
+  .segment[aria-selected="true"],
+  .segment[aria-pressed="true"],
+  .segment[aria-checked="true"],
+  .segment.active {
+    background-color: var(--color-bg-elevated-tertiary);
+    box-shadow: var(--shadow-1);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .tab-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .tab-list-horizontal {
+    flex-direction: row;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .tab {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: var(--space-3);
+    min-height: var(--size-hit);
+    margin: 0;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    color: var(--color-label);
+    font: var(--text-body);
+    text-align: start;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color var(--duration-base) var(--ease-standard);
+  }
+
+  .tab svg {
+    flex: none;
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+  }
+
+  @media (hover: hover) {
+    .tab:hover {
+      background-color: var(--color-fill-quaternary);
+    }
+  }
+
+  .tab[aria-selected="true"],
+  .tab.active {
+    background-color: var(--color-fill-secondary);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  /* =========================================================================
+     Status
+     ========================================================================= */
+
+  /* The tones tint the background. The text stays the label color, because
+     green or orange text on a light page is far under 4.5:1. */
+  .badge {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    gap: var(--space-1);
+    min-height: 1.25rem;
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-fill-secondary);
+    color: var(--color-label);
+    font: var(--text-caption-1-emphasized);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .badge-accent {
+    background-color: var(--color-accent-tint);
+  }
+
+  .badge-success {
+    background-color: var(--color-success-tint);
+  }
+
+  .badge-warning {
+    background-color: var(--color-warning-tint);
+  }
+
+  .badge-danger {
+    background-color: var(--color-danger-tint);
+  }
+
+  .badge-count {
+    justify-content: center;
+    min-width: 1.25rem;
+    padding: 0 var(--space-1);
+    background-color: var(--color-danger);
+    color: var(--color-on-accent);
+  }
+
+  .status-dot {
+    display: inline-block;
+    flex: none;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-gray);
+  }
+
+  .status-dot-accent {
+    background-color: var(--color-accent);
+  }
+
+  .status-dot-success {
+    background-color: var(--color-success);
+  }
+
+  .status-dot-warning {
+    background-color: var(--color-warning);
+  }
+
+  .status-dot-danger {
+    background-color: var(--color-danger);
+  }
+
+  .spinner {
+    display: inline-block;
+    flex: none;
+    width: 1.25rem;
+    height: 1.25rem;
+    border: 2px solid var(--color-fill);
+    border-top-color: currentColor;
+    border-radius: var(--radius-capsule);
+    animation: ds-spin 0.8s linear infinite;
+  }
+
+  .spinner-lg {
+    width: 2.5rem;
+    height: 2.5rem;
+    border-width: 3px;
+  }
+
+  /* =========================================================================
+     Motion
+     ========================================================================= */
+
+  @keyframes ds-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  /* Only transform and opacity move. backdrop-filter is never animated. */
+  @keyframes ds-sheet-in {
+    from {
+      opacity: 0;
+      transform: translateY(1.5rem);
+    }
+  }
+
+  @keyframes ds-pop-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+  }
+
+  /* base.css turns every other animation off under Reduce Motion. The
+     spinner keeps turning, slowly, so loading does not look like a hang. */
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation-duration: 2.4s;
+    }
+  }
+
+  /* =========================================================================
+     Progressive enhancement and forced colors
+     ========================================================================= */
+
+  /* Continuous corners where the browser has them (Chrome 139+, Safari 27.3
+     beta). Everyone else keeps plain border-radius. Capsules stay round. */
+  @supports (corner-shape: squircle) {
+    .card,
+    .list-group,
+    .sheet,
+    .alert,
+    .menu,
+    .menu-item,
+    .toast,
+    .input,
+    .select,
+    .tab {
+      corner-shape: squircle;
+    }
+  }
+
+  /* Forced colors (Windows High Contrast) drops backgrounds and shadows, so
+     the shapes need real borders, and the on states need a system color. */
+  @media (forced-colors: active) {
+    .btn,
+    .icon-btn,
+    .video-control-button,
+    .input,
+    .select,
+    .search-field,
+    .card,
+    .list-group,
+    .segmented,
+    .badge,
+    .tooltip {
+      border: 1px solid ButtonText;
+    }
+
+    .switch {
+      forced-color-adjust: none;
+      border: 1px solid ButtonText;
+      background-color: Canvas;
+    }
+
+    .switch::before {
+      top: 1px;
+      left: 1px;
+      background-color: ButtonText;
+      box-shadow: none;
+    }
+
+    .switch[aria-checked="true"] {
+      background-color: Highlight;
+    }
+
+    .switch[aria-checked="true"]::before {
+      background-color: HighlightText;
+    }
+
+    .video-control-button.active,
+    .segment[aria-selected="true"],
+    .segment[aria-pressed="true"],
+    .segment[aria-checked="true"],
+    .segment.active,
+    .tab[aria-selected="true"],
+    .tab.active,
+    .btn[aria-pressed="true"] {
+      forced-color-adjust: none;
+      background-color: Highlight;
+      color: HighlightText;
+    }
+
+    .status-dot {
+      forced-color-adjust: none;
+      background-color: ButtonText;
+    }
+  }
+}

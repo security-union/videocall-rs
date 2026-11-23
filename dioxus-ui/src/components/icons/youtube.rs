@@ -8,7 +8,6 @@ pub fn YoutubeIcon() -> Element {
         svg {
             class: "external-icon",
             view_box: "0 0 30 20",
-            style: "pointer-events: none; display: block; width: 100%; height: 100%;",
             svg {
                 view_box: "0 0 28.6 19.5",
                 xmlns: "http://www.w3.org/2000/svg",

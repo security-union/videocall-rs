@@ -17,7 +17,7 @@ pub fn DigitalOceanIcon() -> Element {
                 height: "65",
                 rx: "5",
                 fill: "url(#paint0_linear)",
-                style: "mix-blend-mode:overlay",
+                class: "brand-overlay",
             }
             // DigitalOcean logo paths
             path {

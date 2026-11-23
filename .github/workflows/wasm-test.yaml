@@ -9,6 +9,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
+      - 'videocall-theme/**'
       - '.github/workflows/wasm-test.yaml'
       - 'default.nix'
       - 'release.nix'
@@ -21,6 +22,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
+      - 'videocall-theme/**'
       - '.github/workflows/wasm-test.yaml'
       - 'default.nix'
       - 'release.nix'
@@ -63,6 +65,10 @@ jobs:
 
       - name: Run tests for neteq
         run: nix-shell default.nix -A shells.wasm-tests --run "cd neteq && cargo test --no-default-features --features web"
+
+      # Native: the tokens.css reader, the class mapping and SSR renders.
+      - name: Run tests for videocall-theme (native)
+        run: nix-shell default.nix -A shells.wasm-tests --run "cargo test -p videocall-theme"
 
       - name: Run dioxus-ui capture polyfill tests (node)
         run: nix-shell default.nix -A shells.wasm-tests --run "node --test dioxus-ui/tests/js/track-processor.test.cjs"

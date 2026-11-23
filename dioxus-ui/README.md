@@ -11,7 +11,7 @@ Dioxus-based frontend for **videocall-rs**, a Rust video calling platform. This 
 | UI Framework | [Dioxus 0.7](https://dioxuslabs.com/) (web target) |
 | Language | Rust, compiled to `wasm32-unknown-unknown` |
 | Build Tool | [Trunk](https://trunkrs.dev/) |
-| Styling | Tailwind CSS + custom CSS |
+| Styling | Plain CSS in cascade layers: the `videocall-theme` design system plus per-screen sheets |
 | Media | WebRTC `getUserMedia`, WebCodecs, MediaStreamTrackProcessor |
 | Transport | WebTransport (primary), WebSocket (fallback) |
 | Audio | NetEq jitter buffer (separate WASM worker) |
@@ -85,7 +85,9 @@ dioxus-ui/
     login_provider_logo.rs       # OAuth provider branding
   index.html           # Trunk entry point with WebCodecs polyfills
   webdriver.json       # Chrome flags for test device simulation
-  static/              # CSS files
+  styles/              # CSS: features/*.css (one per screen) and unsupported-browser.css;
+                       # tokens/base/components come from ../videocall-theme/styles/
+  static/              # capture/track-processor.js (served as-is)
   scripts/             # Runtime config.js, Opus encoder/decoder workers
   assets/              # Audio files, images
 ```
@@ -142,7 +144,6 @@ window.__APP_CONFIG = Object.freeze({
 
 - Rust stable with `wasm32-unknown-unknown` target
 - [Trunk](https://trunkrs.dev/) (`cargo install trunk`)
-- [tailwindcss](https://tailwindcss.com/blog/standalone-cli) standalone CLI
 - [wasm-bindgen-cli](https://rustwasm.github.io/wasm-bindgen/) (`cargo install wasm-bindgen-cli`)
 
 Or use the Nix devShell (includes all tools):
@@ -156,9 +157,6 @@ nix-shell default.nix -A shells.frontend
 ```bash
 cd dioxus-ui
 
-# Generate tailwind CSS (run in background)
-tailwindcss -i ./static/tailwind.css -o ./static/tailwind.css --watch --minify &
-
 # Start the dev server
 trunk serve --address 0.0.0.0 --port 3001
 ```
@@ -169,7 +167,6 @@ The app will be available at `http://localhost:3001`. Edit `scripts/config.js` t
 
 ```bash
 cd dioxus-ui
-tailwindcss -i ./static/tailwind.css -o ./static/tailwind.css --minify
 trunk build --release
 ```
 
@@ -180,6 +177,74 @@ Output goes to `dioxus-ui/dist/`.
 ```bash
 make dev-ui        # trunk watch mode on :3001 (or `make dev` for the whole stack)
 ```
+
+## Styles
+
+The CSS is plain CSS. There is no Tailwind and no preprocessor. Trunk copies the sheets as they are, so what you write is what the browser gets.
+
+The foundation (tokens, base and the shared components) belongs to the [`videocall-theme`](../videocall-theme/README.md) crate, and `index.html` links it from `../videocall-theme/styles/`. This app owns only its feature sheets. Edit the foundation in the theme crate and check it in its gallery (`make theme-gallery`).
+
+The example I give people is a paint shop. The shop mixes the colors once and puts a name on each can. Painters ask for a can by name. Nobody mixes paint on the wall. Here the cans are in `videocall-theme/styles/tokens.css`, and every other sheet asks for them with `var(--name)`.[^paint]
+
+| File | What it holds |
+|---|---|
+| `videocall-theme/styles/tokens.css` | Every value: colors for light, dark and Increase Contrast, the 11 iOS text styles, spacing, radii, z-index, motion, glass. Also the layer order. |
+| `videocall-theme/styles/base.css` | The element reset, page defaults, the focus ring, and a few helpers (text styles, safe areas, `.stack`, `.row`, `.screen-center`). |
+| `videocall-theme/styles/components.css` | The shared controls: `.btn`, `.input`, `.card`, `.list-row`, `.switch`, `.sheet`, `.menu`, `.toast` and the rest. Its header comment lists every class. |
+| `dioxus-ui/styles/features/*.css` | One sheet per screen or feature. Layout only. |
+| `dioxus-ui/styles/unsupported-browser.css` | The one sheet outside the layers: a plain look for the unsupported-browser notice. |
+
+The system colors and the type scale are Apple's (measured on iOS 27.2, same as the HIG tables). Apple publishes no numbers for glass blur, radii, margins or motion, so those are my approximations, and the comments in `tokens.css` say which is which.
+
+### Layer order
+
+The sheets use cascade layers. A later layer beats an earlier one, whatever the selector looks like.
+
+```css
+@layer reset, tokens, base, components, features, overrides;
+```
+
+That line is at the top of `tokens.css`, which is why `tokens.css` is the first stylesheet in `index.html`.
+
+One thing runs backwards: with `!important`, the earliest layer wins. The only `!important` in the new sheets is the Reduce Motion rule in `base.css`, and it is in `reset` for that reason.
+
+### Browser floor
+
+The sheets need two things a browser only got fairly recently. Every rule sits in `@layer` (Chrome 99, Firefox 97, Safari 15.4), and the speaking ring uses `color-mix()` (Chrome 111, Firefox 113, Safari 16.2). A browser that has neither drops the layered rules and shows the app unstyled. So the floor is Chrome or Edge 111, Firefox 113 and Safari 16.2.
+
+`browser_compatibility.rs` already checks for WebCodecs, and now it also asks `CSS.supports("color", "color-mix(in srgb, red, blue)")`. Every engine shipped `color-mix()` after cascade layers, so that one question covers both. If the answer is no, the page shows the same unsupported-browser card it shows for missing WebCodecs.
+
+That card has to be readable in exactly the browser that drops the layers, so `styles/unsupported-browser.css` styles it again outside any layer. The block sits behind `@supports not (color: color-mix(...))`, so a current browser ignores it.
+
+### Light, dark, and the scope classes
+
+Appearance follows the OS. Three classes change it for part of the page:
+
+- `.theme-dark` pins a subtree to the dark tokens. The in-call screen uses it, because video sits on black.
+- `.theme-light` pins a subtree to the light tokens. The theme gallery uses it for its Light switch.
+- `.surface-elevated` switches the backgrounds to the elevated set that iOS uses for sheets and popovers in dark mode. `.sheet`, `.alert` and `.menu` already do this.
+
+One more scope class, `.over-media`, lives in `components.css` because it changes the glass rather than the colors. The glass rules below explain it.
+
+### Glass rules
+
+- Glass goes on the layer that floats over content: bars, sheets, menus, sidebars, floating controls. Cards, rows and video tiles are content, and content is never glass.
+- No glass on glass. A control sitting on a glass surface uses a fill (`--color-fill-*`).
+- Regular glass (`.glass-regular`) is the default. Clear glass (`.glass-clear`) is only for controls over video, with `.media-dim` behind them when the picture is bright.
+- A screen with live video puts `.over-media` on its root (the call does, on `.call-root`). Inside it Clear is the only glass. Every Regular surface, from the sidebars to sheets, alerts, menus and toasts, turns into an opaque elevated fill with no `backdrop-filter`. So the two materials never sit side by side, and the only blur redrawn on every video frame is the one under the Clear controls.
+- Don't animate `backdrop-filter`, and never put `url()` in it. Safari drops the whole filter when it sees one.
+- Safari can't tell a page that Reduce Transparency is on, so Regular glass is frosty enough to read without it.
+
+### Adding a feature sheet
+
+1. Create `styles/features/<feature>.css` and wrap everything in `@layer features { ... }`.
+2. Link it in `index.html` after the three theme sheets: `<link data-trunk rel="css" href="./styles/features/<feature>.css" />`.
+3. Build the screen from the classes in `components.css`. The feature sheet does layout and the few things that are specific to that screen.
+4. Use tokens for every value. No hex or `rgb()` colors, no font names, no `!important`. Brand logos (Google, Okta and friends) keep their own colors.
+
+Some class names are selected by tests (`video-control-button`, `tooltip`, `close-button`, `peer-toast` and others). The header of `components.css` marks them KEEP. Leave those names on the element and add the new classes next to them.
+
+[^paint]: For the nerds: a custom property is worked out on the element that declares it and inherited as a finished value. So a token built from another token (`--color-accent` from `--color-blue`) is declared again on `.theme-dark` and `.theme-light`, or the subtree would keep the page's value. The paint shop would call that mixing a second batch for the dark room.
 
 ## Testing
 

@@ -5,6 +5,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
+      - 'videocall-theme/**'
       - 'monitoring/**'
       - 'neteq/**'
       - 'videocall-client/**'

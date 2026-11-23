@@ -1,0 +1,200 @@
+/*
+ * sidebars.css
+ *
+ * The two sliding panels over the in-call screen: the attendee list on the
+ * left (#peer-list-container) and the diagnostics panel on the right
+ * (#diagnostics-sidebar). The ids and the .visible class are the contract
+ * with the Rust side. The shell is the one glass surface (.glass-regular);
+ * everything inside it is a fill: .card, .list-group, .list-row.
+ *
+ * The panel contents of diagnostics live in diagnostics.css.
+ */
+
+@layer features {
+  /* ---------------------------------------------------------------------
+     Shell
+     --------------------------------------------------------------------- */
+
+  #peer-list-container,
+  #diagnostics-sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: var(--z-sidebar);
+    display: flex;
+    flex-direction: column;
+    width: min(25rem, 100%);
+    padding-top: var(--safe-top);
+    /* Closed: off screen and out of the tab order. The visibility change
+       waits for the slide to finish. */
+    visibility: hidden;
+    transition:
+      transform var(--duration-slow) var(--ease-standard),
+      visibility 0s linear var(--duration-slow);
+  }
+
+  #peer-list-container {
+    left: 0;
+    transform: translateX(-100%);
+  }
+
+  #diagnostics-sidebar {
+    right: 0;
+    width: min(40.625rem, 100%);
+    transform: translateX(100%);
+  }
+
+  #peer-list-container.visible,
+  #diagnostics-sidebar.visible {
+    visibility: visible;
+    transform: none;
+    transition-delay: 0s;
+  }
+
+  /* PeerList renders one wrapper inside the shell. */
+  .sidebar-panel {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  /* ---------------------------------------------------------------------
+     Header (a .toolbar) and its actions
+     --------------------------------------------------------------------- */
+
+  .sidebar-header {
+    flex: none;
+  }
+
+  .header-actions {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+
+  .header-actions .menu {
+    position: absolute;
+    top: calc(100% + var(--space-1));
+    right: 0;
+  }
+
+  /* The close glyph is a text character, so size it like a title. */
+  .sidebar-header .close-button {
+    font: var(--text-title-2);
+  }
+
+  /* ---------------------------------------------------------------------
+     Content: the only part that scrolls
+     --------------------------------------------------------------------- */
+
+  .sidebar-content {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: var(--space-4);
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: var(--space-2) max(var(--space-page), var(--safe-right))
+      calc(var(--space-4) + var(--safe-bottom)) max(var(--space-page), var(--safe-left));
+  }
+
+  /* ---------------------------------------------------------------------
+     Attendee list
+     --------------------------------------------------------------------- */
+
+  .attendants-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .peer-list ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .peer_item {
+    gap: var(--space-3);
+  }
+
+  .peer_item_icon {
+    display: flex;
+    flex: none;
+    align-items: center;
+    color: var(--color-label-secondary);
+  }
+
+  /* The avatar glyph is drawn with a class from the old sheets. */
+  .peer_item_icon svg {
+    width: var(--size-icon);
+    height: var(--size-icon);
+  }
+
+  .peer_item_icon .st0 {
+    fill: currentColor;
+  }
+
+  .peer_item_text {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  /* The name truncates, the "(Host)" / "(You)" badge never shrinks, so a
+     long name cannot push the real badge out of view. */
+  .peer_item_name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .peer_item_text .badge {
+    flex: none;
+  }
+
+  /* Muted shows the slashed icon. Speaking adds a ring and a tinted disc, so
+     the state reads without color. */
+  .peer_item_mic {
+    display: grid;
+    flex: none;
+    place-items: center;
+    width: var(--size-control-sm);
+    height: var(--size-control-sm);
+    border-radius: var(--radius-capsule);
+    color: var(--color-label-secondary);
+    transition:
+      background-color var(--duration-fast) var(--ease-standard),
+      box-shadow var(--duration-fast) var(--ease-standard);
+  }
+
+  .peer_item_mic svg {
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+  }
+
+  .peer_item_mic.speaking {
+    background-color: var(--color-success-tint);
+    box-shadow: 0 0 0 2px var(--color-success);
+    color: var(--color-success);
+  }
+
+  /* ---------------------------------------------------------------------
+     Narrow screens: full-height sheets over everything
+     --------------------------------------------------------------------- */
+
+  @media (max-width: 37.5em) {
+    #peer-list-container,
+    #diagnostics-sidebar {
+      z-index: var(--z-sheet);
+      width: 100%;
+      border-width: 0;
+      border-radius: 0;
+    }
+  }
+}

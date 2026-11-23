@@ -12,8 +12,19 @@
  */
 
 //! Reusable video control button components with SVG icons.
+//!
+//! Each one is a `videocall_theme::ControlButton` with its icon and tooltip.
 
 use dioxus::prelude::*;
+use videocall_theme::{ControlButton, ControlState, Tooltip, TooltipAlign};
+
+fn on_when(on: bool) -> ControlState {
+    if on {
+        ControlState::On
+    } else {
+        ControlState::Off
+    }
+}
 
 // =============================================================================
 // Microphone Button
@@ -21,17 +32,16 @@ use dioxus::prelude::*;
 
 #[component]
 pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = match (enabled, available) {
-        (true, false) => "video-control-button active error",
-        (true, true) => "video-control-button active",
-        (false, false) => "video-control-button error",
-        (false, true) => "video-control-button",
-    };
-
     rsx! {
-        button {
-            class,
-            disabled: !available,
+        ControlButton {
+            // A toggle: the name stays fixed and aria-pressed carries the
+            // state (on = pressed). The tooltip still says what a click does.
+            // The mic is the first button in the bar, so its tooltip lines up
+            // with the button's left edge instead of hanging off the screen.
+            label: "Microphone",
+            state: on_when(enabled),
+            pressed: enabled,
+            unavailable: !available,
             onclick: move |evt| onclick.call(evt),
             if enabled {
                 svg {
@@ -46,7 +56,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     path { d: "M19 10v2a7 7 0 0 1-14 0v-2" }
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
                 }
-                span { class: "tooltip", "Mute" }
+                Tooltip { align: TooltipAlign::Start, "Mute" }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -61,10 +71,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
                 }
-                span { class: "tooltip", "Unmute" }
-            }
-            if !available {
-                span { class: "device-warning", "!" }
+                Tooltip { align: TooltipAlign::Start, "Unmute" }
             }
         }
     }
@@ -76,17 +83,12 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
 
 #[component]
 pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = match (enabled, available) {
-        (true, false) => "video-control-button active error",
-        (true, true) => "video-control-button active",
-        (false, false) => "video-control-button error",
-        (false, true) => "video-control-button",
-    };
-
     rsx! {
-        button {
-            class,
-            disabled: !available,
+        ControlButton {
+            label: "Camera",
+            state: on_when(enabled),
+            pressed: enabled,
+            unavailable: !available,
             onclick: move |evt| onclick.call(evt),
             if enabled {
                 svg {
@@ -100,7 +102,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     polygon { points: "23 7 16 12 23 17 23 7" }
                     rect { x: "1", y: "5", width: "15", height: "14", rx: "2", ry: "2" }
                 }
-                span { class: "tooltip", "Stop Video" }
+                Tooltip { "Stop Video" }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -113,10 +115,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
-                span { class: "tooltip", "Start Video" }
-            }
-            if !available {
-                span { class: "device-warning", "!" }
+                Tooltip { "Start Video" }
             }
         }
     }
@@ -132,22 +131,14 @@ pub fn ScreenShareButton(
     disabled: bool,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
-    let class = match (active, disabled) {
-        (true, true) => "video-control-button active disabled",
-        (true, false) => "video-control-button active",
-        (false, true) => "video-control-button disabled",
-        (false, false) => "video-control-button",
-    };
-
     rsx! {
-        button {
-            class,
+        ControlButton {
+            label: "Share screen",
+            state: on_when(active),
+            pressed: active,
+            // Also swallows clicks while disabled.
             disabled,
-            onclick: move |evt| {
-                if !disabled {
-                    onclick.call(evt);
-                }
-            },
+            onclick: move |evt| onclick.call(evt),
             if active {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -161,7 +152,7 @@ pub fn ScreenShareButton(
                     line { x1: "8", y1: "21", x2: "16", y2: "21" }
                     line { x1: "12", y1: "17", x2: "12", y2: "21" }
                 }
-                span { class: "tooltip", "Stop Screen Share" }
+                Tooltip { "Stop Screen Share" }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -176,7 +167,7 @@ pub fn ScreenShareButton(
                     polyline { points: "16 7 20 7 20 3" }
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
-                span { class: "tooltip", "Share Screen" }
+                Tooltip { "Share Screen" }
             }
         }
     }
@@ -188,14 +179,9 @@ pub fn ScreenShareButton(
 
 #[component]
 pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = if open {
-        "video-control-button active"
-    } else {
-        "video-control-button"
-    };
-
+    // No label: the tooltip text names it.
     rsx! {
-        button { class, onclick: move |evt| onclick.call(evt),
+        ControlButton { state: on_when(open), onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -210,7 +196,7 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
                     path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
                 }
-                span { class: "tooltip", "Close Peers" }
+                Tooltip { "Close Peers" }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -226,7 +212,7 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
-                span { class: "tooltip", "Open Peers" }
+                Tooltip { "Open Peers" }
             }
         }
     }
@@ -238,14 +224,9 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
 
 #[component]
 pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = if open {
-        "video-control-button active"
-    } else {
-        "video-control-button"
-    };
-
+    // No label: the tooltip text names it.
     rsx! {
-        button { class, onclick: move |evt| onclick.call(evt),
+        ControlButton { state: on_when(open), onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -258,7 +239,7 @@ pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Eleme
                     path { d: "M2 12h2l3.5-7L12 19l2.5-5H20" }
                     line { x1: "3", y1: "3", x2: "21", y2: "21" }
                 }
-                span { class: "tooltip", "Close Diagnostics" }
+                Tooltip { "Close Diagnostics" }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -270,7 +251,7 @@ pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Eleme
                     stroke_linejoin: "round",
                     path { d: "M2 12h2l3.5-7L12 19l2.5-5H20" }
                 }
-                span { class: "tooltip", "Open Diagnostics" }
+                Tooltip { "Open Diagnostics" }
             }
         }
     }
@@ -282,12 +263,6 @@ pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Eleme
 
 #[component]
 pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = if open {
-        "video-control-button active"
-    } else {
-        "video-control-button"
-    };
-
     let tooltip = if open {
         "Close Settings"
     } else {
@@ -295,8 +270,8 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
     };
 
     rsx! {
-        button {
-            class,
+        ControlButton {
+            state: on_when(open),
             "data-testid": "open-settings",
             onclick: move |evt| onclick.call(evt),
 
@@ -312,7 +287,7 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
                 path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
             }
 
-            span { class: "tooltip", "{tooltip}" }
+            Tooltip { "{tooltip}" }
         }
     }
 }
@@ -326,11 +301,10 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
 #[component]
 pub fn BabyModeButton(onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
-        button {
+        ControlButton {
+            label: "Lock controls (baby mode)",
             id: "baby-mode-button",
-            class: "video-control-button",
             "data-testid": "baby-mode-button",
-            "aria-label": "Lock controls (baby mode)",
             onclick: move |evt| onclick.call(evt),
             svg {
                 xmlns: "http://www.w3.org/2000/svg",
@@ -345,7 +319,7 @@ pub fn BabyModeButton(onclick: EventHandler<MouseEvent>) -> Element {
                 path { d: "M10 16c.5.3 1.2.5 2 .5s1.5-.2 2-.5" }
                 path { d: "M19 6.3a9 9 0 0 1 1.8 3.9 2 2 0 0 1 0 3.6 9 9 0 0 1-17.6 0 2 2 0 0 1 0-3.6A9 9 0 0 1 12 3c2 0 3.5 1.1 3.5 2.5s-.9 2.5-2 2.5c-.8 0-1.5-.4-1.5-1" }
             }
-            span { class: "tooltip", "Lock controls (baby mode)" }
+            Tooltip { "Lock controls (baby mode)" }
         }
     }
 }
@@ -357,10 +331,12 @@ pub fn BabyModeButton(onclick: EventHandler<MouseEvent>) -> Element {
 #[component]
 pub fn HangUpButton(onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
-        button {
-            class: "video-control-button danger",
+        // No label: the tooltip text names it, and tests find it by that text.
+        ControlButton {
+            state: ControlState::Danger,
             onclick: move |evt| onclick.call(evt),
-            span { class: "tooltip", "Hang Up" }
+            // Last in the bar: the tooltip lines up with the right edge.
+            Tooltip { align: TooltipAlign::End, "Hang Up" }
             svg {
                 xmlns: "http://www.w3.org/2000/svg",
                 width: "24",

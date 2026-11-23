@@ -8,6 +8,10 @@ use crate::constants::meeting_api_client;
 use crate::routing::Route;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::{ListMeetingsResponse, MeetingSummary};
+use videocall_theme::{
+    Badge, BadgeTone, Button, ButtonSize, IconButton, IconButtonSize, ListGroup, ListRow,
+    ListRowLabel, Spinner,
+};
 
 enum FetchMeetingsError {
     Unauthenticated,
@@ -80,10 +84,10 @@ pub fn MeetingsList(
 
     rsx! {
         div { class: "meetings-list-container",
-            button {
+            ListRow {
                 class: "meetings-list-toggle",
                 onclick: toggle_expanded,
-                r#type: "button",
+                aria_expanded: expanded(),
                 svg {
                     class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
                     xmlns: "http://www.w3.org/2000/svg",
@@ -97,31 +101,31 @@ pub fn MeetingsList(
                     stroke_linejoin: "round",
                     polyline { points: "6 9 12 15 18 9" }
                 }
-                span { "My Meetings" }
-                span { class: "meeting-count", "({total()})" }
+                ListRowLabel { "My Meetings" }
+                Badge { "aria-label": "{total()} meetings", "{total()}" }
             }
 
             if expanded() {
                 div { class: "meetings-list-content",
                     if loading() {
-                        div { class: "meetings-loading",
-                            span { class: "loading-spinner" }
+                        div { class: "meetings-loading text-footnote text-secondary",
+                            Spinner {}
                             "Loading meetings..."
                         }
                     } else if unauthenticated() {
                         div { class: "meetings-auth-prompt",
-                            p { class: "meetings-auth-text", "Sign in to see your meetings" }
+                            p { class: "text-subheadline text-secondary", "Sign in to see your meetings" }
                             ProviderButton { onclick: move |_| do_login() }
                         }
                     } else if let Some(err) = error() {
-                        div { class: "meetings-error",
+                        div { class: "meetings-error text-footnote text-danger",
                             span { "Error: {err}" }
-                            button { onclick: refresh, class: "retry-btn", "Retry" }
+                            Button { size: ButtonSize::Small, onclick: refresh, "Retry" }
                         }
                     } else if meetings().is_empty() {
-                        div { class: "meetings-empty", "No meetings yet" }
+                        div { class: "meetings-empty text-footnote text-secondary", "No meetings yet" }
                     } else {
-                        ul { class: "meetings-list",
+                        ListGroup { list: true, class: "meetings-list",
                             for meeting in meetings().iter() {
                                 MeetingItem {
                                     key: "{meeting.meeting_id}",
@@ -167,10 +171,10 @@ fn MeetingItem(
     let nav = use_navigator();
     let is_active = meeting.state == "active";
     let is_ended = meeting.state == "ended";
-    let state_class = match meeting.state.as_str() {
-        "active" => "state-active",
-        "idle" => "state-idle",
-        _ => "state-ended",
+    let state_tone = match meeting.state.as_str() {
+        "active" => BadgeTone::Success,
+        "idle" => BadgeTone::Warning,
+        _ => BadgeTone::Neutral,
     };
 
     let duration_ms = meeting
@@ -215,13 +219,13 @@ fn MeetingItem(
     };
 
     rsx! {
-        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" }, style: "flex-wrap: wrap;",
+        ListRow { list_item: true, class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" },
             div { class: "meeting-item-content", onclick: on_click,
                 div { class: "meeting-info",
-                    span { class: "meeting-id", "{meeting.meeting_id}" }
-                    span { class: "meeting-state {state_class}", "{meeting.state}" }
+                    span { class: "meeting-id text-headline", "{meeting.meeting_id}" }
+                    Badge { tone: state_tone, "{meeting.state}" }
                 }
-                div { class: "meeting-details",
+                div { class: "meeting-details text-footnote text-secondary",
                     if is_active {
                         span { class: "meeting-participants", title: "Participants in meeting",
                             svg {
@@ -297,8 +301,9 @@ fn MeetingItem(
                     }
                 }
             }
-            button {
-                class: "meeting-edit-btn",
+            IconButton {
+                label: "Meeting settings",
+                size: IconButtonSize::Small,
                 onclick: on_edit_click,
                 title: "Meeting settings",
                 svg {
@@ -309,8 +314,10 @@ fn MeetingItem(
                     path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
                 }
             }
-            button {
-                class: if is_ended { "meeting-delete-btn meeting-delete-btn-ended" } else { "meeting-delete-btn" },
+            IconButton {
+                label: "Delete meeting",
+                size: IconButtonSize::Small,
+                class: "meeting-delete-btn",
                 onclick: on_delete_click,
                 title: "Delete meeting",
                 svg {

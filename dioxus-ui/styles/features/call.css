@@ -1,0 +1,942 @@
+/*
+ * call.css
+ *
+ * The in-call screen: pre-join panel, video grid, tiles, self-view, the
+ * floating control bar, toasts and the in-call dialogs. Lays out the
+ * primitives from components.css; it does not restyle them.
+ *
+ * The screen is pinned dark (.theme-dark on .call-root and the pre-join
+ * .meeting-page), because video sits on black.
+ *
+ * .call-root also carries .over-media (components.css, glass rule 3). Clear
+ * is the only glass on this screen: the control bar and the top bar, with
+ * the 35% dim behind the bar. Every Regular
+ * surface in the call (the attendee and diagnostics panels, host controls,
+ * sheets, alerts, menus, toasts) resolves to an opaque elevated fill with no
+ * backdrop-filter, so nothing but the Clear controls re-blurs the video.
+ * Tiles, name labels, mic badges, the pin/crop buttons and the rename button
+ * on the self-view are content: they use a dim fill. The toasts keep
+ * .toast-solid by name.
+ *
+ * Stacking inside .meeting-page (z tokens, ordered with calc):
+ *   tiles                     auto / --z-base (full-bleed)
+ *   pinned tile               --z-sticky
+ *   bottom dim                --z-sticky + 1
+ *   self-view (holds the bar) --z-sticky + 2
+ *   sidebars, scrims, toasts  their own tokens
+ *
+ * Speaking indicator contract (canvas_generator.rs, host.rs):
+ *   .glow-overlay and .audio-indicator get the class .speaking while the
+ *   peer speaks and an inline style "--speak-level: 0.00" .. "1.00". The
+ *   border, glow and timing below read only those two things.
+ */
+
+@layer features {
+  /* =========================================================================
+     Root
+     ========================================================================= */
+
+  .meeting-page {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background-color: var(--color-bg);
+    color: var(--color-label);
+  }
+
+  /* =========================================================================
+     Pre-join
+     ========================================================================= */
+
+  .join-screen {
+    z-index: var(--z-content);
+  }
+
+  .join-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-4);
+    width: min(100%, 28rem);
+  }
+
+  .join-intro {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+  }
+
+  .join-option {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    min-height: var(--size-hit);
+  }
+
+  .join-panel .toggle-error {
+    font: var(--text-footnote);
+    color: var(--color-danger);
+  }
+
+  .join-button {
+    margin-top: var(--space-2);
+    min-width: 12rem;
+  }
+
+  /* =========================================================================
+     Grid
+     ========================================================================= */
+
+  /* Rust passes the computed column and row counts. */
+  .call-grid {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    grid-template-columns: repeat(var(--grid-cols, 1), 1fr);
+    grid-template-rows: repeat(var(--grid-rows, 1), 1fr);
+    gap: var(--space-2);
+    justify-items: stretch;
+    align-items: stretch;
+    overflow: hidden;
+    padding: max(var(--space-4), var(--safe-top))
+      max(var(--space-4), var(--safe-right))
+      max(var(--space-4), var(--safe-bottom))
+      max(var(--space-4), var(--safe-left));
+  }
+
+  /* Screen share: the shared screen takes 2/3, the peer tiles stack in 1/3. */
+  .call-grid-split {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .call-split-main {
+    display: flex;
+    flex: 2 1 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .call-split-side {
+    display: flex;
+    flex: 1 1 0;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+    height: 100%;
+    overflow-y: auto;
+  }
+
+  @media (max-width: 37.49em) {
+    .call-grid {
+      padding: max(var(--space-2), var(--safe-top))
+        max(var(--space-2), var(--safe-right))
+        max(var(--space-2), var(--safe-bottom))
+        max(var(--space-2), var(--safe-left));
+    }
+  }
+
+  /* =========================================================================
+     Tiles (content: never glass)
+     ========================================================================= */
+
+  .grid-item,
+  .split-peer-tile {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    border: 1px solid var(--color-separator);
+    border-radius: var(--radius-md);
+    background-color: var(--color-bg-secondary);
+  }
+
+  .split-peer-tile {
+    flex: 1 1 0;
+    height: auto;
+  }
+
+  .split-screen-tile {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    border-radius: var(--radius-md);
+  }
+
+  /* Screen-share tile waiting for its first frame. */
+  .grid-item.hidden {
+    display: none;
+  }
+
+  .grid-item.full-bleed {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-base);
+    border-width: 0;
+    border-radius: 0;
+    background-color: var(--color-bg);
+  }
+
+  /* Toggled from Rust (toggle_pinned_div). After .full-bleed on purpose. */
+  :is(.grid-item, .split-peer-tile).grid-item-pinned {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-sticky);
+    width: 100%;
+    height: 100%;
+    border-width: 0;
+    border-radius: 0;
+    background-color: var(--color-bg);
+  }
+
+  .grid-item-pinned .canvas-container {
+    width: min(100%, calc(100vh * 16 / 9));
+    height: min(100%, calc(100vw * 9 / 16));
+  }
+
+  .canvas-container {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+  }
+
+  .canvas-container canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  /* Toggled from Rust (toggle_canvas_crop). */
+  .canvas-container canvas.cropped {
+    object-fit: cover;
+  }
+
+  .canvas-container canvas.uncropped {
+    object-fit: contain;
+  }
+
+  .placeholder-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    color: var(--color-label-secondary);
+  }
+
+  .placeholder-content svg {
+    width: var(--size-icon-lg);
+    height: var(--size-icon-lg);
+  }
+
+  .placeholder-text {
+    font: var(--text-callout);
+    color: var(--color-label-secondary);
+  }
+
+  /* Name label: a dim fill for legibility over video, not glass. The name
+     sits in .floating-name-text and truncates there, so a long name never
+     pushes the host badge out of view. */
+  .floating-name {
+    position: absolute;
+    top: var(--space-2);
+    inset-inline-start: var(--space-2);
+    z-index: var(--z-content);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    max-width: 55%;
+    margin: 0;
+    padding: var(--space-1) var(--space-2);
+    overflow: hidden;
+    border-radius: var(--radius-xs);
+    background-color: var(--material-dim);
+    color: var(--color-label);
+    font: var(--text-footnote-emphasized);
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  .floating-name-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* The "(Host)" label is text in a badge, so it does not rest on color.
+     It never shrinks; the name gives way first. */
+  .floating-name .host-indicator {
+    flex: none;
+  }
+
+  /* A right-to-left name anchors to the other corner, as the old
+     .floating-name[dir="rtl"] rule did. inset-inline-start above does that
+     on its own: the label has dir="auto", so a Hebrew or Arabic name makes
+     the element RTL and its inline start is the right edge. */
+
+  /* ---- Mic badge and speaking glow ---- */
+
+  .audio-indicator,
+  .glow-overlay {
+    /* Attack follows the voice. Release is slow so the glow does not flicker
+       between words. Approximations of the old 0.15s / 1.5s / 5s timing. */
+    --speak-attack: var(--duration-fast);
+    --speak-release: var(--duration-release);
+    --speak-hold-release: var(--duration-release-long);
+  }
+
+  .audio-indicator {
+    position: absolute;
+    top: var(--space-2);
+    right: var(--space-2);
+    z-index: var(--z-content);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--size-control-sm);
+    height: var(--size-control-sm);
+    border-radius: var(--radius-capsule);
+    background-color: var(--material-dim);
+    color: var(--color-label);
+    filter: none;
+    transition:
+      color var(--speak-hold-release) var(--ease-standard),
+      filter var(--speak-release) var(--ease-standard);
+  }
+
+  /* The muted icon has a slash, so mute is a shape, not a color. */
+  .audio-indicator svg {
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+    stroke: currentColor;
+  }
+
+  /* Green while speaking (the class follows the level held 1 s after
+     silence). The glow follows the raw level and is gated to zero at
+     --speak-level 0. */
+  .audio-indicator.speaking {
+    color: var(--color-green);
+    filter: drop-shadow(
+      0 0 calc(var(--space-1) + var(--space-3) * var(--speak-level, 0))
+        color-mix(
+          in srgb,
+          var(--color-green)
+            calc(min(1, var(--speak-level, 0) * 100) * (60% + 40% * var(--speak-level, 0))),
+          transparent
+        )
+    );
+    transition:
+      color var(--speak-attack) var(--ease-standard),
+      filter var(--speak-attack) var(--ease-standard);
+  }
+
+  /* Sits over the video so the inset glow is not hidden by the canvas. */
+  .glow-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: var(--z-content);
+    border: 2px solid transparent;
+    border-radius: inherit;
+    box-shadow: inset 0 0 0 0 transparent;
+    pointer-events: none;
+    transition:
+      border-color var(--speak-release) var(--ease-standard),
+      box-shadow var(--speak-release) var(--ease-standard);
+  }
+
+  .glow-overlay.speaking {
+    border-color: color-mix(
+      in srgb,
+      var(--color-green) calc(40% + 60% * var(--speak-level, 0)),
+      transparent
+    );
+    box-shadow: inset 0 0 calc(var(--space-3) + var(--space-5) * var(--speak-level, 0))
+      calc(var(--space-1) + var(--space-2) * var(--speak-level, 0))
+      color-mix(
+        in srgb,
+        var(--color-green) calc(25% + 40% * var(--speak-level, 0)),
+        transparent
+      );
+    transition:
+      border-color var(--speak-attack) var(--ease-standard),
+      box-shadow var(--speak-attack) var(--ease-standard);
+  }
+
+  /* Reduce Motion: a steady ring instead of a glow that pulses with the
+     voice. base.css already drops the transitions. */
+  @media (prefers-reduced-motion: reduce) {
+    .glow-overlay.speaking {
+      border-color: var(--color-green);
+      box-shadow: inset 0 0 0 0 transparent;
+    }
+
+    .audio-indicator.speaking {
+      filter: none;
+    }
+  }
+
+  /* ---- Pin and crop buttons (content, so a dim fill, not glass) ---- */
+
+  .tile-action {
+    --btn-bg: var(--material-dim);
+    --btn-fg: var(--color-label);
+    position: absolute;
+    top: var(--space-2);
+    z-index: var(--z-content);
+    /* Split-layout tiles never showed these; grid tiles opt in below. */
+    visibility: hidden;
+    opacity: 0;
+    transition:
+      opacity var(--duration-base) var(--ease-standard),
+      transform var(--duration-fast) var(--ease-standard);
+  }
+
+  /* One row from the right edge: mic badge, pin, crop. 12px gaps keep the
+     44px hit areas from overlapping. */
+  .pin-icon {
+    right: calc(var(--space-2) + var(--size-control-sm) + var(--space-3));
+  }
+
+  .crop-icon {
+    right: calc(var(--space-2) + 2 * (var(--size-control-sm) + var(--space-3)));
+  }
+
+  .grid-item .tile-action {
+    visibility: visible;
+  }
+
+  @media (hover: hover) {
+    .grid-item .canvas-container:hover > .tile-action {
+      opacity: 1;
+    }
+  }
+
+  /* Keyboard users see them when one takes focus. */
+  .grid-item .canvas-container:focus-within > .tile-action {
+    opacity: 1;
+  }
+
+  /* Touch tablets have no hover: show them. */
+  @media (hover: none) {
+    .grid-item .tile-action {
+      opacity: 1;
+    }
+  }
+
+  /* Phones tap the tile to pin instead. */
+  @media (max-width: 767.98px) {
+    .tile-action {
+      display: none;
+    }
+  }
+
+  .baby-mode-active .tile-action {
+    display: none;
+  }
+
+  /* =========================================================================
+     Self-view (bottom right). Content: a solid tile, not glass.
+     ========================================================================= */
+
+  .self-view {
+    position: absolute;
+    right: max(var(--space-4), var(--safe-right));
+    bottom: max(var(--space-4), var(--safe-bottom));
+    z-index: calc(var(--z-sticky) + 2);
+    display: flex;
+    flex-direction: column;
+    width: clamp(10rem, 18vw, 15rem);
+    overflow: hidden;
+    border: 1px solid var(--color-separator);
+    border-radius: var(--radius-md);
+    background-color: var(--color-bg-secondary);
+    box-shadow: var(--shadow-2);
+  }
+
+  /* On phones the bar spans the bottom, so the self-view sits above it. */
+  @media (max-width: 37.49em) {
+    .self-view {
+      right: max(var(--space-2), var(--safe-right));
+      bottom: calc(max(var(--space-4), var(--safe-bottom)) + var(--space-16) + var(--space-3));
+      width: 30vw;
+    }
+
+    /* 30vw is about 117px on a 390px phone; the default padding would push
+       "Camera Off" under the rename button. */
+    .self-view .self-view-placeholder {
+      padding: var(--space-2);
+    }
+  }
+
+  .host-video-wrapper {
+    position: relative;
+    flex: none;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+  }
+
+  /* Camera off: the <video> stays mounted (the encoder holds a reference to
+     it) and only collapses. */
+  .host-video-wrapper.is-collapsed {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    aspect-ratio: auto;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .self-camera {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background-color: var(--color-black);
+  }
+
+  .screen-share-preview {
+    display: block;
+    flex: none;
+    width: 100%;
+    max-height: 11.25rem;
+    border-top: 1px solid var(--color-separator);
+    background-color: var(--color-black);
+    object-fit: contain;
+    pointer-events: none;
+  }
+
+  .screen-share-preview.is-hidden {
+    display: none;
+  }
+
+  .self-view-placeholder {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    padding: var(--space-4);
+  }
+
+  .self-view .placeholder-content {
+    gap: var(--space-1);
+  }
+
+  .self-view .placeholder-content svg {
+    width: var(--size-icon);
+    height: var(--size-icon);
+  }
+
+  .self-view .placeholder-text {
+    font: var(--text-footnote);
+  }
+
+  /* Over the self-view picture, above the glow overlay. It sits on the
+     camera all the time, so it is content with the pin/crop dim fill, not
+     Clear glass. */
+  .change-name-fab {
+    --btn-bg: var(--material-dim);
+    --btn-fg: var(--color-label);
+    position: absolute;
+    top: var(--space-1);
+    left: var(--space-1);
+    z-index: calc(var(--z-content) + 1);
+  }
+
+  /* The bar's settings button replaced this one; it was never shown. */
+  .device-settings-menu-button {
+    position: absolute;
+    bottom: var(--space-2);
+    left: var(--space-2);
+    visibility: hidden;
+  }
+
+  /* Connected is a filled dot, connecting a pulsing ring: the state is a
+     shape, not only green versus orange. */
+  .connection-led {
+    position: absolute;
+    top: var(--space-2);
+    right: var(--space-2);
+    z-index: calc(var(--z-content) + 1);
+    box-shadow: 0 0 0 2px var(--material-dim);
+  }
+
+  .connection-led.connecting {
+    background-color: transparent;
+    box-shadow:
+      inset 0 0 0 2px var(--color-warning),
+      0 0 0 2px var(--material-dim);
+    animation: call-led-pulse var(--duration-pulse) var(--ease-standard) infinite;
+  }
+
+  @keyframes call-led-pulse {
+    50% {
+      opacity: 0.5;
+    }
+  }
+
+  /* =========================================================================
+     Control bar (floats over live video: Clear glass)
+     ========================================================================= */
+
+  /* The 35% dim behind the bar, across the bottom of the screen. */
+  .call-controls-dim {
+    position: fixed;
+    z-index: calc(var(--z-sticky) + 1);
+  }
+
+  /* The buttons inside the bar become fills (no glass on glass, in
+     components.css). Hang Up keeps its red; on/off states invert and swap
+     the icon. */
+  .call-controls {
+    position: fixed;
+    bottom: max(var(--space-4), var(--safe-bottom));
+    left: 50%;
+    z-index: var(--z-bar);
+    gap: var(--space-3);
+    max-width: calc(100vw - 2 * var(--space-2));
+    transform: translateX(-50%);
+  }
+
+  /* Narrow phones: tighter gaps rather than squeezed 44px buttons.
+     7 x 44px + 6 x 4px gaps + 2 x 4px padding + 2px border = 342px.
+     With screen share (8 buttons, desktop browsers in a narrow window) the
+     gaps go: 8 x 44px + 10px = 362px, which keeps Hang Up on screen at
+     390px. */
+  @media (max-width: 32.49em) {
+    .call-controls {
+      gap: var(--space-1);
+      padding: var(--space-1);
+    }
+
+    .call-controls:has(> :nth-child(8)) {
+      gap: 0;
+    }
+  }
+
+  /* Below 376px even that does not fit, so the bar scrolls sideways.
+     Scrolling clips the tooltips above the buttons (overflow-x: auto makes
+     overflow-y clip too), which is why it only starts here and not at the
+     breakpoint above. */
+  @media (max-width: 23.49em) {
+    .call-controls {
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .call-controls::-webkit-scrollbar {
+      display: none;
+    }
+  }
+
+  /* =========================================================================
+     Top bar (top_bar.rs)
+     ========================================================================= */
+
+  .call-top-bar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    left: 0;
+    z-index: var(--z-bar);
+    padding-top: max(var(--space-2), var(--safe-top));
+    /* The row itself lets taps through to the video; its groups do not. */
+    pointer-events: none;
+  }
+
+  .call-top-bar > * {
+    pointer-events: auto;
+  }
+
+  .call-top-bar-links {
+    gap: var(--space-1);
+  }
+
+  .call-top-bar-link {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    min-width: var(--size-hit);
+    min-height: var(--size-hit);
+    border-radius: var(--radius-capsule);
+    color: var(--color-label);
+  }
+
+  .call-top-bar-link svg {
+    width: var(--size-icon);
+    height: var(--size-icon);
+  }
+
+  .call-top-bar-link-wide svg {
+    width: calc(var(--size-icon) * 3);
+  }
+
+  .call-top-bar-badge {
+    display: block;
+    width: auto;
+    height: var(--size-icon-sm);
+  }
+
+  .call-top-bar-credit {
+    min-width: 0;
+    padding: var(--space-2) var(--space-4);
+    overflow: hidden;
+    color: var(--color-label-secondary);
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  @media (max-width: 37.49em) {
+    .call-top-bar {
+      display: none;
+    }
+  }
+
+  /* =========================================================================
+     Join / leave toasts (.peer-toasts is a .toast-region, .peer-toast a
+     .toast; the old names stay because tests select them)
+     ========================================================================= */
+
+  .peer-toast {
+    /* Matches the 8_000 ms Timeout that removes the toast in attendants.rs.
+       The exit fade ends as the element goes away. */
+    --toast-lifetime: 8s;
+    width: 100%;
+    animation:
+      ds-pop-in var(--duration-base) var(--ease-enter),
+      call-toast-out var(--duration-slow) var(--ease-exit)
+        calc(var(--toast-lifetime) - var(--duration-slow)) forwards;
+  }
+
+  /* Under Reduce Motion, base.css cuts both animations to a jump but keeps
+     the delay, so the toast appears at once and disappears at the end of
+     its life without sliding. */
+
+  @keyframes call-toast-out {
+    to {
+      opacity: 0;
+      transform: translateY(calc(-1 * var(--space-2)));
+    }
+  }
+
+  .peer-toast .toast-icon {
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: var(--size-control-sm);
+    height: var(--size-control-sm);
+    border-radius: var(--radius-xs);
+  }
+
+  .peer-toast .toast-icon svg {
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+    color: inherit;
+  }
+
+  /* Joined and left differ by icon (person-plus, person-minus) and by text,
+     not only by color. */
+  .peer-toast.toast-joined .toast-icon {
+    background-color: var(--color-success-tint);
+    color: var(--color-success);
+  }
+
+  .peer-toast.toast-left .toast-icon {
+    background-color: var(--color-fill-secondary);
+    color: var(--color-label-secondary);
+  }
+
+  .peer-toast .toast-text {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .peer-toast .toast-name {
+    font: var(--text-subheadline-emphasized);
+    color: var(--color-label);
+  }
+
+  .peer-toast .toast-action {
+    color: var(--color-label-secondary);
+  }
+
+  .peer-toast.toast-joined .toast-action {
+    color: var(--color-success);
+  }
+
+  /* =========================================================================
+     Invite card (no peers yet). Content, so a .card.
+     ========================================================================= */
+
+  .invite-card {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    z-index: var(--z-base);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    width: min(26.25rem, calc(100% - 2 * var(--space-4)));
+    transform: translate(-50%, -50%);
+    text-align: center;
+  }
+
+  .invite-link-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .invite-link-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    text-overflow: ellipsis;
+  }
+
+  .copy-button {
+    flex: none;
+    overflow: visible;
+  }
+
+  .btn-pop-animate {
+    animation: call-btn-pop var(--duration-base) var(--ease-enter);
+  }
+
+  @keyframes call-btn-pop {
+    0% {
+      transform: scale(0.94);
+    }
+
+    60% {
+      transform: scale(1.03);
+    }
+  }
+
+  /* "Link copied" floats under the card. It stays in the accessibility tree
+     (only opacity changes), as before. */
+  .copy-toast {
+    position: absolute;
+    top: calc(100% + var(--space-3));
+    left: 50%;
+    white-space: nowrap;
+    opacity: 0;
+    transform: translate(-50%, calc(-1 * var(--space-2)));
+    pointer-events: none;
+    transition:
+      opacity var(--duration-base) var(--ease-standard),
+      transform var(--duration-base) var(--ease-standard);
+  }
+
+  .copy-toast.copy-toast--visible {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+
+  /* Decorative burst on the Copy button. */
+  .sparkles {
+    position: absolute;
+    top: calc(-1 * var(--space-3));
+    right: calc(-1 * var(--space-3));
+    width: 0;
+    height: 0;
+    pointer-events: none;
+  }
+
+  .sparkle {
+    --sparkle-step: calc(var(--duration-fast) / 6);
+    position: absolute;
+    width: var(--space-2);
+    height: var(--space-2);
+    border-radius: var(--radius-capsule);
+    background-image: radial-gradient(circle, var(--color-yellow) 10%, transparent 70%);
+    mix-blend-mode: screen;
+    animation: call-sparkle-burst var(--duration-burst) var(--ease-enter) both;
+  }
+
+  .sparkle:nth-child(2) { animation-delay: calc(var(--sparkle-step) * 1); }
+  .sparkle:nth-child(3) { animation-delay: calc(var(--sparkle-step) * 2); }
+  .sparkle:nth-child(4) { animation-delay: calc(var(--sparkle-step) * 3); }
+  .sparkle:nth-child(5) { animation-delay: calc(var(--sparkle-step) * 4); }
+  .sparkle:nth-child(6) { animation-delay: calc(var(--sparkle-step) * 5); }
+  .sparkle:nth-child(7) { animation-delay: calc(var(--sparkle-step) * 6); }
+  .sparkle:nth-child(8) { animation-delay: calc(var(--sparkle-step) * 7); }
+
+  @keyframes call-sparkle-burst {
+    0% {
+      opacity: 0;
+      transform: translate(0, 0) scale(0.6);
+    }
+
+    40% {
+      opacity: 1;
+    }
+
+    100% {
+      opacity: 0;
+      transform: translate(var(--space-5), calc(-1 * var(--space-6))) scale(1.08);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sparkles {
+      display: none;
+    }
+  }
+
+  /* =========================================================================
+     Dialogs (.scrim + .alert)
+     ========================================================================= */
+
+  .alert .alert-field {
+    margin-top: var(--space-2);
+  }
+
+  /* The app ends the meeting, so this notice goes above toasts (which carry
+     names other people chose) and the phone-width sidebar sheets. */
+  .meeting-ended-overlay {
+    z-index: var(--z-system);
+  }
+
+  .meeting-ended-alert {
+    align-items: center;
+    text-align: center;
+  }
+
+  /* The X in a circle carries the meaning; red only adds to it. */
+  .meeting-ended-icon {
+    width: var(--size-icon-lg);
+    height: var(--size-icon-lg);
+    color: var(--color-danger);
+  }
+
+  .meeting-ended-alert .alert-actions {
+    align-self: stretch;
+  }
+}

@@ -1,15 +1,35 @@
 <!DOCTYPE html>
-<html class="dark">
+<html lang="en">
     <head>
         <meta charset="utf-8" />
         <title>videocall.rs (Dioxus)</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <meta name="color-scheme" content="light dark">
+        <!-- Matches --color-bg in videocall-theme/styles/tokens.css. A meta tag cannot read a CSS variable. -->
+        <meta name="theme-color" media="(prefers-color-scheme: light)" content="#FFFFFF">
+        <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000">
         <link data-trunk rel="copy-dir" href="./assets" />
         <link data-trunk rel="rust" href="Cargo.toml"/>
-        <link data-trunk rel="css" href="./static/leptos-style.css" />
-        <link data-trunk rel="css" href="./static/tailwind.css" />
-        <link data-trunk rel="css" href="./static/style.css" />
-        <link data-trunk rel="css" href="./static/global.css" />
+        <!-- Styles. The foundation comes from the videocall-theme crate.
+             tokens.css goes first because it declares the cascade layer
+             order; after that, link order does not decide who wins. The
+             feature sheets are this app's own. See README.md, "Styles". -->
+        <link data-trunk rel="css" href="../videocall-theme/styles/tokens.css" />
+        <link data-trunk rel="css" href="../videocall-theme/styles/base.css" />
+        <link data-trunk rel="css" href="../videocall-theme/styles/components.css" />
+        <link data-trunk rel="css" href="./styles/features/home.css" />
+        <link data-trunk rel="css" href="./styles/features/auth.css" />
+        <link data-trunk rel="css" href="./styles/features/call.css" />
+        <link data-trunk rel="css" href="./styles/features/sidebars.css" />
+        <link data-trunk rel="css" href="./styles/features/diagnostics.css" />
+        <link data-trunk rel="css" href="./styles/features/settings.css" />
+        <link data-trunk rel="css" href="./styles/features/prejoin.css" />
+        <link data-trunk rel="css" href="./styles/features/baby-mode.css" />
+        <!-- The only unlayered sheet: the unsupported-browser notice for a
+             browser that drops @layer. Empty for current browsers. -->
+        <link data-trunk rel="css" href="./styles/unsupported-browser.css" />
+        <!-- static/ holds capture/track-processor.js, served as
+             /static/capture/track-processor.js (loaded below). -->
         <link data-trunk rel="copy-dir" href="./static" />
         <link data-trunk rel="copy-file" href="./scripts/config.js" />
         <!-- Mic Opus encoder: the AudioWorklet script plus its ropus wasm
@@ -114,7 +134,7 @@
             }
         </script>
     </head>
-    <body class="bg-background text-foreground">
+    <body>
         <div id="main"></div>
     </body>
 </html>

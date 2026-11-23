@@ -5,6 +5,10 @@
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
+use videocall_theme::{
+    Field, IconButton, ListFooter, Scrim, Select, Sheet, SheetBody, SheetHeader, SheetTitle, Tab,
+    TabList,
+};
 use web_sys::MediaDeviceInfo;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,20 +87,18 @@ pub fn DeviceSettingsModal(
     }
 
     rsx! {
-        div {
-            class: "device-settings-modal-overlay visible",
+        Scrim {
             onclick: move |_| on_close.call(()),
 
-            div {
+            // Sheet brings role="dialog", aria-modal and the stopped click.
+            Sheet {
+                wide: true,
                 id: "device-settings-dialog",
-                class: "device-settings-modal settings-modal",
-                role: "dialog",
-                "aria-modal": "true",
+                class: "device-settings-modal surface-elevated",
                 "aria-labelledby": "device-settings-title",
                 tabindex: "0",
-                onclick: move |e: MouseEvent| e.stop_propagation(),
 
-                onkeydown: move |evt| {
+                onkeydown: move |evt: KeyboardEvent| {
                     match evt.key() {
                         Key::Escape => {
                             evt.stop_propagation();
@@ -114,15 +116,11 @@ pub fn DeviceSettingsModal(
                     }
                 },
 
-                div { class: "device-settings-header settings-header",
-                    h2 {
-                        id: "device-settings-title",
-                        "Settings"
-                    }
-                    button {
+                SheetHeader {
+                    SheetTitle { id: "device-settings-title", "Settings" }
+                    IconButton {
+                        label: "Close settings",
                         class: "close-button",
-                        r#type: "button",
-                        "aria-label": "Close settings",
                         onclick: move |_| on_close.call(()),
 
                         svg {
@@ -140,8 +138,10 @@ pub fn DeviceSettingsModal(
                     }
                 }
 
-                div { class: "device-settings-content settings-layout",
-                    div {
+                SheetBody { class: "settings-layout",
+                    // `role` passed on purpose: TabList then leaves out
+                    // aria-orientation, which this list never had.
+                    TabList {
                         class: "settings-sidebar",
                         role: "tablist",
                         "aria-label": "Settings sections",
@@ -155,7 +155,7 @@ pub fn DeviceSettingsModal(
                         }
                     }
 
-                    div { class: "settings-panel",
+                    div { class: "settings-content",
                         match active_section() {
                             SettingsSection::Audio => rsx! {
                                 div {
@@ -164,16 +164,14 @@ pub fn DeviceSettingsModal(
                                     role: "tabpanel",
                                     "aria-labelledby": SettingsSection::Audio.tab_id(),
 
-                                    h3 { class: "settings-section-title", "Audio" }
-                                    p { class: "settings-section-description",
+                                    h3 { class: "text-title-3", "Audio" }
+                                    p { class: "text-subheadline text-secondary",
                                         "Choose the microphone and speaker used during the call."
                                     }
 
-                                    div { class: "device-setting-group",
-                                        label { r#for: "modal-audio-select", "Microphone" }
-                                        select {
+                                    Field { label: "Microphone", label_for: "modal-audio-select",
+                                        Select {
                                             id: "modal-audio-select",
-                                            class: "device-selector-modal",
                                             onchange: {
                                                 let microphones = microphones.clone();
                                                 move |evt: Event<FormData>| {
@@ -194,11 +192,9 @@ pub fn DeviceSettingsModal(
                                     }
 
                                     if !is_ios_safari {
-                                        div { class: "device-setting-group",
-                                            label { r#for: "modal-speaker-select", "Speaker" }
-                                            select {
+                                        Field { label: "Speaker", label_for: "modal-speaker-select",
+                                            Select {
                                                 id: "modal-speaker-select",
-                                                class: "device-selector-modal",
                                                 onchange: {
                                                     let speakers = speakers.clone();
                                                     move |evt: Event<FormData>| {
@@ -218,9 +214,8 @@ pub fn DeviceSettingsModal(
                                             }
                                         }
                                     } else {
-                                        div { class: "device-setting-group",
-                                            p {
-                                                class: "ios-speaker-note",
+                                        Field {
+                                            ListFooter {
                                                 "Speaker selection is handled by your device settings on iOS/Safari."
                                             }
                                         }
@@ -234,16 +229,14 @@ pub fn DeviceSettingsModal(
                                     role: "tabpanel",
                                     "aria-labelledby": SettingsSection::Video.tab_id(),
 
-                                    h3 { class: "settings-section-title", "Video" }
-                                    p { class: "settings-section-description",
+                                    h3 { class: "text-title-3", "Video" }
+                                    p { class: "text-subheadline text-secondary",
                                         "Choose the camera used during the call."
                                     }
 
-                                    div { class: "device-setting-group",
-                                        label { r#for: "modal-video-select", "Camera" }
-                                        select {
+                                    Field { label: "Camera", label_for: "modal-video-select",
+                                        Select {
                                             id: "modal-video-select",
-                                            class: "device-selector-modal",
                                             onchange: {
                                                 let cameras = cameras.clone();
                                                 move |evt: Event<FormData>| {
@@ -278,6 +271,7 @@ fn SettingsNavButton(
     active: bool,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
+    // `.active` is kept next to aria-selected: tests select it.
     let class = if active {
         "settings-nav-button active"
     } else {
@@ -285,15 +279,12 @@ fn SettingsNavButton(
     };
 
     rsx! {
-        button {
+        Tab {
+            selected: active,
             id: section.tab_id(),
             class,
-            r#type: "button",
-            role: "tab",
-            "aria-selected": if active { "true" } else { "false" },
             "aria-controls": section.panel_id(),
             "data-testid": section.test_id(),
-            tabindex: if active { "0" } else { "-1" },
             onclick: move |evt| onclick.call(evt),
             "{section.title()}"
         }

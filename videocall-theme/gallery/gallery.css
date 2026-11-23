@@ -1,0 +1,689 @@
+/*
+ * gallery.css
+ *
+ * Layout for the gallery app, and nothing else. It follows the rules of the
+ * system it shows: every color and font comes from a token, and glass is
+ * only on floating chrome (the section index and the control bar). It lays
+ * the primitives out; it does not restyle them.
+ *
+ * Layer: `gallery`. The app injects this sheet after tokens, base and
+ * components, so `gallery` is declared last and lands after `overrides` in
+ * the order tokens.css sets. `overrides` is empty, so that costs nothing.
+ *
+ * Breakpoint: compact below 640px, the same convention as tokens.css.
+ */
+
+@layer gallery {
+  /* ---- Page frame ---- */
+
+  .gallery {
+    display: grid;
+    grid-template-columns: 15rem minmax(0, 1fr);
+    min-height: var(--viewport-height);
+    background-color: var(--color-bg-grouped);
+  }
+
+  .gallery-nav {
+    position: sticky;
+    top: 0;
+    z-index: var(--z-sidebar);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    height: var(--viewport-height);
+    overflow-y: auto;
+    padding: max(var(--space-5), var(--safe-top)) var(--space-3) var(--space-16)
+      max(var(--space-3), var(--safe-left));
+  }
+
+  .gallery-brand {
+    display: flex;
+    flex-direction: column;
+    padding: 0 var(--space-3);
+  }
+
+  .gallery-nav-row {
+    display: none;
+  }
+
+  .gallery-main {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-12);
+    width: 100%;
+    max-width: 64rem;
+    min-width: 0;
+    /* A tooltip centered on a control at the page edge pokes out by a few
+       pixels (the .tooltip primitive has no edge handling). Clip it here so
+       the page never scrolls sideways. */
+    overflow-x: clip;
+    /* Bottom room so the floating bar never covers the last section. */
+    padding: var(--space-10) max(var(--space-8), var(--safe-right)) calc(var(--space-16) * 2)
+      var(--space-8);
+  }
+
+  .gallery-intro {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .gallery-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    min-width: 0;
+    scroll-margin-top: var(--space-6);
+  }
+
+  .gallery-section-title {
+    font: var(--text-title-1-emphasized);
+  }
+
+  .gallery-subhead {
+    margin-top: var(--space-4);
+    font: var(--text-title-3-emphasized);
+  }
+
+  .gallery-lede {
+    max-width: 42rem;
+    font: var(--text-callout);
+    color: var(--color-label-secondary);
+  }
+
+  .gallery-wrap {
+    flex-wrap: wrap;
+  }
+
+  .gallery-columns {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+    align-items: start;
+    gap: var(--space-6);
+  }
+
+  @media (max-width: 639.98px) {
+    .gallery {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .gallery-nav {
+      height: auto;
+      padding: max(var(--space-2), var(--safe-top)) max(var(--space-2), var(--safe-right))
+        var(--space-2) max(var(--space-2), var(--safe-left));
+      border-width: 0 0 1px;
+    }
+
+    .gallery-brand,
+    .gallery-nav-column {
+      display: none;
+    }
+
+    .gallery-nav-row {
+      display: flex;
+    }
+
+    .gallery-main {
+      gap: var(--space-10);
+      padding: var(--space-6) max(var(--space-page), var(--safe-right)) calc(var(--space-16) * 2)
+        max(var(--space-page), var(--safe-left));
+    }
+
+    /* The sticky index is about 3.75rem tall here. */
+    .gallery-section {
+      scroll-margin-top: var(--space-16);
+    }
+  }
+
+  /* ---- Token readouts ---- */
+
+  .gallery-token-name {
+    font: var(--text-footnote-emphasized);
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+  }
+
+  .gallery-token-value {
+    font: var(--text-caption-1);
+    font-family: var(--font-mono);
+    color: var(--color-label-secondary);
+    overflow-wrap: anywhere;
+  }
+
+  .gallery-swatches {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+    gap: var(--space-3);
+  }
+
+  .gallery-swatch {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2);
+    border-radius: var(--radius-md);
+    background-color: var(--color-bg-grouped-secondary);
+  }
+
+  /* The color over a checkerboard, so alpha shows. */
+  .gallery-swatch-chip {
+    height: 3.5rem;
+    margin-bottom: var(--space-1);
+    border: 1px solid var(--color-separator);
+    border-radius: var(--radius-sm);
+    background:
+      linear-gradient(var(--sample), var(--sample)),
+      repeating-conic-gradient(var(--color-gray-4) 0% 25%, var(--color-bg) 0% 50%) 0 0 / 12px 12px;
+  }
+
+  .gallery-type {
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  .gallery-type-row {
+    display: grid;
+    grid-template-columns: 13rem minmax(0, 1fr) minmax(0, 1fr);
+    align-items: baseline;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .gallery-type-row + .gallery-type-row {
+    border-top: 1px solid var(--color-separator);
+  }
+
+  .gallery-type-name {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .gallery-scale {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .gallery-scale-row {
+    display: grid;
+    grid-template-columns: 9rem minmax(0, 1fr) 9rem;
+    align-items: center;
+    gap: var(--space-3);
+    min-height: var(--size-control-sm);
+  }
+
+  .gallery-bar {
+    width: var(--sample);
+    height: var(--space-3);
+    border-radius: var(--radius-xs);
+    background-color: var(--color-accent);
+  }
+
+  @media (max-width: 639.98px) {
+    .gallery-type-row {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-1);
+    }
+
+    .gallery-type-head {
+      display: none;
+    }
+
+    .gallery-scale-row {
+      grid-template-columns: 7rem minmax(0, 1fr);
+    }
+
+    .gallery-scale-row .gallery-token-value {
+      grid-column: 1 / -1;
+    }
+  }
+
+  .gallery-tiles {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-4);
+  }
+
+  .gallery-tile {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    min-width: 6rem;
+  }
+
+  .gallery-size-box {
+    width: var(--sample);
+    height: var(--sample);
+    margin-bottom: var(--space-1);
+    border: 1px dashed var(--color-accent);
+    background-color: var(--color-accent-tint);
+  }
+
+  .gallery-radius-tile {
+    width: 5rem;
+    height: 5rem;
+    margin-bottom: var(--space-1);
+    border: 1px solid var(--color-separator);
+    border-radius: var(--sample);
+    background-color: var(--color-fill);
+  }
+
+  .gallery-radius-capsule {
+    width: 8rem;
+    height: 3rem;
+  }
+
+  .gallery-concentric-demo {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-6);
+  }
+
+  .gallery-concentric {
+    width: min(100%, 18rem);
+    padding: var(--concentric-inset);
+    border-radius: var(--concentric-outer);
+    background-color: var(--color-bg-grouped-secondary);
+    box-shadow: var(--shadow-1);
+  }
+
+  .gallery-concentric-inner {
+    height: 6rem;
+    border: 1px solid var(--color-accent);
+    background-color: var(--color-accent-tint);
+  }
+
+  .gallery-range {
+    width: 100%;
+    max-width: 18rem;
+    min-height: var(--size-hit);
+    accent-color: var(--color-accent);
+  }
+
+  .gallery-elevation {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+    gap: var(--space-6);
+    padding: var(--space-6);
+    border-radius: var(--radius-lg);
+    background-color: var(--color-bg-grouped-secondary);
+  }
+
+  .gallery-shadow-tile {
+    display: grid;
+    place-items: center;
+    height: 6rem;
+    border-radius: var(--radius-md);
+    background-color: var(--color-bg-elevated);
+    box-shadow: var(--sample);
+  }
+
+  /* isolation keeps the big z-index values inside this box, so the lock
+     value does not climb over the page's own bar and sheets. */
+  .gallery-z {
+    position: relative;
+    isolation: isolate;
+    height: calc(11 * 1.75rem + 3rem);
+  }
+
+  .gallery-z-tile {
+    position: absolute;
+    top: calc(var(--i) * 1.75rem);
+    left: calc(var(--i) * 1rem);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    width: min(15rem, calc(100% - 9rem));
+    min-width: 11rem;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--color-separator);
+    border-radius: var(--radius-sm);
+    background-color: var(--color-bg-grouped-secondary);
+    box-shadow: var(--shadow-1);
+  }
+
+  .gallery-motion {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .gallery-motion-row {
+    display: grid;
+    grid-template-columns: 13rem minmax(0, 1fr);
+    align-items: center;
+    gap: var(--space-4);
+  }
+
+  .gallery-motion-label {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .gallery-rail {
+    height: var(--space-6);
+    overflow: hidden;
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-fill-tertiary);
+  }
+
+  /* The runner is the rail minus one dot, so translateX(100%) lands the dot
+     at the far end at any width. */
+  .gallery-rail-runner {
+    width: calc(100% - var(--space-6));
+    height: 100%;
+    transition: transform var(--sample-duration) var(--sample-ease);
+  }
+
+  .gallery-motion[data-on="true"] .gallery-rail-runner {
+    transform: translateX(100%);
+  }
+
+  .gallery-rail-dot {
+    width: var(--space-6);
+    height: var(--space-6);
+    border-radius: var(--radius-capsule);
+    background-color: var(--color-accent);
+  }
+
+  @media (max-width: 639.98px) {
+    .gallery-motion-row {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-1);
+    }
+  }
+
+  /* ---- Stages: what glass sits on ---- */
+
+  .gallery-stage {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-6);
+    min-height: 16rem;
+    padding: var(--space-6);
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+  }
+
+  /* Everything but the dim layer stacks above it. */
+  .gallery-stage > :not(.media-dim, .media-dim-top, .media-dim-bottom, .gallery-busy-text),
+  .gallery-strip > *,
+  .gallery-demo > * {
+    position: relative;
+  }
+
+  .gallery-busy {
+    background-color: var(--color-bg);
+    background-image: repeating-linear-gradient(
+      135deg,
+      var(--color-red) 0 0.75rem,
+      var(--color-yellow) 0.75rem 1.5rem,
+      var(--color-blue) 1.5rem 2.25rem,
+      var(--color-bg) 2.25rem 3.5rem
+    );
+  }
+
+  .gallery-busy-text {
+    position: absolute;
+    inset: 0;
+    padding: var(--space-4);
+    overflow: hidden;
+    font: var(--text-large-title-emphasized);
+    color: var(--color-label);
+    pointer-events: none;
+  }
+
+  /* The stand-in for video: a bright gradient that pans forever. The tile is
+     twice the box wide and the animation moves it by exactly one tile, so
+     the loop has no seam. It stops under Reduce Motion like everything else. */
+  .gallery-video {
+    background-color: var(--color-black);
+    background-image:
+      radial-gradient(circle at 30% 35%, var(--color-white), transparent 35%),
+      linear-gradient(
+        90deg,
+        var(--color-indigo),
+        var(--color-pink),
+        var(--color-orange),
+        var(--color-yellow),
+        var(--color-teal),
+        var(--color-indigo)
+      );
+    background-size: 100% 100%, 200% 100%;
+    animation: gallery-video-pan 14s linear infinite;
+  }
+
+  @keyframes gallery-video-pan {
+    from {
+      background-position: 0 0, 0% 0;
+    }
+    to {
+      background-position: 0 0, 200% 0;
+    }
+  }
+
+  .gallery-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    max-width: 18rem;
+    padding: var(--space-4);
+    border-radius: var(--radius-lg);
+  }
+
+  .gallery-stage-caption {
+    align-self: flex-start;
+    padding: var(--space-half) var(--space-2);
+    border-radius: var(--radius-xs);
+    background-color: var(--color-bg);
+    color: var(--color-label);
+    font: var(--text-caption-1-emphasized);
+  }
+
+  .gallery-strip {
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-lg);
+  }
+
+  .gallery-demo {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    padding: var(--space-6);
+    border-radius: var(--radius-lg);
+    background-color: var(--color-bg-grouped-secondary);
+  }
+
+  .gallery-demo-flush {
+    padding: var(--space-2) 0;
+  }
+
+  .gallery-demo-flush > .toolbar {
+    width: 100%;
+  }
+
+  .gallery-toolbar-title {
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-xs);
+    background-color: var(--color-bg);
+  }
+
+  .gallery-menu-anchor {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+
+  /* ---- Sample grids ---- */
+
+  .gallery-variant-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-4);
+  }
+
+  .gallery-variant-name {
+    width: 11rem;
+    font: var(--text-subheadline-emphasized);
+  }
+
+  .gallery-strip .gallery-variant-name {
+    width: auto;
+    margin-right: var(--space-8);
+  }
+
+  .gallery-strip .gallery-variant-name,
+  .gallery-strip .gallery-cell-caption {
+    padding: var(--space-half) var(--space-2);
+    border-radius: var(--radius-xs);
+    background-color: var(--color-bg);
+    color: var(--color-label);
+  }
+
+  .gallery-cells {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-4);
+  }
+
+  .gallery-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .gallery-cell-sample {
+    display: flex;
+    align-items: center;
+    min-height: var(--size-control-lg);
+  }
+
+  .gallery-cell-caption {
+    font: var(--text-caption-1);
+    color: var(--color-label-secondary);
+  }
+
+  .gallery-tooltip-row {
+    padding-top: var(--space-10);
+    padding-bottom: var(--space-10);
+  }
+
+  /* Two controls pushed to the row's edges, tooltips pinned open, so the
+     edge alignment is visible. */
+  .gallery-tooltip-edges {
+    display: flex;
+    justify-content: space-between;
+    padding-top: var(--space-10);
+  }
+
+  /* Draws the ring :focus-visible would, so it shows without a keyboard. */
+  .gallery-focus-ring {
+    outline: var(--focus-ring-width) solid var(--focus-ring-color);
+    outline-offset: var(--focus-ring-offset);
+  }
+
+  .gallery-form {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: var(--space-5);
+  }
+
+  .gallery-accent-text {
+    color: var(--color-accent);
+  }
+
+  .gallery-check {
+    display: inline-flex;
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+    color: var(--color-accent);
+  }
+
+  /* An invisible element a dialog focuses when it opens. */
+  .gallery-focus-target {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    outline: none;
+  }
+
+  /* ---- In-call ---- */
+
+  .gallery-call {
+    padding: var(--space-3);
+    border-radius: var(--radius-xl);
+    background-color: var(--color-black);
+  }
+
+  .gallery-call-tile {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+  }
+
+  /* A phone call tile is taller, and the bar needs the room. */
+  @media (max-width: 639.98px) {
+    .gallery-call-tile {
+      aspect-ratio: 3 / 4;
+    }
+  }
+
+  .gallery-call-name {
+    position: absolute;
+    top: var(--space-3);
+    left: var(--space-3);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .gallery-call-toast {
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+  }
+
+  .gallery-call-controls {
+    position: absolute;
+    bottom: var(--space-4);
+    left: 50%;
+    transform: translateX(-50%);
+  }
+
+  /* ---- Floating controls ---- */
+
+  .gallery-controls {
+    position: fixed;
+    bottom: max(var(--space-4), var(--safe-bottom));
+    left: 50%;
+    z-index: var(--z-bar);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    width: max-content;
+    max-width: calc(100% - 2 * var(--space-4));
+    transform: translateX(-50%);
+  }
+
+  /* The index is 15rem wide on regular screens; center the bar over the
+     content instead of the whole window. */
+  @media (min-width: 640px) {
+    .gallery-controls {
+      left: calc(50% + 7.5rem);
+    }
+  }
+}

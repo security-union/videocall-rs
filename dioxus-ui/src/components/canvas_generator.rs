@@ -30,81 +30,41 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
 
-/// Compute the inline CSS for the speaking glow on the canvas container.
-/// Always returns explicit values so the glow is fully self-contained in the
-/// inline style with zero dependency on CSS classes.
-pub(crate) fn speak_style(audio_level: f32) -> String {
-    if audio_level <= 0.0 {
-        // Explicitly force off — no reliance on CSS class removal
-        return "border: 1.5px solid transparent; box-shadow: none; transition: border 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
-    }
-    let i = audio_level.clamp(0.0, 1.0);
-    // More dramatic glow that scales aggressively with intensity.
-    // Uses full `border` shorthand because the glow overlay div does not
-    // inherit the container's border — it needs its own.
-    format!(
-        "border: 1.5px solid rgba(0, 255, 65, {:.2}); \
-         box-shadow: inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
-                     0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
-         transition: border 0.15s ease-in, box-shadow 0.15s ease-in;",
-        0.4 + i * 0.6,   // border alpha: 0.4–1.0 (more visible)
-        15.0 + i * 25.0, // inset blur: 15–40 (bigger glow)
-        5.0 + i * 10.0,  // inset spread: 5–15 (wider)
-        0.3 + i * 0.5,   // inset alpha: 0.3–0.8 (brighter)
-        15.0 + i * 35.0, // outer blur: 15–50 (much bigger halo)
-        3.0 + i * 10.0,  // outer spread: 3–13 (wider)
-        0.2 + i * 0.4    // outer alpha: 0.2–0.6 (brighter)
-    )
+/// Class that marks a speaking indicator (the tile's `.glow-overlay` and the
+/// `.audio-indicator` mic badge). The look lives in `styles/features/call.css`.
+pub(crate) const SPEAKING_CLASS: &str = "speaking";
+
+/// Whether an audio level counts as speaking.
+pub(crate) fn is_speaking(audio_level: f32) -> bool {
+    audio_level > 0.0
 }
 
-/// Compute the inline CSS for the mic icon glow.
-/// Always returns explicit values — no reliance on CSS class for glow reset.
-///
-/// Two separate signals control different visual properties:
-/// - `mic_audio_level` (held 1s after silence) controls the icon COLOR (green)
-/// - `glow_audio_level` (raw, same as border) controls the drop-shadow GLOW
-///
-/// This way the icon stays green briefly after speech stops (via the held signal)
-/// while the drop-shadow glow tracks the border glow exactly.
-fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
-    if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
-        // Fully silent: fade out both color and filter
-        return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
+/// The inline style for a speaking indicator: one custom property,
+/// `--speak-level`, from `0.00` to `1.00`. The border, glow color and
+/// transitions are in `styles/features/call.css`, keyed off this property and
+/// the [`SPEAKING_CLASS`] class. Anything that is not a positive number
+/// (silence, NaN) is written as `0.00`.
+pub(crate) fn speak_level_style(audio_level: f32) -> String {
+    let level = if is_speaking(audio_level) {
+        audio_level.min(1.0)
+    } else {
+        0.0
+    };
+    format!("--speak-level: {level:.2}")
+}
+
+/// Tile corner buttons. `crop-icon` / `pin-icon` place them (call.css), the
+/// rest is the shared small icon button.
+const CROP_BUTTON_CLASS: &str = "crop-icon tile-action icon-btn icon-btn-sm";
+const PIN_BUTTON_CLASS: &str = "pin-icon tile-action icon-btn icon-btn-sm";
+
+/// Class list for the tile's glow overlay at a given raw audio level.
+fn glow_overlay_class(audio_level: f32) -> &'static str {
+    if is_speaking(audio_level) {
+        "glow-overlay speaking"
+    } else {
+        "glow-overlay"
     }
-    // Unreachable in practice: the mic hold timer guarantees mic_audio_level
-    // stays positive at least as long as glow_audio_level. Handle defensively
-    // by showing only the glow without the green icon color.
-    if mic_audio_level <= 0.0 && glow_audio_level > 0.0 {
-        let clamped = glow_audio_level.clamp(0.0, 1.0);
-        let glow_i = clamped.sqrt();
-        return format!(
-            "color: inherit; \
-             filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})) \
-                     drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
-             transition: color 5.0s ease-out, filter 0.15s ease-in;",
-            8.0 + glow_i * 16.0,
-            0.7 + glow_i * 0.3,
-            3.0 + glow_i * 8.0,
-            0.8 + glow_i * 0.2,
-        );
-    }
-    if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
-        // Held color (still green) but raw glow has faded — no drop-shadow
-        return "color: #00ff41; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();
-    }
-    // Both positive: green color + scaled drop-shadow glow
-    let clamped = glow_audio_level.clamp(0.0, 1.0);
-    let glow_i = clamped.sqrt();
-    format!(
-        "color: #00ff41; \
-         filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})) \
-                 drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
-         transition: color 0.05s ease-in, filter 0.15s ease-in;",
-        8.0 + glow_i * 16.0, // primary drop-shadow blur: 8–24px
-        0.7 + glow_i * 0.3,  // primary drop-shadow alpha: 0.7–1.0
-        3.0 + glow_i * 8.0,  // secondary (tight) glow blur: 3–11px
-        0.8 + glow_i * 0.2,  // secondary glow alpha: 0.8–1.0
-    )
 }
 
 /// Controls what a `PeerTile` renders in the split screen-share layout.
@@ -194,18 +154,18 @@ pub fn generate_for_peer(
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
 
-    let is_speaking = mic_audio_level > 0.0;
-
-    let audio_speaking_class = if is_speaking {
+    // The mic badge turns green on the held level (kept 1 s after silence),
+    // so it stays lit between words. Its glow and the tile border follow the
+    // raw level through --speak-level.
+    let audio_speaking_class = if is_speaking(mic_audio_level) {
         "audio-indicator speaking"
     } else {
         "audio-indicator"
     };
 
-    // Compute inline styles: border glow uses raw audio_level,
-    // mic icon uses mic_audio_level (held for 1s after silence in Rust)
-    let tile_style = speak_style(audio_level);
-    let mic_inline_style = mic_style(mic_audio_level, audio_level);
+    let tile_class = glow_overlay_class(audio_level);
+    let tile_style = speak_level_style(audio_level);
+    let mic_inline_style = tile_style.clone();
 
     // ---- Split-layout: early return for ScreenOnly / VideoOnly ----------------
     let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer);
@@ -229,11 +189,12 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{ss_name_title}",
                         dir: "auto",
-                        "{ss_name}"
+                        span { class: "floating-name-text", "{ss_name}" }
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
-                        class: "crop-icon",
+                        class: CROP_BUTTON_CLASS,
+                        "aria-label": "Crop video",
                         CropIcon {}
                     }
                 }
@@ -256,6 +217,7 @@ pub fn generate_for_peer(
         let vo_tile_style = tile_style.clone();
         let vo_mic_style = mic_inline_style.clone();
         let vo_audio_class = audio_speaking_class;
+        let vo_tile_class = tile_class;
         let grid_class = if is_video_enabled_for_peer {
             "canvas-container video-on"
         } else {
@@ -285,7 +247,7 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{title_vo}",
                         dir: "auto",
-                        "{peer_display_name_vo}"
+                        span { class: "floating-name-text", "{peer_display_name_vo}" }
                         if is_host {
                             CrownIcon {}
                         }
@@ -297,12 +259,13 @@ pub fn generate_for_peer(
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                        class: "crop-icon",
+                        class: CROP_BUTTON_CLASS,
+                        "aria-label": "Crop video",
                         CropIcon {}
                     }
                     div {
                         style: "{vo_tile_style}",
-                        class: "glow-overlay",
+                        class: "{vo_tile_class}",
                     }
                 }
             }
@@ -342,19 +305,16 @@ pub fn generate_for_peer(
                         UserVideo { id: key_clone.clone(), hidden: false }
                     } else {
                         div {
-                            class: "",
-                            div {
-                                class: "placeholder-content",
-                                PeerIcon {}
-                                span { class: "placeholder-text", "Camera Off" }
-                            }
+                            class: "placeholder-content",
+                            PeerIcon {}
+                            span { class: "placeholder-text", "Camera Off" }
                         }
                     }
                     h4 {
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
-                        "{peer_display_name_fb}"
+                        span { class: "floating-name-text", "{peer_display_name_fb}" }
                         if is_host {
                             CrownIcon {}
                         }
@@ -366,19 +326,21 @@ pub fn generate_for_peer(
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&canvas_id_crop),
-                        class: "crop-icon",
+                        class: CROP_BUTTON_CLASS,
+                        "aria-label": "Crop video",
                         CropIcon {}
                     }
                     button {
                         onclick: move |_| toggle_pinned_div(&div_id_pin),
-                        class: "pin-icon",
+                        class: PIN_BUTTON_CLASS,
+                        "aria-label": "Pin video",
                         PushPinIcon {}
                     }
                     // Glow overlay renders ON TOP of video content so the
                     // inset box-shadow is not hidden behind the canvas element.
                     div {
                         style: "{tile_style}",
-                        class: "glow-overlay",
+                        class: "{tile_class}",
                     }
                 }
             }
@@ -428,16 +390,18 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{ss_name}",
                         dir: "auto",
-                        "{ss_name}"
+                        span { class: "floating-name-text", "{ss_name}" }
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
-                        class: "crop-icon",
+                        class: CROP_BUTTON_CLASS,
+                        "aria-label": "Crop video",
                         CropIcon {}
                     }
                     button {
                         onclick: move |_| toggle_pinned_div(&ss_div_pin),
-                        class: "pin-icon",
+                        class: PIN_BUTTON_CLASS,
+                        "aria-label": "Pin video",
                         PushPinIcon {}
                     }
                 }
@@ -451,6 +415,7 @@ pub fn generate_for_peer(
             };
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
+            let grid_tile_class = tile_class;
             rsx! {
                 div {
                     class: "grid-item",
@@ -475,7 +440,7 @@ pub fn generate_for_peer(
                             class: "floating-name",
                             title: "{title_grid}",
                             dir: "auto",
-                            "{peer_display_name_grid}"
+                            span { class: "floating-name-text", "{peer_display_name_grid}" }
                             if is_host {
                                 CrownIcon {}
                             }
@@ -487,18 +452,20 @@ pub fn generate_for_peer(
                         }
                         button {
                             onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                            class: "crop-icon",
+                            class: CROP_BUTTON_CLASS,
+                            "aria-label": "Crop video",
                             CropIcon {}
                         }
                         button {
                             onclick: move |_| toggle_pinned_div(&pv_div_pin),
-                            class: "pin-icon",
+                            class: PIN_BUTTON_CLASS,
+                            "aria-label": "Pin video",
                             PushPinIcon {}
                         }
                         // Glow overlay renders ON TOP of video content
                         div {
                             style: "{grid_tile_style}",
-                            class: "glow-overlay",
+                            class: "{grid_tile_class}",
                         }
                     }
                 }
@@ -755,5 +722,53 @@ mod tests {
     #[test]
     fn tile_mode_default_is_full() {
         assert_eq!(TileMode::default(), TileMode::Full);
+    }
+
+    // -- Speaking indicator contract ------------------------------------------
+    // The style attribute carries only --speak-level; the look is in call.css.
+    #[test]
+    fn speak_level_style_silent_is_zero() {
+        assert_eq!(speak_level_style(0.0), "--speak-level: 0.00");
+    }
+
+    #[test]
+    fn speak_level_style_formats_two_decimals() {
+        assert_eq!(speak_level_style(0.5), "--speak-level: 0.50");
+        assert_eq!(speak_level_style(0.123), "--speak-level: 0.12");
+    }
+
+    #[test]
+    fn speak_level_style_clamps_out_of_range() {
+        assert_eq!(speak_level_style(1.7), "--speak-level: 1.00");
+        assert_eq!(speak_level_style(-0.3), "--speak-level: 0.00");
+        assert_eq!(speak_level_style(f32::NAN), "--speak-level: 0.00");
+    }
+
+    #[test]
+    fn speak_level_style_has_no_literal_look() {
+        // The old inline border/box-shadow/transition must not come back.
+        let style = speak_level_style(0.8);
+        assert!(!style.contains("border"));
+        assert!(!style.contains("box-shadow"));
+        assert!(!style.contains("transition"));
+        assert!(!style.contains("rgba"));
+    }
+
+    #[test]
+    fn is_speaking_only_for_positive_levels() {
+        assert!(!is_speaking(0.0));
+        assert!(!is_speaking(-1.0));
+        assert!(!is_speaking(f32::NAN));
+        assert!(is_speaking(0.01));
+        assert!(is_speaking(1.0));
+    }
+
+    #[test]
+    fn glow_overlay_class_adds_speaking_only_when_speaking() {
+        assert_eq!(glow_overlay_class(0.0), "glow-overlay");
+        assert_eq!(glow_overlay_class(0.4), "glow-overlay speaking");
+        assert!(glow_overlay_class(0.4)
+            .split_whitespace()
+            .any(|c| c == SPEAKING_CLASS));
     }
 }

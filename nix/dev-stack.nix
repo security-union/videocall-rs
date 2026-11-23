@@ -10,7 +10,7 @@
 #   make dev-middleware   -> postgres/nats/prometheus/grafana only
 #
 # State lives in .data/ (gitignored). Toolchains (cargo, cargo-watch, trunk,
-# tailwind, dbmate) come from the surrounding shells.dev nix-shell.
+# dbmate) come from the surrounding shells.dev nix-shell.
 #
 # Also exports e2eStack: the Playwright stack (postgres, nats, meeting-api,
 # websocket, static UI) as native processes — no Docker. Servers run the

@@ -121,22 +121,41 @@ export async function joinAsGuest(
   await admitGuestIfNeeded(hostPage, guestPage, guestResult);
 }
 
-/** A bottom-bar control button, found by its tooltip text (e.g. "Mute", "Hang Up"). */
+/**
+ * A bottom-bar control button, found by its tooltip text (e.g. "Hang Up",
+ * "Open Diagnostics"). The mic, camera and share toggles have fixed names
+ * instead; use `micButton`, `cameraButton` and `shareButton` for those.
+ */
 export function controlButton(page: Page, tooltip: string): Locator {
   return page.locator("button.video-control-button", {
     has: page.locator(".tooltip", { hasText: new RegExp(`^${tooltip}$`) }),
   });
 }
 
+/** The microphone toggle. Its name is fixed; `aria-pressed` says whether the mic is on. */
+export function micButton(page: Page): Locator {
+  return page.getByRole("button", { name: "Microphone" });
+}
+
+/** The camera toggle. Its name is fixed; `aria-pressed` says whether the camera is on. */
+export function cameraButton(page: Page): Locator {
+  return page.getByRole("button", { name: "Camera", exact: true });
+}
+
+/** The screen share toggle. Its name is fixed; `aria-pressed` says whether sharing is on. */
+export function shareButton(page: Page): Locator {
+  return page.getByRole("button", { name: "Share screen" });
+}
+
 /** Turn the local microphone on (the meeting starts with it off). */
 export async function unmute(page: Page): Promise<void> {
-  await controlButton(page, "Unmute").click();
-  await expect(controlButton(page, "Mute")).toBeVisible({ timeout: 10_000 });
+  await micButton(page).click();
+  await expect(micButton(page)).toHaveAttribute("aria-pressed", "true", { timeout: 10_000 });
 }
 
 export async function mute(page: Page): Promise<void> {
-  await controlButton(page, "Mute").click();
-  await expect(controlButton(page, "Unmute")).toBeVisible({ timeout: 10_000 });
+  await micButton(page).click();
+  await expect(micButton(page)).toHaveAttribute("aria-pressed", "false", { timeout: 10_000 });
 }
 
 /** The speaking indicator on the remote peer tile whose name is `peerName`. */

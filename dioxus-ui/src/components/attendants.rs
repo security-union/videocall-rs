@@ -50,6 +50,10 @@ use videocall_client::{
     MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
     PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
+use videocall_theme::{
+    Alert, AlertActions, AlertMessage, Bar, Button, ButtonSize, ButtonVariant, Card, DimEdge,
+    MediaDim, Scrim, TextField, Toast,
+};
 use wasm_bindgen::{closure::Closure, JsCast};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,14 +86,14 @@ pub enum MediaErrorState {
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
         MediaErrorState::NoDevice => rsx! {
-            p { " {device} not found on this device." }
+            AlertMessage { " {device} not found on this device." }
         },
         MediaErrorState::Other => rsx! {
-            p { " {device} has an unexpected problem." }
+            AlertMessage { " {device} has an unexpected problem." }
         },
         MediaErrorState::PermissionDenied => rsx! {
-            p { " {device} is blocked in your browser." }
-            p { style: "front-size: 0.9rem; opacity: 0.8;",
+            AlertMessage { " {device} is blocked in your browser." }
+            AlertMessage {
                 "Please click the lock icon in your browser's address bar and allow access if you want to use it."
             }
         },
@@ -1053,21 +1057,18 @@ pub fn AttendantsComponent(
     };
     let has_screen_share = active_screen_sharer.is_some();
 
-    let container_style = if has_screen_share {
-        // 2/3 screen-share panel on the left, 1/3 peer panel on the right
-        "position: absolute; inset: 0; width: 100%; height: 100%; \
-         display: flex; flex-direction: row; gap: 10px; padding: 16px; \
-         align-items: center; box-sizing: border-box;"
-            .to_string()
+    // Only the computed grid size is inline; the rest of the layout is in
+    // call.css (`.call-grid`, and `.call-grid-split` for the 2/3 + 1/3
+    // screen-share layout).
+    let (container_class, container_style) = if has_screen_share {
+        ("call-grid call-grid-split", String::new())
     } else {
-        format!(
-            "position: absolute; inset: 0; width: 100%; height: 100%; \
-             --num-peers: {}; \
-             grid-template-columns: repeat({}, 1fr); \
-             grid-template-rows: repeat({}, 1fr);",
-            num_peers_for_styling.max(1),
-            cols,
-            rows,
+        (
+            "call-grid",
+            format!(
+                "--num-peers: {}; --grid-cols: {cols}; --grid-rows: {rows};",
+                num_peers_for_styling.max(1),
+            ),
         )
     };
 
@@ -1087,82 +1088,86 @@ pub fn AttendantsComponent(
         return rsx! {
             div {
                 id: "main-container",
-                class: "meeting-page",
+                class: "meeting-page theme-dark touch-pan-only",
                 BrowserCompatibility {}
                 div {
                     id: "join-meeting-container",
-                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;",
-
-                    div { style: "text-align: center; color: white; margin-bottom: 2rem;",
-                        h2 { "Ready to join the meeting?" }
-                        p { "Click the button below to join and start listening to others." }
-                        if let Some(err) = connection_error() {
-                            p { style: "color: #ff6b6b; margin-top: 1rem;", "{err}" }
+                    class: "screen-center join-screen",
+                    div { class: "join-panel",
+                        div { class: "join-intro",
+                            h2 { class: "text-title-2", "Ready to join the meeting?" }
+                            p { class: "text-body text-secondary", "Click the button below to join and start listening to others." }
+                            if let Some(err) = connection_error() {
+                                p { class: "text-callout text-danger", "{err}" }
+                            }
                         }
-                    }
-                    if is_owner {
-                        {
-                            let meeting_id_for_toggle = id.clone();
-                            rsx! {
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
-                                    span { style: "font-size: 0.9rem;", "Waiting Room" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: waiting_room_toggle(),
-                                        disabled: saving(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() {
-                                                    return;
-                                                }
-                                                toggle_error.set(None);
-                                                waiting_room_toggle.set(new_val);
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val).await {
-                                                        Ok(updated) => {
-                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
-                                                            saving.set(false);
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update waiting room setting: {e}");
-                                                            waiting_room_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
+                        if is_owner {
+                            {
+                                let meeting_id_for_toggle = id.clone();
+                                rsx! {
+                                    div { class: "join-option",
+                                        span { class: "text-body", "Waiting Room" }
+                                        crate::components::toggle_switch::ToggleSwitch {
+                                            enabled: waiting_room_toggle(),
+                                            disabled: saving(),
+                                            on_toggle: {
+                                                let meeting_id = meeting_id_for_toggle.clone();
+                                                move |new_val: bool| {
+                                                    if saving() {
+                                                        return;
                                                     }
-                                                });
-                                            }
-                                        },
+                                                    toggle_error.set(None);
+                                                    waiting_room_toggle.set(new_val);
+                                                    saving.set(true);
+                                                    let meeting_id = meeting_id.clone();
+                                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                        match crate::meeting_api::update_meeting(&meeting_id, new_val).await {
+                                                            Ok(updated) => {
+                                                                waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                                saving.set(false);
+                                                            }
+                                                            Err(e) => {
+                                                                log::error!("Failed to update waiting room setting: {e}");
+                                                                waiting_room_toggle.set(!new_val);
+                                                                saving.set(false);
+                                                                toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                        }
                                     }
-                                }
-                                if let Some(err) = toggle_error() {
-                                    p { class: "toggle-error",
-                                        "{err}"
+                                    if let Some(err) = toggle_error() {
+                                        p { class: "toggle-error",
+                                            "{err}"
+                                        }
                                     }
-                                }
-                                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",
-                                    if waiting_room_toggle() {
-                                        "Participants will wait for your approval before joining"
-                                    } else {
-                                        "Participants will join the meeting directly"
+                                    p { class: "text-footnote text-secondary",
+                                        if waiting_room_toggle() {
+                                            "Participants will wait for your approval before joining"
+                                        } else {
+                                            "Participants will join the meeting directly"
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    button {
-                        class: "btn-apple btn-primary",
-                        onclick: move |_| {
-                            mda.borrow().request();
-                        },
-                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                        Button {
+                            variant: ButtonVariant::Prominent,
+                            size: ButtonSize::Large,
+                            class: "join-button",
+                            onclick: move |_| {
+                                mda.borrow().request();
+                            },
+                            if is_owner { "Start Meeting" } else { "Join Meeting" }
+                        }
                     }
                     if show_device_warning() {
-                        div { class: "modal-overlay",
-                            div { class: "modal-window",
-                                h3 { "Device access problem" }
+                        Scrim {
+                            // No dialog role today; `None` keeps it that way.
+                            Alert { role: None::<&str>,
+                                h3 { class: "alert-title", "Device access problem" }
                                 if let Some(err) = mic_error.read().as_ref() {
                                     { render_single_device_error("Microphone", err) }
                                 }
@@ -1172,17 +1177,18 @@ pub fn AttendantsComponent(
                                 {
                                     let mut client = client.clone();
                                     rsx! {
-                                        button {
-                                            class: "btn-apple btn-primary",
-                                            style: "margin-top: 1.5rem;",
-                                            onclick: move |_| {
-                                                show_device_warning.set(false);
-                                                if let Err(e) = client.connect() {
-                                                    error!("Connection failed: {e:?}");
-                                                }
-                                                meeting_joined.set(true);
-                                            },
-                                            "Ok"
+                                        AlertActions {
+                                            Button {
+                                                variant: ButtonVariant::Prominent,
+                                                onclick: move |_| {
+                                                    show_device_warning.set(false);
+                                                    if let Err(e) = client.connect() {
+                                                        error!("Connection failed: {e:?}");
+                                                    }
+                                                    meeting_joined.set(true);
+                                                },
+                                                "Ok"
+                                            }
                                         }
                                     }
                                 }
@@ -1209,13 +1215,15 @@ pub fn AttendantsComponent(
     let locked = baby_mode() && meeting_ended_message().is_none();
 
     rsx! {
+        // The in-call screen is always dark: video sits on black.
         div {
+            class: "call-root theme-dark over-media touch-pan-only",
             // Provide MeetingTime context
             // Provide VideoCallClient context
             TrafficShapingBadge {}
             div {
                 id: "main-container",
-                class: if locked { "meeting-page baby-mode-active" } else { "meeting-page" },
+                class: if locked { "meeting-page call-screen baby-mode-active" } else { "meeting-page call-screen" },
                 // `inert` keeps keyboard focus (Tab/Enter/Space) out of the
                 // meeting while baby mode is on; the shield handles pointers.
                 "inert": if locked { Some("") } else { None },
@@ -1224,10 +1232,10 @@ pub fn AttendantsComponent(
                 // "participant joined/left" toast notifications
                 if !peer_toasts().is_empty() {
                     div {
-                        class: "peer-toasts",
+                        class: "peer-toasts toast-region",
                         for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
-                                let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
+                                let variant_class = if is_joined { "peer-toast toast toast-solid toast-joined" } else { "peer-toast toast toast-solid toast-left" };
                                 let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
                                 rsx! {
                                     div { key: "{id}", class: "{variant_class}",
@@ -1277,13 +1285,13 @@ pub fn AttendantsComponent(
 
                 div {
                     id: "grid-container",
+                    class: container_class,
                     style: "{container_style}",
                     if has_screen_share {
                         // ---- Split layout: active screen share (left 2/3) + peer videos (right 1/3) ----
                         // Left panel — ONLY the most recent (active) screen sharer
                         div {
-                            style: "flex: 2; min-width: 0; height: 100%; display: flex; flex-direction: column; \
-                                    align-items: center; justify-content: center; overflow: hidden;",
+                            class: "call-split-main",
                             if let Some(ref active_peer) = active_screen_sharer {
                                 PeerTile {
                                     key: "ss-active-{active_peer}",
@@ -1296,7 +1304,7 @@ pub fn AttendantsComponent(
                         }
                         // Right panel — all peer video tiles stacked vertically
                         div {
-                            style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
+                            class: "call-split-side",
                             for peer_id in display_peers.iter().take(CANVAS_LIMIT) {
                                 PeerTile {
                                     key: "tile-{peer_id}",
@@ -1326,23 +1334,21 @@ pub fn AttendantsComponent(
 
                         // Invitation overlay when no peers
                         if num_display_peers == 0 && !locked {
-                        div {
+                        Card {
                             id: "invite-overlay",
-                            class: "card-apple",
-                            style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
-                            h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                            p { style: "font-size: 0.9rem; opacity: 0.8;", "Share this meeting link with others you want in the meeting" }
-                            div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
-                                input {
+                            class: "invite-card",
+                            h4 { class: "card-title", "Your meeting is ready!" }
+                            p { class: "text-subheadline text-secondary", "Share this meeting link with others you want in the meeting" }
+                            div { class: "invite-link-row",
+                                TextField {
                                     id: "meeting-link-input",
                                     value: "{meeting_link}",
                                     readonly: true,
-                                    class: "input-apple",
-                                    style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
+                                    class: "invite-link-input",
                                 }
-                                button {
-                                    class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
-                                    style: "margin-left: 0.5rem;",
+                                Button {
+                                    variant: ButtonVariant::Prominent,
+                                    class: if show_copy_toast() { "copy-button btn-pop-animate" } else { "copy-button" },
                                     onclick: {
                                         let meeting_link = meeting_link.clone();
                                         move |_| {
@@ -1370,8 +1376,9 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             }
-                            p { style: "font-size: 0.8rem; opacity: 0.7;", "People who use this meeting link must get your permission before they can join." }
-                            div {
+                            p { class: "text-footnote text-secondary", "People who use this meeting link must get your permission before they can join." }
+                            Toast {
+                                solid: true,
                                 class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
                                 role: "alert",
                                 "aria-live": "assertive",
@@ -1383,10 +1390,17 @@ pub fn AttendantsComponent(
 
                     // Controls nav
                     if can_stream {
-                        nav { class: "host",
+                        // The control bar floats over live video in Clear
+                        // glass, so the bottom of the picture gets the 35% dim.
+                        if !locked {
+                            MediaDim { edge: DimEdge::Bottom, class: "call-controls-dim" }
+                        }
+                        // The self-view tile. The control bar inside it is
+                        // fixed to the bottom of the screen.
+                        nav { class: "self-view",
                             if !locked {
                             div { class: "controls",
-                                nav { class: "video-controls-container",
+                                Bar { clear: true, nav: true, class: "call-controls",
                                     {
                                         let mda_mic = mda.clone();
                                         rsx! {
@@ -1535,13 +1549,13 @@ pub fn AttendantsComponent(
                                 {
                                     let displayed: String = err.chars().take(200).collect();
                                     rsx! {
-                                        div { class: "glass-backdrop",
-                                            div { class: "card-apple", style: "width: 380px;",
-                                                h4 { style: "margin-top:0;", "Error" }
-                                                p { style: "margin-top:0.5rem;", "{displayed}" }
-                                                div { style: "display:flex; gap:8px; justify-content:flex-end; margin-top:12px;",
-                                                    button {
-                                                        class: "btn-apple btn-primary btn-sm",
+                                        Scrim {
+                                            Alert { role: None::<&str>,
+                                                h4 { class: "alert-title", "Error" }
+                                                AlertMessage { "{displayed}" }
+                                                AlertActions {
+                                                    Button {
+                                                        variant: ButtonVariant::Prominent,
                                                         onclick: move |_| user_error.set(None),
                                                         "OK"
                                                     }
@@ -1596,7 +1610,7 @@ pub fn AttendantsComponent(
                                 let status_client = client.clone();
                                 rsx! {
                                     div {
-                                        class: if status_client.is_connected() { "connection-led connected" } else { "connection-led connecting" },
+                                        class: if status_client.is_connected() { "connection-led status-dot status-dot-success connected" } else { "connection-led status-dot status-dot-warning connecting" },
                                         title: if status_client.is_connected() { "Connected" } else { "Connecting" },
                                     }
                                 }
@@ -1608,7 +1622,7 @@ pub fn AttendantsComponent(
                 // Peer list sidebar
                 div {
                     id: "peer-list-container",
-                    class: if peer_list_open() && !locked { "visible" } else { "" },
+                    class: if peer_list_open() && !locked { "glass-regular visible" } else { "glass-regular" },
                     // Stays mounted while locked (only the class hides it):
                     // PeerList's diagnostics task isn't aborted on unmount.
                     if peer_list_open() {

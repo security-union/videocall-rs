@@ -8,6 +8,7 @@
 - **dioxus-ui** - Dioxus-based frontend (the sole UI, uses `videocall-client`)
 - **videocall-types** - Shared protobuf types
 - **videocall-codecs** - Audio/video codec wrappers
+- **videocall-theme** - Design system: tokens/base/components CSS, typed Dioxus primitives, browsable gallery (`make theme-gallery`)
 
 ## Build Commands
 

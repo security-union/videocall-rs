@@ -99,7 +99,7 @@ test.describe("Meetings", () => {
     await expect(page).toHaveURL(/\/meeting\/no_username_test/);
     // The inline prompt should be visible with input and join button
     await expect(page.getByText("Enter your display name")).toBeVisible({ timeout: 5_000 });
-    await expect(page.locator("input.input-apple")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByTestId("display-name-input")).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("Join Meeting")).toBeVisible({ timeout: 5_000 });
   });
 

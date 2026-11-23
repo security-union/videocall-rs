@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - 'dioxus-ui/**'
+      - 'videocall-theme/**'
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'videocall-client/**'

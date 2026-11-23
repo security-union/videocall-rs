@@ -1,0 +1,52 @@
+/*
+ * auth.css
+ *
+ * Sign-in. Every provider button is .btn.btn-lg.btn-block with a leading
+ * brand mark and a label, so height and type are identical. The marks keep
+ * their official colors inside the SVG. The old class names stay on the
+ * buttons because tests select them.
+ */
+
+@layer features {
+  .login-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+    box-sizing: border-box;
+    width: min(100%, 24rem);
+    padding: var(--space-6);
+  }
+
+  .login-title {
+    margin: 0;
+    font: var(--text-title-1-emphasized);
+    text-align: center;
+  }
+
+  .login-footer {
+    margin: 0;
+    font: var(--text-footnote);
+    color: var(--color-label-secondary);
+    text-align: center;
+  }
+
+  .gsi-material-button,
+  .okta-sign-in-button,
+  .generic-sign-in-button {
+    gap: var(--space-3);
+  }
+
+  .gsi-material-button-icon,
+  .okta-sign-in-button-icon {
+    flex: none;
+    width: var(--size-icon);
+    height: var(--size-icon);
+  }
+
+  .gsi-material-button-icon svg,
+  .okta-sign-in-button-icon svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+}

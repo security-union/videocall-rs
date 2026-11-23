@@ -6,6 +6,7 @@
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
+use videocall_theme::{Field, Select};
 use web_sys::MediaDeviceInfo;
 
 #[component]
@@ -23,11 +24,10 @@ pub fn DeviceSelector(
     let is_ios_safari = is_ios();
 
     rsx! {
-        div { class: "device-selector-wrapper",
-            label { r#for: "audio-select", "Audio:" }
-            select {
+        Field { class: "device-selector-wrapper",
+            label { class: "field-label", r#for: "audio-select", "Audio:" }
+            Select {
                 id: "audio-select",
-                class: "device-selector",
                 onchange: {
                     let microphones = microphones.clone();
                     move |evt: Event<FormData>| {
@@ -45,11 +45,9 @@ pub fn DeviceSelector(
                     }
                 }
             }
-            br {}
-            label { r#for: "video-select", "Video:" }
-            select {
+            label { class: "field-label", r#for: "video-select", "Video:" }
+            Select {
                 id: "video-select",
-                class: "device-selector",
                 onchange: {
                     let cameras = cameras.clone();
                     move |evt: Event<FormData>| {
@@ -67,12 +65,10 @@ pub fn DeviceSelector(
                     }
                 }
             }
-            br {}
             if !is_ios_safari {
-                label { r#for: "speaker-select", "Speaker:" }
-                select {
+                label { class: "field-label", r#for: "speaker-select", "Speaker:" }
+                Select {
                     id: "speaker-select",
-                    class: "device-selector",
                     onchange: {
                         let speakers = speakers.clone();
                         move |evt: Event<FormData>| {

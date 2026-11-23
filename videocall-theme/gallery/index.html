@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>videocall-theme gallery</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <meta name="color-scheme" content="light dark">
+        <!-- No stylesheet links on purpose. The app injects tokens.css,
+             base.css and components.css from the crate's Rust constants (in
+             that order, then gallery.css), so it can rewrite their media
+             queries in memory for the appearance and accessibility previews.
+             See src/preview.rs. -->
+        <link
+            data-trunk
+            rel="rust"
+            href="../Cargo.toml"
+            data-bin="videocall-theme-gallery"
+            data-cargo-features="gallery"
+        />
+    </head>
+    <body>
+        <div id="main"></div>
+    </body>
+</html>

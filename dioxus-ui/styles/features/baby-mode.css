@@ -1,0 +1,193 @@
+/*
+ * baby-mode.css
+ *
+ * Full-screen lock over the call. Stacking, all from --z-lock so nothing in
+ * the app can sit above it:
+ *   shield < scrim < lock and hint < dialog
+ * Geometry kept from the old sheet because the e2e tests compute click
+ * positions from it: the lock is 44x44 (--size-hit), fixed, top and
+ * inline-end offset 12px (--space-3) plus the safe area.
+ */
+
+@layer features {
+  /* Tile buttons stay in the DOM while baby mode is on; hide them. */
+  .baby-mode-active .pin-icon,
+  .baby-mode-active .crop-icon {
+    display: none;
+  }
+
+  .baby-mode-shield {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-lock);
+    background: transparent;
+    /* Block pinch-zoom, pan and double-tap zoom on touch screens. */
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .baby-mode-scrim {
+    z-index: calc(var(--z-lock) + 1);
+    touch-action: none;
+  }
+
+  .baby-mode-lock {
+    position: fixed;
+    top: calc(var(--space-3) + var(--safe-top));
+    inset-inline-end: calc(var(--space-3) + var(--safe-right));
+    z-index: calc(var(--z-lock) + 2);
+    width: var(--size-hit);
+    height: var(--size-hit);
+    padding: 0;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .baby-mode-lock svg {
+    pointer-events: none;
+  }
+
+  .baby-mode-lock-icon {
+    width: var(--size-icon-sm);
+    height: var(--size-icon-sm);
+  }
+
+  .baby-mode-lock-progress {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    transform: rotate(-90deg);
+  }
+
+  /* Circumference of r=16 is ~100.5. The duration comes from
+     HOLD_TO_UNLOCK_MS through --baby-mode-hold-duration, set on the circle. */
+  .baby-mode-lock-progress circle {
+    stroke: currentColor;
+    stroke-dasharray: 100.53;
+    stroke-dashoffset: 100.53;
+    animation-duration: var(--baby-mode-hold-duration);
+  }
+
+  .baby-mode-lock.holding .baby-mode-lock-progress circle {
+    animation-name: baby-mode-hold;
+    animation-timing-function: linear;
+    animation-fill-mode: forwards;
+  }
+
+  @keyframes baby-mode-hold {
+    to {
+      stroke-dashoffset: 0;
+    }
+  }
+
+  .baby-mode-hint {
+    position: fixed;
+    top: calc(var(--size-hit) + var(--space-5) + var(--safe-top));
+    inset-inline-end: calc(var(--space-3) + var(--safe-right));
+    z-index: calc(var(--z-lock) + 2);
+    max-width: min(17.5rem, calc(100vw - 2 * var(--space-3)));
+    margin: 0;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    background-color: var(--material-dim);
+    color: var(--color-white);
+    font: var(--text-footnote);
+    text-align: end;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity var(--duration-slow) var(--ease-standard);
+  }
+
+  .baby-mode-hint.visible {
+    opacity: 1;
+  }
+
+  .baby-mode-hint:empty {
+    padding: 0;
+  }
+
+  /* The unlock dialog is an .alert, pinned to the center of the screen.
+     Inset plus auto margins instead of a transform, so the entry animation
+     does not fight the centering. */
+  .baby-mode-dialog {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-lock) + 3);
+    width: min(22.5rem, calc(100vw - 2 * var(--space-4)));
+    max-width: none;
+    height: fit-content;
+    max-height: calc(var(--viewport-height, 100dvh) - 2 * var(--space-4));
+    margin: auto;
+    overflow: auto;
+  }
+
+  /* Anchor near the top on phones so the on-screen keyboard doesn't cover it. */
+  @media (max-width: 640px) {
+    .baby-mode-dialog {
+      inset-block: calc(var(--safe-top) + 12vh) auto;
+    }
+  }
+
+  .baby-mode-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .baby-mode-code {
+    margin: 0;
+    font: var(--text-title-1-emphasized);
+    font-family: var(--font-mono);
+    letter-spacing: 0.3em;
+    text-align: center;
+  }
+
+  .baby-mode-code-input {
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+
+  /* Keep the placeholder readable: no forced caps or wide tracking. */
+  .baby-mode-code-input::placeholder {
+    font-family: inherit;
+    letter-spacing: normal;
+    text-transform: none;
+  }
+
+  .baby-mode-feedback {
+    min-height: 1.25em;
+    margin: 0;
+    color: var(--color-warning);
+  }
+
+  .baby-mode-dialog-actions .btn {
+    min-width: 6rem;
+  }
+
+  @media (forced-colors: active) {
+    .baby-mode-lock {
+      border: 2px solid ButtonText;
+    }
+
+    .baby-mode-dialog {
+      border: 1px solid CanvasText;
+    }
+
+    .baby-mode-lock-progress circle {
+      stroke: ButtonText;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .baby-mode-hint {
+      transition: none;
+    }
+  }
+}

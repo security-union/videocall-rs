@@ -10,18 +10,19 @@ use crate::meeting_api::{
 };
 use crate::routing::Route;
 use dioxus::prelude::*;
+use videocall_theme::{
+    Badge, BadgeTone, Button, ButtonVariant, Card, IconButton, ListFooter, ListGroup, ListHeader,
+    ListRow, ListRowLabel, ListRowValue, Spinner, Toolbar,
+};
 use web_sys::window;
 
-/// Shared page shell — hero-container with floating gradient orbs, matching
-/// the homepage layout.  All early-return states use this wrapper so the page
-/// always looks consistent.
+/// Shared page shell: a grouped settings screen that follows the system
+/// appearance. All early-return states use this wrapper so the page always
+/// looks consistent.
 fn page_shell(inner: Element) -> Element {
     rsx! {
-        div { class: "hero-container",
-            div { class: "floating-element floating-element-1" }
-            div { class: "floating-element floating-element-2" }
-            div { class: "floating-element floating-element-3" }
-            div { class: "hero-content", {inner} }
+        div { class: "surface-grouped settings-page",
+            div { class: "settings-container", {inner} }
         }
     }
 }
@@ -84,8 +85,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     // Auth loading
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return page_shell(rsx! {
-            div { class: "settings-loading-state",
-                span { class: "loading-spinner" }
+            div { class: "settings-state",
+                Spinner { large: true, label: None }
                 span { "Checking authentication..." }
             }
         });
@@ -94,8 +95,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     // Data loading
     if loading() {
         return page_shell(rsx! {
-            div { class: "settings-loading-state",
-                span { class: "loading-spinner" }
+            div { class: "settings-state",
+                Spinner { large: true, label: None }
                 span { "Loading meeting..." }
             }
         });
@@ -104,10 +105,11 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     // Error
     if let Some(err) = error() {
         return page_shell(rsx! {
-            div { class: "settings-empty-state",
+            Card { class: "settings-state",
                 svg {
                     xmlns: "http://www.w3.org/2000/svg", width: "48", height: "48",
-                    view_box: "0 0 24 24", fill: "none", stroke: "var(--warning)",
+                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                    class: "settings-state-icon",
                     stroke_width: "1.5", stroke_linecap: "round", stroke_linejoin: "round",
                     circle { cx: "12", cy: "12", r: "10" }
                     line { x1: "12", y1: "8", x2: "12", y2: "12" }
@@ -115,8 +117,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 }
                 h2 { "Unable to load meeting" }
                 p { "{err}" }
-                button {
-                    class: "btn-apple btn-secondary",
+                Button {
                     onclick: move |_| { navigator.push(Route::Home {}); },
                     "Back to Home"
                 }
@@ -127,10 +128,9 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     // Not found
     let Some(info) = meeting() else {
         return page_shell(rsx! {
-            div { class: "settings-empty-state",
+            Card { class: "settings-state",
                 h2 { "Meeting not found" }
-                button {
-                    class: "btn-apple btn-secondary",
+                Button {
                     onclick: move |_| { navigator.push(Route::Home {}); },
                     "Back to Home"
                 }
@@ -138,10 +138,10 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         });
     };
 
-    let state_class = match info.state.as_str() {
-        "active" => "state-active",
-        "idle" => "state-idle",
-        _ => "state-ended",
+    let state_tone = match info.state.as_str() {
+        "active" => BadgeTone::Success,
+        "idle" => BadgeTone::Warning,
+        _ => BadgeTone::Neutral,
     };
     let is_ended = info.state == "ended";
     let is_active = info.state == "active";
@@ -252,10 +252,10 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     };
 
     page_shell(rsx! {
-        // Back navigation
-        div { class: "settings-header",
-            button {
-                class: "settings-back-btn",
+        // Back navigation and title
+        Toolbar { header: true, class: "settings-toolbar",
+            IconButton {
+                label: "Back to home",
                 onclick: move |_| { navigator.push(Route::Home {}); },
                 title: "Back to home",
                 svg {
@@ -264,145 +264,144 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                     polyline { points: "15 18 9 12 15 6" }
                 }
-                span { "Back" }
             }
+            h1 { class: "toolbar-title", "Meeting Settings" }
+            // Keeps the title centered against the back button.
+            span { class: "settings-toolbar-spacer", "aria-hidden": "true" }
         }
 
-        h1 { class: "hero-title text-center", "Meeting Settings" }
-
-        div { class: "content-separator" }
-
-        // ── Details card (compact) ──
-        div { class: "settings-card settings-card-compact",
-            h3 { class: "settings-card-title", "Details" }
-
-            div { class: "settings-field-compact",
-                span { class: "settings-field-label", "Meeting ID" }
-                span { class: "settings-field-value settings-field-mono", "{info.meeting_id}" }
-            }
-
-            div { class: "settings-field-compact",
-                span { class: "settings-field-label", "Status" }
-                span { class: "meeting-state {state_class}", "{info.state}" }
-            }
-
-            if let Some(host) = &info.host_display_name {
-                div { class: "settings-field-compact",
-                    span { class: "settings-field-label", "Host" }
-                    span { class: "settings-field-value", "{host}" }
+        // Details
+        section { class: "settings-group",
+            ListHeader { "Details" }
+            ListGroup {
+                ListRow {
+                    ListRowLabel { "Meeting ID" }
+                    ListRowValue { class: "text-mono", "{info.meeting_id}" }
+                }
+                ListRow {
+                    ListRowLabel { "Status" }
+                    ListRowValue {
+                        Badge { tone: state_tone, "{info.state}" }
+                    }
+                }
+                if let Some(host) = &info.host_display_name {
+                    ListRow {
+                        ListRowLabel { "Host" }
+                        ListRowValue { "{host}" }
+                    }
                 }
             }
         }
 
-        // ── Activity card (compact rows) ──
-        div { class: "settings-card settings-card-compact",
-            h3 { class: "settings-card-title", "Activity" }
-
-            div { class: "settings-stat-row",
-                svg {
-                    xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
-                    circle { cx: "9", cy: "7", r: "4" }
-                    path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
-                    path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
-                }
-                span { class: "settings-stat-label", "Participants" }
-                span { class: "settings-stat-value", "{participant_count}" }
-            }
-
-            if is_active && waiting_count > 0 {
-                div { class: "settings-stat-row settings-stat-warning",
+        // Activity
+        section { class: "settings-group",
+            ListHeader { "Activity" }
+            ListGroup {
+                ListRow {
                     svg {
-                        xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
+                        xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
                         view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
                         stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        circle { cx: "12", cy: "12", r: "10" }
-                        line { x1: "12", y1: "8", x2: "12", y2: "12" }
-                        line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
+                        path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
+                        circle { cx: "9", cy: "7", r: "4" }
+                        path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
+                        path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
                     }
-                    span { class: "settings-stat-label", "Waiting" }
-                    span { class: "settings-stat-value", "{waiting_count}" }
+                    ListRowLabel { "Participants" }
+                    ListRowValue { "{participant_count}" }
                 }
-            }
 
-            if let Some(ref dur) = duration_str {
-                div { class: "settings-stat-row",
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        circle { cx: "12", cy: "12", r: "10" }
-                        polyline { points: "12 6 12 12 16 14" }
-                    }
-                    span { class: "settings-stat-label", "Duration" }
-                    span { class: "settings-stat-value", "{dur}" }
-                }
-            }
-
-            div { class: "settings-stat-row",
-                svg {
-                    xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    rect { x: "3", y: "4", width: "18", height: "18", rx: "2", ry: "2" }
-                    line { x1: "16", y1: "2", x2: "16", y2: "6" }
-                    line { x1: "8", y1: "2", x2: "8", y2: "6" }
-                    line { x1: "3", y1: "10", x2: "21", y2: "10" }
-                }
-                span { class: "settings-stat-label", if is_ended { "Time" } else { "Started" } }
-                span { class: "settings-stat-value",
-                    "{started_str}"
-                    if let Some(ref ended) = ended_str {
-                        span { class: "settings-stat-separator", " – {ended}" }
-                    }
-                }
-            }
-        }
-
-        // ── Options card ──
-        div { class: "settings-card",
-            h3 { class: "settings-card-title", "Options" }
-
-            div { class: "settings-option-row",
-                span { class: "settings-option-label", "Waiting Room" }
-                div { class: "settings-option-controls",
-                    span {
-                        class: "settings-info-icon",
-                        title: "Participants must be admitted by the host before joining",
+                if is_active && waiting_count > 0 {
+                    ListRow { class: "settings-row-warning",
                         svg {
-                            xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
+                            xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
                             view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
                             stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                             circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
+                            line { x1: "12", y1: "8", x2: "12", y2: "12" }
+                            line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
                         }
-                    }
-                    ToggleSwitch {
-                        enabled: waiting_room_toggle(),
-                        on_toggle: on_toggle_waiting_room,
-                        disabled: saving(),
+                        ListRowLabel { "Waiting" }
+                        ListRowValue { "{waiting_count}" }
                     }
                 }
-            }
 
-            if let Some(err) = toggle_error() {
-                p { class: "toggle-error",
-                    "{err}"
+                if let Some(ref dur) = duration_str {
+                    ListRow {
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                            circle { cx: "12", cy: "12", r: "10" }
+                            polyline { points: "12 6 12 12 16 14" }
+                        }
+                        ListRowLabel { "Duration" }
+                        ListRowValue { "{dur}" }
+                    }
+                }
+
+                ListRow {
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                        rect { x: "3", y: "4", width: "18", height: "18", rx: "2", ry: "2" }
+                        line { x1: "16", y1: "2", x2: "16", y2: "6" }
+                        line { x1: "8", y1: "2", x2: "8", y2: "6" }
+                        line { x1: "3", y1: "10", x2: "21", y2: "10" }
+                    }
+                    ListRowLabel { if is_ended { "Time" } else { "Started" } }
+                    ListRowValue {
+                        "{started_str}"
+                        if let Some(ref ended) = ended_str {
+                            span { " – {ended}" }
+                        }
+                    }
                 }
             }
         }
 
-        // ── Actions card ──
-        div { class: "settings-card",
-            h3 { class: "settings-card-title", "Actions" }
+        // Options
+        section { class: "settings-group",
+            ListHeader { "Options" }
+            ListGroup {
+                ListRow {
+                    ListRowLabel { id: "settings-waiting-room-label", "Waiting Room" }
+                    ListRowValue { class: "settings-option-controls",
+                        span {
+                            class: "settings-info-icon",
+                            title: "Participants must be admitted by the host before joining",
+                            svg {
+                                xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
+                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                                circle { cx: "12", cy: "12", r: "10" }
+                                line { x1: "12", y1: "16", x2: "12", y2: "12" }
+                                line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
+                            }
+                        }
+                        ToggleSwitch {
+                            enabled: waiting_room_toggle(),
+                            on_toggle: on_toggle_waiting_room,
+                            disabled: saving(),
+                            labelled_by: "settings-waiting-room-label",
+                        }
+                    }
+                }
+            }
+            if let Some(err) = toggle_error() {
+                ListFooter { class: "settings-footer-error", role: "alert", "{err}" }
+            }
+        }
 
-            // Start (idle/ended) or Join (active)
-            div { class: "settings-action-row",
-                button {
-                    class: "btn-apple btn-primary settings-action-btn",
+        // Actions
+        section { class: "settings-group",
+            ListHeader { "Actions" }
+            div { class: "settings-actions",
+                // Start (idle/ended) or Join (active)
+                Button {
+                    variant: ButtonVariant::Prominent,
+                    block: true,
                     onclick: on_join,
                     if info.state == "active" {
                         svg {
@@ -424,17 +423,17 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                         span { "Start Meeting" }
                     }
                 }
-            }
 
-            // End Meeting — only when meeting is active or idle
-            if !is_ended {
-                div { class: "settings-action-row",
-                    button {
-                        class: "btn-apple btn-warning settings-action-btn",
+                // End Meeting: only when meeting is active or idle
+                if !is_ended {
+                    Button {
+                        variant: ButtonVariant::Tinted,
+                        block: true,
+                        class: "settings-btn-warning",
                         disabled: ending(),
                         onclick: on_end_meeting,
                         if ending() {
-                            span { class: "loading-spinner" }
+                            Spinner { label: None }
                             span { "Ending..." }
                         } else {
                             svg {
@@ -448,24 +447,21 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     }
                 }
             }
+        }
 
-            // Danger zone divider — only show when there are actions above it
+        // Danger zone: its own group, always available
+        section { class: "settings-group",
             if !is_ended {
-                div { class: "settings-danger-zone",
-                    div { class: "settings-danger-divider" }
-                    span { class: "settings-danger-label", "Danger Zone" }
-                    div { class: "settings-danger-divider" }
-                }
+                ListHeader { "Danger Zone" }
             }
-
-            // Delete — always available, but visually separated
-            div { class: "settings-action-row",
-                button {
-                    class: "btn-apple btn-danger settings-action-btn",
+            div { class: "settings-actions",
+                Button {
+                    variant: ButtonVariant::Destructive,
+                    block: true,
                     disabled: deleting(),
                     onclick: on_delete,
                     if deleting() {
-                        span { class: "loading-spinner" }
+                        Spinner { label: None }
                         span { "Deleting..." }
                     } else {
                         svg {

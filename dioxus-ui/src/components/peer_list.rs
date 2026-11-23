@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
-use videocall_theme::{IconButton, ListGroup, ListHeader, Menu, MenuItem, Toolbar};
+use videocall_theme::{icons, Icon, IconButton, ListGroup, ListHeader, Menu, MenuItem, Toolbar};
 
 #[component]
 pub fn PeerList(
@@ -137,20 +137,7 @@ pub fn PeerList(
                             e.stop_propagation();
                             show_context_menu.set(!show_context_menu());
                         },
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg",
-                            width: "20",
-                            height: "20",
-                            view_box: "0 0 24 24",
-                            fill: "none",
-                            stroke: "currentColor",
-                            stroke_width: "2",
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "1" }
-                            circle { cx: "12", cy: "5", r: "1" }
-                            circle { cx: "12", cy: "19", r: "1" }
-                        }
+                        Icon { glyph: &icons::MORE_VERTICAL, size: "20" }
                     }
                     IconButton {
                         label: "Close",
@@ -164,20 +151,7 @@ pub fn PeerList(
                             MenuItem {
                                 role: None::<&str>,
                                 onclick: move |_| on_toggle_meeting_info.call(()),
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg",
-                                    width: "16",
-                                    height: "16",
-                                    view_box: "0 0 24 24",
-                                    fill: "none",
-                                    stroke: "currentColor",
-                                    stroke_width: "2",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                    circle { cx: "12", cy: "12", r: "10" }
-                                    line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                                    line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                                }
+                                Icon { glyph: &icons::INFO, size: "16" }
                                 if show_meeting_info { "Hide Meeting Info" } else { "Show Meeting Info" }
                             }
                         }
@@ -188,18 +162,7 @@ pub fn PeerList(
             // Sidebar content
             div { class: "sidebar-content",
                 div { class: "search-field",
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg",
-                        view_box: "0 0 24 24",
-                        fill: "none",
-                        stroke: "currentColor",
-                        stroke_width: "2",
-                        stroke_linecap: "round",
-                        stroke_linejoin: "round",
-                        "aria-hidden": "true",
-                        circle { cx: "11", cy: "11", r: "7" }
-                        line { x1: "21", y1: "21", x2: "16.65", y2: "16.65" }
-                    }
+                    Icon { glyph: &icons::SEARCH, "aria-hidden": "true" }
                     input {
                         r#type: "text",
                         placeholder: "Search attendants...",

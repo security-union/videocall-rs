@@ -132,6 +132,52 @@ export function controlButton(page: Page, tooltip: string): Locator {
   });
 }
 
+/**
+ * The phone bar's More button. Below the phone breakpoint (37.5em) the bar
+ * holds only mic, camera, More and hang up; the other controls are rows of
+ * the menu More opens. On a wider screen it does not exist.
+ */
+export function moreButton(page: Page): Locator {
+  return page.locator(".call-controls").getByRole("button", { name: "More", exact: true });
+}
+
+/** The menu the More button opens. */
+export function moreMenu(page: Page): Locator {
+  return page.getByRole("menu", { name: "More" });
+}
+
+/**
+ * A control that moves into the More menu on a phone (peers, diagnostics,
+ * device settings, baby mode, share), by its accessible name, e.g.
+ * "Open Peers". Clicks it in the bar on a wide screen, or opens More and
+ * clicks its row on a phone.
+ */
+export async function clickBarControl(page: Page, name: string): Promise<void> {
+  // The bar renders after the call connects; isVisible() does not wait, so
+  // without this a phone viewport would take the wrong path.
+  await expect(page.locator(".call-controls")).toBeVisible();
+  if (await moreButton(page).isVisible()) {
+    await openMoreMenu(page);
+    await moreMenuItem(page, name).click();
+    return;
+  }
+  await page.locator(".call-controls").getByRole("button", { name, exact: true }).click();
+}
+
+/** A row of the open More menu, by its accessible name ("Open Peers"). */
+export function moreMenuItem(page: Page, name: string): Locator {
+  const menu = moreMenu(page);
+  return menu
+    .getByRole("menuitem", { name, exact: true })
+    .or(menu.getByRole("menuitemcheckbox", { name, exact: true }));
+}
+
+/** Open the More menu and wait for it. */
+export async function openMoreMenu(page: Page): Promise<void> {
+  await moreButton(page).click();
+  await expect(moreMenu(page)).toBeVisible();
+}
+
 /** The microphone toggle. Its name is fixed; `aria-pressed` says whether the mic is on. */
 export function micButton(page: Page): Locator {
   return page.getByRole("button", { name: "Microphone" });

@@ -33,7 +33,27 @@ rsx! { Button { variant: ButtonVariant::Prominent, "data-testid": "join", "Join"
 
 Every component takes `class` and passes `id`, `data-testid` and `aria-*` through to its element. A component that brings an ARIA role (sheet, alert, menu, tab list) lets a `role` you pass replace it, and `role: None::<&str>` leaves it off. A browser test that can't use Trunk can inject `TOKENS_CSS`, `BASE_CSS` and `COMPONENTS_CSS` instead.
 
-dioxus-ui renders its buttons, control bar, fields, cards, lists, dialogs, menus and badges through these, so the gallery shows the controls that ship. It still writes the classes by hand in a few places: markup driven from web-sys (video tiles, the speaking glow, the sidebars' containers), lists that re-render per peer or on the stats tick (peer rows, toasts, the diagnostics panel), and elements no component renders yet (a link styled as a button, headings at other levels).
+dioxus-ui renders its buttons, control bar, fields, cards, lists, dialogs, menus, badges and icons through these, so the gallery shows the controls that ship. It still writes the classes by hand in a few places: markup driven from web-sys (video tiles, the speaking glow, the sidebars' containers), lists that re-render per peer or on the stats tick (peer rows, toasts, the diagnostics panel), and elements no component renders yet (a link styled as a button, headings at other levels).
+
+## Icons
+
+`src/icons.rs` is the one icon set. Each glyph is `&'static` data (a view box, stroke or fill, and its shapes), and one `Icon` component draws any of them, so the app pays for the render glue once. Both dioxus-ui and the gallery draw from it, and the gallery's Icons section lists every glyph by name.
+
+```rust
+use videocall_theme::{icons, Icon};
+
+rsx! { Icon { glyph: &icons::CLOSE, size: "16", "aria-hidden": "true" } }
+```
+
+A glyph keeps the SVG elements it was drawn with, so a `line` stays a `line`. Brand marks and charts aren't icons and stay in the app.
+
+## The call bar
+
+The control bar is described once, by `CallControl`: each control's name, tooltip, icon, look and test ids, on and off. `CallButton` draws a control as a bar button, `CallMenuItem` as a menu row, and `CallMoreButton` is the phone bar's More. The gallery renders its bars from the same enum, so it can't drift from the app.
+
+On a wide screen every control sits in the bar. Under 37.5em (the phone layout's breakpoint) the bar keeps mic, camera, More and hang up, and the rest are rows of the menu More opens: the same names and icons, `aria-checked` where a control has an on state. The app decides which placement to render with a media query listener, so only one exists in the DOM.
+
+`Menu` brings the menu keys when it has its own `menu` role: Down, Up, Home and End move focus between rows, and Escape or Tab call `onclose`. Opening it, focusing the first row (`MenuItem { autofocus }`) and handing focus back to the button is the caller's job.
 
 ## Layer order
 

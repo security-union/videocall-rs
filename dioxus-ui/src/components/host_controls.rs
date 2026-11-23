@@ -18,7 +18,8 @@ use crate::constants::meeting_api_client;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
 use videocall_theme::{
-    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Glass, ListGroup, ListRow, ListRowLabel,
+    icons, Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Glass, Icon, IconButton,
+    IconButtonVariant, ListGroup, ListRow, ListRowLabel,
 };
 use wasm_bindgen::JsCast;
 use web_sys::HtmlAudioElement;
@@ -193,16 +194,7 @@ pub fn HostControls(
             ListRow { class: "host-controls-toggle", "aria-expanded": "{expanded()}", onclick: move |_| expanded.set(!expanded()),
                 Badge { tone: BadgeTone::Count, "{waiting().len()}" }
                 ListRowLabel { "Waiting to join" }
-                svg {
-                    "aria-hidden": "true",
-                    class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "16", height: "16",
-                    view_box: "0 0 24 24",
-                    fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    polyline { points: "6 9 12 15 18 9" }
-                }
+                Icon { glyph: &icons::CHEVRON_DOWN, size: "16", class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" }, "aria-hidden": "true" }
             }
 
             if expanded() {
@@ -210,12 +202,7 @@ pub fn HostControls(
                     if show_admit_all {
                         div { class: "admit-all-container",
                             Button { variant: ButtonVariant::Tinted, size: ButtonSize::Small, onclick: on_admit_all,
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                    polyline { points: "20 6 9 17 4 12" }
-                                }
+                                Icon { glyph: &icons::CHECK, size: "16" }
                                 "Admit all ({waiting().len()})"
                             }
                         }
@@ -259,11 +246,11 @@ pub fn HostControls(
                                         }
                                     }
                                     div { class: "participant-actions",
-                                        button {
-                                            class: "btn-admit icon-btn icon-btn-filled",
-                                            r#type: "button",
+                                        IconButton {
+                                            label: "Admit",
+                                            variant: IconButtonVariant::Filled,
+                                            class: "btn-admit",
                                             title: "Admit",
-                                            "aria-label": "Admit",
                                             onclick: move |_| {
                                                 waiting_admit.write().retain(|p| p.user_id != uid_admit);
                                                 let uid = uid_admit.clone();
@@ -281,19 +268,13 @@ pub fn HostControls(
                                                     }
                                                 });
                                             },
-                                            svg {
-                                                "aria-hidden": "true",
-                                                xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                                polyline { points: "20 6 9 17 4 12" }
-                                            }
+                                            Icon { glyph: &icons::CHECK, size: "16", "aria-hidden": "true" }
                                         }
-                                        button {
-                                            class: "btn-reject icon-btn icon-btn-filled",
-                                            r#type: "button",
+                                        IconButton {
+                                            label: "Reject",
+                                            variant: IconButtonVariant::Filled,
+                                            class: "btn-reject",
                                             title: "Reject",
-                                            "aria-label": "Reject",
                                             onclick: move |_| {
                                                 waiting_reject.write().retain(|p| p.user_id != uid_reject);
                                                 let uid = uid_reject.clone();
@@ -311,14 +292,7 @@ pub fn HostControls(
                                                     }
                                                 });
                                             },
-                                            svg {
-                                                "aria-hidden": "true",
-                                                xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                                line { x1: "18", y1: "6", x2: "6", y2: "18" }
-                                                line { x1: "6", y1: "6", x2: "18", y2: "18" }
-                                            }
+                                            Icon { glyph: &icons::CLOSE, size: "16", "aria-hidden": "true" }
                                         }
                                     }
                                 }

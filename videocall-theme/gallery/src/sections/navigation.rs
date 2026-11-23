@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 use videocall_theme::*;
 
 use super::{Cell, Section, Subhead};
-use crate::icons::{self, Icon};
 
 #[component]
 pub fn Navigation() -> Element {
@@ -23,12 +22,12 @@ pub fn Navigation() -> Element {
             div { class: "gallery-demo gallery-busy gallery-demo-flush",
                 Toolbar {
                     Bar {
-                        IconButton { label: "Back", Icon { paths: icons::BACK } }
+                        IconButton { label: "Back", Icon { glyph: &icons::CHEVRON_LEFT, "aria-hidden": "true" } }
                     }
                     ToolbarTitle { class: "gallery-toolbar-title", "Weekly sync with a long title that truncates" }
                     Bar {
-                        IconButton { label: "Participants", Icon { paths: icons::PEOPLE } }
-                        IconButton { label: "Chat", Icon { paths: icons::CHAT } }
+                        IconButton { label: "Participants", Icon { glyph: &icons::PEOPLE, "aria-hidden": "true" } }
+                        IconButton { label: "Chat", Icon { glyph: &icons::CHAT, "aria-hidden": "true" } }
                     }
                 }
             }

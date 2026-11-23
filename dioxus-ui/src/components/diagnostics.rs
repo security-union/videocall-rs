@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, MetricValue};
+use videocall_theme::IconButton;
 
 // Serializable versions of DiagEvent structures
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -464,6 +465,31 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
     stats
 }
 
+/// What the diagnostics events brought since the panel last updated.
+///
+/// The events arrive far faster than the panel can usefully change: one
+/// NetEq report per remote peer per second, a viewer report per stream
+/// every 500 ms (the "sender" events), and a connection manager report
+/// every second plus one per server connection. Setting a signal per event
+/// re-rendered the whole panel, five SVG charts included, dozens of times a
+/// second in a large call. Events now only land here, and the panel's 1 s
+/// tick (`RECEPTION_PUBLISH_MS`, the rate the charts' NetEq data and the
+/// reception rows already arrive at) copies whatever changed into the
+/// signals: at most one render a second, with the same data.
+#[derive(Default)]
+struct PendingDiagnostics {
+    /// The latest viewer report's text, if one came in since the last tick.
+    sender_stats: Option<String>,
+    neteq_stats: HashMap<String, Vec<String>>,
+    neteq_buffer: HashMap<String, Vec<u64>>,
+    neteq_jitter: HashMap<String, Vec<u64>>,
+    connection_events: Vec<SerializableDiagEvent>,
+    stats_dirty: bool,
+    buffer_dirty: bool,
+    jitter_dirty: bool,
+    connection_dirty: bool,
+}
+
 #[component]
 pub fn Diagnostics(
     is_open: bool,
@@ -522,10 +548,9 @@ pub fn Diagnostics(
             // NetEq workers post stats every second only while this panel is
             // open. Ask after subscribing so the first report is not missed.
             videocall_client::set_audio_diagnostics_enabled(true);
-            let mut connection_events = Vec::<SerializableDiagEvent>::new();
-            let mut neteq_stats = HashMap::<String, Vec<String>>::new();
-            let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();
-            let mut neteq_jitter = HashMap::<String, Vec<u64>>::new();
+            // Events only fill this; the 1 s tick below moves it into the
+            // signals. See `PendingDiagnostics`.
+            let pending = Rc::new(RefCell::new(PendingDiagnostics::default()));
             // Shared with the 1 s refresh below, which ages rows out (and
             // drops departed peers) when no decoder event arrives any more.
             let reception = Rc::new(RefCell::new(ReceptionStore::default()));
@@ -543,17 +568,52 @@ pub fn Diagnostics(
                     }
                 }
             };
-            let refresh = {
+            // Moves the buffer into the signals. Runs once on mount, on the
+            // first event that arrives before the first tick, then every
+            // second, so the first paint does not wait a full tick.
+            let flush = {
                 let mut publish_reception = publish_reception.clone();
+                let pending = pending.clone();
+                Rc::new(RefCell::new(move || {
+                    publish_reception(js_sys::Date::now());
+                    let mut pending = pending.borrow_mut();
+                    if let Some(text) = pending.sender_stats.take() {
+                        sender_stats.set(Some(text));
+                    }
+                    if std::mem::take(&mut pending.stats_dirty) {
+                        neteq_stats_per_peer.set(pending.neteq_stats.clone());
+                    }
+                    if std::mem::take(&mut pending.buffer_dirty) {
+                        neteq_buffer_per_peer.set(pending.neteq_buffer.clone());
+                    }
+                    if std::mem::take(&mut pending.jitter_dirty) {
+                        neteq_jitter_per_peer.set(pending.neteq_jitter.clone());
+                    }
+                    if std::mem::take(&mut pending.connection_dirty) {
+                        let serialized =
+                            serde_json::to_string(&pending.connection_events).unwrap_or_default();
+                        connection_manager_state.set(Some(serialized));
+                    }
+                }))
+            };
+            // Set once the 1 s loop has ticked; the early flush is for events
+            // that beat the first tick only.
+            let tick_seen = Rc::new(std::cell::Cell::new(false));
+            let refresh = {
+                let flush = flush.clone();
+                let tick_seen = tick_seen.clone();
                 async move {
+                    (flush.borrow_mut())();
                     loop {
                         TimeoutFuture::new(RECEPTION_PUBLISH_MS as u32).await;
-                        publish_reception(js_sys::Date::now());
+                        tick_seen.set(true);
+                        (flush.borrow_mut())();
                     }
                 }
             };
 
             let events = async move {
+                let mut flushed_early = false;
                 loop {
                     let evt = match rx.recv().await {
                         Ok(evt) => evt,
@@ -601,7 +661,7 @@ pub fn Diagnostics(
                             }
                             if !text.is_empty() {
                                 text.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
-                                sender_stats.set(Some(text));
+                                pending.borrow_mut().sender_stats = Some(text);
                             }
                         }
                         "neteq" => {
@@ -615,71 +675,68 @@ pub fn Diagnostics(
                             } else {
                                 "unknown"
                             };
-                            let mut stats_dirty = false;
-                            let mut buffer_dirty = false;
-                            let mut jitter_dirty = false;
+                            let mut pending = pending.borrow_mut();
+                            let pending = &mut *pending;
                             for m in &evt.metrics {
                                 match m.name {
                                     "stats_json" => {
                                         if let MetricValue::Text(json) = &m.value {
-                                            let entry = neteq_stats
+                                            let entry = pending
+                                                .neteq_stats
                                                 .entry(target_peer.to_string())
                                                 .or_default();
                                             entry.push(json.clone());
                                             if entry.len() > 60 {
                                                 entry.remove(0);
                                             }
-                                            stats_dirty = true;
+                                            pending.stats_dirty = true;
                                         }
                                     }
                                     "audio_buffer_ms" => {
                                         if let MetricValue::U64(v) = &m.value {
-                                            let entry = neteq_buffer
+                                            let entry = pending
+                                                .neteq_buffer
                                                 .entry(target_peer.to_string())
                                                 .or_default();
                                             entry.push(*v);
                                             if entry.len() > 50 {
                                                 entry.remove(0);
                                             }
-                                            buffer_dirty = true;
+                                            pending.buffer_dirty = true;
                                         }
                                     }
                                     "jitter_buffer_delay_ms" => {
                                         if let MetricValue::U64(v) = &m.value {
-                                            let entry = neteq_jitter
+                                            let entry = pending
+                                                .neteq_jitter
                                                 .entry(target_peer.to_string())
                                                 .or_default();
                                             entry.push(*v);
                                             if entry.len() > 50 {
                                                 entry.remove(0);
                                             }
-                                            jitter_dirty = true;
+                                            pending.jitter_dirty = true;
                                         }
                                     }
                                     _ => {}
                                 }
                             }
-                            // Batch: update signals once per event, not per-metric.
-                            if stats_dirty {
-                                neteq_stats_per_peer.set(neteq_stats.clone());
-                            }
-                            if buffer_dirty {
-                                neteq_buffer_per_peer.set(neteq_buffer.clone());
-                            }
-                            if jitter_dirty {
-                                neteq_jitter_per_peer.set(neteq_jitter.clone());
-                            }
                         }
                         "connection_manager" => {
-                            connection_events.push(SerializableDiagEvent::from(evt));
-                            if connection_events.len() > 20 {
-                                connection_events.remove(0);
+                            let mut pending = pending.borrow_mut();
+                            pending
+                                .connection_events
+                                .push(SerializableDiagEvent::from(evt));
+                            if pending.connection_events.len() > 20 {
+                                pending.connection_events.remove(0);
                             }
-                            let serialized =
-                                serde_json::to_string(&connection_events).unwrap_or_default();
-                            connection_manager_state.set(Some(serialized));
+                            pending.connection_dirty = true;
                         }
                         _ => {}
+                    }
+                    if !tick_seen.get() && !flushed_early {
+                        flushed_early = true;
+                        (flush.borrow_mut())();
                     }
                 }
             };
@@ -812,9 +869,9 @@ pub fn Diagnostics(
                     },
                     "Call Diagnostics"
                 }
-                button {
-                    class: "close-button icon-btn",
-                    "aria-label": "Close",
+                IconButton {
+                    label: "Close",
+                    class: "close-button",
                     onclick: move |_| on_close.call(()),
                     "\u{00d7}"
                 }

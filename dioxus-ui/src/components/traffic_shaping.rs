@@ -28,7 +28,7 @@ use videocall_client::traffic_shaping::{
     TRAFFIC_SHAPING_DELAY_PRESETS_MS, TRAFFIC_SHAPING_RATE_PRESETS_BPS,
 };
 use videocall_client::VideoCallClient;
-use videocall_theme::{StatusDot, StatusTone};
+use videocall_theme::{Button, ButtonVariant, Segment, StatusDot, StatusTone};
 
 use crate::components::toggle_switch::ToggleSwitch;
 
@@ -279,12 +279,11 @@ pub fn TrafficShapingSection() -> Element {
                     span { class: "traffic-shaping-label", "{label}" }
                     div { class: "traffic-shaping-options segmented",
                         for option in options {
-                            button {
+                            Segment {
                                 key: "{option.test_id}",
-                                r#type: "button",
-                                class: "traffic-shaping-option segment",
+                                selected: option.selected,
+                                class: "traffic-shaping-option",
                                 disabled: step_running,
-                                "aria-pressed": if option.selected { "true" } else { "false" },
                                 "data-testid": "{option.test_id}",
                                 onclick: {
                                     let mut apply = apply.clone();
@@ -299,9 +298,9 @@ pub fn TrafficShapingSection() -> Element {
             }
 
             div { class: "traffic-shaping-row list-row",
-                button {
-                    r#type: "button",
-                    class: "traffic-shaping-step btn btn-tinted",
+                Button {
+                    variant: ButtonVariant::Tinted,
+                    class: "traffic-shaping-step",
                     "data-testid": "traffic-shaping-step-test",
                     onclick: {
                         let client = client.clone();

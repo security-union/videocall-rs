@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 use videocall_theme::*;
 
 use super::Section;
-use crate::icons::{self, Icon};
 use crate::Gallery;
 
 #[component]
@@ -53,7 +52,7 @@ pub fn Lists() -> Element {
                         }
                         ListRow { onclick: move |_| gallery.show_toast("Opened encoder settings"),
                             ListRowLabel { "Encoder settings" }
-                            ListRowValue { Icon { paths: icons::CHEVRON_RIGHT } }
+                            ListRowValue { Icon { glyph: &icons::CHEVRON_RIGHT, "aria-hidden": "true" } }
                         }
                         ListRow { href: "#lists",
                             ListRowLabel { subtitle: "A link row", "Diagnostics" }

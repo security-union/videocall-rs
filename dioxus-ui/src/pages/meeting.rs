@@ -24,7 +24,7 @@ use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
-use videocall_theme::{Button, ButtonType, ButtonVariant, Card, Spinner, TextField};
+use videocall_theme::{icons, Button, ButtonType, ButtonVariant, Card, Icon, Spinner, TextField};
 use web_sys::window;
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
@@ -531,11 +531,7 @@ pub fn MeetingPage(id: String) -> Element {
             (Some(_), MeetingStatus::Rejected) => rsx! {
                 div { class: "screen-center prejoin-screen",
                     Card { class: "prejoin-card",
-                        svg { class: "prejoin-icon prejoin-icon-danger", "aria-hidden": "true", xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.5",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "15", y1: "9", x2: "9", y2: "15" }
-                            line { x1: "9", y1: "9", x2: "15", y2: "15" }
-                        }
+                        Icon { glyph: &icons::ERROR, size: "64", stroke_width: "1.5", class: "prejoin-icon prejoin-icon-danger", "aria-hidden": "true" }
                         h2 { class: "text-title-2", "Entry denied" }
                         p { class: "text-secondary", "The meeting host has denied your request to join." }
                         Button {
@@ -553,11 +549,7 @@ pub fn MeetingPage(id: String) -> Element {
             (Some(_), MeetingStatus::Error(error)) => rsx! {
                 div { class: "error-container screen-center prejoin-screen",
                     Card { class: "prejoin-card",
-                        svg { class: "prejoin-icon prejoin-icon-warning", "aria-hidden": "true", xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.5",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "8", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
-                        }
+                        Icon { glyph: &icons::ALERT, size: "64", stroke_width: "1.5", class: "prejoin-icon prejoin-icon-warning", "aria-hidden": "true" }
                         h2 { class: "text-title-2", "Unable to join" }
                         p { class: "text-secondary", "{error}" }
                         Button {

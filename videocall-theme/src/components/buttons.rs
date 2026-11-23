@@ -121,6 +121,10 @@ pub fn ControlButton(
     #[props(default)] pressed: Option<bool>,
     #[props(default)] class: Option<String>,
     #[props(default)] onclick: Option<EventHandler<MouseEvent>>,
+    /// The button is in the DOM. Keep the handle to move focus back to it,
+    /// as the More button does when its menu closes.
+    #[props(default)]
+    onmounted: Option<EventHandler<MountedEvent>>,
     #[props(extends = GlobalAttributes, extends = button)] attributes: Vec<Attribute>,
     children: Element,
 ) -> Element {
@@ -138,6 +142,11 @@ pub fn ControlButton(
                     return;
                 }
                 if let Some(handler) = &onclick {
+                    handler.call(evt);
+                }
+            },
+            onmounted: move |evt| {
+                if let Some(handler) = &onmounted {
                     handler.call(evt);
                 }
             },

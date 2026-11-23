@@ -1,7 +1,9 @@
 // Copyright 2025 Security Union LLC
 // Licensed under MIT OR Apache-2.0
 //
-// Component tests for video control buttons (Dioxus).
+// Component tests for the call bar's buttons (Dioxus). The buttons are
+// `videocall_theme::CallButton`s, described once by `CallControl` and shared
+// with the theme gallery.
 //
 // Pattern:
 //   1. Configure `wasm_bindgen_test` to run in a real browser.
@@ -20,9 +22,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 
 use dioxus::prelude::*;
-use dioxus_ui::components::video_control_buttons::{
-    CameraButton, HangUpButton, MicButton, ScreenShareButton,
-};
+use videocall_theme::{CallButton, CallControl};
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -34,7 +34,7 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 async fn mic_button_enabled_shows_mute_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { MicButton { enabled: true, available: true, onclick: move |_| {} } }
+        rsx! { CallButton { control: CallControl::Microphone, on: true, onclick: move |_| {} } }
     }
     let _app = render_into(&mount, wrapper);
     yield_now().await;
@@ -60,7 +60,7 @@ async fn mic_button_enabled_shows_mute_tooltip() {
 async fn mic_button_disabled_shows_unmute_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { MicButton { enabled: false, available: true, onclick: move |_| {} } }
+        rsx! { CallButton { control: CallControl::Microphone, on: false, onclick: move |_| {} } }
     }
     let _app = render_into(&mount, wrapper);
     yield_now().await;
@@ -90,7 +90,7 @@ async fn mic_button_disabled_shows_unmute_tooltip() {
 async fn camera_button_enabled_shows_stop_video_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { CameraButton { enabled: true, available: true, onclick: move |_| {} } }
+        rsx! { CallButton { control: CallControl::Camera, on: true, onclick: move |_| {} } }
     }
     let _app = render_into(&mount, wrapper);
     yield_now().await;
@@ -105,7 +105,7 @@ async fn camera_button_enabled_shows_stop_video_tooltip() {
 async fn camera_button_disabled_shows_start_video_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { CameraButton { enabled: false, available: true, onclick: move |_| {} } }
+        rsx! { CallButton { control: CallControl::Camera, on: false, onclick: move |_| {} } }
     }
     let _app = render_into(&mount, wrapper);
     yield_now().await;
@@ -124,7 +124,7 @@ async fn camera_button_disabled_shows_start_video_tooltip() {
 async fn screen_share_button_disabled_prop_renders_disabled_attribute() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { ScreenShareButton { active: false, disabled: true, onclick: move |_| {} } }
+        rsx! { CallButton { control: CallControl::ScreenShare, disabled: true, onclick: move |_| {} } }
     }
     let _app = render_into(&mount, wrapper);
     yield_now().await;
@@ -153,7 +153,7 @@ async fn screen_share_button_disabled_prop_renders_disabled_attribute() {
 async fn hang_up_button_has_danger_class() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { HangUpButton { onclick: move |_| {} } }
+        rsx! { CallButton { control: CallControl::HangUp, onclick: move |_| {} } }
     }
     let _app = render_into(&mount, wrapper);
     yield_now().await;

@@ -18,7 +18,7 @@ use crate::meeting_api::{check_status, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
-use videocall_theme::{Button, Card, Spinner};
+use videocall_theme::{icons, Button, Card, Icon, Spinner};
 use wasm_bindgen::JsCast;
 
 pub type ParticipantStatus = JoinMeetingResponse;
@@ -302,14 +302,7 @@ pub fn WaitingRoom(
         div { class: "screen-center prejoin-screen",
             Card { class: "prejoin-card",
                 div { class: "waiting-room-icon",
-                    svg {
-                        "aria-hidden": "true",
-                        xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64",
-                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                        stroke_width: "1.5", stroke_linecap: "round", stroke_linejoin: "round",
-                        circle { cx: "12", cy: "12", r: "10" }
-                        polyline { points: "12 6 12 12 16 14" }
-                    }
+                    Icon { glyph: &icons::CLOCK, size: "64", stroke_width: "1.5", "aria-hidden": "true" }
                 }
                 h2 { class: "text-title-2", "Waiting to be admitted" }
                 if !display_name.trim().is_empty() {
@@ -321,15 +314,7 @@ pub fn WaitingRoom(
 
                 if let Some(err) = error() {
                     p { class: "waiting-room-error", role: "alert",
-                        svg {
-                            "aria-hidden": "true",
-                            xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "8", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
-                        }
+                        Icon { glyph: &icons::ALERT, size: "16", "aria-hidden": "true" }
                         span { "{err}" }
                     }
                 }

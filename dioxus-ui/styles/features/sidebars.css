@@ -128,14 +128,10 @@
     color: var(--color-label-secondary);
   }
 
-  /* The avatar glyph is drawn with a class from the old sheets. */
+  /* The avatar glyph carries a 40px size for the tiles; rows draw it smaller. */
   .peer_item_icon svg {
     width: var(--size-icon);
     height: var(--size-icon);
-  }
-
-  .peer_item_icon .st0 {
-    fill: currentColor;
   }
 
   .peer_item_text {

@@ -30,8 +30,8 @@ use crate::routing::Route;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use videocall_theme::{
-    Button, ButtonType, ButtonVariant, Card, CardTitle, Field, Menu, MenuHeader, MenuItem,
-    MenuSeparator, TextField, Toolbar,
+    icons, Button, ButtonType, ButtonVariant, Card, CardTitle, Field, Icon, Menu, MenuHeader,
+    MenuItem, MenuSeparator, TextField, Toolbar,
 };
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
@@ -166,18 +166,7 @@ pub fn Home() -> Element {
                                     show_dropdown.set(!show_dropdown());
                                 },
                                 span { "{profile.name}" }
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg",
-                                    width: "16",
-                                    height: "16",
-                                    view_box: "0 0 24 24",
-                                    fill: "none",
-                                    stroke: "currentColor",
-                                    stroke_width: "2",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                    polyline { points: "6 9 12 15 18 9" }
-                                }
+                                Icon { glyph: &icons::CHEVRON_DOWN, size: "16" }
                             }
                             if show_dropdown() {
                                 // No menu roles today (they promise arrow-key

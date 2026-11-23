@@ -19,6 +19,7 @@
 
 pub mod classes;
 pub mod components;
+pub mod icons;
 /// Gallery helper: simulates the accessibility media queries. Not part of
 /// the app-facing API, so it only exists with the `gallery` feature (and in
 /// this crate's own tests, which pin its behavior).

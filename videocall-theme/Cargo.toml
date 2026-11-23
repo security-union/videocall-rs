@@ -27,20 +27,25 @@ required-features = ["gallery"]
 # The library only needs the component model. The renderer comes from the
 # app that uses it (dioxus-ui enables "web"), or from the `gallery` feature.
 dioxus = { version = "0.7.3", default-features = false, features = ["macro", "html", "signals", "hooks"] }
-wasm-bindgen = { workspace = true, optional = true }
-web-sys = { version = "0.3.107", optional = true, features = [
+# The menu's arrow-key navigation moves DOM focus between its items. On the
+# host (the SSR tests) these compile to stubs that are never called.
+wasm-bindgen = { workspace = true }
+web-sys = { version = "0.3.107", features = [
     "CssStyleDeclaration",
     "Document",
     "DomTokenList",
     "Element",
+    "HtmlElement",
     "Location",
     "MediaQueryList",
+    "Node",
+    "NodeList",
     "Window",
 ] }
 
 [features]
 default = []
-gallery = ["dioxus/web", "dioxus/launch", "dioxus/lib", "dep:wasm-bindgen", "dep:web-sys"]
+gallery = ["dioxus/web", "dioxus/launch", "dioxus/lib"]
 
 [dev-dependencies]
 # Renders components to HTML on the host, so the tests can check that

@@ -6,6 +6,7 @@ pub mod call;
 pub mod content;
 pub mod controls;
 pub mod foundations;
+pub mod glyphs;
 pub mod materials;
 pub mod navigation;
 pub mod overlays;

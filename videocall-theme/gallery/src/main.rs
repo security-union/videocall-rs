@@ -13,7 +13,6 @@
 //! (`.theme-light`, `.theme-dark`), set on `<html>`.
 
 mod browser;
-mod icons;
 mod sections;
 
 use std::collections::HashMap;
@@ -37,7 +36,7 @@ const WATCHED_QUERIES: [&str; 4] = [
 ];
 
 /// `(anchor id, label)` for the section index.
-pub const SECTIONS: [(&str, &str); 14] = [
+pub const SECTIONS: [(&str, &str); 15] = [
     ("colors", "Colors"),
     ("type", "Type"),
     ("spacing", "Spacing and sizes"),
@@ -51,6 +50,7 @@ pub const SECTIONS: [(&str, &str); 14] = [
     ("overlays", "Overlays"),
     ("navigation", "Navigation"),
     ("status", "Status"),
+    ("icons", "Icons"),
     ("call", "In-call"),
 ];
 
@@ -240,6 +240,7 @@ fn App() -> Element {
                 sections::overlays::Overlays {}
                 sections::navigation::Navigation {}
                 sections::navigation::Status {}
+                sections::glyphs::Icons {}
                 sections::call::Call {}
             }
         }
@@ -254,7 +255,7 @@ fn App() -> Element {
                         label: "Dismiss",
                         size: IconButtonSize::Small,
                         onclick: move |_| gallery.dismiss_toast(id),
-                        icons::Icon { paths: icons::CLOSE }
+                        Icon { glyph: &icons::CLOSE, "aria-hidden": "true" }
                     }
                 }
             }
@@ -324,7 +325,7 @@ fn PreviewControls() -> Element {
                     aria_expanded: if menu_open() { "true" } else { "false" },
                     aria_controls: "gallery-a11y-menu",
                     onclick: move |_| menu_open.toggle(),
-                    icons::Icon { paths: icons::ACCESSIBILITY }
+                    Icon { glyph: &icons::ACCESSIBILITY, "aria-hidden": "true" }
                 }
             }
         }
@@ -338,7 +339,7 @@ fn CheckMark(on: bool) -> Element {
     rsx! {
         span { class: "gallery-check", "aria-hidden": "true",
             if on {
-                icons::Icon { paths: icons::CHECK }
+                Icon { glyph: &icons::CHECK, "aria-hidden": "true" }
             }
         }
     }

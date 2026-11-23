@@ -9,8 +9,8 @@ use crate::routing::Route;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::{ListMeetingsResponse, MeetingSummary};
 use videocall_theme::{
-    Badge, BadgeTone, Button, ButtonSize, IconButton, IconButtonSize, ListGroup, ListRow,
-    ListRowLabel, Spinner,
+    icons, Badge, BadgeTone, Button, ButtonSize, Icon, IconButton, IconButtonSize, ListGroup,
+    ListRow, ListRowLabel, Spinner,
 };
 
 enum FetchMeetingsError {
@@ -88,19 +88,7 @@ pub fn MeetingsList(
                 class: "meetings-list-toggle",
                 onclick: toggle_expanded,
                 aria_expanded: expanded(),
-                svg {
-                    class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "20",
-                    height: "20",
-                    view_box: "0 0 24 24",
-                    fill: "none",
-                    stroke: "currentColor",
-                    stroke_width: "2",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    polyline { points: "6 9 12 15 18 9" }
-                }
+                Icon { glyph: &icons::CHEVRON_DOWN, size: "20", class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" } }
                 ListRowLabel { "My Meetings" }
                 Badge { "aria-label": "{total()} meetings", "{total()}" }
             }
@@ -228,40 +216,19 @@ fn MeetingItem(
                 div { class: "meeting-details text-footnote text-secondary",
                     if is_active {
                         span { class: "meeting-participants", title: "Participants in meeting",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
-                                circle { cx: "9", cy: "7", r: "4" }
-                                path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
-                                path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
-                            }
+                            Icon { glyph: &icons::PEOPLE, size: "14" }
                             "{meeting.participant_count} joined"
                         }
                         if meeting.waiting_count > 0 {
                             span { class: "meeting-waiting", title: "Waiting to join",
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                    circle { cx: "12", cy: "12", r: "10" }
-                                    line { x1: "12", y1: "8", x2: "12", y2: "12" }
-                                    line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
-                                }
+                                Icon { glyph: &icons::ALERT, size: "14" }
                                 "{meeting.waiting_count} waiting"
                             }
                         }
                     }
                     if is_ended {
                         span { class: "meeting-duration", title: "Total duration",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                circle { cx: "12", cy: "12", r: "10" }
-                                polyline { points: "12 6 12 12 16 14" }
-                            }
+                            Icon { glyph: &icons::CLOCK, size: "14" }
                             "{format_duration(duration_ms)}"
                         }
                         span { class: "meeting-time", title: "Started at {format_time(meeting.started_at)}",
@@ -276,27 +243,13 @@ fn MeetingItem(
                     }
                     if !is_active && !is_ended {
                         span { class: "meeting-participants", title: "Participants",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
-                                circle { cx: "9", cy: "7", r: "4" }
-                                path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
-                                path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
-                            }
+                            Icon { glyph: &icons::PEOPLE, size: "14" }
                             "{meeting.participant_count}"
                         }
                     }
                     if meeting.has_password {
                         span { class: "meeting-password", title: "Password protected",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                rect { x: "3", y: "11", width: "18", height: "11", rx: "2", ry: "2" }
-                                path { d: "M7 11V7a5 5 0 0 1 10 0v4" }
-                            }
+                            Icon { glyph: &icons::LOCK, size: "14" }
                         }
                     }
                 }
@@ -306,13 +259,7 @@ fn MeetingItem(
                 size: IconButtonSize::Small,
                 onclick: on_edit_click,
                 title: "Meeting settings",
-                svg {
-                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    path { d: "M12 20h9" }
-                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
-                }
+                Icon { glyph: &icons::PENCIL, size: "16" }
             }
             IconButton {
                 label: "Delete meeting",
@@ -320,15 +267,7 @@ fn MeetingItem(
                 class: "meeting-delete-btn",
                 onclick: on_delete_click,
                 title: "Delete meeting",
-                svg {
-                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    polyline { points: "3 6 5 6 21 6" }
-                    path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
-                    line { x1: "10", y1: "11", x2: "10", y2: "17" }
-                    line { x1: "14", y1: "11", x2: "14", y2: "17" }
-                }
+                Icon { glyph: &icons::TRASH, size: "16" }
             }
         }
     }

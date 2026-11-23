@@ -19,8 +19,10 @@
 //!   renders no role at all.
 
 mod buttons;
+mod call;
 mod content;
 mod forms;
+mod icon;
 mod navigation;
 mod overlays;
 mod status;
@@ -100,8 +102,10 @@ part_renderer!(part_h3, h3);
 part_renderer!(part_p, p);
 
 pub use buttons::*;
+pub use call::*;
 pub use content::*;
 pub use forms::*;
+pub use icon::*;
 pub use navigation::*;
 pub use overlays::*;
 pub use status::*;

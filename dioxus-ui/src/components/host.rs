@@ -33,8 +33,8 @@ use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_theme::{
-    Alert, AlertActions, AlertMessage, Button, ButtonVariant, IconButton, IconButtonSize,
-    IconButtonVariant, Scrim, TextField,
+    icons, Alert, AlertActions, AlertMessage, Button, ButtonVariant, Icon, IconButton,
+    IconButtonSize, IconButtonVariant, Scrim, TextField,
 };
 
 use std::cell::RefCell;
@@ -535,10 +535,7 @@ pub fn Host(
                     show_change_name.set(true);
                     change_name_error.set(None);
                 },
-                svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    path { d: "M12 20h9" }
-                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
-                }
+                Icon { glyph: &icons::PENCIL }
             }
             // Glow overlay renders ON TOP of the video element
             if video_enabled {
@@ -567,10 +564,7 @@ pub fn Host(
             div {
                 class: "self-view-placeholder",
                 div { class: "placeholder-content",
-                    svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
-                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
-                    }
+                    Icon { glyph: &icons::CAMERA_OFF }
                     span { class: "placeholder-text", "Camera Off" }
                 }
                 IconButton {
@@ -582,10 +576,7 @@ pub fn Host(
                         show_change_name.set(true);
                         change_name_error.set(None);
                     },
-                    svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        path { d: "M12 20h9" }
-                        path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
-                    }
+                    Icon { glyph: &icons::PENCIL }
                 }
                 // Glow overlay renders ON TOP of content
                 div {
@@ -605,10 +596,7 @@ pub fn Host(
             class: "device-settings-menu-button",
             onclick: move |_| on_device_settings_toggle.call(()),
             title: "Device Settings",
-            svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                circle { cx: "12", cy: "12", r: "3" }
-                 path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
-             }
+            Icon { glyph: &icons::SETTINGS }
         }
 
         // Mobile Device Settings Modal

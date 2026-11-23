@@ -23,7 +23,6 @@ pub mod reception_stats;
 pub mod toggle_switch;
 pub mod top_bar;
 pub mod traffic_shaping;
-pub mod video_control_buttons;
 pub mod waiting_room;
 
 mod canvas_generator;

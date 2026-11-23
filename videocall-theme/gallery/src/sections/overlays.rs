@@ -7,7 +7,6 @@ use dioxus::prelude::*;
 use videocall_theme::*;
 
 use super::{Cell, Section, Subhead};
-use crate::icons::{self, Icon};
 use crate::Gallery;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -57,16 +56,16 @@ pub fn Overlays() -> Element {
                         pressed: menu_open(),
                         aria_expanded: if menu_open() { "true" } else { "false" },
                         onclick: move |_| menu_open.toggle(),
-                        Icon { paths: icons::MORE }
+                        Icon { glyph: &icons::MORE, "aria-hidden": "true" }
                     }
                     if menu_open() {
                         Menu { aria_label: "Meeting options",
                             MenuHeader { "Weekly sync" }
-                            MenuItem { onclick: move |_| gallery.show_toast("Link copied"), Icon { paths: icons::SHARE } "Copy invite link" }
-                            MenuItem { Icon { paths: icons::PEOPLE } "Participants" }
-                            MenuItem { disabled: true, Icon { paths: icons::SCREEN } "Share screen" }
+                            MenuItem { onclick: move |_| gallery.show_toast("Link copied"), Icon { glyph: &icons::SHARE, "aria-hidden": "true" } "Copy invite link" }
+                            MenuItem { Icon { glyph: &icons::PEOPLE, "aria-hidden": "true" } "Participants" }
+                            MenuItem { disabled: true, Icon { glyph: &icons::SCREEN, "aria-hidden": "true" } "Share screen" }
                             MenuSeparator {}
-                            MenuItem { destructive: true, Icon { paths: icons::TRASH } "End for everyone" }
+                            MenuItem { destructive: true, Icon { glyph: &icons::TRASH, "aria-hidden": "true" } "End for everyone" }
                         }
                     }
                 }
@@ -89,13 +88,13 @@ pub fn Overlays() -> Element {
             Subhead { "Tooltip" }
             div { class: "gallery-cells gallery-tooltip-row",
                 Cell { caption: "Above, on hover or focus",
-                    IconButton { label: "Chat", variant: IconButtonVariant::Filled, Icon { paths: icons::CHAT } Tooltip { "Chat" } }
+                    IconButton { label: "Chat", variant: IconButtonVariant::Filled, Icon { glyph: &icons::CHAT, "aria-hidden": "true" } Tooltip { "Chat" } }
                 }
                 Cell { caption: "Below",
-                    IconButton { label: "Settings", variant: IconButtonVariant::Filled, Icon { paths: icons::SETTINGS } Tooltip { placement: TooltipPlacement::Below, "Settings" } }
+                    IconButton { label: "Settings", variant: IconButtonVariant::Filled, Icon { glyph: &icons::SETTINGS, "aria-hidden": "true" } Tooltip { placement: TooltipPlacement::Below, "Settings" } }
                 }
                 Cell { caption: "Pinned open (.is-open)",
-                    IconButton { label: "Participants", variant: IconButtonVariant::Filled, Icon { paths: icons::PEOPLE } Tooltip { open: true, "Participants" } }
+                    IconButton { label: "Participants", variant: IconButtonVariant::Filled, Icon { glyph: &icons::PEOPLE, "aria-hidden": "true" } Tooltip { open: true, "Participants" } }
                 }
             }
             p { class: "text-subheadline text-secondary",
@@ -103,10 +102,10 @@ pub fn Overlays() -> Element {
                 "and a long one wraps before it gets wider than the screen."
             }
             div { class: "gallery-tooltip-edges",
-                IconButton { label: "Microphone", variant: IconButtonVariant::Filled, Icon { paths: icons::MIC }
+                IconButton { label: "Microphone", variant: IconButtonVariant::Filled, Icon { glyph: &icons::MIC, "aria-hidden": "true" }
                     Tooltip { align: TooltipAlign::Start, open: true, "Start (.tooltip-start)" }
                 }
-                IconButton { label: "Leave", variant: IconButtonVariant::Filled, Icon { paths: icons::HANG_UP }
+                IconButton { label: "Leave", variant: IconButtonVariant::Filled, Icon { glyph: &icons::HANG_UP, "aria-hidden": "true" }
                     Tooltip { align: TooltipAlign::End, open: true, "End (.tooltip-end)" }
                 }
             }
@@ -120,7 +119,7 @@ pub fn Overlays() -> Element {
                         div { class: "gallery-focus-target", tabindex: "-1", onmounted: focus }
                         SheetHeader {
                             SheetTitle { id: "gallery-sheet-title", if open() == Open::WideSheet { "Settings" } else { "Devices" } }
-                            IconButton { label: "Close", variant: IconButtonVariant::Filled, size: IconButtonSize::Small, onclick: close, Icon { paths: icons::CLOSE } }
+                            IconButton { label: "Close", variant: IconButtonVariant::Filled, size: IconButtonSize::Small, onclick: close, Icon { glyph: &icons::CLOSE, "aria-hidden": "true" } }
                         }
                         SheetBody {
                             div { class: "stack gap-4",

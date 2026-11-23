@@ -17,7 +17,9 @@
 //! and a "Return to Home" button that navigates to `/`.
 
 use dioxus::prelude::*;
-use videocall_theme::{Alert, AlertActions, AlertMessage, Button, ButtonVariant, Scrim};
+use videocall_theme::{
+    icons, Alert, AlertActions, AlertMessage, Button, ButtonVariant, Icon, Scrim,
+};
 
 /// A scrim + alert that tells the user the meeting has ended and offers a
 /// button to return to the home page.
@@ -36,18 +38,7 @@ pub fn MeetingEndedOverlay(
             Alert {
                 role: None::<&str>,
                 class: "meeting-ended-alert",
-                svg {
-                    class: "meeting-ended-icon",
-                    xmlns: "http://www.w3.org/2000/svg",
-                    view_box: "0 0 24 24",
-                    fill: "none",
-                    stroke: "currentColor",
-                    stroke_width: "2",
-                    "aria-hidden": "true",
-                    circle { cx: "12", cy: "12", r: "10" }
-                    line { x1: "15", y1: "9", x2: "9", y2: "15" }
-                    line { x1: "9", y1: "9", x2: "15", y2: "15" }
-                }
+                Icon { glyph: &icons::ERROR, class: "meeting-ended-icon", "aria-hidden": "true" }
                 h4 { class: "alert-title", "Meeting Ended" }
                 AlertMessage { class: "meeting-ended-message", "{message}" }
                 AlertActions {

@@ -16,16 +16,13 @@
  * conditions.
  */
 
-use crate::components::icons::crop::CropIcon;
 use crate::components::icons::crown::CrownIcon;
-use crate::components::icons::mic::MicIcon;
-use crate::components::icons::peer::PeerIcon;
-use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::users_allowed_to_stream;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
+use videocall_theme::{icons, Icon};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
@@ -195,7 +192,7 @@ pub fn generate_for_peer(
                         onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
                         class: CROP_BUTTON_CLASS,
                         "aria-label": "Crop video",
-                        CropIcon {}
+                        Icon { glyph: &icons::CROP, "aria-hidden": "true" }
                     }
                 }
             }
@@ -239,7 +236,7 @@ pub fn generate_for_peer(
                     } else {
                         div {
                             class: "placeholder-content",
-                            PeerIcon {}
+                            Icon { glyph: &icons::AVATAR, size: "40px", "aria-hidden": "true" }
                             span { class: "placeholder-text", "Video Disabled" }
                         }
                     }
@@ -255,13 +252,13 @@ pub fn generate_for_peer(
                     div {
                         class: "{vo_audio_class}",
                         style: "{vo_mic_style}",
-                        MicIcon { muted: !is_audio_enabled_for_peer }
+                        Icon { glyph: if is_audio_enabled_for_peer { &icons::MIC } else { &icons::MIC_OFF }, "aria-hidden": "true" }
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
                         class: CROP_BUTTON_CLASS,
                         "aria-label": "Crop video",
-                        CropIcon {}
+                        Icon { glyph: &icons::CROP, "aria-hidden": "true" }
                     }
                     div {
                         style: "{vo_tile_style}",
@@ -306,7 +303,7 @@ pub fn generate_for_peer(
                     } else {
                         div {
                             class: "placeholder-content",
-                            PeerIcon {}
+                            Icon { glyph: &icons::AVATAR, size: "40px", "aria-hidden": "true" }
                             span { class: "placeholder-text", "Camera Off" }
                         }
                     }
@@ -322,19 +319,19 @@ pub fn generate_for_peer(
                     div {
                         class: "{audio_speaking_class}",
                         style: "{mic_inline_style}",
-                        MicIcon { muted: !is_audio_enabled_for_peer }
+                        Icon { glyph: if is_audio_enabled_for_peer { &icons::MIC } else { &icons::MIC_OFF }, "aria-hidden": "true" }
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&canvas_id_crop),
                         class: CROP_BUTTON_CLASS,
                         "aria-label": "Crop video",
-                        CropIcon {}
+                        Icon { glyph: &icons::CROP, "aria-hidden": "true" }
                     }
                     button {
                         onclick: move |_| toggle_pinned_div(&div_id_pin),
                         class: PIN_BUTTON_CLASS,
                         "aria-label": "Pin video",
-                        PushPinIcon {}
+                        Icon { glyph: &icons::PUSH_PIN, "aria-hidden": "true" }
                     }
                     // Glow overlay renders ON TOP of video content so the
                     // inset box-shadow is not hidden behind the canvas element.
@@ -396,13 +393,13 @@ pub fn generate_for_peer(
                         onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
                         class: CROP_BUTTON_CLASS,
                         "aria-label": "Crop video",
-                        CropIcon {}
+                        Icon { glyph: &icons::CROP, "aria-hidden": "true" }
                     }
                     button {
                         onclick: move |_| toggle_pinned_div(&ss_div_pin),
                         class: PIN_BUTTON_CLASS,
                         "aria-label": "Pin video",
-                        PushPinIcon {}
+                        Icon { glyph: &icons::PUSH_PIN, "aria-hidden": "true" }
                     }
                 }
             }
@@ -432,7 +429,7 @@ pub fn generate_for_peer(
                             UserVideo { id: key_clone.clone(), hidden: false }
                         } else {
                             div { class: "placeholder-content",
-                                PeerIcon {}
+                                Icon { glyph: &icons::AVATAR, size: "40px", "aria-hidden": "true" }
                                 span { class: "placeholder-text", "Video Disabled" }
                             }
                         }
@@ -448,19 +445,19 @@ pub fn generate_for_peer(
                         div {
                             class: "{audio_speaking_class}",
                             style: "{grid_mic_style}",
-                            MicIcon { muted: !is_audio_enabled_for_peer }
+                            Icon { glyph: if is_audio_enabled_for_peer { &icons::MIC } else { &icons::MIC_OFF }, "aria-hidden": "true" }
                         }
                         button {
                             onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
                             class: CROP_BUTTON_CLASS,
                             "aria-label": "Crop video",
-                            CropIcon {}
+                            Icon { glyph: &icons::CROP, "aria-hidden": "true" }
                         }
                         button {
                             onclick: move |_| toggle_pinned_div(&pv_div_pin),
                             class: PIN_BUTTON_CLASS,
                             "aria-label": "Pin video",
-                            PushPinIcon {}
+                            Icon { glyph: &icons::PUSH_PIN, "aria-hidden": "true" }
                         }
                         // Glow overlay renders ON TOP of video content
                         div {

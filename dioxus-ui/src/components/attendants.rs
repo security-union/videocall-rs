@@ -27,16 +27,13 @@ use crate::components::{
     peer_list::PeerList,
     peer_tile::PeerTile,
     traffic_shaping::{TrafficShapingBadge, TrafficShapingUi},
-    video_control_buttons::{
-        BabyModeButton, CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MicButton, PeerListButton, ScreenShareButton,
-    },
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerStatusMap};
+use crate::platform::{use_media_query, PHONE_LAYOUT_QUERY};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -51,10 +48,15 @@ use videocall_client::{
     PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
 use videocall_theme::{
-    Alert, AlertActions, AlertMessage, Bar, Button, ButtonSize, ButtonVariant, Card, DimEdge,
-    MediaDim, Scrim, TextField, Toast,
+    icons, Alert, AlertActions, AlertMessage, Bar, Button, ButtonSize, ButtonVariant, CallButton,
+    CallControl, CallMenuItem, CallMoreButton, Card, DimEdge, Icon, MediaDim, Menu, Scrim,
+    TextField, Toast,
 };
+
 use wasm_bindgen::{closure::Closure, JsCast};
+
+/// `id` of the phone bar's More menu, for the button's `aria-controls`.
+const MORE_MENU_ID: &str = "call-more-menu";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
@@ -424,6 +426,75 @@ pub fn AttendantsComponent(
     let can_share_screen = use_hook(supports_screen_share);
     // Baby mode hides the controls and blocks taps; persisted across reloads.
     let mut baby_mode = use_signal(load_baby_mode);
+    // At phone width the bar keeps mic, camera, More and hang up, and the
+    // other controls move into More's menu. Same breakpoint as the rest of
+    // the phone layout in call.css (self-view above the bar, sidebars as
+    // sheets). Only the query's change event updates it.
+    let compact_bar = use_media_query(PHONE_LAYOUT_QUERY);
+    let mut more_open = use_signal(|| false);
+    let mut more_button = use_signal(|| None::<Rc<MountedData>>);
+    // Widening the window past the breakpoint drops the menu with the More
+    // button; it must not reappear open when the window narrows again.
+    use_effect(move || {
+        if !compact_bar() && *more_open.peek() {
+            more_open.set(false);
+        }
+    });
+    // Closes the menu and puts focus back on More, which opened it.
+    let mut close_more = move || {
+        more_open.set(false);
+        if let Some(button) = more_button.peek().clone() {
+            spawn(async move {
+                let _ = button.set_focus(true).await;
+            });
+        }
+    };
+    // The controls a phone keeps in More's menu, and the one action each
+    // has, shared by its bar button (wide screens) and its menu row. One
+    // callback for all of them keeps the call screen's wasm small: every
+    // handler closure is its own type.
+    let on_control = use_callback(move |control: CallControl| match control {
+        CallControl::ScreenShare => {
+            if matches!(*screen_share_state.peek(), ScreenShareState::Idle) {
+                screen_share_state.set(ScreenShareState::Requesting);
+            } else {
+                screen_share_state.set(ScreenShareState::Idle);
+            }
+        }
+        CallControl::BabyMode => {
+            save_baby_mode(true);
+            baby_mode.set(true);
+        }
+        CallControl::Peers => {
+            let open = !*peer_list_open.peek();
+            peer_list_open.set(open);
+            if open {
+                diagnostics_open.set(false);
+            }
+        }
+        CallControl::Diagnostics => {
+            let open = !*diagnostics_open.peek();
+            diagnostics_open.set(open);
+            if open {
+                peer_list_open.set(false);
+            }
+        }
+        CallControl::DeviceSettings => {
+            let open = !*device_settings_open.peek();
+            device_settings_open.set(open);
+            if open {
+                peer_list_open.set(false);
+                diagnostics_open.set(false);
+            }
+        }
+        // Mic, camera and hang up stay in the bar with their own handlers.
+        CallControl::Microphone | CallControl::Camera | CallControl::HangUp => {}
+    });
+    // A menu row does the same, then closes the menu.
+    let on_menu_control = use_callback(move |control: CallControl| {
+        close_more();
+        on_control.call(control);
+    });
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let current_display_name = use_signal(|| display_name.clone());
@@ -1213,6 +1284,26 @@ pub fn AttendantsComponent(
     // `meeting_ended_message`, including the MeetingNotActive reconnect),
     // so the "Meeting Ended" overlay stays usable.
     let locked = baby_mode() && meeting_ended_message().is_none();
+    let share_active = matches!(screen_share_state(), ScreenShareState::Active);
+    let share_busy = matches!(screen_share_state(), ScreenShareState::Requesting);
+    // The controls that move into More's menu on a phone, in bar order,
+    // with their state: (control, on, busy).
+    let secondary_controls = [
+        (CallControl::ScreenShare, share_active, share_busy),
+        (CallControl::BabyMode, false, false),
+        (CallControl::Peers, peer_list_open(), false),
+        (CallControl::Diagnostics, diagnostics_open(), false),
+        (CallControl::DeviceSettings, device_settings_open(), false),
+    ]
+    .into_iter()
+    .filter(move |(control, ..)| can_share_screen || *control != CallControl::ScreenShare);
+    // The row the open menu focuses: the first one that is not disabled (Share
+    // is disabled while its request is pending), so Escape and the arrows reach
+    // the menu's key handler.
+    let first_enabled_row = secondary_controls
+        .clone()
+        .position(|(_, _, busy)| !busy)
+        .unwrap_or(0);
 
     rsx! {
         // The in-call screen is always dark: video sits on black.
@@ -1241,34 +1332,9 @@ pub fn AttendantsComponent(
                                     div { key: "{id}", class: "{variant_class}",
                                         span { class: "toast-icon",
                                             if is_joined {
-                                                svg {
-                                                    width: "16",
-                                                    height: "16",
-                                                    view_box: "0 0 24 24",
-                                                    fill: "none",
-                                                    stroke: "currentColor",
-                                                    stroke_width: "2",
-                                                    stroke_linecap: "round",
-                                                    stroke_linejoin: "round",
-                                                    path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
-                                                    circle { cx: "9", cy: "7", r: "4" }
-                                                    line { x1: "19", y1: "8", x2: "19", y2: "14" }
-                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
-                                                }
+                                                Icon { glyph: &icons::USER_PLUS, size: "16" }
                                             } else {
-                                                svg {
-                                                    width: "16",
-                                                    height: "16",
-                                                    view_box: "0 0 24 24",
-                                                    fill: "none",
-                                                    stroke: "currentColor",
-                                                    stroke_width: "2",
-                                                    stroke_linecap: "round",
-                                                    stroke_linejoin: "round",
-                                                    path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
-                                                    circle { cx: "9", cy: "7", r: "4" }
-                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
-                                                }
+                                                Icon { glyph: &icons::USER_MINUS, size: "16" }
                                             }
                                         }
                                         span { class: "toast-text",
@@ -1404,9 +1470,10 @@ pub fn AttendantsComponent(
                                     {
                                         let mda_mic = mda.clone();
                                         rsx! {
-                                            MicButton {
-                                                enabled: mic_enabled(),
-                                                available: mic_error.read().is_none(),
+                                            CallButton {
+                                                control: CallControl::Microphone,
+                                                on: mic_enabled(),
+                                                unavailable: mic_error.read().is_some(),
                                                 onclick: move |_| {
                                                     if !mic_enabled() {
                                                         if mda_mic.borrow().is_granted(MediaAccessKind::AudioCheck) {
@@ -1425,9 +1492,10 @@ pub fn AttendantsComponent(
                                     {
                                         let mda_cam = mda.clone();
                                         rsx! {
-                                            CameraButton {
-                                                enabled: video_enabled(),
-                                                available: video_error.read().is_none(),
+                                            CallButton {
+                                                control: CallControl::Camera,
+                                                on: video_enabled(),
+                                                unavailable: video_error.read().is_some(),
                                                 onclick: move |_| {
                                                     if !video_enabled() {
                                                         if mda_cam.borrow().is_granted(MediaAccessKind::VideoCheck) {
@@ -1455,64 +1523,34 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-                                    if can_share_screen {
-                                        {
-                                            let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                            let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
-                                            rsx! {
-                                                ScreenShareButton {
-                                                    active: is_active,
-                                                    disabled: is_disabled,
-                                                    onclick: move |_| {
-                                                        if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                            screen_share_state.set(ScreenShareState::Requesting);
-                                                        } else {
-                                                            screen_share_state.set(ScreenShareState::Idle);
-                                                        }
-                                                    },
+                                    // On a phone the other controls move into
+                                    // More's menu (below). Each one has a
+                                    // single state and action, defined above
+                                    // the markup, used by both placements.
+                                    if compact_bar() {
+                                        CallMoreButton {
+                                            open: more_open(),
+                                            menu_id: MORE_MENU_ID,
+                                            onclick: move |_| {
+                                                if more_open() {
+                                                    close_more();
+                                                } else {
+                                                    more_open.set(true);
                                                 }
-                                            }
+                                            },
+                                            onmounted: move |evt: MountedEvent| more_button.set(Some(evt.data())),
                                         }
-                                    }
-                                    BabyModeButton {
-                                        onclick: move |_| {
-                                            save_baby_mode(true);
-                                            baby_mode.set(true);
-                                        },
-                                    }
-                                    PeerListButton {
-                                        open: peer_list_open(),
-                                        onclick: move |_| {
-                                            peer_list_open.set(!peer_list_open());
-                                            if peer_list_open() {
-                                                diagnostics_open.set(false);
-                                            }
-                                        },
-                                    }
-                                    DiagnosticsButton {
-                                        open: diagnostics_open(),
-                                        onclick: move |_| {
-                                            diagnostics_open.set(!diagnostics_open());
-                                            if diagnostics_open() {
-                                                peer_list_open.set(false);
-                                            }
-                                        },
-                                    }
-                                    DeviceSettingsButton {
-                                        open: device_settings_open(),
-                                        onclick: move |_| {
-                                            device_settings_open.set(!device_settings_open());
-                                            if device_settings_open() {
-                                                peer_list_open.set(false);
-                                                diagnostics_open.set(false);
-                                            }
-                                        },
+                                    } else {
+                                        for (control, on, busy) in secondary_controls.clone() {
+                                            CallButton { key: "{control:?}", control, on, disabled: busy, onclick: on_control }
+                                        }
                                     }
                                     {
                                         let hangup_client = client.clone();
                                         let hangup_id = id.clone();
                                         rsx! {
-                                            HangUpButton {
+                                            CallButton {
+                                                control: CallControl::HangUp,
                                                 onclick: move |_| {
                                                     log::info!("Hanging up - resetting to initial state");
                                                     if hangup_client.is_connected() {
@@ -1539,6 +1577,38 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                }
+                                // The More menu opens above the bar, lined up
+                                // with its trailing end (call.css). Opaque:
+                                // inside .over-media a menu is an elevated
+                                // fill, and it is not nested in the bar, so
+                                // there is no glass on glass.
+                                if compact_bar() && more_open() {
+                                    Menu {
+                                        id: MORE_MENU_ID,
+                                        class: "call-more-menu",
+                                        aria_label: "More",
+                                        onclose: move |_| close_more(),
+                                        for (index, (control, on, busy)) in secondary_controls.enumerate() {
+                                            CallMenuItem {
+                                                key: "{control:?}",
+                                                control,
+                                                on,
+                                                disabled: busy,
+                                                autofocus: index == first_enabled_row,
+                                                onclick: on_menu_control,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // A tap anywhere outside the open menu closes it
+                            // and goes no further, as on iOS.
+                            if compact_bar() && more_open() {
+                                div {
+                                    class: "call-more-backdrop",
+                                    "aria-hidden": "true",
+                                    onclick: move |_| close_more(),
                                 }
                             }
                             } // end if !locked

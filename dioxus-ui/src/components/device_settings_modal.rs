@@ -6,8 +6,8 @@ use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
 use videocall_theme::{
-    Field, IconButton, ListFooter, Scrim, Select, Sheet, SheetBody, SheetHeader, SheetTitle, Tab,
-    TabList,
+    icons, Field, Icon, IconButton, ListFooter, Scrim, Select, Sheet, SheetBody, SheetHeader,
+    SheetTitle, Tab, TabList,
 };
 use web_sys::MediaDeviceInfo;
 
@@ -123,18 +123,7 @@ pub fn DeviceSettingsModal(
                         class: "close-button",
                         onclick: move |_| on_close.call(()),
 
-                        svg {
-                            view_box: "0 0 24 24",
-                            width: "18",
-                            height: "18",
-
-                            path {
-                                d: "M6 6L18 18M18 6L6 18",
-                                stroke: "currentColor",
-                                stroke_width: "2",
-                                stroke_linecap: "round"
-                            }
-                        }
+                        Icon { glyph: &icons::CLOSE, size: "18" }
                     }
                 }
 

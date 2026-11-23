@@ -180,32 +180,134 @@ pub fn Alert(
 
 /// A popover list (`.menu`), `role="menu"`. Position it yourself.
 ///
-/// `role="menu"` promises arrow-key navigation, which this component does
-/// not provide. A menu without it passes `role: None::<&str>`, and its items
-/// do the same.
+/// With its own role it also does the menu keys: Down and Up move focus to
+/// the next and previous item (wrapping), Home and End to the first and
+/// last, and Escape or Tab call `onclose`. Disabled items are skipped. The
+/// caller opens it, focuses the first item (`MenuItem { autofocus }`) and,
+/// in `onclose`, hides it and returns focus to the button that opened it.
+///
+/// A list that is not a menu (no arrow keys wanted) passes
+/// `role: None::<&str>`, and its items do the same; it then gets no key
+/// handling either.
 #[component]
 pub fn Menu(
     #[props(default)] class: Option<String>,
+    /// Escape or Tab inside the menu.
+    #[props(default)]
+    onclose: Option<EventHandler<()>>,
     #[props(extends = GlobalAttributes)] attributes: Vec<Attribute>,
     children: Element,
 ) -> Element {
     let class = with_extra("menu", class.as_deref());
-    let role = (!caller_sets(&attributes, "role")).then_some("menu");
+    let own_role = !caller_sets(&attributes, "role");
+    let role = own_role.then_some("menu");
     rsx! {
-        div { class, role, ..attributes, {children} }
+        div {
+            class,
+            role,
+            onkeydown: move |evt: KeyboardEvent| {
+                if !own_role {
+                    return;
+                }
+                let step = match evt.key() {
+                    Key::ArrowDown => MenuStep::Next,
+                    Key::ArrowUp => MenuStep::Previous,
+                    Key::Home => MenuStep::First,
+                    Key::End => MenuStep::Last,
+                    Key::Escape | Key::Tab => {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        if let Some(handler) = &onclose {
+                            handler.call(());
+                        }
+                        return;
+                    }
+                    _ => return,
+                };
+                evt.prevent_default();
+                move_menu_focus(step);
+            },
+            ..attributes,
+            {children}
+        }
+    }
+}
+
+/// Where an arrow key sends focus inside a [`Menu`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuStep {
+    Next,
+    Previous,
+    First,
+    Last,
+}
+
+impl MenuStep {
+    /// The index that gets focus, out of `count` items, when the item at
+    /// `current` has it (`None`: focus is on the menu itself).
+    pub fn target(self, current: Option<u32>, count: u32) -> Option<u32> {
+        if count == 0 {
+            return None;
+        }
+        Some(match (self, current) {
+            (Self::First, _) | (Self::Next, None) => 0,
+            (Self::Last, _) | (Self::Previous, None) => count - 1,
+            (Self::Next, Some(index)) => (index + 1) % count,
+            (Self::Previous, Some(index)) => (index + count - 1) % count,
+        })
+    }
+}
+
+/// Moves DOM focus inside the menu that holds the focused element. It reads
+/// the DOM at key-press time, so items added or removed while the menu is
+/// open are counted.
+fn move_menu_focus(step: MenuStep) {
+    use wasm_bindgen::JsCast;
+
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    let Some(active) = document.active_element() else {
+        return;
+    };
+    let Ok(Some(menu)) = active.closest(r#"[role="menu"]"#) else {
+        return;
+    };
+    let Ok(items) = menu.query_selector_all(
+        r#"[role="menuitem"]:not(:disabled), [role="menuitemcheckbox"]:not(:disabled), [role="menuitemradio"]:not(:disabled)"#,
+    ) else {
+        return;
+    };
+    let count = items.length();
+    let current = (0..count).find(|&index| {
+        items
+            .item(index)
+            .is_some_and(|item| item.is_same_node(Some(active.as_ref())))
+    });
+    let Some(target) = step.target(current, count) else {
+        return;
+    };
+    if let Some(item) = items
+        .item(target)
+        .and_then(|item| item.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = item.focus();
     }
 }
 
 /// One menu entry (`.menu-item`).
 ///
 /// `checked: Some(_)` makes it a `menuitemcheckbox` with `aria-checked`.
-/// `destructive` adds `.menu-item-destructive` (red). A `role` you pass
-/// replaces ours, as on [`Menu`].
+/// `destructive` adds `.menu-item-destructive` (red). `autofocus` focuses
+/// it once it is in the DOM, which is how a menu that just opened puts
+/// focus on its first item. A `role` you pass replaces ours, as on
+/// [`Menu`].
 #[component]
 pub fn MenuItem(
     #[props(default)] destructive: bool,
     #[props(default)] disabled: bool,
     #[props(default)] checked: Option<bool>,
+    #[props(default)] autofocus: bool,
     #[props(default)] class: Option<String>,
     #[props(default)] onclick: Option<EventHandler<MouseEvent>>,
     #[props(extends = GlobalAttributes, extends = button)] attributes: Vec<Attribute>,
@@ -230,6 +332,11 @@ pub fn MenuItem(
             role,
             disabled,
             "aria-checked": checked.map(|on| if on { "true" } else { "false" }),
+            onmounted: move |evt: MountedEvent| async move {
+                if autofocus {
+                    let _ = evt.set_focus(true).await;
+                }
+            },
             onclick: move |evt| {
                 if let Some(handler) = &onclick {
                     handler.call(evt);

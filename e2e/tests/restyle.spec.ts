@@ -6,9 +6,21 @@ import {
   controlButton,
   joinMeetingFromPage,
   micButton,
+  moreButton,
+  moreMenu,
+  moreMenuItem,
   navigateToMeeting,
+  openMoreMenu,
   shareButton,
 } from "../helpers/meeting";
+
+/** The rows the phone bar moves into the More menu, by accessible name. */
+const MOVED_CONTROLS = [
+  "Lock controls (baby mode)",
+  "Open Peers",
+  "Open Diagnostics",
+  "Device Settings",
+];
 
 /** Computed `background-color` and `color-scheme` of the element matching `selector`. */
 async function paint(page: import("@playwright/test").Page, selector: string) {
@@ -178,8 +190,85 @@ test.describe("In-call control bar", () => {
     await expect(camera).toHaveAttribute("aria-pressed", "false", { timeout: 10_000 });
   });
 
+  test("a wide screen keeps every control in the bar and has no More button", async ({ page }) => {
+    await expect(moreButton(page)).toHaveCount(0);
+    for (const name of MOVED_CONTROLS) {
+      await expect(
+        page.locator(".call-controls").getByRole("button", { name, exact: true }),
+        name,
+      ).toBeVisible();
+    }
+  });
+
   test.describe("at a phone viewport", () => {
     test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+    test("the bar holds mic, camera, More and Hang Up, with gaps between them", async ({
+      page,
+    }) => {
+      const buttons = page.locator(".call-controls button.video-control-button");
+      await expect(buttons).toHaveCount(4);
+      const names = [];
+      for (let index = 0; index < 4; index++) {
+        names.push(await buttons.nth(index).getAttribute("aria-label"));
+      }
+      expect(names).toEqual(["Microphone", "Camera", "More", "Hang Up"]);
+      await expect(moreButton(page)).toHaveAttribute("aria-haspopup", "menu");
+      await expect(moreButton(page)).toHaveAttribute("aria-expanded", "false");
+
+      const boxes = [];
+      for (let index = 0; index < 4; index++) {
+        boxes.push((await buttons.nth(index).boundingBox())!);
+      }
+      for (let index = 1; index < 4; index++) {
+        const gap = boxes[index].x - (boxes[index - 1].x + boxes[index - 1].width);
+        expect(gap, `gap before button ${index}`).toBeGreaterThanOrEqual(8);
+      }
+      // The whole bar is on screen.
+      expect(boxes[0].x).toBeGreaterThanOrEqual(0);
+      expect(boxes[3].x + boxes[3].width).toBeLessThanOrEqual(390);
+    });
+
+    test("More opens a menu holding the controls the bar left out", async ({ page }) => {
+      await openMoreMenu(page);
+      await expect(moreButton(page)).toHaveAttribute("aria-expanded", "true");
+      for (const name of MOVED_CONTROLS) {
+        const row = moreMenuItem(page, name);
+        await expect(row, name).toBeVisible();
+        // Layout height: the menu scales in, so the box is smaller for a moment.
+        const height = await row.evaluate((element) => (element as HTMLElement).offsetHeight);
+        expect(height, `${name} row height`).toBeGreaterThanOrEqual(44);
+      }
+      // The toggles say whether they are on.
+      await expect(moreMenuItem(page, "Open Peers")).toHaveAttribute("aria-checked", "false");
+      // Focus starts on the first row, and the arrow keys move it.
+      await expect(moreMenu(page).locator(".menu-item").first()).toBeFocused();
+      await page.keyboard.press("ArrowDown");
+      await expect(moreMenu(page).locator(".menu-item").nth(1)).toBeFocused();
+    });
+
+    test("choosing Peers in the menu opens the peer list and closes the menu", async ({ page }) => {
+      await openMoreMenu(page);
+      await moreMenuItem(page, "Open Peers").click();
+      await expect(moreMenu(page)).toHaveCount(0);
+      await expect(page.locator("#peer-list-container")).toHaveClass(/visible/);
+      await openMoreMenu(page);
+      await expect(moreMenuItem(page, "Close Peers")).toHaveAttribute("aria-checked", "true");
+    });
+
+    test("Escape closes the menu and returns focus to More", async ({ page }) => {
+      await openMoreMenu(page);
+      await page.keyboard.press("Escape");
+      await expect(moreMenu(page)).toHaveCount(0);
+      await expect(moreButton(page)).toBeFocused();
+      await expect(moreButton(page)).toHaveAttribute("aria-expanded", "false");
+    });
+
+    test("a tap outside the menu closes it", async ({ page }) => {
+      await openMoreMenu(page);
+      await page.mouse.click(30, 200);
+      await expect(moreMenu(page)).toHaveCount(0);
+    });
 
     test("every control bar button has a hit box of at least 44x44", async ({ page }) => {
       await expect(controlButton(page, "Hang Up")).toBeVisible();

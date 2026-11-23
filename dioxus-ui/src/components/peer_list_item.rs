@@ -16,9 +16,8 @@
  * conditions.
  */
 
-use crate::components::icons::mic::MicIcon;
-use crate::components::icons::peer::PeerIcon;
 use dioxus::prelude::*;
+use videocall_theme::{icons, Icon};
 
 #[component]
 pub fn PeerListItem(
@@ -56,7 +55,7 @@ pub fn PeerListItem(
     rsx! {
         li { class: "peer_item list-row", title,
             div { class: "peer_item_icon",
-                PeerIcon {}
+                Icon { glyph: &icons::AVATAR, size: "40px", "aria-hidden": "true" }
             }
             div { class: "peer_item_text list-row-label",
                 span { class: "peer_item_name", "{name}" }
@@ -65,7 +64,7 @@ pub fn PeerListItem(
                 }
             }
             div { class: "{mic_class}",
-                MicIcon { muted: muted }
+                Icon { glyph: if muted { &icons::MIC_OFF } else { &icons::MIC }, "aria-hidden": "true" }
             }
         }
     }

@@ -672,6 +672,45 @@
     transform: translateX(-50%);
   }
 
+  /* The phone bar, at an iPhone's width. Taller, so the open menu fits. */
+  .gallery-call-phone {
+    max-width: calc(390px + 2 * var(--space-3));
+    margin-top: var(--space-4);
+  }
+
+  .gallery-call-phone .gallery-call-tile {
+    aspect-ratio: 390 / 560;
+  }
+
+  .gallery-call-phone-controls {
+    display: flex;
+  }
+
+  /* As dioxus-ui's .call-more-menu: above the bar, trailing edges lined up,
+     as wide as its rows up to the cap. */
+  .gallery-call-more {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + var(--space-2));
+    width: max-content;
+    max-width: min(20rem, calc(100vw - 2 * var(--space-4)));
+    transform-origin: bottom right;
+  }
+
+  /* dioxus-ui spaces the call bar's buttons at --space-3 (call.css). */
+  .gallery-call .bar {
+    gap: var(--space-3);
+  }
+
+  /* On a narrow page the eight-button bar is wider than the tile, as it
+     would be on a phone (where the app shows the four-button bar instead),
+     so here it scrolls. */
+  .gallery-call-wide .bar {
+    max-width: calc(100% - 2 * var(--space-3));
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
   /* ---- Floating controls ---- */
 
   .gallery-controls {

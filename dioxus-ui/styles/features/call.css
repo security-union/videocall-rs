@@ -637,35 +637,42 @@
     max-width: 100%;
   }
 
-  /* Narrow phones: tighter gaps rather than squeezed 44px buttons.
-     7 x 44px + 6 x 4px gaps + 2 x 4px padding + 2px border = 342px.
-     With screen share (8 buttons, desktop browsers in a narrow window) the
-     gaps go: 8 x 44px + 10px = 362px, which keeps Hang Up on screen at
-     390px. */
-  @media (max-width: 32.49em) {
-    .call-controls {
-      gap: var(--space-1);
-      padding: var(--space-1);
-    }
+  /* Phones (under 37.5em, the phone layout's breakpoint) get four buttons:
+     mic, camera, More and hang up, at the normal gap. 4 x 44px + 3 x 12px
+     gaps + 2 x 8px padding + 2px border = 230px, which fits a 320px screen.
+     The other controls are rows of More's menu (attendants.rs switches on
+     the same query), so the full bar only exists where it fits. */
 
-    .call-controls:has(> :nth-child(8)) {
-      gap: 0;
-    }
+  /* More's menu opens above the bar with its trailing edge on the bar's,
+     over More and Hang Up. Its width is capped so its leading edge stays
+     16px inside the screen: the bar is centered, so its trailing edge is
+     at 50vw plus half its width (50% here, of .controls). It is a sibling
+     of the bar, not inside it, so it is an opaque elevated fill
+     (.over-media) and not glass on glass. */
+  .call-more-menu {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + var(--space-2));
+    /* As wide as its rows, not the bar: the bar is narrower than a row. */
+    width: max-content;
+    max-width: min(20rem, calc(50vw + 50% - var(--space-4)));
+    transform-origin: bottom right;
   }
 
-  /* Below 376px even that does not fit, so the bar scrolls sideways.
-     Scrolling clips the tooltips above the buttons (overflow-x: auto makes
-     overflow-y clip too), which is why it only starts here and not at the
-     breakpoint above. */
-  @media (max-width: 23.49em) {
-    .call-controls {
-      overflow-x: auto;
-      scrollbar-width: none;
-    }
-
-    .call-controls::-webkit-scrollbar {
-      display: none;
-    }
+  /* Catches the tap outside the open menu. It is inside .self-view, which
+     is its own stacking context (z-sticky + 2), so its z-index only orders
+     it against the bar and menu in there: under them (the bar is
+     z-bar), over the tile. Against the rest of the call it takes the
+     self-view's place, above the video grid, pinned tile and bottom dim
+     (all lower). Everything that sits higher (sidebars, sheets, scrims,
+     toasts) is a surface of its own that a tap should reach. So a tap
+     anywhere else on the call screen closes the menu and goes no further.
+     Tapping Mic or Camera in the bar acts and leaves the menu open, because
+     the bar is above the backdrop. */
+  .call-more-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-bar) - 1);
   }
 
   /* =========================================================================

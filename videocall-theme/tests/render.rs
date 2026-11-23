@@ -488,3 +488,190 @@ fn spinner_without_label_and_optional_invalid() {
     let unset = html(rsx! { TextField {} });
     assert!(!unset.contains("aria-invalid"), "{unset}");
 }
+
+#[test]
+fn icon_keeps_each_shape_and_the_stroke_attributes() {
+    let out = html(rsx! {
+        Icon { glyph: &icons::MIC_OFF, size: "16", class: "x", "aria-hidden": "true" }
+    });
+    assert!(out.starts_with("<svg"), "{out}");
+    for attribute in [
+        r#"viewBox="0 0 24 24""#,
+        r#"fill="none""#,
+        r#"stroke="currentColor""#,
+        r#"stroke-width="2""#,
+        r#"stroke-linecap="round""#,
+        r#"stroke-linejoin="round""#,
+        r#"width="16""#,
+        r#"height="16""#,
+        r#"class="x""#,
+        r#"aria-hidden="true""#,
+    ] {
+        assert!(out.contains(attribute), "{attribute}: {out}");
+    }
+    // A line stays a <line>, so the markup the app had did not change.
+    assert!(
+        out.contains(r#"<line x1="1" y1="1" x2="23" y2="23""#),
+        "{out}"
+    );
+    assert_eq!(out.matches("<path").count(), 2, "{out}");
+}
+
+#[test]
+fn icon_fill_glyphs_and_options() {
+    let out = html(rsx! {
+        Icon { glyph: &icons::PUSH_PIN }
+    });
+    assert!(out.contains(r#"fill="currentColor""#), "{out}");
+    assert!(!out.contains("stroke"), "{out}");
+    assert!(out.contains(r#"fill-rule="evenodd""#), "{out}");
+    assert!(!out.contains("width="), "no size unless asked: {out}");
+
+    let out = html(rsx! {
+        Icon { glyph: &icons::CLOCK, stroke_width: "1.5" }
+    });
+    assert!(out.contains(r#"stroke-width="1.5""#), "{out}");
+    assert!(out.contains(r#"<circle cx="12" cy="12" r="10""#), "{out}");
+    assert!(
+        out.contains(r#"<polyline points="12 6 12 12 16 14""#),
+        "{out}"
+    );
+
+    let out = html(rsx! {
+        Icon { glyph: &icons::LOCK }
+    });
+    assert!(
+        out.contains(r#"<rect x="3" y="11" width="18" height="11" rx="2" ry="2""#),
+        "{out}"
+    );
+}
+
+#[test]
+fn call_button_matches_the_bar_the_app_rendered() {
+    fn app() -> Element {
+        rsx! {
+            CallButton { control: CallControl::Microphone, on: true, onclick: |_| {} }
+            CallButton { control: CallControl::Camera, unavailable: true, onclick: |_| {} }
+            CallButton { control: CallControl::BabyMode, onclick: |_| {} }
+            CallButton { control: CallControl::DeviceSettings, on: true, onclick: |_| {} }
+            CallButton { control: CallControl::HangUp, onclick: |_| {} }
+        }
+    }
+    let out = html_app(app);
+    let buttons: Vec<&str> = out.split("<button").skip(1).collect();
+    assert_eq!(buttons.len(), 5, "{out}");
+
+    let mic = buttons[0];
+    assert!(mic.contains(r#"aria-label="Microphone""#), "{mic}");
+    assert!(mic.contains(r#"aria-pressed="true""#), "{mic}");
+    assert!(mic.contains("active"), "{mic}");
+    assert!(mic.contains("tooltip-start"), "{mic}");
+    assert!(mic.contains(">Mute</span>"), "{mic}");
+
+    let camera = buttons[1];
+    assert!(camera.contains(r#"aria-pressed="false""#), "{camera}");
+    assert!(camera.contains("device-warning"), "{camera}");
+    assert!(camera.contains(">Start Video</span>"), "{camera}");
+
+    let baby = buttons[2];
+    assert!(baby.contains(r#"id="baby-mode-button""#), "{baby}");
+    assert!(baby.contains(r#"data-testid="baby-mode-button""#), "{baby}");
+    assert!(!baby.contains("aria-pressed"), "{baby}");
+
+    let settings = buttons[3];
+    assert!(
+        settings.contains(r#"data-testid="open-settings""#),
+        "{settings}"
+    );
+    assert!(
+        settings.contains(r#"aria-label="Close Settings""#),
+        "{settings}"
+    );
+
+    // Hang up keeps its tooltip before the icon, and its 24px solid glyph.
+    let hang_up = buttons[4];
+    assert!(hang_up.contains("danger"), "{hang_up}");
+    let tooltip = hang_up.find("tooltip").unwrap();
+    let svg = hang_up.find("<svg").unwrap();
+    assert!(tooltip < svg, "{hang_up}");
+    assert!(hang_up.contains(r#"width="24""#), "{hang_up}");
+}
+
+#[test]
+fn more_button_announces_its_menu() {
+    fn closed() -> Element {
+        rsx! {
+            CallMoreButton { open: false, menu_id: "m", onclick: |_| {} }
+        }
+    }
+    fn open() -> Element {
+        rsx! {
+            CallMoreButton { open: true, menu_id: "m", onclick: |_| {} }
+        }
+    }
+    let out = html_app(closed);
+    assert!(out.contains(r#"aria-label="More""#), "{out}");
+    assert!(out.contains(r#"aria-haspopup="menu""#), "{out}");
+    assert!(out.contains(r#"aria-expanded="false""#), "{out}");
+    assert!(!out.contains("aria-controls"), "{out}");
+    assert!(out.contains("video-control-button"), "{out}");
+    assert!(out.contains(">More</span>"), "{out}");
+
+    let out = html_app(open);
+    assert!(out.contains(r#"aria-expanded="true""#), "{out}");
+    assert!(out.contains(r#"aria-controls="m""#), "{out}");
+    assert!(out.contains("active"), "{out}");
+}
+
+#[test]
+fn menu_rows_use_the_bar_names_and_show_state() {
+    fn app() -> Element {
+        rsx! {
+            Menu { onclose: |_| {},
+                CallMenuItem { control: CallControl::Peers, on: true, autofocus: true, onclick: |_| {} }
+                CallMenuItem { control: CallControl::Diagnostics, onclick: |_| {} }
+                CallMenuItem { control: CallControl::BabyMode, onclick: |_| {} }
+                CallMenuItem { control: CallControl::ScreenShare, disabled: true, onclick: |_| {} }
+            }
+        }
+    }
+    let out = html_app(app);
+    assert!(out.starts_with(r#"<div class="menu" role="menu""#), "{out}");
+    let rows: Vec<&str> = out.split("<button").skip(1).collect();
+    assert_eq!(rows.len(), 4, "{out}");
+
+    assert!(
+        rows[0].contains(r#"role="menuitemcheckbox""#),
+        "{}",
+        rows[0]
+    );
+    assert!(rows[0].contains(r#"aria-checked="true""#), "{}", rows[0]);
+    assert!(rows[0].contains(">Close Peers</span>"), "{}", rows[0]);
+    assert_eq!(rows[0].matches("<svg").count(), 2, "icon and check mark");
+
+    assert!(rows[1].contains(r#"aria-checked="false""#), "{}", rows[1]);
+    assert!(rows[1].contains(">Open Diagnostics</span>"), "{}", rows[1]);
+    assert_eq!(rows[1].matches("<svg").count(), 1, "no check mark when off");
+
+    assert!(rows[2].contains(r#"role="menuitem""#), "{}", rows[2]);
+    assert!(!rows[2].contains("aria-checked"), "{}", rows[2]);
+    assert!(
+        rows[2].contains(r#"data-testid="more-baby-mode""#),
+        "{}",
+        rows[2]
+    );
+
+    assert!(rows[3].contains("disabled"), "{}", rows[3]);
+    assert!(rows[3].contains(">Share screen</span>"), "{}", rows[3]);
+}
+
+#[test]
+fn menu_keys_wrap_and_jump() {
+    assert_eq!(MenuStep::Next.target(Some(4), 5), Some(0));
+    assert_eq!(MenuStep::Previous.target(Some(0), 5), Some(4));
+    assert_eq!(MenuStep::Next.target(None, 5), Some(0));
+    assert_eq!(MenuStep::Previous.target(None, 5), Some(4));
+    assert_eq!(MenuStep::First.target(Some(3), 5), Some(0));
+    assert_eq!(MenuStep::Last.target(None, 5), Some(4));
+    assert_eq!(MenuStep::Next.target(None, 0), None);
+}

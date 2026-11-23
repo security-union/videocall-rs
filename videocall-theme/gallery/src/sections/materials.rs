@@ -8,7 +8,6 @@ use dioxus::prelude::*;
 use videocall_theme::*;
 
 use super::{Section, Subhead};
-use crate::icons::{self, Icon};
 
 /// A loud background for glass to sit on: stripes and big type.
 #[component]
@@ -39,12 +38,12 @@ pub fn Materials() -> Element {
                     span { class: "gallery-stage-caption", "On content: glass" }
                     div { class: "row gallery-wrap",
                         Button { variant: ButtonVariant::Glass, "Glass button" }
-                        IconButton { label: "More", variant: IconButtonVariant::Glass, Icon { paths: icons::MORE } }
+                        IconButton { label: "More", variant: IconButtonVariant::Glass, Icon { glyph: &icons::MORE, "aria-hidden": "true" } }
                     }
                     span { class: "gallery-stage-caption", "Inside a bar: the same controls turn into fills" }
                     Bar {
                         Button { variant: ButtonVariant::Glass, "Glass button" }
-                        IconButton { label: "More", variant: IconButtonVariant::Glass, Icon { paths: icons::MORE } }
+                        IconButton { label: "More", variant: IconButtonVariant::Glass, Icon { glyph: &icons::MORE, "aria-hidden": "true" } }
                     }
                 }
             }
@@ -60,13 +59,13 @@ pub fn Materials() -> Element {
                 }
                 div { class: "stack gap-2",
                     Bar { clear: true,
-                        ControlButton { label: "Microphone", state: ControlState::On, Icon { paths: icons::MIC } }
-                        ControlButton { label: "Camera", Icon { paths: icons::CAMERA_OFF } }
+                        ControlButton { label: "Microphone", state: ControlState::On, Icon { glyph: &icons::MIC, "aria-hidden": "true" } }
+                        ControlButton { label: "Camera", Icon { glyph: &icons::CAMERA_OFF, "aria-hidden": "true" } }
                         Button { variant: ButtonVariant::GlassClear, size: ButtonSize::Small, "Clear button" }
                     }
                     div { class: "row gallery-wrap",
                         Button { variant: ButtonVariant::GlassClear, "On video" }
-                        IconButton { label: "Share", variant: IconButtonVariant::GlassClear, Icon { paths: icons::SHARE } }
+                        IconButton { label: "Share", variant: IconButtonVariant::GlassClear, Icon { glyph: &icons::SHARE, "aria-hidden": "true" } }
                     }
                 }
             }
@@ -81,8 +80,8 @@ pub fn Materials() -> Element {
                 }
                 div { class: "stack gap-2",
                     Bar { clear: true,
-                        ControlButton { label: "Microphone", state: ControlState::On, Icon { paths: icons::MIC } }
-                        ControlButton { label: "Camera", Icon { paths: icons::CAMERA_OFF } }
+                        ControlButton { label: "Microphone", state: ControlState::On, Icon { glyph: &icons::MIC, "aria-hidden": "true" } }
+                        ControlButton { label: "Camera", Icon { glyph: &icons::CAMERA_OFF, "aria-hidden": "true" } }
                     }
                     span { class: "gallery-stage-caption", "Clear glass is unchanged" }
                 }

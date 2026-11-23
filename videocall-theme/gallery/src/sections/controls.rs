@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 use videocall_theme::*;
 
 use super::{Cell, Section, Subhead};
-use crate::icons::{self, Icon};
 
 fn variant_name(variant: ButtonVariant) -> &'static str {
     match variant {
@@ -54,7 +53,7 @@ pub fn Buttons() -> Element {
             div { class: "gallery-cells",
                 for size in ButtonSize::ALL {
                     Cell { key: "{size:?}", caption: format!("{size:?}"),
-                        Button { variant: ButtonVariant::Prominent, size, Icon { paths: icons::PLUS } "New meeting" }
+                        Button { variant: ButtonVariant::Prominent, size, Icon { glyph: &icons::PLUS, "aria-hidden": "true" } "New meeting" }
                     }
                 }
                 Cell { caption: "Toggle",
@@ -71,25 +70,25 @@ pub fn Buttons() -> Element {
 
             Subhead { "Icon buttons" }
             div { class: "gallery-cells",
-                Cell { caption: "Plain", IconButton { label: "Back", Icon { paths: icons::BACK } } }
-                Cell { caption: "Filled", IconButton { label: "Close", variant: IconButtonVariant::Filled, Icon { paths: icons::CLOSE } } }
+                Cell { caption: "Plain", IconButton { label: "Back", Icon { glyph: &icons::CHEVRON_LEFT, "aria-hidden": "true" } } }
+                Cell { caption: "Filled", IconButton { label: "Close", variant: IconButtonVariant::Filled, Icon { glyph: &icons::CLOSE, "aria-hidden": "true" } } }
                 Cell { caption: "Small",
-                    IconButton { label: "Delete", variant: IconButtonVariant::Filled, size: IconButtonSize::Small, Icon { paths: icons::TRASH } }
+                    IconButton { label: "Delete", variant: IconButtonVariant::Filled, size: IconButtonSize::Small, Icon { glyph: &icons::TRASH, "aria-hidden": "true" } }
                 }
-                Cell { caption: "Pressed", IconButton { label: "Chat", pressed: true, variant: IconButtonVariant::Filled, Icon { paths: icons::CHAT } } }
-                Cell { caption: "Disabled", IconButton { label: "Share", disabled: true, variant: IconButtonVariant::Filled, Icon { paths: icons::SHARE } } }
+                Cell { caption: "Pressed", IconButton { label: "Chat", pressed: true, variant: IconButtonVariant::Filled, Icon { glyph: &icons::CHAT, "aria-hidden": "true" } } }
+                Cell { caption: "Disabled", IconButton { label: "Share", disabled: true, variant: IconButtonVariant::Filled, Icon { glyph: &icons::SHARE, "aria-hidden": "true" } } }
                 Cell { caption: "With tooltip",
                     IconButton { label: "Participants", variant: IconButtonVariant::Filled,
-                        Icon { paths: icons::PEOPLE }
+                        Icon { glyph: &icons::PEOPLE, "aria-hidden": "true" }
                         Tooltip { "Participants" }
                     }
                 }
             }
             div { class: "gallery-strip gallery-busy gallery-cells",
-                Cell { caption: "Glass", IconButton { label: "More", variant: IconButtonVariant::Glass, Icon { paths: icons::MORE } } }
+                Cell { caption: "Glass", IconButton { label: "More", variant: IconButtonVariant::Glass, Icon { glyph: &icons::MORE, "aria-hidden": "true" } } }
             }
             div { class: "gallery-strip gallery-video gallery-cells",
-                Cell { caption: "Glass clear", IconButton { label: "Share", variant: IconButtonVariant::GlassClear, Icon { paths: icons::SHARE } } }
+                Cell { caption: "Glass clear", IconButton { label: "Share", variant: IconButtonVariant::GlassClear, Icon { glyph: &icons::SHARE, "aria-hidden": "true" } } }
             }
         }
     }

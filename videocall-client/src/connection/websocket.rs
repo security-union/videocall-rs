@@ -59,4 +59,12 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
     fn send_bytes(&self, bytes: Vec<u8>) -> bool {
         self.send_binary(bytes)
     }
+
+    fn send_bytes_control(&self, bytes: Vec<u8>) -> bool {
+        self.send_binary_with_priority(bytes, true)
+    }
+
+    fn send_bytes_datagram_control(&self, bytes: Vec<u8>) {
+        self.send_binary_with_priority(bytes, true);
+    }
 }

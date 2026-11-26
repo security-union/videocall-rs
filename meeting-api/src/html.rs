@@ -74,6 +74,16 @@ pub fn display_ip(ip: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Referrer policy for every page, sent as the header and as a `<meta>`.
+///
+/// `same-origin`, not `no-referrer`: under `no-referrer` the Fetch spec
+/// serializes `Origin` as `null` on non-GET requests, so every form POST
+/// (consent, revoke, sign-out) would arrive with `Origin: null` and fail the
+/// exact-Origin CSRF check. `same-origin` keeps the real Origin on our own
+/// POSTs and still sends no Referer on any cross-origin navigation,
+/// including the 303 to the CLI's `127.0.0.1` callback.
+pub const REFERRER_POLICY: &str = "same-origin";
+
 /// Add the security headers to a response. Headers a handler already set
 /// (e.g. the stylesheet's `Cache-Control`) are kept.
 pub async fn security_headers(mut response: Response) -> Response {
@@ -82,7 +92,7 @@ pub async fn security_headers(mut response: Response) -> Response {
         (header::CONTENT_SECURITY_POLICY, CSP),
         (header::X_FRAME_OPTIONS, "DENY"),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        (header::REFERRER_POLICY, "no-referrer"),
+        (header::REFERRER_POLICY, REFERRER_POLICY),
         (
             HeaderName::from_static("cross-origin-opener-policy"),
             "same-origin",
@@ -104,11 +114,12 @@ fn document(title: &str, body: &str) -> String {
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"color-scheme\" content=\"light dark\">\n\
-         <meta name=\"referrer\" content=\"no-referrer\">\n\
+         <meta name=\"referrer\" content=\"{referrer}\">\n\
          <title>{title} - videocall.rs</title>\n\
          <link rel=\"stylesheet\" href=\"/static/auth.css\">\n\
          </head>\n<body>\n<main class=\"page\">\n{body}\n</main>\n</body>\n</html>\n",
         title = html_escape(title),
+        referrer = REFERRER_POLICY,
     )
 }
 

@@ -1094,7 +1094,7 @@ async fn remote_approval_needs_the_checkbox_and_shows_a_no_store_code() {
     assert_eq!(header(&resp, "cache-control").as_deref(), Some("no-store"));
     assert_eq!(
         header(&resp, "referrer-policy").as_deref(),
-        Some("no-referrer")
+        Some("same-origin")
     );
     let html = body_text(resp).await;
     let code = extract_after(&html, "readonly value=\"").to_string();
@@ -1649,6 +1649,64 @@ async fn pages_and_css_carry_security_headers_and_json_routes_do_not() {
     let resp = send(&st, get("/version").body(Body::empty()).unwrap()).await;
     assert!(header(&resp, "content-security-policy").is_none());
     assert!(header(&resp, "x-frame-options").is_none());
+}
+
+/// Pin the referrer policy on every page that carries a form, in the header
+/// and in the `<meta>`. It must not be `no-referrer`: under that policy the
+/// browser sends `Origin: null` on form POSTs (Fetch spec, "serialize a
+/// request origin"), and the exact-Origin CSRF check then rejects consent,
+/// revoke and sign-out. Hand-set Origin headers in these tests cannot catch
+/// that, so the policy itself is pinned here.
+#[tokio::test]
+#[serial]
+async fn form_pages_use_a_referrer_policy_that_keeps_origin_on_posts() {
+    let pool = get_test_pool().await;
+    reset(&pool).await;
+    let st = state(&pool);
+    let user = unique_user();
+    let loopback = authorize(&st, &Cli::loopback()).await;
+    let remote = authorize(&st, &Cli::remote()).await;
+    let mut pages = vec![
+        send(
+            &st,
+            cookie_get(&format!("/cli/consent?request={loopback}"), &user),
+        )
+        .await,
+        send(
+            &st,
+            cookie_get(&format!("/cli/consent?request={remote}"), &user),
+        )
+        .await,
+        send(&st, cookie_get("/devices", &user)).await,
+    ];
+    // A page rendered by a POST (the remote code page) and the signed-out page.
+    let nonce = consent_nonce(&st, &remote, &user).await;
+    pages.push(decide(&st, &remote, &nonce, &user, "approve", true).await);
+    pages.push(
+        send(
+            &st,
+            request_with_cookie("POST", "/cli/sign-out", &user)
+                .header("Origin", AUD)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await,
+    );
+    let mut forms = 0;
+    for resp in pages {
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "referrer-policy").as_deref(),
+            Some("same-origin")
+        );
+        let html = body_text(resp).await;
+        assert!(html.contains("<meta name=\"referrer\" content=\"same-origin\">"));
+        assert!(!html.contains("no-referrer"));
+        forms += usize::from(html.contains("<form"));
+    }
+    assert!(forms >= 3, "consent pages and /devices carry forms");
+    reset(&pool).await;
 }
 
 #[tokio::test]

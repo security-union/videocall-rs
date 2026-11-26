@@ -201,6 +201,11 @@ pub struct OAuthRequestRow {
     pub csrf_state: Option<String>,
     pub return_to: Option<String>,
     pub nonce: Option<String>,
+    /// When the IdP leg started.
+    pub created_at: Option<DateTime<Utc>>,
+    /// SHA-256 (hex) of the pre-login cookie of the browser that started
+    /// this login. `None` only on rows stored before the column existed.
+    pub browser_binding_hash: Option<String>,
 }
 
 // ---- Conversions to API response types -------------------------------------

@@ -5,7 +5,7 @@ CREATE TABLE oauth_requests (
     csrf_state TEXT UNIQUE,
     return_to TEXT,
     nonce TEXT
-);
+, created_at TEXT, browser_binding_hash TEXT);
 CREATE TABLE users (
     email TEXT PRIMARY KEY CHECK (length(email) <= 255),
     access_token TEXT,
@@ -56,6 +56,8 @@ CREATE INDEX idx_meeting_participants_user_id
     ON meeting_participants(user_id);
 CREATE INDEX idx_meeting_participants_status
     ON meeting_participants(status);
+CREATE INDEX idx_oauth_requests_created_at ON oauth_requests(created_at);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
-  ('20220807000000');
+  ('20220807000000'),
+  ('20261126000000');

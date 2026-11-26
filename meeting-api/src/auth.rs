@@ -24,7 +24,7 @@
 
 use axum::{
     extract::FromRequestParts,
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, HeaderMap, StatusCode},
 };
 use videocall_meeting_types::APIError;
 
@@ -64,6 +64,18 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
+/// The non-empty value of cookie `name`, if the request carries one.
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    let prefix = format!("{name}=");
+    cookie_header
+        .split(';')
+        .filter_map(|pair| pair.trim().strip_prefix(prefix.as_str()))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Extract the raw session JWT from the request.
 ///
 /// Checks (in order):
@@ -71,21 +83,8 @@ impl FromRequestParts<AppState> for AuthUser {
 /// 2. `Authorization: Bearer <jwt>`
 fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
     // 1. Try the configured session cookie name.
-    if let Some(cookie_header) = parts
-        .headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
-        let prefix = format!("{cookie_name}=");
-        for pair in cookie_header.split(';') {
-            let pair = pair.trim();
-            if let Some(value) = pair.strip_prefix(prefix.as_str()) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
+    if let Some(value) = cookie_value(&parts.headers, cookie_name) {
+        return Some(value);
     }
     // 2. Fall back to `Authorization: Bearer <token>`.
     if let Some(auth) = parts

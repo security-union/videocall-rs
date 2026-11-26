@@ -27,8 +27,83 @@ use std::rc::Rc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_theme::{icons, Icon, IconButton, ListGroup, ListHeader, Menu, MenuItem, Toolbar};
 
+/// One remote row in the attendants list.
+///
+/// Rows are per session, not per user: the same account can be in a meeting
+/// twice (a browser tab and `videocall-cli` on another machine), and each
+/// session has its own mute and speaking state.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PeerRow {
+    pub session_id: String,
+    pub user_id: String,
+    pub display_name: String,
+    pub is_host: bool,
+    pub muted: bool,
+    pub speaking: bool,
+}
+
+/// Build the remote rows for `session_ids`, in order, keeping those whose
+/// user id or display name contains `query` (case-insensitive).
+///
+/// `user_id_of` and `display_name_of` look a session up in the client; a
+/// session with no known user id falls back to its session id, and one with
+/// no display name to its user id. Audio and speaking state are keyed by
+/// session id, as the diagnostics `peer_status` events report them.
+pub fn peer_rows(
+    session_ids: &[String],
+    user_id_of: impl Fn(&str) -> Option<String>,
+    display_name_of: impl Fn(&str) -> Option<String>,
+    host_user_id: Option<&str>,
+    audio_states: &HashMap<String, bool>,
+    speaking_states: &HashMap<String, bool>,
+    query: &str,
+) -> Vec<PeerRow> {
+    let query = query.to_lowercase();
+    session_ids
+        .iter()
+        .map(|sid| {
+            let user_id = user_id_of(sid).unwrap_or_else(|| sid.clone());
+            let display_name = display_name_of(sid).unwrap_or_else(|| user_id.clone());
+            PeerRow {
+                session_id: sid.clone(),
+                // Compare authenticated user ids, not display names.
+                is_host: host_user_id == Some(user_id.as_str()),
+                muted: audio_states
+                    .get(sid)
+                    .map(|enabled| !enabled)
+                    .unwrap_or(true),
+                speaking: speaking_states.get(sid).copied().unwrap_or(false),
+                user_id,
+                display_name,
+            }
+        })
+        .filter(|row| {
+            row.user_id.to_lowercase().contains(&query)
+                || row.display_name.to_lowercase().contains(&query)
+        })
+        .collect()
+}
+
+/// The remote rows of the attendants list, keyed by session id.
+#[component]
+pub fn PeerRows(rows: Vec<PeerRow>) -> Element {
+    rsx! {
+        for row in rows.into_iter() {
+            PeerListItem {
+                key: "{row.session_id}",
+                name: row.display_name,
+                tooltip: row.user_id,
+                is_host: row.is_host,
+                muted: row.muted,
+                speaking: row.speaking,
+            }
+        }
+    }
+}
+
 #[component]
 pub fn PeerList(
+    /// Session ids of the remote peers, in display order.
     peers: Vec<String>,
     onclose: EventHandler<MouseEvent>,
     #[props(default = true)] self_muted: bool,
@@ -74,31 +149,17 @@ pub fn PeerList(
         });
     });
 
-    // Get client from context to convert session_id to user_id for display
+    // Get client from context to resolve each session to a user and name.
     let client_ctx = use_context::<VideoCallClientCtx>();
-    let audio_states = peer_audio_states();
-    let speaking_states = peer_speaking_states();
-
-    // Build reverse lookup (user_id -> session_id) once, to avoid O(N^2) scanning inside the loop.
-    let user_id_to_sid: HashMap<String, String> = client_ctx
-        .sorted_peer_keys()
-        .into_iter()
-        .filter_map(|sid| client_ctx.get_peer_user_id(&sid).map(|uid| (uid, sid)))
-        .collect();
-
-    let filtered_peers: Vec<String> = peers
-        .iter()
-        .filter(|peer| {
-            let peer_display_name = user_id_to_sid
-                .get(peer.as_str())
-                .and_then(|sid| client_ctx.get_peer_display_name(sid))
-                .unwrap_or_else(|| peer.to_string());
-            let query = search_query().to_lowercase();
-            peer.to_lowercase().contains(&query)
-                || peer_display_name.to_lowercase().contains(&query)
-        })
-        .cloned()
-        .collect();
+    let rows = peer_rows(
+        &peers,
+        |sid| client_ctx.get_peer_user_id(sid),
+        |sid| client_ctx.get_peer_display_name(sid),
+        host_user_id.as_deref(),
+        &peer_audio_states(),
+        &peer_speaking_states(),
+        &search_query(),
+    );
 
     // Get username from context and append (You)
     let display_name_ctx = use_context::<DisplayNameCtx>();
@@ -181,38 +242,7 @@ pub fn PeerList(
                             // show self as the first item with actual username
                             PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, muted: self_muted, speaking: self_speaking }
 
-                            for peer in filtered_peers.iter() {
-                                {
-                                    // peer is the display user_id; we need the session_id to look up states.
-                                    // Use the pre-built reverse map for O(1) lookup instead of scanning all peers.
-                                    let peer_session_id = user_id_to_sid.get(peer.as_str());
-                                    let peer_display_name = peer_session_id
-                                        .and_then(|sid| client_ctx.get_peer_display_name(sid))
-                                        .unwrap_or_else(|| peer.clone());
-                                    // Compare using authenticated user_id, not display name
-                                    let is_peer_host = host_user_id
-                                        .as_ref()
-                                        .map(|h| h == peer)
-                                        .unwrap_or(false);
-                                    let muted = peer_session_id
-                                        .and_then(|sid| audio_states.get(sid).copied())
-                                        .map(|enabled| !enabled)
-                                        .unwrap_or(true);
-                                    let speaking = peer_session_id
-                                        .and_then(|sid| speaking_states.get(sid).copied())
-                                        .unwrap_or(false);
-                                    rsx! {
-                                        PeerListItem {
-                                            key: "{peer}",
-                                            name: peer_display_name,
-                                            tooltip: peer.clone(),
-                                            is_host: is_peer_host,
-                                            muted: muted,
-                                            speaking: speaking,
-                                        }
-                                    }
-                                }
-                            }
+                            PeerRows { rows }
                         }
                     }
                 }

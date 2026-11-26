@@ -9,7 +9,7 @@ Key facts:
 - Audio and video codecs are pure Rust: Opus for audio, VP9 for video. Every browser client runs a NetEQ-style adaptive jitter buffer. Prometheus metrics export across the stack.
 - Written entirely in Rust: relay servers, meeting-api control plane, browser client (Dioxus/WebAssembly), and a native CLI.
 - Scales out horizontally: add relay servers to add capacity. WebSocket and WebTransport relays scale independently behind a load balancer, and NATS pub/sub fans each published frame out across the relays that share a meeting.
-- Three ways to test, ordered by commitment: (1) stream a camera with videocall-cli in two commands, (2) `git clone && make dev` to run the whole native stack, (3) `cargo add videocall-client` to embed the client in your own WebAssembly app.
+- Three ways to test, ordered by commitment: (1) stream a camera with videocall-cli in three commands, (2) `git clone && make dev` to run the whole native stack, (3) `cargo add videocall-client` to embed the client in your own WebAssembly app.
 - Browser support is Chromium (Chrome, Edge, Brave) and Safari on macOS and iOS. Firefox is not supported.
 
 ## Full content
@@ -18,8 +18,8 @@ Key facts:
 
 ## Try it (three ways)
 
-- Stream a camera in two commands: `cargo install videocall-cli` then `videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0`, then open `https://app.videocall.rs/meeting/<id>` in a browser.
-- Run the whole stack natively: `git clone https://github.com/security-union/videocall-rs.git && cd videocall-rs && make dev`, then open `http://localhost:3001/meeting/you/demo`.
+- Stream a camera in three commands: `cargo install videocall-cli`, `videocall-cli auth login` (once), then `videocall-cli stream --meeting-id <id> --video-device-index 0`. Create the meeting in a browser first, then open `https://app.videocall.rs/meeting/<id>` in a browser.
+- Run the whole stack natively: `git clone https://github.com/security-union/videocall-rs.git && cd videocall-rs && make dev`, then open `http://localhost:3001/meeting/demo`.
 - Embed the client: `cargo add videocall-client` and build on the same transport and media pipeline in your own Rust/WASM app.
 
 ## Docs

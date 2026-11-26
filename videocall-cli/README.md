@@ -96,33 +96,54 @@ NV12:
  - 1920x1080: [60, 30]
  ```
 
-4. Start streaming:
-
-> ⚠️ **The meeting must already exist.** Create the call first from a browser at
-> [videocall.rs](https://videocall.rs) — the CLI can only *join* an existing call,
-> it can no longer create one. If the call's creator is the CLI, it will not work;
-> a browser user has to create it.
-
+4. Log in. The CLI makes a key for this machine and opens your browser:
+```sh
+videocall-cli auth login
 ```
-videocall-cli \
-  stream \
-  --user-id <your-user-id> \
-  --video-device-index 0 \
+Sign in to videocall.rs, check that the fingerprint on the page matches the one in your terminal, and approve. The browser hands the result back to the CLI and you're done. The CLI then joins meetings as the account that approved it, so other people see your name. Check a machine with `videocall-cli auth status`.
+
+5. Create a meeting, or pick one you're invited to, in the web app at [app.videocall.rs](https://app.videocall.rs). The CLI only joins meetings that already exist, and it can't start them; the host does that from a browser.
+
+6. Start streaming:
+```sh
+videocall-cli stream \
   --meeting-id <meeting-id> \
+  --video-device-index 0 \
   --resolution 1280x720 \
   --fps 30 \
   --frame-format NV12 \
   --bitrate-kbps 500
 ```
+If the meeting hasn't started, the CLI waits for the host. If it has a waiting room, the host admits you like any other participant. Pass `--display-name "Garage Pi"` to show a different name than your account's.
+
+## 🍓 Logging in on a Raspberry Pi or over SSH
+
+A headless box has no browser to open, so use `--remote` (the CLI switches to it on its own over SSH, or on Linux without a desktop session):
+```sh
+videocall-cli auth login --remote --name "Garage Pi"
+```
+It prints a URL. Open it on any device where you can sign in (your laptop, your phone), check the fingerprint, approve, and paste the code the page shows back into the terminal. The code works once, for a few minutes, and only for this login, so don't paste it anywhere else.
+
+Every machine has its own key, so logging in on the Pi doesn't touch your laptop. `videocall-cli auth logout` revokes this machine on the server and deletes its key, even if the server can't be reached. Running `auth login` again replaces the key, and revokes the old one once the new login has worked. To see or revoke all your machines, open [api.videocall.rs/devices](https://api.videocall.rs/devices); a revoked machine stops working on its next request.
+
+A Pi has no clock battery, so right after boot its time can be off until NTP catches up. The CLI notices from the server's time, signs with that instead, and tells you to fix NTP.
+
+## 🔑 Where the key lives
+
+The config directory is `~/.config/videocall` (`$XDG_CONFIG_HOME/videocall` if that's set, `%APPDATA%\videocall` on Windows). Set `VIDEOCALL_CONFIG_DIR` to put it somewhere else.
+
+On macOS and Windows the private key goes in the OS keychain. On Linux it's a plain-text `credentials.toml` with mode 0600 in the config directory; set `VIDEOCALL_CREDENTIAL_STORE=file` to use the file on macOS or Windows too. `hosts.toml` next to it holds only the device id, name, fingerprint and account. The key never leaves the machine: the CLI signs a token that lives two minutes for each request. With the server's default settings, a machine that goes unused for 90 days expires, and every machine expires a year after approval. Then you run `auth login` again.
+
+## ⬆️ Upgrading from a version with `--user-id`
+
+Older versions joined with `--user-id` and no login. The relays don't accept that anymore: every connection needs a room token from the meeting API, so older CLI versions can't connect at all. Install the latest, run `videocall-cli auth login` once, and drop `--user-id` from your command. Your identity comes from the account now.
 
 ## 🌐 See Your Stream Live! using Chrome or Safari
-This system integrates directly with [videocall.rs](https://videocall.rs). Simply navigate to the following URL to watch your stream live:
+Open the meeting in a browser to watch your stream live:
 
 ```
 https://app.videocall.rs/meeting/<meeting-id>
 ```
-
-Replace `<your-username>` and `<meeting-id>` with the appropriate values.
 
 ---
 
@@ -140,11 +161,15 @@ Replace `<your-username>` and `<meeting-id>` with the appropriate values.
 ---
 
 ### Run Locally
-Stream your video to a meeting in seconds:
+To stream into the local dev stack (`make dev` at the repo root), point the CLI at your meeting-api and relay. Keys are stored per server, so log in to the local one first:
 
 ```sh
-RUST_LOG=info cargo run --release -- ...
+RUST_LOG=info cargo run --release -- auth login --api-url http://localhost:8081
+RUST_LOG=info cargo run --release -- stream --api-url http://localhost:8081 \
+  --url https://127.0.0.1:4433 --insecure-skip-verify --meeting-id <meeting-id> ...
 ```
+
+`--insecure-skip-verify` exists for the dev stack's self-signed certificate. The CLI refuses it unless `--url` is localhost, a loopback address or a private-range IP. Plain `http://` for `--api-url` has the same limit. You can also set `VIDEOCALL_API_URL` instead of passing `--api-url` each time.
 
 ## 📦 Build a `.deb` Package
 

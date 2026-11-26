@@ -109,8 +109,8 @@ DEV_ENV := NATS_URL=localhost:4222 \
 	RUST_LOG=debug,async_nats=info
 
 dev-websocket: ## Watch the websocket server (:8080)
-	$(DEV_ENV) ACTIX_PORT=8080 UI_ENDPOINT=http://localhost:3001 \
-	DATABASE_ENABLED=false SERVICE_TYPE=websocket REGION=us-east SERVER_ID=server-1 \
+	$(DEV_ENV) ACTIX_PORT=8080 \
+	SERVICE_TYPE=websocket REGION=us-east SERVER_ID=server-1 \
 	cargo watch -x 'run --bin websocket_server'
 
 dev-webtransport: ## Watch the webtransport server (udp :4433)
@@ -126,6 +126,7 @@ dev-meeting-api: ## Watch the meeting REST/auth API (:8081)
 	$(DEV_ENV) LISTEN_ADDR=0.0.0.0:8081 \
 	TOKEN_TTL_SECS=60 COOKIE_SECURE=false \
 	AFTER_LOGIN_URL=http://localhost:3001 ALLOWED_REDIRECT_URLS=http://localhost:3001 \
+	DEVICE_TOKEN_AUDIENCE=http://localhost:8081 \
 	cargo watch -x 'run --bin meeting-api'
 
 dev-metrics: ## Watch the client-metrics server (:9091)

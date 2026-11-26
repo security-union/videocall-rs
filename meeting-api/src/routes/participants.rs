@@ -23,7 +23,7 @@ use videocall_meeting_types::{
     responses::{APIResponse, ParticipantStatusResponse},
 };
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, AuthVia, CliOrBrowserUser};
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::nats_events;
@@ -35,9 +35,16 @@ use crate::token::{generate_observer_token, generate_room_token};
 /// If the meeting doesn't exist, create it with the joining user as host.
 /// Hosts are auto-admitted and receive a room_token immediately.
 /// Attendees enter the waiting room.
+///
+/// CLI credentials ([`AuthVia::Cli`]) never host: a missing meeting is 404
+/// (no auto-create), a non-active meeting is never activated (the creator
+/// gets the same `waiting_for_meeting` answer as anyone else), the host
+/// display name is never touched, and the room token always has
+/// `is_host = false`. A creator joining their own *active* meeting via the
+/// CLI is still admitted without the waiting room.
 pub async fn join_meeting(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    CliOrBrowserUser { user_id, via, .. }: CliOrBrowserUser,
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
@@ -45,6 +52,7 @@ pub async fn join_meeting(
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
         Some(m) => m,
+        None if via == AuthVia::Cli => return Err(AppError::meeting_not_found(&meeting_id)),
         None => {
             // Auto-create meeting with this user as host.
             let attendees = serde_json::Value::Array(vec![]);
@@ -52,7 +60,32 @@ pub async fn join_meeting(
         }
     };
 
-    let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
+    let is_creator = meeting.creator_id.as_deref() == Some(user_id.as_str());
+    let is_host = is_creator && via == AuthVia::Browser;
+    let meeting_active = meeting.state.as_deref() == Some("active");
+
+    if is_creator && via == AuthVia::Cli && meeting_active {
+        // Creator on the CLI: admitted without the waiting room, never host.
+        let row =
+            db_participants::upsert_creator_via_cli(&state.db, meeting.id, &user_id, display_name)
+                .await?;
+        let token = generate_room_token(
+            &state.jwt_secret,
+            state.token_ttl_secs,
+            &user_id,
+            &meeting_id,
+            false,
+            display_name
+                .or(row.display_name.as_deref())
+                .unwrap_or(&user_id),
+        )?;
+        let mut resp = row.into_participant_status(Some(token));
+        resp.is_host = false;
+        resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+        resp.host_display_name = meeting.host_display_name;
+        resp.host_user_id = meeting.creator_id;
+        return Ok(Json(APIResponse::ok(resp)));
+    }
 
     if is_host {
         // Activate the meeting if it's idle or ended.
@@ -150,9 +183,11 @@ pub async fn join_meeting(
 /// GET /api/v1/meetings/{meeting_id}/status
 ///
 /// Polling endpoint. When status is 'admitted', the response includes the room_token.
+///
+/// CLI credentials always get a room token with `is_host = false`.
 pub async fn get_my_status(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    CliOrBrowserUser { user_id, via, .. }: CliOrBrowserUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -174,7 +209,7 @@ pub async fn get_my_status(
             state.token_ttl_secs,
             &user_id,
             &meeting_id,
-            row.is_host,
+            row.is_host && via == AuthVia::Browser,
             row.display_name.as_deref().unwrap_or(&user_id),
         )?)
     } else {
@@ -182,6 +217,9 @@ pub async fn get_my_status(
     };
 
     let mut resp = row.into_participant_status(token);
+    if via == AuthVia::Cli {
+        resp.is_host = false;
+    }
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
@@ -189,6 +227,9 @@ pub async fn get_my_status(
 }
 
 /// POST /api/v1/meetings/{meeting_id}/leave
+///
+/// Browser session only: leaving as the creator ends the meeting, and a CLI
+/// shares its participant row with the same account's browser session.
 pub async fn leave_meeting(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,

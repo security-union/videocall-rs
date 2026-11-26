@@ -23,7 +23,8 @@ use modes::info::get_info;
 use modes::stream::stream;
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
-use videocall_cli::cli_args::{Info, Mode, Opt};
+use videocall_cli::auth;
+use videocall_cli::cli_args::{AuthCommand, Info, Mode, Opt};
 
 async fn initialize() {
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -48,6 +49,15 @@ async fn initialize() {
     }
 }
 
+/// macOS camera-name hint, then the camera/microphone permission prompt.
+async fn prepare_camera() {
+    #[cfg(target_os = "macos")]
+    println!("*Attention: to select a camera on MacOS please use the UUID in the Extras field as the name as opposed to the actual Name.\n");
+
+    // if os is mac os we need to ask for permission for camera and microphone
+    initialize().await;
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(
@@ -61,16 +71,21 @@ async fn main() -> anyhow::Result<()> {
     )
     .unwrap();
 
-    #[cfg(target_os = "macos")]
-    println!("*Attention: to select a camera on MacOS please use the UUID in the Extras field as the name as opposed to the actual Name.\n");
-
-    let mut opt = Opt::parse();
-
-    // if os is mac os we need to ask for permission for camera and microphone
-    initialize().await;
+    let opt = Opt::parse();
 
     match opt.mode {
-        Mode::Stream(ref mut s) => {
+        // Auth commands need no camera, so they skip the permission prompt.
+        Mode::Auth(a) => match a.command {
+            AuthCommand::Login(args) => auth::login(&args).await?,
+            AuthCommand::Logout(args) => auth::logout(&args).await?,
+            AuthCommand::Status(args) => {
+                if !auth::status(&args).await? {
+                    std::process::exit(1);
+                }
+            }
+        },
+        Mode::Stream(s) => {
+            prepare_camera().await;
             // If video device index is None, show available cameras and exit
             match s.video_device_index.clone() {
                 None => {
@@ -86,11 +101,12 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 Some(_index) => {
-                    stream(s.clone()).await;
+                    stream(*s).await?;
                 }
             }
         }
         Mode::Info(i) => {
+            prepare_camera().await;
             get_info(i).await?;
         }
     };

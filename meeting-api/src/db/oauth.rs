@@ -17,10 +17,19 @@
 //! parsed natively by both sqlx drivers, so the query strings are identical;
 //! the current-timestamp expression comes from [`crate::db::SQL_NOW`].
 
+use chrono::{DateTime, Duration, Utc};
+
 use crate::db::{DbPool, OAuthRequestRow, SQL_NOW};
+
+/// How long an IdP leg (`/login` → `/login/callback`) may
+/// take before its stored PKCE/CSRF state is considered abandoned.
+pub const OAUTH_REQUEST_TTL_SECS: i64 = 600;
 
 /// Store a new OAuth request (PKCE + CSRF state + optional nonce) for later
 /// retrieval in the callback.
+///
+/// Opportunistically sweeps rows older than [`OAUTH_REQUEST_TTL_SECS`] so the
+/// table cannot grow without bound from abandoned logins.
 pub async fn store_oauth_request(
     pool: &DbPool,
     pkce_challenge: &str,
@@ -29,10 +38,18 @@ pub async fn store_oauth_request(
     return_to: Option<&str>,
     nonce: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    let now = Utc::now();
+    // Best effort: a sweep failure must never fail the login itself.
+    if let Err(e) =
+        sweep_oauth_requests(pool, now - Duration::seconds(OAUTH_REQUEST_TTL_SECS)).await
+    {
+        tracing::warn!("sweeping oauth_requests failed: {e}");
+    }
     sqlx::query(
         r#"
-        INSERT INTO oauth_requests (pkce_challenge, pkce_verifier, csrf_state, return_to, nonce)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO oauth_requests
+            (pkce_challenge, pkce_verifier, csrf_state, return_to, nonce, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
     .bind(pkce_challenge)
@@ -40,23 +57,51 @@ pub async fn store_oauth_request(
     .bind(csrf_state)
     .bind(return_to)
     .bind(nonce)
+    .bind(now)
     .execute(pool)
     .await?;
     Ok(())
 }
 
+/// Delete up to [`crate::db::SWEEP_BATCH`] OAuth requests created before
+/// `cutoff`, so a historical backlog is drained in small batches rather than
+/// one long DELETE.
+///
+/// Rows with a NULL `created_at` are swept too: on SQLite the column is
+/// nullable, and only a pre-migration binary would insert such a row.
+pub async fn sweep_oauth_requests(
+    pool: &DbPool,
+    cutoff: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "DELETE FROM oauth_requests WHERE csrf_state IN \
+         (SELECT csrf_state FROM oauth_requests \
+          WHERE created_at < $1 OR created_at IS NULL LIMIT $2)",
+    )
+    .bind(cutoff)
+    .bind(crate::db::SWEEP_BATCH)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Fetch and consume an OAuth request by CSRF state.
-/// The row is atomically deleted so that each state token can only be used once.
+/// The row is atomically deleted so that each state token can only be used
+/// once. Rows older than [`OAUTH_REQUEST_TTL_SECS`] are consumed but treated
+/// as absent.
 pub async fn fetch_oauth_request(
     pool: &DbPool,
     csrf_state: &str,
 ) -> Result<Option<OAuthRequestRow>, sqlx::Error> {
-    sqlx::query_as::<_, OAuthRequestRow>(
-        "DELETE FROM oauth_requests WHERE csrf_state = $1 RETURNING pkce_challenge, pkce_verifier, csrf_state, return_to, nonce",
+    let row = sqlx::query_as::<_, OAuthRequestRow>(
+        "DELETE FROM oauth_requests WHERE csrf_state = $1 \
+         RETURNING pkce_challenge, pkce_verifier, csrf_state, return_to, nonce, created_at",
     )
     .bind(csrf_state)
     .fetch_optional(pool)
-    .await
+    .await?;
+    let cutoff = Utc::now() - Duration::seconds(OAUTH_REQUEST_TTL_SECS);
+    Ok(row.filter(|r| r.created_at.is_none_or(|t| t >= cutoff)))
 }
 
 /// Upsert a user after successful OAuth login.

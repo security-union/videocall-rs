@@ -30,7 +30,6 @@
 - [Meeting management](#meeting-management)
 - [Performance](#performance)
 - [Security](#security)
-- [Feature flags](#feature-flags)
 - [Testing](#testing)
 - [Release history](#release-history)
 - [Contributing](#contributing)
@@ -182,7 +181,7 @@ That's it. `make dev` opens the process-compose TUI running the whole stack as n
 | `dioxus-ui` | `trunk serve` | 3001 |
 | `prometheus` / `grafana` | native, same dashboards/config as the container stack | 9090 / 3000 |
 
-Services wait for middleware health (compose-style `depends_on`), recompile and restart instantly on save, and the TUI can restart individual processes on demand. Open `http://localhost:3001` and navigate to a meeting at `http://localhost:3001/meeting/<username>/<meeting-id>`.
+Services wait for middleware health (compose-style `depends_on`), recompile and restart instantly on save, and the TUI can restart individual processes on demand. Open `http://localhost:3001` and navigate to a meeting at `http://localhost:3001/meeting/<meeting-id>`.
 
 To stop: quit the TUI (`F10` / `Ctrl-C`), or run `make dev-down` from another terminal. The TUI needs an interactive terminal; for scripted or headless use run `nix-shell default.nix -A shells.dev --run "dev-stack -t=false"`.
 
@@ -272,31 +271,33 @@ The threshold can also be set via the `VAD_THRESHOLD` environment variable (see 
 
 1. Navigate to your deployed instance or local setup:
    ```
-   http://<server-address>/meeting/<username>/<meeting-id>
+   http://<server-address>/meeting/<meeting-id>
    ```
 2. Grant camera and microphone permissions when prompted.
 3. Click "Connect" to join the meeting.
 
 ### CLI-based streaming
 
-For headless devices like a Raspberry Pi:
+The CLI is how I stream from headless devices like a Raspberry Pi. It joins as your account, so log in once first. The meeting has to exist already, and a host has to start it from the web app.
 
 ```bash
 # Install the CLI tool
 cargo install videocall-cli
 
+# Log in: opens a browser where you approve this machine
+videocall-cli auth login
+
 # Stream from a camera
 videocall-cli stream \
-  --user-id <your-user-id> \
-  --video-device-index 0 \
   --meeting-id <meeting-id> \
+  --video-device-index 0 \
   --resolution 1280x720 \
   --fps 30 \
   --frame-format NV12 \
   --bitrate-kbps 500
 ```
 
-The CLI joins an existing meeting; create the call from a browser first. For all options, see the [videocall-cli README](https://github.com/security-union/videocall-rs/blob/main/videocall-cli/README.md).
+On a headless machine, `videocall-cli auth login --remote` prints a URL to open on your laptop and you paste back the code it shows (over SSH it does this on its own). If the meeting has a waiting room, the host admits the CLI like any other participant. For all options, see the [videocall-cli README](https://github.com/security-union/videocall-rs/blob/main/videocall-cli/README.md).
 
 ## Meeting management
 
@@ -310,11 +311,7 @@ videocall.rs includes a meeting management system with ownership, waiting rooms,
 
 Workflow: navigating to `/meeting/{meeting-id}` creates the meeting and makes you the owner if it does not exist. Owners see "Start Meeting," others see "Join Meeting." Non-owners wait for admission; admitted participants are auto-joined and can then manage the waiting room.
 
-Meeting management requires the `FEATURE_MEETING_MANAGEMENT` flag (see [Feature flags](#feature-flags)):
-
-```bash
-export FEATURE_MEETING_MANAGEMENT=true
-```
+The relays only accept connections that carry a room access token from meeting-api (`/lobby?token=<JWT>`). There is no unauthenticated path, so every client, browser or CLI, goes through the meeting API to join.
 
 Details: [Meeting Ownership & Workflow](https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_OWNERSHIP.md) and [Meeting API Reference](https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_API.md).
 
@@ -342,24 +339,6 @@ Design goals still in progress (minimizing data copies on the media path, furthe
 
 For the full model, see the [security architecture](https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md#security-architecture) and the [security policy](SECURITY.md).
 
-## Feature flags
-
-videocall.rs uses environment-based feature flags to enable optional or experimental functionality at runtime. Flags are loaded lazily on first access and can be overridden for testing.
-
-Flags are set via environment variables with the `FEATURE_` prefix:
-
-```bash
-export FEATURE_MEETING_MANAGEMENT=true
-# or, with Docker:
-docker run -e FEATURE_MEETING_MANAGEMENT=true ...
-```
-
-| Flag | Environment variable | Description | Default |
-|---|---|---|---|
-| Meeting Management | `FEATURE_MEETING_MANAGEMENT` | Meeting lifecycle management: creation, tracking, host controls | `false` |
-
-Truthy values (case-insensitive) are `true`, `1`, and `yes`. Any other value, or an unset variable, is treated as `false`.
-
 ## Testing
 
 ### UI testing (dioxus-ui)
@@ -382,7 +361,7 @@ CI runs these via `.github/workflows/wasm-test.yaml`. For the full guide, see [d
 
 ### Backend testing (actix-api)
 
-The `actix-api` crate has unit and integration tests that run against real PostgreSQL and NATS instances, started natively by `make check-backend`. Coverage includes session management, WebSocket and WebTransport meeting lifecycles, packet classification, the metrics server, and feature-flag behavior.
+The `actix-api` crate has unit and integration tests that run against real PostgreSQL and NATS instances, started natively by `make check-backend`. Coverage includes session management, WebSocket and WebTransport meeting lifecycles, packet classification, the metrics server, and room-token checks on connect.
 
 Tests use `#[serial_test::serial]` because they share a database, and each cleans up its own data. Everything runs natively, no Docker: `make check-backend` starts postgres 18 and NATS (JetStream) from nixpkgs under process-compose in a throwaway data dir, runs `dbmate` migrations, then clippy, fmt, and `cargo test` in the pinned nix-shell.
 

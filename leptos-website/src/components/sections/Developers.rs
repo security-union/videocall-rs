@@ -31,14 +31,15 @@ const LINK_CLASS: &str =
 // same room, so the SSR markup carries an obvious placeholder to swap out.
 const PLACEHOLDER_MEETING_ID: &str = "your-meeting-id";
 
-/// Builds the TRY rung's two-line terminal block for a given meeting id.
+/// Builds the TRY rung's three-line terminal block for a given meeting id.
 /// Declared once so the visible `<pre>`, the clipboard payload, and the fallback
 /// render can never drift apart. Verified against the repo: `cargo install` +
 /// `videocall-cli stream` from the README Usage section.
 fn try_command(meeting_id: &str) -> String {
     format!(
         "cargo install videocall-cli\n\
-         videocall-cli stream --user-id cam-01 --meeting-id {meeting_id} --video-device-index 0"
+         videocall-cli auth login\n\
+         videocall-cli stream --meeting-id {meeting_id} --video-device-index 0"
     )
 }
 
@@ -89,7 +90,7 @@ pub fn DevelopersSection() -> impl IntoView {
                         code=RUN_CMD
                     >
                         "The entire stack — Postgres, NATS, the relays, meeting-api, and the UI — runs natively with hot reload. Open "
-                        <ShipLink href="http://localhost:3001/meeting/you/demo">"localhost:3001/meeting/you/demo"</ShipLink>
+                        <ShipLink href="http://localhost:3001/meeting/demo">"localhost:3001/meeting/demo"</ShipLink>
                         ". You are in the call. Going to production? The repo ships "
                         <ShipLink href="https://github.com/security-union/videocall-rs/tree/main/helm">"Helm charts"</ShipLink>
                         "."
@@ -253,8 +254,8 @@ fn TryRow() -> impl IntoView {
                     <span class="section-index" aria-hidden="true">"01"</span>
                     <span class="section-index text-fg" aria-hidden="true">"TRY"</span>
                 </div>
-                <h3 class="text-h3 text-fg mt-3">"Stream a camera in two commands"</h3>
-                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. No browser, no build — just a camera and a meeting id."</p>
+                <h3 class="text-h3 text-fg mt-3">"Stream a camera in three commands"</h3>
+                <p class="text-sm text-fg-2 mt-2 leading-relaxed">"For the roboticist with a Pi on the desk. No build. Log in once, then it's a camera and a meeting id. Over SSH, open the printed URL on your laptop and paste back the code it shows."</p>
             </div>
             <div class="md:col-span-8 lg:col-span-9">
                 <div class="relative">
@@ -274,12 +275,12 @@ fn TryRow() -> impl IntoView {
                         Some(id) => view! {
                             "Then open "
                             <a href=format!("https://app.videocall.rs/meeting/{id}") class=LINK_CLASS>{format!("app.videocall.rs/meeting/{id}")}</a>
-                            " in any browser. Same meeting id, so the Pi's camera and your browser land in the same call — and the id is fresh on every visit, so you get a private room."
+                            " in any browser to create the meeting, then run the command. Same meeting id, so the Pi's camera and your browser land in the same call."
                         }.into_any(),
                         None => view! {
                             "Then open "
                             <a href="https://app.videocall.rs" class=LINK_CLASS>"app.videocall.rs"</a>
-                            " in any browser and pick any meeting id — swap it in for "
+                            " in any browser, create a meeting, and swap its id in for "
                             <span class="font-mono text-fg">{PLACEHOLDER_MEETING_ID}</span>
                             " in the command above so the Pi's camera and your browser land in the same call."
                         }.into_any(),

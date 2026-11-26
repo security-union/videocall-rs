@@ -61,6 +61,12 @@ meeting-api:
       value: "https://app.videocall.rs"
     - name: ALLOWED_REDIRECT_URLS
       value: "https://app.videocall.rs"
+    # Device login: public origin of this API (matches the ingress host) and
+    # trust the ingress's X-Forwarded-For for requester IPs.
+    - name: DEVICE_TOKEN_AUDIENCE
+      value: "https://api.videocall.rs"
+    - name: TRUST_X_FORWARDED_FOR
+      value: "true"
     - name: SERVICE_VERSION_URLS
       value: "http://websocket-us-east:8080/version,http://webtransport-us-east-lb:444/version,http://videocall-ui-us-east:80/version.json"
 

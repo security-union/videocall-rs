@@ -13,7 +13,13 @@ description = "Cross-platform REST client for the videocall.rs meeting API"
 
 [dependencies]
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
-reqwest = { version = "0.12", features = ["json"] }
+# rustls instead of reqwest's default native-tls, so native consumers (the
+# videocall-cli Raspberry Pi cross-build in particular) don't link OpenSSL.
+# `rustls-tls-native-roots` trusts the OS root store, like native-tls did, and
+# carries ring as its own provider: reqwest uses an installed process-default
+# rustls provider if there is one, else ring, so no caller has to install one.
+# TLS features are no-ops on wasm32 (dioxus-ui), where fetch does TLS.
+reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "http2", "rustls-tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"

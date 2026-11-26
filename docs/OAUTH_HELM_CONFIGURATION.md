@@ -249,6 +249,20 @@ env:
 | `AFTER_LOGIN_URL` | No | `/` | Default redirect after login (primary frontend URL). |
 | `ALLOWED_REDIRECT_URLS` | No | — | Comma-separated list of additional allowed redirect origins (e.g. `https://app2.example.com`). The origin of `AFTER_LOGIN_URL` is implicitly allowed. |
 
+**CLI device login:** `videocall-cli` users sign in through the normal browser login, so nothing extra has to be registered with the provider. Set `DEVICE_TOKEN_AUDIENCE` to turn it on; the rest only change defaults:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DEVICE_TOKEN_AUDIENCE` | For CLI login | — | meeting-api's public origin, e.g. `https://api.videocall.rs`. Unset disables CLI device login. |
+| `TRUST_X_FORWARDED_FOR` | No | `false` | Take the requester IP from the right-most `X-Forwarded-For` entry. Set it only behind a proxy that sets that header. |
+| `DEVICE_IDLE_TTL_SECS` | No | `7776000` (90 days) | A CLI device expires after this long unused. |
+| `DEVICE_ABS_TTL_SECS` | No | `31536000` (365 days) | A CLI device expires this long after approval. |
+| `DEVICE_MAX_PER_USER` | No | `10` | Live CLI devices per account. |
+| `DEVICE_MAX_PENDING` | No | `10000` | Unfinished CLI login requests, globally. |
+| `DEVICE_MAX_PENDING_PER_IP` | No | `5` | Unfinished CLI login requests per requester IP. |
+
+The WebSocket and WebTransport relays take no OAuth configuration. For authentication they only need `JWT_SECRET`, the same value meeting-api signs room access tokens with.
+
 **Resolution order:**
 1. If `OAUTH_ISSUER` is set → discover endpoints, then apply manual overrides on top
 2. If `OAUTH_ISSUER` is not set → `OAUTH_AUTH_URL` + `OAUTH_TOKEN_URL` must be set manually

@@ -16,7 +16,7 @@ The meeting flow:
 4. **Host** admits or rejects attendees
 5. **Admitted attendees** receive a push notification via the media server connection, then fetch their **room access token** via `GET /status`
 6. **Clients connect** to the Media Server using their room access token
-7. The Media Server **rejects** any connection without a valid, signed token (when `FEATURE_MEETING_MANAGEMENT=true`)
+7. The Media Server **rejects** any connection without a valid, signed token
 
 ## Shared Types Crate
 
@@ -48,7 +48,7 @@ All success and error examples below show the full envelope.
 
 ## Authentication
 
-All meeting-api endpoints (except OAuth login/callback and logout) require a valid **signed session JWT**.
+All meeting-api endpoints (except OAuth login/callback and logout, and the CLI device endpoints in [CLI Device Authentication](#cli-device-authentication)) require a valid **signed session JWT**.
 
 ### How to authenticate
 
@@ -59,6 +59,8 @@ Pass the session JWT in the `Authorization` header:
 ```
 
 The session JWT is obtained after a successful OAuth login via `GET /login`. The OAuth callback issues the token, and all subsequent API calls must include it in the `Authorization: Bearer` header.
+
+`videocall-cli` authenticates with a **device JWT** instead (see [CLI Device Authentication](#cli-device-authentication)), sent as `Authorization: Bearer <device_jwt>`. It is accepted only on Get Meeting Info, Join Meeting and Get My Status. Every other meeting endpoint returns **403** `BROWSER_SESSION_REQUIRED` for a device JWT.
 
 > **Browser note**: The web UI (`dioxus-ui`) uses an `HttpOnly` session cookie that the browser sends automatically. This is an implementation detail of the browser client -- for API testing, CLI tools, mobile apps, and all documentation examples, always use the `Authorization: Bearer` header.
 
@@ -226,6 +228,7 @@ GET /api/v1/meetings
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 
 **Error example (401):**
 ```json
@@ -285,6 +288,7 @@ POST /api/v1/meetings
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 400 | `INVALID_MEETING_ID` | Invalid ID format |
 | 400 | `TOO_MANY_ATTENDEES` | More than 100 attendees |
 | 409 | `MEETING_EXISTS` | Meeting ID already taken |
@@ -373,6 +377,7 @@ DELETE /api/v1/meetings/{meeting_id}
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 403 | `NOT_OWNER` | Not the meeting owner |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
@@ -385,6 +390,7 @@ Request to join a meeting. If the meeting doesn't exist, it will be **automatica
 - **First user to join** becomes the host; the meeting is created and activated
 - **Hosts** are auto-admitted and receive a `room_token` immediately
 - **Attendees** (non-hosts) enter the waiting room (no `room_token` until admitted)
+- **CLI devices** never host: a missing meeting returns 404 instead of being created, an idle meeting is never activated, and the `room_token` always has `is_host: false`. The creator joining their own active meeting from the CLI skips the waiting room.
 
 ```
 POST /api/v1/meetings/{meeting_id}/join
@@ -510,6 +516,7 @@ GET /api/v1/meetings/{meeting_id}/waiting
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
@@ -555,6 +562,7 @@ The admitted participant receives a `PARTICIPANT_ADMITTED` push notification via
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `PARTICIPANT_NOT_FOUND` | Participant not in waiting room |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
@@ -606,6 +614,7 @@ POST /api/v1/meetings/{meeting_id}/admit-all
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
@@ -649,6 +658,7 @@ POST /api/v1/meetings/{meeting_id}/reject
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `PARTICIPANT_NOT_FOUND` | Participant not in waiting room |
 
@@ -740,6 +750,7 @@ POST /api/v1/meetings/{meeting_id}/leave
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 404 | `NOT_IN_MEETING` | Not a participant in this meeting |
 
 ---
@@ -788,7 +799,187 @@ GET /api/v1/meetings/{meeting_id}/participants
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `BROWSER_SESSION_REQUIRED` | Called with a CLI device JWT |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
+
+---
+
+## CLI Device Authentication
+
+`videocall-cli` logs in with a per-machine Ed25519 key, the way `aws login` works:
+
+1. The CLI generates a key pair and opens `/cli/authorize` with a PKCE challenge and the public key.
+2. The user signs in with their normal browser session and approves on the consent page, which shows the device name and the key's fingerprint.
+3. The browser hands a one-time code to the CLI: a redirect to `http://127.0.0.1:{port}/callback` (loopback), or a page at `/cli/code` the user copies it from (remote, for headless machines).
+4. The CLI exchanges the code, the PKCE verifier and a registration JWS signed by the new key at `POST /api/v1/devices`.
+
+The server stores only the public key. From then on the CLI signs a short-lived device JWT for every request (`alg: EdDSA`, `kid` = `device_id`, `iss: videocall-cli`, `aud` = `DEVICE_TOKEN_AUDIENCE`, lifetime 120 s, at most 300 s accepted). A revoked or expired device gets 401 on its next request.
+
+Devices expire after 90 days unused and 365 days after approval, and an account can have 10 live devices (defaults, see [Configuration](#device-auth-configuration)). Users list and revoke their devices at `GET /devices`.
+
+The browser pages (`/cli/*`, `/devices`) are server-rendered HTML on the API origin, outside CORS. Form POSTs must be `application/x-www-form-urlencoded` with an `Origin` exactly equal to `DEVICE_TOKEN_AUDIENCE`. When `DEVICE_TOKEN_AUDIENCE` is unset, the login and devices pages return 503 and device JWTs get 401.
+
+> **Rust types**: `videocall-meeting-types/src/device.rs` (`RegisterDeviceRequest`, `RegisterDeviceResponse`, `DeviceStatusResponse`, `DeviceErrorResponse`, `DeviceTokenClaims`, `RegistrationClaims`)
+
+---
+
+### Start CLI Login
+
+```
+GET /cli/authorize?response_type=code&client_id=videocall-cli&redirect_uri={uri}&code_challenge={S256}&code_challenge_method=S256&state={state}&public_key={key}&device_name={name}
+```
+
+| Parameter | Constraint |
+|-----------|------------|
+| `redirect_uri` | `http://127.0.0.1:{port}/callback` or `http://[::1]:{port}/callback` (port 1024-65535), or `{api origin}/cli/code` for a remote login |
+| `code_challenge` | PKCE S256 challenge |
+| `state` | 16-128 visible ASCII characters |
+| `public_key` | Raw Ed25519 public key, base64url without padding (43 characters) |
+| `device_name` | Up to 64 characters: letters, digits, spaces and `. _ ( ) @ : + -` |
+
+Stores the request (valid 10 minutes) and redirects (302) to the consent page.
+
+**Errors** (HTML page, no redirect):
+
+| Status | Description |
+|--------|-------------|
+| 400 | A parameter is missing or invalid |
+| 409 | This public key is already registered |
+| 429 | Too many pending logins, globally or from this IP |
+| 503 | Device login is not configured |
+
+---
+
+### Consent Page
+
+```
+GET /cli/consent?request={id}
+POST /cli/consent
+```
+
+Browser session (cookie) only; a signed-out user is sent through login first. The page shows the device name, the key fingerprint and the requesting IP. The POST carries `request`, a per-render `nonce` and `decision`.
+
+On approval it mints a one-time code. A loopback login is redirected (303) to `{redirect_uri}?code=...&state=...` (code valid 60 s). A remote login gets the code on the response page (valid 5 minutes); the code never appears in a URL. `GET /cli/code` is the remote `redirect_uri` and only renders instructions.
+
+---
+
+### Register Device
+
+```
+POST /api/v1/devices
+```
+
+**Request Body** (`application/json`, at most 4 KiB):
+```json
+{
+  "code": "...",
+  "code_verifier": "...",
+  "redirect_uri": "http://127.0.0.1:53682/callback",
+  "registration": "eyJhbGciOiJFZERTQSIs..."
+}
+```
+
+`registration` is a JWS signed by the new key with claims `iss`, `aud`, `iat`, `exp`, `public_key` and `name`; `public_key` and `name` must match the `/cli/authorize` request. The code is burned on first use, whether or not the exchange succeeds.
+
+**Response (201 Created):**
+```json
+{
+  "device_id": "q3V9mXc0Rk2b7yYt1nWZpA",
+  "fingerprint": "9F3C-21AB-77D0-4E18",
+  "name": "videocall-cli on raspberrypi",
+  "user_id": "alice@example.com",
+  "user_name": "Alice",
+  "idle_expires_at": 1714694400,
+  "abs_expires_at": 1738454400
+}
+```
+
+> **Rust type**: `RegisterDeviceResponse` (bare JSON, no envelope)
+
+**Errors** (`{"error": ..., "error_description": ...}`):
+
+| Status | Error | Description |
+|--------|-------|-------------|
+| 400 | `invalid_request` | Malformed body or `code_verifier` |
+| 400 | `invalid_grant` | Code unknown, expired or used; or verifier, `redirect_uri`, key or name mismatch (one message for all) |
+| 409 | `too_many_devices` | Account is at `DEVICE_MAX_PER_USER`; revoke one at `/devices` |
+| 409 | `key_already_registered` | This public key is already a device |
+| 413 | `invalid_request` | Body too large |
+| 415 | `invalid_request` | `Content-Type` is not `application/json` |
+| 500 | `server_error` | Database error |
+| 503 | `not_configured` | `DEVICE_TOKEN_AUDIENCE` is unset |
+
+---
+
+### Get My Device
+
+```
+GET /api/v1/devices/me
+Authorization: Bearer <device_jwt>
+```
+
+**Response (200 OK):**
+```json
+{
+  "device_id": "q3V9mXc0Rk2b7yYt1nWZpA",
+  "status": "approved",
+  "name": "videocall-cli on raspberrypi",
+  "fingerprint": "9F3C-21AB-77D0-4E18",
+  "user_id": "alice@example.com",
+  "user_name": "Alice",
+  "created_at": 1706918400,
+  "decided_at": 1706918400,
+  "last_used_at": 1706918400,
+  "idle_expires_at": 1714694400,
+  "abs_expires_at": 1738454400
+}
+```
+
+> **Rust type**: `DeviceStatusResponse`
+
+**Errors:**
+
+| Status | Description |
+|--------|-------------|
+| 401 | Device JWT missing, invalid, revoked or expired. The usual `UNAUTHORIZED` envelope plus `WWW-Authenticate: Bearer error="invalid_token"`; never says why |
+
+---
+
+### Revoke My Device
+
+```
+DELETE /api/v1/devices/me
+Authorization: Bearer <device_jwt>
+```
+
+**Response:** 204 No Content. Errors as for Get My Device.
+
+---
+
+### Devices Page
+
+```
+GET /devices
+POST /devices/{device_id}/revoke
+```
+
+Browser session (cookie) only. Lists the user's live devices (name, fingerprint, last use, the IP it was approved from); the revoke form POSTs and redirects (303) back to `/devices`. A revoked device fails on its next request.
+
+---
+
+### Device Auth Configuration
+
+Optional meeting-api environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEVICE_TOKEN_AUDIENCE` | unset | meeting-api's public origin, e.g. `https://api.videocall.rs`. The `aud` of every device JWT and the only accepted form `Origin`. Unset disables device login |
+| `TRUST_X_FORWARDED_FOR` | `false` | Take the requester IP from the right-most `X-Forwarded-For` entry instead of the TCP peer |
+| `DEVICE_IDLE_TTL_SECS` | `7776000` (90 days) | A device expires after this long unused |
+| `DEVICE_ABS_TTL_SECS` | `31536000` (365 days) | A device expires this long after approval |
+| `DEVICE_MAX_PER_USER` | `10` | Live devices per account |
+| `DEVICE_MAX_PENDING` | `10000` | Unfinished login requests, globally |
+| `DEVICE_MAX_PENDING_PER_IP` | `5` | Unfinished login requests per requester IP |
 
 ---
 
@@ -813,15 +1004,13 @@ The Media Server:
 5. Establishes the WebSocket or WebTransport connection
 6. **Rejects the connection** if the token is missing, invalid, or expired
 
-### Deprecated Endpoint
+### Connection Errors
 
-The legacy path-based endpoint is still available for backward compatibility:
-
-```
-GET /lobby/{email}/{room}
-```
-
-This endpoint is **deprecated** and only works when `FEATURE_MEETING_MANAGEMENT=false`. When meeting management is enabled, it returns **HTTP 410 Gone**. Clients should migrate to the token-based endpoint above.
+| Status | Cause |
+|--------|-------|
+| 401 | Token missing, or expired (fetch a new one via `GET /status`) |
+| 403 | Token invalid, signed with another secret, or `room_join` is false |
+| 404 | Any path other than `/lobby`, including the removed `/lobby/{user_id}/{room}` form |
 
 ---
 

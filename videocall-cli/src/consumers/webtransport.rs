@@ -16,33 +16,41 @@
  * conditions.
  */
 
-use anyhow::Error;
+use anyhow::{bail, Error};
 use protobuf::Message;
+use secrecy::ExposeSecret;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     sync::mpsc::{self, Sender},
     time::{self, Duration},
 };
 use tracing::info;
+use url::Url;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
     media_packet::{media_packet::MediaType, HeartbeatMetadata, MediaPacket},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
+use crate::backoff::Backoff;
 use crate::cli_args::Stream;
+use crate::net_policy::is_local_host;
+use crate::room::RoomSession;
 
 use super::camera_synk::CameraSynk;
 
 pub struct WebTransportClient {
     options: Stream,
+    room: RoomSession,
     sender: Option<Sender<Vec<u8>>>,
 }
 
 impl WebTransportClient {
-    pub fn new(options: Stream) -> Self {
+    /// A client for an admitted `room`. Packets carry `room.user_id()`.
+    pub fn new(options: Stream, room: RoomSession) -> Self {
         Self {
             options,
+            room,
             sender: None,
         }
     }
@@ -54,7 +62,7 @@ impl WebTransportClient {
         };
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
-            user_id: self.options.user_id.as_bytes().to_vec(),
+            user_id: self.room.user_id().as_bytes().to_vec(),
             data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
@@ -82,7 +90,7 @@ impl WebTransportClient {
 
     async fn start_heartbeat(&self, session: web_transport_quinn::Session, options: &Stream) {
         let interval = time::interval(Duration::from_secs(1));
-        let email = options.user_id.clone();
+        let email = self.room.user_id().to_string();
         // Advertise audio as enabled only when we are actually capturing a mic
         // (`--audio-device` was provided). Otherwise peers would see the CLI as
         // unmuted while it sends no audio — and vice-versa, a streamed mic would
@@ -124,44 +132,159 @@ impl WebTransportClient {
     }
 }
 
-async fn connect_to_server(options: &Stream) -> anyhow::Result<web_transport_quinn::Session> {
+/// Refuse `--insecure-skip-verify` unless the relay is local.
+///
+/// Skipping certificate checks against a public host would hand the room
+/// token to anyone on the path, so it is only allowed for `localhost`,
+/// loopback, and private-range addresses (a dev stack with a self-signed
+/// certificate).
+pub fn check_insecure_skip_verify(relay: &Url, insecure_skip_verify: bool) -> anyhow::Result<()> {
+    if insecure_skip_verify && !is_local_host(relay) {
+        bail!(
+            "--insecure-skip-verify is only allowed for localhost, loopback, or private-range \
+             relay addresses, not {}. Remove the flag to verify the relay's certificate.",
+            relay.host_str().unwrap_or("<no host>")
+        );
+    }
+    Ok(())
+}
+
+/// `{relay}/lobby?token=<room token>`. Any path or query on `relay` is
+/// replaced. The result contains the token: never log it.
+pub fn lobby_url(relay: &Url, room_token: &str) -> Url {
+    let mut url = relay.clone();
+    url.set_path("/lobby");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.query_pairs_mut().append_pair("token", room_token);
+    url
+}
+
+/// The HTTP status of a refused WebTransport CONNECT, if that is the error.
+///
+/// web-transport-quinn 0.8.1 keeps its connect error types private, so the
+/// status is read from the `Debug` text. A non-2xx response surfaces as
+/// `HttpError(ProtoError(WrongStatus(Some(401))))`; `ErrorStatus(401)` is the
+/// crate's other path for the same thing. Same approach as the relay tests in
+/// `actix-api/src/webtransport/mod.rs`.
+pub fn rejection_status(err: &web_transport_quinn::ClientError) -> Option<u16> {
+    let web_transport_quinn::ClientError::HttpError(inner) = err else {
+        return None;
+    };
+    parse_rejection_status(&format!("{inner:?}"))
+}
+
+fn parse_rejection_status(debug_text: &str) -> Option<u16> {
+    ["WrongStatus(Some(", "ErrorStatus("]
+        .iter()
+        .find_map(|marker| debug_text.split(marker).nth(1))
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+}
+
+/// Connect to the relay, minting a fresh room token for every attempt.
+///
+/// Transient failures back off exponentially (1 s to 30 s, jittered).
+/// A 401/403/404 from the relay, or a non-retryable meeting-api error (not
+/// logged in, meeting gone, no longer admitted), ends the loop with an error.
+async fn connect_to_server(
+    options: &Stream,
+    room: &mut RoomSession,
+) -> anyhow::Result<web_transport_quinn::Session> {
+    check_insecure_skip_verify(&options.url, options.insecure_skip_verify)?;
+    let client = if options.insecure_skip_verify {
+        tracing::warn!("Skipping TLS certificate verification for the local relay");
+        // SAFETY: gated above to localhost / loopback / private addresses.
+        unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
+    } else {
+        web_transport_quinn::ClientBuilder::new().with_system_roots()?
+    };
+
+    let mut backoff = Backoff::relay();
+    let mut previous_was_401 = false;
     loop {
-        info!("Attempting to connect to {}", options.url);
-
-        // Construct WebTransport URL
-        let mut url = options.url.clone();
-        url.set_path(&format!(
-            "/lobby/{}/{}",
-            options.user_id, options.meeting_id
-        ));
-
-        // Create WebTransport client using 0.7.3 API (same pattern as bot)
-        let client = if options.insecure_skip_verify {
-            info!("WARNING: Skipping TLS certificate verification - connection is insecure!");
-            unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
-        } else {
-            web_transport_quinn::ClientBuilder::new().with_system_roots()?
+        let token = match room.next_room_token().await {
+            Ok(token) => token,
+            Err(e) if e.is_retryable() => {
+                let delay = backoff.next_delay();
+                tracing::warn!("Couldn't get a room token: {e}. Retrying in {delay:.1?}...");
+                time::sleep(delay).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
         };
 
-        match client.connect(url).await {
-            Ok(session) => {
-                info!("WebTransport session established successfully");
+        info!("Connecting to relay {}", options.url);
+        let url = lobby_url(&options.url, token.expose_secret());
+        let (status, error) = match time::timeout(CONNECT_TIMEOUT, client.connect(url)).await {
+            Ok(Ok(session)) => {
+                info!("WebTransport session established");
                 return Ok(session);
             }
-            Err(e) => {
-                tracing::error!(
-                    "WebTransport connection failed: {}. Retrying in 5 seconds...",
-                    e
-                );
-                time::sleep(Duration::from_secs(5)).await;
+            Ok(Err(e)) => (rejection_status(&e), e.to_string()),
+            Err(_) => (
+                None,
+                format!("no answer within {} s", CONNECT_TIMEOUT.as_secs()),
+            ),
+        };
+        match after_connect_failure(status, previous_was_401) {
+            NextStep::RetryNow => {
+                previous_was_401 = true;
+                info!("Relay said the room token expired (401); retrying with a fresh one");
             }
+            NextStep::Backoff => {
+                previous_was_401 = false;
+                let delay = backoff.next_delay();
+                tracing::error!(
+                    "WebTransport connection failed: {error}. Retrying in {delay:.1?}..."
+                );
+                time::sleep(delay).await;
+            }
+            NextStep::Fatal(reason) => bail!("{reason} (relay {})", options.url),
         }
+    }
+}
+
+/// How long one WebTransport CONNECT may take. Shorter than QUIC's idle
+/// timeout so a network that drops UDP gets the backoff, not a long hang.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What to do after a failed relay connect attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NextStep {
+    /// Mint a fresh room token and try again right away.
+    RetryNow,
+    /// Sleep for the next backoff delay, then try again.
+    Backoff,
+    /// Stop with this message.
+    Fatal(String),
+}
+
+/// 401 means "come back with a fresh token": retry once immediately, and
+/// give up only if the very next attempt gets 401 too. 403 and 404 are
+/// terminal. Anything else (network, QUIC, timeout, 5xx) backs off.
+pub(crate) fn after_connect_failure(status: Option<u16>, previous_was_401: bool) -> NextStep {
+    match status {
+        Some(401) if !previous_was_401 => NextStep::RetryNow,
+        Some(401) => NextStep::Fatal(
+            "the relay rejected a freshly minted room token twice (401)".to_string(),
+        ),
+        Some(403) => NextStep::Fatal("the relay rejected the room token (403)".to_string()),
+        Some(404) => {
+            NextStep::Fatal("the relay has no /lobby endpoint (404); check --url".to_string())
+        }
+        _ => NextStep::Backoff,
     }
 }
 
 impl CameraSynk for WebTransportClient {
     async fn connect(&mut self) -> anyhow::Result<()> {
-        let session = connect_to_server(&self.options).await?;
+        let session = connect_to_server(&self.options, &mut self.room).await?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
         self.sender = Some(tx);
 
@@ -187,5 +310,85 @@ impl CameraSynk for WebTransportClient {
 
     async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
         self.queue_message(data).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lobby_url_construction() {
+        let relay = Url::parse("https://relay.example:4433").unwrap();
+        let url = lobby_url(&relay, "a.b+c/d=");
+        assert_eq!(url.path(), "/lobby");
+        assert_eq!(url.host_str(), Some("relay.example"));
+        assert_eq!(url.port(), Some(4433));
+        let pairs: Vec<_> = url.query_pairs().collect();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "token");
+        assert_eq!(pairs[0].1, "a.b+c/d=");
+
+        // Stray path / query on --url is replaced, not appended to.
+        let relay = Url::parse("https://relay.example/lobby/old/path?token=stale#x").unwrap();
+        let url = lobby_url(&relay, "fresh");
+        assert_eq!(url.as_str(), "https://relay.example/lobby?token=fresh");
+    }
+
+    #[test]
+    fn insecure_skip_verify_gating() {
+        let check = |url: &str, flag: bool| {
+            check_insecure_skip_verify(&Url::parse(url).unwrap(), flag).is_ok()
+        };
+        assert!(check(
+            "https://webtransport-us-east.webtransport.video",
+            false
+        ));
+        assert!(!check(
+            "https://webtransport-us-east.webtransport.video",
+            true
+        ));
+        assert!(!check("https://8.8.8.8:4433", true));
+        assert!(check("https://localhost:4433", true));
+        assert!(check("https://127.0.0.1:4433", true));
+        assert!(check("https://192.168.1.50:4433", true));
+        assert!(check("https://[::1]:4433", true));
+    }
+
+    #[test]
+    fn rejection_status_parsing() {
+        assert_eq!(
+            parse_rejection_status("ProtoError(WrongStatus(Some(401)))"),
+            Some(401)
+        );
+        assert_eq!(parse_rejection_status("ErrorStatus(403)"), Some(403));
+        assert_eq!(
+            parse_rejection_status("ProtoError(WrongStatus(None))"),
+            None
+        );
+        assert_eq!(parse_rejection_status("UnexpectedEnd"), None);
+    }
+
+    #[test]
+    fn connect_failure_policy() {
+        assert_eq!(after_connect_failure(Some(401), false), NextStep::RetryNow);
+        assert!(matches!(
+            after_connect_failure(Some(401), true),
+            NextStep::Fatal(_)
+        ));
+        assert!(matches!(
+            after_connect_failure(Some(403), false),
+            NextStep::Fatal(_)
+        ));
+        assert!(matches!(
+            after_connect_failure(Some(404), false),
+            NextStep::Fatal(_)
+        ));
+        assert_eq!(after_connect_failure(Some(503), false), NextStep::Backoff);
+        assert_eq!(after_connect_failure(None, false), NextStep::Backoff);
+        // A timeout or network error after a 401 backs off and resets the
+        // 401 streak (the caller clears `previous_was_401`).
+        assert_eq!(after_connect_failure(None, true), NextStep::Backoff);
+        assert!(CONNECT_TIMEOUT < Duration::from_secs(30));
     }
 }

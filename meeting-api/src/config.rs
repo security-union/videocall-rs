@@ -50,6 +50,94 @@ pub struct Config {
     /// Internal URLs for fetching version info from peer services.
     /// Used by the aggregated `/api/v1/versions` endpoint.
     pub service_version_urls: Vec<String>,
+    /// CLI device-key settings (`DEVICE_*`, `TRUST_X_FORWARDED_FOR`).
+    pub device: DeviceAuthConfig,
+}
+
+/// CLI device-key settings.
+#[derive(Debug, Clone)]
+pub struct DeviceAuthConfig {
+    /// `DEVICE_TOKEN_AUDIENCE`: this server's public origin, e.g.
+    /// `https://api.videocall.rs`. It is the `aud` of every device JWT and
+    /// registration JWS, the only accepted `Origin` on the consent form, the
+    /// base of the remote `redirect_uri`, and the origin of the closed
+    /// post-login return targets. `None` disables device auth.
+    pub audience: Option<String>,
+    /// `DEVICE_IDLE_TTL_SECS`: an approved device dies after this long unused.
+    pub idle_ttl_secs: i64,
+    /// `DEVICE_ABS_TTL_SECS`: an approved device dies this long after approval.
+    pub abs_ttl_secs: i64,
+    /// `DEVICE_MAX_PER_USER`: live approved devices per user.
+    pub max_per_user: i64,
+    /// `DEVICE_MAX_PENDING`: unexpired login requests, globally.
+    pub max_pending: i64,
+    /// `DEVICE_MAX_PENDING_PER_IP`: unexpired login requests per requester IP.
+    pub max_pending_per_ip: i64,
+    /// `TRUST_X_FORWARDED_FOR`: take the requester IP from the right-most
+    /// `X-Forwarded-For` entry instead of the TCP peer.
+    pub trust_x_forwarded_for: bool,
+}
+
+pub const DEFAULT_DEVICE_IDLE_TTL_SECS: i64 = 90 * 24 * 3600;
+pub const DEFAULT_DEVICE_ABS_TTL_SECS: i64 = 365 * 24 * 3600;
+pub const DEFAULT_DEVICE_MAX_PER_USER: i64 = 10;
+pub const DEFAULT_DEVICE_MAX_PENDING: i64 = 10_000;
+pub const DEFAULT_DEVICE_MAX_PENDING_PER_IP: i64 = 5;
+
+impl Default for DeviceAuthConfig {
+    fn default() -> Self {
+        Self {
+            audience: None,
+            idle_ttl_secs: DEFAULT_DEVICE_IDLE_TTL_SECS,
+            abs_ttl_secs: DEFAULT_DEVICE_ABS_TTL_SECS,
+            max_per_user: DEFAULT_DEVICE_MAX_PER_USER,
+            max_pending: DEFAULT_DEVICE_MAX_PENDING,
+            max_pending_per_ip: DEFAULT_DEVICE_MAX_PENDING_PER_IP,
+            trust_x_forwarded_for: false,
+        }
+    }
+}
+
+impl DeviceAuthConfig {
+    /// Read the device settings from the environment.
+    pub fn from_env() -> Result<Self, String> {
+        let var = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let positive = |name: &str, default: i64| -> Result<i64, String> {
+            match var(name) {
+                None => Ok(default),
+                Some(v) => match v.trim().parse::<i64>() {
+                    Ok(n) if n > 0 => Ok(n),
+                    _ => Err(format!("{name} must be a positive integer")),
+                },
+            }
+        };
+        let audience = var("DEVICE_TOKEN_AUDIENCE")
+            .map(|s| {
+                parse_origin(s.trim())
+                    .ok_or_else(|| format!("DEVICE_TOKEN_AUDIENCE is not an http(s) origin: {s}"))
+            })
+            .transpose()?;
+        let trust_x_forwarded_for = match var("TRUST_X_FORWARDED_FOR") {
+            None => false,
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => return Err("TRUST_X_FORWARDED_FOR must be true or false".into()),
+            },
+        };
+        Ok(Self {
+            audience,
+            idle_ttl_secs: positive("DEVICE_IDLE_TTL_SECS", DEFAULT_DEVICE_IDLE_TTL_SECS)?,
+            abs_ttl_secs: positive("DEVICE_ABS_TTL_SECS", DEFAULT_DEVICE_ABS_TTL_SECS)?,
+            max_per_user: positive("DEVICE_MAX_PER_USER", DEFAULT_DEVICE_MAX_PER_USER)?,
+            max_pending: positive("DEVICE_MAX_PENDING", DEFAULT_DEVICE_MAX_PENDING)?,
+            max_pending_per_ip: positive(
+                "DEVICE_MAX_PENDING_PER_IP",
+                DEFAULT_DEVICE_MAX_PENDING_PER_IP,
+            )?,
+            trust_x_forwarded_for,
+        })
+    }
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -135,6 +223,8 @@ impl Config {
             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
             .unwrap_or_default();
 
+        let device = DeviceAuthConfig::from_env()?;
+
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
             .filter(|s| !s.is_empty())
@@ -219,6 +309,7 @@ impl Config {
             cors_allowed_origin,
             nats_url,
             service_version_urls,
+            device,
         })
     }
 
@@ -266,5 +357,38 @@ impl Config {
         );
 
         Ok(())
+    }
+}
+
+/// Parse `value` as an absolute http(s) URL and return its ASCII origin
+/// (`scheme://host[:port]`, no trailing slash). `None` if it is not one.
+pub fn parse_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::parse_origin;
+
+    #[test]
+    fn parse_origin_normalizes() {
+        assert_eq!(
+            parse_origin("https://api.videocall.rs/").as_deref(),
+            Some("https://api.videocall.rs")
+        );
+        assert_eq!(
+            parse_origin("http://localhost:8081").as_deref(),
+            Some("http://localhost:8081")
+        );
+        assert_eq!(
+            parse_origin("https://api.videocall.rs:443").as_deref(),
+            Some("https://api.videocall.rs")
+        );
+        assert_eq!(parse_origin("ftp://x"), None);
+        assert_eq!(parse_origin("not a url"), None);
     }
 }

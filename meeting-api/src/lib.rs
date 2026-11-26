@@ -20,9 +20,12 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod device_auth;
 pub mod error;
+pub mod html;
 pub mod nats_events;
 pub mod oauth;
 pub mod routes;
+pub mod secrets;
 pub mod state;
 pub mod token;

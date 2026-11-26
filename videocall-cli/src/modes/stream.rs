@@ -16,11 +16,14 @@
  * conditions.
  */
 
+use anyhow::bail;
 use tokio::sync::mpsc::channel;
+use videocall_cli::auth::store::Store;
+use videocall_cli::auth::{ApiOrigin, Credentials};
 use videocall_cli::cli_args::Stream;
 use videocall_cli::consumers::camera_synk::CameraSynk;
 use videocall_cli::consumers::dead_synk::DeadSynk;
-use videocall_cli::consumers::webtransport::WebTransportClient;
+use videocall_cli::consumers::webtransport::{check_insecure_skip_verify, WebTransportClient};
 use videocall_cli::consumers::CameraSynks;
 use videocall_cli::producers::{
     camera::{CameraConfig, CameraDaemon},
@@ -28,18 +31,49 @@ use videocall_cli::producers::{
     producer::Producer,
     test_pattern_sender::TestPatternSender,
 };
+use videocall_cli::room::RoomSession;
 
-pub async fn stream(opt: Stream) {
-    // The CLI can only JOIN an existing call. The meeting must be created first
-    // by a user from a browser at https://videocall.rs — the API no longer lets
-    // the CLI create a call, so if nobody created it in the browser this stream
-    // will not be visible to anyone.
-    println!(
-        "NOTE: joining meeting '{}'. The call must already exist — a user has to \
-         create it first from a browser at https://videocall.rs. The CLI can only \
-         join an existing call, it cannot create one.",
-        opt.meeting_id
-    );
+/// User id stamped on packets in `--debug-offline-streaming-test`, which
+/// never talks to a server.
+const OFFLINE_TEST_USER_ID: &str = "offline-streaming-test";
+
+/// Resolves on Ctrl-C, or on SIGTERM on unix (systemd/docker stop).
+///
+/// Shutdown is local only: the CLI does not call meeting-api `leave`. Its
+/// account may also be in the meeting from a browser, and leaving would
+/// mark that participant as gone; the relay notices the dropped session.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("can't listen for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    () = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("can't listen for SIGTERM: {e}");
+                ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// Join the meeting through meeting-api, then stream to the relay.
+pub async fn stream(opt: Stream) -> anyhow::Result<()> {
+    // One listener for the whole run, so a signal between selects isn't lost.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     // Parse resolution
     let resolution: Vec<&str> = opt.resolution.split('x').collect();
@@ -52,7 +86,7 @@ pub async fn stream(opt: Stream) {
 
     println!(
         "User requested resolution {}x{} and format {}",
-        width, height, &format
+        width, height, format
     );
     let framerate = opt.fps;
     // validate framerate
@@ -60,7 +94,6 @@ pub async fn stream(opt: Stream) {
     if !valid_framerates.contains(&framerate) {
         panic!("invalid framerate: {framerate}, we currently support only {valid_framerates:?}",);
     }
-    let user_id = opt.user_id.clone();
     let video_device_index = opt.video_device_index.clone().unwrap();
     let send_test_pattern = opt.send_test_pattern;
     let audio_device = opt.audio_device.clone();
@@ -68,12 +101,35 @@ pub async fn stream(opt: Stream) {
     let bitrate_kbps = opt.bitrate_kbps;
     let cpu_used = opt.vp9_cpu_used;
     let frame_format = opt.frame_format;
-    let mut client: CameraSynks = if local_streaming {
-        CameraSynks::DeadSynk(DeadSynk::new(opt))
+    let (user_id, mut client) = if local_streaming {
+        (
+            OFFLINE_TEST_USER_ID.to_string(),
+            CameraSynks::DeadSynk(DeadSynk::new(opt)),
+        )
     } else {
-        CameraSynks::CameraSynk(Box::new(WebTransportClient::new(opt)))
+        // Fail fast on a bad flag before logging in or joining anything.
+        check_insecure_skip_verify(&opt.url, opt.insecure_skip_verify)?;
+        let api = ApiOrigin::from_url(&opt.api.api_url)?;
+        let creds = Credentials::load(Store::open_default()?, api).await?;
+        let meeting_id = opt.meeting_id.clone();
+        println!("Joining meeting '{meeting_id}'...");
+        let room = tokio::select! {
+            room = RoomSession::join(creds, &meeting_id, opt.display_name.clone()) => room?,
+            () = &mut shutdown => bail!("stopped before joining meeting '{meeting_id}'"),
+        };
+        println!("Admitted to meeting '{meeting_id}' as {}.", room.user_id());
+        (
+            room.user_id().to_string(),
+            CameraSynks::CameraSynk(Box::new(WebTransportClient::new(opt, room))),
+        )
     };
-    client.connect().await.expect("failed to connect");
+    tokio::select! {
+        result = client.connect() => result?,
+        () = &mut shutdown => {
+            println!("Stopped.");
+            return Ok(());
+        }
+    }
     let camera_config = CameraConfig {
         width,
         height,
@@ -105,7 +161,15 @@ pub async fn stream(opt: Stream) {
             .expect("failed to start microphone");
     }
 
-    while let Some(data) = wt_rx.recv().await {
+    loop {
+        let data = tokio::select! {
+            data = wt_rx.recv() => data,
+            () = &mut shutdown => {
+                println!("Stopped.");
+                break;
+            }
+        };
+        let Some(data) = data else { break };
         tracing::debug!("Received packet from producer: {} bytes", data.len());
         if let Err(e) = client.send_packet(data).await {
             tracing::error!("Failed to send packet: {}", e);
@@ -113,4 +177,5 @@ pub async fn stream(opt: Stream) {
             tracing::debug!("Packet sent successfully to WebTransport client");
         }
     }
+    Ok(())
 }

@@ -28,7 +28,7 @@ use videocall_meeting_types::{
     },
 };
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, CliOrBrowserUser};
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -172,7 +172,7 @@ pub async fn list_meetings(
 /// GET /api/v1/meetings/{meeting_id}
 pub async fn get_meeting(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    CliOrBrowserUser { user_id, .. }: CliOrBrowserUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)

@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use crate::config::{Config, OAuthConfig};
+use crate::config::{Config, DeviceAuthConfig, OAuthConfig};
 use crate::db::DbPool;
 use crate::oauth::JwksCache;
 
@@ -49,6 +49,8 @@ pub struct AppState {
     pub service_version_urls: Vec<String>,
     /// Shared HTTP client for outbound requests (e.g. version fan-out).
     pub http_client: reqwest::Client,
+    /// CLI device-key settings (audience, lifetimes, caps).
+    pub device: DeviceAuthConfig,
 }
 
 impl AppState {
@@ -75,6 +77,7 @@ impl AppState {
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
                 .expect("failed to build reqwest client"),
+            device: config.device.clone(),
         }
     }
 }

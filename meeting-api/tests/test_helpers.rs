@@ -19,6 +19,7 @@ use axum::http;
 use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
+use meeting_api::config::{DeviceAuthConfig, OAuthConfig};
 use meeting_api::db::DbPool;
 use meeting_api::{routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
@@ -51,9 +52,33 @@ pub async fn cleanup_test_data(pool: &DbPool, room_id: &str) {
         .await;
 }
 
-/// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
-pub fn build_app(pool: DbPool) -> Router {
-    let state = AppState {
+/// Origin of the (test) dioxus-ui.
+pub const TEST_UI_ORIGIN: &str = "http://localhost:3001";
+
+/// `aud` that device JWTs must carry in integration tests.
+pub const TEST_DEVICE_AUDIENCE: &str = "http://localhost:8081";
+
+/// A fake IdP configuration. `/login` only builds a
+/// redirect URL from it, so no network access happens.
+pub fn test_oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: "test-client".to_string(),
+        client_secret: None,
+        redirect_url: "http://localhost:8081/login/callback".to_string(),
+        issuer: None,
+        auth_url: "https://idp.example/authorize".to_string(),
+        token_url: "https://idp.example/token".to_string(),
+        jwks_url: None,
+        userinfo_url: None,
+        scopes: "openid email profile".to_string(),
+        after_login_url: TEST_UI_ORIGIN.to_string(),
+        allowed_redirect_urls: Vec::new(),
+    }
+}
+
+/// Build the test `AppState` backed by the given pool.
+pub fn build_state(pool: DbPool) -> AppState {
+    AppState {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),
         token_ttl_secs: TEST_TOKEN_TTL,
@@ -66,8 +91,26 @@ pub fn build_app(pool: DbPool) -> Router {
         nats: None,
         service_version_urls: Vec::new(),
         http_client: reqwest::Client::new(),
-    };
-    routes::router().with_state(state)
+        device: DeviceAuthConfig {
+            audience: Some(TEST_DEVICE_AUDIENCE.to_string()),
+            trust_x_forwarded_for: true,
+            ..DeviceAuthConfig::default()
+        },
+    }
+}
+
+/// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
+pub fn build_app(pool: DbPool) -> Router {
+    routes::router()
+        .merge(routes::page_router())
+        .with_state(build_state(pool))
+}
+
+/// Build the router from an explicit state (e.g. with OAuth configured).
+pub fn build_app_with_state(state: AppState) -> Router {
+    routes::router()
+        .merge(routes::page_router())
+        .with_state(state)
 }
 
 /// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.

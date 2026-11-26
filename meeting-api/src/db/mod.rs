@@ -32,6 +32,8 @@ compile_error!(
 #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
 compile_error!("enable exactly one database backend feature: `postgres` or `sqlite`");
 
+pub mod cli_auth;
+pub mod devices;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
@@ -50,15 +52,19 @@ pub type DbPool = sqlx::PgPool;
 pub type DbPool = sqlx::SqlitePool;
 
 #[cfg(feature = "postgres")]
-pub(crate) type Db = sqlx::Postgres;
+pub type Db = sqlx::Postgres;
 #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub(crate) type Db = sqlx::Sqlite;
+pub type Db = sqlx::Sqlite;
 
 /// SQL expression yielding the current timestamp.
 ///
 /// On SQLite this is an RFC3339-with-milliseconds string so values sort
 /// consistently with sqlx-bound `DateTime<Utc>` (which encodes via `to_rfc3339`
 /// on SQLite, e.g. `2026-07-21T12:34:56.789+00:00`).
+/// Maximum rows deleted by one opportunistic sweep statement, so a backlog
+/// never turns into one long-running DELETE on a user's request.
+pub const SWEEP_BATCH: i64 = 500;
+
 #[cfg(feature = "postgres")]
 pub(crate) const SQL_NOW: &str = "NOW()";
 #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
@@ -80,9 +86,7 @@ pub(crate) const FOR_UPDATE: &str = "";
 /// front (a plain deferred `BEGIN` would only take the lock on first write,
 /// racing a concurrent toggle). On PostgreSQL a normal `BEGIN` is used and
 /// serialization is provided by explicit `FOR UPDATE` row locks.
-pub(crate) async fn begin_write_tx(
-    pool: &DbPool,
-) -> Result<sqlx::Transaction<'static, Db>, sqlx::Error> {
+pub async fn begin_write_tx(pool: &DbPool) -> Result<sqlx::Transaction<'static, Db>, sqlx::Error> {
     // `Pool::begin_with` exists for every Pool in sqlx 0.8, so a single fn with
     // a runtime `cfg!` branch keeps this backend-agnostic.
     if cfg!(feature = "sqlite") {
@@ -201,6 +205,9 @@ pub struct OAuthRequestRow {
     pub csrf_state: Option<String>,
     pub return_to: Option<String>,
     pub nonce: Option<String>,
+    /// When the IdP leg started. `None` only for rows that predate the column
+    /// on SQLite (backfilled by the migration, so in practice always set).
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 // ---- Conversions to API response types -------------------------------------

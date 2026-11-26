@@ -1,0 +1,422 @@
+/*
+ * auth.css
+ *
+ * The only stylesheet of auth.videocall.rs. Hand-written so the pages need
+ * no build step, no script and no inline style (the CSP allows style-src
+ * 'self' and nothing else).
+ *
+ * The values are copied from videocall-theme/styles/tokens.css: the HIG
+ * colors measured on iOS 27.2, the Dynamic Type scale at "Large", 44px hit
+ * targets, and the theme's radii and spacing. If a token changes there,
+ * change it here too. Only the tokens these pages use are copied.
+ *
+ * Mobile first: the base rules are the phone layout, and one min-width
+ * query (the theme's 640px "regular" breakpoint) widens it.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --color-blue: #0088FF;
+  --color-red: #FF383C;
+  --color-orange: #FF8D28;
+  --color-label: #000000;
+  --color-label-secondary: rgba(60, 60, 67, 0.60);
+  --color-fill-tertiary: rgba(118, 118, 128, 0.12);
+  --color-separator: rgba(60, 60, 67, 0.12);
+  --color-link: #007AFF;
+  --color-on-accent: #FFFFFF;
+  --color-bg-grouped: #F2F2F7;
+  --color-bg-grouped-secondary: #FFFFFF;
+  --color-accent-tint: rgba(0, 136, 255, 0.15);
+  --color-warning-tint: rgba(255, 141, 40, 0.15);
+  --color-danger-tint: rgba(255, 56, 60, 0.15);
+  --color-shadow: rgba(0, 0, 0, 0.12);
+
+  --color-accent: var(--color-blue);
+  --color-danger: var(--color-red);
+  --color-warning: var(--color-orange);
+  --focus-ring-color: var(--color-accent);
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --text-title-1-emphasized: 700 1.75rem/1.2143 var(--font-sans);
+  --text-title-2-emphasized: 700 1.375rem/1.2727 var(--font-sans);
+  --text-headline: 600 1.0625rem/1.2941 var(--font-sans);
+  --text-body: 400 1.0625rem/1.2941 var(--font-sans);
+  --text-subheadline: 400 0.9375rem/1.3333 var(--font-sans);
+  --text-footnote: 400 0.8125rem/1.3846 var(--font-sans);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  --size-hit: 44px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --focus-ring-width: 3px;
+  --focus-ring-offset: 2px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-blue: #0091FF;
+    --color-red: #FF4245;
+    --color-orange: #FF9230;
+    --color-label: #FFFFFF;
+    --color-label-secondary: rgba(235, 235, 245, 0.60);
+    --color-fill-tertiary: rgba(118, 118, 128, 0.24);
+    --color-separator: rgba(84, 84, 88, 0.50);
+    --color-link: #0984FF;
+    --color-bg-grouped: #000000;
+    --color-bg-grouped-secondary: #1C1C1E;
+    --color-accent-tint: rgba(0, 145, 255, 0.24);
+    --color-warning-tint: rgba(255, 146, 48, 0.24);
+    --color-danger-tint: rgba(255, 66, 69, 0.24);
+    --color-shadow: rgba(0, 0, 0, 0.40);
+  }
+}
+
+/* Increase Contrast: the theme's darker blue under white text in light,
+   and black text on the lighter blue in dark. */
+@media (prefers-contrast: more) {
+  :root {
+    --color-blue: #1E6EF4;
+    --color-red: #E9152D;
+  }
+}
+
+@media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+  :root {
+    --color-blue: #5CB8FF;
+    --color-red: #FF6165;
+    --color-on-accent: #000000;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--color-bg-grouped);
+  color: var(--color-label);
+  font: var(--text-body);
+}
+
+.page {
+  width: 100%;
+  max-width: 34rem;
+  margin: 0 auto;
+  padding: var(--space-4);
+}
+
+.card {
+  background: var(--color-bg-grouped-secondary);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-4);
+  box-shadow: 0 1px 3px var(--color-shadow);
+}
+
+h1 {
+  font: var(--text-title-2-emphasized);
+  margin: 0 0 var(--space-3);
+}
+
+p {
+  margin: 0 0 var(--space-4);
+}
+
+.lead,
+.signed-in {
+  color: var(--color-label-secondary);
+}
+
+.signed-in strong,
+.lead strong {
+  color: var(--color-label);
+}
+
+a {
+  color: var(--color-link);
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+}
+
+.hint {
+  font: var(--text-footnote);
+  color: var(--color-label-secondary);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+label {
+  font: var(--text-headline);
+}
+
+/* Visible focus on everything a keyboard can reach. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--size-hit);
+  min-width: var(--size-hit);
+  padding: var(--space-2) var(--space-5);
+  border: 0;
+  border-radius: var(--radius-md);
+  font: var(--text-headline);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button-primary {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+}
+
+.button-secondary {
+  background: var(--color-accent-tint);
+  color: var(--color-link);
+}
+
+.button-danger {
+  background: var(--color-danger-tint);
+  color: var(--color-danger);
+}
+
+.notice {
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  font: var(--text-subheadline);
+}
+
+.notice-error,
+.notice-danger {
+  background: var(--color-danger-tint);
+}
+
+.notice-warning {
+  background: var(--color-warning-tint);
+}
+
+.code-field {
+  width: 100%;
+  min-height: var(--size-hit);
+  margin: var(--space-2) 0 var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-separator);
+  border-radius: var(--radius-sm);
+  background: var(--color-fill-tertiary);
+  color: var(--color-label);
+  font: 600 1.0625rem/1.4 var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.facts {
+  margin: 0 0 var(--space-4);
+}
+
+.facts dt {
+  font: var(--text-footnote);
+  color: var(--color-label-secondary);
+}
+
+.facts dd {
+  margin: 0 0 var(--space-3);
+  overflow-wrap: anywhere;
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-height: var(--size-hit);
+  padding: var(--space-2) 0;
+}
+
+.check input {
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.check label {
+  font: var(--text-body);
+}
+
+.actions {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: var(--space-3);
+}
+
+.actions .button {
+  width: 100%;
+}
+
+.footer-link {
+  margin: var(--space-5) 0 0;
+  font: var(--text-subheadline);
+}
+
+.empty {
+  color: var(--color-label-secondary);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Device list: stacked cards on phones, a table from 640px. */
+.devices {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.devices thead {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.devices tr {
+  display: block;
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-separator);
+}
+
+.devices td {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
+  overflow-wrap: anywhere;
+}
+
+.devices td::before {
+  content: attr(data-label);
+  color: var(--color-label-secondary);
+  font: var(--text-footnote);
+}
+
+.devices td.row-action {
+  justify-content: flex-end;
+  padding-top: var(--space-2);
+}
+
+.devices td.row-action::before {
+  content: none;
+}
+
+@media (min-width: 640px) {
+  .page {
+    padding: var(--space-8) var(--space-6);
+  }
+
+  .card {
+    padding: var(--space-8);
+  }
+
+  .card-wide {
+    max-width: none;
+  }
+
+  .page:has(.card-wide) {
+    max-width: 64rem;
+  }
+
+  h1 {
+    font: var(--text-title-1-emphasized);
+  }
+
+  .actions {
+    flex-direction: row;
+    justify-content: flex-end;
+  }
+
+  .actions .button {
+    width: auto;
+  }
+
+  .devices thead {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip: auto;
+  }
+
+  .devices tr {
+    display: table-row;
+    padding: 0;
+  }
+
+  .devices th,
+  .devices td {
+    display: table-cell;
+    padding: var(--space-3) var(--space-2);
+    text-align: left;
+    vertical-align: middle;
+    border-bottom: 1px solid var(--color-separator);
+  }
+
+  .devices th {
+    font: var(--text-footnote);
+    color: var(--color-label-secondary);
+  }
+
+  .devices td::before {
+    content: none;
+  }
+
+  .devices td.row-action {
+    text-align: right;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

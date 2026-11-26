@@ -126,6 +126,17 @@ impl APIError {
         }
     }
 
+    /// A device JWT was presented on a route that requires a browser
+    /// session.
+    pub fn browser_session_required() -> Self {
+        Self {
+            code: "BROWSER_SESSION_REQUIRED".to_string(),
+            message: "This action requires a browser session; device credentials are not accepted"
+                .to_string(),
+            engineering_error: None,
+        }
+    }
+
     pub fn internal_error(detail: &str) -> Self {
         Self {
             code: "INTERNAL_ERROR".to_string(),

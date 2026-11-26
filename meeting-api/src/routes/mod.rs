@@ -13,18 +13,23 @@
 
 //! Axum router configuration for the Meeting Backend API.
 
+pub mod cli_login;
+pub mod device_pages;
+pub mod devices_api;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
 pub mod waiting_room;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     routing::{delete, get, patch, post},
     Router,
 };
 
 use serde::{Deserialize, Serialize};
+
+use videocall_meeting_types::device as devices;
 
 use crate::state::AppState;
 
@@ -147,4 +152,42 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/reject",
             post(waiting_room::reject_participant),
         )
+        // CLI device keys (JSON, bearer device JWT or none)
+        .route(
+            devices::DEVICES_PATH,
+            post(devices_api::register)
+                .layer(DefaultBodyLimit::max(devices_api::MAX_REGISTER_BODY)),
+        )
+        .route(
+            devices::DEVICES_ME_PATH,
+            get(devices_api::me).delete(devices_api::revoke_me),
+        )
+}
+
+/// The whole application: JSON routes behind `cors`, pages outside it.
+pub fn app(cors: tower_http::cors::CorsLayer) -> Router<AppState> {
+    router().layer(cors).merge(page_router())
+}
+
+/// Largest accepted page form body.
+const MAX_FORM_BODY: usize = 4 * 1024;
+
+/// Server-rendered pages for CLI sign-in and device management, plus their
+/// stylesheet. Mount these outside the CORS layer: no page is readable
+/// cross-origin. Every response gets the strict security headers.
+pub fn page_router() -> Router<AppState> {
+    Router::new()
+        .route(devices::CLI_AUTHORIZE_PATH, get(cli_login::authorize))
+        .route(
+            "/cli/consent",
+            get(cli_login::consent_page).post(cli_login::consent_decision),
+        )
+        .route(devices::CLI_REMOTE_CODE_PATH, get(cli_login::code_info))
+        .route("/devices", get(device_pages::devices_page))
+        .route("/devices/{device_id}/revoke", post(device_pages::revoke))
+        .route("/static/auth.css", get(device_pages::stylesheet))
+        .layer(DefaultBodyLimit::max(MAX_FORM_BODY))
+        .layer(axum::middleware::map_response(
+            crate::html::security_headers,
+        ))
 }

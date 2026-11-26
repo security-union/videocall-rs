@@ -49,9 +49,11 @@ impl BotConfig {
             return Self::from_file(&config_path);
         }
 
-        // Fallback to environment variables (backwards compatibility)
-        let server_url = std::env::var("SERVER_URL")
-            .unwrap_or_else(|_| "https://webtransport-us-east.webtransport.video".to_string());
+        // Fallback to environment variables (backwards compatibility).
+        // Defaults to a local relay: the bot signs its own room tokens, so it
+        // only works against a deployment whose JWT_SECRET you hold.
+        let server_url =
+            std::env::var("SERVER_URL").unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
 
         let n_clients = std::env::var("N_CLIENTS")
             .unwrap_or_else(|_| "1".to_string())

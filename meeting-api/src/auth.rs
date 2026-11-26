@@ -11,29 +11,43 @@
  * at your option.
  */
 
-//! Axum extractor that authenticates the user via a signed session JWT.
+//! Axum extractors that authenticate the caller.
 //!
-//! The JWT can be delivered in two ways (checked in order):
+//! - [`AuthUser`]: browser session only. The signed HS256 session JWT comes
+//!   from `Cookie: <name>=<JWT>` (set by the OAuth callback as `HttpOnly`) or
+//!   from `Authorization: Bearer <JWT>`. A device JWT (header `alg: EdDSA`)
+//!   gets 403 `BROWSER_SESSION_REQUIRED`. This is the default for every route.
+//! - [`CliOrBrowserUser`]: additionally accepts a device JWT as bearer,
+//!   verified against the `devices` table. Used only on get meeting, join and
+//!   status.
 //!
-//! 1. `Cookie: session=<JWT>` -- set by the OAuth callback as `HttpOnly`.
-//! 2. `Authorization: Bearer <JWT>` -- for non-browser clients.
-//!
-//! The extractor validates the JWT signature using the shared secret from
-//! [`AppState`](crate::state::AppState) and extracts the user's identity from
-//! the `sub` claim (the user ID).
+//! The algorithm decides the path and is then pinned by the verifier: HS256
+//! tokens only ever reach the session decoder, EdDSA tokens only ever reach
+//! [`crate::device_auth::verify_device_jwt`].
 
 use axum::{
     extract::FromRequestParts,
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
 };
 use videocall_meeting_types::APIError;
 
+use crate::device_auth::{self, AllowedStates, DeviceAuthError};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::token;
 
-/// Extractor that resolves the authenticated user from a signed session JWT
-/// (cookie or Bearer header).
+/// How the caller authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthVia {
+    /// Browser session JWT (cookie or bearer).
+    Browser,
+    /// Device JWT of a live, approved CLI device.
+    Cli,
+}
+
+/// Extractor for a browser session (signed HS256 session JWT in the cookie or
+/// the bearer header).
 ///
 /// Usage in a handler:
 /// ```ignore
@@ -52,11 +66,22 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_session_token(parts, &state.cookie_name)
-            .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
-
+        // The cookie only ever carries a session JWT.
+        if let Some(token) = extract_cookie_token(&parts.headers, &state.cookie_name) {
+            let claims = token::decode_session_token(&state.jwt_secret, &token)?;
+            return Ok(AuthUser {
+                user_id: claims.sub,
+                name: claims.name,
+            });
+        }
+        let token = extract_bearer_token(&parts.headers).ok_or_else(AppError::unauthorized)?;
+        if device_auth::is_device_token(&token) {
+            return Err(AppError::new(
+                StatusCode::FORBIDDEN,
+                APIError::browser_session_required(),
+            ));
+        }
         let claims = token::decode_session_token(&state.jwt_secret, &token)?;
-
         Ok(AuthUser {
             user_id: claims.sub,
             name: claims.name,
@@ -64,43 +89,116 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
-/// Extract the raw session JWT from the request.
+/// Extractor for routes a CLI device may call (get meeting, join, status).
 ///
-/// Checks (in order):
-/// 1. `Cookie: <cookie_name>=<jwt>`
-/// 2. `Authorization: Bearer <jwt>`
-fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
-    // 1. Try the configured session cookie name.
-    if let Some(cookie_header) = parts
-        .headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
-        let prefix = format!("{cookie_name}=");
-        for pair in cookie_header.split(';') {
-            let pair = pair.trim();
-            if let Some(value) = pair.strip_prefix(prefix.as_str()) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+/// A browser session resolves exactly like [`AuthUser`]. A bearer whose header
+/// says `alg: EdDSA` is verified as a device JWT with
+/// `aud = DEVICE_TOKEN_AUDIENCE` and must belong to a live, approved device;
+/// `user_id` and `name` then come from the device row.
+#[derive(Debug)]
+pub struct CliOrBrowserUser {
+    pub user_id: String,
+    pub name: String,
+    pub via: AuthVia,
+}
+
+impl FromRequestParts<AppState> for CliOrBrowserUser {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let device_token = extract_cookie_token(&parts.headers, &state.cookie_name)
+            .is_none()
+            .then(|| extract_bearer_token(&parts.headers))
+            .flatten()
+            .filter(|token| device_auth::is_device_token(token));
+
+        let Some(token) = device_token else {
+            let user = AuthUser::from_request_parts(parts, state)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            return Ok(CliOrBrowserUser {
+                user_id: user.user_id,
+                name: user.name,
+                via: AuthVia::Browser,
+            });
+        };
+
+        let Some(audience) = state.device.audience.as_deref() else {
+            tracing::info!("device token rejected: DEVICE_TOKEN_AUDIENCE is not configured");
+            return Err(device_unauthorized());
+        };
+        let now = chrono::Utc::now();
+        match device_auth::verify_device_jwt(
+            &state.db,
+            &token,
+            audience,
+            now,
+            AllowedStates::LiveApproved,
+        )
+        .await
+        {
+            Ok(row) => {
+                device_auth::touch_live_device(&state.db, &row, now).await;
+                Ok(CliOrBrowserUser {
+                    user_id: row.user_id,
+                    name: row.user_name,
+                    via: AuthVia::Cli,
+                })
+            }
+            Err(DeviceAuthError::Db(e)) => Err(AppError::from(e).into_response()),
+            Err(err) => {
+                let kid = jsonwebtoken::decode_header(&token)
+                    .ok()
+                    .and_then(|h| h.kid)
+                    .filter(|kid| videocall_meeting_types::device::is_valid_device_id(kid));
+                tracing::info!(device_id = kid.as_deref().unwrap_or("-"), "{err}");
+                Err(device_unauthorized())
             }
         }
     }
-    // 2. Fall back to `Authorization: Bearer <token>`.
-    if let Some(auth) = parts
-        .headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
+}
+
+/// 401 for a rejected device token: the usual `UNAUTHORIZED` body plus
+/// `WWW-Authenticate: Bearer error="invalid_token"`. Never says why.
+pub(crate) fn device_unauthorized() -> Response {
+    let mut response = AppError::unauthorized().into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer error=\"invalid_token\""),
+    );
+    response
+}
+
+/// Extract the session JWT from the configured session cookie.
+pub(crate) fn extract_cookie_token(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())?;
+    let prefix = format!("{cookie_name}=");
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some(value) = pair.strip_prefix(prefix.as_str()) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
             }
         }
     }
     None
+}
+
+/// Extract a token from `Authorization: Bearer <token>`.
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())?;
+    let token = auth.strip_prefix("Bearer ")?.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +244,7 @@ mod tests {
             nats: None,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
+            device: crate::config::DeviceAuthConfig::default(),
         }
     }
 

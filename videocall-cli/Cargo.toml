@@ -2,6 +2,8 @@
 name = "videocall-cli"
 version = "4.1.2"
 edition = "2021"
+# std::fs::File::lock (credential store) is stable since 1.89.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/security-union/videocall-rs"
@@ -24,7 +26,7 @@ depends = "libc6 (>= 2.34), libasound2-dev (>=1.2.8), libv4l-dev (>=1.22.1), lib
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { version = "4.0.32", features = ["derive"] }
+clap = { version = "4.0.32", features = ["derive", "env"] }
 protobuf = "3.3.0"
 web-transport-quinn = { workspace = true }
 tokio = { version = "1.32.0", features = ["full"] }
@@ -39,6 +41,51 @@ image = "0.25.5"
 # libvpx backend is opt-in via the `libvpx` feature below.
 videocall-codecs = { path = "../videocall-codecs", version = "0.1.17" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.10", features = ["input-native", "output-threaded"] }
+# Device-key login (`videocall-cli auth ...`) and meeting join, both against
+# meeting-api.
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.2" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+secrecy = "0.10"
+# PKCE S256 and the constant-time `state` check on the loopback callback.
+sha2 = "0.10"
+subtle = "2.6"
+base64 = "0.22"
+getrandom = "0.3"
+# Ed25519 device key. Same versions and features as the rest of the
+# workspace (jsonwebtoken's `rust_crypto` backend pulls ed25519-dalek), so no
+# second crypto stack (aws-lc / ring) and no OpenSSL on the Pi build.
+ed25519-dalek = { version = "2.2", features = ["std", "zeroize", "pkcs8", "alloc"] }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"] }
+# Server `Date` header, for the clock-offset retry.
+httpdate = "1"
+webbrowser = { version = "1", features = ["hardened"] }
+
+# OS keychain for the CLI device key on macOS and Windows only. Linux uses
+# the 0600 file store: the Secret Service backends need either a system
+# libdbus (breaks the aarch64 Raspberry Pi cross-build) or a running,
+# unlocked session keyring (absent on headless machines).
+# geteuid() for the credential store's ownership checks.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+# Interop test: CLI-signed tokens verify with meeting-api's device-token
+# verifier. Default features (postgres) on purpose: a `sqlite` dev-dependency
+# would unify with the workspace's postgres build in `cargo test --workspace`
+# and trip meeting-api's one-backend compile_error.
+meeting-api = { path = "../meeting-api" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+chrono = "0.4"
 
 
 [dependencies.videocall-types]

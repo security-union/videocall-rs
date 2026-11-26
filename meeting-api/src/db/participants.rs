@@ -56,6 +56,39 @@ pub async fn upsert_host(
         .await
 }
 
+/// Admit the meeting creator when they join through the CLI.
+///
+/// Unlike [`upsert_host`], this never grants host: a new row gets
+/// `is_host = FALSE`, and an existing row (e.g. the creator's browser row)
+/// keeps its `is_host` and `display_name`. The waiting room is bypassed, as
+/// it is for the creator in the browser.
+pub async fn upsert_creator_via_cli(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<ParticipantRow, sqlx::Error> {
+    let query = format!(
+        r#"
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
+        VALUES ($1, $2, 'admitted', FALSE, $3, {SQL_NOW})
+        ON CONFLICT (meeting_id, user_id)
+        DO UPDATE SET status = 'admitted',
+                      admitted_at = COALESCE(meeting_participants.admitted_at, {SQL_NOW}),
+                      left_at = NULL,
+                      updated_at = {SQL_NOW},
+                      display_name = COALESCE(meeting_participants.display_name, $3)
+        RETURNING {PARTICIPANT_COLUMNS}
+        "#
+    );
+    sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(user_id)
+        .bind(display_name)
+        .fetch_one(pool)
+        .await
+}
+
 /// Atomically join a meeting as an attendee, respecting the current
 /// `waiting_room_enabled` setting.
 ///

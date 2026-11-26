@@ -25,18 +25,85 @@ use videocall_nokhwa::utils::FrameFormat;
 
 /// Video Call CLI
 ///
-/// This cli connects to the videocall.rs and streams audio and video to the specified meeting.
+/// Streams audio and video from this machine into a videocall.rs meeting.
 ///
-/// NOTE: the meeting must be created first from a browser at https://videocall.rs.
-/// The CLI can only JOIN an existing call — it cannot create one. A call created
-/// by the CLI will not work.
+/// Log in once with `videocall-cli auth login`. A browser opens, you sign in
+/// to videocall.rs, check that the key fingerprint matches the one in your
+/// terminal, and approve. On a machine without a browser, such as a
+/// Raspberry Pi over SSH, use `auth login --remote`: open the printed URL on
+/// any other device and paste the code it shows back into the terminal.
+/// Then join a meeting that already exists:
 ///
-/// You can watch the video at https://videocall.rs/meeting/{meeting_id}
+///   videocall-cli stream --meeting-id <ID> --video-device-index 0
+///
+/// The CLI cannot create or start meetings; create one in a browser at
+/// https://app.videocall.rs first. You appear in the meeting as the account
+/// that approved this machine. If the meeting has a waiting room, the host
+/// has to admit you.
 #[derive(Parser, Debug)]
-#[clap(name = "client")]
+#[clap(name = "videocall-cli")]
 pub struct Opt {
     #[clap(subcommand)]
     pub mode: Mode,
+}
+
+/// Which meeting-api server to use. Device keys are stored per server.
+#[derive(Args, Debug, Clone)]
+pub struct ApiArgs {
+    /// meeting-api base URL (an origin, no path). Use http:// only for a
+    /// local dev stack.
+    #[arg(
+        long = "api-url",
+        env = "VIDEOCALL_API_URL",
+        default_value = crate::auth::DEFAULT_API_URL
+    )]
+    pub api_url: Url,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Create a key for this machine and approve it in a browser.
+    ///
+    /// Opens the videocall.rs login page in your browser. Sign in, check that
+    /// the fingerprint on the page matches the one printed here, and approve.
+    /// The key replaces this machine's earlier one, which is then revoked.
+    ///
+    /// Over SSH, or on Linux without a desktop session, it switches to
+    /// --remote automatically.
+    Login(LoginArgs),
+
+    /// Revoke this machine's key on the server and delete it locally. The
+    /// local key is deleted even if the server can't be reached.
+    Logout(ApiArgs),
+
+    /// Show this machine's device id, name, fingerprint and where its key is
+    /// stored, then ask the server whether it is still valid. Exits 1 unless
+    /// it is.
+    Status(ApiArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LoginArgs {
+    /// Approve from another device: print the login URL, open it in any
+    /// browser, and paste the code it shows back here. No browser or open
+    /// port is needed on this machine.
+    #[arg(long = "remote")]
+    pub remote: bool,
+
+    /// Name shown on the approval page and in your list of devices.
+    /// Letters, digits, spaces and . _ ( ) @ : + - only, up to 64
+    /// characters. Default: "videocall-cli on <hostname>".
+    #[arg(long = "name")]
+    pub name: Option<String>,
+
+    #[command(flatten)]
+    pub api: ApiArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct Auth {
+    #[command(subcommand)]
+    pub command: AuthCommand,
 }
 
 #[derive(Clone, Debug)]
@@ -65,11 +132,16 @@ impl FromStr for IndexKind {
 
 #[derive(Subcommand, Debug)]
 pub enum Mode {
+    /// Log in, log out, or check the stored login.
+    Auth(Auth),
+
     /// Stream audio and video to an EXISTING meeting.
     ///
-    /// The meeting must be created first by a user in a browser at
-    /// https://videocall.rs. The CLI can only join a call, not create one.
-    Stream(Stream),
+    /// Requires `videocall-cli auth login` first. The meeting must already
+    /// exist (create it in a browser) and be started by its host; the CLI
+    /// joins as the account that approved this machine and waits in the
+    /// waiting room until the host admits you.
+    Stream(Box<Stream>),
 
     /// Information mode to list cameras, formats, and resolutions.
     Info(Info),
@@ -86,17 +158,19 @@ pub struct Stream {
     )]
     pub url: Url,
 
-    #[clap(long = "user-id")]
-    pub user_id: String,
+    #[command(flatten)]
+    pub api: ApiArgs,
 
-    /// Meeting (call) ID to join.
+    /// Meeting ID to join.
     ///
-    /// IMPORTANT: the call must already exist — create it first from a browser
-    /// at https://videocall.rs. The CLI can no longer create a call itself (the
-    /// API changed); if the call's creator is the CLI, it will not work — a
-    /// browser user has to create it.
+    /// The meeting must already exist: create it in a browser first. If it
+    /// doesn't exist the CLI exits with an error rather than creating it.
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
+
+    /// Name shown to other participants. Defaults to your account's name.
+    #[clap(long = "display-name")]
+    pub display_name: Option<String>,
 
     /// Specify which camera to use, either by index number or name.
     ///
@@ -169,8 +243,11 @@ pub struct Stream {
     #[clap(long = "debug-offline-streaming-test")]
     pub local_streaming_test: bool,
 
-    /// Skip TLS certificate verification for QUIC connections.
-    /// Warning: This makes connections insecure and should only be used for testing.
+    /// Skip TLS certificate verification for the relay (QUIC) connection.
+    ///
+    /// Only allowed when --url is localhost, a loopback address, or a
+    /// private-range IP (a local dev stack); refused otherwise. Never applies
+    /// to the meeting-api connection.
     #[clap(long = "insecure-skip-verify")]
     pub insecure_skip_verify: bool,
 }

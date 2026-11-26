@@ -11,6 +11,18 @@ Enhanced bot that streams synthetic audio and video to videocall-rs for load tes
 - **Linear Ramp-up**: Configurable delay between client starts
 - **Multi-Client Support**: Run multiple synthetic clients per container
 
+## Authentication
+
+The relay only lets you in with a room access token: `/lobby?token=<JWT>`. The bot signs its own tokens with the same secret the relay checks, so it only works against a deployment whose `JWT_SECRET` you hold. In practice that means your local dev stack or infrastructure you run.
+
+Set the secret in the environment before you start the bot:
+
+```bash
+export JWT_SECRET=dev-jwt-secret-change-me   # the dev stack's default
+```
+
+The bot reads `JWT_SECRET` from the environment only, never from `config.yaml`, and it exits with an error if the variable is missing. It also never logs the connection URL, because the token rides in the query string.
+
 ## Configuration
 
 ### Option 1: YAML Configuration File (Recommended)
@@ -19,7 +31,8 @@ Create a `config.yaml` file:
 
 ```yaml
 ramp_up_delay_ms: 1000
-server_url: "https://webtransport-us-east.webtransport.video"
+server_url: "https://127.0.0.1:4433"
+insecure: true   # the local relay uses a self-signed certificate
 clients:
   - user_id: "bot001"
     meeting_id: "test-room"
@@ -33,14 +46,16 @@ clients:
 
 Then run:
 ```bash
-BOT_CONFIG_PATH=config.yaml cargo run
+JWT_SECRET=... BOT_CONFIG_PATH=config.yaml cargo run
 ```
 
 ### Option 2: Environment Variables (Backwards Compatible)
 
 ```bash
+JWT_SECRET=...
 N_CLIENTS=3
-SERVER_URL="https://webtransport-us-east.webtransport.video"
+SERVER_URL="https://127.0.0.1:4433"
+INSECURE=true
 ROOM="test-room"
 CLIENT_0_ENABLE_AUDIO=true
 CLIENT_0_ENABLE_VIDEO=false
@@ -62,12 +77,12 @@ The bot includes pre-loaded media assets:
 
 ### Test Audio-Only Clients
 ```bash
-BOT_CONFIG_PATH=config.yaml RUST_LOG=info cargo run
+JWT_SECRET=... BOT_CONFIG_PATH=config.yaml RUST_LOG=info cargo run
 ```
 
 ### Quick 10-Client Test
 ```bash
-N_CLIENTS=10 ROOM="load-test" cargo run
+JWT_SECRET=... INSECURE=true N_CLIENTS=10 ROOM="load-test" cargo run
 ```
 
 ### Docker Build

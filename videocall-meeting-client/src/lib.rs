@@ -37,25 +37,57 @@
 //! ```
 
 pub mod auth;
+pub mod devices;
 pub mod error;
 pub mod meetings;
 pub mod participants;
 pub mod waiting_room;
 
 pub use error::ApiError;
+/// Re-exported so callers of [`MeetingApiClient::with_http`] build the
+/// `reqwest::Client` from the same version this crate uses.
+pub use reqwest;
 pub use videocall_meeting_types;
+
+use std::sync::Arc;
 
 use reqwest::Client;
 
+/// Mints a fresh `Authorization: Bearer` token for each request.
+///
+/// Used for credentials that must not be reused across requests, such as
+/// `videocall-cli`'s device JWTs (one signed token per request, bound to
+/// the meeting-api origin). Implementations must never log the token.
+pub trait TokenSource: Send + Sync {
+    /// A new token for the next request, or `None` if one couldn't be made
+    /// (the request is then sent without credentials and fails with 401).
+    fn token(&self) -> Option<String>;
+}
+
 /// How the client authenticates with the meeting API.
-#[derive(Debug, Clone)]
+///
+/// `Debug` never prints the bearer token.
+#[derive(Clone)]
 pub enum AuthMode {
     /// Browser mode: send credentials (cookies) automatically via `fetch`.
     /// This is the mode used by `dioxus-ui` and other WASM frontends.
     Cookie,
     /// Bearer token mode: attach `Authorization: Bearer <token>` to every
-    /// request. Used by CLI tools, mobile apps, and integration tests.
+    /// request. Used by mobile apps and integration tests.
     Bearer(String),
+    /// Per-request token mode: ask the [`TokenSource`] for a new token for
+    /// every request. Used by `videocall-cli` device keys.
+    Signed(Arc<dyn TokenSource>),
+}
+
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMode::Cookie => f.write_str("Cookie"),
+            AuthMode::Bearer(_) => f.write_str("Bearer([REDACTED])"),
+            AuthMode::Signed(_) => f.write_str("Signed([REDACTED])"),
+        }
+    }
 }
 
 /// A typed REST client for the videocall.rs meeting API.
@@ -77,10 +109,20 @@ impl MeetingApiClient {
     /// * `base_url` - e.g. `"http://localhost:8081"`
     /// * `auth` - how to authenticate requests
     pub fn new(base_url: &str, auth: AuthMode) -> Self {
+        Self::with_http(Client::new(), base_url, auth)
+    }
+
+    /// Create a client that reuses an existing [`reqwest::Client`].
+    ///
+    /// `reqwest::Client` is a cheap handle onto a shared connection pool, so
+    /// a long-running native program (e.g. `videocall-cli`) should build one
+    /// and pass it to every `MeetingApiClient` it creates, instead of paying
+    /// a new TCP + TLS handshake per client.
+    pub fn with_http(http: Client, base_url: &str, auth: AuthMode) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
-            http: Client::new(),
+            http,
         }
     }
 
@@ -129,6 +171,12 @@ impl MeetingApiClient {
             AuthMode::Bearer(token) => {
                 builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
             }
+            AuthMode::Signed(source) => match source.token() {
+                Some(token) => {
+                    builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+                }
+                None => builder,
+            },
         }
     }
 }
@@ -190,5 +238,21 @@ pub(crate) async fn parse_status_only(response: reqwest::Response) -> Result<(),
             let text = response.text().await.unwrap_or_default();
             Err(ApiError::ServerError { status, body: text })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_bearer_token() {
+        let client = MeetingApiClient::new(
+            "http://localhost:8081",
+            AuthMode::Bearer("secret-jwt-value".to_string()),
+        );
+        let printed = format!("{client:?}");
+        assert!(!printed.contains("secret-jwt-value"), "{printed}");
+        assert!(printed.contains("Bearer([REDACTED])"));
     }
 }

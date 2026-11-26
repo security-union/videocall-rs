@@ -660,7 +660,7 @@ async fn test_update_meeting_unauthenticated() {
     let app = build_app(pool.clone());
     let req = axum::http::Request::builder()
         .method("PATCH")
-        .uri(&format!("/api/v1/meetings/{room_id}"))
+        .uri(format!("/api/v1/meetings/{room_id}"))
         .header("Content-Type", "application/json")
         .body(Body::from(r#"{"waiting_room_enabled":false}"#))
         .unwrap();

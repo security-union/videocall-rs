@@ -107,12 +107,16 @@ pub async fn login(
 
     // Sanitize return_to: allow relative paths and absolute URLs whose origin
     // is in the allowlist (after_login_url origin + ALLOWED_REDIRECT_URLS).
+    // The CLI sign-in pages on this server's own origin are a closed set
+    // checked first; everything else goes through the unchanged allowlist.
     let return_to = query.return_to.as_deref().and_then(|u| {
-        validate_return_to(
-            u,
-            &oauth_cfg.after_login_url,
-            &oauth_cfg.allowed_redirect_urls,
-        )
+        device_page_return_to(&state, u).or_else(|| {
+            validate_return_to(
+                u,
+                &oauth_cfg.after_login_url,
+                &oauth_cfg.allowed_redirect_urls,
+            )
+        })
     });
     let return_to = return_to.as_deref();
 
@@ -230,12 +234,15 @@ pub async fn callback(
     let redirect_url = match &oauth_req.return_to {
         Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
             // Absolute URL — re-validate as defense-in-depth.
-            validate_return_to(
-                value,
-                &oauth_cfg.after_login_url,
-                &oauth_cfg.allowed_redirect_urls,
-            )
-            .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
+            device_page_return_to(&state, value)
+                .or_else(|| {
+                    validate_return_to(
+                        value,
+                        &oauth_cfg.after_login_url,
+                        &oauth_cfg.allowed_redirect_urls,
+                    )
+                })
+                .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
         }
         Some(path) => {
             // Relative path (e.g. "/meeting/1") — prepend the frontend base URL.
@@ -256,11 +263,16 @@ pub async fn callback(
         state.cookie_secure,
     );
 
+    // Log only the redirect origin: the returnTo path and query can carry
+    // values such as a device user code.
+    let redirect_origin = url::Url::parse(&redirect_url)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_else(|_| "(relative)".to_string());
     tracing::info!(
         "OAuth login successful for {} ({}), redirecting to {}",
         display_name,
         email,
-        redirect_url
+        redirect_origin
     );
 
     let mut response = Redirect::to(&redirect_url).into_response();
@@ -310,6 +322,15 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A post-login return target on this server's own pages: exactly
+/// `{DEVICE_TOKEN_AUDIENCE}/cli/consent?request=<id>` or
+/// `{DEVICE_TOKEN_AUDIENCE}/devices`, rebuilt server-side. `None` for
+/// anything else, or when device auth is not configured.
+fn device_page_return_to(state: &AppState, raw: &str) -> Option<String> {
+    let origin = state.device.audience.as_deref()?;
+    crate::device_auth::device_return_target(raw, origin)
+}
 
 /// Validate and sanitize a `returnTo` value.
 ///

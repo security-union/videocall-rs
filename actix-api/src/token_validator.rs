@@ -15,8 +15,8 @@
 //!
 //! Validates tokens issued by the Meeting Backend (meeting-api) before allowing
 //! a client to connect to the Media Server. Mirrors the approach used by LiveKit:
-//! parse JWT, verify HMAC signature, check `room_join == true`, and ensure the
-//! room and identity match the connection request.
+//! parse JWT, verify HMAC signature, check `room_join == true` (or `observer`),
+//! and take identity and room from the claims. The relay has no other way in.
 
 use jsonwebtoken::{DecodingKey, Validation};
 use regex::Regex;
@@ -34,7 +34,7 @@ lazy_static::lazy_static! {
 /// Errors that can occur during room token validation.
 #[derive(Debug)]
 pub enum TokenError {
-    /// No token was provided but one is required (FF=on).
+    /// No token was provided. Every connection needs one.
     Missing,
     /// Token could not be decoded or signature is invalid.
     Invalid(String),
@@ -42,16 +42,6 @@ pub enum TokenError {
     Expired,
     /// The `room_join` claim is `false`; participant is not authorized to join.
     RoomJoinDenied,
-    /// The `room` claim does not match the room in the connection URL.
-    RoomMismatch {
-        token_room: String,
-        requested_room: String,
-    },
-    /// The `sub` claim does not match the user ID/identity in the connection URL.
-    IdentityMismatch {
-        token_identity: String,
-        requested_identity: String,
-    },
     /// A claim value contains characters that are unsafe for use in NATS subjects
     /// (dots, wildcards `*` / `>`, spaces, etc.). This indicates either a tampered
     /// JWT or a bug in the token-issuing service.
@@ -65,20 +55,6 @@ impl fmt::Display for TokenError {
             TokenError::Invalid(msg) => write!(f, "invalid token: {msg}"),
             TokenError::Expired => write!(f, "token has expired"),
             TokenError::RoomJoinDenied => write!(f, "token does not grant room join permission"),
-            TokenError::RoomMismatch {
-                token_room,
-                requested_room,
-            } => write!(
-                f,
-                "token room '{token_room}' does not match requested room '{requested_room}'"
-            ),
-            TokenError::IdentityMismatch {
-                token_identity,
-                requested_identity,
-            } => write!(
-                f,
-                "token identity '{token_identity}' does not match '{requested_identity}'"
-            ),
             TokenError::UnsafeIdentifier { field, value } => write!(
                 f,
                 "token {field} '{value}' contains characters unsafe for NATS subjects"
@@ -99,12 +75,17 @@ impl TokenError {
         )
     }
 
-    /// Whether the client should receive a 401 (retry with a fresh token) or
-    /// 403 (do not retry, access denied).
+    /// HTTP status used to refuse a connection with this error, on both
+    /// transports (the WebSocket upgrade response and the WebTransport
+    /// CONNECT response).
     ///
-    /// Only `Expired` is retryable; everything else is a hard denial.
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, TokenError::Expired)
+    /// - `401`: come back with a token. Either none was sent or it expired.
+    /// - `403`: the token was read and refused; sending it again won't help.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            TokenError::Missing | TokenError::Expired => 401,
+            _ => 403,
+        }
     }
 
     /// The message that should be returned to the client.
@@ -137,10 +118,10 @@ impl TokenError {
 
 /// Decode and validate a JWT room access token, extracting claims.
 ///
-/// This is the primary validation function for the **token-based** connection
-/// endpoint (`GET /lobby?token=<JWT>`). The identity (user_id) and room are
-/// extracted from the token claims themselves -- there are no URL path
-/// parameters to cross-check.
+/// This is the validation function for the only connection endpoint
+/// (`/lobby?token=<JWT>` on both WebSocket and WebTransport). The identity
+/// (user_id) and room are extracted from the token claims themselves; there
+/// are no URL path parameters to cross-check.
 ///
 /// Checks:
 /// 1. Signature is valid (HMAC-SHA256)
@@ -184,46 +165,6 @@ pub fn decode_room_token(secret: &str, token: &str) -> Result<RoomAccessTokenCla
     // notifications but cannot participate in the room media exchange.
     if !claims.room_join && !claims.observer {
         return Err(TokenError::RoomJoinDenied);
-    }
-
-    Ok(claims)
-}
-
-/// Validate a JWT room access token against expected room and identity.
-///
-/// Validate a JWT room access token against expected room and identity.
-///
-/// **DEPRECATED**: This function is used by the legacy `GET /lobby/{user_id}/{room}`
-/// endpoint. Prefer [`decode_room_token`] for the new token-based endpoint where
-/// identity and room are extracted from the JWT claims directly.
-///
-/// Decodes the token with HMAC-SHA256 using `secret`, then checks:
-/// 1. Signature is valid
-/// 2. Token is not expired (`exp`)
-/// 3. Issuer matches `RoomAccessTokenClaims::ISSUER`
-/// 4. `room_join` is `true`
-/// 5. `room` matches `expected_room`
-/// 6. `sub` matches `expected_email`
-pub fn validate_room_token(
-    secret: &str,
-    token: &str,
-    expected_room: &str,
-    expected_email: &str,
-) -> Result<RoomAccessTokenClaims, TokenError> {
-    let claims = decode_room_token(secret, token)?;
-
-    if claims.room != expected_room {
-        return Err(TokenError::RoomMismatch {
-            token_room: claims.room.clone(),
-            requested_room: expected_room.to_string(),
-        });
-    }
-
-    if claims.sub != expected_email {
-        return Err(TokenError::IdentityMismatch {
-            token_identity: claims.sub.clone(),
-            requested_identity: expected_email.to_string(),
-        });
     }
 
     Ok(claims)
@@ -324,48 +265,21 @@ mod tests {
         assert!(matches!(result, Err(TokenError::Invalid(_))));
     }
 
-    // -- validate_room_token tests (deprecated, with URL cross-check) --
-
-    #[test]
-    fn valid_token_succeeds() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-1", "alice@test.com");
-        assert!(result.is_ok());
-        let claims = result.unwrap();
-        assert_eq!(claims.sub, "alice@test.com");
-        assert_eq!(claims.room, "room-1");
-        assert!(claims.room_join);
-    }
-
-    #[test]
-    fn room_mismatch_fails() {
-        let token = make_token("alice@test.com", "room-A", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-B", "alice@test.com");
-        assert!(matches!(result, Err(TokenError::RoomMismatch { .. })));
-    }
-
-    #[test]
-    fn identity_mismatch_fails() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-1", "bob@test.com");
-        assert!(matches!(result, Err(TokenError::IdentityMismatch { .. })));
-    }
-
     // -- TokenError classification tests --
 
     #[test]
-    fn expired_is_retryable_and_not_suspicious() {
+    fn expired_is_401_and_not_suspicious() {
         let err = TokenError::Expired;
-        assert!(err.is_retryable());
+        assert_eq!(err.http_status(), 401);
         assert!(!err.is_suspicious());
         assert_eq!(err.client_message(), "token has expired");
     }
 
     #[test]
-    fn invalid_signature_is_suspicious_and_not_retryable() {
+    fn invalid_signature_is_suspicious_and_403() {
         let err = TokenError::Invalid("InvalidSignature".to_string());
+        assert_eq!(err.http_status(), 403);
         assert!(err.is_suspicious());
-        assert!(!err.is_retryable());
         assert_eq!(
             err.client_message(),
             "We detected unusual activity from your browser. This incident has been logged."
@@ -373,48 +287,44 @@ mod tests {
     }
 
     #[test]
-    fn room_join_denied_is_not_retryable_and_not_suspicious() {
+    fn room_join_denied_is_403_and_not_suspicious() {
         let err = TokenError::RoomJoinDenied;
-        assert!(!err.is_retryable());
+        assert_eq!(err.http_status(), 403);
         assert!(!err.is_suspicious());
         assert_eq!(err.client_message(), "access denied");
     }
 
     #[test]
-    fn missing_is_not_retryable_and_not_suspicious() {
+    fn http_status_is_401_for_missing_or_expired_and_403_otherwise() {
+        assert_eq!(TokenError::Missing.http_status(), 401);
+        assert_eq!(TokenError::Expired.http_status(), 401);
+        assert_eq!(TokenError::Invalid("x".to_string()).http_status(), 403);
+        assert_eq!(TokenError::RoomJoinDenied.http_status(), 403);
+        assert_eq!(
+            TokenError::UnsafeIdentifier {
+                field: "room".to_string(),
+                value: "a.b".to_string(),
+            }
+            .http_status(),
+            403
+        );
+    }
+
+    #[test]
+    fn missing_is_401_and_not_suspicious() {
         let err = TokenError::Missing;
-        assert!(!err.is_retryable());
+        assert_eq!(err.http_status(), 401);
         assert!(!err.is_suspicious());
         assert_eq!(err.client_message(), "access denied");
-    }
-
-    #[test]
-    fn room_mismatch_is_not_retryable_and_not_suspicious() {
-        let err = TokenError::RoomMismatch {
-            token_room: "a".to_string(),
-            requested_room: "b".to_string(),
-        };
-        assert!(!err.is_retryable());
-        assert!(!err.is_suspicious());
-    }
-
-    #[test]
-    fn identity_mismatch_is_not_retryable_and_not_suspicious() {
-        let err = TokenError::IdentityMismatch {
-            token_identity: "a@test.com".to_string(),
-            requested_identity: "b@test.com".to_string(),
-        };
-        assert!(!err.is_retryable());
-        assert!(!err.is_suspicious());
     }
 
     // -- End-to-end: decode produces correct classification --
 
     #[test]
-    fn expired_token_error_is_retryable() {
+    fn expired_token_error_is_401() {
         let token = make_token("alice@test.com", "room-1", true, -120);
         let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
-        assert!(err.is_retryable());
+        assert_eq!(err.http_status(), 401);
         assert!(!err.is_suspicious());
     }
 
@@ -423,14 +333,12 @@ mod tests {
         let token = make_token("alice@test.com", "room-1", true, 600);
         let err = decode_room_token("wrong-secret", &token).unwrap_err();
         assert!(err.is_suspicious());
-        assert!(!err.is_retryable());
     }
 
     #[test]
     fn garbage_token_error_is_suspicious() {
         let err = decode_room_token(TEST_SECRET, "not.a.jwt").unwrap_err();
         assert!(err.is_suspicious());
-        assert!(!err.is_retryable());
     }
 
     // -- NATS subject injection tests --
@@ -441,7 +349,6 @@ mod tests {
         let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
         assert!(matches!(err, TokenError::UnsafeIdentifier { .. }));
         assert!(err.is_suspicious());
-        assert!(!err.is_retryable());
     }
 
     #[test]
@@ -474,13 +381,13 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_identifier_error_is_suspicious_and_not_retryable() {
+    fn unsafe_identifier_error_is_suspicious_and_403() {
         let err = TokenError::UnsafeIdentifier {
             field: "room".to_string(),
             value: "evil.>".to_string(),
         };
+        assert_eq!(err.http_status(), 403);
         assert!(err.is_suspicious());
-        assert!(!err.is_retryable());
         assert_eq!(
             err.client_message(),
             "We detected unusual activity from your browser. This incident has been logged."

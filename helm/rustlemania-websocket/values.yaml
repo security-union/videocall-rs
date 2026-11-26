@@ -15,8 +15,6 @@ env:
     value: info
   - name: ACTIX_PORT
     value: "8080"
-  - name: UI_ENDPOINT
-    value: https://rustlemania.com
   - name: NATS_URL
     value: nats:4222
   - name: TOKIO_WORKER_THREADS

@@ -41,6 +41,17 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install --quiet cryptography
           echo "MOCK_PYTHON=$RUNNER_TEMP/venv/bin/python3" >> "$GITHUB_ENV"
 
+      # Started once and shared: starting it per scenario cost 35 s each.
+      - name: Start the mock backend
+        run: |
+          nohup "$RUNNER_TEMP/venv/bin/python3" nix/tests/mock-meeting-api.py 18081 \
+            > "$RUNNER_TEMP/mock.log" 2>&1 &
+          for _ in $(seq 1 120); do
+            curl -sf --max-time 2 http://127.0.0.1:18081/version >/dev/null && exit 0
+            sleep 0.5
+          done
+          cat "$RUNNER_TEMP/mock.log"; exit 1
+
       - name: Keychain works, login and logout
         run: videocall-cli/tests/macos-keychain.sh works
 

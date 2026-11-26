@@ -5,8 +5,9 @@
 #
 # CI only (.github/workflows/macos-cli-keychain.yaml): it swaps the default
 # keychain, so never run it on a machine whose keychain you care about.
-# Needs: CLI (path to videocall-cli), MOCK_PYTHON (python3 with `cryptography`),
-# and the mock backend at nix/tests/mock-meeting-api.py. macOS has no `timeout`,
+# Needs: CLI (path to videocall-cli), MOCK_PYTHON (python3 with `cryptography`)
+# and the mock backend (nix/tests/mock-meeting-api.py) already listening on
+# $PORT (the workflow starts it once). macOS has no `timeout`,
 # so every CLI call runs under `perl -e 'alarm ...; exec'`.
 #
 # How the keychain is made to refuse: the temporary keychain that is the
@@ -23,7 +24,6 @@ SCENARIO=${1:?scenario}
 CLI=${CLI:?path to videocall-cli}
 MOCK_PYTHON=${MOCK_PYTHON:-python3}
 HERE=$(cd "$(dirname "$0")" && pwd)
-MOCK=$HERE/../../nix/tests/mock-meeting-api.py
 PORT=${PORT:-18081}
 API=http://127.0.0.1:$PORT
 WORK=$(mktemp -d)
@@ -38,14 +38,11 @@ die() { printf '\nFAIL: %s\n' "$*" >&2; [ -f "$WORK/login.out" ] && sed 's/^/  l
 check() { local what=$1; shift; "$@" || die "$what"; }
 wait_for() { local n=$(($2 * 4)); while [ $n -gt 0 ]; do eval "$1" && return 0; sleep 0.25; n=$((n - 1)); done; return 1; }
 
-# ---- mock backend ---------------------------------------------------------
-echo "start $(date +%T)"
-"$MOCK_PYTHON" "$MOCK" "$PORT" >"$WORK/mock.log" 2>&1 &
-MOCK_PID=$!
-trap 'kill $MOCK_PID 2>/dev/null' EXIT
-wait_for "curl -sf --max-time 2 $API/version >/dev/null" 90 || { cat "$WORK/mock.log"; die "mock did not start"; }
-echo "mock up $(date +%T)"
+# ---- mock backend (started once by the workflow, shared by all scenarios) ---
+curl -sf --max-time 5 "$API/version" >/dev/null || die "no mock backend on $API"
 mock_state() { curl -sf "$API/_mock/state" | "$MOCK_PYTHON" -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
+DELETES_BEFORE=$(mock_state deletes)
+revokes() { echo $(($(mock_state deletes) - DELETES_BEFORE)); }
 
 # ---- the keychain -----------------------------------------------------------
 kc_item() { tmo 10 security find-generic-password -s videocall-cli -a "$API" >/dev/null 2>&1; }
@@ -128,7 +125,7 @@ works)
   logout
   [ "$LOGOUT_RC" = 0 ] || die "logout exited $LOGOUT_RC: $LOGOUT_OUT"
   ! kc_item || die "the keychain item is still there"
-  [ "$(mock_state deletes)" = 1 ] || die "the mock did not see the revoke"
+  [ "$(revokes)" = 1 ] || die "the mock did not see exactly one revoke"
   ;;
 
 refuses-on-save)
@@ -182,7 +179,7 @@ logout-refused)
   echo "logout exit code: $LOGOUT_RC"
   echo "logout output: $LOGOUT_OUT"
   [ -z "$(key_files)" ] || die "the key file survived logout"
-  [ "$(mock_state deletes)" = 1 ] || die "the mock did not see the revoke"
+  [ "$(revokes)" = 1 ] || die "the mock did not see exactly one revoke"
   [ "$LOGOUT_RC" != 0 ] || die "logout reported success although the keychain refused"
   echo "$LOGOUT_OUT" | grep -q "keychain error" || die "logout did not report the keychain error"
   ;;
@@ -192,7 +189,7 @@ locked)
   kc_default
   security lock-keychain "$KC" || die "could not lock the keychain"
   start=$(date +%s)
-  login 30
+  login 20
   took=$(($(date +%s) - start))
   if [ "$LOGIN_RC" = 142 ]; then
     echo "::warning title=locked keychain::videocall-cli auth login BLOCKS on a locked keychain (killed by the alarm after ${took}s, no error, no output)"
